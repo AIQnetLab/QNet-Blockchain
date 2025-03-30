@@ -1,0 +1,291 @@
+{% extends "base.html" %}
+{% block title %}About QNet Blockchain{% endblock %}
+{% block bodyclass %}page-about{% endblock %}
+
+{% block content %}
+<div class="row">
+    <div class="col-lg-8 mx-auto">
+        <h1 class="text-center mb-5">About QNet Blockchain</h1>
+        
+        <div class="card mb-4">
+            <div class="card-body">
+                <h3>The QNet Blockchain Project</h3>
+                <p>
+                    QNet is a quantum-resistant blockchain platform built from the ground up to be secure, 
+                    energy-efficient, and accessible to everyone, even on mobile devices.
+                </p>
+                
+                <div class="text-center my-5">
+                    <svg width="200" height="200" viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
+                        <!-- Quantum-inspired logo -->
+                        <defs>
+                            <linearGradient id="grad1" x1="0%" y1="0%" x2="100%" y2="100%">
+                                <stop offset="0%" style="stop-color:rgb(110,142,251);stop-opacity:1" />
+                                <stop offset="100%" style="stop-color:rgb(167,119,227);stop-opacity:1" />
+                            </linearGradient>
+                        </defs>
+                        <circle cx="100" cy="100" r="50" fill="none" stroke="url(#grad1)" stroke-width="4" />
+                        <circle cx="100" cy="100" r="70" fill="none" stroke="url(#grad1)" stroke-width="2" stroke-dasharray="5,5" />
+                        <circle cx="100" cy="100" r="90" fill="none" stroke="url(#grad1)" stroke-width="1" stroke-dasharray="2,2" />
+                        <circle cx="100" cy="100" r="30" fill="none" stroke="url(#grad1)" stroke-width="3" />
+                        <circle cx="100" cy="100" r="15" fill="url(#grad1)" />
+                        <circle cx="145" cy="100" r="10" fill="url(#grad1)" opacity="0.7" />
+                        <circle cx="55" cy="100" r="10" fill="url(#grad1)" opacity="0.7" />
+                        <circle cx="100" cy="145" r="10" fill="url(#grad1)" opacity="0.7" />
+                        <circle cx="100" cy="55" r="10" fill="url(#grad1)" opacity="0.7" />
+                    </svg>
+                </div>
+                
+                <h4 class="mt-4">Our Mission</h4>
+                <p>
+                    We believe blockchain technology should be accessible to everyone, not just those with expensive
+                    hardware or technical knowledge. QNet was created to demonstrate that a single developer can build
+                    a fully functional, secure blockchain without massive resources.
+                </p>
+                
+                <h4 class="mt-4">Technical Foundations</h4>
+                <div class="card bg-light p-3 mb-3">
+                    <ul class="list-group list-group-flush">
+                        <li class="list-group-item bg-transparent"><strong>Post-Quantum Cryptography:</strong> Uses Dilithium, a NIST approved PQC algorithm for quantum-resistant signatures</li>
+                        <li class="list-group-item bg-transparent"><strong>Efficient Consensus:</strong> Commit-reveal mechanism with external random beacon for energy efficiency</li>
+                        <li class="list-group-item bg-transparent"><strong>Mobile First:</strong> Optimized for low resource environments including smartphones</li>
+                        <li class="list-group-item bg-transparent"><strong>Modular Architecture:</strong> Core components in Rust, interface layers in Python</li>
+                        <li class="list-group-item bg-transparent"><strong>Decentralized Identity:</strong> Built-in DID support for Sybil resistance</li>
+                    </ul>
+                </div>
+                
+                <h4 class="mt-4">Economic Model</h4>
+                <p>
+                    QNet features a logarithmic emission curve that issues 90% of the total supply (2^32 coins) within the first 10 years.
+                    This creates a balanced approach between initial distribution to early adopters and long-term
+                    sustainability of the network.
+                </p>
+                
+                <div class="card bg-light p-3 mb-4">
+                    <canvas id="emissionChart" height="200"></canvas>
+                </div>
+                
+                <h4 class="mt-4">Unique "Punk" Development Philosophy</h4>
+                <p>
+                    QNet was created by a solo developer with help from AI tools, demonstrating that blockchain 
+                    technology doesn't require large teams or VC funding. This "punk" approach to development
+                    echoes the original ethos of cryptocurrencies - technology built by individuals, for individuals,
+                    without corporate or institutional control.
+                </p>
+                
+                <div class="text-center mt-5">
+                    <a href="/documentation" class="btn btn-primary me-2">Read the Docs</a>
+                    <a href="/explorer" class="btn btn-outline-primary">Explore the Chain</a>
+                </div>
+            </div>
+        </div>
+        
+        <div class="card mb-4">
+            <div class="card-header">
+                <h3 class="mb-0">Frequently Asked Questions</h3>
+            </div>
+            <div class="card-body">
+                <div class="accordion" id="faqAccordion">
+                    <div class="accordion-item">
+                        <h2 class="accordion-header" id="headingOne">
+                            <button class="accordion-button" type="button" data-bs-toggle="collapse" data-bs-target="#collapseOne" aria-expanded="true" aria-controls="collapseOne">
+                                How does QNet achieve quantum resistance?
+                            </button>
+                        </h2>
+                        <div id="collapseOne" class="accordion-collapse collapse show" aria-labelledby="headingOne" data-bs-parent="#faqAccordion">
+                            <div class="accordion-body">
+                                QNet uses Dilithium, a lattice-based cryptographic algorithm that has been selected by NIST
+                                as a standard for post-quantum digital signatures. This means that even quantum computers with
+                                significant qubits cannot break QNet's cryptographic security. Unlike traditional blockchains that
+                                rely on ECDSA signatures (vulnerable to Shor's algorithm running on quantum computers), QNet's 
+                                foundation is built to withstand attacks from both classical and quantum adversaries.
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="accordion-item">
+                        <h2 class="accordion-header" id="headingTwo">
+                            <button class="accordion-button collapsed" type="button" data-bs-toggle="collapse" data-bs-target="#collapseTwo" aria-expanded="false" aria-controls="collapseTwo">
+                                Can I really run a QNet node on my phone?
+                            </button>
+                        </h2>
+                        <div id="collapseTwo" class="accordion-collapse collapse" aria-labelledby="headingTwo" data-bs-parent="#faqAccordion">
+                            <div class="accordion-body">
+                                Yes! QNet was designed from the ground up to be lightweight and efficient. The SPV (Simplified
+                                Payment Verification) client allows full participation in the network even on mobile devices.
+                                The node adjusts its resource consumption based on battery status and network connectivity,
+                                ensuring that it doesn't drain your battery or consume excessive data. This is made possible
+                                through a combination of efficient data structures, pruned blockchain storage, and optimized
+                                consensus mechanisms that don't require energy-intensive computations.
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="accordion-item">
+                        <h2 class="accordion-header" id="headingThree">
+                            <button class="accordion-button collapsed" type="button" data-bs-toggle="collapse" data-bs-target="#collapseThree" aria-expanded="false" aria-controls="collapseThree">
+                                What's the total supply of QNet tokens?
+                            </button>
+                        </h2>
+                        <div id="collapseThree" class="accordion-collapse collapse" aria-labelledby="headingThree" data-bs-parent="#faqAccordion">
+                            <div class="accordion-body">
+                                The total supply is 2^32 (4,294,967,296) tokens. This quantum-based number was chosen
+                                deliberately, with 90% emitted over the first 10 years using a logarithmic curve rather than
+                                Bitcoin's halving model. This creates a more predictable emission schedule that balances
+                                initial distribution with long-term sustainability. The emission curve is designed to reward
+                                early participants while ensuring that new participants can still earn meaningful rewards
+                                in later years.
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="accordion-item">
+                        <h2 class="accordion-header" id="headingFour">
+                            <button class="accordion-button collapsed" type="button" data-bs-toggle="collapse" data-bs-target="#collapseFour" aria-expanded="false" aria-controls="collapseFour">
+                                How does QNet prevent Sybil attacks?
+                            </button>
+                        </h2>
+                        <div id="collapseFour" class="accordion-collapse collapse" aria-labelledby="headingFour" data-bs-parent="#faqAccordion">
+                            <div class="accordion-body">
+                                QNet employs a unique hardware fingerprinting system combined with Decentralized Identifiers (DIDs)
+                                to ensure that each physical device can only run one node. This prevents malicious actors from
+                                spinning up multiple instances to gain control over the network. Additionally, the consensus
+                                mechanism includes reputation-based elements that make it costly to operate dishonestly,
+                                further discouraging Sybil attacks. This approach provides a more sustainable alternative to
+                                both Proof-of-Work's energy consumption and Proof-of-Stake's capital requirements.
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="accordion-item">
+                        <h2 class="accordion-header" id="headingFive">
+                            <button class="accordion-button collapsed" type="button" data-bs-toggle="collapse" data-bs-target="#collapseFive" aria-expanded="false" aria-controls="collapseFive">
+                                What makes QNet different from other blockchains?
+                            </button>
+                        </h2>
+                        <div id="collapseFive" class="accordion-collapse collapse" aria-labelledby="headingFive" data-bs-parent="#faqAccordion">
+                            <div class="accordion-body">
+                                QNet stands out through its combination of quantum resistance, mobile-first design, 
+                                and solo developer creation. While most blockchains require specialized hardware, 
+                                significant technical expertise, or large development teams, QNet aims to democratize 
+                                blockchain participation. Its architecture is designed from first principles to be 
+                                resilient against quantum attacks while remaining accessible to users with only
+                                smartphones. The project also embodies the original cypherpunk ethos of individual 
+                                empowerment and decentralization, rather than corporate or venture-backed development.
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    document.addEventListener('DOMContentLoaded', function() {
+        // Emission curve chart
+        const emissionCtx = document.getElementById('emissionChart').getContext('2d');
+        
+        // Generate logarithmic emission curve data for 20 years
+        const years = Array.from({length: 21}, (_, i) => i);
+        const emissionData = years.map(year => {
+            if (year === 0) return 0;
+            // Logarithmic curve that emits 90% in first 10 years
+            const totalSupply = 4294967296; // 2^32
+            const emission = totalSupply * (1 - Math.exp(-0.23 * year));
+            return emission / 1000000; // Convert to millions for readability
+        });
+        
+        const percentages = years.map(year => {
+            if (year === 0) return 0;
+            // Calculate percentage of total supply
+            const totalSupply = 4294967296; // 2^32
+            const emission = totalSupply * (1 - Math.exp(-0.23 * year));
+            return (emission / totalSupply) * 100;
+        });
+        
+        const emissionChart = new Chart(emissionCtx, {
+            type: 'line',
+            data: {
+                labels: years,
+                datasets: [{
+                    label: 'Emission (Millions of Tokens)',
+                    data: emissionData,
+                    borderColor: 'rgba(110, 142, 251, 1)',
+                    backgroundColor: 'rgba(110, 142, 251, 0.1)',
+                    borderWidth: 2,
+                    yAxisID: 'y',
+                    fill: true
+                },
+                {
+                    label: 'Percentage of Total Supply',
+                    data: percentages,
+                    borderColor: 'rgba(74, 222, 128, 1)',
+                    backgroundColor: 'rgba(74, 222, 128, 0)',
+                    borderWidth: 2,
+                    yAxisID: 'y1',
+                    fill: false
+                }]
+            },
+            options: {
+                responsive: true,
+                interaction: {
+                    mode: 'index',
+                    intersect: false,
+                },
+                plugins: {
+                    tooltip: {
+                        callbacks: {
+                            label: function(context) {
+                                let label = context.dataset.label || '';
+                                if (label) {
+                                    label += ': ';
+                                }
+                                if (context.datasetIndex === 0) {
+                                    label += Math.round(context.raw) + ' million tokens';
+                                } else {
+                                    label += Math.round(context.raw) + '%';
+                                }
+                                return label;
+                            }
+                        }
+                    }
+                },
+                scales: {
+                    x: {
+                        title: {
+                            display: true,
+                            text: 'Years'
+                        }
+                    },
+                    y: {
+                        type: 'linear',
+                        display: true,
+                        position: 'left',
+                        title: {
+                            display: true,
+                            text: 'Tokens (Millions)'
+                        }
+                    },
+                    y1: {
+                        type: 'linear',
+                        display: true,
+                        position: 'right',
+                        title: {
+                            display: true,
+                            text: 'Percentage of Total Supply'
+                        },
+                        min: 0,
+                        max: 100,
+                        grid: {
+                            drawOnChartArea: false
+                        }
+                    }
+                }
+            }
+        });
+    });
+</script>
+{% endblock %}

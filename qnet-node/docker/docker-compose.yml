@@ -1,0 +1,113 @@
+version: '3.8'
+
+services:
+  qnet-node:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: qnet-blockchain/qnet-node:latest
+    container_name: qnet-node
+    restart: unless-stopped
+    networks:
+      - qnet-network
+    ports:
+      - "127.0.0.1:8000:8000"  # API port (restricted to localhost)
+      - "127.0.0.1:8080:8080"  # Dashboard port (restricted to localhost)
+      - "127.0.0.1:9090:9090"  # Prometheus metrics (restricted to localhost)
+    volumes:
+      - ./data:/app/data
+      - ./blockchain_data:/app/blockchain_data
+      - ./keys:/app/keys:ro   # Read-only access to keys
+      - ./snapshots:/app/snapshots
+      - ./logs:/app/logs
+      - ./config:/app/config
+      - ./src:/app/src
+    environment:
+      - QNET_NETWORK=testnet
+      - QNET_EXTERNAL_IP=auto
+      - QNET_PORT=8000
+      - QNET_DASHBOARD_PORT=8080
+      - QNET_STORAGE_TYPE=rocksdb
+      - QNET_DATA_DIR=/app/data
+      - QNET_MAX_PEERS=50
+      - QNET_MIN_PEERS=3
+      - QNET_AUTO_DISCOVERY=true
+      - QNET_MINING_ENABLED=true
+      - QNET_MAX_PENDING_TX=5000
+      - QNET_MAX_BLOCK_SIZE=500
+      - QNET_MINING_THREADS=2
+      - QNET_MONITORING_ENABLED=true
+      - QNET_METRICS_INTERVAL=10
+      - QNET_PROMETHEUS_ENABLED=true
+      - QNET_PROMETHEUS_PORT=9090
+      - QNET_MEMORY_LIMIT_MB=512
+      - QNET_SYBIL_RESISTANCE=true
+      - QNET_TOKEN_VERIFICATION=true
+      - QNET_TLS_REQUIRED=true
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "200m"
+        max-file: "10"
+    command: ["python", "src/node/node.py"]
+
+  qnet-explorer:
+    image: qnet-blockchain/qnet-explorer:latest
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.website
+    container_name: qnet-explorer
+    restart: unless-stopped
+    networks:
+      - qnet-network
+    ports:
+      - "127.0.0.1:5000:5000"  # Explorer web interface (restricted to localhost)
+    volumes:
+      - ./src/website:/app/website
+      - ./templates:/app/templates
+      - ./logs/explorer:/app/logs
+    environment:
+      - QNET_NODE_URL=http://qnet-node:8000
+      - FLASK_ENV=production
+    depends_on:
+      - qnet-node
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    command: ["python", "website/app.py"]
+
+  nginx:
+    image: nginx:1.21-alpine
+    container_name: qnet-nginx
+    restart: unless-stopped
+    networks:
+      - qnet-network
+    ports:
+      - "80:80"     # HTTP port (can be accessed from outside)
+      - "443:443"   # HTTPS port (can be accessed from outside)
+    volumes:
+      - ./docker/nginx/conf.d:/etc/nginx/conf.d
+      - ./docker/nginx/ssl:/etc/nginx/ssl
+      - ./website/static:/usr/share/nginx/html
+      - ./logs/nginx:/var/log/nginx
+    depends_on:
+      - qnet-node
+      - qnet-explorer
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+networks:
+  qnet-network:
+    driver: bridge

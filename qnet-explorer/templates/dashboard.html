@@ -1,0 +1,95 @@
+{% extends "base.html" %}
+{% block title %}Dashboard - Blockchain Node{% endblock %}
+{% block header %}Dashboard{% endblock %}
+
+{% block content %}
+    <div class="node-status {% if system_info.is_synced %}status-online{% elif system_info.is_syncing %}status-syncing{% else %}status-offline{% endif %}">
+        <h4>Node Status: {{ system_info.status }}</h4>
+        <p>Node ID: {{ system_info.node_id }}</p>
+        <p>Address: {{ system_info.address }}</p>
+        <p>Version: {{ system_info.version }}</p>
+    </div>
+
+    <div class="row">
+        <div class="col-md-6">
+            <div class="card mb-4">
+                <div class="card-header">
+                    System Information
+                </div>
+                <div class="card-body">
+                    <p><strong>CPU Usage:</strong> {{ system_stats.cpu_percent }}%</p>
+                    <p><strong>Memory Usage:</strong> {{ system_stats.memory_percent }}%</p>
+                    <p><strong>Disk Usage:</strong> {{ system_stats.disk_usage }}%</p>
+                    <p><strong>Uptime:</strong> {{ system_stats.uptime }}</p>
+                    <p><strong>Last Updated:</strong> {{ system_stats.timestamp }}</p>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-6">
+            <div class="card mb-4">
+                <div class="card-header">
+                    Blockchain Information
+                </div>
+                <div class="card-body">
+                    <p><strong>Chain Height:</strong> {{ blockchain_info.height }}</p>
+                    <p><strong>Last Block:</strong> {{ blockchain_info.last_block_time }}</p>
+                    <p><strong>Peers:</strong> {{ blockchain_info.peer_count }}</p>
+                    <p><strong>Pending Transactions:</strong> {{ blockchain_info.pending_tx_count }}</p>
+                    <p><strong>Balance:</strong> {{ blockchain_info.balance }}</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="row mt-4">
+        <div class="col-12">
+            <div class="card">
+                <div class="card-header">
+                    Network Activity
+                </div>
+                <div class="card-body">
+                    <canvas id="networkChart" width="400" height="200"></canvas>
+                </div>
+            </div>
+        </div>
+    </div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    // Network activity chart
+    var ctx = document.getElementById('networkChart').getContext('2d');
+    var networkChart = new Chart(ctx, {
+        type: 'line',
+        data: {
+            labels: {{ chart_data.labels|safe }},
+            datasets: [{
+                label: 'Transactions',
+                data: {{ chart_data.transaction_counts|safe }},
+                borderColor: 'rgba(54, 162, 235, 1)',
+                backgroundColor: 'rgba(54, 162, 235, 0.2)',
+                borderWidth: 1
+            },
+            {
+                label: 'Blocks',
+                data: {{ chart_data.block_counts|safe }},
+                borderColor: 'rgba(255, 99, 132, 1)',
+                backgroundColor: 'rgba(255, 99, 132, 0.2)',
+                borderWidth: 1
+            }]
+        },
+        options: {
+            scales: {
+                y: {
+                    beginAtZero: true
+                }
+            }
+        }
+    });
+    
+    // Refresh the page every 30 seconds
+    setTimeout(function() {
+        location.reload();
+    }, 30000);
+</script>
+{% endblock %}

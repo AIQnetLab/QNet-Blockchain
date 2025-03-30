@@ -1,0 +1,759 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>QNet Node Activation</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.2.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        .hero {
+            background: linear-gradient(135deg, #6e8efb, #a777e3);
+            color: white;
+            padding: 4rem 2rem;
+            margin-bottom: 2rem;
+        }
+        .card {
+            border-radius: 10px;
+            overflow: hidden;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+            margin-bottom: 2rem;
+        }
+        .card-header {
+            background-color: #f8f9fa;
+            font-weight: bold;
+        }
+        .activation-code {
+            font-family: monospace;
+            font-size: 24px;
+            letter-spacing: 2px;
+            background-color: #f8f9fa;
+            padding: 15px;
+            border-radius: 5px;
+            margin-bottom: 20px;
+            text-align: center;
+        }
+        .code-badge {
+            font-family: monospace;
+            font-size: 14px;
+            background-color: #f0f0f0;
+            border-radius: 4px;
+            padding: 6px 10px;
+            border: 1px solid #ddd;
+            margin-bottom: 10px;
+        }
+        .code-status {
+            display: inline-block;
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            margin-right: 6px;
+        }
+        .code-status.active { background-color: #28a745; }
+        .code-status.expired { background-color: #dc3545; }
+        .code-status.inactive { background-color: #6c757d; }
+        .code-status.transfer { background-color: #ffc107; }
+        
+        .step {
+            display: flex;
+            align-items: flex-start;
+            margin-bottom: 15px;
+        }
+        .step-number {
+            width: 30px;
+            height: 30px;
+            background-color: #6e8efb;
+            color: white;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin-right: 15px;
+            flex-shrink: 0;
+        }
+        .step-content {
+            flex: 1;
+        }
+        .footer {
+            background-color: #343a40;
+            color: white;
+            padding: 2rem 0;
+            margin-top: 3rem;
+        }
+        
+        /* Node transfer styles */
+        .transfer-diagram {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin: 20px 0;
+        }
+        .device-icon {
+            background-color: #f8f9fa;
+            border-radius: 10px;
+            padding: 15px;
+            text-align: center;
+            width: 120px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .transfer-arrow {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            color: #6c757d;
+        }
+        .arrow-line {
+            width: 100px;
+            height: 2px;
+            background-color: #6c757d;
+            position: relative;
+        }
+        .arrow-line:after {
+            content: '';
+            position: absolute;
+            right: 0;
+            top: -4px;
+            width: 0;
+            height: 0;
+            border-left: 8px solid #6c757d;
+            border-top: 5px solid transparent;
+            border-bottom: 5px solid transparent;
+        }
+    </style>
+</head>
+<body>
+    <!-- Navigation -->
+    <nav class="navbar navbar-expand-lg navbar-dark bg-dark">
+        <div class="container">
+            <a class="navbar-brand" href="/">QNet Blockchain</a>
+            <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav">
+                <span class="navbar-toggler-icon"></span>
+            </button>
+            <div class="collapse navbar-collapse" id="navbarNav">
+                <ul class="navbar-nav">
+                    <li class="nav-item">
+                        <a class="nav-link" href="/">Home</a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link active" href="/activate">Node Activation</a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link" href="/explorer">Explorer</a>
+                    </li>
+                </ul>
+            </div>
+        </div>
+    </nav>
+
+    <!-- Hero Section -->
+    <section class="hero text-center">
+        <div class="container">
+            <h1 class="display-4">QNet Node Activation</h1>
+            <p class="lead">Get your activation code to run a QNet node and join the network</p>
+        </div>
+    </section>
+
+    <!-- Main Content -->
+    <div class="container">
+        <div class="row">
+            <div class="col-lg-8 mx-auto">
+                <!-- Connect Wallet Card -->
+                <div class="card mb-4" id="connectWalletCard">
+                    <div class="card-header">Step 1: Connect Your Wallet</div>
+                    <div class="card-body">
+                        <p>Connect your Solana wallet to purchase QNetAccess tokens and activate your node.</p>
+                        <button class="btn btn-primary" id="connectWalletBtn">Connect Wallet</button>
+                        <div class="mt-3" id="walletInfo" style="display: none;">
+                            <div class="alert alert-success">
+                                <strong>Connected: </strong><span id="walletAddress"></span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Purchase Tokens Card -->
+                <div class="card mb-4" id="purchaseTokensCard" style="display: none;">
+                    <div class="card-header">Step 2: Purchase QNetAccess Tokens</div>
+                    <div class="card-body">
+                        <p>You need at least <strong>10,000 QNetAccess</strong> tokens to run a node.</p>
+                        
+                        <div class="mb-3" id="walletBalance">
+                            <div class="alert alert-info">
+                                <strong>Current Balance: </strong><span id="tokenBalance">0</span> QNetAccess
+                            </div>
+                        </div>
+                        
+                        <div id="insufficientBalance">
+                            <p>Purchase QNetAccess tokens to continue:</p>
+                            <button class="btn btn-primary" id="purchaseTokensBtn">Purchase Tokens</button>
+                        </div>
+                        
+                        <div id="sufficientBalance" style="display: none;">
+                            <div class="alert alert-success">
+                                <strong>Great!</strong> You have enough tokens to activate a node.
+                            </div>
+                            <button class="btn btn-success" id="proceedBtn">Continue to Activation</button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Your Activation Codes Card -->
+                <div class="card mb-4" id="yourCodesCard" style="display: none;">
+                    <div class="card-header">Your Activation Codes</div>
+                    <div class="card-body">
+                        <p>You have the following activation codes associated with your wallet:</p>
+                        
+                        <div id="noCodesMessage" style="display: none;">
+                            <div class="alert alert-warning">
+                                You don't have any activation codes yet. Generate a new one below.
+                            </div>
+                        </div>
+                        
+                        <div id="codesList" class="mb-4">
+                            <!-- Codes will be listed here -->
+                        </div>
+                        
+                        <div class="d-grid">
+                            <button class="btn btn-success" id="generateNewCodeBtn">Generate New Activation Code</button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Activation Card -->
+                <div class="card mb-4" id="activationCard" style="display: none;">
+                    <div class="card-header">Generate Activation Code</div>
+                    <div class="card-body">
+                        <p>Generate your unique activation code by confirming with your wallet.</p>
+                        <button class="btn btn-primary" id="generateCodeBtn">Generate Activation Code</button>
+                        
+                        <div id="activationResult" style="display: none;">
+                            <hr>
+                            <h4>Your Activation Code</h4>
+                            <div class="activation-code" id="activationCode">QNET-XXXX-XXXX-XXXX</div>
+                            
+                            <div class="alert alert-warning">
+                                <strong>Important:</strong> Save this code! You will need it when setting up your node.
+                            </div>
+                            
+                            <div class="d-flex justify-content-between">
+                                <button class="btn btn-secondary" id="copyCodeBtn">Copy Code</button>
+                                <button class="btn btn-success" id="downloadCodeBtn">Download as File</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Node Transfer Card -->
+                <div class="card mb-4" id="nodeTransferCard" style="display: none;">
+                    <div class="card-header">Transfer Node to Another Device</div>
+                    <div class="card-body">
+                        <p>Use this feature to migrate your node to a new device. The process takes three steps:</p>
+                        
+                        <div class="transfer-diagram">
+                            <div class="device-icon">
+                                <div><i class="fas fa-server fa-2x mb-2"></i></div>
+                                <div>Old Device</div>
+                            </div>
+                            <div class="transfer-arrow">
+                                <div>Transfer Code</div>
+                                <div class="arrow-line"></div>
+                            </div>
+                            <div class="device-icon">
+                                <div><i class="fas fa-server fa-2x mb-2"></i></div>
+                                <div>New Device</div>
+                            </div>
+                        </div>
+                        
+                        <div class="step">
+                            <div class="step-number">1</div>
+                            <div class="step-content">
+                                <h5>Initiate Transfer</h5>
+                                <p>Select a node and click "Initiate Transfer" to start the process</p>
+                            </div>
+                        </div>
+                        
+                        <div class="step">
+                            <div class="step-number">2</div>
+                            <div class="step-content">
+                                <h5>Copy Transfer Code</h5>
+                                <p>Receive a one-time transfer code for your new device</p>
+                            </div>
+                        </div>
+                        
+                        <div class="step">
+                            <div class="step-number">3</div>
+                            <div class="step-content">
+                                <h5>Activate New Device</h5>
+                                <p>On your new device, enter the activation code and transfer code</p>
+                            </div>
+                        </div>
+                        
+                        <div class="mt-4" id="transferControls" style="display: none;">
+                            <h5>Select Code to Transfer</h5>
+                            <select class="form-select mb-3" id="transferCodeSelect">
+                                <!-- Options will be generated here -->
+                            </select>
+                            
+                            <button class="btn btn-warning" id="initiateTransferBtn">Initiate Transfer</button>
+                        </div>
+                        
+                        <div id="transferResult" style="display: none;">
+                            <hr>
+                            <h4>Transfer Code</h4>
+                            <div class="activation-code" id="transferCode">XXXXXXXXXXXX</div>
+                            
+                            <div class="alert alert-info">
+                                <strong>Note:</strong> This transfer code is valid for 24 hours. Use it on your new device to migrate your node.
+                            </div>
+                            
+                            <div class="d-flex justify-content-between">
+                                <button class="btn btn-secondary" id="copyTransferCodeBtn">Copy Code</button>
+                                <button class="btn btn-danger" id="cancelTransferBtn">Cancel Transfer</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Instructions Card -->
+                <div class="card mb-4">
+                    <div class="card-header">How to Use Your Activation Code</div>
+                    <div class="card-body">
+                        <div class="step">
+                            <div class="step-number">1</div>
+                            <div class="step-content">
+                                <h5>Install the QNet Node Software</h5>
+                                <p>Download and install the QNet node software using our installation script.</p>
+                                <div class="bg-light p-3 rounded">
+                                    <code>curl -s https://qnet.blockchain/install.sh | bash</code>
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <div class="step">
+                            <div class="step-number">2</div>
+                            <div class="step-content">
+                                <h5>Enter Your Activation Code</h5>
+                                <p>When prompted during the installation process, enter your activation code.</p>
+                            </div>
+                        </div>
+                        
+                        <div class="step">
+                            <div class="step-number">3</div>
+                            <div class="step-content">
+                                <h5>Start Your Node</h5>
+                                <p>Once activated, your node will automatically join the QNet network.</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Footer -->
+    <footer class="footer mt-5">
+        <div class="container text-center">
+            <p>© 2025 QNet Blockchain. All rights reserved.</p>
+            <div>
+                <a href="#" class="text-light me-3">GitHub</a>
+                <a href="#" class="text-light me-3">Documentation</a>
+                <a href="#" class="text-light">Contact</a>
+            </div>
+        </div>
+    </footer>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.2.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="https://kit.fontawesome.com/a076d05399.js" crossorigin="anonymous"></script>
+    <script>
+        // Mock wallet implementation for demonstration
+        const wallet = {
+            connected: false,
+            address: '',
+            balance: 0,
+            
+            connect: function() {
+                // In a real implementation, this would connect to a real wallet
+                this.connected = true;
+                this.address = 'test_wallet1'; // For demo purposes
+                this.balance = 15000; // For demo purposes
+                return this.address;
+            },
+            
+            getBalance: function() {
+                // In a real implementation, this would get the actual balance
+                return this.balance;
+            },
+            
+            signTransaction: function() {
+                // In a real implementation, this would sign a transaction
+                return 'mock_signature_' + Date.now();
+            }
+        };
+        
+        // Mock activation codes for the wallet
+        const mockCodes = [
+            {
+                code: "QNET-ABCD-1234-EFGH",
+                created_at: "2025-02-15 10:30:00",
+                expires_at: "2026-02-15 10:30:00",
+                status: "Active (Online)",
+                node_id: "node123456",
+                node_address: "95.164.7.199:8000",
+                last_active: "2025-03-20 15:45:00",
+                is_transferable: true,
+                transfer_in_progress: false,
+                remaining_days: 330
+            },
+            {
+                code: "QNET-5678-IJKL-9012",
+                created_at: "2025-01-10 09:15:00",
+                expires_at: "2026-01-10 09:15:00",
+                status: "Inactive",
+                node_id: "node789012",
+                node_address: "173.212.219.226:8000",
+                last_active: "2025-02-20 12:30:00",
+                is_transferable: true,
+                transfer_in_progress: false,
+                remaining_days: 295
+            }
+        ];
+        
+        // DOM Elements
+        const connectWalletBtn = document.getElementById('connectWalletBtn');
+        const walletInfo = document.getElementById('walletInfo');
+        const walletAddressEl = document.getElementById('walletAddress');
+        const purchaseTokensCard = document.getElementById('purchaseTokensCard');
+        const tokenBalanceEl = document.getElementById('tokenBalance');
+        const insufficientBalance = document.getElementById('insufficientBalance');
+        const sufficientBalance = document.getElementById('sufficientBalance');
+        const activationCard = document.getElementById('activationCard');
+        const generateCodeBtn = document.getElementById('generateCodeBtn');
+        const activationResult = document.getElementById('activationResult');
+        const activationCodeEl = document.getElementById('activationCode');
+        const copyCodeBtn = document.getElementById('copyCodeBtn');
+        const downloadCodeBtn = document.getElementById('downloadCodeBtn');
+        const proceedBtn = document.getElementById('proceedBtn');
+        const purchaseTokensBtn = document.getElementById('purchaseTokensBtn');
+        const yourCodesCard = document.getElementById('yourCodesCard');
+        const noCodesMessage = document.getElementById('noCodesMessage');
+        const codesList = document.getElementById('codesList');
+        const generateNewCodeBtn = document.getElementById('generateNewCodeBtn');
+        const nodeTransferCard = document.getElementById('nodeTransferCard');
+        const transferControls = document.getElementById('transferControls');
+        const transferCodeSelect = document.getElementById('transferCodeSelect');
+        const initiateTransferBtn = document.getElementById('initiateTransferBtn');
+        const transferResult = document.getElementById('transferResult');
+        const transferCodeEl = document.getElementById('transferCode');
+        const copyTransferCodeBtn = document.getElementById('copyTransferCodeBtn');
+        const cancelTransferBtn = document.getElementById('cancelTransferBtn');
+        
+        // Connect wallet button
+        connectWalletBtn.addEventListener('click', () => {
+            const address = wallet.connect();
+            walletAddressEl.textContent = address;
+            walletInfo.style.display = 'block';
+            
+            // Show purchase tokens card
+            purchaseTokensCard.style.display = 'block';
+            
+            // Update token balance
+            updateTokenBalance();
+            
+            // Show your codes card
+            yourCodesCard.style.display = 'block';
+            
+            // Load activation codes
+            loadActivationCodes();
+            
+            // Show node transfer card
+            nodeTransferCard.style.display = 'block';
+            populateTransferCodes();
+        });
+        
+        // Update token balance display
+        function updateTokenBalance() {
+            const balance = wallet.getBalance();
+            tokenBalanceEl.textContent = balance;
+            
+            // Check if balance is sufficient
+            if (balance >= 10000) {
+                insufficientBalance.style.display = 'none';
+                sufficientBalance.style.display = 'block';
+            } else {
+                insufficientBalance.style.display = 'block';
+                sufficientBalance.style.display = 'none';
+            }
+        }
+        
+        // Load activation codes for the wallet
+        function loadActivationCodes() {
+            // Clear existing codes
+            codesList.innerHTML = '';
+            
+            if (mockCodes.length === 0) {
+                noCodesMessage.style.display = 'block';
+                return;
+            }
+            
+            noCodesMessage.style.display = 'none';
+            
+            // Add each code to the list
+            mockCodes.forEach(codeData => {
+                const codeItem = document.createElement('div');
+                codeItem.className = 'mb-3 p-3 border rounded';
+                
+                // Determine status color
+                let statusClass = 'inactive';
+                if (codeData.status.includes('Active')) {
+                    statusClass = 'active';
+                } else if (codeData.status.includes('Transfer')) {
+                    statusClass = 'transfer';
+                } else if (codeData.status.includes('Expired')) {
+                    statusClass = 'expired';
+                }
+                
+                codeItem.innerHTML = `
+                    <div class="d-flex justify-content-between align-items-center mb-2">
+                        <div class="code-badge"><span class="code-status ${statusClass}"></span>${codeData.code}</div>
+                        <span class="badge bg-${statusClass === 'active' ? 'success' : 
+                                               statusClass === 'transfer' ? 'warning' : 
+                                               statusClass === 'expired' ? 'danger' : 'secondary'}">
+                            ${codeData.status}
+                        </span>
+                    </div>
+                    <div><small>Created: ${codeData.created_at}</small></div>
+                    <div><small>Expires: ${codeData.expires_at} (${codeData.remaining_days} days remaining)</small></div>
+                    ${codeData.node_id ? `<div><small>Node ID: ${codeData.node_id}</small></div>` : ''}
+                    ${codeData.node_address ? `<div><small>Node Address: ${codeData.node_address}</small></div>` : ''}
+                    ${codeData.last_active ? `<div><small>Last Active: ${codeData.last_active}</small></div>` : ''}
+                    <div class="mt-3">
+                        <button class="btn btn-sm btn-secondary copy-code-btn" data-code="${codeData.code}">Copy Code</button>
+                        ${codeData.is_transferable && !codeData.transfer_in_progress ? 
+                          `<button class="btn btn-sm btn-warning ms-2 transfer-code-btn" data-code="${codeData.code}">Transfer Node</button>` : ''}
+                    </div>
+                `;
+                
+                codesList.appendChild(codeItem);
+            });
+            
+            // Add event listeners to the copy buttons
+            document.querySelectorAll('.copy-code-btn').forEach(btn => {
+                btn.addEventListener('click', (e) => {
+                    const code = e.target.getAttribute('data-code');
+                    navigator.clipboard.writeText(code).then(() => {
+                        e.target.textContent = 'Copied!';
+                        setTimeout(() => {
+                            e.target.textContent = 'Copy Code';
+                        }, 2000);
+                    });
+                });
+            });
+            
+            // Add event listeners to the transfer buttons
+            document.querySelectorAll('.transfer-code-btn').forEach(btn => {
+                btn.addEventListener('click', (e) => {
+                    const code = e.target.getAttribute('data-code');
+                    // Scroll to transfer section
+                    nodeTransferCard.scrollIntoView({ behavior: 'smooth' });
+                    // Select the code in the dropdown
+                    transferCodeSelect.value = code;
+                    // Show transfer controls
+                    transferControls.style.display = 'block';
+                });
+            });
+        }
+        
+        // Populate transfer codes dropdown
+        function populateTransferCodes() {
+            // Clear existing options
+            transferCodeSelect.innerHTML = '';
+            
+            // Add active, transferable codes
+            const transferableCodes = mockCodes.filter(
+                code => code.is_transferable && !code.transfer_in_progress && code.status.includes('Active')
+            );
+            
+            if (transferableCodes.length === 0) {
+                transferControls.style.display = 'none';
+                return;
+            }
+            
+            transferableCodes.forEach(codeData => {
+                const option = document.createElement('option');
+                option.value = codeData.code;
+                option.textContent = `${codeData.code} (${codeData.status})`;
+                transferCodeSelect.appendChild(option);
+            });
+            
+            transferControls.style.display = 'block';
+        }
+        
+        // Purchase tokens button (mock implementation)
+        purchaseTokensBtn.addEventListener('click', () => {
+            alert('In a real implementation, this would redirect to a token purchase page.');
+            // For demo purposes, update balance
+            wallet.balance = 15000;
+            updateTokenBalance();
+        });
+        
+        // Proceed to activation button
+        proceedBtn.addEventListener('click', () => {
+            activationCard.style.display = 'block';
+            window.scrollTo({
+                top: activationCard.offsetTop - 100,
+                behavior: 'smooth'
+            });
+        });
+        
+        // Generate new code button
+        generateNewCodeBtn.addEventListener('click', () => {
+            activationCard.style.display = 'block';
+            window.scrollTo({
+                top: activationCard.offsetTop - 100,
+                behavior: 'smooth'
+            });
+        });
+        
+        // Generate activation code button
+        generateCodeBtn.addEventListener('click', async () => {
+            // In a real implementation, this would call the backend API
+            try {
+                // Mock API call for demonstration
+                // In production, this would be a real API call
+                const mockResponse = {
+                    success: true,
+                    activation_code: 'QNET-TEST-TEST-TEST',
+                    expires_at: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString()
+                };
+                
+                // Display the activation code
+                activationCodeEl.textContent = mockResponse.activation_code;
+                activationResult.style.display = 'block';
+                
+                // Disable generate button
+                generateCodeBtn.disabled = true;
+                generateCodeBtn.textContent = 'Code Generated';
+                
+                // Add the new code to mock codes
+                mockCodes.unshift({
+                    code: mockResponse.activation_code,
+                    created_at: new Date().toISOString().replace('T', ' ').substring(0, 19),
+                    expires_at: mockResponse.expires_at.replace('T', ' ').substring(0, 19),
+                    status: "Unused",
+                    is_transferable: true,
+                    transfer_in_progress: false,
+                    remaining_days: 7
+                });
+                
+                // Reload codes list
+                loadActivationCodes();
+            } catch (error) {
+                alert('Error generating activation code. Please try again.');
+                console.error(error);
+            }
+        });
+        
+        // Copy code button
+        copyCodeBtn.addEventListener('click', () => {
+            const code = activationCodeEl.textContent;
+            navigator.clipboard.writeText(code).then(() => {
+                copyCodeBtn.textContent = 'Copied!';
+                setTimeout(() => {
+                    copyCodeBtn.textContent = 'Copy Code';
+                }, 2000);
+            }).catch(err => {
+                console.error('Could not copy text: ', err);
+            });
+        });
+        
+        // Download code button
+        downloadCodeBtn.addEventListener('click', () => {
+            const code = activationCodeEl.textContent;
+            const walletAddress = walletAddressEl.textContent;
+            
+            const data = {
+                activation_code: code,
+                wallet_address: walletAddress,
+                generated_at: new Date().toISOString(),
+                expires_at: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString()
+            };
+            
+            const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `qnet_activation_${code.replace(/[^a-zA-Z0-9]/g, '_')}.json`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        });
+        
+        // Initiate transfer button
+        initiateTransferBtn.addEventListener('click', () => {
+            const selectedCode = transferCodeSelect.value;
+            if (!selectedCode) {
+                alert('Please select a code to transfer');
+                return;
+            }
+            
+            // Mock API call
+            const transferCode = 'TRANSFER' + Math.random().toString(36).substring(2, 10).toUpperCase();
+            
+            // Update UI
+            transferCodeEl.textContent = transferCode;
+            transferResult.style.display = 'block';
+            
+            // Update mock code status
+            const codeIndex = mockCodes.findIndex(c => c.code === selectedCode);
+            if (codeIndex >= 0) {
+                mockCodes[codeIndex].transfer_in_progress = true;
+                mockCodes[codeIndex].status = "Transfer Pending";
+            }
+            
+            // Reload codes
+            loadActivationCodes();
+            populateTransferCodes();
+        });
+        
+        // Copy transfer code button
+        copyTransferCodeBtn.addEventListener('click', () => {
+            const code = transferCodeEl.textContent;
+            navigator.clipboard.writeText(code).then(() => {
+                copyTransferCodeBtn.textContent = 'Copied!';
+                setTimeout(() => {
+                    copyTransferCodeBtn.textContent = 'Copy Code';
+                }, 2000);
+            }).catch(err => {
+                console.error('Could not copy text: ', err);
+            });
+        });
+        
+        // Cancel transfer button
+        cancelTransferBtn.addEventListener('click', () => {
+            // Find the code with transfer in progress
+            const codeIndex = mockCodes.findIndex(c => c.transfer_in_progress);
+            if (codeIndex >= 0) {
+                mockCodes[codeIndex].transfer_in_progress = false;
+                mockCodes[codeIndex].status = "Active (Online)";
+            }
+            
+            // Update UI
+            transferResult.style.display = 'none';
+            
+            // Reload codes
+            loadActivationCodes();
+            populateTransferCodes();
+            
+            alert('Transfer cancelled');
+        });
+        
+        // For demonstration purposes, pre-fill with test wallet
+        if (window.location.search.includes('demo=true')) {
+            setTimeout(() => {
+                connectWalletBtn.click();
+            }, 1000);
+        }
+    </script>
+</body>
+</html>

@@ -1,0 +1,205 @@
+{% extends "base.html" %}
+{% block title %}Address {{ address|truncate(10, True, '...') }} - QNet Explorer{% endblock %}
+{% block bodyclass %}page-explorer{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-4">
+    <h1 class="h2">Address Details</h1>
+    <a href="{{ url_for('explorer') }}" class="btn btn-outline-primary btn-sm">Back to Explorer</a>
+</div>
+
+<div class="card mb-4">
+    <div class="card-header">
+        Address Information
+    </div>
+    <div class="card-body">
+        <h5 class="card-title address">{{ address }}</h5>
+        <div class="row mt-4">
+            <div class="col-md-6 mb-4">
+                <div class="card bg-light h-100">
+                    <div class="card-body text-center">
+                        <h5 class="card-title">Balance</h5>
+                        <h2 class="mb-0 text-primary">{{ balance }} QNet</h2>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-6 mb-4">
+                <div class="card bg-light h-100">
+                    <div class="card-body text-center">
+                        <h5 class="card-title">Transactions</h5>
+                        <h2 class="mb-0 text-primary">{{ transactions|length }}</h2>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- QR Code for address -->
+        <div class="row mt-2">
+            <div class="col-md-12 text-center">
+                <img id="qrcode" alt="Address QR Code" class="img-thumbnail" style="width: 180px; height: 180px;">
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Transactions -->
+<div class="card">
+    <div class="card-header d-flex justify-content-between align-items-center">
+        <span>Transactions</span>
+        <div>
+            <div class="btn-group" role="group">
+                <button type="button" class="btn btn-sm btn-outline-primary active" id="allTxBtn">All</button>
+                <button type="button" class="btn btn-sm btn-outline-primary" id="inTxBtn">Incoming</button>
+                <button type="button" class="btn btn-sm btn-outline-primary" id="outTxBtn">Outgoing</button>
+            </div>
+        </div>
+    </div>
+    <div class="card-body p-0">
+        {% if transactions %}
+        <div class="table-responsive">
+            <table class="table table-striped mb-0" id="txTable">
+                <thead>
+                    <tr>
+                        <th>Transaction Hash</th>
+                        <th>Block</th>
+                        <th>Time</th>
+                        <th>From/To</th>
+                        <th>Amount</th>
+                        <th>Type</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for tx in transactions %}
+                    <tr class="tx-row {% if tx.type == 'received' %}tx-in{% else %}tx-out{% endif %}">
+                        <td><a href="{{ url_for('transaction_detail', tx_hash=tx.hash) }}" class="hash-truncated">{{ tx.hash }}</a></td>
+                        <td>
+                            {% if tx.block_height is defined %}
+                            <a href="{{ url_for('block_detail', height=tx.block_height) }}">{{ tx.block_height }}</a>
+                            {% else %}
+                            Pending
+                            {% endif %}
+                        </td>
+                        <td>{{ tx.time }}</td>
+                        <td>
+                            {% if tx.type == "received" %}
+                                <span class="text-success">FROM: 
+                                {% if tx.sender == "network" %}
+                                    <span class="badge bg-success">Coinbase</span>
+                                {% else %}
+                                    <a href="{{ url_for('address_detail', address=tx.sender) }}">{{ tx.sender[:8] }}...{{ tx.sender[-8:] }}</a>
+                                {% endif %}
+                                </span>
+                            {% else %}
+                                <span class="text-danger">TO: <a href="{{ url_for('address_detail', address=tx.recipient) }}">{{ tx.recipient[:8] }}...{{ tx.recipient[-8:] }}</a></span>
+                            {% endif %}
+                        </td>
+                        <td>{{ tx.amount }} QNet</td>
+                        <td>
+                            {% if tx.type == "received" %}
+                            <span class="badge bg-success">IN</span>
+                            {% else %}
+                            <span class="badge bg-danger">OUT</span>
+                            {% endif %}
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        
+        <!-- Pagination -->
+        {% if total_pages > 1 %}
+        <nav aria-label="Transaction pagination" class="p-3">
+            <ul class="pagination justify-content-center mb-0">
+                <li class="page-item {% if page <= 1 %}disabled{% endif %}">
+                    <a class="page-link" href="{{ url_for('address_detail', address=address, page=page-1) if page > 1 else '#' }}">Previous</a>
+                </li>
+                {% for p in range(max(1, page-2), min(total_pages+1, page+3)) %}
+                <li class="page-item {% if p == page %}active{% endif %}">
+                    <a class="page-link" href="{{ url_for('address_detail', address=address, page=p) }}">{{ p }}</a>
+                </li>
+                {% endfor %}
+                <li class="page-item {% if page >= total_pages %}disabled{% endif %}">
+                    <a class="page-link" href="{{ url_for('address_detail', address=address, page=page+1) if page < total_pages else '#' }}">Next</a>
+                </li>
+            </ul>
+        </nav>
+        {% endif %}
+        
+        {% else %}
+        <div class="p-4 text-center">
+            <p>No transactions found for this address</p>
+        </div>
+        {% endif %}
+    </div>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script src="https://cdn.jsdelivr.net/npm/qrcode.js@1.0.0/qrcode.min.js"></script>
+<script>
+    document.addEventListener('DOMContentLoaded', function() {
+        // Generate QR code for the address
+        const qrCode = document.getElementById('qrcode');
+        QRCode.toDataURL('qnet:{{ address }}', { errorCorrectionLevel: 'H' }, function(error, url) {
+            if (!error) {
+                qrCode.src = url;
+            } else {
+                console.error('Error generating QR code:', error);
+            }
+        });
+        
+        // Transaction filtering
+        const allTxBtn = document.getElementById('allTxBtn');
+        const inTxBtn = document.getElementById('inTxBtn');
+        const outTxBtn = document.getElementById('outTxBtn');
+        const txRows = document.querySelectorAll('.tx-row');
+        
+        allTxBtn.addEventListener('click', function() {
+            allTxBtn.classList.add('active');
+            inTxBtn.classList.remove('active');
+            outTxBtn.classList.remove('active');
+            
+            txRows.forEach(row => {
+                row.style.display = '';
+            });
+        });
+        
+        inTxBtn.addEventListener('click', function() {
+            allTxBtn.classList.remove('active');
+            inTxBtn.classList.add('active');
+            outTxBtn.classList.remove('active');
+            
+            txRows.forEach(row => {
+                if (row.classList.contains('tx-in')) {
+                    row.style.display = '';
+                } else {
+                    row.style.display = 'none';
+                }
+            });
+        });
+        
+        outTxBtn.addEventListener('click', function() {
+            allTxBtn.classList.remove('active');
+            inTxBtn.classList.remove('active');
+            outTxBtn.classList.add('active');
+            
+            txRows.forEach(row => {
+                if (row.classList.contains('tx-out')) {
+                    row.style.display = '';
+                } else {
+                    row.style.display = 'none';
+                }
+            });
+        });
+        
+        // Set blockchain stats for footer
+        window.blockchainStats = {
+            blockCount: '{{ blockchain_info.height|default("0") }}',
+            txCount: '{{ blockchain_info.total_transactions|default("0") }}',
+            nodeCount: '10+' // Placeholder value
+        };
+    });
+</script>
+{% endblock %}

@@ -1,0 +1,17 @@
+[package]
+name = "qnet_core"
+version = "0.2.0"
+edition = "2021"
+
+[lib]
+name = "qnet_core"
+crate-type = ["cdylib"]
+
+[dependencies]
+oqs = "0.8.0"
+libc = "0.2"
+hex = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+thiserror = "1.0"

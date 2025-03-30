@@ -1,0 +1,1020 @@
+{% extends "base.html" %}
+{% block title %}API Documentation - QNet Blockchain{% endblock %}
+{% block bodyclass %}page-api-docs{% endblock %}
+
+{% block content %}
+<div class="row">
+    <div class="col-lg-3 mb-4">
+        <div class="sticky-top pt-4" style="top: 80px;">
+            <div class="card">
+                <div class="card-header">
+                    <h5 class="mb-0">API Endpoints</h5>
+                </div>
+                <div class="card-body p-0">
+                    <div class="list-group list-group-flush">
+                        <a href="#introduction" class="list-group-item list-group-item-action">Introduction</a>
+                        <a href="#authentication" class="list-group-item list-group-item-action">Authentication</a>
+                        <a href="#chain-endpoints" class="list-group-item list-group-item-action">Chain Endpoints</a>
+                        <a href="#transaction-endpoints" class="list-group-item list-group-item-action">Transaction Endpoints</a>
+                        <a href="#block-endpoints" class="list-group-item list-group-item-action">Block Endpoints</a>
+                        <a href="#address-endpoints" class="list-group-item list-group-item-action">Address Endpoints</a>
+                        <a href="#statistics-endpoints" class="list-group-item list-group-item-action">Statistics Endpoints</a>
+                        <a href="#node-endpoints" class="list-group-item list-group-item-action">Node Endpoints</a>
+                        <a href="#sdk-libraries" class="list-group-item list-group-item-action">SDK Libraries</a>
+                        <a href="#rate-limits" class="list-group-item list-group-item-action">Rate Limits</a>
+                        <a href="#error-codes" class="list-group-item list-group-item-action">Error Codes</a>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <div class="col-lg-9">
+        <h1 class="mb-4">QNet API Documentation</h1>
+        
+        <div class="card mb-4" id="introduction">
+            <div class="card-header">
+                <h2>Introduction</h2>
+            </div>
+            <div class="card-body">
+                <p>The QNet API provides programmatic access to the QNet blockchain data and functionality. This RESTful API allows developers to interact with the blockchain, query data, and submit transactions.</p>
+                
+                <h4 class="mt-4">Base URL</h4>
+                <div class="bg-light p-3 rounded">
+                    <code>https://api.qnet.network/v1</code>
+                </div>
+                
+                <h4 class="mt-4">Response Format</h4>
+                <p>All API responses are returned in JSON format with the following structure:</p>
+                <pre class="bg-light p-3 rounded"><code>{
+  "success": true,
+  "data": {
+    // Response data here
+  },
+  "error": null
+}</code></pre>
+                
+                <p>In case of an error:</p>
+                <pre class="bg-light p-3 rounded"><code>{
+  "success": false,
+  "data": null,
+  "error": {
+    "code": "ERROR_CODE",
+    "message": "Error description"
+  }
+}</code></pre>
+            </div>
+        </div>
+        
+        <div class="card mb-4" id="authentication">
+            <div class="card-header">
+                <h2>Authentication</h2>
+            </div>
+            <div class="card-body">
+                <p>The QNet API offers both public endpoints (no authentication required) and private endpoints (API key required).</p>
+                
+                <h4 class="mt-4">API Keys</h4>
+                <p>To use authenticated endpoints, you'll need to:</p>
+                <ol>
+                    <li>Register for an API key from the <a href="#">developer portal</a></li>
+                    <li>Include your API key in the request header:</li>
+                </ol>
+                
+                <pre class="bg-light p-3 rounded"><code>X-API-Key: your_api_key_here</code></pre>
+                
+                <div class="alert alert-info mt-4">
+                    <i class="bi bi-info-circle me-2"></i>
+                    <strong>Note:</strong> Keep your API key secure. Do not share it publicly or include it in client-side code.
+                </div>
+                
+                <h4 class="mt-4">Rate Limits</h4>
+                <p>Public endpoints have stricter rate limits compared to authenticated endpoints. See the <a href="#rate-limits">Rate Limits</a> section for details.</p>
+            </div>
+        </div>
+        
+        <div class="card mb-4" id="chain-endpoints">
+            <div class="card-header">
+                <h2>Chain Endpoints</h2>
+            </div>
+            <div class="card-body">
+                <div class="endpoint-section mb-4">
+                    <div class="d-flex align-items-center mb-2">
+                        <span class="badge bg-success me-2">GET</span>
+                        <code>/chain</code>
+                    </div>
+                    <p>Get blockchain data with pagination</p>
+                    
+                    <h5 class="mt-3">Parameters</h5>
+                    <div class="table-responsive">
+                        <table class="table">
+                            <thead>
+                                <tr>
+                                    <th>Name</th>
+                                    <th>Type</th>
+                                    <th>Required</th>
+                                    <th>Description</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr>
+                                    <td>limit</td>
+                                    <td>integer</td>
+                                    <td>No</td>
+                                    <td>Number of transactions to return (default: 50, max: 100)</td>
+                                </tr>
+                                <tr>
+                                    <td>offset</td>
+                                    <td>integer</td>
+                                    <td>No</td>
+                                    <td>Pagination offset (default: 0)</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                    
+                    <h5 class="mt-3">Response</h5>
+                    <pre class="bg-light p-3 rounded"><code>{
+  "success": true,
+  "data": {
+    "address": "your_address",
+    "transactions": [
+      {
+        "hash": "tx_hash",
+        "sender": "sender_address",
+        "recipient": "recipient_address",
+        "amount": 10.5,
+        "block_height": 1000,
+        "timestamp": 1646064000,
+        "type": "receive"
+      },
+      ...
+    ],
+    "total": 152,
+    "offset": 0,
+    "limit": 50
+  },
+  "error": null
+}</code></pre>
+                </div>
+            </div>
+        </div>
+        
+        <div class="card mb-4" id="statistics-endpoints">
+            <div class="card-header">
+                <h2>Statistics Endpoints</h2>
+            </div>
+            <div class="card-body">
+                <div class="endpoint-section">
+                    <div class="d-flex align-items-center mb-2">
+                        <span class="badge bg-success me-2">GET</span>
+                        <code>/api/v1/stats</code>
+                    </div>
+                    <p>Get blockchain statistics</p>
+                    
+                    <h5 class="mt-3">Parameters</h5>
+                    <p>No parameters</p>
+                    
+                    <h5 class="mt-3">Response</h5>
+                    <pre class="bg-light p-3 rounded"><code>{
+  "success": true,
+  "data": {
+    "block_count": 10050,
+    "transaction_count": 42567,
+    "average_block_time": 9.8,
+    "current_reward": 8.0,
+    "total_supply": 2000000,
+    "pending_transactions": 15,
+    "peer_count": 28,
+    "timestamp": 1646064000
+  },
+  "error": null
+}</code></pre>
+                </div>
+            </div>
+        </div>
+        
+        <div class="card mb-4" id="node-endpoints">
+            <div class="card-header">
+                <h2>Node Endpoints</h2>
+            </div>
+            <div class="card-body">
+                <div class="endpoint-section mb-4">
+                    <div class="d-flex align-items-center mb-2">
+                        <span class="badge bg-success me-2">GET</span>
+                        <code>/get_peers</code>
+                    </div>
+                    <p>Get list of known peers</p>
+                    
+                    <h5 class="mt-3">Parameters</h5>
+                    <p>No parameters</p>
+                    
+                    <h5 class="mt-3">Response</h5>
+                    <pre class="bg-light p-3 rounded"><code>{
+  "success": true,
+  "data": {
+    "peers": {
+      "127.0.0.1:8001": 60,
+      "192.168.1.100:8000": 120,
+      ...
+    }
+  },
+  "error": null
+}</code></pre>
+                </div>
+                
+                <div class="endpoint-section">
+                    <div class="d-flex align-items-center mb-2">
+                        <span class="badge bg-primary me-2">POST</span>
+                        <code>/add_peer</code>
+                    </div>
+                    <p>Add a new peer to the network</p>
+                    
+                    <h5 class="mt-3">Request Body</h5>
+                    <div class="table-responsive">
+                        <table class="table">
+                            <thead>
+                                <tr>
+                                    <th>Name</th>
+                                    <th>Type</th>
+                                    <th>Required</th>
+                                    <th>Description</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr>
+                                    <td>peer_url</td>
+                                    <td>string</td>
+                                    <td>Yes</td>
+                                    <td>Peer URL (IP:Port)</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                    
+                    <h5 class="mt-3">Response</h5>
+                    <pre class="bg-light p-3 rounded"><code>{
+  "success": true,
+  "data": {
+    "message": "Peer added",
+    "peers": ["127.0.0.1:8001", "192.168.1.100:8000", ...]
+  },
+  "error": null
+}</code></pre>
+                </div>
+            </div>
+        </div>
+        
+        <div class="card mb-4" id="sdk-libraries">
+            <div class="card-header">
+                <h2>SDK Libraries</h2>
+            </div>
+            <div class="card-body">
+                <p>To make integration with QNet easier, we provide SDK libraries for various programming languages.</p>
+                
+                <div class="row mt-4">
+                    <div class="col-md-4 mb-3">
+                        <div class="card h-100">
+                            <div class="card-body text-center">
+                                <i class="bi bi-filetype-js display-4 text-primary"></i>
+                                <h5 class="mt-3">JavaScript/Node.js</h5>
+                                <pre class="bg-light p-2 mt-3"><code>npm install qnet-js</code></pre>
+                                <a href="#" class="btn btn-outline-primary btn-sm mt-3">Documentation</a>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="col-md-4 mb-3">
+                        <div class="card h-100">
+                            <div class="card-body text-center">
+                                <i class="bi bi-filetype-py display-4 text-primary"></i>
+                                <h5 class="mt-3">Python</h5>
+                                <pre class="bg-light p-2 mt-3"><code>pip install qnet</code></pre>
+                                <a href="#" class="btn btn-outline-primary btn-sm mt-3">Documentation</a>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="col-md-4 mb-3">
+                        <div class="card h-100">
+                            <div class="card-body text-center">
+                                <i class="bi bi-code-slash display-4 text-primary"></i>
+                                <h5 class="mt-3">Other Languages</h5>
+                                <p class="mt-3">Java, Go, and .NET SDKs coming soon</p>
+                                <a href="#" class="btn btn-outline-primary btn-sm mt-3">Request SDK</a>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                
+                <h4 class="mt-4">Example Usage (JavaScript)</h4>
+                <pre class="bg-light p-3 rounded"><code>const QNet = require('qnet-js');
+
+// Initialize client
+const client = new QNet.Client({
+  apiUrl: 'https://api.qnet.network/v1',
+  apiKey: 'your_api_key' // Optional
+});
+
+// Get blockchain info
+client.getChainInfo()
+  .then(info => console.log(info))
+  .catch(err => console.error(err));
+
+// Create and send a transaction
+const wallet = new QNet.Wallet('your_private_key');
+wallet.sendTransaction({
+  recipient: 'recipient_address',
+  amount: 10.5
+})
+  .then(txHash => console.log('Transaction sent:', txHash))
+  .catch(err => console.error(err));</code></pre>
+            </div>
+        </div>
+        
+        <div class="card mb-4" id="rate-limits">
+            <div class="card-header">
+                <h2>Rate Limits</h2>
+            </div>
+            <div class="card-body">
+                <p>To ensure fair access to the API and maintain system performance, rate limits are applied to API requests.</p>
+                
+                <div class="table-responsive">
+                    <table class="table">
+                        <thead>
+                            <tr>
+                                <th>Endpoint</th>
+                                <th>Public (Unauthenticated)</th>
+                                <th>Authenticated</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td><code>/chain</code></td>
+                                <td>10 requests per minute</td>
+                                <td>120 requests per minute</td>
+                            </tr>
+                            <tr>
+                                <td><code>/new_transaction</code></td>
+                                <td>20 requests per minute</td>
+                                <td>300 requests per minute</td>
+                            </tr>
+                            <tr>
+                                <td><code>/sync_chain</code></td>
+                                <td>5 requests per minute</td>
+                                <td>60 requests per minute</td>
+                            </tr>
+                            <tr>
+                                <td><code>/state</code></td>
+                                <td>15 requests per minute</td>
+                                <td>180 requests per minute</td>
+                            </tr>
+                            <tr>
+                                <td><code>/get_peers</code></td>
+                                <td>15 requests per minute</td>
+                                <td>300 requests per minute</td>
+                            </tr>
+                            <tr>
+                                <td>All other endpoints</td>
+                                <td>15 requests per minute</td>
+                                <td>180 requests per minute</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+                
+                <div class="alert alert-warning mt-4">
+                    <i class="bi bi-exclamation-triangle me-2"></i>
+                    <strong>Note:</strong> Exceeding rate limits will result in HTTP 429 (Too Many Requests) responses. Repeated violations may lead to temporary or permanent blocking of your IP address or API key.
+                </div>
+            </div>
+        </div>
+        
+        <div class="card mb-4" id="error-codes">
+            <div class="card-header">
+                <h2>Error Codes</h2>
+            </div>
+            <div class="card-body">
+                <p>The API uses standard HTTP status codes and returns detailed error information in the response body.</p>
+                
+                <h4 class="mt-4">HTTP Status Codes</h4>
+                <div class="table-responsive">
+                    <table class="table">
+                        <thead>
+                            <tr>
+                                <th>Status Code</th>
+                                <th>Description</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td>200 OK</td>
+                                <td>Request successful</td>
+                            </tr>
+                            <tr>
+                                <td>201 Created</td>
+                                <td>Resource created successfully</td>
+                            </tr>
+                            <tr>
+                                <td>400 Bad Request</td>
+                                <td>Invalid parameters or request</td>
+                            </tr>
+                            <tr>
+                                <td>401 Unauthorized</td>
+                                <td>Missing or invalid API key</td>
+                            </tr>
+                            <tr>
+                                <td>403 Forbidden</td>
+                                <td>API key doesn't have permission</td>
+                            </tr>
+                            <tr>
+                                <td>404 Not Found</td>
+                                <td>Resource not found</td>
+                            </tr>
+                            <tr>
+                                <td>429 Too Many Requests</td>
+                                <td>Rate limit exceeded</td>
+                            </tr>
+                            <tr>
+                                <td>500 Internal Server Error</td>
+                                <td>Server error</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+                
+                <h4 class="mt-4">Common Error Codes</h4>
+                <div class="table-responsive">
+                    <table class="table">
+                        <thead>
+                            <tr>
+                                <th>Error Code</th>
+                                <th>Description</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td><code>INVALID_PARAMS</code></td>
+                                <td>Missing or invalid request parameters</td>
+                            </tr>
+                            <tr>
+                                <td><code>INVALID_TX</code></td>
+                                <td>Transaction validation failed</td>
+                            </tr>
+                            <tr>
+                                <td><code>INSUFFICIENT_FUNDS</code></td>
+                                <td>Sender has insufficient balance</td>
+                            </tr>
+                            <tr>
+                                <td><code>INVALID_SIGNATURE</code></td>
+                                <td>Transaction signature verification failed</td>
+                            </tr>
+                            <tr>
+                                <td><code>RESOURCE_NOT_FOUND</code></td>
+                                <td>Requested resource not found</td>
+                            </tr>
+                            <tr>
+                                <td><code>RATE_LIMIT_EXCEEDED</code></td>
+                                <td>Too many requests</td>
+                            </tr>
+                            <tr>
+                                <td><code>SERVER_ERROR</code></td>
+                                <td>Internal server error</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    document.addEventListener('DOMContentLoaded', function() {
+        // Smooth scrolling for documentation links
+        document.querySelectorAll('.list-group-item').forEach(link => {
+            link.addEventListener('click', function(e) {
+                e.preventDefault();
+                const targetId = this.getAttribute('href').substring(1);
+                const targetElement = document.getElementById(targetId);
+                
+                if (targetElement) {
+                    // Offset for fixed navbar
+                    const offset = 80;
+                    const targetPosition = targetElement.getBoundingClientRect().top + window.pageYOffset - offset;
+                    
+                    window.scrollTo({
+                        top: targetPosition,
+                        behavior: 'smooth'
+                    });
+                    
+                    // Update URL hash without jumping
+                    history.pushState(null, null, `#${targetId}`);
+                }
+            });
+        });
+        
+        // Handle direct navigation to hash
+        if (window.location.hash) {
+            const targetId = window.location.hash.substring(1);
+            const targetElement = document.getElementById(targetId);
+            
+            if (targetElement) {
+                setTimeout(function() {
+                    const offset = 80;
+                    const targetPosition = targetElement.getBoundingClientRect().top + window.pageYOffset - offset;
+                    
+                    window.scrollTo({
+                        top: targetPosition,
+                        behavior: 'smooth'
+                    });
+                }, 100);
+            }
+        }
+        
+        // Highlight active section on scroll
+        window.addEventListener('scroll', function() {
+            const sections = document.querySelectorAll('.card[id]');
+            let currentSection = '';
+            
+            sections.forEach(section => {
+                const sectionTop = section.offsetTop - 100;
+                const sectionHeight = section.offsetHeight;
+                
+                if (window.pageYOffset >= sectionTop && window.pageYOffset < sectionTop + sectionHeight) {
+                    currentSection = section.getAttribute('id');
+                }
+            });
+            
+            if (currentSection !== '') {
+                document.querySelectorAll('.list-group-item').forEach(link => {
+                    link.classList.remove('active');
+                    if (link.getAttribute('href') === `#${currentSection}`) {
+                        link.classList.add('active');
+                    }
+                });
+            }
+        });
+    });
+</script>
+{% endblock %}
+                                <tr>
+                                    <td>start</td>
+                                    <td>integer</td>
+                                    <td>No</td>
+                                    <td>Starting index (default: 0)</td>
+                                </tr>
+                                <tr>
+                                    <td>limit</td>
+                                    <td>integer</td>
+                                    <td>No</td>
+                                    <td>Number of blocks to return (default: 100, max: 100)</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                    
+                    <h5 class="mt-3">Response</h5>
+                    <pre class="bg-light p-3 rounded"><code>{
+  "success": true,
+  "data": {
+    "chain": [
+      {
+        "index": 1,
+        "timestamp": 1646064000,
+        "transactions": [...],
+        "previous_hash": "...",
+        "hash": "...",
+        "nonce": 123,
+        "signature": "...",
+        "producer": "..."
+      },
+      ...
+    ],
+    "length": 10000,
+    "start": 0,
+    "limit": 100
+  },
+  "error": null
+}</code></pre>
+                    
+                    <h5 class="mt-3">Example</h5>
+                    <pre class="bg-light p-3 rounded"><code>curl -X GET "https://api.qnet.network/v1/chain?start=1000&limit=10"</code></pre>
+                </div>
+                
+                <div class="endpoint-section mb-4">
+                    <div class="d-flex align-items-center mb-2">
+                        <span class="badge bg-success me-2">GET</span>
+                        <code>/sync_chain</code>
+                    </div>
+                    <p>Synchronize the blockchain with peers</p>
+                    
+                    <h5 class="mt-3">Parameters</h5>
+                    <p>No parameters</p>
+                    
+                    <h5 class="mt-3">Response</h5>
+                    <pre class="bg-light p-3 rounded"><code>{
+  "success": true,
+  "data": {
+    "message": "Chain updated",
+    "new_length": 10050,
+    "conflicts_detected": 0
+  },
+  "error": null
+}</code></pre>
+                </div>
+                
+                <div class="endpoint-section">
+                    <div class="d-flex align-items-center mb-2">
+                        <span class="badge bg-success me-2">GET</span>
+                        <code>/state</code>
+                    </div>
+                    <p>Get current blockchain state (account balances)</p>
+                    
+                    <h5 class="mt-3">Parameters</h5>
+                    <div class="table-responsive">
+                        <table class="table">
+                            <thead>
+                                <tr>
+                                    <th>Name</th>
+                                    <th>Type</th>
+                                    <th>Required</th>
+                                    <th>Description</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr>
+                                    <td>address</td>
+                                    <td>string</td>
+                                    <td>No</td>
+                                    <td>Get balance for specific address</td>
+                                </tr>
+                                <tr>
+                                    <td>limit</td>
+                                    <td>integer</td>
+                                    <td>No</td>
+                                    <td>Number of addresses to return (default: 1000, max: 1000)</td>
+                                </tr>
+                                <tr>
+                                    <td>offset</td>
+                                    <td>integer</td>
+                                    <td>No</td>
+                                    <td>Pagination offset (default: 0)</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                    
+                    <h5 class="mt-3">Response</h5>
+                    <pre class="bg-light p-3 rounded"><code>{
+  "success": true,
+  "data": {
+    "balances": {
+      "address1": 100.5,
+      "address2": 250.75,
+      ...
+    },
+    "total_issued": 4000000,
+    "total_addresses": 1254,
+    "offset": 0,
+    "limit": 1000
+  },
+  "error": null
+}</code></pre>
+                </div>
+            </div>
+        </div>
+        
+        <div class="card mb-4" id="transaction-endpoints">
+            <div class="card-header">
+                <h2>Transaction Endpoints</h2>
+            </div>
+            <div class="card-body">
+                <div class="endpoint-section mb-4">
+                    <div class="d-flex align-items-center mb-2">
+                        <span class="badge bg-primary me-2">POST</span>
+                        <code>/new_transaction</code>
+                    </div>
+                    <p>Submit a new transaction to the network</p>
+                    
+                    <h5 class="mt-3">Request Body</h5>
+                    <div class="table-responsive">
+                        <table class="table">
+                            <thead>
+                                <tr>
+                                    <th>Name</th>
+                                    <th>Type</th>
+                                    <th>Required</th>
+                                    <th>Description</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr>
+                                    <td>sender</td>
+                                    <td>string</td>
+                                    <td>Yes</td>
+                                    <td>Sender's address</td>
+                                </tr>
+                                <tr>
+                                    <td>recipient</td>
+                                    <td>string</td>
+                                    <td>Yes</td>
+                                    <td>Recipient's address</td>
+                                </tr>
+                                <tr>
+                                    <td>amount</td>
+                                    <td>number</td>
+                                    <td>Yes</td>
+                                    <td>Transaction amount</td>
+                                </tr>
+                                <tr>
+                                    <td>signature</td>
+                                    <td>string</td>
+                                    <td>Yes</td>
+                                    <td>Cryptographic signature of the transaction</td>
+                                </tr>
+                                <tr>
+                                    <td>pub_key</td>
+                                    <td>string</td>
+                                    <td>Yes</td>
+                                    <td>Sender's public key</td>
+                                </tr>
+                                <tr>
+                                    <td>timestamp</td>
+                                    <td>number</td>
+                                    <td>No</td>
+                                    <td>Transaction timestamp (default: current time)</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                    
+                    <h5 class="mt-3">Response</h5>
+                    <pre class="bg-light p-3 rounded"><code>{
+  "success": true,
+  "data": {
+    "message": "Transaction added successfully"
+  },
+  "error": null
+}</code></pre>
+                    
+                    <h5 class="mt-3">Example</h5>
+                    <pre class="bg-light p-3 rounded"><code>curl -X POST "https://api.qnet.network/v1/new_transaction" \
+-H "Content-Type: application/json" \
+-d '{
+  "sender": "your_address",
+  "recipient": "recipient_address",
+  "amount": 10.5,
+  "signature": "transaction_signature",
+  "pub_key": "your_public_key"
+}'</code></pre>
+                </div>
+                
+                <div class="endpoint-section">
+                    <div class="d-flex align-items-center mb-2">
+                        <span class="badge bg-success me-2">GET</span>
+                        <code>/api/v1/transaction/{tx_hash}</code>
+                    </div>
+                    <p>Get transaction details by hash</p>
+                    
+                    <h5 class="mt-3">Path Parameters</h5>
+                    <div class="table-responsive">
+                        <table class="table">
+                            <thead>
+                                <tr>
+                                    <th>Name</th>
+                                    <th>Type</th>
+                                    <th>Required</th>
+                                    <th>Description</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr>
+                                    <td>tx_hash</td>
+                                    <td>string</td>
+                                    <td>Yes</td>
+                                    <td>Transaction hash (64 characters)</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                    
+                    <h5 class="mt-3">Response</h5>
+                    <pre class="bg-light p-3 rounded"><code>{
+  "success": true,
+  "data": {
+    "hash": "1a2b3c...",
+    "sender": "sender_address",
+    "recipient": "recipient_address",
+    "amount": 10.5,
+    "block_height": 1000,
+    "block_hash": "block_hash",
+    "timestamp": 1646064000,
+    "confirmation_status": "confirmed",
+    "transaction_index": 2,
+    "signature": "tx_signature",
+    "pub_key": "sender_public_key"
+  },
+  "error": null
+}</code></pre>
+                </div>
+            </div>
+        </div>
+        
+        <div class="card mb-4" id="block-endpoints">
+            <div class="card-header">
+                <h2>Block Endpoints</h2>
+            </div>
+            <div class="card-body">
+                <div class="endpoint-section mb-4">
+                    <div class="d-flex align-items-center mb-2">
+                        <span class="badge bg-success me-2">GET</span>
+                        <code>/api/v1/block/{height}</code>
+                    </div>
+                    <p>Get block by height</p>
+                    
+                    <h5 class="mt-3">Path Parameters</h5>
+                    <div class="table-responsive">
+                        <table class="table">
+                            <thead>
+                                <tr>
+                                    <th>Name</th>
+                                    <th>Type</th>
+                                    <th>Required</th>
+                                    <th>Description</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr>
+                                    <td>height</td>
+                                    <td>integer</td>
+                                    <td>Yes</td>
+                                    <td>Block height</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                    
+                    <h5 class="mt-3">Response</h5>
+                    <pre class="bg-light p-3 rounded"><code>{
+  "success": true,
+  "data": {
+    "index": 1000,
+    "timestamp": 1646064000,
+    "transactions": [...],
+    "previous_hash": "...",
+    "hash": "...",
+    "nonce": 123,
+    "signature": "...",
+    "producer": "...",
+    "pub_key": "...",
+    "merkle_root": "...",
+    "previous_block_url": "/api/v1/block/999",
+    "next_block_url": "/api/v1/block/1001"
+  },
+  "error": null
+}</code></pre>
+                </div>
+                
+                <div class="endpoint-section">
+                    <div class="d-flex align-items-center mb-2">
+                        <span class="badge bg-success me-2">GET</span>
+                        <code>/block_headers</code>
+                    </div>
+                    <p>Get block headers for SPV/lightweight clients</p>
+                    
+                    <h5 class="mt-3">Parameters</h5>
+                    <div class="table-responsive">
+                        <table class="table">
+                            <thead>
+                                <tr>
+                                    <th>Name</th>
+                                    <th>Type</th>
+                                    <th>Required</th>
+                                    <th>Description</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr>
+                                    <td>start_height</td>
+                                    <td>integer</td>
+                                    <td>No</td>
+                                    <td>Starting block height (default: 0)</td>
+                                </tr>
+                                <tr>
+                                    <td>count</td>
+                                    <td>integer</td>
+                                    <td>No</td>
+                                    <td>Number of headers to return (default: 100, max: 100)</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                    
+                    <h5 class="mt-3">Response</h5>
+                    <pre class="bg-light p-3 rounded"><code>{
+  "success": true,
+  "data": {
+    "headers": [
+      {
+        "index": 1000,
+        "timestamp": 1646064000,
+        "previous_hash": "...",
+        "hash": "...",
+        "nonce": 123,
+        "merkle_root": "..."
+      },
+      ...
+    ],
+    "length": 100
+  },
+  "error": null
+}</code></pre>
+                </div>
+            </div>
+        </div>
+        
+        <div class="card mb-4" id="address-endpoints">
+            <div class="card-header">
+                <h2>Address Endpoints</h2>
+            </div>
+            <div class="card-body">
+                <div class="endpoint-section mb-4">
+                    <div class="d-flex align-items-center mb-2">
+                        <span class="badge bg-success me-2">GET</span>
+                        <code>/api/v1/address/{address}/balance</code>
+                    </div>
+                    <p>Get address balance</p>
+                    
+                    <h5 class="mt-3">Path Parameters</h5>
+                    <div class="table-responsive">
+                        <table class="table">
+                            <thead>
+                                <tr>
+                                    <th>Name</th>
+                                    <th>Type</th>
+                                    <th>Required</th>
+                                    <th>Description</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr>
+                                    <td>address</td>
+                                    <td>string</td>
+                                    <td>Yes</td>
+                                    <td>Blockchain address</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                    
+                    <h5 class="mt-3">Response</h5>
+                    <pre class="bg-light p-3 rounded"><code>{
+  "success": true,
+  "data": {
+    "address": "your_address",
+    "balance": 152.75
+  },
+  "error": null
+}</code></pre>
+                </div>
+                
+                <div class="endpoint-section">
+                    <div class="d-flex align-items-center mb-2">
+                        <span class="badge bg-success me-2">GET</span>
+                        <code>/api/v1/address/{address}/transactions</code>
+                    </div>
+                    <p>Get transactions for an address</p>
+                    
+                    <h5 class="mt-3">Path Parameters</h5>
+                    <div class="table-responsive">
+                        <table class="table">
+                            <thead>
+                                <tr>
+                                    <th>Name</th>
+                                    <th>Type</th>
+                                    <th>Required</th>
+                                    <th>Description</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr>
+                                    <td>address</td>
+                                    <td>string</td>
+                                    <td>Yes</td>
+                                    <td>Blockchain address</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                    
+                    <h5 class="mt-3">Query Parameters</h5>
+                    <div class="table-responsive">
+                        <table class="table">
+                            <thead>
+                                <tr>
+                                    <th>Name</th>
+                                    <th>Type</th>
+                                    <th>Required</th>
+                                    <th>Description</th>
+                                </tr>
+                            </thead>

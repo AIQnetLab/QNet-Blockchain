@@ -1,0 +1,71 @@
+{% extends "base.html" %}
+{% block title %}Peers - QNet Node{% endblock %}
+{% block header %}Network Peers{% endblock %}
+
+{% block content %}
+    <div class="alert alert-info">
+        Connected to {{ peers|length }} peers. Minimum recommended: 3
+    </div>
+
+    <div class="card mb-4">
+        <div class="card-header">
+            Active Peers
+        </div>
+        <div class="card-body">
+            <div class="table-responsive">
+                <table class="table table-striped">
+                    <thead>
+                        <tr>
+                            <th>Address</th>
+                            <th>Last Seen</th>
+                            <th>Success Rate</th>
+                            <th>Status</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for peer in peers %}
+                        <tr>
+                            <td>{{ peer.address }}</td>
+                            <td>{{ peer.last_seen }}</td>
+                            <td>{{ peer.success_rate }}%</td>
+                            <td>
+                                {% if peer.is_active %}
+                                <span class="badge bg-success">Active</span>
+                                {% else %}
+                                <span class="badge bg-secondary">Inactive</span>
+                                {% endif %}
+                            </td>
+                            <td>
+                                <a href="{{ url_for('peer_info', address=peer.address) }}" class="btn btn-sm btn-info">Details</a>
+                                <form method="post" action="{{ url_for('remove_peer') }}" style="display:inline;">
+                                    <input type="hidden" name="address" value="{{ peer.address }}">
+                                    <button type="submit" class="btn btn-sm btn-danger">Remove</button>
+                                </form>
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+    
+    <div class="card mt-4">
+        <div class="card-header d-flex justify-content-between align-items-center">
+            <span>Add New Peer</span>
+        </div>
+        <div class="card-body">
+            <form method="post" action="{{ url_for('add_peer') }}">
+                <div class="row g-3 align-items-center">
+                    <div class="col-auto">
+                        <input type="text" name="address" class="form-control" placeholder="IP:Port" required>
+                    </div>
+                    <div class="col-auto">
+                        <button type="submit" class="btn btn-primary">Add Peer</button>
+                    </div>
+                </div>
+            </form>
+        </div>
+    </div>
+{% endblock %}

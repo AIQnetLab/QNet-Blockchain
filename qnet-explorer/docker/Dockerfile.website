@@ -1,0 +1,29 @@
+# Use Python 3.9 slim as the base image
+FROM python:3.9-slim
+
+# Set working directory
+WORKDIR /app
+
+# Install dependencies (requirements.txt will be mounted from the root directory)
+RUN pip install --no-cache-dir -r requirements.txt gunicorn
+
+# Copy application code
+COPY . .
+
+# Create logs directory
+RUN mkdir -p logs
+
+# Environment variables (can be overridden at runtime)
+ENV NODE_API_URL=http://qnet-node:8000
+ENV SITE_NAME="QNet Blockchain"
+ENV EXPLORER_NAME="QNet Explorer"
+ENV PORT=8080
+ENV ENABLE_CACHING=true
+ENV CACHE_TIMEOUT=60
+ENV API_TIMEOUT=10
+
+# Expose port
+EXPOSE 8080
+
+# Run with Gunicorn for production
+CMD gunicorn --bind 0.0.0.0:$PORT --workers 4 --access-logfile logs/access.log --error-logfile logs/error.log app:app
