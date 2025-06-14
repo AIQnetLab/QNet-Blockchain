@@ -1,0 +1,463 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>QNet Wallet</title>
+    <link rel="stylesheet" href="styles/popup.css">
+</head>
+<body>
+    <div id="app">
+        <!-- Loading Screen -->
+        <div id="loading-screen" class="screen">
+            <div class="loading-container">
+                <div class="qnet-logo">
+                    <div class="logo-icon">Q</div>
+                    <div class="logo-text">QNet</div>
+                </div>
+                <div class="loading-spinner"></div>
+                <p data-i18n="common.loading">Loading QNet Wallet...</p>
+            </div>
+        </div>
+
+        <!-- Welcome Screen -->
+        <div id="welcome-screen" class="screen hidden">
+            <div class="welcome-container">
+                <div class="qnet-logo">
+                    <div class="logo-icon">Q</div>
+                    <div class="logo-text">QNet Wallet</div>
+                </div>
+                <h1 data-i18n="setup.welcome">Welcome to QNet</h1>
+                <p data-i18n="wallet.subtitle">Your gateway to the post-quantum blockchain</p>
+                <div class="button-group">
+                    <button id="create-wallet-btn" class="btn btn-primary" data-i18n="setup.createWallet">Create New Wallet</button>
+                    <button id="import-wallet-btn" class="btn btn-secondary" data-i18n="setup.importWallet">Import Wallet</button>
+                </div>
+                <div class="language-selector">
+                    <select id="language-select">
+                        <option value="en">US English</option>
+                        <option value="ru">RU Русский</option>
+                        <option value="zh-CN">CN 简体中文</option>
+                        <option value="fr">FR Français</option>
+                        <option value="es">ES Español</option>
+                        <option value="ja">JP 日本語</option>
+                        <option value="ko">KR 한국어</option>
+                        <option value="hi">IN हिंदी</option>
+                        <option value="id">ID Bahasa Indonesia</option>
+                        <option value="th">TH ไทย</option>
+                        <option value="vi">VN Tiếng Việt</option>
+                    </select>
+                </div>
+            </div>
+        </div>
+
+        <!-- Unlock Screen -->
+        <div id="unlock-screen" class="screen hidden">
+            <div class="unlock-container">
+                <div class="qnet-logo">
+                    <div class="logo-icon">Q</div>
+                    <div class="logo-text">QNet</div>
+                </div>
+                <h2 data-i18n="wallet.unlock">Unlock Wallet</h2>
+                <form id="unlock-form">
+                    <div class="input-group">
+                        <input type="password" id="unlock-password" data-i18n-placeholder="wallet.enterPassword" required>
+                        <button type="submit" class="btn btn-primary" data-i18n="wallet.unlock">Unlock</button>
+                    </div>
+                </form>
+                <div id="unlock-error" class="error-message hidden"></div>
+            </div>
+        </div>
+
+        <!-- Main Wallet Screen -->
+        <div id="wallet-screen" class="screen hidden">
+            <div class="wallet-header">
+                <div class="wallet-info">
+                    <div class="wallet-address" id="wallet-address">Loading...</div>
+                    <div class="wallet-balance">
+                        <span class="balance-amount" id="balance-amount">0.00</span>
+                        <span class="balance-currency">QNC</span>
+                    </div>
+                </div>
+                <div class="wallet-actions">
+                    <button id="settings-btn" class="btn-icon" title="Settings">Settings</button>
+                    <button id="lock-btn" class="btn-icon" title="Lock Wallet">Lock</button>
+                </div>
+            </div>
+
+            <div class="wallet-tabs">
+                <button class="tab-btn active" data-tab="overview" data-i18n="wallet.overview">Overview</button>
+                <button class="tab-btn" data-tab="send" data-i18n="wallet.send">Send</button>
+                <button class="tab-btn" data-tab="receive" data-i18n="wallet.receive">Receive</button>
+                <button class="tab-btn" data-tab="node" data-i18n="node.nodeActivation">Node</button>
+            </div>
+
+            <div class="wallet-content">
+                <!-- Overview Tab -->
+                <div id="overview-tab" class="tab-content active">
+                    <div class="balance-card">
+                        <h3 data-i18n="wallet.balance">Total Balance</h3>
+                        <div class="balance-display">
+                            <span class="balance-qnc" id="balance-qnc">0.00 QNC</span>
+                            <span class="balance-usd" id="balance-usd">$0.00 USD</span>
+                        </div>
+                        <div class="post-quantum-indicator">
+                            <span class="pq-icon">SHIELD</span>
+                            <span data-i18n="security.postQuantum">Post-Quantum Secured</span>
+                        </div>
+                    </div>
+                    
+                    <div class="quick-actions">
+                        <button class="action-btn" data-action="send">
+                            <span class="action-icon">SEND</span>
+                            <span data-i18n="wallet.send">Send</span>
+                        </button>
+                        <button class="action-btn" data-action="receive">
+                            <span class="action-icon">RECEIVE</span>
+                            <span data-i18n="wallet.receive">Receive</span>
+                        </button>
+                        <button class="action-btn" data-action="node">
+                            <span class="action-icon">NODE</span>
+                            <span data-i18n="node.activateNode">Node</span>
+                        </button>
+                    </div>
+
+                    <div class="recent-transactions">
+                        <h4 data-i18n="transactions.history">Recent Transactions</h4>
+                        <div id="transaction-list" class="transaction-list">
+                            <div class="no-transactions" data-i18n="transactions.noTransactions">No transactions yet</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Send Tab -->
+                <div id="send-tab" class="tab-content">
+                    <form id="send-form">
+                        <div class="input-group">
+                            <label data-i18n="transactions.recipient">Recipient Address</label>
+                            <input type="text" id="send-address" data-i18n-placeholder="transactions.recipient" required>
+                            <button type="button" id="scan-qr-btn" class="btn-icon">QR SCAN</button>
+                        </div>
+                        <div class="input-group">
+                            <label data-i18n="transactions.amount">Amount</label>
+                            <div class="amount-input">
+                                <input type="number" id="send-amount" placeholder="0.00" step="0.00000001" required>
+                                <span class="input-suffix">QNC</span>
+                                <button type="button" id="max-amount-btn" class="btn-max">MAX</button>
+                            </div>
+                        </div>
+                        <div class="input-group">
+                            <label data-i18n="transactions.memo">Memo (Optional)</label>
+                            <input type="text" id="send-memo" data-i18n-placeholder="transactions.memo">
+                        </div>
+                        <div class="transaction-summary">
+                            <div class="fee-display">
+                                <span data-i18n="transactions.fee">Network Fee:</span>
+                                <span id="network-fee">0.001 QNC</span>
+                            </div>
+                            <div class="total-display">
+                                <span data-i18n="transactions.total">Total:</span>
+                                <span id="total-amount">0.001 QNC</span>
+                            </div>
+                        </div>
+                        <button type="submit" class="btn btn-primary" data-i18n="transactions.send">Send Transaction</button>
+                    </form>
+                </div>
+
+                <!-- Receive Tab -->
+                <div id="receive-tab" class="tab-content">
+                    <div class="receive-container">
+                        <h3 data-i18n="transactions.receive">Receive QNC</h3>
+                        <div class="qr-code" id="qr-code">
+                            <!-- QR code will be generated here -->
+                        </div>
+                        <div class="address-display">
+                            <label data-i18n="wallet.address">Your QNet Address</label>
+                            <div class="address-copy">
+                                <input type="text" id="receive-address" readonly>
+                                <button id="copy-address-btn" class="btn btn-secondary" data-i18n="common.copy">Copy</button>
+                            </div>
+                        </div>
+                        <div class="share-options">
+                            <button id="share-address-btn" class="btn btn-outline">Share</button>
+                            <button id="save-qr-btn" class="btn btn-outline">Save QR</button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Node Tab -->
+                <div id="node-tab" class="tab-content">
+                    <div class="node-activation">
+                        <div class="phase-indicator" id="phase-indicator">
+                            <span class="phase-badge" id="phase-badge">Phase 1</span>
+                            <span class="phase-description" id="phase-description">Burn 1DEV for Node Access</span>
+                        </div>
+                        
+                        <div class="node-status" id="node-status">
+                            <div class="status-indicator inactive">
+                                <span class="status-dot"></span>
+                                <span data-i18n="node.nodeStatus">Node Status: Inactive</span>
+                            </div>
+                        </div>
+                        
+                        <!-- Phase 1 Interface -->
+                        <div id="phase1-interface" class="phase-interface">
+                            <div class="phase-warning">
+                                <span class="warning-icon">BURN</span>
+                                <span data-i18n="node.phase1Warning">Burn 1DEV tokens for node activation. Price decreases as more tokens burned</span>
+                            </div>
+                            
+                            <div class="token-balance">
+                                <label data-i18n="node.your1DevBalance">Your 1DEV Balance (Filtered):</label>
+                                <span id="1dev-balance" class="balance-amount">0 1DEV</span>
+                                <small style="color: #9ca3af; display: block; margin-top: 4px;">
+                                    INFO: Only 1DEV tokens shown (other Solana tokens hidden)
+                                </small>
+                            </div>
+                            
+                            <div class="node-types">
+                                <h4 data-i18n="node.nodeType">Select Node Type</h4>
+                                <div class="radio-group">
+                                    <label class="radio-option">
+                                        <input type="radio" name="nodeTypePhase1" value="light" checked>
+                                        <span class="radio-custom"></span>
+                                        <div class="radio-content">
+                                            <div class="radio-title" data-i18n="node.lightNode">Light Node</div>
+                                            <div class="radio-subtitle">Mobile/IoT • 1,500 1DEV • Ping-based rewards</div>
+                                        </div>
+                                    </label>
+                                    
+                                    <label class="radio-option">
+                                        <input type="radio" name="nodeTypePhase1" value="full">
+                                        <span class="radio-custom"></span>
+                                        <div class="radio-content">
+                                            <div class="radio-title" data-i18n="node.fullNode">Full Node</div>
+                                            <div class="radio-subtitle">Desktop/Server • 1,500 1DEV • Full validation + fees</div>
+                                        </div>
+                                    </label>
+                                    
+                                    <label class="radio-option">
+                                        <input type="radio" name="nodeTypePhase1" value="super">
+                                        <span class="radio-custom"></span>
+                                        <div class="radio-content">
+                                            <div class="radio-title" data-i18n="node.superNode">Super Node</div>
+                                            <div class="radio-subtitle">Enterprise • 1,500 1DEV • Block production + premium fees</div>
+                                        </div>
+                                    </label>
+                                </div>
+                            </div>
+                            
+                            <div class="activation-summary">
+                                <div class="summary-row">
+                                    <span data-i18n="node.requiredBurn">Required Burn:</span>
+                                    <span class="burn-amount" id="burn-requirement">1,500 1DEV</span>
+                                </div>
+                                <div class="summary-row">
+                                    <span data-i18n="node.mechanism">Mechanism:</span>
+                                    <span data-i18n="node.burnMechanism">Burn → Network Access → Earn via Pings</span>
+                                </div>
+                                <div class="summary-row">
+                                    <span data-i18n="node.networkStatus">Network Status:</span>
+                                    <span class="status-amount" id="network-status">Phase 1 Active</span>
+                                </div>
+                                <div class="summary-row">
+                                    <span data-i18n="node.automation">Automation:</span>
+                                    <span data-i18n="node.oneClickProcess">LIGHTNING One-Click: Burn → Verify → Setup</span>
+                                </div>
+                            </div>
+                            
+                            <button class="btn btn-primary" id="activate-node-one-click-btn">
+                                <span data-i18n="node.activateOneClick">LIGHTNING Activate Node (One-Click)</span>
+                            </button>
+                            
+                            <div class="activation-progress hidden" id="activation-progress">
+                                <div class="progress-steps">
+                                    <div class="step" id="step-burn">BURN Burning 1DEV tokens...</div>
+                                    <div class="step" id="step-verify">VERIFY Verifying on network...</div>  
+                                    <div class="step" id="step-setup">SETUP Setting up node...</div>
+                                    <div class="step" id="step-complete">COMPLETE Node activated!</div>
+                                </div>
+                                <div class="progress-bar">
+                                    <div class="progress-fill" id="progress-fill"></div>
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <!-- Phase 2 Interface -->
+                        <div id="phase2-interface" class="phase-interface hidden">
+                            <div class="phase-warning">
+                                <span class="warning-icon">DIAMOND</span>
+                                <span data-i18n="node.phase2Warning">Spend QNC for activation code. Varies by network size</span>
+                            </div>
+                            
+                            <div class="token-balance">
+                                <label data-i18n="node.yourQNCBalance">Your QNC Balance:</label>
+                                <span id="qnc-balance" class="balance-amount">0 QNC</span>
+                            </div>
+                            
+                            <div class="node-types">
+                                <h4 data-i18n="node.nodeType">Select Node Type</h4>
+                                <div class="node-type-options">
+                                    <label class="node-option">
+                                        <input type="radio" name="nodeTypePhase2" value="light" checked>
+                                        <div class="option-content">
+                                            <span class="option-title" data-i18n="node.lightNode">Light Node</span>
+                                            <span class="option-desc">Low resource requirements</span>
+                                            <span class="option-cost">2,500-15,000 QNC SPEND</span>
+                                            <span class="option-earning">~2.58 QNC per 4h</span>
+                                        </div>
+                                    </label>
+                                    <label class="node-option">
+                                        <input type="radio" name="nodeTypePhase2" value="full">
+                                        <div class="option-content">
+                                            <span class="option-title" data-i18n="node.fullNode">Full Node</span>
+                                            <span class="option-desc">Complete blockchain validation</span>
+                                            <span class="option-cost">3,750-22,500 QNC SPEND</span>
+                                            <span class="option-earning">~2.71 QNC per 4h</span>
+                                        </div>
+                                    </label>
+                                    <label class="node-option">
+                                        <input type="radio" name="nodeTypePhase2" value="super">
+                                        <div class="option-content">
+                                            <span class="option-title" data-i18n="node.validatorNode">Super Node</span>
+                                            <span class="option-desc">Full consensus participation</span>
+                                            <span class="option-cost">5,000-30,000 QNC SPEND</span>
+                                            <span class="option-earning">~2.85 QNC per 4h</span>
+                                        </div>
+                                    </label>
+                                </div>
+                            </div>
+                            
+                            <div class="activation-summary">
+                                <div class="summary-row">
+                                    <span data-i18n="node.requiredSpend">Required QNC Spend:</span>
+                                    <span class="spend-amount" id="spend-requirement">5,000 QNC</span>
+                                </div>
+                                <div class="summary-row">
+                                    <span data-i18n="node.mechanism">Mechanism:</span>
+                                    <span data-i18n="node.spendToPool3">Spend → Pool 3 → All Nodes Benefit</span>
+                                </div>
+                                <div class="summary-row">
+                                    <span data-i18n="node.networkBonus">Network Bonus:</span>
+                                    <span class="bonus-amount" id="network-bonus">+0.5 QNC per existing node</span>
+                                </div>
+                                <div class="summary-row">
+                                    <span data-i18n="node.oneTimePayment">One-time Payment:</span>
+                                    <span data-i18n="node.permanentActivation">Permanent Node Activation</span>
+                                </div>
+                            </div>
+                            
+                            <button class="btn btn-primary" id="spend-qnc-btn">
+                                <span data-i18n="node.spendQNC">Spend QNC & Activate Node</span>
+                            </button>
+                        </div>
+                        
+                        <button id="activate-node-btn" class="btn btn-primary" data-i18n="node.activateNode">Activate Node</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Settings Modal -->
+        <div id="settings-modal" class="modal hidden">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h3 data-i18n="wallet.settings">Settings</h3>
+                    <button class="modal-close">&times;</button>
+                </div>
+                <div class="modal-body">
+                    <div class="settings-section">
+                        <h4 data-i18n="settings.general">General</h4>
+                        <div class="setting-item">
+                            <label data-i18n="settings.language">Language</label>
+                            <select id="settings-language">
+                                <option value="en">US English</option>
+                                <option value="ru">RU Русский</option>
+                                <option value="zh-CN">CN 简体中文</option>
+                                <option value="fr">FR Français</option>
+                                <option value="es">ES Español</option>
+                                <option value="ja">JP 日本語</option>
+                                <option value="ko">KR 한국어</option>
+                                <option value="hi">IN हिंदी</option>
+                                <option value="id">ID Bahasa Indonesia</option>
+                                <option value="th">TH ไทย</option>
+                                <option value="vi">VN Tiếng Việt</option>
+                            </select>
+                        </div>
+                        <div class="setting-item">
+                            <label data-i18n="settings.currency">Currency</label>
+                            <select id="settings-currency">
+                                <option value="USD">USD</option>
+                                <option value="EUR">EUR</option>
+                                <option value="GBP">GBP</option>
+                                <option value="JPY">JPY</option>
+                                <option value="CNY">CNY</option>
+                            </select>
+                        </div>
+                        <div class="setting-item">
+                            <label data-i18n="settings.theme">Theme</label>
+                            <select id="settings-theme">
+                                <option value="dark">Dark</option>
+                                <option value="light">Light</option>
+                                <option value="auto">Auto</option>
+                            </select>
+                        </div>
+                    </div>
+                    
+                    <div class="settings-section">
+                        <h4 data-i18n="security.security">Security</h4>
+                        <div class="setting-item">
+                            <label data-i18n="security.autoLock">Auto Lock</label>
+                            <select id="settings-autolock">
+                                <option value="300000">5 minutes</option>
+                                <option value="600000">10 minutes</option>
+                                <option value="1800000">30 minutes</option>
+                                <option value="3600000">1 hour</option>
+                                <option value="0">Never</option>
+                            </select>
+                        </div>
+                        <button class="btn btn-outline" data-i18n="security.changePassword">Change Password</button>
+                        <button class="btn btn-outline" data-i18n="security.backupWallet">Backup Wallet</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Transaction Confirmation Modal -->
+        <div id="tx-confirm-modal" class="modal hidden">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h3 data-i18n="transactions.confirmTransaction">Confirm Transaction</h3>
+                </div>
+                <div class="modal-body">
+                    <div class="tx-details">
+                        <div class="detail-item">
+                            <span data-i18n="transactions.recipient">To:</span>
+                            <span id="confirm-recipient"></span>
+                        </div>
+                        <div class="detail-item">
+                            <span data-i18n="transactions.amount">Amount:</span>
+                            <span id="confirm-amount"></span>
+                        </div>
+                        <div class="detail-item">
+                            <span data-i18n="transactions.fee">Fee:</span>
+                            <span id="confirm-fee"></span>
+                        </div>
+                        <div class="detail-item total">
+                            <span data-i18n="transactions.total">Total:</span>
+                            <span id="confirm-total"></span>
+                        </div>
+                    </div>
+                    <div class="modal-actions">
+                        <button id="confirm-tx-btn" class="btn btn-primary" data-i18n="common.confirm">Confirm</button>
+                        <button id="cancel-tx-btn" class="btn btn-secondary" data-i18n="common.cancel">Cancel</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script type="module" src="src/i18n/index.js"></script>
+    <script type="module" src="popup.js"></script>
+</body>
+</html> 

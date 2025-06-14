@@ -1,0 +1,14 @@
+{
+  "timestamp": 1749696803.437328,
+  "max_tps": 0,
+  "burst_tps": 0,
+  "machine_gun_tps": 0.0,
+  "sustained_tps": 0.0,
+  "target_achieved": false,
+  "nodes_used": 6,
+  "total_stats": {
+    "total_sent": 158400,
+    "total_success": 0,
+    "peak_tps": 0
+  }
+}

@@ -1,0 +1,61 @@
+[package]
+name = "qnet-api"
+version = "0.1.0"
+edition = "2021"
+authors = ["QNet Team"]
+description = "High-performance API server for QNet blockchain"
+license = "MIT"
+
+[dependencies]
+# QNet crates
+qnet-state = { path = "../../core/qnet-state" }
+qnet-mempool = { path = "../../core/qnet-mempool" }
+qnet-consensus = { path = "../../core/qnet-consensus" }
+
+# Web framework
+actix = "0.13"
+actix-web = "4.4"
+actix-web-actors = "4.2"
+actix-cors = "0.7"
+actix-ws = "0.2"
+
+# Async runtime
+tokio = { version = "1.35", features = ["full"] }
+async-trait = "0.1"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# API documentation
+utoipa = { version = "4.1", features = ["actix_extras"] }
+utoipa-swagger-ui = { version = "5.0", features = ["actix-web"] }
+
+# Validation
+validator = { version = "0.16", features = ["derive"] }
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-actix-web = "0.7"
+
+# Metrics
+prometheus = "0.13"
+actix-web-prom = "0.7"
+
+# Utils
+uuid = { version = "1.6", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+hex = "0.4"
+
+[dev-dependencies]
+actix-rt = "2.9"
+reqwest = { version = "0.11", features = ["json"] }
+
+[[bin]]
+name = "qnet-api"
+path = "src/main.rs" 

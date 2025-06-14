@@ -1,0 +1,232 @@
+{
+  "timestamp": "2025-06-12T13:00:36.513675",
+  "test_duration_seconds": 10.46116304397583,
+  "crypto_performance": {
+    "key_generation": {
+      "avg_ms": 0.3915071487426758,
+      "min_ms": 0.11396408081054688,
+      "max_ms": 24.258136749267578,
+      "ops_per_second": 2554.2317763838987
+    },
+    "signing": {
+      "avg_ms": 0.12988567352294922,
+      "min_ms": 0.1049041748046875,
+      "max_ms": 0.2903938293457031,
+      "ops_per_second": 7699.078527111862
+    },
+    "verification": {
+      "avg_ms": 0.12340784072875977,
+      "min_ms": 0.10395050048828125,
+      "max_ms": 0.8618831634521484,
+      "ops_per_second": 8103.212843646761
+    },
+    "working": true
+  },
+  "post_quantum_performance": {
+    "dilithium": {
+      "key_generation": {
+        "avg_ms": 3.7554121017456055,
+        "min_ms": 2.7616024017333984,
+        "max_ms": 6.528377532958984,
+        "ops_per_second": 266.2823607388324
+      },
+      "signing": {
+        "avg_ms": 0.1550436019897461,
+        "min_ms": 0.148773193359375,
+        "max_ms": 0.186920166015625,
+        "ops_per_second": 6449.7985545133015
+      },
+      "verification": {
+        "avg_ms": 0.0019693374633789062,
+        "min_ms": 0.001430511474609375,
+        "max_ms": 0.009059906005859375,
+        "ops_per_second": 507784.9878934625
+      },
+      "public_key_size": 1952,
+      "private_key_size": 4000,
+      "signature_size": 3293,
+      "quantum_resistance": {
+        "large_message_sign_ms": 0.1735687255859375,
+        "large_message_verify_ms": 0.009059906005859375,
+        "concurrent_operations_ms": 1.566171646118164,
+        "concurrent_success_rate": 1.0,
+        "invalid_signature_rejected": true,
+        "resistance_score": 100,
+        "resistance_level": "EXCELLENT"
+      }
+    },
+    "working": true
+  },
+  "transaction_processing": {
+    "transactions_processed": 5474,
+    "test_duration_seconds": 10.000674486160278,
+    "actual_tps": 547.3630811177139,
+    "working": true
+  },
+  "cross_shard_performance": {
+    "working": true,
+    "intra_shard": {
+      "avg_time_ms": 0.09719371795654297,
+      "success_rate": 100.0,
+      "total_tests": 100
+    },
+    "cross_shard": {
+      "avg_time_ms": 0.038361549377441406,
+      "success_rate": 100.0,
+      "total_tests": 50
+    },
+    "shard_stats": {
+      "0": {
+        "shard_id": 0,
+        "account_count": 55,
+        "transaction_count": 23,
+        "block_height": 0,
+        "last_update": 1749722436,
+        "state_size_bytes": 6500
+      },
+      "1": {
+        "shard_id": 1,
+        "account_count": 59,
+        "transaction_count": 25,
+        "block_height": 0,
+        "last_update": 1749722436,
+        "state_size_bytes": 6900
+      },
+      "2": {
+        "shard_id": 2,
+        "account_count": 54,
+        "transaction_count": 21,
+        "block_height": 0,
+        "last_update": 1749722436,
+        "state_size_bytes": 6400
+      },
+      "3": {
+        "shard_id": 3,
+        "account_count": 79,
+        "transaction_count": 31,
+        "block_height": 0,
+        "last_update": 1749722436,
+        "state_size_bytes": 8900
+      },
+      "15": {
+        "shard_id": 15,
+        "account_count": 6,
+        "transaction_count": 6,
+        "block_height": 0,
+        "last_update": 1749722436,
+        "state_size_bytes": 1600
+      },
+      "14": {
+        "shard_id": 14,
+        "account_count": 5,
+        "transaction_count": 5,
+        "block_height": 0,
+        "last_update": 1749722436,
+        "state_size_bytes": 1500
+      },
+      "12": {
+        "shard_id": 12,
+        "account_count": 6,
+        "transaction_count": 6,
+        "block_height": 0,
+        "last_update": 1749722436,
+        "state_size_bytes": 1600
+      },
+      "5": {
+        "shard_id": 5,
+        "account_count": 6,
+        "transaction_count": 6,
+        "block_height": 0,
+        "last_update": 1749722436,
+        "state_size_bytes": 1600
+      },
+      "6": {
+        "shard_id": 6,
+        "account_count": 6,
+        "transaction_count": 6,
+        "block_height": 0,
+        "last_update": 1749722436,
+        "state_size_bytes": 1600
+      },
+      "4": {
+        "shard_id": 4,
+        "account_count": 3,
+        "transaction_count": 3,
+        "block_height": 0,
+        "last_update": 1749722436,
+        "state_size_bytes": 1300
+      },
+      "8": {
+        "shard_id": 8,
+        "account_count": 4,
+        "transaction_count": 4,
+        "block_height": 0,
+        "last_update": 1749722436,
+        "state_size_bytes": 1400
+      },
+      "11": {
+        "shard_id": 11,
+        "account_count": 5,
+        "transaction_count": 5,
+        "block_height": 0,
+        "last_update": 1749722436,
+        "state_size_bytes": 1500
+      },
+      "9": {
+        "shard_id": 9,
+        "account_count": 4,
+        "transaction_count": 4,
+        "block_height": 0,
+        "last_update": 1749722436,
+        "state_size_bytes": 1400
+      },
+      "13": {
+        "shard_id": 13,
+        "account_count": 1,
+        "transaction_count": 1,
+        "block_height": 0,
+        "last_update": 1749722436,
+        "state_size_bytes": 1100
+      },
+      "10": {
+        "shard_id": 10,
+        "account_count": 4,
+        "transaction_count": 4,
+        "block_height": 0,
+        "last_update": 1749722436,
+        "state_size_bytes": 1400
+      }
+    },
+    "cross_shard_stats": {
+      "total_transactions": 50,
+      "pending": 0,
+      "locked": 0,
+      "committed": 50,
+      "failed": 0,
+      "success_rate": 100.0
+    },
+    "performance_analysis": {
+      "intra_shard_meets_target": true,
+      "cross_shard_meets_target": true,
+      "microblock_constraint_ok": true
+    }
+  },
+  "memory_performance": {
+    "initial_memory_mb": 21.48046875,
+    "peak_memory_mb": 26.46875,
+    "final_memory_mb": 23.46875,
+    "memory_increase_mb": 4.98828125,
+    "working": true
+  },
+  "tps_estimates": {
+    "base_simulated_tps": 547.3630811177139,
+    "crypto_limited_tps": 7699.078527111862,
+    "realistic_single_thread_tps": 547.3630811177139,
+    "estimated_4_threads_tps": 2189.4523244708557,
+    "estimated_8_threads_tps": 4378.9046489417115,
+    "estimated_16_threads_tps": 8757.809297883423,
+    "working": true
+  },
+  "working_components": 5,
+  "total_components": 5
+}

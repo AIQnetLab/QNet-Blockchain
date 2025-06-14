@@ -1,0 +1,51 @@
+{
+  "name": "qnet-project",
+  "version": "1.0.0",
+  "description": "QNet - High-Performance Blockchain Network with Mobile Optimization",
+  "private": true,
+  "workspaces": [
+    "../applications/qnet-explorer/frontend",
+    "qnet-proto/src"
+  ],
+  "scripts": {
+    "dev": "npm run dev -w ../applications/qnet-explorer/frontend",
+    "build": "npm run build -w ../applications/qnet-explorer/frontend",
+    "start": "npm run start -w ../applications/qnet-explorer/frontend",
+    "test": "npm run test -w ../applications/qnet-explorer/frontend",
+    "lint": "npm run lint -w ../applications/qnet-explorer/frontend",
+    "type-check": "npm run type-check -w ../applications/qnet-explorer/frontend",
+    "build:rust": "cargo build --release",
+    "test:rust": "cargo test",
+    "test:python": "python -m pytest",
+    "setup": "npm install && cargo build",
+    "start:network": "python scripts/start_network.py",
+    "monitor": "python performance_dashboard.py"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/qnet-project/qnet.git"
+  },
+  "keywords": [
+    "blockchain",
+    "cryptocurrency",
+    "mobile",
+    "post-quantum",
+    "high-performance"
+  ],
+  "author": "QNet Development Team",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0",
+    "npm": ">=9.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "eslint": "^8.0.0",
+    "prettier": "^3.0.0",
+    "typescript": "^5.0.0"
+  },
+  "dependencies": {
+    "axios": "^1.9.0",
+    "dotenv": "^16.0.0"
+  }
+}

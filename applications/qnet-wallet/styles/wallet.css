@@ -1,0 +1,243 @@
+/* One-click activation styles */
+.activation-progress {
+  margin-top: 20px;
+  padding: 20px;
+  background: rgba(34, 197, 94, 0.1);
+  border: 1px solid rgba(34, 197, 94, 0.3);
+  border-radius: 12px;
+}
+
+.progress-steps {
+  margin-bottom: 16px;
+}
+
+.step {
+  padding: 8px 0;
+  color: #9ca3af;
+  font-size: 14px;
+  transition: color 0.3s ease;
+}
+
+.step.active {
+  color: #22c55e;
+  font-weight: 600;
+}
+
+.step.completed {
+  color: #10b981;
+}
+
+.progress-bar {
+  width: 100%;
+  height: 8px;
+  background: rgba(156, 163, 175, 0.2);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #22c55e, #10b981);
+  width: 0%;
+  transition: width 0.5s ease;
+  border-radius: 4px;
+}
+
+/* Radio button styles */
+.radio-group {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-bottom: 20px;
+}
+
+.radio-option {
+  display: flex;
+  align-items: center;
+  padding: 16px;
+  background: rgba(34, 197, 94, 0.05);
+  border: 2px solid rgba(34, 197, 94, 0.2);
+  border-radius: 12px;
+  cursor: pointer;
+  transition: all 0.3s ease;
+}
+
+.radio-option:hover {
+  background: rgba(34, 197, 94, 0.1);
+  border-color: rgba(34, 197, 94, 0.4);
+}
+
+.radio-option input[type="radio"] {
+  display: none;
+}
+
+.radio-option input[type="radio"]:checked + .radio-custom {
+  background: linear-gradient(135deg, #22c55e, #10b981);
+  border-color: #22c55e;
+}
+
+.radio-option input[type="radio"]:checked + .radio-custom::after {
+  opacity: 1;
+}
+
+.radio-custom {
+  width: 20px;
+  height: 20px;
+  border: 2px solid #6b7280;
+  border-radius: 50%;
+  margin-right: 12px;
+  position: relative;
+  transition: all 0.3s ease;
+}
+
+.radio-custom::after {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 8px;
+  height: 8px;
+  background: white;
+  border-radius: 50%;
+  opacity: 0;
+  transition: opacity 0.3s ease;
+}
+
+.radio-content {
+  flex: 1;
+}
+
+.radio-title {
+  font-weight: 600;
+  color: #f3f4f6;
+  margin-bottom: 4px;
+}
+
+.radio-subtitle {
+  font-size: 13px;
+  color: #9ca3af;
+}
+
+/* Activation summary styles */
+.activation-summary {
+  background: rgba(139, 92, 246, 0.1);
+  border: 1px solid rgba(139, 92, 246, 0.3);
+  border-radius: 12px;
+  padding: 16px;
+  margin-bottom: 20px;
+}
+
+.summary-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 6px 0;
+  border-bottom: 1px solid rgba(139, 92, 246, 0.2);
+}
+
+.summary-row:last-child {
+  border-bottom: none;
+}
+
+.summary-row span:first-child {
+  color: #d1d5db;
+  font-size: 13px;
+}
+
+.summary-row span:last-child {
+  color: #a855f7;
+  font-weight: 600;
+  font-size: 13px;
+}
+
+/* Balance display with filter indicator */
+.token-balance {
+  margin-bottom: 20px;
+}
+
+.token-balance label {
+  display: block;
+  font-size: 14px;
+  font-weight: 500;
+  color: #d1d5db;
+  margin-bottom: 8px;
+}
+
+.balance-amount {
+  font-size: 18px;
+  font-weight: 600;
+  color: #22c55e;
+}
+
+/* One-click button styling */
+#activate-node-one-click-btn {
+  background: linear-gradient(135deg, #7c3aed 0%, #06b6d4 100%);
+  border: none;
+  border-radius: 12px;
+  padding: 16px 24px;
+  color: white;
+  font-size: 16px;
+  font-weight: 600;
+  cursor: pointer;
+  width: 100%;
+  transition: all 0.3s ease;
+  box-shadow: 0 4px 12px rgba(124, 58, 237, 0.3);
+}
+
+#activate-node-one-click-btn:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 6px 20px rgba(124, 58, 237, 0.4);
+}
+
+#activate-node-one-click-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+  transform: none;
+}
+
+/* Hidden class */
+.hidden {
+  display: none !important;
+}
+
+/* Success/Error message improvements */
+.success-message {
+  background: rgba(34, 197, 94, 0.15);
+  border: 1px solid rgba(34, 197, 94, 0.3);
+  color: #22c55e;
+  padding: 12px 16px;
+  border-radius: 8px;
+  margin: 12px 0;
+  font-size: 14px;
+}
+
+.error-message {
+  background: rgba(239, 68, 68, 0.15);
+  border: 1px solid rgba(239, 68, 68, 0.3);
+  color: #ef4444;
+  padding: 12px 16px;
+  border-radius: 8px;
+  margin: 12px 0;
+  font-size: 14px;
+}
+
+/* Animation for progress steps */
+@keyframes stepActivate {
+  0% { transform: scale(1); }
+  50% { transform: scale(1.05); }
+  100% { transform: scale(1); }
+}
+
+.step.active {
+  animation: stepActivate 0.5s ease-in-out;
+}
+
+/* Filtered balance indicator */
+.token-balance small {
+  display: block;
+  margin-top: 4px;
+  font-size: 11px;
+  color: #6b7280;
+  font-style: italic;
+} 

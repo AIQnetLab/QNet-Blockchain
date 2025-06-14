@@ -1,0 +1,100 @@
+/* New component styles */
+.node-details {
+  margin-top: 1rem;
+  padding-top: 1rem;
+  border-top: 1px solid rgba(0, 255, 255, 0.3);
+}
+
+.node-details p {
+  color: #f0f0f0 !important;
+  font-size: 0.9rem;
+  margin: 0.25rem 0;
+}
+
+.test-results {
+  margin-top: 1rem;
+  padding-top: 1rem;
+  border-top: 1px solid rgba(0, 255, 255, 0.3);
+}
+
+.test-results p {
+  color: #f0f0f0 !important;
+  font-size: 0.9rem;
+  margin: 0.25rem 0;
+}
+
+.wallet-features {
+  margin-top: 3rem;
+}
+
+.download-status {
+  color: #9333ea !important;
+  font-weight: bold;
+  font-size: 0.9rem;
+  margin: 0.5rem 0;
+}
+
+.qnet-button.disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+  border-color: #666;
+  color: #888;
+}
+
+.qnet-button.disabled:hover {
+  background: transparent;
+  box-shadow: none;
+  transform: none;
+}
+
+.download-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 2rem;
+  margin-bottom: 3rem;
+}
+
+.download-card {
+  background: rgba(0, 0, 0, 0.97);
+  border: 1px solid rgba(0, 255, 255, 0.7);
+  padding: 2rem;
+  text-align: center;
+  border-radius: 12px;
+  transition: all 0.3s ease;
+  backdrop-filter: blur(30px);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.8);
+}
+
+.download-card:hover {
+  border-color: rgba(0, 255, 255, 1);
+  box-shadow: 0 0 50px rgba(0, 255, 255, 0.6);
+  transform: translateY(-5px);
+}
+
+.app-logo {
+  margin-bottom: 1.5rem;
+}
+
+.status-banner {
+  background: rgba(147, 51, 234, 0.2);
+  border: 1px solid rgba(147, 51, 234, 0.5);
+  padding: 2rem;
+  text-align: center;
+  border-radius: 12px;
+  margin-bottom: 3rem;
+}
+
+.status-banner h3 {
+  color: #9333ea !important;
+  margin-bottom: 1rem;
+}
+
+.status-banner p {
+  color: #f0f0f0 !important;
+}
+
+@media (max-width: 768px) {
+  .download-grid {
+    grid-template-columns: 1fr;
+  }
+} 

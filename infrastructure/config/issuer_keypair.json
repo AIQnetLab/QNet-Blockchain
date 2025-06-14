@@ -1,0 +1,8 @@
+{
+  "private_key_b58": "2Y4drEnuQQZjyZ14GgkL2R9ViRNSCDdNWStQCZwCevutTgNSwbLF1hbgi3Q3fbAvEUnD2wbE1gC1Z9ckrZwhPwrM",
+  "public_key_b58": "8hiJmW8TB1ssJzBUC1Tr4NWergEggPE9DBfJv3VkLvZT",
+  "generated_at": 1748052628,
+  "generated_at_readable": "2025-05-24 02:10:28 UTC",
+  "note": "Auto-generated issuer keypair for QNet activation bridge",
+  "warning": "KEEP THIS FILE SECURE! Contains private key for signing activation tokens."
+}

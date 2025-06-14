@@ -1,0 +1,103 @@
+version: '3.8'
+
+services:
+  # QNet Full Node
+  qnet-node:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: qnet-node
+    environment:
+      - NODE_TYPE=full
+      - NETWORK_ID=qnet-mainnet
+      - MINING_ENABLED=true
+      - RUST_OPTIMIZATION=true
+    ports:
+      - "9876:9876"     # P2P port
+      - "5000:5000"     # API port
+      - "9090:9090"     # Metrics port
+    volumes:
+      - ./data:/app/data
+      - ./keys:/app/keys
+      - ./config:/app/config
+    networks:
+      - qnet-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # QNet Explorer (optional)
+  qnet-explorer:
+    build:
+      context: ./qnet-explorer
+      dockerfile: Dockerfile
+    container_name: qnet-explorer
+    environment:
+      - API_URL=http://qnet-node:5000
+      - NODE_ENV=production
+    ports:
+      - "3000:3000"
+    depends_on:
+      - qnet-node
+    networks:
+      - qnet-network
+    restart: unless-stopped
+
+  # Redis for caching (optional)
+  redis:
+    image: redis:7-alpine
+    container_name: qnet-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - qnet-network
+    restart: unless-stopped
+
+  # Prometheus for monitoring (optional)
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: qnet-prometheus
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    ports:
+      - "9091:9090"
+    networks:
+      - qnet-network
+    restart: unless-stopped
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+
+  # Grafana for visualization (optional)
+  grafana:
+    image: grafana/grafana:latest
+    container_name: qnet-grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    ports:
+      - "3001:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources
+    depends_on:
+      - prometheus
+    networks:
+      - qnet-network
+    restart: unless-stopped
+
+networks:
+  qnet-network:
+    driver: bridge
+
+volumes:
+  redis-data:
+  prometheus-data:
+  grafana-data: 

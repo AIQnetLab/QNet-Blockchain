@@ -1,0 +1,48 @@
+[package]
+name = "qnet_node"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Core dependencies
+qnet-consensus = { path = "../../../core/qnet-consensus" }
+qnet-state = { path = "../../../core/qnet-state" }
+qnet-mempool = { path = "../../../core/qnet-mempool" }
+# qnet-p2p = { path = "../qnet-p2p" } # Removed - using simple_p2p instead
+qnet-api = { path = "../../../infrastructure/qnet-api" }
+
+# Async runtime
+tokio = { version = "1.35", features = ["full"] }
+futures = "0.3"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+bincode = "1.3"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Configuration
+config = "0.13"
+clap = { version = "4.4", features = ["derive"] }
+
+# Metrics and monitoring
+prometheus = "0.13"
+sysinfo = "0.30"
+
+# Utilities
+hex = "0.4"
+
+[dev-dependencies]
+tempfile = "3.8"
+criterion = "0.5"
+
+# [[bench]]
+# name = "node_benchmarks"
+# harness = false 

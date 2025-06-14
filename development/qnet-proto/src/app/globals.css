@@ -1,0 +1,257 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 0 0% 100%;
+    --foreground: 240 10% 3.9%;
+    --card: 0 0% 100%;
+    --card-foreground: 240 10% 3.9%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 240 10% 3.9%;
+    --primary: 263.4 69.5% 50.4%;
+    --primary-foreground: 210 40% 98%;
+    --secondary: 240 4.8% 95.9%;
+    --secondary-foreground: 240 5.9% 10%;
+    --muted: 240 4.8% 95.9%;
+    --muted-foreground: 240 3.8% 46.1%;
+    --accent: 240 4.8% 95.9%;
+    --accent-foreground: 240 5.9% 10%;
+    --destructive: 0 84.2% 60.2%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 240 5.9% 90%;
+    --input: 240 5.9% 90%;
+    --ring: 263.4 70% 50%;
+
+    /* Quantum theme colors */
+    --quantum-blue: 220 100% 50%;
+    --quantum-purple: 270 100% 60%;
+    --quantum-pink: 325 100% 60%;
+    --quantum-cyan: 180 100% 50%;
+    --quantum-gradient: linear-gradient(135deg, hsl(var(--quantum-purple)/0.8), hsl(var(--quantum-blue)/0.8));
+
+    --radius: 0.5rem;
+  }
+
+  .dark {
+    --background: 240 10% 3.9%;
+    --foreground: 0 0% 98%;
+    --card: 240 10% 3.9%;
+    --card-foreground: 0 0% 98%;
+    --popover: 240 10% 3.9%;
+    --popover-foreground: 0 0% 98%;
+    --primary: 263.4 70% 50.4%;
+    --primary-foreground: 0 0% 98%;
+    --secondary: 240 3.7% 15.9%;
+    --secondary-foreground: 0 0% 98%;
+    --muted: 240 3.7% 15.9%;
+    --muted-foreground: 240 5% 64.9%;
+    --accent: 240 3.7% 15.9%;
+    --accent-foreground: 0 0% 98%;
+    --destructive: 0 62.8% 30.6%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 240 3.7% 15.9%;
+    --input: 240 3.7% 15.9%;
+    --ring: 263.4 70% 50.4%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground;
+    font-feature-settings: "rlig" 1, "calt" 1;
+  }
+}
+
+/* Quantum futuristic background */
+.quantum-bg {
+  background: radial-gradient(circle at center, rgba(30, 23, 38, 0.8) 0%, rgba(16, 14, 22, 1) 100%);
+  position: relative;
+  overflow: hidden;
+}
+
+.quantum-bg::before {
+  content: "";
+  position: absolute;
+  width: 200%;
+  height: 200%;
+  top: -50%;
+  left: -50%;
+  z-index: -1;
+  background-image:
+    radial-gradient(circle at 30% 40%, rgba(105, 60, 255, 0.04) 0%, transparent 20%),
+    radial-gradient(circle at 70% 60%, rgba(60, 150, 255, 0.05) 0%, transparent 30%);
+  animation: quantum-pulse 15s infinite alternate ease-in-out;
+}
+
+@keyframes quantum-pulse {
+  0% {
+    opacity: 0.8;
+    transform: scale(1) rotate(0deg);
+  }
+  100% {
+    opacity: 1;
+    transform: scale(1.05) rotate(0.5deg);
+  }
+}
+
+/* Glow effects */
+.quantum-glow {
+  text-shadow: 0 0 8px rgba(156, 81, 255, 0.7), 0 0 18px rgba(117, 60, 212, 0.3);
+}
+
+.quantum-glow-box {
+  box-shadow: 0 0 15px rgba(156, 81, 255, 0.3), 0 0 30px rgba(117, 60, 212, 0.1);
+}
+
+.quantum-card {
+  background: rgba(30, 26, 38, 0.3);
+  border: 1px solid rgba(156, 81, 255, 0.1);
+  backdrop-filter: blur(12px);
+  transition: all 0.3s ease;
+}
+
+.quantum-card:hover {
+  border: 1px solid rgba(156, 81, 255, 0.3);
+  box-shadow: 0 0 20px rgba(156, 81, 255, 0.15);
+}
+
+/* Quantum buttons */
+.quantum-button {
+  background: rgba(45, 40, 60, 0.5);
+  color: white;
+  border: 1px solid rgba(156, 81, 255, 0.3);
+  padding: 0.75rem 1.5rem;
+  border-radius: 0.375rem;
+  transition: all 0.2s ease;
+  position: relative;
+  overflow: hidden;
+  backdrop-filter: blur(4px);
+}
+
+.quantum-button::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: -100%;
+  width: 100%;
+  height: 100%;
+  background: linear-gradient(90deg, transparent, rgba(156, 81, 255, 0.2), transparent);
+  transition: 0.5s;
+}
+
+.quantum-button:hover {
+  border-color: rgba(156, 81, 255, 0.7);
+  box-shadow: 0 0 15px rgba(156, 81, 255, 0.4);
+}
+
+.quantum-button:hover::before {
+  left: 100%;
+}
+
+.quantum-button-primary {
+  background: linear-gradient(135deg, rgba(120, 80, 220, 0.9), rgba(80, 40, 180, 0.9));
+}
+
+/* Wallet connect modal */
+.modal-overlay {
+  background: rgba(10, 8, 16, 0.8);
+  backdrop-filter: blur(6px);
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  animation: fadeIn 0.2s ease-out;
+}
+
+.modal-content {
+  background: rgba(25, 23, 36, 0.9);
+  border: 1px solid rgba(156, 81, 255, 0.2);
+  border-radius: 1rem;
+  padding: 2rem;
+  width: 90%;
+  max-width: 480px;
+  box-shadow: 0 10px 25px rgba(0, 0, 0, 0.2), 0 0 30px rgba(156, 81, 255, 0.2);
+  animation: scaleIn 0.3s ease-out;
+  backdrop-filter: blur(10px);
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes scaleIn {
+  from { transform: scale(0.9); opacity: 0; }
+  to { transform: scale(1); opacity: 1; }
+}
+
+/* Wallet option buttons */
+.wallet-option {
+  display: flex;
+  align-items: center;
+  padding: 0.75rem 1rem;
+  margin: 0.5rem 0;
+  border-radius: 0.5rem;
+  background: rgba(40, 35, 55, 0.5);
+  border: 1px solid rgba(156, 81, 255, 0.1);
+  transition: all 0.2s ease;
+}
+
+.wallet-option:hover {
+  background: rgba(60, 50, 80, 0.5);
+  border-color: rgba(156, 81, 255, 0.3);
+  transform: translateY(-2px);
+  box-shadow: 0 5px 15px rgba(0, 0, 0, 0.1), 0 0 10px rgba(156, 81, 255, 0.1);
+}
+
+.wallet-option img {
+  width: 2rem;
+  height: 2rem;
+  margin-right: 1rem;
+  border-radius: 0.375rem;
+}
+
+/* Quantum gradient text */
+.quantum-text-gradient {
+  background: linear-gradient(to right, #c084fc, #818cf8, #38bdf8);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+/* Hero orb effect */
+.quantum-orb {
+  position: absolute;
+  width: 500px;
+  height: 500px;
+  border-radius: 50%;
+  background: radial-gradient(circle at center, rgba(156, 81, 255, 0.15), transparent 60%);
+  filter: blur(30px);
+  animation: orbFloat 20s infinite alternate ease-in-out;
+  z-index: -1;
+}
+
+@keyframes orbFloat {
+  0% {
+    transform: translate(-5%, -5%);
+    opacity: 0.7;
+  }
+  50% {
+    transform: translate(5%, 3%);
+    opacity: 0.9;
+  }
+  100% {
+    transform: translate(-2%, -4%);
+    opacity: 0.7;
+  }
+}

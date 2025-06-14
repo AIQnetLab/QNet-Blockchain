@@ -1,0 +1,33 @@
+{
+  "name": "qnet-explorer",
+  "version": "1.0.0",
+  "description": "Qnet - Quantum Blockchain Explorer",
+  "private": true,
+  "scripts": {
+    "dev": "cd frontend && npm run dev",
+    "build": "cd frontend && npm run build",
+    "start": "cd frontend && npm start",
+    "lint": "cd frontend && npm run lint",
+    "install-deps": "cd frontend && npm install",
+    "clean": "cd frontend && rm -rf .next node_modules && npm install"
+  },
+  "keywords": [
+    "blockchain",
+    "quantum",
+    "explorer",
+    "nextjs",
+    "solana"
+  ],
+  "author": "QNet Team",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/qnet-project/qnet-explorer"
+  },
+  "workspaces": [
+    "frontend"
+  ],
+  "dependencies": {
+    "react-simple-maps": "^3.0.0"
+  }
+}

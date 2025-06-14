@@ -1,0 +1,79 @@
+{
+  "manifest_version": 3,
+  "name": "QNet Wallet",
+  "version": "1.0.0",
+  "description": "Official QNet blockchain wallet with post-quantum security and node management",
+  
+  "permissions": [
+    "storage",
+    "tabs",
+    "notifications",
+    "alarms",
+    "activeTab",
+    "scripting",
+    "clipboardWrite"
+  ],
+  
+  "host_permissions": [
+    "http://localhost/*",
+    "https://*.qnet.network/*",
+    "https://*.solana.com/*",
+    "https://api.mainnet-beta.solana.com/*",
+    "https://api.devnet.solana.com/*",
+    "https://api.testnet.solana.com/*"
+  ],
+  
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "QNet Wallet",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "32": "icons/icon-32.png",
+      "48": "icons/icon-48.png",
+      "128": "icons/icon-128.png"
+    }
+  },
+  
+  "icons": {
+    "16": "icons/icon-16.png",
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
+  
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_start",
+      "all_frames": true
+    }
+  ],
+  
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "inject.js",
+        "src/i18n/locales/*.json",
+        "icons/*"
+      ],
+      "matches": ["<all_urls>"]
+    }
+  ],
+  
+  "content_security_policy": {
+    "extension_pages": "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self'; connect-src 'self' http://localhost:* https://*.qnet.network wss://*.qnet.network https://*.solana.com https://api.mainnet-beta.solana.com https://api.devnet.solana.com https://api.testnet.solana.com; object-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none';"
+  },
+  
+  "externally_connectable": {
+    "matches": [
+      "https://*.qnet.network/*",
+      "http://localhost:*/*"
+    ]
+  }
+} 

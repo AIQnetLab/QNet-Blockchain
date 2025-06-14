@@ -1,0 +1,58 @@
+{
+  "data_dir": "./data",
+  "node_type": "Full",
+  "network": {
+    "listen_addresses": [
+      "/ip4/0.0.0.0/tcp/9000",
+      "/ip6/::/tcp/9000"
+    ],
+    "bootstrap_nodes": [],
+    "max_peers": 50,
+    "min_peers": 5,
+    "connection_timeout": {
+      "secs": 10,
+      "nanos": 0
+    },
+    "request_timeout": {
+      "secs": 30,
+      "nanos": 0
+    },
+    "enable_mdns": true,
+    "enable_dht": true,
+    "gossip": {
+      "validation_time": {
+        "secs": 0,
+        "nanos": 100000000
+      },
+      "heartbeat_interval": {
+        "secs": 1,
+        "nanos": 0
+      },
+      "history_length": 12,
+      "history_gossip": 3,
+      "max_transmit_size": 65536
+    },
+    "sync": {
+      "max_blocks_per_request": 100,
+      "max_concurrent_requests": 5,
+      "sync_timeout": {
+        "secs": 60,
+        "nanos": 0
+      },
+      "fast_sync": true
+    }
+  },
+  "consensus": {
+    "enable_producer": false,
+    "producer_key": null,
+    "block_time_ms": 1000,
+    "min_stake": 1000
+  },
+  "api": {
+    "enabled": true,
+    "listen_addr": "127.0.0.1:8080",
+    "enable_ws": true,
+    "ws_addr": "127.0.0.1:8081",
+    "enable_metrics": true
+  }
+} 
