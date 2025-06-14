@@ -1,56 +1,56 @@
-# 🔒 QNet Project - Стратегия Приватного Репозитория
+# 🔒 QNet Project - Private Repository Strategy
 
-## 📋 План Развертывания
+## 📋 Deployment Plan
 
-### Этап 1: Приватная Разработка (Сейчас)
-- ✅ Создать **приватный** репозиторий на GitHub
-- ✅ Ограниченный доступ только для команды разработки
-- ✅ Безопасная разработка и тестирование
-- ✅ Возможность исправлений и улучшений
+### Phase 1: Private Development (Current)
+- ✅ Create **private** repository on GitHub
+- ✅ Limited access for development team only
+- ✅ Safe development and testing
+- ✅ Ability for fixes and improvements
 
-### Этап 2: Подготовка к Мейннету
-- 🔄 Финальное тестирование
-- 🔄 Аудит безопасности
-- 🔄 Документация для пользователей
-- 🔄 Подготовка релиза
+### Phase 2: Mainnet Preparation
+- 🔄 Final testing
+- 🔄 Security audit
+- 🔄 User documentation
+- 🔄 Release preparation
 
-### Этап 3: Публичный Запуск (Перед Мейннетом)
-- 🚀 Переключение на **публичный** репозиторий
-- 🚀 Открытый доступ к коду
-- 🚀 Запуск мейннета
-- 🚀 Сообщество разработчиков
+### Phase 3: Public Launch (Before Mainnet)
+- 🚀 Switch to **public** repository
+- 🚀 Open source code access
+- 🚀 Mainnet launch
+- 🚀 Developer community
 
-## 🔐 Настройки Приватного Репозитория
+## 🔐 Private Repository Settings
 
-### Доступы:
-- **Owner**: Ваш GitHub аккаунт
-- **Collaborators**: Команда разработки
-- **AI Assistant**: Доступ через GitHub API (если нужно)
+### Access Control:
+- **Owner**: Your GitHub account
+- **Collaborators**: Development team
+- **AI Assistant**: Access via GitHub API (if needed)
 
-### Ветки:
-- `main` - стабильная версия
-- `develop` - активная разработка  
-- `feature/*` - новые функции
-- `hotfix/*` - критические исправления
+### Branches:
+- `main` - stable version
+- `develop` - active development  
+- `feature/*` - new features
+- `hotfix/*` - critical fixes
 
-### Защита:
+### Protection:
 - ✅ Branch protection rules
 - ✅ Required reviews
 - ✅ Status checks
 - ✅ No force push to main
 
-## 📝 Инструкции по Созданию
+## 📝 Setup Instructions
 
-### 1. Создание Репозитория на GitHub:
+### 1. Creating Repository on GitHub:
 
 ```bash
-# Инициализация Git (если еще не сделано)
+# Initialize Git (if not done already)
 git init
 
-# Добавление всех файлов
+# Add all files
 git add .
 
-# Первый коммит
+# First commit
 git commit -m "feat: initial QNet blockchain project setup
 
 - Post-quantum cryptography implementation
@@ -60,16 +60,16 @@ git commit -m "feat: initial QNet blockchain project setup
 - Professional monorepo structure
 - Size optimized: 11MB (99.96% reduction from 30GB)"
 
-# Добавление remote (замените YOUR_USERNAME)
+# Add remote (replace YOUR_USERNAME)
 git remote add origin https://github.com/YOUR_USERNAME/qnet-project.git
 
-# Отправка в приватный репозиторий
+# Push to private repository
 git push -u origin main
 ```
 
-### 2. Настройки Репозитория:
+### 2. Repository Settings:
 
-#### В GitHub Settings:
+#### In GitHub Settings:
 - **Visibility**: Private ✅
 - **Features**: 
   - Issues ✅
@@ -91,63 +91,63 @@ Branch name pattern: main
 ☑ Include administrators
 ```
 
-### 3. Добавление Collaborators:
+### 3. Adding Collaborators:
 
 #### Settings → Manage access → Invite a collaborator:
-- Добавить членов команды с ролью **Write** или **Maintain**
-- Для внешних консультантов - роль **Read**
+- Add team members with **Write** or **Maintain** role
+- For external consultants - **Read** role
 
-## 🚀 Преимущества Приватного Подхода
+## 🚀 Private Approach Benefits
 
-### Безопасность:
-- 🔒 Защита от копирования кода до релиза
-- 🔒 Контроль доступа к критическим компонентам
-- 🔒 Безопасное тестирование экономических моделей
+### Security:
+- 🔒 Protection from code copying before release
+- 🔒 Access control to critical components
+- 🔒 Safe testing of economic models
 
-### Разработка:
-- 🛠️ Возможность экспериментов без публичного давления
-- 🛠️ Исправление багов до публичного релиза
-- 🛠️ Итеративная разработка
+### Development:
+- 🛠️ Ability to experiment without public pressure
+- 🛠️ Bug fixes before public release
+- 🛠️ Iterative development
 
-### Маркетинг:
-- 📢 Контролируемый анонс
-- 📢 Подготовка сообщества
-- 📢 Профессиональный запуск
+### Marketing:
+- 📢 Controlled announcement
+- 📢 Community preparation
+- 📢 Professional launch
 
-## 📅 Временная Шкала
+## 📅 Timeline
 
-### Фаза 1: Приватная Разработка (1-3 месяца)
-- Доработка функционала
-- Тестирование производительности
-- Исправление багов
-- Подготовка документации
+### Phase 1: Private Development (1-3 months)
+- Feature development
+- Performance testing
+- Bug fixes
+- Documentation preparation
 
-### Фаза 2: Закрытое Тестирование (1 месяц)
-- Альфа-тестирование с ограниченной группой
-- Сбор обратной связи
-- Финальные исправления
+### Phase 2: Closed Testing (1 month)
+- Alpha testing with limited group
+- Feedback collection
+- Final fixes
 
-### Фаза 3: Публичный Запуск
-- Переключение на публичный репозиторий
-- Анонс в сообществе
-- Запуск мейннета
-- Открытие для контрибьюторов
+### Phase 3: Public Launch
+- Switch to public repository
+- Community announcement
+- Mainnet launch
+- Open for contributors
 
-## 🔄 Переход к Публичному Репозиторию
+## 🔄 Transition to Public Repository
 
-### Когда будете готовы:
+### When ready:
 1. Settings → General → Danger Zone
 2. "Change repository visibility"
-3. Выбрать "Make public"
-4. Подтвердить действие
+3. Select "Make public"
+4. Confirm action
 
-### Подготовка к публикации:
-- ✅ Финальная проверка кода
-- ✅ Обновление README
-- ✅ Подготовка CONTRIBUTING.md
-- ✅ Создание релиза v1.0.0
-- ✅ Анонс в социальных сетях
+### Preparation for publication:
+- ✅ Final code review
+- ✅ README update
+- ✅ CONTRIBUTING.md preparation
+- ✅ Release v1.0.0 creation
+- ✅ Social media announcement
 
 ---
 
-**Этот подход позволит вам безопасно разрабатывать проект, получать помощь от AI, и контролировать процесс до готовности к публичному запуску!** 
+**This approach allows you to safely develop the project, get AI assistance, and control the process until ready for public launch!** 
