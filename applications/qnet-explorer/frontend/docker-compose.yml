@@ -1,0 +1,46 @@
+version: '3.8'
+
+services:
+  qnet-explorer-frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: qnet-explorer-frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - NEXT_PUBLIC_API_URL=http://localhost:8545
+      - NEXT_PUBLIC_NETWORK=mainnet
+    volumes:
+      - ./logs:/app/logs
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - qnet-network
+
+  # Optional: Add nginx reverse proxy
+  nginx:
+    image: nginx:alpine
+    container_name: qnet-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - qnet-explorer-frontend
+    restart: unless-stopped
+    networks:
+      - qnet-network
+
+networks:
+  qnet-network:
+    driver: bridge 
