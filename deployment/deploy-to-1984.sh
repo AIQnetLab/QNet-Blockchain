@@ -13,7 +13,7 @@ NC='\033[0m' # No Color
 
 # Configuration
 SERVER_IP=${1:-"YOUR_VPS_IP"}
-DOMAIN_NAME=${2:-"qnet-blockchain.com"}
+DOMAIN_NAME=${2:-"qnet.is"}
 SSH_USER="root"
 APP_DIR="/var/www/qnet"
 GITHUB_REPO="https://github.com/AIQnetLab/QNet-Blockchain.git"
