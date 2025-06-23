@@ -1,12 +1,11 @@
 'use client';
 
-import { memo, useState, useEffect } from 'react';
+import { memo } from 'react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 
 const HeaderComponent = () => {
   const pathname = usePathname();
-  const [isMenuOpen, setIsMenuOpen] = useState(false);
 
   const navLinks = [
     { href: '/', label: 'Home' },
@@ -18,21 +17,12 @@ const HeaderComponent = () => {
     { href: '/docs', label: 'Docs' },
   ];
 
-  useEffect(() => {
-    // Close menu on route change
-    setIsMenuOpen(false);
-  }, [pathname]);
-
-  const toggleMenu = () => {
-    setIsMenuOpen(!isMenuOpen);
-  };
-
   return (
     <header className="qnet-header">
       <div className="header-content">
         <Link href="/" className="qnet-logo">QNET</Link>
         
-        <nav className={`qnet-nav ${isMenuOpen ? 'active' : ''}`}>
+        <nav className="qnet-nav">
           {navLinks.map(link => (
             <Link 
               key={link.href}
@@ -43,18 +33,11 @@ const HeaderComponent = () => {
               {link.label}
             </Link>
           ))}
-          <div className="header-right-mobile">
-            <button className="qnet-button">Connect Wallet</button>
-          </div>
         </nav>
         
-        <div className="header-right-desktop">
+        <div className="header-right">
           <button className="qnet-button">Connect Wallet</button>
         </div>
-
-        <button className="mobile-menu-button" onClick={toggleMenu} aria-label="Toggle menu">
-          {isMenuOpen ? '✕' : '☰'}
-        </button>
       </div>
     </header>
   );

@@ -1,9 +1,4 @@
-import { GeistSans } from "geist/font/sans";
-import "./globals.css";
-import "./mobile-fixes.css";
-
-import { ThemeProvider } from "@/components/theme/theme-provider";
-import { AppWrapper } from "@/contexts/AppContext";
+import './globals.css';
 import Header from '@/components/Header';
 import MatrixRain from '@/components/MatrixRain';
 import Footer from '@/components/Footer';

@@ -1,0 +1,109 @@
+/* QNet Mobile Responsiveness Overrides */
+
+/* == TABLET & SMALLER DESKTOPS == */
+@media (max-width: 1024px) {
+  .hero-section, .features-section, .technology-section, .explorer-section {
+    padding: 3rem 1.5rem;
+  }
+  .header-content, .footer-content {
+    padding: 0 1.5rem;
+  }
+  .hero-title .title-main {
+    font-size: 3rem;
+  }
+  .hero-stats, .network-stats {
+    grid-template-columns: repeat(2, 1fr);
+  }
+  .code-verification-banner {
+    flex-direction: column;
+    text-align: center;
+    gap: 1.5rem;
+  }
+  .verification-text-container,
+  .verification-right {
+    align-items: center;
+    text-align: center;
+    flex-basis: auto;
+  }
+  .verification-details,
+  .verification-links {
+    justify-content: center;
+  }
+}
+
+/* == MOBILE PHONES == */
+@media (max-width: 768px) {
+  /* --- Header & Mobile Navigation --- */
+  .qnet-header { height: 60px; }
+  .header-content { justify-content: space-between; }
+  .mobile-menu-button {
+    display: flex !important;
+    align-items: center;
+    justify-content: center;
+    background: transparent;
+    border: 1px solid rgba(0, 255, 255, 0.3);
+    color: #00ffff;
+    width: 40px;
+    height: 40px;
+    border-radius: 8px;
+    font-size: 1.5rem;
+    z-index: 1001;
+  }
+  .qnet-nav {
+    flex-direction: column;
+    position: absolute;
+    top: 60px;
+    left: 0;
+    right: 0;
+    width: 100vw;
+    background: rgba(10, 25, 40, 0.95);
+    backdrop-filter: blur(10px);
+    border-bottom: 1px solid rgba(0, 255, 255, 0.3);
+    padding: 1rem 0;
+    z-index: 999;
+  }
+  .nav-button { padding: 1rem 1.5rem; width: 100%; text-align: center; border-bottom: 1px solid rgba(0, 255, 255, 0.1); }
+  .nav-button:last-child { border-bottom: none; }
+  .header-right-desktop { display: none !important; }
+  .header-right-mobile { display: block !important; padding: 1rem; margin-top: 0.5rem; }
+  .header-right-mobile .qnet-button { width: calc(100% - 2rem); margin: 0 1rem; }
+
+  /* --- General Layout & Typography --- */
+  .hero-section { padding: 2rem 1rem; min-height: calc(100vh - 60px); }
+  .features-section, .technology-section, .explorer-section { padding: 2rem 1rem; }
+  .hero-title .title-main { font-size: 2.2rem; }
+  .hero-title .subtitle, .hero-description p { font-size: 1rem; }
+  .section-title { font-size: 2rem; }
+  .tech-item, .tool-card-large { word-wrap: break-word; }
+
+  /* --- Grids --- */
+  .hero-stats, .network-stats, .features-grid, .nodes-grid, .tools-grid-large, .info-grid { 
+    grid-template-columns: 1fr !important; 
+  }
+
+  /* --- Common Components --- */
+  .action-buttons, .tabs-nav, .footer-content, .verification-details, .verification-links, .activation-details {
+    flex-direction: column;
+    gap: 1rem;
+    align-items: center;
+  }
+  .stat-card, .feature-card, .node-card, .tool-card-large, .explorer-card, .activation-card { padding: 1.5rem; }
+  .github-link, .verify-link { justify-content: center; width: 100%; }
+  .block-item { padding: 1rem 1.5rem; }
+
+  /* --- Specific Component Fixes --- */
+  .search-container { flex-direction: column; gap: 1rem; align-items: stretch; }
+  .search-input, .search-button { border-radius: 8px !important; width: 100%; }
+  .search-button { justify-content: center; }
+
+  .tool-card-large[data-section="testnet"] .qnet-input { width: 100%; text-align: center; }
+  .tool-card-large[data-section="testnet"] .qnet-button { width: 100%; }
+  
+  .activation-content { padding: 0; gap: 1.5rem; }
+  .node-type-selector { flex-wrap: wrap; justify-content: center; }
+  .requirements-list { margin-top: 1rem; }
+  .requirements-list li { white-space: normal; line-height: 1.5; text-align: left; }
+  .activation-details { align-items: stretch; }
+  .activation-cost, .activation-button-container { text-align: center; }
+  .activation-button-container .qnet-button { width: 100%; }
+} 
