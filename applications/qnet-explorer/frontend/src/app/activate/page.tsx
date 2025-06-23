@@ -18,8 +18,8 @@ export default function ActivatePage() {
     if (currentPhase === 'phase1') {
       const base: Record<'light' | 'full' | 'super', [number, number]> = {
         light: [1500, 150],
-        full: [2250, 225],
-        super: [3000, 300]
+        full: [1500, 150],
+        super: [1500, 150]
       };
       const burnedPercent = Math.min(1, burnedTokensPhase1 / totalPhase1Supply);
       const [start, end] = base[type];

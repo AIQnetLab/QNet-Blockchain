@@ -1949,4 +1949,258 @@ a[href*="play.google.com"] img {
 .activation-card .activation-content {
   padding-top: 0 !important;
   padding-bottom: 0 !important;
+}
+
+/* Enhanced Mobile Responsiveness */
+@media (max-width: 768px) {
+  .hero-section {
+    padding: 2rem 1rem;
+    min-height: calc(100vh - 80px);
+  }
+  
+  .hero-title .title-main {
+    font-size: 2.5rem;
+  }
+  
+  .hero-title .subtitle {
+    font-size: 1rem;
+  }
+  
+  .hero-description p {
+    font-size: 1rem;
+  }
+  
+  .action-buttons {
+    flex-direction: column;
+    gap: 1rem;
+    align-items: center;
+  }
+  
+  .qnet-button.large {
+    width: 100%;
+    max-width: 280px;
+  }
+  
+  .hero-stats {
+    grid-template-columns: 1fr 1fr;
+    gap: 1rem;
+    margin-top: 2rem;
+  }
+  
+  .stat-card {
+    padding: 1.5rem;
+  }
+  
+  .stat-number {
+    font-size: 2rem;
+  }
+  
+  .code-verification-banner {
+    flex-direction: column;
+    text-align: center;
+    gap: 1rem;
+    padding: 1.5rem;
+  }
+  
+  .verification-flicker-word {
+    font-size: 2rem;
+  }
+  
+  .verification-right {
+    align-items: center;
+  }
+  
+  .verification-details,
+  .verification-links {
+    flex-direction: column;
+    gap: 0.5rem;
+    align-items: center;
+  }
+  
+  .features-section,
+  .technology-section {
+    padding: 2rem 1rem;
+  }
+  
+  .features-grid {
+    grid-template-columns: 1fr;
+    gap: 1.5rem;
+  }
+  
+  .feature-card {
+    padding: 2rem;
+  }
+  
+  .technology-grid.expanded {
+    grid-template-columns: 1fr;
+    gap: 1.5rem;
+  }
+  
+  .tech-item {
+    padding: 1.5rem;
+  }
+  
+  .header-content {
+    padding: 0 1rem;
+  }
+  
+  .qnet-nav {
+    display: none;
+  }
+}
+
+@media (max-width: 480px) {
+  .hero-title .title-main {
+    font-size: 2rem;
+  }
+  
+  .hero-stats {
+    grid-template-columns: 1fr;
+    gap: 1rem;
+  }
+  
+  .stat-card {
+    padding: 1rem;
+  }
+  
+  .verification-flicker-word {
+    font-size: 1.5rem;
+  }
+  
+  .feature-card,
+  .tech-item {
+    padding: 1.5rem;
+  }
 } 
+ 
+ / *   E n h a n c e d   M o b i l e   R e s p o n s i v e n e s s   * / 
+ @ m e d i a   ( m a x - w i d t h :   7 6 8 p x )   { 
+     . h e r o - s e c t i o n   { 
+         p a d d i n g :   2 r e m   1 r e m ; 
+         m i n - h e i g h t :   c a l c ( 1 0 0 v h   -   8 0 p x ) ; 
+     } 
+     
+     . h e r o - t i t l e   . t i t l e - m a i n   { 
+         f o n t - s i z e :   2 . 5 r e m ; 
+     } 
+     
+     . h e r o - t i t l e   . s u b t i t l e   { 
+         f o n t - s i z e :   1 r e m ; 
+     } 
+     
+     . h e r o - d e s c r i p t i o n   p   { 
+         f o n t - s i z e :   1 r e m ; 
+     } 
+     
+     . a c t i o n - b u t t o n s   { 
+         f l e x - d i r e c t i o n :   c o l u m n ; 
+         g a p :   1 r e m ; 
+         a l i g n - i t e m s :   c e n t e r ; 
+     } 
+     
+     . q n e t - b u t t o n . l a r g e   { 
+         w i d t h :   1 0 0 % ; 
+         m a x - w i d t h :   2 8 0 p x ; 
+     } 
+     
+     . h e r o - s t a t s   { 
+         g r i d - t e m p l a t e - c o l u m n s :   1 f r   1 f r ; 
+         g a p :   1 r e m ; 
+         m a r g i n - t o p :   2 r e m ; 
+     } 
+     
+     . s t a t - c a r d   { 
+         p a d d i n g :   1 . 5 r e m ; 
+     } 
+     
+     . s t a t - n u m b e r   { 
+         f o n t - s i z e :   2 r e m ; 
+     } 
+     
+     . c o d e - v e r i f i c a t i o n - b a n n e r   { 
+         f l e x - d i r e c t i o n :   c o l u m n ; 
+         t e x t - a l i g n :   c e n t e r ; 
+         g a p :   1 r e m ; 
+         p a d d i n g :   1 . 5 r e m ; 
+     } 
+     
+     . v e r i f i c a t i o n - f l i c k e r - w o r d   { 
+         f o n t - s i z e :   2 r e m ; 
+     } 
+     
+     . v e r i f i c a t i o n - r i g h t   { 
+         a l i g n - i t e m s :   c e n t e r ; 
+     } 
+     
+     . v e r i f i c a t i o n - d e t a i l s , 
+     . v e r i f i c a t i o n - l i n k s   { 
+         f l e x - d i r e c t i o n :   c o l u m n ; 
+         g a p :   0 . 5 r e m ; 
+         a l i g n - i t e m s :   c e n t e r ; 
+     } 
+     
+     . f e a t u r e s - s e c t i o n , 
+     . t e c h n o l o g y - s e c t i o n   { 
+         p a d d i n g :   2 r e m   1 r e m ; 
+     } 
+     
+     . f e a t u r e s - g r i d   { 
+         g r i d - t e m p l a t e - c o l u m n s :   1 f r ; 
+         g a p :   1 . 5 r e m ; 
+     } 
+     
+     . f e a t u r e - c a r d   { 
+         p a d d i n g :   2 r e m ; 
+     } 
+     
+     . t e c h n o l o g y - g r i d . e x p a n d e d   { 
+         g r i d - t e m p l a t e - c o l u m n s :   1 f r ; 
+         g a p :   1 . 5 r e m ; 
+     } 
+     
+     . t e c h - i t e m   { 
+         p a d d i n g :   1 . 5 r e m ; 
+     } 
+     
+     . h e a d e r - c o n t e n t   { 
+         p a d d i n g :   0   1 r e m ; 
+     } 
+     
+     . q n e t - n a v   { 
+         d i s p l a y :   n o n e ; 
+     } 
+ } 
+ 
+ @ m e d i a   ( m a x - w i d t h :   4 8 0 p x )   { 
+     . h e r o - t i t l e   . t i t l e - m a i n   { 
+         f o n t - s i z e :   2 r e m ; 
+     } 
+     
+     . h e r o - s t a t s   { 
+         g r i d - t e m p l a t e - c o l u m n s :   1 f r ; 
+         g a p :   1 r e m ; 
+     } 
+     
+     . s t a t - c a r d   { 
+         p a d d i n g :   1 r e m ; 
+     } 
+     
+     . v e r i f i c a t i o n - f l i c k e r - w o r d   { 
+         f o n t - s i z e :   1 . 5 r e m ; 
+     } 
+     
+     . f e a t u r e - c a r d , 
+     . t e c h - i t e m   { 
+         p a d d i n g :   1 . 5 r e m ; 
+     } 
+ }  
+ 
+/* Enhanced Mobile Responsiveness */
+@media (max-width: 768px) {
+  .hero-section { padding: 2rem 1rem; }
+  .hero-title .title-main { font-size: 2.5rem; }
+  .action-buttons { flex-direction: column; gap: 1rem; }
+  .hero-stats { grid-template-columns: 1fr 1fr; }
+  .features-grid { grid-template-columns: 1fr; }
+  .technology-grid.expanded { grid-template-columns: 1fr; }
+}

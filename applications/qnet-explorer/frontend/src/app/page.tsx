@@ -51,7 +51,7 @@ export default function HomePage() {
               <div className="stat-trend">Peak performance</div>
             </div>
             <div className="stat-card">
-              <div className="stat-number">99.9%</div>
+              <div className="stat-number">100%</div>
               <div className="stat-label">NETWORK UPTIME</div>
               <div className="stat-trend">24h average</div>
             </div>
