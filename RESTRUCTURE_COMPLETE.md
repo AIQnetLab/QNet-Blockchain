@@ -115,7 +115,7 @@ QNet-Project/
 
 #### **Code Documentation**
 - ✅ All code comments kept **in English only**
-- ✅ Preserved Russian localization for user interface
+- ✅ Preserved multi-language localization for user interface
 
 ### 6. **✅ COMPLETED: Tested Build of All Modules**
 

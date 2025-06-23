@@ -106,7 +106,7 @@ const HomeSection = React.memo(function HomeSection({ setActiveSection }: { setA
                   <span className="build-time">Build: {process.env.NEXT_PUBLIC_BUILD_TIME || '2025-06-14 12:34:56'}</span>
                 </div>
                 <div className="verification-links">
-                  <a href="https://github.com/qnet-lab/qnet-project/commit/ab7f2e1" target="_blank" rel="noopener noreferrer" className="github-link">
+                  <a href="https://github.com/qnet-lab/qnet-project" target="_blank" rel="noopener noreferrer" className="github-link">
                     Check source code
                   </a>
                   <a href="/api/verify-build" target="_blank" rel="noopener noreferrer" className="verify-link">

@@ -1,92 +1,86 @@
 'use client';
 
-import React, { useRef, useEffect, useState } from 'react';
+import { useRef, useEffect, useCallback } from 'react';
 
-const MatrixRain = React.memo(function MatrixRain({ activeSection }: { activeSection: string }) {
+const MatrixRain = () => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const animationRef = useRef<number>();
-  const [isScrolling, setIsScrolling] = useState(false);
 
-  // Effect to detect scrolling
-  useEffect(() => {
-    let scrollTimer: NodeJS.Timeout;
-    const handleScroll = () => {
-      setIsScrolling(true);
-      clearTimeout(scrollTimer);
-      scrollTimer = setTimeout(() => setIsScrolling(false), 150);
-    };
-    window.addEventListener('scroll', handleScroll, { passive: true });
-    return () => {
-      window.removeEventListener('scroll', handleScroll);
-      clearTimeout(scrollTimer);
-    };
+  const draw = useCallback((ctx: CanvasRenderingContext2D, drops: number[], fontSize: number, matrix: string, speeds: number[]) => {
+    // Semi-transparent black for trailing effect
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.05)';
+    ctx.fillRect(0, 0, ctx.canvas.width, ctx.canvas.height);
+    
+    ctx.font = `${fontSize}px 'Courier New', monospace`;
+
+    for (let i = 0; i < drops.length; i++) {
+      const char = matrix[Math.floor(Math.random() * matrix.length)];
+      const x = i * fontSize;
+      const y = drops[i] * fontSize;
+
+      const flickerIntensity = 0.5 + Math.random() * 0.5;
+
+      // All characters are cyan
+      ctx.fillStyle = `rgba(0, 255, 255, ${flickerIntensity})`;
+      
+      ctx.fillText(char, x, y);
+      
+      // Move drop down
+      drops[i] += speeds[i];
+
+      // Reset drop when it goes off screen
+      if (drops[i] * fontSize > ctx.canvas.height && Math.random() > 0.975) {
+        drops[i] = 0;
+        speeds[i] = 0.5 + Math.random() * 1.5; // Reset speed
+      }
+    }
   }, []);
 
-  // Effect to run the animation
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-
+    
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    let drops: number[] = [];
-    const matrix = 'QNET01';
+    let animationFrameId: number;
+    const matrix = 'アイウエオカキクケコサシスセソタチツテトナニヌネノハヒフヘホマミムメモヤユヨラリルレロワヲンQNET0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ';
     const fontSize = 16;
+    let columns = 0;
+    let drops: number[] = [];
+    let speeds: number[] = [];
+
+    const setup = () => {
+      canvas.width = window.innerWidth;
+      canvas.height = window.innerHeight;
+      columns = Math.floor(canvas.width / fontSize);
+      drops = [];
+      speeds = [];
+      for (let i = 0; i < columns; i++) {
+        drops[i] = Math.random() * -canvas.height; // Start off-screen
+        speeds[i] = 0.5 + Math.random() * 1.5;
+      }
+    };
     
-    const setupCanvas = () => {
-      const dpr = window.devicePixelRatio || 1;
-      canvas.width = window.innerWidth * dpr;
-      canvas.height = window.innerHeight * dpr;
-      ctx.scale(dpr, dpr);
-      const columns = Math.floor(canvas.width / dpr / fontSize);
-      drops = Array(columns).fill(1).map(() => Math.random() * canvas.height);
+    setup();
+
+    const render = () => {
+      draw(ctx, drops, fontSize, matrix, speeds);
+      animationFrameId = window.requestAnimationFrame(render);
     };
-
-    setupCanvas();
-
-    let lastTime = 0;
-    const targetInterval = activeSection === 'home' ? 1000 / 15 : 1000 / 20;
-
-    const draw = (currentTime: number) => {
-      if (!isScrolling) {
-        const elapsed = currentTime - lastTime;
-        if (elapsed >= targetInterval) {
-          lastTime = currentTime;
-
-          ctx.fillStyle = `rgba(0, 0, 0, ${activeSection === 'home' ? 0.04 : 0.05})`;
-          ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-          ctx.fillStyle = '#00ffff';
-          ctx.font = `${fontSize}px 'Courier New', monospace`;
-          
-          for (let i = 0; i < drops.length; i++) {
-            const char = matrix[Math.floor(Math.random() * matrix.length)];
-            ctx.fillText(char, i * fontSize, drops[i] * fontSize);
-
-            if (drops[i] * fontSize > canvas.height && Math.random() > 0.975) {
-              drops[i] = 0;
-            }
-            drops[i]++;
-          }
-        }
-      }
-      animationRef.current = requestAnimationFrame(draw);
-    };
-
-    animationRef.current = requestAnimationFrame(draw);
-    window.addEventListener('resize', setupCanvas);
-
+    
+    render();
+    
+    window.addEventListener('resize', setup);
+    
     return () => {
-      if (animationRef.current) {
-        cancelAnimationFrame(animationRef.current);
-      }
-      window.removeEventListener('resize', setupCanvas);
+      window.cancelAnimationFrame(animationFrameId);
+      window.removeEventListener('resize', setup);
     };
-  }, [activeSection, isScrolling]);
+  }, [draw]);
 
   return (
     <canvas
+      id="matrix-rain-canvas"
       ref={canvasRef}
       style={{
         position: 'fixed',
@@ -95,12 +89,12 @@ const MatrixRain = React.memo(function MatrixRain({ activeSection }: { activeSec
         width: '100vw',
         height: '100vh',
         zIndex: -1,
-        opacity: 0.5,
+        opacity: 0.7,
         pointerEvents: 'none',
-        willChange: 'transform'
+        display: 'block'
       }}
     />
   );
-});
+};
 
 export default MatrixRain; 

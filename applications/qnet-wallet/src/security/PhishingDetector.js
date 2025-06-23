@@ -19,7 +19,7 @@ export class PhishingDetector {
             /[qg]net\./, // gnet
             
             // Homograph attacks
-            /[а-я]/, // Cyrillic characters
+            /[\u0400-\u04FF]/, // Non-Latin script detection
             /[αβγδεζηθικλμνξοπρστυφχψω]/, // Greek characters
             
             // Suspicious TLDs often used in phishing

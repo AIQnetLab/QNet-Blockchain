@@ -1,25 +1,37 @@
 'use client';
 
-import React from 'react';
+import { memo } from 'react';
+import Link from 'next/link';
+import { usePathname } from 'next/navigation';
 
-const navItems = ['home', 'nodes', 'explorer', 'dao', 'testnet', 'wallet', 'docs'];
+const HeaderComponent = () => {
+  const pathname = usePathname();
 
-const Header = React.memo(function Header({ activeSection, onNavClick }: { activeSection: string, onNavClick: (section: string) => void }) {
+  const navLinks = [
+    { href: '/', label: 'Home' },
+    { href: '/nodes', label: 'Nodes' },
+    { href: '/explorer', label: 'Explorer' },
+    { href: '/dao', label: 'DAO' },
+    { href: '/testnet', label: 'Testnet' },
+    { href: '/wallet', label: 'Wallet' },
+    { href: '/docs', label: 'Docs' },
+  ];
+
   return (
     <header className="qnet-header">
       <div className="header-content">
-        <div className="qnet-logo">QNET</div>
+        <Link href="/" className="qnet-logo">QNET</Link>
         
         <nav className="qnet-nav">
-          {navItems.map(item => (
-            <button 
-              key={item}
+          {navLinks.map(link => (
+            <Link 
+              key={link.href}
+              href={link.href}
               className="nav-button" 
-              data-state={activeSection === item ? 'active' : undefined}
-              onClick={() => onNavClick(item)}
+              data-state={pathname === link.href ? 'active' : undefined}
             >
-              {item.charAt(0).toUpperCase() + item.slice(1)}
-            </button>
+              {link.label}
+            </Link>
           ))}
         </nav>
         
@@ -29,6 +41,8 @@ const Header = React.memo(function Header({ activeSection, onNavClick }: { activ
       </div>
     </header>
   );
-});
+};
+
+const Header = memo(HeaderComponent);
 
 export default Header; 
