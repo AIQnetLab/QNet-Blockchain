@@ -1,15 +1,17 @@
 "use client"
 
 import type * as React from "react"
-import { ThemeProvider as NextThemesProvider } from "next-themes"
 
-// Simplified theme provider using any type to avoid build issues
+// Simplified theme provider without external dependencies
 export function ThemeProvider({
   children,
   ...props
 }: {
   children: React.ReactNode;
-  [key: string]: any;
+  attribute?: string;
+  defaultTheme?: string;
+  enableSystem?: boolean;
+  disableTransitionOnChange?: boolean;
 }) {
-  return <NextThemesProvider {...props}>{children}</NextThemesProvider>
+  return <div className="theme-provider" {...props}>{children}</div>
 }

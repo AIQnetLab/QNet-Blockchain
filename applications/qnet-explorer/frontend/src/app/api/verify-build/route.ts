@@ -10,9 +10,9 @@ export async function GET(request: NextRequest) {
     
     // GitHub links for verification
     github: {
-      repository: 'https://github.com/qnet-lab/qnet-project',
-      commitUrl: `https://github.com/qnet-lab/qnet-project/commit/${process.env.NEXT_PUBLIC_GIT_COMMIT || 'ab7f2e1'}`,
-      sourceTree: `https://github.com/qnet-lab/qnet-project/tree/${process.env.NEXT_PUBLIC_GIT_COMMIT || 'ab7f2e1'}/qnet-explorer/frontend`,
+      repository: 'https://github.com/AIQnetLab/QNet-Blockchain',
+      commitUrl: `https://github.com/AIQnetLab/QNet-Blockchain/commit/${process.env.NEXT_PUBLIC_GIT_COMMIT || 'main'}`,
+      sourceTree: `https://github.com/AIQnetLab/QNet-Blockchain/tree/${process.env.NEXT_PUBLIC_GIT_COMMIT || 'main'}/applications/qnet-explorer/frontend`,
     },
     
     // Hashes for verification
