@@ -16,9 +16,9 @@ from .seed_generator import SeedGenerator
 
 class NodeType(Enum):
     """Node types with their burn requirements."""
-    LIGHT = ("light", 1000)
+    LIGHT = ("light", 1500)
     FULL = ("full", 1500)
-    SUPER = ("super", 2000)
+    SUPER = ("super", 1500)
     
     def __init__(self, name: str, burn_amount: int):
         self.node_name = name

@@ -1,6 +1,6 @@
 """
 Pricing API - Dynamic pricing for node activation
-Integrates QNA burn model and QNC pricing
+Integrates 1DEV burn model and QNC pricing
 """
 
 from flask import Blueprint, jsonify, request, current_app
@@ -11,14 +11,14 @@ import os
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from economics.qna_burn_model import QNABurnCalculator, NodeType, BurnProgressTracker
+from economics.onedev_burn_model import OneDEVBurnCalculator, NodeType, BurnProgressTracker
 from economics.dynamic_pricing import DynamicPricingCalculator
 from economics.transition_protection import TransitionProtectionManager
 
 pricing_bp = Blueprint('pricing', __name__)
 
 # Global instances
-qna_calculator = QNABurnCalculator()
+onedev_calculator = OneDEVBurnCalculator()
 qnc_calculator = DynamicPricingCalculator()
 transition_manager = TransitionProtectionManager()
 burn_tracker = BurnProgressTracker()
@@ -32,15 +32,15 @@ except ImportError:
     current_app.logger.warning("BurnStateTracker not available, using mock data")
 
 def get_current_burn_stats() -> Dict:
-    """Get current QNA burn statistics from blockchain"""
+    """Get current 1DEV burn statistics from blockchain"""
     if state_tracker:
         # Get real data from blockchain
         return state_tracker.get_current_burn_state()
     else:
         # Fallback to mock data
         return {
-            "total_burned": 2_500_000_000,  # 25% burned (mock)
-            "burn_rate_per_day": 10_000_000,  # 10M QNA/day (mock)
+            "total_burned": 250_000_000,  # 25% burned (mock)
+            "burn_rate_per_day": 1_000_000,  # 1M 1DEV/day (mock)
             "days_since_launch": 180,  # 6 months (mock)
             "data_source": "mock"
         }
@@ -63,11 +63,11 @@ def get_current_prices():
         burn_stats = get_current_burn_stats()
         total_burned = burn_stats["total_burned"]
         
-        # Get QNA burn prices
-        qna_schedule = qna_calculator.get_burn_schedule(total_burned)
+        # Get 1DEV burn prices
+        onedev_schedule = onedev_calculator.get_burn_schedule(total_burned)
         
         # Check if we've transitioned to QNC
-        if qna_schedule["light"]["transition_complete"]:
+        if onedev_schedule["light"]["transition_complete"]:
             # Get QNC prices based on active nodes
             active_nodes = get_active_nodes_count()
             qnc_prices = qnc_calculator.get_price_schedule(active_nodes)
@@ -82,20 +82,20 @@ def get_current_prices():
                 "transition_complete": True
             }
         else:
-            # Still in QNA phase
+            # Still in 1DEV phase
             prices = {
-                "token": "QNA",
+                "token": "1DEV",
                 "prices": {
-                    "light": qna_schedule["light"]["amount"],
-                    "full": qna_schedule["full"]["amount"],
-                    "super": qna_schedule["super"]["amount"]
+                    "light": onedev_schedule["light"]["amount"],
+                    "full": onedev_schedule["full"]["amount"],
+                    "super": onedev_schedule["super"]["amount"]
                 },
                 "transition_complete": False,
-                "burn_percentage": qna_schedule["light"]["burn_percentage"]
+                "burn_percentage": onedev_schedule["light"]["burn_percentage"]
             }
         
         # Add transition protection if applicable
-        if 0.85 <= burn_stats["total_burned"] / 10_000_000_000 < 0.9:
+        if 0.85 <= burn_stats["total_burned"] / 1_000_000_000 < 0.9:
             prices["transition_protection_active"] = True
         
         return jsonify({
@@ -132,7 +132,7 @@ def get_price_for_node():
         total_burned = burn_stats["total_burned"]
         
         # Calculate price
-        burn_requirement = qna_calculator.calculate_burn_requirement(
+        burn_requirement = onedev_calculator.calculate_burn_requirement(
             node_type, 
             total_burned
         )
@@ -167,7 +167,7 @@ def get_price_for_node():
 
 @pricing_bp.route('/burn_progress', methods=['GET'])
 def get_burn_progress():
-    """Get detailed QNA burn progress and analytics"""
+    """Get detailed 1DEV burn progress and analytics"""
     try:
         burn_stats = get_current_burn_stats()
         
@@ -179,8 +179,8 @@ def get_burn_progress():
         
         # Add transition status
         transition_status = transition_manager.calculate_transition_metrics(
-            qna_burned=burn_stats["total_burned"],
-            qna_total_supply=10_000_000_000,
+            onedev_burned=burn_stats["total_burned"],
+            onedev_total_supply=1_000_000_000,
             days_elapsed=burn_stats["days_since_launch"]
         )
         
@@ -202,28 +202,28 @@ def get_burn_progress():
 
 @pricing_bp.route('/value_preservation', methods=['POST'])
 def calculate_value_preservation():
-    """Calculate value preservation for QNA holders"""
+    """Calculate value preservation for 1DEV holders"""
     try:
         data = request.get_json()
-        qna_holdings = data.get("qna_holdings", 0)
+        onedev_holdings = data.get("onedev_holdings", 0)
         
-        if qna_holdings <= 0:
+        if onedev_holdings <= 0:
             return jsonify({
                 "success": False,
-                "error": "Invalid QNA holdings amount"
+                "error": "Invalid 1DEV holdings amount"
             }), 400
         
         burn_stats = get_current_burn_stats()
         
         # Calculate value preservation
-        value_info = qna_calculator.estimate_qna_value_preservation(
-            qna_holdings=qna_holdings,
-            total_qna_burned=burn_stats["total_burned"]
+        value_info = onedev_calculator.estimate_onedev_value_preservation(
+            onedev_holdings=onedev_holdings,
+            total_onedev_burned=burn_stats["total_burned"]
         )
         
         # Add holder benefits
-        holder_benefits = transition_manager.get_qna_holder_benefits(
-            is_qna_holder=True,
+        holder_benefits = transition_manager.get_onedev_holder_benefits(
+            is_onedev_holder=True,
             days_since_transition=0  # Not transitioned yet
         )
         
@@ -250,12 +250,12 @@ def get_price_history():
         # For now, return mock data showing price progression
         
         mock_history = [
-            {"date": "2024-01-01", "light": 10000, "full": 15000, "super": 20000, "token": "QNA", "burned_percent": 0},
-            {"date": "2024-02-01", "light": 8500, "full": 12750, "super": 17000, "token": "QNA", "burned_percent": 10},
-            {"date": "2024-03-01", "light": 6000, "full": 9000, "super": 12000, "token": "QNA", "burned_percent": 25},
-            {"date": "2024-04-01", "light": 3500, "full": 5250, "super": 7000, "token": "QNA", "burned_percent": 50},
-            {"date": "2024-05-01", "light": 1500, "full": 2250, "super": 3000, "token": "QNA", "burned_percent": 75},
-            {"date": "2024-06-01", "light": 500, "full": 750, "super": 1000, "token": "QNA", "burned_percent": 85},
+            {"date": "2024-01-01", "light": 1500, "full": 1500, "super": 1500, "token": "1DEV", "burned_percent": 0},
+            {"date": "2024-02-01", "light": 1350, "full": 1350, "super": 1350, "token": "1DEV", "burned_percent": 10},
+            {"date": "2024-03-01", "light": 1200, "full": 1200, "super": 1200, "token": "1DEV", "burned_percent": 25},
+            {"date": "2024-04-01", "light": 950, "full": 950, "super": 950, "token": "1DEV", "burned_percent": 50},
+            {"date": "2024-05-01", "light": 750, "full": 750, "super": 750, "token": "1DEV", "burned_percent": 75},
+            {"date": "2024-06-01", "light": 500, "full": 500, "super": 500, "token": "1DEV", "burned_percent": 85},
         ]
         
         return jsonify({
@@ -285,7 +285,7 @@ def simulate_pricing():
         node_distribution = data.get("distribution", {"light": 0.7, "full": 0.25, "super": 0.05})
         
         # Calculate burned amount
-        total_burned = (burned_percent / 100) * 10_000_000_000
+        total_burned = (burned_percent / 100) * 1_000_000_000
         
         # Calculate node counts
         active_nodes = {
@@ -307,10 +307,10 @@ def simulate_pricing():
                 }
             }
         else:
-            # QNA pricing
-            schedule = qna_calculator.get_burn_schedule(total_burned)
+            # 1DEV pricing
+            schedule = onedev_calculator.get_burn_schedule(total_burned)
             result = {
-                "token": "QNA",
+                "token": "1DEV",
                 "prices": {
                     "light": schedule["light"]["amount"],
                     "full": schedule["full"]["amount"],

@@ -1,6 +1,6 @@
 """
-QNA Phase Handler
-Handles node activation during QNA phase by reading Solana burn data
+1DEV Phase Handler
+Handles node activation during 1DEV phase by reading Solana burn data
 NO smart contract needed - just reads Solana and activates nodes in QNet
 """
 
@@ -12,25 +12,25 @@ import logging
 logger = logging.getLogger(__name__)
 
 @dataclass 
-class QNANodeActivation:
-    """Record of node activation during QNA phase"""
+class OneDEVNodeActivation:
+    """Record of node activation during 1DEV phase"""
     node_id: str
     owner_address: str
     node_type: str
     activation_timestamp: int
-    qna_burned: int
+    onedev_burned: int
     solana_burn_tx: str
     is_genesis: bool = False
 
-class QNAPhaseHandler:
+class OneDEVPhaseHandler:
     """
-    Handles node activation during QNA phase (first 5 years or until 90% burn)
+    Handles node activation during 1DEV phase (first 5 years or until 90% burn)
     Reads burn data from Solana and activates nodes in QNet
     """
     
     def __init__(self):
         # Node registry
-        self.activated_nodes: Dict[str, QNANodeActivation] = {}
+        self.activated_nodes: Dict[str, OneDEVNodeActivation] = {}
         self.used_burn_txs = set()  # Prevent reuse of burn transactions
         
         # Genesis whitelist
@@ -42,16 +42,16 @@ class QNAPhaseHandler:
         }
         self.genesis_claimed = set()
         
-        # Pricing model
+        # Pricing model - ALL NODE TYPES SAME PRICE
         self.base_prices = {
-            "light": 1000,
+            "light": 1500,
             "full": 1500,
-            "super": 2000
+            "super": 1500
         }
         self.min_prices = {
-            "light": 100,
+            "light": 150,
             "full": 150,
-            "super": 200
+            "super": 150
         }
         
     def activate_node(
@@ -64,7 +64,7 @@ class QNAPhaseHandler:
         total_burned_global: int
     ) -> Tuple[bool, str]:
         """
-        Activate a node based on Solana QNA burn
+        Activate a node based on Solana 1DEV burn
         
         Args:
             owner_address: QNet address of node owner
@@ -72,7 +72,7 @@ class QNAPhaseHandler:
             node_id: Unique node identifier
             solana_burn_tx: Solana burn transaction hash
             burned_amount: Amount burned in this transaction
-            total_burned_global: Total QNA burned globally (from Solana)
+            total_burned_global: Total 1DEV burned globally (from Solana)
             
         Returns:
             (success, message)
@@ -95,12 +95,12 @@ class QNAPhaseHandler:
             if owner_address not in self.genesis_claimed:
                 # Free activation for genesis
                 self.genesis_claimed.add(owner_address)
-                activation = QNANodeActivation(
+                activation = OneDEVNodeActivation(
                     node_id=node_id,
                     owner_address=owner_address,
                     node_type=node_type,
                     activation_timestamp=int(time.time()),
-                    qna_burned=0,
+                    onedev_burned=0,
                     solana_burn_tx="GENESIS_FREE",
                     is_genesis=True
                 )
@@ -113,15 +113,15 @@ class QNAPhaseHandler:
         
         # Verify burned amount
         if burned_amount < required_price:
-            return False, f"Insufficient burn: {burned_amount} < {required_price} QNA"
+            return False, f"Insufficient burn: {burned_amount} < {required_price} 1DEV"
         
         # Create activation record
-        activation = QNANodeActivation(
+        activation = OneDEVNodeActivation(
             node_id=node_id,
             owner_address=owner_address,
             node_type=node_type,
             activation_timestamp=int(time.time()),
-            qna_burned=burned_amount,
+            onedev_burned=burned_amount,
             solana_burn_tx=solana_burn_tx,
             is_genesis=False
         )
@@ -130,7 +130,7 @@ class QNAPhaseHandler:
         self.activated_nodes[node_id] = activation
         self.used_burn_txs.add(solana_burn_tx)
         
-        logger.info(f"Node activated: {node_id}, type: {node_type}, burned: {burned_amount} QNA")
+        logger.info(f"Node activated: {node_id}, type: {node_type}, burned: {burned_amount} 1DEV")
         return True, f"Node activated successfully. Type: {node_type}"
     
     def _calculate_dynamic_price(self, node_type: str, total_burned: int) -> int:
@@ -166,7 +166,7 @@ class QNAPhaseHandler:
         # For now, assume valid
         return True
     
-    def get_node_info(self, node_id: str) -> Optional[QNANodeActivation]:
+    def get_node_info(self, node_id: str) -> Optional[OneDEVNodeActivation]:
         """Get activation info for a node"""
         return self.activated_nodes.get(node_id)
     
@@ -184,21 +184,21 @@ class QNAPhaseHandler:
         
         for node in self.activated_nodes.values():
             node_counts[node.node_type] += 1
-            total_burned += node.qna_burned
+            total_burned += node.onedev_burned
             
         return {
-            "phase": "QNA",
+            "phase": "1DEV",
             "total_nodes": len(self.activated_nodes),
             "nodes_by_type": node_counts,
             "genesis_claimed": len(self.genesis_claimed),
             "genesis_remaining": 4 - len(self.genesis_claimed),
-            "total_qna_burned_for_nodes": total_burned,
+            "total_onedev_burned_for_nodes": total_burned,
             "unique_burn_txs": len(self.used_burn_txs)
         }
     
-    def export_for_migration(self) -> Dict[str, QNANodeActivation]:
+    def export_for_migration(self) -> Dict[str, OneDEVNodeActivation]:
         """
-        Export all QNA activations for migration to QNC phase
+        Export all 1DEV activations for migration to QNC phase
         This data will be used to allow free migration
         """
         return self.activated_nodes.copy() 

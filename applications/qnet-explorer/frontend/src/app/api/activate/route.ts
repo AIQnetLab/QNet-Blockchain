@@ -1,11 +1,11 @@
 import { type NextRequest, NextResponse } from 'next/server';
 import crypto from 'crypto';
 
-// Node prices in QNA tokens
+// Node prices in 1DEV tokens - ALL TYPES SAME PRICE
 const NODE_PRICES = {
-  light: 1000,
+  light: 1500,
   full: 1500,
-  super: 2000
+  super: 1500
 };
 
 // QNet salt for deterministic generation

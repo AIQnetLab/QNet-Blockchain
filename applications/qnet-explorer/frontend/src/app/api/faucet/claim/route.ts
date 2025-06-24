@@ -7,9 +7,9 @@ const DEVNET_RPC = 'https://api.devnet.solana.com';
 const FAUCET_AMOUNT = 1500 * 1000000; // 1500 tokens with 6 decimals
 const COOLDOWN_HOURS = 24;
 
-// In production, these should be environment variables
+// Test token configuration
+const TOKEN_MINT_ADDRESS = process.env.TOKEN_MINT_ADDRESS || '9GcdXAo2EyjNdNLuQoScSVbfJSnh9RdkSS8YYKnGQ8Pf';
 const FAUCET_PRIVATE_KEY = process.env.FAUCET_PRIVATE_KEY;
-const TOKEN_MINT_ADDRESS = process.env.TOKEN_MINT_ADDRESS || 'PLACEHOLDER_TO_BE_CREATED';
 
 interface ClaimRequest {
   walletAddress: string;
@@ -64,10 +64,19 @@ export async function POST(request: NextRequest): Promise<NextResponse<ClaimResp
     }
 
     // Check if we have faucet configuration
-    if (!FAUCET_PRIVATE_KEY || TOKEN_MINT_ADDRESS === 'PLACEHOLDER_TO_BE_CREATED') {
+    if (!FAUCET_PRIVATE_KEY || FAUCET_PRIVATE_KEY === '[PLACEHOLDER_FOR_MANUAL_SETUP]') {
       return NextResponse.json({
         success: false,
-        error: 'Faucet not configured. Please run token setup first.'
+        error: 'Faucet temporarily unavailable. Test token created but faucet setup incomplete due to devnet limits. Please use manual token distribution for testing.',
+        tokenInfo: {
+          mintAddress: TOKEN_MINT_ADDRESS,
+          network: 'devnet',
+          symbol: '1DEV-TEST',
+          explorers: {
+            solscan: `https://solscan.io/token/${TOKEN_MINT_ADDRESS}?cluster=devnet`,
+            solanaExplorer: `https://explorer.solana.com/address/${TOKEN_MINT_ADDRESS}?cluster=devnet`
+          }
+        }
       }, { status: 503 });
     }
 
@@ -140,11 +149,22 @@ export async function POST(request: NextRequest): Promise<NextResponse<ClaimResp
 }
 
 export async function GET(): Promise<NextResponse> {
+  const isConfigured = FAUCET_PRIVATE_KEY && FAUCET_PRIVATE_KEY !== '[PLACEHOLDER_FOR_MANUAL_SETUP]';
+  
   return NextResponse.json({
     faucetAmount: FAUCET_AMOUNT / 1000000, // Convert back to UI amount
     cooldownHours: COOLDOWN_HOURS,
-    tokenType: '1DEV',
+    tokenType: '1DEV-TEST',
     network: 'Solana Devnet',
-    status: TOKEN_MINT_ADDRESS === 'PLACEHOLDER_TO_BE_CREATED' ? 'not_configured' : 'active'
+    status: isConfigured ? 'active' : 'setup_required',
+    tokenInfo: {
+      mintAddress: TOKEN_MINT_ADDRESS,
+      totalSupply: '1,000,000,000',
+      standard: 'pump.fun compatible',
+      explorers: {
+        solscan: `https://solscan.io/token/${TOKEN_MINT_ADDRESS}?cluster=devnet`,
+        solanaExplorer: `https://explorer.solana.com/address/${TOKEN_MINT_ADDRESS}?cluster=devnet`
+      }
+    }
   });
 } 

@@ -836,7 +836,7 @@ export class WalletManager {
     }
 
     /**
-     * Phase 1: Burn 1DEV tokens for node access (NO QNC given)
+     * Phase 1: Burn 1DEV tokens for node testing (Node earns QNC via pings)
      * CORRECTED: All node types cost 1500 1DEV (same price)
      */
     async activateNodePhase1(nodeType, accountIndex = null) {

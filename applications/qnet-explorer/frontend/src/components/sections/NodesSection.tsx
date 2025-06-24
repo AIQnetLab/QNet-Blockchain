@@ -23,7 +23,11 @@ const NodeActivation = React.memo(function NodeActivation() {
         const activeNodes = 156;
       
         if (currentPhase === 'phase1') {
-            const base: Record<'light' | 'full' | 'super', [number,number]> = { light: [1500,150], full: [2250,225], super:[3000,300] };
+            const base: Record<'light' | 'full' | 'super', [number,number]> = { 
+                light: [1500,150], 
+                full: [1500,150], 
+                super: [1500,150] 
+            };
             const burnedPercent = Math.min(1, burnedTokensPhase1 / totalPhase1Supply);
             const [start,end] = base[type];
             const cost= Math.round(start - (start-end)*burnedPercent);

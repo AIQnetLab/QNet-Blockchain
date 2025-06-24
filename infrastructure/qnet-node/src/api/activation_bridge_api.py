@@ -849,11 +849,11 @@ def request_activation_token():
     
     # Import pricing calculator
     try:
-        from economics.qna_burn_model import QNABurnCalculator, NodeType
-        calculator = QNABurnCalculator()
+        from economics.onedev_burn_model import OneDEVBurnCalculator, NodeType
+        calculator = OneDEVBurnCalculator()
         
         # TODO: Get actual burn stats from blockchain
-        total_burned = 2_500_000_000  # Mock: 25% burned
+        total_burned = 250_000_000  # Mock: 25% burned
         
         # Calculate required burn amount
         burn_requirement = calculator.calculate_burn_requirement(
@@ -861,22 +861,22 @@ def request_activation_token():
             total_burned
         )
         
-        if burn_requirement["token"] != "QNA":
-            logger.error("Transition to QNC detected but activation bridge only handles QNA")
+        if burn_requirement["token"] != "1DEV":
+            logger.error("Transition to QNC detected but activation bridge only handles 1DEV")
             return jsonify({"error": "Network has transitioned to QNC. Please use QNC activation."}), 400
             
-        # Convert QNA amount to units (with 6 decimals)
-        qna_required_units = int(burn_requirement["amount"] * 1_000_000)
+        # Convert 1DEV amount to units (with 6 decimals)
+        onedev_required_units = int(burn_requirement["amount"] * 1_000_000)
         
     except Exception as e:
         logger.error(f"Failed to calculate dynamic burn requirement: {e}")
         # Fallback to config value based on node type
         fallback_map = {
-            "light": app_config.getint("Token", "qna_initial_burn_light", fallback=1000000000),
-            "full": app_config.getint("Token", "qna_initial_burn_full", fallback=1500000000),
-            "super": app_config.getint("Token", "qna_initial_burn_super", fallback=2000000000)
+            "light": app_config.getint("Token", "onedev_initial_burn_light", fallback=1500000000),
+            "full": app_config.getint("Token", "onedev_initial_burn_full", fallback=1500000000),
+            "super": app_config.getint("Token", "onedev_initial_burn_super", fallback=1500000000)
         }
-        qna_required_units = fallback_map.get(node_type, 1000000000)
+        onedev_required_units = fallback_map.get(node_type, 1500000000)
     
     solana_burn_address = app_config.get("Solana", "burn_address")
 
@@ -907,21 +907,21 @@ def request_activation_token():
 
     # Enhanced check for configuration values after loading them
     logger.debug(f"Config values - qna_mint_address: '{qna_mint_address}'")
-    logger.debug(f"Config values - qna_required_units: {qna_required_units} (type: {type(qna_required_units)})")
+    logger.debug(f"Config values - onedev_required_units: {onedev_required_units} (type: {type(onedev_required_units)})")
     logger.debug(f"Config values - solana_burn_address: '{solana_burn_address}'")
 
     if not all([
         qna_mint_address,
-        qna_required_units is not None and isinstance(qna_required_units, int),
-        qna_required_units is not None and qna_required_units > 0,
+        onedev_required_units is not None and isinstance(onedev_required_units, int),
+        onedev_required_units is not None and onedev_required_units > 0,
         solana_burn_address
     ]):
         logger.error(
             f"CRITICAL: Token or Solana burn configuration missing or invalid. "
-            f"Mint: {qna_mint_address is not None}, RequiredUnits_is_int: {isinstance(qna_required_units, int)}, "
-            f"RequiredUnits_value: {qna_required_units}, BurnAddr: {solana_burn_address is not None}"
+            f"Mint: {qna_mint_address is not None}, RequiredUnits_is_int: {isinstance(onedev_required_units, int)}, "
+            f"RequiredUnits_value: {onedev_required_units}, BurnAddr: {solana_burn_address is not None}"
         )
-        return jsonify({"error": "Server token or burn address configuration error (qna_required_units might be missing, not an int, or not > 0)."}), 500
+        return jsonify({"error": "Server token or burn address configuration error (onedev_required_units might be missing, not an int, or not > 0)."}), 500
 
     if not SOLANA_PY_AVAILABLE:
         logger.error("CRITICAL: Solana Python libraries are not available on the server.")
@@ -946,7 +946,7 @@ def request_activation_token():
     # Verify Solana burn transaction
     is_burn_tx_valid, burn_tx_reason, burn_details = check_solana_burn_tx_details(
         solana_client, solana_txid, solana_pubkey_user,
-        qna_mint_address, solana_burn_address, qna_required_units
+        qna_mint_address, solana_burn_address, onedev_required_units
     )
     if not is_burn_tx_valid:
         logger.warning(f"Solana burn tx {solana_txid} verification failed for {solana_pubkey_user}: {burn_tx_reason}")
@@ -1028,7 +1028,7 @@ def request_activation_token():
         "details": {
             "qnet_pubkey": qnet_pubkey,
             "solana_txid": solana_txid,
-            "verified_burn_amount": burn_details.get('amount_units_transferred') if burn_details else qna_required_units,
+            "verified_burn_amount": burn_details.get('amount_units_transferred') if burn_details else onedev_required_units,
             "timestamp": int(time.time())
         }
     })
@@ -1083,7 +1083,7 @@ def get_config_info():
         },
         "token": {
             "mint_address": app_config.get("Token", "qna_mint_address", fallback="not_configured"),
-            "required_burn_units": app_config.getint("Token", "qna_required_burn_units", fallback=0)
+            "required_burn_units": app_config.getint("Token", "onedev_required_burn_units", fallback=0)
         },
         "activation": {
             "mock_solana_checks": app_config.getboolean("Activation", "mock_solana_checks", fallback=False),

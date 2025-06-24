@@ -1,6 +1,6 @@
 """
-QNA Burn Model - Dynamic burning threshold based on supply burned
-As discussed: Start with 1,000 QNA, decrease as more is burned
+1DEV Burn Model - Dynamic burning threshold based on supply burned
+As discussed: Start with 1,500 1DEV, decrease as more is burned
 """
 
 import math
@@ -15,28 +15,28 @@ class NodeType(Enum):
 
 @dataclass
 class BurnModelConfig:
-    """Configuration for QNA burn model"""
-    # Starting prices (at 0% burned)
-    light_node_start: float = 1000
+    """Configuration for 1DEV burn model"""
+    # Starting prices (at 0% burned) - ALL SAME PRICE
+    light_node_start: float = 1500
     full_node_start: float = 1500
-    super_node_start: float = 2000
+    super_node_start: float = 1500
     
-    # Minimum prices (at 90% burned)
-    light_node_min: float = 100
+    # Minimum prices (at 90% burned) - ALL SAME PRICE
+    light_node_min: float = 150
     full_node_min: float = 150
-    super_node_min: float = 200
+    super_node_min: float = 150
     
     # Transition parameters
     burn_threshold_percent: float = 90.0  # Transition at 90% burned
     max_transition_years: float = 5.0     # Or after 5 years
-    total_qna_supply: float = 1_000_000_000  # 1 billion QNA (Pump.fun standard)
+    total_onedev_supply: float = 1_000_000_000  # 1 billion 1DEV (Pump.fun standard)
     
     # Price curve parameters
     decay_factor: float = 3.0  # Controls steepness of price decay
-    round_to_nearest: int = 50  # Round prices to nearest 50 QNA
+    round_to_nearest: int = 50  # Round prices to nearest 50 1DEV
 
-class QNABurnCalculator:
-    """Calculates QNA burn requirements based on current burn progress"""
+class OneDevBurnCalculator:
+    """Calculates 1DEV burn requirements based on current burn progress"""
     
     def __init__(self, config: BurnModelConfig = None):
         self.config = config or BurnModelConfig()
@@ -44,21 +44,21 @@ class QNABurnCalculator:
     def calculate_burn_requirement(
         self,
         node_type: NodeType,
-        total_qna_burned: float,
+        total_one_dev_burned: float,
         current_qnc_price: float = None
     ) -> Dict[str, any]:
         """
-        Calculate QNA burn requirement for node activation
+        Calculate 1DEV burn requirement for node activation
         
         Args:
             node_type: Type of node to activate
-            total_qna_burned: Total QNA burned so far
+            total_one_dev_burned: Total 1DEV burned so far
             current_qnc_price: Current QNC price (for post-transition)
             
         Returns:
             Burn requirement details
         """
-        burn_ratio = total_qna_burned / self.config.total_qna_supply
+        burn_ratio = total_one_dev_burned / self.config.total_onedev_supply
         
         # Check if we've transitioned to QNC
         if burn_ratio >= self.config.burn_threshold_percent / 100:
@@ -77,7 +77,7 @@ class QNABurnCalculator:
                 "method": "qnc_payment"
             }
         
-        # Still in QNA burning phase
+        # Still in 1DEV burning phase
         base_burn = self._calculate_dynamic_burn(burn_ratio, node_type)
         
         # Apply minimum floor
@@ -91,12 +91,12 @@ class QNABurnCalculator:
             final_burn = max(final_burn, min_burn)
         
         return {
-            "token": "QNA",
-            "amount": round(final_burn, 0),  # Round to whole QNA
+            "token": "1DEV",
+            "amount": round(final_burn, 0),  # Round to whole 1DEV
             "burn_ratio": burn_ratio,
             "burn_percentage": burn_ratio * 100,
             "transition_complete": False,
-            "method": "qna_burn",
+            "method": "one_dev_burn",
             "remaining_to_transition": (self.config.burn_threshold_percent / 100 - burn_ratio) * 100
         }
     
@@ -106,7 +106,7 @@ class QNABurnCalculator:
         More burned = lower requirement
         """
         # Inverse exponential curve
-        # At 0% burned: initial_burn_amount (10,000)
+        # At 0% burned: initial_burn_amount (1,500)
         # At 90% burned: approaches minimum
         
         # Calculate progress (0 to 1, where 1 is 90% burned)
@@ -151,37 +151,37 @@ class QNABurnCalculator:
             NodeType.SUPER: self.config.super_node_start
         }[node_type]
     
-    def get_burn_schedule(self, total_qna_burned: float) -> Dict[str, Dict]:
+    def get_burn_schedule(self, total_onedev_burned: float) -> Dict[str, Dict]:
         """Get current burn requirements for all node types"""
         schedule = {}
         for node_type in NodeType:
             schedule[node_type.value] = self.calculate_burn_requirement(
-                node_type, total_qna_burned
+                node_type, total_onedev_burned
             )
         return schedule
     
-    def estimate_qna_value_preservation(
+    def estimate_onedev_value_preservation(
         self,
-        qna_holdings: float,
-        total_qna_burned: float
+        onedev_holdings: float,
+        total_onedev_burned: float
     ) -> Dict[str, float]:
         """
-        Estimate value preservation for QNA holders
-        As supply decreases, remaining QNA becomes more valuable
+        Estimate value preservation for 1DEV holders
+        As supply decreases, remaining 1DEV becomes more valuable
         """
-        burn_ratio = total_qna_burned / self.config.total_qna_supply
-        remaining_supply = self.config.total_qna_supply - total_qna_burned
+        burn_ratio = total_onedev_burned / self.config.total_onedev_supply
+        remaining_supply = self.config.total_onedev_supply - total_onedev_burned
         
         # Scarcity multiplier - as supply decreases, value increases
         # Using logarithmic scale
         scarcity_factor = 1 + math.log10(1 + burn_ratio * 9)  # 1x to ~2x
         
         # Calculate implied value
-        base_value = qna_holdings
+        base_value = onedev_holdings
         adjusted_value = base_value * scarcity_factor
         
         return {
-            "qna_holdings": qna_holdings,
+            "onedev_holdings": onedev_holdings,
             "burn_ratio": burn_ratio,
             "remaining_supply": remaining_supply,
             "scarcity_multiplier": scarcity_factor,
@@ -190,7 +190,7 @@ class QNABurnCalculator:
         }
 
 class BurnProgressTracker:
-    """Tracks and analyzes QNA burn progress"""
+    """Tracks and analyzes 1DEV burn progress"""
     
     def __init__(self, total_supply: float = 1_000_000_000):
         self.total_supply = total_supply
@@ -254,25 +254,25 @@ class BurnProgressTracker:
 
 # Example usage and testing
 if __name__ == "__main__":
-    calculator = QNABurnCalculator()
+    calculator = OneDevBurnCalculator()
     
     # Test burn requirements at different stages
     test_burns = [
         0,  # 0% burned
-        1_000_000_000,  # 10% burned
-        2_500_000_000,  # 25% burned
-        5_000_000_000,  # 50% burned
-        7_500_000_000,  # 75% burned
-        8_500_000_000,  # 85% burned
-        8_900_000_000,  # 89% burned
-        9_000_000_000,  # 90% burned - transition point
+        100_000_000,  # 10% burned
+        250_000_000,  # 25% burned
+        500_000_000,  # 50% burned
+        750_000_000,  # 75% burned
+        850_000_000,  # 85% burned
+        890_000_000,  # 89% burned
+        900_000_000,  # 90% burned - transition point
     ]
     
-    print("QNA Burn Requirements by Progress:\n")
+    print("1DEV Burn Requirements by Progress:\n")
     
     for burned in test_burns:
         burn_percent = (burned / 1_000_000_000) * 100
-        print(f"--- {burn_percent:.0f}% QNA Burned ({burned:,} QNA) ---")
+        print(f"--- {burn_percent:.0f}% 1DEV Burned ({burned:,} 1DEV) ---")
         
         schedule = calculator.get_burn_schedule(burned)
         for node_type, details in schedule.items():
@@ -282,10 +282,10 @@ if __name__ == "__main__":
     
     # Test value preservation
     print("\nValue Preservation Example:")
-    holder_qna = 100_000  # Holder has 100K QNA
-    burned = 5_000_000_000  # 50% burned
+    holder_onedev = 100_000  # Holder has 100K 1DEV
+    burned = 500_000_000  # 50% burned
     
-    value_info = calculator.estimate_qna_value_preservation(holder_qna, burned)
-    print(f"Holder with {holder_qna:,} QNA at {value_info['burn_ratio']*100:.0f}% burn:")
+    value_info = calculator.estimate_onedev_value_preservation(holder_onedev, burned)
+    print(f"Holder with {holder_onedev:,} 1DEV at {value_info['burn_ratio']*100:.0f}% burn:")
     print(f"Scarcity multiplier: {value_info['scarcity_multiplier']:.2f}x")
     print(f"Implied value increase: {value_info['value_increase_percent']:.1f}%") 

@@ -1,8 +1,8 @@
 """
-Visualization of QNA Burn Model with Round Numbers
+Visualization of 1DEV Burn Model with Round Numbers
 """
 
-from qna_burn_model import QNABurnCalculator, NodeType
+from onedev_burn_model import OneDEVBurnCalculator, NodeType
 
 def format_number(num):
     """Format number with thousands separator"""

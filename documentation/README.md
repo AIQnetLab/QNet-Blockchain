@@ -54,8 +54,8 @@
 
 ### Three-Layer Architecture
 
-#### 1. $1DEV Access Token (Solana)
-**Purpose**: Experimental network access via pump.fun mechanism  
+#### 1. $1DEV Fun Token (Solana)
+**Purpose**: Fun memecoin for experimental network testing via pump.fun mechanism  
 **Requirement**: Variable $1DEV tokens burned based on node type  
 
 ```bash

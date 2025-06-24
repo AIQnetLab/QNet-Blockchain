@@ -1,157 +1,178 @@
 """
-Transition Monitor for QNA -> QNC Phase Change
-Monitors Solana burn data and network age to determine transition timing
+Transition Monitor for 1DEV -> QNC Phase Change
+Monitors conditions for transitioning from 1DEV burns to QNC payments
 """
 
-import time
-from typing import Dict, Tuple, Optional
 from dataclasses import dataclass
+from typing import Dict, Optional
+import time
 import logging
 
 logger = logging.getLogger(__name__)
 
 @dataclass
 class TransitionState:
-    """Current state of QNA->QNC transition"""
-    is_transitioned: bool
-    transition_timestamp: Optional[int]
-    trigger_reason: Optional[str]
-    total_burned_at_transition: Optional[int]
-    network_age_at_transition: Optional[float]
+    """Current state of 1DEV->QNC transition"""
+    is_transitioned: bool = False
+    transition_timestamp: Optional[int] = None
+    trigger_reason: Optional[str] = None  # "burn_threshold" or "time_limit"
+    final_onedev_burned: Optional[int] = None
 
 class TransitionMonitor:
     """
-    Monitors conditions for QNA->QNC transition
-    Checks both burn percentage and time elapsed
+    Monitors conditions for 1DEV->QNC transition
+    
+    Transition occurs when:
+    1. 90% of 1DEV supply is burned (900M out of 1B)
+    2. OR 5 years have elapsed since network launch
     """
     
-    def __init__(self, launch_timestamp: int):
-        self.launch_timestamp = launch_timestamp
-        self.total_qna_supply = 1_000_000_000  # 1 billion (Pump.fun standard)
-        self.burn_threshold_percent = 90.0
-        self.max_years = 5.0
+    def __init__(self, network_launch_timestamp: int = None):
+        self.network_launch_timestamp = network_launch_timestamp or int(time.time())
+        self.transition_state = TransitionState()
         
-        # Transition state
-        self.transition_state = TransitionState(
-            is_transitioned=False,
-            transition_timestamp=None,
-            trigger_reason=None,
-            total_burned_at_transition=None,
-            network_age_at_transition=None
-        )
+        # Transition parameters
+        self.onedev_total_supply = 1_000_000_000  # 1 billion
+        self.burn_threshold_percent = 90.0  # 90%
+        self.time_limit_years = 5
         
-    def check_transition_conditions(self, total_burned: int) -> Tuple[bool, str]:
+    def check_transition_conditions(
+        self,
+        total_burned: int,
+        current_timestamp: int = None
+    ) -> tuple[bool, str]:
         """
         Check if transition conditions are met
         
         Args:
-            total_burned: Total QNA burned from Solana
+            total_burned: Total 1DEV burned from Solana
+            current_timestamp: Current time (defaults to now)
             
         Returns:
             (should_transition, reason)
         """
+        current_time = current_timestamp or int(time.time())
         
-        # If already transitioned, return current state
-        if self.transition_state.is_transitioned:
-            return False, f"Already transitioned at {self.transition_state.transition_timestamp}"
+        # Check burn threshold (90% of supply)
+        burn_threshold = (self.burn_threshold_percent / 100) * self.onedev_total_supply
+        if total_burned >= burn_threshold:
+            return True, f"Burn threshold reached: {total_burned:,} >= {burn_threshold:,} 1DEV"
         
-        current_time = int(time.time())
+        # Check time limit (5 years)
+        elapsed_seconds = current_time - self.network_launch_timestamp
+        elapsed_years = elapsed_seconds / (365.25 * 24 * 3600)  # Account for leap years
         
-        # Check burn percentage
-        burn_percentage = (total_burned / self.total_qna_supply) * 100
-        if burn_percentage >= self.burn_threshold_percent:
-            return True, f"Burn threshold reached: {burn_percentage:.2f}% >= {self.burn_threshold_percent}%"
+        if elapsed_years >= self.time_limit_years:
+            return True, f"Time limit reached: {elapsed_years:.1f} >= {self.time_limit_years} years"
         
-        # Check time elapsed
-        years_elapsed = (current_time - self.launch_timestamp) / (365 * 24 * 3600)
-        if years_elapsed >= self.max_years:
-            return True, f"Time limit reached: {years_elapsed:.2f} years >= {self.max_years} years"
+        # No transition yet
+        burn_percent = (total_burned / self.onedev_total_supply) * 100
+        time_remaining = self.time_limit_years - elapsed_years
         
-        # Not ready for transition
-        remaining_burn = self.burn_threshold_percent - burn_percentage
-        remaining_years = self.max_years - years_elapsed
-        
-        return False, f"Not ready: {burn_percentage:.2f}% burned, {years_elapsed:.2f} years elapsed"
+        return False, f"No transition: {burn_percent:.1f}% burned, {time_remaining:.1f} years remaining"
     
-    def execute_transition(self, total_burned: int, trigger_reason: str) -> bool:
+    def execute_transition(
+        self,
+        total_burned: int,
+        trigger_reason: str,
+        timestamp: int = None
+    ) -> bool:
         """
         Execute the transition to QNC phase
         
         Args:
-            total_burned: Total burned at transition time
-            trigger_reason: Why transition was triggered
+            total_burned: Final 1DEV burn amount
+            trigger_reason: Why transition occurred
+            timestamp: When transition occurred
             
         Returns:
             Success status
         """
-        
         if self.transition_state.is_transitioned:
-            logger.warning("Attempted to transition when already transitioned")
+            logger.warning("Transition already executed")
             return False
         
-        current_time = int(time.time())
-        years_elapsed = (current_time - self.launch_timestamp) / (365 * 24 * 3600)
+        transition_time = timestamp or int(time.time())
         
-        # Record transition
-        self.transition_state = TransitionState(
-            is_transitioned=True,
-            transition_timestamp=current_time,
-            trigger_reason=trigger_reason,
-            total_burned_at_transition=total_burned,
-            network_age_at_transition=years_elapsed
-        )
+        # Update transition state
+        self.transition_state.is_transitioned = True
+        self.transition_state.transition_timestamp = transition_time
+        self.transition_state.trigger_reason = trigger_reason
+        self.transition_state.final_onedev_burned = total_burned
         
-        logger.info(f"QNA->QNC transition executed: {trigger_reason}")
-        logger.info(f"Total burned: {total_burned:,} QNA")
-        logger.info(f"Network age: {years_elapsed:.2f} years")
+        logger.info(f"1DEV->QNC transition executed: {trigger_reason}")
+        logger.info(f"Total burned: {total_burned:,} 1DEV")
+        logger.info(f"Transition time: {transition_time}")
+        
+        # TODO: Notify other systems about transition
+        # - Update pricing models
+        # - Activate QNC payment system
+        # - Disable 1DEV burn tracking
         
         return True
     
-    def get_transition_status(self, total_burned: int) -> Dict:
-        """
-        Get detailed transition status
-        
-        Args:
-            total_burned: Current total burned
-        """
-        
+    def get_transition_status(self) -> Dict:
+        """Get current transition status"""
+        return {
+            "is_transitioned": self.transition_state.is_transitioned,
+            "transition_timestamp": self.transition_state.transition_timestamp,
+            "trigger_reason": self.transition_state.trigger_reason,
+            "final_onedev_burned": self.transition_state.final_onedev_burned,
+            "network_launch": self.network_launch_timestamp,
+            "onedev_total_supply": self.onedev_total_supply,
+            "burn_threshold_percent": self.burn_threshold_percent,
+            "time_limit_years": self.time_limit_years
+        }
+    
+    def get_progress_metrics(self, total_burned: int) -> Dict:
+        """Get detailed progress metrics"""
         current_time = int(time.time())
-        years_elapsed = (current_time - self.launch_timestamp) / (365 * 24 * 3600)
-        burn_percentage = (total_burned / self.total_qna_supply) * 100
         
-        if self.transition_state.is_transitioned:
-            return {
-                "phase": "QNC",
-                "transitioned": True,
-                "transition_timestamp": self.transition_state.transition_timestamp,
-                "trigger_reason": self.transition_state.trigger_reason,
-                "burned_at_transition": self.transition_state.total_burned_at_transition,
-                "age_at_transition": self.transition_state.network_age_at_transition
+        # Burn progress
+        burn_ratio = total_burned / self.onedev_total_supply
+        burn_percent = burn_ratio * 100
+        
+        # Time progress
+        elapsed_seconds = current_time - self.network_launch_timestamp
+        elapsed_years = elapsed_seconds / (365.25 * 24 * 3600)
+        time_progress_percent = (elapsed_years / self.time_limit_years) * 100
+        
+        # Which condition is closer?
+        burn_distance = (90.0 - burn_percent) / 90.0  # 0 = reached, 1 = far
+        time_distance = (self.time_limit_years - elapsed_years) / self.time_limit_years
+        
+        closer_condition = "burn" if burn_distance < time_distance else "time"
+        
+        return {
+            "phase": "1DEV",
+            "burn_progress": {
+                "total_burned": total_burned,
+                "burn_ratio": burn_ratio,
+                "burn_percent": burn_percent,
+                "target_percent": 90.0,
+                "remaining_to_target": max(0, 900_000_000 - total_burned)
+            },
+            "time_progress": {
+                "elapsed_years": elapsed_years,
+                "elapsed_percent": min(100, time_progress_percent),
+                "target_years": self.time_limit_years,
+                "remaining_years": max(0, self.time_limit_years - elapsed_years)
+            },
+            "transition_prediction": {
+                "closer_condition": closer_condition,
+                "estimated_days_to_transition": self._estimate_transition_time(total_burned)
             }
-        else:
-            return {
-                "phase": "QNA",
-                "transitioned": False,
-                "current_burn_percentage": burn_percentage,
-                "current_network_age": years_elapsed,
-                "burn_threshold": self.burn_threshold_percent,
-                "time_threshold_years": self.max_years,
-                "burn_remaining": max(0, self.burn_threshold_percent - burn_percentage),
-                "years_remaining": max(0, self.max_years - years_elapsed)
-            }
+        }
     
     def should_use_qnc_contract(self) -> bool:
-        """
-        Simple check if QNC contract should be used for activations
-        """
+        """Check if we should use QNC contract instead of 1DEV burns"""
         return self.transition_state.is_transitioned
     
-    def get_activation_method(self) -> str:
-        """
-        Get current activation method
-        """
-        return "QNC_BURN" if self.transition_state.is_transitioned else "QNA_BURN"
-
+    def _estimate_transition_time(self, total_burned: int) -> Optional[int]:
+        """Estimate days until transition (simplified)"""
+        # This would use burn rate analysis in production
+        # For now, return None (unknown)
+        return None
 
 # Integration with node activation
 class NodeActivationRouter:
@@ -200,15 +221,15 @@ class NodeActivationRouter:
                 "contract": "qnet_native"
             }
         else:
-            # QNA phase - dynamic pricing based on burn progress
-            from qna_burn_model import QNABurnModel
-            model = QNABurnModel()
+            # 1DEV phase - dynamic pricing based on burn progress
+            from onedev_burn_model import OneDEVBurnModel
+            model = OneDEVBurnModel()
             price = model.calculate_node_price(node_type, total_burned)
             
             return {
-                "phase": "QNA",
-                "token": "QNA",
+                "phase": "1DEV",
+                "token": "1DEV",
                 "amount": price,
-                "method": "burn_qna_solana",
+                "method": "burn_onedev_solana",
                 "contract": "solana"
             } 

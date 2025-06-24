@@ -11,7 +11,7 @@ pub enum NodeType {
 impl NodeType {
     /// Get 1DEV burn amount for Phase 1 activation (decreasing by 10% per 10% burned)
     pub fn get_1dev_burn_amount(&self, burn_percentage: f64) -> u64 {
-        let base_amount = 1_500_000_000; // 1500 1DEV for any node type (6 decimals)
+        let base_amount = 1_500_000_000; // 1500 1DEV for ALL node types (6 decimals)
         
         // Dynamic pricing: decreases by 10% per 10% burned (from 1500 to 150 1DEV)
         let reduction = (burn_percentage / 10.0) * 0.1; // 10% reduction per 10% burned

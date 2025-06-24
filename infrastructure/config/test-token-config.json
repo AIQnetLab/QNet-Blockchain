@@ -1,0 +1,29 @@
+{
+  "tokenInfo": {
+    "name": "1DEV Test Token",
+    "symbol": "1DEV-TEST",
+    "decimals": 6,
+    "totalSupply": 1000000000,
+    "mintAddress": "9GcdXAo2EyjNdNLuQoScSVbfJSnh9RdkSS8YYKnGQ8Pf",
+    "network": "devnet",
+    "createdAt": "2025-06-24T14:20:00.000Z",
+    "status": "created_partial"
+  },
+  "faucet": {
+    "status": "needs_setup",
+    "reason": "devnet_airdrop_limit",
+    "note": "Token created successfully but faucet needs manual SOL funding"
+  },
+  "urls": {
+    "solscan": "https://solscan.io/token/9GcdXAo2EyjNdNLuQoScSVbfJSnh9RdkSS8YYKnGQ8Pf?cluster=devnet",
+    "solanaExplorer": "https://explorer.solana.com/address/9GcdXAo2EyjNdNLuQoScSVbfJSnh9RdkSS8YYKnGQ8Pf?cluster=devnet"
+  },
+  "testing": {
+    "instructions": [
+      "1. Token mint created successfully",
+      "2. Use Solana faucet to get SOL for gas fees",
+      "3. Manually mint tokens for testing",
+      "4. Update faucet configuration when ready"
+    ]
+  }
+} 

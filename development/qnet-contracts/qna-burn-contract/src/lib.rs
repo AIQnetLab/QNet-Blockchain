@@ -25,7 +25,7 @@ pub mod one_dev_burn_contract {
         instructions::initialize::handler(ctx, burn_address, one_dev_mint, admin)
     }
 
-    /// Burn 1DEV tokens for QNet node activation access (Phase 1)
+    /// Burn 1DEV tokens for QNet node testing (Phase 1) - Fun memecoin experiment
     pub fn burn_1dev_for_node_activation(
         ctx: Context<Burn1DevForNodeActivation>,
         node_type: NodeType,
@@ -95,7 +95,7 @@ pub mod one_dev_burn_contract {
         instructions::get_current_1dev_price::handler(ctx)
     }
 
-    /// Bridge function: Grant QNet access after verified 1DEV burn
+    /// Bridge function: Enable QNet node testing after verified 1DEV burn
     pub fn grant_qnet_access(
         ctx: Context<GrantQNetAccess>,
         solana_wallet: Pubkey,

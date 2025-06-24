@@ -43,15 +43,15 @@ The pricing system separates **static configuration** from **dynamic blockchain 
 ```ini
 [Token]
 # These NEVER change after deployment
-qna_initial_burn_light = 1000000000  # Formula parameter
-qna_initial_burn_full = 1500000000   # Formula parameter
-qna_initial_burn_super = 2000000000  # Formula parameter
-qna_min_burn_light = 100000000      # Floor value
-qna_min_burn_full = 150000000       # Floor value
-qna_min_burn_super = 200000000      # Floor value
-qna_total_supply = 10000000000000000
-qna_burn_target_ratio = 0.9
-qna_transition_years = 5
+onedev_initial_burn_light = 1500000000  # 1500 1DEV (6 decimals)
+onedev_initial_burn_full = 1500000000   # 1500 1DEV (6 decimals)
+onedev_initial_burn_super = 1500000000  # 1500 1DEV (6 decimals)
+onedev_min_burn_light = 150000000       # 150 1DEV minimum
+onedev_min_burn_full = 150000000        # 150 1DEV minimum
+onedev_min_burn_super = 150000000       # 150 1DEV minimum
+onedev_total_supply = 1000000000000000
+onedev_burn_target_ratio = 0.9
+onedev_transition_years = 5
 ```
 
 ### 2. Dynamic State (Blockchain)
@@ -76,9 +76,9 @@ current_price = calculate_price(
 
 ## Transition Handling
 
-### Before Transition (QNA)
+### Before Transition (1DEV)
 - Check: burned < 90% AND years < 5
-- Use: QNA burn model
+- Use: 1DEV burn model
 - Price: Dynamic based on burn progress
 
 ### After Transition (QNC)
@@ -125,17 +125,10 @@ def get_activation_price(node_type):
        burn_state["days_since_launch"] >= (5 * 365):
         return get_qnc_price(node_type)
     
-    # 4. Calculate QNA price
-    calculator = QNABurnCalculator()
+    # 4. Calculate 1DEV price
+    calculator = OneDEVBurnCalculator()
     return calculator.calculate_burn_requirement(
         node_type,
         burn_state["total_burned"]
     )
 ```
-
-## Summary
-
-- **Config.ini** = Constants (never change)
-- **Blockchain** = State (always current)
-- **Calculator** = Logic (combines both)
-- **Result** = Current price (always accurate) 
