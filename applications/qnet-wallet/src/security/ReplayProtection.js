@@ -1,139 +1,37 @@
-// QNet Replay Attack Protection
+// QNet Replay Protection - Simple Implementation
 
 export class ReplayProtection {
     constructor() {
-        this.processedTxs = new Map();
-        this.maxAge = 24 * 60 * 60 * 1000; // 24 hours
-        this.cleanupInterval = 60 * 60 * 1000; // 1 hour
-        
-        // Start cleanup timer
-        this.startCleanup();
+        this.usedNonces = new Set();
+        this.chainId = 'qnet-mainnet';
     }
-    
-    // Check if transaction is replay
-    async checkTransaction(tx) {
-        const txId = await this.generateTxId(tx);
-        
-        // Check if already processed
-        if (this.processedTxs.has(txId)) {
-            const processedAt = this.processedTxs.get(txId);
-            return {
-                isReplay: true,
-                processedAt,
-                txId
-            };
-        }
-        
-        // Check timestamp validity
-        const now = Date.now();
-        const txAge = now - tx.timestamp;
-        
-        if (txAge > this.maxAge) {
-            return {
-                isReplay: true,
-                reason: 'Transaction too old',
-                maxAge: this.maxAge,
-                txAge
-            };
-        }
-        
-        if (tx.timestamp > now + 5 * 60 * 1000) { // 5 minutes in future
-            return {
-                isReplay: true,
-                reason: 'Transaction timestamp in future',
-                timestamp: tx.timestamp,
-                now
-            };
-        }
-        
-        // Mark as processed
-        this.processedTxs.set(txId, now);
-        
-        return {
-            isReplay: false,
-            txId
-        };
-    }
-    
-    // Generate unique transaction ID
-    async generateTxId(tx) {
-        // Create canonical transaction data
-        const canonicalTx = {
-            from: tx.from,
-            to: tx.to,
-            amount: tx.amount,
-            nonce: tx.nonce,
-            timestamp: tx.timestamp,
-            chainId: tx.chainId || 'qnet-mainnet'
-        };
-        
-        const txData = JSON.stringify(canonicalTx);
-        const encoder = new TextEncoder();
-        const data = encoder.encode(txData);
-        
-        // Hash to get unique ID
-        const hashBuffer = await crypto.subtle.digest('SHA-256', data);
-        const hashArray = Array.from(new Uint8Array(hashBuffer));
-        const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
-        
-        return hashHex;
-    }
-    
-    // Add chain ID to transaction
-    addChainProtection(tx, chainId = 'qnet-mainnet') {
+
+    // Add chain-specific protection to transaction
+    addChainProtection(tx) {
         return {
             ...tx,
-            chainId,
-            version: 2 // Transaction version with replay protection
+            chainId: this.chainId,
+            nonce: tx.nonce || Date.now()
         };
     }
-    
-    // Verify chain ID
-    verifyChainId(tx, expectedChainId = 'qnet-mainnet') {
-        if (!tx.chainId) {
-            return {
-                valid: false,
-                reason: 'Missing chain ID'
-            };
-        }
-        
-        if (tx.chainId !== expectedChainId) {
-            return {
-                valid: false,
-                reason: 'Invalid chain ID',
-                expected: expectedChainId,
-                actual: tx.chainId
-            };
-        }
-        
-        return { valid: true };
+
+    // Check if transaction has been used before
+    isReplayAttack(tx) {
+        const txKey = `${tx.from}:${tx.nonce}:${tx.chainId}`;
+        return this.usedNonces.has(txKey);
     }
-    
-    // Clean up old transactions
+
+    // Mark transaction as used
+    markAsUsed(tx) {
+        const txKey = `${tx.from}:${tx.nonce}:${tx.chainId}`;
+        this.usedNonces.add(txKey);
+    }
+
+    // Clean up old nonces (in production, would use persistent storage)
     cleanup() {
-        const now = Date.now();
-        const cutoff = now - this.maxAge;
-        
-        for (const [txId, processedAt] of this.processedTxs.entries()) {
-            if (processedAt < cutoff) {
-                this.processedTxs.delete(txId);
-            }
+        // Simple cleanup - in production would be more sophisticated
+        if (this.usedNonces.size > 10000) {
+            this.usedNonces.clear();
         }
-    }
-    
-    // Start periodic cleanup
-    startCleanup() {
-        setInterval(() => {
-            this.cleanup();
-        }, this.cleanupInterval);
-    }
-    
-    // Get statistics
-    getStats() {
-        return {
-            processedCount: this.processedTxs.size,
-            oldestTx: Math.min(...this.processedTxs.values()),
-            newestTx: Math.max(...this.processedTxs.values())
-        };
     }
 } 

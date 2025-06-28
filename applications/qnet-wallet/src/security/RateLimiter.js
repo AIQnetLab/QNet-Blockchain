@@ -1,119 +1,64 @@
-// QNet Rate Limiter Module - Simplified
+// QNet Rate Limiter - Simple Implementation
 
 export class RateLimiter {
     constructor() {
-        this.attempts = new Map();
-        this.blocked = new Map();
+        this.limits = new Map();
+        this.requests = new Map();
     }
-    
-    // Check if action is allowed
-    async checkLimit(action, identifier, limits) {
-        const key = `${action}:${identifier}`;
-        const now = Date.now();
-        
-        // Check if blocked
-        const blockExpiry = this.blocked.get(key);
-        if (blockExpiry && blockExpiry > now) {
-            const minutesLeft = Math.ceil((blockExpiry - now) / 60000);
-            throw new Error(`Too many requests. Please wait ${minutesLeft} minutes.`);
-        }
-        
-        // Get attempts history
-        let history = this.attempts.get(key) || [];
-        
-        // Clean old attempts
-        history = history.filter(timestamp => 
-            now - timestamp < limits.windowMs
-        );
-        
-        // Check limits
-        if (history.length >= limits.maxAttempts) {
-            // Block for specified duration
-            const blockDuration = limits.blockDurationMs || 15 * 60 * 1000; // 15 min default
-            this.blocked.set(key, now + blockDuration);
-            
-            // Clear attempts
-            this.attempts.delete(key);
-            
-            const minutesBlocked = Math.ceil(blockDuration / 60000);
-            throw new Error(`Rate limit exceeded. Blocked for ${minutesBlocked} minutes.`);
-        }
-        
-        // Add current attempt
-        history.push(now);
-        this.attempts.set(key, history);
-        
-        return {
-            attemptsUsed: history.length,
-            attemptsRemaining: limits.maxAttempts - history.length,
-            resetTime: history[0] + limits.windowMs
-        };
-    }
-    
-    // Reset limits for identifier
-    resetLimit(action, identifier) {
-        const key = `${action}:${identifier}`;
-        this.attempts.delete(key);
-        this.blocked.delete(key);
-    }
-    
-    // Get default limits - only for API protection
+
+    // Set rate limits for specific actions
     static getLimits(action) {
         const limits = {
-            // API calls - prevent DDoS
-            'api_call': {
-                maxAttempts: 100,
-                windowMs: 60 * 1000, // 1 minute
-                blockDurationMs: 5 * 60 * 1000 // 5 minutes
-            },
-            
-            // DApp connections - prevent spam
-            'dapp_connect': {
-                maxAttempts: 20,
-                windowMs: 60 * 1000, // 1 minute
-                blockDurationMs: 5 * 60 * 1000 // 5 minutes
-            },
-            
-            // Mass signature requests - prevent abuse
-            'bulk_sign': {
-                maxAttempts: 50,
-                windowMs: 60 * 1000, // 1 minute
-                blockDurationMs: 5 * 60 * 1000 // 5 minutes
-            }
+            'api_call': { requests: 100, window: 60000 }, // 100 requests per minute
+            'dapp_connect': { requests: 10, window: 60000 }, // 10 connections per minute
+            'bulk_sign': { requests: 5, window: 60000 } // 5 bulk signs per minute
         };
         
         return limits[action] || null;
     }
-    
-    // Clean up old entries (run periodically)
-    cleanup() {
+
+    // Check if request is within rate limits
+    async checkLimit(action, identifier, limits) {
+        const key = `${action}:${identifier}`;
         const now = Date.now();
         
-        // Clean attempts
-        for (const [key, history] of this.attempts.entries()) {
-            const action = key.split(':')[0];
-            const limits = RateLimiter.getLimits(action);
-            
-            if (!limits) {
-                this.attempts.delete(key);
-                continue;
-            }
-            
-            const validHistory = history.filter(timestamp => 
-                now - timestamp < limits.windowMs
-            );
-            
-            if (validHistory.length === 0) {
-                this.attempts.delete(key);
-            } else {
-                this.attempts.set(key, validHistory);
-            }
+        if (!this.requests.has(key)) {
+            this.requests.set(key, []);
         }
         
-        // Clean expired blocks
-        for (const [key, expiry] of this.blocked.entries()) {
-            if (expiry <= now) {
-                this.blocked.delete(key);
+        const requests = this.requests.get(key);
+        
+        // Remove old requests outside the window
+        const validRequests = requests.filter(timestamp => 
+            now - timestamp < limits.window
+        );
+        
+        // Check if over limit
+        if (validRequests.length >= limits.requests) {
+            throw new Error(`Rate limit exceeded for ${action}`);
+        }
+        
+        // Add current request
+        validRequests.push(now);
+        this.requests.set(key, validRequests);
+        
+        return true;
+    }
+
+    // Cleanup old entries
+    cleanup() {
+        const now = Date.now();
+        const maxAge = 300000; // 5 minutes
+        
+        for (const [key, requests] of this.requests.entries()) {
+            const validRequests = requests.filter(timestamp => 
+                now - timestamp < maxAge
+            );
+            
+            if (validRequests.length === 0) {
+                this.requests.delete(key);
+            } else {
+                this.requests.set(key, validRequests);
             }
         }
     }

@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>QNet Wallet Seed Test</title>
+    <style>
+        body { font-family: Arial, sans-serif; padding: 20px; }
+        .test-container { max-width: 600px; margin: 0 auto; }
+        .seed-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin: 20px 0; }
+        .seed-word { padding: 10px; background: #f0f0f0; border-radius: 5px; }
+        .word-number { color: #666; margin-right: 10px; }
+        .word-text { font-weight: bold; }
+        button { padding: 10px 20px; margin: 10px; font-size: 16px; }
+    </style>
+</head>
+<body>
+    <div class="test-container">
+        <h1>QNet Wallet Seed Phrase Test</h1>
+        <button onclick="testSeedGeneration()">Generate Test Seed</button>
+        <button onclick="testWalletCreation()">Test Wallet Creation</button>
+        
+        <div id="results"></div>
+        
+        <div id="seed-display" style="display: none;">
+            <h3>Generated Seed Phrase:</h3>
+            <div id="seed-grid" class="seed-grid"></div>
+        </div>
+    </div>
+
+    <script type="module">
+        import * as bip39 from './node_modules/bip39/src/index.js';
+        
+        window.testSeedGeneration = function() {
+            try {
+                console.log('Testing seed generation...');
+                const mnemonic = bip39.generateMnemonic(128);
+                console.log('Generated mnemonic:', mnemonic);
+                
+                document.getElementById('results').innerHTML = `
+                    <h3>Test Results:</h3>
+                    <p><strong>Mnemonic:</strong> ${mnemonic}</p>
+                    <p><strong>Words count:</strong> ${mnemonic.split(' ').length}</p>
+                    <p><strong>Valid:</strong> ${bip39.validateMnemonic(mnemonic)}</p>
+                `;
+                
+                displaySeedPhrase(mnemonic);
+            } catch (error) {
+                console.error('Error:', error);
+                document.getElementById('results').innerHTML = `<p style="color: red;">Error: ${error.message}</p>`;
+            }
+        };
+        
+        function displaySeedPhrase(mnemonic) {
+            const words = mnemonic.split(' ');
+            const seedGrid = document.getElementById('seed-grid');
+            
+            seedGrid.innerHTML = '';
+            
+            words.forEach((word, index) => {
+                const wordElement = document.createElement('div');
+                wordElement.className = 'seed-word';
+                wordElement.innerHTML = `
+                    <span class="word-number">${index + 1}</span>
+                    <span class="word-text">${word}</span>
+                `;
+                seedGrid.appendChild(wordElement);
+            });
+            
+            document.getElementById('seed-display').style.display = 'block';
+        }
+        
+        window.testWalletCreation = async function() {
+            try {
+                // Import WalletManager from built version
+                const { WalletManager } = await import('./dist/popup.js');
+                console.log('WalletManager imported successfully');
+                
+                // Create a mock connection
+                const mockConnection = {
+                    getVersion: () => Promise.resolve({ 'solana-core': '1.0.0' })
+                };
+                
+                const walletManager = new WalletManager(mockConnection);
+                const result = await walletManager.createWallet('test123456');
+                
+                console.log('Wallet creation result:', result);
+                
+                document.getElementById('results').innerHTML = `
+                    <h3>Wallet Creation Test:</h3>
+                    <p><strong>Success:</strong> true</p>
+                    <p><strong>Address:</strong> ${result.address}</p>
+                    <p><strong>Mnemonic:</strong> ${result.mnemonic}</p>
+                `;
+                
+                if (result.mnemonic) {
+                    displaySeedPhrase(result.mnemonic);
+                }
+                
+            } catch (error) {
+                console.error('Error:', error);
+                document.getElementById('results').innerHTML = `<p style="color: red;">Wallet creation error: ${error.message}</p>`;
+            }
+        };
+    </script>
+</body>
+</html> 

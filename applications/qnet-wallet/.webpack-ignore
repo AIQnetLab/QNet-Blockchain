@@ -1,0 +1,10 @@
+# Exclude test files and private keys
+**/test/**
+**/*test*
+**/*.pem
+**/test_key.pem
+**/test_rsa_privkey.pem
+**/test_rsa_pubkey.pem
+**/node_modules/**/test/**
+**/node_modules/**/*test*
+**/node_modules/**/*.pem 

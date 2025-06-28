@@ -20,12 +20,12 @@
     "https://*.solana.com/*",
     "https://api.mainnet-beta.solana.com/*",
     "https://api.devnet.solana.com/*",
-    "https://api.testnet.solana.com/*"
+    "https://api.testnet.solana.com/*",
+    "https://aiqnet.io/*"
   ],
   
   "background": {
-    "service_worker": "background.js",
-    "type": "module"
+    "service_worker": "dist/background.js"
   },
   
   "action": {
@@ -49,7 +49,7 @@
   "content_scripts": [
     {
       "matches": ["<all_urls>"],
-      "js": ["content.js"],
+      "js": ["dist/content.js"],
       "run_at": "document_start",
       "all_frames": true
     }
@@ -59,20 +59,21 @@
     {
       "resources": [
         "inject.js",
-        "src/i18n/locales/*.json",
-        "icons/*"
+        "icons/*",
+        "dist/*"
       ],
       "matches": ["<all_urls>"]
     }
   ],
   
   "content_security_policy": {
-    "extension_pages": "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self'; connect-src 'self' http://localhost:* https://*.qnet.network wss://*.qnet.network https://*.solana.com https://api.mainnet-beta.solana.com https://api.devnet.solana.com https://api.testnet.solana.com; object-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none';"
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; style-src 'self' 'unsafe-inline';"
   },
   
   "externally_connectable": {
     "matches": [
       "https://*.qnet.network/*",
+      "https://aiqnet.io/*",
       "http://localhost:*/*"
     ]
   }
