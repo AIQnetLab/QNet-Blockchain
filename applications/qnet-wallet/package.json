@@ -1,49 +1,174 @@
 {
-  "name": "qnet-wallet",
+  "name": "qnet-dual-wallet",
   "version": "1.0.0",
-  "description": "QNet Wallet Chrome Extension with post-quantum security",
-  "main": "popup.js",
+  "description": "QNet Dual Wallet - Production-ready dual-network wallet for Solana and QNet blockchains",
+  "main": "src/main.js",
+  "type": "module",
   "scripts": {
-    "build": "webpack --mode production",
-    "dev": "webpack --mode development --watch",
-    "clean": "rimraf dist node_modules/**/*test* node_modules/**/*.pem",
-    "test": "jest",
-    "lint": "eslint src/**/*.js",
-    "package": "npm run clean && npm run build && cd dist && powershell Compress-Archive -Path * -DestinationPath ../qnet-wallet-production-clean.zip -Force && cd .. && echo 'Clean package created: qnet-wallet-production-clean.zip'"
-  },
-  "dependencies": {
-    "@solana/spl-token": "^0.4.8",
-    "@solana/web3.js": "^1.95.7",
-    "bip39": "^3.1.0",
-    "bs58": "^6.0.0",
-    "ed25519-hd-key": "^1.3.0"
-  },
-  "devDependencies": {
-    "@babel/core": "^7.26.0",
-    "@babel/plugin-transform-class-properties": "^7.25.9",
-    "@babel/plugin-transform-private-methods": "^7.25.9",
-    "@babel/preset-env": "^7.26.0",
-    "babel-loader": "^9.2.1",
-    "buffer": "^6.0.3",
-    "copy-webpack-plugin": "^12.0.2",
-    "crypto-browserify": "^3.12.1",
-    "eslint": "^8.44.0",
-    "jest": "^29.6.0",
-    "path-browserify": "^1.0.1",
-    "process": "^0.11.10",
-    "rimraf": "^6.0.1",
-    "stream-browserify": "^3.0.0",
-    "util": "^0.12.5",
-    "webpack": "^5.99.9",
-    "webpack-cli": "^5.1.4"
+    "start": "npm run serve",
+    "serve": "python -m http.server 8080",
+    "serve-prod": "python -m http.server 8080 --bind 0.0.0.0",
+    "build": "npm run build:production",
+    "build:production": "node scripts/build-production.js",
+    "build:testnet": "node scripts/build-testnet.js",
+    "test": "npm run test:unit && npm run test:integration",
+    "test:unit": "node scripts/test-runner.js",
+    "test:integration": "node scripts/integration-tests.js",
+    "test:e2e": "node scripts/e2e-tests.js",
+    "lint": "eslint src/ --ext .js",
+    "lint:fix": "eslint src/ --ext .js --fix",
+    "format": "prettier --write src/**/*.js",
+    "validate": "npm run lint && npm run test:unit",
+    "deploy:testnet": "npm run build:testnet && npm run deploy:upload",
+    "deploy:production": "npm run build:production && npm run deploy:upload",
+    "deploy:upload": "node scripts/deploy.js",
+    "security:audit": "npm audit && node scripts/security-scan.js",
+    "performance:analyze": "node scripts/performance-analysis.js",
+    "docs:generate": "node scripts/generate-docs.js",
+    "clean": "rm -rf dist/ build/ .cache/",
+    "postinstall": "node scripts/post-install.js"
   },
   "keywords": [
-    "blockchain",
+    "qnet",
     "wallet",
-    "chrome-extension",
+    "blockchain",
     "solana",
-    "qnet"
+    "cryptocurrency",
+    "dual-network",
+    "eon-addresses",
+    "cross-chain",
+    "node-activation",
+    "production-ready"
   ],
-  "author": "QNet Development Team",
-  "license": "MIT"
+  "author": "QNet Team",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/qnet-project/qnet-wallet.git"
+  },
+  "bugs": {
+    "url": "https://github.com/qnet-project/qnet-wallet/issues"
+  },
+  "homepage": "https://wallet.qnet.network",
+  "engines": {
+    "node": ">=16.0.0",
+    "npm": ">=8.0.0"
+  },
+  "dependencies": {
+    "@solana/web3.js": "^1.95.2",
+    "@solana/spl-token": "^0.4.8",
+    "@solana/wallet-adapter-base": "^0.9.23",
+    "bip39": "^3.1.0",
+    "ed25519-hd-key": "^1.3.0",
+    "tweetnacl": "^1.0.3",
+    "bs58": "^5.0.0",
+    "buffer": "^6.0.3",
+    "crypto-js": "^4.2.0",
+    "qrcode": "^1.5.3",
+    "big.js": "^6.2.1"
+  },
+  "devDependencies": {
+    "eslint": "^8.57.0",
+    "prettier": "^3.2.5",
+    "terser": "^5.28.1",
+    "rollup": "^4.12.0",
+    "rollup-plugin-terser": "^7.0.2",
+    "rollup-plugin-node-resolve": "^5.2.0",
+    "rollup-plugin-commonjs": "^10.1.0",
+    "http-server": "^14.1.1",
+    "cross-env": "^7.0.3",
+    "rimraf": "^5.0.5"
+  },
+  "browserslist": [
+    "last 2 Chrome versions",
+    "last 2 Firefox versions",
+    "last 2 Safari versions",
+    "last 2 Edge versions",
+    "> 1%",
+    "not dead"
+  ],
+  "files": [
+    "src/",
+    "public/",
+    "index.html",
+    "manifest.json",
+    "sw.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "config": {
+    "production": {
+      "solana_rpc": "https://api.mainnet-beta.solana.com",
+      "qnet_rpc": "https://rpc.qnet.network",
+      "bridge_url": "https://bridge.qnet.network"
+    },
+    "testnet": {
+      "solana_rpc": "https://api.devnet.solana.com",
+      "qnet_rpc": "https://testnet-rpc.qnet.network",
+      "bridge_url": "https://testnet-bridge.qnet.network"
+    }
+  },
+  "funding": {
+    "type": "opencollective",
+    "url": "https://opencollective.com/qnet"
+  },
+  "pwa": {
+    "name": "QNet Dual Wallet",
+    "short_name": "QNet Wallet",
+    "description": "Dual-network wallet for Solana and QNet blockchains",
+    "theme_color": "#4a90e2",
+    "background_color": "#0a0a0a",
+    "display": "standalone",
+    "orientation": "portrait",
+    "start_url": "/",
+    "scope": "/"
+  },
+  "security": {
+    "content_security_policy": {
+      "default-src": "'self'",
+      "script-src": "'self' 'unsafe-inline' 'unsafe-eval'",
+      "style-src": "'self' 'unsafe-inline'",
+      "img-src": "'self' data: https:",
+      "font-src": "'self' data:",
+      "connect-src": "'self' https: wss: ws:",
+      "worker-src": "'self'"
+    },
+    "permissions_policy": {
+      "camera": "none",
+      "microphone": "none",
+      "geolocation": "none",
+      "payment": "self"
+    }
+  },
+  "performance": {
+    "budget": {
+      "bundle_size": "500kb",
+      "initial_load": "2s",
+      "first_contentful_paint": "1.5s"
+    }
+  },
+  "testing": {
+    "unit_tests": "src/**/*.test.js",
+    "integration_tests": "tests/integration/**/*.js",
+    "e2e_tests": "tests/e2e/**/*.js"
+  },
+  "build": {
+    "output_dir": "dist",
+    "source_maps": false,
+    "minify": true,
+    "compress": true,
+    "tree_shake": true
+  },
+  "deployment": {
+    "environments": {
+      "testnet": {
+        "url": "https://testnet-wallet.qnet.network",
+        "branch": "testnet"
+      },
+      "production": {
+        "url": "https://wallet.qnet.network",
+        "branch": "main"
+      }
+    }
+  }
 }
