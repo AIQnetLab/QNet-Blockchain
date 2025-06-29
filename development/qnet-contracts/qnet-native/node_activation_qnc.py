@@ -1,7 +1,7 @@
 """
 QNet Native Smart Contract for Node Activation (QNC Phase)
-This contract is ONLY activated after QNA->QNC transition
-Handles node activation by burning native QNC tokens
+This contract is ONLY activated after 1DEV->QNC transition
+Handles node activation by transferring QNC tokens to Pool 3
 """
 
 from typing import Dict, Optional, Tuple
@@ -21,14 +21,14 @@ class NodeActivation:
     owner_address: str
     node_type: NodeType
     activation_timestamp: int
-    qnc_burned: int
+    qnc_spent_to_pool3: int
     tx_hash: str
-    migrated_from_qna: bool = False
+    migrated_from_1dev: bool = False
 
 class QNCNodeActivationContract:
     """
     QNet native smart contract for node activation (POST-TRANSITION)
-    This contract is dormant until QNA->QNC transition occurs
+    This contract is dormant until 1DEV->QNC transition occurs
     """
     
     def __init__(self):
@@ -37,7 +37,7 @@ class QNCNodeActivationContract:
         self.transition_timestamp = 0
         self.activated_nodes: Dict[str, NodeActivation] = {}
         
-        # QNC burn requirements (fixed amounts)
+        # QNC Pool 3 transfer requirements (fixed amounts)
         self.burn_requirements = {
             NodeType.LIGHT: 5_000,    # 5k QNC
             NodeType.FULL: 7_500,     # 7.5k QNC
@@ -54,7 +54,7 @@ class QNCNodeActivationContract:
         
     def activate_contract(self, transition_timestamp: int) -> Tuple[bool, str]:
         """
-        Activate this contract when QNA->QNC transition occurs
+        Activate this contract when 1DEV->QNC transition occurs
         Can only be called once by governance
         """
         if self.is_active:
@@ -69,19 +69,19 @@ class QNCNodeActivationContract:
         owner_address: str,
         node_type: NodeType,
         node_id: str,
-        qnc_burned: int,
+        qnc_spent_to_pool3: int,
         tx_hash: str,
         total_network_nodes: int
     ) -> Tuple[bool, str]:
         """
-        Activate a node by burning QNC tokens
-        Only works AFTER transition from QNA
+        Activate a node by transferring QNC tokens to Pool 3
+        Only works AFTER transition from 1DEV
         
         Args:
             owner_address: Address of node owner
             node_type: Type of node to activate
             node_id: Unique node identifier
-            qnc_burned: Amount of QNC burned
+            qnc_spent_to_pool3: Amount of QNC transferred to Pool 3
             tx_hash: QNet transaction hash
             total_network_nodes: Current total nodes in network
             
@@ -91,7 +91,7 @@ class QNCNodeActivationContract:
         
         # Check if contract is active
         if not self.is_active:
-            return False, "Contract not active. Still in QNA phase."
+            return False, "Contract not active. Still in 1DEV phase."
             
         # Check if node already activated
         if node_id in self.activated_nodes:
@@ -104,8 +104,8 @@ class QNCNodeActivationContract:
         )
         
         # Verify burned amount
-        if qnc_burned < required_burn:
-            return False, f"Insufficient burn: {qnc_burned} < {required_burn} QNC"
+        if qnc_spent_to_pool3 < required_burn:
+            return False, f"Insufficient QNC: {qnc_spent_to_pool3} < {required_burn} QNC for Pool 3"
         
         # Create activation record
         activation = NodeActivation(
@@ -113,38 +113,38 @@ class QNCNodeActivationContract:
             owner_address=owner_address,
             node_type=node_type,
             activation_timestamp=int(time.time()),
-            qnc_burned=qnc_burned,
+            qnc_spent_to_pool3=qnc_spent_to_pool3,
             tx_hash=tx_hash,
-            migrated_from_qna=False
+            migrated_from_1dev=False
         )
         
         # Store activation
         self.activated_nodes[node_id] = activation
         
-        return True, f"Node activated successfully. Type: {node_type.value}, Burned: {qnc_burned} QNC"
+        return True, f"Node activated successfully. Type: {node_type.value}, Sent to Pool 3: {qnc_spent_to_pool3} QNC"
     
-    def migrate_qna_node(
+    def migrate_1dev_node(
         self,
         owner_address: str,
         node_id: str,
         original_activation_proof: Dict
     ) -> Tuple[bool, str]:
         """
-        Free migration for nodes activated during QNA phase
+        Free migration for nodes activated during 1DEV phase
         
         Args:
             owner_address: Address of node owner
             node_id: Node ID to migrate
-            original_activation_proof: Proof of QNA-era activation
+            original_activation_proof: Proof of 1DEV-era activation
         """
         
         if not self.is_active:
             return False, "Migration not available until QNC phase"
             
-        # Verify node was activated in QNA era
+        # Verify node was activated in 1DEV era
         # In real implementation, this would verify cryptographic proof
-        if not self._verify_qna_activation(original_activation_proof):
-            return False, "Invalid QNA activation proof"
+        if not self._verify_1dev_activation(original_activation_proof):
+            return False, "Invalid 1DEV activation proof"
             
         # Check not already migrated
         if node_id in self.activated_nodes:
@@ -156,14 +156,14 @@ class QNCNodeActivationContract:
             owner_address=owner_address,
             node_type=NodeType(original_activation_proof['node_type']),
             activation_timestamp=int(time.time()),
-            qnc_burned=0,  # Free migration
-            tx_hash=f"MIGRATION_{original_activation_proof['qna_tx_hash']}",
-            migrated_from_qna=True
+            qnc_spent_to_pool3=0,  # Free migration
+            tx_hash=f"MIGRATION_{original_activation_proof['1dev_tx_hash']}",
+            migrated_from_1dev=True
         )
         
         self.activated_nodes[node_id] = activation
         
-        return True, "QNA node successfully migrated to QNC network"
+        return True, "1DEV node successfully migrated to QNC network"
     
     def _calculate_burn_requirement(
         self, 
@@ -171,7 +171,7 @@ class QNCNodeActivationContract:
         total_nodes: int
     ) -> int:
         """
-        Calculate QNC burn requirement based on network size
+        Calculate QNC Pool 3 transfer requirement based on network size
         """
         
         # Get base requirement
@@ -186,18 +186,18 @@ class QNCNodeActivationContract:
         
         return int(base_burn * multiplier)
     
-    def _verify_qna_activation(self, proof: Dict) -> bool:
+    def _verify_1dev_activation(self, proof: Dict) -> bool:
         """
-        Verify proof of QNA-era activation
+        Verify proof of 1DEV-era activation
         In real implementation, this would check cryptographic proofs
         """
-        required_fields = ['node_id', 'node_type', 'qna_tx_hash', 'activation_timestamp']
+        required_fields = ['node_id', 'node_type', '1dev_tx_hash', 'activation_timestamp']
         return all(field in proof for field in required_fields)
     
     def get_current_prices(self, total_nodes: int) -> Dict[str, int]:
-        """Get current QNC burn requirements for all node types"""
+        """Get current QNC Pool 3 transfer requirements for all node types"""
         if not self.is_active:
-            return {"error": "Contract not active. Still in QNA phase."}
+            return {"error": "Contract not active. Still in 1DEV phase."}
             
         return {
             node_type.value: self._calculate_burn_requirement(node_type, total_nodes)
@@ -207,14 +207,14 @@ class QNCNodeActivationContract:
     def get_stats(self) -> Dict:
         """Get contract statistics"""
         if not self.is_active:
-            return {"status": "inactive", "message": "Waiting for QNA->QNC transition"}
+            return {"status": "inactive", "message": "Waiting for 1DEV->QNC transition"}
             
         node_counts = {t.value: 0 for t in NodeType}
         migrated_count = 0
         
         for node in self.activated_nodes.values():
             node_counts[node.node_type.value] += 1
-            if node.migrated_from_qna:
+            if node.migrated_from_1dev:
                 migrated_count += 1
                 
         return {
@@ -222,6 +222,6 @@ class QNCNodeActivationContract:
             "transition_timestamp": self.transition_timestamp,
             "total_nodes": len(self.activated_nodes),
             "nodes_by_type": node_counts,
-            "migrated_from_qna": migrated_count,
+            "migrated_from_1dev": migrated_count,
             "new_qnc_activations": len(self.activated_nodes) - migrated_count
         } 

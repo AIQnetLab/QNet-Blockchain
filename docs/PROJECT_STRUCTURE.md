@@ -152,7 +152,7 @@ qnet-network (Go) ←→ qnet-consensus (Rust)
 - Memory encryption
 
 ### Economics
-- QNA → QNC transition
+- 1DEV → QNC transition
 - 4-hour reward cycles
 - Halving every 4 years
 - No leader rewards

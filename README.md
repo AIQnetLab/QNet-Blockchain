@@ -561,4 +561,4 @@ QNet is experimental software. Use at your own risk. Always test thoroughly befo
 
 ---
 
-**Built with ❤️ by the QNet Team** 
+**QNet Blockchain Project** 

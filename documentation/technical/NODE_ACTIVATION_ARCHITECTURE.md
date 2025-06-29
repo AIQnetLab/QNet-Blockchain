@@ -7,7 +7,7 @@ QNet operates without a centralized database, using blockchain and distributed s
 
 ### 1. Token Burn on Solana
 ```
-User → Solana Wallet → Burn QNA → Get Transaction Hash
+User → Solana Wallet → Burn 1DEV → Get Transaction Hash
 ```
 
 ### 2. Activation Token Generation
@@ -81,8 +81,8 @@ chmod +x qnet-node
 ```typescript
 // pages/activate-node.tsx
 async function activateNode(nodeType: NodeType) {
-  // 1. Burn QNA tokens via Solana
-  const burnTx = await burnQNATokens(nodeType);
+  // 1. Burn 1DEV tokens via Solana
+const burnTx = await burn1DEVTokens(nodeType);
   
   // 2. Request activation token from API
   const response = await fetch('/api/activate', {

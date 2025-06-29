@@ -212,7 +212,7 @@ Performance:
 ```
 
 **What Happens Automatically**:
-1. **QNA Burn Verification**: Checks Solana blockchain
+1. **1DEV Burn Verification**: Checks Solana blockchain
 2. **P2P Optimization**: Analyzes bootstrap peers for optimal routing
 3. **Regional Clustering**: Creates geographic clusters if beneficial
 4. **Failover Protection**: Monitors node health and adapts
@@ -229,11 +229,11 @@ Performance:
 
 #### Better Economics for Node Operators
 ```
-Super Node ROI Improvement:
-- Hardware: $2,000 (unchanged)
-- QNA Burn: ~$500 (unchanged)
-- Monthly Earnings: ~2,500 QNC (↑25% due to better uptime)
-- ROI Period: 2.5 months (↓20% faster payback)
+Super Node Enhancement:
+- Hardware: Server infrastructure setup
+- 1DEV Burn: Required activation cost (varies by burn rate)
+- Monthly Performance: Enhanced system uptime and capabilities
+- Research Participation: Advanced network contribution features
 ```
 
 ### Technical Architecture
@@ -326,6 +326,6 @@ The unified architecture provides:
 - **Resilience**: Built-in protection against node failures
 - **Simplicity**: One protocol, one configuration
 - **Performance**: Optimal routing for any topology
-- **Economics**: Reduced costs, higher uptime, better ROI
+- **Economics**: Experimental research network with improved efficiency
 
 **Status**: ✅ PRODUCTION READY - Unified P2P with regional intelligence and automatic failover protection successfully implemented. 

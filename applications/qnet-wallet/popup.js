@@ -12,19 +12,8 @@ let walletState = {
     selectedNetwork: 'testnet'
 };
 
-// BIP39 word list (first 100 words for verification options)
-const BIP39_WORDS = [
-    'abandon', 'ability', 'able', 'about', 'above', 'absent', 'absorb', 'abstract', 'absurd', 'abuse',
-    'access', 'accident', 'account', 'accuse', 'achieve', 'acid', 'acoustic', 'acquire', 'across', 'act',
-    'action', 'actor', 'actress', 'actual', 'adapt', 'add', 'addict', 'address', 'adjust', 'admit',
-    'adult', 'advance', 'advice', 'aerobic', 'affair', 'afford', 'afraid', 'again', 'against', 'age',
-    'agent', 'agree', 'ahead', 'aim', 'air', 'airport', 'aisle', 'alarm', 'album', 'alcohol',
-    'alert', 'alien', 'all', 'alley', 'allow', 'almost', 'alone', 'alpha', 'already', 'also',
-    'alter', 'always', 'amateur', 'amazing', 'among', 'amount', 'amused', 'analyst', 'anchor', 'ancient',
-    'anger', 'angle', 'angry', 'animal', 'ankle', 'announce', 'annual', 'another', 'answer', 'antenna',
-    'antique', 'anxiety', 'any', 'apart', 'apology', 'appear', 'apple', 'approve', 'april', 'area',
-    'arena', 'argue', 'arm', 'armed', 'armor', 'army', 'around', 'arrange', 'arrest', 'arrive'
-];
+// PRODUCTION SECURITY: Import full BIP39 validation instead of partial wordlist
+import { secureBIP39 } from './src/crypto/ProductionBIP39.js';
 
 /**
  * Initialize popup when DOM is loaded
@@ -306,10 +295,10 @@ async function handleImportWallet() {
         return;
     }
     
-    // Validate seed phrase
-    const words = seedPhrase.split(/\s+/);
-    if (words.length !== 12 && words.length !== 24) {
-        showInlineError('import-error', 'Seed phrase must be 12 or 24 words');
+    // PRODUCTION SECURITY: Validate imported seed phrase with full BIP39 validation
+    const validation = secureBIP39.validateImportedSeed(seedPhrase);
+    if (!validation.valid) {
+        showInlineError('import-error', validation.error);
         return;
     }
     
@@ -335,15 +324,16 @@ async function handleImportWallet() {
 }
 
 /**
- * Generate a mock mnemonic phrase
+ * Generate secure mnemonic phrase using full BIP39 validation
  */
 function generateMnemonic() {
-    const words = [];
-    for (let i = 0; i < 12; i++) {
-        const randomIndex = Math.floor(Math.random() * BIP39_WORDS.length);
-        words.push(BIP39_WORDS[randomIndex]);
+    try {
+        // PRODUCTION SECURITY: Use full BIP39 library with proper entropy
+        return secureBIP39.generateSecure(12); // 128-bit entropy, industry standard
+    } catch (error) {
+        console.error('Failed to generate secure mnemonic:', error);
+        throw new Error('Failed to generate secure wallet');
     }
-    return words.join(' ');
 }
 
 /**
@@ -440,26 +430,36 @@ function showSeedVerification() {
 }
 
 /**
- * Generate word options for verification
+ * Generate word options for verification using secure BIP39 wordlist
  */
 function generateWordOptions(correctWord) {
     const options = [correctWord];
     
-    // Add 3 random incorrect options
-    while (options.length < 4) {
-        const randomWord = BIP39_WORDS[Math.floor(Math.random() * BIP39_WORDS.length)];
-        if (!options.includes(randomWord)) {
-            options.push(randomWord);
+    try {
+        // PRODUCTION SECURITY: Generate random options from full BIP39 wordlist
+        const tempMnemonic = secureBIP39.generateSecure(24); // Generate 24 words for variety
+        const allWords = tempMnemonic.split(' ');
+        
+        // Add 3 random incorrect options from generated words
+        while (options.length < 4) {
+            const randomWord = allWords[Math.floor(Math.random() * allWords.length)];
+            if (!options.includes(randomWord)) {
+                options.push(randomWord);
+            }
         }
+        
+        // Shuffle options
+        for (let i = options.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [options[i], options[j]] = [options[j], options[i]];
+        }
+        
+        return options;
+    } catch (error) {
+        console.error('Failed to generate word options:', error);
+        // Fallback: just return the correct word
+        return [correctWord];
     }
-    
-    // Shuffle options
-    for (let i = options.length - 1; i > 0; i--) {
-        const j = Math.floor(Math.random() * (i + 1));
-        [options[i], options[j]] = [options[j], options[i]];
-    }
-    
-    return options;
 }
 
 /**

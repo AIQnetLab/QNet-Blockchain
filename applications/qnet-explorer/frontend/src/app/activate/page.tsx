@@ -7,12 +7,19 @@ export default function ActivatePage() {
   const [nodeId, setNodeId] = useState('');
   const [activating, setActivating] = useState(false);
   
-  // Fixed values for Phase 1 (current phase)
+  // CORRECT 1DEV SUPPLY VALUES (Fixed from wrong 10B to correct 1B)
   const currentPhase: 'phase1' | 'phase2' = 'phase1';
-  const burnedTokensPhase1 = 120000;
+  const burnedTokensPhase1 = 150_000_000; // 150 million burned (15% of 1B supply)
   const activeNodes = 156;
 
-  const totalPhase1Supply = 2_000_000;
+  const totalPhase1Supply = 1_000_000_000; // 1 billion 1DEV total supply (pump.fun standard)
+
+  // Phase 1: Universal pricing - ALL node types cost 1500 1DEV
+  const basePricing: Record<string, [number, number]> = {
+    light: [1500, 150],
+    full: [1500, 150],
+    super: [1500, 150]
+  };
 
   const getCostInfo = (type: 'light' | 'full' | 'super') => {
     if (currentPhase === 'phase1') {

@@ -15,16 +15,17 @@ class NodeType(Enum):
 
 @dataclass
 class PricingConfig:
-    """Configuration for node activation pricing"""
-    # Base prices (in QNC/QNA)
-    light_min_price: float = 2_500   # 0.5x multiplier
-    light_max_price: float = 15_000  # 3x multiplier
+    """Configuration for Phase 2 QNC node activation pricing"""
+    # CORRECT Phase 2 Base prices (QNC)
+    light_base_price: float = 5_000   # Light node base cost
+    full_base_price: float = 7_500    # Full node base cost  
+    super_base_price: float = 10_000  # Super node base cost
     
-    full_min_price: float = 3_750    # 0.5x multiplier
-    full_max_price: float = 22_500   # 3x multiplier
-    
-    super_min_price: float = 5_000   # 0.5x multiplier
-    super_max_price: float = 30_000  # 3x multiplier
+    # Network size multipliers (CORRECT implementation)
+    multiplier_0_100k: float = 0.5    # 0-100k nodes: 0.5x
+    multiplier_100k_1m: float = 1.0   # 100k-1M nodes: 1.0x  
+    multiplier_1m_10m: float = 2.0    # 1M-10M nodes: 2.0x
+    multiplier_10m_plus: float = 3.0  # 10M+ nodes: 3.0x
     
     # Target equilibrium points
     target_total_nodes: int = 100_000
@@ -50,37 +51,27 @@ class DynamicPricingCalculator:
         active_nodes: Dict[NodeType, int]
     ) -> float:
         """
-        Calculate activation price for a node type based on active nodes
+        CORRECT Phase 2 QNC pricing: base price * network size multiplier
         
         Args:
             node_type: Type of node to activate
             active_nodes: Current count of active nodes by type
             
         Returns:
-            Price in QNC/QNA tokens
+            Price in QNC tokens
         """
         total_active = sum(active_nodes.values())
         
-        # Handle edge cases
-        if total_active < self.config.min_network_size:
-            # Early network phase - use minimum prices
-            return self._get_min_price(node_type)
+        # Get base price for node type
+        base_price = self._get_base_price(node_type)
         
-        # Calculate network saturation (0 to 1+)
-        saturation = total_active / self.config.target_total_nodes
+        # Get network size multiplier
+        multiplier = self._get_network_multiplier(total_active)
         
-        # Calculate type-specific saturation
-        type_count = active_nodes.get(node_type, 0)
-        target_count = self._get_target_count(node_type, self.config.target_total_nodes)
-        type_saturation = type_count / max(target_count, 1)
+        # Calculate final price
+        final_price = base_price * multiplier
         
-        # Combined saturation factor (weighted average)
-        combined_saturation = 0.7 * saturation + 0.3 * type_saturation
-        
-        # Calculate price using smooth curve
-        price = self._calculate_curve_price(node_type, combined_saturation)
-        
-        return round(price, 2)
+        return int(final_price)
     
     def _calculate_curve_price(self, node_type: NodeType, saturation: float) -> float:
         """Calculate price using quadratic curve"""
@@ -101,21 +92,24 @@ class DynamicPricingCalculator:
             curve_value = math.pow(saturation, self.config.curve_steepness)
             return min_price + price_range * curve_value
     
-    def _get_min_price(self, node_type: NodeType) -> float:
-        """Get minimum price for node type"""
+    def _get_base_price(self, node_type: NodeType) -> float:
+        """Get base price for node type (Phase 2 QNC)"""
         return {
-            NodeType.LIGHT: self.config.light_min_price,
-            NodeType.FULL: self.config.full_min_price,
-            NodeType.SUPER: self.config.super_min_price
+            NodeType.LIGHT: self.config.light_base_price,    # 5000 QNC
+            NodeType.FULL: self.config.full_base_price,      # 7500 QNC
+            NodeType.SUPER: self.config.super_base_price     # 10000 QNC
         }[node_type]
     
-    def _get_max_price(self, node_type: NodeType) -> float:
-        """Get maximum price for node type"""
-        return {
-            NodeType.LIGHT: self.config.light_max_price,
-            NodeType.FULL: self.config.full_max_price,
-            NodeType.SUPER: self.config.super_max_price
-        }[node_type]
+    def _get_network_multiplier(self, total_nodes: int) -> float:
+        """Get network size multiplier for CORRECT Phase 2 pricing"""
+        if total_nodes < 100_000:
+            return self.config.multiplier_0_100k      # 0.5x
+        elif total_nodes < 1_000_000:
+            return self.config.multiplier_100k_1m     # 1.0x
+        elif total_nodes < 10_000_000:
+            return self.config.multiplier_1m_10m      # 2.0x
+        else:
+            return self.config.multiplier_10m_plus    # 3.0x
     
     def _get_target_count(self, node_type: NodeType, total_target: int) -> int:
         """Get target count for node type"""
@@ -142,22 +136,22 @@ class DynamicPricingCalculator:
         return total_value
 
 class TransitionPricingModel:
-    """Handles QNA to QNC transition pricing"""
+    """Handles 1DEV to QNC transition pricing"""
     
     def __init__(self):
         self.transition_period_days = 90
-        self.qna_burn_target = 0.9  # 90% of supply
+        self.onedev_burn_target = 0.9  # 90% of supply
         self.max_transition_years = 5
     
-    def calculate_qna_burn_amount(
+    def calculate_1dev_burn_amount(
         self,
         node_type: NodeType,
         qnc_price: float,
-        qna_burned_ratio: float,
+        onedev_burned_ratio: float,
         days_since_launch: int
     ) -> Tuple[float, str]:
         """
-        Calculate QNA burn amount during transition period
+        Calculate 1DEV burn amount during transition period
         
         Returns:
             (burn_amount, pricing_method)
@@ -165,33 +159,33 @@ class TransitionPricingModel:
         # Check if we should transition to QNC
         years_passed = days_since_launch / 365
         
-        if qna_burned_ratio >= self.qna_burn_target or years_passed >= self.max_transition_years:
+        if onedev_burned_ratio >= self.onedev_burn_target or years_passed >= self.max_transition_years:
             # Transition complete - use QNC only
             return (0, "qnc_only")
         
-        # During transition - QNA burn equals QNC price
+        # During transition - 1DEV burn equals QNC price
         # This creates 1:1 value preservation
-        return (qnc_price, "qna_burn")
+        return (qnc_price, "1dev_burn")
     
     def get_transition_status(
         self,
-        qna_burned_ratio: float,
+        onedev_burned_ratio: float,
         days_since_launch: int
     ) -> Dict[str, any]:
         """Get current transition status"""
         years_passed = days_since_launch / 365
         transition_complete = (
-            qna_burned_ratio >= self.qna_burn_target or 
+            onedev_burned_ratio >= self.onedev_burn_target or 
             years_passed >= self.max_transition_years
         )
         
         return {
             "transition_complete": transition_complete,
-            "qna_burned_percent": qna_burned_ratio * 100,
+            "onedev_burned_percent": onedev_burned_ratio * 100,
             "years_elapsed": years_passed,
-            "burn_target_percent": self.qna_burn_target * 100,
+            "burn_target_percent": self.onedev_burn_target * 100,
             "max_years": self.max_transition_years,
-            "method": "qnc_only" if transition_complete else "qna_burn"
+            "method": "qnc_only" if transition_complete else "1dev_burn"
         }
 
 # Example usage

@@ -2,7 +2,7 @@
 
 ## Overview
 
-The Solana smart contract is a **simple burn counter** that tracks QNA burns.
+The Solana smart contract is a **simple burn counter** that tracks 1DEV burns.
 No business logic, no pricing, no node types - just counting.
 
 ## Contract Purpose
@@ -14,7 +14,7 @@ QNet Blockchain = All Business Logic
 
 ## What It Does
 
-✅ **Tracks total QNA burned**
+✅ **Tracks total 1DEV burned**
 ✅ **Records burn transactions**
 ✅ **Provides burn statistics**
 
@@ -46,7 +46,7 @@ get_burn_stats() -> BurnStats {
 
 ## Usage
 
-1. User burns QNA tokens on Solana
+1. User burns 1DEV tokens on Solana
 2. Contract records the burn with `record_burn()`
 3. Anyone can query statistics with `get_burn_stats()`
 4. Total burned amount is publicly verifiable

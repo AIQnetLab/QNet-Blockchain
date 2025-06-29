@@ -130,8 +130,8 @@ def root():
             "/api/v1/contracts/templates": "Get contract templates",
             "/api/v1/pricing/current_prices": "Get current node activation prices",
             "/api/v1/pricing/price_for_node": "Get price for specific node type",
-            "/api/v1/pricing/burn_progress": "Get QNA burn progress",
-            "/api/v1/pricing/value_preservation": "Calculate QNA value preservation",
+            "/api/v1/pricing/burn_progress": "Get 1DEV burn progress",
+            "/api/v1/pricing/value_preservation": "Calculate 1DEV value preservation",
             "/api/v1/pricing/price_history": "Get historical pricing data",
             "/api/v1/pricing/simulate_pricing": "Simulate pricing scenarios"
         }

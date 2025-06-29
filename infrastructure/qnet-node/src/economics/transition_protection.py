@@ -1,6 +1,6 @@
 """
 Transition Protection Module
-Prevents price shocks during QNA to QNC transition
+Prevents price shocks during 1DEV to QNC transition
 """
 
 from typing import Dict, Optional
@@ -99,12 +99,12 @@ class TransitionProtectionManager:
     
     def calculate_transition_metrics(
         self,
-        qna_burned: float,
-        qna_total_supply: float,
+        onedev_burned: float,
+        onedev_total_supply: float,
         days_elapsed: int
     ) -> Dict[str, any]:
         """Calculate comprehensive transition metrics"""
-        burn_ratio = qna_burned / qna_total_supply if qna_total_supply > 0 else 0
+        burn_ratio = onedev_burned / onedev_total_supply if onedev_total_supply > 0 else 0
         years_elapsed = days_elapsed / 365
         
         # Transition progress (0-1)
@@ -205,17 +205,13 @@ if __name__ == "__main__":
     print(f"Protected price: {protected_price}")
     print(f"Change limited to: {((protected_price - previous_price) / previous_price * 100):.1f}%")
     
-    # Test QNA holder benefits
-    benefits = protection.get_qna_holder_benefits(
-        is_qna_holder=True,
-        days_since_transition=15
-    )
-    print(f"\nQNA Holder Benefits: {benefits}")
-    
-    # Test transition metrics
+    # Test transition metrics  
     metrics = protection.calculate_transition_metrics(
-        qna_burned=8_500_000_000,  # 85% burned
-        qna_total_supply=10_000_000_000,
+        onedev_burned=850_000_000,  # 85% burned (850M out of 1B total supply)
+        onedev_total_supply=1_000_000_000,  # 1 billion 1DEV total supply
         days_elapsed=730  # 2 years
     )
-    print(f"\nTransition Metrics: {metrics}") 
+    print(f"\nTransition Metrics: {metrics}")
+    print(f"Burn progress: {metrics['burn_percentage']:.1f}% of 1DEV supply") 
+    print(f"Transition phase: {metrics['transition_phase']}")
+    print(f"Estimated completion: {metrics['estimated_days_to_completion']:.0f} days") 

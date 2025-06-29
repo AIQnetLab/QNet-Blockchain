@@ -118,7 +118,7 @@ burn_address = 1nc1nerator11111111111111111111111111111111
 Update these files with new mint address:
 - `qnet-node/src/api/activation_bridge_api.py`
 - `qnet-integration/src/solana_integration.rs`
-- Any other files referencing `qna_mint_address`
+- Any other files referencing `onedev_mint_address`
 
 ## 🧪 Testing the Token
 

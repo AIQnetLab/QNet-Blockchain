@@ -15,8 +15,8 @@ export default function NodesPage() {
 
   const getCostRange = (type: 'light' | 'full' | 'super'): string => {
     const currentPhase: 'phase1' | 'phase2' = 'phase1';
-    const burnedTokensPhase1 = 120_000;
-    const totalPhase1Supply = 2_000_000;
+    const burnedTokensPhase1 = 150_000_000; // 150 million burned (15% of 1B supply)
+    const totalPhase1Supply = 1_000_000_000; // 1 billion 1DEV total supply (pump.fun standard)
     const activeNodes = 156;
 
     if (currentPhase === 'phase1') {

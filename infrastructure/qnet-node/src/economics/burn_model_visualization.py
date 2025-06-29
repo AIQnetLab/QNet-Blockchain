@@ -9,7 +9,7 @@ def format_number(num):
     return f"{int(num):,}"
 
 def main():
-    calculator = QNABurnCalculator()
+    calculator = OneDEVBurnCalculator()
     
     # Test points for visualization
     test_points = [
@@ -29,22 +29,22 @@ def main():
     ]
     
     print("=" * 80)
-    print("QNA BURN MODEL - ACTIVATION PRICES")
+    print("1DEV BURN MODEL - ACTIVATION PRICES")
     print("=" * 80)
-    print("\nStarting prices:")
-    print(f"  Light Node:  1,000 QNA")
-    print(f"  Full Node:   1,500 QNA")
-    print(f"  Super Node:  2,000 QNA")
+    print("\nStarting prices (Universal - ALL node types):")
+    print(f"  Light Node:  1,500 1DEV")
+    print(f"  Full Node:   1,500 1DEV")
+    print(f"  Super Node:  1,500 1DEV")
     print("\nMinimum prices (floor):")
-    print(f"  Light Node:    100 QNA")
-    print(f"  Full Node:     150 QNA")
-    print(f"  Super Node:    200 QNA")
+    print(f"  Light Node:    150 1DEV")
+    print(f"  Full Node:     150 1DEV")
+    print(f"  Super Node:    150 1DEV")
     print("\n" + "-" * 80)
     print(f"{'Burned':<12} {'Percent':<8} {'Light':<12} {'Full':<12} {'Super':<12} {'Note'}")
     print("-" * 80)
     
     for ratio, label in test_points:
-        burned = ratio * 10_000_000_000
+        burned = ratio * 1_000_000_000  # 1 billion 1DEV total supply
         
         # Get prices for each node type
         light_req = calculator.calculate_burn_requirement(NodeType.LIGHT, burned)
@@ -52,7 +52,7 @@ def main():
         super_req = calculator.calculate_burn_requirement(NodeType.SUPER, burned)
         
         # Format output
-        burned_str = f"{burned/1_000_000_000:.1f}B" if burned >= 1_000_000_000 else f"{burned/1_000_000:.0f}M"
+        burned_str = f"{burned/1_000_000:.0f}M" if burned >= 1_000_000 else f"{burned/1_000:.0f}K"
         
         note = ""
         if ratio == 0:
@@ -90,7 +90,7 @@ def main():
     initial_super = calculator.calculate_burn_requirement(NodeType.SUPER, 0)['amount']
     
     for ratio, description in entry_points:
-        burned = ratio * 10_000_000_000
+        burned = ratio * 1_000_000_000
         
         light_price = calculator.calculate_burn_requirement(NodeType.LIGHT, burned)['amount']
         full_price = calculator.calculate_burn_requirement(NodeType.FULL, burned)['amount']
@@ -101,9 +101,9 @@ def main():
         super_savings = ((initial_super - super_price) / initial_super) * 100
         
         print(f"\n{description}:")
-        print(f"  Light: {format_number(light_price)} QNA (save {light_savings:.0f}%)")
-        print(f"  Full:  {format_number(full_price)} QNA (save {full_savings:.0f}%)")
-        print(f"  Super: {format_number(super_price)} QNA (save {super_savings:.0f}%)")
+        print(f"  Light: {format_number(light_price)} 1DEV (save {light_savings:.0f}%)")
+        print(f"  Full:  {format_number(full_price)} 1DEV (save {full_savings:.0f}%)")
+        print(f"  Super: {format_number(super_price)} 1DEV (save {super_savings:.0f}%)")
     
     # Whitelist benefits
     print("\n" + "=" * 80)

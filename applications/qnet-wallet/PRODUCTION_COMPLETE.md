@@ -52,7 +52,7 @@ src/
 - **Transaction Confirmation** - Proper confirmation waiting
 
 ### 🎯 Node Activation
-- **Dynamic Pricing** - Cost reduction based on burn progress (1500→150 1DEV)
+- **Dynamic Pricing** - Cost reduction based on burn progress (1500 1DEV base, decreases until Phase 2)
 - **Real Transactions** - Actual token burning on Solana blockchain
 - **Activation Codes** - Unique codes generated from transaction hashes
 - **Progress Tracking** - Burn ratio and phase transition monitoring
@@ -86,7 +86,7 @@ src/
 - **Solana RPC**: `https://api.devnet.solana.com`
 - **1DEV Mint**: `9GcdXAo2EyjNdNLuQoScSVbfJSnh9RdkSS8YYKnGQ8Pf`
 - **Derivation Path**: `m/44'/501'/0'/0'` (Solana standard)
-- **Base Cost**: 1500 1DEV → 150 1DEV (90% burn progress)
+- **Base Cost**: 1500 1DEV (decreases with burn progress until Phase 2 transition)
 
 ## Installation
 

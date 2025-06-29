@@ -217,7 +217,7 @@ class NodeActivationRouter:
                 "phase": "QNC",
                 "token": "QNC",
                 "amount": price,
-                "method": "burn_qnc",
+                "method": "spend_qnc_to_pool3",
                 "contract": "qnet_native"
             }
         else:

@@ -404,18 +404,18 @@ Week 4: Go-Live Preparation
 ### **Infrastructure Costs (Monthly)**
 ```yaml
 Monitoring Infrastructure:
-  - Prometheus/Grafana servers: $200/month
-  - ELK Stack: $300/month
-  - Metrics storage: $150/month
-  - Alerting services: $100/month
+  - Prometheus/Grafana servers: Standard hosting
+  - ELK Stack: Standard hosting
+  - Metrics storage: Standard hosting
+  - Alerting services: Standard hosting
 
 Third-Party Services:
-  - Firebase Analytics: $50/month
-  - PagerDuty: $150/month
-  - Security monitoring: $200/month
+  - Firebase Analytics: Standard plan
+  - PagerDuty: Standard plan
+  - Security monitoring: Standard hosting
 
-Total Estimated Cost: $1,150/month
-Annual Cost: ~$14,000
+Total Infrastructure: Standard hosting requirements
+Annual Cost: Variable based on usage
 ```
 
 ### **Team Requirements**
@@ -424,7 +424,7 @@ DevOps Engineer: 0.5 FTE (monitoring maintenance)
 SRE Engineer: 1.0 FTE (incident response)
 Security Analyst: 0.3 FTE (security monitoring)
 
-Additional Cost: ~$150k/year in personnel
+Additional Requirements: Dedicated monitoring team
 ```
 
 ---

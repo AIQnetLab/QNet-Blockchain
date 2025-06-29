@@ -1,7 +1,7 @@
 import { type NextRequest, NextResponse } from 'next/server';
 import crypto from 'crypto';
 
-// Node prices in QNA tokens - ALL SAME PRICE
+// Node prices in 1DEV tokens - ALL SAME PRICE
 const NODE_PRICES = {
   light: 1500,
   full: 1500,

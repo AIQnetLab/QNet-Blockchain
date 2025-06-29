@@ -842,7 +842,7 @@ def request_activation_token():
 
     # Load configuration values
     solana_rpc_url = app_config.get("Solana", "rpc_url", fallback="https://api.devnet.solana.com")
-    qna_mint_address = app_config.get("Token", "qna_mint_address")
+    onedev_mint_address = app_config.get("Token", "dev_mint_address")
     
     # Get dynamic burn requirement based on node type
     node_type = data.get("node_type", "light").lower()
@@ -906,19 +906,19 @@ def request_activation_token():
         return jsonify({"error": "Issuer key configuration error on server."}), 500
 
     # Enhanced check for configuration values after loading them
-    logger.debug(f"Config values - qna_mint_address: '{qna_mint_address}'")
+    logger.debug(f"Config values - onedev_mint_address: '{onedev_mint_address}'")
     logger.debug(f"Config values - onedev_required_units: {onedev_required_units} (type: {type(onedev_required_units)})")
     logger.debug(f"Config values - solana_burn_address: '{solana_burn_address}'")
 
     if not all([
-        qna_mint_address,
+        onedev_mint_address,
         onedev_required_units is not None and isinstance(onedev_required_units, int),
         onedev_required_units is not None and onedev_required_units > 0,
         solana_burn_address
     ]):
         logger.error(
             f"CRITICAL: Token or Solana burn configuration missing or invalid. "
-            f"Mint: {qna_mint_address is not None}, RequiredUnits_is_int: {isinstance(onedev_required_units, int)}, "
+            f"Mint: {onedev_mint_address is not None}, RequiredUnits_is_int: {isinstance(onedev_required_units, int)}, "
             f"RequiredUnits_value: {onedev_required_units}, BurnAddr: {solana_burn_address is not None}"
         )
         return jsonify({"error": "Server token or burn address configuration error (onedev_required_units might be missing, not an int, or not > 0)."}), 500
@@ -946,7 +946,7 @@ def request_activation_token():
     # Verify Solana burn transaction
     is_burn_tx_valid, burn_tx_reason, burn_details = check_solana_burn_tx_details(
         solana_client, solana_txid, solana_pubkey_user,
-        qna_mint_address, solana_burn_address, onedev_required_units
+        onedev_mint_address, solana_burn_address, onedev_required_units
     )
     if not is_burn_tx_valid:
         logger.warning(f"Solana burn tx {solana_txid} verification failed for {solana_pubkey_user}: {burn_tx_reason}")
@@ -1082,7 +1082,7 @@ def get_config_info():
             "burn_address": app_config.get("Solana", "burn_address", fallback="not_configured")
         },
         "token": {
-            "mint_address": app_config.get("Token", "qna_mint_address", fallback="not_configured"),
+            "mint_address": app_config.get("Token", "dev_mint_address", fallback="not_configured"),
             "required_burn_units": app_config.getint("Token", "onedev_required_burn_units", fallback=0)
         },
         "activation": {

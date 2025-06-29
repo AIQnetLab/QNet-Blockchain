@@ -240,7 +240,7 @@ async def get_stats():
 
 @app.post("/node/activate", tags=["Node"])
 async def activate_node(node_type: str, burn_amount: float):
-    """Activate a node by burning QNA"""
+    """Activate a node by burning 1DEV (Phase 1) or spending QNC to Pool 3 (Phase 2)"""
     if node_type not in ["light", "full", "super"]:
         raise HTTPException(status_code=400, detail="Invalid node type")
     

@@ -53,7 +53,7 @@ struct Args {
     #[arg(long)]
     producer: bool,
     
-    /// QNA wallet private key for burn verification
+    /// 1DEV wallet private key for burn verification
     #[arg(long)]
     wallet_key: Option<String>,
     
@@ -82,9 +82,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Display configuration
     display_node_config(&args, &node_type, &region);
     
-    // Verify QNA burn if required for production
+    // Verify 1DEV burn if required for production
     if std::env::var("QNET_PRODUCTION").unwrap_or_default() == "1" {
-        verify_qna_burn(&args, &node_type).await?;
+        verify_1dev_burn(&args, &node_type).await?;
     }
     
     // Create blockchain node with production optimizations
@@ -237,27 +237,27 @@ fn display_node_config(args: &Args, node_type: &NodeType, region: &Region) {
     }
 }
 
-async fn verify_qna_burn(args: &Args, node_type: &NodeType) -> Result<(), String> {
-    // Production QNA burn verification
+async fn verify_1dev_burn(args: &Args, node_type: &NodeType) -> Result<(), String> {
+    // Production 1DEV burn verification - Universal pricing for all node types
     let required_burn = match node_type {
-        NodeType::Light => 100.0,
-        NodeType::Full => 150.0, 
-        NodeType::Super => 200.0,
+        NodeType::Light => 1500.0,
+        NodeType::Full => 1500.0, 
+        NodeType::Super => 1500.0,
     };
     
     if let Some(wallet_key) = &args.wallet_key {
-        println!("🔐 Verifying QNA burn on Solana blockchain...");
+        println!("🔐 Verifying 1DEV burn on Solana blockchain...");
         
         // In production: Query Solana blockchain for burn proof
         let burn_verified = simulate_solana_burn_check(wallet_key, required_burn).await;
         
         if burn_verified {
-            println!("✅ QNA burn verified: {} QNA", required_burn);
+            println!("✅ 1DEV burn verified: {} 1DEV", required_burn);
         } else {
-            return Err(format!("❌ QNA burn verification failed. Required: {} QNA", required_burn));
+            return Err(format!("❌ 1DEV burn verification failed. Required: {} 1DEV", required_burn));
         }
     } else if std::env::var("QNET_SKIP_BURN_CHECK").unwrap_or_default() != "1" {
-        return Err("Production mode requires QNA burn verification. Use --wallet-key or set QNET_SKIP_BURN_CHECK=1".to_string());
+        return Err("Production mode requires 1DEV burn verification. Use --wallet-key or set QNET_SKIP_BURN_CHECK=1".to_string());
     }
     
     Ok(())

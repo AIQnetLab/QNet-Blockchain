@@ -78,16 +78,16 @@ export default function ClientWrapper({
   // ---- Activation pricing logic ----
   // Forcing Phase 1 as requested by user. Contract/API will drive this later.
   const currentPhase: 'phase1' | 'phase2' = 'phase1';
-  const burnedTokensPhase1 = 120_000;                // TODO: fetch real burned amount
-  const totalPhase1Supply = 2_000_000;              // Total 1DEV supply allocated for burns
+  const burnedTokensPhase1 = 150_000_000;        // 150 million 1DEV burned (15% of 1B supply)
+  const totalPhase1Supply = 1_000_000_000;        // 1 billion 1DEV total supply (pump.fun standard)
   const activeNodes = 156;                          // TODO: fetch real active node count
 
   const getCostRange = (type: 'light' | 'full' | 'super'): string => {
     if (currentPhase === 'phase1') {
       const base: Record<'light' | 'full' | 'super', [number,number]> = {
         light: [1500,150],
-        full: [2250,225],
-        super:[3000,300]
+        full: [1500,150],
+        super: [1500,150]
       };
       const burnedPercent = Math.min(1, burnedTokensPhase1 / totalPhase1Supply);
       const [start,end] = base[type];

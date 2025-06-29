@@ -1,0 +1,40 @@
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+pydantic==2.5.0
+python-multipart==0.0.6
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+aiofiles==23.2.1
+aiohttp==3.9.1
+redis==5.0.1
+asyncio-mqtt==0.16.1
+cryptography==41.0.8
+requests==2.31.0
+websockets==12.0
+httpx==0.25.2
+
+# Solana integration
+solana==0.30.2
+solders==0.18.1
+anchorpy==0.19.1
+
+# Database
+databases[postgresql]==0.8.0
+sqlalchemy==2.0.23
+alembic==1.13.1
+
+# Monitoring and logging
+prometheus-client==0.19.0
+sentry-sdk[fastapi]==1.38.0
+structlog==23.2.0
+
+# Security
+python-dotenv==1.0.0
+bcrypt==4.1.2
+pyjwt==2.8.0
+
+# Development
+pytest==7.4.3
+pytest-asyncio==0.21.1
+black==23.11.0
+flake8==6.1.0 

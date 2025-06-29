@@ -1,0 +1,27 @@
+[package]
+name = "1dev-burn-contract"
+version = "0.1.0"
+description = "Simple 1DEV burn tracker for QNet Phase 1 - no business logic"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "onedev_burn_contract"
+
+[features]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+cpi = ["no-entrypoint"]
+default = []
+
+[dependencies]
+anchor-lang = "0.29.0"
+anchor-spl = "0.29.0"
+solana-program = "1.17.0"
+
+[dev-dependencies]
+anchor-client = "0.29.0"
+solana-sdk = "1.17.0"
+solana-program-test = "1.17.0"
+tokio = { version = "1", features = ["full"] } 

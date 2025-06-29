@@ -2,24 +2,24 @@
 
 ## Overview
 
-This guide explains how QNet integrates with the QNA burn contract on Solana for node activation.
+This guide explains how QNet integrates with the 1DEV burn contract on Solana for node activation.
 
 ## Architecture
 
 ```
 ┌─────────────────┐         ┌──────────────────┐         ┌─────────────────┐
 │                 │         │                  │         │                 │
-│  User Wallet    │────────▶│  QNA Burn        │────────▶│  QNet Node      │
-│  (Phantom etc)  │  Burn   │  Contract        │  Verify │  Software       │
-│                 │  QNA    │  (Solana)        │  PDA    │                 │
+│  User Wallet    │────────▶│  1DEV Burn       │────────▶│  QNet Node      │
+│  (Phantom)      │  Burn   │  Contract        │  Verify │  (Rust)         │
+│                 │  1DEV   │  (Solana)        │  PDA    │                 │
 └─────────────────┘         └──────────────────┘         └─────────────────┘
 ```
 
 ## Node Activation Flow
 
-### 1. User Burns QNA (Solana)
+### 1. User Burns 1DEV (Solana)
 ```typescript
-// User connects wallet and burns QNA
+// User connects wallet and burns 1DEV
 const tx = await program.methods
   .burnForNode(
     nodeType,           // LightNode, FullNode, or SuperNode
@@ -29,8 +29,8 @@ const tx = await program.methods
     burnState: burnStatePDA,
     nodeActivation: nodeActivationPDA,
     user: wallet.publicKey,
-    userTokenAccount: userQnaAccount,
-    qnaMint: QNA_MINT,
+    userTokenAccount: user1devAccount,
+    onedevMint: ONEDEV_MINT,
     tokenProgram: TOKEN_PROGRAM_ID,
     systemProgram: SystemProgram.programId,
   })
@@ -47,7 +47,7 @@ pub async fn verify_node_activation(
     // Calculate PDA address
     let (pda, _) = Pubkey::find_program_address(
         &[b"node", node_pubkey.as_ref()],
-        &QNA_BURN_PROGRAM_ID,
+        &ONEDEV_BURN_PROGRAM_ID,
     );
     
     // Fetch account data from Solana
@@ -96,7 +96,7 @@ async fn start_node() -> Result<()> {
     println!("Node activated!");
     println!("Type: {:?}", activation.node_type);
     println!("Activated: {}", activation.activation_timestamp);
-    println!("QNA burned: {}", activation.qna_burned);
+    println!("1DEV burned: {}", activation.onedev_burned);
     
     // Start node with appropriate permissions
     match activation.node_type {
@@ -114,9 +114,9 @@ async fn start_node() -> Result<()> {
 // Check current burn status
 const burnState = await program.account.burnState.fetch(burnStatePDA);
 
-console.log(`Total burned: ${burnState.totalBurned} QNA`);
+console.log(`Total burned: ${burnState.totalBurned} 1DEV`);
 console.log(`Total nodes: ${burnState.totalNodes}`);
-console.log(`Current price: ${burnState.currentPrice} QNA`);
+console.log(`Current price: ${burnState.currentPrice} 1DEV`);
 console.log(`Transition completed: ${burnState.transitionCompleted}`);
 ```
 
@@ -205,7 +205,7 @@ anchor deploy --provider.cluster devnet
    - Verify PDA derivation
 
 2. **"Insufficient balance"**
-   - Check QNA token balance
+   - Check 1DEV token balance
    - Ensure correct token account
    - Verify current price
 

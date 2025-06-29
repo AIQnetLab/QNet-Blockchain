@@ -238,5 +238,4 @@ This release represents a major milestone in QNet development:
 
 ---
 
-*Built with ❤️ by the QNet Team*  
-*Powered by Rust, Next.js, and Post-Quantum Cryptography* 
+**QNet Project Release Notes** 

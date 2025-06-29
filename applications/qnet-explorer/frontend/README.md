@@ -14,7 +14,7 @@ Modern Next.js frontend for QNet Blockchain Explorer with **Quantum UI Design Sy
 ### 🔗 Solana Wallet Integration
 - **Multi-wallet support**: Phantom, Solflare, Backpack, Brave, Slope, Coin98, Exodus
 - **Custom styled** Solana Wallet Adapter
-- **QNA token management** for node activation
+- **1DEV token management** for node activation
 - **Seamless integration** with QNet Activation Bridge API
 
 ### 🚀 Modern Tech Stack
@@ -186,7 +186,7 @@ Navigate to [http://localhost:3000](http://localhost:3000)
 - [ ] **Performance metrics** dashboard
 
 ### Phase 4: Solana Integration
-- [ ] **QNA token staking** interface
+- [ ] **1DEV token staking** interface
 - [ ] **Cross-chain bridge** visualization  
 - [ ] **Activation history** tracking
 - [ ] **Multi-wallet management** for node operators

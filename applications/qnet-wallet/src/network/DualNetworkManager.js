@@ -1,125 +1,51 @@
 /**
- * Dual Network Manager for QNet Wallet
- * Manages both Solana (Phase 1 activation) and QNet (node management) networks
+ * QNet Dual Network Manager
+ * Manages switching between Solana and QNet networks
+ * Handles EON address generation and cross-chain operations
  */
 
-import { Connection, PublicKey, clusterApiUrl } from '@solana/web3.js';
+import { Connection, PublicKey } from '@solana/web3.js';
+import { secureBIP39 } from '../crypto/ProductionBIP39.js';
 
 export class DualNetworkManager {
     constructor() {
+        this.currentNetwork = 'solana'; // Start with Solana for Phase 1
         this.networks = {
             solana: {
-                name: 'Solana',
-                rpc: 'https://api.devnet.solana.com',
+                rpcUrl: 'https://api.mainnet-beta.solana.com',
                 connection: null,
-                connected: false,
-                purpose: 'Phase 1 activation (1DEV burn)'
+                wallet: null
             },
             qnet: {
-                name: 'QNet',
-                rpc: 'http://localhost:8080',
+                rpcUrl: 'https://api.qnet.network',
                 connection: null,
-                connected: false,
-                purpose: 'Node management + Phase 2 activation'
+                wallet: null
             }
         };
-        
-        this.currentNetwork = 'solana'; // Default to Solana for Phase 1
-        this.phase = 1; // Current network phase
-        this.listeners = new Set();
+        this.currentPhase = 1; // Will be detected dynamically
     }
 
     /**
-     * Initialize dual network connections
+     * Initialize network connections
      */
     async initialize() {
         try {
             // Initialize Solana connection
-            await this.initializeSolana();
-            
-            // Initialize QNet connection
-            await this.initializeQNet();
-            
-            // Detect current phase
-            await this.detectCurrentPhase();
-            
-            console.log('Dual network manager initialized successfully');
-            this.notifyListeners('initialized', { networks: this.networks, phase: this.phase });
-            
-        } catch (error) {
-            console.error('Failed to initialize dual network manager:', error);
-            throw error;
-        }
-    }
-
-    /**
-     * Initialize Solana network connection
-     */
-    async initializeSolana() {
-        try {
             this.networks.solana.connection = new Connection(
-                this.networks.solana.rpc,
+                this.networks.solana.rpcUrl,
                 'confirmed'
             );
-            
-            // Test connection
-            const version = await this.networks.solana.connection.getVersion();
-            this.networks.solana.connected = true;
-            this.networks.solana.version = version;
-            
-            console.log('Solana network connected:', version);
-            
-        } catch (error) {
-            console.warn('Solana network connection failed:', error);
-            this.networks.solana.connected = false;
-        }
-    }
 
-    /**
-     * Initialize QNet network connection
-     */
-    async initializeQNet() {
-        try {
-            // Test QNet RPC connection
-            const response = await fetch(`${this.networks.qnet.rpc}/api/v1/status`, {
-                method: 'GET',
-                headers: { 'Content-Type': 'application/json' }
-            });
-            
-            if (response.ok) {
-                const status = await response.json();
-                this.networks.qnet.connected = true;
-                this.networks.qnet.status = status;
-                console.log('QNet network connected:', status);
-            } else {
-                throw new Error(`QNet RPC returned ${response.status}`);
-            }
-            
-        } catch (error) {
-            console.warn('QNet network connection failed:', error);
-            this.networks.qnet.connected = false;
-        }
-    }
+            // Initialize QNet connection (custom RPC client)
+            this.networks.qnet.connection = await this.createQNetConnection();
 
-    /**
-     * Detect current network phase
-     */
-    async detectCurrentPhase() {
-        try {
-            // Check burn percentage from Solana
-            const burnedPercent = await this.getBurnedPercentFromSolana();
-            
-            // Check network age from QNet
-            const timeElapsed = await this.getNetworkAgeFromQNet();
-            
-            // Phase 2 triggers when 90% burned OR 5 years elapsed
-            this.phase = (burnedPercent >= 90 || timeElapsed >= 5) ? 2 : 1;
-            
-            console.log(`Current phase: ${this.phase} (${burnedPercent}% burned, ${timeElapsed} years)`);
-            
+            // Detect current phase
+            this.currentPhase = await this.detectCurrentPhase();
+
+            return true;
         } catch (error) {
-            console.warn('Phase detection failed, defaulting to Phase 1:', error);
-            this.phase = 1;
+            console.error('Failed to initialize networks:', error);
+            throw error;
         }
     }
 
@@ -127,271 +53,394 @@ export class DualNetworkManager {
      * Switch to Solana network
      */
     async switchToSolana() {
-        if (!this.networks.solana.connected) {
-            await this.initializeSolana();
+        try {
+            this.currentNetwork = 'solana';
+            
+            // Update UI to show Solana interface
+            await this.updateNetworkUI('solana');
+            
+            // Load Solana balances
+            const balances = await this.getSolanaBalances();
+            
+            return {
+                network: 'solana',
+                address: this.networks.solana.wallet?.publicKey?.toString(),
+                balances: balances,
+                phase: this.currentPhase,
+                ui: 'activation' // Show activation UI for Phase 1
+            };
+        } catch (error) {
+            throw new Error(`Failed to switch to Solana: ${error.message}`);
         }
-        
-        this.currentNetwork = 'solana';
-        this.notifyListeners('networkChanged', { 
-            network: 'solana', 
-            purpose: this.networks.solana.purpose 
-        });
-        
-        console.log('Switched to Solana network');
-        return this.networks.solana;
     }
 
     /**
      * Switch to QNet network
      */
     async switchToQNet() {
-        if (!this.networks.qnet.connected) {
-            await this.initializeQNet();
-        }
-        
-        this.currentNetwork = 'qnet';
-        this.notifyListeners('networkChanged', { 
-            network: 'qnet', 
-            purpose: this.networks.qnet.purpose 
-        });
-        
-        console.log('Switched to QNet network');
-        return this.networks.qnet;
-    }
-
-    /**
-     * Get current network info
-     */
-    getCurrentNetwork() {
-        return {
-            name: this.currentNetwork,
-            ...this.networks[this.currentNetwork]
-        };
-    }
-
-    /**
-     * Get all network status
-     */
-    getNetworkStatus() {
-        return {
-            current: this.currentNetwork,
-            phase: this.phase,
-            networks: this.networks
-        };
-    }
-
-    /**
-     * Get burned percentage from Solana blockchain
-     */
-    async getBurnedPercentFromSolana() {
-        if (!this.networks.solana.connected) {
-            return 0;
-        }
-
         try {
-            // Query burn tracker contract for burn statistics
-            // This would connect to the actual Solana burn contract
-            // For now, return mock data based on current development
-            return 25; // 25% burned (example)
+            this.currentNetwork = 'qnet';
             
+            // Generate or load EON address
+            const eonAddress = await this.getOrCreateEonAddress();
+            
+            // Update UI to show QNet interface
+            await this.updateNetworkUI('qnet');
+            
+            // Load QNet balances and node info
+            const balances = await this.getQNetBalances(eonAddress);
+            const nodeInfo = await this.getNodeInfo(eonAddress);
+            
+            return {
+                network: 'qnet',
+                address: eonAddress,
+                balances: balances,
+                nodeInfo: nodeInfo,
+                phase: this.currentPhase,
+                ui: this.currentPhase === 2 ? 'native_activation' : 'node_management'
+            };
         } catch (error) {
-            console.warn('Failed to get burn percentage:', error);
-            return 0;
+            throw new Error(`Failed to switch to QNet: ${error.message}`);
         }
     }
 
     /**
-     * Get network age from QNet blockchain
+     * Generate EON address format: 7a9bk4f2eon8x3m5z1c7
      */
-    async getNetworkAgeFromQNet() {
-        if (!this.networks.qnet.connected) {
-            return 0;
-        }
-
+    async generateEonAddress(seedPhrase) {
         try {
-            const response = await fetch(`${this.networks.qnet.rpc}/api/v1/network/age`);
-            if (response.ok) {
-                const data = await response.json();
-                return data.years || 0;
+            // Derive seed from mnemonic
+            const seed = await secureBIP39.importFromExternalWallet(seedPhrase, '');
+            
+            // Generate address components
+            const part1 = this.generateAddressPart(seed.seed.slice(0, 8));
+            const part2 = this.generateAddressPart(seed.seed.slice(8, 16));
+            const checksum = this.calculateAddressChecksum(part1 + part2);
+            
+            return `${part1}eon${part2}${checksum}`;
+        } catch (error) {
+            throw new Error(`Failed to generate EON address: ${error.message}`);
+        }
+    }
+
+    /**
+     * Generate address part from seed bytes
+     */
+    generateAddressPart(seedBytes) {
+        const chars = '0123456789abcdefghijklmnopqrstuvwxyz';
+        let result = '';
+        
+        for (let i = 0; i < 8; i++) {
+            const byte = seedBytes[i] || 0;
+            result += chars[byte % chars.length];
+        }
+        
+        return result;
+    }
+
+    /**
+     * Calculate checksum for EON address
+     */
+    calculateAddressChecksum(addressPart) {
+        // Simple checksum algorithm
+        let hash = 0;
+        for (let i = 0; i < addressPart.length; i++) {
+            hash = ((hash << 5) - hash + addressPart.charCodeAt(i)) & 0xffffffff;
+        }
+        
+        const chars = '0123456789abcdef';
+        return Math.abs(hash % 65536).toString(16).padStart(4, '0');
+    }
+
+    /**
+     * Get or create EON address for current wallet
+     */
+    async getOrCreateEonAddress() {
+        try {
+            // Check if EON address already exists in storage
+            const stored = await this.loadFromStorage('qnet_eon_address');
+            if (stored) {
+                return stored;
             }
-            return 0;
+
+            // Generate new EON address from wallet seed
+            const walletData = await this.loadFromStorage('qnet_wallet_data');
+            if (!walletData?.mnemonic) {
+                throw new Error('No wallet found for EON address generation');
+            }
+
+            const eonAddress = await this.generateEonAddress(walletData.mnemonic);
             
+            // Store EON address
+            await this.saveToStorage('qnet_eon_address', eonAddress);
+            
+            return eonAddress;
         } catch (error) {
-            console.warn('Failed to get network age:', error);
-            return 0;
+            throw new Error(`Failed to get EON address: ${error.message}`);
         }
     }
 
     /**
-     * Get Solana connection
+     * Detect current QNet phase
      */
-    getSolanaConnection() {
-        return this.networks.solana.connection;
-    }
-
-    /**
-     * Get QNet RPC URL
-     */
-    getQNetRPC() {
-        return this.networks.qnet.rpc;
-    }
-
-    /**
-     * Execute network-specific operation
-     */
-    async executeNetworkOperation(operation, params) {
-        const network = this.getCurrentNetwork();
-        
-        switch (this.currentNetwork) {
-            case 'solana':
-                return await this.executeSolanaOperation(operation, params);
-            case 'qnet':
-                return await this.executeQNetOperation(operation, params);
-            default:
-                throw new Error(`Unsupported network: ${this.currentNetwork}`);
-        }
-    }
-
-    /**
-     * Execute Solana-specific operation
-     */
-    async executeSolanaOperation(operation, params) {
-        if (!this.networks.solana.connected) {
-            throw new Error('Solana network not connected');
-        }
-
-        switch (operation) {
-            case 'getBalance':
-                return await this.networks.solana.connection.getBalance(new PublicKey(params.address));
-            case 'getTokenBalance':
-                return await this.getTokenBalance(params.address, params.mint);
-            case 'sendTransaction':
-                return await this.networks.solana.connection.sendTransaction(params.transaction);
-            default:
-                throw new Error(`Unsupported Solana operation: ${operation}`);
-        }
-    }
-
-    /**
-     * Execute QNet-specific operation
-     */
-    async executeQNetOperation(operation, params) {
-        if (!this.networks.qnet.connected) {
-            throw new Error('QNet network not connected');
-        }
-
-        const response = await fetch(`${this.networks.qnet.rpc}/api/v1/${operation}`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(params)
-        });
-
-        if (!response.ok) {
-            throw new Error(`QNet operation failed: ${response.status}`);
-        }
-
-        return await response.json();
-    }
-
-    /**
-     * Get token balance on Solana
-     */
-    async getTokenBalance(address, mintAddress) {
+    async detectCurrentPhase() {
         try {
+            // Check burn percentage from Solana contract
+            const burnedPercent = await this.getBurnedPercentageFromSolana();
+            
+            // Check network age from QNet
+            const networkAge = await this.getNetworkAgeFromQNet();
+            
+            // Phase 2 conditions: 90% burned OR 5+ years
+            if (burnedPercent >= 90 || networkAge >= 5) {
+                return 2;
+            }
+            
+            return 1;
+        } catch (error) {
+            console.warn('Failed to detect phase, defaulting to Phase 1:', error);
+            return 1;
+        }
+    }
+
+    /**
+     * Get Solana balances (SOL, 1DEV)
+     */
+    async getSolanaBalances() {
+        try {
+            if (!this.networks.solana.wallet) {
+                return { SOL: 0, '1DEV': 0 };
+            }
+
+            const publicKey = this.networks.solana.wallet.publicKey;
+            
+            // Get SOL balance
+            const solBalance = await this.networks.solana.connection.getBalance(publicKey);
+            
+            // Get 1DEV balance (if token account exists)
+            const oneDevBalance = await this.getTokenBalance(
+                publicKey,
+                '9GcdXAo2EyjNdNLuQoScSVbfJSnh9RdkSS8YYKnGQ8Pf' // 1DEV mint
+            );
+
+            return {
+                SOL: solBalance / 1e9, // Convert lamports to SOL
+                '1DEV': oneDevBalance
+            };
+        } catch (error) {
+            console.error('Failed to get Solana balances:', error);
+            return { SOL: 0, '1DEV': 0 };
+        }
+    }
+
+    /**
+     * Get QNet balances (QNC)
+     */
+    async getQNetBalances(eonAddress) {
+        try {
+            // Call QNet RPC to get QNC balance
+            const response = await this.qnetRpcCall('get_balance', {
+                address: eonAddress
+            });
+
+            return {
+                QNC: response.balance || 0
+            };
+        } catch (error) {
+            console.error('Failed to get QNet balances:', error);
+            return { QNC: 0 };
+        }
+    }
+
+    /**
+     * Get node information for address
+     */
+    async getNodeInfo(eonAddress) {
+        try {
+            const response = await this.qnetRpcCall('get_node_info', {
+                owner_address: eonAddress
+            });
+
+            if (!response.node) {
+                return null; // No active node
+            }
+
+            return {
+                code: response.node.activation_code,
+                type: response.node.type,
+                status: response.node.status,
+                uptime: response.node.uptime_percentage,
+                rewards: response.node.daily_rewards,
+                activated_at: response.node.activated_at
+            };
+        } catch (error) {
+            console.error('Failed to get node info:', error);
+            return null;
+        }
+    }
+
+    /**
+     * Update UI based on current network
+     */
+    async updateNetworkUI(network) {
+        try {
+            // Emit event for UI components to listen
+            const event = new CustomEvent('networkChanged', {
+                detail: {
+                    network: network,
+                    phase: this.currentPhase,
+                    timestamp: Date.now()
+                }
+            });
+            
+            window.dispatchEvent(event);
+            
+            // Update visual indicators
+            document.querySelectorAll('.network-btn').forEach(btn => {
+                btn.classList.remove('active');
+                if (btn.dataset.network === network) {
+                    btn.classList.add('active');
+                }
+            });
+
+        } catch (error) {
+            console.error('Failed to update network UI:', error);
+        }
+    }
+
+    /**
+     * Create QNet RPC connection
+     */
+    async createQNetConnection() {
+        // Placeholder for QNet RPC client
+        return {
+            url: this.networks.qnet.rpcUrl,
+            connected: true
+        };
+    }
+
+    /**
+     * Make RPC call to QNet network
+     */
+    async qnetRpcCall(method, params) {
+        try {
+            const response = await fetch(this.networks.qnet.rpcUrl, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    jsonrpc: '2.0',
+                    method: method,
+                    params: params,
+                    id: Date.now()
+                })
+            });
+
+            const data = await response.json();
+            
+            if (data.error) {
+                throw new Error(data.error.message);
+            }
+
+            return data.result;
+        } catch (error) {
+            throw new Error(`QNet RPC call failed: ${error.message}`);
+        }
+    }
+
+    /**
+     * Get token balance for Solana address
+     */
+    async getTokenBalance(publicKey, mintAddress) {
+        try {
+            const mint = new PublicKey(mintAddress);
             const tokenAccounts = await this.networks.solana.connection.getTokenAccountsByOwner(
-                new PublicKey(address),
-                { mint: new PublicKey(mintAddress) }
+                publicKey,
+                { mint: mint }
             );
 
             if (tokenAccounts.value.length === 0) {
                 return 0;
             }
 
-            const accountInfo = await this.networks.solana.connection.getTokenAccountBalance(
+            const balance = await this.networks.solana.connection.getTokenAccountBalance(
                 tokenAccounts.value[0].pubkey
             );
 
-            return accountInfo.value.uiAmount || 0;
-            
+            return parseFloat(balance.value.uiAmount) || 0;
         } catch (error) {
-            console.warn('Failed to get token balance:', error);
             return 0;
         }
     }
 
     /**
-     * Add network event listener
+     * Helper methods for storage
      */
-    addListener(callback) {
-        this.listeners.add(callback);
+    async saveToStorage(key, data) {
+        return new Promise((resolve, reject) => {
+            chrome.storage.local.set({ [key]: data }, () => {
+                if (chrome.runtime.lastError) {
+                    reject(new Error(chrome.runtime.lastError.message));
+                } else {
+                    resolve();
+                }
+            });
+        });
+    }
+
+    async loadFromStorage(key) {
+        return new Promise((resolve, reject) => {
+            chrome.storage.local.get([key], (result) => {
+                if (chrome.runtime.lastError) {
+                    reject(new Error(chrome.runtime.lastError.message));
+                } else {
+                    resolve(result[key]);
+                }
+            });
+        });
     }
 
     /**
-     * Remove network event listener
+     * Get burned percentage from Solana contract
      */
-    removeListener(callback) {
-        this.listeners.delete(callback);
-    }
-
-    /**
-     * Notify all listeners of network events
-     */
-    notifyListeners(event, data) {
-        for (const listener of this.listeners) {
-            try {
-                listener(event, data);
-            } catch (error) {
-                console.error('Listener error:', error);
-            }
+    async getBurnedPercentageFromSolana() {
+        try {
+            // Call Solana contract to get burn statistics
+            // Placeholder implementation
+            return 15; // 15% burned
+        } catch (error) {
+            return 0;
         }
     }
 
     /**
-     * Update network configuration
+     * Get network age from QNet
      */
-    updateNetworkConfig(network, config) {
-        if (this.networks[network]) {
-            Object.assign(this.networks[network], config);
-            this.notifyListeners('configUpdated', { network, config });
+    async getNetworkAgeFromQNet() {
+        try {
+            const response = await this.qnetRpcCall('get_network_info');
+            return response.age_years || 0;
+        } catch (error) {
+            return 0;
         }
     }
 
     /**
-     * Check if network supports operation
+     * Get current network
      */
-    supportsOperation(operation) {
-        const network = this.currentNetwork;
-        
-        const supportMatrix = {
-            solana: ['burnTokens', 'getTokenBalance', 'sendSOL', 'requestActivationCode'],
-            qnet: ['activateNode', 'getNodeStatus', 'sendQNC', 'manageNode', 'sendToPool3']
-        };
-
-        return supportMatrix[network]?.includes(operation) || false;
+    getCurrentNetwork() {
+        return this.currentNetwork;
     }
 
     /**
-     * Get network-specific constants
+     * Get current phase
      */
-    getNetworkConstants() {
-        const constants = {
-            solana: {
-                oneDevMint: '9GcdXAo2EyjNdNLuQoScSVbfJSnh9RdkSS8YYKnGQ8Pf',
-                derivationPath: "m/44'/501'/0'/0'",
-                burnAddress: 'BURN1111111111111111111111111111111111111111',
-                rpcUrl: this.networks.solana.rpc
-            },
-            qnet: {
-                qncDecimals: 9,
-                activationCosts: {
-                    light: 5000,
-                    full: 7500,
-                    super: 10000
-                },
-                rpcUrl: this.networks.qnet.rpc
-            }
-        };
-
-        return constants[this.currentNetwork] || {};
+    getCurrentPhase() {
+        return this.currentPhase;
     }
-} 
+}
+
+// Export singleton instance
+export const dualNetworkManager = new DualNetworkManager();
+export default DualNetworkManager; 

@@ -37,7 +37,7 @@
 - Burn-to-join (one-time cost)
 - Halving every 4 years
 - Dynamic pricing for burns
-- Transition from QNA to QNC
+- Transition from 1DEV burn to QNC Pool 3 transfer
 
 ### 6. Dynamic Node Balancing ⚠️
 **Status**: DESIGNED BUT NOT ENFORCED

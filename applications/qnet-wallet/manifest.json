@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "QNet Wallet",
-  "version": "1.0.0",
-  "description": "Official QNet blockchain wallet with post-quantum security and node management",
+  "version": "2.0.0",
+  "description": "QNet Production Wallet - Dual Network (Solana/QNet) with Phase 2 QNC Pool 3 Activation",
   
   "permissions": [
     "storage",
@@ -11,17 +11,23 @@
     "alarms",
     "activeTab",
     "scripting",
-    "clipboardWrite"
+    "clipboardWrite",
+    "background",
+    "identity"
   ],
   
   "host_permissions": [
     "http://localhost/*",
     "https://*.qnet.network/*",
+    "https://*.qnet.io/*",
+    "https://bridge.qnet.io/*",
+    "https://testnet-bridge.qnet.io/*",
     "https://*.solana.com/*",
     "https://api.mainnet-beta.solana.com/*",
     "https://api.devnet.solana.com/*",
     "https://api.testnet.solana.com/*",
-    "https://aiqnet.io/*"
+    "https://aiqnet.io/*",
+    "https://1984.hosting/*"
   ],
   
   "background": {

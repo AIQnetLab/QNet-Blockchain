@@ -1,7 +1,7 @@
 import { type NextRequest, NextResponse } from 'next/server';
 import crypto from 'crypto';
 
-// Node prices in 1DEV tokens - ALL TYPES SAME PRICE
+// Node prices in 1DEV tokens - UNIVERSAL PRICING (Phase 1)
 const NODE_PRICES = {
   light: 1500,
   full: 1500,

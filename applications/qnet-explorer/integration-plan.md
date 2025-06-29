@@ -76,7 +76,7 @@ components/admin/
 ### Step 3: Solana Integration  
 1. Connect Solana wallet for node activation
 2. Integrate with QNet Activation Bridge API
-3. Create UI for burning QNA tokens
+3. Create UI for burning 1DEV tokens
 
 ### Step 4: Monitoring and Admin Panel
 1. Port admin_dashboard.py functionality
@@ -93,7 +93,7 @@ components/admin/
 
 ### Wallet Integration:
 - **Solana wallet connection** for node activation
-- **QNA token management** 
+- **1DEV token management** 
 - **User activation history**
 - **Quantum UI** for all wallet operations
 

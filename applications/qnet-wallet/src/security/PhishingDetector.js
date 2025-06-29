@@ -143,7 +143,7 @@ export class PhishingDetector {
     
     // Check if domain contains QNet-related terms
     containsQNetTerms(domain) {
-        const qnetTerms = ['qnet', 'qnc', 'qna'];
+        const qnetTerms = ['qnet', 'qnc', '1dev'];
         const lowerDomain = domain.toLowerCase();
         
         return qnetTerms.some(term => lowerDomain.includes(term));

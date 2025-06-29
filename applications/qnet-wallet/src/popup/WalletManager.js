@@ -73,12 +73,13 @@ export class WalletManager {
     }
 
     /**
-     * Import existing wallet from mnemonic
+     * Import existing wallet from mnemonic with production security
      */
     async importWallet(mnemonic, password) {
         try {
-            if (!bip39.validateMnemonic(mnemonic)) {
-                throw new Error('Invalid mnemonic phrase');
+            // PRODUCTION SECURITY: Use comprehensive BIP39 validation
+            if (!this.validateSecureMnemonic(mnemonic)) {
+                throw new Error('Invalid or insecure mnemonic phrase');
             }
             
             const masterKeypair = await this.deriveSolanaKeypair(mnemonic, 0);
@@ -282,6 +283,30 @@ export class WalletManager {
         } catch (error) {
             return [];
         }
+    }
+
+    /**
+     * Validate mnemonic with production security requirements
+     */
+    validateSecureMnemonic(mnemonic) {
+        // Basic BIP39 validation
+        if (!bip39.validateMnemonic(mnemonic)) {
+            return false;
+        }
+        
+        // Check entropy strength
+        const words = mnemonic.trim().split(/\s+/);
+        const validLengths = [12, 15, 18, 21, 24];
+        
+        if (!validLengths.includes(words.length)) {
+            return false;
+        }
+        
+        // Calculate entropy bits
+        const entropyBits = Math.floor(words.length * 11 * 4 / 3);
+        
+        // Require minimum 128 bits of entropy
+        return entropyBits >= 128;
     }
 
     /**

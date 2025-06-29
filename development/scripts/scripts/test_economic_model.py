@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Comprehensive Economic Model Testing Suite
-Tests Phase 1 (1DEV burn) → Phase 2 (QNC hold) transition
-Includes node migration, reward testing, and attack simulations
+QNet Economic Model Testing Script
+Tests Phase 1 (1DEV burn) → Phase 2 (QNC spend to Pool 3) transition
+Validates burn pricing, phase transitions, and Pool 3 redistribution
 """
 
 import asyncio
@@ -59,7 +59,7 @@ class EconomicModelTester:
             token_type="1DEV",
             mechanism="burn",
             requirements={
-                "light": 1500,
+                "light": 1500, # Price is the same for all node types in Phase 1
                 "full": 1500, 
                 "super": 1500
             },
@@ -69,7 +69,7 @@ class EconomicModelTester:
         self.phase2 = EconomicPhase(
             phase_number=2,
             token_type="QNC",
-            mechanism="hold",
+            mechanism="send_to_pool_3", # CORRECTED: QNC is sent to Pool #3 for redistribution to ALL active nodes, not held
             requirements={
                 "light": 5000,
                 "full": 7500,
@@ -77,6 +77,13 @@ class EconomicModelTester:
             },
             active=False
         )
+
+        # Phase 1: Universal pricing - ALL node types cost 1500 1DEV
+        self.onedev_costs = {
+            "light": 1500,
+            "full": 1500,
+            "super": 1500
+        }
 
     async def test_phase1_activation(self, wallet_address: str, node_type: str) -> NodeRecord:
         """Test Phase 1 node activation with 1DEV burn - SECURITY FIXED"""
@@ -87,7 +94,7 @@ class EconomicModelTester:
             raise ValueError(f"Invalid node type: {node_type}")
         
         # Calculate burn amount
-        burn_amount = self.phase1.requirements[node_type]
+        burn_amount = self.onedev_costs[node_type]
         
         # Generate burn transaction
         burn_tx_hash = self._generate_burn_tx(wallet_address, burn_amount)
@@ -255,15 +262,16 @@ class EconomicModelTester:
             for node in self.nodes.values():
                 if node.activation_phase == 1:
                     required_qnc = self.phase2.requirements[node.node_type]
-                    # Simulate 1:1 exchange rate
-                    node.qnc_balance = node.burn_amount  # 1 1DEV = 1 QNC
+                    # EXPERIMENTAL: No guaranteed exchange rate or transition benefits
+                    # Phase 1 participants may need to acquire QNC separately for Phase 2
+                    node.qnc_balance = 0  # No automatic QNC provision
                     if node.qnc_balance >= required_qnc:
                         node.activation_phase = 2
                         node.status = "active_phase2"
                         print(f"   Migrated {node.node_id} to Phase 2")
                     else:
-                        node.status = "insufficient_qnc"
-                        print(f"   {node.node_id} needs more QNC: {node.qnc_balance} < {required_qnc}")
+                        node.status = "needs_qnc_for_phase2"
+                        print(f"   {node.node_id} needs QNC for Phase 2: {required_qnc} QNC required")
             
             return True
         
@@ -471,7 +479,7 @@ class EconomicModelTester:
         
         # Test 3: Nothing-at-stake attack (Phase 2)
         print("   Testing nothing-at-stake resistance...")
-        # In Phase 2, nodes must hold QNC tokens
+        # In Phase 2, nodes must spend QNC tokens to Pool 3
         # Moving tokens away deactivates the node
         phase2_nodes = [n for n in self.nodes.values() if n.activation_phase == 2]
         

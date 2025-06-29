@@ -75,8 +75,8 @@ function setupEventListeners() {
     document.getElementById('verify-seed-button')?.addEventListener('click', handleVerifySeed);
     document.getElementById('back-to-seed-button')?.addEventListener('click', handleBackToSeed);
     
-    // Node activation
-    document.getElementById('activate-node-button')?.addEventListener('click', handleNodeActivation);
+    // Node activation code generation (NOT full activation - browser extension limitation)
+    document.getElementById('get-activation-code-button')?.addEventListener('click', handleGetActivationCode);
     
     // Tab switching
     document.querySelectorAll('.tab-button').forEach(button => {
@@ -577,6 +577,51 @@ async function handleClearData() {
         } catch (error) {
             uiManager.showToast('Failed to clear data', 'error');
         }
+    }
+}
+
+/**
+ * Handle activation code generation (Browser Extension - Code Only)
+ * Browser extensions can only generate activation codes, NOT activate full nodes
+ * Full/Super nodes must be activated on servers directly
+ */
+async function handleGetActivationCode() {
+    try {
+        const nodeType = prompt('Select node type (light/full/super):', 'light');
+        if (!nodeType || !['light', 'full', 'super'].includes(nodeType)) {
+            uiManager.showToast('Invalid node type', 'error');
+            return;
+        }
+
+        // Phase 1: Generate 1DEV burn transaction for activation code
+        if (await walletManager.getCurrentPhase() === 1) {
+            const burnAmount = await walletManager.getActivationCost(nodeType);
+            const burnResult = await walletManager.burn1DEVForCode(nodeType, burnAmount);
+            
+            uiManager.showModal('activation-code-modal');
+            document.getElementById('activation-code-display').textContent = burnResult.activationCode;
+            
+            uiManager.showToast(
+                `Activation code generated! Use this code on a server to activate your ${nodeType} node.`,
+                'success'
+            );
+        } 
+        // Phase 2: Generate QNC transfer code
+        else {
+            const qncAmount = await walletManager.getQNCActivationCost(nodeType);
+            const transferResult = await walletManager.generateQNCTransferCode(nodeType, qncAmount);
+            
+            uiManager.showModal('activation-code-modal');
+            document.getElementById('activation-code-display').textContent = transferResult.activationCode;
+            
+            uiManager.showToast(
+                `QNC transfer code generated! Complete activation on a server.`,
+                'success'
+            );
+        }
+        
+    } catch (error) {
+        uiManager.showToast('Failed to generate activation code: ' + error.message, 'error');
     }
 }
 

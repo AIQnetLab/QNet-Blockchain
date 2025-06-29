@@ -1,13 +1,41 @@
 /**
- * Activation Bridge Client for QNet Wallet
- * Handles communication with the activation bridge API for cross-chain operations
+ * QNet Activation Bridge Client - Production Ready
+ * Integrates with 1dev-burn-contract and production QNet bridge
+ * Handles Phase 1 (1DEV burn) and Phase 2 (QNC Pool 3) activations
  */
 
 export class ActivationBridgeClient {
     constructor(networkManager) {
         this.networkManager = networkManager;
-        this.bridgeUrl = 'http://localhost:5000'; // Activation bridge API URL
-        this.timeout = 30000; // 30 second timeout
+        
+        // Production bridge endpoints
+        this.bridgeEndpoints = {
+            mainnet: 'https://bridge.qnet.io',
+            testnet: 'https://testnet-bridge.qnet.io',
+            local: 'http://localhost:8080'
+        };
+        
+        this.currentEndpoint = this.bridgeEndpoints.testnet;
+        this.timeout = 30000;
+        this.authToken = null;
+        
+        // Phase 2 QNC activation costs with network size multipliers
+        this.qncActivationCosts = {
+            baseMultipliers: {
+                '0-100k': 0.5,
+                '100k-1m': 1.0,
+                '1m-10m': 2.0,
+                '10m+': 3.0
+            },
+            baseCosts: {
+                Light: 5000,
+                Full: 7500,
+                Super: 10000
+            }
+        };
+        
+        // 1dev-burn-contract integration for Phase 1
+        this.burnContractAddress = '1DEVBurnContract...'; // Production 1DEV burn contract address
     }
 
     /**
@@ -141,12 +169,166 @@ export class ActivationBridgeClient {
                 burnProgress: response.burn_progress,
                 phaseStatus: response.phase_status,
                 activeNodes: response.active_nodes,
-                networkHealth: response.network_health
+                networkHealth: response.network_health,
+                // Phase 2 stats
+                totalQNCInPool3: response.total_qnc_pool3,
+                phase2Activations: response.phase2_activations,
+                networkSize: response.network_size
             };
 
         } catch (error) {
             console.error('Failed to get bridge stats:', error);
             return null;
+        }
+    }
+
+    /**
+     * Phase 2: Calculate required QNC amount based on network size
+     */
+    async calculateRequiredQNC(nodeType) {
+        try {
+            // Get current network size from bridge
+            const stats = await this.getBridgeStats();
+            const networkSize = stats?.networkSize || 0;
+            
+            // Determine multiplier based on network size
+            let multiplier = 1.0;
+            if (networkSize < 100000) {
+                multiplier = this.qncActivationCosts.baseMultipliers['0-100k'];
+            } else if (networkSize < 1000000) {
+                multiplier = this.qncActivationCosts.baseMultipliers['100k-1m'];
+            } else if (networkSize < 10000000) {
+                multiplier = this.qncActivationCosts.baseMultipliers['1m-10m'];
+            } else {
+                multiplier = this.qncActivationCosts.baseMultipliers['10m+'];
+            }
+            
+            // Calculate final cost
+            const baseCost = this.qncActivationCosts.baseCosts[nodeType];
+            const requiredQNC = Math.floor(baseCost * multiplier);
+            
+            return {
+                nodeType,
+                baseCost,
+                multiplier,
+                networkSize,
+                requiredQNC,
+                networkSizeCategory: this.getNetworkSizeCategory(networkSize)
+            };
+        } catch (error) {
+            console.error('Failed to calculate QNC cost:', error);
+            // Return base cost if calculation fails
+            return {
+                nodeType,
+                baseCost: this.qncActivationCosts.baseCosts[nodeType] || 5000,
+                multiplier: 1.0,
+                requiredQNC: this.qncActivationCosts.baseCosts[nodeType] || 5000
+            };
+        }
+    }
+
+    /**
+     * Phase 2: Start QNC activation (spend-to-Pool3)
+     */
+    async startPhase2Activation(eonAddress, nodeType, qncAmount) {
+        try {
+            // Validate inputs
+            if (!['Light', 'Full', 'Super'].includes(nodeType)) {
+                throw new Error('Invalid node type');
+            }
+
+            // Calculate required QNC
+            const qncInfo = await this.calculateRequiredQNC(nodeType);
+            
+            if (qncAmount < qncInfo.requiredQNC) {
+                throw new Error(`Insufficient QNC. Required: ${qncInfo.requiredQNC}, Provided: ${qncAmount}`);
+            }
+
+            const requestData = {
+                eon_address: eonAddress,
+                node_type: nodeType,
+                qnc_amount: qncAmount,
+                timestamp: Date.now(),
+                activation_type: 'phase2_qnc_pool3'
+            };
+
+            console.log('Starting Phase 2 QNC activation:', requestData);
+
+            const response = await this.makeAuthenticatedRequest('/api/v2/phase2/activate', {
+                method: 'POST',
+                body: JSON.stringify(requestData)
+            });
+
+            if (response.success) {
+                return {
+                    success: true,
+                    activationId: response.activation_id,
+                    nodeCode: response.node_code,
+                    qncSpentToPool3: response.qnc_spent_to_pool3,
+                    poolDistribution: response.pool_distribution,
+                    estimatedDailyRewards: response.estimated_daily_rewards,
+                    activationTimestamp: response.activation_timestamp,
+                    poolTransactionHash: response.pool_tx_hash
+                };
+            } else {
+                throw new Error(response.error || 'Phase 2 activation failed');
+            }
+
+        } catch (error) {
+            console.error('Phase 2 activation failed:', error);
+            throw error;
+        }
+    }
+
+    /**
+     * Phase 2: Get Pool 3 information
+     */
+    async getPool3Info() {
+        try {
+            const response = await this.makeRequest('/api/v2/pool3/info', {
+                method: 'GET'
+            });
+
+            return {
+                totalQNCInPool: response.total_qnc,
+                activeNodes: response.active_nodes,
+                dailyDistributionAmount: response.daily_distribution,
+                rewardsPerActiveNode: response.rewards_per_node,
+                lastDistributionTime: response.last_distribution,
+                nextDistributionTime: response.next_distribution,
+                poolGrowthRate: response.pool_growth_rate
+            };
+
+        } catch (error) {
+            console.error('Failed to get Pool 3 info:', error);
+            return null;
+        }
+    }
+
+    /**
+     * Get current phase information
+     */
+    async getCurrentPhase() {
+        try {
+            const response = await this.makeRequest('/api/v2/phase/current', {
+                method: 'GET'
+            });
+
+            return {
+                currentPhase: response.current_phase,
+                phase1Active: response.phase1_active,
+                phase2Active: response.phase2_active,
+                transitionTimestamp: response.transition_timestamp,
+                networkReadiness: response.network_readiness
+            };
+
+        } catch (error) {
+            console.error('Failed to get current phase:', error);
+            return {
+                currentPhase: 1,
+                phase1Active: true,
+                phase2Active: false
+            };
         }
     }
 
@@ -259,15 +441,155 @@ export class ActivationBridgeClient {
     }
 
     /**
+     * Authenticate wallet with bridge
+     */
+    async authenticateWallet(walletAddress, signature) {
+        try {
+            const requestData = {
+                address: walletAddress,
+                signature: signature,
+                timestamp: Date.now()
+            };
+
+            const response = await this.makeRequest('/api/auth/wallet', {
+                method: 'POST',
+                body: JSON.stringify(requestData)
+            });
+
+            if (response.success && response.token) {
+                this.authToken = {
+                    token: response.token,
+                    expires: response.expires,
+                    address: walletAddress
+                };
+                return true;
+            } else {
+                throw new Error(response.error || 'Authentication failed');
+            }
+        } catch (error) {
+            console.error('Wallet authentication failed:', error);
+            throw error;
+        }
+    }
+
+    /**
+     * Make authenticated request to bridge API
+     */
+    async makeAuthenticatedRequest(endpoint, options = {}) {
+        if (!this.authToken || this.isTokenExpired()) {
+            throw new Error('No valid authentication token. Please authenticate first.');
+        }
+
+        const headers = {
+            'Authorization': `Bearer ${this.authToken.token}`,
+            ...options.headers
+        };
+
+        return await this.makeRequest(endpoint, {
+            ...options,
+            headers
+        });
+    }
+
+    /**
+     * Check if auth token is expired
+     */
+    isTokenExpired() {
+        if (!this.authToken || !this.authToken.expires) {
+            return true;
+        }
+        return Date.now() > this.authToken.expires;
+    }
+
+    /**
+     * 1dev-burn-contract: Get Phase 1 burn contract information
+     */
+    async get1DEVBurnContractInfo() {
+        try {
+            const response = await this.makeRequest('/api/v1/1dev_burn_contract/info', {
+                method: 'GET'
+            });
+
+            return {
+                contractAddress: response.contract_address,
+                total1DEVBurned: response.total_1dev_burned,
+                burnEvents: response.burn_events,
+                isActive: response.is_active,
+                currentBurnPrice: response.current_burn_price,
+                minimumBurnAmount: response.minimum_burn_amount,
+                dynamicPricing: response.dynamic_pricing
+            };
+        } catch (error) {
+            console.error('Failed to get 1DEV burn contract info:', error);
+            return null;
+        }
+    }
+
+    /**
+     * 1dev-burn-contract: Verify 1DEV burn with contract
+     */
+    async verify1DEVBurnWithContract(txSignature, expectedAmount, tokenMint) {
+        try {
+            const requestData = {
+                tx_signature: txSignature,
+                expected_amount: expectedAmount,
+                token_mint: tokenMint, // 1DEV token mint
+                contract_address: this.burnContractAddress
+            };
+
+            const response = await this.makeRequest('/api/v1/1dev_burn_contract/verify', {
+                method: 'POST',
+                body: JSON.stringify(requestData)
+            });
+
+            return {
+                verified: response.verified,
+                burnAmount: response.burn_amount,
+                burnTimestamp: response.burn_timestamp,
+                contractConfirmed: response.contract_confirmed,
+                blockConfirmations: response.block_confirmations,
+                burnEventId: response.burn_event_id,
+                dynamicPrice: response.dynamic_price
+            };
+        } catch (error) {
+            console.error('Failed to verify 1DEV burn with contract:', error);
+            return { verified: false, error: error.message };
+        }
+    }
+
+    /**
+     * Get network size category for multiplier calculation
+     */
+    getNetworkSizeCategory(networkSize) {
+        if (networkSize < 100000) return '0-100k';
+        if (networkSize < 1000000) return '100k-1m';
+        if (networkSize < 10000000) return '1m-10m';
+        return '10m+';
+    }
+
+    /**
+     * Set bridge endpoint (testnet/mainnet/local)
+     */
+    setBridgeEndpoint(environment) {
+        if (this.bridgeEndpoints[environment]) {
+            this.currentEndpoint = this.bridgeEndpoints[environment];
+            console.log(`Bridge endpoint set to: ${this.currentEndpoint}`);
+        } else {
+            throw new Error(`Invalid bridge environment: ${environment}`);
+        }
+    }
+
+    /**
      * Make HTTP request to bridge API
      */
     async makeRequest(endpoint, options = {}) {
-        const url = `${this.bridgeUrl}${endpoint}`;
+        const url = `${this.currentEndpoint}${endpoint}`;
         
         const defaultOptions = {
             headers: {
                 'Content-Type': 'application/json',
-                'User-Agent': 'QNet-Wallet/1.0.0'
+                'User-Agent': 'QNet-Wallet/2.0.0',
+                'X-Client-Type': 'desktop'
             },
             timeout: this.timeout
         };
@@ -292,6 +614,12 @@ export class ActivationBridgeClient {
 
             clearTimeout(timeoutId);
 
+            // Handle authentication errors
+            if (response.status === 401) {
+                this.authToken = null;
+                throw new Error('Authentication expired');
+            }
+
             if (!response.ok) {
                 const errorText = await response.text();
                 throw new Error(`HTTP ${response.status}: ${errorText}`);
@@ -309,10 +637,11 @@ export class ActivationBridgeClient {
     }
 
     /**
-     * Set bridge URL
+     * Set bridge URL (deprecated - use setBridgeEndpoint instead)
      */
     setBridgeUrl(url) {
-        this.bridgeUrl = url;
+        console.warn('setBridgeUrl is deprecated. Use setBridgeEndpoint("testnet"/"mainnet"/"local") instead.');
+        this.currentEndpoint = url;
     }
 
     /**

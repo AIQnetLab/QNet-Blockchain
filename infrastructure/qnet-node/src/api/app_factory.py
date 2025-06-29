@@ -164,7 +164,7 @@ def create_app(): # This is THE factory now
     @app.route('/')
     def root():
         return jsonify({
-            "message": "Welcome to QNet Node API Service (created by app_factory)",
+            "message": "Welcome to QNet Node API Service",
             "version": app_config.get('App', 'version', fallback="0.1.0"),
             "status": "running"
         })

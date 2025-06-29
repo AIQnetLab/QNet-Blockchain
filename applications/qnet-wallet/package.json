@@ -1,7 +1,7 @@
 {
   "name": "qnet-dual-wallet",
-  "version": "1.0.0",
-  "description": "QNet Dual Wallet - Production-ready dual-network wallet for Solana and QNet blockchains",
+  "version": "2.0.0",
+  "description": "QNet Production Wallet V2 - Dual-network wallet with Phase 2 QNC Pool 3 activation support",
   "main": "src/main.js",
   "type": "module",
   "scripts": {
@@ -38,7 +38,12 @@
     "eon-addresses",
     "cross-chain",
     "node-activation",
-    "production-ready"
+    "production-ready",
+    "1dev-burn",
+    "qnc-pool3",
+    "dynamic-pricing",
+    "phase1-phase2",
+    "bridge-integration"
   ],
   "author": "QNet Team",
   "license": "MIT",
@@ -99,13 +104,19 @@
   "config": {
     "production": {
       "solana_rpc": "https://api.mainnet-beta.solana.com",
-      "qnet_rpc": "https://rpc.qnet.network",
-      "bridge_url": "https://bridge.qnet.network"
+      "qnet_rpc": "https://rpc.qnet.io",
+      "bridge_url": "https://bridge.qnet.io",
+      "1dev_burn_contract": "1DEVBurnContractMainnet...",
+      "qnc_pool3_contract": "QNCPool3ContractMainnet...",
+      "1dev_token_mint": "1DEVTokenMintMainnet..."
     },
     "testnet": {
       "solana_rpc": "https://api.devnet.solana.com",
-      "qnet_rpc": "https://testnet-rpc.qnet.network",
-      "bridge_url": "https://testnet-bridge.qnet.network"
+      "qnet_rpc": "https://testnet-rpc.qnet.io",
+      "bridge_url": "https://testnet-bridge.qnet.io",
+      "1dev_burn_contract": "1DEVBurnContractTestnet...",
+      "qnc_pool3_contract": "QNCPool3ContractTestnet...",
+      "1dev_token_mint": "1DEVTokenMintTestnet..."
     }
   },
   "funding": {
