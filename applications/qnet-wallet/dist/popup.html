@@ -20,35 +20,37 @@
             </div>
         </div>
 
-        <!-- Setup Screen -->
-        <div id="setup-screen" class="screen hidden">
+        <!-- Setup Options Screen -->
+        <div id="setup-options-screen" class="screen hidden">
             <div class="setup-container">
-                <div class="wallet-logo">💎</div>
-                <h2>Welcome to QNet Wallet</h2>
-                <p>Your dual-network crypto wallet for Solana and QNet</p>
+                <div class="wallet-logo">QNet</div>
+                <h2>QNet Dual Wallet</h2>
+                <p>Professional dual-network cryptocurrency wallet</p>
                 
-                <div class="setup-actions">
-                    <button id="create-wallet-button" class="qnet-button primary gradient">
-                        ✨ Create New Wallet
+                <div class="setup-options">
+                    <button id="create-wallet-button" class="qnet-button primary gradient full-width">
+                        <div class="button-content">
+                            <div class="button-icon">+</div>
+                            <div class="button-text">
+                                <span class="button-title">Create New Wallet</span>
+                                <span class="button-subtitle">Generate a new dual-network wallet</span>
+                            </div>
+                        </div>
                     </button>
-                    <button id="import-wallet-button" class="qnet-button secondary modern">
-                        📥 Import Existing Wallet
+                    
+                    <button id="import-wallet-button" class="qnet-button secondary gradient full-width">
+                        <div class="button-content">
+                            <div class="button-icon">↑</div>
+                            <div class="button-text">
+                                <span class="button-title">Import Wallet</span>
+                                <span class="button-subtitle">Import from recovery phrase</span>
+                            </div>
+                        </div>
                     </button>
                 </div>
                 
-                <div class="setup-features">
-                    <div class="feature-item">
-                        <span class="feature-icon">🔒</span>
-                        <span>Secure HD wallet with BIP39</span>
-                    </div>
-                    <div class="feature-item">
-                        <span class="feature-icon">🌐</span>
-                        <span>Dual Solana + QNet support</span>
-                    </div>
-                    <div class="feature-item">
-                        <span class="feature-icon">🤖</span>
-                        <span>Node activation & management</span>
-                    </div>
+                <div class="setup-footer">
+                    <p>Your keys, your crypto. Always secure.</p>
                 </div>
             </div>
         </div>
@@ -56,14 +58,14 @@
         <!-- Locked Screen -->
         <div id="locked-screen" class="screen hidden">
             <div class="lock-container">
-                <div class="wallet-logo">💎</div>
+                <div class="wallet-logo">QNet</div>
                 <h2>QNet Dual Wallet</h2>
                 <p>Enter password to unlock your dual-network wallet</p>
                 
                 <div class="password-section">
                     <input type="password" id="password-input" placeholder="Enter password" autocomplete="current-password" />
-                    <div id="password-error" class="inline-error" style="display: none;"></div>
-                    <button id="unlock-button" class="qnet-button primary">🔓 Unlock Wallet</button>
+                    <div id="password-error" class="inline-error hidden"></div>
+                    <button id="unlock-button" class="qnet-button primary">Unlock Wallet</button>
                 </div>
             </div>
         </div>
@@ -74,11 +76,11 @@
             <div class="network-switcher">
                 <div class="network-tabs">
                     <button class="network-tab active" data-network="qnet">
-                        <span class="network-icon">💎</span>
+                        <span class="network-icon">Q</span>
                         <span>QNet</span>
                     </button>
                     <button class="network-tab" data-network="solana">
-                        <span class="network-icon">🔥</span>
+                        <span class="network-icon">S</span>
                         <span>Solana</span>
                     </button>
                 </div>
@@ -96,7 +98,7 @@
                     </button>
                 </div>
                 <div class="header-actions">
-                    <button id="settings-button" class="settings-button" title="Settings">⚙️</button>
+                    <button id="settings-button" class="settings-button" title="Settings">⚙</button>
                     <button id="lock-wallet-btn" class="lock-button" title="Lock Wallet">🔒</button>
                 </div>
             </header>
@@ -128,15 +130,15 @@
                 <!-- Quick Actions -->
                 <section class="main-actions">
                     <button class="action-button modern" id="send-button" data-action="send">
-                        <div class="action-icon">📤</div>
+                        <div class="action-icon">↗</div>
                         <span>Send</span>
                     </button>
                     <button class="action-button modern" id="receive-button" data-action="receive">
-                        <div class="action-icon">📥</div>
+                        <div class="action-icon">↙</div>
                         <span>Receive</span>
                     </button>
                     <button class="action-button modern" id="swap-button" data-action="swap">
-                        <div class="action-icon">🔄</div>
+                        <div class="action-icon">⟷</div>
                         <span>Bridge</span>
                     </button>
                 </section>
@@ -163,7 +165,7 @@
                         <div class="tab-content hidden" id="qnet-node-tab">
                             <div class="node-card modern" id="node-activation-card">
                                 <div class="node-header">
-                                    <h3>🤖 Node Management</h3>
+                                    <h3>Node Management</h3>
                                     <p id="node-status-text">No active node</p>
                                 </div>
                                 
@@ -173,7 +175,7 @@
                                 
                                 <div class="node-actions" id="node-actions">
                                     <button id="activate-node-button" class="qnet-button primary gradient">
-                                        🚀 Activate Node
+                                        Activate Node
                                     </button>
                                 </div>
                             </div>
@@ -182,7 +184,7 @@
                         <!-- QNet Rewards Tab -->
                         <div class="tab-content hidden" id="qnet-rewards-tab">
                             <div class="rewards-card modern">
-                                <h3>💰 Node Rewards</h3>
+                                <h3>Node Rewards</h3>
                                 <div class="rewards-stats">
                                     <div class="stat-item">
                                         <span class="stat-value">0 QNC</span>
@@ -216,35 +218,35 @@
                         <div class="tab-content hidden" id="solana-activation-tab">
                             <div class="activation-card modern">
                                 <div class="activation-header">
-                                    <h3>🔥 Phase 1 Activation</h3>
+                                    <h3>Phase 1 Activation</h3>
                                     <p>Burn 1DEV tokens to activate your QNet node</p>
                                 </div>
                                 
                                 <div class="pricing-info" id="pricing-info">
                                     <div class="price-card">
                                         <span class="price-label">Current Price</span>
-                                        <span class="price-value">1,350 1DEV</span>
-                                        <span class="price-savings">150 1DEV saved (10%)</span>
+                                        <span class="price-value">1,500 1DEV</span>
+                                        <span class="price-savings">Standard pricing</span>
                                     </div>
                                 </div>
                                 
                                 <div class="node-type-selector">
                                     <div class="node-option active" data-type="light">
-                                        <span class="node-emoji">⚡</span>
+                                        <span class="node-emoji">L</span>
                                         <span class="node-name">Light Node</span>
                                     </div>
                                     <div class="node-option" data-type="full">
-                                        <span class="node-emoji">🔥</span>
+                                        <span class="node-emoji">F</span>
                                         <span class="node-name">Full Node</span>
                                     </div>
                                     <div class="node-option" data-type="super">
-                                        <span class="node-emoji">⭐</span>
+                                        <span class="node-emoji">S</span>
                                         <span class="node-name">Super Node</span>
                                     </div>
                                 </div>
                                 
                                 <button id="burn-activate-button" class="qnet-button primary gradient">
-                                    🔥 Burn & Activate
+                                    Burn & Activate
                                 </button>
                             </div>
                         </div>
@@ -282,8 +284,8 @@
                             <select id="autolock-select" class="setting-select modern">
                                 <option value="0">Never</option>
                                 <option value="60">1 minute</option>
-                                <option value="300" selected>5 minutes</option>
-                                <option value="900">15 minutes</option>
+                                <option value="300">5 minutes</option>
+                                <option value="900" selected>15 minutes</option>
                                 <option value="1800">30 minutes</option>
                                 <option value="3600">1 hour</option>
                             </select>
@@ -416,7 +418,7 @@
                                    autocomplete="new-password" minlength="8" />
                         </div>
                         
-                        <div id="password-create-error" class="inline-error" style="display: none;"></div>
+                        <div id="password-create-error" class="inline-error hidden"></div>
                         
                         <div class="password-requirements">
                             <p>Password requirements:</p>
@@ -455,7 +457,7 @@
                                    autocomplete="new-password" minlength="8" />
                         </div>
                         
-                        <div id="import-error" class="inline-error" style="display: none;"></div>
+                        <div id="import-error" class="inline-error hidden"></div>
                         
                         <button id="import-wallet-confirm-button" class="qnet-button primary gradient full-width">
                             📥 Import Dual Wallet
@@ -513,7 +515,7 @@
                             <!-- Verification fields will be populated here -->
                         </div>
                         
-                        <div id="verification-error" class="inline-error" style="display: none;"></div>
+                        <div id="verification-error" class="inline-error hidden"></div>
                         
                         <div class="verification-actions">
                             <button id="back-to-seed-button" class="qnet-button secondary modern">
@@ -527,137 +529,6 @@
                 </div>
             </div>
         </div>
-        <!-- Seed Phrase Modal -->
-        <div id="seed-phrase-modal" class="modal-overlay hidden">
-            <div class="modal-box large modern">
-                <div class="modal-header">
-                    <h3>🔑 Your Recovery Phrase</h3>
-                    <button class="close-button">✕</button>
-                </div>
-                
-                <div class="seed-phrase-content">
-                    <div class="warning-banner">
-                        <span class="warning-icon">⚠️</span>
-                        <span>Never share your recovery phrase with anyone!</span>
-                    </div>
-                    
-                    <div id="seed-phrase-container" class="seed-phrase-grid">
-                        <!-- Seed words will be populated here -->
-                    </div>
-                    
-                    <div class="seed-actions">
-                        <button id="copy-seed-button" class="qnet-button secondary modern">
-                            📋 Copy to Clipboard
-                        </button>
-                        <button id="download-seed-button" class="qnet-button secondary modern">
-                            💾 Download as File
-                        </button>
-                    </div>
-                    
-                    <div class="seed-warnings">
-                        <div class="warning-item">
-                            <span class="warning-icon">🔒</span>
-                            <span>QNet cannot recover lost recovery phrases</span>
-                        </div>
-                        <div class="warning-item">
-                            <span class="warning-icon">💡</span>
-                            <span>Store multiple copies in secure locations</span>
-                        </div>
-                    </div>
-                    
-                    <button id="seed-confirmed-button" class="qnet-button primary gradient full-width">
-                        ✅ I've Saved My Recovery Phrase
-                    </button>
-                </div>
-            </div>
-        </div>
-
-        <!-- Seed Verification Modal -->
-        <div id="seed-verification-modal" class="modal-overlay hidden">
-            <div class="modal-box large modern">
-                <div class="modal-header">
-                    <h3>🔍 Verify Recovery Phrase</h3>
-                    <button class="close-button">✕</button>
-                </div>
-                
-                <div class="verification-content">
-                    <p>Please enter the following words from your recovery phrase in ascending order:</p>
-                    
-                    <div id="verification-container" class="verification-inputs">
-                        <!-- Verification inputs will be populated here -->
-                    </div>
-                    
-                    <div class="verification-actions">
-                        <button id="verify-seed-button" class="qnet-button primary gradient full-width">
-                            ✅ Verify & Continue
-                        </button>
-                    </div>
-                </div>
-            </div>
-        </div>
-
-        <!-- Password Setup Modal -->
-        <div id="password-setup-modal" class="modal-overlay hidden">
-            <div class="modal-box modern">
-                <div class="modal-header">
-                    <h3>🔐 Set Wallet Password</h3>
-                    <button class="close-button">✕</button>
-                </div>
-                
-                <div class="password-setup-content">
-                    <div class="form-group">
-                        <label for="setup-password">Create Password</label>
-                        <input type="password" id="setup-password" placeholder="Enter a strong password" 
-                               autocomplete="new-password" minlength="8" />
-                    </div>
-                    
-                    <div class="form-group">
-                        <label for="confirm-password">Confirm Password</label>
-                        <input type="password" id="confirm-password" placeholder="Confirm your password" 
-                               autocomplete="new-password" minlength="8" />
-                    </div>
-                    
-                    <div class="password-requirements">
-                        <p>Password requirements:</p>
-                        <ul>
-                            <li>At least 8 characters</li>
-                            <li>Recommended: mix of letters, numbers, and symbols</li>
-                        </ul>
-                    </div>
-                    
-                    <button id="create-wallet-final-button" class="qnet-button primary gradient full-width">
-                        🚀 Create Wallet
-                    </button>
-                </div>
-            </div>
-        </div>
-
-        <!-- Import Wallet Modal -->
-        <div id="import-wallet-modal" class="modal-overlay hidden">
-            <div class="modal-box modern">
-                <div class="modal-header">
-                    <h3>📥 Import Wallet</h3>
-                    <button class="close-button">✕</button>
-                </div>
-                
-                <div class="import-content">
-                    <div class="form-group">
-                        <label for="import-seed-phrase">Recovery Phrase</label>
-                        <textarea id="import-seed-phrase" 
-                                  placeholder="Enter your 12-word recovery phrase separated by spaces" 
-                                  rows="4" autocomplete="off" spellcheck="false" autocorrect="off"></textarea>
-                        <div class="input-hint">
-                            Compatible with MetaMask, Phantom, and all BIP39 wallets
-                        </div>
-                    </div>
-                    
-                    <button id="import-confirm-button" class="qnet-button primary gradient full-width">
-                        📥 Import Wallet
-                    </button>
-                </div>
-            </div>
-        </div>
-
     </div>
 
     <!-- Load production version with working interface -->

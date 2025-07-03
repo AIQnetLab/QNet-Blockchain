@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Qnet Wallet Setup - Edit Test</title>
+    <link rel="stylesheet" href="styles/setup.css">
+</head>
+<body>
+    <div class="setup-container">
+        <!-- Header -->
+        <div class="setup-header">
+            <div class="setup-title">
+                <img src="icons/icon-32.png" alt="Qnet Wallet" class="wallet-icon">
+                <span>Qnet Wallet</span>
+            </div>
+            <div class="header-actions">
+                <button id="language-toggle" class="language-button" onclick="toggleLanguage()">
+                    EN
+                </button>
+                <button id="close-setup" class="close-button">✕</button>
+            </div>
+        </div>
+
+        <!-- Progress Bar -->
+        <div class="progress-container">
+            <div class="progress-bar">
+                <div id="progress-fill" class="progress-fill"></div>
+            </div>
+            <div id="step-indicator" class="step-indicator">Step 1 of 5</div>
+        </div>
+
+        <!-- Welcome Step -->
+        <div id="step-welcome" class="setup-step active">
+            <div class="step-content">
+                <div class="step-header">
+                    <h1 class="step-title">Welcome to Qnet Wallet</h1>
+                    <p class="step-description">Create a new wallet or import an existing one to get started with QNet and Solana dual networks.</p>
+                </div>
+
+                <div class="wallet-options">
+                    <button id="create-new-wallet" class="primary-button">
+                        Create New Wallet
+                    </button>
+                    <button id="import-existing-wallet" class="secondary-button">
+                        Import Existing Wallet
+                    </button>
+                </div>
+
+                <div class="security-notice">
+                    <div class="warning-title">Your security is our priority</div>
+                    <div class="warning-text">Qnet Wallet uses industry-standard encryption and never stores your private keys on our servers.</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Password Step -->
+        <div id="step-password" class="setup-step">
+            <div class="step-content">
+                <div class="step-header">
+                    <h1 class="step-title">Create Password</h1>
+                    <p class="step-description">This password will unlock your wallet on this device.</p>
+                </div>
+
+                <form id="password-form" class="password-form">
+                    <div class="input-group">
+                        <label for="new-password">New Password</label>
+                        <input type="password" id="new-password" required placeholder="Enter password (8+ characters)">
+                    </div>
+
+                    <div class="input-group">
+                        <label for="confirm-password">Confirm Password</label>
+                        <input type="password" id="confirm-password" required placeholder="Confirm your password">
+                    </div>
+
+                    <!-- Simplified Requirements -->
+                    <div class="password-requirements">
+                        <div id="check-length" class="requirement-item">
+                            <span class="check-icon">⏳</span>
+                            <span>At least 8 characters</span>
+                        </div>
+                    </div>
+
+                    <div id="password-error" class="error-message"></div>
+
+                    <div class="form-actions">
+                        <button type="button" id="back-to-welcome" class="back-button">← Back</button>
+                        <button type="submit" id="continue-password" class="primary-button" disabled>Continue</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+
+        <!-- Seed Phrase Display Step -->
+        <div id="step-seed-display" class="setup-step">
+            <div class="step-content">
+                <div class="step-header">
+                    <h1 class="step-title">Your Recovery Phrase</h1>
+                    <p class="step-description">Write down this 12-word recovery phrase in the exact order shown. Keep it secure and never share it.</p>
+                </div>
+
+                <div class="seed-phrase-container">
+                    <div id="seed-phrase-grid" class="seed-phrase-grid">
+                        <!-- Words will be populated by JavaScript -->
+                    </div>
+                </div>
+
+                <div class="seed-actions">
+                    <button id="copy-seed" class="secondary-button">Copy</button>
+                    <button id="download-seed" class="secondary-button">Download</button>
+                </div>
+
+                <div class="warning-box">
+                    <div class="warning-icon">!</div>
+                    <div class="warning-content">
+                        <strong>Warning:</strong> Never share your recovery phrase with anyone. Anyone with this phrase can access your funds.
+                    </div>
+                </div>
+
+                <div class="form-actions">
+                    <button type="button" id="back-to-password" class="back-button">← Back</button>
+                    <button type="button" id="continue-to-verify" class="primary-button">I've Saved It</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Seed Import Step -->
+        <div id="step-seed-import" class="setup-step">
+            <div class="step-content">
+                <div class="step-header">
+                    <h1 class="step-title">Import Recovery Phrase</h1>
+                    <p class="step-description">Enter your 12 or 24-word recovery phrase to restore your wallet.</p>
+                </div>
+
+                <form id="import-form" class="import-form">
+                    <div class="input-group">
+                        <label for="seed-phrase-input">Recovery Phrase</label>
+                        <textarea 
+                            id="seed-phrase-input" 
+                            rows="4"
+                            placeholder="Enter your recovery phrase..."
+                            required
+                        ></textarea>
+                    </div>
+
+                    <div class="validation-checks">
+                        <div id="word-count-check" class="validation-item waiting">
+                            <span class="check-icon">⏳</span>
+                            <span>Valid word count (12 or 24 words)</span>
+                        </div>
+                        <div id="words-valid-check" class="validation-item waiting">
+                            <span class="check-icon">⏳</span>
+                            <span>All words are valid</span>
+                        </div>
+                    </div>
+
+                    <div id="import-error" class="error-message"></div>
+
+                    <div class="form-actions">
+                        <button type="button" id="back-to-password-import" class="back-button">← Back</button>
+                        <button type="submit" id="continue-import" class="primary-button" disabled>Import Wallet</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+
+        <!-- Verification Step -->
+        <div id="step-verification" class="setup-step">
+            <div class="step-content">
+                <div class="step-header">
+                    <h1 class="step-title">Verify Recovery Phrase</h1>
+                    <p class="step-description">Click the words in the correct order to verify you've saved your recovery phrase.</p>
+                </div>
+
+                <div id="verification-container" class="verification-container">
+                    <!-- Verification UI will be populated by JavaScript -->
+                </div>
+
+                <div id="verification-error" class="error-message" style="display: none;"></div>
+
+                <div class="form-actions">
+                    <button type="button" id="back-to-seed" class="back-button">← Back</button>
+                    <button type="button" id="complete-verification" class="primary-button" disabled>Complete Setup</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Success Step -->
+        <div id="step-success" class="setup-step">
+            <div class="step-content">
+                <div class="success-container">
+                    <div class="success-icon">✓</div>
+                    <h1 class="step-title">Wallet Created Successfully!</h1>
+                    <p class="step-description">Your Qnet Wallet is ready to use. You can now manage QNet and Solana assets securely.</p>
+                    
+                    <div class="wallet-addresses">
+                        <div class="address-item">
+                            <span class="address-label">QNet Address:</span>
+                            <span id="qnet-address" class="address-value">Loading...</span>
+                        </div>
+                        <div class="address-item">
+                            <span class="address-label">Solana Address:</span>
+                            <span id="solana-address" class="address-value">Loading...</span>
+                        </div>
+                    </div>
+
+                    <div class="success-actions">
+                        <button id="open-wallet" class="primary-button large">Open Wallet</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="src/crypto/ProductionBIP39.js"></script>
+    <script src="setup.js"></script>
+</body>
+</html> 
