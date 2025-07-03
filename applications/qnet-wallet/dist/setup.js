@@ -856,6 +856,15 @@ async function completeWalletSetup() {
         
         localStorage.setItem('qnet_wallet_encrypted', encryptedData);
         localStorage.setItem('qnet_wallet_password_hash', passwordHash);
+        localStorage.setItem('qnet_wallet_unlocked', 'true');
+        
+        // Trigger storage event to notify popup
+        window.dispatchEvent(new StorageEvent('storage', {
+            key: 'qnet_wallet_encrypted',
+            oldValue: null,
+            newValue: encryptedData,
+            url: window.location.href
+        }));
         
         // Generate addresses for display
         const qnetAddress = generateEONAddress();
@@ -870,6 +879,10 @@ async function completeWalletSetup() {
         
         showStep('success');
         showToast('Wallet created successfully', 'success');
+        
+        // Store wallet addresses for later use
+        localStorage.setItem('qnet_temp_address', qnetAddress);
+        localStorage.setItem('solana_temp_address', solanaAddress);
         
         console.log('Wallet creation completed successfully');
         
@@ -926,19 +939,26 @@ async function openWalletAfterSetup() {
     try {
         console.log('Opening wallet after setup...');
         
-        showToast('Wallet setup complete! Click the extension icon to access your wallet.', 'success');
+        showToast('Opening wallet interface...', 'success');
         
-        // Close setup window after short delay
-        setTimeout(() => {
-            window.close();
-        }, 2000);
+        // Wait a moment for localStorage to be written
+        await new Promise(resolve => setTimeout(resolve, 500));
+        
+        // Open wallet in same window instead of closing
+        if (chrome?.runtime) {
+            const popupUrl = chrome.runtime.getURL('popup.html');
+            window.location.href = popupUrl;
+        } else {
+            // Fallback
+            window.location.href = 'popup.html';
+        }
         
     } catch (error) {
         console.error('Failed to open wallet:', error);
         showToast('Wallet created! Please click the extension icon to access your wallet.', 'info');
         setTimeout(() => {
             window.close();
-        }, 2000);
+        }, 3000);
     }
 }
 
