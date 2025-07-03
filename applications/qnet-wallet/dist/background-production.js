@@ -2027,14 +2027,15 @@ async function getCurrentPhase() {
         const networkAge = await getNetworkAgeYears();
         
         // Phase 2 conditions: 90% burned OR 5+ years (whichever comes first)
-        const phase = (burnPercent >= 90 || networkAge >= 5) ? 2 : 1;
+        // Only transition if we have real data
+        const phase = (burnPercent !== null && burnPercent >= 90) || networkAge >= 5 ? 2 : 1;
         
         return { 
             success: true, 
             phase: phase,
             burnPercent: burnPercent,
             networkAge: networkAge,
-            transitionReason: burnPercent >= 90 ? 'burn_threshold' : networkAge >= 5 ? 'time_limit' : null,
+            transitionReason: (burnPercent !== null && burnPercent >= 90) ? 'burn_threshold' : networkAge >= 5 ? 'time_limit' : null,
             timestamp: Date.now()
         };
     } catch (error) {
@@ -2076,12 +2077,13 @@ async function getNetworkSize() {
  */
 async function getBurnPercentage() {
     try {
-        // For production demo, return realistic burn percentage
-        // In real implementation, this would query blockchain
-        return 15.7; // Demo: 15.7% burned, Phase 1 continues
+        // Get real burn percentage from blockchain
+        // For production, return null if no real data available
+        // Do not show fake percentages
+        return null; // No real data available yet
     } catch (error) {
         console.error('Failed to get burn percentage:', error);
-        return 0; // Default to 0% burned
+        return null; // No data available
     }
 }
 

@@ -10,8 +10,14 @@
   --bg-primary: #0f0f1a;
   --bg-secondary: #1a1a2e;
   --bg-tertiary: #16213e;
-  --bg-card: rgba(255, 255, 255, 0.05);
+  --bg-card: rgba(255, 255, 255, 0.1);
   --bg-modal: rgba(15, 15, 26, 0.95);
+  
+  /* Solflare-style gradients */
+  --gradient-main: linear-gradient(135deg, #667eea 0%, #764ba2 50%, #f093fb 100%);
+  --gradient-card: linear-gradient(145deg, rgba(255, 255, 255, 0.15) 0%, rgba(255, 255, 255, 0.05) 100%);
+  --gradient-button: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  --gradient-purple: linear-gradient(135deg, #a855f7 0%, #ec4899 100%);
   
   /* QNet Brand Colors */
   --qnet-primary: #00d4ff;
@@ -57,13 +63,13 @@
 
 body {
   font-family: var(--font-primary);
-  background: var(--bg-primary);
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 50%, #f093fb 100%);
   color: var(--text-primary);
   width: 360px;
   height: 520px;
   overflow: hidden;
-  font-size: 14px;
-  line-height: 1.5;
+  font-size: 13px;
+  line-height: 1.4;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
@@ -74,7 +80,9 @@ body {
   display: flex;
   flex-direction: column;
   position: relative;
-  background: var(--bg-primary);
+  background: rgba(15, 15, 26, 0.4);
+  backdrop-filter: blur(20px);
+  border: 1px solid rgba(255, 255, 255, 0.1);
 }
 
 /* --- LOADING SCREEN --- */
@@ -101,9 +109,22 @@ body {
   width: 40px;
   height: 40px;
   border: 3px solid rgba(0, 212, 255, 0.2);
-  border-top: 3px solid var(--qnet-primary);
+  border-top: 3px solid transparent;
   border-radius: 50%;
+  background: conic-gradient(from 0deg, #667eea, #764ba2, #f093fb, #667eea);
   animation: spin 1s linear infinite;
+  position: relative;
+}
+
+.loading-spinner::before {
+  content: '';
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  right: 3px;
+  bottom: 3px;
+  border-radius: 50%;
+  background: var(--bg-primary);
 }
 
 .loading-container h2 {
@@ -136,11 +157,12 @@ body {
   font-size: 2.5rem;
   margin-bottom: 1rem;
   font-weight: 700;
-  background: var(--qnet-gradient);
+  background: linear-gradient(45deg, #667eea, #764ba2, #f093fb, #667eea);
+  background-size: 400% 400%;
   -webkit-background-clip: text;
   -webkit-text-fill-color: transparent;
   background-clip: text;
-  animation: glow 2s ease-in-out infinite alternate;
+  animation: gradientShift 3s ease infinite, float 4s ease-in-out infinite;
 }
 
 .lock-container h2 {
@@ -193,11 +215,12 @@ body {
 
 /* --- NETWORK SWITCHER --- */
 .network-switcher {
-  background: var(--bg-card);
-  backdrop-filter: blur(20px);
-  border-bottom: 1px solid var(--border-primary);
-  padding: 0.75rem 1rem;
+  background: rgba(255, 255, 255, 0.1);
+  backdrop-filter: blur(30px);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.2);
+  padding: 0.5rem 0.75rem;
   position: relative;
+  box-shadow: 0 4px 20px rgba(31, 38, 135, 0.2);
 }
 
 .network-tabs {
@@ -211,13 +234,13 @@ body {
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 0.5rem;
-  padding: 0.75rem 1rem;
+  gap: 0.35rem;
+  padding: 0.5rem 0.75rem;
   background: transparent;
   border: 1px solid var(--border-primary);
   border-radius: var(--radius-sm);
   color: var(--text-secondary);
-  font-size: 0.9rem;
+  font-size: 0.8rem;
   font-weight: 500;
   cursor: pointer;
   transition: all 0.3s ease;
@@ -283,30 +306,34 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 1rem;
-  background: var(--bg-card);
-  backdrop-filter: blur(20px);
-  border-bottom: 1px solid var(--border-primary);
+  padding: 0.75rem;
+  background: rgba(255, 255, 255, 0.1);
+  backdrop-filter: blur(30px);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.2);
+  box-shadow: 0 4px 20px rgba(31, 38, 135, 0.2);
 }
 
 .account-menu-button {
-  background: var(--bg-secondary);
-  border: 1px solid var(--border-primary);
+  background: rgba(255, 255, 255, 0.1);
+  border: 1px solid rgba(255, 255, 255, 0.2);
   color: var(--text-primary);
-  padding: 0.75rem 1rem;
-  border-radius: var(--radius-md);
+  padding: 0.5rem 0.75rem;
+  border-radius: var(--radius-sm);
   cursor: pointer;
   display: flex;
   align-items: center;
-  transition: all 0.3s ease;
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
   font-family: var(--font-primary);
-  font-size: 0.9rem;
+  font-size: 0.8rem;
+  backdrop-filter: blur(20px);
+  box-shadow: 0 4px 15px rgba(31, 38, 135, 0.2);
 }
 
 .account-menu-button:hover {
-  border-color: var(--border-active);
-  background: var(--bg-tertiary);
-  transform: translateY(-1px);
+  border-color: rgba(255, 255, 255, 0.4);
+  background: rgba(255, 255, 255, 0.15);
+  transform: translateY(-2px);
+  box-shadow: 0 8px 25px rgba(31, 38, 135, 0.3);
 }
 
 .header-actions {
@@ -316,35 +343,56 @@ body {
 
 .settings-button,
 .lock-button {
-  background: var(--bg-secondary);
-  border: 1px solid var(--border-primary);
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.15);
   color: var(--text-secondary);
-  font-size: 1.2rem;
+  font-size: 0.8rem;
   cursor: pointer;
-  padding: 0.75rem;
+  padding: 0.5rem;
   border-radius: var(--radius-sm);
-  transition: all 0.3s ease;
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  backdrop-filter: blur(20px);
+  font-weight: 500;
+  min-width: 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
 
 .settings-button:hover,
 .lock-button:hover {
   color: var(--qnet-primary);
-  background: var(--bg-tertiary);
-  border-color: var(--border-active);
+  background: rgba(255, 255, 255, 0.12);
+  border-color: rgba(255, 255, 255, 0.3);
+  transform: translateY(-1px);
+  box-shadow: 0 4px 15px rgba(31, 38, 135, 0.2);
 }
 
 /* --- PHASE INDICATOR --- */
 .phase-indicator {
-  background: linear-gradient(90deg, rgba(0, 212, 255, 0.1) 0%, rgba(153, 69, 255, 0.1) 100%);
-  padding: 0.75rem 1rem;
-  border-bottom: 1px solid var(--border-primary);
+  background: linear-gradient(90deg, rgba(102, 126, 234, 0.15) 0%, rgba(118, 75, 162, 0.15) 50%, rgba(240, 147, 251, 0.15) 100%);
+  padding: 0.5rem 0.75rem;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.2);
+  backdrop-filter: blur(20px);
+  position: relative;
+}
+
+.phase-indicator::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.4), transparent);
 }
 
 .phase-info {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  font-size: 0.85rem;
+  font-size: 0.75rem;
 }
 
 #phase-text {
@@ -360,63 +408,66 @@ body {
 /* --- MAIN CONTENT --- */
 .wallet-main {
   flex: 1;
-  padding: 1rem;
+  padding: 0.75rem;
   overflow-y: auto;
   display: flex;
   flex-direction: column;
-  gap: 1rem;
+  gap: 0.75rem;
 }
 
 /* --- ACCOUNT OVERVIEW --- */
 .account-overview {
   text-align: center;
-  padding: 1.5rem;
-  background: var(--bg-card);
-  backdrop-filter: blur(20px);
-  border: 1px solid var(--border-primary);
-  border-radius: var(--radius-lg);
-  box-shadow: var(--shadow-card);
+  padding: 1rem;
+  background: rgba(255, 255, 255, 0.1);
+  backdrop-filter: blur(30px);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: var(--radius-md);
+  box-shadow: 0 8px 32px rgba(31, 38, 135, 0.37);
+  position: relative;
+  overflow: hidden;
+}
+
+.account-overview::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.4), transparent);
 }
 
 .address-container {
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 0.5rem;
-  margin-bottom: 1rem;
+  margin-bottom: 0.75rem;
 }
 
 .account-address {
   color: var(--text-secondary);
   font-family: var(--font-mono);
-  font-size: 0.9rem;
+  font-size: 0.75rem;
   font-weight: 500;
-  padding: 0.5rem 1rem;
-  background: var(--bg-secondary);
+  padding: 0.4rem 0.6rem;
+  background: rgba(255, 255, 255, 0.05);
   border-radius: var(--radius-sm);
-  border: 1px solid var(--border-primary);
+  border: 1px solid rgba(255, 255, 255, 0.1);
   transition: all 0.3s ease;
+  cursor: pointer;
+  user-select: all;
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .account-address:hover {
-  color: var(--qnet-primary);
-  border-color: var(--border-active);
-}
-
-.copy-btn {
-  background: var(--bg-secondary);
-  border: 1px solid var(--border-primary);
-  color: var(--text-secondary);
-  padding: 0.5rem;
-  border-radius: var(--radius-sm);
-  cursor: pointer;
-  transition: all 0.3s ease;
-  font-size: 0.9rem;
-}
-
-.copy-btn:hover {
-  color: var(--qnet-primary);
-  border-color: var(--border-active);
+  color: var(--text-primary);
+  background: rgba(255, 255, 255, 0.08);
+  border-color: rgba(255, 255, 255, 0.2);
+  transform: scale(1.02);
 }
 
 .balance-container {
@@ -426,7 +477,7 @@ body {
 }
 
 .total-balance {
-  font-size: 2.5rem;
+  font-size: 2rem;
   font-weight: 600;
   background: var(--qnet-gradient);
   -webkit-background-clip: text;
@@ -436,7 +487,7 @@ body {
 }
 
 .network-balance {
-  font-size: 1rem;
+  font-size: 0.85rem;
   color: var(--text-secondary);
   font-weight: 500;
 }
@@ -445,38 +496,72 @@ body {
 .main-actions {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
-  gap: 0.75rem;
-  margin-bottom: 1rem;
+  gap: 0.5rem;
+  margin-bottom: 0.75rem;
 }
 
 .action-button.modern {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 0.5rem;
-  background: var(--bg-card);
-  backdrop-filter: blur(20px);
-  border: 1px solid var(--border-primary);
+  gap: 0.35rem;
+  background: rgba(255, 255, 255, 0.1);
+  backdrop-filter: blur(30px);
+  border: 1px solid rgba(255, 255, 255, 0.2);
   color: var(--text-primary);
   cursor: pointer;
-  padding: 1.25rem 0.75rem;
-  border-radius: var(--radius-md);
-  transition: all 0.3s ease;
-  font-size: 0.9rem;
+  padding: 0.75rem 0.5rem;
+  border-radius: var(--radius-sm);
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  font-size: 0.75rem;
   font-weight: 500;
-  box-shadow: var(--shadow-card);
+  box-shadow: 0 4px 20px rgba(31, 38, 135, 0.2);
+  position: relative;
+  overflow: hidden;
+  min-height: 64px;
+}
+
+.action-button.modern::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: linear-gradient(135deg, rgba(255, 255, 255, 0.1) 0%, rgba(255, 255, 255, 0.05) 100%);
+  opacity: 0;
+  transition: opacity 0.3s ease;
+}
+
+.action-button.modern:hover::before {
+  opacity: 1;
 }
 
 .action-button.modern:hover {
-  background: var(--bg-secondary);
-  border-color: var(--border-active);
-  transform: translateY(-2px);
-  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.4);
+  background: rgba(255, 255, 255, 0.15);
+  border-color: rgba(255, 255, 255, 0.4);
+  transform: translateY(-3px);
+  box-shadow: 0 15px 50px rgba(31, 38, 135, 0.5);
 }
 
 .action-icon {
-  font-size: 1.5rem;
-  margin-bottom: 0.25rem;
+  font-size: 1.1rem;
+  margin-bottom: 0.15rem;
+  position: relative;
+  z-index: 1;
+}
+
+.action-icon svg {
+  transition: all 0.3s ease;
+}
+
+.action-button.modern:hover .action-icon svg {
+  transform: scale(1.1);
+}
+
+.action-button.modern span {
+  position: relative;
+  z-index: 1;
 }
 
 /* --- NETWORK CONTENT --- */
@@ -493,11 +578,12 @@ body {
 /* --- TABS --- */
 .tabs-nav {
   display: flex;
-  background: var(--bg-card);
-  backdrop-filter: blur(20px);
-  border: 1px solid var(--border-primary);
+  background: rgba(255, 255, 255, 0.08);
+  backdrop-filter: blur(30px);
+  border: 1px solid rgba(255, 255, 255, 0.15);
   border-radius: var(--radius-md);
   padding: 0.25rem;
+  box-shadow: 0 4px 20px rgba(31, 38, 135, 0.2);
 }
 
 .tab-button {
@@ -509,20 +595,45 @@ body {
   font-size: 0.9rem;
   font-weight: 500;
   cursor: pointer;
-  transition: all 0.3s ease;
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
   border-radius: var(--radius-sm);
   font-family: var(--font-primary);
+  position: relative;
+  overflow: hidden;
+}
+
+.tab-button::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: linear-gradient(135deg, rgba(255, 255, 255, 0.1) 0%, rgba(255, 255, 255, 0.05) 100%);
+  opacity: 0;
+  transition: opacity 0.3s ease;
 }
 
 .tab-button.active {
   color: var(--text-primary);
-  background: var(--bg-secondary);
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+  background: rgba(255, 255, 255, 0.15);
+  box-shadow: 0 4px 20px rgba(31, 38, 135, 0.3);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+}
+
+.tab-button.active::before {
+  opacity: 1;
 }
 
 .tab-button:hover:not(.active) {
   color: var(--text-primary);
-  background: rgba(255, 255, 255, 0.05);
+  background: rgba(255, 255, 255, 0.08);
+  transform: translateY(-1px);
+}
+
+.tab-button span {
+  position: relative;
+  z-index: 1;
 }
 
 /* --- TOKEN LIST --- */
@@ -537,19 +648,32 @@ body {
   display: flex;
   align-items: center;
   padding: 1rem;
-  background: var(--bg-card);
-  backdrop-filter: blur(20px);
-  border: 1px solid var(--border-primary);
+  background: rgba(255, 255, 255, 0.08);
+  backdrop-filter: blur(30px);
+  border: 1px solid rgba(255, 255, 255, 0.15);
   border-radius: var(--radius-md);
-  transition: all 0.3s ease;
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
   cursor: pointer;
-  box-shadow: var(--shadow-card);
+  box-shadow: 0 8px 32px rgba(31, 38, 135, 0.37);
+  position: relative;
+  overflow: hidden;
+}
+
+.token-item::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.3), transparent);
 }
 
 .token-item:hover {
-  border-color: var(--border-active);
-  background: var(--bg-secondary);
-  transform: translateX(4px);
+  border-color: rgba(255, 255, 255, 0.25);
+  background: rgba(255, 255, 255, 0.12);
+  transform: translateY(-2px);
+  box-shadow: 0 12px 40px rgba(31, 38, 135, 0.5);
 }
 
 .token-icon {
@@ -557,12 +681,28 @@ body {
   height: 40px;
   border-radius: 50%;
   margin-right: 1rem;
-  background: var(--bg-secondary);
+  background: linear-gradient(135deg, rgba(255, 255, 255, 0.15) 0%, rgba(255, 255, 255, 0.05) 100%);
   display: flex;
   align-items: center;
   justify-content: center;
   font-size: 1.2rem;
-  border: 1px solid var(--border-primary);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  transition: all 0.3s ease;
+}
+
+.token-item:hover .token-icon {
+  transform: scale(1.1);
+  box-shadow: 0 4px 20px rgba(31, 38, 135, 0.4);
+}
+
+.no-tokens {
+  text-align: center;
+  padding: 2rem;
+  color: var(--text-secondary);
+  font-style: italic;
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: var(--radius-md);
+  border: 1px dashed rgba(255, 255, 255, 0.1);
 }
 
 .token-info {
@@ -602,12 +742,26 @@ body {
 .node-card.modern,
 .activation-card.modern,
 .rewards-card.modern {
-  background: var(--bg-card);
-  backdrop-filter: blur(20px);
-  border: 1px solid var(--border-primary);
+  background: rgba(255, 255, 255, 0.08);
+  backdrop-filter: blur(30px);
+  border: 1px solid rgba(255, 255, 255, 0.15);
   border-radius: var(--radius-lg);
   padding: 1.5rem;
-  box-shadow: var(--shadow-card);
+  box-shadow: 0 8px 32px rgba(31, 38, 135, 0.37);
+  position: relative;
+  overflow: hidden;
+}
+
+.node-card.modern::before,
+.activation-card.modern::before,
+.rewards-card.modern::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.3), transparent);
 }
 
 .node-header h3,
@@ -762,15 +916,39 @@ body {
 }
 
 .qnet-button.primary.gradient {
-  background: var(--qnet-gradient);
+  background: linear-gradient(45deg, #667eea, #764ba2, #f093fb, #667eea);
+  background-size: 400% 400%;
   color: white;
   border: none;
   box-shadow: var(--shadow-card);
+  position: relative;
+  overflow: hidden;
+  animation: gradientShift 3s ease infinite;
+}
+
+.qnet-button.primary.gradient::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: -100%;
+  width: 100%;
+  height: 100%;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.4), transparent);
+  transition: left 0.5s ease;
+}
+
+.qnet-button.primary.gradient:hover::before {
+  left: 100%;
 }
 
 .qnet-button.primary.gradient:hover {
   box-shadow: 0 12px 40px rgba(0, 212, 255, 0.4);
   transform: translateY(-2px);
+}
+
+.qnet-button.primary.gradient span {
+  position: relative;
+  z-index: 1;
 }
 
 .qnet-button.secondary.modern {
@@ -929,6 +1107,28 @@ body {
   to { filter: drop-shadow(0 0 20px rgba(0, 212, 255, 0.8)); }
 }
 
+@keyframes pulse {
+  0% { transform: scale(1); }
+  50% { transform: scale(1.05); }
+  100% { transform: scale(1); }
+}
+
+@keyframes shimmer {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(100%); }
+}
+
+@keyframes float {
+  0%, 100% { transform: translateY(0px); }
+  50% { transform: translateY(-6px); }
+}
+
+@keyframes gradientShift {
+  0% { background-position: 0% 50%; }
+  50% { background-position: 100% 50%; }
+  100% { background-position: 0% 50%; }
+}
+
 @keyframes fadeIn {
   from { opacity: 0; }
   to { opacity: 1; }
@@ -1035,10 +1235,21 @@ body {
   overflow-y: auto;
 }
 
+.solflare-content {
+  padding: 0;
+  background: transparent;
+}
+
+.solflare-style {
+  background: rgba(15, 15, 26, 0.95);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  backdrop-filter: blur(30px);
+}
+
 .setting-group {
-  margin-bottom: 2rem;
-  padding-bottom: 1.5rem;
-  border-bottom: 1px solid var(--border-primary);
+  margin-bottom: 0;
+  padding: 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
 }
 
 .setting-group:last-child {
@@ -1049,20 +1260,28 @@ body {
 .setting-group.danger-zone {
   border-color: rgba(239, 68, 68, 0.3);
   background: rgba(239, 68, 68, 0.05);
-  border-radius: var(--radius-md);
-  padding: 1.5rem;
+  border-radius: 0;
+  padding: 0;
 }
 
 .setting-item {
   display: flex;
   justify-content: space-between;
-  align-items: flex-start;
+  align-items: center;
   gap: 1rem;
-  margin-bottom: 1.5rem;
+  margin-bottom: 0;
+  padding: 1rem 1.5rem;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+  transition: all 0.2s ease;
 }
 
 .setting-item:last-child {
   margin-bottom: 0;
+  border-bottom: none;
+}
+
+.setting-item:hover {
+  background: rgba(255, 255, 255, 0.02);
 }
 
 .setting-info {
@@ -1087,6 +1306,47 @@ body {
   flex-direction: column;
   gap: 0.5rem;
   min-width: 140px;
+}
+
+.solflare-content .setting-actions {
+  min-width: auto;
+}
+
+.solflare-content .qnet-button.secondary.modern {
+  background: transparent;
+  border: none;
+  color: var(--text-secondary);
+  padding: 0;
+  border-radius: 0;
+  box-shadow: none;
+  font-size: 0.9rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  text-align: left;
+  min-width: 140px;
+}
+
+.solflare-content .qnet-button.secondary.modern:hover {
+  background: transparent;
+  color: var(--text-primary);
+  transform: none;
+  box-shadow: none;
+}
+
+.solflare-content .qnet-button.secondary.modern .arrow {
+  color: var(--text-muted);
+  font-size: 0.8rem;
+  margin-left: 0.5rem;
+}
+
+.solflare-content .qnet-button.danger.modern {
+  color: var(--error);
+}
+
+.solflare-content .qnet-button.danger.modern:hover {
+  color: #ff6b6b;
 }
 
 .setting-note {
