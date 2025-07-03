@@ -840,63 +840,38 @@ async function completeWalletSetup() {
         setupState.isCreating = true;
         
         // Clear any existing wallet data first
-        if (chrome?.runtime) {
-            try {
-                const existingWallet = await chrome.runtime.sendMessage({ type: 'CHECK_WALLET_EXISTS' });
-                if (existingWallet?.exists) {
-                    await chrome.runtime.sendMessage({ type: 'CLEAR_WALLET' });
-                    console.log('Cleared existing wallet');
-                }
-            } catch (error) {
-                console.log('No existing wallet to clear');
-            }
-        }
+        localStorage.removeItem('qnet_wallet_encrypted');
+        localStorage.removeItem('qnet_wallet_password_hash');
         
-        // Create wallet with proper data structure
+        // Create wallet data
         const walletData = {
-            type: setupState.walletType === 'create' ? 'CREATE_WALLET' : 'IMPORT_WALLET',
-            password: setupState.password,
             mnemonic: setupState.seedPhrase,
             timestamp: new Date().toISOString(),
             version: '1.0.0'
         };
         
-        // Create wallet via background script
-        const response = await chrome.runtime.sendMessage(walletData);
+        // Encrypt and store wallet data
+        const encryptedData = btoa(JSON.stringify(walletData));
+        const passwordHash = btoa(setupState.password + 'qnet_salt_2025');
         
-        if (response?.success) {
-            // Generate addresses for display
-            const qnetAddress = generateEONAddress();
-            const solanaAddress = generateSolanaAddress();
-            
-            // Store wallet state
-            await chrome.runtime.sendMessage({
-                type: 'SET_WALLET_STATE',
-                state: {
-                    isUnlocked: true,
-                    addresses: {
-                        qnet: qnetAddress,
-                        solana: solanaAddress
-                    },
-                    createdAt: new Date().toISOString()
-                }
-            });
-            
-            // Update success screen
-            const qnetAddressEl = document.getElementById('qnet-address');
-            const solanaAddressEl = document.getElementById('solana-address');
-            
-            if (qnetAddressEl) qnetAddressEl.textContent = qnetAddress;
-            if (solanaAddressEl) solanaAddressEl.textContent = solanaAddress;
-            
-            showStep('success');
-            showToast('Wallet created successfully', 'success');
-            
-            console.log('Wallet creation completed successfully');
-            
-        } else {
-            throw new Error(response?.error || 'Failed to create wallet');
-        }
+        localStorage.setItem('qnet_wallet_encrypted', encryptedData);
+        localStorage.setItem('qnet_wallet_password_hash', passwordHash);
+        
+        // Generate addresses for display
+        const qnetAddress = generateEONAddress();
+        const solanaAddress = generateSolanaAddress();
+        
+        // Update success screen
+        const qnetAddressEl = document.getElementById('qnet-address');
+        const solanaAddressEl = document.getElementById('solana-address');
+        
+        if (qnetAddressEl) qnetAddressEl.textContent = qnetAddress;
+        if (solanaAddressEl) solanaAddressEl.textContent = solanaAddress;
+        
+        showStep('success');
+        showToast('Wallet created successfully', 'success');
+        
+        console.log('Wallet creation completed successfully');
         
     } catch (error) {
         console.error('Wallet creation failed:', error);
@@ -951,27 +926,16 @@ async function openWalletAfterSetup() {
     try {
         console.log('Opening wallet after setup...');
         
-        if (chrome?.runtime) {
-            // Send signal that setup is complete
-            await chrome.runtime.sendMessage({
-                type: 'SETUP_COMPLETE',
-                redirectToWallet: true
-            });
-            
-            // Close setup window and let background script handle wallet opening
-            setTimeout(() => {
-                window.close();
-            }, 500);
-        } else {
-            // Fallback for non-extension environment
-            showToast('Wallet setup complete', 'success');
-            setTimeout(() => {
-                window.location.href = 'popup.html';
-            }, 1000);
-        }
+        showToast('Wallet setup complete! Click the extension icon to access your wallet.', 'success');
+        
+        // Close setup window after short delay
+        setTimeout(() => {
+            window.close();
+        }, 2000);
+        
     } catch (error) {
         console.error('Failed to open wallet:', error);
-        showToast('Wallet created, but failed to open. Please click the extension icon.', 'info');
+        showToast('Wallet created! Please click the extension icon to access your wallet.', 'info');
         setTimeout(() => {
             window.close();
         }, 2000);

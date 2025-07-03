@@ -98,8 +98,8 @@
                     </button>
                 </div>
                 <div class="header-actions">
-                    <button id="settings-button" class="settings-button" title="Settings">⚙</button>
-                    <button id="lock-wallet-btn" class="lock-button" title="Lock Wallet">🔒</button>
+                    <button id="settings-button" class="settings-button" title="Settings">Settings</button>
+                    <button id="lock-wallet-btn" class="lock-button" title="Lock Wallet">Lock</button>
                 </div>
             </header>
 
@@ -117,13 +117,13 @@
                 <section class="account-overview">
                     <div class="address-container">
                         <div id="account-address" class="account-address" title="Click to copy">
-                            7a9bk4f2eon8x3m5z1c7
+                            Loading...
                         </div>
-                        <button class="copy-btn" id="copy-address-btn">📋</button>
+                        <button class="copy-btn" id="copy-address-btn">Copy</button>
                     </div>
                     <div class="balance-container">
                         <div id="total-balance" class="total-balance">$0.00</div>
-                        <div id="network-balance" class="network-balance">0 QNC</div>
+                        <div id="network-balance" class="network-balance">Loading...</div>
                     </div>
                 </section>
 
@@ -259,7 +259,7 @@
         <div id="settings-modal" class="modal-overlay hidden">
             <div class="modal-box modern">
                 <div class="modal-header">
-                    <h3>⚙️ Wallet Settings</h3>
+                    <h3>Wallet Settings</h3>
                     <button id="close-settings" class="close-button">✕</button>
                 </div>
                 
@@ -267,18 +267,18 @@
                     <div class="setting-group">
                         <div class="setting-item">
                             <div class="setting-info">
-                                <h4>🌐 Network Environment</h4>
+                                <h4>Network Environment</h4>
                                 <p>Switch between testnet and mainnet</p>
                             </div>
                             <select id="network-select" class="setting-select modern">
-                                <option value="testnet">🧪 Testnet (Development)</option>
-                                <option value="mainnet">🚀 Mainnet (Production)</option>
+                                <option value="testnet">Testnet (Development)</option>
+                                <option value="mainnet">Mainnet (Production)</option>
                             </select>
                         </div>
                         
                         <div class="setting-item">
                             <div class="setting-info">
-                                <h4>🔒 Auto-Lock Timer</h4>
+                                <h4>Auto-Lock Timer</h4>
                                 <p>Automatically lock wallet after inactivity</p>
                             </div>
                             <select id="autolock-select" class="setting-select modern">
@@ -293,21 +293,21 @@
                         
                         <div class="setting-item">
                             <div class="setting-info">
-                                <h4>🌐 Language</h4>
+                                <h4>Language</h4>
                                 <p>Wallet interface language</p>
                             </div>
                             <select id="language-select" class="setting-select modern">
-                                <option value="en" selected>🇺🇸 English</option>
-                                <option value="zh">🇨🇳 中文 (Chinese)</option>
-                                <option value="ko">🇰🇷 한국어 (Korean)</option>
-                                <option value="ja">🇯🇵 日本語 (Japanese)</option>
-                                <option value="ru">🇷🇺 Русский (Russian)</option>
-                                <option value="es">🇪🇸 Español (Spanish)</option>
-                                <option value="pt">🇵🇹 Português (Portuguese)</option>
-                                <option value="fr">🇫🇷 Français (French)</option>
-                                <option value="de">🇩🇪 Deutsch (German)</option>
-                                <option value="it">🇮🇹 Italiano (Italian)</option>
-                                <option value="ar">🇸🇦 العربية (Arabic)</option>
+                                <option value="en" selected>English</option>
+                                <option value="zh">中文 (Chinese)</option>
+                                <option value="ko">한국어 (Korean)</option>
+                                <option value="ja">日本語 (Japanese)</option>
+                                <option value="ru">Русский (Russian)</option>
+                                <option value="es">Español (Spanish)</option>
+                                <option value="pt">Português (Portuguese)</option>
+                                <option value="fr">Français (French)</option>
+                                <option value="de">Deutsch (German)</option>
+                                <option value="it">Italiano (Italian)</option>
+                                <option value="ar">العربية (Arabic)</option>
                             </select>
                         </div>
                     </div>
@@ -315,7 +315,7 @@
                     <div class="setting-group">
                         <div class="setting-item">
                             <div class="setting-info">
-                                <h4>🔐 Security Options</h4>
+                                <h4>Security Options</h4>
                                 <p>Manage wallet security settings</p>
                             </div>
                             <div class="setting-actions">
@@ -326,7 +326,7 @@
                         
                         <div class="setting-item">
                             <div class="setting-info">
-                                <h4>🔗 Connected dApps</h4>
+                                <h4>Connected dApps</h4>
                                 <p>Manage blockchain app connections</p>
                             </div>
                             <div class="setting-actions">
@@ -339,7 +339,7 @@
                     <div class="setting-group danger-zone">
                         <div class="setting-item">
                             <div class="setting-info">
-                                <h4>⚠️ Danger Zone</h4>
+                                <h4>Danger Zone</h4>
                                 <p>Irreversible actions - use with extreme caution</p>
                             </div>
                             <div class="setting-actions">
@@ -356,7 +356,7 @@
         <div id="receive-modal" class="modal-overlay hidden">
             <div class="modal-box modern">
                 <div class="modal-header">
-                    <h3>📥 Receive <span id="receive-network-name">QNC</span></h3>
+                    <h3>Receive <span id="receive-network-name">QNC</span></h3>
                     <button class="close-button" id="close-receive-modal">✕</button>
                 </div>
                 <div class="receive-content">
@@ -365,7 +365,7 @@
                     </div>
                     <div class="address-display">
                         <div class="address-text" id="receive-address">Loading...</div>
-                        <button class="copy-address-btn" id="copy-receive-address-btn">📋 Copy Address</button>
+                        <button class="copy-address-btn" id="copy-receive-address-btn">Copy Address</button>
                     </div>
                 </div>
             </div>
@@ -384,8 +384,8 @@
                 </div>
                 
                 <div class="modal-actions">
-                    <button id="create-account-button" class="qnet-button secondary modern">✨ Create Account</button>
-                    <button id="import-account-button" class="qnet-button secondary modern">📥 Import Account</button>
+                    <button id="create-account-button" class="qnet-button secondary modern">Create Account</button>
+                    <button id="import-account-button" class="qnet-button secondary modern">Import Account</button>
                 </div>
             </div>
         </div>
@@ -394,7 +394,7 @@
         <div id="wallet-setup-modal" class="modal-overlay hidden">
             <div class="modal-box large modern">
                 <div class="modal-header">
-                    <h3 id="setup-modal-title">✨ Create New Wallet</h3>
+                    <h3 id="setup-modal-title">Create New Wallet</h3>
                     <button id="close-setup" class="close-button">✕</button>
                 </div>
                 
@@ -430,7 +430,7 @@
                         </div>
                         
                         <button id="generate-wallet-button" class="qnet-button primary gradient full-width">
-                            ✨ Generate Dual Wallet
+                            Generate Dual Wallet
                         </button>
                     </div>
                     
@@ -460,14 +460,14 @@
                         <div id="import-error" class="inline-error hidden"></div>
                         
                         <button id="import-wallet-confirm-button" class="qnet-button primary gradient full-width">
-                            📥 Import Dual Wallet
+                            Import Dual Wallet
                         </button>
                     </div>
                     
                     <!-- Seed Phrase Display -->
                     <div id="seed-phrase-display" class="setup-step hidden">
                         <div class="step-header">
-                            <h4>⚠️ Save Your Recovery Phrase</h4>
+                            <h4>Save Your Recovery Phrase</h4>
                             <p>Write down these 12 words in order and keep them safe:</p>
                         </div>
                         
@@ -477,37 +477,37 @@
                         
                         <div class="seed-actions">
                             <button id="copy-seed-button" class="qnet-button secondary modern">
-                                📋 Copy to Clipboard
+                                Copy to Clipboard
                             </button>
                             <button id="download-seed-button" class="qnet-button secondary modern">
-                                💾 Download as File
+                                Download as File
                             </button>
                         </div>
                         
                         <div class="seed-warnings">
                             <div class="warning-item">
-                                <span class="warning-icon">⚠️</span>
+                                <span class="warning-icon">!</span>
                                 <span>Never share your recovery phrase with anyone!</span>
                             </div>
                             <div class="warning-item">
-                                <span class="warning-icon">🔒</span>
+                                <span class="warning-icon">•</span>
                                 <span>QNet cannot recover lost recovery phrases.</span>
                             </div>
                             <div class="warning-item">
-                                <span class="warning-icon">💡</span>
+                                <span class="warning-icon">i</span>
                                 <span>Store multiple copies in secure locations.</span>
                             </div>
                         </div>
                         
                         <button id="seed-confirmed-button" class="qnet-button primary gradient full-width">
-                            ✅ I've Saved My Recovery Phrase
+                            I've Saved My Recovery Phrase
                         </button>
                     </div>
                     
                     <!-- Seed Phrase Verification -->
                     <div id="seed-verification" class="setup-step hidden">
                         <div class="step-header">
-                            <h4>🔍 Verify Your Recovery Phrase</h4>
+                            <h4>Verify Your Recovery Phrase</h4>
                             <p>Select the correct words to confirm you saved it correctly:</p>
                         </div>
                         
@@ -522,7 +522,7 @@
                                 ← Back to Recovery Phrase
                             </button>
                             <button id="verify-seed-button" class="qnet-button primary gradient" disabled>
-                                ✅ Verify & Complete Setup
+                                Verify & Complete Setup
                             </button>
                         </div>
                     </div>
