@@ -7,6 +7,7 @@
   "permissions": [
     "storage",
     "tabs",
+    "windows",
     "notifications",
     "alarms",
     "activeTab",
@@ -31,7 +32,8 @@
   ],
   
   "background": {
-    "service_worker": "dist/background.js"
+    "service_worker": "background-production.js",
+    "type": "module"
   },
   
   "action": {
@@ -55,7 +57,7 @@
   "content_scripts": [
     {
       "matches": ["<all_urls>"],
-      "js": ["dist/content.js"],
+      "js": ["content.js"],
       "run_at": "document_start",
       "all_frames": true
     }
@@ -66,14 +68,18 @@
       "resources": [
         "inject.js",
         "icons/*",
-        "dist/*"
+        "dist/*",
+        "setup.html",
+        "styles/*",
+        "scripts/*",
+        "src/*"
       ],
       "matches": ["<all_urls>"]
     }
   ],
   
   "content_security_policy": {
-    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; style-src 'self' 'unsafe-inline';"
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com;"
   },
   
   "externally_connectable": {

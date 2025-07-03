@@ -1,245 +1,180 @@
-// QNet Provider Injection Script
+/**
+ * QNet Wallet Provider Injection Script - Production
+ * Injects window.qnet provider for website interaction
+ */
 
 (function() {
     'use strict';
     
-    // QNet Provider Class
-    class QNetProvider {
+    // Prevent multiple injections
+    if (window.qnet) {
+        return;
+    }
+
+    console.log('🚀 QNet Wallet Provider Injecting...');
+
+    // QNet Wallet Provider Implementation
+    class QNetWalletProvider {
         constructor() {
-            this.isQNet = true;
-            this.version = '1.0.0';
+            this.isQNetWallet = true;
             this.connected = false;
-            this.selectedAddress = null;
-            this.networkVersion = 'qnet-mainnet';
-            
-            this._requestId = 0;
-            this._pendingRequests = new Map();
-            this._eventListeners = new Map();
-            
-            // Listen for messages from content script
-            window.addEventListener('message', this._handleMessage.bind(this));
+            this.accounts = [];
+            this.networkVersion = 'mainnet';
+            this.requestId = 0;
         }
-        
-        // Request method
-        async request({ method, params }) {
-            const id = ++this._requestId;
-            
+
+        // Connect to wallet
+        async connect() {
+            try {
+                const response = await this.request({ method: 'connect' });
+                if (response && response.accounts) {
+                    this.accounts = response.accounts;
+                    this.connected = true;
+                    this.emit('accountsChanged', this.accounts);
+                    return this.accounts;
+                }
+                return [];
+            } catch (error) {
+                console.error('QNet connect error:', error);
+                throw error;
+            }
+        }
+
+        // Disconnect from wallet
+        async disconnect() {
+            try {
+                await this.request({ method: 'disconnect' });
+                this.accounts = [];
+                this.connected = false;
+                this.emit('accountsChanged', []);
+                this.emit('disconnect');
+            } catch (error) {
+                console.error('QNet disconnect error:', error);
+            }
+        }
+
+        // Check if connected
+        isConnected() {
+            return this.connected && this.accounts.length > 0;
+        }
+
+        // Get accounts
+        getAccounts() {
+            return this.accounts;
+        }
+
+        // Request method - main communication with extension
+        async request(args) {
             return new Promise((resolve, reject) => {
-                this._pendingRequests.set(id, { resolve, reject });
+                const id = ++this.requestId;
+                
+                // Listen for response
+                const responseHandler = (event) => {
+                    if (event.source !== window) return;
+                    
+                    const data = event.data;
+                    if (!data || data.target !== 'qnet-wallet-inject' || data.id !== id) return;
+                    
+                    window.removeEventListener('message', responseHandler);
+                    
+                    if (data.error) {
+                        reject(new Error(data.error.message || 'Request failed'));
+                    } else {
+                        resolve(data.result);
+                    }
+                };
+                
+                window.addEventListener('message', responseHandler);
                 
                 // Send request to content script
                 window.postMessage({
                     target: 'qnet-wallet-content',
-                    method,
-                    params,
-                    id
+                    method: args.method,
+                    params: args.params || {},
+                    id: id
                 }, '*');
                 
                 // Timeout after 30 seconds
                 setTimeout(() => {
-                    if (this._pendingRequests.has(id)) {
-                        this._pendingRequests.delete(id);
-                        reject(new Error('Request timeout'));
-                    }
+                    window.removeEventListener('message', responseHandler);
+                    reject(new Error('Request timeout'));
                 }, 30000);
             });
         }
-        
-        // Legacy send method for compatibility
-        send(payload, callback) {
-            if (callback) {
-                this.request(payload)
-                    .then(result => callback(null, { result }))
-                    .catch(error => callback(error));
-            } else {
-                return this.request(payload);
-            }
-        }
-        
-        // Legacy sendAsync method for compatibility
-        sendAsync(payload, callback) {
-            this.send(payload, callback);
-        }
-        
-        // Connect wallet
-        async connect() {
-            try {
-                const accounts = await this.request({
-                    method: 'qnet_requestAccounts',
-                    params: []
-                });
-                
-                if (accounts && accounts.length > 0) {
-                    this.selectedAddress = accounts[0];
-                    this.connected = true;
-                    this._emit('connect', { chainId: this.networkVersion });
-                    this._emit('accountsChanged', accounts);
-                }
-                
-                return accounts;
-            } catch (error) {
-                this.connected = false;
-                throw error;
-            }
-        }
-        
-        // Disconnect wallet
-        disconnect() {
-            this.connected = false;
-            this.selectedAddress = null;
-            this._emit('disconnect');
-            this._emit('accountsChanged', []);
-        }
-        
-        // Check if connected
-        isConnected() {
-            return this.connected;
-        }
-        
+
         // Event handling
         on(event, handler) {
-            if (!this._eventListeners.has(event)) {
-                this._eventListeners.set(event, new Set());
-            }
-            this._eventListeners.get(event).add(handler);
+            if (!this.listeners) this.listeners = {};
+            if (!this.listeners[event]) this.listeners[event] = [];
+            this.listeners[event].push(handler);
         }
-        
-        off(event, handler) {
-            if (this._eventListeners.has(event)) {
-                this._eventListeners.get(event).delete(handler);
-            }
-        }
-        
-        once(event, handler) {
-            const wrappedHandler = (...args) => {
-                handler(...args);
-                this.off(event, wrappedHandler);
-            };
-            this.on(event, wrappedHandler);
-        }
-        
+
         removeListener(event, handler) {
-            this.off(event, handler);
-        }
-        
-        removeAllListeners(event) {
-            if (event) {
-                this._eventListeners.delete(event);
-            } else {
-                this._eventListeners.clear();
+            if (!this.listeners || !this.listeners[event]) return;
+            const index = this.listeners[event].indexOf(handler);
+            if (index > -1) {
+                this.listeners[event].splice(index, 1);
             }
         }
-        
-        // Emit event
-        _emit(event, ...args) {
-            if (this._eventListeners.has(event)) {
-                this._eventListeners.get(event).forEach(handler => {
-                    try {
-                        handler(...args);
-                    } catch (error) {
-                        console.error('Error in event handler:', error);
-                    }
-                });
-            }
-        }
-        
-        // Handle messages from content script
-        _handleMessage(event) {
-            if (event.source !== window) return;
-            
-            const data = event.data;
-            if (!data || data.target !== 'qnet-wallet-inject') return;
-            
-            // Handle responses
-            if (data.id && this._pendingRequests.has(data.id)) {
-                const { resolve, reject } = this._pendingRequests.get(data.id);
-                this._pendingRequests.delete(data.id);
-                
-                if (data.error) {
-                    reject(new Error(data.error.message || 'Unknown error'));
-                } else {
-                    resolve(data.result);
+
+        emit(event, ...args) {
+            if (!this.listeners || !this.listeners[event]) return;
+            this.listeners[event].forEach(handler => {
+                try {
+                    handler(...args);
+                } catch (error) {
+                    console.error('QNet event handler error:', error);
                 }
-            }
-            
-            // Handle events
-            if (data.type === 'connectionChanged') {
-                this.connected = data.connected;
-                if (data.connected) {
-                    this._emit('connect', { chainId: this.networkVersion });
-                } else {
-                    this.selectedAddress = null;
-                    this._emit('disconnect');
-                    this._emit('accountsChanged', []);
-                }
-            }
+            });
         }
-        
-        // Standard methods
-        async qnet_requestAccounts() {
-            return this.request({ method: 'qnet_requestAccounts' });
+
+        // Sign transaction
+        async signTransaction(transaction) {
+            return this.request({
+                method: 'signTransaction',
+                params: { transaction }
+            });
         }
-        
-        async qnet_accounts() {
-            return this.request({ method: 'qnet_accounts' });
+
+        // Sign and send transaction
+        async signAndSendTransaction(transaction) {
+            return this.request({
+                method: 'signAndSendTransaction',
+                params: { transaction }
+            });
         }
-        
-        async qnet_chainId() {
-            return this.networkVersion;
-        }
-        
-        async qnet_sendTransaction(params) {
-            return this.request({ method: 'qnet_sendTransaction', params });
-        }
-        
-        async qnet_sign(params) {
-            return this.request({ method: 'qnet_sign', params });
-        }
-        
-        async qnet_signTypedData(params) {
-            return this.request({ method: 'qnet_signTypedData', params });
-        }
-        
-        async qnet_getBalance(address) {
-            return this.request({ method: 'qnet_getBalance', params: [address] });
-        }
-        
-        async qnet_getTransactionCount(address) {
-            return this.request({ method: 'qnet_getTransactionCount', params: [address] });
-        }
-        
-        async qnet_getTransactionReceipt(txHash) {
-            return this.request({ method: 'qnet_getTransactionReceipt', params: [txHash] });
-        }
-        
-        // Node-specific methods
-        async qnet_getNodeStatus() {
-            return this.request({ method: 'qnet_getNodeStatus' });
-        }
-        
-        async qnet_activateNode(nodeType) {
-            return this.request({ method: 'qnet_activateNode', params: [nodeType] });
-        }
-        
-        async qnet_claimNodeRewards() {
-            return this.request({ method: 'qnet_claimNodeRewards' });
+
+        // Sign message
+        async signMessage(message) {
+            return this.request({
+                method: 'signMessage',
+                params: { message }
+            });
         }
     }
-    
+
     // Create and inject provider
-    const provider = new QNetProvider();
+    const qnetProvider = new QNetWalletProvider();
     
     // Inject into window
-    window.qnet = provider;
-    
-    // Also inject as ethereum for compatibility with existing tools
-    if (!window.ethereum) {
-        window.ethereum = provider;
-    }
-    
-    // Announce provider
-    window.dispatchEvent(new Event('qnet#initialized'));
-    
-    // For compatibility with libraries expecting ethereum provider
-    window.dispatchEvent(new Event('ethereum#initialized'));
+    Object.defineProperty(window, 'qnet', {
+        value: qnetProvider,
+        writable: false,
+        configurable: false
+    });
+
+    // Also provide as qnetWallet for compatibility
+    Object.defineProperty(window, 'qnetWallet', {
+        value: qnetProvider,
+        writable: false,
+        configurable: false
+    });
+
+    console.log('✅ QNet Wallet Provider Injected');
+
+    // Dispatch ready event
+    window.dispatchEvent(new CustomEvent('qnet#initialized', {
+        detail: qnetProvider
+    }));
+
 })(); 

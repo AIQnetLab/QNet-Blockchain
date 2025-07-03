@@ -3,6 +3,12 @@
 import { memo, useState, useEffect } from 'react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
+import dynamic from 'next/dynamic';
+
+const WalletConnectButton = dynamic(() => import('./wallet/wallet-connect-button'), {
+  ssr: false,
+  loading: () => <button className="qnet-button" disabled>Loading...</button>
+});
 
 const HeaderComponent = () => {
   const pathname = usePathname();
@@ -44,12 +50,12 @@ const HeaderComponent = () => {
             </Link>
           ))}
           <div className="header-right-mobile">
-            <button className="qnet-button">Connect Wallet</button>
+            <WalletConnectButton />
           </div>
         </nav>
         
         <div className="header-right-desktop">
-          <button className="qnet-button">Connect Wallet</button>
+          <WalletConnectButton />
         </div>
 
         <button className="mobile-menu-button" onClick={toggleMenu} aria-label="Toggle menu">

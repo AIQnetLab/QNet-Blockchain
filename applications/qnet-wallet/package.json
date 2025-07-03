@@ -9,7 +9,7 @@
     "serve": "python -m http.server 8080",
     "serve-prod": "python -m http.server 8080 --bind 0.0.0.0",
     "build": "npm run build:production",
-    "build:production": "node scripts/build-production.js",
+    "build:production": "node scripts/build-production.cjs",
     "build:testnet": "node scripts/build-testnet.js",
     "test": "npm run test:unit && npm run test:integration",
     "test:unit": "node scripts/test-runner.js",
@@ -60,29 +60,29 @@
     "npm": ">=8.0.0"
   },
   "dependencies": {
-    "@solana/web3.js": "^1.95.2",
     "@solana/spl-token": "^0.4.8",
-    "@solana/wallet-adapter-base": "^0.9.23",
+    "@solana/wallet-adapter-base": "^0.9.27",
+    "@solana/web3.js": "^1.98.2",
+    "big.js": "^6.2.1",
     "bip39": "^3.1.0",
-    "ed25519-hd-key": "^1.3.0",
-    "tweetnacl": "^1.0.3",
     "bs58": "^5.0.0",
     "buffer": "^6.0.3",
     "crypto-js": "^4.2.0",
-    "qrcode": "^1.5.3",
-    "big.js": "^6.2.1"
+    "ed25519-hd-key": "^1.3.0",
+    "qrcode": "^1.5.4",
+    "tweetnacl": "^1.0.3"
   },
   "devDependencies": {
-    "eslint": "^8.57.0",
-    "prettier": "^3.2.5",
-    "terser": "^5.28.1",
-    "rollup": "^4.12.0",
-    "rollup-plugin-terser": "^7.0.2",
-    "rollup-plugin-node-resolve": "^5.2.0",
-    "rollup-plugin-commonjs": "^10.1.0",
-    "http-server": "^14.1.1",
     "cross-env": "^7.0.3",
-    "rimraf": "^5.0.5"
+    "eslint": "^8.57.0",
+    "http-server": "^14.1.1",
+    "prettier": "^3.2.5",
+    "rimraf": "^5.0.5",
+    "rollup": "^4.12.0",
+    "rollup-plugin-commonjs": "^10.1.0",
+    "rollup-plugin-node-resolve": "^5.2.0",
+    "rollup-plugin-terser": "^7.0.2",
+    "terser": "^5.28.1"
   },
   "browserslist": [
     "last 2 Chrome versions",

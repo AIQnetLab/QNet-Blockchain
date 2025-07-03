@@ -20,7 +20,7 @@ export class SecureSeedImport {
             <div class="secure-seed-import">
                 <div class="import-header">
                     <h3>Import from Other Wallet</h3>
-                    <p>Enter your seed phrase from MetaMask, Trust Wallet, Phantom, Solflare, or other BIP39 wallets</p>
+                                                <p>Enter your seed phrase from any BIP39 compatible wallet</p>
                 </div>
                 
                 <div class="seed-input-container">

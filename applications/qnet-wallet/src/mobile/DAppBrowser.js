@@ -1,6 +1,6 @@
 /**
  * QNet Mobile DApp Browser
- * Provides web3 functionality for mobile apps like Phantom wallet
+ * Provides web3 functionality for mobile apps
  */
 
 export class DAppBrowser {
@@ -143,7 +143,7 @@ export class DAppBrowser {
                 class QNetProvider {
                     constructor() {
                         this.isQNet = true;
-                        this.isPhantom = true; // Phantom compatibility
+                        this.isQNet = true; // QNet wallet identification
                         this.isConnected = false;
                         this.publicKey = null;
                     }
@@ -233,7 +233,7 @@ export class DAppBrowser {
                 
                 // Make provider available globally
                 window.qnet = new QNetProvider();
-                window.solana = window.qnet; // Phantom compatibility
+                window.solana = window.qnet; // Solana protocol compatibility
                 
                 // Dispatch ready event
                 window.dispatchEvent(new Event('qnet#initialized'));

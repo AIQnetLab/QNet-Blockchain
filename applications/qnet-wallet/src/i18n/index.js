@@ -1,9 +1,24 @@
 /**
  * QNet Wallet Internationalization
  * Languages ordered by crypto community size (descending)
+ * Auto-detects browser language with fallback to English
  */
 
 let currentLanguage = 'en';
+
+/**
+ * Detect browser language and set appropriate language
+ */
+function detectBrowserLanguage() {
+    const supportedLanguages = ['en', 'zh', 'ko', 'ja', 'ru', 'es', 'pt', 'fr', 'de', 'it', 'ar'];
+    const browserLang = navigator.language || navigator.userLanguage;
+    
+    // Extract language code (e.g., 'en-US' -> 'en')
+    const langCode = browserLang.split('-')[0].toLowerCase();
+    
+    // Return supported language or fallback to English
+    return supportedLanguages.includes(langCode) ? langCode : 'en';
+}
 
 const translations = {
     en: {
@@ -171,11 +186,26 @@ const translations = {
 };
 
 /**
+ * Initialize i18n system with auto-detection
+ */
+export async function initializeI18n() {
+    const savedLanguage = localStorage.getItem('qnet_wallet_language');
+    const detectedLanguage = detectBrowserLanguage();
+    
+    // Use saved language or auto-detected language
+    const languageToUse = savedLanguage || detectedLanguage;
+    
+    await setLanguage(languageToUse);
+    console.log(`✅ Language initialized: ${languageToUse} (saved: ${savedLanguage}, detected: ${detectedLanguage})`);
+}
+
+/**
  * Set current language
  */
 export async function setLanguage(languageCode) {
     if (translations[languageCode]) {
         currentLanguage = languageCode;
+        localStorage.setItem('qnet_wallet_language', languageCode);
         updatePageTexts();
         return true;
     }

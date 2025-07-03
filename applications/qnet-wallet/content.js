@@ -1,5 +1,9 @@
 // QNet Wallet Content Script
 
+// Don't run in extension popup/options pages
+if (window.location.protocol !== 'chrome-extension:') {
+    console.log('🚀 QNet Content Script starting on:', window.location.href);
+
 // Inject provider script into page
 const script = document.createElement('script');
 script.src = chrome.runtime.getURL('inject.js');
@@ -71,4 +75,8 @@ chrome.runtime.sendMessage({
             connected: true
         }, '*');
     }
-}); 
+});
+
+} else {
+    console.log('🚫 Content script skipped - running in extension context');
+}

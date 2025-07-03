@@ -1,3 +1,7 @@
+# QNet Wallet - EDIT_FILE TEST
+
+Test line to check if edit_file works with markdown files.
+
 # QNet Dual Wallet - Production Ready
 
 **Version**: 1.0.0 Production  

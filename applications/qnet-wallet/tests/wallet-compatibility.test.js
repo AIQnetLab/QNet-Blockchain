@@ -1,6 +1,6 @@
 /**
  * QNet Wallet - Compatibility Tests
- * Testing import compatibility with major wallets including Phantom and Solflare
+ * Testing import compatibility with BIP39 standard wallets
  */
 
 import { secureBIP39 } from '../src/crypto/ProductionBIP39.js';
@@ -16,7 +16,7 @@ describe('Wallet Compatibility Tests', () => {
 
     describe('Major Wallet Compatibility', () => {
         
-        test('Should support MetaMask seed format', () => {
+        test('Should support standard BIP39 seed format', () => {
             const result = secureBIP39.validateImportedSeed(testSeeds.standard_12);
             expect(result.valid).toBe(true);
             expect(result.wordCount).toBe(12);
@@ -28,8 +28,8 @@ describe('Wallet Compatibility Tests', () => {
             expect(result.valid).toBe(true);
         });
 
-        test('Should support Phantom wallet seed format', () => {
-            // Phantom uses standard BIP39
+        test('Should support alternative wallet seed format', () => {
+            // Testing standard BIP39 compatibility
             const result = secureBIP39.validateImportedSeed(testSeeds.standard_12);
             expect(result.valid).toBe(true);
             expect(result.message).toBe("Valid BIP39 seed phrase ready for import");

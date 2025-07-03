@@ -24,8 +24,8 @@ export class WalletManager {
         try {
             let mnemonic;
             
-            // Use fallback mnemonic generation for Chrome Extension compatibility
-            mnemonic = SecureCrypto.generateMnemonic();
+            // Use production-grade mnemonic generation (full 2048-word list)
+            mnemonic = await SecureCrypto.generateMnemonic();
             
             // Backup: try BIP39 if fallback fails
             if (!mnemonic || typeof mnemonic !== 'string') {
