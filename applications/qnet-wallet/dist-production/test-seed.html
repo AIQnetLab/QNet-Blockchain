@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Seed Generation Test</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #1a1a2e;
+            color: #eee;
+        }
+        .test-result {
+            margin: 20px 0;
+            padding: 15px;
+            border: 1px solid #333;
+            border-radius: 8px;
+            background: #16213e;
+        }
+        .seed-words {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 10px;
+            margin: 10px 0;
+        }
+        .word {
+            padding: 8px;
+            background: #0f3460;
+            border-radius: 4px;
+            text-align: center;
+        }
+        button {
+            background: linear-gradient(135deg, #00ffff, #9333ea);
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 6px;
+            cursor: pointer;
+            margin: 10px 5px;
+        }
+        button:hover {
+            opacity: 0.9;
+        }
+    </style>
+</head>
+<body>
+    <h1>QNet Wallet - Seed Generation Test</h1>
+    
+    <button onclick="testSeedGeneration()">Generate New Seed</button>
+    <button onclick="testValidation()">Test Validation</button>
+    
+    <div id="results"></div>
+
+    <script src="https://unpkg.com/bip39@3.1.0/dist/index.js"></script>
+    <script type="module">
+        import { SecureCrypto } from './src/crypto/SecureCrypto.js';
+        
+        window.testSeedGeneration = async function() {
+            const resultsDiv = document.getElementById('results');
+            
+            try {
+                console.log('Testing seed generation...');
+                
+                // Test 1: Generate seed
+                const mnemonic = await SecureCrypto.generateMnemonic(128);
+                console.log('Generated mnemonic:', mnemonic);
+                
+                // Test 2: Validate seed
+                const isValid = await SecureCrypto.validateMnemonic(mnemonic);
+                console.log('Validation result:', isValid);
+                
+                // Test 3: Check word diversity
+                const words = mnemonic.split(' ');
+                const uniqueFirstLetters = new Set(words.map(w => w[0]));
+                
+                const result = `
+                    <div class="test-result">
+                        <h3>✅ Seed Generation Test Results</h3>
+                        <p><strong>Generated Mnemonic:</strong></p>
+                        <div class="seed-words">
+                            ${words.map((word, i) => `<div class="word">${i+1}. ${word}</div>`).join('')}
+                        </div>
+                        <p><strong>Word Count:</strong> ${words.length}</p>
+                        <p><strong>Valid BIP39:</strong> ${isValid ? '✅ Yes' : '❌ No'}</p>
+                        <p><strong>First Letters:</strong> ${Array.from(uniqueFirstLetters).sort().join(', ')}</p>
+                        <p><strong>Letter Diversity:</strong> ${uniqueFirstLetters.size}/26 letters used</p>
+                        <p><strong>Status:</strong> ${uniqueFirstLetters.size > 1 ? '✅ Good diversity' : '❌ Poor diversity'}</p>
+                    </div>
+                `;
+                
+                resultsDiv.innerHTML = result;
+                
+            } catch (error) {
+                console.error('Test failed:', error);
+                resultsDiv.innerHTML = `
+                    <div class="test-result">
+                        <h3>❌ Test Failed</h3>
+                        <p><strong>Error:</strong> ${error.message}</p>
+                        <p><strong>Stack:</strong> <pre>${error.stack}</pre></p>
+                    </div>
+                `;
+            }
+        };
+        
+        window.testValidation = async function() {
+            const testPhrases = [
+                'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about',
+                'legal winner thank year wave sausage worth useful legal winner thank yellow',
+                'invalid phrase with wrong words that should fail validation test'
+            ];
+            
+            const resultsDiv = document.getElementById('results');
+            let results = '<div class="test-result"><h3>Validation Tests</h3>';
+            
+            for (const phrase of testPhrases) {
+                try {
+                    const isValid = await SecureCrypto.validateMnemonic(phrase);
+                    results += `<p><strong>"${phrase}"</strong><br>Result: ${isValid ? '✅ Valid' : '❌ Invalid'}</p>`;
+                } catch (error) {
+                    results += `<p><strong>"${phrase}"</strong><br>Error: ${error.message}</p>`;
+                }
+            }
+            
+            results += '</div>';
+            resultsDiv.innerHTML = results;
+        };
+        
+        // Auto-run test on load
+        setTimeout(() => {
+            testSeedGeneration();
+        }, 1000);
+    </script>
+</body>
+</html> 
