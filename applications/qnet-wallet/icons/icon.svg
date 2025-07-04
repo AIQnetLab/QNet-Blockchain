@@ -1,38 +1,50 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
-  <!-- Background gradient -->
   <defs>
-    <linearGradient id="bgGradient" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" style="stop-color:#667eea;stop-opacity:1" />
-      <stop offset="100%" style="stop-color:#764ba2;stop-opacity:1" />
+    <!-- Quantum background gradient -->
+    <radialGradient id="bgGradient" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" style="stop-color:#1a1a2e;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#0f0f1a;stop-opacity:1" />
+    </radialGradient>
+    
+    <!-- Outer ring gradient -->
+    <linearGradient id="outerRing" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#00d4ff;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#9945ff;stop-opacity:1" />
     </linearGradient>
+    
+    <!-- Inner ring gradient -->
+    <linearGradient id="innerRing" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#9945ff;stop-opacity:0.8" />
+      <stop offset="100%" style="stop-color:#7c3aed;stop-opacity:0.8" />
+    </linearGradient>
+    
+    <!-- Q letter gradient -->
     <linearGradient id="qGradient" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" style="stop-color:#ffffff;stop-opacity:1" />
-      <stop offset="100%" style="stop-color:#f093fb;stop-opacity:1" />
+      <stop offset="0%" style="stop-color:#00d4ff;stop-opacity:1" />
+      <stop offset="50%" style="stop-color:#9945ff;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#0099cc;stop-opacity:1" />
     </linearGradient>
+    
+    <!-- Core gradient -->
+    <radialGradient id="centralCore" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" style="stop-color:rgba(0,212,255,0.2);stop-opacity:1" />
+      <stop offset="100%" style="stop-color:rgba(153,69,255,0.1);stop-opacity:1" />
+    </radialGradient>
   </defs>
   
   <!-- Background circle -->
-  <circle cx="64" cy="64" r="60" fill="url(#bgGradient)" stroke="#ffffff" stroke-width="2"/>
+  <circle cx="64" cy="64" r="60" fill="url(#bgGradient)" stroke="url(#outerRing)" stroke-width="2"/>
   
-  <!-- QNet logo - stylized Q -->
-  <g transform="translate(64,64)">
-    <!-- Main Q circle -->
-    <circle cx="0" cy="-5" r="25" fill="none" stroke="url(#qGradient)" stroke-width="6"/>
-    
-    <!-- Q tail -->
-    <path d="M 15 15 L 25 25" stroke="url(#qGradient)" stroke-width="6" stroke-linecap="round"/>
-    
-    <!-- Network nodes -->
-    <circle cx="-20" cy="-20" r="3" fill="#ffffff" opacity="0.8"/>
-    <circle cx="20" cy="-20" r="3" fill="#ffffff" opacity="0.8"/>
-    <circle cx="-20" cy="20" r="3" fill="#ffffff" opacity="0.8"/>
-    <circle cx="20" cy="20" r="3" fill="#ffffff" opacity="0.6"/>
-    
-    <!-- Connection lines -->
-    <path d="M -20 -20 L 0 -30 L 20 -20" stroke="#ffffff" stroke-width="1" opacity="0.4"/>
-    <path d="M -20 20 L 0 10 L 20 20" stroke="#ffffff" stroke-width="1" opacity="0.4"/>
+  <!-- Quantum rings -->
+  <circle cx="64" cy="64" r="45" fill="none" stroke="url(#outerRing)" stroke-width="2"/>
+  <circle cx="64" cy="64" r="35" fill="none" stroke="url(#innerRing)" stroke-width="1.5"/>
+  
+  <!-- Central core -->
+  <circle cx="64" cy="64" r="28" fill="url(#centralCore)"/>
+  
+  <!-- Clean Q letter -->
+  <g transform="translate(64, 64)">
+    <circle cx="0" cy="0" r="18" fill="none" stroke="url(#qGradient)" stroke-width="3"/>
+    <path d="M12 12 L18 18" stroke="url(#qGradient)" stroke-width="3" stroke-linecap="round"/>
   </g>
-  
-  <!-- QNet text -->
-  <text x="64" y="110" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" font-weight="bold" fill="#ffffff">QNet</text>
 </svg> 
