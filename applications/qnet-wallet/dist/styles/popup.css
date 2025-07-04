@@ -13,21 +13,24 @@
   --bg-card: rgba(255, 255, 255, 0.08);
   --bg-modal: rgba(15, 15, 26, 0.95);
   
-  /* Modern gradients */
-  --gradient-main: linear-gradient(135deg, #667eea 0%, #764ba2 50%, #f093fb 100%);
-  --gradient-card: linear-gradient(145deg, rgba(255, 255, 255, 0.15) 0%, rgba(255, 255, 255, 0.05) 100%);
-  --gradient-button: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-  --gradient-purple: linear-gradient(135deg, #a855f7 0%, #ec4899 100%);
+  /* Quantum Network Gradients */
+  --gradient-main: linear-gradient(135deg, #00d4ff 0%, #9945ff 50%, #7c3aed 100%);
+  --gradient-card: linear-gradient(145deg, rgba(0, 212, 255, 0.12) 0%, rgba(153, 69, 255, 0.08) 100%);
+  --gradient-button: linear-gradient(135deg, #00d4ff 0%, #9945ff 100%);
+  --gradient-purple: linear-gradient(135deg, #9945ff 0%, #7c3aed 100%);
+  --gradient-quantum: linear-gradient(135deg, #00d4ff 0%, #9945ff 25%, #7c3aed 50%, #0099cc 100%);
   
-  /* QNet Brand Colors */
+  /* QNet Quantum Colors */
   --qnet-primary: #00d4ff;
   --qnet-secondary: #0099cc;
-  --qnet-gradient: linear-gradient(135deg, #00d4ff 0%, #0099cc 100%);
+  --qnet-gradient: linear-gradient(135deg, #00d4ff 0%, #9945ff 50%, #0099cc 100%);
+  --qnet-glow: rgba(0, 212, 255, 0.4);
   
-  /* Solana Brand Colors */
+  /* Solana Quantum Colors */
   --solana-primary: #9945ff;
   --solana-secondary: #7c3aed;
   --solana-gradient: linear-gradient(135deg, #9945ff 0%, #7c3aed 100%);
+  --solana-glow: rgba(153, 69, 255, 0.4);
   
   /* Text Colors */
   --text-primary: #ffffff;
@@ -63,7 +66,7 @@
 
 body {
   font-family: var(--font-primary);
-  background: linear-gradient(135deg, #0f0f1a 0%, #1a1a2e 50%, #16213e 100%);
+  background: linear-gradient(135deg, #0f0f1a 0%, #1a1a2e 30%, #16213e 60%, #0f0f1a 100%);
   color: var(--text-primary);
   width: 360px;
   height: 600px;
@@ -83,6 +86,7 @@ body {
   background: rgba(15, 15, 26, 0.95);
   backdrop-filter: blur(20px);
   border: 1px solid rgba(255, 255, 255, 0.05);
+  overflow: hidden;
 }
 
 /* --- LOADING SCREEN --- */
@@ -181,12 +185,12 @@ body {
 }
 
 .qnet-emblem {
-  opacity: 0.9;
-  animation: phantomGlow 3s ease-in-out infinite alternate;
+  opacity: 0.95;
+  animation: quantumPulse 4s ease-in-out infinite alternate;
 }
 
 .qnet-emblem svg {
-  filter: drop-shadow(0 0 20px rgba(0, 212, 255, 0.3));
+  filter: drop-shadow(0 0 25px var(--qnet-glow)) drop-shadow(0 0 40px var(--solana-glow));
 }
 
 .lock-form {
@@ -245,14 +249,14 @@ body {
   font-family: var(--font-primary);
   cursor: pointer;
   transition: all 0.3s ease;
-  box-shadow: var(--shadow-card);
+  box-shadow: var(--shadow-card), 0 0 25px var(--qnet-glow);
   min-height: 56px;
   box-sizing: border-box;
 }
 
 .phantom-unlock-btn:hover {
   transform: translateY(-2px);
-  box-shadow: 0 12px 40px rgba(0, 212, 255, 0.4);
+  box-shadow: 0 12px 50px var(--qnet-glow), 0 0 35px var(--qnet-glow);
 }
 
 .phantom-unlock-btn:active {
@@ -281,14 +285,18 @@ body {
   display: none;
 }
 
-@keyframes phantomGlow {
+@keyframes quantumPulse {
   0% { 
-    opacity: 0.8;
+    opacity: 0.95;
     transform: scale(1);
   }
-  100% { 
+  50% { 
     opacity: 1;
-    transform: scale(1.02);
+    transform: scale(1.03);
+  }
+  100% { 
+    opacity: 0.98;
+    transform: scale(1.01);
   }
 }
 
@@ -360,10 +368,12 @@ body {
 .network-switcher-compact .network-tab.active {
   background: var(--qnet-primary);
   color: var(--bg-primary);
+  box-shadow: 0 0 15px var(--qnet-glow);
 }
 
 .network-switcher-compact .network-tab[data-network="solana"].active {
   background: var(--solana-primary);
+  box-shadow: 0 0 15px var(--solana-glow);
 }
 
 .header-right {
@@ -526,6 +536,7 @@ body {
 .main-tab.active {
   color: var(--qnet-primary);
   border-bottom-color: var(--qnet-primary);
+  box-shadow: 0 2px 10px var(--qnet-glow);
 }
 
 /* --- TAB CONTENT CONTAINER --- */
@@ -713,11 +724,12 @@ body {
 .action-btn.primary {
   background: var(--qnet-gradient);
   color: white;
+  box-shadow: 0 0 20px var(--qnet-glow);
 }
 
 .action-btn.primary:hover {
   transform: translateY(-1px);
-  box-shadow: 0 4px 12px rgba(0, 212, 255, 0.3);
+  box-shadow: 0 4px 25px var(--qnet-glow), 0 0 30px var(--qnet-glow);
 }
 
 .action-btn.secondary {
@@ -1109,7 +1121,7 @@ body {
 
 /* --- MODAL STYLES --- */
 .modal-overlay {
-  position: fixed;
+  position: absolute;
   inset: 0;
   background: rgba(0, 0, 0, 0.7);
   display: flex;
@@ -1123,9 +1135,9 @@ body {
   background: var(--bg-primary);
   border: 1px solid var(--border-primary);
   border-radius: var(--radius-lg);
-  max-width: 400px;
+  max-width: 320px;
   width: 90%;
-  max-height: 80vh;
+  max-height: 500px;
   overflow-y: auto;
   animation: fadeIn 0.3s ease;
 }
@@ -1192,9 +1204,10 @@ body {
 
 /* --- TOAST NOTIFICATIONS --- */
 .toast-notification {
-  position: fixed;
+  position: absolute;
   top: 1rem;
   right: 1rem;
+  left: 1rem;
   background: var(--bg-card);
   border: 1px solid var(--border-primary);
   border-radius: var(--radius-md);
@@ -1202,12 +1215,12 @@ body {
   color: var(--text-primary);
   font-size: 0.8rem;
   z-index: 1001;
-  transform: translateX(100%);
+  transform: translateY(-100%);
   transition: transform 0.3s ease;
 }
 
 .toast-notification.show {
-  transform: translateX(0);
+  transform: translateY(0);
 }
 
 .toast-success {
