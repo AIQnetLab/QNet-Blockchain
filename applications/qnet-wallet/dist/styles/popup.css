@@ -129,16 +129,6 @@ body {
 }
 
 /* --- LOCK SCREEN --- */
-.lock-container {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  height: 100%;
-  padding: 2rem;
-  text-align: center;
-}
-
 .wallet-logo {
   font-size: 2rem;
   margin-bottom: 1rem;
@@ -149,48 +139,177 @@ body {
   background-clip: text;
 }
 
-.lock-container h2 {
-  font-size: 1.4rem;
-  font-weight: 600;
-  margin-bottom: 0.5rem;
-  color: var(--text-primary);
+/* --- PHANTOM-STYLE LOCK SCREEN --- */
+.phantom-lock-container {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  padding: 0;
+  text-align: center;
+  background: var(--bg-primary);
 }
 
-.lock-container p {
-  color: var(--text-secondary);
-  margin-bottom: 1.5rem;
+.lock-header-top {
+  padding: 1rem 2rem 0.75rem 2rem;
+  border-bottom: 1px solid rgba(0, 212, 255, 0.2);
+  background: rgba(0, 212, 255, 0.03);
+}
+
+.wallet-title {
+  font-size: 2.5rem;
+  font-weight: 600;
+  background: var(--qnet-gradient);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+  margin: 0;
+  letter-spacing: 0.5px;
+}
+
+.header-divider {
+  display: none;
+}
+
+.lock-content {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 2rem;
+  gap: 2rem;
+}
+
+.qnet-emblem {
+  opacity: 0.9;
+  animation: phantomGlow 3s ease-in-out infinite alternate;
+}
+
+.qnet-emblem svg {
+  filter: drop-shadow(0 0 20px rgba(0, 212, 255, 0.3));
+}
+
+.lock-form {
+  width: 100%;
+  max-width: 320px;
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+  margin-top: 1rem;
+}
+
+.phantom-password-input {
+  width: 100%;
+  padding: 1.2rem 1.5rem;
+  background: var(--bg-card);
+  border: 2px solid var(--border-primary);
+  border-radius: 12px;
+  color: var(--text-primary);
+  font-size: 1.1rem;
+  font-family: var(--font-primary);
+  transition: all 0.3s ease;
+  backdrop-filter: blur(10px);
+  text-align: center;
+  min-height: 56px;
+  box-sizing: border-box;
+}
+
+.phantom-password-input:focus {
+  outline: none;
+  border-color: var(--qnet-primary);
+  box-shadow: var(--shadow-glow);
+  background: var(--bg-secondary);
+  transform: translateY(-1px);
+}
+
+.phantom-password-input::placeholder {
+  color: var(--text-muted);
+  text-align: center;
+}
+
+.phantom-password-input.error {
+  border-color: #ef4444;
+  background: rgba(239, 68, 68, 0.1);
+  animation: shakeError 0.6s ease-in-out;
+}
+
+.phantom-unlock-btn {
+  width: 100%;
+  padding: 1.2rem 1.5rem;
+  background: var(--qnet-gradient);
+  border: none;
+  border-radius: 12px;
+  color: white;
+  font-size: 1.1rem;
+  font-weight: 600;
+  font-family: var(--font-primary);
+  cursor: pointer;
+  transition: all 0.3s ease;
+  box-shadow: var(--shadow-card);
+  min-height: 56px;
+  box-sizing: border-box;
+}
+
+.phantom-unlock-btn:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 12px 40px rgba(0, 212, 255, 0.4);
+}
+
+.phantom-unlock-btn:active {
+  transform: translateY(0);
+}
+
+.phantom-unlock-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+  transform: none;
+}
+
+.phantom-error-message {
+  background: rgba(239, 68, 68, 0.1);
+  border: 1px solid rgba(239, 68, 68, 0.3);
+  border-radius: var(--radius-sm);
+  padding: 0.8rem 1rem;
   font-size: 0.9rem;
+  color: #ef4444;
+  text-align: center;
+  margin-top: -0.5rem;
+  animation: fadeInError 0.3s ease-out;
+}
+
+.phantom-error-message.hidden {
+  display: none;
+}
+
+@keyframes phantomGlow {
+  0% { 
+    opacity: 0.8;
+    transform: scale(1);
+  }
+  100% { 
+    opacity: 1;
+    transform: scale(1.02);
+  }
+}
+
+@keyframes shakeError {
+  0%, 100% { transform: translateX(0); }
+  10%, 30%, 50%, 70%, 90% { transform: translateX(-4px); }
+  20%, 40%, 60%, 80% { transform: translateX(4px); }
+}
+
+@keyframes fadeInError {
+  0% { 
+    opacity: 0;
+    transform: translateY(-10px);
+  }
+  100% { 
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 
 /* --- PASSWORD SECTION --- */
-.password-section {
-  width: 100%;
-  max-width: 280px;
-  display: flex;
-  flex-direction: column;
-  gap: 1rem;
-}
-
-.password-section input {
-  width: 100%;
-  padding: 0.8rem;
-  background: var(--bg-card);
-  border: 1px solid var(--border-primary);
-  border-radius: var(--radius-md);
-  color: var(--text-primary);
-  font-size: 0.9rem;
-  transition: all 0.2s ease;
-}
-
-.password-section input:focus {
-  outline: none;
-  border-color: var(--qnet-primary);
-  box-shadow: 0 0 0 2px rgba(0, 212, 255, 0.2);
-}
-
-.password-section input::placeholder {
-  color: var(--text-muted);
-}
 
 /* --- COMPACT HEADER --- */
 .compact-header {
