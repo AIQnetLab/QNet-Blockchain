@@ -919,7 +919,6 @@ async function completeWalletSetup() {
         if (solanaAddressEl) solanaAddressEl.textContent = solanaAddress;
         
         showStep('success');
-        showToast('Wallet created successfully', 'success');
         
         // Store wallet addresses for later use
         localStorage.setItem('qnet_temp_address', qnetAddress);
@@ -974,32 +973,40 @@ function generateSolanaAddress() {
 }
 
 /**
- * Open wallet after setup with proper state management
+ * Open full-screen wallet after setup
  */
 async function openWalletAfterSetup() {
     try {
-        console.log('Opening wallet after setup...');
+        console.log('Opening full-screen wallet...');
         
-        showToast('Opening wallet interface...', 'success');
-        
-        // Wait a moment for localStorage to be written
+        // Wait for localStorage to be written
         await new Promise(resolve => setTimeout(resolve, 500));
         
-        // Open wallet in same window instead of closing
+        // ALWAYS open full-screen app version
         if (chrome?.runtime) {
-            const popupUrl = chrome.runtime.getURL('popup.html');
-            window.location.href = popupUrl;
+            chrome.tabs.create({ 
+                url: chrome.runtime.getURL('app.html'),
+                active: true 
+            });
         } else {
-            // Fallback
-            window.location.href = 'popup.html';
+            // Fallback - open in new window
+            window.open('app.html', '_blank');
         }
         
-    } catch (error) {
-        console.error('Failed to open wallet:', error);
-        showToast('Wallet created! Please click the extension icon to access your wallet.', 'info');
+        // Close setup window
         setTimeout(() => {
             window.close();
-        }, 3000);
+        }, 1000);
+        
+    } catch (error) {
+        console.error('Failed to open full-screen wallet:', error);
+        // Final fallback
+        try {
+            window.location.href = 'app.html';
+        } catch (fallbackError) {
+            showToast('Wallet created! Open extension to access your wallet.', 'success');
+            setTimeout(() => window.close(), 3000);
+        }
     }
 }
 
@@ -1036,19 +1043,69 @@ function clearAllErrors() {
 }
 
 /**
- * Show toast notification
+ * Show toast notification with CORRECT positioning
  */
 function showToast(message, type = 'info') {
+    // Remove any existing toast
+    const existingToast = document.querySelector('.toast-notification');
+    if (existingToast) {
+        existingToast.remove();
+    }
+    
     const toast = document.createElement('div');
-    toast.className = `toast toast-${type}`;
+    toast.className = `toast-notification toast-${type}`;
     toast.textContent = message;
+    
+    // CORRECT positioning styles
+    toast.style.cssText = `
+        position: fixed;
+        top: 20px;
+        right: 20px;
+        z-index: 10000;
+        padding: 12px 16px;
+        border-radius: 8px;
+        color: white;
+        font-weight: 500;
+        font-size: 14px;
+        font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+        backdrop-filter: blur(10px);
+        transform: translateX(400px);
+        transition: transform 0.3s ease;
+        max-width: 300px;
+        word-wrap: break-word;
+    `;
+    
+    // Type-specific colors
+    switch (type) {
+        case 'success':
+            toast.style.background = 'linear-gradient(135deg, #22c55e, #16a34a)';
+            break;
+        case 'error':
+            toast.style.background = 'linear-gradient(135deg, #ef4444, #dc2626)';
+            break;
+        case 'info':
+            toast.style.background = 'linear-gradient(135deg, #3b82f6, #2563eb)';
+            break;
+        default:
+            toast.style.background = 'linear-gradient(135deg, #6b7280, #4b5563)';
+    }
     
     document.body.appendChild(toast);
     
-    setTimeout(() => toast.classList.add('show'), 100);
+    // Animate in
     setTimeout(() => {
-        toast.classList.remove('show');
-        setTimeout(() => toast.remove(), 300);
+        toast.style.transform = 'translateX(0)';
+    }, 100);
+    
+    // Auto-remove after 3 seconds
+    setTimeout(() => {
+        toast.style.transform = 'translateX(400px)';
+        setTimeout(() => {
+            if (toast.parentNode) {
+                toast.remove();
+            }
+        }, 300);
     }, 3000);
 }
 

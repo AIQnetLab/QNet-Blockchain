@@ -238,7 +238,7 @@ const translations = {
     }
 };
 
-// Password validation rules - simplified like Phantom (8+ characters only)
+    // Password validation rules - simplified (8+ characters only)
 const passwordRules = {
     minLength: 8,
     requireLowercase: false,
@@ -496,7 +496,7 @@ function validatePassword() {
     // Update checklist
     updatePasswordChecklist(newPassword);
     
-    // Check if passwords match and meet requirements - simplified like Phantom
+    // Check if passwords match and meet requirements - simplified
     let isValid = true;
     let errorMessage = '';
     
@@ -521,7 +521,7 @@ function validatePassword() {
 }
 
 /**
- * Update password requirements checklist - simplified like Phantom (only length check)
+ * Update password requirements checklist - simplified (only length check)
  */
 function updatePasswordChecklist(password) {
     const lengthCheck = document.getElementById('check-length');
@@ -878,12 +878,6 @@ async function completeWalletSetup() {
             if (solanaAddressEl) solanaAddressEl.textContent = solanaAddress;
             
             showStep('success');
-            showToast('🎉 Wallet created successfully!', 'success');
-            
-            // Auto-redirect to wallet after 3 seconds
-            setTimeout(() => {
-                openWalletAfterSetup();
-            }, 3000);
         } else {
             throw new Error(response.error || 'Failed to create wallet');
         }
@@ -1004,20 +998,37 @@ function showToast(message, type = 'info') {
 }
 
 /**
- * Open wallet popup after successful setup
+ * Open full-screen wallet after setup
  */
 async function openWalletAfterSetup() {
     try {
-        console.log('🚀 Opening wallet after setup...');
+        // Wait for localStorage to be written
+        await new Promise(resolve => setTimeout(resolve, 500));
         
-        // Remove fullscreen mode and redirect to popup
-        document.body.classList.remove('fullscreen-mode');
-        window.location.href = 'popup.html';
+        // ALWAYS open full-screen app version
+        if (chrome?.runtime) {
+            chrome.tabs.create({ 
+                url: chrome.runtime.getURL('app.html'),
+                active: true 
+            });
+        } else {
+            // Fallback - open in new window
+            window.open('app.html', '_blank');
+        }
+        
+        // Close setup window
+        setTimeout(() => {
+            window.close();
+        }, 1000);
         
     } catch (error) {
-        console.error('❌ Failed to open wallet:', error);
-        // Fallback - just redirect to popup
-        window.location.href = 'popup.html';
+        console.error('Failed to open full-screen wallet:', error);
+        // Final fallback
+        try {
+            window.location.href = 'app.html';
+        } catch (fallbackError) {
+            setTimeout(() => window.close(), 3000);
+        }
     }
 }
 

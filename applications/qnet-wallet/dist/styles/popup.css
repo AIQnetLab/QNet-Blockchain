@@ -13,7 +13,7 @@
   --bg-card: rgba(255, 255, 255, 0.1);
   --bg-modal: rgba(15, 15, 26, 0.95);
   
-  /* Solflare-style gradients */
+     /* Modern gradients */
   --gradient-main: linear-gradient(135deg, #667eea 0%, #764ba2 50%, #f093fb 100%);
   --gradient-card: linear-gradient(145deg, rgba(255, 255, 255, 0.15) 0%, rgba(255, 255, 255, 0.05) 100%);
   --gradient-button: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
@@ -438,37 +438,37 @@ body {
   background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.4), transparent);
 }
 
+/* ADDRESS DISPLAY - NO FUCKING BORDER! */
 .address-container {
-  background: rgba(255, 255, 255, 0.05);
-  border: 1px solid var(--border-primary);
-  border-radius: var(--radius-md);
-  padding: var(--spacing-md);
-  margin-bottom: var(--spacing-md);
-  cursor: pointer;
-  transition: all 0.2s ease;
-}
-
-.address-container:hover {
-  background: rgba(255, 255, 255, 0.08);
-  border-color: var(--qnet-primary);
+  margin-bottom: 1rem;
+  background: none !important;
+  border: none !important;
+  padding: 0 !important;
+  box-shadow: none !important;
+  border-radius: 0 !important;
 }
 
 .account-address {
-  color: var(--text-primary);
   font-family: var(--font-mono);
   font-size: 0.85rem;
-  font-weight: 500;
-  text-align: center;
+  color: var(--text-primary);
+  background: none !important;
+  border: none !important;
+  padding: 0.5rem 0 !important;
   word-break: break-all;
   line-height: 1.4;
-  padding: 0;
-  background: transparent;
-  border: none;
+  cursor: pointer;
   transition: all 0.2s ease;
+  text-align: center;
+  box-shadow: none !important;
+  border-radius: 0 !important;
 }
 
 .account-address:hover {
+  background: rgba(255, 255, 255, 0.05) !important;
   color: var(--qnet-primary);
+  border: none !important;
+  box-shadow: none !important;
 }
 
 .balance-container {
@@ -1236,16 +1236,16 @@ body {
   overflow-y: auto;
 }
 
-.solflare-content {
-  padding: 0;
-  background: transparent;
-}
-
-.solflare-style {
-  background: rgba(15, 15, 26, 0.95);
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  backdrop-filter: blur(30px);
-}
+ .modern-content {
+   padding: 0;
+   background: transparent;
+ }
+ 
+ .modern-style {
+   background: rgba(15, 15, 26, 0.95);
+   border: 1px solid rgba(255, 255, 255, 0.1);
+   backdrop-filter: blur(30px);
+ }
 
 .setting-group {
   margin-bottom: 0;
@@ -1309,46 +1309,46 @@ body {
   min-width: 140px;
 }
 
-.solflare-content .setting-actions {
-  min-width: auto;
-}
-
-.solflare-content .qnet-button.secondary.modern {
-  background: transparent;
-  border: none;
-  color: var(--text-secondary);
-  padding: 0;
-  border-radius: 0;
-  box-shadow: none;
-  font-size: 0.9rem;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  width: 100%;
-  text-align: left;
-  min-width: 140px;
-}
-
-.solflare-content .qnet-button.secondary.modern:hover {
-  background: transparent;
-  color: var(--text-primary);
-  transform: none;
-  box-shadow: none;
-}
-
-.solflare-content .qnet-button.secondary.modern .arrow {
-  color: var(--text-muted);
-  font-size: 0.8rem;
-  margin-left: 0.5rem;
-}
-
-.solflare-content .qnet-button.danger.modern {
-  color: var(--error);
-}
-
-.solflare-content .qnet-button.danger.modern:hover {
-  color: #ff6b6b;
-}
+ .modern-content .setting-actions {
+   min-width: auto;
+ }
+ 
+ .modern-content .qnet-button.secondary.modern {
+   background: transparent;
+   border: none;
+   color: var(--text-secondary);
+   padding: 0;
+   border-radius: 0;
+   box-shadow: none;
+   font-size: 0.9rem;
+   display: flex;
+   align-items: center;
+   justify-content: space-between;
+   width: 100%;
+   text-align: left;
+   min-width: 140px;
+ }
+ 
+ .modern-content .qnet-button.secondary.modern:hover {
+   background: transparent;
+   color: var(--text-primary);
+   transform: none;
+   box-shadow: none;
+ }
+ 
+ .modern-content .qnet-button.secondary.modern .arrow {
+   color: var(--text-muted);
+   font-size: 0.8rem;
+   margin-left: 0.5rem;
+ }
+ 
+ .modern-content .qnet-button.danger.modern {
+   color: var(--error);
+ }
+ 
+ .modern-content .qnet-button.danger.modern:hover {
+   color: #ff6b6b;
+ }
 
 .setting-note {
   font-size: 0.8rem;
@@ -1627,9 +1627,47 @@ body {
   flex-direction: column;
   height: 100%;
 }
-
 .screen.hidden {
   display: none;
+}
+
+/* ULTRA NUCLEAR OPTION - KILL ALL ADDRESS STYLING */
+#account-address,
+.account-address,
+.address-container,
+div[id*="address"],
+div[class*="address"],
+span[class*="address"],
+.wallet-address,
+.address-display,
+.address-oval,
+.address-box {
+  background: transparent !important;
+  border: none !important;
+  box-shadow: none !important;
+  padding: 0.5rem 0 !important;
+  margin: 0 !important;
+  border-radius: 0 !important;
+  outline: none !important;
+}
+
+/* MEGA KILL - TARGET SPECIFIC ELEMENTS */
+.account-overview .address-container,
+.account-overview #account-address,
+.account-overview .account-address,
+.wallet-main .address-container,
+.wallet-main #account-address,
+.wallet-main .account-address,
+#main-wallet-screen .address-container,
+#main-wallet-screen #account-address,
+#main-wallet-screen .account-address {
+  background: none !important;
+  border: none !important;
+  box-shadow: none !important;
+  padding: 0 !important;
+  border-radius: 0 !important;
+  outline: none !important;
+  backdrop-filter: none !important;
 }
 
 /* EOF */
