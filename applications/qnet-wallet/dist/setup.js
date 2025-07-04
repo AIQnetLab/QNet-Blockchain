@@ -454,15 +454,13 @@ function updateProgress() {
 }
 
 /**
- * Validate password in real-time (no error messages until submit)
+ * Validate password in real-time (ненавязчивая валидация)
  */
 function validatePasswordRealtime() {
     const newPassword = document.getElementById('new-password')?.value || '';
     const confirmPassword = document.getElementById('confirm-password')?.value || '';
     const continueBtn = document.getElementById('continue-password');
-    
-    // Update checklist
-    updatePasswordChecklist(newPassword);
+    const passwordInput = document.getElementById('new-password');
     
     // Enable/disable continue button
     const isValid = newPassword.length >= 8 && newPassword === confirmPassword;
@@ -470,9 +468,52 @@ function validatePasswordRealtime() {
         continueBtn.disabled = !isValid;
     }
     
+    // Show subtle validation hint under password field
+    showPasswordHint(newPassword.length);
+    
+    // Add visual feedback to input
+    if (passwordInput) {
+        passwordInput.classList.remove('error', 'success');
+        if (newPassword.length > 0) {
+            if (newPassword.length >= 8) {
+                passwordInput.classList.add('success');
+            } else {
+                passwordInput.classList.add('error');
+            }
+        }
+    }
+    
     // Only show errors if user has submitted before
     if (setupState.hasSubmittedPasswords) {
         validatePasswordWithErrors();
+    }
+}
+
+/**
+ * Show subtle password hint
+ */
+function showPasswordHint(passwordLength) {
+    let hintElement = document.getElementById('password-hint');
+    
+    if (!hintElement) {
+        hintElement = document.createElement('div');
+        hintElement.id = 'password-hint';
+        hintElement.className = 'validation-message';
+        
+        const passwordInput = document.getElementById('new-password');
+        if (passwordInput && passwordInput.parentNode) {
+            passwordInput.parentNode.appendChild(hintElement);
+        }
+    }
+    
+    if (passwordLength > 0 && passwordLength < 8) {
+        hintElement.textContent = `${8 - passwordLength} more characters needed`;
+        hintElement.className = 'validation-message show error';
+    } else if (passwordLength >= 8) {
+        hintElement.textContent = 'Password length is good';
+        hintElement.className = 'validation-message show success';
+    } else {
+        hintElement.className = 'validation-message';
     }
 }
 

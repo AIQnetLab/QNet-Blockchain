@@ -439,35 +439,36 @@ body {
 }
 
 .address-container {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  margin-bottom: 0.75rem;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius-md);
+  padding: var(--spacing-md);
+  margin-bottom: var(--spacing-md);
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.address-container:hover {
+  background: rgba(255, 255, 255, 0.08);
+  border-color: var(--qnet-primary);
 }
 
 .account-address {
-  color: var(--text-secondary);
+  color: var(--text-primary);
   font-family: var(--font-mono);
-  font-size: 0.75rem;
+  font-size: 0.85rem;
   font-weight: 500;
-  padding: 0.4rem 0.6rem;
-  background: rgba(255, 255, 255, 0.05);
-  border-radius: var(--radius-sm);
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  transition: all 0.3s ease;
-  cursor: pointer;
-  user-select: all;
-  max-width: 200px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  text-align: center;
+  word-break: break-all;
+  line-height: 1.4;
+  padding: 0;
+  background: transparent;
+  border: none;
+  transition: all 0.2s ease;
 }
 
 .account-address:hover {
-  color: var(--text-primary);
-  background: rgba(255, 255, 255, 0.08);
-  border-color: rgba(255, 255, 255, 0.2);
-  transform: scale(1.02);
+  color: var(--qnet-primary);
 }
 
 .balance-container {
