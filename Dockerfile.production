@@ -1,5 +1,5 @@
 # Multi-stage build for production QNet node
-FROM rust:1.75-slim as builder
+FROM rust:1.70-slim as builder
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
@@ -33,8 +33,11 @@ RUN for module in qnet-core qnet-state qnet-consensus qnet-mempool qnet-sharding
     echo "pub fn dummy() {}" > ./core/$module/src/lib.rs; \
 done
 
-# Clear cargo cache and update index with pinned versions
-RUN cargo clean && rm -rf ~/.cargo/registry/cache/*
+# Aggressively clear all cargo caches and force index update
+RUN cargo clean && \
+    rm -rf ~/.cargo/registry ~/.cargo/git ~/.cargo/.package-cache && \
+    rm -rf /usr/local/cargo/registry /usr/local/cargo/git && \
+    cargo update --dry-run
 
 # Build the production node from workspace root
 RUN cargo build --release --bin qnet-node
