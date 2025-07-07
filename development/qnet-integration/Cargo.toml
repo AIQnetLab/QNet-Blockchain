@@ -53,8 +53,8 @@ chrono = { version = "0.4", features = ["serde"] }
 log = "0.4"
 env_logger = "0.11"
 
-# RPC server - modern stable versions
-warp = "0.3"
+# RPC server - pin to older version without ICU dependencies
+warp = "0.3.2"
 num_cpus = "1.16"
 
 # Additional dependencies - modern stable versions
