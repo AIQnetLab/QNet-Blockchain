@@ -14,29 +14,26 @@ RUN apt-get update && apt-get install -y \
 # Set working directory
 WORKDIR /build
 
-# Copy only the integration node source
-COPY development/qnet-integration/ ./qnet-integration/
-
-# Copy workspace Cargo.toml
+# Copy workspace Cargo.toml first
 COPY Cargo.toml ./Cargo.toml
 
-# Try to copy core modules if they exist, create fallback structure if not
+# Copy integration node source with correct path structure
+COPY development/qnet-integration/ ./development/qnet-integration/
+
+# Create minimal core module structure for workspace
 RUN mkdir -p ./core/qnet-core ./core/qnet-state ./core/qnet-consensus ./core/qnet-mempool ./core/qnet-sharding
 
 # Create minimal core module Cargo.toml files if they don't exist
 RUN for module in qnet-core qnet-state qnet-consensus qnet-mempool qnet-sharding; do \
-    if [ ! -f ./core/$module/Cargo.toml ]; then \
-        mkdir -p ./core/$module/src && \
-        echo "[package]" > ./core/$module/Cargo.toml && \
-        echo "name = \"$module\"" >> ./core/$module/Cargo.toml && \
-        echo "version = \"0.1.0\"" >> ./core/$module/Cargo.toml && \
-        echo "edition = \"2021\"" >> ./core/$module/Cargo.toml && \
-        echo "pub fn dummy() {}" > ./core/$module/src/lib.rs; \
-    fi; \
+    mkdir -p ./core/$module/src && \
+    echo "[package]" > ./core/$module/Cargo.toml && \
+    echo "name = \"$module\"" >> ./core/$module/Cargo.toml && \
+    echo "version = \"0.1.0\"" >> ./core/$module/Cargo.toml && \
+    echo "edition = \"2021\"" >> ./core/$module/Cargo.toml && \
+    echo "pub fn dummy() {}" > ./core/$module/src/lib.rs; \
 done
 
-# Build the production node
-WORKDIR /build/qnet-integration
+# Build the production node from workspace root
 RUN cargo build --release --bin qnet-node
 
 # Final runtime image
@@ -54,8 +51,8 @@ RUN apt-get update && apt-get install -y \
 RUN groupadd -r qnet && useradd -r -g qnet qnet
 RUN mkdir -p /app/{data,logs} && chown -R qnet:qnet /app
 
-# Copy binary from builder
-COPY --from=builder /build/qnet-integration/target/release/qnet-node /usr/local/bin/qnet-node
+# Copy binary from builder (built in workspace root)
+COPY --from=builder /build/target/release/qnet-node /usr/local/bin/qnet-node
 
 # Set permissions
 RUN chmod +x /usr/local/bin/qnet-node
