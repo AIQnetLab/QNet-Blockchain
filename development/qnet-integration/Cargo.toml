@@ -20,48 +20,48 @@ qnet-mempool = { path = "../../core/qnet-mempool" }
 qnet-sharding = { path = "../../core/qnet-sharding" }
 
 
-# Async runtime - pin to early 2023 stable versions
-tokio = { version = "=1.25.0", features = ["full"] }
-async-trait = "=0.1.66"
+# Async runtime - pin to 2022 stable versions
+tokio = { version = "=1.21.2", features = ["full"] }
+async-trait = "=0.1.57"
 
 # Storage - RocksDB for high performance
-rocksdb = "=0.20.1"
+rocksdb = "=0.19.0"
 
-# Serialization - pin to early 2023 stable versions
-serde = { version = "=1.0.152", features = ["derive"] }
-serde_json = "=1.0.93"
+# Serialization - pin to 2022 stable versions
+serde = { version = "=1.0.144", features = ["derive"] }
+serde_json = "=1.0.85"
 bincode = "=1.3.3"
 
-# Logging - pin to early 2023 stable versions
-tracing = "=0.1.37"
-tracing-subscriber = "=0.3.16"
+# Logging - pin to 2022 stable versions
+tracing = "=0.1.36"
+tracing-subscriber = "=0.3.15"
 
-# Error handling - pin to early 2023 stable versions
-thiserror = "=1.0.38"
-anyhow = "=1.0.69"
+# Error handling - pin to 2022 stable versions
+thiserror = "=1.0.32"
+anyhow = "=1.0.62"
 
-# Cryptography - pin to early 2023 stable versions that don't pull base64ct-1.8.0
+# Cryptography - pin to 2022 stable versions
 ed25519-dalek = "=1.0.1"
-blake3 = "=1.3.3"
+blake3 = "=1.3.1"
 hex = "=0.4.3"
-sha2 = "=0.10.6"
+sha2 = "=0.10.2"
 
-# Time - pin to early 2023 stable version
-chrono = "=0.4.23"
+# Time - pin to 2022 stable version that doesn't pull icu_locale_core
+chrono = { version = "=0.4.22", default-features = false, features = ["serde"] }
 
-# Network - pin to early 2023 stable versions
+# Network - pin to 2022 stable versions
 log = "=0.4.17"
-env_logger = "=0.10.0"
+env_logger = "=0.9.0"
 
-# RPC server - pin to early 2023 stable versions
-warp = "=0.3.4"
-num_cpus = "=1.15.0"
+# RPC server - pin to 2022 stable versions
+warp = "=0.3.2"
+num_cpus = "=1.13.1"
 
-# Additional dependencies - pin to early 2023 stable versions
+# Additional dependencies - pin to 2022 stable versions
 rand = "=0.8.5"
-clap = { version = "=4.1.8", features = ["derive"] }
-sha3 = "=0.10.6"
-lz4_flex = "=0.9.5"
+clap = { version = "=3.2.17", features = ["derive"] }
+sha3 = "=0.10.2"
+lz4_flex = "=0.8.2"
 
 [dev-dependencies]
-tempfile = "=3.4.0" 
+tempfile = "=3.3.0" 
