@@ -1,0 +1,39 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - "qnet_rules.yml"
+
+scrape_configs:
+  # QNet Genesis Node
+  - job_name: 'qnet-genesis'
+    static_configs:
+      - targets: ['genesis:9090']
+    metrics_path: /metrics
+    scrape_interval: 15s
+    scrape_timeout: 10s
+    scheme: http
+
+  # QNet Validator Node 1
+  - job_name: 'qnet-validator1'
+    static_configs:
+      - targets: ['validator1:9091']
+    metrics_path: /metrics
+    scrape_interval: 15s
+    scrape_timeout: 10s
+    scheme: http
+
+  # QNet Validator Node 2
+  - job_name: 'qnet-validator2'
+    static_configs:
+      - targets: ['validator2:9092']
+    metrics_path: /metrics
+    scrape_interval: 15s
+    scrape_timeout: 10s
+    scheme: http
+
+  # Prometheus itself
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090'] 

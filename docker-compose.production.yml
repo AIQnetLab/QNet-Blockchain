@@ -1,0 +1,199 @@
+services:
+  # Genesis Super Node (Block Producer)
+  qnet-genesis:
+    build:
+      context: .
+      dockerfile: Dockerfile.production
+    container_name: qnet-genesis
+    hostname: genesis
+    environment:
+      - RUST_LOG=info,qnet=debug
+      - QNET_TESTNET=1
+      - QNET_FREE_GENESIS_ACTIVATION=1
+      - QNET_ENABLE_MICROBLOCKS=1
+      - QNET_DETAILED_LOGGING=1
+      - QNET_NODE_TYPE=super
+      - QNET_PRODUCER_ENABLED=1
+      - QNET_GENESIS_NODE=1
+    command: >
+      qnet-node
+      --config /app/config/genesis.toml
+      --data-dir /app/data
+      --log-dir /app/logs
+      --p2p-port 9876
+      --rpc-port 8545
+      --metrics-port 9090
+      --node-type super
+      --producer
+      --genesis
+      --network testnet
+      --enable-metrics
+      --log-level debug
+    ports:
+      - "8545:8545"   # RPC API
+      - "9876:9876"   # P2P network
+      - "9090:9090"   # Metrics
+    volumes:
+      - ./genesis-data:/app/data
+      - ./genesis-logs:/app/logs
+      - ./genesis-config:/app/config
+    networks:
+      - qnet-testnet
+    restart: unless-stopped
+    mem_limit: 4g
+    cpus: '2.0'
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8545/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # Validator Node 1 (Full Node)
+  qnet-validator1:
+    build:
+      context: .
+      dockerfile: Dockerfile.production
+    container_name: qnet-validator1
+    hostname: validator1
+    environment:
+      - RUST_LOG=info,qnet=debug
+      - QNET_TESTNET=1
+      - QNET_FREE_GENESIS_ACTIVATION=1
+      - QNET_ENABLE_MICROBLOCKS=1
+      - QNET_DETAILED_LOGGING=1
+      - QNET_NODE_TYPE=full
+      - QNET_VALIDATOR_ENABLED=1
+    command: >
+      qnet-node
+      --config /app/config/validator1.toml
+      --data-dir /app/data
+      --log-dir /app/logs
+      --p2p-port 9877
+      --rpc-port 8546
+      --metrics-port 9091
+      --node-type full
+      --validator
+      --network testnet
+      --bootstrap-nodes genesis:9876
+      --enable-metrics
+      --log-level debug
+    ports:
+      - "8546:8546"   # RPC API
+      - "9877:9877"   # P2P network
+      - "9091:9091"   # Metrics
+    volumes:
+      - ./validator1-data:/app/data
+      - ./validator1-logs:/app/logs
+      - ./validator1-config:/app/config
+    networks:
+      - qnet-testnet
+    restart: unless-stopped
+    mem_limit: 2g
+    cpus: '1.0'
+    depends_on:
+      - qnet-genesis
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8546/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
+
+  # Validator Node 2 (Full Node)
+  qnet-validator2:
+    build:
+      context: .
+      dockerfile: Dockerfile.production
+    container_name: qnet-validator2
+    hostname: validator2
+    environment:
+      - RUST_LOG=info,qnet=debug
+      - QNET_TESTNET=1
+      - QNET_FREE_GENESIS_ACTIVATION=1
+      - QNET_ENABLE_MICROBLOCKS=1
+      - QNET_DETAILED_LOGGING=1
+      - QNET_NODE_TYPE=full
+      - QNET_VALIDATOR_ENABLED=1
+    command: >
+      qnet-node
+      --config /app/config/validator2.toml
+      --data-dir /app/data
+      --log-dir /app/logs
+      --p2p-port 9878
+      --rpc-port 8547
+      --metrics-port 9092
+      --node-type full
+      --validator
+      --network testnet
+      --bootstrap-nodes genesis:9876,validator1:9877
+      --enable-metrics
+      --log-level debug
+    ports:
+      - "8547:8547"   # RPC API
+      - "9878:9878"   # P2P network
+      - "9092:9092"   # Metrics
+    volumes:
+      - ./validator2-data:/app/data
+      - ./validator2-logs:/app/logs
+      - ./validator2-config:/app/config
+    networks:
+      - qnet-testnet
+    restart: unless-stopped
+    mem_limit: 2g
+    cpus: '1.0'
+    depends_on:
+      - qnet-genesis
+      - qnet-validator1
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8547/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+
+  # Monitoring Stack
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: qnet-prometheus
+    ports:
+      - "9093:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    networks:
+      - qnet-testnet
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: qnet-grafana
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=qnet2025
+      - GF_USERS_ALLOW_SIGN_UP=false
+    networks:
+      - qnet-testnet
+    restart: unless-stopped
+
+networks:
+  qnet-testnet:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+volumes:
+  prometheus-data:
+  grafana-data: 

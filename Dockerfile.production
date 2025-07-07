@@ -1,0 +1,57 @@
+# Multi-stage build for production QNet node
+FROM rust:1.74-slim as builder
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    cmake \
+    pkg-config \
+    libssl-dev \
+    libclang-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set working directory
+WORKDIR /build
+
+# Copy entire project (including core modules)
+COPY . .
+
+# Build the production node
+WORKDIR /build/development/qnet-integration
+RUN cargo build --release --bin qnet-node
+
+# Final runtime image
+FROM ubuntu:22.04
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y \
+    libssl3 \
+    curl \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create qnet user and directories
+RUN groupadd -r qnet && useradd -r -g qnet qnet
+RUN mkdir -p /app/{data,logs,config} && chown -R qnet:qnet /app
+
+# Copy binary from builder
+COPY --from=builder /build/development/qnet-integration/target/release/qnet-node /usr/local/bin/qnet-node
+
+# Set permissions
+RUN chmod +x /usr/local/bin/qnet-node
+
+# Switch to qnet user
+USER qnet
+
+# Create data directories
+WORKDIR /app
+
+# Expose ports
+EXPOSE 8545 9876 9090
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+  CMD curl -f http://localhost:8545/health || exit 1
+
+# Default command
+CMD ["qnet-node"] 
