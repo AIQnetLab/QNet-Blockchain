@@ -32,7 +32,7 @@ RUN apt-get update && apt-get install -y \
 
 # Create qnet user and directories
 RUN groupadd -r qnet && useradd -r -g qnet qnet
-RUN mkdir -p /app/{data,logs,config} && chown -R qnet:qnet /app
+RUN mkdir -p /app/{data,logs} && chown -R qnet:qnet /app
 
 # Copy binary from builder
 COPY --from=builder /build/development/qnet-integration/target/release/qnet-node /usr/local/bin/qnet-node
@@ -46,12 +46,8 @@ USER qnet
 # Create data directories
 WORKDIR /app
 
-# Expose ports
-EXPOSE 8545 9876 9090
-
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-  CMD curl -f http://localhost:8545/health || exit 1
+# Expose ports (RPC, P2P, Metrics)
+EXPOSE 8545 8546 8547 9876 9877 9878 9945 9946 9947
 
 # Default command
 CMD ["qnet-node"] 

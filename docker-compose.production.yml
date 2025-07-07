@@ -12,38 +12,34 @@ services:
       - QNET_FREE_GENESIS_ACTIVATION=1
       - QNET_ENABLE_MICROBLOCKS=1
       - QNET_DETAILED_LOGGING=1
-      - QNET_NODE_TYPE=super
-      - QNET_PRODUCER_ENABLED=1
-      - QNET_GENESIS_NODE=1
+      - QNET_IS_LEADER=1
+      - QNET_MICROBLOCK_PRODUCER=1
+      - QNET_PRODUCTION_ENABLED=1
+      - QNET_SKIP_BURN_CHECK=1
     command: >
       qnet-node
-      --config /app/config/genesis.toml
       --data-dir /app/data
-      --log-dir /app/logs
       --p2p-port 9876
       --rpc-port 8545
-      --metrics-port 9090
       --node-type super
+      --region na
       --producer
-      --genesis
-      --network testnet
+      --high-performance
       --enable-metrics
-      --log-level debug
     ports:
       - "8545:8545"   # RPC API
       - "9876:9876"   # P2P network
-      - "9090:9090"   # Metrics
+      - "9945:9945"   # Metrics (RPC port + 400)
     volumes:
       - ./genesis-data:/app/data
       - ./genesis-logs:/app/logs
-      - ./genesis-config:/app/config
     networks:
       - qnet-testnet
     restart: unless-stopped
     mem_limit: 4g
     cpus: '2.0'
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8545/health"]
+      test: ["CMD", "sh", "-c", "curl -f http://localhost:8545/rpc -d '{\"method\":\"ping\",\"params\":[],\"id\":1}' -H 'Content-Type: application/json' || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -62,30 +58,26 @@ services:
       - QNET_FREE_GENESIS_ACTIVATION=1
       - QNET_ENABLE_MICROBLOCKS=1
       - QNET_DETAILED_LOGGING=1
-      - QNET_NODE_TYPE=full
-      - QNET_VALIDATOR_ENABLED=1
+      - QNET_FULL_SYNC=1
+      - QNET_SYNC_ALL_MICROBLOCKS=1
+      - QNET_SKIP_BURN_CHECK=1
     command: >
       qnet-node
-      --config /app/config/validator1.toml
       --data-dir /app/data
-      --log-dir /app/logs
       --p2p-port 9877
       --rpc-port 8546
-      --metrics-port 9091
       --node-type full
-      --validator
-      --network testnet
-      --bootstrap-nodes genesis:9876
+      --region na
+      --bootstrap-peers genesis:9876
+      --high-performance
       --enable-metrics
-      --log-level debug
     ports:
       - "8546:8546"   # RPC API
       - "9877:9877"   # P2P network
-      - "9091:9091"   # Metrics
+      - "9946:9946"   # Metrics (RPC port + 400)
     volumes:
       - ./validator1-data:/app/data
       - ./validator1-logs:/app/logs
-      - ./validator1-config:/app/config
     networks:
       - qnet-testnet
     restart: unless-stopped
@@ -94,7 +86,7 @@ services:
     depends_on:
       - qnet-genesis
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8546/health"]
+      test: ["CMD", "sh", "-c", "curl -f http://localhost:8546/rpc -d '{\"method\":\"ping\",\"params\":[],\"id\":1}' -H 'Content-Type: application/json' || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -113,30 +105,26 @@ services:
       - QNET_FREE_GENESIS_ACTIVATION=1
       - QNET_ENABLE_MICROBLOCKS=1
       - QNET_DETAILED_LOGGING=1
-      - QNET_NODE_TYPE=full
-      - QNET_VALIDATOR_ENABLED=1
+      - QNET_FULL_SYNC=1
+      - QNET_SYNC_ALL_MICROBLOCKS=1
+      - QNET_SKIP_BURN_CHECK=1
     command: >
       qnet-node
-      --config /app/config/validator2.toml
       --data-dir /app/data
-      --log-dir /app/logs
       --p2p-port 9878
       --rpc-port 8547
-      --metrics-port 9092
       --node-type full
-      --validator
-      --network testnet
-      --bootstrap-nodes genesis:9876,validator1:9877
+      --region na
+      --bootstrap-peers genesis:9876,validator1:9877
+      --high-performance
       --enable-metrics
-      --log-level debug
     ports:
       - "8547:8547"   # RPC API
       - "9878:9878"   # P2P network
-      - "9092:9092"   # Metrics
+      - "9947:9947"   # Metrics (RPC port + 400)
     volumes:
       - ./validator2-data:/app/data
       - ./validator2-logs:/app/logs
-      - ./validator2-config:/app/config
     networks:
       - qnet-testnet
     restart: unless-stopped
@@ -146,7 +134,7 @@ services:
       - qnet-genesis
       - qnet-validator1
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8547/health"]
+      test: ["CMD", "sh", "-c", "curl -f http://localhost:8547/rpc -d '{\"method\":\"ping\",\"params\":[],\"id\":1}' -H 'Content-Type: application/json' || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3

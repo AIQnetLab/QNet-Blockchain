@@ -9,14 +9,20 @@
 
 QNet is a high-performance, post-quantum secure blockchain network designed for the next generation of decentralized applications. With cutting-edge cryptography and innovative consensus mechanisms, QNet delivers unprecedented performance while maintaining quantum resistance.
 
-### 🚀 **Current Status: Testnet Preparation Complete**
+### 🚀 **Current Status: Production Testnet Ready**
 
-**QNet is production-ready and preparing for testnet launch in July 2025.**
+**QNet production testnet is ready for deployment with real Rust nodes.**
 
 - ✅ **Post-Quantum Cryptography**: CRYSTALS-Dilithium integration complete
 - ✅ **Cross-Chain Bridge**: Solana integration tested and secured
+- ✅ **Microblock Architecture**: 1-second block production, 100k+ TPS capability
+- ✅ **Production Rust Nodes**: Docker deployment with real blockchain nodes
 - ✅ **Browser Extension Wallet**: Production-ready with full-screen interface
 - ✅ **Mobile Applications**: iOS/Android apps ready for deployment
+
+### 📋 **Testnet Deployment**
+
+For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCTION_TESTNET_MANUAL.md)**
 - ✅ **Performance Validated**: 10,000+ TPS sustained with <200ms latency
 - ✅ **Security Audited**: Comprehensive security review completed
 

@@ -6,28 +6,28 @@ rule_files:
   - "qnet_rules.yml"
 
 scrape_configs:
-  # QNet Genesis Node
+  # QNet Genesis Node (Super Node)
   - job_name: 'qnet-genesis'
     static_configs:
-      - targets: ['genesis:9090']
+      - targets: ['genesis:9945']
     metrics_path: /metrics
     scrape_interval: 15s
     scrape_timeout: 10s
     scheme: http
 
-  # QNet Validator Node 1
+  # QNet Validator Node 1 (Full Node)
   - job_name: 'qnet-validator1'
     static_configs:
-      - targets: ['validator1:9091']
+      - targets: ['validator1:9946']
     metrics_path: /metrics
     scrape_interval: 15s
     scrape_timeout: 10s
     scheme: http
 
-  # QNet Validator Node 2
+  # QNet Validator Node 2 (Full Node)
   - job_name: 'qnet-validator2'
     static_configs:
-      - targets: ['validator2:9092']
+      - targets: ['validator2:9947']
     metrics_path: /metrics
     scrape_interval: 15s
     scrape_timeout: 10s
