@@ -36,7 +36,7 @@ RUN echo "=== CHECKING COPIED FILES ===" && \
     head -20 Cargo.toml 2>/dev/null || echo "workspace Cargo.toml not found"
 
 # Build production binary with maximum optimization
-RUN cargo build --release --bin qnet-node --locked
+RUN cargo build --release --bin qnet-node
 
 # Final production runtime image
 FROM ubuntu:22.04
