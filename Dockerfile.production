@@ -15,8 +15,8 @@ RUN apt-get update && apt-get install -y \
 
 # Production optimization environment
 ENV CARGO_BUILD_JOBS=8
-ENV RUSTFLAGS="-C target-cpu=native -C opt-level=3 -C lto=fat -C codegen-units=1"
-ENV CARGO_PROFILE_RELEASE_LTO=fat
+ENV RUSTFLAGS="-C opt-level=3"
+ENV CARGO_PROFILE_RELEASE_LTO=true
 ENV CARGO_PROFILE_RELEASE_PANIC=abort
 ENV CARGO_PROFILE_RELEASE_STRIP=symbols
 
