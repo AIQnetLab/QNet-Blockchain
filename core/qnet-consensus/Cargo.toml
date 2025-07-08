@@ -63,14 +63,4 @@ python = ["pyo3", "pyo3-asyncio"]
 
 [[bench]]
 name = "consensus_bench"
-harness = false
-
-[profile.release]
-lto = true
-codegen-units = 1
-opt-level = 3
-
-[profile.bench]
-lto = true
-codegen-units = 1
-opt-level = 3 
+harness = false 

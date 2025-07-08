@@ -60,9 +60,4 @@ python = ["pyo3"]
 
 [[bench]]
 name = "state_bench"
-harness = false
-
-[profile.release]
-lto = true
-codegen-units = 1
-opt-level = 3 
+harness = false 

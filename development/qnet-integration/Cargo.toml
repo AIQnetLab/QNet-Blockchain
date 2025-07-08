@@ -81,15 +81,6 @@ tempfile = "3.8.1"
 default = []
 python = []
 
-[[bench]]
-name = "integration_bench"
-harness = false
-
-[profile.release]
-lto = true
-codegen-units = 1
-opt-level = 3
-
 [[bin]]
 name = "qnet-node"
 path = "src/bin/main.rs" 

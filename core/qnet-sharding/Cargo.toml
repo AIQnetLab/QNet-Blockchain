@@ -66,8 +66,3 @@ python = ["pyo3"]
 [[bench]]
 name = "sharding_bench"
 harness = false
-
-[profile.release]
-lto = true
-codegen-units = 1
-opt-level = 3
