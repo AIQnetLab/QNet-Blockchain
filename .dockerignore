@@ -16,6 +16,8 @@ ARCHIVE/
 target/
 */target/
 development/*/target/
+core/*/target/
+infrastructure/*/target/
 
 # Node modules and dependencies
 node_modules/
@@ -41,10 +43,13 @@ monitoring/
 applications/
 governance/
 deployment/
-infrastructure/qnet-api/
-infrastructure/qnet-node/
 
-# Only include essential files for build
+# Include essential files for blockchain build
 !Cargo.toml
 !development/qnet-integration/
-!core/ 
+!core/qnet-core/
+!core/qnet-state/
+!core/qnet-consensus/
+!core/qnet-mempool/
+!core/qnet-sharding/
+!infrastructure/qnet-api/ 
