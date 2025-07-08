@@ -1,6 +1,13 @@
-# Multi-stage build for production QNet node with dependency caching
-FROM rust:1.83-slim as builder
+# Multi-stage build with cargo-chef for optimal dependency caching
+FROM rust:1.83-slim as chef
+RUN cargo install cargo-chef
+WORKDIR /build
 
+FROM chef as planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef as builder
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
     build-essential \
@@ -11,47 +18,21 @@ RUN apt-get update && apt-get install -y \
     git \
     && rm -rf /var/lib/apt/lists/*
 
-# Set working directory
-WORKDIR /build
+# Copy recipe and build dependencies
+COPY --from=planner /build/recipe.json recipe.json
 
-# Copy workspace configuration first
-COPY Cargo.toml ./Cargo.toml
-
-# Create minimal core module structure for workspace
-RUN mkdir -p ./core/qnet-core ./core/qnet-state ./core/qnet-consensus ./core/qnet-mempool ./core/qnet-sharding
-
-# Create minimal core module Cargo.toml files
-RUN for module in qnet-core qnet-state qnet-consensus qnet-mempool qnet-sharding; do \
-    mkdir -p ./core/$module/src && \
-    echo "[package]" > ./core/$module/Cargo.toml && \
-    echo "name = \"$module\"" >> ./core/$module/Cargo.toml && \
-    echo "version = \"0.1.0\"" >> ./core/$module/Cargo.toml && \
-    echo "edition = \"2021\"" >> ./core/$module/Cargo.toml && \
-    echo "pub fn dummy() {}" > ./core/$module/src/lib.rs; \
-done
-
-# Copy only Cargo.toml and Cargo.lock for dependency caching
-COPY development/qnet-integration/Cargo.toml ./development/qnet-integration/Cargo.toml
-
-# Create dummy main.rs to cache dependencies
-RUN mkdir -p ./development/qnet-integration/src/bin && \
-    echo "fn main() {println!(\"dummy\");}" > ./development/qnet-integration/src/bin/qnet-node.rs
-
-# Optimize build settings for faster compilation
-ENV CARGO_BUILD_JOBS=2
+# Aggressive optimization settings for faster builds
+ENV CARGO_BUILD_JOBS=4
 ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
-ENV RUSTFLAGS="-C target-cpu=native -C opt-level=2 -C debug-assertions=off"
+ENV RUSTFLAGS="-C target-cpu=native -C opt-level=1 -C debug-assertions=off -C overflow-checks=off -C codegen-units=1"
+ENV CARGO_PROFILE_RELEASE_LTO=true
+ENV CARGO_PROFILE_RELEASE_PANIC=abort
 
-# Build dependencies first (this layer will be cached)
-RUN cargo build --release --bin qnet-node
+# Build dependencies - this layer will be cached aggressively
+RUN cargo chef cook --release --recipe-path recipe.json
 
-# Remove dummy source
-RUN rm -rf ./development/qnet-integration/src
-
-# Copy real source code
-COPY development/qnet-integration/src ./development/qnet-integration/src
-
-# Build final binary (only application code, dependencies are cached)
+# Copy source and build application
+COPY . .
 RUN cargo build --release --bin qnet-node
 
 # Final runtime image
