@@ -1,55 +1,25 @@
-# Git and version control
+# Only exclude heavy/unnecessary files for Docker build
 .git
-.gitignore
-.gitmodules
-
-# Documentation and markdown files
-*.md
-docs/
-documentation/
-
-# Backup and archive files
-backups/
-ARCHIVE/
-
-# Target and build directories
 target/
 */target/
-development/*/target/
-core/*/target/
-infrastructure/*/target/
-
-# Node modules and dependencies
 node_modules/
 */node_modules/
-
-# IDE and editor files
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# OS files
+*.log
 .DS_Store
 Thumbs.db
-*.log
+.vscode/
+.idea/
 
-# Test and development files
+# Exclude documentation and backups
+docs/
+documentation/
+backups/
+ARCHIVE/
 testing/
 scripts/
 monitoring/
 
-# Application specific excludes
+# Exclude applications (not needed for core node)
 applications/
 governance/
-deployment/
-
-# Include essential files for blockchain build
-!Cargo.toml
-!development/qnet-integration/
-!core/qnet-core/
-!core/qnet-state/
-!core/qnet-consensus/
-!core/qnet-mempool/
-!core/qnet-sharding/
-!infrastructure/qnet-api/ 
+deployment/ 

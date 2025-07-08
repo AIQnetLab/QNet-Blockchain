@@ -3,67 +3,82 @@ name = "qnet-integration"
 version = "0.1.0"
 edition = "2021"
 authors = ["QNet Team"]
-description = "Integration layer to connect all QNet modules"
+description = "QNet blockchain integration node"
+license = "MIT"
 
-[[bin]]
-name = "qnet-node"
-path = "src/bin/qnet-node.rs"
-
-
+[lib]
+name = "qnet_integration"
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-# Core QNet blockchain modules - REAL PRODUCTION MODULES
+# Local dependencies
 qnet-core = { path = "../../core/qnet-core" }
 qnet-state = { path = "../../core/qnet-state" }
 qnet-consensus = { path = "../../core/qnet-consensus" }
 qnet-mempool = { path = "../../core/qnet-mempool" }
 qnet-sharding = { path = "../../core/qnet-sharding" }
 
-# Infrastructure modules
-qnet-api = { path = "../../infrastructure/qnet-api" }
-
-# Async runtime - production ready with full features
+# Async runtime
 tokio = { version = "1.35", features = ["full"] }
-async-trait = "0.1.74"
+async-trait = "0.1.75"
 
-# Storage - high performance blockchain database
-rocksdb = "0.21"
-
-# Serialization - blockchain data handling
-serde = { version = "1.0.193", features = ["derive"] }
-serde_json = "1.0.108"
+# Serialization
+serde = { version = "1.0.195", features = ["derive"] }
+serde_json = "1.0.111"
 bincode = "1.3.3"
 
-# Advanced logging and monitoring - production observability
-tracing = "0.1.40"
-tracing-subscriber = { version = "0.3.18", default-features = false, features = ["fmt", "ansi", "env-filter"] }
-
-# Error handling - production reliability and debugging
-thiserror = "1.0.50"
-anyhow = "1.0.75"
-
-# Cryptography - blockchain security critical
-ed25519-dalek = "1.0.1"
-blake3 = "1.4.1"
-hex = "0.4.3"
+# Cryptography - modern production versions
+blake3 = "1.5.0"
+ed25519-dalek = { version = "2.0.0", features = ["std"] }
+curve25519-dalek = "4.1.3"
 sha2 = "0.10.8"
-sha3 = "0.10.8"
+hex = "0.4.3"
 
-# Time handling - blockchain timestamps and scheduling
-chrono = { version = "0.4.31", default-features = false, features = ["clock", "serde"] }
+# Networking
+libp2p = "0.53"
+multiaddr = "0.18"
 
-# Network and logging - production environment
-log = "0.4.20"
-env_logger = "0.10.1"
+# Data structures
+dashmap = "5.5"
+parking_lot = "0.12"
+crossbeam = "0.8"
 
-# RPC server - blockchain API and external interfaces
-warp = "0.3.6"
-num_cpus = "1.16"
-
-# Additional blockchain utilities
+# Utilities
+rayon = "1.10"
 rand = "0.8.5"
-clap = { version = "4.4.8", features = ["derive"] }
-lz4_flex = "0.11.1"
+
+# Error handling
+thiserror = "1.0.56"
+anyhow = "1.0.79"
+
+# Logging
+tracing = "0.1.40"
+tracing-subscriber = { version = "0.3.18", default-features = false, features = ["fmt", "ansi"] }
+
+# Metrics
+prometheus = "0.13"
+lazy_static = "1.4"
+
+# Network framework
+bytes = "1.5"
 
 [dev-dependencies]
-tempfile = "3.8.1" 
+criterion = "0.5"
+tempfile = "3.8.1"
+
+[features]
+default = []
+python = []
+
+[[bench]]
+name = "integration_bench"
+harness = false
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+
+[[bin]]
+name = "qnet-node"
+path = "src/bin/main.rs" 
