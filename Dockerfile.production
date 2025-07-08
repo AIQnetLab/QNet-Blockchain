@@ -23,6 +23,16 @@ ENV CARGO_PROFILE_RELEASE_STRIP=symbols
 # Copy ALL source code
 COPY . .
 
+# Debug: Show what files were copied
+RUN echo "=== CHECKING COPIED FILES ===" && \
+    ls -la && \
+    echo "=== CORE DIRECTORY ===" && \
+    ls -la core/ && \
+    echo "=== CORE/QNET-CORE ===" && \
+    ls -la core/qnet-core/ && \
+    echo "=== WORKSPACE CARGO.TOML ===" && \
+    head -20 Cargo.toml
+
 # Build production binary with maximum optimization
 RUN cargo build --release --bin qnet-node --locked
 
