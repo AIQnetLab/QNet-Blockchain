@@ -1,14 +1,13 @@
-# Only exclude heavy/unnecessary files for Docker build
+# Only exclude git and build artifacts
 .git
 target/
 */target/
-node_modules/
-*/node_modules/
 *.log
-.DS_Store
-Thumbs.db
-.vscode/
-.idea/
+
+# Keep everything else including core/, docs/, etc
+# !core/
+# !development/
+# !infrastructure/
 
 # Exclude top-level documentation and backups (not core module docs)
 ./docs/
