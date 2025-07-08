@@ -1,15 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
-    "core/qnet-core",
-    "core/qnet-sharding",
-    "core/qnet-consensus", 
-    "core/qnet-state",
-    "core/qnet-mempool",
     "development/qnet-integration",
-    # "infrastructure/qnet-api",
-    # "qnet-p2p", 
-    # "qnet_node",
 ]
 
 [workspace.package]
