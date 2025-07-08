@@ -21,19 +21,24 @@ RUN apt-get update && apt-get install -y \
 # Copy recipe and build dependencies
 COPY --from=planner /build/recipe.json recipe.json
 
-# Aggressive optimization settings for faster builds
-ENV CARGO_BUILD_JOBS=4
+# Ultra-aggressive optimization settings for maximum build speed
+ENV CARGO_BUILD_JOBS=6
 ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
-ENV RUSTFLAGS="-C target-cpu=native -C opt-level=1 -C debug-assertions=off -C overflow-checks=off -C codegen-units=1"
-ENV CARGO_PROFILE_RELEASE_LTO=true
+ENV RUSTFLAGS="-C target-cpu=native -C opt-level=1 -C debug-assertions=off -C overflow-checks=off -C codegen-units=1 -C incremental=false"
+ENV CARGO_PROFILE_RELEASE_LTO=thin
 ENV CARGO_PROFILE_RELEASE_PANIC=abort
+ENV CARGO_PROFILE_RELEASE_STRIP=symbols
+ENV CARGO_PROFILE_RELEASE_DEBUG=false
 
 # Build dependencies - this layer will be cached aggressively
 RUN cargo chef cook --release --recipe-path recipe.json
 
-# Copy source and build application
+# Copy source and build application with maximum speed settings
 COPY . .
-RUN cargo build --release --bin qnet-node
+RUN cargo build --release --bin qnet-node \
+    --jobs 6 \
+    --offline \
+    --locked
 
 # Final runtime image
 FROM ubuntu:22.04
