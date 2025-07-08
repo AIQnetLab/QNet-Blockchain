@@ -1,0 +1,50 @@
+# Git and version control
+.git
+.gitignore
+.gitmodules
+
+# Documentation and markdown files
+*.md
+docs/
+documentation/
+
+# Backup and archive files
+backups/
+ARCHIVE/
+
+# Target and build directories
+target/
+*/target/
+development/*/target/
+
+# Node modules and dependencies
+node_modules/
+*/node_modules/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+*.log
+
+# Test and development files
+testing/
+scripts/
+monitoring/
+
+# Application specific excludes
+applications/
+governance/
+deployment/
+infrastructure/qnet-api/
+infrastructure/qnet-node/
+
+# Only include essential files for build
+!Cargo.toml
+!development/qnet-integration/
+!core/ 

@@ -1,4 +1,4 @@
-# Multi-stage build for production QNet node
+# Multi-stage build for production QNet node with dependency caching
 FROM rust:1.83-slim as builder
 
 # Install system dependencies
@@ -14,16 +14,13 @@ RUN apt-get update && apt-get install -y \
 # Set working directory
 WORKDIR /build
 
-# Copy workspace Cargo.toml first
+# Copy workspace configuration first
 COPY Cargo.toml ./Cargo.toml
-
-# Copy integration node source with correct path structure
-COPY development/qnet-integration/ ./development/qnet-integration/
 
 # Create minimal core module structure for workspace
 RUN mkdir -p ./core/qnet-core ./core/qnet-state ./core/qnet-consensus ./core/qnet-mempool ./core/qnet-sharding
 
-# Create minimal core module Cargo.toml files if they don't exist
+# Create minimal core module Cargo.toml files
 RUN for module in qnet-core qnet-state qnet-consensus qnet-mempool qnet-sharding; do \
     mkdir -p ./core/$module/src && \
     echo "[package]" > ./core/$module/Cargo.toml && \
@@ -33,11 +30,28 @@ RUN for module in qnet-core qnet-state qnet-consensus qnet-mempool qnet-sharding
     echo "pub fn dummy() {}" > ./core/$module/src/lib.rs; \
 done
 
-# Optimize build for production - single job to avoid memory issues
-ENV CARGO_BUILD_JOBS=1
-ENV RUSTFLAGS="-C target-cpu=native -C opt-level=3"
+# Copy only Cargo.toml and Cargo.lock for dependency caching
+COPY development/qnet-integration/Cargo.toml ./development/qnet-integration/Cargo.toml
 
-# Build the production node from workspace root
+# Create dummy main.rs to cache dependencies
+RUN mkdir -p ./development/qnet-integration/src/bin && \
+    echo "fn main() {println!(\"dummy\");}" > ./development/qnet-integration/src/bin/qnet-node.rs
+
+# Optimize build settings for faster compilation
+ENV CARGO_BUILD_JOBS=2
+ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
+ENV RUSTFLAGS="-C target-cpu=native -C opt-level=2 -C debug-assertions=off"
+
+# Build dependencies first (this layer will be cached)
+RUN cargo build --release --bin qnet-node
+
+# Remove dummy source
+RUN rm -rf ./development/qnet-integration/src
+
+# Copy real source code
+COPY development/qnet-integration/src ./development/qnet-integration/src
+
+# Build final binary (only application code, dependencies are cached)
 RUN cargo build --release --bin qnet-node
 
 # Final runtime image
@@ -55,7 +69,7 @@ RUN apt-get update && apt-get install -y \
 RUN groupadd -r qnet && useradd -r -g qnet qnet
 RUN mkdir -p /app/{data,logs} && chown -R qnet:qnet /app
 
-# Copy binary from builder (built in workspace root)
+# Copy binary from builder
 COPY --from=builder /build/target/release/qnet-node /usr/local/bin/qnet-node
 
 # Set permissions
@@ -63,11 +77,9 @@ RUN chmod +x /usr/local/bin/qnet-node
 
 # Switch to qnet user
 USER qnet
-
-# Create data directories
 WORKDIR /app
 
-# Expose ports (RPC, P2P, Metrics)
+# Expose ports
 EXPOSE 8545 8546 8547 9876 9877 9878 9945 9946 9947
 
 # Default command
