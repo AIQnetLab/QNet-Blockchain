@@ -1,0 +1,21 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "qnet-mempool"
+version = "0.1.0"
+description = "Python bindings for QNet mempool"
+authors = [
+    {name = "QNet Team", email = "team@qnet.io"}
+]
+requires-python = ">=3.8"
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Python :: Implementation :: PyPy",
+]
+
+[tool.maturin]
+features = ["python"]
+module-name = "qnet_mempool" 

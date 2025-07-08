@@ -7,6 +7,11 @@ description = "High-performance API server for QNet blockchain"
 license = "MIT"
 
 [dependencies]
+# QNet core modules - NOW EXIST!
+qnet-state = { path = "../../core/qnet-state" }
+qnet-mempool = { path = "../../core/qnet-mempool" }
+qnet-consensus = { path = "../../core/qnet-consensus" }
+
 # Web framework
 actix = "0.13"
 actix-web = "4.4"

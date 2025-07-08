@@ -11,6 +11,13 @@ name = "qnet_integration"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+# QNet core modules - NOW EXIST!
+qnet-core = { path = "../../core/qnet-core" }
+qnet-state = { path = "../../core/qnet-state" }
+qnet-consensus = { path = "../../core/qnet-consensus" }
+qnet-mempool = { path = "../../core/qnet-mempool" }
+qnet-sharding = { path = "../../core/qnet-sharding" }
+
 # Async runtime
 tokio = { version = "1.35", features = ["full"] }
 async-trait = "0.1.75"

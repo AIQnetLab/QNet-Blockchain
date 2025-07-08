@@ -1,0 +1,68 @@
+[package]
+name = "qnet-state"
+version = "0.1.0"
+edition = "2021"
+authors = ["QNet Team"]
+description = "State management for QNet blockchain"
+license = "MIT"
+
+[lib]
+name = "qnet_state"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Storage
+rocksdb = "0.21"
+
+# Async runtime
+tokio = { version = "1.35", features = ["full"] }
+async-trait = "0.1.75"
+
+# Serialization
+serde = { version = "1.0.195", features = ["derive"] }
+serde_json = "1.0.111"
+bincode = "1.3.3"
+borsh = "1.5"
+
+# Cryptography - modern production versions
+blake3 = "1.5.0"
+ed25519-dalek = { version = "2.0.0", features = ["std"] }
+curve25519-dalek = "4.1.3"
+sha3 = "0.10.8"
+
+# Data structures
+dashmap = "5.5"
+parking_lot = "0.12"
+crossbeam = "0.8"
+indexmap = "2.0"
+
+# Utilities
+hex = "0.4.3"
+bytes = "1.5"
+
+# Error handling
+thiserror = "1.0.56"
+anyhow = "1.0.79"
+
+# Logging
+tracing = "0.1.40"
+
+# Python bindings
+pyo3 = { version = "0.20", features = ["extension-module"], optional = true }
+
+[dev-dependencies]
+tempfile = "3.8.1"
+criterion = "0.5"
+
+[features]
+default = []
+python = ["pyo3"]
+
+[[bench]]
+name = "state_bench"
+harness = false
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3 

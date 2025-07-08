@@ -180,10 +180,10 @@ secrets/
 perf.data
 perf.data.old
 
-# Core dumps
-core
+# Core dumps (but not core/ directory)
 core.*
-*.stackdump
+# Exclude core dumps but allow core/ directory
+!/core/
 
 # Archives
 *.tar
