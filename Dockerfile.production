@@ -13,36 +13,15 @@ RUN apt-get update && apt-get install -y \
     git \
     && rm -rf /var/lib/apt/lists/*
 
-# Optimized build environment
+# Production build environment
 ENV CARGO_BUILD_JOBS=4
 ENV CARGO_PROFILE_RELEASE_LTO=thin
 ENV CARGO_PROFILE_RELEASE_PANIC=abort
 
-# Copy dependency files first for layer caching
-COPY Cargo.toml ./
-COPY core/qnet-consensus/Cargo.toml ./core/qnet-consensus/
-COPY core/qnet-core/Cargo.toml ./core/qnet-core/
-COPY core/qnet-mempool/Cargo.toml ./core/qnet-mempool/
-COPY core/qnet-state/Cargo.toml ./core/qnet-state/
-COPY core/qnet-sharding/Cargo.toml ./core/qnet-sharding/
-COPY development/qnet-integration/Cargo.toml ./development/qnet-integration/
-
-# Create dummy main for dependency pre-build
-RUN mkdir -p development/qnet-integration/src/bin && \
-    echo "fn main() {}" > development/qnet-integration/src/bin/qnet-node.rs && \
-    mkdir -p core/qnet-core/src && echo "pub fn dummy() {}" > core/qnet-core/src/lib.rs && \
-    mkdir -p core/qnet-consensus/src && echo "pub fn dummy() {}" > core/qnet-consensus/src/lib.rs && \
-    mkdir -p core/qnet-mempool/src && echo "pub fn dummy() {}" > core/qnet-mempool/src/lib.rs && \
-    mkdir -p core/qnet-state/src && echo "pub fn dummy() {}" > core/qnet-state/src/lib.rs && \
-    mkdir -p core/qnet-sharding/src && echo "pub fn dummy() {}" > core/qnet-sharding/src/lib.rs
-
-# Build dependencies only (cached layer)
-RUN cargo build --release --bin qnet-node
-
-# Copy actual source code
+# Copy all source code
 COPY . .
 
-# Build final binary with real code
+# Build production binary
 RUN cargo build --release --bin qnet-node
 
 # Final production runtime image
