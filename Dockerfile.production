@@ -13,29 +13,32 @@ RUN apt-get update && apt-get install -y \
     git \
     && rm -rf /var/lib/apt/lists/*
 
-# Production optimization environment
-ENV CARGO_BUILD_JOBS=8
-ENV RUSTFLAGS="-C opt-level=3"
-ENV CARGO_PROFILE_RELEASE_LTO=true
+# Optimized build environment
+ENV CARGO_BUILD_JOBS=4
+ENV CARGO_PROFILE_RELEASE_LTO=thin
 ENV CARGO_PROFILE_RELEASE_PANIC=abort
-ENV CARGO_PROFILE_RELEASE_STRIP=symbols
 
-# Copy ALL source code
+# Copy dependency files first for layer caching
+COPY Cargo.toml Cargo.lock ./
+COPY core/*/Cargo.toml ./core/
+COPY development/qnet-integration/Cargo.toml ./development/qnet-integration/
+
+# Create dummy main for dependency pre-build
+RUN mkdir -p development/qnet-integration/src/bin && \
+    echo "fn main() {}" > development/qnet-integration/src/bin/qnet-node.rs && \
+    mkdir -p core/qnet-core/src && echo "pub fn dummy() {}" > core/qnet-core/src/lib.rs && \
+    mkdir -p core/qnet-consensus/src && echo "pub fn dummy() {}" > core/qnet-consensus/src/lib.rs && \
+    mkdir -p core/qnet-mempool/src && echo "pub fn dummy() {}" > core/qnet-mempool/src/lib.rs && \
+    mkdir -p core/qnet-state/src && echo "pub fn dummy() {}" > core/qnet-state/src/lib.rs && \
+    mkdir -p core/qnet-sharding/src && echo "pub fn dummy() {}" > core/qnet-sharding/src/lib.rs
+
+# Build dependencies only (cached layer)
+RUN cargo build --release --bin qnet-node
+
+# Copy actual source code
 COPY . .
 
-# Debug: Show what files were actually copied
-RUN echo "=== CHECKING COPIED FILES ===" && \
-    ls -la && \
-    echo "=== LOOKING FOR CORE ===" && \
-    find . -name "core" -type d || echo "core directory not found" && \
-    echo "=== LOOKING FOR QNET-CORE ===" && \
-    find . -name "*qnet*core*" || echo "qnet-core not found" && \
-    echo "=== LOOKING FOR CARGO FILES ===" && \
-    find . -name "Cargo.toml" || echo "no Cargo.toml found" && \
-    echo "=== WORKSPACE CARGO.TOML ===" && \
-    head -20 Cargo.toml 2>/dev/null || echo "workspace Cargo.toml not found"
-
-# Build production binary with maximum optimization
+# Build final binary with real code
 RUN cargo build --release --bin qnet-node
 
 # Final production runtime image
