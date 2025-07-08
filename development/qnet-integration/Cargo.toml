@@ -19,32 +19,48 @@ qnet-consensus = { path = "../../core/qnet-consensus" }
 qnet-mempool = { path = "../../core/qnet-mempool" }
 qnet-sharding = { path = "../../core/qnet-sharding" }
 
-# Essential blockchain runtime
-tokio = { version = "1.35", features = ["rt-multi-thread", "net", "sync", "time"] }
+# Async runtime - production ready with full features
+tokio = { version = "1.35", features = ["full"] }
 async-trait = "0.1.74"
 
-# Blockchain storage
+# Storage - high performance blockchain database
 rocksdb = "0.21"
 
-# Essential serialization
+# Serialization - blockchain data handling
 serde = { version = "1.0.193", features = ["derive"] }
 serde_json = "1.0.108"
 bincode = "1.3.3"
 
-# Essential cryptography
+# Advanced logging and monitoring - production observability
+tracing = "0.1.40"
+tracing-subscriber = { version = "0.3.18", default-features = false, features = ["fmt", "ansi", "env-filter"] }
+
+# Error handling - production reliability and debugging
+thiserror = "1.0.50"
+anyhow = "1.0.75"
+
+# Cryptography - blockchain security critical
 ed25519-dalek = "1.0.1"
 blake3 = "1.4.1"
 hex = "0.4.3"
 sha2 = "0.10.8"
+sha3 = "0.10.8"
 
-# Basic logging
+# Time handling - blockchain timestamps and scheduling
+chrono = { version = "0.4.31", default-features = false, features = ["clock", "serde"] }
+
+# Network and logging - production environment
 log = "0.4.20"
+env_logger = "0.10.1"
 
-# Essential networking
+# RPC server - blockchain API and external interfaces
+warp = "0.3.6"
+num_cpus = "1.16"
+
+# Additional blockchain utilities
 rand = "0.8.5"
-
-# CLI interface
 clap = { version = "4.4.8", features = ["derive"] }
+lz4_flex = "0.11.1"
 
 [dev-dependencies]
 tempfile = "3.8.1" 
