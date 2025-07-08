@@ -110,17 +110,56 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 ### Prerequisites
 
 ```bash
-# Install Rust
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source ~/.cargo/env
+# Update system packages
+sudo apt update && sudo apt upgrade -y
 
-# Install Node.js
-curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
-sudo apt-get install -y nodejs
+# Install essential packages
+sudo apt install -y curl wget git htop nano ufw fail2ban
 
-# Install Git
-sudo apt-get update
-sudo apt-get install git
+# Configure timezone
+sudo timedatectl set-timezone UTC
+```
+
+### Install Docker
+
+QNet runs in production-ready Docker containers for maximum reliability and security.
+
+```bash
+# Remove old Docker versions if any
+sudo apt remove docker docker-engine docker.io containerd runc
+
+# Install Docker dependencies
+sudo apt install -y apt-transport-https ca-certificates curl gnupg lsb-release
+
+# Add Docker GPG key
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+
+# Add Docker repository
+echo "deb [arch=amd64 signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+# Install Docker
+sudo apt update
+sudo apt install -y docker-ce docker-ce-cli containerd.io
+
+# Add user to docker group
+sudo usermod -aG docker $USER
+
+# Start and enable Docker
+sudo systemctl start docker
+sudo systemctl enable docker
+
+# Logout and login again to apply group changes
+# OR restart your terminal session
+```
+
+### Verify Docker Installation
+
+```bash
+# Test Docker installation
+docker --version
+docker run hello-world
+
+# Should output Docker version and run test container successfully
 ```
 
 ### Clone Repository
@@ -128,317 +167,298 @@ sudo apt-get install git
 ```bash
 git clone https://github.com/AIQnetLab/QNet-Blockchain.git
 cd QNet-Blockchain
+
+# Switch to testnet branch (latest production code)
+git checkout testnet
+git pull origin testnet
 ```
 
-### Build from Source
+### Build Production Docker Image
 
 ```bash
-# Build Rust components
-cargo build --release
+# Build QNet production node image
+docker build -f Dockerfile.production -t qnet-node:production .
 
-# Install Node.js dependencies
-npm install
-
-# Build frontend
-cd applications/qnet-explorer/frontend
-npm install
-npm run build
+# Verify build success - should show ~150MB image
+docker images | grep qnet-node
 ```
 
 ## 🔧 Node Setup Guides
 
-### 💡 Light Node Setup
+All QNet nodes run in Docker containers for production deployment. Choose your node type based on available resources.
+
+### 💡 Light Node Setup (Minimal Resources)
 
 Light nodes provide basic network participation with minimal resources.
 
-#### Installation
+#### System Requirements
+- **CPU**: 2 cores
+- **RAM**: 4 GB  
+- **Storage**: 50 GB
+- **Network**: 10 Mbps
+
+#### Setup Steps
 
 ```bash
-# Download light node binary
-wget https://github.com/AIQnetLab/QNet-Blockchain/releases/latest/download/qnet-light-node
-chmod +x qnet-light-node
+# Create data directories
+mkdir -p ~/qnet-data/{data,logs,config}
+chmod 755 ~/qnet-data ~/qnet-data/data ~/qnet-data/logs ~/qnet-data/config
 
-# Create configuration
-mkdir ~/.qnet
-cat > ~/.qnet/config.toml << EOF
-[node]
-type = "light"
-network = "mainnet"
-data_dir = "~/.qnet/data"
+# Configure firewall
+sudo ufw allow 9876  # P2P port
+sudo ufw allow 9877  # RPC port
+sudo ufw --force enable
 
-[network]
-listen_port = 8333
-max_peers = 50
-bootstrap_nodes = [
-    "bootstrap1.qnet.io:8333",
-    "bootstrap2.qnet.io:8333"
-]
+# Generate 1DEV wallet key for node activation
+# Replace YOUR_1DEV_WALLET_PRIVATE_KEY with actual key
+echo "YOUR_1DEV_WALLET_PRIVATE_KEY" > ~/qnet-data/config/wallet.key
+chmod 600 ~/qnet-data/config/wallet.key
 
-[logging]
-level = "info"
-file = "~/.qnet/logs/node.log"
-EOF
-
-# Start node
-./qnet-light-node --config ~/.qnet/config.toml
-```
-
-#### Docker Setup
-
-```bash
-# Pull Docker image
-docker pull qnetlab/qnet-light-node:latest
-
-# Run container
+# Run light node
 docker run -d \
   --name qnet-light \
-  -p 8333:8333 \
-  -v ~/.qnet:/root/.qnet \
-  qnetlab/qnet-light-node:latest
+  --restart unless-stopped \
+  -p 9876:9876 \
+  -p 9877:9877 \
+  -v ~/qnet-data:/app/data \
+  qnet-node:production \
+  --node-type light \
+  --region na \
+  --wallet-key "$(cat ~/qnet-data/config/wallet.key)"
 ```
 
-### 🖥️ Full Node Setup
+### 🖥️ Full Node Setup (Recommended)
 
 Full nodes maintain complete blockchain state and participate in consensus.
 
-#### System Preparation
+#### System Requirements
+- **CPU**: 8 cores
+- **RAM**: 32 GB
+- **Storage**: 1 TB NVMe SSD
+- **Network**: 100 Mbps
+
+#### Setup Steps
 
 ```bash
-# Update system
-sudo apt-get update && sudo apt-get upgrade -y
-
-# Install dependencies
-sudo apt-get install -y \
-  build-essential \
-  pkg-config \
-  libssl-dev \
-  libclang-dev \
-  cmake
-
-# Optimize system for blockchain
+# System optimization for full nodes
 echo 'vm.swappiness=10' | sudo tee -a /etc/sysctl.conf
 echo 'net.core.rmem_max=134217728' | sudo tee -a /etc/sysctl.conf
 echo 'net.core.wmem_max=134217728' | sudo tee -a /etc/sysctl.conf
 sudo sysctl -p
+
+# Create data directories
+mkdir -p ~/qnet-data/{data,logs,config}
+chmod 755 ~/qnet-data ~/qnet-data/data ~/qnet-data/logs ~/qnet-data/config
+
+# Configure firewall for full node
+sudo ufw allow 9876  # P2P port
+sudo ufw allow 9877  # RPC port
+sudo ufw --force enable
+
+# Setup 1DEV wallet key
+echo "YOUR_1DEV_WALLET_PRIVATE_KEY" > ~/qnet-data/config/wallet.key
+chmod 600 ~/qnet-data/config/wallet.key
+
+# Run full node with high performance settings
+docker run -d \
+  --name qnet-full \
+  --restart unless-stopped \
+  -p 9876:9876 \
+  -p 9877:9877 \
+  -v ~/qnet-data:/app/data \
+  qnet-node:production \
+  --node-type full \
+  --region na \
+  --high-performance \
+  --enable-metrics \
+  --wallet-key "$(cat ~/qnet-data/config/wallet.key)"
 ```
 
-#### Installation
+#### Create Systemd Service (Optional)
 
 ```bash
-# Clone and build
-git clone https://github.com/AIQnetLab/QNet-Blockchain.git
-cd QNet-Blockchain
-cargo build --release --bin qnet-full-node
-
-# Create full node configuration
-mkdir -p ~/.qnet/data ~/.qnet/logs
-cat > ~/.qnet/config.toml << EOF
-[node]
-type = "full"
-network = "mainnet"
-data_dir = "~/.qnet/data"
-enable_mining = false
-enable_api = true
-
-[network]
-listen_port = 8333
-max_peers = 200
-bootstrap_nodes = [
-    "bootstrap1.qnet.io:8333",
-    "bootstrap2.qnet.io:8333",
-    "bootstrap3.qnet.io:8333"
-]
-
-[consensus]
-enable_validator = true
-stake_amount = 1000  # QNC tokens
-
-[api]
-listen_address = "127.0.0.1:8545"
-enable_cors = true
-max_connections = 100
-
-[storage]
-cache_size = "2GB"
-max_open_files = 1000
-
-[logging]
-level = "info"
-file = "~/.qnet/logs/node.log"
-max_size = "100MB"
-max_files = 10
-EOF
-
-# Generate node identity
-./target/release/qnet-full-node --generate-identity
-
-# Start full node
-./target/release/qnet-full-node --config ~/.qnet/config.toml
-```
-
-#### Systemd Service
-
-```bash
-# Create service file
-sudo cat > /etc/systemd/system/qnet-node.service << EOF
+# Create systemd service for auto-restart
+sudo tee /etc/systemd/system/qnet-node.service > /dev/null << 'EOF'
 [Unit]
 Description=QNet Full Node
-After=network.target
+After=docker.service
+Requires=docker.service
 
 [Service]
-Type=simple
-User=qnet
-WorkingDirectory=/home/qnet/QNet-Blockchain
-ExecStart=/home/qnet/QNet-Blockchain/target/release/qnet-full-node --config /home/qnet/.qnet/config.toml
-Restart=always
-RestartSec=10
-StandardOutput=journal
-StandardError=journal
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/docker start qnet-full
+ExecStop=/usr/bin/docker stop qnet-full
+TimeoutStartSec=0
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-# Enable and start service
+# Enable service
 sudo systemctl enable qnet-node
-sudo systemctl start qnet-node
-sudo systemctl status qnet-node
 ```
 
-### ⚡ Super Node Setup
+### ⚡ Super Node Setup (High Performance)
 
-Super nodes provide high-performance infrastructure for the network.
+Super nodes provide high-performance infrastructure for the network and can act as block producers.
 
-#### Hardware Optimization
+#### System Requirements
+- **CPU**: 16+ cores (32+ threads)
+- **RAM**: 64+ GB
+- **Storage**: 2+ TB NVMe SSD
+- **Network**: 1 Gbps dedicated
+
+#### Setup Steps
 
 ```bash
-# CPU optimization
+# Advanced system optimization
 echo 'performance' | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
-
-# Memory optimization
 echo 'never' | sudo tee /sys/kernel/mm/transparent_hugepage/enabled
-echo 'madvise' | sudo tee /sys/kernel/mm/transparent_hugepage/defrag
-
-# Network optimization
 echo 'net.core.netdev_max_backlog=5000' | sudo tee -a /etc/sysctl.conf
 echo 'net.ipv4.tcp_congestion_control=bbr' | sudo tee -a /etc/sysctl.conf
 sudo sysctl -p
+
+# Increase file descriptor limits
+echo "* soft nofile 65536" | sudo tee -a /etc/security/limits.conf
+echo "* hard nofile 65536" | sudo tee -a /etc/security/limits.conf
+
+# Create data directories
+mkdir -p ~/qnet-data/{data,logs,config}
+chmod 755 ~/qnet-data ~/qnet-data/data ~/qnet-data/logs ~/qnet-data/config
+
+# Configure firewall for super node
+sudo ufw allow 9876  # P2P port
+sudo ufw allow 9877  # RPC port  
+sudo ufw allow 9878  # Metrics port
+sudo ufw --force enable
+
+# Setup 1DEV wallet key for block production
+echo "YOUR_1DEV_WALLET_PRIVATE_KEY" > ~/qnet-data/config/wallet.key
+chmod 600 ~/qnet-data/config/wallet.key
+
+# Run super node with producer capabilities
+docker run -d \
+  --name qnet-super \
+  --restart unless-stopped \
+  -p 9876:9876 \
+  -p 9877:9877 \
+  -p 9878:9878 \
+  -v ~/qnet-data:/app/data \
+  --memory="32g" \
+  --cpus="16" \
+  qnet-node:production \
+  --node-type super \
+  --region na \
+  --high-performance \
+  --producer \
+  --enable-metrics \
+  --wallet-key "$(cat ~/qnet-data/config/wallet.key)"
 ```
 
-#### Installation
+## 🔍 Node Management
+
+### Check Node Status
 
 ```bash
-# Build with optimizations
-RUSTFLAGS="-C target-cpu=native" cargo build --release --bin qnet-super-node
+# Check if container is running
+docker ps | grep qnet
 
-# Create super node configuration
-cat > ~/.qnet/config.toml << EOF
-[node]
-type = "super"
-network = "mainnet"
-data_dir = "~/.qnet/data"
-enable_mining = true
-enable_api = true
-enable_metrics = true
+# View real-time logs
+docker logs -f qnet-full  # or qnet-light, qnet-super
 
-[network]
-listen_port = 8333
-max_peers = 1000
-bootstrap_nodes = [
-    "bootstrap1.qnet.io:8333",
-    "bootstrap2.qnet.io:8333",
-    "bootstrap3.qnet.io:8333"
-]
-enable_upnp = true
-
-[consensus]
-enable_validator = true
-stake_amount = 10000  # QNC tokens
-max_block_size = "10MB"
-target_block_time = "2s"
-
-[mining]
-enable = true
-threads = 8
-algorithm = "qnet-pow"
-
-[api]
-listen_address = "0.0.0.0:8545"
-enable_cors = true
-max_connections = 1000
-enable_websocket = true
-
-[storage]
-cache_size = "8GB"
-max_open_files = 10000
-enable_compression = true
-
-[metrics]
-enable = true
-listen_address = "127.0.0.1:9090"
-export_interval = "10s"
-
-[logging]
-level = "debug"
-file = "~/.qnet/logs/node.log"
-max_size = "500MB"
-max_files = 20
-EOF
-
-# Start super node
-./target/release/qnet-super-node --config ~/.qnet/config.toml
+# Check resource usage
+docker stats qnet-full
 ```
 
-#### Monitoring Setup
+### Test Node Connectivity
 
 ```bash
-# Install Prometheus
-wget https://github.com/prometheus/prometheus/releases/download/v2.40.0/prometheus-2.40.0.linux-amd64.tar.gz
-tar xvfz prometheus-*.tar.gz
-cd prometheus-*
+# Test RPC endpoint
+curl -X POST http://localhost:9877/rpc \
+  -H "Content-Type: application/json" \
+  -d '{"method":"get_node_info","params":[],"id":1}'
 
-# Configure Prometheus
-cat > prometheus.yml << EOF
-global:
-  scrape_interval: 15s
+# Check peer connections
+curl -s http://localhost:9877/rpc \
+  -H "Content-Type: application/json" \
+  -d '{"method":"get_peer_count","params":[],"id":1}' | jq
 
-scrape_configs:
-  - job_name: 'qnet-node'
-    static_configs:
-      - targets: ['localhost:9090']
-EOF
+# Check sync status
+curl -s http://localhost:9877/rpc \
+  -H "Content-Type: application/json" \
+  -d '{"method":"get_sync_status","params":[],"id":1}' | jq
+```
 
-# Start Prometheus
-./prometheus --config.file=prometheus.yml
+### Update Node
+
+```bash
+# Navigate to repository
+cd QNet-Blockchain
+
+# Pull latest changes
+git pull origin testnet
+
+# Rebuild Docker image
+docker build -f Dockerfile.production -t qnet-node:production .
+
+# Restart node with new image
+docker stop qnet-full  # or your container name
+docker rm qnet-full
+# Run the same docker run command from setup
+```
+
+### Backup Node Data
+
+```bash
+# Create backup
+docker run --rm \
+  -v ~/qnet-data:/data \
+  -v ~/backups:/backup \
+  ubuntu tar czf /backup/qnet-backup-$(date +%Y%m%d).tar.gz /data
+
+# Restore from backup
+tar xzf ~/backups/qnet-backup-YYYYMMDD.tar.gz -C ~/
 ```
 
 ## 🌐 Network Configuration
 
-### Mainnet
+### Production Network (Mainnet)
 
-```toml
-[network]
-name = "mainnet"
-chain_id = 1
-genesis_hash = "0x..."
-bootstrap_nodes = [
-    "mainnet1.qnet.io:8333",
-    "mainnet2.qnet.io:8333",
-    "mainnet3.qnet.io:8333"
-]
+```bash
+# Mainnet nodes automatically connect to production bootstrap nodes
+# No additional configuration required
 ```
 
-### Testnet
+### Test Network (Testnet)
 
-```toml
-[network]
-name = "testnet"
-chain_id = 2
-genesis_hash = "0x..."
-bootstrap_nodes = [
-    "testnet1.qnet.io:8333",
-    "testnet2.qnet.io:8333"
-]
+```bash
+# Current deployment runs on testnet
+# Add --network testnet flag if needed (default)
+```
+
+### Regional Configuration
+
+Choose your region for optimal performance:
+
+```bash
+# North America
+--region na
+
+# Europe  
+--region eu
+
+# Asia
+--region asia
+
+# South America
+--region sa
+
+# Africa
+--region africa
+
+# Oceania
+--region oceania
 ```
 
 ## 🔍 Monitoring & Maintenance
