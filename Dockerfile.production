@@ -1,14 +1,9 @@
-# Multi-stage build with cargo-chef for optimal dependency caching
-FROM rust:1.83-slim as chef
-RUN cargo install cargo-chef
+# Production QNet Blockchain Node - Direct Build
+FROM rust:1.83-slim as builder
+
 WORKDIR /build
 
-FROM chef as planner
-COPY . .
-RUN cargo chef prepare --recipe-path recipe.json
-
-FROM chef as builder
-# Install system dependencies
+# Install system dependencies for production build
 RUN apt-get update && apt-get install -y \
     build-essential \
     cmake \
@@ -18,55 +13,51 @@ RUN apt-get update && apt-get install -y \
     git \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy recipe and build dependencies
-COPY --from=planner /build/recipe.json recipe.json
-
-# Ultra-aggressive optimization settings for maximum build speed
-ENV CARGO_BUILD_JOBS=6
-ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
-ENV RUSTFLAGS="-C target-cpu=native -C opt-level=1 -C debug-assertions=off -C overflow-checks=off -C codegen-units=1 -C incremental=false"
-ENV CARGO_PROFILE_RELEASE_LTO=thin
+# Production optimization environment
+ENV CARGO_BUILD_JOBS=8
+ENV RUSTFLAGS="-C target-cpu=native -C opt-level=3 -C lto=fat -C codegen-units=1"
+ENV CARGO_PROFILE_RELEASE_LTO=fat
 ENV CARGO_PROFILE_RELEASE_PANIC=abort
 ENV CARGO_PROFILE_RELEASE_STRIP=symbols
-ENV CARGO_PROFILE_RELEASE_DEBUG=false
 
-# Build dependencies - this layer will be cached aggressively
-RUN cargo chef cook --release --recipe-path recipe.json
-
-# Copy source and build application with maximum speed settings
+# Copy ALL source code
 COPY . .
-RUN cargo build --release --bin qnet-node \
-    --jobs 6 \
-    --offline \
-    --locked
 
-# Final runtime image
+# Build production binary with maximum optimization
+RUN cargo build --release --bin qnet-node --locked
+
+# Final production runtime image
 FROM ubuntu:22.04
 
-# Install runtime dependencies
+# Install production runtime dependencies
 RUN apt-get update && apt-get install -y \
     libssl3 \
     curl \
     ca-certificates \
     netcat-openbsd \
+    htop \
     && rm -rf /var/lib/apt/lists/*
 
-# Create qnet user and directories
+# Create production user and directories
 RUN groupadd -r qnet && useradd -r -g qnet qnet
-RUN mkdir -p /app/{data,logs} && chown -R qnet:qnet /app
+RUN mkdir -p /app/{data,logs,config} && chown -R qnet:qnet /app
 
-# Copy binary from builder
+# Copy production binary
 COPY --from=builder /build/target/release/qnet-node /usr/local/bin/qnet-node
 
-# Set permissions
+# Set production permissions
 RUN chmod +x /usr/local/bin/qnet-node
 
-# Switch to qnet user
+# Switch to production user
 USER qnet
 WORKDIR /app
 
-# Expose ports
+# Production port exposure
 EXPOSE 8545 8546 8547 9876 9877 9878 9945 9946 9947
 
-# Default command
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8545/health || exit 1
+
+# Production entrypoint
 CMD ["qnet-node"] 
