@@ -19,8 +19,12 @@ ENV CARGO_PROFILE_RELEASE_LTO=thin
 ENV CARGO_PROFILE_RELEASE_PANIC=abort
 
 # Copy dependency files first for layer caching
-COPY Cargo.toml Cargo.lock ./
-COPY core/*/Cargo.toml ./core/
+COPY Cargo.toml ./
+COPY core/qnet-consensus/Cargo.toml ./core/qnet-consensus/
+COPY core/qnet-core/Cargo.toml ./core/qnet-core/
+COPY core/qnet-mempool/Cargo.toml ./core/qnet-mempool/
+COPY core/qnet-state/Cargo.toml ./core/qnet-state/
+COPY core/qnet-sharding/Cargo.toml ./core/qnet-sharding/
 COPY development/qnet-integration/Cargo.toml ./development/qnet-integration/
 
 # Create dummy main for dependency pre-build
