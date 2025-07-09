@@ -214,31 +214,28 @@ sudo ufw --force enable
 echo "YOUR_1DEV_WALLET_PRIVATE_KEY" > ~/qnet-data/config/wallet.key
 chmod 600 ~/qnet-data/config/wallet.key
 
-# Run light node (standard QNet ports)
+# Run light node (simplified - recommended)
 docker run -d \
   --name qnet-light \
   --restart unless-stopped \
-  -p 9876-9878:9876-9878 \
+  --network host \
   -v ~/qnet-data:/app/data \
   qnet-node:production \
   --node-type light \
   --wallet-key "$(cat ~/qnet-data/config/wallet.key)"
 
-# Alternative: Custom ports (if standard ports are in use)
+# Alternative: Explicit port mapping (if host network not preferred)
 # docker run -d \
 #   --name qnet-light \
 #   --restart unless-stopped \
-#   -p 8876-8878:9876-9878 \
-#   -e QNET_P2P_PORT=8876 \
-#   -e QNET_RPC_PORT=8877 \
-#   -e QNET_METRICS_PORT=8878 \
+#   -p 9876-9878:9876-9878 \
 #   -v ~/qnet-data:/app/data \
 #   qnet-node:production \
 #   --node-type light \
 #   --wallet-key "$(cat ~/qnet-data/config/wallet.key)"
 
-# Note: Standard QNet ports 9876-9878 used by default
-# P2P networks require predictable ports for node discovery
+# Note: --network host uses host network directly (no port mapping needed)
+# Standard QNet ports 9876-9878 available automatically
 ```
 
 ### 🖥️ Full Node Setup (Recommended)
@@ -273,11 +270,11 @@ sudo ufw --force enable
 echo "YOUR_1DEV_WALLET_PRIVATE_KEY" > ~/qnet-data/config/wallet.key
 chmod 600 ~/qnet-data/config/wallet.key
 
-# Run full node with high performance settings
+# Run full node with high performance settings (simplified)
 docker run -d \
   --name qnet-full \
   --restart unless-stopped \
-  -p 9876-9878:9876-9878 \
+  --network host \
   -v ~/qnet-data:/app/data \
   qnet-node:production \
   --node-type full \
@@ -285,7 +282,7 @@ docker run -d \
   --enable-metrics \
   --wallet-key "$(cat ~/qnet-data/config/wallet.key)"
 
-# Note: Uses standard QNet ports, configurable via environment variables
+# Note: Host network provides best performance for blockchain P2P communication
 ```
 
 #### Create Systemd Service (Optional)
@@ -351,11 +348,11 @@ sudo ufw --force enable
 echo "YOUR_1DEV_WALLET_PRIVATE_KEY" > ~/qnet-data/config/wallet.key
 chmod 600 ~/qnet-data/config/wallet.key
 
-# Run super node with producer capabilities
+# Run super node with producer capabilities (simplified)
 docker run -d \
   --name qnet-super \
   --restart unless-stopped \
-  -p 9876-9878:9876-9878 \
+  --network host \
   -v ~/qnet-data:/app/data \
   --memory="32g" \
   --cpus="16" \
@@ -366,7 +363,7 @@ docker run -d \
   --enable-metrics \
   --wallet-key "$(cat ~/qnet-data/config/wallet.key)"
 
-# Note: Standard QNet ports, resource limits for high-performance operation
+# Note: Host network + resource limits for maximum performance
 ```
 
 ## 🔍 Node Management
