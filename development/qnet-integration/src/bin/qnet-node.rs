@@ -103,6 +103,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // node.set_node_type(node_type);
     // node.set_region(region);
     
+    // Set RPC port environment variable
+    std::env::set_var("QNET_RPC_PORT", args.rpc_port.to_string());
+    
     // Start enterprise monitoring if enabled
     if args.enable_metrics {
         start_metrics_server(args.rpc_port + 100).await;
@@ -324,8 +327,41 @@ async fn start_metrics_server(port: u16) {
     println!("📊 Starting metrics server on port {}", port);
     
     tokio::spawn(async move {
-        // In production: Start Prometheus metrics endpoint
+        use warp::Filter;
+        
+        let metrics_route = warp::path("metrics")
+            .and(warp::get())
+            .map(|| {
+                // Basic Prometheus metrics format
+                format!(
+                    "# HELP qnet_node_uptime_seconds Total uptime of the node\n\
+                     # TYPE qnet_node_uptime_seconds counter\n\
+                     qnet_node_uptime_seconds {}\n\
+                     # HELP qnet_blocks_height Current blockchain height\n\
+                     # TYPE qnet_blocks_height gauge\n\
+                     qnet_blocks_height 0\n\
+                     # HELP qnet_peers_connected Number of connected peers\n\
+                     # TYPE qnet_peers_connected gauge\n\
+                     qnet_peers_connected 0\n\
+                     # HELP qnet_transactions_total Total number of transactions\n\
+                     # TYPE qnet_transactions_total counter\n\
+                     qnet_transactions_total 0\n",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs()
+                )
+            });
+        
+        let cors = warp::cors()
+            .allow_any_origin()
+            .allow_methods(vec!["GET"])
+            .allow_headers(vec!["Content-Type"]);
+        
+        let routes = metrics_route.with(cors);
+        
         println!("📈 Metrics available at: http://localhost:{}/metrics", port);
+        warp::serve(routes).run(([0, 0, 0, 0], port)).await;
     });
 }
 

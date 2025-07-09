@@ -256,6 +256,17 @@ impl BlockchainNode {
             self.start_consensus_loop().await;
         }
         
+        // Start RPC server
+        let rpc_port = std::env::var("QNET_RPC_PORT")
+            .unwrap_or_default()
+            .parse::<u16>()
+            .unwrap_or(9877);
+        
+        let node_clone = self.clone();
+        tokio::spawn(async move {
+            crate::rpc::start_rpc_server(node_clone, rpc_port).await;
+        });
+        
         println!("[Node] ✅ Blockchain node started successfully");
         Ok(())
     }

@@ -68,7 +68,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
     let routes = rpc_path.or(root_path).with(cors);
     
     println!("Starting RPC server on port {}", port);
-    warp::serve(routes).run(([127, 0, 0, 1], port)).await;
+    warp::serve(routes).run(([0, 0, 0, 0], port)).await;
 }
 
 async fn handle_rpc(
