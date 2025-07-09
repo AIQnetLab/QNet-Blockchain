@@ -14,9 +14,10 @@ pub mod blockchain;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{info, error};
+use sha3::{Sha3_256, Digest};
 
-// Core imports with correct paths
-pub use qnet_state::{StateManager, Account, Transaction, Block, StateDB};
+// Core imports with correct paths  
+pub use qnet_state::{StateManager, Account, Transaction, Block, StateDB, StateError, StateResult};
 pub use qnet_mempool::{SimpleMempool, SimpleMempoolConfig};
 pub use qnet_consensus::{ConsensusEngine, ConsensusConfig, NodeId};
 pub use qnet_sharding::{ShardCoordinator, ParallelValidator};
@@ -320,7 +321,6 @@ pub mod feature_flags {
 // Add serde_json dependency for serialization
 use serde_json;
 use hex;
-use sha3::{Digest, Sha3_256};
 
 // Re-export commonly used types
 pub type BlockHash = [u8; 32];

@@ -5,6 +5,7 @@ use qnet_state::{Block, Account};
 use crate::errors::{IntegrationError, IntegrationResult};
 use std::path::Path;
 use std::collections::HashMap;
+use hex;
 
 pub struct PersistentStorage {
     db: DB,
@@ -159,6 +160,52 @@ impl PersistentStorage {
         Ok(())
     }
     
+    pub fn load_microblock(&self, height: u64) -> IntegrationResult<Option<Vec<u8>>> {
+        let microblocks_cf = self.db.cf_handle("microblocks")
+            .ok_or_else(|| IntegrationError::StorageError("microblocks column family not found".to_string()))?;
+        
+        let key = format!("microblock_{}", height);
+        match self.db.get_cf(&microblocks_cf, key.as_bytes())? {
+            Some(data) => Ok(Some(data)),
+            None => Ok(None),
+        }
+    }
+    
+    pub fn get_latest_macroblock_hash(&self) -> Result<[u8; 32], IntegrationError> {
+        let metadata_cf = self.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
+        
+        match self.db.get_cf(&metadata_cf, b"latest_macroblock_hash")? {
+            Some(data) if data.len() >= 32 => {
+                let mut hash = [0u8; 32];
+                hash.copy_from_slice(&data[..32]);
+                Ok(hash)
+            },
+            _ => Ok([0u8; 32]), // Default genesis hash
+        }
+    }
+    
+    pub async fn save_macroblock(&self, height: u64, macroblock: &qnet_state::MacroBlock) -> IntegrationResult<()> {
+        let microblocks_cf = self.db.cf_handle("microblocks")
+            .ok_or_else(|| IntegrationError::StorageError("microblocks column family not found".to_string()))?;
+        let metadata_cf = self.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
+        
+        let key = format!("macroblock_{}", height);
+        let data = bincode::serialize(macroblock)
+            .map_err(|e| IntegrationError::SerializationError(e.to_string()))?;
+        
+        let mut batch = WriteBatch::default();
+        batch.put_cf(&microblocks_cf, key.as_bytes(), &data);
+        
+        // Update latest macroblock hash
+        let hash = macroblock.hash();
+        batch.put_cf(&metadata_cf, b"latest_macroblock_hash", &hash);
+        
+        self.db.write(batch)?;
+        Ok(())
+    }
+    
     pub fn get_stats(&self) -> IntegrationResult<StorageStats> {
         let mut stats = StorageStats::default();
         
@@ -233,6 +280,18 @@ impl Storage {
     
     pub fn save_microblock(&self, height: u64, data: &[u8]) -> IntegrationResult<()> {
         self.persistent.save_microblock(height, data)
+    }
+    
+    pub fn load_microblock(&self, height: u64) -> IntegrationResult<Option<Vec<u8>>> {
+        self.persistent.load_microblock(height)
+    }
+    
+    pub fn get_latest_macroblock_hash(&self) -> Result<[u8; 32], IntegrationError> {
+        self.persistent.get_latest_macroblock_hash()
+    }
+    
+    pub async fn save_macroblock(&self, height: u64, macroblock: &qnet_state::MacroBlock) -> IntegrationResult<()> {
+        self.persistent.save_macroblock(height, macroblock).await
     }
     
     pub fn get_stats(&self) -> IntegrationResult<StorageStats> {

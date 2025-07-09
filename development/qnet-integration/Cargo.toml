@@ -51,6 +51,9 @@ crossbeam = "0.8"
 # Storage
 rocksdb = "0.21"
 
+# Compression
+flate2 = "1.0"
+
 # Utilities
 rayon = "1.10"
 rand = "0.8.5"
