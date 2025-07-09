@@ -81,11 +81,12 @@ pub enum QNetError {
     IoError(#[from] std::io::Error),
 }
 
-impl From<qnet_mempool::MempoolError> for QNetError {
-    fn from(err: qnet_mempool::MempoolError) -> Self {
-        QNetError::MempoolError(err.to_string())
-    }
-}
+// TODO: Implement proper mempool error conversion
+// impl From<qnet_mempool::MempoolError> for QNetError {
+//     fn from(err: qnet_mempool::MempoolError) -> Self {
+//         QNetError::MempoolError(err.to_string())
+//     }
+// }
 
 impl From<crate::validator::ValidationError> for IntegrationError {
     fn from(err: crate::validator::ValidationError) -> Self {

@@ -311,7 +311,7 @@ impl BlockchainNode {
                         // Convert raw transactions to proper format
                         let mut valid_txs = Vec::new();
                         for tx_str in raw_txs.iter().take(max_tx_per_microblock) {
-                            if let Ok(tx) = serde_json::from_str::<qnet_state::Transaction>(tx_str) {
+                            if let Ok(tx) = serde_json::from_str::<qnet_state::Transaction>(&tx_str) {
                                 valid_txs.push(tx);
                             }
                         }
@@ -685,7 +685,7 @@ impl BlockchainNode {
         let mempool = self.mempool.read().await;
         mempool.get_pending_transactions(1000)
             .into_iter()
-            .filter_map(|tx_str| serde_json::from_str(&tx_str).ok())
+            .filter_map(|tx_str| serde_json::from_str::<qnet_state::Transaction>(&tx_str).ok())
             .collect()
     }
     
