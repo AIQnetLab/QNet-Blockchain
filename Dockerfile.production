@@ -32,13 +32,14 @@ COPY development/qnet-integration/Cargo.toml ./development/qnet-integration/
 # Create dummy source files to cache dependencies
 RUN mkdir -p core/qnet-consensus/src core/qnet-core/src core/qnet-mempool/src \
     core/qnet-state/src core/qnet-sharding/src infrastructure/qnet-api/src \
-    development/qnet-integration/src/bin && \
+    development/qnet-integration/src/bin development/qnet-integration/src && \
     echo "pub fn dummy() {}" > core/qnet-consensus/src/lib.rs && \
     echo "pub fn dummy() {}" > core/qnet-core/src/lib.rs && \
     echo "pub fn dummy() {}" > core/qnet-mempool/src/lib.rs && \
     echo "pub fn dummy() {}" > core/qnet-state/src/lib.rs && \
     echo "pub fn dummy() {}" > core/qnet-sharding/src/lib.rs && \
     echo "pub fn dummy() {}" > infrastructure/qnet-api/src/lib.rs && \
+    echo "pub fn dummy() {}" > development/qnet-integration/src/lib.rs && \
     echo "fn main() {}" > development/qnet-integration/src/bin/qnet-node.rs
 
 # Build dependencies only (this layer gets cached!)
@@ -76,12 +77,12 @@ RUN chmod +x /usr/local/bin/qnet-node
 USER qnet
 WORKDIR /app
 
-# Production port exposure
-EXPOSE 8545 8546 8547 9876 9877 9878 9945 9946 9947
+# Production port exposure - QNet standard ports
+EXPOSE 9876 9877 9878
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8545/health || exit 1
+    CMD curl -f http://localhost:9877/health || exit 1
 
 # Production entrypoint
 ENTRYPOINT ["qnet-node"] 

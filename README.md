@@ -218,13 +218,14 @@ chmod 600 ~/qnet-data/config/wallet.key
 docker run -d \
   --name qnet-light \
   --restart unless-stopped \
-  -p 9876:9876 \
-  -p 9877:9877 \
+  -p 9876-9878:9876-9878 \
   -v ~/qnet-data:/app/data \
   qnet-node:production \
   --node-type light \
-  --region na \
   --wallet-key "$(cat ~/qnet-data/config/wallet.key)"
+
+# Note: Region auto-detected from IP address (no need to specify --region)
+# Standard QNet ports: 9876 (P2P), 9877 (RPC), 9878 (Metrics)
 ```
 
 ### 🖥️ Full Node Setup (Recommended)
@@ -263,15 +264,15 @@ chmod 600 ~/qnet-data/config/wallet.key
 docker run -d \
   --name qnet-full \
   --restart unless-stopped \
-  -p 9876:9876 \
-  -p 9877:9877 \
+  -p 9876-9878:9876-9878 \
   -v ~/qnet-data:/app/data \
   qnet-node:production \
   --node-type full \
-  --region na \
   --high-performance \
   --enable-metrics \
   --wallet-key "$(cat ~/qnet-data/config/wallet.key)"
+
+# Note: Region auto-detected, standard QNet ports used
 ```
 
 #### Create Systemd Service (Optional)
@@ -341,19 +342,18 @@ chmod 600 ~/qnet-data/config/wallet.key
 docker run -d \
   --name qnet-super \
   --restart unless-stopped \
-  -p 9876:9876 \
-  -p 9877:9877 \
-  -p 9878:9878 \
+  -p 9876-9878:9876-9878 \
   -v ~/qnet-data:/app/data \
   --memory="32g" \
   --cpus="16" \
   qnet-node:production \
   --node-type super \
-  --region na \
   --high-performance \
   --producer \
   --enable-metrics \
   --wallet-key "$(cat ~/qnet-data/config/wallet.key)"
+
+# Note: Region auto-detected, all QNet ports exposed
 ```
 
 ## 🔍 Node Management
@@ -467,39 +467,39 @@ Choose your region for optimal performance:
 
 ```bash
 # Check node status
-curl http://localhost:8545/health
+curl http://localhost:9877/health
 
 # Check peer connections
-curl http://localhost:8545/peers
+curl http://localhost:9877/peers
 
 # Check sync status
-curl http://localhost:8545/sync
+curl http://localhost:9877/sync
 
 # Check validator status
-curl http://localhost:8545/validator/status
+curl http://localhost:9877/validator/status
 ```
 
 ### Log Analysis
 
 ```bash
 # View recent logs
-tail -f ~/.qnet/logs/node.log
+docker logs -f qnet-full
 
 # Search for errors
-grep "ERROR" ~/.qnet/logs/node.log
+docker logs qnet-full 2>&1 | grep "ERROR"
 
 # Monitor performance
-grep "TPS\|latency" ~/.qnet/logs/node.log
+docker logs qnet-full 2>&1 | grep "TPS\|latency"
 ```
 
 ### Backup & Recovery
 
 ```bash
 # Backup node data
-tar -czf qnet-backup-$(date +%Y%m%d).tar.gz ~/.qnet/data
+tar -czf qnet-backup-$(date +%Y%m%d).tar.gz ~/qnet-data
 
 # Backup configuration
-cp ~/.qnet/config.toml ~/qnet-config-backup.toml
+cp ~/qnet-data/config/* ~/qnet-config-backup/
 
 # Recovery
 tar -xzf qnet-backup-YYYYMMDD.tar.gz -C ~/
@@ -557,7 +557,7 @@ POST /api/v1/transactions
 ### WebSocket API
 
 ```javascript
-const ws = new WebSocket('ws://localhost:8545/ws');
+const ws = new WebSocket('ws://localhost:9877/ws');
 
 // Subscribe to new blocks
 ws.send(JSON.stringify({
