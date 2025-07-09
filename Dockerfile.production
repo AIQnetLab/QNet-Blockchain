@@ -74,17 +74,20 @@ RUN apt-get update && apt-get install -y \
     htop \
     && rm -rf /var/lib/apt/lists/*
 
+# Copy production binary FIRST (as root)
+COPY --from=builder /build/target/release/qnet-node /usr/local/bin/qnet-node
+
+# Set production permissions (as root)
+RUN chmod +x /usr/local/bin/qnet-node
+
+# Verify binary was copied successfully
+RUN ls -la /usr/local/bin/qnet-node
+
 # Create production user and directories
 RUN groupadd -r qnet && useradd -r -g qnet qnet
 RUN mkdir -p /app/{data,logs,config} && chown -R qnet:qnet /app
 
-# Copy production binary
-COPY --from=builder /build/target/release/qnet-node /usr/local/bin/qnet-node
-
-# Set production permissions
-RUN chmod +x /usr/local/bin/qnet-node
-
-# Switch to production user
+# Switch to production user AFTER copying binary
 USER qnet
 WORKDIR /app
 
