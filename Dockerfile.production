@@ -19,6 +19,11 @@ ENV CARGO_PROFILE_RELEASE_LTO=thin
 ENV CARGO_PROFILE_RELEASE_PANIC=abort
 ENV CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
 
+# Production port configuration
+ENV QNET_P2P_PORT=9876
+ENV QNET_RPC_PORT=9877  
+ENV QNET_METRICS_PORT=9878
+
 # Copy dependency manifests first for better caching
 COPY Cargo.toml ./
 COPY core/qnet-consensus/Cargo.toml ./core/qnet-consensus/
@@ -88,7 +93,7 @@ EXPOSE 9876 9877 9878
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:9877/health || exit 1
+    CMD curl -f http://localhost:${QNET_RPC_PORT}/health || exit 1
 
 # Production entrypoint
 ENTRYPOINT ["qnet-node"] 

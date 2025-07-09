@@ -214,7 +214,7 @@ sudo ufw --force enable
 echo "YOUR_1DEV_WALLET_PRIVATE_KEY" > ~/qnet-data/config/wallet.key
 chmod 600 ~/qnet-data/config/wallet.key
 
-# Run light node
+# Run light node (standard QNet ports)
 docker run -d \
   --name qnet-light \
   --restart unless-stopped \
@@ -224,8 +224,21 @@ docker run -d \
   --node-type light \
   --wallet-key "$(cat ~/qnet-data/config/wallet.key)"
 
-# Note: Region auto-detected from IP address (no need to specify --region)
-# Standard QNet ports: 9876 (P2P), 9877 (RPC), 9878 (Metrics)
+# Alternative: Custom ports (if standard ports are in use)
+# docker run -d \
+#   --name qnet-light \
+#   --restart unless-stopped \
+#   -p 8876-8878:9876-9878 \
+#   -e QNET_P2P_PORT=8876 \
+#   -e QNET_RPC_PORT=8877 \
+#   -e QNET_METRICS_PORT=8878 \
+#   -v ~/qnet-data:/app/data \
+#   qnet-node:production \
+#   --node-type light \
+#   --wallet-key "$(cat ~/qnet-data/config/wallet.key)"
+
+# Note: Standard QNet ports 9876-9878 used by default
+# P2P networks require predictable ports for node discovery
 ```
 
 ### 🖥️ Full Node Setup (Recommended)
@@ -272,7 +285,7 @@ docker run -d \
   --enable-metrics \
   --wallet-key "$(cat ~/qnet-data/config/wallet.key)"
 
-# Note: Region auto-detected, standard QNet ports used
+# Note: Uses standard QNet ports, configurable via environment variables
 ```
 
 #### Create Systemd Service (Optional)
@@ -353,7 +366,7 @@ docker run -d \
   --enable-metrics \
   --wallet-key "$(cat ~/qnet-data/config/wallet.key)"
 
-# Note: Region auto-detected, all QNet ports exposed
+# Note: Standard QNet ports, resource limits for high-performance operation
 ```
 
 ## 🔍 Node Management
