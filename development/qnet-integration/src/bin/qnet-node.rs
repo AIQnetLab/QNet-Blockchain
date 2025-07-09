@@ -33,9 +33,9 @@ struct Args {
     #[arg(long, default_value = "full")]
     node_type: String,
     
-    /// Geographic region (na, eu, asia, sa, africa, oceania)
-    #[arg(long, default_value = "na")]
-    region: String,
+    /// Geographic region (na, eu, asia, sa, africa, oceania) - auto-detected if not specified
+    #[arg(long)]
+    region: Option<String>,
     
     /// Bootstrap peers (comma-separated)
     #[arg(long)]
@@ -76,7 +76,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // Parse and validate arguments
     let node_type = parse_node_type(&args.node_type)?;
-    let region = parse_region(&args.region)?;
+    let region = if let Some(region_str) = &args.region {
+        parse_region(region_str)?
+    } else {
+        auto_detect_region().await?
+    };
     let bootstrap_peers = parse_bootstrap_peers(&args.bootstrap_peers);
     
     // Display configuration
@@ -213,6 +217,50 @@ fn parse_region(region_str: &str) -> Result<Region, String> {
         "africa" => Ok(Region::Africa),
         "oceania" => Ok(Region::Oceania),
         _ => Err(format!("Invalid region: {}. Use: na, eu, asia, sa, africa, oceania", region_str)),
+    }
+}
+
+async fn auto_detect_region() -> Result<Region, String> {
+    println!("🌍 Auto-detecting region from IP address...");
+    
+    // Try to get public IP and determine region
+    match get_public_ip_region().await {
+        Ok(region) => {
+            println!("✅ Region auto-detected: {:?}", region);
+            Ok(region)
+        }
+        Err(e) => {
+            println!("⚠️  Auto-detection failed: {}, using default region: Europe", e);
+            Ok(Region::Europe) // Default fallback
+        }
+    }
+}
+
+async fn get_public_ip_region() -> Result<Region, String> {
+    // Use a simple IP geolocation service
+    let response = match std::process::Command::new("curl")
+        .arg("-s")
+        .arg("http://ip-api.com/json/?fields=continent")
+        .output()
+    {
+        Ok(output) => String::from_utf8_lossy(&output.stdout).to_string(),
+        Err(_) => return Err("Failed to execute curl command".to_string()),
+    };
+    
+    if response.contains("\"continent\":\"North America\"") {
+        Ok(Region::NorthAmerica)
+    } else if response.contains("\"continent\":\"Europe\"") {
+        Ok(Region::Europe)
+    } else if response.contains("\"continent\":\"Asia\"") {
+        Ok(Region::Asia)
+    } else if response.contains("\"continent\":\"South America\"") {
+        Ok(Region::SouthAmerica)
+    } else if response.contains("\"continent\":\"Africa\"") {
+        Ok(Region::Africa)
+    } else if response.contains("\"continent\":\"Oceania\"") {
+        Ok(Region::Oceania)
+    } else {
+        Err("Unknown continent in response".to_string())
     }
 }
 
