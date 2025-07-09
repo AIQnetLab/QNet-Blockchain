@@ -79,6 +79,12 @@ pub enum QNetError {
     
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
+    
+    #[error("Already running")]
+    AlreadyRunning,
+    
+    #[error("Account not found: {0}")]
+    AccountNotFound(String),
 }
 
 // TODO: Implement proper mempool error conversion
@@ -91,5 +97,46 @@ pub enum QNetError {
 impl From<crate::validator::ValidationError> for IntegrationError {
     fn from(err: crate::validator::ValidationError) -> Self {
         IntegrationError::ValidationError(err.to_string())
+    }
+}
+
+impl From<rocksdb::Error> for IntegrationError {
+    fn from(err: rocksdb::Error) -> Self {
+        IntegrationError::StorageError(err.to_string())
+    }
+}
+
+impl From<std::io::Error> for IntegrationError {
+    fn from(err: std::io::Error) -> Self {
+        IntegrationError::Other(err.to_string())
+    }
+}
+
+impl From<qnet_state::StateError> for IntegrationError {
+    fn from(err: qnet_state::StateError) -> Self {
+        IntegrationError::StateError(err.to_string())
+    }
+}
+
+impl From<IntegrationError> for QNetError {
+    fn from(err: IntegrationError) -> Self {
+        match err {
+            IntegrationError::StorageError(msg) => QNetError::StorageError(msg),
+            IntegrationError::NetworkError(msg) => QNetError::NetworkError(msg),
+            IntegrationError::ValidationError(msg) => QNetError::ValidationError(msg),
+            IntegrationError::SerializationError(msg) => QNetError::SerializationError(msg),
+            IntegrationError::StateError(msg) => QNetError::StateError(msg),
+            IntegrationError::MempoolError(msg) => QNetError::MempoolError(msg),
+            IntegrationError::ConsensusError(msg) => QNetError::ConsensusError(msg),
+            IntegrationError::AlreadyRunning => QNetError::AlreadyRunning,
+            IntegrationError::AccountNotFound(addr) => QNetError::AccountNotFound(addr),
+            _ => QNetError::InvalidInput(err.to_string()),
+        }
+    }
+}
+
+impl From<qnet_state::StateError> for QNetError {
+    fn from(err: qnet_state::StateError) -> Self {
+        QNetError::StateError(err.to_string())
     }
 } 

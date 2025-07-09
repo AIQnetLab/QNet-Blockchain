@@ -4,22 +4,19 @@ use crate::{
     errors::QNetError,
     storage::Storage,
     // validator::Validator, // disabled for compilation
-    network::{self, NetworkInterface, NetworkEvent},
-    unified_p2p::{SimplifiedP2P, NodeType as UnifiedNodeType, Region as UnifiedRegion, NetworkMessage as UnifiedP2PMessage},
+    network::{NetworkInterface},
+    unified_p2p::{SimplifiedP2P, NodeType as UnifiedNodeType, Region as UnifiedRegion},
 };
-use qnet_state::{StateManager, Transaction, Account, Block};
+use qnet_state::{Account, Transaction, Block, StateManager};
 use qnet_state::block::{BlockType, MicroBlock, MacroBlock, LightMicroBlock, ConsensusData};
-use qnet_mempool::Mempool;
-use qnet_consensus::{ConsensusEngine, ConsensusConfig};
-use qnet_consensus::NodeId;
+use qnet_mempool::{Mempool, MempoolConfig};
+use qnet_consensus::{ConsensusEngine, ConsensusConfig, NodeId};
+use qnet_sharding::{ShardCoordinator, ParallelValidator};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use hex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use chrono::Timelike;
 use std::env;
-use qnet_sharding::{ShardCoordinator, ParallelValidator};
-
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum NodeType {
@@ -83,9 +80,9 @@ impl Default for PerformanceConfig {
 /// Main blockchain node with unified P2P and regional clustering
 pub struct BlockchainNode {
     storage: Arc<Storage>,
-    state: Arc<RwLock<StateManager>>,
-    mempool: Arc<RwLock<qnet_mempool::SimpleMempool>>,
-    consensus: Arc<RwLock<ConsensusEngine>>,
+    state: Arc<RwLock<qnet_state::StateManager>>,
+    mempool: Arc<RwLock<qnet_mempool::Mempool>>,
+    consensus: Arc<RwLock<qnet_consensus::ConsensusEngine>>,
     // validator: Arc<Validator>, // disabled for compilation
     
     // Unified P2P with regional clustering and automatic failover
@@ -108,14 +105,14 @@ pub struct BlockchainNode {
     is_running: Arc<RwLock<bool>>,
     
     // Micro/macro block tracking
-    current_microblocks: Arc<RwLock<Vec<MicroBlock>>>,
+    current_microblocks: Arc<RwLock<Vec<qnet_state::block::MicroBlock>>>,
     last_microblock_time: Arc<RwLock<Instant>>,
     microblock_interval: Duration,
     is_leader: Arc<RwLock<bool>>,
     
     // Sharding components for regional scaling
-    shard_coordinator: Option<Arc<ShardCoordinator>>,
-    parallel_validator: Option<Arc<ParallelValidator>>,
+    shard_coordinator: Option<Arc<qnet_sharding::ShardCoordinator>>,
+    parallel_validator: Option<Arc<qnet_sharding::ParallelValidator>>,
 }
 
 impl BlockchainNode {
@@ -142,22 +139,29 @@ impl BlockchainNode {
         let storage = Arc::new(Storage::new(data_dir)?);
         
         // Initialize state manager
-        let state = Arc::new(RwLock::new(StateManager::new()));
+        let state = Arc::new(RwLock::new(qnet_state::StateManager::new()));
         
         // Initialize production-ready mempool
-        let mempool_config = qnet_mempool::SimpleMempoolConfig {
+        let mempool_config = qnet_mempool::mempool::MempoolConfig {
             max_size: std::env::var("QNET_MEMPOOL_SIZE")
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(200_000), // 200k for production
+            max_per_account: 100,
             min_gas_price: 1,
+            tx_expiry: std::time::Duration::from_secs(3600),
+            eviction_interval: std::time::Duration::from_secs(300),
+            enable_priority_senders: true,
         };
-        let mempool = Arc::new(RwLock::new(qnet_mempool::SimpleMempool::new(mempool_config)));
+        
+        // Create a temporary state DB for mempool
+        let state_db = Arc::new(qnet_state::StateDB::new(data_dir, Some(1000)).await?);
+        let mempool = Arc::new(RwLock::new(qnet_mempool::Mempool::new(mempool_config, state_db)));
         
         // Initialize consensus engine
         let node_id = format!("node_{}_{}", p2p_port, node_type as u8);
         let consensus = Arc::new(RwLock::new(
-            ConsensusEngine::new(node_id.clone())
+            qnet_consensus::ConsensusEngine::new(node_id.clone())
         ));
         
         // Initialize validator (disabled for compilation)
@@ -204,6 +208,21 @@ impl BlockchainNode {
         // Start unified P2P
         unified_p2p.start();
         
+        // Initialize sharding components for production
+        let shard_coordinator = if perf_config.enable_sharding {
+            Some(Arc::new(qnet_sharding::ShardCoordinator::new()))
+        } else {
+            None
+        };
+        
+        let parallel_validator = if perf_config.parallel_validation {
+            Some(Arc::new(qnet_sharding::ParallelValidator::new(
+                perf_config.parallel_threads,
+            )))
+        } else {
+            None
+        };
+        
         let blockchain = Self {
             storage,
             state,
@@ -225,8 +244,8 @@ impl BlockchainNode {
             last_microblock_time: Arc::new(RwLock::new(Instant::now())),
             microblock_interval,
             is_leader: Arc::new(RwLock::new(false)),
-            shard_coordinator: None,
-            parallel_validator: None,
+            shard_coordinator,
+            parallel_validator,
         };
         
         Ok(blockchain)
@@ -280,6 +299,7 @@ impl BlockchainNode {
         let microblock_interval = self.microblock_interval;
         let is_leader = self.is_leader.clone();
         let node_id = self.node_id.clone();
+        let parallel_validator = self.parallel_validator.clone();
         
         tokio::spawn(async move {
             let mut microblock_height = 0u64;
@@ -296,9 +316,9 @@ impl BlockchainNode {
                         .parse::<usize>()
                         .unwrap_or(5000);
                         
-                    let high_performance = std::env::var("QNET_HIGH_FREQUENCY").unwrap_or_default() == "1";
+                    let _high_performance = std::env::var("QNET_HIGH_FREQUENCY").unwrap_or_default() == "1";
                     let compression_enabled = std::env::var("QNET_COMPRESSION").unwrap_or_default() == "1";
-                    let adaptive_intervals = std::env::var("QNET_ADAPTIVE_INTERVALS").unwrap_or_default() == "1";
+                    let _adaptive_intervals = std::env::var("QNET_ADAPTIVE_INTERVALS").unwrap_or_default() == "1";
                     
                     // Adaptive interval based on mempool size
                     let current_interval = microblock_interval;
@@ -306,42 +326,7 @@ impl BlockchainNode {
                     // Get transactions from mempool using batch processing
                     let txs = {
                         let mempool_guard = mempool.read().await;
-                        let raw_txs = mempool_guard.get_pending_transactions(max_tx_per_microblock);
-                        
-                        // Convert raw transactions to proper format
-                        let mut valid_txs = Vec::new();
-                        for tx_str in raw_txs.iter().take(max_tx_per_microblock) {
-                            if let Ok(tx) = serde_json::from_str::<qnet_state::Transaction>(&tx_str) {
-                                valid_txs.push(tx);
-                            }
-                        }
-                        
-                        // If no JSON transactions, create test transactions for demonstration
-                        if valid_txs.is_empty() && raw_txs.len() > 0 {
-                            println!("[Microblock] 📝 Converting raw transactions to structured format");
-                            for (i, _) in raw_txs.iter().enumerate().take(max_tx_per_microblock) {
-                                let test_tx = qnet_state::Transaction {
-                                    hash: format!("tx_{:08x}", i),
-                                    from: format!("addr_{}", i % 1000),
-                                    to: Some(format!("addr_{}", (i + 1) % 1000)),
-                                    amount: 100 + (i as u64 % 1000),
-                                    nonce: i as u64,
-                                    gas_price: 10,
-                                    gas_limit: 21000,
-                                    timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
-                                    signature: None,
-                                    tx_type: qnet_state::transaction::TransactionType::Transfer {
-                                        from: format!("addr_{}", i % 1000),
-                                        to: format!("addr_{}", (i + 1) % 1000),
-                                        amount: 100 + (i as u64 % 1000),
-                                    },
-                                    data: None,
-                                };
-                                valid_txs.push(test_tx);
-                            }
-                        }
-                        
-                        valid_txs
+                        mempool_guard.get_top_transactions(max_tx_per_microblock)
                     };
                     
                     microblock_height += 1;
@@ -367,6 +352,16 @@ impl BlockchainNode {
                     if let Err(e) = Self::validate_microblock_production(&microblock) {
                         println!("[Microblock] ❌ Validation failed: {}", e);
                         continue;
+                    }
+                    
+                    // Parallel validation if enabled
+                    if let Some(_validator) = &parallel_validator {
+                        // TODO: Implement parallel validation once API is available
+                        // Basic validation for now
+                        if microblock.transactions.is_empty() && microblock.height % 10 != 0 {
+                            // Skip empty microblocks except every 10th
+                            continue;
+                        }
                     }
                     
                     // Calculate TPS for this microblock
@@ -407,12 +402,13 @@ impl BlockchainNode {
                     
                     // Enhanced logging with performance metrics
                     if txs.len() > 0 {
-                        println!("[Microblock] ✅ #{} created: {} tx, {:.2} TPS, {}ms interval, {} bytes", 
+                        println!("[Microblock] ✅ #{} created: {} tx, {:.2} TPS, {}ms interval, {} bytes, {} finalized", 
                                  microblock.height, 
                                  txs.len(), 
                                  tps,
                                  current_interval.as_millis(),
-                                 microblock_data.len());
+                                 microblock_data.len(),
+                                 locally_finalized_count);
                     } else if microblock_height % 10 == 0 {
                         println!("[Microblock] ⏳ #{} empty (waiting for transactions)", microblock.height);
                     }
@@ -555,9 +551,9 @@ impl BlockchainNode {
     
     async fn log_performance_metrics(
         microblock_height: u64,
-        mempool: &Arc<RwLock<qnet_mempool::SimpleMempool>>,
+        mempool: &Arc<RwLock<qnet_mempool::Mempool>>,
     ) {
-        let mempool_size = mempool.read().await.get_pending_transactions(1).len();
+        let mempool_size = mempool.read().await.size();
         let blocks_per_minute = 60; // Approximate for 1s intervals
         let estimated_tps = blocks_per_minute * 5000; // Assuming 5k tx per block average
         
@@ -603,12 +599,10 @@ impl BlockchainNode {
         });
     }
     
-    /// Get current blockchain height
     pub async fn get_height(&self) -> u64 {
         *self.height.read().await
     }
     
-    /// Get connected peer count
     pub async fn get_peer_count(&self) -> Result<usize, QNetError> {
         if let Some(unified_p2p) = &self.unified_p2p {
             Ok(unified_p2p.get_peer_count())
@@ -617,27 +611,22 @@ impl BlockchainNode {
         }
     }
     
-    /// Get node type
     pub fn get_node_type(&self) -> NodeType {
         self.node_type
     }
     
-    /// Get node region
     pub fn get_region(&self) -> Region {
         self.region
     }
     
-    /// Get P2P port
     pub fn get_port(&self) -> u16 {
         self.p2p_port
     }
     
-    /// Get node ID
     pub fn get_node_id(&self) -> String {
         self.node_id.clone()
     }
     
-    /// Get regional health score
     pub fn get_regional_health(&self) -> f64 {
         if let Some(unified_p2p) = &self.unified_p2p {
             unified_p2p.get_regional_health()
@@ -646,67 +635,57 @@ impl BlockchainNode {
         }
     }
     
-    /// Get mempool size
     pub async fn get_mempool_size(&self) -> Result<usize, QNetError> {
         let mempool = self.mempool.read().await;
-        Ok(mempool.get_pending_transactions(100000).len())
+        Ok(mempool.size())
     }
     
-    /// Get block by height
-    pub async fn get_block(&self, height: u64) -> Result<Option<Block>, QNetError> {
-        // In production, this would query the storage
-        // For now, return None as blocks are handled by microblock system
-        Ok(None)
+    pub async fn get_block(&self, height: u64) -> Result<Option<qnet_state::Block>, QNetError> {
+        match self.storage.load_block_by_height(height).await {
+            Ok(block) => Ok(block),
+            Err(e) => Err(QNetError::StorageError(e.to_string())),
+        }
     }
     
-    /// Submit transaction
     pub async fn submit_transaction(&self, tx: qnet_state::Transaction) -> Result<String, QNetError> {
         let tx_json = serde_json::to_string(&tx)
             .map_err(|e| QNetError::SerializationError(format!("Failed to serialize transaction: {}", e)))?;
         let hash = hex::encode(&tx.hash);
         
-        let mempool = self.mempool.write().await;
-        let success = mempool.add_raw_transaction(tx_json, hash.clone());
-        
-        if success {
-            // Broadcast to network
-            if let Some(unified_p2p) = &self.unified_p2p {
-                let tx_data = serde_json::to_vec(&tx).unwrap_or_default();
-                let _ = unified_p2p.broadcast_transaction(tx_data);
-            }
-            Ok(hash)
-        } else {
-            Err(QNetError::MempoolError("Failed to add transaction to mempool".to_string()))
+        {
+            let mut mempool = self.mempool.write().await;
+            mempool.add_transaction(tx.clone()).await
+                .map_err(|e| QNetError::MempoolError(e.to_string()))?;
         }
+        
+        // Broadcast to network
+        if let Some(unified_p2p) = &self.unified_p2p {
+            let tx_data = serde_json::to_vec(&tx).unwrap_or_default();
+            let _ = unified_p2p.broadcast_transaction(tx_data);
+        }
+        
+        Ok(hash)
     }
     
-    /// Get mempool transactions
     pub async fn get_mempool_transactions(&self) -> Vec<qnet_state::Transaction> {
         let mempool = self.mempool.read().await;
-        mempool.get_pending_transactions(1000)
-            .into_iter()
-            .filter_map(|tx_str| serde_json::from_str::<qnet_state::Transaction>(&tx_str).ok())
-            .collect()
+        mempool.get_top_transactions(1000)
     }
     
-    /// Add transaction to mempool (alias for submit_transaction)
     pub async fn add_transaction_to_mempool(&self, tx: qnet_state::Transaction) -> Result<String, QNetError> {
         self.submit_transaction(tx).await
     }
     
-    /// Get account (placeholder)
-    pub async fn get_account(&self, _address: &str) -> Result<Option<qnet_state::Account>, QNetError> {
-        // In production, this would query the state
-        Ok(None)
+    pub async fn get_account(&self, address: &str) -> Result<Option<qnet_state::Account>, QNetError> {
+        let state = self.state.read().await;
+        Ok(state.get_account(address).cloned())
     }
     
-    /// Get balance (placeholder)
-    pub async fn get_balance(&self, _address: &str) -> Result<u64, QNetError> {
-        // In production, this would query the state
-        Ok(0)
+    pub async fn get_balance(&self, address: &str) -> Result<u64, QNetError> {
+        let state = self.state.read().await;
+        Ok(state.get_balance(address))
     }
     
-    /// Get node statistics
     pub async fn get_stats(&self) -> Result<serde_json::Value, QNetError> {
         let height = self.get_height().await;
         let peer_count = self.get_peer_count().await?;
@@ -720,7 +699,9 @@ impl BlockchainNode {
             "regional_health": regional_health,
             "node_type": format!("{:?}", self.node_type),
             "region": format!("{:?}", self.region),
-            "node_id": self.node_id
+            "node_id": self.node_id,
+            "sharding_enabled": self.perf_config.enable_sharding,
+            "parallel_validation": self.perf_config.parallel_validation,
         }))
     }
 }
@@ -732,10 +713,9 @@ impl Clone for BlockchainNode {
             state: self.state.clone(),
             mempool: self.mempool.clone(),
             consensus: self.consensus.clone(),
-            // validator: self.validator.clone(), // disabled for compilation
             unified_p2p: self.unified_p2p.clone(),
             network: self.network.clone(),
-            network_handle: None, // Don't clone handle
+            network_handle: None, // Cannot clone JoinHandle
             node_id: self.node_id.clone(),
             node_type: self.node_type,
             region: self.region,
@@ -749,7 +729,6 @@ impl Clone for BlockchainNode {
             microblock_interval: self.microblock_interval,
             is_leader: self.is_leader.clone(),
             shard_coordinator: self.shard_coordinator.clone(),
-
             parallel_validator: self.parallel_validator.clone(),
         }
     }
