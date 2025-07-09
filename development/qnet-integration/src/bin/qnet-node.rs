@@ -6,7 +6,7 @@
 //! - Smart synchronization and compression
 //! - Enterprise security and monitoring
 
-use qnet_integration::{BlockchainNode, node::{NodeType, Region}};
+use qnet_integration::{BlockchainNode, NodeType, Region};
 use clap::Parser;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -946,7 +946,7 @@ async fn verify_1dev_burn(args: &Args, node_type: &NodeType) -> Result<(), Strin
     Ok(())
 }
 
-async fn simulate_solana_burn_check(wallet_key: &str, required_amount: f64) -> bool {
+async fn simulate_solana_burn_check(wallet_key: &str, _required_amount: f64) -> bool {
     // In production: This would verify actual burn transaction on Solana
     println!("📡 Checking Solana burn transaction for wallet: {}...", &wallet_key[..8]);
     tokio::time::sleep(Duration::from_millis(500)).await;

@@ -16,7 +16,7 @@ pub use errors::QNetError;
 pub use self::storage::Storage;
 // pub use self::validator::Validator; // disabled for compilation
 pub use network::{NetworkInterface, NetworkEvent, NetworkMessage};
-pub use node::BlockchainNode;
+pub use node::{BlockchainNode, NodeType, Region};
 
 // Re-export main types
 pub use qnet_state::{Account, Transaction, Block};
