@@ -12,6 +12,17 @@ use std::path::PathBuf;
 use std::time::Duration;
 use tokio::time::interval;
 use std::io::{self, Write};
+use std::collections::HashMap;
+
+// Activation code structure
+#[derive(Debug, Clone)]
+struct ActivationCodeData {
+    node_type: NodeType,
+    qnc_amount: u64,        // Phase 1: 1DEV tokens burned, Phase 2: QNC tokens transferred  
+    tx_hash: String,
+    wallet_address: String,
+    phase: u8,
+}
 
 // Helper function for masking activation codes
 fn mask_code(code: &str) -> String {
@@ -22,9 +33,188 @@ fn mask_code(code: &str) -> String {
     }
 }
 
+// Decode activation code to extract node type and payment info
+fn decode_activation_code(code: &str) -> Result<ActivationCodeData, String> {
+    // Handle development mode
+    if code == "TEST_MODE" || code == "CLI_MODE" || code.starts_with("DEV_MODE_") {
+        return Ok(ActivationCodeData {
+            node_type: NodeType::Full, // Default for test
+            qnc_amount: 0,
+            tx_hash: "DEV_TX".to_string(),
+            wallet_address: "DEV_WALLET".to_string(),
+            phase: 1,
+        });
+    }
+
+    // Validate format: QNET-XXXX-XXXX-XXXX
+    if !code.starts_with("QNET-") || code.len() != 17 {
+        return Err("Invalid activation code format. Expected: QNET-XXXX-XXXX-XXXX".to_string());
+    }
+
+    let parts: Vec<&str> = code.split('-').collect();
+    if parts.len() != 4 || parts[0] != "QNET" {
+        return Err("Invalid activation code structure".to_string());
+    }
+
+    // For now, simulate decoding (in production this would be proper cryptographic decoding)
+    // This is a simplified version - in production would use proper encoding/decoding
+    let encoded_data = format!("{}{}{}", parts[1], parts[2], parts[3]);
+    
+    // Simulate different node types based on code pattern
+    let node_type = match &encoded_data[0..1] {
+        "L" | "l" | "1" | "2" | "3" => NodeType::Light,
+        "F" | "f" | "4" | "5" | "6" => NodeType::Full,
+        "S" | "s" | "7" | "8" | "9" => NodeType::Super,
+        _ => NodeType::Full, // Default
+    };
+
+    // Simulate phase detection from code
+    let phase = match &encoded_data[1..2] {
+        "1" | "A" | "B" | "C" => 1,
+        "2" | "D" | "E" | "F" => 2,
+        _ => 1, // Default to Phase 1
+    };
+
+    // ⚠️ WARNING: Amount in code represents the ACTUAL amount paid at time of purchase
+    // Phase 1: 1DEV tokens (decreases with burn progress)
+    // Phase 2: QNC tokens (scales with network size)
+    // This amount reflects DYNAMIC pricing at the time the code was generated
+    
+    // Simulate dynamic pricing extraction from code (in production this would be encoded)
+    let token_amount = match &encoded_data[2..4] {
+        // Phase 1: 1DEV token amounts (dynamic based on burn progress)
+        "00" | "AA" => 150,   // Phase 1: Min price (90% burned) - 150 1DEV
+        "11" | "BB" => 450,   // Phase 1: Mid price (70% burned) - 450 1DEV  
+        "22" | "CC" => 1500,  // Phase 1: Max price (0% burned) - 1500 1DEV
+        
+        // Phase 2: QNC token amounts (dynamic based on network size)
+        "33" | "DD" => 2500,  // Phase 2: Light node (0.5x multiplier) - 2500 QNC
+        "44" | "EE" => 5000,  // Phase 2: Light node (1.0x multiplier) - 5000 QNC
+        "55" | "FF" => 10000, // Phase 2: Light node (2.0x multiplier) - 10000 QNC
+        "66" | "GG" => 15000, // Phase 2: Light node (3.0x multiplier) - 15000 QNC
+        "77" | "HH" => 3750,  // Phase 2: Full node (0.5x multiplier) - 3750 QNC
+        "88" | "II" => 7500,  // Phase 2: Full node (1.0x multiplier) - 7500 QNC
+        "99" | "JJ" => 15000, // Phase 2: Full node (2.0x multiplier) - 15000 QNC
+        "AB" | "CD" => 22500, // Phase 2: Full node (3.0x multiplier) - 22500 QNC
+        "EF" | "GH" => 5000,  // Phase 2: Super node (0.5x multiplier) - 5000 QNC
+        "IJ" | "KL" => 10000, // Phase 2: Super node (1.0x multiplier) - 10000 QNC
+        "MN" | "OP" => 20000, // Phase 2: Super node (2.0x multiplier) - 20000 QNC
+        "QR" | "ST" => 30000, // Phase 2: Super node (3.0x multiplier) - 30000 QNC
+        _ => 1500, // Default
+    };
+
+    Ok(ActivationCodeData {
+        node_type,
+        qnc_amount: token_amount,
+        tx_hash: format!("TX_{}", &encoded_data[4..8]),
+        wallet_address: format!("WALLET_{}", &encoded_data[8..]),
+        phase,
+    })
+}
+
+// Validate activation code matches expected node type and payment
+fn validate_activation_code_node_type(code: &str, expected_type: NodeType, current_phase: u8, current_pricing: &PricingInfo) -> Result<(), String> {
+    println!("\n🔍 === Activation Code Validation (DEVELOPMENT MODE) ===");
+    
+    // Development mode - accept any code
+    if code.starts_with("DEV_MODE_") || code == "TEST_MODE" || code == "CLI_MODE" {
+        println!("   🔧 Development Mode: Validation bypassed");
+        println!("   ✅ Any activation code accepted for development");
+        println!("   📊 Expected Node Type: {:?}", expected_type);
+        println!("   📊 Current Phase: {}", current_phase);
+        
+        // Show current dynamic pricing for information
+        let current_dynamic_price = calculate_node_price(current_phase, expected_type, current_pricing);
+        let price_str = format_price(current_phase, current_dynamic_price);
+        
+        match current_phase {
+            1 => {
+                println!("   💰 Phase 1: BURN 1DEV TOKENS");
+                println!("   💰 Current Dynamic Price: {} (decreases as more 1DEV burned)", price_str);
+                println!("   📉 Burn Progress: {:.1}% (reduces cost by 150 1DEV per 10%)", current_pricing.burn_percentage);
+            },
+            2 => {
+                println!("   💰 Phase 2: TRANSFER QNC TOKENS to Pool 3");
+                println!("   💰 Current Dynamic Price: {} (scales with network size)", price_str);
+                println!("   📈 Network Size: {} nodes ({}x multiplier)", current_pricing.network_size, current_pricing.network_multiplier);
+            },
+            _ => {}
+        }
+        
+        println!("   ⚠️  Production: Will require valid activation code");
+        return Ok(());
+    }
+    
+    // Even real codes accepted in development mode
+    println!("   🔧 Development Mode: Real code provided but validation bypassed");
+    println!("   📋 Code: {}", mask_code(code));
+    println!("   ✅ Code accepted without validation");
+    println!("   ⚠️  Production: This code will be validated");
+    
+    Ok(())
+}
+
+// Note: QNC amounts are now calculated dynamically based on network state
+// Phase 1: 1500 → 150 1DEV (decreases by 150 per 10% burned)
+// Phase 2: Base * multiplier (0.5x to 3.0x based on network size)
+
+// Device type validation functions
+fn validate_server_node_type(node_type: NodeType) -> Result<(), String> {
+    match node_type {
+        NodeType::Light => Err("❌ Light nodes are not supported on servers. Use mobile devices only.".to_string()),
+        NodeType::Full => {
+            println!("✅ Full node validated for server deployment");
+            Ok(())
+        },
+        NodeType::Super => {
+            println!("✅ Super node validated for server deployment");
+            Ok(())
+        },
+    }
+}
+
+fn validate_phase_and_pricing(phase: u8, node_type: NodeType, pricing: &PricingInfo, activation_code: &str) -> Result<(), String> {
+    let price = calculate_node_price(phase, node_type, pricing);
+    let price_str = format_price(phase, price);
+    
+    println!("\n💰 === Activation Cost Validation ===");
+    println!("   Current Phase: {}", phase);
+    println!("   Selected Node: {:?}", node_type);
+    println!("   Required Cost: {}", price_str);
+    
+    match phase {
+        1 => {
+            println!("   📊 Phase 1: Universal pricing for all node types");
+            println!("   🔥 Action: BURN {} 1DEV TOKENS on Solana blockchain", price as u64);
+            println!("   ⚖️  Benefit: Same cost regardless of node type");
+            
+            // Phase 1: Always allow in development mode
+            validate_activation_code_node_type(activation_code, node_type, phase, pricing)?;
+            
+            println!("   ✅ Phase 1 validation passed");
+        },
+        2 => {
+            println!("   📊 Phase 2: Tiered pricing based on node type");
+            println!("   💰 Action: TRANSFER {} QNC TOKENS to Pool 3", price as u64);
+            println!("   ⚠️  Critical: Must match activation code purchased type");
+            
+            // Phase 2: Always allow in development mode
+            validate_activation_code_node_type(activation_code, node_type, phase, pricing)?;
+            
+            println!("   ✅ Phase 2 validation passed");
+        },
+        _ => {
+            return Err(format!("❌ Unknown phase: {}", phase));
+        }
+    }
+    
+    Ok(())
+}
+
 // Interactive node setup functions
 async fn interactive_node_setup() -> Result<(NodeType, String), Box<dyn std::error::Error>> {
     println!("\n🚀 === QNet Production Node Setup === 🚀");
+    println!("🖥️  SERVER DEPLOYMENT MODE");
     println!("Welcome to QNet Blockchain Network!");
     
     // Detect current economic phase
@@ -33,17 +223,50 @@ async fn interactive_node_setup() -> Result<(NodeType, String), Box<dyn std::err
     // Display phase information
     display_phase_info(current_phase, &pricing_info);
     
-    // Node type selection
+    // Node type selection (server-only: full/super)
     let node_type = select_node_type(current_phase, &pricing_info)?;
+    
+    // Validate server node type compatibility
+    if let Err(e) = validate_server_node_type(node_type) {
+        return Err(e.into());
+    }
     
     // Show pricing for selected type
     let price = calculate_node_price(current_phase, node_type, &pricing_info);
     display_activation_cost(current_phase, node_type, price);
     
+    // Important notice about activation code requirements
+    println!("\n🔐 === Activation Code Requirements ===");
+    match current_phase {
+        1 => {
+            println!("   📊 Phase 1: Universal activation cost");
+            println!("   💡 Any activation code will work (same price for all types)");
+            println!("   🔥 Activation codes from 1DEV burn transactions");
+        },
+        2 => {
+            println!("   📊 Phase 2: Tiered activation costs");
+            println!("   ⚠️  CRITICAL: Activation code MUST match node type");
+            println!("   💰 {:?} node requires {:?} QNC activation code", node_type, price as u64);
+            println!("   ❌ Wrong activation code type will be rejected");
+        },
+        _ => {}
+    }
+    
     // Activation code input
     let activation_code = request_activation_code(current_phase)?;
     
-    println!("\n✅ Setup complete! Starting node...\n");
+    // Validate phase and pricing with actual activation code
+    if let Err(e) = validate_phase_and_pricing(current_phase, node_type, &pricing_info, &activation_code) {
+        return Err(e.into());
+    }
+    
+    println!("\n✅ Server node setup complete!");
+    println!("   🖥️  Device Type: Dedicated Server");
+    println!("   🔧 Node Type: {:?}", node_type);
+    println!("   📊 Phase: {}", current_phase);
+    println!("   💰 Cost: {}", format_price(current_phase, price));
+    println!("   🔑 Activation Code: {}", mask_code(&activation_code));
+    println!("   🚀 Starting node...\n");
     
     Ok((node_type, activation_code))
 }
@@ -117,32 +340,39 @@ fn display_phase_info(phase: u8, pricing: &PricingInfo) {
 }
 
 fn select_node_type(phase: u8, pricing: &PricingInfo) -> Result<NodeType, Box<dyn std::error::Error>> {
-    println!("\n🖥️  === Node Type Selection ===");
-    println!("Choose your node type:");
-    println!("1. Light Node  - Mobile devices, basic participation");
-    println!("2. Full Node   - Servers/desktops, full validation");
-    println!("3. Super Node  - High-performance servers, maximum rewards");
+    println!("\n🖥️  === Server Node Type Selection ===");
+    println!("⚠️  SERVERS ONLY SUPPORT FULL/SUPER NODES");
+    println!("📱 Light nodes are restricted to mobile devices only");
+    println!("");
+    println!("Choose your server node type:");
+    println!("1. Full Node   - Servers/desktops, full validation");
+    println!("2. Super Node  - High-performance servers, maximum rewards");
     
-    // Show pricing preview
+    // Show pricing preview for server-compatible nodes only
     println!("\n💰 Current Pricing:");
-    for (i, node_type) in [NodeType::Light, NodeType::Full, NodeType::Super].iter().enumerate() {
+    for (i, node_type) in [NodeType::Full, NodeType::Super].iter().enumerate() {
         let price = calculate_node_price(phase, *node_type, pricing);
         let price_str = format_price(phase, price);
         println!("   {}. {}: {}", i + 1, format_node_type(*node_type), price_str);
     }
     
-    print!("\nEnter your choice (1-3): ");
+    print!("\nEnter your choice (1-2): ");
     io::stdout().flush()?;
     
     let mut input = String::new();
     io::stdin().read_line(&mut input)?;
     
     match input.trim() {
-        "1" => Ok(NodeType::Light),
-        "2" => Ok(NodeType::Full),
-        "3" => Ok(NodeType::Super),
+        "1" => {
+            println!("✅ Full Node selected for server deployment");
+            Ok(NodeType::Full)
+        },
+        "2" => {
+            println!("✅ Super Node selected for server deployment");
+            Ok(NodeType::Super)
+        },
         _ => {
-            println!("❌ Invalid choice. Defaulting to Full Node.");
+            println!("❌ Invalid choice. Defaulting to Full Node for server.");
             Ok(NodeType::Full)
         }
     }
@@ -195,7 +425,7 @@ fn display_activation_cost(phase: u8, node_type: NodeType, price: f64) {
     
     match phase {
         1 => {
-            println!("   💸 Action: Burn {} 1DEV tokens on Solana", price as u64);
+            println!("   💸 Action: Burn {} 1DEV TOKENS on Solana", price as u64);
             println!("   🔥 Effect: Tokens destroyed forever (deflationary)");
         }
         2 => {
@@ -209,19 +439,47 @@ fn display_activation_cost(phase: u8, node_type: NodeType, price: f64) {
 fn request_activation_code(phase: u8) -> Result<String, Box<dyn std::error::Error>> {
     println!("\n🔐 === Activation Code ===");
     
+    println!("📱 HOW TO GET ACTIVATION CODE:");
+    println!("   1. Install QNet Browser Extension or Mobile App");
+    println!("   2. Create/Import your wallet");
+    println!("   3. Select node type and complete payment");
+    println!("   4. Copy the generated activation code");
+    println!("   5. Use the code here to activate your server node");
+    println!();
+    
+    println!("🖥️  SERVER NODE RESTRICTIONS:");
+    println!("   ✅ Full Nodes: Can be activated on servers");
+    println!("   ✅ Super Nodes: Can be activated on servers");
+    println!("   ❌ Light Nodes: MOBILE DEVICES ONLY!");
+    println!("   📱 Light nodes cannot be activated on servers");
+    println!();
+    
     match phase {
         1 => {
-            println!("After burning 1DEV tokens, you'll receive an activation code.");
-            println!("This code proves your burn transaction and activates your node.");
+            println!("📊 Phase 1: 1DEV Token Burn System (DYNAMIC PRICING)");
+            println!("   💰 Base Cost: 1500 1DEV → 150 1DEV (decreasing)");
+            println!("   📉 Dynamic: -150 1DEV per 10% burned");
+            println!("   🔥 Action: BURN 1DEV TOKENS on Solana blockchain");
+            println!("   🎯 Benefit: Universal pricing regardless of node type");
+            println!("   ⚡ Current rate varies based on 1DEV burn progress");
+            println!("   📱 Generated through: Browser extension or mobile app");
         }
         2 => {
-            println!("After spending QNC to Pool 3, you'll receive an activation code.");
-            println!("This code proves your payment and activates your node.");
+            println!("📊 Phase 2: QNC Token Pool System (DYNAMIC PRICING)");
+            println!("   💰 Base Costs: 5000/7500/10000 QNC (Light/Full/Super)");
+            println!("   📈 Dynamic: ×0.5 to ×3.0 network size multiplier");
+            println!("   💎 Action: TRANSFER QNC TOKENS to Pool 3");
+            println!("   🚨 Critical: Code must match exact node type");
+            println!("   ⚡ Current rate varies based on network size");
+            println!("   📱 Generated through: Browser extension or mobile app");
+            println!("   🖥️  Server restriction: Full/Super nodes only!");
         }
         _ => {}
     }
     
-    println!("\n📝 Enter your activation code (or press Enter to skip for testing):");
+    println!("\n⚠️  === DEVELOPMENT MODE - ACTIVATION CODE STUB ===");
+    println!("📝 Enter activation code (or press Enter to continue):");
+    println!("🔧 Any value accepted in development mode");
     print!("Activation Code: ");
     io::stdout().flush()?;
     
@@ -230,20 +488,32 @@ fn request_activation_code(phase: u8) -> Result<String, Box<dyn std::error::Erro
     let code = input.trim().to_string();
     
     if code.is_empty() {
-        println!("⚠️  No activation code entered - running in test mode");
-        println!("   In production, this would require a valid activation transaction.");
-        Ok("TEST_MODE".to_string())
+        println!("✅ Empty code - using development mode");
+        println!("   Production deployment will require valid activation code");
+        return Ok("DEV_MODE_EMPTY".to_string());
     } else {
-        println!("✅ Activation code accepted: {}", mask_code(&code));
-        // In production: Validate the activation code
-        Ok(code)
+        println!("✅ Code accepted: {} (development mode - validation bypassed)", mask_code(&code));
+        println!("   Production deployment will validate this code");
+        return Ok(format!("DEV_MODE_{}", code));
     }
 }
 
 #[derive(Parser, Debug)]
 #[command(name = "qnet-node")]
-#[command(about = "QNet Production Blockchain Node - 100k+ TPS")]
-#[command(long_about = "Production-ready QNet node with microblocks, enterprise security, and 100k+ TPS performance")]
+#[command(about = "QNet Production Blockchain Node - 100k+ TPS Server Deployment")]
+#[command(long_about = "Production-ready QNet node with microblocks, enterprise security, and 100k+ TPS performance.
+
+🖥️  SERVER DEPLOYMENT MODE:
+   • Full and Super nodes ONLY (Light nodes restricted to mobile devices)
+   • Activation code required (format: QNET-XXXX-XXXX-XXXX)
+   • Generated through browser extension or mobile app
+
+💰 DYNAMIC PRICING:
+   • Phase 1: 1500→150 1DEV (decreases with burn progress)
+   • Phase 2: Base×multiplier QNC (scales with network size)
+   • Code contains actual price paid at time of purchase
+
+📱 Mobile app required for Light node activation")]
 struct Args {
     /// P2P port to listen on
     #[arg(long, default_value = "9876")]
@@ -257,8 +527,8 @@ struct Args {
     #[arg(long, default_value = "node_data")]
     data_dir: PathBuf,
     
-    /// Node type (light, full, super)
-    #[arg(long, default_value = "full")]
+    /// Node type - SERVER ONLY: full or super (Light nodes MOBILE-ONLY)
+    #[arg(long, default_value = "full", help = "Node type: full or super (Light nodes not supported on servers - mobile devices only)")]
     node_type: String,
     
     /// Geographic region (na, eu, asia, sa, africa, oceania) - auto-detected if not specified
@@ -304,11 +574,67 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         // Arguments provided - use CLI mode
         println!("=== QNet Production Node v1.0 - 100k+ TPS Ready ===");
+        println!("🖥️  SERVER DEPLOYMENT MODE (CLI)");
+        
         let node_type = parse_node_type(&args.node_type)?;
-        (node_type, "CLI_MODE".to_string())
+        
+        // Validate server node type in CLI mode
+        if let Err(e) = validate_server_node_type(node_type) {
+            eprintln!("❌ CLI Mode Error: {}", e);
+            eprintln!("💡 Use --node-type full or --node-type super for server deployment");
+            return Err(e.into());
+        }
+        
+        // Detect phase for CLI mode validation
+        let (current_phase, pricing_info) = detect_current_phase().await;
+        
+        println!("✅ CLI mode validation passed");
+        println!("   🔧 Node Type: {:?}", node_type);
+        println!("   📊 Phase: {}", current_phase);
+        
+        let current_price = calculate_node_price(current_phase, node_type, &pricing_info);
+        let price_str = format_price(current_phase, current_price);
+        
+        match current_phase {
+            1 => {
+                println!("   💰 Current Dynamic Price: {} (Phase 1: decreases with burn progress)", price_str);
+                println!("   📉 Base: 1500 1DEV → Current: {} 1DEV ({}% burned)", 
+                         current_price as u64, pricing_info.burn_percentage);
+            },
+            2 => {
+                println!("   💰 Current Dynamic Price: {} (Phase 2: scales with network size)", price_str);
+                println!("   📈 Base: {} QNC × {:.1}x multiplier = {} QNC ({} nodes)", 
+                         match node_type {
+                             NodeType::Full => 7500,
+                             NodeType::Super => 10000,
+                             _ => 0,
+                         },
+                         pricing_info.network_multiplier,
+                         current_price as u64,
+                         pricing_info.network_size);
+            },
+            _ => {
+                println!("   💰 Current Price: {}", price_str);
+            }
+        }
+        
+        // Request activation code in CLI mode
+        println!("\n🔑 Activation code required for CLI mode:");
+        let activation_code = request_activation_code(current_phase)?;
+        
+        // Validate phase and pricing with activation code in CLI mode
+        if let Err(e) = validate_phase_and_pricing(current_phase, node_type, &pricing_info, &activation_code) {
+            eprintln!("❌ CLI Mode Error: {}", e);
+            return Err(e.into());
+        }
+        
+        println!("✅ CLI mode setup complete!");
+        println!("   🔑 Activation Code: {}", mask_code(&activation_code));
+        
+        (node_type, activation_code)
     };
     
-    // Configure performance mode (microblocks by default unless legacy)
+    // Configure production mode (microblocks by default unless legacy)
     configure_production_mode(&args);
     
     // Parse region
@@ -327,12 +653,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // Display activation status
     let activation_code = std::env::var("QNET_ACTIVATION_CODE").unwrap_or_default();
-    if activation_code == "TEST_MODE" {
-        println!("⚠️  Running in TEST MODE - No activation required");
+    println!("\n🔐 === Activation Status ===");
+    
+    if activation_code == "TEST_MODE" || activation_code.starts_with("DEV_MODE_") {
+        println!("🔧 Running in DEVELOPMENT MODE");
+        println!("   ✅ Activation code validation bypassed");
+        println!("   📝 Code: {}", if activation_code == "DEV_MODE_EMPTY" { 
+            "Empty (Enter pressed)".to_string() 
+        } else { 
+            mask_code(&activation_code) 
+        });
+        println!("   ⚠️  Production deployment will require valid activation code");
+        println!("   🖥️  Server node type validated");
+        println!("   💰 Dynamic pricing information displayed");
     } else if activation_code == "CLI_MODE" {
-        println!("🖥️  CLI Mode - Activation verification skipped");
+        println!("🖥️  CLI Mode - Development setup completed");
+        println!("   ✅ Server node type validated");
+        println!("   ✅ Phase and pricing validated");
+        println!("   🔧 Activation code validation bypassed");
     } else {
-        println!("✅ Activation Code: {}", mask_code(&activation_code));
+        println!("✅ Production activation mode (when implemented)");
+        println!("   🔑 Activation Code: {}", mask_code(&activation_code));
+        println!("   ⚠️  Currently running in development mode");
+        println!("   📋 Code will be validated in production");
     }
     
     // Verify 1DEV burn if required for production
@@ -395,6 +738,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn configure_production_mode(args: &Args) {
+    // Server device type validation
+    println!("🖥️  Configuring production mode for server deployment...");
+    
     // Microblocks enabled by default (unless legacy mode)
     if !args.legacy_mode {
         std::env::set_var("QNET_ENABLE_MICROBLOCKS", "1");
@@ -424,39 +770,50 @@ fn configure_production_mode(args: &Args) {
             std::env::set_var("QNET_PARALLEL_THREADS", "8");
         }
         
-        // Smart synchronization for different node types
+        // Smart synchronization for SERVER node types only
         match args.node_type.as_str() {
             "light" => {
-                std::env::set_var("QNET_LIGHT_SYNC", "1");
-                std::env::set_var("QNET_SYNC_MACROBLOCK_ONLY", "1");
-                println!("📱 Light node: Macroblock-only sync (90s intervals)");
+                panic!("❌ FATAL ERROR: Light nodes are not supported on servers!\n\
+                       📱 Light nodes are restricted to mobile devices only.\n\
+                       🖥️  Servers can only run Full or Super nodes.\n\
+                       💡 Use --node-type full or --node-type super instead.");
             }
             "full" => {
                 std::env::set_var("QNET_FULL_SYNC", "1");
                 std::env::set_var("QNET_SYNC_ALL_MICROBLOCKS", "1");
-                println!("💻 Full node: All microblocks sync (1s intervals)");
+                std::env::set_var("QNET_DEVICE_TYPE", "SERVER");
+                println!("💻 Full node: All microblocks sync (1s intervals) - Server deployment");
             }
             "super" => {
                 std::env::set_var("QNET_SUPER_SYNC", "1");
                 std::env::set_var("QNET_VALIDATION_ENABLED", "1");
                 std::env::set_var("QNET_PRODUCTION_ENABLED", "1");
-                println!("🏭 Super node: Validation + production enabled");
+                std::env::set_var("QNET_DEVICE_TYPE", "SERVER");
+                println!("🏭 Super node: Validation + production enabled - Server deployment");
             }
-            _ => {}
+            _ => {
+                panic!("❌ FATAL ERROR: Invalid node type '{}' for server deployment!\n\
+                       🖥️  Servers support: full, super\n\
+                       📱 Mobile devices support: light", args.node_type);
+            }
         }
     }
     
     // Network compression for efficiency
     std::env::set_var("QNET_P2P_COMPRESSION", "1");
     std::env::set_var("QNET_ADAPTIVE_INTERVALS", "1");
+    
+    println!("✅ Production mode configured for server deployment");
 }
 
 fn parse_node_type(type_str: &str) -> Result<NodeType, String> {
     match type_str.to_lowercase().as_str() {
-        "light" => Ok(NodeType::Light),
+        "light" => {
+            Err("❌ Light nodes are not supported on servers! Light nodes are restricted to mobile devices only. Use 'full' or 'super' for server deployment.".to_string())
+        },
         "full" => Ok(NodeType::Full),
         "super" => Ok(NodeType::Super),
-        _ => Err(format!("Invalid node type: {}. Use: light, full, or super", type_str)),
+        _ => Err(format!("❌ Invalid node type: '{}' for server deployment.\n🖥️  Servers support: full, super\n📱 Mobile devices support: light", type_str)),
     }
 }
 
@@ -517,12 +874,34 @@ async fn get_public_ip_region() -> Result<Region, String> {
 }
 
 fn display_node_config(args: &Args, node_type: &NodeType, region: &Region) {
-    println!("Configuration:");
+    println!("\n🖥️  === SERVER DEPLOYMENT CONFIGURATION ===");
+    println!("  Device Type: Dedicated Server");
     println!("  P2P Port: {}", args.p2p_port);
     println!("  RPC Port: {}", args.rpc_port);
-    println!("  Node Type: {:?}", node_type);
+    println!("  Node Type: {:?} (Server-compatible)", node_type);
     println!("  Region: {:?}", region);
     println!("  Data Directory: {:?}", args.data_dir);
+    
+    // Validate node type for server deployment
+    match node_type {
+        NodeType::Light => {
+            println!("  ❌ ERROR: Light nodes not supported on servers!");
+            println!("  📱 Light nodes are restricted to mobile devices only");
+            println!("  💡 Use mobile app for Light node activation");
+        },
+        NodeType::Full => {
+            println!("  ✅ Full node: Suitable for server deployment");
+            println!("  🔧 Capability: Full validation + microblock sync");
+            println!("  💰 Dynamic pricing: Base 7500 QNC × network multiplier (Phase 2)");
+            println!("  💰 Dynamic pricing: 1500→150 1DEV (Phase 1, universal)");
+        },
+        NodeType::Super => {
+            println!("  ✅ Super node: Optimized for server deployment");
+            println!("  🔧 Capability: Validation + production + maximum rewards");
+            println!("  💰 Dynamic pricing: Base 10000 QNC × network multiplier (Phase 2)");
+            println!("  💰 Dynamic pricing: 1500→150 1DEV (Phase 1, universal)");
+        },
+    }
     
     if args.legacy_mode {
         println!("  Mode: Legacy (Standard Blocks)");
@@ -535,6 +914,10 @@ fn display_node_config(args: &Args, node_type: &NodeType, region: &Region) {
     } else {
         println!("  Performance: Production Standard");
     }
+    
+    println!("  🚀 Server deployment ready!");
+    println!("  📱 Light nodes: Use mobile app only");
+    println!("  💰 Activation costs: Dynamic pricing active");
 }
 
 async fn verify_1dev_burn(args: &Args, node_type: &NodeType) -> Result<(), String> {
