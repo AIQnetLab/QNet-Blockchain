@@ -1,4 +1,4 @@
-# Production QNet Blockchain Node - Direct Build
+# Production QNet Blockchain Node - Optimized Build
 FROM rust:1.86-slim as builder
 
 WORKDIR /build
@@ -13,15 +13,41 @@ RUN apt-get update && apt-get install -y \
     git \
     && rm -rf /var/lib/apt/lists/*
 
-# Production build environment
-ENV CARGO_BUILD_JOBS=4
+# Optimized build environment for faster compilation
+ENV CARGO_BUILD_JOBS=8
 ENV CARGO_PROFILE_RELEASE_LTO=thin
 ENV CARGO_PROFILE_RELEASE_PANIC=abort
+ENV CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
 
-# Copy all source code
+# Copy dependency manifests first for better caching
+COPY Cargo.toml ./
+COPY core/qnet-consensus/Cargo.toml ./core/qnet-consensus/
+COPY core/qnet-core/Cargo.toml ./core/qnet-core/
+COPY core/qnet-mempool/Cargo.toml ./core/qnet-mempool/
+COPY core/qnet-state/Cargo.toml ./core/qnet-state/
+COPY core/qnet-sharding/Cargo.toml ./core/qnet-sharding/
+COPY infrastructure/qnet-api/Cargo.toml ./infrastructure/qnet-api/
+COPY development/qnet-integration/Cargo.toml ./development/qnet-integration/
+
+# Create dummy source files to cache dependencies
+RUN mkdir -p core/qnet-consensus/src core/qnet-core/src core/qnet-mempool/src \
+    core/qnet-state/src core/qnet-sharding/src infrastructure/qnet-api/src \
+    development/qnet-integration/src/bin && \
+    echo "pub fn dummy() {}" > core/qnet-consensus/src/lib.rs && \
+    echo "pub fn dummy() {}" > core/qnet-core/src/lib.rs && \
+    echo "pub fn dummy() {}" > core/qnet-mempool/src/lib.rs && \
+    echo "pub fn dummy() {}" > core/qnet-state/src/lib.rs && \
+    echo "pub fn dummy() {}" > core/qnet-sharding/src/lib.rs && \
+    echo "pub fn dummy() {}" > infrastructure/qnet-api/src/lib.rs && \
+    echo "fn main() {}" > development/qnet-integration/src/bin/qnet-node.rs
+
+# Build dependencies only (this layer gets cached!)
+RUN cargo build --release --bin qnet-node
+
+# Copy real source code
 COPY . .
 
-# Build production binary
+# Build final optimized binary
 RUN cargo build --release --bin qnet-node
 
 # Final production runtime image
@@ -58,4 +84,4 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:8545/health || exit 1
 
 # Production entrypoint
-CMD ["qnet-node"] 
+ENTRYPOINT ["qnet-node"] 
