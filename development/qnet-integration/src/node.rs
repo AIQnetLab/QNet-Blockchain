@@ -7,9 +7,8 @@ use crate::{
     network::{NetworkInterface},
     unified_p2p::{SimplifiedP2P, NodeType as UnifiedNodeType, Region as UnifiedRegion},
 };
-use qnet_state::{Account, Transaction, Block, StateManager};
-use qnet_state::block::{BlockType, MicroBlock, MacroBlock, LightMicroBlock, ConsensusData};
-use qnet_mempool::{Mempool, MempoolConfig};
+use qnet_state::{Account, Transaction, Block, StateManager, BlockType, MicroBlock, MacroBlock, LightMicroBlock, ConsensusData};
+use qnet_mempool::{SimpleMempool, SimpleMempoolConfig};
 use qnet_consensus::{ConsensusEngine, ConsensusConfig, NodeId};
 use qnet_sharding::{ShardCoordinator, ParallelValidator};
 use std::sync::Arc;
@@ -81,7 +80,7 @@ impl Default for PerformanceConfig {
 pub struct BlockchainNode {
     storage: Arc<Storage>,
     state: Arc<RwLock<qnet_state::StateManager>>,
-    mempool: Arc<RwLock<qnet_mempool::Mempool>>,
+    mempool: Arc<RwLock<qnet_mempool::SimpleMempool>>,
     consensus: Arc<RwLock<qnet_consensus::ConsensusEngine>>,
     // validator: Arc<Validator>, // disabled for compilation
     
@@ -142,21 +141,15 @@ impl BlockchainNode {
         let state = Arc::new(RwLock::new(qnet_state::StateManager::new()));
         
         // Initialize production-ready mempool
-        let mempool_config = qnet_mempool::mempool::MempoolConfig {
+        let mempool_config = qnet_mempool::SimpleMempoolConfig {
             max_size: std::env::var("QNET_MEMPOOL_SIZE")
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(200_000), // 200k for production
-            max_per_account: 100,
             min_gas_price: 1,
-            tx_expiry: std::time::Duration::from_secs(3600),
-            eviction_interval: std::time::Duration::from_secs(300),
-            enable_priority_senders: true,
         };
         
-        // Create a temporary state DB for mempool
-        let state_db = Arc::new(qnet_state::StateDB::new(data_dir, Some(1000)).await?);
-        let mempool = Arc::new(RwLock::new(qnet_mempool::Mempool::new(mempool_config, state_db)));
+        let mempool = Arc::new(RwLock::new(qnet_mempool::SimpleMempool::new(mempool_config)));
         
         // Initialize consensus engine
         let node_id = format!("node_{}_{}", p2p_port, node_type as u8);
@@ -326,13 +319,13 @@ impl BlockchainNode {
                     // Get transactions from mempool using batch processing
                     let txs = {
                         let mempool_guard = mempool.read().await;
-                        mempool_guard.get_top_transactions(max_tx_per_microblock)
+                        mempool_guard.get_pending_transactions(max_tx_per_microblock)
                     };
                     
                     microblock_height += 1;
                     
                     // Create production-ready microblock with local finalization
-                    let microblock = qnet_state::block::MicroBlock {
+                    let microblock = qnet_state::MicroBlock {
                         height: microblock_height,
                         timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
                         transactions: txs.clone(),
@@ -551,7 +544,7 @@ impl BlockchainNode {
     
     async fn log_performance_metrics(
         microblock_height: u64,
-        mempool: &Arc<RwLock<qnet_mempool::Mempool>>,
+        mempool: &Arc<RwLock<qnet_mempool::SimpleMempool>>,
     ) {
         let mempool_size = mempool.read().await.size();
         let blocks_per_minute = 60; // Approximate for 1s intervals
@@ -654,7 +647,9 @@ impl BlockchainNode {
         
         {
             let mut mempool = self.mempool.write().await;
-            mempool.add_transaction(tx.clone()).await
+            let tx_json = serde_json::to_string(&tx).unwrap();
+            let tx_hash = format!("{:x}", sha3::Sha3_256::digest(tx_json.as_bytes()));
+            mempool.add_raw_transaction(tx_json, tx_hash)
                 .map_err(|e| QNetError::MempoolError(e.to_string()))?;
         }
         
@@ -669,7 +664,7 @@ impl BlockchainNode {
     
     pub async fn get_mempool_transactions(&self) -> Vec<qnet_state::Transaction> {
         let mempool = self.mempool.read().await;
-        mempool.get_top_transactions(1000)
+        mempool.get_pending_transactions(1000)
     }
     
     pub async fn add_transaction_to_mempool(&self, tx: qnet_state::Transaction) -> Result<String, QNetError> {

@@ -6,7 +6,7 @@
 //! - Smart synchronization and compression
 //! - Enterprise security and monitoring
 
-use qnet_integration::{BlockchainNode, NodeType, Region};
+use qnet_integration::node::{BlockchainNode, NodeType, Region};
 use clap::Parser;
 use std::path::PathBuf;
 use std::time::Duration;
