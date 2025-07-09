@@ -11,6 +11,234 @@ use clap::Parser;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::time::interval;
+use std::io::{self, Write};
+
+// Helper function for masking activation codes
+fn mask_code(code: &str) -> String {
+    if code.len() <= 8 {
+        code.to_string()
+    } else {
+        format!("{}...{}", &code[..4], &code[code.len()-4..])
+    }
+}
+
+// Interactive node setup functions
+async fn interactive_node_setup() -> Result<(NodeType, String), Box<dyn std::error::Error>> {
+    println!("\n🚀 === QNet Production Node Setup === 🚀");
+    println!("Welcome to QNet Blockchain Network!");
+    
+    // Detect current economic phase
+    let (current_phase, pricing_info) = detect_current_phase().await;
+    
+    // Display phase information
+    display_phase_info(current_phase, &pricing_info);
+    
+    // Node type selection
+    let node_type = select_node_type(current_phase, &pricing_info)?;
+    
+    // Show pricing for selected type
+    let price = calculate_node_price(current_phase, node_type, &pricing_info);
+    display_activation_cost(current_phase, node_type, price);
+    
+    // Activation code input
+    let activation_code = request_activation_code(current_phase)?;
+    
+    println!("\n✅ Setup complete! Starting node...\n");
+    
+    Ok((node_type, activation_code))
+}
+
+#[derive(Debug)]
+struct PricingInfo {
+    network_size: u64,
+    burn_percentage: f64, // Phase 1: percentage of 1DEV burned
+    network_multiplier: f64, // Phase 2: network size multiplier
+}
+
+async fn detect_current_phase() -> (u8, PricingInfo) {
+    // In production: Query blockchain for actual data
+    // For now: Use simulated data
+    
+    println!("🔍 Detecting current network phase...");
+    
+    // Simulate network state detection
+    let total_1dev_burned = 450_000_000u64; // 45% burned (example)
+    let burn_percentage = (total_1dev_burned as f64 / 1_000_000_000.0) * 100.0;
+    let network_size = 75_000u64; // Example: 75k active nodes
+    
+    let current_phase = if burn_percentage >= 90.0 {
+        2 // Phase 2: QNC economy
+    } else {
+        1 // Phase 1: 1DEV burn
+    };
+    
+    let network_multiplier = calculate_network_multiplier(network_size);
+    
+    let pricing_info = PricingInfo {
+        network_size,
+        burn_percentage,
+        network_multiplier,
+    };
+    
+    println!("✅ Phase {} detected", current_phase);
+    
+    (current_phase, pricing_info)
+}
+
+fn calculate_network_multiplier(network_size: u64) -> f64 {
+    match network_size {
+        0..=10_000 => 0.5,      // Early network discount
+        10_001..=100_000 => 1.0, // Standard pricing
+        100_001..=1_000_000 => 2.0, // High demand
+        _ => 3.0                 // Mature network premium
+    }
+}
+
+fn display_phase_info(phase: u8, pricing: &PricingInfo) {
+    println!("\n📊 === Current Network Status ===");
+    
+    match phase {
+        1 => {
+            println!("🔥 Phase 1: 1DEV Burn-to-Join Active");
+            println!("   📈 1DEV Burned: {:.1}%", pricing.burn_percentage);
+            println!("   💰 Universal Pricing: Same cost for all node types");
+            println!("   📉 Dynamic Reduction: Lower prices as more tokens burned");
+            println!("   🎯 Transition: Occurs at 90% burned or 5 years");
+        }
+        2 => {
+            println!("💎 Phase 2: QNC Operational Economy Active");
+            println!("   🌐 Network Size: {} active nodes", pricing.network_size);
+            println!("   📊 Price Multiplier: {:.1}x", pricing.network_multiplier);
+            println!("   💰 Tiered Pricing: Different costs per node type");
+            println!("   🏦 Pool 3: Activation fees redistributed to all nodes");
+        }
+        _ => println!("❓ Unknown phase detected"),
+    }
+}
+
+fn select_node_type(phase: u8, pricing: &PricingInfo) -> Result<NodeType, Box<dyn std::error::Error>> {
+    println!("\n🖥️  === Node Type Selection ===");
+    println!("Choose your node type:");
+    println!("1. Light Node  - Mobile devices, basic participation");
+    println!("2. Full Node   - Servers/desktops, full validation");
+    println!("3. Super Node  - High-performance servers, maximum rewards");
+    
+    // Show pricing preview
+    println!("\n💰 Current Pricing:");
+    for (i, node_type) in [NodeType::Light, NodeType::Full, NodeType::Super].iter().enumerate() {
+        let price = calculate_node_price(phase, *node_type, pricing);
+        let price_str = format_price(phase, price);
+        println!("   {}. {}: {}", i + 1, format_node_type(*node_type), price_str);
+    }
+    
+    print!("\nEnter your choice (1-3): ");
+    io::stdout().flush()?;
+    
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    
+    match input.trim() {
+        "1" => Ok(NodeType::Light),
+        "2" => Ok(NodeType::Full),
+        "3" => Ok(NodeType::Super),
+        _ => {
+            println!("❌ Invalid choice. Defaulting to Full Node.");
+            Ok(NodeType::Full)
+        }
+    }
+}
+
+fn calculate_node_price(phase: u8, node_type: NodeType, pricing: &PricingInfo) -> f64 {
+    match phase {
+        1 => {
+            // Phase 1: Universal 1DEV pricing with burn reduction
+            let base_price = 1500.0;
+            let reduction_per_tier = 150.0;
+            let tier = (pricing.burn_percentage / 10.0).floor();
+            let total_reduction = tier * reduction_per_tier;
+            let current_price = base_price - total_reduction;
+            current_price.max(150.0) // Minimum 150 1DEV
+        }
+        2 => {
+            // Phase 2: Tiered QNC pricing with network multiplier
+            let base_price = match node_type {
+                NodeType::Light => 5_000.0,
+                NodeType::Full => 7_500.0,
+                NodeType::Super => 10_000.0,
+            };
+            base_price * pricing.network_multiplier
+        }
+        _ => 0.0,
+    }
+}
+
+fn format_price(phase: u8, price: f64) -> String {
+    match phase {
+        1 => format!("{:.0} 1DEV", price),
+        2 => format!("{:.0} QNC", price),
+        _ => "Unknown".to_string(),
+    }
+}
+
+fn format_node_type(node_type: NodeType) -> &'static str {
+    match node_type {
+        NodeType::Light => "Light Node ",
+        NodeType::Full => "Full Node  ",
+        NodeType::Super => "Super Node ",
+    }
+}
+
+fn display_activation_cost(phase: u8, node_type: NodeType, price: f64) {
+    println!("\n💳 === Activation Cost ===");
+    println!("   Node Type: {:?}", node_type);
+    println!("   Cost: {}", format_price(phase, price));
+    
+    match phase {
+        1 => {
+            println!("   💸 Action: Burn {} 1DEV tokens on Solana", price as u64);
+            println!("   🔥 Effect: Tokens destroyed forever (deflationary)");
+        }
+        2 => {
+            println!("   💰 Action: Spend {} QNC to Pool 3", price as u64);
+            println!("   🏦 Effect: QNC redistributed to all active nodes");
+        }
+        _ => {}
+    }
+}
+
+fn request_activation_code(phase: u8) -> Result<String, Box<dyn std::error::Error>> {
+    println!("\n🔐 === Activation Code ===");
+    
+    match phase {
+        1 => {
+            println!("After burning 1DEV tokens, you'll receive an activation code.");
+            println!("This code proves your burn transaction and activates your node.");
+        }
+        2 => {
+            println!("After spending QNC to Pool 3, you'll receive an activation code.");
+            println!("This code proves your payment and activates your node.");
+        }
+        _ => {}
+    }
+    
+    println!("\n📝 Enter your activation code (or press Enter to skip for testing):");
+    print!("Activation Code: ");
+    io::stdout().flush()?;
+    
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let code = input.trim().to_string();
+    
+    if code.is_empty() {
+        println!("⚠️  No activation code entered - running in test mode");
+        println!("   In production, this would require a valid activation transaction.");
+        Ok("TEST_MODE".to_string())
+    } else {
+        println!("✅ Activation code accepted: {}", mask_code(&code));
+        // In production: Validate the activation code
+        Ok(code)
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "qnet-node")]
@@ -69,13 +297,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     let args = Args::parse();
     
-    println!("=== QNet Production Node v1.0 - 100k+ TPS Ready ===");
+    // Interactive setup if no arguments provided
+    let (node_type, activation_code) = if std::env::args().len() == 1 {
+        // No arguments - run interactive setup
+        interactive_node_setup().await?
+    } else {
+        // Arguments provided - use CLI mode
+        println!("=== QNet Production Node v1.0 - 100k+ TPS Ready ===");
+        let node_type = parse_node_type(&args.node_type)?;
+        (node_type, "CLI_MODE".to_string())
+    };
     
     // Configure performance mode (microblocks by default unless legacy)
     configure_production_mode(&args);
     
-    // Parse and validate arguments
-    let node_type = parse_node_type(&args.node_type)?;
+    // Parse region
     let region = if let Some(region_str) = &args.region {
         parse_region(region_str)?
     } else {
@@ -83,8 +319,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let bootstrap_peers = parse_bootstrap_peers(&args.bootstrap_peers);
     
+    // Store activation code for validation
+    std::env::set_var("QNET_ACTIVATION_CODE", activation_code);
+    
     // Display configuration
     display_node_config(&args, &node_type, &region);
+    
+    // Display activation status
+    let activation_code = std::env::var("QNET_ACTIVATION_CODE").unwrap_or_default();
+    if activation_code == "TEST_MODE" {
+        println!("⚠️  Running in TEST MODE - No activation required");
+    } else if activation_code == "CLI_MODE" {
+        println!("🖥️  CLI Mode - Activation verification skipped");
+    } else {
+        println!("✅ Activation Code: {}", mask_code(&activation_code));
+    }
     
     // Verify 1DEV burn if required for production
     if std::env::var("QNET_PRODUCTION").unwrap_or_default() == "1" {
