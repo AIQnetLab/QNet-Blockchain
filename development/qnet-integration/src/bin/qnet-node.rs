@@ -13,6 +13,7 @@ use std::time::Duration;
 use tokio::time::interval;
 use std::io::{self, Write};
 use std::collections::HashMap;
+use atty;
 
 // Activation code structure
 #[derive(Debug, Clone)]
@@ -36,7 +37,7 @@ fn mask_code(code: &str) -> String {
 // Decode activation code to extract node type and payment info
 fn decode_activation_code(code: &str) -> Result<ActivationCodeData, String> {
     // Handle development mode
-    if code == "TEST_MODE" || code == "CLI_MODE" || code.starts_with("DEV_MODE_") {
+    if code == "TEST_MODE" || code == "CLI_MODE" || code == "DOCKER_MODE" || code.starts_with("DEV_MODE_") {
         return Ok(ActivationCodeData {
             node_type: NodeType::Full, // Default for test
             qnc_amount: 0,
@@ -117,7 +118,7 @@ fn validate_activation_code_node_type(code: &str, expected_type: NodeType, curre
     println!("\n🔍 === Activation Code Validation (DEVELOPMENT MODE) ===");
     
     // Development mode - accept any code
-    if code.starts_with("DEV_MODE_") || code == "TEST_MODE" || code == "CLI_MODE" {
+    if code.starts_with("DEV_MODE_") || code == "TEST_MODE" || code == "CLI_MODE" || code == "DOCKER_MODE" {
         println!("   🔧 Development Mode: Validation bypassed");
         println!("   ✅ Any activation code accepted for development");
         println!("   📊 Expected Node Type: {:?}", expected_type);
@@ -558,6 +559,10 @@ struct Args {
     /// Enable metrics server
     #[arg(long)]
     enable_metrics: bool,
+    
+    /// Force interactive mode (always show menu)
+    #[arg(long)]
+    interactive: bool,
 }
 
 #[tokio::main]
@@ -567,10 +572,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     let args = Args::parse();
     
-    // Interactive setup if no arguments provided
-    let (node_type, activation_code) = if std::env::args().len() == 1 {
-        // No arguments - run interactive setup
-        interactive_node_setup().await?
+    // Interactive setup if explicitly requested or in Docker without TTY
+    let (node_type, activation_code) = if args.interactive || !atty::is(atty::Stream::Stdin) {
+        // Force interactive mode or Docker mode without TTY
+        if atty::is(atty::Stream::Stdin) {
+            // Real interactive terminal available
+            interactive_node_setup().await?
+        } else {
+            // Docker mode - use defaults without interactive input
+            println!("=== QNet Production Node v1.0 - 100k+ TPS Ready ===");
+            println!("🐳 DOCKER DEPLOYMENT MODE");
+            println!("🖥️  Auto-configuring for server deployment...");
+            
+            let node_type = parse_node_type(&args.node_type)?;
+            
+            // Validate server node type
+            if let Err(e) = validate_server_node_type(node_type) {
+                eprintln!("❌ Docker Mode Error: {}", e);
+                return Err(e.into());
+            }
+            
+            // Detect phase for Docker mode
+            let (current_phase, pricing_info) = detect_current_phase().await;
+            
+            println!("✅ Docker mode auto-configuration complete");
+            println!("   🔧 Node Type: {:?}", node_type);
+            println!("   📊 Phase: {}", current_phase);
+            
+            let current_price = calculate_node_price(current_phase, node_type, &pricing_info);
+            let price_str = format_price(current_phase, current_price);
+            
+            println!("   💰 Current Dynamic Price: {}", price_str);
+            
+            // Use development mode activation code for Docker
+            let activation_code = "DOCKER_MODE".to_string();
+            
+            println!("   🔑 Using Docker mode activation");
+            println!("   ⚠️  Production deployment will require real activation code");
+            
+            (node_type, activation_code)
+        }
     } else {
         // Arguments provided - use CLI mode
         println!("=== QNet Production Node v1.0 - 100k+ TPS Ready ===");
@@ -666,6 +707,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("   ⚠️  Production deployment will require valid activation code");
         println!("   🖥️  Server node type validated");
         println!("   💰 Dynamic pricing information displayed");
+    } else if activation_code == "DOCKER_MODE" {
+        println!("🐳 Running in DOCKER MODE");
+        println!("   ✅ Auto-configured for Docker deployment");
+        println!("   🔧 Activation code validation bypassed");
+        println!("   🖥️  Server node type validated");
+        println!("   💰 Dynamic pricing information displayed");
+        println!("   ⚠️  Production deployment will require real activation code");
     } else if activation_code == "CLI_MODE" {
         println!("🖥️  CLI Mode - Development setup completed");
         println!("   ✅ Server node type validated");
