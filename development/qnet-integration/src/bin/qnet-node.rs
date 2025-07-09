@@ -13,7 +13,6 @@ use std::time::Duration;
 use tokio::time::interval;
 use std::io::{self, Write};
 use std::collections::HashMap;
-use atty;
 
 // Activation code structure
 #[derive(Debug, Clone)]
@@ -37,7 +36,7 @@ fn mask_code(code: &str) -> String {
 // Decode activation code to extract node type and payment info
 fn decode_activation_code(code: &str) -> Result<ActivationCodeData, String> {
     // Handle development mode
-    if code == "TEST_MODE" || code == "CLI_MODE" || code == "DOCKER_MODE" || code.starts_with("DEV_MODE_") {
+    if code == "TEST_MODE" || code == "CLI_MODE" || code.starts_with("DEV_MODE_") {
         return Ok(ActivationCodeData {
             node_type: NodeType::Full, // Default for test
             qnc_amount: 0,
@@ -118,7 +117,7 @@ fn validate_activation_code_node_type(code: &str, expected_type: NodeType, curre
     println!("\n🔍 === Activation Code Validation (DEVELOPMENT MODE) ===");
     
     // Development mode - accept any code
-    if code.starts_with("DEV_MODE_") || code == "TEST_MODE" || code == "CLI_MODE" || code == "DOCKER_MODE" {
+    if code.starts_with("DEV_MODE_") || code == "TEST_MODE" || code == "CLI_MODE" {
         println!("   🔧 Development Mode: Validation bypassed");
         println!("   ✅ Any activation code accepted for development");
         println!("   📊 Expected Node Type: {:?}", expected_type);
@@ -504,7 +503,8 @@ fn request_activation_code(phase: u8) -> Result<String, Box<dyn std::error::Erro
 #[command(about = "QNet Production Blockchain Node - 100k+ TPS Server Deployment")]
 #[command(long_about = "Production-ready QNet node with microblocks, enterprise security, and 100k+ TPS performance.
 
-🖥️  SERVER DEPLOYMENT MODE:
+🖥️  SERVER DEPLOYMENT:
+   • Interactive setup menu for easy configuration
    • Full and Super nodes ONLY (Light nodes restricted to mobile devices)
    • Activation code required (format: QNET-XXXX-XXXX-XXXX)
    • Generated through browser extension or mobile app
@@ -559,10 +559,6 @@ struct Args {
     /// Enable metrics server
     #[arg(long)]
     enable_metrics: bool,
-    
-    /// Force interactive mode (always show menu)
-    #[arg(long)]
-    interactive: bool,
 }
 
 #[tokio::main]
@@ -572,108 +568,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     let args = Args::parse();
     
-    // Interactive setup if explicitly requested or in Docker without TTY
-    let (node_type, activation_code) = if args.interactive || !atty::is(atty::Stream::Stdin) {
-        // Force interactive mode or Docker mode without TTY
-        if atty::is(atty::Stream::Stdin) {
-            // Real interactive terminal available
-            interactive_node_setup().await?
-        } else {
-            // Docker mode - use defaults without interactive input
-            println!("=== QNet Production Node v1.0 - 100k+ TPS Ready ===");
-            println!("🐳 DOCKER DEPLOYMENT MODE");
-            println!("🖥️  Auto-configuring for server deployment...");
-            
-            let node_type = parse_node_type(&args.node_type)?;
-            
-            // Validate server node type
-            if let Err(e) = validate_server_node_type(node_type) {
-                eprintln!("❌ Docker Mode Error: {}", e);
-                return Err(e.into());
-            }
-            
-            // Detect phase for Docker mode
-            let (current_phase, pricing_info) = detect_current_phase().await;
-            
-            println!("✅ Docker mode auto-configuration complete");
-            println!("   🔧 Node Type: {:?}", node_type);
-            println!("   📊 Phase: {}", current_phase);
-            
-            let current_price = calculate_node_price(current_phase, node_type, &pricing_info);
-            let price_str = format_price(current_phase, current_price);
-            
-            println!("   💰 Current Dynamic Price: {}", price_str);
-            
-            // Use development mode activation code for Docker
-            let activation_code = "DOCKER_MODE".to_string();
-            
-            println!("   🔑 Using Docker mode activation");
-            println!("   ⚠️  Production deployment will require real activation code");
-            
-            (node_type, activation_code)
-        }
-    } else {
-        // Arguments provided - use CLI mode
-        println!("=== QNet Production Node v1.0 - 100k+ TPS Ready ===");
-        println!("🖥️  SERVER DEPLOYMENT MODE (CLI)");
-        
-        let node_type = parse_node_type(&args.node_type)?;
-        
-        // Validate server node type in CLI mode
-        if let Err(e) = validate_server_node_type(node_type) {
-            eprintln!("❌ CLI Mode Error: {}", e);
-            eprintln!("💡 Use --node-type full or --node-type super for server deployment");
-            return Err(e.into());
-        }
-        
-        // Detect phase for CLI mode validation
-        let (current_phase, pricing_info) = detect_current_phase().await;
-        
-        println!("✅ CLI mode validation passed");
-        println!("   🔧 Node Type: {:?}", node_type);
-        println!("   📊 Phase: {}", current_phase);
-        
-        let current_price = calculate_node_price(current_phase, node_type, &pricing_info);
-        let price_str = format_price(current_phase, current_price);
-        
-        match current_phase {
-            1 => {
-                println!("   💰 Current Dynamic Price: {} (Phase 1: decreases with burn progress)", price_str);
-                println!("   📉 Base: 1500 1DEV → Current: {} 1DEV ({}% burned)", 
-                         current_price as u64, pricing_info.burn_percentage);
-            },
-            2 => {
-                println!("   💰 Current Dynamic Price: {} (Phase 2: scales with network size)", price_str);
-                println!("   📈 Base: {} QNC × {:.1}x multiplier = {} QNC ({} nodes)", 
-                         match node_type {
-                             NodeType::Full => 7500,
-                             NodeType::Super => 10000,
-                             _ => 0,
-                         },
-                         pricing_info.network_multiplier,
-                         current_price as u64,
-                         pricing_info.network_size);
-            },
-            _ => {
-                println!("   💰 Current Price: {}", price_str);
-            }
-        }
-        
-        // Request activation code in CLI mode
-        println!("\n🔑 Activation code required for CLI mode:");
-        let activation_code = request_activation_code(current_phase)?;
-        
-        // Validate phase and pricing with activation code in CLI mode
-        if let Err(e) = validate_phase_and_pricing(current_phase, node_type, &pricing_info, &activation_code) {
-            eprintln!("❌ CLI Mode Error: {}", e);
-            return Err(e.into());
-        }
-        
-        println!("✅ CLI mode setup complete!");
-        println!("   🔑 Activation Code: {}", mask_code(&activation_code));
-        
-        (node_type, activation_code)
-    };
+    // Always run interactive setup - ONE SIMPLE WAY
+    let (node_type, activation_code) = interactive_node_setup().await?;
     
     // Configure production mode (microblocks by default unless legacy)
     configure_production_mode(&args);
@@ -707,13 +603,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("   ⚠️  Production deployment will require valid activation code");
         println!("   🖥️  Server node type validated");
         println!("   💰 Dynamic pricing information displayed");
-    } else if activation_code == "DOCKER_MODE" {
-        println!("🐳 Running in DOCKER MODE");
-        println!("   ✅ Auto-configured for Docker deployment");
-        println!("   🔧 Activation code validation bypassed");
-        println!("   🖥️  Server node type validated");
-        println!("   💰 Dynamic pricing information displayed");
-        println!("   ⚠️  Production deployment will require real activation code");
     } else if activation_code == "CLI_MODE" {
         println!("🖥️  CLI Mode - Development setup completed");
         println!("   ✅ Server node type validated");

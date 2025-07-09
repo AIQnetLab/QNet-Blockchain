@@ -85,7 +85,6 @@ warp = "0.3.6"
 
 # CLI
 clap = { version = "4.4.0", features = ["derive"] }
-atty = "0.2"
 
 [dev-dependencies]
 criterion = "0.5"
