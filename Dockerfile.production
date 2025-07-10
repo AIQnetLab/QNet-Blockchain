@@ -99,6 +99,6 @@ EXPOSE 9876 9877 9878
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:${QNET_RPC_PORT}/health || exit 1
 
-# Production entrypoint - ALWAYS interactive mode (no flags!)
-ENTRYPOINT ["qnet-node"]
+# Production entrypoint - Docker auto mode
+ENTRYPOINT ["qnet-node", "--auto-mode"]
 CMD [] 
