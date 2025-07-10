@@ -54,13 +54,13 @@ RUN mkdir -p core/qnet-consensus/src core/qnet-core/src core/qnet-mempool/src \
     echo "fn main() {}" > core/qnet-sharding/benches/sharding_bench.rs
 
 # Build dependencies only (this layer gets cached!)
-RUN cd development/qnet-integration && cargo build --release --bin qnet-node
+RUN cargo build --release --bin qnet-node --manifest-path development/qnet-integration/Cargo.toml
 
 # Copy real source code
 COPY . .
 
 # Build final optimized binary
-RUN cd development/qnet-integration && cargo build --release --bin qnet-node
+RUN cargo build --release --bin qnet-node --manifest-path development/qnet-integration/Cargo.toml
 
 # Final production runtime image
 FROM ubuntu:22.04
@@ -75,7 +75,7 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy production binary FIRST (as root)
-COPY --from=builder /build/development/qnet-integration/target/release/qnet-node /usr/local/bin/qnet-node
+COPY --from=builder /build/target/release/qnet-node /usr/local/bin/qnet-node
 
 # Set production permissions (as root)
 RUN chmod +x /usr/local/bin/qnet-node
