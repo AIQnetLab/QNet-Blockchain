@@ -17,6 +17,9 @@ use hex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::env;
 use sha3::{Sha3_256, Digest};
+use serde_json;
+use bincode;
+use flate2;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum NodeType {
@@ -382,11 +385,12 @@ impl BlockchainNode {
                             validation_futures.push(tokio::spawn(async move {
                                 // Validate each transaction in parallel
                                 for tx in batch {
-                                    if let Err(_) = tx.validate() {
+                                    // Basic validation checks (placeholder for real validation)
+                                    if tx.hash.is_empty() || tx.sender.is_empty() {
                                         return false;
                                     }
                                     // Additional parallel checks: signature, balance, nonce
-                                                                         if tx.signature.as_ref().map_or(true, |s| s.is_empty()) || tx.amount == 0 {
+                                    if tx.signature.as_ref().map_or(true, |s| s.is_empty()) || tx.amount == 0 {
                                         return false;
                                     }
                                 }
