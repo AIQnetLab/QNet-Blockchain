@@ -24,22 +24,23 @@ impl PersistentStorage {
         let path = Path::new(data_dir);
         std::fs::create_dir_all(path)?;
         
+        // Simple, reliable RocksDB configuration
         let mut opts = Options::default();
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
-        opts.set_max_open_files(10000);
+        
+        // Basic settings that work reliably
+        opts.set_max_open_files(1000);
         opts.set_use_fsync(false);
         opts.set_bytes_per_sync(1048576);
-        opts.set_use_fsync(false);
-        opts.set_table_cache_num_shard_bits(6);
-        opts.set_max_write_buffer_number(16);
-        opts.set_write_buffer_size(134217728);
-        opts.set_target_file_size_base(268435456);
+        opts.set_max_write_buffer_number(4);
+        opts.set_write_buffer_size(67108864); // 64MB
+        opts.set_target_file_size_base(67108864); // 64MB
         opts.set_min_write_buffer_number_to_merge(2);
-        opts.set_level_zero_stop_writes_trigger(24);
-        opts.set_level_zero_slowdown_writes_trigger(20);
+        opts.set_level_zero_stop_writes_trigger(12);
+        opts.set_level_zero_slowdown_writes_trigger(8);
         opts.set_compaction_style(rocksdb::DBCompactionStyle::Level);
-        opts.set_max_background_jobs(8); // Replaces both compactions and flushes
+        opts.set_max_background_jobs(4);
         opts.set_disable_auto_compactions(false);
         
         let cfs = vec![
@@ -50,7 +51,13 @@ impl PersistentStorage {
             ColumnFamilyDescriptor::new("microblocks", Options::default()),
         ];
         
-        let db = DB::open_cf_descriptors(&opts, path, cfs)?;
+        let db = match DB::open_cf_descriptors(&opts, path, cfs) {
+            Ok(db) => db,
+            Err(e) => {
+                eprintln!("❌ RocksDB Error: {}", e);
+                return Err(IntegrationError::StorageError(format!("RocksDB initialization failed: {}", e)));
+            }
+        };
         
         Ok(Self { db })
     }

@@ -599,10 +599,34 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize logging
-    env_logger::init();
+    // Critical: This must be the FIRST line to catch any issues
+    println!("🔍 DEBUG: QNet node binary started - checking basic functionality...");
     
-    let args = Args::parse();
+    // Test basic functionality before doing anything else
+    println!("🔍 DEBUG: Testing std::env...");
+    if std::env::var("RUST_LOG").is_err() {
+        std::env::set_var("RUST_LOG", "info");
+    }
+    println!("🔍 DEBUG: std::env working");
+    
+    // Initialize logging
+    println!("🔍 DEBUG: Initializing logger...");
+    env_logger::init();
+    println!("🔍 DEBUG: Logger initialized");
+    
+    // Parse arguments - this is where it might fail
+    println!("🔍 DEBUG: About to parse command line arguments...");
+    let args = match Args::try_parse() {
+        Ok(args) => {
+            println!("🔍 DEBUG: Arguments parsed successfully");
+            args
+        }
+        Err(e) => {
+            println!("❌ ERROR: Failed to parse command line arguments: {}", e);
+            eprintln!("❌ ERROR: Failed to parse command line arguments: {}", e);
+            return Err(e.into());
+        }
+    };
     
     // Choose setup mode - interactive or auto
     println!("🔍 DEBUG: Starting setup mode selection...");
@@ -682,11 +706,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create data directory if it doesn't exist
     if let Err(e) = std::fs::create_dir_all(&args.data_dir) {
         println!("❌ ERROR: Cannot create data directory: {}", e);
+        eprintln!("❌ ERROR: Cannot create data directory: {}", e);
         return Err(format!("Failed to create data directory: {}", e).into());
     }
     
-    println!("🔍 DEBUG: Data directory created/exists");
+    println!("🔍 DEBUG: Data directory created/exists at: {:?}", args.data_dir);
     
+    // Test directory write permissions
+    let test_file = args.data_dir.join("test_write.tmp");
+    match std::fs::write(&test_file, "test") {
+        Ok(_) => {
+            println!("🔍 DEBUG: Directory write permissions OK");
+            let _ = std::fs::remove_file(&test_file);
+        }
+        Err(e) => {
+            println!("❌ ERROR: Cannot write to data directory: {}", e);
+            eprintln!("❌ ERROR: Cannot write to data directory: {}", e);
+            return Err(format!("Cannot write to data directory: {}", e).into());
+        }
+    }
+    
+    println!("🔍 DEBUG: About to create BlockchainNode...");
     let mut node = match BlockchainNode::new(
         &args.data_dir.to_string_lossy(),
         args.p2p_port,
@@ -698,7 +738,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Err(e) => {
             println!("❌ ERROR: BlockchainNode creation failed: {}", e);
-            return Err(e.into());
+            eprintln!("❌ ERROR: BlockchainNode creation failed: {}", e);
+            println!("🔍 DEBUG: Error details: {:?}", e);
+            return Err(format!("BlockchainNode creation failed: {}", e).into());
         }
     };
     

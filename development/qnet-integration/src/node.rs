@@ -147,6 +147,7 @@ impl BlockchainNode {
             }
             Err(e) => {
                 println!("[Node] ❌ ERROR: Storage initialization failed: {}", e);
+                eprintln!("[Node] ❌ ERROR: Storage initialization failed: {}", e);
                 return Err(QNetError::StorageError(format!("Storage init error: {}", e)));
             }
         };
@@ -175,7 +176,18 @@ impl BlockchainNode {
         // let validator = Arc::new(Validator::new());
         
         // Get current height from storage
-        let height = storage.get_chain_height()?;
+        println!("[Node] 🔍 DEBUG: Getting chain height from storage...");
+        let height = match storage.get_chain_height() {
+            Ok(height) => {
+                println!("[Node] 🔍 DEBUG: Chain height: {}", height);
+                height
+            }
+            Err(e) => {
+                println!("[Node] ❌ ERROR: Failed to get chain height: {}", e);
+                eprintln!("[Node] ❌ ERROR: Failed to get chain height: {}", e);
+                return Err(QNetError::StorageError(format!("Failed to get chain height: {}", e)));
+            }
+        };
         
         // Performance configuration
         let perf_config = PerformanceConfig::default();
@@ -188,7 +200,7 @@ impl BlockchainNode {
         };
         
         // Create unified P2P with regional clustering
-        println!("[UnifiedP2P] Initializing unified P2P network");
+        println!("[UnifiedP2P] 🔍 DEBUG: Initializing unified P2P network");
         
         let unified_node_type = match node_type {
             NodeType::Light => UnifiedNodeType::Light,
@@ -205,6 +217,7 @@ impl BlockchainNode {
             Region::Oceania => UnifiedRegion::Oceania,
         };
         
+        println!("[UnifiedP2P] 🔍 DEBUG: Creating SimplifiedP2P instance...");
         let unified_p2p = Arc::new(SimplifiedP2P::new(
             node_id.clone(),
             unified_node_type,
@@ -213,7 +226,9 @@ impl BlockchainNode {
         ));
         
         // Start unified P2P
+        println!("[UnifiedP2P] 🔍 DEBUG: Starting unified P2P...");
         unified_p2p.start();
+        println!("[UnifiedP2P] 🔍 DEBUG: Unified P2P started");
         
         // Initialize sharding components for production
         let shard_coordinator = if perf_config.enable_sharding {
@@ -230,6 +245,7 @@ impl BlockchainNode {
             None
         };
         
+        println!("[Node] 🔍 DEBUG: Creating BlockchainNode struct...");
         let blockchain = Self {
             storage,
             state,
@@ -239,7 +255,7 @@ impl BlockchainNode {
             unified_p2p: Some(unified_p2p),
             network: None,
             network_handle: None,
-            node_id,
+            node_id: node_id.clone(),
             node_type,
             region,
             p2p_port,
@@ -255,6 +271,7 @@ impl BlockchainNode {
             parallel_validator,
         };
         
+        println!("[Node] 🔍 DEBUG: BlockchainNode created successfully for node_id: {}", node_id);
         Ok(blockchain)
     }
     
