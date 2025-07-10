@@ -613,7 +613,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("🐳 DOCKER MODE: Using CLI arguments");
         
         let node_type = parse_node_type(&args.node_type)?;
-        let activation_code = args.activation_code.unwrap_or_else(|| "DEV_MODE_AUTO".to_string());
+        let activation_code = args.activation_code.clone().unwrap_or_else(|| "DEV_MODE_AUTO".to_string());
         
         println!("✅ Auto setup complete:");
         println!("   🖥️  Node Type: {:?}", node_type);

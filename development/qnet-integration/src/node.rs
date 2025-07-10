@@ -777,6 +777,34 @@ impl BlockchainNode {
     }
     
     pub async fn submit_transaction(&self, tx: qnet_state::Transaction) -> Result<String, QNetError> {
+        // PRODUCTION VALIDATION - reject invalid transactions immediately
+        if let Err(validation_error) = tx.validate() {
+            return Err(QNetError::ValidationError(format!("Transaction validation failed: {}", validation_error)));
+        }
+        
+        // Additional production checks: signature, balance, nonce
+        if tx.signature.as_ref().map_or(true, |s| s.is_empty()) {
+            return Err(QNetError::ValidationError("Transaction signature is empty".to_string()));
+        }
+        
+        if tx.amount == 0 && matches!(tx.tx_type, qnet_state::TransactionType::Transfer { .. }) {
+            return Err(QNetError::ValidationError("Transfer amount cannot be zero".to_string()));
+        }
+        
+        // Check sender balance in state
+        {
+            let state = self.state.read().await;
+            let sender_balance = state.get_balance(&tx.from);
+            let required_balance = tx.amount + (tx.gas_price * tx.gas_limit);
+            
+            if sender_balance < required_balance {
+                return Err(QNetError::ValidationError(format!(
+                    "Insufficient balance: have {}, need {}", 
+                    sender_balance, required_balance
+                )));
+            }
+        }
+        
         let tx_json = serde_json::to_string(&tx)
             .map_err(|e| QNetError::SerializationError(format!("Failed to serialize transaction: {}", e)))?;
         let hash = hex::encode(&tx.hash);
@@ -788,11 +816,14 @@ impl BlockchainNode {
             mempool.add_raw_transaction(tx_json, tx_hash);
         }
         
-        // Broadcast to network
+        // Broadcast to network only after successful validation
         if let Some(unified_p2p) = &self.unified_p2p {
             let tx_data = serde_json::to_vec(&tx).unwrap_or_default();
             let _ = unified_p2p.broadcast_transaction(tx_data);
         }
+        
+        println!("[Transaction] ✅ Validated and submitted: {} (amount: {}, gas: {})", 
+                 hash, tx.amount, tx.gas_price * tx.gas_limit);
         
         Ok(hash)
     }
