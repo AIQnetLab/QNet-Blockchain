@@ -213,18 +213,23 @@ fn validate_phase_and_pricing(phase: u8, node_type: NodeType, pricing: &PricingI
 
 // Interactive node setup functions
 async fn interactive_node_setup() -> Result<(NodeType, String), Box<dyn std::error::Error>> {
+    println!("🔍 DEBUG: Entering interactive_node_setup()...");
     println!("\n🚀 === QNet Production Node Setup === 🚀");
     println!("🖥️  SERVER DEPLOYMENT MODE");
     println!("Welcome to QNet Blockchain Network!");
     
     // Detect current economic phase
+    println!("🔍 DEBUG: Calling detect_current_phase()...");
     let (current_phase, pricing_info) = detect_current_phase().await;
+    println!("🔍 DEBUG: detect_current_phase() completed, phase = {}", current_phase);
     
     // Display phase information
     display_phase_info(current_phase, &pricing_info);
     
     // Node type selection (server-only: full/super)
+    println!("🔍 DEBUG: Calling select_node_type()...");
     let node_type = select_node_type(current_phase, &pricing_info)?;
+    println!("🔍 DEBUG: select_node_type() completed, type = {:?}", node_type);
     
     // Validate server node type compatibility
     if let Err(e) = validate_server_node_type(node_type) {
@@ -340,6 +345,7 @@ fn display_phase_info(phase: u8, pricing: &PricingInfo) {
 }
 
 fn select_node_type(phase: u8, pricing: &PricingInfo) -> Result<NodeType, Box<dyn std::error::Error>> {
+    println!("🔍 DEBUG: Entering select_node_type()...");
     println!("\n🖥️  === Server Node Type Selection ===");
     println!("⚠️  SERVERS ONLY SUPPORT FULL/SUPER NODES");
     println!("📱 Light nodes are restricted to mobile devices only");
@@ -359,8 +365,19 @@ fn select_node_type(phase: u8, pricing: &PricingInfo) -> Result<NodeType, Box<dy
     print!("\nEnter your choice (1-2): ");
     io::stdout().flush()?;
     
+    println!("🔍 DEBUG: Waiting for user input...");
+    
     let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
+    match io::stdin().read_line(&mut input) {
+        Ok(bytes_read) => {
+            println!("🔍 DEBUG: Read {} bytes: '{}'", bytes_read, input.trim());
+        }
+        Err(e) => {
+            println!("❌ ERROR: Cannot read from stdin: {}", e);
+            println!("🐳 Docker mode detected - using default Full Node");
+            return Ok(NodeType::Full);
+        }
+    }
     
     match input.trim() {
         "1" => {
@@ -483,9 +500,20 @@ fn request_activation_code(phase: u8) -> Result<String, Box<dyn std::error::Erro
     print!("Activation Code: ");
     io::stdout().flush()?;
     
+    println!("🔍 DEBUG: Waiting for activation code input...");
+    
     let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-    let code = input.trim().to_string();
+    let code = match io::stdin().read_line(&mut input) {
+        Ok(bytes_read) => {
+            println!("🔍 DEBUG: Read {} bytes: '{}'", bytes_read, input.trim());
+            input.trim().to_string()
+        }
+        Err(e) => {
+            println!("❌ ERROR: Cannot read activation code from stdin: {}", e);
+            println!("🐳 Docker mode detected - using default DEV_MODE_EMPTY");
+            "DEV_MODE_EMPTY".to_string()
+        }
+    };
     
     if code.is_empty() {
         println!("✅ Empty code - using development mode");
@@ -577,6 +605,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     
     // Choose setup mode - interactive or auto
+    println!("🔍 DEBUG: Starting setup mode selection...");
+    
     let (node_type, activation_code) = if args.auto_mode {
         // Auto mode - use CLI arguments (Docker mode)
         println!("🚀 === QNet Production Node - Auto Setup === 🚀");
