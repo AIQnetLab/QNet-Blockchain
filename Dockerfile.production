@@ -83,13 +83,11 @@ RUN chmod +x /usr/local/bin/qnet-node
 # Verify binary was copied successfully
 RUN ls -la /usr/local/bin/qnet-node
 
-# Create production user and directories
-RUN groupadd -r qnet && useradd -r -g qnet qnet
-RUN mkdir -p /app/{data,logs,config,node_data} && chown -R qnet:qnet /app
+# Create directories for production
+RUN mkdir -p /app/{data,logs,config,node_data}
 RUN chmod -R 755 /app
 
-# Switch to production user AFTER copying binary
-USER qnet
+# Stay as root for now - for debugging
 WORKDIR /app
 
 # Production port exposure - QNet standard ports
