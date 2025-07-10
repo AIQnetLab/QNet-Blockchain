@@ -676,11 +676,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     
     // Create blockchain node with production optimizations
-    let mut node = BlockchainNode::new(
+    println!("🔍 DEBUG: Creating BlockchainNode with data_dir: '{}'", args.data_dir.display());
+    println!("🔍 DEBUG: Checking directory permissions...");
+    
+    // Create data directory if it doesn't exist
+    if let Err(e) = std::fs::create_dir_all(&args.data_dir) {
+        println!("❌ ERROR: Cannot create data directory: {}", e);
+        return Err(format!("Failed to create data directory: {}", e).into());
+    }
+    
+    println!("🔍 DEBUG: Data directory created/exists");
+    
+    let mut node = match BlockchainNode::new(
         &args.data_dir.to_string_lossy(),
         args.p2p_port,
         bootstrap_peers,
-    ).await?;
+    ).await {
+        Ok(node) => {
+            println!("🔍 DEBUG: BlockchainNode created successfully");
+            node
+        }
+        Err(e) => {
+            println!("❌ ERROR: BlockchainNode creation failed: {}", e);
+            return Err(e.into());
+        }
+    };
     
     // Configure node type and region
     // TODO: Configure node type and region when methods are implemented

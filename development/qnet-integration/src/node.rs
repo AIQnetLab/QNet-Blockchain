@@ -136,7 +136,17 @@ impl BlockchainNode {
         region: Region,
     ) -> Result<Self, QNetError> {
         // Initialize storage
-        let storage = Arc::new(Storage::new(data_dir)?);
+        println!("[Node] 🔍 DEBUG: Initializing storage at '{}'", data_dir);
+        let storage = match Storage::new(data_dir) {
+            Ok(storage) => {
+                println!("[Node] 🔍 DEBUG: Storage initialized successfully");
+                Arc::new(storage)
+            }
+            Err(e) => {
+                println!("[Node] ❌ ERROR: Storage initialization failed: {}", e);
+                return Err(QNetError::StorageError(format!("Storage init error: {}", e)));
+            }
+        };
         
         // Initialize state manager
         let state = Arc::new(RwLock::new(qnet_state::StateManager::new()));
