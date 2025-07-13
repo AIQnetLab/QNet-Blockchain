@@ -114,58 +114,38 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 sudo apt update && sudo apt upgrade -y
 
 # Install essential packages
-sudo apt install -y curl wget git htop nano ufw fail2ban
+sudo apt install -y curl wget git htop nano ufw fail2ban build-essential cmake pkg-config libssl-dev
 
 # Configure timezone
 sudo timedatectl set-timezone UTC
 ```
 
-### Install Docker
+### Install Rust
 
-QNet runs in production-ready Docker containers for maximum reliability and security.
-
-```bash
-# Remove old Docker versions if any
-sudo apt remove docker docker-engine docker.io containerd runc
-
-# Install Docker dependencies
-sudo apt install -y apt-transport-https ca-certificates curl gnupg lsb-release
-
-# Add Docker GPG key
-curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
-
-# Add Docker repository
-echo "deb [arch=amd64 signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-
-# Install Docker
-sudo apt update
-sudo apt install -y docker-ce docker-ce-cli containerd.io
-
-# Add user to docker group
-sudo usermod -aG docker $USER
-
-# Start and enable Docker
-sudo systemctl start docker
-sudo systemctl enable docker
-
-# Logout and login again to apply group changes
-# OR restart your terminal session
-```
-
-### Verify Docker Installation
+QNet requires the latest Rust toolchain for optimal performance and security.
 
 ```bash
-# Test Docker installation
-docker --version
-docker run hello-world
+# Install Rust using rustup
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 
-# Should output Docker version and run test container successfully
+# Source the environment
+source ~/.cargo/env
+
+# Update to latest Rust version
+rustup update
+
+# Verify installation
+rustc --version
+cargo --version
 ```
 
 ### Clone Repository
 
 ```bash
-git clone https://github.com/AIQnetLab/QNet-Blockchain.git
+# Clone to /opt for production deployment
+cd /opt
+sudo git clone https://github.com/AIQnetLab/QNet-Blockchain.git
+sudo chown -R $USER:$USER QNet-Blockchain
 cd QNet-Blockchain
 
 # Switch to testnet branch (latest production code)
@@ -173,19 +153,20 @@ git checkout testnet
 git pull origin testnet
 ```
 
-### Build Production Docker Image
+### Build Production Binary
 
 ```bash
-# Build QNet production node image
-docker build -f Dockerfile.production -t qnet-production .
+# Production build with maximum optimizations
+RUSTFLAGS="-C target-cpu=native" cargo build --release --bin qnet-node --manifest-path development/qnet-integration/Cargo.toml
 
-# Verify build success - should show ~150MB image
-docker images | grep qnet-production
+# Verify build success
+ls -la target/release/qnet-node
+./target/release/qnet-node --help
 ```
 
 ## 🔧 Node Setup Guides
 
-All QNet nodes run in Docker containers for production deployment. Choose your node type based on available resources.
+QNet nodes run natively for maximum performance. Choose your node type based on available resources.
 
 ### 💡 Node Setup (Interactive Menu)
 
@@ -215,10 +196,6 @@ QNet nodes use an interactive setup menu for easy configuration. All node types 
 #### Interactive Setup Steps
 
 ```bash
-# Create data directories
-mkdir -p ~/qnet-data/{data,logs,config}
-chmod 755 ~/qnet-data ~/qnet-data/data ~/qnet-data/logs ~/qnet-data/config
-
 # Configure firewall
 sudo ufw allow 9876  # P2P port
 sudo ufw allow 9877  # RPC port
@@ -226,13 +203,8 @@ sudo ufw allow 9878  # Metrics port
 sudo ufw --force enable
 
 # Run interactive node setup
-docker run -it --rm --name qnet-setup \
-  -p 9876:9876 \
-  -p 9877:9877 \
-  -p 9878:9878 \
-  -v qnet-node-data:/app/data \
-  -v qnet-node-logs:/app/logs \
-  qnet-production
+cd /opt/QNet-Blockchain
+./target/release/qnet-node
 ```
 
 #### What You'll See (Interactive Menu)
@@ -308,27 +280,34 @@ echo "* hard nofile 65536" | sudo tee -a /etc/security/limits.conf
 #### Auto-restart Service (Systemd)
 
 ```bash
-# Create systemd service for auto-restart
-sudo tee /etc/systemd/system/qnet-node.service > /dev/null << 'EOF'
+# Create system user for QNet
+sudo useradd -r -s /bin/false qnet
+sudo chown -R qnet:qnet /opt/QNet-Blockchain
+
+# Create systemd service
+sudo tee /etc/systemd/system/qnet-node.service << EOF
 [Unit]
 Description=QNet Blockchain Node
-After=docker.service
-Requires=docker.service
+After=network.target
 
 [Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/usr/bin/docker start qnet-production
-ExecStop=/usr/bin/docker stop qnet-production
-TimeoutStartSec=0
+Type=simple
+User=qnet
+WorkingDirectory=/opt/QNet-Blockchain
+ExecStart=/opt/QNet-Blockchain/target/release/qnet-node --auto-mode --node-type full --activation-code QNET-XXXX-XXXX-XXXX
+Restart=always
+RestartSec=10
+Environment=RUST_LOG=info
+Environment=QNET_PRODUCTION=1
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-# Enable service
+# Enable and start service
 sudo systemctl enable qnet-node
 sudo systemctl start qnet-node
+sudo systemctl status qnet-node
 ```
 
 ## 🔍 Node Management
@@ -336,14 +315,14 @@ sudo systemctl start qnet-node
 ### Check Node Status
 
 ```bash
-# Check if container is running
-docker ps | grep qnet-production
+# Check if service is running
+sudo systemctl status qnet-node
 
 # View real-time logs
-docker logs -f qnet-production
+sudo journalctl -u qnet-node -f
 
 # Check resource usage
-docker stats qnet-production
+htop -p $(pgrep qnet-node)
 ```
 
 ### Test Node Connectivity
@@ -369,39 +348,28 @@ curl -s http://localhost:9877/rpc \
 
 ```bash
 # Navigate to repository
-cd QNet-Blockchain
+cd /opt/QNet-Blockchain
 
 # Pull latest changes
 git pull origin testnet
 
-# Rebuild Docker image
-docker build -f Dockerfile.production -t qnet-production .
+# Rebuild binary
+RUSTFLAGS="-C target-cpu=native" cargo build --release --bin qnet-node --manifest-path development/qnet-integration/Cargo.toml
 
-# Restart node with new image
-docker stop qnet-production
-docker rm qnet-production
-
-# Run interactive setup again
-docker run -it --rm --name qnet-setup \
-  -p 9876:9876 \
-  -p 9877:9877 \
-  -p 9878:9878 \
-  -v qnet-node-data:/app/data \
-  -v qnet-node-logs:/app/logs \
-  qnet-production
+# Restart service
+sudo systemctl restart qnet-node
+sudo systemctl status qnet-node
 ```
 
 ### Backup Node Data
 
 ```bash
 # Create backup
-docker run --rm \
-  -v ~/qnet-data:/data \
-  -v ~/backups:/backup \
-  ubuntu tar czf /backup/qnet-backup-$(date +%Y%m%d).tar.gz /data
+sudo tar czf /backup/qnet-backup-$(date +%Y%m%d).tar.gz /opt/QNet-Blockchain/node_data
 
 # Restore from backup
-tar xzf ~/backups/qnet-backup-YYYYMMDD.tar.gz -C ~/
+sudo tar xzf /backup/qnet-backup-YYYYMMDD.tar.gz -C /opt/QNet-Blockchain/
+sudo chown -R qnet:qnet /opt/QNet-Blockchain/node_data
 ```
 
 ## 🌐 Network Configuration
@@ -452,26 +420,27 @@ curl http://localhost:9877/validator/status
 
 ```bash
 # View recent logs
-docker logs -f qnet-production
+sudo journalctl -u qnet-node -f
 
 # Search for errors
-docker logs qnet-production 2>&1 | grep "ERROR"
+sudo journalctl -u qnet-node | grep "ERROR"
 
 # Monitor performance
-docker logs qnet-production 2>&1 | grep "TPS\|latency"
+sudo journalctl -u qnet-node | grep "TPS\|latency"
 ```
 
 ### Backup & Recovery
 
 ```bash
 # Backup node data
-tar -czf qnet-backup-$(date +%Y%m%d).tar.gz ~/qnet-data
+sudo tar -czf qnet-backup-$(date +%Y%m%d).tar.gz /opt/QNet-Blockchain/node_data
 
 # Backup configuration
-cp ~/qnet-data/config/* ~/qnet-config-backup/
+sudo cp -r /opt/QNet-Blockchain/node_data/config /backup/qnet-config-backup/
 
 # Recovery
-tar -xzf qnet-backup-YYYYMMDD.tar.gz -C ~/
+sudo tar -xzf qnet-backup-YYYYMMDD.tar.gz -C /opt/QNet-Blockchain/
+sudo chown -R qnet:qnet /opt/QNet-Blockchain/node_data
 ```
 
 ## 🛠️ Development
