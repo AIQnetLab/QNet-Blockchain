@@ -214,6 +214,24 @@ fn validate_phase_and_pricing(phase: u8, node_type: NodeType, pricing: &PricingI
 // Interactive node setup functions
 async fn interactive_node_setup() -> Result<(NodeType, String), Box<dyn std::error::Error>> {
     println!("🔍 DEBUG: Entering interactive_node_setup()...");
+    
+    // Check if we're in Docker or headless environment
+    if std::env::var("DOCKER_ENV").is_ok() || std::env::var("CONTAINER").is_ok() {
+        println!("🐳 Docker/Container environment detected - using default settings");
+        println!("   🖥️  Node Type: Full");
+        println!("   🔑 Activation Code: DEV_MODE_AUTO");
+        println!("   🌍 Region: Europe");
+        return Ok((NodeType::Full, "DEV_MODE_AUTO".to_string()));
+    }
+    
+    // Check if stdin is available
+    if !atty::is(atty::Stream::Stdin) {
+        println!("🤖 Non-interactive environment detected - using default settings");
+        println!("   🖥️  Node Type: Full");
+        println!("   🔑 Activation Code: DEV_MODE_AUTO");
+        return Ok((NodeType::Full, "DEV_MODE_AUTO".to_string()));
+    }
+    
     println!("\n🚀 === QNet Production Node Setup === 🚀");
     println!("🖥️  SERVER DEPLOYMENT MODE");
     println!("Welcome to QNet Blockchain Network!");
@@ -780,9 +798,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     println!("Press Ctrl+C to stop\n");
     
-    // Handle graceful shutdown
-    tokio::signal::ctrl_c().await?;
-    println!("\n⏹️  Graceful shutdown initiated...");
+    // Handle graceful shutdown - Docker compatible
+    if std::env::var("DOCKER_ENV").is_ok() || std::env::var("CONTAINER").is_ok() {
+        println!("🐳 Docker mode: Running in daemon mode");
+        println!("   Use 'docker stop' to gracefully shutdown");
+        
+        // In Docker, run indefinitely with health checks
+        loop {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            
+            // Simple health check
+            if let Ok(stats) = node.get_stats().await {
+                println!("💓 Node health check: height={}, peers={}", 
+                    stats.get("height").unwrap_or(&serde_json::Value::Null),
+                    stats.get("peers").unwrap_or(&serde_json::Value::Null)
+                );
+            }
+        }
+    } else {
+        // Interactive mode - wait for Ctrl+C
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => {
+                println!("\n⏹️  Graceful shutdown initiated...");
+            }
+            Err(e) => {
+                println!("⚠️  Signal handling error: {}", e);
+                println!("   Continuing in daemon mode...");
+                
+                // Fallback to daemon mode
+                loop {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                }
+            }
+        }
+    }
     
     // TODO: Add stop method to BlockchainNode
     // node.stop().await?;
@@ -886,27 +935,47 @@ fn parse_region(region_str: &str) -> Result<Region, String> {
 async fn auto_detect_region() -> Result<Region, String> {
     println!("🌍 Auto-detecting region from IP address...");
     
-    // Try to get public IP and determine region
-    match get_public_ip_region().await {
-        Ok(region) => {
+    // In Docker/server environment, skip external IP detection and use default
+    if std::env::var("DOCKER_ENV").is_ok() || std::env::var("CONTAINER").is_ok() {
+        println!("🐳 Docker environment detected - using default region: Europe");
+        return Ok(Region::Europe);
+    }
+    
+    // Try to get public IP and determine region with timeout
+    match tokio::time::timeout(Duration::from_secs(5), get_public_ip_region()).await {
+        Ok(Ok(region)) => {
             println!("✅ Region auto-detected: {:?}", region);
             Ok(region)
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             println!("⚠️  Auto-detection failed: {}, using default region: Europe", e);
             Ok(Region::Europe) // Default fallback
+        }
+        Err(_) => {
+            println!("⚠️  Auto-detection timed out, using default region: Europe");
+            Ok(Region::Europe) // Timeout fallback
         }
     }
 }
 
 async fn get_public_ip_region() -> Result<Region, String> {
-    // Use a simple IP geolocation service
-    let response = match std::process::Command::new("curl")
+    // Use a simple IP geolocation service with better error handling
+    let response = match tokio::process::Command::new("curl")
         .arg("-s")
+        .arg("--max-time")
+        .arg("3")
+        .arg("--connect-timeout")
+        .arg("3")
         .arg("http://ip-api.com/json/?fields=continent")
         .output()
+        .await
     {
-        Ok(output) => String::from_utf8_lossy(&output.stdout).to_string(),
+        Ok(output) => {
+            if !output.status.success() {
+                return Err("Curl command failed".to_string());
+            }
+            String::from_utf8_lossy(&output.stdout).to_string()
+        },
         Err(_) => return Err("Failed to execute curl command".to_string()),
     };
     
