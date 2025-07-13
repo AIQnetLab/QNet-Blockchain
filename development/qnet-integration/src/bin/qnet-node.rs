@@ -13,7 +13,6 @@ use std::time::Duration;
 use tokio::time::interval;
 use std::io::{self, Write};
 use std::collections::HashMap;
-use atty;
 use chrono;
 
 // Activation code structure
@@ -33,26 +32,6 @@ fn mask_code(code: &str) -> String {
     } else {
         format!("{}...{}", &code[..4], &code[code.len()-4..])
     }
-}
-
-/// Simplified Docker node creation
-async fn create_docker_node() -> Result<BlockchainNode, Box<dyn std::error::Error>> {
-    println!("🐳 Creating simplified Docker node...");
-    
-    // Use hardcoded safe defaults for Docker
-    let data_dir = "/app/node_data";
-    let p2p_port = 9876;
-    let bootstrap_peers = vec![];
-    
-    // Create data directory
-    std::fs::create_dir_all(data_dir)?;
-    println!("📁 Data directory created: {}", data_dir);
-    
-    // Create node with minimal configuration
-    let node = BlockchainNode::new(data_dir, p2p_port, bootstrap_peers).await?;
-    println!("✅ BlockchainNode created successfully");
-    
-    Ok(node)
 }
 
 // Decode activation code to extract node type and payment info
@@ -236,23 +215,6 @@ fn validate_phase_and_pricing(phase: u8, node_type: NodeType, pricing: &PricingI
 // Interactive node setup functions
 async fn interactive_node_setup() -> Result<(NodeType, String), Box<dyn std::error::Error>> {
     println!("🔍 DEBUG: Entering interactive_node_setup()...");
-    
-    // Check if we're in Docker or headless environment
-    if std::env::var("DOCKER_ENV").is_ok() || std::env::var("CONTAINER").is_ok() {
-        println!("🐳 Docker/Container environment detected - using default settings");
-        println!("   🖥️  Node Type: Full");
-        println!("   🔑 Activation Code: DEV_MODE_AUTO");
-        println!("   🌍 Region: Europe");
-        return Ok((NodeType::Full, "DEV_MODE_AUTO".to_string()));
-    }
-    
-    // Check if stdin is available
-    if !atty::is(atty::Stream::Stdin) {
-        println!("🤖 Non-interactive environment detected - using default settings");
-        println!("   🖥️  Node Type: Full");
-        println!("   🔑 Activation Code: DEV_MODE_AUTO");
-        return Ok((NodeType::Full, "DEV_MODE_AUTO".to_string()));
-    }
     
     println!("\n🚀 === QNet Production Node Setup === 🚀");
     println!("🖥️  SERVER DEPLOYMENT MODE");
@@ -534,9 +496,9 @@ fn request_activation_code(phase: u8) -> Result<String, Box<dyn std::error::Erro
         _ => {}
     }
     
-    println!("\n⚠️  === DEVELOPMENT MODE - ACTIVATION CODE STUB ===");
-    println!("📝 Enter activation code (or press Enter to continue):");
-    println!("🔧 Any value accepted in development mode");
+    println!("\n⚠️  === PRODUCTION ACTIVATION REQUIRED ===");
+    println!("📝 Enter your activation code:");
+    println!("🔐 Code format: QNET-XXXX-XXXX-XXXX");
     print!("Activation Code: ");
     io::stdout().flush()?;
     
@@ -628,7 +590,7 @@ struct Args {
     #[arg(long)]
     enable_metrics: bool,
     
-    /// Skip interactive setup - use CLI arguments (Docker mode)
+    /// Skip interactive setup - use CLI arguments for automated deployment
     #[arg(long)]
     auto_mode: bool,
     
@@ -639,47 +601,8 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // CRITICAL: Basic output test - if this doesn't show, binary is broken
-    eprintln!("STDERR: QNet node starting...");
-    println!("STDOUT: QNet node starting...");
-    std::io::stdout().flush().unwrap();
-    std::io::stderr().flush().unwrap();
-    
     // Critical: This must be the FIRST line to catch any issues
     println!("🔍 DEBUG: QNet node binary started - checking basic functionality...");
-    
-    // Test Docker environment detection FIRST
-    if std::env::var("DOCKER_ENV").is_ok() || std::env::var("CONTAINER").is_ok() {
-        println!("🐳 Docker environment detected - using simplified startup");
-        
-        // In Docker, skip all complex initialization and use defaults
-        println!("📋 Docker mode settings:");
-        println!("   - Node Type: Full");
-        println!("   - Region: Europe");  
-        println!("   - Activation: DEV_MODE_AUTO");
-        println!("   - Data Dir: /app/node_data");
-        
-        // Try to create a simple node
-        match create_docker_node().await {
-            Ok(_) => {
-                println!("✅ Docker node created successfully");
-                
-                // Simple daemon loop
-                println!("🔄 Starting daemon mode...");
-                loop {
-                    tokio::time::sleep(Duration::from_secs(30)).await;
-                    println!("💓 Node alive: {}", chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"));
-                }
-            }
-            Err(e) => {
-                eprintln!("❌ DOCKER NODE CREATION FAILED: {}", e);
-                return Err(e);
-            }
-        }
-    }
-    
-    // Non-Docker mode (original code path)
-    println!("🖥️ Non-Docker environment - starting normal initialization");
     
     // Test basic functionality before doing anything else
     println!("🔍 DEBUG: Testing std::env...");
@@ -859,37 +782,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     println!("Press Ctrl+C to stop\n");
     
-    // Handle graceful shutdown - Docker compatible
-    if std::env::var("DOCKER_ENV").is_ok() || std::env::var("CONTAINER").is_ok() {
-        println!("🐳 Docker mode: Running in daemon mode");
-        println!("   Use 'docker stop' to gracefully shutdown");
-        
-        // In Docker, run indefinitely with health checks
-        loop {
-            tokio::time::sleep(Duration::from_secs(30)).await;
-            
-            // Simple health check
-            if let Ok(stats) = node.get_stats().await {
-                println!("💓 Node health check: height={}, peers={}", 
-                    stats.get("height").unwrap_or(&serde_json::Value::Null),
-                    stats.get("peers").unwrap_or(&serde_json::Value::Null)
-                );
-            }
+    // Handle graceful shutdown
+    match tokio::signal::ctrl_c().await {
+        Ok(()) => {
+            println!("\n⏹️  Graceful shutdown initiated...");
         }
-    } else {
-        // Interactive mode - wait for Ctrl+C
-        match tokio::signal::ctrl_c().await {
-            Ok(()) => {
-                println!("\n⏹️  Graceful shutdown initiated...");
-            }
-            Err(e) => {
-                println!("⚠️  Signal handling error: {}", e);
-                println!("   Continuing in daemon mode...");
-                
-                // Fallback to daemon mode
-                loop {
-                    tokio::time::sleep(Duration::from_secs(30)).await;
-                }
+        Err(e) => {
+            println!("⚠️  Signal handling error: {}", e);
+            println!("   Node will continue running...");
+            
+            // Fallback - keep running if signal handling fails
+            loop {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                println!("💓 Node health check: {}", chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"));
             }
         }
     }
