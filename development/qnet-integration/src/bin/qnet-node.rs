@@ -421,17 +421,16 @@ fn display_phase_info(phase: u8, pricing: &PricingInfo) {
             println!("💎 Phase 2: QNC Operational Economy Active");
             println!("   🌐 Network Size: {} active nodes (Real data)", pricing.network_size);
             println!("   📊 Price Multiplier: {:.1}x (Based on network size)", pricing.network_multiplier);
-            println!("   💰 Dynamic Pricing per Node Type:");
+            println!("   💰 Server Node Dynamic Pricing:");
             
-            // Show different prices for each node type
-            let light_price = calculate_node_price(2, NodeType::Light, pricing);
+            // Show only server-compatible node prices (Full and Super)
             let full_price = calculate_node_price(2, NodeType::Full, pricing);  
             let super_price = calculate_node_price(2, NodeType::Super, pricing);
             
-            println!("      📱 Light Node: {:.0} QNC (Base: 5,000 × {:.1}x)", light_price, pricing.network_multiplier);
             println!("      🖥️  Full Node:  {:.0} QNC (Base: 7,500 × {:.1}x)", full_price, pricing.network_multiplier);
             println!("      🏭 Super Node: {:.0} QNC (Base: 10,000 × {:.1}x)", super_price, pricing.network_multiplier);
             
+            println!("   📱 Light Node: MOBILE DEVICES ONLY (5,000 QNC base)");
             println!("   🏦 Pool 3: Activation fees redistributed to all nodes");
             println!("   📈 Final Burn: {:.1}% of 1DEV supply destroyed", pricing.burn_percentage);
             println!("   ⚠️  CRITICAL: Activation code must match exact node type");

@@ -212,7 +212,51 @@ export ONE_DEV_MINT_ADDRESS="1DEVbPWX3Wo39EKfcUeMcEE1aRKe8CnTEWdH7kW5CrT"
 
 ⚠️ **Activation Codes**: Real activation codes are still generated through browser extension or mobile app, regardless of displayed pricing.
 
-## 🔧 Node Setup Guides
+### Node Management Commands
+
+#### Stop Running Node
+
+```bash
+# If running in terminal (Ctrl+C)
+^C
+
+# If running as systemd service
+sudo systemctl stop qnet-node
+sudo systemctl disable qnet-node
+
+# Kill process if needed
+sudo pkill -f qnet-node
+```
+
+#### Remove Node Data
+
+```bash
+# Remove node data directory (keeps wallet/keys safe)
+rm -rf ~/QNet-Blockchain/node_data
+
+# Remove entire installation
+rm -rf ~/QNet-Blockchain
+
+# Remove systemd service
+sudo rm /etc/systemd/system/qnet-node.service
+sudo systemctl daemon-reload
+```
+
+#### Backup Before Removal
+
+```bash
+# Backup important data before removal
+mkdir -p ~/qnet-backup
+cp -r ~/QNet-Blockchain/node_data/config ~/qnet-backup/
+cp ~/QNet-Blockchain/node_data/*.key ~/qnet-backup/ 2>/dev/null || true
+
+# Remove node data
+rm -rf ~/QNet-Blockchain/node_data
+```
+
+⚠️ **Important**: Node deactivation from QNet network requires activation code expiry or manual deregistration through mobile app/browser extension.
+
+## �� Node Setup Guides
 
 QNet nodes run natively for maximum performance. Choose your node type based on available resources.
 
