@@ -1,0 +1,42 @@
+{
+  "tokenInfo": {
+    "name": "1DEV Token (QNet Phase 1)",
+    "symbol": "1DEV",
+    "decimals": 6,
+    "totalSupply": 1000000000,
+    "currentSupply": 1000000000,
+    "burned": 0,
+    "burnPercentage": 0,
+    "mintAddress": "Wkg19zERBsBiyqsh2ffcUrFG4eL5BF5BWkg19zERBsBi",
+    "network": "devnet",
+    "createdAt": "2025-07-14T07:26:32.453Z",
+    "status": "phase_1_ready",
+    "phase": 1
+  },
+  "pricing": {
+    "phase1": {
+      "baseCost": 1500,
+      "currentCost": 1500,
+      "minCost": 150,
+      "reductionPer10Percent": 150
+    },
+    "phase2": {
+      "lightNode": 5000,
+      "fullNode": 7500,
+      "superNode": 10000,
+      "networkMultiplier": 1
+    }
+  },
+  "urls": {
+    "solscan": "https://solscan.io/token/Wkg19zERBsBiyqsh2ffcUrFG4eL5BF5BWkg19zERBsBi?cluster=devnet",
+    "solanaExplorer": "https://explorer.solana.com/address/Wkg19zERBsBiyqsh2ffcUrFG4eL5BF5BWkg19zERBsBi?cluster=devnet"
+  },
+  "testing": {
+    "instructions": [
+      "1. Token created with full 1B supply",
+      "2. Phase 1 pricing: 1500 1DEV (universal for all node types)",
+      "3. Ready for node activation testing",
+      "4. Burns will reduce price by 150 1DEV per 10%"
+    ]
+  }
+}

@@ -198,7 +198,7 @@ export SOLANA_RPC_URL="https://api.devnet.solana.com"
 export BURN_TRACKER_PROGRAM_ID="YOUR_DEPLOYED_PROGRAM_ID_HERE"
 
 # Set real 1DEV token mint address
-export ONE_DEV_MINT_ADDRESS="9GcdXAo2EyjNdNLuQoScSVbfJSnh9RdkSS8YYKnGQ8Pf"
+export ONE_DEV_MINT_ADDRESS="Wkg19zERBsBiyqsh2ffcUrFG4eL5BF5BWkg19zERBsBi"
 
 # Run node with real blockchain data
 ./target/release/qnet-node
@@ -208,7 +208,7 @@ export ONE_DEV_MINT_ADDRESS="9GcdXAo2EyjNdNLuQoScSVbfJSnh9RdkSS8YYKnGQ8Pf"
 
 ⚠️ **Real Pricing Data**: When configured, the node fetches real burn percentage and network size from the Solana contract to show accurate pricing.
 
-⚠️ **1DEV Token**: Real token address `9GcdXAo2EyjNdNLuQoScSVbfJSnh9RdkSS8YYKnGQ8Pf` on Solana devnet.
+⚠️ **1DEV Token**: Real token address `Wkg19zERBsBiyqsh2ffcUrFG4eL5BF5BWkg19zERBsBi` on Solana devnet (Phase 1 ready).
 
 ⚠️ **Activation Codes**: Real activation codes are still generated through browser extension or mobile app, regardless of displayed pricing.
 

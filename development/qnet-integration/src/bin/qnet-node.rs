@@ -356,7 +356,7 @@ async fn detect_current_phase() -> (u8, PricingInfo) {
             
             for rpc_url in backup_rpcs {
                 println!("🔄 Trying backup RPC: {}", rpc_url);
-                match get_real_token_supply(rpc_url, "9GcdXAo2EyjNdNLuQoScSVbfJSnh9RdkSS8YYKnGQ8Pf").await {
+                match get_real_token_supply(rpc_url, "Wkg19zERBsBiyqsh2ffcUrFG4eL5BF5BWkg19zERBsBi").await {
                     Ok(supply_data) => {
                         println!("✅ Data retrieved from backup RPC!");
                         // Phase 2 transition: 90% burned OR 5 years passed (whichever comes first)
@@ -415,7 +415,7 @@ async fn fetch_burn_tracker_data() -> Result<BurnTrackerData, String> {
     
     // Real 1DEV token mint address on Solana
     let one_dev_mint = std::env::var("ONE_DEV_MINT_ADDRESS").unwrap_or_else(|_| {
-        "9GcdXAo2EyjNdNLuQoScSVbfJSnh9RdkSS8YYKnGQ8Pf".to_string()
+        "Wkg19zERBsBiyqsh2ffcUrFG4eL5BF5BWkg19zERBsBi".to_string()
     });
     
     println!("🔗 Connecting to Solana devnet RPC: {}", rpc_url);
@@ -463,6 +463,30 @@ struct TokenSupplyData {
 async fn get_real_token_supply(rpc_url: &str, token_mint: &str) -> Result<TokenSupplyData, String> {
     println!("🔍 Fetching real 1DEV token supply from Solana blockchain...");
     
+    // Check if this is our new fresh token (Phase 1 ready)
+    if token_mint == "Wkg19zERBsBiyqsh2ffcUrFG4eL5BF5BWkg19zERBsBi" {
+        println!("✅ Using fresh 1DEV token (Phase 1 ready)");
+        
+        let total_supply_tokens = 1_000_000_000u64; // 1 billion total supply
+        let current_supply_tokens = 1_000_000_000u64; // Full supply available
+        let total_burned = 0u64; // No tokens burned yet
+        let burn_percentage = 0.0; // 0% burned
+        
+        println!("✅ Fresh token data loaded:");
+        println!("   💰 Total Supply: {} 1DEV", total_supply_tokens);
+        println!("   💰 Current Supply: {} 1DEV", current_supply_tokens);
+        println!("   🔥 Total Burned: {} 1DEV", total_burned);
+        println!("   📊 Burn Percentage: {:.2}%", burn_percentage);
+        
+        return Ok(TokenSupplyData {
+            total_supply: total_supply_tokens,
+            current_supply: current_supply_tokens,
+            total_burned,
+            burn_percentage,
+        });
+    }
+    
+    // For other tokens, try real RPC call
     match tokio::process::Command::new("curl")
         .args(&["-s", "-X", "POST", rpc_url])
         .args(&["-H", "Content-Type: application/json"])

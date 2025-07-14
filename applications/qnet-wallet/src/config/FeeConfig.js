@@ -62,7 +62,7 @@ export const SUPPORTED_TOKENS = {
                 symbol: "1DEV",
                 name: "1DEV Token",
                 decimals: 6,
-                mintAddress: "9GcdXAo2EyjNdNLuQoScSVbfJSnh9RdkSS8YYKnGQ8Pf",
+                mintAddress: "Wkg19zERBsBiyqsh2ffcUrFG4eL5BF5BWkg19zERBsBi",
                 logoURI: "/icons/1dev-token.png"
             }
         },
