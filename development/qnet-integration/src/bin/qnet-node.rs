@@ -347,12 +347,11 @@ async fn detect_current_phase() -> (u8, PricingInfo) {
             println!("   Error: {}", e);
             println!("   Trying backup RPC nodes...");
             
-            // Try backup RPC nodes
+            // Try backup devnet RPC nodes
             let backup_rpcs = vec![
-                "https://api.mainnet-beta.solana.com",
-                "https://rpc.ankr.com/solana",
-                "https://solana-api.projectserum.com",
-                "https://rpc.solana.com",
+                "https://api.devnet.solana.com",
+                "https://devnet.helius-rpc.com",
+                "https://solana-devnet.g.alchemy.com/v2/demo",
             ];
             
             for rpc_url in backup_rpcs {
@@ -378,34 +377,13 @@ async fn detect_current_phase() -> (u8, PricingInfo) {
                 }
             }
             
-            println!("💥 FATAL ERROR: All RPC nodes unavailable!");
-            println!("   Cannot get real 1DEV token burn data");
+            println!("💥 FATAL ERROR: All devnet RPC nodes unavailable!");
+            println!("   Cannot get real 1DEV token burn data from Solana devnet");
             println!("   Node CANNOT run without real blockchain data!");
+            println!("   Please check 1DEV token address on devnet or RPC connectivity");
             
-            // Development fallback: Allow node to start with estimated data
-            println!("🔧 DEVELOPMENT MODE: Using estimated blockchain data");
-            println!("   ⚠️  This is for development only - production requires real data");
-            
-            // Use conservative estimates for development
-            let estimated_burned = 100_000_000u64; // 100M tokens burned (10%)
-            let estimated_nodes = estimated_burned / 1000; // ~100K nodes
-            let burn_percentage = 10.0; // 10% burned
-            
-            let current_phase = if burn_percentage >= 90.0 { 2 } else { 1 };
-            let network_multiplier = calculate_network_multiplier(estimated_nodes);
-            
-            let pricing_info = PricingInfo {
-                network_size: estimated_nodes,
-                burn_percentage,
-                network_multiplier,
-            };
-            
-            println!("📊 Development estimates used:");
-            println!("   🔥 Estimated burned: {} 1DEV ({:.1}%)", estimated_burned, burn_percentage);
-            println!("   🌐 Estimated nodes: {}", estimated_nodes);
-            println!("   📈 Phase: {}", current_phase);
-            
-            return (current_phase, pricing_info);
+            // PRODUCTION MODE: Exit if cannot get real data
+            std::process::exit(1);
         }
     }
 }
@@ -425,9 +403,9 @@ struct BurnTrackerData {
 
 // Fetch real data from Solana contract
 async fn fetch_burn_tracker_data() -> Result<BurnTrackerData, String> {
-    // Production Solana RPC configuration
+    // Testnet Solana RPC configuration (devnet)
     let rpc_url = std::env::var("SOLANA_RPC_URL").unwrap_or_else(|_| {
-        "https://api.mainnet-beta.solana.com".to_string()
+        "https://api.devnet.solana.com".to_string()
     });
     
     let program_id = std::env::var("BURN_TRACKER_PROGRAM_ID").unwrap_or_else(|_| {
@@ -440,9 +418,9 @@ async fn fetch_burn_tracker_data() -> Result<BurnTrackerData, String> {
         "1DEVbPWX3Wo39EKfcUeMcEE1aRKe8CnTEWdH7kW5CrT".to_string()
     });
     
-    println!("🔗 Connecting to Solana RPC: {}", rpc_url);
+    println!("🔗 Connecting to Solana devnet RPC: {}", rpc_url);
     println!("📋 Burn Tracker Program ID: {}", program_id);
-    println!("💰 1DEV Token Mint: {}", one_dev_mint);
+    println!("💰 1DEV Token Mint (devnet): {}", one_dev_mint);
     
     // Try to get real token supply from Solana
     match get_real_token_supply(&rpc_url, &one_dev_mint).await {
