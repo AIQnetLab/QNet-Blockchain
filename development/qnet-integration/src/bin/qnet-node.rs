@@ -321,36 +321,45 @@ async fn detect_current_phase() -> (u8, PricingInfo) {
             (current_phase, pricing_info)
         }
         Err(e) => {
-            println!("⚠️  Failed to fetch blockchain data: {}", e);
-            println!("   Using development fallback data");
+            println!("❌ CRITICAL ERROR: Cannot fetch blockchain data!");
+            println!("   Error: {}", e);
+            println!("   Trying backup RPC nodes...");
             
-            // ⚠️ DEVELOPMENT FALLBACK - THESE ARE MOCK VALUES!
-            // In production: Replace with real Solana contract integration
-            let total_1dev_burned = 450_000_000u64; // MOCK: 45% burned 
-            let burn_percentage = (total_1dev_burned as f64 / 1_000_000_000.0) * 100.0;
-            let network_size = 75_000u64; // MOCK: 75k active nodes
+            // Try backup RPC nodes
+            let backup_rpcs = vec![
+                "https://api.mainnet-beta.solana.com",
+                "https://rpc.ankr.com/solana",
+                "https://solana-api.projectserum.com",
+                "https://rpc.solana.com",
+            ];
             
-            println!("   ⚠️  WARNING: Using hardcoded mock data:");
-            println!("      • Burn percentage: 45% (FAKE)");
-            println!("      • Network size: 75,000 nodes (FAKE)");
-            println!("      • Real integration: TODO");
+            for rpc_url in backup_rpcs {
+                println!("🔄 Trying backup RPC: {}", rpc_url);
+                match get_real_token_supply(rpc_url, "1DEVbPWX3Wo39EKfcUeMcEE1aRKe8CnTEWdH7kW5CrT").await {
+                    Ok(supply_data) => {
+                        println!("✅ Data retrieved from backup RPC!");
+                        let current_phase = if supply_data.burn_percentage >= 90.0 { 2 } else { 1 };
+                        let network_multiplier = calculate_network_multiplier(supply_data.total_burned / 500);
+                        let pricing_info = PricingInfo {
+                            network_size: supply_data.total_burned / 500,
+                            burn_percentage: supply_data.burn_percentage,
+                            network_multiplier,
+                        };
+                        return (current_phase, pricing_info);
+                    }
+                    Err(e) => {
+                        println!("❌ Backup RPC also failed: {}", e);
+                        continue;
+                    }
+                }
+            }
             
-            let current_phase = if burn_percentage >= 90.0 {
-                2 // Phase 2: QNC economy
-            } else {
-                1 // Phase 1: 1DEV burn
-            };
+            println!("💥 FATAL ERROR: All RPC nodes unavailable!");
+            println!("   Cannot get real 1DEV token burn data");
+            println!("   Node CANNOT run without real blockchain data!");
             
-            let network_multiplier = calculate_network_multiplier(network_size);
-            
-            let pricing_info = PricingInfo {
-                network_size,
-                burn_percentage,
-                network_multiplier,
-            };
-            
-            println!("✅ Phase {} detected (development fallback)", current_phase);
-            (current_phase, pricing_info)
+            // Exit - cannot work without real data
+            std::process::exit(1);
         }
     }
 }
@@ -389,17 +398,102 @@ async fn fetch_burn_tracker_data() -> Result<BurnTrackerData, String> {
     println!("📋 Burn Tracker Program ID: {}", program_id);
     println!("💰 1DEV Token Mint: {}", one_dev_mint);
     
-    // TODO: Implement real Solana RPC call
-    // For now, return error to trigger fallback
-    Err("Solana RPC not implemented yet - using development fallback".to_string())
+    // Try to get real token supply from Solana
+    match get_real_token_supply(&rpc_url, &one_dev_mint).await {
+        Ok(supply_data) => {
+            println!("✅ Real token data retrieved from Solana!");
+            println!("   💰 Current Supply: {} 1DEV", supply_data.current_supply);
+            println!("   🔥 Total Burned: {} 1DEV", supply_data.total_burned);
+            println!("   📊 Burn Percentage: {:.2}%", supply_data.burn_percentage);
+            
+            // TODO: Get real node count from burn tracker contract
+            let estimated_nodes = estimate_nodes_from_burn(supply_data.total_burned);
+            
+            Ok(BurnTrackerData {
+                total_1dev_burned: supply_data.total_burned,
+                burn_percentage: supply_data.burn_percentage,
+                total_nodes_activated: estimated_nodes,
+                light_nodes: estimated_nodes / 3,
+                full_nodes: estimated_nodes / 3,
+                super_nodes: estimated_nodes / 3,
+                phase_transitioned: supply_data.burn_percentage >= 90.0,
+                last_update: chrono::Utc::now().timestamp(),
+            })
+        }
+        Err(e) => {
+            println!("❌ Failed to get real token data: {}", e);
+            Err(format!("Failed to fetch real 1DEV token data: {}", e))
+        }
+    }
+}
+
+// Get real token supply data from Solana
+#[derive(Debug)]
+struct TokenSupplyData {
+    total_supply: u64,
+    current_supply: u64,
+    total_burned: u64,
+    burn_percentage: f64,
+}
+
+async fn get_real_token_supply(rpc_url: &str, token_mint: &str) -> Result<TokenSupplyData, String> {
+    println!("🔍 Fetching real 1DEV token supply from Solana blockchain...");
     
-    // Future implementation:
-    // 1. Connect to Solana RPC
-    // 2. Derive burn_tracker PDA from program_id and seed b"burn_tracker"
-    // 3. Fetch account data from burn tracker
-    // 4. Deserialize BurnTracker struct
-    // 5. Query 1DEV token supply and burn statistics
-    // 6. Return real data
+    match tokio::process::Command::new("curl")
+        .args(&["-s", "-X", "POST", rpc_url])
+        .args(&["-H", "Content-Type: application/json"])
+        .args(&["-d", &format!(r#"{{"jsonrpc":"2.0","id":1,"method":"getTokenSupply","params":["{}"]}}"#, token_mint)])
+        .output()
+        .await
+    {
+        Ok(output) => {
+            let response = String::from_utf8_lossy(&output.stdout);
+            println!("📡 Solana RPC Response received");
+            
+            // Parse the JSON response to get token supply
+            if response.contains("\"result\"") && response.contains("\"value\"") {
+                // Extract current supply from response
+                if let Some(start) = response.find("\"amount\":\"") {
+                    if let Some(end) = response[start + 10..].find("\"") {
+                        let amount_str = &response[start + 10..start + 10 + end];
+                        if let Ok(current_supply) = amount_str.parse::<u64>() {
+                            // 1DEV has 6 decimals, so convert from smallest units
+                            let current_supply_tokens = current_supply / 1_000_000;
+                            let total_supply_tokens = 1_000_000_000u64; // 1 billion total supply
+                            let total_burned = total_supply_tokens - current_supply_tokens;
+                            let burn_percentage = (total_burned as f64 / total_supply_tokens as f64) * 100.0;
+                            
+                            println!("✅ Real blockchain data fetched successfully:");
+                            println!("   💰 Total Supply: {} 1DEV", total_supply_tokens);
+                            println!("   💰 Current Supply: {} 1DEV", current_supply_tokens);
+                            println!("   🔥 Total Burned: {} 1DEV", total_burned);
+                            println!("   📊 Burn Percentage: {:.2}%", burn_percentage);
+                            
+                            return Ok(TokenSupplyData {
+                                total_supply: total_supply_tokens,
+                                current_supply: current_supply_tokens,
+                                total_burned,
+                                burn_percentage,
+                            });
+                        }
+                    }
+                }
+            }
+            
+            Err("Failed to parse token supply from Solana response".to_string())
+        }
+        Err(e) => {
+            Err(format!("Failed to call Solana RPC: {}", e))
+        }
+    }
+}
+
+// Estimate node count from burned tokens (until we have real burn tracker)
+fn estimate_nodes_from_burn(total_burned: u64) -> u64 {
+    // Estimate: each node burns ~1500-150 1DEV on average
+    // Conservative estimate: 500 1DEV per node average
+    let estimated_nodes = total_burned / 500;
+    estimated_nodes.max(1000) // Minimum estimate
 }
 
 fn calculate_network_multiplier(network_size: u64) -> f64 {
@@ -417,16 +511,15 @@ fn display_phase_info(phase: u8, pricing: &PricingInfo) {
     match phase {
         1 => {
             println!("🔥 Phase 1: 1DEV Burn-to-Join Active");
-            println!("   📈 1DEV Burned: {:.1}% (DEVELOPMENT FALLBACK DATA)", pricing.burn_percentage);
+            println!("   📈 1DEV Burned: {:.1}% (Real blockchain data)", pricing.burn_percentage);
             println!("   💰 Universal Pricing: Same cost for all node types");
             println!("   📉 Dynamic Reduction: -150 1DEV per 10% burned");
             println!("   🎯 Transition: Occurs at 90% burned or 5 years");
-            println!("   🌐 Active Nodes: {} (DEVELOPMENT FALLBACK DATA)", pricing.network_size);
-            println!("   ⚠️  MOCK DATA: Real contract integration not implemented yet");
+            println!("   🌐 Active Nodes: {} (Estimated from burn data)", pricing.network_size);
         }
         2 => {
             println!("💎 Phase 2: QNC Operational Economy Active");
-            println!("   🌐 Network Size: {} active nodes (DEVELOPMENT FALLBACK DATA)", pricing.network_size);
+            println!("   🌐 Network Size: {} active nodes (Estimated from burn data)", pricing.network_size);
             println!("   📊 Price Multiplier: {:.1}x (Based on network size)", pricing.network_multiplier);
             println!("   💰 Server Node Dynamic Pricing:");
             
@@ -439,9 +532,8 @@ fn display_phase_info(phase: u8, pricing: &PricingInfo) {
             
             println!("   📱 Light Node: MOBILE DEVICES ONLY (5,000 QNC base)");
             println!("   🏦 Pool 3: Activation fees redistributed to all nodes");
-            println!("   📈 Final Burn: {:.1}% of 1DEV supply destroyed (MOCK DATA)", pricing.burn_percentage);
+            println!("   📈 Final Burn: {:.1}% of 1DEV supply destroyed (Real blockchain data)", pricing.burn_percentage);
             println!("   ⚠️  CRITICAL: Activation code must match exact node type");
-            println!("   ⚠️  MOCK DATA: Real contract integration not implemented yet");
         }
         _ => println!("❓ Unknown phase detected"),
     }
@@ -501,16 +593,20 @@ fn select_node_type(phase: u8, pricing: &PricingInfo) -> Result<NodeType, Box<dy
 fn calculate_node_price(phase: u8, node_type: NodeType, pricing: &PricingInfo) -> f64 {
     match phase {
         1 => {
-            // Phase 1: Real 1DEV pricing with burn reduction (from contract constants)
-            // BASE_1DEV_PRICE = 1500 1DEV, MIN_1DEV_PRICE = 150 1DEV
+            // Phase 1: CORRECT 1DEV pricing mathematics
+            // Base price: 1500 1DEV
+            // Reduction: 150 1DEV per each COMPLETE 10% burned tokens
+            // Minimum price: 150 1DEV (at 90%+ burned)
             let base_price = 1500.0;
             let min_price = 150.0;
-            let reduction_per_tier = 150.0; // 150 1DEV reduction per 10% burned
-            let tier = (pricing.burn_percentage / 10.0).floor();
-            let total_reduction = tier * reduction_per_tier;
+            let reduction_per_tier = 150.0; // 150 1DEV per each 10%
+            
+            // CORRECT calculation: number of COMPLETE 10% tiers
+            let completed_tiers = (pricing.burn_percentage / 10.0).floor();
+            let total_reduction = completed_tiers * reduction_per_tier;
             let current_price = base_price - total_reduction;
             
-            // Universal pricing for all node types in Phase 1
+            // Universal price for all node types in Phase 1
             current_price.max(min_price)
         }
         2 => {
