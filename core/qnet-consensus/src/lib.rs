@@ -2,7 +2,10 @@
 //! 
 //! Implements commit-reveal consensus mechanism with reputation-based leader selection
 
-#![warn(missing_docs)]
+#![allow(unused_imports)]
+#![allow(unused_variables)]
+#![allow(dead_code)]
+#![allow(missing_docs)]
 
 pub mod commit_reveal;
 pub mod reputation;
@@ -20,21 +23,19 @@ pub mod kademlia;
 #[cfg(feature = "python")]
 pub mod python_bindings;
 
-// Re-export main types
-pub use types::{
-    ConsensusState, ConsensusPhase, CommitData, RevealData,
-    ValidatorInfo, ConsensusMessage, ConsensusRound,
-    ConsensusConfig, DoubleSignEvidence, Evidence, SlashingResult,
-};
-pub use errors::{ConsensusError, ConsensusResult};
-pub use reputation::ReputationSystem;
+// Export main types
+pub use types::{NodeInfo, ValidatorInfo, DoubleSignEvidence, Evidence, SlashingResult, RoundState, ConsensusConfig};
+
+// Export consensus engine and related types
+pub use commit_reveal::{CommitRevealConsensus, CommitRevealConfig};
+pub use reputation::{NodeReputation, ReputationSystem, ReputationConfig};
+pub use fork_manager::{ForkManager, ForkEventType};
+pub use fork_choice::{ForkChoice, BlockInfo};
 pub use dynamic_timing::DynamicTiming;
 pub use leader_selection::LeaderSelector;
-pub use metrics::ConsensusMetrics;
-pub use fork_choice::ForkChoice;
-pub use fork_resolution::ForkResolution;
 pub use burn_security::BurnSecurityValidator;
-pub use fork_manager::ForkManager;
+pub use metrics::ConsensusMetrics;
+pub use errors::{ConsensusError, ConsensusResult};
 pub use kademlia::{PeerScore, TokenBucket};
 
 // Python bindings
@@ -42,7 +43,7 @@ pub use kademlia::{PeerScore, TokenBucket};
 pub use python_bindings::*;
 
 // Export types needed by integration
-pub use self::commit_reveal::{CommitRevealConsensus as CommitRevealEngine, CommitRevealConfig};
+// OLD: pub use self::commit_reveal::{CommitRevealConsensus as CommitRevealEngine, CommitRevealConfig};
 
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -156,7 +157,7 @@ impl ConsensusEngine {
         &self,
         microblock_hashes: Vec<[u8; 32]>,
         state_root: [u8; 32],
-    ) -> ConsensusResult<MacroConsensusResult> {
+    ) -> Result<MacroConsensusResult, ConsensusError> {
         // Create consensus data
         let mut consensus_data = Vec::new();
         for hash in &microblock_hashes {

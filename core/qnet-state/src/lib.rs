@@ -3,8 +3,10 @@
 //! This crate provides efficient state storage and retrieval
 //! with support for multiple backends and concurrent access.
 
-#![warn(missing_docs)]
-#![warn(clippy::all)]
+#![allow(unused_imports)]
+#![allow(unused_variables)]
+#![allow(dead_code)]
+#![allow(missing_docs)]
 
 pub mod account;
 pub mod block;

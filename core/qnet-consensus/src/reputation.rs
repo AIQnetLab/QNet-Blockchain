@@ -1,10 +1,10 @@
 //! Reputation management for consensus nodes
 
+use std::collections::HashMap;
+use std::sync::Arc;
 use crate::{
     types::{NodeInfo, ValidatorInfo, DoubleSignEvidence, Evidence, SlashingResult},
 };
-use std::collections::HashMap;
-use std::sync::Arc;
 use dashmap::DashMap;
 use tracing::{debug, info, warn};
 
@@ -179,8 +179,8 @@ impl NodeReputation {
     /// Penalize node for consensus violations (slashing)
     pub fn penalize(&self, address: &str, penalty: f64, reason: &str) -> SlashingResult {
         let current_time = current_timestamp();
-        let mut reputation_penalty = penalty;
-        let mut score_penalty = (penalty * 10.0) as u8; // Convert to score penalty
+        let reputation_penalty = penalty;
+        let score_penalty = (penalty * 10.0) as u8; // Convert to score penalty
         let mut banned = false;
         
         if let Some(mut node) = self.reputations.get_mut(address) {

@@ -1,7 +1,6 @@
 //! Fork choice rule implementation for QNet
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 
 /// Fork choice rule - determines the canonical chain
 pub struct ForkChoice {

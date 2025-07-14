@@ -1,3 +1,8 @@
+#![allow(unused_imports)]
+#![allow(unused_variables)]
+#![allow(dead_code)]
+#![allow(missing_docs)]
+
 //! High-performance transaction mempool for QNet blockchain
 
 pub mod config;

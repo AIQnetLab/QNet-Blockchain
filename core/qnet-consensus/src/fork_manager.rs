@@ -1,12 +1,11 @@
 //! Complete fork management system for QNet
 
 use crate::{
-    burn_security::{BurnSecurityValidator, NodeBurnInfo},
-    fork_choice::{BlockInfo, ForkChoice, Fork},
+    burn_security::BurnSecurityValidator,
+    fork_choice::{BlockInfo, ForkChoice},
     fork_resolution::{ForkResolution, ResolutionResult, SecurityError},
-    ConsensusError,
 };
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing;

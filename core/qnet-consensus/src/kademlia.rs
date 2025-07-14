@@ -2,13 +2,8 @@
 //! Production implementation for QNet P2P discovery
 //! June 2025
 
-use dashmap::DashMap;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::time::{interval, MissedTickBehavior};
-use tracing::{debug, info, warn, error};
 use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
 
 /// Peer score and statistics
 #[derive(Debug, Clone, Serialize, Deserialize)]

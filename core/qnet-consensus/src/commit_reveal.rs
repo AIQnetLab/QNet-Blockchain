@@ -3,15 +3,12 @@
 use crate::{
     errors::{ConsensusError, ConsensusResult},
     types::{Commit, ConsensusConfig, Reveal, RoundState, ConsensusPhase, RoundStatus, DoubleSignEvidence},
-    reputation::ReputationSystem,
-    dynamic_timing::DynamicTiming,
-    leader_selection::LeaderSelector,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
 use parking_lot::RwLock;
 use tracing::{debug, info, warn};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Configuration for commit-reveal consensus
 #[derive(Debug, Clone)]
