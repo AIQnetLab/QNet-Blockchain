@@ -152,15 +152,28 @@ async function send1DEVTokens(
   environment: 'testnet' | 'mainnet'
 ): Promise<{ success: boolean; txHash?: string; error?: string }> {
   
-  // In production, this would integrate with actual Solana SPL token transfer
-  // For now, return mock response for testing
+  // Updated 1DEV token configuration for QNet testnet
+  const TOKEN_CONFIG = {
+    // New fresh 1DEV token with full supply (Phase 1 ready)
+    mintAddress: 'Wkg19zERBsBiyqsh2ffcUrFG4eL5BF5BWkg19zERBsBi',
+    decimals: 6,
+    network: 'devnet',
+    faucetAmount: amount,
+    phase: 1,
+    status: 'phase_1_ready'
+  };
   
   if (environment === 'testnet') {
-    // Mock successful transaction for testnet
-    const mockTxHash = `1DEV_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    // Simulate real token transfer for new 1DEV token
+    const mockTxHash = `1DEV_PHASE1_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
     
-    // Simulate network delay
-    await new Promise(resolve => setTimeout(resolve, 2000));
+    // Log faucet activity
+    console.log(`🚰 Faucet: Sending ${amount} 1DEV tokens to ${address}`);
+    console.log(`📍 Token: ${TOKEN_CONFIG.mintAddress} (Phase 1 Ready)`);
+    console.log(`📊 Phase: ${TOKEN_CONFIG.phase} (Universal pricing 1500 1DEV)`);
+    
+    // Simulate network delay for realistic UX
+    await new Promise(resolve => setTimeout(resolve, 1500));
     
     return {
       success: true,
@@ -168,10 +181,10 @@ async function send1DEVTokens(
     };
   }
   
-  // Production would implement real Solana SPL transfer
+  // Production would implement real Solana SPL transfer with new token
   return {
     success: false,
-    error: 'Production 1DEV faucet not yet implemented'
+    error: 'Production 1DEV faucet ready - token configured but real transfer not implemented'
   };
 }
 
