@@ -202,8 +202,8 @@ sudo ufw allow 9877  # RPC port
 sudo ufw allow 9878  # Metrics port
 sudo ufw --force enable
 
-# Run interactive node setup
-cd /opt/QNet-Blockchain
+# Run interactive node setup (PRODUCTION ONLY)
+cd /QNet-Blockchain
 ./target/release/qnet-node
 ```
 
@@ -282,7 +282,7 @@ echo "* hard nofile 65536" | sudo tee -a /etc/security/limits.conf
 ```bash
 # Create system user for QNet
 sudo useradd -r -s /bin/false qnet
-sudo chown -R qnet:qnet /opt/QNet-Blockchain
+sudo chown -R qnet:qnet /QNet-Blockchain
 
 # Create systemd service
 sudo tee /etc/systemd/system/qnet-node.service << EOF
@@ -293,8 +293,8 @@ After=network.target
 [Service]
 Type=simple
 User=qnet
-WorkingDirectory=/opt/QNet-Blockchain
-ExecStart=/opt/QNet-Blockchain/target/release/qnet-node --auto-mode --node-type full --activation-code QNET-XXXX-XXXX-XXXX
+WorkingDirectory=/QNet-Blockchain
+ExecStart=/QNet-Blockchain/target/release/qnet-node
 Restart=always
 RestartSec=10
 Environment=RUST_LOG=info
@@ -348,7 +348,7 @@ curl -s http://localhost:9877/rpc \
 
 ```bash
 # Navigate to repository
-cd /opt/QNet-Blockchain
+cd /QNet-Blockchain
 
 # Pull latest changes
 git pull origin testnet
@@ -365,11 +365,11 @@ sudo systemctl status qnet-node
 
 ```bash
 # Create backup
-sudo tar czf /backup/qnet-backup-$(date +%Y%m%d).tar.gz /opt/QNet-Blockchain/node_data
+sudo tar czf /backup/qnet-backup-$(date +%Y%m%d).tar.gz /QNet-Blockchain/node_data
 
 # Restore from backup
-sudo tar xzf /backup/qnet-backup-YYYYMMDD.tar.gz -C /opt/QNet-Blockchain/
-sudo chown -R qnet:qnet /opt/QNet-Blockchain/node_data
+sudo tar xzf /backup/qnet-backup-YYYYMMDD.tar.gz -C /QNet-Blockchain/
+sudo chown -R qnet:qnet /QNet-Blockchain/node_data
 ```
 
 ## 🌐 Network Configuration
@@ -433,14 +433,14 @@ sudo journalctl -u qnet-node | grep "TPS\|latency"
 
 ```bash
 # Backup node data
-sudo tar -czf qnet-backup-$(date +%Y%m%d).tar.gz /opt/QNet-Blockchain/node_data
+sudo tar -czf qnet-backup-$(date +%Y%m%d).tar.gz /QNet-Blockchain/node_data
 
 # Backup configuration
-sudo cp -r /opt/QNet-Blockchain/node_data/config /backup/qnet-config-backup/
+sudo cp -r /QNet-Blockchain/node_data/config /backup/qnet-config-backup/
 
 # Recovery
-sudo tar -xzf qnet-backup-YYYYMMDD.tar.gz -C /opt/QNet-Blockchain/
-sudo chown -R qnet:qnet /opt/QNet-Blockchain/node_data
+sudo tar -xzf qnet-backup-YYYYMMDD.tar.gz -C /QNet-Blockchain/
+sudo chown -R qnet:qnet /QNet-Blockchain/node_data
 ```
 
 ## 🛠️ Development

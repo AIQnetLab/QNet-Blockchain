@@ -1,4 +1,14 @@
+#![allow(unused_imports)]
+#![allow(unused_variables)]
+#![allow(dead_code)]
+#![allow(unused_mut)]
+
 //! QNet Production Node - 100k+ TPS Ready
+//! 
+//! PRODUCTION DEPLOYMENT: Interactive Setup Only
+//! - No command-line arguments for activation
+//! - Use built-in interactive menu for node configuration
+//! - Activation code required (format: QNET-XXXX-XXXX-XXXX)
 //! 
 //! Features:
 //! - Microblocks as default mode for 100k+ TPS
@@ -589,14 +599,6 @@ struct Args {
     /// Enable metrics server
     #[arg(long)]
     enable_metrics: bool,
-    
-    /// Skip interactive setup - use CLI arguments for automated deployment
-    #[arg(long)]
-    auto_mode: bool,
-    
-    /// Activation code for auto mode
-    #[arg(long)]
-    activation_code: Option<String>,
 }
 
 #[tokio::main]
@@ -633,24 +635,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Choose setup mode - interactive or auto
     println!("🔍 DEBUG: Starting setup mode selection...");
     
-    let (node_type, activation_code) = if args.auto_mode {
-        // Auto mode - use CLI arguments (Docker mode)
-        println!("🚀 === QNet Production Node - Auto Setup === 🚀");
-        println!("🐳 DOCKER MODE: Using CLI arguments");
-        
-        let node_type = parse_node_type(&args.node_type)?;
-        let activation_code = args.activation_code.clone().unwrap_or_else(|| "DEV_MODE_AUTO".to_string());
-        
-        println!("✅ Auto setup complete:");
-        println!("   🖥️  Node Type: {:?}", node_type);
-        println!("   🔑 Activation Code: {}", mask_code(&activation_code));
-        println!("   🐳 Docker Mode: CLI arguments used");
-        
-        (node_type, activation_code)
-    } else {
-        // Interactive setup - ONE SIMPLE WAY
-        interactive_node_setup().await?
-    };
+    // PRODUCTION: Only interactive setup supported
+    let (node_type, activation_code) = interactive_node_setup().await?;
     
     // Configure production mode (microblocks by default unless legacy)
     configure_production_mode(&args);

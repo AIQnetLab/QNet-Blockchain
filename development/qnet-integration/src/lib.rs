@@ -1,3 +1,8 @@
+#![allow(unused_imports)]
+#![allow(unused_variables)]
+#![allow(dead_code)]
+#![allow(unused_mut)]
+
 //! QNet Integration - Full blockchain system
 //! This module integrates all QNet components into a cohesive blockchain system.
 
