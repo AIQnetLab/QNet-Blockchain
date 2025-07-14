@@ -6,8 +6,9 @@ members = [
     "core/qnet-consensus", 
     "core/qnet-mempool",
     "core/qnet-sharding",
-    "infrastructure/qnet-api",
-    "development/qnet-integration",
+    "development/qnet-integration",      # Keep for qnet-node binary
+    # Removed non-production modules:
+    # "infrastructure/qnet-api",           # Experimental module, not needed for production
 ]
 
 [workspace.package]

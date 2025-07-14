@@ -1,6 +1,7 @@
 //! Node configuration
 
-use qnet_p2p::NetworkConfig;
+// Removed qnet_p2p dependency - using local NetworkConfig instead
+// use qnet_p2p::NetworkConfig;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use libp2p::Multiaddr;

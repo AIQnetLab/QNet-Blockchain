@@ -32,12 +32,13 @@ COPY core/qnet-core/Cargo.toml ./core/qnet-core/
 COPY core/qnet-mempool/Cargo.toml ./core/qnet-mempool/
 COPY core/qnet-state/Cargo.toml ./core/qnet-state/
 COPY core/qnet-sharding/Cargo.toml ./core/qnet-sharding/
-COPY infrastructure/qnet-api/Cargo.toml ./infrastructure/qnet-api/
 COPY development/qnet-integration/Cargo.toml ./development/qnet-integration/
+# Removed non-production modules from build:
+# COPY infrastructure/qnet-api/Cargo.toml ./infrastructure/qnet-api/     # Experimental, not for production
 
 # Create dummy source files to cache dependencies
 RUN mkdir -p core/qnet-consensus/src core/qnet-core/src core/qnet-mempool/src \
-    core/qnet-state/src core/qnet-sharding/src infrastructure/qnet-api/src \
+    core/qnet-state/src core/qnet-sharding/src \
     development/qnet-integration/src/bin development/qnet-integration/src \
     core/qnet-consensus/benches core/qnet-mempool/benches \
     core/qnet-state/benches core/qnet-sharding/benches && \
@@ -46,13 +47,13 @@ RUN mkdir -p core/qnet-consensus/src core/qnet-core/src core/qnet-mempool/src \
     echo "pub fn dummy() {}" > core/qnet-mempool/src/lib.rs && \
     echo "pub fn dummy() {}" > core/qnet-state/src/lib.rs && \
     echo "pub fn dummy() {}" > core/qnet-sharding/src/lib.rs && \
-    echo "pub fn dummy() {}" > infrastructure/qnet-api/src/lib.rs && \
     echo "pub fn dummy() {}" > development/qnet-integration/src/lib.rs && \
     echo "fn main() {}" > development/qnet-integration/src/bin/qnet-node.rs && \
     echo "fn main() {}" > core/qnet-consensus/benches/consensus_bench.rs && \
     echo "fn main() {}" > core/qnet-mempool/benches/mempool_bench.rs && \
     echo "fn main() {}" > core/qnet-state/benches/state_bench.rs && \
     echo "fn main() {}" > core/qnet-sharding/benches/sharding_bench.rs
+    # Removed qnet-api dummy files - not needed for production
 
 # Build dependencies only (this layer gets cached!)
 RUN cargo build --release --bin qnet-node --manifest-path development/qnet-integration/Cargo.toml

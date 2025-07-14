@@ -4,12 +4,12 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# Core dependencies
+# Core dependencies - Production modules only
 qnet-consensus = { path = "../../../core/qnet-consensus" }
 qnet-state = { path = "../../../core/qnet-state" }
 qnet-mempool = { path = "../../../core/qnet-mempool" }
 # qnet-p2p = { path = "../qnet-p2p" } # Removed - using simple_p2p instead
-qnet-api = { path = "../../../infrastructure/qnet-api" }
+# qnet-api = { path = "../../../infrastructure/qnet-api" }  # Removed - experimental module, not for production
 
 # Async runtime
 tokio = { version = "1.35", features = ["full"] }
