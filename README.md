@@ -142,10 +142,9 @@ cargo --version
 ### Clone Repository
 
 ```bash
-# Clone to /opt for production deployment
-cd /opt
-sudo git clone https://github.com/AIQnetLab/QNet-Blockchain.git
-sudo chown -R $USER:$USER QNet-Blockchain
+# Clone to home directory for production deployment
+cd ~
+git clone https://github.com/AIQnetLab/QNet-Blockchain.git
 cd QNet-Blockchain
 
 # Switch to testnet branch (latest production code)
@@ -157,11 +156,34 @@ git pull origin testnet
 
 ```bash
 # Production build with maximum optimizations
-RUSTFLAGS="-C target-cpu=native" cargo build --release --bin qnet-node --manifest-path development/qnet-integration/Cargo.toml
+# Note: Workspace builds in root directory, not in development/qnet-integration/
+RUSTFLAGS="-C target-cpu=native" cargo build --release --bin qnet-node
 
 # Verify build success
 ls -la target/release/qnet-node
-./target/release/qnet-node --help
+file target/release/qnet-node
+```
+
+### Important Notes
+
+⚠️ **Workspace Structure**: QNet uses Rust workspace that builds in the **root directory** (`~/QNet-Blockchain/`), not in subdirectories.
+
+⚠️ **Interactive Setup Only**: Production deployment supports **ONLY interactive setup menu**. No command-line arguments for activation.
+
+⚠️ **Binary Location**: The compiled binary is located at `~/QNet-Blockchain/target/release/qnet-node`
+
+### Quick Start Commands
+
+```bash
+# Full deployment sequence
+cd ~
+git clone https://github.com/AIQnetLab/QNet-Blockchain.git
+cd QNet-Blockchain
+git checkout testnet
+cargo build --release --bin qnet-node
+
+# Run interactive setup
+./target/release/qnet-node
 ```
 
 ## 🔧 Node Setup Guides
@@ -203,7 +225,7 @@ sudo ufw allow 9878  # Metrics port
 sudo ufw --force enable
 
 # Run interactive node setup (PRODUCTION ONLY)
-cd /QNet-Blockchain
+cd ~/QNet-Blockchain
 ./target/release/qnet-node
 ```
 
@@ -282,7 +304,7 @@ echo "* hard nofile 65536" | sudo tee -a /etc/security/limits.conf
 ```bash
 # Create system user for QNet
 sudo useradd -r -s /bin/false qnet
-sudo chown -R qnet:qnet /QNet-Blockchain
+sudo chown -R qnet:qnet ~/QNet-Blockchain
 
 # Create systemd service
 sudo tee /etc/systemd/system/qnet-node.service << EOF
@@ -293,8 +315,8 @@ After=network.target
 [Service]
 Type=simple
 User=qnet
-WorkingDirectory=/QNet-Blockchain
-ExecStart=/QNet-Blockchain/target/release/qnet-node
+WorkingDirectory=/home/qnet/QNet-Blockchain
+ExecStart=/home/qnet/QNet-Blockchain/target/release/qnet-node
 Restart=always
 RestartSec=10
 Environment=RUST_LOG=info
@@ -348,7 +370,7 @@ curl -s http://localhost:9877/rpc \
 
 ```bash
 # Navigate to repository
-cd /QNet-Blockchain
+cd ~/QNet-Blockchain
 
 # Pull latest changes
 git pull origin testnet
@@ -365,11 +387,11 @@ sudo systemctl status qnet-node
 
 ```bash
 # Create backup
-sudo tar czf /backup/qnet-backup-$(date +%Y%m%d).tar.gz /QNet-Blockchain/node_data
+sudo tar czf /backup/qnet-backup-$(date +%Y%m%d).tar.gz ~/QNet-Blockchain/node_data
 
 # Restore from backup
-sudo tar xzf /backup/qnet-backup-YYYYMMDD.tar.gz -C /QNet-Blockchain/
-sudo chown -R qnet:qnet /QNet-Blockchain/node_data
+sudo tar xzf /backup/qnet-backup-YYYYMMDD.tar.gz -C ~/QNet-Blockchain/
+sudo chown -R qnet:qnet ~/QNet-Blockchain/node_data
 ```
 
 ## 🌐 Network Configuration
@@ -433,14 +455,14 @@ sudo journalctl -u qnet-node | grep "TPS\|latency"
 
 ```bash
 # Backup node data
-sudo tar -czf qnet-backup-$(date +%Y%m%d).tar.gz /QNet-Blockchain/node_data
+sudo tar -czf qnet-backup-$(date +%Y%m%d).tar.gz ~/QNet-Blockchain/node_data
 
 # Backup configuration
-sudo cp -r /QNet-Blockchain/node_data/config /backup/qnet-config-backup/
+sudo cp -r ~/QNet-Blockchain/node_data/config /backup/qnet-config-backup/
 
 # Recovery
-sudo tar -xzf qnet-backup-YYYYMMDD.tar.gz -C /QNet-Blockchain/
-sudo chown -R qnet:qnet /QNet-Blockchain/node_data
+sudo tar -xzf qnet-backup-YYYYMMDD.tar.gz -C ~/QNet-Blockchain/
+sudo chown -R qnet:qnet ~/QNet-Blockchain/node_data
 ```
 
 ## 🛠️ Development
