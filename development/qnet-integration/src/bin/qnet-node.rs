@@ -295,6 +295,26 @@ struct PricingInfo {
     network_multiplier: f64, // Phase 2: network size multiplier
 }
 
+// Check if 5 years have passed since QNet mainnet launch
+async fn is_five_years_passed_since_mainnet() -> bool {
+    // QNet mainnet launch timestamp (TODO: Replace with actual mainnet launch date)
+    // For now using placeholder - in production this should be the actual launch timestamp
+    let mainnet_launch_timestamp = std::env::var("QNET_MAINNET_LAUNCH_TIMESTAMP")
+        .unwrap_or_else(|_| "1704067200".to_string()) // Placeholder: 2024-01-01 00:00:00 UTC
+        .parse::<i64>()
+        .unwrap_or(1704067200);
+    
+    let current_timestamp = chrono::Utc::now().timestamp();
+    let five_years_in_seconds = 5 * 365 * 24 * 60 * 60; // 5 years in seconds
+    
+    let years_passed = (current_timestamp - mainnet_launch_timestamp) / (365 * 24 * 60 * 60);
+    
+    println!("📅 Time check: {:.2} years passed since mainnet launch", 
+             years_passed as f64);
+    
+    (current_timestamp - mainnet_launch_timestamp) >= five_years_in_seconds
+}
+
 async fn detect_current_phase() -> (u8, PricingInfo) {
     println!("🔍 Detecting current network phase...");
     
@@ -303,7 +323,9 @@ async fn detect_current_phase() -> (u8, PricingInfo) {
         Ok(burn_data) => {
             println!("✅ Real blockchain data loaded");
             
-            let current_phase = if burn_data.burn_percentage >= 90.0 {
+            // Phase 2 transition: 90% burned OR 5 years passed (whichever comes first)
+            let five_years_passed = is_five_years_passed_since_mainnet().await;
+            let current_phase = if burn_data.burn_percentage >= 90.0 || five_years_passed {
                 2 // Phase 2: QNC economy
             } else {
                 1 // Phase 1: 1DEV burn
@@ -338,7 +360,9 @@ async fn detect_current_phase() -> (u8, PricingInfo) {
                 match get_real_token_supply(rpc_url, "1DEVbPWX3Wo39EKfcUeMcEE1aRKe8CnTEWdH7kW5CrT").await {
                     Ok(supply_data) => {
                         println!("✅ Data retrieved from backup RPC!");
-                        let current_phase = if supply_data.burn_percentage >= 90.0 { 2 } else { 1 };
+                        // Phase 2 transition: 90% burned OR 5 years passed (whichever comes first)
+                        let five_years_passed = is_five_years_passed_since_mainnet().await;
+                        let current_phase = if supply_data.burn_percentage >= 90.0 || five_years_passed { 2 } else { 1 };
                         let network_multiplier = calculate_network_multiplier(supply_data.total_burned / 500);
                         let pricing_info = PricingInfo {
                             network_size: supply_data.total_burned / 500,
@@ -514,7 +538,7 @@ fn display_phase_info(phase: u8, pricing: &PricingInfo) {
             println!("   📈 1DEV Burned: {:.1}% (Real blockchain data)", pricing.burn_percentage);
             println!("   💰 Universal Pricing: Same cost for all node types");
             println!("   📉 Dynamic Reduction: -150 1DEV per 10% burned");
-            println!("   🎯 Transition: Occurs at 90% burned or 5 years");
+            println!("   🎯 Transition: Occurs at 90% burned OR 5 years (whichever comes first)");
             println!("   🌐 Active Nodes: {} (Estimated from burn data)", pricing.network_size);
         }
         2 => {
