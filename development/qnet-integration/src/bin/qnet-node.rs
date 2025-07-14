@@ -356,7 +356,7 @@ async fn detect_current_phase() -> (u8, PricingInfo) {
             
             for rpc_url in backup_rpcs {
                 println!("🔄 Trying backup RPC: {}", rpc_url);
-                match get_real_token_supply(rpc_url, "1DEVbPWX3Wo39EKfcUeMcEE1aRKe8CnTEWdH7kW5CrT").await {
+                match get_real_token_supply(rpc_url, "9GcdXAo2EyjNdNLuQoScSVbfJSnh9RdkSS8YYKnGQ8Pf").await {
                     Ok(supply_data) => {
                         println!("✅ Data retrieved from backup RPC!");
                         // Phase 2 transition: 90% burned OR 5 years passed (whichever comes first)
@@ -415,7 +415,7 @@ async fn fetch_burn_tracker_data() -> Result<BurnTrackerData, String> {
     
     // Real 1DEV token mint address on Solana
     let one_dev_mint = std::env::var("ONE_DEV_MINT_ADDRESS").unwrap_or_else(|_| {
-        "1DEVbPWX3Wo39EKfcUeMcEE1aRKe8CnTEWdH7kW5CrT".to_string()
+        "9GcdXAo2EyjNdNLuQoScSVbfJSnh9RdkSS8YYKnGQ8Pf".to_string()
     });
     
     println!("🔗 Connecting to Solana devnet RPC: {}", rpc_url);
