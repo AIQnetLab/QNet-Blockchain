@@ -370,12 +370,18 @@ async fn fetch_burn_tracker_data() -> Result<BurnTrackerData, String> {
     });
     
     let program_id = std::env::var("BURN_TRACKER_PROGRAM_ID").unwrap_or_else(|_| {
-        // TODO: Replace with actual deployed program ID
+        // TODO: Replace with actual deployed burn tracker program ID
         "QNETxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx".to_string()
     });
     
+    // Real 1DEV token mint address on Solana
+    let one_dev_mint = std::env::var("ONE_DEV_MINT_ADDRESS").unwrap_or_else(|_| {
+        "1DEVbPWX3Wo39EKfcUeMcEE1aRKe8CnTEWdH7kW5CrT".to_string()
+    });
+    
     println!("🔗 Connecting to Solana RPC: {}", rpc_url);
-    println!("📋 Program ID: {}", program_id);
+    println!("📋 Burn Tracker Program ID: {}", program_id);
+    println!("💰 1DEV Token Mint: {}", one_dev_mint);
     
     // TODO: Implement real Solana RPC call
     // For now, return error to trigger fallback
@@ -384,9 +390,10 @@ async fn fetch_burn_tracker_data() -> Result<BurnTrackerData, String> {
     // Future implementation:
     // 1. Connect to Solana RPC
     // 2. Derive burn_tracker PDA from program_id and seed b"burn_tracker"
-    // 3. Fetch account data
+    // 3. Fetch account data from burn tracker
     // 4. Deserialize BurnTracker struct
-    // 5. Return real data
+    // 5. Query 1DEV token supply and burn statistics
+    // 6. Return real data
 }
 
 fn calculate_network_multiplier(network_size: u64) -> f64 {
@@ -414,9 +421,20 @@ fn display_phase_info(phase: u8, pricing: &PricingInfo) {
             println!("💎 Phase 2: QNC Operational Economy Active");
             println!("   🌐 Network Size: {} active nodes (Real data)", pricing.network_size);
             println!("   📊 Price Multiplier: {:.1}x (Based on network size)", pricing.network_multiplier);
-            println!("   💰 Tiered Pricing: Different costs per node type");
+            println!("   💰 Dynamic Pricing per Node Type:");
+            
+            // Show different prices for each node type
+            let light_price = calculate_node_price(2, NodeType::Light, pricing);
+            let full_price = calculate_node_price(2, NodeType::Full, pricing);  
+            let super_price = calculate_node_price(2, NodeType::Super, pricing);
+            
+            println!("      📱 Light Node: {:.0} QNC (Base: 5,000 × {:.1}x)", light_price, pricing.network_multiplier);
+            println!("      🖥️  Full Node:  {:.0} QNC (Base: 7,500 × {:.1}x)", full_price, pricing.network_multiplier);
+            println!("      🏭 Super Node: {:.0} QNC (Base: 10,000 × {:.1}x)", super_price, pricing.network_multiplier);
+            
             println!("   🏦 Pool 3: Activation fees redistributed to all nodes");
             println!("   📈 Final Burn: {:.1}% of 1DEV supply destroyed", pricing.burn_percentage);
+            println!("   ⚠️  CRITICAL: Activation code must match exact node type");
         }
         _ => println!("❓ Unknown phase detected"),
     }
