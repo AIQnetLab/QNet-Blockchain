@@ -415,7 +415,7 @@ async fn fetch_burn_tracker_data() -> Result<BurnTrackerData, String> {
     
     // Real 1DEV token mint address on Solana
     let one_dev_mint = std::env::var("ONE_DEV_MINT_ADDRESS").unwrap_or_else(|_| {
-        "Wkg19zERBsBiyqsh2ffcUrFG4eL5BF5BWkg19zERBsBi".to_string()
+        "62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ".to_string()
     });
     
     println!("🔗 Connecting to Solana devnet RPC: {}", rpc_url);
@@ -463,16 +463,16 @@ struct TokenSupplyData {
 async fn get_real_token_supply(rpc_url: &str, token_mint: &str) -> Result<TokenSupplyData, String> {
     println!("🔍 Fetching real 1DEV token supply from Solana blockchain...");
     
-    // Check if this is our new fresh token (Phase 1 ready)
-    if token_mint == "Wkg19zERBsBiyqsh2ffcUrFG4eL5BF5BWkg19zERBsBi" {
-        println!("✅ Using fresh 1DEV token (Phase 1 ready)");
+    // Check if this is our production token (Phase 1 active)
+    if token_mint == "62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ" {
+        println!("✅ Using production 1DEV token (Phase 1 active)");
         
         let total_supply_tokens = 1_000_000_000u64; // 1 billion total supply
         let current_supply_tokens = 1_000_000_000u64; // Full supply available
         let total_burned = 0u64; // No tokens burned yet
         let burn_percentage = 0.0; // 0% burned
         
-        println!("✅ Fresh token data loaded:");
+        println!("✅ Production token data loaded:");
         println!("   💰 Total Supply: {} 1DEV", total_supply_tokens);
         println!("   💰 Current Supply: {} 1DEV", current_supply_tokens);
         println!("   🔥 Total Burned: {} 1DEV", total_burned);

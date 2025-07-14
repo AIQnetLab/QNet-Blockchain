@@ -52,7 +52,7 @@ export class UIManager {
 
             // Get balances
             const [oneDEVBalance, solBalance] = await Promise.all([
-                this.walletManager.getTokenBalance(currentAccount.address, '9GcdXAo2EyjNdNLuQoScSVbfJSnh9RdkSS8YYKnGQ8Pf'),
+                this.walletManager.getTokenBalance(currentAccount.address, '62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ'),
                 this.walletManager.getSolBalance(currentAccount.address)
             ]);
 

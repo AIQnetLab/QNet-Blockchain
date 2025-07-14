@@ -130,7 +130,7 @@ export class NetworkConfig {
                         rpc: 'https://api.devnet.solana.com',
                         wsRpc: 'wss://api.devnet.solana.com',
                         explorer: 'https://explorer.solana.com',
-                        oneDevMint: '9GcdXAo2EyjNdNLuQoScSVbfJSnh9RdkSS8YYKnGQ8Pf',
+                        oneDevMint: '62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ',
                         burnAddress: 'BURN1111111111111111111111111111111111111111',
                         burnContract: 'QNETxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
                         derivationPath: "m/44'/501'/0'/0'",

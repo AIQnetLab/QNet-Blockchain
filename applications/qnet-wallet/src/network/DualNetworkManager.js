@@ -220,7 +220,7 @@ export class DualNetworkManager {
             // Get 1DEV balance (if token account exists)
             const oneDevBalance = await this.getTokenBalance(
                 publicKey,
-                '9GcdXAo2EyjNdNLuQoScSVbfJSnh9RdkSS8YYKnGQ8Pf' // 1DEV mint
+                '62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ' // 1DEV mint
             );
 
             return {

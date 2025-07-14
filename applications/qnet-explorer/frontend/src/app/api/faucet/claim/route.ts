@@ -154,13 +154,13 @@ async function send1DEVTokens(
   
   // Updated 1DEV token configuration for QNet testnet
   const TOKEN_CONFIG = {
-    // New fresh 1DEV token with full supply (Phase 1 ready)
-    mintAddress: 'Wkg19zERBsBiyqsh2ffcUrFG4eL5BF5BWkg19zERBsBi',
+    // Production 1DEV token with full supply (Phase 1 active)
+    mintAddress: '62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ',
     decimals: 6,
     network: 'devnet',
     faucetAmount: amount,
     phase: 1,
-    status: 'phase_1_ready'
+    status: 'phase_1_active'
   };
   
   if (environment === 'testnet') {

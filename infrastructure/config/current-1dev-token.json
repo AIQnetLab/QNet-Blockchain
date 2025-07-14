@@ -7,10 +7,10 @@
     "currentSupply": 1000000000,
     "burned": 0,
     "burnPercentage": 0,
-    "mintAddress": "Wkg19zERBsBiyqsh2ffcUrFG4eL5BF5BWkg19zERBsBi",
+    "mintAddress": "62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ",
     "network": "devnet",
-    "createdAt": "2025-07-14T07:26:32.453Z",
-    "status": "phase_1_ready",
+    "createdAt": "2025-07-14T09:03:55.022Z",
+    "status": "phase_1_active",
     "phase": 1
   },
   "pricing": {
@@ -28,15 +28,17 @@
     }
   },
   "urls": {
-    "solscan": "https://solscan.io/token/Wkg19zERBsBiyqsh2ffcUrFG4eL5BF5BWkg19zERBsBi?cluster=devnet",
-    "solanaExplorer": "https://explorer.solana.com/address/Wkg19zERBsBiyqsh2ffcUrFG4eL5BF5BWkg19zERBsBi?cluster=devnet"
+    "solscan": "https://solscan.io/token/62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ?cluster=devnet",
+    "solanaExplorer": "https://explorer.solana.com/address/62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ?cluster=devnet"
   },
   "testing": {
     "instructions": [
-      "1. Token created with full 1B supply",
+      "1. Token created with full 1B supply - PRODUCTION READY",
       "2. Phase 1 pricing: 1500 1DEV (universal for all node types)",
-      "3. Ready for node activation testing",
-      "4. Burns will reduce price by 150 1DEV per 10%"
+      "3. MINT AUTHORITY: 6gesV5Dojg9tfH9TRytvXabnQT8U7oMbz5VKpTFi8rG4",
+      "4. Faucet: Full supply available for node activation",
+      "5. Burns will reduce price by 150 1DEV per 10%",
+      "6. Integrated with QNet blockchain nodes"
     ]
   }
 }

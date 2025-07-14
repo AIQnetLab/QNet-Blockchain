@@ -10,7 +10,7 @@ import { DynamicPricing } from './DynamicPricing.js';
 
 // Constants
 const SOLANA_RPC_URL = 'https://api.devnet.solana.com';
-const ONE_DEV_MINT_ADDRESS = '9GcdXAo2EyjNdNLuQoScSVbfJSnh9RdkSS8YYKnGQ8Pf';
+const ONE_DEV_MINT_ADDRESS = '62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ';
 
 // Global instances
 let walletManager;

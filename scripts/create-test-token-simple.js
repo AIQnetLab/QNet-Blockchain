@@ -49,45 +49,60 @@ async function createTestToken() {
   console.log('🚀 Creating 1DEV Test Token on Solana Devnet');
   console.log('============================================');
   
-  // Connect to devnet
-  const connection = new Connection(DEVNET_RPC, 'confirmed');
+  // Connect to devnet with enhanced settings
+  const connection = new Connection(DEVNET_RPC, {
+    commitment: 'confirmed',
+    confirmTransactionInitialTimeout: 60000,
+    wsEndpoint: 'wss://api.devnet.solana.com/'
+  });
   
-  // Create keypairs
-  const mintAuthority = Keypair.generate();
-  const faucetWallet = Keypair.generate();
+  // Load existing keypairs with SOL balance
+  const existingConfigPath = path.join(__dirname, '../infrastructure/config/generated-keypairs.json');
+  let existingConfig;
+  
+  try {
+    existingConfig = JSON.parse(fs.readFileSync(existingConfigPath, 'utf8'));
+  } catch (error) {
+    console.error('❌ Cannot load existing wallet config:', error.message);
+    process.exit(1);
+  }
+  
+  // Use existing wallet with SOL balance as MINT AUTHORITY
+  const mintAuthority = Keypair.fromSecretKey(new Uint8Array(existingConfig.mintAuthority.secretKey));
+  console.log(`🔑 Using existing MINT AUTHORITY: ${mintAuthority.publicKey.toString()}`);
+  
+  // Use same wallet for faucet (single wallet approach)
+  const faucetWallet = mintAuthority;
   
   console.log('📋 Token Configuration:');
   console.log(`Name: ${TOKEN_NAME}`);
   console.log(`Symbol: ${TOKEN_SYMBOL}`);
   console.log(`Decimals: ${TOKEN_DECIMALS}`);
   console.log(`Total Supply: ${TOTAL_SUPPLY.toLocaleString()} tokens`);
-  console.log(`Faucet Amount: ${FAUCET_AMOUNT.toLocaleString()} tokens`);
+  console.log(`Faucet Amount: ${TOTAL_SUPPLY.toLocaleString()} tokens (FULL SUPPLY)`);
   console.log('');
   
-  // Request airdrops for gas fees
-  console.log('💰 Requesting SOL airdrops for gas fees...');
+  // Check existing SOL balance
+  console.log('💰 Checking existing SOL balance...');
   
   try {
-    const mintAuthorityAirdrop = await connection.requestAirdrop(
-      mintAuthority.publicKey,
-      2 * LAMPORTS_PER_SOL
-    );
-    await connection.confirmTransaction(mintAuthorityAirdrop);
+    const balance = await connection.getBalance(mintAuthority.publicKey);
+    console.log(`✅ Current balance: ${balance / LAMPORTS_PER_SOL} SOL`);
     
-    const faucetAirdrop = await connection.requestAirdrop(
-      faucetWallet.publicKey,
-      1 * LAMPORTS_PER_SOL
-    );
-    await connection.confirmTransaction(faucetAirdrop);
+    if (balance < 0.1 * LAMPORTS_PER_SOL) {
+      console.error('❌ Insufficient SOL balance for gas fees!');
+      console.error('Please fund the wallet with at least 0.1 SOL');
+      process.exit(1);
+    }
     
-    console.log('✅ Airdrops completed');
+    console.log('✅ Sufficient SOL balance for token creation');
   } catch (error) {
-    console.error('❌ Airdrop failed:', error.message);
-    console.log('ℹ️ Continuing with existing SOL balance...');
+    console.error('❌ Error checking balance:', error.message);
+    process.exit(1);
   }
   
-  // Create mint
-  console.log('🏭 Creating token mint...');
+  // Create mint with enhanced gas settings
+  console.log('🏭 Creating token mint with enhanced gas settings...');
   const mint = await createMint(
     connection,
     mintAuthority,
@@ -95,26 +110,33 @@ async function createTestToken() {
     null, // No freeze authority
     TOKEN_DECIMALS,
     undefined,
-    undefined,
+    {
+      commitment: 'confirmed',
+      preflightCommitment: 'confirmed',
+      skipPreflight: false,
+      maxRetries: 5
+    },
     TOKEN_PROGRAM_ID
   );
   
   console.log(`✅ Token mint created: ${mint.toString()}`);
   
-  // Create faucet token account
-  console.log('🪣 Creating faucet token account...');
+  // Create faucet token account with enhanced gas settings
+  console.log('🪣 Creating faucet token account with enhanced gas settings...');
   const faucetTokenAccount = await getOrCreateAssociatedTokenAccount(
     connection,
     faucetWallet,
     mint,
-    faucetWallet.publicKey
+    faucetWallet.publicKey,
+    false,
+    'confirmed'
   );
   
   console.log(`✅ Faucet token account: ${faucetTokenAccount.address.toString()}`);
   
-  // Mint tokens to faucet
-  console.log('⚡ Minting tokens to faucet...');
-  const mintAmount = FAUCET_AMOUNT * Math.pow(10, TOKEN_DECIMALS); // Convert to atomic units
+  // Mint tokens to faucet with enhanced gas settings
+  console.log('⚡ Minting FULL SUPPLY (1 billion tokens) to faucet with enhanced gas settings...');
+  const mintAmount = TOTAL_SUPPLY * Math.pow(10, TOKEN_DECIMALS); // Convert to atomic units
   
   const mintTx = await mintTo(
     connection,
@@ -122,13 +144,20 @@ async function createTestToken() {
     mint,
     faucetTokenAccount.address,
     mintAuthority,
-    mintAmount
+    mintAmount,
+    [],
+    {
+      commitment: 'confirmed',
+      preflightCommitment: 'confirmed',
+      skipPreflight: false,
+      maxRetries: 5
+    }
   );
   
-  console.log(`✅ Minted ${FAUCET_AMOUNT.toLocaleString()} tokens to faucet`);
+  console.log(`✅ Minted ${TOTAL_SUPPLY.toLocaleString()} tokens (FULL SUPPLY) to faucet`);
   console.log(`📄 Mint transaction: ${mintTx}`);
   
-  // Save configuration
+  // Save enhanced configuration
   const config = {
     tokenInfo: {
       name: TOKEN_NAME,
@@ -137,13 +166,19 @@ async function createTestToken() {
       totalSupply: TOTAL_SUPPLY,
       mintAddress: mint.toString(),
       network: 'devnet',
-      createdAt: new Date().toISOString()
+      createdAt: new Date().toISOString(),
+      gasEnhanced: true
+    },
+    mintAuthority: {
+      publicKey: mintAuthority.publicKey.toString(),
+      privateKey: Array.from(mintAuthority.secretKey)
     },
     faucet: {
-      walletAddress: faucetWallet.publicKey.toString(),
+      walletAddress: faucetWallet.publicKey.toString(), // Same as mint authority
       tokenAccountAddress: faucetTokenAccount.address.toString(),
-      initialBalance: FAUCET_AMOUNT,
-      privateKey: Array.from(faucetWallet.secretKey)
+      initialBalance: TOTAL_SUPPLY,
+      privateKey: Array.from(faucetWallet.secretKey), // Same as mint authority
+      note: "Single wallet used for MINT AUTHORITY and faucet operations - FULL SUPPLY MINTED"
     },
     urls: {
       solscan: `https://solscan.io/token/${mint.toString()}?cluster=devnet`,
@@ -163,22 +198,26 @@ async function createTestToken() {
   
   // Save environment variables
   const envPath = path.join(__dirname, '../applications/qnet-explorer/frontend/.env.local');
-  const envContent = `# QNet Test Token Configuration
+  const envContent = `# QNet Test Token Configuration (Enhanced Gas)
 TOKEN_MINT_ADDRESS=${mint.toString()}
 FAUCET_PRIVATE_KEY='${JSON.stringify(Array.from(faucetWallet.secretKey))}'
 FAUCET_WALLET_ADDRESS=${faucetWallet.publicKey.toString()}
+MINT_AUTHORITY_PRIVATE_KEY='${JSON.stringify(Array.from(mintAuthority.secretKey))}'
+MINT_AUTHORITY_WALLET_ADDRESS=${mintAuthority.publicKey.toString()}
 SOLANA_NETWORK=devnet
 SOLANA_RPC_URL=${DEVNET_RPC}
+GAS_ENHANCED=true
 `;
   
   fs.writeFileSync(envPath, envContent);
   
   console.log('');
-  console.log('🎉 Token Creation Complete!');
-  console.log('===========================');
+  console.log('🎉 Token Creation Complete! (Enhanced Gas)');
+  console.log('==========================================');
   console.log(`Token Mint: ${mint.toString()}`);
-  console.log(`Faucet Wallet: ${faucetWallet.publicKey.toString()}`);
-  console.log(`Faucet Balance: ${FAUCET_AMOUNT.toLocaleString()} 1DEV-TEST`);
+  console.log(`MINT AUTHORITY: ${mintAuthority.publicKey.toString()}`);
+  console.log(`Faucet Wallet: ${faucetWallet.publicKey.toString()} (Same as MINT AUTHORITY)`);
+  console.log(`Faucet Balance: ${TOTAL_SUPPLY.toLocaleString()} 1DEV-TEST (FULL SUPPLY)`);
   console.log('');
   console.log('🔗 Explorer Links:');
   console.log(`Solscan: https://solscan.io/token/${mint.toString()}?cluster=devnet`);
@@ -188,7 +227,8 @@ SOLANA_RPC_URL=${DEVNET_RPC}
   console.log(`Config: ${configPath}`);
   console.log(`Environment: ${envPath}`);
   console.log('');
-  console.log('✅ Ready for testing! Restart the frontend server to use the new token.');
+  console.log('✅ Ready for production! Single wallet controls all operations.');
+  console.log('💡 Enhanced gas settings used for reliable token creation.');
   
   return config;
 }

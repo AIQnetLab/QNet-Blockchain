@@ -213,7 +213,7 @@ export class WalletManager {
     async burnTokensForNodeActivation(account, amount) {
         try {
             const keypair = await this.getKeypairForAccount(account.index);
-            const mintPublicKey = new PublicKey('9GcdXAo2EyjNdNLuQoScSVbfJSnh9RdkSS8YYKnGQ8Pf'); // 1DEV mint
+            const mintPublicKey = new PublicKey('62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ'); // 1DEV mint
             
             // Get or create token account
             const tokenAccount = await getOrCreateAssociatedTokenAccount(

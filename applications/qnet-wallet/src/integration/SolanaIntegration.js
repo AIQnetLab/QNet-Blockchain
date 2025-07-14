@@ -7,7 +7,7 @@ export class SolanaIntegration {
     constructor(networkManager) {
         this.networkManager = networkManager;
         this.connection = null;
-        this.oneDevMint = '9GcdXAo2EyjNdNLuQoScSVbfJSnh9RdkSS8YYKnGQ8Pf';
+        this.oneDevMint = '62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ';
         this.burnContractProgram = 'QNETxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx';
         this.LAMPORTS_PER_SOL = 1000000000;
     }
