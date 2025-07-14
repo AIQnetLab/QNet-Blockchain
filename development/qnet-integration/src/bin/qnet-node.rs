@@ -324,10 +324,16 @@ async fn detect_current_phase() -> (u8, PricingInfo) {
             println!("⚠️  Failed to fetch blockchain data: {}", e);
             println!("   Using development fallback data");
             
-            // Fallback to simulated data for development
-            let total_1dev_burned = 450_000_000u64; // 45% burned (example)
+            // ⚠️ DEVELOPMENT FALLBACK - THESE ARE MOCK VALUES!
+            // In production: Replace with real Solana contract integration
+            let total_1dev_burned = 450_000_000u64; // MOCK: 45% burned 
             let burn_percentage = (total_1dev_burned as f64 / 1_000_000_000.0) * 100.0;
-            let network_size = 75_000u64; // Example: 75k active nodes
+            let network_size = 75_000u64; // MOCK: 75k active nodes
+            
+            println!("   ⚠️  WARNING: Using hardcoded mock data:");
+            println!("      • Burn percentage: 45% (FAKE)");
+            println!("      • Network size: 75,000 nodes (FAKE)");
+            println!("      • Real integration: TODO");
             
             let current_phase = if burn_percentage >= 90.0 {
                 2 // Phase 2: QNC economy
@@ -411,15 +417,16 @@ fn display_phase_info(phase: u8, pricing: &PricingInfo) {
     match phase {
         1 => {
             println!("🔥 Phase 1: 1DEV Burn-to-Join Active");
-            println!("   📈 1DEV Burned: {:.1}% (Real blockchain data)", pricing.burn_percentage);
+            println!("   📈 1DEV Burned: {:.1}% (DEVELOPMENT FALLBACK DATA)", pricing.burn_percentage);
             println!("   💰 Universal Pricing: Same cost for all node types");
             println!("   📉 Dynamic Reduction: -150 1DEV per 10% burned");
             println!("   🎯 Transition: Occurs at 90% burned or 5 years");
-            println!("   🌐 Active Nodes: {} (Real network size)", pricing.network_size);
+            println!("   🌐 Active Nodes: {} (DEVELOPMENT FALLBACK DATA)", pricing.network_size);
+            println!("   ⚠️  MOCK DATA: Real contract integration not implemented yet");
         }
         2 => {
             println!("💎 Phase 2: QNC Operational Economy Active");
-            println!("   🌐 Network Size: {} active nodes (Real data)", pricing.network_size);
+            println!("   🌐 Network Size: {} active nodes (DEVELOPMENT FALLBACK DATA)", pricing.network_size);
             println!("   📊 Price Multiplier: {:.1}x (Based on network size)", pricing.network_multiplier);
             println!("   💰 Server Node Dynamic Pricing:");
             
@@ -432,8 +439,9 @@ fn display_phase_info(phase: u8, pricing: &PricingInfo) {
             
             println!("   📱 Light Node: MOBILE DEVICES ONLY (5,000 QNC base)");
             println!("   🏦 Pool 3: Activation fees redistributed to all nodes");
-            println!("   📈 Final Burn: {:.1}% of 1DEV supply destroyed", pricing.burn_percentage);
+            println!("   📈 Final Burn: {:.1}% of 1DEV supply destroyed (MOCK DATA)", pricing.burn_percentage);
             println!("   ⚠️  CRITICAL: Activation code must match exact node type");
+            println!("   ⚠️  MOCK DATA: Real contract integration not implemented yet");
         }
         _ => println!("❓ Unknown phase detected"),
     }
