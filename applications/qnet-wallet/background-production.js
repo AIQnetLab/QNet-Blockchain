@@ -477,7 +477,7 @@ class SolanaRPC {
     constructor(network = 'devnet') {
         this.network = network;
         this.endpoint = network === 'mainnet' 
-            ? 'https://api.mainnet-beta.solana.com'
+            ? 'https://api.devnet.solana.com'
             : 'https://api.devnet.solana.com';
     }
     
@@ -1404,8 +1404,8 @@ async function getSupportedTokens(network = 'solana') {
                 "1DEV": {
                     symbol: "1DEV",
                     name: "1DEV Token",
-                    decimals: 9,
-                    mintAddress: "1DEVbPWX3Wo39EKfcUeMcEE1aRKe8CnTEWdH7kW5CrT",
+                    decimals: 6,
+                    mintAddress: "9GcdXAo2EyjNdNLuQoScSVbfJSnh9RdkSS8YYKnGQ8Pf",
                     logoURI: "/icons/1dev-token.png"
                 }
             },

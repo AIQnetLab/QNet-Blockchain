@@ -191,14 +191,14 @@ cargo build --release --bin qnet-node
 For production deployment, configure real Solana contract connection:
 
 ```bash
-# Set Solana RPC endpoint (default: mainnet-beta)
-export SOLANA_RPC_URL="https://api.mainnet-beta.solana.com"
+# Set Solana RPC endpoint (default: devnet for testing)
+export SOLANA_RPC_URL="https://api.devnet.solana.com"
 
 # Set burn tracker program ID (replace with actual deployed contract)
 export BURN_TRACKER_PROGRAM_ID="YOUR_DEPLOYED_PROGRAM_ID_HERE"
 
 # Set real 1DEV token mint address
-export ONE_DEV_MINT_ADDRESS="1DEVbPWX3Wo39EKfcUeMcEE1aRKe8CnTEWdH7kW5CrT"
+export ONE_DEV_MINT_ADDRESS="9GcdXAo2EyjNdNLuQoScSVbfJSnh9RdkSS8YYKnGQ8Pf"
 
 # Run node with real blockchain data
 ./target/release/qnet-node
@@ -208,7 +208,7 @@ export ONE_DEV_MINT_ADDRESS="1DEVbPWX3Wo39EKfcUeMcEE1aRKe8CnTEWdH7kW5CrT"
 
 ⚠️ **Real Pricing Data**: When configured, the node fetches real burn percentage and network size from the Solana contract to show accurate pricing.
 
-⚠️ **1DEV Token**: Real token address `1DEVbPWX3Wo39EKfcUeMcEE1aRKe8CnTEWdH7kW5CrT` on Solana mainnet.
+⚠️ **1DEV Token**: Real token address `9GcdXAo2EyjNdNLuQoScSVbfJSnh9RdkSS8YYKnGQ8Pf` on Solana devnet.
 
 ⚠️ **Activation Codes**: Real activation codes are still generated through browser extension or mobile app, regardless of displayed pricing.
 

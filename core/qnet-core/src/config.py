@@ -88,7 +88,7 @@ class NodeConfig:
 @dataclass
 class SolanaConfig:
     """Solana integration configuration"""
-    rpc_mainnet: str = "https://api.mainnet-beta.solana.com"
+    rpc_mainnet: str = "https://api.devnet.solana.com"
     rpc_devnet: str = "https://api.devnet.solana.com"
     
     # $1DEV token details
