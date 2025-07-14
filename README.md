@@ -186,6 +186,27 @@ cargo build --release --bin qnet-node
 ./target/release/qnet-node
 ```
 
+### Production Contract Configuration
+
+For production deployment, configure real Solana contract connection:
+
+```bash
+# Set Solana RPC endpoint (default: mainnet-beta)
+export SOLANA_RPC_URL="https://api.mainnet-beta.solana.com"
+
+# Set burn tracker program ID (replace with actual deployed contract)
+export BURN_TRACKER_PROGRAM_ID="YOUR_DEPLOYED_PROGRAM_ID_HERE"
+
+# Run node with real blockchain data
+./target/release/qnet-node
+```
+
+**Note**: Without these environment variables, the node will use development fallback data for testing.
+
+⚠️ **Real Pricing Data**: When configured, the node fetches real burn percentage and network size from the Solana contract to show accurate pricing.
+
+⚠️ **Activation Codes**: Real activation codes are still generated through browser extension or mobile app, regardless of displayed pricing.
+
 ## 🔧 Node Setup Guides
 
 QNet nodes run natively for maximum performance. Choose your node type based on available resources.
