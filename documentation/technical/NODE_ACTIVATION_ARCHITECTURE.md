@@ -158,13 +158,15 @@ class NodeActivation:
         return True
 ```
 
-## Benefits of No-Database Architecture
+## Benefits of Efficient Validation Architecture
 
 1. **True Decentralization**: No central point of failure
 2. **Privacy**: No user data stored centrally
 3. **Resilience**: System works even if website is down
 4. **Transparency**: All activations visible on blockchain
 5. **No Maintenance**: No database to backup/manage
+6. **Scalable**: DHT + caching prevents network overload
+7. **Efficient**: 1-hour sync cycle, background processing
 
 ## Security Considerations
 
@@ -173,6 +175,8 @@ class NodeActivation:
 3. **Signature Verification**: All tokens cryptographically signed
 4. **Blockchain Verification**: Double-check on QNet blockchain
 5. **Rate Limiting**: API endpoints protected against abuse
+6. **Device Migration**: Secure migration without ownership change
+7. **Light Node Limits**: Maximum 3 devices per wallet
 
 ## Alternative Activation Methods
 

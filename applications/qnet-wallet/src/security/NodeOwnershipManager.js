@@ -48,65 +48,77 @@ export class NodeOwnershipManager {
     }
 
     /**
-     * Transfer node ownership to another wallet
+     * Migrate node to new device (same wallet)
      */
-    async transferNode(activationCode, fromWallet, toWallet, privateKey) {
+    async migrateDevice(activationCode, walletAddress, newDeviceSignature, privateKey) {
         try {
             // Verify current ownership
-            const isOwner = await this.verifyOwnership(activationCode, fromWallet);
+            const isOwner = await this.verifyOwnership(activationCode, walletAddress);
             if (!isOwner) {
                 throw new Error('Not the owner of this node');
             }
 
-            // Validate destination address
-            if (!this.qnetIntegration.validateAddress(toWallet)) {
-                throw new Error('Invalid destination address');
+            // Validate device signature
+            if (!newDeviceSignature || newDeviceSignature.length < 16) {
+                throw new Error('Invalid device signature');
             }
 
-            // Check if destination wallet already has a node (one node per wallet rule)
-            const destinationNodes = await this.qnetIntegration.getWalletNodes(toWallet);
-            if (destinationNodes.length > 0) {
-                throw new Error('Destination wallet already has an active node');
+            // Check if new device already has an active node
+            const deviceNodes = await this.qnetIntegration.getDeviceNodes(newDeviceSignature);
+            if (deviceNodes.length > 0) {
+                throw new Error('Device already has an active node');
             }
 
-            // Create ownership transfer transaction
-            const transferTx = await this.qnetIntegration.makeRPCCall('transfer_node_ownership', {
+            // Create device migration transaction
+            const migrationTx = await this.qnetIntegration.makeRPCCall('migrate_device', {
                 activation_code: activationCode,
-                from: fromWallet,
-                to: toWallet,
+                wallet_address: walletAddress,
+                new_device_signature: newDeviceSignature,
                 private_key: privateKey,
                 timestamp: Date.now(),
-                signature: await this.createTransferSignature(activationCode, fromWallet, toWallet, privateKey)
+                signature: await this.createMigrationSignature(activationCode, walletAddress, newDeviceSignature, privateKey)
             });
 
-            // Clear ownership cache
-            this.clearOwnershipCache(activationCode);
+            // Update device cache
+            this.updateDeviceCache(activationCode, newDeviceSignature);
 
             return {
                 success: true,
-                txHash: transferTx.tx_hash,
-                transferredAt: transferTx.transferred_at,
-                newOwner: toWallet
+                txHash: migrationTx.tx_hash,
+                migratedAt: migrationTx.migrated_at,
+                newDevice: newDeviceSignature
             };
 
         } catch (error) {
-            console.error('Failed to transfer node ownership:', error);
+            console.error('Failed to migrate device:', error);
             throw error;
         }
     }
 
     /**
-     * Create cryptographic signature for ownership transfer
+     * Create cryptographic signature for device migration
      */
-    async createTransferSignature(activationCode, fromWallet, toWallet, privateKey) {
+    async createMigrationSignature(activationCode, walletAddress, newDeviceSignature, privateKey) {
         try {
-            const message = `TRANSFER:${activationCode}:${fromWallet}:${toWallet}:${Date.now()}`;
+            const message = `MIGRATE:${activationCode}:${walletAddress}:${newDeviceSignature}:${Date.now()}`;
             const signature = await this.cryptoManager.signMessage(message, privateKey);
             return signature;
         } catch (error) {
-            console.error('Failed to create transfer signature:', error);
+            console.error('Failed to create migration signature:', error);
             throw error;
         }
+    }
+
+    /**
+     * Update device cache after migration
+     */
+    updateDeviceCache(activationCode, newDeviceSignature) {
+        const cacheKey = `device_${activationCode}`;
+        this.deviceCache = this.deviceCache || new Map();
+        this.deviceCache.set(cacheKey, {
+            deviceSignature: newDeviceSignature,
+            updatedAt: Date.now()
+        });
     }
 
     /**

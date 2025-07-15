@@ -21,6 +21,7 @@ qnet-sharding = { path = "../../core/qnet-sharding" }
 # Async runtime
 tokio = { version = "1.35", features = ["full"] }
 async-trait = "0.1.75"
+futures = "0.3"
 
 # Serialization
 serde = { version = "1.0.195", features = ["derive"] }

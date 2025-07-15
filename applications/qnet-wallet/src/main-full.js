@@ -587,7 +587,7 @@ async function updateNodeCard() {
         
         nodeActions.innerHTML = `
             <button class="qnet-button secondary modern" onclick="monitorNode()">📊 Monitor</button>
-            <button class="qnet-button secondary modern" onclick="transferNode()">🔄 Transfer</button>
+            <button class="qnet-button secondary modern" onclick="migrateDevice()">🔄 Migrate</button>
         `;
         
     } else {
@@ -1108,8 +1108,8 @@ window.monitorNode = function() {
     showToast('Node monitoring coming soon', 'info');
 };
 
-window.transferNode = function() {
-    showToast('Node transfer coming soon', 'info');
+window.migrateDevice = function() {
+    showToast('Device migration coming soon', 'info');
 };
 
 window.activateNode = async function() {

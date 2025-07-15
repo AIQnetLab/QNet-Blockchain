@@ -168,6 +168,59 @@ export class SingleNodeEnforcement {
     }
 
     /**
+     * Validate device migration (same wallet, different device)
+     */
+    async validateDeviceMigration(walletAddress, activationCode, newDeviceSignature) {
+        try {
+            // Check if wallet owns this activation code
+            const isOwner = await this.verifyWalletOwnership(walletAddress, activationCode);
+            if (!isOwner) {
+                return {
+                    allowed: false,
+                    reason: 'NOT_OWNER',
+                    message: 'Wallet does not own this activation code'
+                };
+            }
+
+            // Check if new device already has an active node
+            const deviceHasNode = await this.checkDeviceHasActiveNode(newDeviceSignature);
+            if (deviceHasNode) {
+                return {
+                    allowed: false,
+                    reason: 'DEVICE_ALREADY_ACTIVE',
+                    message: 'New device already has an active node'
+                };
+            }
+
+            // Light nodes: check 3-device limit
+            const nodeType = await this.getNodeType(activationCode);
+            if (nodeType === 'light') {
+                const deviceCount = await this.getWalletDeviceCount(walletAddress);
+                if (deviceCount >= 3) {
+                    return {
+                        allowed: false,
+                        reason: 'DEVICE_LIMIT_EXCEEDED',
+                        message: 'Maximum 3 devices allowed for Light nodes'
+                    };
+                }
+            }
+
+            return {
+                allowed: true,
+                message: 'Device migration allowed'
+            };
+
+        } catch (error) {
+            console.error('Error validating device migration:', error);
+            return {
+                allowed: false,
+                reason: 'VALIDATION_ERROR',
+                message: 'Error validating device migration'
+            };
+        }
+    }
+
+    /**
      * Reset device activation (admin function)
      */
     resetDeviceActivation(deviceFingerprint) {

@@ -535,7 +535,7 @@ export class PhaseAwareUI {
                     
                     <div class="node-actions">
                         <button onclick="phaseAwareUI.monitorNode()">📊 Monitor</button>
-                        <button onclick="phaseAwareUI.transferNode()">🔄 Transfer</button>
+                        <button onclick="phaseAwareUI.migrateDevice()">🔄 Migrate</button>
                     </div>
                 </div>
             `;
@@ -634,7 +634,7 @@ export class PhaseAwareUI {
     updateFlowStep(index, text) { /* Implementation */ }
     completeFlowStep(index) { /* Implementation */ }
     monitorNode() { /* Implementation */ }
-    transferNode() { /* Implementation */ }
+    migrateDevice() { /* Implementation */ }
 }
 
 // Export and make globally available

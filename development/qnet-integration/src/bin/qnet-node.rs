@@ -222,6 +222,60 @@ fn validate_phase_and_pricing(phase: u8, node_type: NodeType, pricing: &PricingI
     Ok(())
 }
 
+// Check for existing activation or run interactive setup
+async fn check_existing_activation_or_setup() -> Result<(NodeType, String), Box<dyn std::error::Error>> {
+    println!("🔍 Checking for existing activation code...");
+    
+    // Create temporary storage to check for existing activation
+    let temp_storage = match qnet_integration::storage::PersistentStorage::new("node_data") {
+        Ok(storage) => storage,
+        Err(_) => {
+            println!("⚠️  Storage not available, running interactive setup");
+            return interactive_node_setup().await;
+        }
+    };
+    
+    // Check for existing activation code
+    match temp_storage.load_activation_code() {
+        Ok(Some((code, node_type_id, timestamp))) => {
+            let node_type = match node_type_id {
+                0 => NodeType::Light,
+                1 => NodeType::Full,
+                2 => NodeType::Super,
+                _ => NodeType::Full,
+            };
+            
+            // Check if activation is still valid (not expired)
+            let current_time = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            
+            // Activation codes are valid for 1 year
+            if current_time - timestamp < 365 * 24 * 60 * 60 {
+                println!("✅ Found valid activation code with cryptographic binding");
+                println!("   🔑 Code: {}", mask_code(&code));
+                println!("   🔧 Node Type: {:?}", node_type);
+                println!("   📅 Activated: {} days ago", (current_time - timestamp) / (24 * 60 * 60));
+                println!("   🛡️  Universal: Works on VPS, VDS, PC, laptop, server");
+                println!("   🚀 Resuming node with existing activation...\n");
+                return Ok((node_type, code));
+            } else {
+                println!("⚠️  Activation code expired, requesting new one");
+                let _ = temp_storage.clear_activation_code();
+            }
+        }
+        Ok(None) => {
+            println!("📝 No existing activation found, running interactive setup");
+        }
+        Err(e) => {
+            println!("⚠️  Error checking activation: {}, running interactive setup", e);
+        }
+    }
+    
+    interactive_node_setup().await
+}
+
 // Interactive node setup functions
 async fn interactive_node_setup() -> Result<(NodeType, String), Box<dyn std::error::Error>> {
     println!("🔍 DEBUG: Entering interactive_node_setup()...");
@@ -283,6 +337,8 @@ async fn interactive_node_setup() -> Result<(NodeType, String), Box<dyn std::err
     println!("   📊 Phase: {}", current_phase);
     println!("   💰 Cost: {}", format_price(current_phase, price));
     println!("   🔑 Activation Code: {}", mask_code(&activation_code));
+    println!("   💾 Activation will be saved with cryptographic binding");
+    println!("   🛡️  Universal: Works on VPS, VDS, PC, laptop, server");
     println!("   🚀 Starting node...\n");
     
     Ok((node_type, activation_code))
@@ -896,8 +952,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Choose setup mode - interactive or auto
     println!("🔍 DEBUG: Starting setup mode selection...");
     
-    // PRODUCTION: Only interactive setup supported
-    let (node_type, activation_code) = interactive_node_setup().await?;
+    // PRODUCTION: Check for existing activation or run interactive setup
+    let (node_type, activation_code) = check_existing_activation_or_setup().await?;
     
     // Configure production mode (microblocks by default unless legacy)
     configure_production_mode(&args);
@@ -992,6 +1048,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err(format!("BlockchainNode creation failed: {}", e).into());
         }
     };
+    
+    // Save activation code to persistent storage for future restarts
+    if !activation_code.is_empty() && !activation_code.starts_with("DEV_MODE_EMPTY") {
+        if let Err(e) = node.save_activation_code(&activation_code, node_type).await {
+            println!("⚠️  Warning: Could not save activation code: {}", e);
+        }
+    }
     
     // Configure node type and region
     // TODO: Configure node type and region when methods are implemented

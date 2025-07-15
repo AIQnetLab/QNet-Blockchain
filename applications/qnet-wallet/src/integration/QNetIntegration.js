@@ -182,14 +182,14 @@ export class QNetIntegration {
     }
 
     /**
-     * Transfer node ownership
+     * Migrate device (same wallet, different device)
      */
-    async transferNodeOwnership(nodeId, fromAddress, toAddress, privateKey) {
+    async migrateDevice(nodeId, walletAddress, newDeviceSignature, privateKey) {
         try {
-            const response = await this.makeRPCCall('transfer_node_ownership', {
+            const response = await this.makeRPCCall('migrate_device', {
                 node_id: nodeId,
-                from: fromAddress,
-                to: toAddress,
+                wallet_address: walletAddress,
+                new_device_signature: newDeviceSignature,
                 private_key: privateKey,
                 timestamp: Date.now()
             });
@@ -197,12 +197,29 @@ export class QNetIntegration {
             return {
                 success: response.success,
                 txHash: response.tx_hash,
-                transferredAt: response.transferred_at
+                migratedAt: response.migrated_at
             };
 
         } catch (error) {
-            console.error('Failed to transfer node ownership:', error);
+            console.error('Failed to migrate device:', error);
             throw error;
+        }
+    }
+
+    /**
+     * Get nodes for device signature
+     */
+    async getDeviceNodes(deviceSignature) {
+        try {
+            const response = await this.makeRPCCall('get_device_nodes', {
+                device_signature: deviceSignature
+            });
+
+            return response.nodes || [];
+
+        } catch (error) {
+            console.error('Failed to get device nodes:', error);
+            return [];
         }
     }
 

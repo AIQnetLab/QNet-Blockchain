@@ -102,6 +102,10 @@ async fn handle_rpc(
         // Stats methods
         "stats_get" => stats_get(blockchain).await,
         
+        // Node transfer methods
+        "node_transfer" => node_transfer(blockchain, request.params).await,
+        "node_getTransferStatus" => node_get_transfer_status(blockchain, request.params).await,
+        
         _ => Err(RpcError {
             code: -32601,
             message: "Method not found".to_string(),
@@ -489,5 +493,85 @@ pub async fn handle_get_stats(blockchain: Arc<BlockchainNode>) -> Result<impl wa
             });
             Ok(warp::reply::json(&error_response))
         }
+    }
+}
+
+/// Transfer node to new wallet
+async fn node_transfer(
+    blockchain: Arc<BlockchainNode>,
+    params: Option<Value>,
+) -> Result<Value, RpcError> {
+    let params = params.ok_or_else(|| RpcError {
+        code: -32602,
+        message: "Invalid params".to_string(),
+    })?;
+    
+    let activation_code = params["activation_code"].as_str().ok_or_else(|| RpcError {
+        code: -32602,
+        message: "Missing activation_code parameter".to_string(),
+    })?;
+    
+    let new_wallet = params["new_wallet"].as_str().ok_or_else(|| RpcError {
+        code: -32602,
+        message: "Missing new_wallet parameter".to_string(),
+    })?;
+    
+    let node_type = blockchain.get_node_type();
+    
+    match blockchain.transfer_node_to_wallet(activation_code, node_type, new_wallet).await {
+        Ok(_) => Ok(json!({
+            "success": true,
+            "message": "Node successfully transferred",
+            "new_wallet": new_wallet,
+            "timestamp": chrono::Utc::now().timestamp()
+        })),
+        Err(e) => Err(RpcError {
+            code: -32000,
+            message: format!("Node transfer failed: {}", e),
+        }),
+    }
+}
+
+/// Get node transfer status
+async fn node_get_transfer_status(
+    blockchain: Arc<BlockchainNode>,
+    params: Option<Value>,
+) -> Result<Value, RpcError> {
+    let params = params.ok_or_else(|| RpcError {
+        code: -32602,
+        message: "Invalid params".to_string(),
+    })?;
+    
+    let activation_code = params["activation_code"].as_str().ok_or_else(|| RpcError {
+        code: -32602,
+        message: "Missing activation_code parameter".to_string(),
+    })?;
+    
+    // Load activation to check transfer status
+    match blockchain.load_activation_code().await {
+        Ok(Some((code, node_type, timestamp))) => {
+            if code == activation_code {
+                Ok(json!({
+                    "has_activation": true,
+                    "node_type": format!("{:?}", node_type),
+                    "activated_at": timestamp,
+                    "supports_transfer": true,
+                    "device_support": "VPS, VDS, PC, laptop, server"
+                }))
+            } else {
+                Ok(json!({
+                    "has_activation": false,
+                    "supports_transfer": false
+                }))
+            }
+        }
+        Ok(None) => Ok(json!({
+            "has_activation": false,
+            "supports_transfer": false
+        })),
+        Err(e) => Err(RpcError {
+            code: -32000,
+            message: format!("Failed to check transfer status: {}", e),
+        }),
     }
 } 

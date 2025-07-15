@@ -41,6 +41,9 @@ pub enum IntegrationError {
     #[error("Network error: {0}")]
     NetworkError(String),
     
+    #[error("Security error: {0}")]
+    SecurityError(String),
+    
     #[error("Other error: {0}")]
     Other(String),
 }
@@ -64,6 +67,9 @@ pub enum QNetError {
     
     #[error("Validation error: {0}")]
     ValidationError(String),
+    
+    #[error("Security error: {0}")]
+    SecurityError(String),
     
     #[error("Serialization error: {0}")]
     SerializationError(String),

@@ -6,6 +6,7 @@ use crate::errors::{IntegrationError, IntegrationResult};
 use std::path::Path;
 use std::collections::HashMap;
 use hex;
+use sha3;
 
 pub struct PersistentStorage {
     db: DB,
@@ -165,6 +166,297 @@ impl PersistentStorage {
         let key = format!("microblock_{}", height);
         self.db.put_cf(&microblocks_cf, key.as_bytes(), data)?;
         Ok(())
+    }
+    
+    /// Save activation code to persistent storage with code-based binding
+    pub fn save_activation_code(&self, code: &str, node_type: u8, timestamp: u64) -> IntegrationResult<()> {
+        let metadata_cf = self.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
+        
+        // Generate cryptographic node identity from activation code
+        let node_identity = Self::generate_node_identity(code, node_type, timestamp)?;
+        let server_ip = Self::get_server_ip();
+        
+        // Create secure state binding
+        let state_key = Self::derive_state_key(code, &node_identity)?;
+        
+        // Save with cryptographic binding to activation code
+        let activation_data = format!("{}:{}:{}:{}:{}", 
+            code, node_type, timestamp, node_identity, server_ip);
+        
+        // Encrypt entire record with code-derived key
+        let encrypted_data = Self::encrypt_with_code_key(&activation_data, &state_key)?;
+        
+        self.db.put_cf(&metadata_cf, b"activation_code", encrypted_data.as_bytes())?;
+        
+        // Save state key for validation
+        self.db.put_cf(&metadata_cf, b"state_key", state_key.as_bytes())?;
+        
+        Ok(())
+    }
+    
+    /// Load activation code from persistent storage with code-based validation
+    pub fn load_activation_code(&self) -> IntegrationResult<Option<(String, u8, u64)>> {
+        let metadata_cf = self.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
+        
+        match self.db.get_cf(&metadata_cf, b"activation_code")? {
+            Some(encrypted_data) => {
+                // Load state key for decryption
+                let state_key = match self.db.get_cf(&metadata_cf, b"state_key")? {
+                    Some(key) => String::from_utf8_lossy(&key).to_string(),
+                    None => {
+                        // Try legacy format
+                        return self.load_legacy_activation_code(&encrypted_data);
+                    }
+                };
+                
+                // Decrypt with code-derived key
+                let decrypted_data = Self::decrypt_with_code_key(&String::from_utf8_lossy(&encrypted_data), &state_key)?;
+                
+                let parts: Vec<&str> = decrypted_data.split(':').collect();
+                
+                // New secure format: code:node_type:timestamp:node_identity:server_ip[:migration:new_device_signature]
+                if parts.len() == 5 || parts.len() == 7 {
+                    let code = parts[0];
+                    let node_type = parts[1].parse::<u8>().unwrap_or(1);
+                    let timestamp = parts[2].parse::<u64>().unwrap_or(0);
+                    let stored_node_identity = parts[3];
+                    let stored_server_ip = parts[4];
+                    
+                    // Check if this is a migrated device
+                    let is_migrated = parts.len() == 7 && parts[5] == "migration";
+                    let device_signature = if is_migrated { Some(parts[6]) } else { None };
+                    
+                    // Validate node identity (considering migration)
+                    let current_node_identity = if is_migrated {
+                        Self::generate_migration_identity(code, node_type, timestamp, device_signature.unwrap())?
+                    } else {
+                        Self::generate_node_identity(code, node_type, timestamp)?
+                    };
+                    
+                    if current_node_identity != stored_node_identity {
+                        eprintln!("🚨 SECURITY WARNING: Node identity mismatch!");
+                        eprintln!("   This activation code was bound to a different node configuration");
+                        return Err(IntegrationError::SecurityError("Node identity mismatch".to_string()));
+                    }
+                    
+                    // Validate state key consistency
+                    let expected_state_key = Self::derive_state_key(code, &current_node_identity)?;
+                    if expected_state_key != state_key {
+                        eprintln!("🚨 SECURITY WARNING: State key mismatch!");
+                        eprintln!("   Activation code integrity compromised");
+                        return Err(IntegrationError::SecurityError("State key mismatch".to_string()));
+                    }
+                    
+                    // Log IP changes (device migration is normal)
+                    let current_server_ip = Self::get_server_ip();
+                    if current_server_ip != stored_server_ip {
+                        println!("📍 INFO: Server IP changed from {} to {} (device migration/restart)", stored_server_ip, current_server_ip);
+                    }
+                    
+                    // Log migration status
+                    if is_migrated {
+                        println!("🔄 INFO: Device was migrated to signature: {}", device_signature.unwrap());
+                    }
+                    
+                    println!("✅ Activation code validated with cryptographic binding");
+                    Ok(Some((code.to_string(), node_type, timestamp)))
+                } else {
+                    Err(IntegrationError::SecurityError("Invalid activation record format".to_string()))
+                }
+            }
+            None => Ok(None),
+        }
+    }
+    
+    /// Load legacy activation code format for backwards compatibility
+    fn load_legacy_activation_code(&self, data: &[u8]) -> IntegrationResult<Option<(String, u8, u64)>> {
+        let activation_str = String::from_utf8_lossy(data);
+        let parts: Vec<&str> = activation_str.split(':').collect();
+        
+        if parts.len() == 3 {
+            println!("⚠️  WARNING: Using legacy activation format (upgrading to secure format recommended)");
+            let code = parts[0].to_string();
+            let node_type = parts[1].parse::<u8>().unwrap_or(1);
+            let timestamp = parts[2].parse::<u64>().unwrap_or(0);
+            Ok(Some((code, node_type, timestamp)))
+        } else {
+            Ok(None)
+        }
+    }
+    
+    /// Clear activation code (for security)
+    pub fn clear_activation_code(&self) -> IntegrationResult<()> {
+        let metadata_cf = self.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
+        
+        self.db.delete_cf(&metadata_cf, b"activation_code")?;
+        self.db.delete_cf(&metadata_cf, b"state_key")?;
+        Ok(())
+    }
+    
+    /// Update activation code for device migration (preserves activation, updates device)
+    pub fn update_activation_for_migration(&self, code: &str, node_type: u8, timestamp: u64, new_device_signature: &str) -> IntegrationResult<()> {
+        let metadata_cf = self.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
+        
+        // Generate new node identity with migration indicator
+        let migration_identity = Self::generate_migration_identity(code, node_type, timestamp, new_device_signature)?;
+        let server_ip = Self::get_server_ip();
+        
+        // Create new state key for migrated device
+        let state_key = Self::derive_state_key(code, &migration_identity)?;
+        
+        // Save with migration binding
+        let activation_data = format!("{}:{}:{}:{}:{}:migration:{}", 
+            code, node_type, timestamp, migration_identity, server_ip, new_device_signature);
+        
+        // Encrypt entire record with new state key
+        let encrypted_data = Self::encrypt_with_code_key(&activation_data, &state_key)?;
+        
+        self.db.put_cf(&metadata_cf, b"activation_code", encrypted_data.as_bytes())?;
+        self.db.put_cf(&metadata_cf, b"state_key", state_key.as_bytes())?;
+        
+        println!("✅ Activation code updated for device migration to signature: {}", new_device_signature);
+        Ok(())
+    }
+    
+    /// Generate migration identity for device changes
+    fn generate_migration_identity(code: &str, node_type: u8, timestamp: u64, new_device_signature: &str) -> IntegrationResult<String> {
+        use sha3::{Sha3_256, Digest};
+        
+        // Identity components for migrated device
+        let mut identity_components = Vec::new();
+        
+        // Core: activation code + migration info
+        identity_components.push(code.to_string());
+        identity_components.push(format!("node_type:{}", node_type));
+        identity_components.push(format!("timestamp:{}", timestamp));
+        identity_components.push(format!("device_signature:{}", new_device_signature));
+        
+        // Add migration marker
+        identity_components.push("migration_enabled".to_string());
+        
+        // Generate deterministic identity from transfer data
+        let combined = identity_components.join("|");
+        let identity_hash = hex::encode(Sha3_256::digest(combined.as_bytes()));
+        
+        // Use first 16 characters for transfer identity
+        Ok(identity_hash[..16].to_string())
+    }
+    
+    /// Generate cryptographic node identity from activation code (universal device support)
+    fn generate_node_identity(code: &str, node_type: u8, timestamp: u64) -> IntegrationResult<String> {
+        use sha3::{Sha3_256, Digest};
+        
+        // Primary components: activation code + node config
+        let mut identity_components = Vec::new();
+        
+        // Core: activation code itself (unique and immutable)
+        identity_components.push(code.to_string());
+        
+        // Node configuration (stable across device migrations)
+        identity_components.push(format!("node_type:{}", node_type));
+        identity_components.push(format!("timestamp:{}", timestamp));
+        
+        // Add stable system info (works on all devices: VPS, VDS, PC, laptop, server)
+        identity_components.push(format!("user:{}", 
+            std::env::var("USER").unwrap_or_else(|_| "qnet".to_string())
+        ));
+        
+        // Add hostname (may change but helps with uniqueness)
+        if let Ok(hostname) = std::env::var("HOSTNAME") {
+            identity_components.push(format!("hostname:{}", hostname));
+        }
+        
+        // Universal device support: use activation code as primary entropy source
+        let primary_hash = hex::encode(Sha3_256::digest(code.as_bytes()));
+        identity_components.push(format!("code_hash:{}", &primary_hash[..16]));
+        
+        // Generate deterministic identity from activation code
+        let combined = identity_components.join("|");
+        let identity_hash = hex::encode(Sha3_256::digest(combined.as_bytes()));
+        
+        // Use first 16 characters for node identity
+        Ok(identity_hash[..16].to_string())
+    }
+    
+    /// Get server IP address
+    fn get_server_ip() -> String {
+        use std::process::Command;
+        
+        // Try to get public IP
+        if let Ok(output) = Command::new("curl")
+            .arg("-s")
+            .arg("--max-time")
+            .arg("2")
+            .arg("https://api.ipify.org")
+            .output() {
+            if let Ok(ip) = String::from_utf8(output.stdout) {
+                if !ip.trim().is_empty() {
+                    return ip.trim().to_string();
+                }
+            }
+        }
+        
+        // Fallback to local IP
+        if let Ok(output) = Command::new("hostname").arg("-I").output() {
+            if let Ok(ip) = String::from_utf8(output.stdout) {
+                if let Some(first_ip) = ip.split_whitespace().next() {
+                    return first_ip.to_string();
+                }
+            }
+        }
+        
+        "unknown".to_string()
+    }
+    
+    /// Derive state key from activation code and node identity
+    fn derive_state_key(code: &str, node_identity: &str) -> IntegrationResult<String> {
+        use sha3::{Sha3_256, Digest};
+        
+        // Create deterministic key from activation code
+        let key_material = format!("{}:{}:state_key", code, node_identity);
+        let key_hash = hex::encode(Sha3_256::digest(key_material.as_bytes()));
+        
+        // Use first 32 characters as state key
+        Ok(key_hash[..32].to_string())
+    }
+    
+    /// Encrypt data with code-derived key
+    fn encrypt_with_code_key(data: &str, state_key: &str) -> IntegrationResult<String> {
+        use sha3::{Sha3_256, Digest};
+        
+        // Create encryption key from state key
+        let key_bytes = hex::decode(format!("{:0<32}", state_key))
+            .map_err(|e| IntegrationError::SecurityError(format!("Key generation failed: {}", e)))?;
+        
+        let mut encrypted = Vec::new();
+        for (i, byte) in data.as_bytes().iter().enumerate() {
+            encrypted.push(byte ^ key_bytes[i % key_bytes.len()]);
+        }
+        
+        Ok(hex::encode(encrypted))
+    }
+    
+    /// Decrypt data with code-derived key
+    fn decrypt_with_code_key(encrypted_data: &str, state_key: &str) -> IntegrationResult<String> {
+        use sha3::{Sha3_256, Digest};
+        
+        let encrypted_bytes = hex::decode(encrypted_data)
+            .map_err(|e| IntegrationError::SecurityError(format!("Decryption failed: {}", e)))?;
+        
+        let key_bytes = hex::decode(format!("{:0<32}", state_key))
+            .map_err(|e| IntegrationError::SecurityError(format!("Key generation failed: {}", e)))?;
+        
+        let mut decrypted = Vec::new();
+        for (i, byte) in encrypted_bytes.iter().enumerate() {
+            decrypted.push(byte ^ key_bytes[i % key_bytes.len()]);
+        }
+        
+        String::from_utf8(decrypted)
+            .map_err(|e| IntegrationError::SecurityError(format!("Decryption failed: {}", e)))
     }
     
     pub fn load_microblock(&self, height: u64) -> IntegrationResult<Option<Vec<u8>>> {
