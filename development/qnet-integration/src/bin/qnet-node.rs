@@ -921,34 +921,11 @@ async fn find_available_port(preferred: u16) -> Result<u16, Box<dyn std::error::
     Err("No available ports found".into())
 }
 
-// Get bootstrap peers for region
+// Get bootstrap peers for region - AUTOMATIC PEER DISCOVERY
 fn get_bootstrap_peers_for_region(region: &Region) -> Vec<String> {
-    match region {
-        Region::NorthAmerica => vec![
-            "na-bootstrap-1.qnet.io:9876".to_string(),
-            "na-bootstrap-2.qnet.io:9876".to_string(),
-        ],
-        Region::Europe => vec![
-            "eu-bootstrap-1.qnet.io:9876".to_string(),
-            "eu-bootstrap-2.qnet.io:9876".to_string(),
-        ],
-        Region::Asia => vec![
-            "asia-bootstrap-1.qnet.io:9876".to_string(),
-            "asia-bootstrap-2.qnet.io:9876".to_string(),
-        ],
-        Region::SouthAmerica => vec![
-            "sa-bootstrap-1.qnet.io:9876".to_string(),
-            "sa-bootstrap-2.qnet.io:9876".to_string(),
-        ],
-        Region::Africa => vec![
-            "africa-bootstrap-1.qnet.io:9876".to_string(),
-            "africa-bootstrap-2.qnet.io:9876".to_string(),
-        ],
-        Region::Oceania => vec![
-            "oceania-bootstrap-1.qnet.io:9876".to_string(),
-            "oceania-bootstrap-2.qnet.io:9876".to_string(),
-        ],
-    }
+    // Return empty vector to force automatic peer discovery
+    // No hardcoded bootstrap servers - nodes will find each other automatically
+    Vec::new()
 }
 
 #[tokio::main]
