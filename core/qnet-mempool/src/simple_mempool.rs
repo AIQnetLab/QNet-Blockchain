@@ -15,7 +15,7 @@ pub struct SimpleMempoolConfig {
 impl Default for SimpleMempoolConfig {
     fn default() -> Self {
         Self {
-            max_size: 50_000,
+            max_size: 500_000, // Production default: 500k transactions
             min_gas_price: 1,
         }
     }

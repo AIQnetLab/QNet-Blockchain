@@ -7,6 +7,7 @@
 use std::fmt;
 use sha2::{Sha256, Digest};
 use serde::{Serialize, Deserialize};
+use rand::RngCore;
 
 /// File encryption system for protecting data at rest
 /// NOTE: This encrypts only the file storage, not the data content
@@ -252,24 +253,38 @@ impl FileEncryption {
     
     /// Encrypt data using ChaCha20-Poly1305
     fn encrypt_with_chacha20_poly1305(&self, data: &[u8], nonce: &[u8; 12]) -> Result<Vec<u8>, EncryptionError> {
-        // In production, would use actual ChaCha20-Poly1305 implementation
-        // For now, use XOR cipher with key rotation
-        let mut encrypted = Vec::with_capacity(data.len());
+        use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce, aead::{Aead, generic_array::GenericArray}};
         
-        for (i, &byte) in data.iter().enumerate() {
-            let key_index = (i + nonce[i % 12] as usize) % self.master_key.len();
-            let key_byte = self.master_key[key_index];
-            let nonce_byte = nonce[i % 12];
-            encrypted.push(byte ^ key_byte ^ nonce_byte);
-        }
+        // Create cipher instance from master key
+        let key = GenericArray::from_slice(&self.master_key);
+        let cipher = ChaCha20Poly1305::new(key);
         
-        Ok(encrypted)
+        // Convert nonce to GenericArray
+        let nonce_array = Nonce::from_slice(nonce);
+        
+        // Encrypt data
+        let ciphertext = cipher.encrypt(nonce_array, data)
+            .map_err(|e| EncryptionError::CryptoError(format!("ChaCha20-Poly1305 encryption failed: {}", e)))?;
+        
+        Ok(ciphertext)
     }
     
     /// Decrypt data using ChaCha20-Poly1305
     fn decrypt_with_chacha20_poly1305(&self, encrypted_data: &[u8], nonce: &[u8; 12]) -> Result<Vec<u8>, EncryptionError> {
-        // XOR is symmetric, so decryption is the same as encryption
-        self.encrypt_with_chacha20_poly1305(encrypted_data, nonce)
+        use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce, aead::{Aead, generic_array::GenericArray}};
+        
+        // Create cipher instance from master key
+        let key = GenericArray::from_slice(&self.master_key);
+        let cipher = ChaCha20Poly1305::new(key);
+        
+        // Convert nonce to GenericArray
+        let nonce_array = Nonce::from_slice(nonce);
+        
+        // Decrypt data
+        let plaintext = cipher.decrypt(nonce_array, encrypted_data)
+            .map_err(|e| EncryptionError::CryptoError(format!("ChaCha20-Poly1305 decryption failed: {}", e)))?;
+        
+        Ok(plaintext)
     }
     
     /// Convert file type to byte representation

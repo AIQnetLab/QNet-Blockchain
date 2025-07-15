@@ -1,29 +1,33 @@
-//! Rust cryptography implementation for QNet
-//! Production-ready post-quantum and classical cryptography
+// QNet-core crypto module
 
 pub mod production_crypto;
+pub mod utils;
 
-// Re-export all production crypto types and functions
-pub use production_crypto::*;
+use production_crypto::{
+    ProductionCrypto, DilithiumParams, SphincsParams, CryptoErrorWithKind as CryptoError, 
+    CryptoErrorKind, default_dilithium_params, default_sphincs_params
+};
 
-// Utility functions
-pub mod utils {
-    use super::*;
-    
-    /// Create a new keypair with recommended algorithm (Dilithium3)
-    pub fn generate_keypair() -> Result<(PublicKey, SecretKey), CryptoError> {
-        generate_production_keypair(Algorithm::Dilithium3)
-    }
-    
-    /// Sign data with recommended algorithm
-    pub fn sign(data: &[u8], secret_key: &SecretKey) -> Result<Signature, CryptoError> {
-        let signer = ProductionSig::new(secret_key.algorithm())?;
-        signer.sign(data, secret_key)
-    }
-    
-    /// Verify signature with automatic algorithm detection
-    pub fn verify(data: &[u8], signature: &Signature, public_key: &PublicKey) -> Result<bool, CryptoError> {
-        let verifier = ProductionSig::new(signature.algorithm())?;
-        verifier.verify(data, signature, public_key)
-    }
+// Re-export main types for backward compatibility
+pub use production_crypto::{ProductionCrypto, DilithiumParams, SphincsParams, CryptoErrorWithKind as CryptoError, CryptoErrorKind};
+
+// Simplified interface for backward compatibility
+pub fn generate_keypair() -> Result<(Vec<u8>, Vec<u8>), CryptoError> {
+    let crypto = ProductionCrypto::new();
+    let params = default_dilithium_params();
+    crypto.generate_dilithium_keypair(&params)
+}
+
+pub fn sign(data: &[u8], secret_key: &[u8]) -> Result<Vec<u8>, CryptoError> {
+    let crypto = ProductionCrypto::new();
+    let params = default_dilithium_params();
+    let message_hash = crypto.secure_hash(data);
+    crypto.dilithium_sign(&message_hash, secret_key, &params)
+}
+
+pub fn verify(data: &[u8], signature: &[u8], public_key: &[u8]) -> Result<bool, CryptoError> {
+    let crypto = ProductionCrypto::new();
+    let params = default_dilithium_params();
+    let message_hash = crypto.secure_hash(data);
+    crypto.dilithium_verify(signature, &message_hash, public_key, &params)
 }

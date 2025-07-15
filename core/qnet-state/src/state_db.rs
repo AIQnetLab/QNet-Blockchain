@@ -56,8 +56,9 @@ impl StateDB {
     
     /// Execute transaction
     pub async fn execute_transaction(&self, tx: Transaction) -> StateResult<String> {
-        // Simple mock implementation
-        let tx_hash = format!("0x{}", hex::encode(&tx.hash()?));
+        // TODO: Replace with production blockchain integration
+        // This should connect to real QNet blockchain state
+        let tx_hash = format!("qnet{}", hex::encode(&tx.hash()?)[..14]);
         
         if let Some(to) = &tx.to {
             let mut accounts = self.accounts.write().await;
@@ -65,7 +66,7 @@ impl StateDB {
             // Deduct from sender
             let sender = accounts.entry(tx.from.clone()).or_insert_with(|| Account {
                 address: tx.from.clone(),
-                balance: 1000000, // Mock initial balance
+                balance: 1000000, // TODO: Get real balance from blockchain
                 nonce: 0,
                 is_node: false,
                 node_type: None,

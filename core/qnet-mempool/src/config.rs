@@ -33,7 +33,7 @@ impl Default for MempoolConfig {
         let max_size = std::env::var("QNET_MEMPOOL_SIZE")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(200_000); // 200k default for production
+            .unwrap_or(500_000); // 500k default for production (unified)
             
         let max_per_sender = std::env::var("QNET_MAX_PER_SENDER")
             .ok()

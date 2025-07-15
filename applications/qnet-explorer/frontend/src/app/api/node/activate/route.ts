@@ -4,7 +4,7 @@ import { createHash } from 'crypto';
 
 // Configuration
 const DEVNET_RPC = 'https://api.devnet.solana.com';
-const BURN_ADDRESS = '11111111111111111111111111111112'; // Solana burn address
+const BURN_ADDRESS = '1nc1nerator11111111111111111111111111111111'; // Official Solana incinerator address
 const TOKEN_MINT_ADDRESS = process.env.TOKEN_MINT_ADDRESS || 'PLACEHOLDER_TO_BE_CREATED';
 
 const QNET_API_BASE = process.env.QNET_API_BASE || 'http://localhost:8080';

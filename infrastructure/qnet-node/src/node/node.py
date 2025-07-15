@@ -238,7 +238,7 @@ class Node:
             consensus_config = qnet_consensus.ConsensusConfig(
                 commit_duration_ms=60000,
                 reveal_duration_ms=30000,
-                reputation_threshold=50.0,
+                reputation_threshold=0.7,  # FIXED: 0-1 scale (70.0/100.0)
                 participation_weight=0.4,
                 response_time_weight=0.3,
                 block_quality_weight=0.3

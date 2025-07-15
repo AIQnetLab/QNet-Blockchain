@@ -1,182 +1,76 @@
 //! QNet Consensus Module
 //! 
-//! Implements commit-reveal consensus mechanism with reputation-based leader selection
+//! High-performance consensus mechanism for QNet blockchain
+//! with advanced features like dynamic timing, commit-reveal,
+//! and Byzantine fault tolerance.
 
-#![allow(unused_imports)]
-#![allow(unused_variables)]
-#![allow(dead_code)]
-#![allow(missing_docs)]
+// External crates
+extern crate qnet_state;
 
+/// QNet Consensus Implementation
+pub mod lazy_rewards;
+pub mod reward_integration;
+pub mod batch_operations;
 pub mod commit_reveal;
-pub mod reputation;
 pub mod dynamic_timing;
-pub mod leader_selection;
 pub mod errors;
-pub mod types;
-pub mod metrics;
-pub mod fork_choice;
-pub mod fork_resolution;
-pub mod burn_security;
-pub mod fork_manager;
-pub mod kademlia;
 
-#[cfg(feature = "python")]
-pub mod python_bindings;
+// Re-export main types for public API
+pub use lazy_rewards::{PhaseAwareRewardManager, PhaseAwareReward, RewardClaimResult};
+pub use reward_integration::{RewardIntegrationManager, RewardInfo};
+pub use batch_operations::{
+    BatchOperationsManager, BatchRewardClaimRequest, BatchRewardClaimResult,
+    BatchNodeActivationRequest, BatchNodeActivationResult, BatchTransferRequest, BatchTransferResult
+};
+pub use commit_reveal::CommitRevealConsensus;
+pub use errors::ConsensusError;
 
-// Export main types
-pub use types::{NodeInfo, ValidatorInfo, DoubleSignEvidence, Evidence, SlashingResult, RoundState, ConsensusConfig};
+// Common types used across modules
+pub use lazy_rewards::{NodeType, QNetPhase};
 
-// Export consensus engine and related types
-pub use commit_reveal::{CommitRevealConsensus, CommitRevealConfig};
-pub use reputation::{NodeReputation, ReputationSystem, ReputationConfig};
-pub use fork_manager::{ForkManager, ForkEventType};
-pub use fork_choice::{ForkChoice, BlockInfo};
-pub use dynamic_timing::DynamicTiming;
-pub use leader_selection::LeaderSelector;
-pub use burn_security::BurnSecurityValidator;
-pub use metrics::ConsensusMetrics;
-pub use errors::{ConsensusError, ConsensusResult};
-pub use kademlia::{PeerScore, TokenBucket};
+/// Initialize consensus system with batch operations support
+pub fn initialize_consensus_with_batch_operations(
+    genesis_timestamp: u64,
+    dev_burn_percentage: f64,
+    years_since_launch: u64,
+) -> (RewardIntegrationManager, BatchOperationsManager) {
+    // Initialize reward integration for standalone operations
+    let reward_integration = RewardIntegrationManager::new();
+    
+    // Initialize reward integration for batch operations (separate instance)
+    let reward_integration_for_batch = RewardIntegrationManager::new();
+    
+    // Wrap in Arc<Mutex> for batch operations
+    let reward_integration_shared = std::sync::Arc::new(std::sync::Mutex::new(reward_integration_for_batch));
+    
+    // Initialize batch operations manager
+    let batch_manager = BatchOperationsManager::new(reward_integration_shared);
+    
+    (reward_integration, batch_manager)
+}
 
-// Python bindings
-#[cfg(feature = "python")]
-pub use python_bindings::*;
+/// Initialize consensus system (original function for backwards compatibility)
+pub fn initialize_consensus(
+    genesis_timestamp: u64,
+    dev_burn_percentage: f64,
+    years_since_launch: u64,
+) -> RewardIntegrationManager {
+    let (reward_integration, _) = initialize_consensus_with_batch_operations(
+        genesis_timestamp,
+        dev_burn_percentage,
+        years_since_launch,
+    );
+    reward_integration
+}
+
+// Production initialization functions
+pub fn create_production_rewards(genesis_timestamp: u64) -> lazy_rewards::PhaseAwareRewardManager {
+    lazy_rewards::create_production_phase_aware_rewards(genesis_timestamp)
+}
+
+pub fn create_production_reward_integration() -> reward_integration::RewardIntegrationManager {
+    reward_integration::RewardIntegrationManager::new()
+}
 
 // Export types needed by integration
-// OLD: pub use self::commit_reveal::{CommitRevealConsensus as CommitRevealEngine, CommitRevealConfig};
-
-use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
-
-/// Node identifier type
-pub type NodeId = String;
-
-/// Result type for macro consensus
-pub struct MacroConsensusResult {
-    /// Commits from validators
-    pub commits: HashMap<String, Vec<u8>>,
-    /// Reveals from validators
-    pub reveals: HashMap<String, Vec<u8>>,
-    /// Selected leader for next round
-    pub next_leader: String,
-}
-
-/// Consensus engine for QNet
-pub struct ConsensusEngine {
-    node_id: NodeId,
-    authorized_producers: Vec<NodeId>,
-    microblock_interval: u64, // seconds
-}
-
-impl ConsensusEngine {
-    /// Create new consensus engine
-    pub fn new(node_id: NodeId) -> Self {
-        // Read interval from env var, fallback to 1 second (project spec June-2025)
-        let interval = std::env::var("QNET_MICROBLOCK_INTERVAL")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .filter(|v| *v >= 1)
-            .unwrap_or(1);
-
-        Self {
-            node_id: node_id.clone(),
-            authorized_producers: vec![node_id],
-            microblock_interval: interval,
-        }
-    }
-    
-    /// Validate a microblock
-    pub async fn validate_microblock(
-        &self,
-        producer: &NodeId,
-        height: u64,
-        timestamp: u64,
-    ) -> Result<bool, ConsensusError> {
-        println!("[DEBUG] Validating microblock from producer: {:?}", producer);
-        println!("[DEBUG] Height: {}, Timestamp: {}", height, timestamp);
-        
-        // Check timestamp
-        let current_time = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let time_diff = if current_time > timestamp {
-            current_time - timestamp
-        } else {
-            timestamp - current_time
-        };
-        
-        println!("[DEBUG] Current time: {}, Time difference: {} seconds", current_time, time_diff);
-        
-        if time_diff > 10 {
-            println!("[DEBUG] Invalid timestamp: too far from current time");
-            return Ok(false);
-        }
-        
-        // Check if producer is authorized
-        let is_authorized = self.is_authorized_producer(producer).await;
-        println!("[DEBUG] Producer authorization check: {}", is_authorized);
-        
-        if !is_authorized {
-            println!("[DEBUG] Producer not authorized");
-            return Ok(false);
-        }
-        
-        // Check height
-        let expected_height = self.get_expected_height().await;
-        println!("[DEBUG] Expected height: {}, Actual height: {}", expected_height, height);
-        
-        if height > expected_height + 1 {
-            println!("[DEBUG] Invalid height: too far ahead");
-            return Ok(false);
-        }
-        
-        println!("[DEBUG] Microblock validation successful");
-        Ok(true)
-    }
-    
-    /// Check if a producer is authorized to create microblocks
-    async fn is_authorized_producer(&self, producer: &NodeId) -> bool {
-        self.authorized_producers.contains(producer)
-    }
-    
-    /// Get expected microblock height based on current time
-    async fn get_expected_height(&self) -> u64 {
-        let current_time = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        
-        // Calculate expected height based on microblock interval
-        // This is a simple calculation - in production you'd want more sophisticated logic
-        current_time / self.microblock_interval
-    }
-    
-    /// Run macro consensus for finalizing microblocks
-    pub async fn run_macro_consensus(
-        &self,
-        microblock_hashes: Vec<[u8; 32]>,
-        state_root: [u8; 32],
-    ) -> Result<MacroConsensusResult, ConsensusError> {
-        // Create consensus data
-        let mut consensus_data = Vec::new();
-        for hash in &microblock_hashes {
-            consensus_data.extend_from_slice(hash);
-        }
-        consensus_data.extend_from_slice(&state_root);
-        
-        // For now, return simple result
-        // TODO: Implement full commit-reveal consensus
-        let mut commits = HashMap::new();
-        let mut reveals = HashMap::new();
-        
-        commits.insert(self.node_id.clone(), vec![1, 2, 3]);
-        reveals.insert(self.node_id.clone(), vec![4, 5, 6]);
-        
-        Ok(MacroConsensusResult {
-            commits,
-            reveals,
-            next_leader: self.node_id.clone(),
-        })
-    }
-} 
+pub type ConsensusResult<T> = Result<T, ConsensusError>; 

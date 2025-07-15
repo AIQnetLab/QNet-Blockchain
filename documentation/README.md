@@ -82,7 +82,7 @@ Macroblocks: 90 second intervals (90 microblocks)
 
 #### 3. QNC Native Token (Post-Transition)
 **Mechanism**: QNC payment to Pool #3 (no burning, redistributed to all active nodes)  
-**Transition**: At 90% $1DEV burned OR 5 years
+**Transition**: At 90% $1DEV burned OR 5 years from first block creation
 
 ```bash
 # Phase 2: Dynamic QNC pricing based on network size
@@ -245,7 +245,7 @@ let required_balance = match node_type {
 
 **Transition Triggers**:
 - 90% of $1DEV supply burned
-- OR 5 years since network launch
+- OR 5 years from first block creation
 
 ---
 

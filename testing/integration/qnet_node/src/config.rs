@@ -104,16 +104,44 @@ pub struct StorageConfig {
 
 impl Default for NodeConfig {
     fn default() -> Self {
-        Self {
-            data_dir: PathBuf::from("./data"),
-            network: NetworkConfig::default(),
-            consensus: ConsensusConfig::default(),
-            api: ApiConfig::default(),
-            storage: StorageConfig::default(),
-            api_port: default_api_port(),
-            p2p_port: default_p2p_port(),
-            bootnodes: Vec::new(),
-            validator: false,
+        // Get external IP dynamically
+        let listen_addr = match std::process::Command::new("curl")
+            .arg("-s")
+            .arg("--max-time")
+            .arg("3")
+            .arg("https://api.ipify.org")
+            .output()
+        {
+            Ok(output) if output.status.success() => {
+                let ip = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                format!("{}:8080", ip)
+            }
+            _ => "0.0.0.0:8080".to_string(), // Bind to all interfaces
+        };
+        
+        NodeConfig {
+            listen_addr,
+            max_peers: 50,
+            bootstrap_nodes: Vec::new(),
+            data_dir: "data".to_string(),
+            log_level: "info".to_string(),
+            enable_metrics: true,
+            metrics_port: 9090,
+            rpc_port: 8080,
+            p2p_port: 9876,
+            enable_discovery: true,
+            discovery_port: 9877,
+            network_name: "qnet".to_string(),
+            chain_id: 1,
+            genesis_hash: "0x0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+            enable_mining: false,
+            mining_threads: 1,
+            enable_rpc: true,
+            enable_websocket: true,
+            websocket_port: 9944,
+            cors_origins: vec!["*".to_string()],
+            enable_prometheus: true,
+            prometheus_port: 9615,
         }
     }
 }

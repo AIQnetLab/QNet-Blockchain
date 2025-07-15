@@ -10,6 +10,7 @@ import os
 import sys
 from pathlib import Path
 from typing import Optional, Dict, Any
+import time
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -357,6 +358,241 @@ def version():
     """Show QNet CLI version."""
     click.echo("QNet CLI v0.1.0")
     click.echo("QNet Protocol v1.0.0")
+
+
+@cli.group()
+def batch():
+    """Batch operations for efficient processing."""
+    pass
+
+@batch.command()
+@click.option('--node-ids', required=True, help='Comma-separated list of node IDs')
+@click.option('--batch-id', help='Optional batch ID for tracking')
+def claim_rewards(node_ids, batch_id):
+    """Claim rewards for multiple nodes in a single batch."""
+    try:
+        node_id_list = [nid.strip() for nid in node_ids.split(',')]
+        
+        if len(node_id_list) > 50:
+            click.echo("❌ Maximum batch size is 50 nodes", err=True)
+            return
+        
+        if not batch_id:
+            batch_id = f"batch_rewards_{int(time.time())}"
+        
+        click.echo(f"Processing batch reward claims for {len(node_id_list)} nodes...")
+        click.echo(f"Batch ID: {batch_id}")
+        
+        # Make batch request
+        response = requests.post(f"{config.node_url}/api/v1/batch/reward-claims", 
+                               json={
+                                   "node_ids": node_id_list,
+                                   "batch_id": batch_id
+                               }, timeout=30)
+        
+        if response.status_code == 200:
+            data = response.json()
+            successful = data.get('successful_claims', [])
+            failed = data.get('failed_claims', [])
+            total_claimed = data.get('total_claimed', 0)
+            
+            click.echo(f"✅ Batch processing completed!")
+            click.echo(f"   Total claimed: {total_claimed:.3f} QNC")
+            click.echo(f"   Successful: {len(successful)}")
+            click.echo(f"   Failed: {len(failed)}")
+            click.echo(f"   Processing time: {data.get('processing_time_ms', 0)}ms")
+            
+            if failed:
+                click.echo(f"\n❌ Failed claims:")
+                for failure in failed:
+                    click.echo(f"   - {failure['node_id']}: {failure['error']}")
+            
+        else:
+            error_msg = response.json().get('detail', 'Unknown error')
+            click.echo(f"❌ Batch reward claims failed: {error_msg}", err=True)
+            
+    except Exception as e:
+        click.echo(f"Error: {str(e)}", err=True)
+
+@batch.command()
+@click.option('--activation-file', required=True, help='JSON file with activation data')
+@click.option('--batch-id', help='Optional batch ID for tracking')
+def activate_nodes(activation_file, batch_id):
+    """Activate multiple nodes in a single batch."""
+    try:
+        import json
+        
+        # Read activation data from file
+        with open(activation_file, 'r') as f:
+            activation_data = json.load(f)
+        
+        activations = activation_data.get('activations', [])
+        
+        if not activations:
+            click.echo("❌ No activations found in file", err=True)
+            return
+        
+        if len(activations) > 20:
+            click.echo("❌ Maximum batch size is 20 activations", err=True)
+            return
+        
+        if not batch_id:
+            batch_id = f"batch_nodes_{int(time.time())}"
+        
+        click.echo(f"Processing batch node activations for {len(activations)} nodes...")
+        click.echo(f"Batch ID: {batch_id}")
+        
+        # Make batch request
+        response = requests.post(f"{config.node_url}/api/v1/batch/node-activations", 
+                               json={
+                                   "activations": activations,
+                                   "batch_id": batch_id
+                               }, timeout=60)
+        
+        if response.status_code == 200:
+            data = response.json()
+            successful = data.get('successful_activations', [])
+            failed = data.get('failed_activations', [])
+            total_pool3 = data.get('total_pool3_contributions', 0)
+            
+            click.echo(f"✅ Batch processing completed!")
+            click.echo(f"   Total Pool 3 contributions: {total_pool3:.3f} QNC")
+            click.echo(f"   Successful: {len(successful)}")
+            click.echo(f"   Failed: {len(failed)}")
+            click.echo(f"   Processing time: {data.get('processing_time_ms', 0)}ms")
+            
+            if failed:
+                click.echo(f"\n❌ Failed activations:")
+                for failure in failed:
+                    click.echo(f"   - {failure['node_id']}: {failure['error']}")
+            
+        else:
+            error_msg = response.json().get('detail', 'Unknown error')
+            click.echo(f"❌ Batch node activations failed: {error_msg}", err=True)
+            
+    except Exception as e:
+        click.echo(f"Error: {str(e)}", err=True)
+
+@batch.command()
+@click.option('--transfer-file', required=True, help='JSON file with transfer data')
+@click.option('--sender', required=True, help='Sender address')
+@click.option('--batch-id', help='Optional batch ID for tracking')
+def transfer(transfer_file, sender, batch_id):
+    """Process multiple transfers in a single batch."""
+    try:
+        import json
+        
+        # Read transfer data from file
+        with open(transfer_file, 'r') as f:
+            transfer_data = json.load(f)
+        
+        transfers = transfer_data.get('transfers', [])
+        
+        if not transfers:
+            click.echo("❌ No transfers found in file", err=True)
+            return
+        
+        if len(transfers) > 100:
+            click.echo("❌ Maximum batch size is 100 transfers", err=True)
+            return
+        
+        if not batch_id:
+            batch_id = f"batch_transfers_{int(time.time())}"
+        
+        total_amount = sum(t.get('amount', 0) for t in transfers)
+        
+        click.echo(f"Processing batch transfers for {len(transfers)} recipients...")
+        click.echo(f"Batch ID: {batch_id}")
+        click.echo(f"Total amount: {total_amount:.3f} QNC")
+        
+        if not click.confirm("Proceed with batch transfer?"):
+            return
+        
+        # Make batch request
+        response = requests.post(f"{config.node_url}/api/v1/batch/transfers", 
+                               json={
+                                   "transfers": transfers,
+                                   "sender_address": sender,
+                                   "batch_id": batch_id
+                               }, timeout=60)
+        
+        if response.status_code == 200:
+            data = response.json()
+            successful = data.get('successful_transfers', [])
+            failed = data.get('failed_transfers', [])
+            total_transferred = data.get('total_amount_transferred', 0)
+            total_fees = data.get('total_fees_paid', 0)
+            
+            click.echo(f"✅ Batch processing completed!")
+            click.echo(f"   Total transferred: {total_transferred:.3f} QNC")
+            click.echo(f"   Total fees: {total_fees:.3f} QNC")
+            click.echo(f"   Successful: {len(successful)}")
+            click.echo(f"   Failed: {len(failed)}")
+            click.echo(f"   Processing time: {data.get('processing_time_ms', 0)}ms")
+            
+            if failed:
+                click.echo(f"\n❌ Failed transfers:")
+                for failure in failed:
+                    click.echo(f"   - {failure['to_address']}: {failure['error']}")
+            
+        else:
+            error_msg = response.json().get('detail', 'Unknown error')
+            click.echo(f"❌ Batch transfers failed: {error_msg}", err=True)
+            
+    except Exception as e:
+        click.echo(f"Error: {str(e)}", err=True)
+
+@batch.command()
+@click.argument('batch_id')
+def status(batch_id):
+    """Check the status of a batch operation."""
+    try:
+        response = requests.get(f"{config.node_url}/api/v1/batch/status/{batch_id}", timeout=10)
+        
+        if response.status_code == 200:
+            data = response.json()
+            status = data.get('status', 'unknown')
+            
+            click.echo(f"Batch ID: {batch_id}")
+            click.echo(f"Status: {status}")
+            click.echo(f"Created: {data.get('created_at', 'unknown')}")
+            click.echo(f"Completed: {data.get('completed_at', 'not yet')}")
+            click.echo(f"Processing time: {data.get('processing_time_ms', 0)}ms")
+            click.echo(f"Operations: {data.get('operations_count', 0)}")
+            click.echo(f"Successful: {data.get('successful_operations', 0)}")
+            click.echo(f"Failed: {data.get('failed_operations', 0)}")
+            
+        else:
+            error_msg = response.json().get('detail', 'Unknown error')
+            click.echo(f"❌ Failed to get batch status: {error_msg}", err=True)
+            
+    except Exception as e:
+        click.echo(f"Error: {str(e)}", err=True)
+
+@batch.command()
+def metrics():
+    """Show batch processing metrics."""
+    try:
+        response = requests.get(f"{config.node_url}/api/v1/batch/metrics", timeout=10)
+        
+        if response.status_code == 200:
+            data = response.json()
+            
+            click.echo("📊 Batch Processing Metrics:")
+            click.echo(f"   Total batches processed: {data.get('total_batches_processed', 0)}")
+            click.echo(f"   Total reward claims: {data.get('total_reward_claims_processed', 0)}")
+            click.echo(f"   Total node activations: {data.get('total_node_activations_processed', 0)}")
+            click.echo(f"   Total transfers: {data.get('total_transfers_processed', 0)}")
+            click.echo(f"   Average processing time: {data.get('avg_processing_time_ms', 0):.1f}ms")
+            click.echo(f"   Success rate: {data.get('success_rate', 0):.1%}")
+            click.echo(f"   Active batches: {data.get('active_batches', 0)}")
+            
+        else:
+            error_msg = response.json().get('detail', 'Unknown error')
+            click.echo(f"❌ Failed to get batch metrics: {error_msg}", err=True)
+            
+    except Exception as e:
+        click.echo(f"Error: {str(e)}", err=True)
 
 
 if __name__ == '__main__':

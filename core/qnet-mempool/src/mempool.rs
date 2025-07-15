@@ -56,7 +56,7 @@ impl Default for MempoolConfig {
         let max_size = std::env::var("QNET_MEMPOOL_SIZE")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(500_000); // 500k for high throughput
+            .unwrap_or(500_000); // 500k for high throughput (unified)
             
         let max_per_account = std::env::var("QNET_MAX_PER_ACCOUNT")
             .ok()

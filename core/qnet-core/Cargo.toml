@@ -23,9 +23,19 @@ blake3 = "1.5.0"
 sha2 = "0.10.8"
 hex = "0.4.3"
 
-# Post-quantum cryptography
+# Post-quantum cryptography - production ready with latest versions
 pqcrypto = "0.18"
 pqcrypto-dilithium = "0.5"
+pqcrypto-kyber = "0.7"
+pqcrypto-falcon = "0.3"
+pqcrypto-sphincsplus = "0.7"
+pqcrypto-traits = "0.3"
+
+# Additional crypto for production
+sha3 = "0.10"
+aes-gcm = "0.10"
+chacha20poly1305 = "0.10"
+argon2 = "0.5"
 
 # Error handling
 thiserror = "1.0.56"

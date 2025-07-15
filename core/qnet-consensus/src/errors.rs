@@ -1,66 +1,83 @@
 //! Error types for consensus module
 
-use thiserror::Error;
+use std::fmt;
 
 /// Consensus error types
-#[derive(Error, Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ConsensusError {
-    /// Invalid commit format
-    #[error("Invalid commit: {0}")]
+    /// Invalid operation
+    InvalidOperation(String),
+    
+    /// Invalid proof
+    InvalidProof(String),
+    
+    /// Invalid commit
     InvalidCommit(String),
     
-    /// Invalid reveal format
-    #[error("Invalid reveal: {0}")]
+    /// Invalid reveal
     InvalidReveal(String),
     
-    /// Insufficient reveals for consensus
-    #[error("Insufficient reveals: {actual} < {required}")]
-    InsufficientReveals { actual: usize, required: usize },
+    /// Invalid signature
+    InvalidSignature(String),
     
-    /// Round timeout
-    #[error("Round timeout")]
-    RoundTimeout,
-    
-    /// No active round
-    #[error("No active round")]
-    NoActiveRound,
+    /// Invalid node type
+    InvalidNodeType(String),
     
     /// Invalid phase
-    #[error("Invalid phase: {0}")]
     InvalidPhase(String),
     
-    /// Phase timeout
-    #[error("Phase timeout: {0}")]
-    PhaseTimeout(String),
+    /// Storage error
+    StorageError(String),
     
-    /// Insufficient nodes
-    #[error("Insufficient nodes for consensus")]
+    /// Network error
+    NetworkError(String),
+    
+    /// Serialization error
+    SerializationError(String),
+    
+    /// Insufficient nodes for consensus
     InsufficientNodes,
     
+    /// No active consensus round
+    NoActiveRound,
+    
+    /// Phase timeout
+    PhaseTimeout(String),
+    
+    /// No valid reveals
+    NoValidReveals,
+    
     /// Leader selection failed
-    #[error("Leader selection failed")]
     LeaderSelectionFailed,
     
-    /// Reputation too low
-    #[error("Reputation too low: {reputation} < {threshold}")]
-    ReputationTooLow { reputation: f64, threshold: f64 },
-    
-    /// Duplicate commit
-    #[error("Duplicate commit from node: {0}")]
-    DuplicateCommit(String),
-    
-    /// Duplicate reveal
-    #[error("Duplicate reveal from node: {0}")]
-    DuplicateReveal(String),
-    
     /// Double signing detected
-    #[error("Double signing detected from node: {0}")]
     DoubleSigningDetected(String),
-    
-    /// Internal error
-    #[error("Internal error: {0}")]
-    Internal(String),
 }
+
+impl std::fmt::Display for ConsensusError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConsensusError::InvalidOperation(msg) => write!(f, "Invalid operation: {}", msg),
+            ConsensusError::InvalidProof(msg) => write!(f, "Invalid proof: {}", msg),
+            ConsensusError::InvalidCommit(msg) => write!(f, "Invalid commit: {}", msg),
+            ConsensusError::InvalidReveal(msg) => write!(f, "Invalid reveal: {}", msg),
+            ConsensusError::InvalidSignature(msg) => write!(f, "Invalid signature: {}", msg),
+            ConsensusError::InvalidNodeType(msg) => write!(f, "Invalid node type: {}", msg),
+            ConsensusError::InvalidPhase(msg) => write!(f, "Invalid phase: {}", msg),
+            ConsensusError::StorageError(msg) => write!(f, "Storage error: {}", msg),
+            ConsensusError::NetworkError(msg) => write!(f, "Network error: {}", msg),
+            ConsensusError::SerializationError(msg) => write!(f, "Serialization error: {}", msg),
+            ConsensusError::InsufficientNodes => write!(f, "Insufficient nodes for consensus"),
+            ConsensusError::NoActiveRound => write!(f, "No active consensus round"),
+            ConsensusError::PhaseTimeout(msg) => write!(f, "Phase timeout: {}", msg),
+            ConsensusError::NoValidReveals => write!(f, "No valid reveals received"),
+            ConsensusError::LeaderSelectionFailed => write!(f, "Leader selection failed"),
+            ConsensusError::DoubleSigningDetected(msg) => write!(f, "Double signing detected: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for ConsensusError {}
 
 /// Result type for consensus operations
 pub type ConsensusResult<T> = Result<T, ConsensusError>; 

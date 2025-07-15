@@ -6,6 +6,7 @@
 //! QNet Core - Fundamental blockchain components
 
 pub mod crypto;
+pub mod security;
 
 // Re-export main crypto functions
 pub use crypto::{hash, sign, verify, KeyPair, PublicKey, Signature};

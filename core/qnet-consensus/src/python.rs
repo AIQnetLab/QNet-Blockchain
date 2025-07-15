@@ -21,7 +21,7 @@ pub struct PyConsensusConfig {
 #[pymethods]
 impl PyConsensusConfig {
     #[new]
-    #[pyo3(signature = (commit_duration_ms=60000, reveal_duration_ms=30000, reputation_threshold=50.0))]
+    #[pyo3(signature = (commit_duration_ms=60000, reveal_duration_ms=30000, reputation_threshold=0.7))]
     fn new(
         commit_duration_ms: u64,
         reveal_duration_ms: u64,

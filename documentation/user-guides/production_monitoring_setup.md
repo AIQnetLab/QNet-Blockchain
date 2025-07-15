@@ -170,7 +170,7 @@ def collect_qnet_metrics():
     while True:
         try:
             # Get blockchain metrics
-            response = requests.get('http://localhost:8080/api/metrics')
+            response = requests.get('http://localhost:5000/api/metrics')
             if response.status_code == 200:
                 data = response.json()
                 

@@ -12,7 +12,7 @@ class NetworkConfig:
     """Network configuration parameters"""
     name: str = "QNet"
     version: str = "2.0.0"
-    genesis_timestamp: int = 1640995200  # 2022-01-01 00:00:00 UTC
+    genesis_timestamp: int = 0  # Dynamic: set from first block creation, not fixed date
     
     # Block timing (corrected parameters)
     microblock_interval_seconds: int = 1    # 1 second microblocks
@@ -23,6 +23,19 @@ class NetworkConfig:
     target_tps: int = 100_000
     max_block_size: int = 50_000_000  # 50MB
     max_transactions_per_microblock: int = 50_000
+
+    def get_network_launch_timestamp(self) -> int:
+        """Get network launch timestamp from blockchain or current time if not set"""
+        if self.genesis_timestamp == 0:
+            # Network not launched yet, use current time
+            import time
+            return int(time.time())
+        return self.genesis_timestamp
+    
+    def set_network_launch_timestamp(self, timestamp: int):
+        """Set network launch timestamp from genesis block"""
+        if self.genesis_timestamp == 0:  # Only set once
+            self.genesis_timestamp = timestamp
 
 @dataclass 
 class TokenConfig:
@@ -91,8 +104,9 @@ class SolanaConfig:
     rpc_mainnet: str = "https://api.devnet.solana.com"
     rpc_devnet: str = "https://api.devnet.solana.com"
     
-    # $1DEV token details
-    one_dev_mint: str = "1DEVxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"  # Placeholder
+    # $1DEV token details - REAL DEVNET TOKEN
+    one_dev_mint: str = "62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ"
+    mint_authority: str = "6gesV5Dojg9tfH9TRytvXabnQT8U7oMbz5VKpTFi8rG4"
     burn_address: str = "1nc1nerator11111111111111111111111111111111"
     
     # Bridge monitoring

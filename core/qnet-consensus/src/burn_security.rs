@@ -1,11 +1,63 @@
-//! Security mechanisms for burn-to-join consensus model
+//! Security mechanisms for QNet burn-to-join consensus model
+//! Based on real QNet economic model with 1DEV/QNC phases
 
 use std::collections::{HashMap, HashSet};
 
-/// Security validator for burn-to-join model
+/// Block information for security validation
+#[derive(Clone, Debug)]
+pub struct BlockInfo {
+    /// Block height
+    pub height: u64,
+    /// Block hash
+    pub hash: [u8; 32],
+    /// Previous block hash
+    pub prev_hash: [u8; 32],
+    /// Block proposer (node ID)
+    pub proposer: [u8; 32],
+    /// Timestamp
+    pub timestamp: u64,
+    /// Phase 1: 1DEV burned amount, Phase 2: QNC transferred to Pool 3
+    pub activation_cost: u64,
+}
+
+/// Security error types
+#[derive(Debug, Clone)]
+pub enum SecurityError {
+    /// Node not authorized (hasn't burned 1DEV or transferred QNC)
+    NodeNotAuthorized([u8; 32]),
+    /// Insufficient burn/transfer amount
+    InsufficientActivationCost { required: u64, actual: u64 },
+    /// Node is banned
+    NodeBanned([u8; 32]),
+    /// Invalid block
+    InvalidBlock(String),
+    /// Fork detected
+    ForkDetected,
+    /// Other security violation
+    SecurityViolation(String),
+}
+
+impl std::fmt::Display for SecurityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            SecurityError::NodeNotAuthorized(node) => write!(f, "Node not authorized: {:?}", node),
+            SecurityError::InsufficientActivationCost { required, actual } => {
+                write!(f, "Insufficient activation cost: required {}, actual {}", required, actual)
+            }
+            SecurityError::NodeBanned(node) => write!(f, "Node banned: {:?}", node),
+            SecurityError::InvalidBlock(msg) => write!(f, "Invalid block: {}", msg),
+            SecurityError::ForkDetected => write!(f, "Fork detected"),
+            SecurityError::SecurityViolation(msg) => write!(f, "Security violation: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for SecurityError {}
+
+/// Security validator for QNet burn-to-join model
 pub struct BurnSecurityValidator {
-    /// Active nodes (those who burned QNA)
-    active_nodes: HashMap<[u8; 32], NodeBurnInfo>,
+    /// Active nodes (those who burned 1DEV or transferred QNC)
+    active_nodes: HashMap<[u8; 32], NodeActivationInfo>,
     
     /// Banned nodes (caught misbehaving)
     banned_nodes: HashSet<[u8; 32]>,
@@ -14,25 +66,28 @@ pub struct BurnSecurityValidator {
     checkpoints: HashMap<u64, [u8; 32]>,
     
     /// Security parameters
-    params: BurnSecurityParams,
+    params: QNetSecurityParams,
 }
 
 #[derive(Clone, Debug)]
-pub struct NodeBurnInfo {
+pub struct NodeActivationInfo {
     /// Node ID
     pub node_id: [u8; 32],
     
-    /// Amount of QNA burned
-    pub burned_amount: u64,
+    /// Amount used for activation (1DEV burned or QNC transferred)
+    pub activation_amount: u64,
     
-    /// When they joined (burn timestamp)
-    pub joined_at: u64,
+    /// When they activated
+    pub activated_at: u64,
     
     /// Node type (Light/Full/Super)
     pub node_type: NodeType,
     
     /// Current reputation
     pub reputation: f64,
+    
+    /// Which phase they activated in (1 = 1DEV burn, 2 = QNC Pool 3)
+    pub activation_phase: u8,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -42,6 +97,67 @@ pub enum NodeType {
     Super,
 }
 
+impl NodeType {
+    /// Get Phase 1 activation cost (1DEV burn) - REAL QNet model
+    pub fn get_phase1_cost(&self, burn_percentage: f64) -> u64 {
+        // REAL QNet economic model: Universal pricing for ALL node types
+        let base_cost = 1500u64; // 1500 1DEV for all node types
+        let min_cost = 150u64;   // 150 1DEV minimum at 90% burned
+        
+        // Every 10% burned = -150 1DEV reduction
+        let reduction_per_10_percent = 150u64;
+        let reduction_tiers = (burn_percentage / 10.0).floor() as u64;
+        let total_reduction = reduction_tiers * reduction_per_10_percent;
+        
+        // Calculate final cost
+        let final_cost = base_cost.saturating_sub(total_reduction);
+        final_cost.max(min_cost)
+    }
+    
+    /// Get Phase 2 activation cost (QNC Pool 3 transfer) - REAL QNet model
+    pub fn get_phase2_cost(&self, network_size: u64) -> u64 {
+        // REAL QNet economic model: Different base costs per node type
+        let base_cost = match self {
+            NodeType::Light => 5000u64,  // 5,000 QNC
+            NodeType::Full => 7500u64,   // 7,500 QNC
+            NodeType::Super => 10000u64, // 10,000 QNC
+        };
+        
+        // Network size multipliers - REAL QNet model
+        let multiplier = match network_size {
+            0..=100_000 => 0.5,      // Early discount
+            100_001..=1_000_000 => 1.0, // Standard rate
+            1_000_001..=10_000_000 => 2.0, // High demand
+            _ => 3.0,                // Mature network (10M+)
+        };
+        
+        (base_cost as f64 * multiplier) as u64
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct QNetSecurityParams {
+    /// Phase 1: Total 1DEV supply (1 billion tokens)
+    pub onedev_total_supply: u64,
+    /// Phase 1: Transition threshold (90% burned)
+    pub phase1_transition_threshold: f64,
+    /// Phase 2: Reputation threshold for banning (unified: 10.0)
+    pub ban_threshold: f64,
+    /// Time window for reputation calculation
+    pub reputation_window: u64,
+}
+
+impl Default for QNetSecurityParams {
+    fn default() -> Self {
+        Self {
+            onedev_total_supply: 1_000_000_000, // 1 billion 1DEV (real QNet supply)
+            phase1_transition_threshold: 0.9,    // 90% burned triggers Phase 2
+            ban_threshold: 10.0,                 // 0-100 scale ban threshold
+            reputation_window: 86400,            // 24 hours
+        }
+    }
+}
+
 impl BurnSecurityValidator {
     /// Create new validator
     pub fn new() -> Self {
@@ -49,273 +165,197 @@ impl BurnSecurityValidator {
             active_nodes: HashMap::new(),
             banned_nodes: HashSet::new(),
             checkpoints: HashMap::new(),
-            params: BurnSecurityParams::default(),
+            params: QNetSecurityParams::default(),
         }
     }
     
-    /// Validate chain in burn-to-join model
+    /// Validate chain in QNet burn-to-join model
     pub fn validate_chain(&self, chain: &[BlockInfo]) -> Result<(), SecurityError> {
-        // 1. Check all block producers have burned QNA
+        // 1. Check all block producers are properly activated
         for block in chain {
             if !self.active_nodes.contains_key(&block.proposer) {
-                return Err(SecurityError::UnauthorizedProducer(block.proposer));
+                return Err(SecurityError::NodeNotAuthorized(block.proposer));
             }
             
-            // Check if banned
+            // 2. Check if node is banned
             if self.banned_nodes.contains(&block.proposer) {
-                return Err(SecurityError::BannedNode(block.proposer));
+                return Err(SecurityError::NodeBanned(block.proposer));
             }
-        }
-        
-        // 2. Verify minimum active nodes threshold
-        let unique_producers: HashSet<_> = chain.iter()
-            .map(|b| b.proposer)
-            .collect();
-        
-        if unique_producers.len() < self.params.min_active_nodes {
-            return Err(SecurityError::InsufficientActiveNodes {
-                found: unique_producers.len(),
-                required: self.params.min_active_nodes,
-            });
-        }
-        
-        // 3. Check node diversity (prevent single entity control)
-        let diversity_score = self.calculate_diversity_score(&unique_producers);
-        if diversity_score < self.params.min_diversity_score {
-            return Err(SecurityError::InsufficientDiversity(diversity_score));
-        }
-        
-        // 4. Verify checkpoints
-        for block in chain {
-            if let Some(checkpoint) = self.checkpoints.get(&block.height) {
-                if &block.hash != checkpoint {
-                    return Err(SecurityError::CheckpointMismatch);
+            
+            // 3. Check activation cost requirements
+            if let Some(node_info) = self.active_nodes.get(&block.proposer) {
+                if node_info.activation_amount < block.activation_cost {
+                    return Err(SecurityError::InsufficientActivationCost {
+                        required: block.activation_cost,
+                        actual: node_info.activation_amount,
+                    });
                 }
             }
-        }
-        
-        // 5. Check reorganization depth
-        if chain.len() > self.params.max_reorg_depth {
-            return Err(SecurityError::DeepReorganization(chain.len()));
         }
         
         Ok(())
     }
     
-    /// Calculate diversity score based on burn amounts and join times
-    fn calculate_diversity_score(&self, producers: &HashSet<[u8; 32]>) -> f64 {
-        if producers.is_empty() {
-            return 0.0;
+    /// Add node after successful Phase 1 activation (1DEV burn)
+    pub fn add_phase1_node(&mut self, node_id: [u8; 32], burned_amount: u64, node_type: NodeType, burn_percentage: f64) -> Result<(), SecurityError> {
+        let required_cost = node_type.get_phase1_cost(burn_percentage);
+        
+        if burned_amount < required_cost {
+            return Err(SecurityError::InsufficientActivationCost {
+                required: required_cost,
+                actual: burned_amount,
+            });
         }
         
-        let mut burn_amounts = Vec::new();
-        let mut join_times = Vec::new();
-        
-        for &producer in producers {
-            if let Some(info) = self.active_nodes.get(&producer) {
-                burn_amounts.push(info.burned_amount as f64);
-                join_times.push(info.joined_at as f64);
-            }
-        }
-        
-        // Calculate variance in burn amounts (higher = more diverse)
-        let burn_variance = calculate_variance(&burn_amounts);
-        
-        // Calculate spread in join times (higher = more diverse)
-        let time_spread = if join_times.is_empty() {
-            0.0
-        } else {
-            let max_time = join_times.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
-            let min_time = join_times.iter().fold(f64::INFINITY, |a, &b| a.min(b));
-            max_time - min_time
+        let node_info = NodeActivationInfo {
+            node_id,
+            activation_amount: burned_amount,
+            activated_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            node_type,
+            reputation: 100.0, // Start with max reputation
+            activation_phase: 1, // Phase 1 activation
         };
         
-        // Combined diversity score
-        (burn_variance.sqrt() / 1000.0).min(1.0) * 0.5 + 
-        (time_spread / (365.0 * 24.0 * 3600.0)).min(1.0) * 0.5
+        self.active_nodes.insert(node_id, node_info);
+        Ok(())
     }
     
-    /// Check if node can produce blocks
-    pub fn can_produce_blocks(&self, node_id: &[u8; 32]) -> bool {
-        if let Some(info) = self.active_nodes.get(node_id) {
-            // Must be Full or Super node
-            info.node_type != NodeType::Light &&
-            // Must have good reputation
-            info.reputation > self.params.min_reputation &&
-            // Must not be banned
-            !self.banned_nodes.contains(node_id)
-        } else {
-            false
-        }
-    }
-    
-    /// Ban node for misbehavior
-    pub fn ban_node(&mut self, node_id: [u8; 32], reason: BanReason) {
-        tracing::warn!("Banning node {:?} for {:?}", node_id, reason);
+    /// Add node after successful Phase 2 activation (QNC Pool 3 transfer)
+    pub fn add_phase2_node(&mut self, node_id: [u8; 32], transferred_amount: u64, node_type: NodeType, network_size: u64) -> Result<(), SecurityError> {
+        let required_cost = node_type.get_phase2_cost(network_size);
         
+        if transferred_amount < required_cost {
+            return Err(SecurityError::InsufficientActivationCost {
+                required: required_cost,
+                actual: transferred_amount,
+            });
+        }
+        
+        let node_info = NodeActivationInfo {
+            node_id,
+            activation_amount: transferred_amount,
+            activated_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            node_type,
+            reputation: 100.0, // Start with max reputation
+            activation_phase: 2, // Phase 2 activation
+        };
+        
+        self.active_nodes.insert(node_id, node_info);
+        Ok(())
+    }
+    
+    /// Ban a node for misbehavior
+    pub fn ban_node(&mut self, node_id: [u8; 32]) {
         self.banned_nodes.insert(node_id);
-        
-        // Set reputation to 0
-        if let Some(info) = self.active_nodes.get_mut(&node_id) {
-            info.reputation = 0.0;
+        self.active_nodes.remove(&node_id);
+    }
+    
+    /// Check if node is authorized
+    pub fn is_authorized(&self, node_id: &[u8; 32]) -> bool {
+        self.active_nodes.contains_key(node_id) && !self.banned_nodes.contains(node_id)
+    }
+    
+    /// Update node reputation
+    pub fn update_reputation(&mut self, node_id: &[u8; 32], reputation: f64) {
+        if let Some(node_info) = self.active_nodes.get_mut(node_id) {
+            node_info.reputation = reputation;
+            
+            // Ban if reputation too low (unified threshold: 10.0)
+            if reputation < self.params.ban_threshold {
+                self.ban_node(*node_id);
+            }
         }
+    }
+    
+    /// Get node info
+    pub fn get_node_info(&self, node_id: &[u8; 32]) -> Option<&NodeActivationInfo> {
+        self.active_nodes.get(node_id)
+    }
+    
+    /// Get all active nodes
+    pub fn get_active_nodes(&self) -> Vec<&NodeActivationInfo> {
+        self.active_nodes.values().collect()
+    }
+    
+    /// Check if we should transition to Phase 2
+    pub fn should_transition_to_phase2(&self, total_burned: u64, years_since_launch: f64) -> bool {
+        let burn_percentage = (total_burned as f64) / (self.params.onedev_total_supply as f64);
+        burn_percentage >= self.params.phase1_transition_threshold || years_since_launch >= 5.0
     }
 }
 
-/// Fork resolution for burn-to-join model
+/// Fork resolution for QNet burn-to-join model
 pub struct BurnForkResolution {
     /// Security validator
     security: BurnSecurityValidator,
-    
-    /// Fork choice (reusing existing)
-    fork_choice: crate::fork_choice::ForkChoice,
 }
 
 impl BurnForkResolution {
-    /// Resolve forks using burn-based security
+    /// Create new fork resolution system
+    pub fn new() -> Self {
+        Self {
+            security: BurnSecurityValidator::new(),
+        }
+    }
+    
+    /// Resolve fork between two chains
     pub fn resolve_fork(
-        &mut self,
+        &self,
         chain_a: &[BlockInfo],
         chain_b: &[BlockInfo],
-    ) -> Result<ForkDecision, SecurityError> {
-        // Validate both chains
+    ) -> Result<Vec<BlockInfo>, SecurityError> {
+        // 1. Validate both chains
         self.security.validate_chain(chain_a)?;
         self.security.validate_chain(chain_b)?;
         
-        // Calculate chain scores based on burn model
-        let score_a = self.calculate_burn_chain_score(chain_a)?;
-        let score_b = self.calculate_burn_chain_score(chain_b)?;
+        // 2. Calculate chain scores based on QNet economic model
+        let score_a = self.calculate_qnet_chain_score(chain_a)?;
+        let score_b = self.calculate_qnet_chain_score(chain_b)?;
         
-        tracing::info!("Fork resolution: Chain A score={}, Chain B score={}", score_a, score_b);
-        
-        if score_a > score_b {
-            Ok(ForkDecision::ChooseA)
-        } else if score_b > score_a {
-            Ok(ForkDecision::ChooseB)
+        // 3. Choose chain with higher score
+        if score_a >= score_b {
+            Ok(chain_a.to_vec())
         } else {
-            // Tie breaker: choose chain with more unique producers
-            let producers_a: HashSet<_> = chain_a.iter().map(|b| b.proposer).collect();
-            let producers_b: HashSet<_> = chain_b.iter().map(|b| b.proposer).collect();
-            
-            if producers_a.len() >= producers_b.len() {
-                Ok(ForkDecision::ChooseA)
-            } else {
-                Ok(ForkDecision::ChooseB)
-            }
+            Ok(chain_b.to_vec())
         }
     }
     
-    /// Calculate chain score in burn model
-    fn calculate_burn_chain_score(&self, chain: &[BlockInfo]) -> Result<f64, SecurityError> {
-        let mut score = 0.0;
-        let mut seen_producers = HashSet::new();
+    /// Calculate chain score based on QNet economic model
+    fn calculate_qnet_chain_score(&self, chain: &[BlockInfo]) -> Result<f64, SecurityError> {
+        let mut total_score = 0.0;
         
         for block in chain {
-            if let Some(node_info) = self.security.active_nodes.get(&block.proposer) {
-                // Base score from burn amount (logarithmic to prevent whale dominance)
-                let burn_score = (node_info.burned_amount as f64).ln();
+            if let Some(node_info) = self.security.get_node_info(&block.proposer) {
+                // Score based on activation amount and reputation
+                let activation_score = node_info.activation_amount as f64;
+                let reputation_score = node_info.reputation;
                 
-                // Reputation multiplier
-                let reputation_mult = node_info.reputation;
+                // Phase 2 nodes get bonus (they contributed to Pool 3)
+                let phase_bonus = if node_info.activation_phase == 2 { 1.2 } else { 1.0 };
                 
-                // Node type bonus
-                let type_bonus = match node_info.node_type {
-                    NodeType::Super => 1.5,
-                    NodeType::Full => 1.0,
-                    NodeType::Light => 0.5,
-                };
-                
-                // Diversity bonus (first time seeing this producer)
-                let diversity_bonus = if seen_producers.insert(block.proposer) {
-                    1.2
-                } else {
-                    1.0
-                };
-                
-                score += burn_score * reputation_mult * type_bonus * diversity_bonus;
+                total_score += activation_score * (reputation_score / 100.0) * phase_bonus;
             }
         }
         
-        // Length bonus (longer chains are preferred)
-        score += (chain.len() as f64).sqrt() * 10.0;
-        
-        Ok(score)
+        Ok(total_score)
     }
 }
-
-#[derive(Debug)]
-pub enum ForkDecision {
-    ChooseA,
-    ChooseB,
-}
-
-#[derive(Debug)]
-pub enum BanReason {
-    DoubleSign,
-    InvalidBlock,
-    Censorship,
-    Downtime,
-}
-
-/// Security parameters for burn model
-pub struct BurnSecurityParams {
-    /// Minimum active nodes required
-    pub min_active_nodes: usize,
-    
-    /// Minimum diversity score (0-1)
-    pub min_diversity_score: f64,
-    
-    /// Maximum reorg depth
-    pub max_reorg_depth: usize,
-    
-    /// Minimum reputation to produce blocks
-    pub min_reputation: f64,
-}
-
-impl Default for BurnSecurityParams {
-    fn default() -> Self {
-        Self {
-            min_active_nodes: 10,
-            min_diversity_score: 0.3,
-            max_reorg_depth: 100,
-            min_reputation: 50.0,  // FIXED: 0-100 scale
-        }
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum SecurityError {
-    #[error("Unauthorized block producer: {:?}", .0)]
-    UnauthorizedProducer([u8; 32]),
-    
-    #[error("Block from banned node: {:?}", .0)]
-    BannedNode([u8; 32]),
-    
-    #[error("Insufficient active nodes: found {found}, required {required}")]
-    InsufficientActiveNodes { found: usize, required: usize },
-    
-    #[error("Insufficient network diversity: {0}")]
-    InsufficientDiversity(f64),
-    
-    #[error("Checkpoint mismatch")]
-    CheckpointMismatch,
-    
-    #[error("Deep reorganization: {0} blocks")]
-    DeepReorganization(usize),
-}
-
-// Re-use BlockInfo from fork_choice
-use crate::fork_choice::BlockInfo;
 
 fn calculate_variance(values: &[f64]) -> f64 {
-    if values.is_empty() {
+    if values.len() < 2 {
         return 0.0;
     }
     
     let mean = values.iter().sum::<f64>() / values.len() as f64;
     let variance = values.iter()
-        .map(|v| (v - mean).powi(2))
+        .map(|x| (x - mean).powi(2))
         .sum::<f64>() / values.len() as f64;
-    
+        
     variance
 } 

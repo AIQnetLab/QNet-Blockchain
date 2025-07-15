@@ -30,9 +30,23 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Self {
-            host: "127.0.0.1".to_string(),
-            port: 8080,
+        // Get external IP dynamically
+        let host = match std::process::Command::new("curl")
+            .arg("-s")
+            .arg("--max-time")
+            .arg("3")
+            .arg("https://api.ipify.org")
+            .output()
+        {
+            Ok(output) if output.status.success() => {
+                String::from_utf8_lossy(&output.stdout).trim().to_string()
+            }
+            _ => "0.0.0.0".to_string(), // Bind to all interfaces
+        };
+        
+        Config {
+            host,
+            port: 5000,
             network_id: "qnet-mainnet".to_string(),
             state_db_path: "./data/state".to_string(),
             enable_websocket: true,

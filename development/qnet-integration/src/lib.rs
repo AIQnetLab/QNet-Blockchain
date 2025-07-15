@@ -9,7 +9,6 @@
 pub mod errors;
 pub mod storage;
 pub mod validator;
-pub mod network;
 pub mod unified_p2p;
 pub mod node;
 pub mod rpc;
@@ -31,8 +30,8 @@ pub use qnet_sharding::{ShardCoordinator, ParallelValidator};
 pub use errors::{IntegrationError, IntegrationResult};
 pub use storage::PersistentStorage;
 pub use validator::BlockValidator;
-pub use network::{NetworkInterface, NetworkEvent, NetworkMessage};
 pub use node::{BlockchainNode, NodeType, Region};
+pub use unified_p2p::SimplifiedP2P;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -52,9 +51,6 @@ pub struct QNetBlockchain {
     
     /// Validator
     validator: Arc<validator::BlockValidator>,
-    
-    /// Network interface
-    network: Option<Arc<RwLock<NetworkInterface>>>,
     
     /// Node running flag
     running: Arc<AtomicBool>,
@@ -77,9 +73,12 @@ impl QNetBlockchain {
         // Initialize state manager
         let state_manager = Arc::new(RwLock::new(StateManager::new()));
         
-        // Initialize mempool
+        // Initialize mempool with production settings
         let mempool_config = qnet_mempool::SimpleMempoolConfig {
-            max_size: 10000,
+            max_size: std::env::var("QNET_MEMPOOL_SIZE")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(500_000), // Production default: 500k
             min_gas_price: 1,
         };
         
@@ -92,12 +91,6 @@ impl QNetBlockchain {
         // Initialize validator
         let validator = Arc::new(validator::BlockValidator::new());
         
-        // Initialize network
-        let (network, network_handle) = network::start_p2p_network(
-            9876,
-            vec![]
-        ).await.map_err(|e| IntegrationError::NetworkError(e.to_string()))?;
-        
         // Initialize sharding
         let shard_coordinator = Some(Arc::new(ShardCoordinator::new()));
         let parallel_validator = Some(Arc::new(ParallelValidator::new(4)));
@@ -108,7 +101,6 @@ impl QNetBlockchain {
             mempool,
             consensus,
             validator,
-            network: Some(Arc::new(RwLock::new(network))),
             running: Arc::new(AtomicBool::new(false)),
             shard_coordinator,
             parallel_validator,
@@ -307,7 +299,7 @@ pub mod feature_flags {
         pub enable_parallel_validation: bool,
         pub shard_count: u32,
         pub batch_size: usize,
-        pub microblock_interval: u64,
+        pub microblock_interval: std::time::Duration,
     }
     
     impl Default for PerformanceConfig {
@@ -317,7 +309,7 @@ pub mod feature_flags {
                 enable_parallel_validation: true,
                 shard_count: 100,
                 batch_size: 1000,
-                microblock_interval: 1,
+                microblock_interval: std::time::Duration::from_secs(1),
             }
         }
     }

@@ -15,7 +15,7 @@ from datetime import datetime
 from contextlib import asynccontextmanager
 
 # FastAPI and dependencies
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Depends, status
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Depends, status, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, validator
@@ -45,7 +45,7 @@ class TransactionRequest(BaseModel):
     to_address: str = Field(..., description="Recipient address")
     amount: float = Field(..., gt=0, description="Amount to transfer")
     gas_price: Optional[int] = Field(None, ge=1, description="Gas price in Gwei")
-    gas_limit: Optional[int] = Field(None, ge=21000, description="Gas limit")
+    gas_limit: Optional[int] = Field(None, ge=10000, description="Gas limit")
     memo: Optional[str] = Field(None, max_length=256, description="Transaction memo")
     
     @validator('from_address', 'to_address')
@@ -234,7 +234,7 @@ async def submit_transaction(tx_request: TransactionRequest):
             int(tx_request.amount * 1e9),  # Convert to smallest unit
             0,  # Nonce will be set by mempool
             tx_request.gas_price or 10,
-            tx_request.gas_limit or 21000
+            tx_request.gas_limit or 10000
         )
         
         # Add to mempool
@@ -243,7 +243,7 @@ async def submit_transaction(tx_request: TransactionRequest):
             "to": tx_request.to_address,
             "amount": tx_request.amount,
             "gas_price": tx_request.gas_price or 10,
-            "gas_limit": tx_request.gas_limit or 21000,
+            "gas_limit": tx_request.gas_limit or 10000,
             "memo": tx_request.memo
         })
         
@@ -347,7 +347,7 @@ async def estimate_gas(request: GasEstimateRequest):
     """Estimate gas for a transaction."""
     try:
         # Basic estimation logic
-        gas_limit = 21000  # Base transfer cost
+        gas_limit = 10000  # QNet optimized transfer cost
         
         if request.data:
             # Add gas for data
@@ -593,7 +593,7 @@ def main():
     
     parser = argparse.ArgumentParser(description="QNet API Server with Rust Backend")
     parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")
-    parser.add_argument("--port", type=int, default=8080, help="Port to bind to")
+    parser.add_argument("--port", type=int, default=5000, help="Port to bind to")
     parser.add_argument("--workers", type=int, default=4, help="Number of workers")
     parser.add_argument("--data-dir", default="./data", help="Data directory")
     parser.add_argument("--reload", action="store_true", help="Enable auto-reload")
@@ -616,3 +616,302 @@ def main():
 
 if __name__ == "__main__":
     main() 
+
+@app.get("/api/v1/mobile/gas-recommendations")
+async def get_mobile_gas_recommendations():
+    """Get mobile-optimized gas price recommendations with dynamic pricing."""
+    try:
+        # Get current mempool size and block utilization
+        mempool_size = api_state.mempool.size()
+        block_utilization = 0.5  # Mock value - in production, calculate from recent blocks
+        
+        # Update dynamic pricing
+        from qnet_state.transaction import update_network_load, get_mobile_gas_recommendations
+        update_network_load(mempool_size, block_utilization)
+        
+        # Get recommendations
+        recommendations = get_mobile_gas_recommendations()
+        
+        return {
+            "success": True,
+            "recommendations": {
+                "eco": {
+                    "gas_price": recommendations.eco.to_qnc(),
+                    "display_name": "Eco",
+                    "description": "Slowest, cheapest option",
+                    "estimated_time": format_confirmation_time(recommendations.estimated_confirmation_time),
+                    "icon": "🌱"
+                },
+                "standard": {
+                    "gas_price": recommendations.standard.to_qnc(),
+                    "display_name": "Standard",
+                    "description": "Normal speed and price",
+                    "estimated_time": format_confirmation_time(recommendations.estimated_confirmation_time),
+                    "icon": "⚡"
+                },
+                "fast": {
+                    "gas_price": recommendations.fast.to_qnc(),
+                    "display_name": "Fast",
+                    "description": "Faster confirmation",
+                    "estimated_time": format_confirmation_time(recommendations.estimated_confirmation_time),
+                    "icon": "🚀"
+                },
+                "priority": {
+                    "gas_price": recommendations.priority.to_qnc(),
+                    "display_name": "Priority",
+                    "description": "Fastest, highest priority",
+                    "estimated_time": format_confirmation_time(recommendations.estimated_confirmation_time),
+                    "icon": "⚡🔥"
+                }
+            },
+            "network_status": {
+                "load": format_network_load(recommendations.network_load),
+                "mempool_size": mempool_size,
+                "block_utilization": block_utilization
+            },
+            "mobile_optimized": True
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting mobile gas recommendations: {e}")
+        # Fallback to static recommendations
+        return {
+            "success": True,
+            "recommendations": {
+                "eco": {
+                    "gas_price": 0.0001,
+                    "display_name": "Eco",
+                    "description": "Slowest, cheapest option",
+                    "estimated_time": "1-2 seconds",
+                    "icon": "🌱"
+                },
+                "standard": {
+                    "gas_price": 0.0002,
+                    "display_name": "Standard",
+                    "description": "Normal speed and price",
+                    "estimated_time": "1-2 seconds",
+                    "icon": "⚡"
+                },
+                "fast": {
+                    "gas_price": 0.0005,
+                    "display_name": "Fast",
+                    "description": "Faster confirmation",
+                    "estimated_time": "1-2 seconds",
+                    "icon": "🚀"
+                },
+                "priority": {
+                    "gas_price": 0.001,
+                    "display_name": "Priority",
+                    "description": "Fastest, highest priority",
+                    "estimated_time": "1-2 seconds",
+                    "icon": "⚡🔥"
+                }
+            },
+            "network_status": {
+                "load": "Normal",
+                "mempool_size": 0,
+                "block_utilization": 0.5
+            },
+            "mobile_optimized": True
+        }
+
+@app.post("/api/v1/mobile/estimate-transaction-cost")
+async def estimate_mobile_transaction_cost(request: Request):
+    """Estimate transaction cost for mobile wallets with detailed breakdown."""
+    try:
+        data = await request.json()
+        transaction_type = data.get('type', 'transfer')
+        gas_tier = data.get('gas_tier', 'standard')
+        
+        # Get gas limits based on transaction type
+        from qnet_state.transaction import gas_limits
+        gas_limit = {
+            'transfer': gas_limits.TRANSFER,
+            'batch_transfer': gas_limits.BATCH_OPERATION,
+            'reward_claim': gas_limits.REWARD_CLAIM,
+            'batch_reward_claim': gas_limits.BATCH_OPERATION,
+            'node_activation': gas_limits.NODE_ACTIVATION,
+            'batch_node_activation': gas_limits.BATCH_OPERATION,
+            'contract_call': gas_limits.CONTRACT_CALL,
+            'contract_deploy': gas_limits.CONTRACT_DEPLOY,
+            'ping': gas_limits.PING,
+        }.get(transaction_type, gas_limits.TRANSFER)
+        
+        # Get dynamic gas price
+        from qnet_state.transaction import get_mobile_gas_recommendations
+        recommendations = get_mobile_gas_recommendations()
+        
+        gas_price = {
+            'eco': recommendations.eco,
+            'standard': recommendations.standard,
+            'fast': recommendations.fast,
+            'priority': recommendations.priority,
+        }.get(gas_tier, recommendations.standard)
+        
+        # Calculate costs
+        gas_cost = gas_price.to_qnc() * gas_limit
+        
+        # Add transaction amount if provided
+        amount = data.get('amount', 0)
+        total_cost = gas_cost + amount
+        
+        return {
+            "success": True,
+            "estimate": {
+                "transaction_amount": amount,
+                "gas_fee": gas_cost,
+                "total_cost": total_cost,
+                "gas_price": gas_price.to_qnc(),
+                "gas_limit": gas_limit,
+                "gas_tier": gas_tier,
+                "transaction_type": transaction_type,
+                "currency": "QNC"
+            },
+            "breakdown": {
+                "base_fee": gas_cost * 0.7,  # 70% base fee
+                "priority_fee": gas_cost * 0.3,  # 30% priority fee
+                "estimated_confirmation": format_confirmation_time(recommendations.estimated_confirmation_time),
+                "savings_vs_priority": (recommendations.priority.to_qnc() - gas_price.to_qnc()) * gas_limit if gas_tier != 'priority' else 0
+            },
+            "mobile_optimized": True
+        }
+        
+    except Exception as e:
+        logger.error(f"Error estimating mobile transaction cost: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/v1/mobile/network-status")
+async def get_mobile_network_status():
+    """Get mobile-friendly network status information."""
+    try:
+        mempool_size = api_state.mempool.size()
+        
+        # Get current recommendations for network load
+        from qnet_state.transaction import get_mobile_gas_recommendations
+        recommendations = get_mobile_gas_recommendations()
+        
+        # Calculate network health metrics
+        network_health = "🟢 Healthy"
+        if mempool_size > 2000:
+            network_health = "🔴 Congested"
+        elif mempool_size > 1000:
+            network_health = "🟡 Busy"
+        elif mempool_size > 500:
+            network_health = "🟠 Active"
+        
+        return {
+            "success": True,
+            "network": {
+                "health": network_health,
+                "load": format_network_load(recommendations.network_load),
+                "mempool_size": mempool_size,
+                "average_confirmation_time": format_confirmation_time(recommendations.estimated_confirmation_time),
+                "recommended_gas_tier": "eco" if mempool_size < 100 else "standard" if mempool_size < 500 else "fast",
+                "congestion_level": min(100, (mempool_size / 20))  # Percentage out of 100
+            },
+            "mobile_tips": [
+                "Use Eco tier during low network activity for maximum savings",
+                "Batch multiple operations together to save on fees",
+                "Ping responses are always free - no gas required",
+                "Set transaction deadlines to avoid stuck transactions"
+            ] if mempool_size < 500 else [
+                "Network is busy - consider using Fast tier for quicker confirmation",
+                "Batch operations are especially cost-effective during high congestion",
+                "Consider waiting for lower congestion if transaction is not urgent"
+            ],
+            "mobile_optimized": True
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting mobile network status: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/v1/mobile/batch-estimate")
+async def estimate_mobile_batch_cost(request: Request):
+    """Estimate cost for batch operations optimized for mobile wallets."""
+    try:
+        data = await request.json()
+        operations = data.get('operations', [])
+        gas_tier = data.get('gas_tier', 'standard')
+        
+        if not operations:
+            raise HTTPException(status_code=400, detail="No operations provided")
+        
+        # Get gas recommendations
+        from qnet_state.transaction import get_mobile_gas_recommendations, gas_limits
+        recommendations = get_mobile_gas_recommendations()
+        
+        gas_price = {
+            'eco': recommendations.eco,
+            'standard': recommendations.standard,
+            'fast': recommendations.fast,
+            'priority': recommendations.priority,
+        }.get(gas_tier, recommendations.standard)
+        
+        # Calculate individual vs batch costs
+        individual_cost = 0
+        individual_gas = 0
+        
+        for op in operations:
+            op_type = op.get('type', 'transfer')
+            gas_limit = {
+                'transfer': gas_limits.TRANSFER,
+                'reward_claim': gas_limits.REWARD_CLAIM,
+                'node_activation': gas_limits.NODE_ACTIVATION,
+            }.get(op_type, gas_limits.TRANSFER)
+            
+            individual_gas += gas_limit
+            individual_cost += gas_price.to_qnc() * gas_limit
+        
+        # Batch cost (more efficient)
+        batch_gas = gas_limits.BATCH_OPERATION + (len(operations) * 1000)  # Base + per-operation overhead
+        batch_cost = gas_price.to_qnc() * batch_gas
+        
+        # Calculate savings
+        savings = individual_cost - batch_cost
+        savings_percentage = (savings / individual_cost * 100) if individual_cost > 0 else 0
+        
+        return {
+            "success": True,
+            "estimate": {
+                "individual_cost": individual_cost,
+                "individual_gas": individual_gas,
+                "batch_cost": batch_cost,
+                "batch_gas": batch_gas,
+                "savings": savings,
+                "savings_percentage": savings_percentage,
+                "operations_count": len(operations),
+                "gas_tier": gas_tier,
+                "currency": "QNC"
+            },
+            "recommendation": {
+                "use_batch": savings > 0,
+                "savings_reason": f"Save {savings:.6f} QNC ({savings_percentage:.1f}%) by batching {len(operations)} operations",
+                "estimated_confirmation": format_confirmation_time(recommendations.estimated_confirmation_time)
+            },
+            "mobile_optimized": True
+        }
+        
+    except Exception as e:
+        logger.error(f"Error estimating mobile batch cost: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+def format_confirmation_time(time_enum):
+    """Format confirmation time for mobile display."""
+    if hasattr(time_enum, 'Seconds'):
+        return f"{time_enum.Seconds} seconds"
+    elif hasattr(time_enum, 'Minutes'):
+        return f"{time_enum.Minutes} minutes"
+    else:
+        return "1-2 seconds"
+
+def format_network_load(load_enum):
+    """Format network load for mobile display."""
+    load_map = {
+        'Low': 'Low',
+        'Normal': 'Normal',
+        'High': 'High',
+        'VeryHigh': 'Very High',
+        'Extreme': 'Extreme'
+    }
+    return load_map.get(str(load_enum), 'Normal') 

@@ -159,6 +159,6 @@ qnet-network (Go) ←→ qnet-consensus (Rust)
 
 ### Consensus
 - Commit-reveal mechanism
-- 5s commit, 5s reveal
+- 60s commit, 30s reveal
 - Reputation-based selection
 - Fork resolution by weight 

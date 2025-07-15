@@ -16,7 +16,7 @@ pub struct PyMempoolConfig {
 #[pymethods]
 impl PyMempoolConfig {
     #[new]
-    #[pyo3(signature = (max_size=50000, min_gas_price=1))]
+    #[pyo3(signature = (max_size=500000, min_gas_price=1))]
     fn new(
         max_size: usize,
         min_gas_price: u64,

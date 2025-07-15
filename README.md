@@ -200,7 +200,7 @@ export SOLANA_RPC_URL="https://api.devnet.solana.com"
 export BURN_TRACKER_PROGRAM_ID="YOUR_DEPLOYED_PROGRAM_ID_HERE"
 
 # Set real 1DEV token mint address
-export ONE_DEV_MINT_ADDRESS="Wkg19zERBsBiyqsh2ffcUrFG4eL5BF5BWkg19zERBsBi"
+export ONE_DEV_MINT_ADDRESS="62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ"
 
 # Run node with real blockchain data
 ./target/release/qnet-node

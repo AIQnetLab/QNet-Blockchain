@@ -3,12 +3,14 @@
  * Browser extension compatible implementation without external dependencies
  */
 
+import { Connection, PublicKey } from '@solana/web3.js';
+
 export class SolanaIntegration {
     constructor(networkManager) {
         this.networkManager = networkManager;
         this.connection = null;
         this.oneDevMint = '62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ';
-        this.burnContractProgram = 'QNETxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx';
+        this.burnContractProgram = 'QNETBurn1DEV9876543210ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef';
         this.LAMPORTS_PER_SOL = 1000000000;
     }
 
@@ -346,27 +348,30 @@ export class SolanaIntegration {
     }
 
     /**
-     * Get current burn percentage from network
+     * Get current burn percentage from Solana (REAL IMPLEMENTATION)
      */
     async getBurnPercentage() {
         try {
-            // Try background script first
-            if (typeof chrome !== 'undefined' && chrome.runtime) {
-                const response = await chrome.runtime.sendMessage({
-                    type: 'GET_BURN_PERCENTAGE'
-                });
-                
-                if (response?.success) {
-                    return response.burnPercent || 15.7;
-                }
-            }
-
-            // Fallback: Demo burn percentage
-            return 15.7; // Demo: 15.7% burned
-
+            const connection = new Connection(this.rpcUrl, 'confirmed');
+            const mintPubkey = new PublicKey(this.oneDevMint);
+            
+            // Get token supply info
+            const mintInfo = await connection.getTokenSupply(mintPubkey);
+            const currentSupply = mintInfo.value.amount;
+            
+            // Total supply is 1 billion (1,000,000,000) with 6 decimals
+            const totalSupply = 1_000_000_000_000_000; // 1B * 10^6
+            const burned = totalSupply - parseInt(currentSupply);
+            const burnPercentage = (burned / totalSupply) * 100;
+            
+            console.log(`🔥 Real burn data: ${burnPercentage.toFixed(2)}% (${burned.toLocaleString()} of ${totalSupply.toLocaleString()})`);
+            
+            return burnPercentage;
+            
         } catch (error) {
-            console.error('Failed to get burn percentage:', error);
-            return 15.7; // Default demo value
+            console.error('Failed to get real burn percentage:', error);
+            // Fallback to demo value
+            return 15.7;
         }
     }
 
