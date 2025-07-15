@@ -45,11 +45,11 @@ fn mask_code(code: &str) -> String {
 }
 
 // Decode activation code to extract node type and payment info
-fn decode_activation_code(code: &str) -> Result<ActivationCodeData, String> {
-    // Handle development mode
+fn decode_activation_code(code: &str, selected_node_type: NodeType) -> Result<ActivationCodeData, String> {
+    // Handle development mode - use selected node type
     if code == "TEST_MODE" || code == "CLI_MODE" || code.starts_with("DEV_MODE_") {
         return Ok(ActivationCodeData {
-            node_type: NodeType::Full, // Default for test
+            node_type: selected_node_type, // Use actual selected type
             qnc_amount: 0,
             tx_hash: "DEV_TX".to_string(),
             wallet_address: "DEV_WALLET".to_string(),
@@ -1051,10 +1051,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     
     println!("🔍 DEBUG: About to create BlockchainNode...");
-    let mut node = match BlockchainNode::new(
+    let mut node = match BlockchainNode::new_with_config(
         &config.data_dir.to_string_lossy(),
         config.p2p_port,
         bootstrap_peers,
+        node_type,
+        region,
     ).await {
         Ok(node) => {
             println!("🔍 DEBUG: BlockchainNode created successfully");
@@ -1069,7 +1071,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     
     // Save activation code to persistent storage for future restarts
-    if !activation_code.is_empty() && !activation_code.starts_with("DEV_MODE_EMPTY") {
+    // Always save in development mode to remember selected node type
+    if !activation_code.is_empty() {
         if let Err(e) = node.save_activation_code(&activation_code, node_type).await {
             println!("⚠️  Warning: Could not save activation code: {}", e);
         }
