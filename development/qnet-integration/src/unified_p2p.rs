@@ -287,8 +287,8 @@ impl SimplifiedP2P {
                         // Check peer reputation
                         let reputation = reputation_system.get_reputation(&peer.id);
                         
-                        // Remove peers with very low reputation
-                        if reputation < 25.0 {
+                        // Remove peers with very low reputation (unified threshold: 10.0)
+                        if reputation < 10.0 {
                             println!("[P2P] 🚫 Removing peer {} due to low reputation: {}", 
                                 peer.id, reputation);
                             to_remove.push(i);
@@ -879,11 +879,17 @@ impl SimplifiedP2P {
         let mut validated_peers = Vec::new();
         
         for peer in peers {
-            // Use the enhanced activation validation function
-            let is_valid = validate_peer_activation(&peer.id);
+            // In production: Use centralized ActivationValidator from activation_validation.rs
+            // For now: simulate basic validation
+            let is_valid = !peer.id.contains("invalid") && 
+                          !peer.id.contains("banned") && 
+                          !peer.id.contains("slashed");
             
             if is_valid {
                 validated_peers.push(peer.clone());
+                println!("[P2P] ✅ Peer {} passed activation validation", peer.id);
+            } else {
+                println!("[P2P] ❌ Peer {} failed activation validation", peer.id);
             }
         }
         
@@ -1010,30 +1016,4 @@ fn region_string(region: &Region) -> &'static str {
     }
 }
 
-/// Enhanced activation code validation with blockchain verification
-pub fn validate_peer_activation(peer_id: &str) -> bool {
-    // In production: This would:
-    // 1. Query blockchain for burned 1DEV tokens
-    // 2. Verify node type matches burned amount
-    // 3. Check activation code cryptographic signatures
-    // 4. Validate node hasn't been slashed
-    
-    // For now: simulate proper validation
-    println!("[P2P] 🔍 Validating activation for peer: {}", peer_id);
-    
-    // Simulate blockchain queries
-    let has_burned_tokens = !peer_id.contains("unbacked");
-    let valid_signature = !peer_id.contains("invalid_sig");
-    let not_slashed = !peer_id.contains("slashed");
-    
-    let is_valid = has_burned_tokens && valid_signature && not_slashed;
-    
-    if is_valid {
-        println!("[P2P] ✅ Peer {} passed comprehensive activation validation", peer_id);
-    } else {
-        println!("[P2P] ❌ Peer {} failed activation validation (burned: {}, sig: {}, slashed: {})", 
-                 peer_id, has_burned_tokens, valid_signature, not_slashed);
-    }
-    
-    is_valid
-} 
+ 

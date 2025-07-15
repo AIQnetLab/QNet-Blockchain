@@ -925,6 +925,7 @@ async fn find_available_port(preferred: u16) -> Result<u16, Box<dyn std::error::
 fn get_bootstrap_peers_for_region(region: &Region) -> Vec<String> {
     // Return empty vector to force automatic peer discovery
     // No hardcoded bootstrap servers - nodes will find each other automatically
+    println!("[Config] 🔍 Using automatic peer discovery for region: {:?}", region);
     Vec::new()
 }
 

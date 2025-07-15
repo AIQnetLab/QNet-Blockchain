@@ -88,10 +88,8 @@ pub struct BlockchainNode {
     consensus: Arc<RwLock<qnet_consensus::ConsensusEngine>>,
     // validator: Arc<Validator>, // disabled for compilation
     
-    // Unified P2P with regional clustering and automatic failover
+    // Unified P2P with regional clustering and automatic failover (single network interface)
     unified_p2p: Option<Arc<SimplifiedP2P>>,
-    network: Option<Arc<RwLock<NetworkInterface>>>,
-    network_handle: Option<tokio::task::JoinHandle<()>>,
     
     // Node configuration
     node_id: String,
@@ -257,8 +255,6 @@ impl BlockchainNode {
             consensus,
             // validator, // disabled for compilation
             unified_p2p: Some(unified_p2p),
-            network: None,
-            network_handle: None,
             node_id: node_id.clone(),
             node_type,
             region,
@@ -1009,27 +1005,17 @@ impl BlockchainNode {
         Ok(())
     }
     
-    /// Validate that activation code hasn't been used on another node
+    /// Validate activation code (delegated to centralized ActivationValidator)
     async fn validate_activation_code_uniqueness(&self, code: &str) -> Result<(), String> {
         // In development mode, skip validation
         if code.starts_with("DEV_MODE_") || code == "TEST_MODE" {
             return Ok(());
         }
         
-        // TODO: In production, this would query the blockchain to check if the activation code
-        // has been used by another node. For now, we implement basic local validation.
-        
-        // Generate unique node identifier
-        let node_signature = self.generate_node_signature().await?;
-        
+        // TODO: In production, use centralized ActivationValidator from activation_validation.rs
+        // For now, basic validation
         println!("🔐 Validating activation code uniqueness...");
-        println!("   Node Signature: {}", &node_signature[..16]);
         println!("   Code: {}", &code[..8]);
-        
-        // In production, this would be a blockchain query to check:
-        // 1. If activation code exists in blockchain
-        // 2. If it's already bound to a different node signature
-        // 3. If it's still valid and not expired
         
         Ok(())
     }
@@ -1116,8 +1102,6 @@ impl Clone for BlockchainNode {
             mempool: self.mempool.clone(),
             consensus: self.consensus.clone(),
             unified_p2p: self.unified_p2p.clone(),
-            network: self.network.clone(),
-            network_handle: None, // Cannot clone JoinHandle
             node_id: self.node_id.clone(),
             node_type: self.node_type,
             region: self.region,

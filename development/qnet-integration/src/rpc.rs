@@ -103,7 +103,7 @@ async fn handle_rpc(
         "stats_get" => stats_get(blockchain).await,
         
         // Node transfer methods
-        "node_transfer" => node_transfer(blockchain, request.params).await,
+        "device_migration" => device_migration(blockchain, request.params).await,
         "node_getTransferStatus" => node_get_transfer_status(blockchain, request.params).await,
         
         _ => Err(RpcError {
@@ -496,8 +496,8 @@ pub async fn handle_get_stats(blockchain: Arc<BlockchainNode>) -> Result<impl wa
     }
 }
 
-/// Transfer node to new wallet
-async fn node_transfer(
+/// Migrate device (same wallet, different device)
+async fn device_migration(
     blockchain: Arc<BlockchainNode>,
     params: Option<Value>,
 ) -> Result<Value, RpcError> {
@@ -511,23 +511,23 @@ async fn node_transfer(
         message: "Missing activation_code parameter".to_string(),
     })?;
     
-    let new_wallet = params["new_wallet"].as_str().ok_or_else(|| RpcError {
+    let new_device_signature = params["new_device_signature"].as_str().ok_or_else(|| RpcError {
         code: -32602,
-        message: "Missing new_wallet parameter".to_string(),
+        message: "Missing new_device_signature parameter".to_string(),
     })?;
     
     let node_type = blockchain.get_node_type();
     
-    match blockchain.migrate_device(activation_code, node_type, new_wallet).await {
+    match blockchain.migrate_device(activation_code, node_type, new_device_signature).await {
         Ok(_) => Ok(json!({
             "success": true,
-            "message": "Node successfully transferred",
-            "new_wallet": new_wallet,
+            "message": "Device successfully migrated",
+            "new_device_signature": new_device_signature,
             "timestamp": chrono::Utc::now().timestamp()
         })),
         Err(e) => Err(RpcError {
             code: -32000,
-            message: format!("Node transfer failed: {}", e),
+            message: format!("Device migration failed: {}", e),
         }),
     }
 }
