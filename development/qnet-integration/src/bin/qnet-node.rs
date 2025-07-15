@@ -912,7 +912,7 @@ async fn find_available_port(preferred: u16) -> Result<u16, Box<dyn std::error::
     }
     
     // Find any available port in range
-    for port in (preferred..preferred + 100) {
+    for port in preferred..preferred + 100 {
         if TcpListener::bind(format!("0.0.0.0:{}", port)).is_ok() {
             return Ok(port);
         }
