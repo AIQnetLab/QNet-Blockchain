@@ -19,6 +19,7 @@ QNet is a high-performance, post-quantum secure blockchain network designed for 
 - ✅ **Production Rust Nodes**: Docker deployment with real blockchain nodes
 - ✅ **Browser Extension Wallet**: Production-ready with full-screen interface
 - ✅ **Mobile Applications**: iOS/Android apps ready for deployment
+- ✅ **Zero-Configuration Setup**: Fully automatic deployment with no parameters
 
 ### 📋 **Testnet Deployment**
 
@@ -34,6 +35,7 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 - **🔗 Cross-Chain Compatibility**: Seamless integration with existing networks
 - **🏛️ Decentralized Governance**: Community-driven decision making
 - **📱 Mobile-First Design**: Optimized for mobile and IoT devices
+- **🔧 Zero-Configuration**: Fully automatic setup with no command-line arguments
 
 ### 📊 Performance Metrics
 
@@ -168,7 +170,7 @@ file target/release/qnet-node
 
 ⚠️ **Workspace Structure**: QNet uses Rust workspace that builds in the **root directory** (`~/QNet-Blockchain/`), not in subdirectories.
 
-⚠️ **Interactive Setup Only**: Production deployment supports **ONLY interactive setup menu**. No command-line arguments for activation.
+⚠️ **Fully Automatic Configuration**: Production deployment uses **ZERO command-line arguments**. Everything is auto-configured including ports, region, and performance settings.
 
 ⚠️ **Binary Location**: The compiled binary is located at `~/QNet-Blockchain/target/release/qnet-node`
 
@@ -285,26 +287,40 @@ QNet nodes use an interactive setup menu for easy configuration. All node types 
 - **Storage**: 2+ TB NVMe SSD
 - **Network**: 1 Gbps
 
-#### Interactive Setup Steps
+#### Automatic Node Setup
 
 ```bash
-# Configure firewall
-sudo ufw allow 9876  # P2P port
-sudo ufw allow 9877  # RPC port
+# Configure firewall (ports auto-selected if 9876/9877 unavailable)
+sudo ufw allow 9876  # P2P port (default)
+sudo ufw allow 9877  # RPC port (default)
 sudo ufw allow 9878  # Metrics port
 sudo ufw --force enable
 
-# Run interactive node setup (PRODUCTION ONLY)
+# Run auto-configured node setup (ZERO CONFIGURATION REQUIRED)
 cd ~/QNet-Blockchain
 ./target/release/qnet-node
 ```
 
-#### What You'll See (Interactive Menu)
+**New Features:**
+- ✅ **Auto-port selection**: Finds available ports if defaults are busy
+- ✅ **Auto-region detection**: Detects your location via IP geolocation
+- ✅ **Auto-performance tuning**: Always enables 100k+ TPS optimizations
+- ✅ **Auto-bootstrap peers**: Selects optimal peers for your region
+- ✅ **Smart data directory**: Standard `node_data` location
+
+#### What You'll See (Auto-Configuration)
 
 ```
 🚀 === QNet Production Node Setup === 🚀
 🖥️  SERVER DEPLOYMENT MODE
 Welcome to QNet Blockchain Network!
+
+🔧 Auto-configuring QNet node...
+🌍 Auto-detecting region from IP address...
+✅ Region auto-detected: Europe
+🔌 Selected ports: P2P=9876, RPC=9877
+📁 Data directory: "node_data"
+🔗 Bootstrap peers: ["eu-bootstrap-1.qnet.io:9876", "eu-bootstrap-2.qnet.io:9876"]
 
 🔍 Detecting current network phase...
 ✅ Phase 1 detected
@@ -330,11 +346,12 @@ Choose your server node type:
 Enter your choice (1-2): 
 ```
 
-#### Interactive Steps
+#### Setup Steps
 
-1. **Select Node Type**: Choose between Full Node (1) or Super Node (2)
-2. **Enter Activation Code**: Provide your activation code from QNet wallet app
-3. **Node Starts**: Automatic configuration and blockchain sync begins
+1. **Auto-Configuration**: System automatically detects region, ports, and performance settings
+2. **Select Node Type**: Choose between Full Node (1) or Super Node (2) 
+3. **Enter Activation Code**: Provide your activation code from QNet wallet app
+4. **Node Starts**: Fully optimized node with 100k+ TPS capabilities begins sync
 
 #### Activation Code Requirements
 
@@ -595,6 +612,46 @@ ws.send(JSON.stringify({
     params: ['newBlocks']
 }));
 ```
+
+## 🔧 Auto-Configuration Features
+
+QNet node deployment now features **zero-configuration** setup for maximum ease of use:
+
+### 🌍 Automatic Region Detection
+
+- **IP-based geolocation**: Automatically detects your geographic region
+- **Optimal bootstrap peers**: Selects the best peers for your region
+- **Reduced latency**: Connects to nearest network nodes
+- **Supported regions**: North America, Europe, Asia, South America, Africa, Oceania
+
+### 🔌 Smart Port Management
+
+- **Auto-port selection**: Finds available ports if defaults are busy
+- **Default ports**: P2P=9876, RPC=9877, Metrics=9878
+- **Port range scanning**: Automatically scans for available ports in +100 range
+- **Conflict resolution**: Handles port conflicts gracefully
+
+### ⚡ Performance Optimization
+
+- **Always enabled**: 100k+ TPS optimizations active by default
+- **Microblock production**: Enabled for all production nodes
+- **High-performance mode**: Ultra-high throughput settings
+- **Optimized batching**: 10,000 transactions per batch
+- **Parallel processing**: 16 threads for validation
+
+### 📁 Data Management
+
+- **Standard location**: `node_data` directory in project root
+- **Automatic creation**: Creates data directory if not exists
+- **Permission checking**: Validates write permissions
+- **Backup-friendly**: Clear data structure for easy backups
+
+### 🛡️ Security Features
+
+- **Post-quantum crypto**: Always enabled
+- **Secure by default**: No insecure fallback modes
+- **Activation validation**: Cryptographic proof of node purchase
+- **Network isolation**: Proper firewall configuration
 
 ## 🤝 Contributing
 
