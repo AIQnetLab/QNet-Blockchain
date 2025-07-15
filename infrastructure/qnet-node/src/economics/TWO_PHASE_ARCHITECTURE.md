@@ -27,7 +27,7 @@ QNet uses a two-phase system for node activation that transitions from external 
 
 ### Transition triggers when:
 - 90% of 1DEV supply is burned (900 million)
-- OR 5 years have passed since launch
+- OR 5 years have passed since the first block (genesis block)
 - Whichever comes first
 
 ### How it works:

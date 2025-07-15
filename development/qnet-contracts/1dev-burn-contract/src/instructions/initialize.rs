@@ -27,7 +27,7 @@ pub fn handler(
     
     burn_tracker.authority = ctx.accounts.authority.key();
     burn_tracker.burn_address = burn_address;
-    burn_tracker.launch_timestamp = clock.unix_timestamp;
+    burn_tracker.genesis_timestamp = clock.unix_timestamp;
     burn_tracker.total_burned = 0;
     burn_tracker.total_transactions = 0;
     burn_tracker.last_update = clock.unix_timestamp;

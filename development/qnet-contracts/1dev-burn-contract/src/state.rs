@@ -42,8 +42,8 @@ pub struct BurnTracker {
     pub burn_address: Pubkey,
     /// 1DEV mint address
     pub one_dev_mint: Pubkey,
-    /// Network launch timestamp
-    pub launch_timestamp: i64,
+    /// Network genesis timestamp (first block time)
+    pub genesis_timestamp: i64,
     /// Total 1DEV burned (in smallest units - 6 decimals)
     pub total_1dev_burned: u64,
     /// Total burn transactions recorded
@@ -74,7 +74,7 @@ impl BurnTracker {
         32 + // admin
         32 + // burn_address
         32 + // one_dev_mint
-        8 +  // launch_timestamp
+        8 +  // genesis_timestamp
         8 +  // total_1dev_burned
         8 +  // total_burn_transactions
         8 +  // total_nodes_activated
@@ -89,9 +89,9 @@ impl BurnTracker {
 
     pub fn should_transition(&self) -> bool {
         let current_time = Clock::get().unwrap().unix_timestamp;
-        let days_elapsed = (current_time - self.launch_timestamp) / 86400;
+        let days_elapsed = (current_time - self.genesis_timestamp) / 86400;
         
-        // Transition at 90% 1DEV burned OR 5 years elapsed
+        // Transition at 90% 1DEV burned OR 5 years elapsed since genesis block
         self.burn_percentage >= 90.0 || days_elapsed >= 1825 // 5 years
     }
 
