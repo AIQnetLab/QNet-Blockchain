@@ -7,6 +7,7 @@ use std::path::Path;
 use std::collections::HashMap;
 use hex;
 use sha3;
+use bincode;
 
 pub struct PersistentStorage {
     db: DB,
@@ -595,5 +596,22 @@ impl Storage {
     
     pub fn get_stats(&self) -> IntegrationResult<StorageStats> {
         self.persistent.get_stats()
+    }
+
+    // Activation code methods
+    pub fn save_activation_code(&self, code: &str, node_type: u8, timestamp: u64) -> IntegrationResult<()> {
+        self.persistent.save_activation_code(code, node_type, timestamp)
+    }
+
+    pub fn load_activation_code(&self) -> IntegrationResult<Option<(String, u8, u64)>> {
+        self.persistent.load_activation_code()
+    }
+
+    pub fn clear_activation_code(&self) -> IntegrationResult<()> {
+        self.persistent.clear_activation_code()
+    }
+
+    pub fn update_activation_for_migration(&self, code: &str, node_type: u8, timestamp: u64, new_device_signature: &str) -> IntegrationResult<()> {
+        self.persistent.update_activation_for_migration(code, node_type, timestamp, new_device_signature)
     }
 } 

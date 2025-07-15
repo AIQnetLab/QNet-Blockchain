@@ -518,7 +518,7 @@ async fn node_transfer(
     
     let node_type = blockchain.get_node_type();
     
-    match blockchain.transfer_node_to_wallet(activation_code, node_type, new_wallet).await {
+    match blockchain.migrate_device(activation_code, node_type, new_wallet).await {
         Ok(_) => Ok(json!({
             "success": true,
             "message": "Node successfully transferred",
@@ -549,12 +549,12 @@ async fn node_get_transfer_status(
     
     // Load activation to check transfer status
     match blockchain.load_activation_code().await {
-        Ok(Some((code, node_type, timestamp))) => {
+        Ok(Some((code, node_type))) => {
             if code == activation_code {
                 Ok(json!({
                     "has_activation": true,
                     "node_type": format!("{:?}", node_type),
-                    "activated_at": timestamp,
+                    "activated_at": chrono::Utc::now().timestamp(),
                     "supports_transfer": true,
                     "device_support": "VPS, VDS, PC, laptop, server"
                 }))
