@@ -28,13 +28,16 @@ serde = { version = "1.0.195", features = ["derive"] }
 serde_json = "1.0.111"
 bincode = "1.3.3"
 
-# Cryptography - modern production versions
+# Cryptography - modern production versions with edition constraints
 blake3 = "1.5.0"
 ed25519-dalek = { version = "2.0.0", features = ["std"] }
 curve25519-dalek = "4.1.3"
 sha2 = "0.10.8"
 sha3 = "0.10.8"
 hex = "0.4.3"
+
+# Force older base64ct version to avoid edition2024 requirement
+base64ct = "=1.6.0"
 
 # Post-quantum cryptography
 pqcrypto = "0.18"
@@ -86,11 +89,14 @@ bytes = "1.5"
 # Web framework for RPC
 actix-web = "4.4"
 actix-cors = "0.7"
-warp = "0.3.6"
+warp = "0.3.7"
 
 # CLI
 clap = { version = "4.4.0", features = ["derive"] }
 atty = "0.2"
+
+# Modern base64 handling
+base64 = "0.22"
 
 [dev-dependencies]
 criterion = "0.5"

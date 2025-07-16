@@ -38,10 +38,10 @@ cd QNet-Blockchain && git checkout testnet
 # 4. Pull latest changes
 git pull origin testnet
 
-# 5. Build with latest Rust
+# 5. Build with latest Rust (requires rebuild after updates)
 cargo build --release
 
-# 6. Build Docker image (uses Rust 1.76)
+# 6. Build Docker image (uses Rust 1.78 - supports edition2024)
 docker build -t qnet-production -f development/Dockerfile .
 
 # 7. Launch node
