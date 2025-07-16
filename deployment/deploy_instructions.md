@@ -2,6 +2,24 @@
 
 ## 🚀 Quick Installation Guide (Simplified)
 
+### Docker Cleanup Commands (if needed)
+
+```bash
+# Clean up failed builds and cache
+docker system prune -f
+docker builder prune -f
+docker image prune -f
+
+# Remove all stopped containers
+docker container prune -f
+
+# Remove all unused images
+docker image prune -a -f
+
+# Complete cleanup (WARNING: removes all unused Docker data)
+docker system prune -a -f
+```
+
 ### One-Command Installation (Production Ready)
 
 ```bash
@@ -16,18 +34,23 @@ source ~/.cargo/env
 # 3. Build QNet
 git clone https://github.com/AIQnetLab/QNet-Blockchain.git
 cd QNet-Blockchain && git checkout testnet
+
+# 4. Pull latest changes
+git pull origin testnet
+
+# 5. Build with latest Rust
 cargo build --release
 
-# 4. Build Docker image
+# 6. Build Docker image (uses Rust 1.76)
 docker build -t qnet-production -f development/Dockerfile .
 
-# 5. Launch node
+# 7. Launch node
 docker run -d --name qnet-node --restart=always \
   -p 9876:9876 -p 9877:9877 -p 8001:8001 \
   -v $(pwd)/node_data:/opt/qnet/node_data \
   qnet-production
 
-# 6. Activate node (INTERACTIVE REQUIRED)
+# 8. Activate node (INTERACTIVE REQUIRED)
 docker exec -it qnet-node /bin/bash
 /usr/local/bin/qnet-node
 ```
