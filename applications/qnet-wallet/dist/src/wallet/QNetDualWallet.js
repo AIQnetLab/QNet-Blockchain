@@ -774,50 +774,51 @@ export class QNetDualWallet {
     }
 
     /**
-     * Transfer node ownership
+     * Migrate node to new device (same wallet)
      */
-    async transferNode(toAddress) {
+    async migrateDevice(newDeviceSignature) {
         try {
             if (this.locked) {
                 throw new Error('Wallet is locked');
             }
 
             if (!this.walletData.networks.qnet.activeNode) {
-                throw new Error('No active node to transfer');
+                throw new Error('No active node to migrate');
             }
 
             const activeNode = this.walletData.networks.qnet.activeNode;
-            const fromAddress = this.walletData.networks.qnet.address;
+            const walletAddress = this.walletData.networks.qnet.address;
             const privateKey = this.getQNetPrivateKey();
 
-            // Validate transfer
-            await this.enforcement.validateNodeTransfer(
-                fromAddress,
-                toAddress,
-                activeNode.code || activeNode.nodeId
+            // Validate device migration (same wallet, different device)
+            await this.enforcement.validateDeviceMigration(
+                walletAddress,
+                activeNode.code || activeNode.nodeId,
+                newDeviceSignature
             );
 
-            // Execute transfer
-            const transferResult = await this.ownershipManager.transferNode(
+            // Execute device migration
+            const migrationResult = await this.ownershipManager.migrateDevice(
                 activeNode.code || activeNode.nodeId,
-                fromAddress,
-                toAddress,
+                walletAddress,
+                newDeviceSignature,
                 privateKey
             );
 
-            // Update wallet state
-            this.walletData.networks.qnet.activeNode = null;
+            // Update device info only, wallet remains same
+            this.walletData.networks.qnet.activeNode.deviceSignature = newDeviceSignature;
+            this.walletData.networks.qnet.activeNode.migratedAt = Date.now();
 
             await this.saveWallet();
-            this.notifyListeners('nodeTransferred', {
-                to: toAddress,
-                txHash: transferResult.txHash
+            this.notifyListeners('deviceMigrated', {
+                newDevice: newDeviceSignature,
+                txHash: migrationResult.txHash
             });
 
-            return transferResult;
+            return migrationResult;
 
         } catch (error) {
-            console.error('Failed to transfer node:', error);
+            console.error('Failed to migrate device:', error);
             throw error;
         }
     }

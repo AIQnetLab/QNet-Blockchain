@@ -3,7 +3,7 @@
  * Wraps the i18n functions into a class interface
  */
 
-import { setLanguage, t, getCurrentLanguage, getAvailableLanguages } from './index.js';
+import { setLanguage, t, getCurrentLanguage, getAvailableLanguages, initializeI18n } from './index.js';
 
 export class I18n {
     constructor() {
@@ -12,11 +12,10 @@ export class I18n {
 
     async initialize() {
         try {
-            // Load saved language from storage
-            const savedLanguage = localStorage.getItem('qnet_wallet_language') || 'en';
-            await setLanguage(savedLanguage);
+            // Initialize with auto-detection
+            await initializeI18n();
             this.isInitialized = true;
-            console.log('✅ I18n initialized with language:', savedLanguage);
+            console.log('✅ I18n initialized with auto-detection');
         } catch (error) {
             console.error('❌ I18n initialization failed:', error);
             // Fallback to English

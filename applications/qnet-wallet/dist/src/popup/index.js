@@ -3,14 +3,14 @@
  * Production-ready Chrome Extension with ES6 modules and real Solana integration
  */
 
-// Production version - no npm dependencies - Cache Bust v2025-01-19
-import { WalletManager } from './WalletManager.js?v=2025-01-19';
-import { UIManager } from './UIManager.js?v=2025-01-19';
-import { DynamicPricing } from './DynamicPricing.js?v=2025-01-19';
+import { Connection, PublicKey, Keypair } from '@solana/web3.js';
+import { WalletManager } from './WalletManager.js';
+import { UIManager } from './UIManager.js';
+import { DynamicPricing } from './DynamicPricing.js';
 
 // Constants
 const SOLANA_RPC_URL = 'https://api.devnet.solana.com';
-const ONE_DEV_MINT_ADDRESS = '9GcdXAo2EyjNdNLuQoScSVbfJSnh9RdkSS8YYKnGQ8Pf';
+const ONE_DEV_MINT_ADDRESS = '62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ';
 
 // Global instances
 let walletManager;
@@ -27,22 +27,8 @@ async function initialize() {
         document.getElementById('locked-screen').style.display = 'none';
         document.getElementById('wallet-setup-modal').style.display = 'none';
         
-        // Initialize Solana connection (production compatible)
-        solanaConnection = {
-            rpcUrl: SOLANA_RPC_URL,
-            type: 'solana',
-            // Wrapper for background script calls
-            async getBalance(address) {
-                if (typeof chrome !== 'undefined' && chrome.runtime) {
-                    const response = await chrome.runtime.sendMessage({
-                        type: 'GET_SOL_BALANCE',
-                        address: address
-                    });
-                    return response?.balance || 0;
-                }
-                return 2.5; // Demo fallback
-            }
-        };
+        // Initialize Solana connection
+        solanaConnection = new Connection(SOLANA_RPC_URL, 'confirmed');
         
         // Initialize managers
         walletManager = new WalletManager(solanaConnection);
@@ -406,7 +392,7 @@ async function handleChangePassword() {
                 <input type="password" id="current-password" placeholder="Current password" />
                 <input type="password" id="new-password" placeholder="New password" />
                 <input type="password" id="confirm-new-password" placeholder="Confirm new password" />
-                <div id="password-change-error" class="inline-error hidden"></div>
+                <div id="password-change-error" class="inline-error" style="display: none;"></div>
                 <div class="modal-actions">
                     <button id="cancel-password-change">Cancel</button>
                     <button id="confirm-password-change" class="primary">Change Password</button>
@@ -522,7 +508,7 @@ async function handleExportPrivateKey() {
                         <button id="close-key-modal">✕</button>
                     </div>
                     <div class="private-key-display">
-                        <textarea readonly class="private-key-display">${privateKey}</textarea>
+                        <textarea readonly style="width: 100%; height: 100px; font-family: monospace;">${privateKey}</textarea>
                         <button id="copy-private-key">📋 Copy Private Key</button>
                         <div class="key-warning">
                             <p>⚠️ Never share your private key with anyone!</p>

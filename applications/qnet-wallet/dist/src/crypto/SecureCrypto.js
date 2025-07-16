@@ -3,8 +3,7 @@
  * Using Web Crypto API for Ed25519 and AES-GCM encryption
  */
 
-// Cache Bust v2025-01-19
-import { secureBIP39 } from './ProductionBIP39.js?v=2025-01-19';
+import { secureBIP39 } from './ProductionBIP39.js';
 
 export class SecureCrypto {
     constructor() {
@@ -494,55 +493,6 @@ export class SecureCrypto {
         return result;
     }
     
-    /**
-     * Convert mnemonic to seed (NEW)
-     */
-    static async mnemonicToSeed(mnemonic, passphrase = '') {
-        try {
-            // Use production BIP39 implementation
-            const seedData = await secureBIP39.importFromExternalWallet(mnemonic, passphrase);
-            return seedData.seed;
-        } catch (error) {
-            console.error('Error converting mnemonic to seed:', error);
-            // Fallback: simple hash-based seed
-            const combined = mnemonic + passphrase;
-            return new TextEncoder().encode(await SecureCrypto.hashData(combined));
-        }
-    }
-
-    /**
-     * Generate keypair from seed (NEW)
-     */
-    static async generateKeypairFromSeed(seed, accountIndex = 0) {
-        try {
-            // Create account-specific seed
-            const accountSeed = await SecureCrypto.hashData(
-                Array.from(seed).join('') + accountIndex.toString()
-            );
-            
-            // Generate deterministic address
-            const chars = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
-            let address = '';
-            
-            for (let i = 0; i < 44; i++) {
-                const index = parseInt(accountSeed.slice(i % accountSeed.length, (i % accountSeed.length) + 2), 16) % chars.length;
-                address += chars[index];
-            }
-            
-            return {
-                publicKey: new Uint8Array(32),
-                address: address
-            };
-        } catch (error) {
-            console.error('Error generating keypair from seed:', error);
-            // Fallback
-            return {
-                publicKey: new Uint8Array(32),
-                address: 'QNetDemo' + Math.random().toString(36).substring(2, 10)
-            };
-        }
-    }
-
     /**
      * Validate QNet address format
      */

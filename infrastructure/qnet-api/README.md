@@ -1,4 +1,4 @@
-# QNet API Server
+# QNet API Server - Decentralized Architecture
 
 ### **CRITICAL WARNINGS**
 - **EXPERIMENTAL SOFTWARE**: All code is experimental and may contain critical bugs or security vulnerabilities
@@ -18,235 +18,207 @@
 
 ---
 
-## Features
+## QNet Decentralized API Architecture
 
-High-performance REST API server for QNet experimental blockchain with WebSocket support.
+QNet now implements a **fully decentralized API architecture** where every blockchain node provides complete API functionality.
 
-- **RESTful API endpoints** for blockchain interaction (experimental implementation)
-- **WebSocket support** for real-time updates (experimental)
-- **Prometheus metrics** integration (research monitoring)
-- **CORS support** for web applications (experimental security)
-- **Request validation** and rate limiting (experimental protection)
-- **Comprehensive error handling** (research-focused)
+### **Why Multi-Node API?**
+- **Distributed Access**: Multiple nodes provide API access simultaneously
+- **High Availability**: If one node goes down, others continue working
+- **Scalable**: More nodes = more API capacity
 
-## Building
-**⚠️ Warning**: This builds experimental research software. Use at your own risk.
-
-## Running
-
-```bash
-# Run with default settings (experimental)
-cargo run --release
-
-# Run with custom settings (experimental)
-QNET_API_HOST=0.0.0.0 QNET_API_PORT=5000 cargo run --release
-```
-
-**⚠️ Warning**: Running experimental API server. Monitor for unexpected behavior.
-
-High-performance REST API server for QNet experimental blockchain with WebSocket support.
-
-## Architecture
+### **Architecture Overview**
 
 ```
 ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│   QNet CLI      │────│   API Server    │────│   QNet Node     │
-│   (client)      │    │   (port 5000)   │    │   (port 9877)   │
+│ Web/Mobile Apps │    │   QNet Wallet   │    │   CLI Tools     │
+│ (browsers)      │    │   (extension)   │    │   (terminal)    │
 └─────────────────┘    └─────────────────┘    └─────────────────┘
-                                │
-                                └─────────────────────────────────┐
-                                                                  │
-                                                         ┌─────────────────┐
-                                                         │   QNet P2P      │
-                                                         │   (port 9876)   │
-                                                         └─────────────────┘
+         │                       │                       │
+         └───────────────────────┼───────────────────────┘
+                                 │
+                    ┌────────────┴────────────┐
+                    │                         │
+           ┌─────────────────┐       ┌─────────────────┐
+           │   QNet Node 1   │       │   QNet Node 2   │
+           │   API: 8001     │       │   API: 8002     │
+           │   RPC: 9877     │       │   RPC: 9879     │
+           │   P2P: 9876     │       │   P2P: 9878     │
+           └─────────────────┘       └─────────────────┘
 ```
 
-## Port Configuration
+**Each QNet node provides:**
+- Full blockchain functionality (consensus, P2P, storage)
+- Complete REST API endpoints
+- JSON-RPC server for internal communication
+- Real-time WebSocket connections
+- Prometheus metrics endpoints
 
-- **QNet Node P2P**: 9876 (peer-to-peer networking)
-- **QNet Node RPC**: 9877 (blockchain RPC calls)
-- **API Server**: 5000 (REST API for wallets/CLI)
-- **Metrics**: 9878 (monitoring/prometheus)
+### **Node Activation (CRITICAL)**
 
-## Quick Start
+**⚠️ EXPERIMENTAL**: Node activation requires interactive setup with activation codes
 
 ```bash
-# Build the project
-cargo build --release
+# Launch node - requires activation code
+cd development/qnet-integration
+./target/release/qnet-node
 
-# Run with default settings
-cargo run --release
-
-# Run with custom settings
-QNET_API_HOST=0.0.0.0 QNET_API_PORT=5000 cargo run --release
+# Interactive setup will prompt for:
+# - Activation code (format: QNET-XXXX-XXXX-XXXX)
+# - Node type (Light/Full/Super)
+# - Region (auto-detected)
 ```
 
-## Configuration
+### **API Endpoints (Per Node)**
 
-Environment variables:
-- `QNET_API_HOST` - Server host (default: 127.0.0.1)
-- `QNET_API_PORT` - Server port (default: 5000)
-- `QNET_NETWORK_ID` - Network identifier (default: qnet-mainnet)
-- `QNET_STATE_DB_PATH` - State database path (default: ./data/state)
-- `QNET_ENABLE_WEBSOCKET` - Enable WebSocket support (default: true)
-- `QNET_NODE_RPC_URL` - QNet Node RPC URL (default: http://localhost:9877)
+Each node provides identical API endpoints:
 
-## API Endpoints
+**Account Management:**
+- `GET /api/v1/account/{address}` - Get account info
+- `GET /api/v1/account/{address}/balance` - Get balance
+- `GET /api/v1/account/{address}/transactions` - Get transaction history
 
-### Account Endpoints
-
-- `GET /api/v1/account/{address}` - Get account information
-- `GET /api/v1/account/{address}/balance` - Get account balance
-- `GET /api/v1/account/{address}/transactions` - Get account transactions
-
-### Block Endpoints
-
+**Block Operations:**
 - `GET /api/v1/block/latest` - Get latest block
 - `GET /api/v1/block/{height}` - Get block by height
 - `GET /api/v1/block/hash/{hash}` - Get block by hash
 
-### Transaction Endpoints
+**Transaction Operations:**
+- `POST /api/v1/transaction` - Submit transaction
+- `GET /api/v1/transaction/{hash}` - Get transaction details
 
-- `POST /api/v1/transaction` - Submit new transaction
-- `GET /api/v1/transaction/{hash}` - Get transaction by hash
-- `GET /api/v1/transaction/{hash}/receipt` - Get transaction receipt
+**Mempool Operations:**
+- `GET /api/v1/mempool/status` - Get mempool status
+- `GET /api/v1/mempool/transactions` - Get pending transactions
 
-### Batch Operations
-
+**Batch Operations:**
 - `POST /api/v1/batch/claim-rewards` - Batch claim rewards
-- `POST /api/v1/batch/activate-nodes` - Batch activate nodes
-- `POST /api/v1/batch/transfer` - Batch transfer QNC
-- `GET /api/v1/batch/metrics` - Get batch metrics
+- `POST /api/v1/batch/transfer` - Batch transfer
 
-### Mobile API
+**Network Operations:**
+- `GET /api/v1/nodes/discovery` - Discover available nodes
+- `GET /api/v1/node/health` - Check node health
+- `GET /api/v1/gas/recommendations` - Get gas price recommendations
 
-- `GET /api/v1/mobile/gas-recommendations` - Get gas recommendations
-- `GET /api/v1/mobile/network-status` - Get network status
+### **Client-Side Failover (RECOMMENDED)**
 
-### WebSocket
-
-Connect to `/ws` for real-time updates:
+Applications should implement failover between nodes:
 
 ```javascript
-const ws = new WebSocket('ws://localhost:5000/ws');
+// EXPERIMENTAL - Use with caution
+const qnetNodes = [
+    'http://node1.example.com:8001',
+    'http://node2.example.com:8002',
+    'http://node3.example.com:8003'
+];
 
-// Subscribe to events
-ws.send(JSON.stringify({
-  type: 'subscribe',
-  channels: ['blocks', 'transactions']
-}));
-
-// Handle messages
-ws.onmessage = (event) => {
-  const data = JSON.parse(event.data);
-  console.log('Received:', data);
-};
+async function qnetApiCall(endpoint, data) {
+    for (const node of qnetNodes) {
+        try {
+            const response = await fetch(`${node}/api/v1/${endpoint}`, {
+                method: data ? 'POST' : 'GET',
+                headers: {'Content-Type': 'application/json'},
+                body: data ? JSON.stringify(data) : undefined
+            });
+            if (response.ok) {
+                return await response.json();
+            }
+        } catch (error) {
+            console.log(`Node ${node} unavailable, trying next...`);
+        }
+    }
+    throw new Error('All nodes unavailable');
+}
 ```
 
-### Metrics
+### **Production Deployment**
 
-Prometheus metrics available at `/metrics`
-
-## Example Requests
-
-### Get Account Balance
+**⚠️ EXPERIMENTAL DEPLOYMENT**
 
 ```bash
-curl http://localhost:5000/api/v1/account/7a9bk4f2eon8x3m5z1c7/balance
+# Multiple nodes for redundancy
+# Terminal 1
+cd development/qnet-integration
+./target/release/qnet-node
+# Enter activation code: QNET-XXXX-XXXX-XXXX
+
+# Terminal 2
+QNET_P2P_PORT=9878 QNET_RPC_PORT=9879 QNET_API_PORT=8002 ./target/release/qnet-node
+# Enter activation code: QNET-YYYY-YYYY-YYYY
+
+# Terminal 3
+QNET_P2P_PORT=9880 QNET_RPC_PORT=9881 QNET_API_PORT=8003 ./target/release/qnet-node
+# Enter activation code: QNET-ZZZZ-ZZZZ-ZZZZ
 ```
 
-### Submit Transaction
+### **API Usage Examples**
+
+**⚠️ EXPERIMENTAL ENDPOINTS**
 
 ```bash
-curl -X POST http://localhost:5000/api/v1/transaction \
+# Node discovery
+curl http://localhost:8001/api/v1/nodes/discovery
+
+# Account balance
+curl http://localhost:8001/api/v1/account/ADDRESS/balance
+
+# Submit transaction
+curl -X POST http://localhost:8001/api/v1/transaction \
   -H "Content-Type: application/json" \
   -d '{
-    "from": "7a9bk4f2eon8x3m5z1c7",
-    "to": "5n2j8k9deonb7f3x4m6q",
-    "amount": 1000000,
+    "from": "addr1",
+    "to": "addr2",
+    "amount": 1000,
     "gas_price": 10,
-    "gas_limit": 10000
+    "gas_limit": 21000,
+    "nonce": 1
   }'
-```
 
-### Get Latest Block
+# Get latest block
+curl http://localhost:8001/api/v1/block/latest
 
-```bash
-curl http://localhost:5000/api/v1/block/latest
-```
-
-### Batch Claim Rewards
-
-```bash
-curl -X POST http://localhost:5000/api/v1/batch/claim-rewards \
+# Batch operations
+curl -X POST http://localhost:8001/api/v1/batch/claim-rewards \
   -H "Content-Type: application/json" \
   -d '{
     "node_ids": ["node_123", "node_456"],
-    "owner_address": "7a9bk4f2eon8x3m5z1c7"
+    "owner_address": "owner_address"
   }'
 ```
 
-## Development
+### **Development Setup**
 
-### Running Tests
-
-```bash
-cargo test
-```
-
-### Running with Logging
+**⚠️ EXPERIMENTAL DEVELOPMENT**
 
 ```bash
-RUST_LOG=qnet_api=debug cargo run
+# Build project
+cargo build --release
+
+# Run single node
+./target/release/qnet-node
+
+# Run multiple nodes
+QNET_P2P_PORT=9878 QNET_RPC_PORT=9879 QNET_API_PORT=8002 ./target/release/qnet-node
 ```
 
-## Production Deployment
+### **Monitoring**
 
-### With Docker
+Each node provides metrics:
+- Prometheus metrics: `http://localhost:PORT/metrics`
+- Node health: `http://localhost:8001/api/v1/node/health`
+- Network status: `http://localhost:8001/api/v1/nodes/discovery`
 
-```bash
-# Build image
-docker build -t qnet-api .
+### **Security Considerations**
 
-# Run container
-docker run -d \
-  --name qnet-api \
-  -p 5000:5000 \
-  -e QNET_NODE_RPC_URL=http://qnet-node:9877 \
-  qnet-api
-```
+**⚠️ EXPERIMENTAL SECURITY**
+- All endpoints are experimental and may have vulnerabilities
+- No authentication/authorization implemented
+- Use at your own risk in production
+- Monitor for unexpected behavior
+- Implement proper security measures before production use
 
-### With systemd
+### **Production Architecture**
 
-```ini
-[Unit]
-Description=QNet API Server
-After=network.target
+QNet uses a distributed API architecture where every Full/Super node provides complete REST API functionality. This ensures maximum availability and performance for all applications.
 
-[Service]
-Type=simple
-User=qnet
-WorkingDirectory=/opt/qnet-api
-ExecStart=/opt/qnet-api/target/release/qnet-api
-Restart=always
-Environment=QNET_API_HOST=0.0.0.0
-Environment=QNET_API_PORT=5000
-Environment=QNET_NODE_RPC_URL=http://localhost:9877
-
-[Install]
-WantedBy=multi-user.target
-```
-
-## Architecture
-
-The API server acts as a bridge between:
-- **Frontend applications** (wallets, explorers, mobile apps)
-- **QNet blockchain node** (Rust implementation)
-- **External services** (monitoring, analytics)
-
-This separation provides:
-- **Security**: Filtered access to blockchain node
-- **Performance**: Caching and request optimization
-- **Scalability**: Load balancing and horizontal scaling
-- **Flexibility**: Version management and feature flags 
+**⚠️ EXPERIMENTAL SOFTWARE - USE AT YOUR OWN RISK ⚠️** 

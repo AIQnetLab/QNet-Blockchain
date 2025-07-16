@@ -182,14 +182,14 @@ export class QNetIntegration {
     }
 
     /**
-     * Transfer node ownership
+     * Migrate device (same wallet, different device)
      */
-    async transferNodeOwnership(nodeId, fromAddress, toAddress, privateKey) {
+    async migrateDevice(nodeId, walletAddress, newDeviceSignature, privateKey) {
         try {
-            const response = await this.makeRPCCall('transfer_node_ownership', {
+            const response = await this.makeRPCCall('migrate_device', {
                 node_id: nodeId,
-                from: fromAddress,
-                to: toAddress,
+                wallet_address: walletAddress,
+                new_device_signature: newDeviceSignature,
                 private_key: privateKey,
                 timestamp: Date.now()
             });
@@ -197,12 +197,29 @@ export class QNetIntegration {
             return {
                 success: response.success,
                 txHash: response.tx_hash,
-                transferredAt: response.transferred_at
+                migratedAt: response.migrated_at
             };
 
         } catch (error) {
-            console.error('Failed to transfer node ownership:', error);
+            console.error('Failed to migrate device:', error);
             throw error;
+        }
+    }
+
+    /**
+     * Get nodes for device signature
+     */
+    async getDeviceNodes(deviceSignature) {
+        try {
+            const response = await this.makeRPCCall('get_device_nodes', {
+                device_signature: deviceSignature
+            });
+
+            return response.nodes || [];
+
+        } catch (error) {
+            console.error('Failed to get device nodes:', error);
+            return [];
         }
     }
 
@@ -405,34 +422,195 @@ export class QNetIntegration {
     }
 
     /**
-     * Make RPC call to QNet network
+     * Batch claim rewards for multiple nodes
      */
-    async makeRPCCall(method, params = {}) {
+    async batchClaimRewards(nodeIds, ownerAddress) {
         try {
-            const response = await fetch(`${this.rpcUrl}/api/v1/${method}`, {
-                method: 'POST',
+            const response = await this.makeRPCCall('batch/claim-rewards', {
+                node_ids: nodeIds,
+                owner_address: ownerAddress
+            }, 'POST');
+
+            return {
+                success: response.success,
+                batchId: response.batch_id,
+                totalClaimed: response.total_claimed,
+                processedNodes: response.processed_nodes,
+                gasSaved: response.gas_saved,
+                results: response.results
+            };
+
+        } catch (error) {
+            console.error('Failed to batch claim rewards:', error);
+            throw error;
+        }
+    }
+
+    /**
+     * Batch activate multiple nodes
+     */
+    async batchActivateNodes(activations, ownerAddress) {
+        try {
+            const response = await this.makeRPCCall('batch/activate-nodes', {
+                activations: activations,
+                owner_address: ownerAddress
+            }, 'POST');
+
+            return {
+                success: response.success,
+                batchId: response.batch_id,
+                totalCost: response.total_cost,
+                activatedNodes: response.activated_nodes,
+                gasSaved: response.gas_saved,
+                results: response.results
+            };
+
+        } catch (error) {
+            console.error('Failed to batch activate nodes:', error);
+            throw error;
+        }
+    }
+
+    /**
+     * Batch transfer QNC to multiple addresses
+     */
+    async batchTransfer(transfers, fromAddress) {
+        try {
+            const response = await this.makeRPCCall('batch/transfer', {
+                transfers: transfers,
+                from_address: fromAddress
+            }, 'POST');
+
+            return {
+                success: response.success,
+                batchId: response.batch_id,
+                totalAmount: response.total_amount,
+                processedTransfers: response.processed_transfers,
+                gasSaved: response.gas_saved,
+                results: response.results
+            };
+
+        } catch (error) {
+            console.error('Failed to batch transfer:', error);
+            throw error;
+        }
+    }
+
+    /**
+     * Get batch operation metrics
+     */
+    async getBatchMetrics() {
+        try {
+            const response = await this.makeRPCCall('batch/metrics');
+            return response.metrics;
+        } catch (error) {
+            console.error('Failed to get batch metrics:', error);
+            throw error;
+        }
+    }
+
+    /**
+     * Get batch operation status
+     */
+    async getBatchStatus(batchId) {
+        try {
+            const response = await this.makeRPCCall(`batch/status/${batchId}`);
+            return response;
+        } catch (error) {
+            console.error('Failed to get batch status:', error);
+            throw error;
+        }
+    }
+
+    /**
+     * Get mobile gas recommendations
+     */
+    async getMobileGasRecommendations() {
+        try {
+            const response = await this.makeRPCCall('mobile/gas-recommendations');
+            return response.recommendations;
+        } catch (error) {
+            console.error('Failed to get mobile gas recommendations:', error);
+            throw error;
+        }
+    }
+
+    /**
+     * Get mobile network status
+     */
+    async getMobileNetworkStatus() {
+        try {
+            const response = await this.makeRPCCall('mobile/network-status');
+            return response.network;
+        } catch (error) {
+            console.error('Failed to get mobile network status:', error);
+            throw error;
+        }
+    }
+
+    /**
+     * Get mobile-optimized transaction cost estimate
+     */
+    async estimateTransactionCost(transactionType, gasTier = 'standard', amount = 0) {
+        try {
+            const response = await this.makeRPCCall('mobile/estimate-transaction-cost', {
+                type: transactionType,
+                gas_tier: gasTier,
+                amount: amount
+            }, 'POST');
+
+            return response.estimate;
+        } catch (error) {
+            console.error('Failed to estimate transaction cost:', error);
+            throw error;
+        }
+    }
+
+    /**
+     * Get batch operation cost comparison
+     */
+    async estimateBatchCost(operations, gasTier = 'standard') {
+        try {
+            const response = await this.makeRPCCall('mobile/batch-estimate', {
+                operations: operations,
+                gas_tier: gasTier
+            }, 'POST');
+
+            return response.estimate;
+        } catch (error) {
+            console.error('Failed to estimate batch cost:', error);
+            throw error;
+        }
+    }
+
+    /**
+     * Enhanced RPC call with mobile optimization
+     */
+    async makeRPCCall(method, params = {}, httpMethod = 'GET') {
+        try {
+            const apiUrl = this.rpcUrl || 'http://localhost:5000';
+            const endpoint = `${apiUrl}/api/v1/${method}`;
+            
+            const options = {
+                method: httpMethod,
                 headers: {
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({
-                    jsonrpc: '2.0',
-                    method: method,
-                    params: params,
-                    id: Date.now()
-                })
-            });
+                    'Content-Type': 'application/json',
+                    'X-Wallet-Type': 'QNetWallet',
+                    'X-Mobile-Optimized': 'true'
+                }
+            };
 
+            if (httpMethod === 'POST' || httpMethod === 'PUT') {
+                options.body = JSON.stringify(params);
+            }
+
+            const response = await fetch(endpoint, options);
+            
             if (!response.ok) {
-                throw new Error(`RPC call failed: ${response.status} ${response.statusText}`);
+                throw new Error(`HTTP ${response.status}: ${response.statusText}`);
             }
 
-            const data = await response.json();
-
-            if (data.error) {
-                throw new Error(`RPC error: ${data.error.message || data.error}`);
-            }
-
-            return data.result || data;
+            return await response.json();
 
         } catch (error) {
             console.error(`RPC call failed for ${method}:`, error);

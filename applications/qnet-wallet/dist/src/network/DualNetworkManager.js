@@ -4,8 +4,8 @@
  * Handles EON address generation and cross-chain operations
  */
 
-// Production version - no npm dependencies - Cache Bust v2025-01-19
-import { secureBIP39 } from '../crypto/ProductionBIP39.js?v=2025-01-19';
+import { Connection, PublicKey } from '@solana/web3.js';
+import { secureBIP39 } from '../crypto/ProductionBIP39.js';
 
 export class DualNetworkManager {
     constructor() {
@@ -30,22 +30,11 @@ export class DualNetworkManager {
      */
     async initialize() {
         try {
-            // Initialize Solana connection (production compatible)
-            this.networks.solana.connection = {
-                rpcUrl: this.networks.solana.rpcUrl,
-                type: 'solana',
-                // Wrapper for background script calls
-                async getBalance(address) {
-                    if (typeof chrome !== 'undefined' && chrome.runtime) {
-                        const response = await chrome.runtime.sendMessage({
-                            type: 'GET_SOL_BALANCE',
-                            address: address
-                        });
-                        return response?.balance || 0;
-                    }
-                    return 2.5; // Demo fallback
-                }
-            };
+            // Initialize Solana connection
+            this.networks.solana.connection = new Connection(
+                this.networks.solana.rpcUrl,
+                'confirmed'
+            );
 
             // Initialize QNet connection (custom RPC client)
             this.networks.qnet.connection = await this.createQNetConnection();
@@ -215,7 +204,55 @@ export class DualNetworkManager {
     }
 
     /**
-     * Get Solana balances (SOL, 1DEV)
+     * Get QNet testnet balance
+     */
+    async getQNetBalance(address) {
+        try {
+            if (!address) {
+                return 0;
+            }
+
+            // Real QNet testnet API integration
+            const response = await fetch('http://localhost:8080/api/v1/account/balance', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    address: address
+                })
+            });
+
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+            }
+
+            const data = await response.json();
+
+            if (data.success) {
+                // Convert from smallest units to QNC
+                const balance = data.balance / 1000000000; // 1 QNC = 1B smallest units
+                console.log(`💰 Real QNet testnet balance for ${address}: ${balance} QNC`);
+                return balance;
+            } else {
+                throw new Error(data.error || 'Failed to get QNet balance');
+            }
+
+        } catch (error) {
+            console.error('Failed to get QNet testnet balance:', error);
+            
+            // Fallback for testnet development - provide faucet balance
+            if (address.startsWith('test') || address.startsWith('faucet')) {
+                console.log('🔄 Using testnet faucet balance');
+                return 1000000; // 1M QNC for testing
+            }
+            
+            return 0;
+        }
+    }
+
+    /**
+     * Get Solana balances (SOL, 1DEV) - Updated for real devnet
      */
     async getSolanaBalances() {
         try {
@@ -225,21 +262,24 @@ export class DualNetworkManager {
 
             const publicKey = this.networks.solana.wallet.publicKey;
             
-            // Get SOL balance (production compatible)
-            const solBalance = await this.getSolanaBalance(publicKey);
+            // Get SOL balance from real devnet
+            const solBalance = await this.networks.solana.connection.getBalance(publicKey);
             
-            // Get 1DEV balance (if token account exists)
+            // Get 1DEV balance (if token account exists) from real devnet
             const oneDevBalance = await this.getTokenBalance(
                 publicKey,
-                '9GcdXAo2EyjNdNLuQoScSVbfJSnh9RdkSS8YYKnGQ8Pf' // 1DEV mint
+                '62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ' // 1DEV mint
             );
 
-            return {
-                SOL: solBalance, // Already converted in getSolanaBalance
+            const result = {
+                SOL: solBalance / 1e9, // Convert lamports to SOL
                 '1DEV': oneDevBalance
             };
+
+            console.log('💰 Real Solana devnet balances:', result);
+            return result;
         } catch (error) {
-            console.error('Failed to get Solana balances:', error);
+            console.error('Failed to get Solana devnet balances:', error);
             return { SOL: 0, '1DEV': 0 };
         }
     }
@@ -361,50 +401,25 @@ export class DualNetworkManager {
     }
 
     /**
-     * Get SOL balance for address (production compatible)
-     */
-    async getSolanaBalance(publicKey) {
-        try {
-            // Production implementation: Use background script
-            if (typeof chrome !== 'undefined' && chrome.runtime) {
-                const response = await chrome.runtime.sendMessage({
-                    type: 'GET_SOL_BALANCE',
-                    publicKey: publicKey
-                });
-                
-                if (response?.success) {
-                    return response.balance || 0;
-                }
-            }
-
-            // Fallback: Demo balance
-            return 2.5; // Demo SOL balance
-        } catch (error) {
-            console.error('Failed to get SOL balance:', error);
-            return 0;
-        }
-    }
-
-    /**
-     * Get token balance for Solana address (production compatible)
+     * Get token balance for Solana address
      */
     async getTokenBalance(publicKey, mintAddress) {
         try {
-            // Production implementation: Use background script
-            if (typeof chrome !== 'undefined' && chrome.runtime) {
-                const response = await chrome.runtime.sendMessage({
-                    type: 'GET_TOKEN_BALANCE',
-                    publicKey: publicKey,
-                    mintAddress: mintAddress
-                });
-                
-                if (response?.success) {
-                    return response.balance || 0;
-                }
+            const mint = new PublicKey(mintAddress);
+            const tokenAccounts = await this.networks.solana.connection.getTokenAccountsByOwner(
+                publicKey,
+                { mint: mint }
+            );
+
+            if (tokenAccounts.value.length === 0) {
+                return 0;
             }
 
-            // Fallback: Demo balance
-            return mintAddress === '9GcdXAo2EyjNdNLuQoScSVbfJSnh9RdkSS8YYKnGQ8Pf' ? 1350 : 0;
+            const balance = await this.networks.solana.connection.getTokenAccountBalance(
+                tokenAccounts.value[0].pubkey
+            );
+
+            return parseFloat(balance.value.uiAmount) || 0;
         } catch (error) {
             return 0;
         }

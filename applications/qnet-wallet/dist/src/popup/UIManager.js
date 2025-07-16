@@ -52,7 +52,7 @@ export class UIManager {
 
             // Get balances
             const [oneDEVBalance, solBalance] = await Promise.all([
-                this.walletManager.getTokenBalance(currentAccount.address, '9GcdXAo2EyjNdNLuQoScSVbfJSnh9RdkSS8YYKnGQ8Pf'),
+                this.walletManager.getTokenBalance(currentAccount.address, '62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ'),
                 this.walletManager.getSolBalance(currentAccount.address)
             ]);
 
@@ -548,8 +548,21 @@ export class UIManager {
         toast.className = `toast toast-${type}`;
         toast.textContent = message;
         
-        // Apply toast CSS class instead of inline styles
-        toast.classList.add('toast-notification');
+        // Style the toast
+        toast.style.cssText = `
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            background: ${type === 'error' ? '#ff4444' : type === 'success' ? '#44ff44' : '#333'};
+            color: white;
+            padding: 12px 20px;
+            border-radius: 8px;
+            z-index: 10000;
+            font-size: 14px;
+            max-width: 300px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+            animation: slideIn 0.3s ease;
+        `;
 
         // Add animation keyframes
         if (!document.getElementById('toast-styles')) {
@@ -598,7 +611,12 @@ export class UIManager {
             errorElement = document.createElement('div');
             errorElement.id = errorId;
             errorElement.className = 'inline-error';
-            errorElement.classList.add('inline-error-dynamic');
+            errorElement.style.cssText = `
+                color: #ff4444;
+                font-size: 12px;
+                margin-top: 5px;
+                display: block;
+            `;
             
             // Find the appropriate parent to insert the error
             const parentElement = this.findErrorParent(errorId);
@@ -608,8 +626,7 @@ export class UIManager {
         }
         
         errorElement.textContent = message;
-        errorElement.classList.remove('hidden');
-        errorElement.classList.add('error-visible');
+        errorElement.style.display = 'block';
     }
 
     /**
@@ -618,8 +635,7 @@ export class UIManager {
     clearError(errorId) {
         const errorElement = this.getElement(errorId);
         if (errorElement) {
-            errorElement.classList.add('hidden');
-            errorElement.classList.remove('error-visible');
+            errorElement.style.display = 'none';
             errorElement.textContent = '';
         }
     }
@@ -648,18 +664,35 @@ export class UIManager {
             // Create modal overlay
             const overlay = document.createElement('div');
             overlay.className = 'modal-overlay';
-            overlay.classList.add('confirm-overlay');
+            overlay.style.cssText = `
+                position: fixed;
+                inset: 0;
+                background: rgba(0,0,0,0.7);
+                backdrop-filter: blur(5px);
+                z-index: 10000;
+                display: flex;
+                justify-content: center;
+                align-items: center;
+            `;
 
             // Create modal box
             const modal = document.createElement('div');
             modal.className = 'confirm-modal';
-            modal.classList.add('confirm-modal-box');
+            modal.style.cssText = `
+                background: var(--background-secondary);
+                border: 1px solid var(--border-color);
+                border-radius: 12px;
+                padding: 24px;
+                max-width: 400px;
+                width: 90%;
+                color: var(--text-primary);
+            `;
 
             modal.innerHTML = `
-                <h3 class="confirm-title">${title}</h3>
-                <p class="confirm-message">${message}</p>
-                <div class="confirm-actions">
-                    <button id="confirm-cancel" class="qnet-button confirm-cancel">Cancel</button>
+                <h3 style="margin: 0 0 16px 0; color: var(--text-primary);">${title}</h3>
+                <p style="margin: 0 0 24px 0; color: var(--text-secondary); line-height: 1.5;">${message}</p>
+                <div style="display: flex; gap: 12px; justify-content: flex-end;">
+                    <button id="confirm-cancel" class="qnet-button" style="background: transparent;">Cancel</button>
                     <button id="confirm-ok" class="qnet-button primary">Confirm</button>
                 </div>
             `;
@@ -712,6 +745,7 @@ export class UIManager {
         const element = this.getElement(id);
         if (element) {
             element.classList.remove('hidden');
+            element.style.display = '';
         }
     }
 
@@ -722,6 +756,7 @@ export class UIManager {
         const element = this.getElement(id);
         if (element) {
             element.classList.add('hidden');
+            element.style.display = 'none';
         }
     }
 

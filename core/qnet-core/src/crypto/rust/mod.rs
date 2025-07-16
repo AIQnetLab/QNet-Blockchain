@@ -3,13 +3,11 @@
 pub mod production_crypto;
 pub mod utils;
 
-use production_crypto::{
+// Re-export main types for backward compatibility
+pub use production_crypto::{
     ProductionCrypto, DilithiumParams, SphincsParams, CryptoErrorWithKind as CryptoError, 
     CryptoErrorKind, default_dilithium_params, default_sphincs_params
 };
-
-// Re-export main types for backward compatibility
-pub use production_crypto::{ProductionCrypto, DilithiumParams, SphincsParams, CryptoErrorWithKind as CryptoError, CryptoErrorKind};
 
 // Simplified interface for backward compatibility
 pub fn generate_keypair() -> Result<(Vec<u8>, Vec<u8>), CryptoError> {

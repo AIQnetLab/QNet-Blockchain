@@ -83,7 +83,7 @@ export class SwapComponent {
                 </div>
                 
                 <!-- Fee Information -->
-                <div class="fee-information hidden" id="fee-info">
+                <div class="fee-information" id="fee-info" style="display: none;">
                     <div class="fee-item">
                         <span>Platform Fee (0.5%)</span>
                         <span id="platform-fee-amount">0.0000</span>

@@ -7,19 +7,28 @@
 
 ## 🌟 Overview
 
-QNet is a high-performance, post-quantum secure blockchain network designed for the next generation of decentralized applications. With cutting-edge cryptography and innovative consensus mechanisms, QNet delivers unprecedented performance while maintaining quantum resistance.
+QNet is a high-performance, post-quantum secure blockchain network with a **two-phase activation system** designed for the next generation of decentralized applications.
+
+### ⚠️ **CRITICAL PHASE SYSTEM**
+- **Phase 1 (Current)**: ONLY 1DEV token activation on Solana blockchain
+- **Phase 2 (Future)**: ONLY QNC token activation on QNet blockchain
+- **Transition**: 90% 1DEV burned OR 5 years from genesis block (whichever comes first)
+
+### 🖥️ **DEVICE RESTRICTIONS**
+- **Full/Super Nodes**: ONLY servers, VPS, desktops with interactive setup
+- **Light Nodes**: ONLY mobile devices & tablets through mobile app
 
 ### 🚀 **Current Status: Production Testnet Ready**
 
 **QNet production testnet is ready for deployment with real Rust nodes.**
 
 - ✅ **Post-Quantum Cryptography**: CRYSTALS-Dilithium integration complete
-- ✅ **Cross-Chain Bridge**: Solana integration tested and secured
+- ✅ **Two-Phase Activation**: 1DEV burn (Phase 1) → QNC Pool 3 (Phase 2)
 - ✅ **Microblock Architecture**: 1-second block production, 100k+ TPS capability
-- ✅ **Production Rust Nodes**: Docker deployment with real blockchain nodes
+- ✅ **Production Rust Nodes**: Server deployment with real blockchain nodes
 - ✅ **Browser Extension Wallet**: Production-ready with full-screen interface
-- ✅ **Mobile Applications**: iOS/Android apps ready for deployment
-- ✅ **Zero-Configuration Setup**: Fully automatic deployment with no parameters
+- ✅ **Mobile Applications**: iOS/Android apps for Light nodes only
+- ✅ **Interactive Setup**: Server nodes require interactive activation menu
 
 ### 📋 **Testnet Deployment**
 
@@ -31,11 +40,14 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 
 - **🔐 Post-Quantum Security**: Quantum-resistant cryptographic algorithms
 - **⚡ Ultra-High Performance**: 424,411 TPS with sub-100ms latency
+- **🔥 Phase 1 Active**: 1DEV burn-to-join (1,500 → 150 1DEV universal pricing)
+- **💎 Phase 2 Ready**: QNC Pool 3 system (5k-30k QNC dynamic pricing)
 - **🌐 Scalable Architecture**: Sharding and microblock technology
-- **🔗 Cross-Chain Compatibility**: Seamless integration with existing networks
+- **🔗 Cross-Chain Compatibility**: Solana integration for Phase 1
 - **🏛️ Decentralized Governance**: Community-driven decision making
-- **📱 Mobile-First Design**: Optimized for mobile and IoT devices
-- **🔧 Zero-Configuration**: Fully automatic setup with no command-line arguments
+- **📱 Mobile-First Design**: Light nodes on phones & tablets
+- **🖥️ Server Architecture**: Full/Super nodes on dedicated servers
+- **🔧 Interactive Setup**: User-friendly activation process
 
 ### 📊 Performance Metrics
 
@@ -258,34 +270,31 @@ rm -rf ~/QNet-Blockchain/node_data
 
 ⚠️ **Important**: Node deactivation from QNet network requires activation code expiry or manual deregistration through mobile app/browser extension.
 
-## �� Node Setup Guides
+## 📄 Node Setup Guides
 
 QNet nodes run natively for maximum performance. Choose your node type based on available resources.
 
 ### 💡 Node Setup (Interactive Menu)
 
-QNet nodes use an interactive setup menu for easy configuration. All node types (Light, Full, Super) are configured through the same interface.
+QNet nodes use device-specific deployment methods:
 
-#### System Requirements
+**Server Nodes (Full/Super)**: Interactive setup menu on dedicated servers
+**Mobile Nodes (Light)**: Mobile app activation on phones & tablets
 
-**Light Node (Mobile/IoT devices only)**
-- **CPU**: 2 cores
-- **RAM**: 4 GB  
-- **Storage**: 50 GB
-- **Network**: 10 Mbps
-- **Note**: Light nodes restricted to mobile devices only
+### Node Types & Platform Support
 
-**Full Node (Servers/Desktops)**
-- **CPU**: 8 cores
-- **RAM**: 32 GB
-- **Storage**: 1 TB NVMe SSD
-- **Network**: 100 Mbps
+| Node Type | Platform | Activation Method | API Server | Features |
+|-----------|----------|-------------------|------------|----------|
+| **Light** | 📱 Mobile phones & tablets | Mobile app only | ❌ No | Basic sync, wallet |
+| **Full** | 🖥️ Servers, VPS, desktops | Interactive setup | ✅ Yes | Full validation, API |
+| **Super** | 🖥️ Servers, VPS, desktops | Interactive setup | ✅ Yes | Enhanced features, API |
 
-**Super Node (High Performance Servers)**
-- **CPU**: 16+ cores
-- **RAM**: 64+ GB
-- **Storage**: 2+ TB NVMe SSD
-- **Network**: 1 Gbps
+### Device Restrictions
+
+**⚠️ CRITICAL LIMITATIONS:**
+- **Light Nodes**: Cannot be activated on servers/desktops
+- **Full/Super Nodes**: Cannot be activated on mobile devices
+- **API Access**: Only Full/Super nodes provide REST endpoints
 
 #### Automatic Node Setup
 
@@ -585,25 +594,94 @@ cargo test --test performance --release
 
 ## 📚 API Documentation
 
-### REST API
+### Multi-Node REST API Architecture
+
+**🌐 Every Full/Super node provides complete API functionality:**
 
 ```bash
-# Get node info
-GET /api/v1/node/info
+# Node 1 API endpoints
+curl http://localhost:8001/api/v1/node/info
+curl http://localhost:8001/api/v1/blocks/{height}
+curl http://localhost:8001/api/v1/transactions/{hash}
 
-# Get block by height
-GET /api/v1/blocks/{height}
+# Node 2 API endpoints  
+curl http://localhost:8002/api/v1/node/info
+curl http://localhost:8002/api/v1/blocks/{height}
+curl http://localhost:8002/api/v1/transactions/{hash}
 
-# Get transaction by hash
-GET /api/v1/transactions/{hash}
-
-# Submit transaction
-POST /api/v1/transactions
+# Node 3 API endpoints
+curl http://localhost:8003/api/v1/node/info
+curl http://localhost:8003/api/v1/blocks/{height}
+curl http://localhost:8003/api/v1/transactions/{hash}
 ```
 
-### WebSocket API
+### Available API Endpoints (Per Node)
+
+**Account Management:**
+- `GET /api/v1/account/{address}` - Get account information
+- `GET /api/v1/account/{address}/balance` - Get account balance
+- `GET /api/v1/account/{address}/transactions` - Get transaction history
+
+**Blockchain Data:**
+- `GET /api/v1/block/latest` - Get latest block
+- `GET /api/v1/block/{height}` - Get block by height
+- `GET /api/v1/block/hash/{hash}` - Get block by hash
+
+**Transactions:**
+- `POST /api/v1/transaction` - Submit transaction
+- `GET /api/v1/transaction/{hash}` - Get transaction details
+
+**Network Status:**
+- `GET /api/v1/mempool/status` - Get mempool status
+- `GET /api/v1/nodes/discovery` - Discover available nodes
+- `GET /api/v1/node/health` - Check node health
+- `GET /api/v1/gas/recommendations` - Get gas price recommendations
+
+### Client Implementation with Multiple Nodes
 
 ```javascript
+// Production-ready client with multiple node support
+const qnetNodes = [
+    'http://node1.example.com:8001',  // Full node
+    'http://node2.example.com:8002',  // Super node  
+    'http://node3.example.com:8003'   // Full node
+];
+
+async function qnetApiCall(endpoint, data = null) {
+    for (const nodeUrl of qnetNodes) {
+        try {
+            const response = await fetch(`${nodeUrl}/api/v1/${endpoint}`, {
+                method: data ? 'POST' : 'GET',
+                headers: data ? {'Content-Type': 'application/json'} : {},
+                body: data ? JSON.stringify(data) : null
+            });
+            if (response.ok) return await response.json();
+        } catch (error) {
+            console.log(`Node ${nodeUrl} unavailable, trying next...`);
+        }
+    }
+    throw new Error('All QNet nodes unavailable');
+}
+```
+
+**🔑 Architecture Benefits:**
+- ✅ **Distributed Access**: Multiple nodes provide API access
+- ✅ **Load Distribution**: API traffic spread across multiple nodes
+- ✅ **High Availability**: Multiple nodes ensure service continuity
+- ✅ **Scalability**: More nodes = more API capacity
+- ✅ **Redundancy**: Built-in failover capabilities
+
+**📝 Node Requirements:**
+- Full/Super nodes provide REST API endpoints
+- Light nodes focus on mobile functionality
+- Each node offers identical API interface
+
+### WebSocket API (Per Node)
+
+Each Full/Super node also provides WebSocket endpoints for real-time updates:
+
+```javascript
+// Connect to specific node WebSocket
 const ws = new WebSocket('ws://localhost:9877/ws');
 
 // Subscribe to new blocks
@@ -611,7 +689,18 @@ ws.send(JSON.stringify({
     method: 'subscribe',
     params: ['newBlocks']
 }));
+
+// Subscribe to new transactions
+ws.send(JSON.stringify({
+    method: 'subscribe', 
+    params: ['newTransactions']
+}));
 ```
+
+**WebSocket Endpoints:**
+- `ws://localhost:9877/ws` - Node 1 WebSocket
+- `ws://localhost:9879/ws` - Node 2 WebSocket  
+- `ws://localhost:9881/ws` - Node 3 WebSocket 
 
 ## 🔧 Auto-Configuration Features
 

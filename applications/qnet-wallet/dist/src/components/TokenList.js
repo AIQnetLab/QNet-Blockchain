@@ -63,7 +63,7 @@ export class TokenList {
                 </div>
                 
                 <!-- Add Custom Token Modal -->
-                <div class="modal hidden" id="add-token-modal">
+                <div class="modal" id="add-token-modal" style="display: none;">
                     <div class="modal-content">
                         <div class="modal-header">
                             <h3>Add Custom Token</h3>

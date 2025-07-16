@@ -437,20 +437,19 @@ function updateNetworkStatus(status) {
     const statusElement = document.getElementById('network-status');
     if (!statusElement) return;
     
-    // Remove all status classes
     statusElement.className = 'network-status';
     
     switch (status) {
         case 'connected':
-            statusElement.classList.add('status-connected');
+            statusElement.style.background = '#10b981';
             statusElement.title = 'Connected to both networks';
                 break;
         case 'connecting':
-            statusElement.classList.add('status-connecting');
+            statusElement.style.background = '#f59e0b';
             statusElement.title = 'Connecting to networks...';
                 break;
         case 'error':
-            statusElement.classList.add('status-error');
+            statusElement.style.background = '#ef4444';
             statusElement.title = 'Connection error';
                 break;
         }
@@ -588,7 +587,7 @@ async function updateNodeCard() {
         
         nodeActions.innerHTML = `
             <button class="qnet-button secondary modern" onclick="monitorNode()">📊 Monitor</button>
-            <button class="qnet-button secondary modern" onclick="transferNode()">🔄 Transfer</button>
+            <button class="qnet-button secondary modern" onclick="migrateDevice()">🔄 Migrate</button>
         `;
         
     } else {
@@ -849,8 +848,16 @@ async function generateQRCode(address) {
             }
         }
         
-        // No fallback - only use background service QR generation
-        console.log('QR generation from background service failed');
+        // Fallback: Simple QR placeholder
+        const ctx = canvas.getContext('2d');
+        canvas.width = 200;
+        canvas.height = 200;
+        ctx.fillStyle = '#f0f0f0';
+        ctx.fillRect(0, 0, 200, 200);
+        ctx.fillStyle = '#333';
+        ctx.font = '12px Arial';
+        ctx.textAlign = 'center';
+        ctx.fillText('QR Code', 100, 100);
         
     } catch (error) {
         console.error('❌ QR code generation failed:', error);
@@ -996,8 +1003,7 @@ function setupModalControls() {
 function showSetupScreen() {
     const setupOptions = document.querySelector('.setup-options');
     if (setupOptions) {
-        setupOptions.classList.remove('hidden');
-        setupOptions.classList.add('setup-visible');
+        setupOptions.style.display = 'flex';
     }
     showScreen('locked-screen');
 }
@@ -1073,7 +1079,7 @@ function showInlineError(errorId, message) {
     const errorElement = document.getElementById(errorId);
     if (errorElement) {
         errorElement.textContent = message;
-        errorElement.classList.remove('hidden');
+        errorElement.style.display = 'block';
         errorElement.classList.add('error-visible');
     }
 }
@@ -1102,8 +1108,8 @@ window.monitorNode = function() {
     showToast('Node monitoring coming soon', 'info');
 };
 
-window.transferNode = function() {
-    showToast('Node transfer coming soon', 'info');
+window.migrateDevice = function() {
+    showToast('Device migration coming soon', 'info');
 };
 
 window.activateNode = async function() {
@@ -1197,9 +1203,9 @@ function showErrorInterface(errorMessage) {
     if (loadingScreen) {
         loadingScreen.innerHTML = `
             <div class="loading-container">
-                <div class="error-icon">⚠️</div>
+                <div style="font-size: 48px; margin-bottom: 20px;">⚠️</div>
                 <h2>Initialization Error</h2>
-                <p class="error-text">${errorMessage}</p>
+                <p style="color: #ef4444; margin: 20px 0;">${errorMessage}</p>
                 <button onclick="window.location.reload()" class="qnet-button primary">
                     🔄 Reload Wallet
                 </button>

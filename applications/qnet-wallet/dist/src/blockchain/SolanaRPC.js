@@ -70,16 +70,25 @@ export class SolanaRPC {
             const cached = this.getFromCache(cacheKey);
             if (cached !== null) return cached;
             
+            // Real Solana devnet integration - no mocks for production
             const result = await this.makeRequest('getBalance', [address]);
+            
+            if (!result || typeof result.value !== 'number') {
+                console.warn('Invalid balance response from Solana devnet:', result);
+                return 0;
+            }
+            
             const balanceInLamports = result.value;
             const balanceInSOL = balanceInLamports / 1000000000; // Convert lamports to SOL
             
-            // Cache result
-            this.setCache(cacheKey, balanceInSOL);
+            // Cache result for 30 seconds
+            this.setCache(cacheKey, balanceInSOL, 30000);
             
+            console.log(`💰 Real Solana devnet balance for ${address}: ${balanceInSOL} SOL`);
             return balanceInSOL;
         } catch (error) {
-            console.error('Failed to get balance:', error);
+            console.error('Failed to get balance from Solana devnet:', error);
+            // For testnet, don't fallback to mock - return 0 for real integration
             return 0;
         }
     }
@@ -196,29 +205,39 @@ export class SolanaRPC {
      */
     async sendTransaction(signedTransaction) {
         try {
-            // Serialize transaction
+            // Serialize transaction for real Solana devnet
             const serialized = signedTransaction.serialize();
             const base64Transaction = Buffer.from(serialized).toString('base64');
             
-            // Send transaction
+            // Send transaction to real Solana devnet
             const signature = await this.makeRequest('sendTransaction', [
                 base64Transaction,
-                { encoding: 'base64', skipPreflight: false, preflightCommitment: 'processed' }
+                { 
+                    encoding: 'base64', 
+                    skipPreflight: false, 
+                    preflightCommitment: 'processed',
+                    maxRetries: 3
+                }
             ]);
             
-            console.log('Transaction sent:', signature);
+            if (!signature || typeof signature !== 'string') {
+                throw new Error('Invalid signature response from Solana devnet');
+            }
             
-            // Wait for confirmation
+            console.log('✅ Transaction sent to Solana devnet:', signature);
+            
+            // Wait for confirmation on real devnet
             const confirmation = await this.confirmTransaction(signature);
             
             return {
                 signature: signature,
                 confirmed: confirmation.confirmed,
-                slot: confirmation.slot
+                slot: confirmation.slot,
+                network: 'solana-devnet'
             };
         } catch (error) {
-            console.error('Failed to send transaction:', error);
-            throw new Error(`Transaction failed: ${error.message}`);
+            console.error('Failed to send transaction to Solana devnet:', error);
+            throw error;
         }
     }
     
@@ -362,16 +381,17 @@ export class SolanaRPC {
     /**
      * Cache management
      */
-    setCache(key, value) {
+    setCache(key, value, timeout = this.cacheTimeout) {
         this.cache.set(key, {
             value: value,
-            timestamp: Date.now()
+            timestamp: Date.now(),
+            timeout: timeout
         });
     }
     
     getFromCache(key) {
         const cached = this.cache.get(key);
-        if (cached && (Date.now() - cached.timestamp) < this.cacheTimeout) {
+        if (cached && (Date.now() - cached.timestamp) < cached.timeout) {
             return cached.value;
         }
         this.cache.delete(key);

@@ -621,9 +621,11 @@ if __name__ == "__main__":
 async def get_mobile_gas_recommendations():
     """Get mobile-optimized gas price recommendations with dynamic pricing."""
     try:
-        # Get current mempool size and block utilization
+        # Get current mempool size
         mempool_size = api_state.mempool.size()
-        block_utilization = 0.5  # Mock value - in production, calculate from recent blocks
+        
+        # Calculate real block utilization from recent blocks
+        block_utilization = await calculate_real_block_utilization()
         
         # Update dynamic pricing
         from qnet_state.transaction import update_network_load, get_mobile_gas_recommendations
@@ -644,7 +646,7 @@ async def get_mobile_gas_recommendations():
                 },
                 "standard": {
                     "gas_price": recommendations.standard.to_qnc(),
-                    "display_name": "Standard",
+                    "display_name": "Standard", 
                     "description": "Normal speed and price",
                     "estimated_time": format_confirmation_time(recommendations.estimated_confirmation_time),
                     "icon": "⚡"
@@ -681,7 +683,7 @@ async def get_mobile_gas_recommendations():
                 "eco": {
                     "gas_price": 0.0001,
                     "display_name": "Eco",
-                    "description": "Slowest, cheapest option",
+                    "description": "Slowest, cheapest option", 
                     "estimated_time": "1-2 seconds",
                     "icon": "🌱"
                 },
@@ -713,6 +715,98 @@ async def get_mobile_gas_recommendations():
                 "block_utilization": 0.5
             },
             "mobile_optimized": True
+        }
+
+
+async def calculate_real_block_utilization() -> float:
+    """Calculate real block utilization from recent blocks for testnet"""
+    try:
+        # Get recent blocks from state database
+        recent_blocks = []
+        current_height = api_state.state_db.get_chain_height()
+        
+        # Get last 10 blocks for utilization calculation
+        for i in range(max(0, current_height - 10), current_height):
+            try:
+                block = await api_state.state_db.get_block_by_height(i)
+                if block:
+                    recent_blocks.append(block)
+            except Exception as e:
+                logger.warning(f"Could not get block {i}: {e}")
+                continue
+        
+        if not recent_blocks:
+            # No recent blocks available, return default utilization
+            return 0.3  # Conservative default for testnet
+        
+        # Calculate total gas used vs total gas limit
+        total_gas_used = 0
+        total_gas_limit = 0
+        
+        for block in recent_blocks:
+            # Calculate gas used by all transactions in block
+            block_gas_used = 0
+            for tx in block.transactions:
+                block_gas_used += tx.gas_price * tx.gas_limit
+            
+            # Standard block gas limit for QNet testnet
+            block_gas_limit = 1_000_000  # 1M gas per block
+            
+            total_gas_used += block_gas_used
+            total_gas_limit += block_gas_limit
+        
+        # Calculate utilization percentage
+        if total_gas_limit > 0:
+            utilization = min(total_gas_used / total_gas_limit, 1.0)
+        else:
+            utilization = 0.0
+        
+        logger.info(f"Block utilization calculated: {utilization:.3f} ({total_gas_used}/{total_gas_limit} gas)")
+        return utilization
+        
+    except Exception as e:
+        logger.error(f"Error calculating block utilization: {e}")
+        # Return conservative default for testnet
+        return 0.3
+
+
+@app.get("/api/v1/network/stats")
+async def get_network_stats():
+    """Get comprehensive network statistics for testnet."""
+    try:
+        mempool_size = api_state.mempool.size()
+        block_utilization = await calculate_real_block_utilization()
+        chain_height = api_state.state_db.get_chain_height()
+        
+        return {
+            "success": True,
+            "network": {
+                "name": "QNet Testnet",
+                "chain_height": chain_height,
+                "mempool_size": mempool_size,
+                "block_utilization": block_utilization,
+                "target_utilization": 0.8,
+                "average_block_time": "2 seconds",
+                "finality_time": "6 seconds"
+            },
+            "performance": {
+                "tps_current": max(1, mempool_size // 10),
+                "tps_peak": 1000,
+                "utilization_efficiency": block_utilization / 0.8 if block_utilization > 0 else 0.0
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting network stats: {e}")
+        return {
+            "success": False,
+            "error": str(e),
+            "network": {
+                "name": "QNet Testnet",
+                "chain_height": 0,
+                "mempool_size": 0,
+                "block_utilization": 0.3
+            }
         }
 
 @app.post("/api/v1/mobile/estimate-transaction-cost")

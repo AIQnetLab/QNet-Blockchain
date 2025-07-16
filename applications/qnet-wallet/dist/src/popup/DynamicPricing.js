@@ -169,5 +169,9 @@ class DynamicPricing {
     }
 }
 
-// ES6 module export
-export { DynamicPricing };
+// Export for use in other modules
+if (typeof module !== 'undefined' && module.exports) {
+    module.exports = DynamicPricing;
+} else {
+    window.DynamicPricing = DynamicPricing;
+}

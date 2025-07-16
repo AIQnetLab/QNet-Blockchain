@@ -1100,6 +1100,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     
     println!("📊 RPC endpoint: http://{}:{}/rpc", external_ip, config.rpc_port);
+    println!("🌐 API endpoint: http://{}:{}/api/v1/", external_ip, std::env::var("QNET_CURRENT_API_PORT").unwrap_or("8001".to_string()));
     println!("🔍 DEBUG: Node ready to accept connections");
     
     // Start metrics server

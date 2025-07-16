@@ -9,7 +9,7 @@ pub mod crypto;
 pub mod security;
 
 // Re-export main crypto functions
-pub use crypto::{hash, sign, verify, KeyPair, PublicKey, Signature};
+pub use crypto::{hash, sign, verify, KeyPair};
 
 // Common types
 pub type Hash = [u8; 32];

@@ -5,8 +5,8 @@ pub mod rust;
 
 // Re-export main crypto functions
 pub use rust::{
-    Algorithm, PublicKey, SecretKey, Signature, CryptoError, CryptoErrorKind,
-    ProductionSig as Sig, generate_production_keypair, create_production_sig, verify_production_signature
+    ProductionCrypto, DilithiumParams, SphincsParams, CryptoError, CryptoErrorKind,
+    generate_keypair, sign as rust_sign, verify as rust_verify
 };
 
 // Convenience functions
@@ -20,12 +20,12 @@ pub fn hash(data: &[u8]) -> [u8; 32] {
     result
 }
 
-pub fn sign(data: &[u8], secret_key: &SecretKey) -> Result<Signature, CryptoError> {
-    rust::utils::sign(data, secret_key)
+pub fn sign(data: &[u8], secret_key: &[u8]) -> Result<Vec<u8>, CryptoError> {
+    rust_sign(data, secret_key)
 }
 
-pub fn verify(data: &[u8], signature: &Signature, public_key: &PublicKey) -> Result<bool, CryptoError> {
-    rust::utils::verify(data, signature, public_key)
+pub fn verify(data: &[u8], signature: &[u8], public_key: &[u8]) -> Result<bool, CryptoError> {
+    rust_verify(data, signature, public_key)
 }
 
-pub type KeyPair = (PublicKey, SecretKey); 
+pub type KeyPair = (Vec<u8>, Vec<u8>); 

@@ -323,11 +323,58 @@ impl BlockchainNode {
                 }
                 9877 // fallback
             });
+
+        // Start API server ONLY for Full and Super nodes
+        // Light nodes are mobile-only and don't provide API
+        let should_start_api = !matches!(self.node_type, NodeType::Light);
         
-        let node_clone = self.clone();
-        tokio::spawn(async move {
-            crate::rpc::start_rpc_server(node_clone, rpc_port).await;
-        });
+        if should_start_api {
+            let api_port = std::env::var("QNET_API_PORT")
+                .ok()
+                .and_then(|s| s.parse::<u16>().ok())
+                .unwrap_or_else(|| {
+                    // Find available port starting from 8001
+                    use std::net::TcpListener;
+                    for port in 8001..8101 {
+                        if TcpListener::bind(format!("0.0.0.0:{}", port)).is_ok() {
+                            return port;
+                        }
+                    }
+                    8001 // fallback
+                });
+            
+            // Start both RPC and API servers for Full/Super nodes
+            let node_clone_rpc = self.clone();
+            let node_clone_api = self.clone();
+            
+            tokio::spawn(async move {
+                crate::rpc::start_rpc_server(node_clone_rpc, rpc_port).await;
+            });
+            
+            println!("[Node] 🚀 API server starting on port {}", api_port);
+            tokio::spawn(async move {
+                crate::rpc::start_rpc_server(node_clone_api, api_port).await;
+            });
+            
+            // Store ports for external access
+            std::env::set_var("QNET_CURRENT_RPC_PORT", rpc_port.to_string());
+            std::env::set_var("QNET_CURRENT_API_PORT", api_port.to_string());
+            
+            println!("[Node] 🔌 RPC server: port {}", rpc_port);
+            println!("[Node] 🌐 API server: port {}", api_port);
+        } else {
+            // Light nodes: RPC only, no API server
+            let node_clone_rpc = self.clone();
+            
+            tokio::spawn(async move {
+                crate::rpc::start_rpc_server(node_clone_rpc, rpc_port).await;
+            });
+            
+            std::env::set_var("QNET_CURRENT_RPC_PORT", rpc_port.to_string());
+            
+            println!("[Node] 🔌 RPC server: port {} (Light node - no API)", rpc_port);
+            println!("[Node] 📱 Light node: Mobile-only, no public API endpoints");
+        }
         
         println!("[Node] ✅ Blockchain node started successfully");
         Ok(())

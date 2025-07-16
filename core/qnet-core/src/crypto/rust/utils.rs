@@ -1,6 +1,6 @@
 //! Cryptographic utilities for QNet
 
-use rand::RngCore;
+use rand::{RngCore, Rng};
 use rand::thread_rng;
 use crate::crypto::rust::production_crypto::{ProductionCrypto, CryptoErrorWithKind as CryptoError, CryptoErrorKind};
 
@@ -16,6 +16,22 @@ pub fn generate_seed() -> [u8; 64] {
     let mut seed = [0u8; 64];
     rand::thread_rng().fill(&mut seed);
     seed
+}
+
+/// Sign data with secret key
+pub fn sign(data: &[u8], secret_key: &[u8]) -> Result<Vec<u8>, CryptoError> {
+    let crypto = ProductionCrypto::new();
+    let params = super::default_dilithium_params();
+    let message_hash = crypto.secure_hash(data);
+    crypto.dilithium_sign(&message_hash, secret_key, &params)
+}
+
+/// Verify signature with public key
+pub fn verify(data: &[u8], signature: &[u8], public_key: &[u8]) -> Result<bool, CryptoError> {
+    let crypto = ProductionCrypto::new();
+    let params = super::default_dilithium_params();
+    let message_hash = crypto.secure_hash(data);
+    crypto.dilithium_verify(signature, &message_hash, public_key, &params)
 }
 
 /// Secure comparison of two byte slices (constant time)
