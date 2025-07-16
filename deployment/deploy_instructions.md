@@ -17,17 +17,19 @@ source ~/.cargo/env
 git clone https://github.com/AIQnetLab/QNet-Blockchain.git
 cd QNet-Blockchain && git checkout testnet
 cargo build --release
+
+# 4. Build Docker image
 docker build -t qnet-production -f development/Dockerfile .
 
-# 4. Launch node
+# 5. Launch node
 docker run -d --name qnet-node --restart=always \
   -p 9876:9876 -p 9877:9877 -p 8001:8001 \
   -v $(pwd)/node_data:/opt/qnet/node_data \
   qnet-production
 
-# 5. Activate node (INTERACTIVE REQUIRED)
+# 6. Activate node (INTERACTIVE REQUIRED)
 docker exec -it qnet-node /bin/bash
-./target/release/qnet-node
+/usr/local/bin/qnet-node
 ```
 
 ### Quick Monitoring Commands
