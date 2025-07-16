@@ -175,44 +175,67 @@ ls -la development/qnet-integration/target/release/qnet-node
 - ❌ **Super Nodes**: Cannot be activated on mobile devices
 
 ```bash
-# Terminal 1 - First node (Full or Super only)
-cd development/qnet-integration
-./target/release/qnet-node
+# Launch first node - NO ENVIRONMENT VARIABLES
+docker run -d \
+  --name qnet-node-1 \
+  --restart=always \
+  -p 9876:9876 \
+  -p 9877:9877 \
+  -p 8001:8001 \
+  -v $(pwd)/node_data:/opt/qnet/node_data \
+  qnet-production
 
-# Interactive setup will prompt for:
-# 1. Activation code (format: QNET-XXXX-XXXX-XXXX) 
-# 2. Node type selection (Full/Super only on servers)
-# 3. Region auto-detection confirmation
-# 4. Network configuration
+# Launch second node - NO ENVIRONMENT VARIABLES
+docker run -d \
+  --name qnet-node-2 \
+  --restart=always \
+  -p 9878:9878 \
+  -p 9879:9879 \
+  -p 8002:8002 \
+  -v $(pwd)/node2_data:/opt/qnet/node_data \
+  qnet-production
 
-# Example activation flow:
-# > Enter activation code: QNET-F234-5678-9012
-# > Select node type: [1] Full [2] Super (Light not available on servers)
-# > Detected region: Europe [Y/n]
-# > P2P port: 9876 (auto-detected)
-# > RPC port: 9877 (auto-detected)  
-# > API port: 8001 (auto-detected)
-
-# After successful activation:
-# - API server starts on port 8001 (Full/Super only)
-# - RPC server starts on port 9877
-# - P2P networking on port 9876
-# - Node begins blockchain synchronization
+# Launch third node - NO ENVIRONMENT VARIABLES
+docker run -d \
+  --name qnet-node-3 \
+  --restart=always \
+  -p 9880:9880 \
+  -p 9881:9881 \
+  -p 8003:8003 \
+  -v $(pwd)/node3_data:/opt/qnet/node_data \
+  qnet-production
 ```
+
+**INTERACTIVE ACTIVATION REQUIRED:**
+Each node will present an interactive menu where you must:
+1. Enter activation code (QNET-XXXX-XXXX-XXXX)
+2. Select node type (Full/Super only on servers)
+3. Confirm detected region
+4. Confirm network ports
+5. Complete cryptographic setup
+
+**NO AUTOMATIC CONFIGURATION** - All settings determined through interactive menu!
 
 ### Multiple Nodes for High Availability
 
 ```bash
-# Terminal 2 - Second node (Full/Super only)
-QNET_P2P_PORT=9878 QNET_RPC_PORT=9879 QNET_API_PORT=8002 ./target/release/qnet-node
-# Enter activation code: QNET-YYYY-YYYY-YYYY
-# Select node type: Full or Super (Light not available)
+# Connect to first node container for interactive activation
+docker exec -it qnet-node-1 /bin/bash
+./target/release/qnet-node
+# Interactive menu will appear - enter activation code and configure
 
-# Terminal 3 - Third node (Full/Super only)
-QNET_P2P_PORT=9880 QNET_RPC_PORT=9881 QNET_API_PORT=8003 ./target/release/qnet-node
-# Enter activation code: QNET-ZZZZ-ZZZZ-ZZZZ
-# Select node type: Full or Super (Light not available)
+# Connect to second node container for interactive activation  
+docker exec -it qnet-node-2 /bin/bash
+./target/release/qnet-node
+# Interactive menu will appear - enter activation code and configure
+
+# Connect to third node container for interactive activation
+docker exec -it qnet-node-3 /bin/bash
+./target/release/qnet-node
+# Interactive menu will appear - enter activation code and configure
 ```
+
+**IMPORTANT:** Each node must be activated through its own interactive menu session. No environment variables or automatic configuration allowed!
 
 ### Activation Code Requirements
 
@@ -279,85 +302,48 @@ curl -X POST http://localhost:8001/api/v1/transaction \
 
 ### Production Systemd Services
 
-For production deployment with auto-restart:
+**IMPORTANT:** All nodes must be activated interactively before creating systemd services.
 
 ```bash
-# Node 1 Service (Full node)
+# Create systemd service for Node 1 (after interactive activation)
 sudo tee /etc/systemd/system/qnet-node-1.service > /dev/null <<EOF
 [Unit]
-Description=QNet Blockchain Node 1 (Full)
-After=network.target
+Description=QNet Blockchain Node 1
+After=docker.service
+Requires=docker.service
 
 [Service]
 Type=simple
 User=qnet
 Group=qnet
-WorkingDirectory=/opt/qnet-node
-ExecStart=/opt/qnet-node/target/release/qnet-node
 Restart=always
 RestartSec=10
-Environment=RUST_LOG=info
-Environment=QNET_ACTIVATION_CODE=QNET-FXXX-XXXX-XXXX
-Environment=QNET_P2P_PORT=9876
-Environment=QNET_RPC_PORT=9877
-Environment=QNET_API_PORT=8001
+ExecStart=/usr/bin/docker start -a qnet-node-1
+ExecStop=/usr/bin/docker stop qnet-node-1
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-# Node 2 Service (Super node)
+# Create systemd service for Node 2 (after interactive activation)
 sudo tee /etc/systemd/system/qnet-node-2.service > /dev/null <<EOF
 [Unit]
-Description=QNet Blockchain Node 2 (Super)
-After=network.target
+Description=QNet Blockchain Node 2
+After=docker.service
+Requires=docker.service
 
 [Service]
 Type=simple
 User=qnet
 Group=qnet
-WorkingDirectory=/opt/qnet-node
-ExecStart=/opt/qnet-node/target/release/qnet-node
 Restart=always
 RestartSec=10
-Environment=RUST_LOG=info
-Environment=QNET_ACTIVATION_CODE=QNET-SXXX-XXXX-XXXX
-Environment=QNET_P2P_PORT=9878
-Environment=QNET_RPC_PORT=9879
-Environment=QNET_API_PORT=8002
+ExecStart=/usr/bin/docker start -a qnet-node-2
+ExecStop=/usr/bin/docker stop qnet-node-2
 
 [Install]
 WantedBy=multi-user.target
 EOF
-
-# Enable and start services
-sudo systemctl daemon-reload
-sudo systemctl enable qnet-node-1 qnet-node-2
-sudo systemctl start qnet-node-1 qnet-node-2
-
-# Check status
-sudo systemctl status qnet-node-1
-sudo systemctl status qnet-node-2
-```
-
-### Interactive vs Environment Variables
-
-**Interactive Mode (Recommended for Development):**
-```bash
-# Run without environment variables
-./target/release/qnet-node
-# Follow interactive prompts for activation
-# Node type selection: Full or Super only
-```
-
-**Environment Variable Mode (Production):**
-```bash
-# Pre-configure activation
-export QNET_ACTIVATION_CODE=QNET-FXXX-XXXX-XXXX
-export QNET_P2P_PORT=9876
-export QNET_RPC_PORT=9877
-export QNET_API_PORT=8001
-./target/release/qnet-node
 ```
 
 ### Node Types and Activation
@@ -550,15 +536,12 @@ ExecStart=/opt/qnet-node/target/release/qnet-node
 Restart=always
 RestartSec=10
 Environment=RUST_LOG=info
-Environment=QNET_ACTIVATION_CODE=QNET-XXXX-XXXX-XXXX
-Environment=QNET_P2P_PORT=9876
-Environment=QNET_RPC_PORT=9877
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-# Enable and start service
+# Enable and start service (after interactive activation)
 sudo systemctl daemon-reload
 sudo systemctl enable qnet-node
 sudo systemctl start qnet-node
