@@ -1,5 +1,5 @@
 # Multi-stage build for QNet Production Node
-FROM rust:1.78 as builder
+FROM rust:1.82 as builder
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y \

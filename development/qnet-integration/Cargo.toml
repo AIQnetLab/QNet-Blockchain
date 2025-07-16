@@ -36,9 +36,6 @@ sha2 = "0.10.8"
 sha3 = "0.10.8"
 hex = "0.4.3"
 
-# Force older base64ct version to avoid edition2024 requirement
-base64ct = "=1.6.0"
-
 # Post-quantum cryptography
 pqcrypto = "0.18"
 pqcrypto-dilithium = "0.5"
@@ -94,9 +91,6 @@ warp = "0.3.7"
 # CLI
 clap = { version = "4.4.0", features = ["derive"] }
 atty = "0.2"
-
-# Modern base64 handling
-base64 = "0.22"
 
 [dev-dependencies]
 criterion = "0.5"
