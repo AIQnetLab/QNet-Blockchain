@@ -925,10 +925,11 @@ fn get_bootstrap_peers_for_region(region: &Region) -> Vec<String> {
             "testnet-asia-2.qnet.network:9876".to_string(),
             "testnet-asia-3.qnet.network:9876".to_string(),
         ],
-        Region::Global => vec![
-            "testnet-global-1.qnet.network:9876".to_string(),
-            "testnet-global-2.qnet.network:9876".to_string(),
-            "testnet-bootstrap.qnet.network:9876".to_string(),
+        // Fallback: use all available regions
+        _ => vec![
+            "testnet-eu-1.qnet.network:9876".to_string(),
+            "testnet-na-1.qnet.network:9876".to_string(),
+            "testnet-asia-1.qnet.network:9876".to_string(),
         ],
     }
 }

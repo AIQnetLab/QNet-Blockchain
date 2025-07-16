@@ -106,9 +106,11 @@ impl ActivationValidator {
 
         // Propagate to DHT (distributed, async)
         if let Some(dht) = &self.dht_client {
+            let code_clone = code.to_string();
+            let node_info_clone = node_info.clone();
             tokio::spawn(async move {
                 // DHT propagation in background
-                let _ = Self::propagate_to_dht(code, &node_info).await;
+                let _ = Self::propagate_to_dht(&code_clone, &node_info_clone).await;
             });
         }
 

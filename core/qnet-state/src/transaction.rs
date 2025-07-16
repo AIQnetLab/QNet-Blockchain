@@ -8,6 +8,8 @@ use std::collections::HashMap;
 use crate::Account;
 use std::collections::HashSet;
 use crate::account::{NodeType, ActivationPhase};
+use std::sync::{Arc, RwLock};
+use once_cell::sync::Lazy;
 
 /// QNet native transaction fee units (OPTIMIZED for mobile)
 pub const QNC_DECIMALS: u8 = 9; // 1 QNC = 10^9 smallest units (nanoQNC)
@@ -15,7 +17,7 @@ pub const BASE_FEE_NANO_QNC: u64 = 100_000; // 0.0001 QNC base fee (5x cheaper!)
 pub const PRIORITY_MULTIPLIER: u64 = 10; // 10x for priority transactions
 
 /// Gas price in nanoQNC (QNet native units)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct GasPrice(pub u64);
 
 impl GasPrice {
@@ -379,6 +381,12 @@ impl Transaction {
                 if transfers.is_empty() {
                     return Err("Batch transfers must have at least one transfer".to_string());
                 }
+                // Validate each transfer amount
+                for transfer in transfers {
+                    if transfer.amount == 0 {
+                        return Err("Batch transfer amount cannot be zero".to_string());
+                    }
+                }
             }
         }
         
@@ -620,10 +628,6 @@ impl Transaction {
                 // Log batch transfer
                 println!("Batch transfer of {} QNC to {} recipients by {} with total fee {} QNC", 
                         total_transfer_amount, transfers.len(), self.from, total_fee);
-            }
-            _ => {
-                // Other transaction types not implemented yet
-                return Err(StateError::InvalidTransaction("Transaction type not implemented".to_string()));
             }
         }
         
@@ -881,7 +885,8 @@ impl TransactionProcessor {
     }
 }
 
-/// Dynamic gas pricing based on network load
+/// Dynamic gas pricing system
+#[derive(Debug, Clone)]
 pub struct DynamicGasPricing {
     /// Current mempool size
     mempool_size: usize,
@@ -959,13 +964,14 @@ impl DynamicGasPricing {
     
     /// Get human-readable network load status
     fn get_network_load_status(&self) -> NetworkLoadStatus {
-        match self.mempool_size {
+        let status = match self.mempool_size {
             0..=100 => NetworkLoadStatus::Low,
             101..=500 => NetworkLoadStatus::Normal,
             501..=1000 => NetworkLoadStatus::High,
-            1001..=2000 => NetworkLoadStatus::VeryHigh,
+            1001..=2000 => NetworkLoadStatus::Extreme,
             _ => NetworkLoadStatus::Extreme,
-        }
+        };
+        status
     }
     
     /// Estimate confirmation time based on network load
@@ -989,8 +995,8 @@ pub enum GasTier {
     Priority, // Fastest, highest price
 }
 
-/// Mobile-optimized gas recommendations
-#[derive(Debug, Clone)]
+/// Mobile gas recommendations for wallet integration
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MobileGasRecommendations {
     pub eco: GasPrice,
     pub standard: GasPrice,
@@ -1000,57 +1006,40 @@ pub struct MobileGasRecommendations {
     pub estimated_confirmation_time: ConfirmationTime,
 }
 
-/// Network load status for mobile UI
-#[derive(Debug, Clone)]
+/// Network load status
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum NetworkLoadStatus {
     Low,
     Normal,
     High,
-    VeryHigh,
     Extreme,
 }
 
-/// Confirmation time estimate
-#[derive(Debug, Clone)]
+/// Estimated confirmation time
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ConfirmationTime {
-    Seconds(u32),
-    Minutes(u32),
+    Seconds(u64),
+    Minutes(u64),
 }
 
-/// Global dynamic gas pricing instance
-static mut DYNAMIC_GAS_PRICING: Option<DynamicGasPricing> = None;
+/// Dynamic gas pricing configuration (thread-safe)
+static DYNAMIC_GAS_PRICING: Lazy<Arc<RwLock<Option<DynamicGasPricing>>>> = 
+    Lazy::new(|| Arc::new(RwLock::new(None)));
 
 /// Initialize dynamic gas pricing
-pub fn initialize_dynamic_gas_pricing() {
-    unsafe {
-        DYNAMIC_GAS_PRICING = Some(DynamicGasPricing::new());
-    }
+pub fn init_dynamic_gas_pricing() {
+    let pricing = DynamicGasPricing::new();
+    *DYNAMIC_GAS_PRICING.write().unwrap() = Some(pricing);
 }
 
-/// Get current gas recommendations for mobile wallets
-pub fn get_mobile_gas_recommendations() -> MobileGasRecommendations {
-    unsafe {
-        DYNAMIC_GAS_PRICING
-            .as_ref()
-            .map(|pricing| pricing.get_mobile_gas_recommendations())
-            .unwrap_or_else(|| MobileGasRecommendations {
-                eco: GasPrice::mobile(),
-                standard: GasPrice::standard(),
-                fast: GasPrice::fast(),
-                priority: GasPrice::priority(),
-                network_load: NetworkLoadStatus::Normal,
-                estimated_confirmation_time: ConfirmationTime::Seconds(2),
-            })
-    }
+/// Get dynamic gas pricing
+pub fn get_dynamic_gas_pricing() -> Option<DynamicGasPricing> {
+    DYNAMIC_GAS_PRICING.read().unwrap().as_ref().cloned()
 }
 
-/// Update network load for dynamic pricing
-pub fn update_network_load(mempool_size: usize, block_utilization: f64) {
-    unsafe {
-        if let Some(pricing) = DYNAMIC_GAS_PRICING.as_mut() {
-            pricing.update_network_load(mempool_size, block_utilization);
-        }
-    }
+/// Update dynamic gas pricing
+pub fn update_dynamic_gas_pricing(new_pricing: DynamicGasPricing) {
+    *DYNAMIC_GAS_PRICING.write().unwrap() = Some(new_pricing);
 }
 
 #[cfg(test)]

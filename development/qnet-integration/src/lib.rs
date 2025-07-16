@@ -14,6 +14,7 @@ pub mod node;
 pub mod rpc;
 pub mod genesis;
 pub mod blockchain;
+pub mod activation_validation;
 
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -25,6 +26,9 @@ pub use qnet_state::{StateManager, Account, Transaction, Block, StateDB, StateEr
 pub use qnet_mempool::{SimpleMempool, SimpleMempoolConfig};
 pub use qnet_consensus::{ConsensusEngine, ConsensusConfig, NodeId};
 pub use qnet_sharding::{ShardCoordinator, ParallelValidator};
+
+// Import NetworkMessage for compilation
+pub use unified_p2p::NetworkMessage;
 
 // Re-export for external use
 pub use errors::{IntegrationError, IntegrationResult};
@@ -84,9 +88,9 @@ impl QNetBlockchain {
         
         let mempool = Arc::new(qnet_mempool::SimpleMempool::new(mempool_config));
         
-        // Initialize consensus
+        // Initialize consensus with proper config
         let consensus_config = qnet_consensus::ConsensusConfig::default();
-        let consensus = Arc::new(qnet_consensus::ConsensusEngine::new("node1".to_string()));
+        let consensus = Arc::new(qnet_consensus::ConsensusEngine::new("node1".to_string(), consensus_config));
         
         // Initialize validator
         let validator = Arc::new(validator::BlockValidator::new());
@@ -242,17 +246,14 @@ impl QNetBlockchain {
     
     /// Start network event handler
     async fn start_network_handler(&self) -> IntegrationResult<()> {
-        let network = self.network.clone();
         let running = self.running.clone();
         
-        if let Some(net) = network {
-            tokio::spawn(async move {
-                while running.load(Ordering::SeqCst) {
-                    // Simulate network events
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                }
-            });
-        }
+        tokio::spawn(async move {
+            while running.load(Ordering::SeqCst) {
+                // Simulate network events
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        });
         
         Ok(())
     }
@@ -262,12 +263,14 @@ impl QNetBlockchain {
         info!("Received message from {}: {:?}", peer_id, message);
         
         match message {
-            NetworkMessage::NewBlock(block_data) => {
+            NetworkMessage::Block { height, data, block_type } => {
                 // Process new block
+                info!("Received block at height {}: {:?}", height, block_type);
                 // For now, just log
             }
-            NetworkMessage::NewTransaction(tx_data) => {
+            NetworkMessage::Transaction { data, .. } => {
                 // Add transaction to mempool
+                info!("Received transaction: {:?}", data);
                 // For now, just log
             }
             _ => {
@@ -280,11 +283,8 @@ impl QNetBlockchain {
     
     /// Broadcast message to network
     pub async fn broadcast_message(&self, message: NetworkMessage) -> IntegrationResult<()> {
-        if let Some(net) = &self.network {
-            let net = net.read().await;
-            // net.broadcast(message)?;
-        }
-        
+        // For now, just log
+        info!("Broadcasting message: {:?}", message);
         Ok(())
     }
 }

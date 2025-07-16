@@ -529,18 +529,37 @@ impl SimplifiedP2P {
     
     // === PRIVATE METHODS ===
     
-    /// Get backup regions for failover
-    fn get_backup_regions(primary: &Region) -> Vec<Region> {
-        use Region::*;
-        
-        match primary {
-            NorthAmerica => vec![Europe, Asia],
-            Europe => vec![NorthAmerica, Asia],
-            Asia => vec![Europe, NorthAmerica],
-            SouthAmerica => vec![NorthAmerica, Europe],
-            Africa => vec![Europe, Asia],
-            Oceania => vec![Asia, NorthAmerica],
+    /// Get adjacent regions for peer discovery
+    pub fn get_adjacent_regions(region: &Region) -> Vec<Region> {
+        match region {
+            Region::NorthAmerica => vec![Region::SouthAmerica, Region::Europe],
+            Region::Europe => vec![Region::NorthAmerica, Region::Africa, Region::Asia],
+            Region::Asia => vec![Region::Europe, Region::Oceania],
+            Region::SouthAmerica => vec![Region::NorthAmerica, Region::Africa],
+            Region::Africa => vec![Region::Europe, Region::SouthAmerica],
+            Region::Oceania => vec![Region::Asia],
         }
+    }
+
+    /// Get backup regions for failover
+    pub fn get_backup_regions(region: &Region) -> Vec<Region> {
+        // Get all regions except the current one
+        let all_regions = vec![
+            Region::NorthAmerica,
+            Region::Europe,
+            Region::Asia,
+            Region::SouthAmerica,
+            Region::Africa,
+            Region::Oceania,
+        ];
+        
+        all_regions.into_iter().filter(|r| r != region).collect()
+    }
+
+    /// Get connected peers count
+    pub async fn get_connected_peers(&self) -> Vec<String> {
+        let peers = self.connected_peers.lock().unwrap();
+        peers.iter().map(|p| p.id.clone()).collect()
     }
     
     /// Parse peer address string

@@ -1,5 +1,7 @@
-//! Commit-Reveal consensus implementation for QNet
-//! Production-ready Byzantine Fault Tolerant consensus
+#![allow(dead_code)]
+
+//! Commit-Reveal consensus mechanism for QNet
+//! Provides Byzantine fault tolerance and secure leader election
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -211,7 +213,7 @@ impl CommitRevealConsensus {
     }
     
     /// Verify signature (simplified implementation)
-    fn verify_signature(&self, node_id: &str, message: &str, signature: &str) -> bool {
+    fn verify_signature(&self, _node_id: &str, _message: &str, signature: &str) -> bool {
         // In production, this would verify actual cryptographic signatures
         // For now, we simulate signature verification
         !signature.is_empty() && signature.len() > 10

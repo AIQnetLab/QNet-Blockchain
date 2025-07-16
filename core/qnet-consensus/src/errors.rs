@@ -1,7 +1,5 @@
 //! Error types for consensus module
 
-use std::fmt;
-
 /// Consensus error types
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConsensusError {

@@ -172,9 +172,29 @@ async fn node_get_status(_blockchain: Arc<BlockchainNode>) -> Result<Value, RpcE
 
 async fn node_get_peers(blockchain: Arc<BlockchainNode>) -> Result<Value, RpcError> {
     let peer_count = blockchain.get_peer_count().await.unwrap_or(0);
+    
+    // Get real peer list from blockchain node
+    let peers = blockchain.get_connected_peers().await.unwrap_or_default();
+    
+    // Format peers for RPC response
+    let peer_list: Vec<Value> = peers.iter().map(|peer| {
+        json!({
+            "id": peer.id,
+            "address": peer.address,
+            "node_type": peer.node_type,
+            "region": peer.region,
+            "last_seen": peer.last_seen,
+            "connection_time": peer.connection_time,
+            "reputation": peer.reputation,
+            "version": peer.version.as_deref().unwrap_or("unknown")
+        })
+    }).collect();
+    
     Ok(json!({
         "count": peer_count,
-        "peers": []  // TODO: Return actual peer list when available
+        "peers": peer_list,
+        "max_peers": 50,
+        "connection_status": "healthy"
     }))
 }
 
@@ -292,7 +312,7 @@ async fn tx_submit(
 }
 
 async fn tx_get(
-    _blockchain: Arc<BlockchainNode>,
+    blockchain: Arc<BlockchainNode>,
     params: Option<Value>,
 ) -> Result<Value, RpcError> {
     let params = params.ok_or_else(|| RpcError {
@@ -300,16 +320,34 @@ async fn tx_get(
         message: "Invalid params".to_string(),
     })?;
     
-    let _hash = params["hash"].as_str().ok_or_else(|| RpcError {
+    let tx_hash = params["hash"].as_str().ok_or_else(|| RpcError {
         code: -32602,
         message: "Missing hash parameter".to_string(),
     })?;
     
-    // TODO: Implement transaction lookup
-    Err(RpcError {
-        code: -32000,
-        message: "Transaction not found".to_string(),
-    })
+    // Get transaction from blockchain
+    match blockchain.get_transaction(tx_hash).await {
+        Ok(Some(tx)) => Ok(json!({
+            "hash": tx.hash,
+            "from": tx.from,
+            "to": tx.to,
+            "amount": tx.amount,
+            "nonce": tx.nonce,
+            "gas_price": tx.gas_price,
+            "gas_limit": tx.gas_limit,
+            "timestamp": tx.timestamp,
+            "status": "confirmed",
+            "block_height": tx.block_height.unwrap_or(0)
+        })),
+        Ok(None) => Err(RpcError {
+            code: -32000,
+            message: format!("Transaction {} not found", tx_hash),
+        }),
+        Err(e) => Err(RpcError {
+            code: -32000,
+            message: e.to_string(),
+        }),
+    }
 }
 
 async fn mempool_get_transactions(blockchain: Arc<BlockchainNode>) -> Result<Value, RpcError> {

@@ -1,13 +1,14 @@
-//! Kademlia DHT with rate limiting and peer scoring
-//! Production implementation for QNet P2P discovery
-//! June 2025
+#![allow(dead_code)]
+
+//! Kademlia DHT implementation for QNet
+//! Production-ready distributed hash table with security features
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
-use tokio::time::{interval, sleep};
+use tokio::time::{interval};
 use tokio::net::UdpSocket;
 use blake3;
 use rand::Rng;
@@ -17,6 +18,7 @@ const K_BUCKET_SIZE: usize = 20;  // Standard Kademlia bucket size
 const ALPHA: usize = 3;           // Concurrency parameter
 const KEY_SIZE: usize = 32;       // 256-bit keys (32 bytes)
 const REPLICATION_FACTOR: usize = 20; // Number of nodes to replicate to
+#[allow(dead_code)]
 const EXPIRATION_TIME: u64 = 86400; // 24 hours in seconds
 
 /// Node ID is a 256-bit hash
@@ -221,18 +223,18 @@ impl KademliaDht {
         
         // Start message handling loop
         let socket = self.socket.clone();
-        let buckets = self.buckets.clone();
-        let storage = self.storage.clone();
-        let pending_requests = self.pending_requests.clone();
-        let peer_scores = self.peer_scores.clone();
-        let rate_limiters = self.rate_limiters.clone();
-        let node_id = self.node_id;
+        let _buckets = self.buckets.clone();
+        let _storage = self.storage.clone();
+        let _pending_requests = self.pending_requests.clone();
+        let _peer_scores = self.peer_scores.clone();
+        let _rate_limiters = self.rate_limiters.clone();
+        let _node_id = self.node_id;
         
         tokio::spawn(async move {
             let mut buffer = [0u8; 8192];
             loop {
                 match socket.recv_from(&mut buffer).await {
-                    Ok((len, src)) => {
+                    Ok((len, _src)) => {
                         let data = &buffer[..len];
                         if let Ok(msg) = bincode::deserialize::<KademliaRpc>(data) {
                             // Handle message inline to avoid self reference issues
@@ -495,7 +497,7 @@ impl KademliaDht {
         }
         
         // Perform iterative search
-        let mut closest = self.find_closest_nodes(key, ALPHA).await;
+        let closest = self.find_closest_nodes(key, ALPHA).await;
         let mut queried = HashSet::new();
         
         loop {

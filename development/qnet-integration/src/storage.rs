@@ -550,6 +550,20 @@ impl PersistentStorage {
         
         Ok(stats)
     }
+
+    /// Find transaction by hash
+    pub async fn find_transaction_by_hash(&self, _tx_hash: &str) -> IntegrationResult<Option<qnet_state::Transaction>> {
+        // In production, this would search for the transaction in the blockchain
+        // For now, return None (transaction not found)
+        Ok(None)
+    }
+
+    /// Get transaction block height
+    pub async fn get_transaction_block_height(&self, _tx_hash: &str) -> IntegrationResult<u64> {
+        // In production, this would return the block height containing the transaction
+        // For now, return 0 (genesis block)
+        Ok(0)
+    }
 }
 
 pub struct Storage {
@@ -609,6 +623,16 @@ impl Storage {
 
     pub fn clear_activation_code(&self) -> IntegrationResult<()> {
         self.persistent.clear_activation_code()
+    }
+    
+    /// Find transaction by hash
+    pub async fn find_transaction_by_hash(&self, tx_hash: &str) -> IntegrationResult<Option<qnet_state::Transaction>> {
+        self.persistent.find_transaction_by_hash(tx_hash).await
+    }
+
+    /// Get transaction block height
+    pub async fn get_transaction_block_height(&self, tx_hash: &str) -> IntegrationResult<u64> {
+        self.persistent.get_transaction_block_height(tx_hash).await
     }
 
     pub fn update_activation_for_migration(&self, code: &str, node_type: u8, timestamp: u64, new_device_signature: &str) -> IntegrationResult<()> {

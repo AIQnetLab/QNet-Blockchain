@@ -14,6 +14,8 @@ pub mod batch_operations;
 pub mod commit_reveal;
 pub mod dynamic_timing;
 pub mod errors;
+pub mod reputation;
+pub mod kademlia;
 
 // Re-export main types for public API
 pub use lazy_rewards::{PhaseAwareRewardManager, PhaseAwareReward, RewardClaimResult};
@@ -22,17 +24,23 @@ pub use batch_operations::{
     BatchOperationsManager, BatchRewardClaimRequest, BatchRewardClaimResult,
     BatchNodeActivationRequest, BatchNodeActivationResult, BatchTransferRequest, BatchTransferResult
 };
-pub use commit_reveal::CommitRevealConsensus;
+pub use commit_reveal::{CommitRevealConsensus, ConsensusConfig};
 pub use errors::ConsensusError;
+pub use reputation::{NodeReputation, ReputationConfig};
+pub use kademlia::{KademliaDht, KademliaNode, generate_node_id};
 
 // Common types used across modules
 pub use lazy_rewards::{NodeType, QNetPhase};
 
+// Type aliases for compatibility
+pub type ConsensusEngine = CommitRevealConsensus;
+pub type NodeId = String;
+
 /// Initialize consensus system with batch operations support
 pub fn initialize_consensus_with_batch_operations(
-    genesis_timestamp: u64,
-    dev_burn_percentage: f64,
-    years_since_launch: u64,
+    _genesis_timestamp: u64,
+    _dev_burn_percentage: f64,
+    _years_since_launch: u64,
 ) -> (RewardIntegrationManager, BatchOperationsManager) {
     // Initialize reward integration for standalone operations
     let reward_integration = RewardIntegrationManager::new();
@@ -51,26 +59,26 @@ pub fn initialize_consensus_with_batch_operations(
 
 /// Initialize consensus system (original function for backwards compatibility)
 pub fn initialize_consensus(
-    genesis_timestamp: u64,
-    dev_burn_percentage: f64,
-    years_since_launch: u64,
+    _genesis_timestamp: u64,
+    _dev_burn_percentage: f64,
+    _years_since_launch: u64,
 ) -> RewardIntegrationManager {
-    let (reward_integration, _) = initialize_consensus_with_batch_operations(
-        genesis_timestamp,
-        dev_burn_percentage,
-        years_since_launch,
-    );
-    reward_integration
+    RewardIntegrationManager::new()
 }
 
-// Production initialization functions
-pub fn create_production_rewards(genesis_timestamp: u64) -> lazy_rewards::PhaseAwareRewardManager {
-    lazy_rewards::create_production_phase_aware_rewards(genesis_timestamp)
+/// Create new consensus engine
+pub fn create_consensus_engine(node_id: String) -> ConsensusEngine {
+    let config = ConsensusConfig::default();
+    CommitRevealConsensus::new(node_id, config)
 }
 
-pub fn create_production_reward_integration() -> reward_integration::RewardIntegrationManager {
-    reward_integration::RewardIntegrationManager::new()
+/// Create new node reputation manager
+pub fn create_reputation_manager() -> NodeReputation {
+    let config = ReputationConfig::default();
+    NodeReputation::new(config)
 }
 
-// Export types needed by integration
-pub type ConsensusResult<T> = Result<T, ConsensusError>; 
+/// Create new Kademlia DHT instance (async wrapper)
+pub async fn create_kademlia_dht(addr: String, port: u16) -> Result<KademliaDht, Box<dyn std::error::Error>> {
+    KademliaDht::new(addr, port).await
+} 

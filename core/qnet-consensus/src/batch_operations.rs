@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use serde::{Serialize, Deserialize};
-use crate::lazy_rewards::{PhaseAwareRewardManager, RewardClaimResult, PhaseAwareReward};
+use crate::lazy_rewards::{PhaseAwareReward};
 use crate::reward_integration::RewardIntegrationManager;
 use crate::errors::ConsensusError;
 use crate::NodeType;
@@ -298,8 +298,8 @@ impl BatchOperationsManager {
         let mut total_fees_paid = 0u64;
         
         // Calculate total amount needed
-        let total_amount_needed: u64 = request.transfers.iter().map(|t| t.amount).sum();
-        let estimated_fees = request.transfers.len() as u64 * 1000; // Rough estimate
+        let _total_amount_needed: u64 = request.transfers.iter().map(|t| t.amount).sum();
+        let _estimated_fees = request.transfers.len() as u64 * 1000; // Rough estimate
         
         // Process each transfer (in production, this would integrate with transaction system)
         for (index, transfer) in request.transfers.iter().enumerate() {

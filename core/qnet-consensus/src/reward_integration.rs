@@ -342,7 +342,7 @@ pub fn create_production_transaction_processor() -> (TransactionProcessor, Rewar
 impl Clone for RewardIntegrationManager {
     fn clone(&self) -> Self {
         // Create a new manager with the same configuration
-        let genesis_timestamp = {
+        let _genesis_timestamp = {
             let reward_manager = self.reward_manager.read().unwrap();
             reward_manager.get_genesis_timestamp()
         };

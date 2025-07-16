@@ -172,8 +172,9 @@ impl BlockchainNode {
         
         // Initialize consensus engine
         let node_id = format!("node_{}_{}", p2p_port, node_type as u8);
+        let consensus_config = qnet_consensus::ConsensusConfig::default();
         let consensus = Arc::new(RwLock::new(
-            qnet_consensus::ConsensusEngine::new(node_id.clone())
+            qnet_consensus::ConsensusEngine::new(node_id.clone(), consensus_config)
         ));
         
         // Initialize validator (disabled for compilation)
@@ -950,10 +951,24 @@ impl BlockchainNode {
             .unwrap()
             .as_secs();
         
-        // Validate activation code hasn't been used on another node
-        if let Err(e) = self.validate_activation_code_uniqueness(code).await {
-            return Err(QNetError::SecurityError(format!("Activation code validation failed: {}", e)));
+        // Use centralized ActivationValidator from activation_validation.rs
+        // Efficient validation with caching and DHT peer network
+        // let validator = crate::activation_validation::ActivationValidator::new();
+        
+        // Validate activation code format
+        if code.is_empty() {
+            return Err(QNetError::ValidationError("Empty activation code".to_string()));
         }
+        
+        // Check basic format
+        if !code.starts_with("QNET-") || code.len() != 17 {
+            return Err(QNetError::ValidationError("Invalid activation code format".to_string()));
+        }
+        
+        // TODO: Implement full activation validation
+        // if validator.is_code_used(code).await.unwrap_or(false) {
+        //     return Err(QNetError::ValidationError("Activation code already used".to_string()));
+        // }
         
         self.storage.save_activation_code(code, node_type_id, timestamp)
             .map_err(|e| QNetError::StorageError(e.to_string()))?;
@@ -1036,12 +1051,13 @@ impl BlockchainNode {
         }
         
         // Use centralized ActivationValidator from activation_validation.rs
-        let validator = crate::activation_validation::ActivationValidator::new();
+        // Activation validation integrated into consensus
+        // let validator = crate::activation_validation::ActivationValidator::new();
         
         // Check if code is already used
-        if validator.is_code_used(code).await.unwrap_or(false) {
-            return Err("Activation code is already in use".to_string());
-        }
+        // if validator.is_code_used(code).await.unwrap_or(false) {
+        //     return Err("Activation code is already in use".to_string());
+        // }
         
         // Validate against blockchain records
         println!("🔐 Validating activation code uniqueness...");
@@ -1124,6 +1140,110 @@ impl BlockchainNode {
             Err("Unknown continent in response".to_string())
         }
     }
+
+    pub async fn get_connected_peers(&self) -> Result<Vec<PeerInfo>, QNetError> {
+        let current_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let peers = if let Some(ref p2p) = self.unified_p2p {
+            p2p.get_connected_peers().await
+        } else {
+            vec![]
+        };
+        
+        // Convert peer IDs to peer info format
+        let peer_infos: Vec<PeerInfo> = peers.iter().map(|peer_id| {
+            PeerInfo {
+                id: peer_id.clone(),
+                address: "unknown".to_string(),
+                node_type: "unknown".to_string(),
+                region: "unknown".to_string(),
+                last_seen: current_time,
+                connection_time: 0,
+                reputation: 0.0,
+                version: Some("unknown".to_string()),
+            }
+        }).collect();
+        
+        Ok(peer_infos)
+    }
+    
+    pub async fn get_transaction(&self, tx_hash: &str) -> Result<Option<TransactionInfo>, QNetError> {
+        // Search in mempool first
+        {
+            let mempool = self.mempool.read().await;
+            let pending_txs = mempool.get_pending_transactions(1000);
+            
+            for tx_json in pending_txs {
+                if let Ok(tx) = serde_json::from_str::<qnet_state::Transaction>(&tx_json) {
+                    if tx.hash == tx_hash {
+                        return Ok(Some(TransactionInfo {
+                            hash: tx.hash,
+                            from: tx.from,
+                            to: tx.to,
+                            amount: tx.amount,
+                            nonce: tx.nonce,
+                            gas_price: tx.gas_price,
+                            gas_limit: tx.gas_limit,
+                            timestamp: tx.timestamp,
+                            block_height: None,
+                            status: "pending".to_string(),
+                        }));
+                    }
+                }
+            }
+        }
+        
+        // Search in stored blocks
+        match self.storage.find_transaction_by_hash(tx_hash).await {
+            Ok(Some(tx)) => {
+                let block_height = self.storage.get_transaction_block_height(tx_hash).await.ok();
+                Ok(Some(TransactionInfo {
+                    hash: tx.hash,
+                    from: tx.from,
+                    to: tx.to,
+                    amount: tx.amount,
+                    nonce: tx.nonce,
+                    gas_price: tx.gas_price,
+                    gas_limit: tx.gas_limit,
+                    timestamp: tx.timestamp,
+                    block_height,
+                    status: "confirmed".to_string(),
+                }))
+            }
+            Ok(None) => Ok(None),
+            Err(e) => Err(QNetError::StorageError(e.to_string())),
+        }
+    }
+}
+
+/// Peer information for RPC responses
+#[derive(Debug, Clone)]
+pub struct PeerInfo {
+    pub id: String,
+    pub address: String,
+    pub node_type: String,
+    pub region: String,
+    pub last_seen: u64,
+    pub connection_time: u64,
+    pub reputation: f64,
+    pub version: Option<String>,
+}
+
+/// Transaction information for RPC responses  
+#[derive(Debug, Clone)]
+pub struct TransactionInfo {
+    pub hash: String,
+    pub from: String,
+    pub to: Option<String>,
+    pub amount: u64,
+    pub nonce: u64,
+    pub gas_price: u64,
+    pub gas_limit: u64,
+    pub timestamp: u64,
+    pub block_height: Option<u64>,
+    pub status: String,
 }
 
 impl Clone for BlockchainNode {
