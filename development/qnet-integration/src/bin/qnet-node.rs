@@ -951,9 +951,62 @@ fn get_bootstrap_peers_for_region(region: &Region) -> Vec<String> {
     
     // If no local nodes found, try external discovery
     if bootstrap_peers.is_empty() {
-        println!("🌍 No local nodes found, enabling external discovery mode");
-        // Return empty to trigger external IP announcement
-        // Node will announce itself and wait for connections
+        println!("🌍 No local nodes found, trying internet discovery methods...");
+        
+        // Try DNS seeds for well-known QNet nodes
+        let dns_seeds = vec![
+            "bootstrap.qnet.network",
+            "node1.qnet.network", 
+            "node2.qnet.network",
+            "seednode.qnet.network"
+        ];
+        
+        for seed in dns_seeds {
+            match std::net::ToSocketAddrs::to_socket_addrs(&format!("{}:9876", seed)) {
+                Ok(addresses) => {
+                    for addr in addresses {
+                        let addr_str = addr.to_string();
+                        if is_qnet_node_running(&addr_str) {
+                            bootstrap_peers.push(addr_str.clone());
+                            println!("🌐 Found QNet node via DNS seed: {}", addr_str);
+                        }
+                    }
+                }
+                Err(_) => {
+                    // DNS seed not available, try next one
+                }
+            }
+        }
+        
+        // Try known hardcoded bootstrap nodes (fallback)
+        if bootstrap_peers.is_empty() {
+            let hardcoded_nodes = vec![
+                "95.164.7.199:9876",   // Known QNet node
+                "173.212.219.226:9876", // Known QNet node
+                "1.2.3.4:9876",        // Example production node
+                "5.6.7.8:9876"         // Example production node
+            ];
+            
+            for node in hardcoded_nodes {
+                if is_qnet_node_running(node) {
+                    bootstrap_peers.push(node.to_string());
+                    println!("🔗 Connected to hardcoded bootstrap node: {}", node);
+                    break; // One connection is enough to start
+                }
+            }
+        }
+        
+        // If still no peers, enable passive discovery mode
+        if bootstrap_peers.is_empty() {
+            println!("🎯 No external nodes found, enabling passive discovery mode");
+            println!("   Node will listen for incoming connections and announce itself");
+            println!("   Other nodes can connect to this node's IP address");
+            
+            // Get external IP and announce
+            if let Ok(external_ip) = get_external_ip() {
+                println!("🌐 External IP detected: {} (other nodes can connect to {}:9876)", external_ip, external_ip);
+            }
+        }
     }
     
     bootstrap_peers
@@ -1003,6 +1056,52 @@ fn is_qnet_node_running(addr: &str) -> bool {
         },
         Err(_) => false
     }
+}
+
+fn get_external_ip() -> Result<String, Box<dyn std::error::Error>> {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    
+    // Try multiple IP detection services
+    let services = vec![
+        ("httpbin.org", 80, "GET /ip HTTP/1.1\r\nHost: httpbin.org\r\n\r\n"),
+        ("icanhazip.com", 80, "GET / HTTP/1.1\r\nHost: icanhazip.com\r\n\r\n"),
+        ("api.ipify.org", 80, "GET / HTTP/1.1\r\nHost: api.ipify.org\r\n\r\n"),
+    ];
+    
+    for (host, port, request) in services {
+        if let Ok(mut stream) = TcpStream::connect(format!("{}:{}", host, port)) {
+            if let Ok(()) = stream.write_all(request.as_bytes()) {
+                let mut response = String::new();
+                if let Ok(_) = stream.read_to_string(&mut response) {
+                    // Parse IP from response
+                    if let Some(ip) = extract_ip_from_response(&response) {
+                        return Ok(ip);
+                    }
+                }
+            }
+        }
+    }
+    
+    Err("Could not determine external IP".into())
+}
+
+fn extract_ip_from_response(response: &str) -> Option<String> {
+    use std::net::IpAddr;
+    
+    // Find IP address in response
+    for line in response.lines() {
+        for word in line.split_whitespace() {
+            let clean_word = word.trim_matches(|c: char| !c.is_ascii_digit() && c != '.');
+            if let Ok(ip) = clean_word.parse::<IpAddr>() {
+                if !ip.is_loopback() && !ip.is_multicast() {
+                    return Some(ip.to_string());
+                }
+            }
+        }
+    }
+    
+    None
 }
 
 #[tokio::main]

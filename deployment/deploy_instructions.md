@@ -90,9 +90,31 @@ docker run -d --name qnet-node3 --restart=always \
   qnet-production
 ```
 
-### Method 2: Internet-Wide Discovery (Manual Peer Configuration)
+### Method 2: Internet-Wide Discovery (Automatic + Manual)
 For nodes on different servers across the internet:
 
+#### **🌐 Automatic Discovery (No IP needed!)**
+```bash
+# Server 1 - First node (automatic DNS seeds + bootstrap nodes)
+docker run -d --name qnet-node --restart=always \
+  -p 9876:9876 -p 8001:8001 \
+  -v $(pwd)/node_data:/app/node_data \
+  qnet-production
+
+# Server 2 - Automatic discovery (finds other nodes via DNS/bootstrap)
+docker run -d --name qnet-node --restart=always \
+  -p 9876:9876 -p 8001:8001 \
+  -v $(pwd)/node_data:/app/node_data \
+  qnet-production
+
+# Server 3 - Also automatic discovery
+docker run -d --name qnet-node --restart=always \
+  -p 9876:9876 -p 8001:8001 \
+  -v $(pwd)/node_data:/app/node_data \
+  qnet-production
+```
+
+#### **🎯 Manual Peer Configuration (Faster connection)**
 ```bash
 # Server 1 (IP: 1.2.3.4) - First node
 docker run -d --name qnet-node --restart=always \
@@ -120,7 +142,10 @@ docker run -d --name qnet-node --restart=always \
 **Automatic Discovery Methods:**
 - **Local Network Scanning**: Nodes scan subnet (192.168.x.x) for other QNet nodes
 - **Port Discovery**: Checks common QNet ports (9876-9880) automatically  
+- **DNS Seeds**: Automatic lookup of bootstrap.qnet.network, node1.qnet.network, etc.
+- **Bootstrap Nodes**: Connects to hardcoded known QNet nodes (95.164.7.199, 173.212.219.226)
 - **External IP Detection**: Nodes announce their external IP for internet connectivity
+- **Passive Discovery**: Nodes can announce themselves and wait for connections
 - **Dynamic Peer Lists**: Nodes share discovered peers with each other
 
 **Manual Configuration (Optional):**
@@ -137,11 +162,18 @@ docker run -d --name qnet-node --restart=always \
 # Check node's discovered peers
 docker exec qnet-node curl -s http://localhost:8001/api/peers | jq
 
-# Monitor connection status
-docker logs qnet-node | grep "Discovered QNet node"
+# Monitor automatic discovery process
+docker logs qnet-node | grep "🔍 Discovered QNet node"          # Local discovery
+docker logs qnet-node | grep "🌐 Found QNet node via DNS"       # DNS seeds
+docker logs qnet-node | grep "🔗 Connected to hardcoded"        # Bootstrap nodes
+docker logs qnet-node | grep "🎯 No external nodes found"       # Passive mode
+docker logs qnet-node | grep "🌐 External IP detected"          # IP announcement
 
-# Check network connectivity
+# Check manual peer configuration (if used)
 docker logs qnet-node | grep "🌐 Using provided peer IPs"
+
+# Monitor internet discovery methods
+docker logs qnet-node | grep "🌍 No local nodes found, trying internet"
 ```
 
 ### Alternative Installation (if Docker fails)
