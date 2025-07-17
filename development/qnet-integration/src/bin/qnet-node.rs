@@ -133,14 +133,6 @@ fn validate_activation_code_node_type(code: &str, expected_type: NodeType, curre
     }
     
     println!("   ✅ Activation code ready for blockchain validation");
-    return Ok(());
-    
-    // Even real codes accepted in development mode
-    println!("   🔧 Development Mode: Real code provided but validation bypassed");
-    println!("   📋 Code: {}", mask_code(code));
-    println!("   ✅ Code accepted without validation");
-    println!("   ⚠️  Production: This code will be validated");
-    
     Ok(())
 }
 
@@ -302,13 +294,29 @@ async fn interactive_node_setup() -> Result<(NodeType, String), Box<dyn std::err
         _ => {}
     }
     
-    // Activation code input
-    let activation_code = request_activation_code(current_phase)?;
-    
-    // Validate phase and pricing with actual activation code
-    if let Err(e) = validate_phase_and_pricing(current_phase, node_type, &pricing_info, &activation_code) {
-        return Err(e.into());
-    }
+    // Activation code input with retry loop
+    let activation_code = loop {
+        match request_activation_code(current_phase) {
+            Ok(code) => {
+                // Validate phase and pricing with actual activation code
+                match validate_phase_and_pricing(current_phase, node_type, &pricing_info, &code) {
+                    Ok(()) => {
+                        println!("✅ Activation code validated successfully!");
+                        break code; // Exit loop with valid code
+                    }
+                    Err(e) => {
+                        println!("❌ Activation code validation failed: {}", e);
+                        println!("   Please try again or press Ctrl+C to exit.");
+                        continue; // Continue loop for retry
+                    }
+                }
+            }
+            Err(e) => {
+                println!("❌ Error requesting activation code: {}", e);
+                return Err(e);
+            }
+        }
+    };
     
     println!("\n✅ Server node setup complete!");
     println!("   🖥️  Device Type: Dedicated Server");
