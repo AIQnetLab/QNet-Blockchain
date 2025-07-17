@@ -41,7 +41,7 @@ git pull origin testnet
 # 5. Build with latest Rust (requires rebuild after updates)
 cargo build --release
 
-# 6. Build Docker image (uses Rust 1.82 - latest stable)
+# 6. Build Docker image (uses Rust 1.85 - supports edition2024)
 docker build -t qnet-production -f development/Dockerfile .
 
 # 7. Launch node
@@ -53,6 +53,21 @@ docker run -d --name qnet-node --restart=always \
 # 8. Activate node (INTERACTIVE REQUIRED)
 docker exec -it qnet-node /bin/bash
 /usr/local/bin/qnet-node
+```
+
+### Alternative Installation (if Docker fails)
+
+```bash
+# 4. Pull latest changes
+git pull origin testnet
+
+# 5. Build with Rust 1.85 (for edition2024 support)
+rustup toolchain install 1.85.0
+rustup default 1.85.0
+cargo build --release
+
+# 6. Build Docker image
+docker build -t qnet-production -f development/Dockerfile .
 ```
 
 ### Quick Monitoring Commands
