@@ -808,7 +808,10 @@ fn request_activation_code(phase: u8) -> Result<String, Box<dyn std::error::Erro
         println!("📝 Enter your activation code:");
         println!("🔐 Code format: QNET-XXXX-XXXX-XXXX");
         print!("Activation Code: ");
-        io::stdout().flush()?;
+        if let Err(e) = io::stdout().flush() {
+            println!("❌ Error flushing stdout: {}", e);
+            continue;
+        }
         
         println!("🔍 DEBUG: Waiting for activation code input...");
         
@@ -1137,7 +1140,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("🔍 DEBUG: Starting setup mode selection...");
     
     // PRODUCTION: Check for existing activation or run interactive setup
-    let (node_type, activation_code) = check_existing_activation_or_setup().await?;
+    let (node_type, activation_code) = loop {
+        match check_existing_activation_or_setup().await {
+            Ok((node_type, activation_code)) => {
+                break (node_type, activation_code);
+            }
+            Err(e) => {
+                println!("❌ Setup failed: {}", e);
+                println!("   Please try again or press Ctrl+C to exit.");
+                println!();
+                continue;
+            }
+        }
+    };
     
     // Configure production mode (microblocks by default)
     configure_production_mode();
