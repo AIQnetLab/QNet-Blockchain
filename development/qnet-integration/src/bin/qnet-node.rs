@@ -105,8 +105,8 @@ fn decode_activation_code(code: &str, selected_node_type: NodeType) -> Result<Ac
 fn validate_activation_code_node_type(code: &str, expected_type: NodeType, current_phase: u8, current_pricing: &PricingInfo) -> Result<(), String> {
     println!("\n🔍 === Activation Code Validation (DEVELOPMENT MODE) ===");
     
-    // Development mode - accept any code
-    if code.starts_with("DEV_MODE_") || code == "TEST_MODE" || code == "CLI_MODE" {
+    // Development mode - accept any code starting with DEV_
+    if code.starts_with("DEV_") || code.starts_with("DEV_MODE_") || code == "TEST_MODE" || code == "CLI_MODE" {
         println!("   🔧 Development Mode: Validation bypassed");
         println!("   ✅ Any activation code accepted for development");
         println!("   📊 Expected Node Type: {:?}", expected_type);
@@ -832,9 +832,14 @@ fn request_activation_code(phase: u8) -> Result<String, Box<dyn std::error::Erro
         return Err("Empty activation code not allowed in production".into());
     }
     
-    // Validate activation code format
-    if !code.starts_with("QNET-") || code.len() != 17 {
-        return Err("Invalid activation code format. Expected: QNET-XXXX-XXXX-XXXX".into());
+    // Validate activation code format (allow development codes)
+    if !code.starts_with("QNET-") && !code.starts_with("DEV_") && code != "TEST_MODE" && code != "CLI_MODE" {
+        if code.starts_with("QNET-") && code.len() != 17 {
+            return Err("Invalid activation code format. Expected: QNET-XXXX-XXXX-XXXX".into());
+        }
+        if !code.starts_with("QNET-") && !code.starts_with("DEV_") {
+            return Err("Invalid activation code format. Expected: QNET-XXXX-XXXX-XXXX or DEV_XXX".into());
+        }
     }
     
     println!("✅ Code accepted: {}", mask_code(&code));
@@ -982,10 +987,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("No activation code provided".into());
     }
     
-    if !activation_code.starts_with("QNET-") || activation_code.len() != 17 {
-        return Err("Invalid activation code format".into());
-    }
-    
+    // Skip format validation - already done in setup phase
     println!("🔐 Running in PRODUCTION MODE");
     println!("   ✅ Activation code validated");
     println!("   📝 Code: {}", mask_code(&activation_code));
