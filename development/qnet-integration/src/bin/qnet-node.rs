@@ -105,34 +105,35 @@ fn decode_activation_code(code: &str, selected_node_type: NodeType) -> Result<Ac
 fn validate_activation_code_node_type(code: &str, expected_type: NodeType, current_phase: u8, current_pricing: &PricingInfo) -> Result<(), String> {
     println!("\n🔍 === Activation Code Validation (DEVELOPMENT MODE) ===");
     
-    // Development mode - accept any code starting with DEV_
-    if code.starts_with("DEV_") || code.starts_with("DEV_MODE_") || code == "TEST_MODE" || code == "CLI_MODE" {
-        println!("   🔧 Development Mode: Validation bypassed");
-        println!("   ✅ Any activation code accepted for development");
-        println!("   📊 Expected Node Type: {:?}", expected_type);
-        println!("   📊 Current Phase: {}", current_phase);
-        
-        // Show current dynamic pricing for information
-        let current_dynamic_price = calculate_node_price(current_phase, expected_type, current_pricing);
-        let price_str = format_price(current_phase, current_dynamic_price);
-        
-        match current_phase {
-            1 => {
-                println!("   💰 Phase 1: BURN 1DEV TOKENS");
-                println!("   💰 Current Dynamic Price: {} (decreases as more 1DEV burned)", price_str);
-                println!("   📉 Burn Progress: {:.1}% (reduces cost by 150 1DEV per 10%)", current_pricing.burn_percentage);
-            },
-            2 => {
-                println!("   💰 Phase 2: TRANSFER QNC TOKENS to Pool 3");
-                println!("   💰 Current Dynamic Price: {} (scales with network size)", price_str);
-                println!("   📈 Network Size: {} nodes ({}x multiplier)", current_pricing.network_size, current_pricing.network_multiplier);
-            },
-            _ => {}
-        }
-        
-        println!("   ⚠️  Production: Will require valid activation code");
-        return Ok(());
+    // Production mode - validate QNET activation codes only
+    if !code.starts_with("QNET-") || code.len() != 17 {
+        return Err("Invalid activation code format. Expected: QNET-XXXX-XXXX-XXXX".to_string());
     }
+    
+    println!("   ✅ QNET activation code format validated");
+    println!("   📊 Expected Node Type: {:?}", expected_type);
+    println!("   📊 Current Phase: {}", current_phase);
+    
+    // Show current dynamic pricing for information
+    let current_dynamic_price = calculate_node_price(current_phase, expected_type, current_pricing);
+    let price_str = format_price(current_phase, current_dynamic_price);
+    
+    match current_phase {
+        1 => {
+            println!("   💰 Phase 1: BURN 1DEV TOKENS");
+            println!("   💰 Current Dynamic Price: {} (decreases as more 1DEV burned)", price_str);
+            println!("   📉 Burn Progress: {:.1}% (reduces cost by 150 1DEV per 10%)", current_pricing.burn_percentage);
+        },
+        2 => {
+            println!("   💰 Phase 2: TRANSFER QNC TOKENS to Pool 3");
+            println!("   💰 Current Dynamic Price: {} (scales with network size)", price_str);
+            println!("   📈 Network Size: {} nodes ({}x multiplier)", current_pricing.network_size, current_pricing.network_multiplier);
+        },
+        _ => {}
+    }
+    
+    println!("   ✅ Activation code ready for blockchain validation");
+    return Ok(());
     
     // Even real codes accepted in development mode
     println!("   🔧 Development Mode: Real code provided but validation bypassed");
@@ -786,64 +787,50 @@ fn request_activation_code(phase: u8) -> Result<String, Box<dyn std::error::Erro
     println!("   📱 Light nodes cannot be activated on servers");
     println!();
     
-    match phase {
-        1 => {
-            println!("📊 Phase 1: 1DEV Token Burn System (DYNAMIC PRICING)");
-            println!("   💰 Base Cost: 1500 1DEV → 150 1DEV (decreasing)");
-            println!("   📉 Dynamic: -150 1DEV per 10% burned");
-            println!("   🔥 Action: BURN 1DEV TOKENS on Solana blockchain");
-            println!("   🎯 Benefit: Universal pricing regardless of node type");
-            println!("   ⚡ Current rate varies based on 1DEV burn progress");
-            println!("   📱 Generated through: Browser extension or mobile app");
+    println!("📊 QNet Activation System:");
+    println!("   💰 Cost: Variable based on node type and network conditions");
+    println!("   🔥 Payment: Transfer QNC tokens to activation pool");
+    println!("   🎯 Benefit: Permanent node activation");
+    println!("   ⚡ Generated through: Browser extension or mobile app");
+    println!("   📱 Code format: QNET-XXXX-XXXX-XXXX");
+    
+    // Retry loop for activation code input
+    loop {
+        println!("\n⚠️  === PRODUCTION ACTIVATION REQUIRED ===");
+        println!("📝 Enter your activation code:");
+        println!("🔐 Code format: QNET-XXXX-XXXX-XXXX");
+        print!("Activation Code: ");
+        io::stdout().flush()?;
+        
+        println!("🔍 DEBUG: Waiting for activation code input...");
+        
+        let mut input = String::new();
+        let code = match io::stdin().read_line(&mut input) {
+            Ok(bytes_read) => {
+                println!("🔍 DEBUG: Read {} bytes: '{}'", bytes_read, input.trim());
+                input.trim().to_string()
+            }
+            Err(e) => {
+                println!("❌ Error reading input: {}", e);
+                continue;
+            }
+        };
+        
+        if code.is_empty() {
+            println!("❌ Empty activation code not allowed. Please try again.");
+            continue;
         }
-        2 => {
-            println!("📊 Phase 2: QNC Token Pool System (DYNAMIC PRICING)");
-            println!("   💰 Base Costs: 5000/7500/10000 QNC (Light/Full/Super)");
-            println!("   📈 Dynamic: ×0.5 to ×3.0 network size multiplier");
-            println!("   💎 Action: TRANSFER QNC TOKENS to Pool 3");
-            println!("   🚨 Critical: Code must match exact node type");
-            println!("   ⚡ Current rate varies based on network size");
-            println!("   📱 Generated through: Browser extension or mobile app");
-            println!("   🖥️  Server restriction: Full/Super nodes only!");
+        
+        // Validate activation code format (ONLY QNET codes accepted)
+        if !code.starts_with("QNET-") || code.len() != 17 {
+            println!("❌ Invalid activation code format. Expected: QNET-XXXX-XXXX-XXXX");
+            println!("   Please try again or press Ctrl+C to exit.");
+            continue;
         }
-        _ => {}
+        
+        println!("✅ Code accepted: {}", mask_code(&code));
+        return Ok(code);
     }
-    
-    println!("\n⚠️  === PRODUCTION ACTIVATION REQUIRED ===");
-    println!("📝 Enter your activation code:");
-    println!("🔐 Code format: QNET-XXXX-XXXX-XXXX");
-    print!("Activation Code: ");
-    io::stdout().flush()?;
-    
-    println!("🔍 DEBUG: Waiting for activation code input...");
-    
-    let mut input = String::new();
-    let code = match io::stdin().read_line(&mut input) {
-        Ok(bytes_read) => {
-            println!("🔍 DEBUG: Read {} bytes: '{}'", bytes_read, input.trim());
-            input.trim().to_string()
-        }
-        Err(e) => {
-            return Err(format!("Cannot read activation code from stdin: {}", e).into());
-        }
-    };
-    
-    if code.is_empty() {
-        return Err("Empty activation code not allowed in production".into());
-    }
-    
-    // Validate activation code format (allow development codes)
-    if !code.starts_with("QNET-") && !code.starts_with("DEV_") && code != "TEST_MODE" && code != "CLI_MODE" {
-        if code.starts_with("QNET-") && code.len() != 17 {
-            return Err("Invalid activation code format. Expected: QNET-XXXX-XXXX-XXXX".into());
-        }
-        if !code.starts_with("QNET-") && !code.starts_with("DEV_") {
-            return Err("Invalid activation code format. Expected: QNET-XXXX-XXXX-XXXX or DEV_XXX".into());
-        }
-    }
-    
-    println!("✅ Code accepted: {}", mask_code(&code));
-    Ok(code)
 }
 
 // Automatic configuration - no command line arguments
@@ -914,28 +901,107 @@ async fn find_available_port(preferred: u16) -> Result<u16, Box<dyn std::error::
 
 // Get bootstrap peers for region - REAL PRODUCTION PEERS
 fn get_bootstrap_peers_for_region(region: &Region) -> Vec<String> {
-    match region {
-        Region::Europe => vec![
-            "testnet-eu-1.qnet.network:9876".to_string(),
-            "testnet-eu-2.qnet.network:9876".to_string(),
-            "testnet-eu-3.qnet.network:9876".to_string(),
-        ],
-        Region::NorthAmerica => vec![
-            "testnet-na-1.qnet.network:9876".to_string(),
-            "testnet-na-2.qnet.network:9876".to_string(),
-            "testnet-na-3.qnet.network:9876".to_string(),
-        ],
-        Region::Asia => vec![
-            "testnet-asia-1.qnet.network:9876".to_string(),
-            "testnet-asia-2.qnet.network:9876".to_string(),
-            "testnet-asia-3.qnet.network:9876".to_string(),
-        ],
-        // Fallback: use all available regions
-        _ => vec![
-            "testnet-eu-1.qnet.network:9876".to_string(),
-            "testnet-na-1.qnet.network:9876".to_string(),
-            "testnet-asia-1.qnet.network:9876".to_string(),
-        ],
+    // For production, nodes will discover each other dynamically
+    // When multiple nodes are running, they announce themselves
+    // and other nodes can discover them via network scanning
+    
+    // Check for user-provided peer IPs via environment variable
+    if let Ok(peer_ips) = std::env::var("QNET_PEER_IPS") {
+        let peers: Vec<String> = peer_ips
+            .split(',')
+            .map(|ip| ip.trim().to_string())
+            .filter(|ip| !ip.is_empty())
+            .map(|ip| {
+                // Add default port if not specified
+                if ip.contains(':') {
+                    ip
+                } else {
+                    format!("{}:9876", ip)
+                }
+            })
+            .collect();
+        
+        if !peers.is_empty() {
+            println!("🌐 Using provided peer IPs: {:?}", peers);
+            return peers;
+        }
+    }
+    
+    // Auto-discovery fallback: scan local network and common ports
+    let mut bootstrap_peers = Vec::new();
+    
+    // Try to detect other nodes on local network
+    let local_ip = get_local_ip();
+    let subnet = get_subnet_from_ip(&local_ip);
+    
+    // Scan common QNet ports on subnet
+    for host in 1..=254 {
+        let ip = format!("{}.{}", subnet, host);
+        if ip != local_ip {
+            // Try common QNet ports
+            for port in [9876, 9877, 9878, 9879, 9880] {
+                let addr = format!("{}:{}", ip, port);
+                if is_qnet_node_running(&addr) {
+                    bootstrap_peers.push(addr);
+                    println!("🔍 Discovered QNet node at: {}", bootstrap_peers.last().unwrap());
+                }
+            }
+        }
+    }
+    
+    // If no local nodes found, try external discovery
+    if bootstrap_peers.is_empty() {
+        println!("🌍 No local nodes found, enabling external discovery mode");
+        // Return empty to trigger external IP announcement
+        // Node will announce itself and wait for connections
+    }
+    
+    bootstrap_peers
+}
+
+// Helper functions for network discovery
+fn get_local_ip() -> String {
+    use std::net::UdpSocket;
+    
+    // Connect to a remote address to determine local IP
+    match UdpSocket::bind("0.0.0.0:0") {
+        Ok(socket) => {
+            if let Ok(()) = socket.connect("8.8.8.8:80") {
+                if let Ok(addr) = socket.local_addr() {
+                    return addr.ip().to_string();
+                }
+            }
+        }
+        Err(_) => {}
+    }
+    
+    "127.0.0.1".to_string()
+}
+
+fn get_subnet_from_ip(ip: &str) -> String {
+    let parts: Vec<&str> = ip.split('.').collect();
+    if parts.len() >= 3 {
+        format!("{}.{}.{}", parts[0], parts[1], parts[2])
+    } else {
+        "192.168.1".to_string()
+    }
+}
+
+fn is_qnet_node_running(addr: &str) -> bool {
+    use std::net::TcpStream;
+    use std::time::Duration;
+    
+    // Quick connection test with short timeout
+    match TcpStream::connect_timeout(
+        &addr.parse().unwrap_or("127.0.0.1:9876".parse().unwrap()),
+        Duration::from_millis(100)
+    ) {
+        Ok(_) => {
+            // Could add QNet-specific handshake here
+            // For now, just check if port is open
+            true
+        },
+        Err(_) => false
     }
 }
 

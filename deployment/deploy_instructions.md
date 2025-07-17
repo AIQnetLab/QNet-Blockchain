@@ -41,18 +41,107 @@ git pull origin testnet
 # 5. Build with latest Rust (requires rebuild after updates)
 cargo build --release
 
-# 6. Build Docker image (uses Rust 1.85 - supports edition2024)
-docker build -t qnet-production -f development/Dockerfile .
+# 6. Build Docker image (uses Rust 1.86 - latest production)
+docker build -f Dockerfile.production -t qnet-production .
 
-# 7. Launch node
-docker run -d --name qnet-node --restart=always \
+# 7. Stop and remove old container if exists
+docker stop qnet-node || true
+docker rm qnet-node || true
+
+# 8. Launch node in interactive mode for initial setup
+docker run -it --name qnet-node --restart=always \
   -p 9876:9876 -p 9877:9877 -p 8001:8001 \
-  -v $(pwd)/node_data:/opt/qnet/node_data \
+  -v $(pwd)/node_data:/app/node_data \
   qnet-production
 
-# 8. Activate node (INTERACTIVE REQUIRED)
-docker exec -it qnet-node /bin/bash
-/usr/local/bin/qnet-node
+# Note: Interactive setup will prompt for:
+# - Node type selection (Full/Super for servers)
+# - Activation code input (format: QNET-XXXX-XXXX-XXXX or DEV_XXX)
+# - Network configuration (auto-configured)
+
+# 9. After setup, restart in background mode
+docker restart qnet-node
+```
+
+## 🌐 Automatic Node Discovery
+
+**QNet nodes automatically discover each other on the network!**
+
+### Method 1: Local Network Discovery (Automatic)
+Nodes running on the same local network will automatically discover each other:
+
+```bash
+# Start first node
+docker run -d --name qnet-node1 --restart=always \
+  -p 9876:9876 -p 8001:8001 \
+  -v $(pwd)/node1_data:/app/node_data \
+  qnet-production
+
+# Start second node (will automatically discover first node)
+docker run -d --name qnet-node2 --restart=always \
+  -p 9877:9876 -p 8002:8001 \
+  -v $(pwd)/node2_data:/app/node_data \
+  qnet-production
+
+# Start third node (will automatically discover other nodes)
+docker run -d --name qnet-node3 --restart=always \
+  -p 9878:9876 -p 8003:8001 \
+  -v $(pwd)/node3_data:/app/node_data \
+  qnet-production
+```
+
+### Method 2: Internet-Wide Discovery (Manual Peer Configuration)
+For nodes on different servers across the internet:
+
+```bash
+# Server 1 (IP: 1.2.3.4) - First node
+docker run -d --name qnet-node --restart=always \
+  -p 9876:9876 -p 8001:8001 \
+  -v $(pwd)/node_data:/app/node_data \
+  qnet-production
+
+# Server 2 (IP: 5.6.7.8) - Connect to Server 1
+docker run -d --name qnet-node --restart=always \
+  -p 9876:9876 -p 8001:8001 \
+  -e QNET_PEER_IPS="1.2.3.4" \
+  -v $(pwd)/node_data:/app/node_data \
+  qnet-production
+
+# Server 3 (IP: 9.10.11.12) - Connect to both servers
+docker run -d --name qnet-node --restart=always \
+  -p 9876:9876 -p 8001:8001 \
+  -e QNET_PEER_IPS="1.2.3.4,5.6.7.8" \
+  -v $(pwd)/node_data:/app/node_data \
+  qnet-production
+```
+
+### Discovery Features
+
+**Automatic Discovery Methods:**
+- **Local Network Scanning**: Nodes scan subnet (192.168.x.x) for other QNet nodes
+- **Port Discovery**: Checks common QNet ports (9876-9880) automatically  
+- **External IP Detection**: Nodes announce their external IP for internet connectivity
+- **Dynamic Peer Lists**: Nodes share discovered peers with each other
+
+**Manual Configuration (Optional):**
+```bash
+# Specify exact peer IPs for faster connection
+-e QNET_PEER_IPS="server1.example.com:9876,server2.example.com:9876"
+
+# Or use IP addresses directly
+-e QNET_PEER_IPS="95.164.7.199:9876,173.212.219.226:9876"
+```
+
+**Connection Verification:**
+```bash
+# Check node's discovered peers
+docker exec qnet-node curl -s http://localhost:8001/api/peers | jq
+
+# Monitor connection status
+docker logs qnet-node | grep "Discovered QNet node"
+
+# Check network connectivity
+docker logs qnet-node | grep "🌐 Using provided peer IPs"
 ```
 
 ### Alternative Installation (if Docker fails)
@@ -67,7 +156,40 @@ rustup default 1.85.0
 cargo build --release
 
 # 6. Build Docker image
-docker build -t qnet-production -f development/Dockerfile .
+docker build -f Dockerfile.production -t qnet-production .
+```
+
+### Step-by-Step Commands for Complete Deployment
+
+```bash
+# 1. Get latest changes
+cd ~/QNet-Blockchain
+git pull origin testnet
+
+# 2. Stop and remove old container
+docker stop qnet-node || true
+docker rm qnet-node || true
+docker rmi qnet-production || true
+
+# 3. Build new production container
+docker build -f Dockerfile.production -t qnet-production .
+
+# 4. Launch container in interactive mode
+docker run -it --name qnet-node --restart=always \
+  -p 9876:9876 -p 9877:9877 -p 8001:8001 \
+  -v $(pwd)/node_data:/app/node_data \
+  qnet-production
+
+# 5. Follow the interactive setup:
+#    - Select node type (Full/Super for servers)
+#    - Enter activation code (QNET-XXXX-XXXX-XXXX or DEV_XXX)
+#    - Node will start automatically after setup
+
+# 6. To access running container (in another terminal)
+docker exec -it qnet-node /bin/bash
+
+# 7. View logs
+docker logs -f qnet-node
 ```
 
 ### Quick Monitoring Commands
@@ -78,10 +200,13 @@ docker ps
 docker logs -f qnet-node
 
 # Health check
-curl http://localhost:8001/api/v1/node/health
+curl http://localhost:9877/health
 
 # Node info
-curl http://localhost:8001/api/v1/node/info
+curl http://localhost:9877/info
+
+# Check P2P connections
+curl http://localhost:9877/peers
 ```
 
 ---
