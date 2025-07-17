@@ -1,5 +1,197 @@
 # QNet Production Server Setup Guide
 
+## 🚀 Complete Setup from Scratch
+
+### Prerequisites
+- Ubuntu 20.04+ / CentOS 8+ / Debian 11+
+- 4+ GB RAM, 50+ GB SSD
+- Stable internet connection
+- Open ports: 9876 (P2P), 8001 (API)
+
+### Step 1: System Preparation
+```bash
+# Update system
+sudo apt update && sudo apt upgrade -y
+
+# Install required packages
+sudo apt install -y curl git build-essential pkg-config libssl-dev
+
+# Configure firewall
+sudo ufw allow 9876  # P2P port
+sudo ufw allow 8001  # API port
+sudo ufw --force enable
+```
+
+### Step 2: Install Dependencies
+```bash
+# Install Docker
+curl -fsSL https://get.docker.com | sh
+sudo usermod -aG docker $USER
+
+# Install Rust
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+source ~/.cargo/env
+```
+
+### Step 3: Download QNet
+```bash
+# Clone repository
+git clone https://github.com/AIQnetLab/QNet-Blockchain.git
+cd QNet-Blockchain
+git checkout testnet
+
+# Build Docker image
+docker build -f Dockerfile.production -t qnet-node:latest .
+```
+
+### Step 4: Launch Node (Interactive Setup)
+```bash
+# Launch node with interactive setup
+docker run -it --name qnet-node --restart=always \
+  -p 9876:9876 -p 8001:8001 \
+  -v $(pwd)/node_data:/app/node_data \
+  qnet-node:latest
+
+# Follow the interactive menu to:
+# 1. Select node type (Full/Super for servers)
+# 2. Enter activation code (format: QNET-XXXX-XXXX-XXXX)
+# 3. Confirm configuration
+```
+
+### Step 5: Verify Installation
+```bash
+# Check node status
+docker logs qnet-node
+
+# Test API endpoint
+curl http://localhost:8001/api/v1/info
+
+# Check peer connections
+curl http://localhost:8001/api/v1/peers
+```
+
+## 🏗️ Node Types & Architecture
+
+### **Server Nodes (Full/Super)**
+```bash
+# Server deployment only
+docker run -it --name qnet-node --restart=always \
+  -p 9876:9876 -p 8001:8001 \
+  -v $(pwd)/node_data:/app/node_data \
+  qnet-node:latest
+```
+
+**Features:**
+- ✅ **Full blockchain validation**
+- ✅ **REST API endpoints** (`http://localhost:8001/api/v1/`)
+- ✅ **P2P network participation**
+- ✅ **Automatic peer discovery**
+- ✅ **Consensus participation**
+
+### **Mobile Nodes (Light)**
+```bash
+# Mobile app deployment only
+# Download QNet Mobile App from App Store/Play Store
+# Activate through mobile interface
+```
+
+**Features:**
+- ✅ **Lightweight validation**
+- ✅ **Mobile-optimized**
+- ✅ **Battery-efficient**
+- ❌ **No API endpoints**
+- ❌ **No server deployment**
+
+### **Node Discovery Process**
+
+**How nodes find each other:**
+1. **Local Network**: Automatic scanning of subnet (192.168.x.x)
+2. **DNS Seeds**: Lookup of bootstrap.qnet.network, node1.qnet.network
+3. **Bootstrap Nodes**: Connection to hardcoded nodes (95.164.7.199, 173.212.219.226)
+4. **Manual Configuration**: Optional `QNET_PEER_IPS` environment variable
+5. **Peer Sharing**: Nodes share discovered peers with each other
+
+**Network Hierarchy:**
+```
+Internet
+   ↓
+Super Nodes (Servers) - Core mesh network
+   ↓
+Full Nodes (Servers) - Regional validators
+   ↓
+Light Nodes (Mobile) - End users
+```
+
+## 🔐 Node Activation
+
+### **Activation Code Format**
+```bash
+# Valid activation codes MUST use this format:
+QNET-XXXX-XXXX-XXXX
+
+# Examples:
+QNET-1234-5678-9012
+QNET-A1B2-C3D4-E5F6
+```
+
+### **Phase 1: 1DEV Token Burn (Current)**
+```bash
+# Universal pricing for all node types:
+Light Node:  1,500 1DEV → 150 1DEV (decreases as tokens burned)
+Full Node:   1,500 1DEV → 150 1DEV (decreases as tokens burned)
+Super Node:  1,500 1DEV → 150 1DEV (decreases as tokens burned)
+
+# Price reduction mechanism:
+# 0% burned: 1,500 1DEV per node
+# 50% burned: ~750 1DEV per node  
+# 90% burned: 150 1DEV per node (minimum)
+```
+
+### **Interactive Setup Process**
+```bash
+# When you run the node, you'll see:
+🚀 === QNet Production Node Setup === 🚀
+🖥️  SERVER DEPLOYMENT MODE
+
+📊 Phase 1: Universal activation cost
+💰 Current cost: 1,500 1DEV (burn)
+⚖️  Same price for all node types
+
+🔧 Select node type:
+[1] Full Node - Complete validation + API
+[2] Super Node - Enhanced validation + API
+
+🔐 Enter activation code (format: QNET-XXXX-XXXX-XXXX):
+```
+
+### **Node Activation Examples**
+
+**Full Node Activation:**
+```bash
+docker run -it --name qnet-full-node --restart=always \
+  -p 9876:9876 -p 8001:8001 \
+  -v $(pwd)/node_data:/app/node_data \
+  qnet-node:latest
+
+# In interactive menu:
+# 1. Choose [1] Full Node
+# 2. Enter: QNET-1234-5678-9012
+# 3. Confirm: ✅ Node activated successfully
+```
+
+**Super Node Activation:**
+```bash
+docker run -it --name qnet-super-node --restart=always \
+  -p 9876:9876 -p 8001:8001 \
+  -v $(pwd)/node_data:/app/node_data \
+  qnet-node:latest
+
+# In interactive menu:
+# 1. Choose [2] Super Node
+# 2. Enter: QNET-A1B2-C3D4-E5F6
+# 3. Confirm: ✅ Node activated successfully
+```
+
 ## 🚀 Quick Installation Guide (Simplified)
 
 ### Docker Cleanup Commands (if needed)
