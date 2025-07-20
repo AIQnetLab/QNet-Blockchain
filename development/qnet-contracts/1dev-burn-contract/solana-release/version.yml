@@ -1,0 +1,3 @@
+channel: v1.18.26
+commit: d9f20e951a06b61e4505da0955228020b96a8915
+target: x86_64-pc-windows-msvc

@@ -3,19 +3,19 @@ seeds = false
 skip-lint = false
 
 [programs.localnet]
-onedev_burn_contract = "QNETxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+onedev_burn_contract = "4n6wAph553sx32ZkCEt3HdeAnZY28av4sutLdjBB5caq"
 
 [programs.devnet]
-onedev_burn_contract = "QNETxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+onedev_burn_contract = "4n6wAph553sx32ZkCEt3HdeAnZY28av4sutLdjBB5caq"
 
 [programs.mainnet]
-onedev_burn_contract = "QNETxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+onedev_burn_contract = "4n6wAph553sx32ZkCEt3HdeAnZY28av4sutLdjBB5caq"
 
 [registry]
 url = "https://api.apr.dev"
 
 [provider]
-cluster = "localnet"
+cluster = "devnet"
 wallet = "~/.config/solana/id.json"
 
 [scripts]

@@ -1,7 +1,7 @@
 use anchor_lang::prelude::*;
-use anchor_spl::token::{self, Token, TokenAccount, Transfer};
+use anchor_spl::token::{Mint, Token};
 use crate::state::*;
-use crate::errors::*;
+use crate::errors::BurnError;
 
 #[derive(Accounts)]
 #[instruction(node_type: NodeType, one_dev_amount: u64, solana_burn_tx: String)]
@@ -10,8 +10,8 @@ pub struct Burn1DevForNodeActivation<'info> {
         mut,
         seeds = [BURN_TRACKER_SEED],
         bump = burn_tracker.bump,
-        constraint = !burn_tracker.paused @ ErrorCode::ContractPaused,
-        constraint = !burn_tracker.phase_transitioned @ ErrorCode::PhaseTransitioned
+        constraint = !burn_tracker.paused @ BurnError::ContractPaused,
+        constraint = !burn_tracker.phase_transitioned @ BurnError::PhaseTransitioned
     )]
     pub burn_tracker: Account<'info, BurnTracker>,
 
@@ -43,7 +43,7 @@ pub struct Burn1DevForNodeActivation<'info> {
 
     /// 1DEV token mint (Solana SPL)
     #[account(
-        address = burn_tracker.one_dev_mint @ ErrorCode::InvalidMint
+        address = burn_tracker.one_dev_mint @ BurnError::InvalidMint
     )]
     pub one_dev_mint: Account<'info, Mint>,
 
@@ -57,6 +57,7 @@ pub fn handler(
     node_type: NodeType,
     one_dev_amount: u64,
     solana_burn_tx: String,
+    _node_pubkey: Pubkey,
 ) -> Result<()> {
     let burn_tracker = &mut ctx.accounts.burn_tracker;
     let node_activation = &mut ctx.accounts.node_activation;
@@ -66,7 +67,7 @@ pub fn handler(
     // Validate burn transaction signature format
     require!(
         solana_burn_tx.len() >= 64 && solana_burn_tx.len() <= 88,
-        ErrorCode::InvalidBurnTransaction
+        BurnError::InvalidBurnTransaction
     );
 
     // Calculate required 1DEV amount based on current burn percentage
@@ -75,14 +76,14 @@ pub fn handler(
     // Validate burn amount
     require!(
         one_dev_amount >= required_amount,
-        ErrorCode::InsufficientBurnAmount
+        BurnError::InsufficientBurnAmount
     );
 
     // SECURITY: Check for duplicate burn transaction
     // This prevents reusing the same burn transaction for multiple activations
     require!(
         burn_record.to_account_info().lamports() == 0, // Account must be new
-        ErrorCode::DuplicateBurnTransaction
+        BurnError::DuplicateBurnTransaction
     );
 
     // Verify burn transaction on Solana (simplified for production)
@@ -95,7 +96,7 @@ pub fn handler(
         &burn_tracker.one_dev_mint,
     )?;
 
-    require!(verified_burn, ErrorCode::BurnNotVerified);
+    require!(verified_burn, BurnError::BurnNotVerified);
 
     // Create activation signature for QNet verification
     let activation_signature = generate_activation_signature(
@@ -108,7 +109,7 @@ pub fn handler(
 
     // Initialize node activation record
     node_activation.node_pubkey = ctx.accounts.node_pubkey.key();
-    node_activation.node_type = node_type;
+    node_activation.node_type = node_type.clone();
     node_activation.activated_at = clock.unix_timestamp;
     node_activation.one_dev_burned = one_dev_amount;
     node_activation.qnc_used = 0; // Phase 1 uses 1DEV burn
@@ -119,7 +120,7 @@ pub fn handler(
     node_activation.bump = ctx.bumps.node_activation;
 
     // Initialize burn record for audit trail
-    burn_record.solana_tx_signature = solana_burn_tx;
+    burn_record.solana_tx_signature = solana_burn_tx.clone();
     burn_record.one_dev_amount = one_dev_amount;
     burn_record.burner_wallet = ctx.accounts.user.key();
     burn_record.qnet_node_activated = Some(ctx.accounts.node_pubkey.key());
@@ -131,32 +132,32 @@ pub fn handler(
     // Update burn tracker statistics
     burn_tracker.total_1dev_burned = burn_tracker.total_1dev_burned
         .checked_add(one_dev_amount)
-        .ok_or(ErrorCode::MathOverflow)?;
+        .ok_or(BurnError::MathOverflow)?;
     
     burn_tracker.total_burn_transactions = burn_tracker.total_burn_transactions
         .checked_add(1)
-        .ok_or(ErrorCode::MathOverflow)?;
+        .ok_or(BurnError::MathOverflow)?;
     
     burn_tracker.total_nodes_activated = burn_tracker.total_nodes_activated
         .checked_add(1)
-        .ok_or(ErrorCode::MathOverflow)?;
+        .ok_or(BurnError::MathOverflow)?;
 
     // Update node type counters
     match node_type {
         NodeType::Light => {
             burn_tracker.light_nodes = burn_tracker.light_nodes
                 .checked_add(1)
-                .ok_or(ErrorCode::MathOverflow)?;
+                .ok_or(BurnError::MathOverflow)?;
         }
         NodeType::Full => {
             burn_tracker.full_nodes = burn_tracker.full_nodes
                 .checked_add(1)
-                .ok_or(ErrorCode::MathOverflow)?;
+                .ok_or(BurnError::MathOverflow)?;
         }
         NodeType::Super => {
             burn_tracker.super_nodes = burn_tracker.super_nodes
                 .checked_add(1)
-                .ok_or(ErrorCode::MathOverflow)?;
+                .ok_or(BurnError::MathOverflow)?;
         }
     }
 
@@ -201,12 +202,12 @@ fn verify_solana_burn_transaction(
     // For now, basic validation
     require!(
         tx_signature.len() >= 64,
-        ErrorCode::InvalidBurnTransaction
+        BurnError::InvalidBurnTransaction
     );
     
     require!(
         amount >= MIN_1DEV_PRICE,
-        ErrorCode::InsufficientBurnAmount
+        BurnError::InsufficientBurnAmount
     );
 
     // In production: actual cross-chain verification
@@ -255,30 +256,4 @@ pub struct NodeActivatedEvent {
     pub burn_percentage: f64,
 }
 
-/// Custom error codes
-#[error_code]
-pub enum ErrorCode {
-    #[msg("Contract is paused")]
-    ContractPaused,
-    
-    #[msg("Phase has already transitioned to QNC")]
-    PhaseTransitioned,
-    
-    #[msg("Invalid 1DEV mint address")]
-    InvalidMint,
-    
-    #[msg("Invalid burn transaction format")]
-    InvalidBurnTransaction,
-    
-    #[msg("Insufficient 1DEV burn amount")]
-    InsufficientBurnAmount,
-    
-    #[msg("Duplicate burn transaction")]
-    DuplicateBurnTransaction,
-    
-    #[msg("Burn transaction not verified on Solana")]
-    BurnNotVerified,
-    
-    #[msg("Math overflow error")]
-    MathOverflow,
-} 
+// Error codes are defined in errors.rs 
