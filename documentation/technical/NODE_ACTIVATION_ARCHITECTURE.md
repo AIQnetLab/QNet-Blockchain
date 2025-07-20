@@ -20,8 +20,8 @@ QNet uses a two-phase activation system transitioning from 1DEV burn on Solana t
 ### Phase 1: 1DEV Token Burn on Solana (Years 0-5)
 
 **Solana Contract Address (Devnet):**
-- Contract: `QNETxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx` (Anchor program)
-- 1DEV Mint: `1DEVxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx`
+- Contract: `4hC1c4smV4An7JAjgKPk33H16j7ePffNpd2FqMQbgzNQ` (Anchor program)
+- 1DEV Mint: `62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ`
 
 **How Phase 1 Works:**
 1. User burns 1DEV tokens on Solana blockchain

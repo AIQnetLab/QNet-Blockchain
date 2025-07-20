@@ -170,8 +170,8 @@ git pull origin testnet
 
 ```bash
 # Production build with maximum optimizations
-# Note: Workspace builds in root directory, not in development/qnet-integration/
-RUSTFLAGS="-C target-cpu=native" cargo build --release --bin qnet-node
+# Note: Workspace builds in root directory from development/qnet-integration/
+RUSTFLAGS="-C target-cpu=native" cargo build --release --bin qnet-node --manifest-path development/qnet-integration/Cargo.toml
 
 # Verify build success
 ls -la target/release/qnet-node
@@ -194,10 +194,40 @@ cd ~
 git clone https://github.com/AIQnetLab/QNet-Blockchain.git
 cd QNet-Blockchain
 git checkout testnet
-cargo build --release --bin qnet-node
+cargo build --release --bin qnet-node --manifest-path development/qnet-integration/Cargo.toml
 
 # Run interactive setup
 ./target/release/qnet-node
+```
+
+### Docker Deployment (Recommended)
+
+For production server deployment, Docker is the recommended approach:
+
+```bash
+# Clone repository
+cd ~
+git clone https://github.com/AIQnetLab/QNet-Blockchain.git
+cd QNet-Blockchain
+git checkout testnet
+
+# Build Docker image
+docker build -f Dockerfile.production -t qnet-production .
+
+# Stop and remove old container if exists
+docker stop qnet-node || true
+docker rm qnet-node || true
+
+# Launch container in interactive mode for setup
+docker run -it --name qnet-node --restart=always \
+  -p 9876:9876 -p 9877:9877 -p 8001:8001 \
+  -v $(pwd)/node_data:/app/node_data \
+  qnet-production
+
+# Follow interactive setup:
+# 1. Select node type (Full/Super for servers)
+# 2. Enter activation code (QNET-XXXX-XXXX-XXXX or DEV_XXX)
+# 3. Node will start automatically after setup
 ```
 
 ### Production Contract Configuration
@@ -208,8 +238,8 @@ For production deployment, configure real Solana contract connection:
 # Set Solana RPC endpoint (default: devnet for testing)
 export SOLANA_RPC_URL="https://api.devnet.solana.com"
 
-# Set burn tracker program ID (replace with actual deployed contract)
-export BURN_TRACKER_PROGRAM_ID="YOUR_DEPLOYED_PROGRAM_ID_HERE"
+# Set burn tracker program ID (deployed production contract)
+export BURN_TRACKER_PROGRAM_ID="8HmsJ4QaJptLSYFGygApyd2k91QNXUHLWrz9saPE2ur5"
 
 # Set real 1DEV token mint address
 export ONE_DEV_MINT_ADDRESS="62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ"

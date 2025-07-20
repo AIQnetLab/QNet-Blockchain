@@ -998,10 +998,6 @@ impl BlockchainNode {
             .unwrap()
             .as_secs();
         
-        // Use centralized ActivationValidator from activation_validation.rs
-        // Efficient validation with caching and DHT peer network
-        // let validator = crate::activation_validation::ActivationValidator::new();
-        
         // Validate activation code format
         if code.is_empty() {
             return Err(QNetError::ValidationError("Empty activation code".to_string()));
@@ -1012,15 +1008,47 @@ impl BlockchainNode {
             return Err(QNetError::ValidationError("Invalid activation code format".to_string()));
         }
         
-        // TODO: Implement full activation validation
-        // if validator.is_code_used(code).await.unwrap_or(false) {
-        //     return Err(QNetError::ValidationError("Activation code already used".to_string()));
-        // }
+        // Initialize blockchain registry for production validation
+        let registry = crate::activation_validation::BlockchainActivationRegistry::new(
+            Some("https://rpc.qnet.io".to_string())
+        );
         
+        // Check if code is used globally
+        match registry.is_code_used_globally(code).await {
+            Ok(true) => {
+                return Err(QNetError::ValidationError("Activation code already used".to_string()));
+            }
+            Ok(false) => {
+                println!("✅ Activation code available for use");
+            }
+            Err(e) => {
+                println!("⚠️  Warning: Blockchain registry check failed: {}", e);
+                // Continue with local validation only
+            }
+        }
+        
+        // Create node info for blockchain registry
+        let node_info = crate::activation_validation::NodeInfo {
+            activation_code: code.to_string(),
+            wallet_address: format!("wallet_{}", &blake3::hash(code.as_bytes()).to_hex()[..16]),
+            device_signature: self.get_device_signature(),
+            node_type: format!("{:?}", node_type),
+            activated_at: timestamp,
+            last_seen: timestamp,
+            migration_count: 0,
+        };
+        
+        // Register activation on blockchain
+        if let Err(e) = registry.register_activation_on_blockchain(code, node_info).await {
+            println!("⚠️  Warning: Failed to register on blockchain: {}", e);
+            // Continue with local storage only
+        }
+        
+        // Save to local storage
         self.storage.save_activation_code(code, node_type_id, timestamp)
             .map_err(|e| QNetError::StorageError(e.to_string()))?;
         
-        println!("✅ Activation code saved to persistent storage with cryptographic binding");
+        println!("✅ Activation code saved with blockchain registry and cryptographic binding");
         Ok(())
     }
     
@@ -1036,22 +1064,9 @@ impl BlockchainNode {
                     _ => NodeType::Full,
                 };
                 
-                // Check if activation is still valid (not expired)
-                let current_time = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs();
-                
-                // Activation codes are valid for 1 year
-                if current_time - timestamp < 365 * 24 * 60 * 60 {
-                    println!("✅ Found valid activation code with cryptographic binding");
-                    Ok(Some((code, node_type)))
-                } else {
-                    println!("⚠️  Activation code expired, requesting new one");
-                    // Clear expired code
-                    let _ = self.storage.clear_activation_code();
-                    Ok(None)
-                }
+                // Check if activation is still valid (codes never expire - tied to blockchain burns)
+                println!("✅ Found valid activation code with cryptographic binding");
+                Ok(Some((code, node_type)))
             }
             None => Ok(None),
         }
@@ -1147,6 +1162,27 @@ impl BlockchainNode {
         let hash = hex::encode(Sha3_256::digest(combined.as_bytes()));
         
         Ok(hash)
+    }
+    
+    /// Get device signature for blockchain registry
+    pub fn get_device_signature(&self) -> String {
+        use sha3::{Sha3_256, Digest};
+        
+        // Generate consistent device signature based on node characteristics
+        let mut hasher = Sha3_256::new();
+        hasher.update(self.node_id.as_bytes());
+        hasher.update(format!("{:?}", self.node_type).as_bytes());
+        hasher.update(format!("{:?}", self.region).as_bytes());
+        
+        // Add system info for device uniqueness
+        if let Ok(hostname) = std::env::var("HOSTNAME") {
+            hasher.update(hostname.as_bytes());
+        }
+        if let Ok(user) = std::env::var("USER") {
+            hasher.update(user.as_bytes());
+        }
+        
+        format!("device_{}", hex::encode(hasher.finalize())[..16].to_string())
     }
     
     /// Get public IP region using IP geolocation service

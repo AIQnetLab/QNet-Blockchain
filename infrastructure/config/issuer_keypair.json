@@ -1,8 +1,8 @@
 {
-  "private_key_b58": "2Y4drEnuQQZjyZ14GgkL2R9ViRNSCDdNWStQCZwCevutTgNSwbLF1hbgi3Q3fbAvEUnD2wbE1gC1Z9ckrZwhPwrM",
-  "public_key_b58": "8hiJmW8TB1ssJzBUC1Tr4NWergEggPE9DBfJv3VkLvZT",
-  "generated_at": 1748052628,
-  "generated_at_readable": "2025-05-24 02:10:28 UTC",
-  "note": "Auto-generated issuer keypair for QNet activation bridge",
-  "warning": "KEEP THIS FILE SECURE! Contains private key for signing activation tokens."
+  "private_key_b58": "PRODUCTION_PRIVATE_KEY_PLACEHOLDER",
+  "public_key_b58": "PRODUCTION_PUBLIC_KEY_PLACEHOLDER",
+  "generated_at": 0,
+  "generated_at_readable": "PRODUCTION_DEPLOYMENT_TIME",
+  "note": "Production issuer keypair for QNet activation bridge",
+  "warning": "REPLACE WITH SECURE PRODUCTION KEYS! Generate new keypair for production deployment."
 }

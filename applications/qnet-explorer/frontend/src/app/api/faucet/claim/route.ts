@@ -249,23 +249,114 @@ async function sendQNCTokens(
 ): Promise<{ success: boolean; txHash?: string; error?: string }> {
   
   if (environment === 'testnet') {
-    // Mock QNC transaction for testnet
-    const mockTxHash = `QNC_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-    
-    // Simulate network delay
-    await new Promise(resolve => setTimeout(resolve, 1500));
-    
-    return {
-      success: true,
-      txHash: mockTxHash
-    };
+    try {
+      // Real QNet testnet faucet integration
+      const qnetApiUrl = process.env.QNET_TESTNET_API || 'https://testnet-api.qnet.io';
+      
+      const response = await fetch(`${qnetApiUrl}/v1/faucet/claim`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'User-Agent': 'QNet-Explorer-Faucet/1.0'
+        },
+        body: JSON.stringify({
+          address: address,
+          amount: amount,
+          token: 'QNC'
+        }),
+        timeout: 30000
+      });
+      
+      if (response.ok) {
+        const data = await response.json();
+        return {
+          success: true,
+          txHash: data.txHash
+        };
+      } else {
+        const error = await response.json();
+        return {
+          success: false,
+          error: error.message || 'QNet faucet request failed'
+        };
+      }
+      
+    } catch (error) {
+      console.error('QNet testnet faucet error:', error);
+      
+      // Fallback to local node faucet
+      try {
+        const localResponse = await fetch('http://localhost:8080/api/v1/faucet/claim', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            address: address,
+            amount: amount,
+            token: 'QNC'
+          }),
+          timeout: 10000
+        });
+        
+        if (localResponse.ok) {
+          const data = await localResponse.json();
+          return {
+            success: true,
+            txHash: data.txHash
+          };
+        }
+      } catch (localError) {
+        console.error('Local QNet faucet error:', localError);
+      }
+      
+      return {
+        success: false,
+        error: 'QNet testnet faucet unavailable'
+      };
+    }
   }
   
-  // Production would implement real QNet transfer
-  return {
-    success: false,
-    error: 'Production QNC faucet not yet implemented'
-  };
+  // Production QNet faucet
+  try {
+    const qnetApiUrl = process.env.QNET_MAINNET_API || 'https://api.qnet.io';
+    
+    const response = await fetch(`${qnetApiUrl}/v1/faucet/claim`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${process.env.QNET_FAUCET_API_KEY}`,
+        'User-Agent': 'QNet-Explorer-Faucet/1.0'
+      },
+      body: JSON.stringify({
+        address: address,
+        amount: amount,
+        token: 'QNC'
+      }),
+      timeout: 30000
+    });
+    
+    if (response.ok) {
+      const data = await response.json();
+      return {
+        success: true,
+        txHash: data.txHash
+      };
+    } else {
+      const error = await response.json();
+      return {
+        success: false,
+        error: error.message || 'Production QNet faucet request failed'
+      };
+    }
+    
+  } catch (error) {
+    console.error('Production QNet faucet error:', error);
+    return {
+      success: false,
+      error: 'Production QNet faucet unavailable'
+    };
+  }
 }
 
 /**

@@ -73,7 +73,7 @@ pub async fn verify_node_activation(
 # qnet-node/config.toml
 [solana]
 rpc_url = "https://api.mainnet-beta.solana.com"
-burn_program_id = "QNETxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+burn_program_id = "4hC1c4smV4An7JAjgKPk33H16j7ePffNpd2FqMQbgzNQ"
 
 [node]
 type = "LightNode"

@@ -255,14 +255,15 @@ class ActivationVerifier:
 class SolanaVerifier:
     """Verifies burn transactions on Solana (Phase 1)."""
     
-    def __init__(self, rpc_url: str = "https://api.mainnet-beta.solana.com"):
+    def __init__(self, rpc_url: str = "https://api.devnet.solana.com"):
         """Initialize Solana verifier.
         
         Args:
             rpc_url: Solana RPC endpoint
         """
         self.rpc_url = rpc_url
-        # TODO: Initialize Solana client
+        self.one_dev_mint = "62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ"  # Real 1DEV token
+        self.burn_address = "1nc1nerator11111111111111111111111111111111"  # Solana incinerator
     
     def verify_burn(self, 
                    tx_hash: str,
@@ -280,9 +281,37 @@ class SolanaVerifier:
         Returns:
             Tuple of (valid, error_message)
         """
-        # TODO: Implement actual Solana verification
-        # For now, return mock success
-        return True, ""
+        try:
+            # Get transaction details from Solana
+            tx_details = self.get_burn_details(tx_hash)
+            
+            if not tx_details:
+                return False, "Transaction not found on Solana"
+            
+            # Verify transaction is confirmed
+            if not tx_details.get('confirmed', False):
+                return False, "Transaction not confirmed on Solana"
+            
+            # Verify wallet matches
+            if tx_details['wallet'] != expected_wallet:
+                return False, f"Wallet mismatch: expected {expected_wallet}, got {tx_details['wallet']}"
+            
+            # Verify amount matches (Phase 1: universal 1500 1DEV pricing)
+            if tx_details['amount'] != expected_amount:
+                return False, f"Amount mismatch: expected {expected_amount}, got {tx_details['amount']}"
+            
+            # Verify it's a burn transaction to incinerator
+            if not tx_details.get('is_burn', False):
+                return False, "Transaction is not a burn to incinerator address"
+            
+            # Verify token is 1DEV
+            if tx_details.get('token_mint') != self.one_dev_mint:
+                return False, f"Wrong token: expected 1DEV ({self.one_dev_mint})"
+            
+            return True, "Burn transaction verified successfully"
+            
+        except Exception as e:
+            return False, f"Verification failed: {str(e)}"
     
     def get_burn_details(self, tx_hash: str) -> Optional[dict]:
         """Get details of a burn transaction.
@@ -293,14 +322,101 @@ class SolanaVerifier:
         Returns:
             Burn details or None
         """
-        # TODO: Implement Solana transaction lookup
-        return {
-            'tx_hash': tx_hash,
-            'wallet': 'mock_wallet',
-            'amount': 1500,
-            'timestamp': int(time.time()),
-            'confirmed': True
-        }
+        try:
+            import requests
+            import json
+            
+            # Request transaction details from Solana RPC
+            payload = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getTransaction",
+                "params": [
+                    tx_hash,
+                    {
+                        "encoding": "jsonParsed",
+                        "commitment": "confirmed",
+                        "maxSupportedTransactionVersion": 0
+                    }
+                ]
+            }
+            
+            response = requests.post(
+                self.rpc_url,
+                json=payload,
+                headers={'Content-Type': 'application/json'},
+                timeout=30
+            )
+            
+            if response.status_code != 200:
+                print(f"❌ RPC request failed: {response.status_code}")
+                return None
+            
+            data = response.json()
+            
+            if 'error' in data:
+                print(f"❌ RPC error: {data['error']}")
+                return None
+            
+            if not data.get('result'):
+                print(f"❌ Transaction not found: {tx_hash}")
+                return None
+            
+            tx_data = data['result']
+            
+            # Parse transaction for burn details
+            return self.parse_burn_transaction(tx_data)
+            
+        except Exception as e:
+            print(f"❌ Error getting burn details: {e}")
+            return None
+    
+    def parse_burn_transaction(self, tx_data: dict) -> Optional[dict]:
+        """Parse Solana transaction for burn details"""
+        try:
+            # Extract metadata
+            meta = tx_data.get('meta', {})
+            transaction = tx_data.get('transaction', {})
+            
+            # Check if transaction succeeded
+            if meta.get('err') is not None:
+                return None
+            
+            # Get transaction message
+            message = transaction.get('message', {})
+            instructions = message.get('instructions', [])
+            
+            # Look for SPL token transfer to burn address
+            for instruction in instructions:
+                if instruction.get('program') == 'spl-token':
+                    parsed = instruction.get('parsed', {})
+                    if parsed.get('type') == 'transfer':
+                        info = parsed.get('info', {})
+                        
+                        # Check if transfer is to burn address
+                        destination = info.get('destination')
+                        if destination == self.burn_address:
+                            # Extract burn details
+                            amount = int(info.get('amount', 0))
+                            authority = info.get('authority')  # Sender wallet
+                            mint = info.get('mint')  # Token mint
+                            
+                            return {
+                                'tx_hash': tx_data.get('transaction', {}).get('signatures', [None])[0],
+                                'wallet': authority,
+                                'amount': amount,
+                                'token_mint': mint,
+                                'timestamp': tx_data.get('blockTime', 0),
+                                'confirmed': True,
+                                'is_burn': True,
+                                'block_height': tx_data.get('slot', 0)
+                            }
+            
+            return None
+            
+        except Exception as e:
+            print(f"❌ Error parsing burn transaction: {e}")
+            return None
 
 
 class QNetVerifier:
@@ -330,6 +446,58 @@ class QNetVerifier:
         Returns:
             Tuple of (valid, error_message)
         """
-        # Look up transaction in QNet blockchain
-        # TODO: Implement QNet transaction verification
-        return True, "" 
+        try:
+            # Look up transaction in QNet blockchain
+            tx_details = self.get_qnet_transaction(tx_hash)
+            
+            if not tx_details:
+                return False, "Transaction not found on QNet"
+            
+            # Verify transaction is confirmed
+            if not tx_details.get('confirmed', False):
+                return False, "Transaction not confirmed on QNet"
+            
+            # Verify wallet matches
+            if tx_details['from_wallet'] != expected_wallet:
+                return False, f"Wallet mismatch: expected {expected_wallet}, got {tx_details['from_wallet']}"
+            
+            # Verify amount matches (Phase 2: tiered pricing)
+            if tx_details['amount'] != expected_amount:
+                return False, f"Amount mismatch: expected {expected_amount}, got {tx_details['amount']}"
+            
+            # Verify it's a transfer to Pool 3
+            if tx_details.get('to_wallet') != "POOL_3_ADDRESS":
+                return False, "Transaction is not a transfer to Pool 3"
+            
+            # Verify token is QNC
+            if tx_details.get('token_type') != "QNC":
+                return False, "Transaction is not QNC token transfer"
+            
+            return True, "QNet transaction verified successfully"
+            
+        except Exception as e:
+            return False, f"Verification failed: {str(e)}"
+    
+    def get_qnet_transaction(self, tx_hash: str) -> Optional[dict]:
+        """Get QNet transaction details"""
+        try:
+            # Query blockchain state for transaction
+            if hasattr(self.state, 'get_transaction'):
+                tx = self.state.get_transaction(tx_hash)
+                if tx:
+                    return {
+                        'tx_hash': tx_hash,
+                        'from_wallet': tx.sender,
+                        'to_wallet': tx.recipient,
+                        'amount': tx.amount,
+                        'token_type': 'QNC',
+                        'timestamp': tx.timestamp,
+                        'confirmed': True,
+                        'block_height': tx.block_height
+                    }
+            
+            return None
+            
+        except Exception as e:
+            print(f"❌ Error getting QNet transaction: {e}")
+            return None 

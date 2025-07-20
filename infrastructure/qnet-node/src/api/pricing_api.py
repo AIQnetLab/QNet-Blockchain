@@ -47,13 +47,66 @@ def get_current_burn_stats() -> Dict:
 
 def get_active_nodes_count() -> Dict[NodeType, int]:
     """Get current active node counts from network"""
-    # TODO: Integrate with actual network data
-    # For now, return mock data
-    return {
-        NodeType.LIGHT: 7000,
-        NodeType.FULL: 2500,
-        NodeType.SUPER: 500
-    }
+    try:
+        # Try to get real data from blockchain registry
+        from qnet_integration.activation_validation import BlockchainActivationRegistry
+        
+        registry = BlockchainActivationRegistry(Some("https://api.devnet.solana.com"))
+        
+        # Get active node counts by type
+        active_nodes = registry.get_active_nodes_by_type()
+        
+        return {
+            NodeType.LIGHT: active_nodes.get('light', 0),
+            NodeType.FULL: active_nodes.get('full', 0),
+            NodeType.SUPER: active_nodes.get('super', 0)
+        }
+        
+    except Exception as e:
+        print(f"⚠️ Warning: Could not fetch real node counts: {e}")
+        
+        # Try to get data from burn tracker
+        try:
+            import requests
+            
+            # Get burn data from Solana
+            response = requests.get("https://api.devnet.solana.com/v1/token/62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ/supply")
+            if response.status_code == 200:
+                data = response.json()
+                total_burned = data.get('total_burned', 0)
+                
+                # Estimate node counts from burn data for PRICING CALCULATION ONLY
+                # This is used to calculate dynamic pricing multipliers
+                # NOT for actual node management or rewards distribution
+                estimated_nodes = total_burned // 1500  # Phase 1: 1500 1DEV per node
+                
+                # Distribute by typical economic ratios for pricing purposes
+                # Based on economic modeling: most users choose Light nodes (mobile)
+                # This helps estimate network size for dynamic pricing multipliers
+                light_nodes = int(estimated_nodes * 0.6)   # 60% light nodes (mobile users)
+                full_nodes = int(estimated_nodes * 0.3)    # 30% full nodes (servers)
+                super_nodes = int(estimated_nodes * 0.1)   # 10% super nodes (enterprise)
+                
+                return {
+                    NodeType.LIGHT: light_nodes,
+                    NodeType.FULL: full_nodes,
+                    NodeType.SUPER: super_nodes
+                }
+                
+        except Exception as e2:
+            print(f"⚠️ Warning: Could not fetch burn data: {e2}")
+        
+        # Emergency fallback - conservative estimates if no data available
+        # These are NOT real node counts, just estimates for pricing calculation
+        
+        print(f"⚠️ Warning: Using conservative estimates for pricing calculation")
+        print(f"   Real node counts will be fetched from blockchain when available")
+        
+        return {
+            NodeType.LIGHT: 1000,   # Conservative estimate for pricing
+            NodeType.FULL: 500,     # Conservative estimate for pricing
+            NodeType.SUPER: 100     # Conservative estimate for pricing
+        }
 
 @pricing_bp.route('/current_prices', methods=['GET'])
 def get_current_prices():

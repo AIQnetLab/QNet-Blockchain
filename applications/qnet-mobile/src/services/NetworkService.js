@@ -273,25 +273,133 @@ class NetworkServiceClass {
 
   async getQNetData(eonAddress) {
     try {
-      // Placeholder for QNet API calls
-      // Will be replaced with actual QNet network integration
+      // Real QNet API calls using the actual network
+      const apiUrl = process.env.REACT_NATIVE_QNET_API_URL || 'https://api.qnet.io';
+      
+      // Get QNC balance from QNet blockchain
+      const balanceResponse = await fetch(`${apiUrl}/v1/balances/${eonAddress}`, {
+        method: 'GET',
+        headers: {
+          'Content-Type': 'application/json',
+          'User-Agent': 'QNet-Mobile/1.0'
+        },
+        timeout: 10000
+      });
+      
+      let qncBalance = 0;
+      if (balanceResponse.ok) {
+        const balanceData = await balanceResponse.json();
+        qncBalance = balanceData.qnc_balance || 0;
+      }
+      
+      // Get node information
+      const nodeResponse = await fetch(`${apiUrl}/v1/nodes/${eonAddress}`, {
+        method: 'GET',
+        headers: {
+          'Content-Type': 'application/json',
+          'User-Agent': 'QNet-Mobile/1.0'
+        },
+        timeout: 10000
+      });
+      
+      let nodeInfo = null;
+      if (nodeResponse.ok) {
+        const nodeData = await nodeResponse.json();
+        nodeInfo = {
+          code: nodeData.activation_code || 'Not activated',
+          type: nodeData.node_type || 'Light',
+          status: nodeData.status || 'Inactive',
+          rewards: nodeData.pending_rewards || 0,
+          lastSeen: nodeData.last_seen || 0,
+          uptime: nodeData.uptime_percentage || 0
+        };
+      }
+      
+      // Get network statistics
+      const statsResponse = await fetch(`${apiUrl}/v1/network/stats`, {
+        method: 'GET',
+        headers: {
+          'Content-Type': 'application/json',
+          'User-Agent': 'QNet-Mobile/1.0'
+        },
+        timeout: 10000
+      });
+      
+      let networkStats = {};
+      if (statsResponse.ok) {
+        networkStats = await statsResponse.json();
+      }
       
       return {
         balances: {
-          QNC: 0 // Placeholder
+          QNC: qncBalance
         },
-        nodeInfo: {
-          code: 'MOBILE001',
-          type: 'Light',
-          status: 'Inactive',
-          rewards: 0
+        nodeInfo: nodeInfo,
+        networkStats: {
+          totalNodes: networkStats.total_nodes || 0,
+          currentTPS: networkStats.current_tps || 0,
+          currentPhase: networkStats.current_phase || 1,
+          burnPercentage: networkStats.burn_percentage || 0
         }
       };
+      
     } catch (error) {
       console.warn('Failed to get QNet data:', error);
+      
+      // Try backup API endpoints
+      const backupUrls = [
+        'https://backup1.qnet.io',
+        'https://backup2.qnet.io',
+        'https://rpc.qnet.io'
+      ];
+      
+      for (const backupUrl of backupUrls) {
+        try {
+          const response = await fetch(`${backupUrl}/v1/balances/${eonAddress}`, {
+            method: 'GET',
+            headers: {
+              'Content-Type': 'application/json',
+              'User-Agent': 'QNet-Mobile/1.0'
+            },
+            timeout: 5000
+          });
+          
+          if (response.ok) {
+            const data = await response.json();
+            return {
+              balances: {
+                QNC: data.qnc_balance || 0
+              },
+              nodeInfo: {
+                code: 'Retrieved from backup',
+                type: 'Light',
+                status: 'Unknown',
+                rewards: 0
+              },
+              networkStats: {
+                totalNodes: 0,
+                currentTPS: 0,
+                currentPhase: 1,
+                burnPercentage: 0
+              }
+            };
+          }
+        } catch (backupError) {
+          console.warn(`Backup API ${backupUrl} failed:`, backupError);
+          continue;
+        }
+      }
+      
+      // Return empty data if all APIs fail
       return {
         balances: { QNC: 0 },
-        nodeInfo: null
+        nodeInfo: null,
+        networkStats: {
+          totalNodes: 0,
+          currentTPS: 0,
+          currentPhase: 1,
+          burnPercentage: 0
+        }
       };
     }
   }
