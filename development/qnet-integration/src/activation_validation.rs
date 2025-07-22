@@ -822,9 +822,9 @@ mod tests {
         assert!(validator.migrate_device_on_blockchain("QNET-TEST-CODE-002", "wallet123", "device789").await.is_ok());
         
         // Check new device is active
-        assert!(validator.device_has_active_node("device789").await.unwrap());
-        
-        // Check old device is no longer active
-        assert!(!validator.device_has_active_node("device456").await.unwrap());
+        // Check if devices are properly tracked in active nodes registry
+        let active_nodes = validator.active_nodes.read().await;
+        assert!(active_nodes.contains_key("device789"), "New device should be active");
+        assert!(!active_nodes.contains_key("device456"), "Old device should not be active");
     }
 } 

@@ -17,6 +17,7 @@
 //! - Enterprise security and monitoring
 
 use qnet_integration::node::{BlockchainNode, NodeType, Region};
+use qnet_integration::quantum_crypto::{QNetQuantumCrypto, ActivationPayload};
 // No clap - fully automatic configuration
 use std::path::PathBuf;
 use std::time::Duration;
@@ -44,59 +45,96 @@ fn mask_code(code: &str) -> String {
     }
 }
 
-// Decode activation code to extract node type and payment info
-fn decode_activation_code(code: &str, selected_node_type: NodeType) -> Result<ActivationCodeData, String> {
-    // Validate format: QNET-XXXX-XXXX-XXXX
-    if !code.starts_with("QNET-") || code.len() != 17 {
-        return Err("Invalid activation code format. Expected: QNET-XXXX-XXXX-XXXX".to_string());
-    }
+// Simple phase detection for display purposes (uses main detect_current_phase internally)
+async fn get_current_phase_simple() -> Result<u8, String> {
+    let (phase, _pricing) = detect_current_phase().await;
+    Ok(phase)
+}
 
-    let parts: Vec<&str> = code.split('-').collect();
-    if parts.len() != 4 || parts[0] != "QNET" {
-        return Err("Invalid activation code structure".to_string());
-    }
+// Quantum-secure activation code decryption with Light node blocking
+async fn decode_activation_code_quantum_secure(
+    code: &str, 
+    selected_node_type: NodeType
+) -> Result<ActivationCodeData, String> {
+    // Initialize quantum crypto module
+    let mut quantum_crypto = QNetQuantumCrypto::new();
+    quantum_crypto.initialize().await
+        .map_err(|e| format!("Failed to initialize quantum crypto: {}", e))?;
 
-    // Real cryptographic decoding of activation code
-    let encoded_data = format!("{}{}{}", parts[1], parts[2], parts[3]);
-    
-    // Decode node type from first segment
-    let node_type = match &encoded_data[0..1] {
-        "L" | "l" | "1" | "2" | "3" => NodeType::Light,
-        "F" | "f" | "4" | "5" | "6" => NodeType::Full,
-        "S" | "s" | "7" | "8" | "9" => NodeType::Super,
-        _ => return Err("Invalid node type in activation code".to_string()),
+    // 1. Decrypt activation code using quantum-resistant decryption
+    println!("🔓 Decrypting quantum-secure activation code...");
+    let payload = quantum_crypto.decrypt_activation_code(code).await
+        .map_err(|e| format!("Quantum decryption failed: {}", e))?;
+
+    // 2. Parse node type from payload
+    let node_type = match payload.node_type.as_str() {
+        "light" => NodeType::Light,
+        "full" => NodeType::Full,
+        "super" => NodeType::Super,
+        _ => return Err(format!("Invalid node type in activation code: {}", payload.node_type)),
     };
 
-    // Decode phase from second segment
-    let phase = match &encoded_data[1..2] {
-        "1" | "A" | "B" | "C" => 1,
-        "2" | "D" | "E" | "F" => 2,
-        _ => return Err("Invalid phase in activation code".to_string()),
-    };
+    // 3. CRITICAL SECURITY: Block Light nodes on servers IMMEDIATELY
+    if node_type == NodeType::Light {
+        eprintln!("🚨 SECURITY VIOLATION: Light node activation attempted on server!");
+        eprintln!("   Light nodes can ONLY be activated on mobile devices");
+        eprintln!("   Server activation is STRICTLY FORBIDDEN for Light nodes");
+        eprintln!("   Use Full or Super node activation codes for servers");
+        std::process::exit(1); // IMMEDIATE TERMINATION
+    }
 
-    // Decode transaction hash from remaining segments
-    let tx_hash = format!("0x{}", &encoded_data[2..]);
-    
-    // Decode wallet address from activation code
-    let wallet_hash = blake3::hash(code.as_bytes());
-    let wallet_address = bs58::encode(wallet_hash.as_bytes()).into_string();
+    // 4. Verify node type matches selected type
+    if node_type != selected_node_type {
+        return Err(format!(
+            "Node type mismatch: activation code is for {:?}, but {:?} was selected", 
+            node_type, selected_node_type
+        ));
+    }
 
-    // Calculate amount based on phase and node type
+    // 5. Verify Dilithium signature with wallet binding
+    let signature_data = format!("{}:{}:{}", payload.burn_tx, payload.node_type, payload.timestamp);
+    let signature_valid = quantum_crypto.verify_dilithium_signature(
+        &signature_data,
+        &payload.signature,
+        &payload.wallet
+    ).await.map_err(|e| format!("Signature verification failed: {}", e))?;
+
+    if !signature_valid {
+        return Err("Invalid wallet signature - activation code is not authentic".to_string());
+    }
+
+    // 6. Check blockchain to prevent double-usage
+    let already_used = quantum_crypto.check_blockchain_usage(code).await
+        .map_err(|e| format!("Blockchain check failed: {}", e))?;
+
+    if already_used {
+        return Err("Activation code already used - each code can only be used once".to_string());
+    }
+
+    // 7. Determine phase and QNC amount from payload
+    let phase = if payload.burn_tx.starts_with("burn_tx_") { 1 } else { 2 };
     let qnc_amount = match phase {
         1 => 1500, // Phase 1: 1500 1DEV (universal)
         2 => match node_type {
-            NodeType::Light => 5000,  // Phase 2: 5000 QNC
-            NodeType::Full => 7500,   // Phase 2: 7500 QNC  
+            NodeType::Light => 5000,  // Phase 2: 5000 QNC (blocked on servers)
+            NodeType::Full => 7500,   // Phase 2: 7500 QNC
             NodeType::Super => 10000, // Phase 2: 10000 QNC
         },
-        _ => return Err("Invalid phase in activation code".to_string()),
+        _ => return Err("Invalid phase detected".to_string()),
     };
+
+    println!("✅ Quantum-secure activation code validation successful");
+    println!("   🔐 Quantum encryption: CRYSTALS-Kyber compatible");
+    println!("   📝 Digital signature: Dilithium verified"); 
+    println!("   🛡️  Wallet binding: Cryptographically secured");
+    println!("   ♾️  Permanent: Code never expires");
+    println!("   🚫 Light node blocking: Enforced on servers");
 
     Ok(ActivationCodeData {
         node_type,
         qnc_amount,
-        tx_hash,
-        wallet_address,
+        tx_hash: payload.burn_tx,
+        wallet_address: payload.wallet,
         phase,
     })
 }
@@ -155,7 +193,7 @@ fn validate_server_node_type(node_type: NodeType) -> Result<(), String> {
     }
 }
 
-fn validate_phase_and_pricing(phase: u8, node_type: NodeType, pricing: &PricingInfo, activation_code: &str) -> Result<(), String> {
+async fn validate_phase_and_pricing(phase: u8, node_type: NodeType, pricing: &PricingInfo, activation_code: &str) -> Result<(), String> {
     let price = calculate_node_price(phase, node_type, pricing);
     let price_str = format_price(phase, price);
     
@@ -170,20 +208,24 @@ fn validate_phase_and_pricing(phase: u8, node_type: NodeType, pricing: &PricingI
             println!("   🔥 Action: BURN {} 1DEV TOKENS on Solana blockchain", price as u64);
             println!("   ⚖️  Benefit: Same cost regardless of node type");
             
-            // Phase 1: Always allow in development mode
-            validate_activation_code_node_type(activation_code, node_type, phase, pricing)?;
+            // Phase 1: Quantum-secure validation with Light node blocking
+            let decoded = decode_activation_code_quantum_secure(activation_code, node_type).await?;
+            println!("   🔐 Quantum decryption successful for Phase 1");
+            println!("   💰 Verified burn amount: {} 1DEV", decoded.qnc_amount);
             
-            println!("   ✅ Phase 1 validation passed");
+            println!("   ✅ Phase 1 validation passed with quantum security");
         },
         2 => {
             println!("   📊 Phase 2: Tiered pricing based on node type");
             println!("   💰 Action: TRANSFER {} QNC TOKENS to Pool 3", price as u64);
             println!("   ⚠️  Critical: Must match activation code purchased type");
             
-            // Phase 2: Always allow in development mode
-            validate_activation_code_node_type(activation_code, node_type, phase, pricing)?;
+            // Phase 2: Quantum-secure validation with Light node blocking
+            let decoded = decode_activation_code_quantum_secure(activation_code, node_type).await?;
+            println!("   🔐 Quantum decryption successful for Phase 2");
+            println!("   💰 Verified QNC amount: {} QNC", decoded.qnc_amount);
             
-            println!("   ✅ Phase 2 validation passed");
+            println!("   ✅ Phase 2 validation passed with quantum security");
         },
         _ => {
             return Err(format!("❌ Unknown phase: {}", phase));
@@ -308,10 +350,10 @@ async fn validate_activation_code_comprehensive(
         return Ok(());
     }
     
-    // 4. Phase and pricing validation
-    if let Err(e) = validate_phase_and_pricing(current_phase, node_type, pricing_info, code) {
-        return Err(format!("Phase validation failed: {}", e));
-    }
+            // 4. Phase and pricing validation with quantum decryption
+        if let Err(e) = validate_phase_and_pricing(current_phase, node_type, pricing_info, code).await {
+            return Err(format!("Phase validation failed: {}", e));
+        }
     
     // 5. Blockchain uniqueness validation (production only)
     if std::env::var("QNET_PRODUCTION").unwrap_or_default() == "1" {
@@ -1392,17 +1434,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("   📝 Code: {}", mask_code(&activation_code));
     println!("   🖥️  Server node type: {:?}", node_type);
     println!("   💰 Dynamic pricing: Phase {} pricing active", {
-        let decoded = decode_activation_code(&activation_code, node_type).unwrap_or_else(|_| {
-            ActivationCodeData {
-                node_type,
-                qnc_amount: 0,
-                tx_hash: "unknown".to_string(),
-                wallet_address: "unknown".to_string(),
-                phase: 1,
-            }
-        });
-        decoded.phase
+        // Get current phase for pricing display
+        let current_phase = get_current_phase_simple().await.unwrap_or(1);
+        current_phase
     });
+    println!("   🔐 Using quantum-secure activation codes with permanent validity");
+    println!("   🛡️  Light node blocking: Enforced on server hardware");
     
     // Verify 1DEV burn if required for production
     if std::env::var("QNET_PRODUCTION").unwrap_or_default() == "1" {
@@ -1436,6 +1473,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     
+    // Record quantum-secure activation in QNet blockchain before node start
+    if std::env::var("QNET_PRODUCTION").unwrap_or_default() == "1" {
+        println!("🔐 Recording quantum-secure activation in QNet blockchain...");
+        
+        let mut quantum_crypto = qnet_integration::quantum_crypto::QNetQuantumCrypto::new();
+        quantum_crypto.initialize().await?;
+        
+        // Decrypt activation code to get payload
+        let payload = quantum_crypto.decrypt_activation_code(&activation_code).await?;
+        
+        // Generate node public key for blockchain record
+        let node_pubkey = format!("qnet_node_{}", blake3::hash(activation_code.as_bytes()).to_hex()[..16]);
+        
+        // Record in QNet blockchain (replaces database storage)
+        quantum_crypto.record_activation_in_blockchain(&activation_code, &payload, &node_pubkey).await?;
+        
+        println!("✅ Quantum activation recorded in QNet blockchain successfully");
+        println!("   📝 Node: {}...", &node_pubkey[..12]);
+        println!("   🔐 Quantum-secure: CRYSTALS-Kyber + Dilithium");
+        println!("   🚫 Database: Not used - blockchain is source of truth");
+    }
+
     println!("🔍 DEBUG: About to create BlockchainNode...");
     let mut node = match BlockchainNode::new_with_config(
         &config.data_dir.to_string_lossy(),
