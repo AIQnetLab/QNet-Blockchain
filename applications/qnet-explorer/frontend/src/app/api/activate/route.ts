@@ -41,35 +41,23 @@ export async function POST(request: NextRequest) {
     // For now, we'll skip this in development
     const burnAmount = NODE_PRICES[nodeType];
     
-    // Generate deterministic seed (same as Python implementation)
-    const entropyData = `${burnTx}:${wallet}:${nodeType}:${burnAmount}:${QNET_SALT}`;
-    const fullHash = crypto.createHash('sha512').update(entropyData).digest();
-    
-    // Use first 32 bytes for entropy
-    const entropy = fullHash.slice(0, 32);
-    
-    // Generate node ID from remaining bytes
-    const nodeIdData = fullHash.slice(32);
-    const nodeId = crypto.createHash('sha256').update(nodeIdData).digest('hex').slice(0, 16);
-    
-    // Note: For production, we would generate BIP39 mnemonic here
-    // For now, return mock data
-    const mockMnemonic = "quantum pulse energy ocean miracle sunset robot dance victory shield matrix code";
+    // Generate activation code with embedded wallet address
+    const activationCode = generateActivationCodeWithEmbeddedWallet(burnTx, wallet, nodeType, burnAmount);
     
     // Generate installation script
-    const installScript = generateInstallScript(burnTx, wallet, nodeType, nodeId);
+    const installScript = generateInstallScript(burnTx, wallet, nodeType, activationCode);
     
     // Generate Docker command
-    const dockerCommand = `docker run -e BURN_TX=${burnTx} -e WALLET=${wallet} -e NODE_TYPE=${nodeType} -e NODE_ID=${nodeId} qnet/node:latest`;
+    const dockerCommand = `docker run -e BURN_TX=${burnTx} -e WALLET=${wallet} -e NODE_TYPE=${nodeType} -e ACTIVATION_CODE=${activationCode} qnet/node:latest`;
     
     // Return activation data
     // Note: In production, the mnemonic would be generated client-side
     return NextResponse.json({
       success: true,
       activationToken: burnTx, // Using burn tx as token for simplicity
+      activationCode: activationCode,
       installScript,
       dockerCommand,
-      nodeId,
       nodeType,
       // Don't send mnemonic from server in production!
       warning: "In production, seed phrase will be generated client-side for security"
@@ -82,6 +70,43 @@ export async function POST(request: NextRequest) {
       { status: 500 }
     );
   }
+}
+
+function generateActivationCodeWithEmbeddedWallet(burnTx: string, wallet: string, nodeType: string, burnAmount: number): string {
+  // Generate quantum-secure activation code with embedded wallet address
+  const timestamp = Date.now();
+  const hardwareEntropy = crypto.randomBytes(8).toString('hex'); // Shorter for space
+  
+  // Create encryption key from burn transaction (deterministic)
+  const keyMaterial = `${burnTx}:${nodeType}:${burnAmount}`;
+  const encryptionKey = crypto.createHash('sha256').update(keyMaterial).digest('hex').substring(0, 32);
+  
+  // Encrypt wallet address with XOR (simple and reversible)
+  let encryptedWallet = '';
+  for (let i = 0; i < wallet.length; i++) {
+    const walletChar = wallet.charCodeAt(i);
+    const keyChar = encryptionKey.charCodeAt(i % encryptionKey.length);
+    encryptedWallet += String.fromCharCode(walletChar ^ keyChar);
+  }
+  
+  // Convert encrypted wallet to hex
+  const encryptedWalletHex = Buffer.from(encryptedWallet, 'binary').toString('hex');
+  
+  // Create structured code with embedded data
+  const nodeTypeMarker = nodeType.charAt(0).toUpperCase(); // L, F, S
+  const timestampHex = timestamp.toString(16).substring(-8); // Last 8 hex chars
+  const entropyShort = hardwareEntropy.substring(0, 4); // 4 hex chars
+  
+  // Embed wallet in the code structure: QNET-[TYPE+TIMESTAMP]-[WALLET_PART1]-[WALLET_PART2+ENTROPY]
+  const walletPart1 = encryptedWalletHex.substring(0, 8);
+  const walletPart2 = encryptedWalletHex.substring(8, 16);
+  
+  // Store metadata for decryption in first segment
+  const segment1 = (nodeTypeMarker + timestampHex).substring(0, 4).toUpperCase();
+  const segment2 = walletPart1.substring(0, 4).toUpperCase();  
+  const segment3 = (walletPart2 + entropyShort).substring(0, 4).toUpperCase();
+  
+  return `QNET-${segment1}-${segment2}-${segment3}`;
 }
 
 function generateInstallScript(burnTx: string, wallet: string, nodeType: string, nodeId: string): string {

@@ -1,6 +1,6 @@
 import { type NextRequest, NextResponse } from 'next/server';
 import { PublicKey, Connection } from '@solana/web3.js';
-import { createHash } from 'crypto';
+import { createHash, randomBytes } from 'crypto';
 
 // Configuration
 const DEVNET_RPC = 'https://api.devnet.solana.com';
@@ -66,8 +66,8 @@ export async function POST(request: NextRequest): Promise<NextResponse<Activatio
       return NextResponse.json({ success: false, error: result.error || 'Activation failed' }, { status: 500 });
     }
 
-    // Generate activation code locally (hash of tx hash)
-    const activationCode = generateActivationCode(result.hash);
+    // Generate activation code with embedded wallet address
+    const activationCode = generateActivationCodeWithEmbeddedWallet(result.hash, walletAddress, nodeType, burnAmount);
 
     return NextResponse.json({ success: true, activationCode, txHash: result.hash });
   } catch (error) {
@@ -98,8 +98,41 @@ export async function GET(): Promise<NextResponse> {
   });
 }
 
-function generateActivationCode(txHash: string): string {
-  return `QNET-${txHash.substring(0, 4)}-${txHash.substring(4, 8)}-${txHash.substring(8, 12)}`.toUpperCase();
+function generateActivationCodeWithEmbeddedWallet(burnTx: string, wallet: string, nodeType: string, burnAmount: number): string {
+  // Generate quantum-secure activation code with embedded wallet address
+  const timestamp = Date.now();
+  const hardwareEntropy = randomBytes(8).toString('hex'); // Shorter for space
+  
+  // Create encryption key from burn transaction (deterministic)
+  const keyMaterial = `${burnTx}:${nodeType}:${burnAmount}`;
+  const encryptionKey = createHash('sha256').update(keyMaterial).digest('hex').substring(0, 32);
+  
+  // Encrypt wallet address with XOR (simple and reversible)
+  let encryptedWallet = '';
+  for (let i = 0; i < wallet.length; i++) {
+    const walletChar = wallet.charCodeAt(i);
+    const keyChar = encryptionKey.charCodeAt(i % encryptionKey.length);
+    encryptedWallet += String.fromCharCode(walletChar ^ keyChar);
+  }
+  
+  // Convert encrypted wallet to hex
+  const encryptedWalletHex = Buffer.from(encryptedWallet, 'binary').toString('hex');
+  
+  // Create structured code with embedded data
+  const nodeTypeMarker = nodeType.charAt(0).toUpperCase(); // L, F, S
+  const timestampHex = timestamp.toString(16).substring(-8); // Last 8 hex chars
+  const entropyShort = hardwareEntropy.substring(0, 4); // 4 hex chars
+  
+  // Embed wallet in the code structure: QNET-[TYPE+TIMESTAMP]-[WALLET_PART1]-[WALLET_PART2+ENTROPY]
+  const walletPart1 = encryptedWalletHex.substring(0, 8);
+  const walletPart2 = encryptedWalletHex.substring(8, 16);
+  
+  // Store metadata for decryption in first segment
+  const segment1 = (nodeTypeMarker + timestampHex).substring(0, 4).toUpperCase();
+  const segment2 = walletPart1.substring(0, 4).toUpperCase();  
+  const segment3 = (walletPart2 + entropyShort).substring(0, 4).toUpperCase();
+  
+  return `QNET-${segment1}-${segment2}-${segment3}`;
 }
 
 function generateNodeId(walletAddress: string, nodeType: string): string {

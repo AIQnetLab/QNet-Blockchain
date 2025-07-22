@@ -1,0 +1,75 @@
+# PRODUCTION QNet Node Dockerfile - Latest Rust and dependencies
+FROM rust:1.75-slim as builder
+
+LABEL maintainer="QNet Development Team"
+LABEL description="Production QNet Blockchain Node"
+LABEL version="2.0.0"
+
+# Install production system dependencies
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    pkg-config \
+    libssl-dev \
+    libclang-dev \
+    cmake \
+    protobuf-compiler \
+    git \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set working directory
+WORKDIR /build
+
+# Copy dependency files first for better caching
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+
+# Build with maximum optimization for production
+ENV RUSTFLAGS="-C target-cpu=native -C opt-level=3 -C lto=fat -C codegen-units=1"
+ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
+
+RUN cargo build --release --locked \
+    && strip target/release/qnet-node \
+    && cp target/release/qnet-node /usr/local/bin/
+
+# Production runtime image
+FROM debian:bookworm-slim
+
+# Install minimal runtime dependencies
+RUN apt-get update && apt-get install -y \
+    libssl3 \
+    ca-certificates \
+    curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd -r qnet \
+    && useradd -r -g qnet -s /bin/false qnet
+
+# Copy binary from builder
+COPY --from=builder /usr/local/bin/qnet-node /usr/local/bin/
+COPY --from=builder /build/config/production.toml /etc/qnet/config.toml
+
+# Create necessary directories with proper permissions
+RUN mkdir -p /app/data /app/logs /etc/qnet \
+    && chown -R qnet:qnet /app /etc/qnet \
+    && chmod 755 /app/data /app/logs
+
+# Switch to non-root user
+USER qnet
+
+# Set environment variables for production
+ENV RUST_LOG=info
+ENV RUST_BACKTRACE=1
+ENV QNET_CONFIG_PATH=/etc/qnet/config.toml
+ENV QNET_DATA_DIR=/app/data
+ENV QNET_LOG_DIR=/app/logs
+
+# Health check for production monitoring
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8545/health || exit 1
+
+# Expose required ports
+EXPOSE 8545 30303 9090
+
+# Production startup command with proper signal handling
+ENTRYPOINT ["/usr/local/bin/qnet-node"]
+CMD ["--config", "/etc/qnet/config.toml", "--data-dir", "/app/data"] 
