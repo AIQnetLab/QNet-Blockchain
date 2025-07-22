@@ -181,7 +181,17 @@ fn validate_activation_code_node_type(code: &str, expected_type: NodeType, curre
 // Device type validation functions
 fn validate_server_node_type(node_type: NodeType) -> Result<(), String> {
     match node_type {
-        NodeType::Light => Err("❌ Light nodes are not supported on servers. Use mobile devices only.".to_string()),
+        NodeType::Light => {
+            eprintln!("❌ CRITICAL ERROR: Light nodes are NOT allowed on server hardware!");
+            eprintln!("   🚫 Light nodes must run ONLY on mobile devices (phones, tablets)");
+            eprintln!("   🖥️  For servers use: Full Node or Super Node activation codes");
+            eprintln!("   💡 Get correct server activation code from wallet extension");
+            eprintln!("");
+            eprintln!("🛑 SYSTEM SECURITY: Blocking Light node server activation");
+            
+            // ABSOLUTE BLOCKING: Light nodes cannot run on servers 
+            std::process::exit(1);
+        },
         NodeType::Full => {
             println!("✅ Full node validated for server deployment");
             Ok(())
@@ -262,6 +272,7 @@ async fn check_existing_activation_or_setup() -> Result<(NodeType, String), Box<
             println!("✅ Found valid activation code with cryptographic binding");
             println!("   🔑 Code: {}", mask_code(&code));
             println!("   🔧 Node Type: {:?}", node_type);
+            let current_time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
             println!("   📅 Activated: {} days ago", (current_time - timestamp) / (24 * 60 * 60));
             println!("   🛡️  Universal: Works on VPS, VDS, PC, laptop, server");
             println!("   🚀 Resuming node with existing activation...\n");
@@ -1484,7 +1495,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let payload = quantum_crypto.decrypt_activation_code(&activation_code).await?;
         
         // Generate node public key for blockchain record
-        let node_pubkey = format!("qnet_node_{}", blake3::hash(activation_code.as_bytes()).to_hex()[..16]);
+        let hash_result = blake3::hash(activation_code.as_bytes());
+        let node_pubkey = format!("qnet_node_{}", &hash_result.to_hex()[..16]);
         
         // Record in QNet blockchain (replaces database storage)
         quantum_crypto.record_activation_in_blockchain(&activation_code, &payload, &node_pubkey).await?;
@@ -1781,10 +1793,12 @@ async fn verify_1dev_burn(node_type: &NodeType) -> Result<(), String> {
     let burn_verified = verify_solana_burn_transaction(&wallet_address, required_burn).await?;
     
     if !burn_verified {
-        return Err(format!("1DEV burn verification failed: Required {} 1DEV not found for wallet {}", required_burn, &wallet_address[..8]));
+        let wallet_preview = if wallet_address.len() >= 8 { &wallet_address[..8] } else { &wallet_address };
+        return Err(format!("1DEV burn verification failed: Required {} 1DEV not found for wallet {}", required_burn, wallet_preview));
     }
     
-    println!("✅ 1DEV burn verified: {} 1DEV burned by wallet {}", required_burn, &wallet_address[..8]);
+    let wallet_preview = if wallet_address.len() >= 8 { &wallet_address[..8] } else { &wallet_address };
+    println!("✅ 1DEV burn verified: {} 1DEV burned by wallet {}", required_burn, wallet_preview);
     Ok(())
 }
 
@@ -2040,7 +2054,8 @@ async fn start_reward_claiming_service(wallet_key: String, node_type: String) {
         loop {
             interval.tick().await;
             
-            println!("💰 Claiming rewards for wallet: {}...", &wallet_key[..8]);
+            let wallet_preview = if wallet_key.len() >= 8 { &wallet_key[..8] } else { &wallet_key };
+        println!("💰 Claiming rewards for wallet: {}...", wallet_preview);
             
             // In production: Claim rewards from blockchain
             let reward_amount = calculate_base_reward().await.unwrap_or(0.0);

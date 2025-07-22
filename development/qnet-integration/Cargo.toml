@@ -42,10 +42,15 @@ pqcrypto = "0.18"
 pqcrypto-dilithium = "0.5"
 aes-gcm = "0.10"
 base64 = "0.21"
+lazy_static = "1.4"
+chacha20poly1305 = "0.10"
+aead = "0.5"
 
 # Networking
 libp2p = "0.53"
 multiaddr = "0.18"
+reqwest = { version = "0.11", features = ["json"] }
+chrono = { version = "0.4", features = ["serde"] }
 
 # Data structures
 dashmap = "5.5"
@@ -63,8 +68,10 @@ rayon = "1.10"
 rand = "0.8.5"
 
 # HTTP client
-reqwest = { version = "0.11", features = ["json"] }
 bs58 = "0.5"
+
+# Development and debugging
+log = "0.4.20"
 
 # Error handling
 thiserror = "1.0.56"
@@ -73,15 +80,10 @@ anyhow = "1.0.79"
 # Logging
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", default-features = false, features = ["fmt", "ansi"] }
-log = "0.4.20"
 env_logger = "0.10.0"
-
-# Time handling
-chrono = { version = "0.4.31", features = ["serde"] }
 
 # Metrics
 prometheus = "0.13"
-lazy_static = "1.4"
 
 # Network framework
 bytes = "1.5"

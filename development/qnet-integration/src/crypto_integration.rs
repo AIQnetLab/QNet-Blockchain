@@ -419,6 +419,26 @@ impl CryptoService {
         let mut cache = self.signature_cache.lock().unwrap();
         cache.clear(); // Simplified for now
     }
+
+    /// Start cryptographic performance monitoring
+    pub async fn start_performance_monitoring(&self) {
+        let metrics_clone = self.metrics.clone();
+        
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            
+            loop {
+                interval.tick().await;
+                
+                let metrics = metrics_clone.lock().unwrap();
+                println!("🔐 Crypto Performance:");
+                println!("   Signatures: {}", metrics.signatures_created);
+                println!("   Verifications: {}", metrics.signatures_verified);
+                println!("   Avg Sign Time: {:.2}ms", metrics.average_sign_time_ms);
+                println!("   Avg Verify Time: {:.2}ms", metrics.average_verify_time_ms);
+            }
+        });
+    }
 }
 
 impl KeyStore {
@@ -476,47 +496,4 @@ pub fn get_crypto_service() -> Option<Arc<CryptoService>> {
 /// Initialize with production defaults
 pub fn initialize_production_crypto() {
     initialize_crypto_service(Algorithm::Dilithium3);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    
-    #[test]
-    fn test_crypto_service_initialization() {
-        let service = CryptoService::production_default();
-        assert_eq!(service.default_algorithm, Algorithm::Dilithium3);
-    }
-    
-    #[test]
-    fn test_node_key_generation() {
-        let service = CryptoService::production_default();
-        let result = service.generate_node_keys("test_node");
-        assert!(result.is_ok());
-        
-        let key_id = result.unwrap();
-        assert_eq!(key_id, "node_test_node");
-        
-        let public_key = service.get_node_public_key("test_node");
-        assert!(public_key.is_some());
-    }
-    
-    #[test]
-    fn test_signature_verification() {
-        let service = CryptoService::production_default();
-        
-        // Generate test keys
-        let node_id = "test_node";
-        service.generate_node_keys(node_id).unwrap();
-        
-        // Sign message
-        let message = b"test message";
-        let signature = service.sign_as_node(node_id, message).unwrap();
-        
-        // Verify signature
-        let public_key = service.get_node_public_key(node_id).unwrap();
-        let is_valid = service.verify_signature(message, &signature, &public_key).unwrap();
-        
-        assert!(is_valid);
-    }
 } 

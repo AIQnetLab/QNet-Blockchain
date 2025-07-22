@@ -5,7 +5,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use warp::{Filter, Rejection, Reply};
-use crate::BlockchainNode;
+use crate::node::BlockchainNode;
 use chrono;
 use sha3::Digest; // Add missing Digest trait
 

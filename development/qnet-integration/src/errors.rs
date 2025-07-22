@@ -44,6 +44,15 @@ pub enum IntegrationError {
     #[error("Security error: {0}")]
     SecurityError(String),
     
+    #[error("Blockchain error: {0}")]
+    BlockchainError(String),
+    
+    #[error("Cryptographic error: {0}")]
+    CryptoError(String),
+    
+    #[error("Rate limit exceeded: {0}")]
+    RateLimitExceeded(String),
+    
     #[error("Other error: {0}")]
     Other(String),
 }

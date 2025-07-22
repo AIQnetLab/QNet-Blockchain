@@ -1123,7 +1123,8 @@ impl BlockchainNode {
         
         // Validate against blockchain records
         println!("🔐 Validating activation code uniqueness...");
-        println!("   Code: {}", &code[..8]);
+                    let code_preview = if code.len() >= 8 { &code[..8] } else { code };
+            println!("   Code: {}", code_preview);
         
         // In production: Query blockchain for code usage
         // For now, accept all valid format codes
@@ -1236,7 +1237,7 @@ impl BlockchainNode {
         };
         
         // Convert peer IDs to peer info format
-        let peer_infos: Vec<PeerInfo> = peers.iter().map(|peer_id| {
+        let peer_infos: Vec<PeerInfo> = peers.iter().map(|peer_id: &String| {
             PeerInfo {
                 id: peer_id.clone(),
                 address: "unknown".to_string(),
