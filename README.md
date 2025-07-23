@@ -29,6 +29,7 @@ QNet is a high-performance, post-quantum secure blockchain network with a **two-
 - ✅ **Browser Extension Wallet**: Production-ready with full-screen interface
 - ✅ **Mobile Applications**: iOS/Android apps for Light nodes only
 - ✅ **Interactive Setup**: Server nodes require interactive activation menu
+- ✅ **1DEV Burn Contract Deployed**: [D7g7mkL8o1YEex6ZgETJEQyyHV7uuUMvV3Fy3u83igJ7](https://explorer.solana.com/address/D7g7mkL8o1YEex6ZgETJEQyyHV7uuUMvV3Fy3u83igJ7?cluster=devnet) on Solana Devnet
 
 ### 📋 **Testnet Deployment**
 
@@ -247,6 +248,21 @@ export ONE_DEV_MINT_ADDRESS="62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ"
 # Run node with real blockchain data
 ./target/release/qnet-node
 ```
+
+### 🔗 Contract Deployment Proofs
+
+**1DEV Burn Contract is successfully deployed on Solana Devnet:**
+
+- **🔴 Program Address**: [D7g7mkL8o1YEex6ZgETJEQyyHV7uuUMvV3Fy3u83igJ7](https://explorer.solana.com/address/D7g7mkL8o1YEex6ZgETJEQyyHV7uuUMvV3Fy3u83igJ7?cluster=devnet)
+- **📦 Program Data**: [HMbSTfp7fqsMopRqEy5u4fxQgLnYmM7ThPZzoo2VF4Gm](https://explorer.solana.com/address/HMbSTfp7fqsMopRqEy5u4fxQgLnYmM7ThPZzoo2VF4Gm?cluster=devnet)
+- **💰 Deployer Wallet**: [6gesV5Dojg9tfH9TRytvXabnQT8U7oMbz5VKpTFi8rG4](https://explorer.solana.com/address/6gesV5Dojg9tfH9TRytvXabnQT8U7oMbz5VKpTFi8rG4?cluster=devnet)
+- **🚀 Deploy Transaction**: [4z2A93vJ527LayPu8baer4MxYT8hVkoGCumCeJPpn6mmKZUpPtFmzFatFg7sTA5wzCUubuLupmKRTcA26EwpcwRR](https://explorer.solana.com/tx/4z2A93vJ527LayPu8baer4MxYT8hVkoGCumCeJPpn6mmKZUpPtFmzFatFg7sTA5wzCUubuLupmKRTcA26EwpcwRR?cluster=devnet)
+
+**Contract Status:**
+- ✅ **Immutable** (no upgrade authority)
+- ✅ **Size**: 368,896 bytes
+- ✅ **Slot**: 396,252,496
+- ✅ **Network**: Solana Devnet
 
 **Note**: Without these environment variables, the node will use development fallback data for testing.
 
