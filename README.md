@@ -272,6 +272,88 @@ export ONE_DEV_MINT_ADDRESS="62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ"
 
 ⚠️ **Activation Codes**: Real activation codes are still generated through browser extension or mobile app, regardless of displayed pricing.
 
+### 🖥️ Server Node Installation & Management
+
+**Quick Node Installation:**
+
+```bash
+# Install dependencies (Ubuntu/Debian)
+sudo apt update && sudo apt install -y git curl build-essential pkg-config libssl-dev
+
+# Install Rust
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+source ~/.cargo/env
+
+# Clone and build QNet node
+git clone https://github.com/AIQnetLab/QNet-Blockchain.git
+cd QNet-Blockchain
+git checkout testnet
+cd development/qnet-integration
+cargo build --release
+
+# Run node with production contract
+export BURN_TRACKER_PROGRAM_ID="D7g7mkL8o1YEex6ZgETJEQyyHV7uuUMvV3Fy3u83igJ7"
+export SOLANA_RPC_URL="https://api.devnet.solana.com"
+./target/release/qnet-node
+```
+
+**Clean Build & Cache:**
+
+```bash
+# Clean Rust build artifacts
+cargo clean
+
+# Remove all target directories (saves ~1GB+ space)
+find . -name "target" -type d -exec rm -rf {} +
+
+# Clean Cargo cache (saves space)
+rm -rf ~/.cargo/registry/cache
+rm -rf ~/.cargo/git/db
+
+# Clean node_modules if present
+find . -name "node_modules" -type d -exec rm -rf {} +
+
+# Clean .next and dist directories
+find . -name ".next" -type d -exec rm -rf {} +
+find . -name "dist" -type d -exec rm -rf {} +
+
+# Full clean rebuild
+cargo build --release
+```
+
+**Systemd Service Setup:**
+
+```bash
+# Create service file
+sudo tee /etc/systemd/system/qnet-node.service > /dev/null <<EOF
+[Unit]
+Description=QNet Blockchain Node
+After=network.target
+
+[Service]
+Type=simple
+User=$USER
+WorkingDirectory=$PWD
+ExecStart=$PWD/target/release/qnet-node
+Environment=BURN_TRACKER_PROGRAM_ID=D7g7mkL8o1YEex6ZgETJEQyyHV7uuUMvV3Fy3u83igJ7
+Environment=SOLANA_RPC_URL=https://api.devnet.solana.com
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Start service
+sudo systemctl daemon-reload
+sudo systemctl enable qnet-node
+sudo systemctl start qnet-node
+
+# Check status
+sudo systemctl status qnet-node
+sudo journalctl -u qnet-node -f
+```
+
 ### Node Management Commands
 
 #### Stop Running Node
