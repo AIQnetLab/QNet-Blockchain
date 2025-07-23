@@ -688,7 +688,7 @@ async fn fetch_burn_tracker_data() -> Result<BurnTrackerData, String> {
     
     let program_id = std::env::var("BURN_TRACKER_PROGRAM_ID").unwrap_or_else(|_| {
         // Production program ID for 1DEV burn tracker
-        "8HmsJ4QaJptLSYFGygApyd2k91QNXUHLWrz9saPE2ur5".to_string()
+        "D7g7mkL8o1YEex6ZgETJEQyyHV7uuUMvV3Fy3u83igJ7".to_string()
     });
     
     // Program ID is set and ready for production

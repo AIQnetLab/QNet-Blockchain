@@ -163,7 +163,7 @@ fn verify_node_ownership(user_key: &Pubkey, node_pubkey: &Pubkey) -> bool {
 ### Phase 1: 1DEV Token Burn on Solana (Years 0-5)
 
 **Solana Contract Address (Devnet):**
-- Contract: `4hC1c4smV4An7JAjgKPk33H16j7ePffNpd2FqMQbgzNQ` (Anchor program)
+- Contract: `D7g7mkL8o1YEex6ZgETJEQyyHV7uuUMvV3Fy3u83igJ7` (Anchor program)
 - 1DEV Mint: `62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ`
 
 **How Phase 1 Works:**

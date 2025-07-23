@@ -239,7 +239,7 @@ For production deployment, configure real Solana contract connection:
 export SOLANA_RPC_URL="https://api.devnet.solana.com"
 
 # Set burn tracker program ID (deployed production contract)
-export BURN_TRACKER_PROGRAM_ID="8HmsJ4QaJptLSYFGygApyd2k91QNXUHLWrz9saPE2ur5"
+export BURN_TRACKER_PROGRAM_ID="D7g7mkL8o1YEex6ZgETJEQyyHV7uuUMvV3Fy3u83igJ7"
 
 # Set real 1DEV token mint address
 export ONE_DEV_MINT_ADDRESS="62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ"

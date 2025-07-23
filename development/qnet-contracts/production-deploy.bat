@@ -3,7 +3,7 @@ echo ====================================
 echo QNet Production Contract Deployment
 echo ====================================
 echo.
-echo Program ID: 4hC1c4smV4An7JAjgKPk33H16j7ePffNpd2FqMQbgzNQ
+echo Program ID: D7g7mkL8o1YEex6ZgETJEQyyHV7uuUMvV3Fy3u83igJ7
 echo 1DEV Token: 62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ
 echo Network: Solana Devnet
 echo.
@@ -29,7 +29,7 @@ echo.
 echo Production deployment ready!
 echo Run QNet nodes with these environment variables:
 echo.
-echo set BURN_TRACKER_PROGRAM_ID=4hC1c4smV4An7JAjgKPk33H16j7ePffNpd2FqMQbgzNQ
+echo set BURN_TRACKER_PROGRAM_ID=D7g7mkL8o1YEex6ZgETJEQyyHV7uuUMvV3Fy3u83igJ7
 echo set ONE_DEV_MINT_ADDRESS=62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ
 echo set SOLANA_RPC_URL=https://api.devnet.solana.com
 echo.
