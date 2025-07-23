@@ -30,4 +30,6 @@ pub enum BurnError {
     DuplicateBurnTransaction,
     #[msg("Invalid burner address")]
     InvalidBurner,
+    #[msg("Phase transition conditions not met")]
+    TransitionNotReady,
 } 

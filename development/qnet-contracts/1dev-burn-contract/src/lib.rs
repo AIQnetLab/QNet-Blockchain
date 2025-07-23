@@ -20,8 +20,9 @@ pub mod onedev_burn_contract {
         admin: Pubkey,
         burn_address: Pubkey,
         one_dev_mint: Pubkey,
+        network_genesis_timestamp: i64,
     ) -> Result<()> {
-        initialize::handler(ctx, authority, admin, burn_address, one_dev_mint)
+        initialize::handler(ctx, authority, admin, burn_address, one_dev_mint, network_genesis_timestamp)
     }
 
     /// Record a 1DEV burn transaction for node activation
@@ -47,5 +48,10 @@ pub mod onedev_burn_contract {
     /// Get current burn statistics
     pub fn get_burn_stats(ctx: Context<GetBurnStats>) -> Result<BurnStatistics> {
         get_burn_stats::handler(ctx)
+    }
+
+    /// Execute Phase 2 transition (disable 1DEV activation, enable QNC Pool #3)
+    pub fn execute_phase_transition(ctx: Context<ExecutePhaseTransition>) -> Result<()> {
+        execute_phase_transition::handler(ctx)
     }
 } 

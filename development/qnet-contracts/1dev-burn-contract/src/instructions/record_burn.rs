@@ -44,6 +44,9 @@ pub fn handler(
         .checked_add(amount)
         .ok_or(BurnError::Overflow)?;
     burn_tracker.total_burn_transactions += 1;
+    
+    // Update burn_percentage in burn_tracker
+    burn_tracker.update_burn_percentage();
     burn_tracker.last_update = clock.unix_timestamp;
     
     // Create burn record
@@ -56,13 +59,10 @@ pub fn handler(
     burn_record.verified = true;
     burn_record.bump = ctx.bumps.burn_record;
     
-    // Calculate burn percentage
-    let burn_percentage = (burn_tracker.total_1dev_burned as f64 / ONE_DEV_TOTAL_SUPPLY as f64) * 100.0;
-    
     msg!("Burn recorded successfully");
     msg!("Amount: {} 1DEV", amount);
     msg!("Total burned: {} 1DEV", burn_tracker.total_1dev_burned);
-    msg!("Burn percentage: {:.2}%", burn_percentage);
+    msg!("Burn percentage: {:.2}%", burn_tracker.burn_percentage);
     
     Ok(())
 } 

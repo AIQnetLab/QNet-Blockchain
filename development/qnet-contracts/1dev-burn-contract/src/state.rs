@@ -91,8 +91,9 @@ impl BurnTracker {
         let current_time = Clock::get().unwrap().unix_timestamp;
         let days_elapsed = (current_time - self.genesis_timestamp) / 86400;
         
-        // Transition at 90% 1DEV burned OR 5 years elapsed since genesis block
-        self.burn_percentage >= 90.0 || days_elapsed >= 1825 // 5 years
+        // Transition at 90% 1DEV burned OR 5 years elapsed since QNet NETWORK GENESIS BLOCK
+        // (fixed genesis timestamp, not contract deployment time)
+        self.burn_percentage >= 90.0 || days_elapsed >= 1825 // 5 years = 1825 days
     }
 
     pub fn update_burn_percentage(&mut self) {
@@ -208,75 +209,11 @@ pub struct BurnStatistics {
     pub last_update: i64,
 }
 
-/// Phase transition record
-#[account]
-pub struct PhaseTransitionRecord {
-    /// Transition timestamp
-    pub transition_timestamp: i64,
-    /// Final 1DEV burn amount
-    pub final_1dev_burned: u64,
-    /// Final burn percentage
-    pub final_burn_percentage: f64,
-    /// Total nodes at transition
-    pub nodes_at_transition: u64,
-    /// Transition trigger (burn percentage or time limit)
-    pub trigger_reason: TransitionTrigger,
-    /// QNC distribution started
-    pub qnc_distribution_active: bool,
-    /// Bump seed
-    pub bump: u8,
-}
-
-#[derive(AnchorSerialize, AnchorDeserialize, Clone, PartialEq, Eq)]
-pub enum TransitionTrigger {
-    BurnPercentage, // 90% 1DEV burned
-    TimeLimit,      // 5 years elapsed
-}
-
-impl PhaseTransitionRecord {
-    pub const LEN: usize = 8 + // discriminator
-        8 +  // transition_timestamp
-        8 +  // final_1dev_burned
-        8 +  // final_burn_percentage
-        8 +  // nodes_at_transition
-        1 +  // trigger_reason
-        1 +  // qnc_distribution_active
-        1;   // bump
-}
-
-/// QNC reward claim record (Phase 2)
-#[account]
-pub struct QNCRewardClaimRecord {
-    /// Node public key
-    pub node_pubkey: Pubkey,
-    /// Claim timestamp
-    pub claim_timestamp: i64,
-    /// QNC reward amount
-    pub qnc_reward_amount: u64,
-    /// Claim period (epoch)
-    pub claim_epoch: u64,
-    /// Reward pool source
-    pub pool_source: RewardPoolSource,
-    /// Bump seed
-    pub bump: u8,
-}
-
-#[derive(AnchorSerialize, AnchorDeserialize, Clone, PartialEq, Eq)]
-pub enum RewardPoolSource {
-    BaseEmission,      // Pool 1: Network inflation
-    TransactionFees,   // Pool 2: Transaction fees
-    ActivationPool,    // Pool 3: Redistribution of activation fees
-}
-
-impl QNCRewardClaimRecord {
-    pub const LEN: usize = 8 + // discriminator
-        32 + // node_pubkey
-        8 +  // claim_timestamp
-        8 +  // qnc_reward_amount
-        8 +  // claim_epoch
-        1 +  // pool_source
-        1;   // bump
-}
+// REMOVED UNUSED STRUCTURES:  
+// - PhaseTransitionRecord (not used in contract)
+// - QNCRewardClaimRecord (not used in contract)
+// - TransitionTrigger enum (not used in contract)  
+// - RewardPoolSource enum (not used in contract)
 
 /// Constants for 1DEV token
 pub const ONE_DEV_TOTAL_SUPPLY: u64 = 1_000_000_000_000_000; // 1 billion with 6 decimals
@@ -299,8 +236,9 @@ pub const QNC_SUPER_ACTIVATION: u64 = 10_000_000_000;  // 10000 QNC
 pub const BURN_TRACKER_SEED: &[u8] = b"burn_tracker";
 pub const NODE_ACTIVATION_SEED: &[u8] = b"node_activation";
 pub const BURN_RECORD_SEED: &[u8] = b"burn_record";
-pub const PHASE_TRANSITION_SEED: &[u8] = b"phase_transition";
-pub const QNC_REWARD_CLAIM_SEED: &[u8] = b"qnc_reward_claim";
+// REMOVED UNUSED SEEDS:
+// pub const PHASE_TRANSITION_SEED: &[u8] = b"phase_transition";
+// pub const QNC_REWARD_CLAIM_SEED: &[u8] = b"qnc_reward_claim";
 
 /// Error codes
 pub const ERROR_INSUFFICIENT_1DEV: u32 = 6000;
@@ -310,4 +248,5 @@ pub const ERROR_NODE_ALREADY_ACTIVATED: u32 = 6003;
 pub const ERROR_INVALID_SIGNATURE: u32 = 6004;
 pub const ERROR_UNAUTHORIZED: u32 = 6005;
 pub const ERROR_BURN_NOT_VERIFIED: u32 = 6006;
-pub const ERROR_WRONG_PHASE: u32 = 6007; 
+pub const ERROR_WRONG_PHASE: u32 = 6007;
+pub const ERROR_TRANSITION_NOT_READY: u32 = 6008; 
