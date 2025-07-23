@@ -274,27 +274,23 @@ export ONE_DEV_MINT_ADDRESS="62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ"
 
 ### 🖥️ Server Node Installation & Management
 
-**Quick Node Installation:**
+**Production Docker Deployment (ONLY METHOD):**
 
 ```bash
-# Install dependencies (Ubuntu/Debian)
-sudo apt update && sudo apt install -y git curl build-essential pkg-config libssl-dev
-
-# Install Rust
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-source ~/.cargo/env
-
-# Clone and build QNet node
+# Clone and checkout testnet
 git clone https://github.com/AIQnetLab/QNet-Blockchain.git
 cd QNet-Blockchain
 git checkout testnet
-cd development/qnet-integration
-cargo build --release
 
-# Run node with production contract
-export BURN_TRACKER_PROGRAM_ID="D7g7mkL8o1YEex6ZgETJEQyyHV7uuUMvV3Fy3u83igJ7"
-export SOLANA_RPC_URL="https://api.devnet.solana.com"
-./target/release/qnet-node
+# Build production Docker image
+cargo build --release
+docker build -t qnet-production -f development/Dockerfile .
+
+# Run interactive production node
+docker run -it --name qnet-node --restart=always \
+  -p 9876:9876 -p 9877:9877 -p 8001:8001 \
+  -v $(pwd)/node_data:/app/node_data \
+  qnet-production
 ```
 
 **Clean Build & Cache:**
