@@ -18,21 +18,21 @@ RUN apt-get update && apt-get install -y \
 ENV LIBCLANG_PATH=/usr/lib/x86_64-linux-gnu
 ENV BINDGEN_EXTRA_CLANG_ARGS="-I/usr/include"
 
-# Set working directory
-WORKDIR /build
+# Set working directory to qnet-integration
+WORKDIR /build/qnet-integration
 
-# Copy workspace configuration
-COPY Cargo.toml ./
-COPY core/ ./core/
-COPY development/qnet-integration/ ./development/qnet-integration/
+# Copy core dependencies first
+COPY core/ ../core/
+
+# Copy qnet-integration project
+COPY development/qnet-integration/ ./
 
 # Create Cargo.lock with pinned base64ct version
-RUN cd development/qnet-integration && \
-    cargo generate-lockfile && \
+RUN cargo generate-lockfile && \
     cargo update --package base64ct --precise 1.6.0
 
-# Build the production node from workspace root
-RUN cargo build --release --bin qnet-node
+# Build the production node from qnet-integration directory
+RUN cargo build --release
 
 # Runtime stage
 FROM ubuntu:22.04
@@ -51,8 +51,8 @@ RUN useradd -m -u 1000 qnet
 RUN mkdir -p /opt/qnet/node_data && \
     chown -R qnet:qnet /opt/qnet
 
-# Copy the built binary from WORKSPACE ROOT
-COPY --from=builder /build/target/release/qnet-node /usr/local/bin/qnet-node
+# Copy the built binary from qnet-integration directory
+COPY --from=builder /build/qnet-integration/target/release/qnet-node /usr/local/bin/qnet-node
 
 # Make binary executable
 RUN chmod +x /usr/local/bin/qnet-node
