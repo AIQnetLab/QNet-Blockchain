@@ -18,14 +18,17 @@ RUN apt-get update && apt-get install -y \
 ENV LIBCLANG_PATH=/usr/lib/x86_64-linux-gnu
 ENV BINDGEN_EXTRA_CLANG_ARGS="-I/usr/include"
 
-# Set working directory to qnet-integration
-WORKDIR /build/qnet-integration
+# Set working directory  
+WORKDIR /build
 
-# Copy core dependencies first
-COPY core/ ../core/
+# Copy core dependencies to correct path
+COPY core/ ./core/
 
 # Copy qnet-integration project
-COPY development/qnet-integration/ ./
+COPY development/qnet-integration/ ./qnet-integration/
+
+# Change to qnet-integration directory
+WORKDIR /build/qnet-integration
 
 # Create Cargo.lock with pinned base64ct version
 RUN cargo generate-lockfile && \
