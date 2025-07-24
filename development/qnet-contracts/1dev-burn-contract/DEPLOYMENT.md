@@ -81,7 +81,7 @@ PowerShell -ExecutionPolicy Bypass -File deploy.ps1
 
 1. **Update environment variable:**
    ```bash
-   export BURN_TRACKER_PROGRAM_ID="<your-program-id>"
+   # Program ID: D7g7mkL8o1YEex6ZgETJEQyyHV7uuUMvV3Fy3u83igJ7 (embedded in node)
    ```
 
 2. **Update config files:**

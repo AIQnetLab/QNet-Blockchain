@@ -26,15 +26,30 @@ ENV QNET_METRICS_PORT=9878
 ENV DOCKER_ENV=1
 
 # Copy dependency manifests first for better caching
-COPY Cargo.toml ./
+COPY Cargo.toml ./Cargo.toml.original
 COPY core/qnet-consensus/Cargo.toml ./core/qnet-consensus/
 COPY core/qnet-core/Cargo.toml ./core/qnet-core/
 COPY core/qnet-mempool/Cargo.toml ./core/qnet-mempool/
 COPY core/qnet-state/Cargo.toml ./core/qnet-state/
 COPY core/qnet-sharding/Cargo.toml ./core/qnet-sharding/
 COPY development/qnet-integration/Cargo.toml ./development/qnet-integration/
-# Removed non-production modules from build:
-# COPY infrastructure/qnet-api/Cargo.toml ./infrastructure/qnet-api/     # Experimental, not for production
+
+# Create production workspace Cargo.toml without qnet-api (not needed for blockchain node)
+RUN echo '[workspace]' > Cargo.toml && \
+    echo 'members = [' >> Cargo.toml && \
+    echo '    "core/qnet-core",' >> Cargo.toml && \
+    echo '    "core/qnet-consensus",' >> Cargo.toml && \
+    echo '    "core/qnet-mempool",' >> Cargo.toml && \
+    echo '    "core/qnet-state",' >> Cargo.toml && \
+    echo '    "core/qnet-sharding",' >> Cargo.toml && \
+    echo '    "development/qnet-integration"' >> Cargo.toml && \
+    echo ']' >> Cargo.toml && \
+    echo 'resolver = "2"' >> Cargo.toml && \
+    echo '' >> Cargo.toml && \
+    echo '[workspace.dependencies]' >> Cargo.toml && \
+    echo 'tokio = { version = "1.35", features = ["full"] }' >> Cargo.toml && \
+    echo 'serde = { version = "1.0.195", features = ["derive"] }' >> Cargo.toml && \
+    echo 'ed25519-dalek = { version = "2.0.0", features = ["std"] }' >> Cargo.toml
 
 # Create dummy source files to cache dependencies
 RUN mkdir -p core/qnet-consensus/src core/qnet-core/src core/qnet-mempool/src \

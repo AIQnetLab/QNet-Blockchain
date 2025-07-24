@@ -33,24 +33,29 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 source ~/.cargo/env
 ```
 
-### Step 3: Download QNet
+### Step 3: Download and Build QNet
 ```bash
 # Clone repository
 git clone https://github.com/AIQnetLab/QNet-Blockchain.git
 cd QNet-Blockchain
 git checkout testnet
 
-# Build Docker image
-docker build -f Dockerfile.production -t qnet-node:latest .
+# Build Rust binary first
+cd development/qnet-integration
+cargo build --release
+cd ../../
+
+# Build production Docker image using root Dockerfile.production
+docker build -t qnet-production -f Dockerfile.production .
 ```
 
-### Step 4: Launch Node (Interactive Setup)
+### Step 4: Launch Node (Interactive Setup - ONLY METHOD)
 ```bash
-# Launch node with interactive setup
+# Launch interactive production node
 docker run -it --name qnet-node --restart=always \
-  -p 9876:9876 -p 8001:8001 \
+  -p 9876:9876 -p 9877:9877 -p 8001:8001 \
   -v $(pwd)/node_data:/app/node_data \
-  qnet-node:latest
+  qnet-production
 
 # Follow the interactive menu to:
 # 1. Select node type (Full/Super for servers)
@@ -655,20 +660,23 @@ Each node will present an interactive menu where you must:
 ### Multiple Nodes for High Availability
 
 ```bash
-# Connect to first node container for interactive activation
-docker exec -it qnet-node-1 /bin/bash
-./target/release/qnet-node
-# Interactive menu will appear - enter activation code and configure
+# Run multiple production nodes (ONLY METHOD)
+docker run -it --name qnet-node-1 --restart=always \
+  -p 9876:9876 -p 9877:9877 -p 8001:8001 \
+  -v $(pwd)/node1_data:/app/node_data \
+  qnet-production
 
-# Connect to second node container for interactive activation  
-docker exec -it qnet-node-2 /bin/bash
-./target/release/qnet-node
-# Interactive menu will appear - enter activation code and configure
+# Run second node on different ports
+docker run -it --name qnet-node-2 --restart=always \
+  -p 9878:9876 -p 9879:9877 -p 8002:8001 \
+  -v $(pwd)/node2_data:/app/node_data \
+  qnet-production
 
-# Connect to third node container for interactive activation
-docker exec -it qnet-node-3 /bin/bash
-./target/release/qnet-node
-# Interactive menu will appear - enter activation code and configure
+# Run third node on different ports  
+docker run -it --name qnet-node-3 --restart=always \
+  -p 9880:9876 -p 9881:9877 -p 8003:8001 \
+  -v $(pwd)/node3_data:/app/node_data \
+  qnet-production
 ```
 
 **IMPORTANT:** Each node must be activated through its own interactive menu session. No environment variables or automatic configuration allowed!
@@ -1054,7 +1062,7 @@ docker stop qnet-node-1 qnet-node-2 qnet-node-3
 # Update code
 git pull origin testnet
 cargo build --release
-docker build -t qnet-production -f development/Dockerfile .
+docker build -t qnet-production -f Dockerfile.production .
 
 # Start nodes
 docker start qnet-node-1 qnet-node-2 qnet-node-3
@@ -1082,7 +1090,6 @@ apt install -y htop iftop nethogs
 # Monitor system continuously
 watch -n 5 'docker stats --no-stream'
 ```
-
 **⚠️ IMPORTANT NOTES:**
 - All nodes require interactive activation with valid codes
 - Only Full/Super nodes can run on servers

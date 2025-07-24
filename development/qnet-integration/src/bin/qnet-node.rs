@@ -300,8 +300,58 @@ const BOOTSTRAP_WHITELIST: &[&str] = &[
 
 // Check if this is a genesis bootstrap node
 fn is_genesis_bootstrap_node() -> bool {
-    // Check environment variable for genesis bootstrap
-    std::env::var("QNET_GENESIS_BOOTSTRAP").unwrap_or_default() == "1"
+    // AUTOMATIC GENESIS DETECTION: First 5 nodes can start without activation code
+    
+    // Method 1: Check environment variable (manual override)
+    if std::env::var("QNET_GENESIS_BOOTSTRAP").unwrap_or_default() == "1" {
+        return true;
+    }
+    
+    // Method 2: Check if network is in genesis state (no other nodes exist)
+    if is_network_in_genesis_state() {
+        println!("🚀 Network in genesis state - allowing bootstrap node startup");
+        return true;
+    }
+    
+    false
+}
+
+// Check if network is in genesis state (very few or no active nodes)
+fn is_network_in_genesis_state() -> bool {
+    // Check if this is the very beginning of the network
+    // by trying to connect to known bootstrap addresses
+    
+    let bootstrap_addresses = vec![
+        "testnet-asia-1.qnet.network:9876",
+        "testnet-europe-1.qnet.network:9876", 
+        "testnet-america-1.qnet.network:9876",
+    ];
+    
+    let mut active_peers = 0;
+    
+    // Quick connection test to each bootstrap address
+    for addr in bootstrap_addresses {
+        if test_connection_quick(addr) {
+            active_peers += 1;
+        }
+    }
+    
+    // If less than 3 bootstrap peers are active, consider network in genesis state
+    active_peers < 3
+}
+
+// Test quick connection to bootstrap peer
+fn test_connection_quick(addr: &str) -> bool {
+    use std::net::TcpStream;
+    use std::time::Duration;
+    
+    match std::net::TcpStream::connect_timeout(
+        &addr.parse().unwrap_or_else(|_| "127.0.0.1:9876".parse().unwrap()),
+        Duration::from_secs(2)
+    ) {
+        Ok(_) => true,
+        Err(_) => false,
+    }
 }
 
 // Generate bootstrap activation code for genesis nodes

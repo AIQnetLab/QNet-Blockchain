@@ -167,87 +167,38 @@ git checkout testnet
 git pull origin testnet
 ```
 
-### Build Production Binary
+### Production Deployment (ONLY METHOD)
+
+⚠️ **Single Deployment Method**: QNet uses ONLY Docker deployment for production servers.
+
+⚠️ **Fully Automatic Configuration**: Everything is auto-configured including Solana contracts, ports, region, and performance settings.
+
+⚠️ **Interactive Activation Only**: Node requires activation code input through interactive menu.
+
+### Complete Production Setup
 
 ```bash
-# Production build with maximum optimizations
-# Note: Workspace builds in root directory from development/qnet-integration/
-RUSTFLAGS="-C target-cpu=native" cargo build --release --bin qnet-node --manifest-path development/qnet-integration/Cargo.toml
-
-# Verify build success
-ls -la target/release/qnet-node
-file target/release/qnet-node
-```
-
-### Important Notes
-
-⚠️ **Workspace Structure**: QNet uses Rust workspace that builds in the **root directory** (`~/QNet-Blockchain/`), not in subdirectories.
-
-⚠️ **Fully Automatic Configuration**: Production deployment uses **ZERO command-line arguments**. Everything is auto-configured including ports, region, and performance settings.
-
-⚠️ **Binary Location**: The compiled binary is located at `~/QNet-Blockchain/target/release/qnet-node`
-
-### Quick Start Commands
-
-```bash
-# Full deployment sequence
-cd ~
-git clone https://github.com/AIQnetLab/QNet-Blockchain.git
-cd QNet-Blockchain
-git checkout testnet
-cargo build --release --bin qnet-node --manifest-path development/qnet-integration/Cargo.toml
-
-# Run interactive setup
-./target/release/qnet-node
-```
-
-### Docker Deployment (Recommended)
-
-For production server deployment, Docker is the recommended approach:
-
-```bash
-# Clone repository
-cd ~
+# Clone and checkout testnet
 git clone https://github.com/AIQnetLab/QNet-Blockchain.git
 cd QNet-Blockchain
 git checkout testnet
 
-# Build Docker image
-docker build -f Dockerfile.production -t qnet-production .
+# Build Rust binary first (IMPORTANT!)
+cd development/qnet-integration
+cargo build --release
+cd ../../
 
-# Stop and remove old container if exists
-docker stop qnet-node || true
-docker rm qnet-node || true
+# Build production Docker image
+docker build -t qnet-production -f Dockerfile.production .
 
-# Launch container in interactive mode for setup
+# Run interactive production node
 docker run -it --name qnet-node --restart=always \
   -p 9876:9876 -p 9877:9877 -p 8001:8001 \
   -v $(pwd)/node_data:/app/node_data \
   qnet-production
-
-# Follow interactive setup:
-# 1. Select node type (Full/Super for servers)
-# 2. Enter activation code (QNET-XXXX-XXXX-XXXX or DEV_XXX)
-# 3. Node will start automatically after setup
 ```
 
-### Production Contract Configuration
-
-For production deployment, configure real Solana contract connection:
-
-```bash
-# Set Solana RPC endpoint (default: devnet for testing)
-export SOLANA_RPC_URL="https://api.devnet.solana.com"
-
-# Set burn tracker program ID (deployed production contract)
-export BURN_TRACKER_PROGRAM_ID="D7g7mkL8o1YEex6ZgETJEQyyHV7uuUMvV3Fy3u83igJ7"
-
-# Set real 1DEV token mint address
-export ONE_DEV_MINT_ADDRESS="62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ"
-
-# Run node with real blockchain data
-./target/release/qnet-node
-```
+**Note**: All Solana contract configuration is embedded in the Docker image. No manual configuration required.
 
 ### 🔗 Contract Deployment Proofs
 
@@ -284,7 +235,7 @@ git checkout testnet
 
 # Build production Docker image
 cargo build --release
-docker build -t qnet-production -f development/Dockerfile .
+docker build -t qnet-production -f Dockerfile.production .
 
 # Run interactive production node
 docker run -it --name qnet-node --restart=always \
@@ -317,67 +268,38 @@ find . -name "dist" -type d -exec rm -rf {} +
 cargo build --release
 ```
 
-**Systemd Service Setup:**
+**Node Management:**
 
 ```bash
-# Create service file
-sudo tee /etc/systemd/system/qnet-node.service > /dev/null <<EOF
-[Unit]
-Description=QNet Blockchain Node
-After=network.target
+# Check running containers
+docker ps
 
-[Service]
-Type=simple
-User=$USER
-WorkingDirectory=$PWD
-ExecStart=$PWD/target/release/qnet-node
-Environment=BURN_TRACKER_PROGRAM_ID=D7g7mkL8o1YEex6ZgETJEQyyHV7uuUMvV3Fy3u83igJ7
-Environment=SOLANA_RPC_URL=https://api.devnet.solana.com
-Restart=always
-RestartSec=5
+# View logs
+docker logs -f qnet-node
 
-[Install]
-WantedBy=multi-user.target
-EOF
+# Stop node
+docker stop qnet-node
 
-# Start service
-sudo systemctl daemon-reload
-sudo systemctl enable qnet-node
-sudo systemctl start qnet-node
+# Restart node
+docker restart qnet-node
 
-# Check status
-sudo systemctl status qnet-node
-sudo journalctl -u qnet-node -f
+# Remove node (keeps data volume)
+docker rm qnet-node
 ```
 
-### Node Management Commands
-
-#### Stop Running Node
-
-```bash
-# If running in terminal (Ctrl+C)
-^C
-
-# If running as systemd service
-sudo systemctl stop qnet-node
-sudo systemctl disable qnet-node
-
-# Kill process if needed
-sudo pkill -f qnet-node
-```
+### Additional Node Operations
 
 #### Remove Node Data
 
 ```bash
-# Remove node data directory (keeps wallet/keys safe)
-rm -rf ~/QNet-Blockchain/node_data
+# Remove node data volume (keeps Docker image)
+docker volume rm qnet-node-data
 
 # Remove entire installation
 rm -rf ~/QNet-Blockchain
 
-# Remove systemd service
-sudo rm /etc/systemd/system/qnet-node.service
-sudo systemctl daemon-reload
+# Clean Docker resources
+docker system prune -f
 ```
 
 #### Backup Before Removal

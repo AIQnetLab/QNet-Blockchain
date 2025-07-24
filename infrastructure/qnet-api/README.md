@@ -188,17 +188,27 @@ curl -X POST http://localhost:8001/api/v1/batch/claim-rewards \
 
 ### **Development Setup**
 
-**⚠️ EXPERIMENTAL DEVELOPMENT**
+**🚀 PRODUCTION DEPLOYMENT (ONLY METHOD)**
 
 ```bash
-# Build project
+# Clone and build production node 
+git clone https://github.com/AIQnetLab/QNet-Blockchain.git
+cd QNet-Blockchain
+git checkout testnet
+
+# Build Rust binary first
+cd development/qnet-integration
 cargo build --release
+cd ../../
 
-# Run single node
-./target/release/qnet-node
+# Build production Docker image
+docker build -t qnet-production -f Dockerfile.production .
 
-# Run multiple nodes
-QNET_P2P_PORT=9878 QNET_RPC_PORT=9879 QNET_API_PORT=8002 ./target/release/qnet-node
+# Run production node with interactive activation
+docker run -it --name qnet-node --restart=always \
+  -p 9876:9876 -p 9877:9877 -p 8001:8001 \
+  -v $(pwd)/node_data:/app/node_data \
+  qnet-production
 ```
 
 ### **Monitoring**

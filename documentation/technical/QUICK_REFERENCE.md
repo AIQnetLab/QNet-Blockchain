@@ -28,21 +28,30 @@
 - TCP connections established and maintained
 - Ready for block/transaction propagation
 
-### 🔧 Quick Commands
+### 🔧 Production Commands (ONLY METHOD)
 
 ```bash
-# Build the node
-cd qnet-integration
-cargo build --release --bin qnet-node
+# Clone and build QNet
+git clone https://github.com/AIQnetLab/QNet-Blockchain.git
+cd QNet-Blockchain
+git checkout testnet
 
-# Start first node
-.\target\release\qnet-node.exe --p2p-port 9876 --rpc-port 9877 --data-dir node1_data
+# Build Rust binary first
+cd development/qnet-integration
+cargo build --release
+cd ../../
 
-# Start second node with bootstrap
-.\target\release\qnet-node.exe --p2p-port 9878 --rpc-port 9879 --data-dir node2_data --bootstrap-peers 127.0.0.1:9876
+# Build production Docker image
+docker build -t qnet-production -f Dockerfile.production .
 
-# Check peer count
-curl -X POST http://localhost:9877/rpc -H "Content-Type: application/json" -d '{"jsonrpc":"2.0","method":"node_getInfo","params":[],"id":1}'
+# Run interactive production node (single deployment method)
+docker run -it --name qnet-node --restart=always \
+  -p 9876:9876 -p 9877:9877 -p 8001:8001 \
+  -v $(pwd)/node_data:/app/node_data \
+  qnet-production
+
+# Check node status
+curl http://localhost:8001/health
 ```
 
 ### 📁 Key Files

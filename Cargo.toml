@@ -1,0 +1,19 @@
+[workspace]
+members = [
+    "core/qnet-core",
+    "core/qnet-consensus", 
+    "core/qnet-mempool",
+    "core/qnet-state",
+    "core/qnet-sharding",
+    "development/qnet-integration",
+    "infrastructure/qnet-api"
+]
+resolver = "2"
+
+[workspace.dependencies]
+# Core blockchain dependencies - production ready versions
+tokio = { version = "1.35", features = ["full"] }
+serde = { version = "1.0.195", features = ["derive"] }
+ed25519-dalek = { version = "2.0.0", features = ["std"] }
+actix-web = "4.4"
+rocksdb = "0.21" 

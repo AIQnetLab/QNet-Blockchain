@@ -1,1 +1,55 @@
-.git 
+# Build artifacts and caches - EXCLUDE FROM DOCKER BUILD
+target/
+*/target/
+**/target/
+Cargo.lock
+node_modules/
+*/node_modules/
+**/node_modules/
+.next/
+*/dist/
+build/
+*/build/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+*.tmp
+*.log
+
+# Git and development
+.git/
+.gitignore
+*.md
+README.md
+LICENSE
+
+# Test and development data  
+testing/
+**/testing/
+node_data/
+data/
+logs/
+
+# Backup and temporary files
+backups/
+ARCHIVE/
+*.bak
+*.backup
+temp/
+tmp/
+
+# Large development artifacts
+applications/qnet-wallet/dist/
+applications/qnet-explorer/frontend/node_modules/
+applications/qnet-explorer/frontend/.next/
+applications/qnet-mobile/node_modules/
+
+# Only include essential source code for production build 
