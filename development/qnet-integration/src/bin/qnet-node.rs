@@ -484,87 +484,82 @@ async fn verify_activation_burn(code: &str, node_type: &NodeType) -> Result<(), 
 
 // Interactive node setup functions
 async fn interactive_node_setup() -> Result<(NodeType, String), Box<dyn std::error::Error>> {
-    println!("🔍 DEBUG: Entering interactive_node_setup()...");
-    
-    println!("\n🚀 === QNet Production Node Setup === 🚀");
-    println!("🖥️  SERVER DEPLOYMENT MODE");
+    println!("[DEBUG] Entering interactive_node_setup()...");
+
+    println!("\n[SETUP] === QNet Production Node Setup ===");
+    println!("[SERVER] SERVER DEPLOYMENT MODE");
     println!("Welcome to QNet Blockchain Network!");
-    
-    // Detect current economic phase
-    println!("🔍 DEBUG: Calling detect_current_phase()...");
+
+    println!("[DEBUG] Calling detect_current_phase()...");
     let (current_phase, pricing_info) = detect_current_phase().await;
-    println!("🔍 DEBUG: detect_current_phase() completed, phase = {}", current_phase);
-    
+    println!("[DEBUG] detect_current_phase() completed, phase = {}", current_phase);
+
     // Display phase information
     display_phase_info(current_phase, &pricing_info);
-    
-    // Node type selection (server-only: full/super)
-    println!("🔍 DEBUG: Calling select_node_type()...");
+
+    println!("[DEBUG] Calling select_node_type()...");
     let node_type = select_node_type(current_phase, &pricing_info)?;
-    println!("🔍 DEBUG: select_node_type() completed, type = {:?}", node_type);
-    
-    // Validate server node type compatibility
-    if let Err(e) = validate_server_node_type(node_type) {
-        return Err(e.into());
-    }
-    
-    // Show pricing for selected type
-    let price = calculate_node_price(current_phase, node_type, &pricing_info);
-    display_activation_cost(current_phase, node_type, price);
-    
-    // Important notice about activation code requirements
-    println!("\n🔐 === Activation Code Requirements ===");
-    match current_phase {
-        1 => {
-            println!("   📊 Phase 1: Universal activation cost");
-            println!("   💡 Any activation code will work (same price for all types)");
-            println!("   🔥 Activation codes from 1DEV burn transactions");
+    println!("[DEBUG] select_node_type() completed, type = {:?}", node_type);
+
+    // Calculate activation price
+    let price = match current_phase {
+        1 => 10.0,      // Phase 1: Universal pricing
+        2 => match node_type {
+            NodeType::Light => 5.0,
+            NodeType::Full => 10.0,
+            NodeType::Super => 20.0,
         },
-        2 => {
-            println!("   📊 Phase 2: Tiered activation costs");
-            println!("   ⚠️  CRITICAL: Activation code MUST match node type");
-            println!("   �� {:?} node requires {:?} QNC activation code", node_type, price as u64);
-            println!("   ❌ Wrong activation code type will be rejected");
-        },
-        _ => {}
-    }
+        _ => 10.0,
+    };
+
+    println!("\n[SECURITY] === Activation Code Requirements ===");
     
-    // FIXED: Comprehensive validation in retry loop
-    let activation_code = loop {
-        println!("\n🔐 === Enter Activation Code ===");
-        
-        // Request activation code (no validation here, just input)
-        let code = match request_activation_code(current_phase) {
-            Ok(code) => code,
-            Err(e) => {
-                println!("❌ Error requesting activation code: {}", e);
-                continue;
-            }
-        };
-        
-        // Comprehensive validation BEFORE accepting code
-        match validate_activation_code_comprehensive(&code, node_type, current_phase, &pricing_info).await {
-            Ok(()) => {
-                println!("✅ Activation code validation successful!");
-                break code; // Exit loop with valid code
-            }
-            Err(e) => {
-                println!("❌ Activation code validation failed: {}", e);
-                println!("   Please try again or press Ctrl+C to exit.");
-                continue; // Continue loop for retry
+    if current_phase == 1 {
+        println!("   [INFO] Phase 1: Universal activation cost");
+        println!("   [BURN] {} 1DEV tokens required", price as u64);
+        println!("   [INFO] Activation codes from 1DEV burn transactions");
+    } else {
+        println!("   [INFO] Phase 2: Tiered activation costs");
+        println!("   [CRITICAL] CRITICAL: Activation code MUST match node type");
+        println!("   [COST] {:?} node requires {} tokens", node_type, price as u64);
+        println!("   [ERROR] Wrong activation code type will be rejected");
+    }
+
+    // Request activation code input
+    use std::io::Write;
+    print!("\n[INPUT] === Enter Activation Code ===\nCode: ");
+    std::io::stdout().flush().unwrap();
+    
+    let mut input = String::new();
+    let activation_code = match io::stdin().read_line(&mut input) {
+        Ok(_) => {
+            let code = input.trim().to_string();
+            
+            // Handle empty input for genesis bootstrap
+            if code.is_empty() && is_genesis_bootstrap_node() {
+                println!("[SUCCESS] Generating genesis bootstrap code...");
+                match generate_genesis_activation_code() {
+                    Ok(genesis_code) => genesis_code,
+                    Err(e) => {
+                        return Err(format!("Failed to generate genesis code: {}", e).into());
+                    }
+                }
+            } else if code.is_empty() {
+                return Err("Empty activation code not allowed for regular nodes".into());
+            } else {
+                code
             }
         }
+        Err(e) => return Err(format!("Error reading input: {}", e).into()),
     };
-    
-    println!("\n✅ Server node setup complete!");
-    println!("   🖥️  Device Type: Dedicated Server");
-    println!("   🔧 Node Type: {:?}", node_type);
-    println!("   📊 Phase: {}", current_phase);
-    println!("   💰 Cost: {}", format_price(current_phase, price));
-    println!("   🔑 Activation Code: {}", mask_code(&activation_code));
-    println!("   💾 Activation will be saved with cryptographic binding");
-    println!("   🛡️  Universal: Works on VPS, VDS, PC, laptop, server");
-    println!("   🚀 Starting node...\n");
+
+    println!("\n[SUCCESS] Server node setup complete!");
+    println!("   [SERVER] Device Type: Dedicated Server");
+    println!("   [TYPE] Node Type: {:?}", node_type);
+    println!("   [PHASE] Phase: {}", current_phase);
+    println!("   [COST] Cost: {} tokens", price as u64);
+    println!("   [CODE] Activation Code: {}", mask_code(&activation_code));
+    println!("   [STARTING] Starting node...\n");
     
     Ok((node_type, activation_code))
 }
@@ -1444,26 +1439,26 @@ fn extract_ip_from_response(response: &str) -> Option<String> {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Critical: This must be the FIRST line to catch any issues
-    println!("🔍 DEBUG: QNet node binary started - checking basic functionality...");
+    println!("[DEBUG] QNet node binary started - checking basic functionality...");
     
     // Test basic functionality before doing anything else
-    println!("🔍 DEBUG: Testing std::env...");
+    println!("[DEBUG] Testing std::env...");
     if std::env::var("RUST_LOG").is_err() {
         std::env::set_var("RUST_LOG", "info");
     }
-    println!("🔍 DEBUG: std::env working");
+    println!("[DEBUG] std::env working");
     
     // Initialize logging
-    println!("🔍 DEBUG: Initializing logger...");
+    println!("[DEBUG] Initializing logger...");
     env_logger::init();
-    println!("🔍 DEBUG: Logger initialized");
+    println!("[DEBUG] Logger initialized");
     
     // Auto-configure everything
-    println!("🔍 DEBUG: Auto-configuring QNet node...");
+    println!("[DEBUG] Auto-configuring QNet node...");
     let config = AutoConfig::new().await?;
     
     // Choose setup mode - interactive or auto
-    println!("🔍 DEBUG: Starting setup mode selection...");
+    println!("[DEBUG] Starting setup mode selection...");
     
     // PRODUCTION: Check for existing activation or run interactive setup
     let (node_type, activation_code) = check_existing_activation_or_setup().await?;
@@ -2173,3 +2168,4 @@ fn parse_bootstrap_peers(peers_str: &Option<String>) -> Vec<String> {
         .map(|s| s.split(',').map(|p| p.trim().to_string()).collect())
         .unwrap_or_default()
 } 
+
