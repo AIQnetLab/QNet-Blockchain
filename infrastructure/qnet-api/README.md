@@ -197,12 +197,11 @@ cd QNet-Blockchain
 git checkout testnet
 
 # Build Rust binary first
-cd development/qnet-integration
-cargo build --release
-cd ../../
+# Build QNet production node from project root
+cargo build --release --bin qnet-node
 
-# Build production Docker image
-docker build -t qnet-production -f Dockerfile.production .
+# Build Docker image with correct path
+docker build -f development/qnet-integration/Dockerfile.production -t qnet-production .
 
 # Run production node with interactive activation
 docker run -it --name qnet-node --restart=always \

@@ -40,13 +40,11 @@ git clone https://github.com/AIQnetLab/QNet-Blockchain.git
 cd QNet-Blockchain
 git checkout testnet
 
-# Build Rust binary first
-cd development/qnet-integration
-cargo build --release
-cd ../../
+# Build Rust binary first (from project root)
+cargo build --release --bin qnet-node
 
-# Build production Docker image using root Dockerfile.production
-docker build -t qnet-production -f Dockerfile.production .
+# Build production Docker image using correct Dockerfile path
+docker build -t qnet-production -f development/qnet-integration/Dockerfile.production .
 ```
 
 ### Step 4: Launch Node (Interactive Setup - ONLY METHOD)
@@ -379,13 +377,11 @@ docker logs qnet-node | grep "🌍 No local nodes found, trying internet"
 # 4. Pull latest changes
 git pull origin testnet
 
-# 5. Build with Rust 1.85 (for edition2024 support)
-rustup toolchain install 1.85.0
-rustup default 1.85.0
-cargo build --release
+# 5. Build with latest Rust from project root
+cargo build --release --bin qnet-node
 
-# 6. Build Docker image
-docker build -f Dockerfile.production -t qnet-production .
+# 6. Build Docker image with correct path
+docker build -f development/qnet-integration/Dockerfile.production -t qnet-production .
 ```
 
 ### Step-by-Step Commands for Complete Deployment
@@ -401,7 +397,7 @@ docker rm qnet-node || true
 docker rmi qnet-production || true
 
 # 3. Build new production container
-docker build -f Dockerfile.production -t qnet-production .
+docker build -f development/qnet-integration/Dockerfile.production -t qnet-production .
 
 # 4. Launch container in interactive mode
 docker run -it --name qnet-node --restart=always \
