@@ -20,15 +20,14 @@ RUN apt-get update && apt-get install -y \
 # Set working directory
 WORKDIR /build
 
-# Copy dependency files first for better caching
-COPY Cargo.toml Cargo.lock ./
-COPY src ./src
+# Copy entire workspace from project root
+COPY . .
 
-# Build with maximum optimization for production
+# Build the specific binary with maximum optimization for production
 ENV RUSTFLAGS="-C target-cpu=native -C opt-level=3 -C lto=fat -C codegen-units=1"
 ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
 
-RUN cargo build --release --locked \
+RUN cargo build --release --locked --bin qnet-node \
     && strip target/release/qnet-node \
     && cp target/release/qnet-node /usr/local/bin/
 
