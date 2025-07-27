@@ -27,9 +27,9 @@ COPY . .
 ENV RUSTFLAGS="-C target-cpu=native"
 ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
 
-RUN cargo build --release --bin qnet-node \
-    && strip target/release/qnet-node \
-    && cp target/release/qnet-node /usr/local/bin/
+RUN cargo build --profile release-fast --bin qnet-node \
+    && strip target/release-fast/qnet-node \
+    && cp target/release-fast/qnet-node /usr/local/bin/
 
 # Production runtime image
 FROM debian:bookworm-slim
@@ -45,11 +45,10 @@ RUN apt-get update && apt-get install -y \
 
 # Copy binary from builder
 COPY --from=builder /usr/local/bin/qnet-node /usr/local/bin/
-COPY --from=builder /build/config/production.toml /etc/qnet/config.toml
 
 # Create necessary directories with proper permissions
-RUN mkdir -p /app/data /app/logs /etc/qnet \
-    && chown -R qnet:qnet /app /etc/qnet \
+RUN mkdir -p /app/data /app/logs \
+    && chown -R qnet:qnet /app \
     && chmod 755 /app/data /app/logs
 
 # Switch to non-root user
@@ -58,7 +57,6 @@ USER qnet
 # Set environment variables for production
 ENV RUST_LOG=info
 ENV RUST_BACKTRACE=1
-ENV QNET_CONFIG_PATH=/etc/qnet/config.toml
 ENV QNET_DATA_DIR=/app/data
 ENV QNET_LOG_DIR=/app/logs
 
@@ -71,4 +69,4 @@ EXPOSE 8545 30303 9090
 
 # Production startup command with proper signal handling
 ENTRYPOINT ["/usr/local/bin/qnet-node"]
-CMD ["--config", "/etc/qnet/config.toml", "--data-dir", "/app/data"] 
+CMD ["--data-dir", "/app/data"] 
