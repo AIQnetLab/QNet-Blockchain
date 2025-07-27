@@ -24,7 +24,7 @@ WORKDIR /build
 COPY . .
 
 # Build the specific binary with maximum optimization for production
-ENV RUSTFLAGS="-C target-cpu=native -C opt-level=3 -C lto=fat -C codegen-units=1"
+ENV RUSTFLAGS="-C target-cpu=native"
 ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
 
 RUN cargo build --release --bin qnet-node \

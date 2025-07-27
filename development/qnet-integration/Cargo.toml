@@ -107,4 +107,10 @@ python = []
 
 [[bin]]
 name = "qnet-node"
-path = "src/bin/qnet-node.rs" 
+path = "src/bin/qnet-node.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+opt-level = 3 
