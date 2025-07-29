@@ -121,9 +121,9 @@ pub struct BlockchainNode {
 impl BlockchainNode {
     /// Create a new blockchain node with default settings (backward compatibility)
     pub async fn new(data_dir: &str, p2p_port: u16, bootstrap_peers: Vec<String>) -> Result<Self, QNetError> {
-        // Auto-detect region from IP geolocation
+        // Production region detection - no defaults allowed
         let region = Self::auto_detect_region().await
-            .unwrap_or(Region::Europe); // Default to Europe if detection fails
+            .map_err(|e| QNetError::NetworkError(format!("Region detection failed: {}", e)))?;
         
         Self::new_with_config(
             data_dir,
@@ -960,29 +960,65 @@ impl BlockchainNode {
     
     /// Auto-detect region from IP geolocation
     pub async fn auto_detect_region() -> Result<Region, String> {
-        println!("🌍 Auto-detecting region from IP address...");
+        println!("🌍 Production auto-region detection - no defaults allowed...");
         
-        // In Docker/server environment, skip external IP detection and use default
-        if std::env::var("DOCKER_ENV").is_ok() || std::env::var("CONTAINER").is_ok() {
-            println!("🐳 Docker environment detected - using default region: Europe");
-            return Ok(Region::Europe);
+        // Production mode: No default regions - must detect accurately
+        // Use the same detection system as the main node binary
+        
+        // Method 1: Check QNET_REGION environment variable
+        if let Ok(region_hint) = std::env::var("QNET_REGION") {
+            match region_hint.to_lowercase().as_str() {
+                "na" | "northamerica" => return Ok(Region::NorthAmerica),
+                "eu" | "europe" => return Ok(Region::Europe),
+                "asia" => return Ok(Region::Asia),
+                "sa" | "southamerica" => return Ok(Region::SouthAmerica),
+                "africa" => return Ok(Region::Africa),
+                "oceania" => return Ok(Region::Oceania),
+                _ => {}
+            }
         }
         
-        // Try to get public IP and determine region with timeout
-        match tokio::time::timeout(Duration::from_secs(5), Self::get_public_ip_region()).await {
-            Ok(Ok(region)) => {
-                println!("✅ Region auto-detected: {:?}", region);
-                Ok(region)
-            }
-            Ok(Err(e)) => {
-                println!("⚠️  Auto-detection failed: {}, using default region: Europe", e);
-                Ok(Region::Europe) // Default fallback
-            }
-            Err(_) => {
-                println!("⚠️  Auto-detection timed out, using default region: Europe");
-                Ok(Region::Europe) // Timeout fallback
+        // Method 2: Get physical IP and check regional ranges
+        if let Ok(physical_ip_str) = Self::get_physical_ip_without_external_services().await {
+            if let Ok(physical_ip) = physical_ip_str.parse::<std::net::Ipv4Addr>() {
+                println!("🌍 Physical IP detected: {}", physical_ip);
+                
+                // Use the same regional IP detection as main binary
+                if Self::is_north_america_ip(&physical_ip) {
+                    println!("✅ Region detected: North America");
+                    return Ok(Region::NorthAmerica);
+                } else if Self::is_europe_ip(&physical_ip) {
+                    println!("✅ Region detected: Europe");
+                    return Ok(Region::Europe);
+                } else if Self::is_asia_ip(&physical_ip) {
+                    println!("✅ Region detected: Asia");
+                    return Ok(Region::Asia);
+                } else if Self::is_south_america_ip(&physical_ip) {
+                    println!("✅ Region detected: South America");
+                    return Ok(Region::SouthAmerica);
+                } else if Self::is_africa_ip(&physical_ip) {
+                    println!("✅ Region detected: Africa");
+                    return Ok(Region::Africa);
+                } else if Self::is_oceania_ip(&physical_ip) {
+                    println!("✅ Region detected: Oceania");
+                    return Ok(Region::Oceania);
+                }
             }
         }
+        
+        // Method 3: Network latency testing (simplified version)
+        match Self::simple_latency_region_test().await {
+            Ok(region) => {
+                println!("✅ Region detected via latency test: {:?}", region);
+                return Ok(region);
+            }
+            Err(e) => {
+                println!("⚠️ Latency test failed: {}", e);
+            }
+        }
+        
+        // Production: MUST detect region - no fallback defaults allowed
+        Err("Production region detection failed - manual QNET_REGION environment variable required".to_string())
     }
     
     /// Save activation code to persistent storage with security validation
@@ -1300,7 +1336,134 @@ impl BlockchainNode {
             Err(e) => Err(QNetError::StorageError(e.to_string())),
         }
     }
-}
+    
+    // Production-grade region detection functions (decentralized)
+    
+    /// Get physical IP without external services
+    async fn get_physical_ip_without_external_services() -> Result<String, String> {
+        use std::net::{UdpSocket, IpAddr};
+        use std::process::Command;
+        
+        // Method 1: Check all network interfaces
+        #[cfg(target_os = "windows")]
+        {
+            if let Ok(output) = Command::new("ipconfig").output() {
+                let output_str = String::from_utf8_lossy(&output.stdout);
+                for line in output_str.lines() {
+                    if line.trim().starts_with("IPv4 Address") {
+                        if let Some(ip_part) = line.split(':').nth(1) {
+                            let ip_str = ip_part.trim();
+                            if let Ok(ip) = ip_str.parse::<std::net::Ipv4Addr>() {
+                                if !ip.is_loopback() && !ip.is_private() && !ip.is_link_local() {
+                                    return Ok(ip.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        #[cfg(target_os = "linux")]
+        {
+            if let Ok(output) = Command::new("hostname").arg("-I").output() {
+                let output_str = String::from_utf8_lossy(&output.stdout);
+                for ip_str in output_str.split_whitespace() {
+                    if let Ok(ip) = ip_str.parse::<std::net::Ipv4Addr>() {
+                        if !ip.is_loopback() && !ip.is_private() && !ip.is_link_local() {
+                            return Ok(ip.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Method 2: Use socket binding to determine local IP
+        match UdpSocket::bind("0.0.0.0:0") {
+            Ok(socket) => {
+                if let Ok(()) = socket.connect("10.0.0.1:9876") {
+                    if let Ok(addr) = socket.local_addr() {
+                        let ip = addr.ip();
+                        if let IpAddr::V4(ipv4) = ip {
+                            if !ipv4.is_loopback() && !ipv4.is_link_local() {
+                                return Ok(ipv4.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            Err(_) => {}
+        }
+        
+        Err("Could not determine physical IP address".to_string())
+    }
+    
+    /// Simple latency-based region testing (disabled - IP-based detection only)
+    async fn simple_latency_region_test() -> Result<Region, String> {
+        // Latency testing removed - only IP-based region detection for production
+        // In real decentralized network, nodes would use actual peer discovery
+        Err("Latency-based region testing disabled - use IP-based detection".to_string())
+    }
+    
+    // Regional IP detection functions (same as main binary)
+    fn is_north_america_ip(ip: &std::net::Ipv4Addr) -> bool {
+        let ip_u32 = u32::from(*ip);
+        let first_octet = (ip_u32 >> 24) as u8;
+        match first_octet {
+            3..=9 | 11..=24 | 26 | 28..=30 | 32..=35 | 38 | 40 | 44..=45 | 47..=48 | 50 | 52 | 54..=56 | 
+            63 | 68..=76 | 96..=100 | 104 | 107..=108 | 173..=174 | 184 | 199 | 208..=209 | 216 => true,
+            64..=67 => ip_u32 >= 0x40000000 && ip_u32 <= 0x43FFFFFF,
+            _ => false
+        }
+    }
+    
+    fn is_europe_ip(ip: &std::net::Ipv4Addr) -> bool {
+        let ip_u32 = u32::from(*ip);
+        let first_octet = (ip_u32 >> 24) as u8;
+        match first_octet {
+            2 | 5 | 25 | 31 | 37 | 46 | 53 | 62 | 77..=95 | 109 | 128 | 130..=141 | 145..=149 | 151 |
+            176 | 178 | 185 | 188 | 193..=195 | 212..=213 | 217 => true,
+            _ => false
+        }
+    }
+    
+    fn is_asia_ip(ip: &std::net::Ipv4Addr) -> bool {
+        let ip_u32 = u32::from(*ip);
+        let first_octet = (ip_u32 >> 24) as u8;
+        match first_octet {
+            1 | 14 | 27 | 36 | 39 | 42..=43 | 49 | 58..=61 | 101 | 103 | 106 | 110..=126 | 150 | 152..=153 |
+            163 | 175 | 180 | 182..=183 | 202..=203 | 210..=211 | 218..=223 => true,
+            _ => false
+        }
+    }
+    
+    fn is_south_america_ip(ip: &std::net::Ipv4Addr) -> bool {
+        let ip_u32 = u32::from(*ip);
+        let first_octet = (ip_u32 >> 24) as u8;
+        match first_octet {
+            177 | 179 | 181 | 186..=187 | 189..=191 | 200..=201 => true,
+            _ => false
+        }
+    }
+    
+    fn is_africa_ip(ip: &std::net::Ipv4Addr) -> bool {
+        let ip_u32 = u32::from(*ip);
+        let first_octet = (ip_u32 >> 24) as u8;
+        match first_octet {
+            41 | 102 | 105 | 154..=156 | 160..=162 | 164..=165 | 196..=197 => true,
+            _ => false
+        }
+    }
+    
+    fn is_oceania_ip(ip: &std::net::Ipv4Addr) -> bool {
+        let ip_u32 = u32::from(*ip);
+        let first_octet = (ip_u32 >> 24) as u8;
+        match first_octet {
+            1 | 27 | 58..=59 | 101 | 103 | 110 | 115..=116 | 118..=119 | 124..=125 | 150 | 202..=203 | 210 => true,
+            _ => false
+        }
+    }
+} 
 
 /// Peer information for RPC responses
 #[derive(Debug, Clone)]
