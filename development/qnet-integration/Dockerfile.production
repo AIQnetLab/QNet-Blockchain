@@ -26,9 +26,9 @@ ENV CARGO_HTTP_MULTIPLEXING=false
 ENV CARGO_NET_RETRY=10
 ENV CARGO_HTTP_TIMEOUT=300
 
-RUN cargo build --release --bin qnet-node \
-    && strip target/release/qnet-node \
-    && cp target/release/qnet-node /usr/local/bin/
+RUN cargo build --profile release-fast --bin qnet-node \
+    && strip target/release-fast/qnet-node \
+    && cp target/release-fast/qnet-node /usr/local/bin/
 
 # Production runtime image
 FROM debian:bookworm-slim

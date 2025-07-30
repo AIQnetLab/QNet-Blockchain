@@ -101,6 +101,25 @@ atty = "0.2"
 criterion = "0.5"
 tempfile = "3.8.1"
 
+# Production build profiles
+[profile.release]
+opt-level = 3
+debug = false
+strip = true
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[profile.release-fast]
+inherits = "release"
+opt-level = 3
+debug = false
+strip = true
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+overflow-checks = false
+
 [features]
 default = []
 python = []
