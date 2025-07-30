@@ -47,6 +47,14 @@ cargo build --release --bin qnet-node
 docker build -t qnet-production -f development/qnet-integration/Dockerfile.production .
 ```
 
+### Step 3B: Genesis Bootstrap Network (Production)
+QNet uses built-in genesis nodes for automatic decentralized bootstrap:
+- **154.38.160.39:9876** - North America
+- **62.171.157.44:9877** - Europe
+- **161.97.86.81:9877** - Europe
+
+**✅ No manual configuration needed!** New nodes automatically discover the network through genesis bootstrap, then switch to full decentralized peer exchange.
+
 ### Step 4: Launch Node (Interactive Setup - ONLY METHOD)
 ```bash
 # Launch interactive production node

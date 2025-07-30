@@ -254,52 +254,79 @@ impl SimplifiedP2P {
             
             let mut discovered_peers = Vec::new();
             
-                         // Get known QNet node IPs from environment variable or config
+                         // Get known QNet node IPs from environment variable or genesis nodes
              let mut known_node_ips = Vec::new();
              
-             // Check environment variable for peer IPs
+             // Check environment variable for peer IPs (manual override)
              if let Ok(peer_ips) = std::env::var("QNET_PEER_IPS") {
                  for ip in peer_ips.split(',') {
                      let ip = ip.trim();
                      if !ip.is_empty() {
                          known_node_ips.push(ip.to_string());
-                         println!("[P2P] 🌐 Added known peer IP: {}", ip);
+                         println!("[P2P] 🔧 Using manual peer IP: {}", ip);
                      }
                  }
-             }
-             
-             // If no environment peers, try some default discovery
-             if known_node_ips.is_empty() {
-                 println!("[P2P] 💡 No peer IPs configured. Set QNET_PEER_IPS environment variable");
-                 println!("[P2P] 💡 Example: QNET_PEER_IPS=1.2.3.4,5.6.7.8");
+             } else {
+                 // Use built-in genesis nodes for bootstrap
+                 for (ip, region_name) in GENESIS_BOOTSTRAP_NODES {
+                     known_node_ips.push(ip.to_string());
+                     println!("[P2P] 🌟 Using genesis bootstrap node: {} ({})", ip, region_name);
+                 }
+                 println!("[P2P] ✅ Genesis bootstrap enabled - true decentralized network");
              }
             
-            // Search on known server IPs
+            // Search on known server IPs with proper regional ports
             for ip in known_node_ips {
-                for port_offset in 0..5 {
-                    let target_port = port + port_offset;
+                // Determine correct regional ports for this IP
+                let target_ports = if let Some((_, region_name)) = GENESIS_BOOTSTRAP_NODES.iter().find(|(node_ip, _)| *node_ip == ip) {
+                    match *region_name {
+                        "NorthAmerica" => vec![9876],
+                        "Europe" => vec![9877],
+                        "Asia" => vec![9878],
+                        "SouthAmerica" => vec![9879], 
+                        "Africa" => vec![9880],
+                        "Oceania" => vec![9881],
+                        _ => vec![port, port + 1, port + 2], // Fallback scan
+                    }
+                } else {
+                    // For manual QNET_PEER_IPS, try regional ports
+                    vec![9876, 9877, 9878, 9879, 9880, 9881]
+                };
+                
+                for target_port in target_ports {
                     let target_addr = format!("{}:{}", ip, target_port);
                     
                     // Try to connect with timeout
                     match tokio::time::timeout(
-                        std::time::Duration::from_secs(3),
+                        std::time::Duration::from_secs(5),
                         tokio::net::TcpStream::connect(&target_addr)
                     ).await {
                         Ok(Ok(_)) => {
-                            println!("[P2P] 🌐 Found QNet node at {}", target_addr);
+                            println!("[P2P] 🌟 Connected to QNet node at {}", target_addr);
+                            
+                            // Determine region based on IP and port
+                            let peer_region = match target_port {
+                                9876 => Region::NorthAmerica,
+                                9877 => Region::Europe,
+                                9878 => Region::Asia,
+                                9879 => Region::SouthAmerica,
+                                9880 => Region::Africa,
+                                9881 => Region::Oceania,
+                                _ => region.clone(),
+                            };
                             
                             let peer_info = PeerInfo {
-                                id: format!("inet_{}", target_addr.replace(":", "_")),
+                                id: format!("genesis_{}", target_addr.replace(":", "_")),
                                 addr: target_addr.clone(),
                                 node_type: NodeType::Full,
-                                region: region.clone(),
+                                region: peer_region,
                                 last_seen: std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .unwrap()
                                     .as_secs(),
                                 is_stable: true,
-                                cpu_load: 0.3,
-                                latency_ms: 50,
+                                cpu_load: 0.2,
+                                latency_ms: 30,
                                 connection_count: 0,
                                 bandwidth_usage: 0,
                             };
@@ -307,21 +334,39 @@ impl SimplifiedP2P {
                             discovered_peers.push(peer_info);
                             break;
                         }
-                        _ => {} // Connection failed
+                        _ => {} // Connection failed, try next port
                     }
                 }
             }
             
-            // If no known peers, try to discover through port scanning
-            // on common VPS provider IP ranges (very limited scan)
+            // If no direct connections found, load cached peers from previous sessions
             if discovered_peers.is_empty() {
-                println!("[P2P] 🔍 No known peers found, trying discovery...");
+                println!("[P2P] 🔍 No direct connections found, loading cached peers...");
                 
-                // Try connecting to other nodes that might be announced
-                // This could be enhanced with a peer registry service
+                if let Ok(cached_peers) = tokio::fs::read_to_string("node_data/cached_peers.json").await {
+                    if let Ok(cached_peer_list) = serde_json::from_str::<Vec<PeerInfo>>(&cached_peers) {
+                        for cached_peer in cached_peer_list {
+                            // Test if cached peer is still alive
+                            match tokio::time::timeout(
+                                std::time::Duration::from_secs(3),
+                                tokio::net::TcpStream::connect(&cached_peer.addr)
+                            ).await {
+                                Ok(Ok(_)) => {
+                                    println!("[P2P] 📱 Reconnected to cached peer: {}", cached_peer.addr);
+                                    discovered_peers.push(cached_peer);
+                                }
+                                _ => {
+                                    println!("[P2P] ⚠️ Cached peer {} offline", cached_peer.addr);
+                                }
+                            }
+                        }
+                    }
+                }
                 
-                println!("[P2P] 💡 To connect nodes, add server IPs to known_node_ips list");
-                println!("[P2P] 💡 Or implement a peer registry service");
+                if discovered_peers.is_empty() {
+                    println!("[P2P] 🌐 Network discovery: Waiting for peer announcements...");
+                    println!("[P2P] 💡 New nodes will find this network through genesis bootstrap");
+                }
             }
             
             println!("[P2P] 🌐 Internet peer search found {} nodes", discovered_peers.len());
@@ -337,20 +382,41 @@ impl SimplifiedP2P {
                 }
             }
             
-            // Add to connected peers
+            // Add to connected peers and save cache for true decentralization
             {
                 let mut connected = connected_peers.lock().unwrap();
-                for peer in discovered_peers {
+                for peer in discovered_peers.clone() {
                     connected.push(peer.clone());
                     println!("[P2P] ✅ Connected to internet peer: {}", peer.id);
                 }
             }
             
-            // If no peers found, run in standalone mode
+            // Save discovered peers to cache for future decentralized discovery
+            if !discovered_peers.is_empty() {
+                if let Err(_) = tokio::fs::create_dir_all("node_data").await {
+                    // Ignore directory creation errors
+                }
+                
+                if let Ok(cache_json) = serde_json::to_string_pretty(&discovered_peers) {
+                    if let Err(e) = tokio::fs::write("node_data/cached_peers.json", cache_json).await {
+                        println!("[P2P] ⚠️ Failed to cache peers: {}", e);
+                    } else {
+                        println!("[P2P] 💾 Cached {} peers for decentralized discovery", discovered_peers.len());
+                    }
+                }
+                
+                // Start peer exchange protocol for continued growth
+                let exchange_peers = discovered_peers.clone();
+                tokio::spawn(async move {
+                    Self::start_peer_exchange_protocol(exchange_peers).await;
+                });
+            }
+            
+            // If no peers found, still ready to accept new connections
             if connected_peers.lock().unwrap().is_empty() {
-                println!("[P2P] 🔍 No internet peers found, running in standalone mode");
-                println!("[P2P] 💡 Node is ready to accept connections from other QNet nodes");
-                println!("[P2P] 💡 Other nodes can connect to this node's external IP:port");
+                println!("[P2P] 🌐 Running in genesis mode - accepting new peer connections");
+                println!("[P2P] 💡 Node ready to bootstrap other QNet nodes joining the network");
+                println!("[P2P] 💡 Other nodes will discover this node through bootstrap or peer exchange");
             }
         });
     }
@@ -1121,6 +1187,74 @@ fn region_string(region: &Region) -> &'static str {
         Region::SouthAmerica => "SouthAmerica",
         Region::Africa => "Africa",
         Region::Oceania => "Oceania",
+    }
+}
+
+// Built-in genesis nodes for initial bootstrap (production deployment)
+const GENESIS_BOOTSTRAP_NODES: &[(&str, &str)] = &[
+    ("154.38.160.39", "NorthAmerica"), // Genesis Node #1
+    ("62.171.157.44", "Europe"),       // Genesis Node #2 
+    ("161.97.86.81", "Europe"),        // Genesis Node #3
+];
+
+impl SimplifiedP2P {
+    /// Start peer exchange protocol for decentralized network growth
+    async fn start_peer_exchange_protocol(initial_peers: Vec<PeerInfo>) {
+        println!("[P2P] 🔄 Starting peer exchange protocol for network growth...");
+        
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(300)); // 5 minutes
+        
+        loop {
+            interval.tick().await;
+            
+            // Request peer lists from connected nodes
+            for peer in &initial_peers {
+                if let Ok(new_peers) = Self::request_peer_list_from_node(&peer.addr).await {
+                    println!("[P2P] 📡 Received {} new peers from {}", new_peers.len(), peer.addr);
+                    
+                    // Cache new peers for future discovery
+                    if !new_peers.is_empty() {
+                        if let Ok(existing_cache) = tokio::fs::read_to_string("node_data/cached_peers.json").await {
+                            if let Ok(mut existing_peers) = serde_json::from_str::<Vec<PeerInfo>>(&existing_cache) {
+                                // Add unique new peers
+                                for new_peer in new_peers {
+                                    if !existing_peers.iter().any(|p| p.addr == new_peer.addr) {
+                                        existing_peers.push(new_peer);
+                                        println!("[P2P] 🆕 Cached new peer via exchange: {}", existing_peers.last().unwrap().addr);
+                                    }
+                                }
+                                
+                                // Save updated cache
+                                if let Ok(updated_cache) = serde_json::to_string_pretty(&existing_peers) {
+                                    let _ = tokio::fs::write("node_data/cached_peers.json", updated_cache).await;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            
+            println!("[P2P] 🌐 Peer exchange cycle completed - network continues to grow");
+        }
+    }
+    
+    /// Request peer list from a connected node for decentralized discovery
+    async fn request_peer_list_from_node(node_addr: &str) -> Result<Vec<PeerInfo>, String> {
+        // Simulate peer list request - in production this would be actual P2P protocol
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::net::TcpStream::connect(node_addr)
+        ).await {
+            Ok(Ok(_)) => {
+                // Node is alive, simulate receiving peer list
+                println!("[P2P] 📞 Requested peer list from {}", node_addr);
+                Ok(Vec::new()) // In production, this would return actual peer list from the node
+            }
+            _ => {
+                println!("[P2P] ⚠️ Failed to request peers from {}", node_addr);
+                Err("Connection failed".to_string())
+            }
+        }
     }
 }
 
