@@ -133,7 +133,7 @@ async fn decode_activation_code_quantum_secure(
 fn validate_activation_code_node_type(code: &str, expected_type: NodeType, current_phase: u8, current_pricing: &PricingInfo) -> Result<(), String> {
     println!("\n🔍 === Activation Code Validation (DEVELOPMENT MODE) ===");
     
-    // Production mode - validate QNET activation codes only
+    // Production mode - validate QNET activation codes only  
     if !code.starts_with("QNET-") || code.len() != 17 {
         return Err("Invalid activation code format. Expected: QNET-XXXX-XXXX-XXXX".to_string());
     }
@@ -406,7 +406,7 @@ async fn validate_activation_code_comprehensive(
         }
     }
     
-    // 2. Format validation
+    // 2. Format validation - QNET-XXXX-XXXX-XXXX for production
     if !code.starts_with("QNET-") || code.len() != 17 {
         return Err("Invalid activation code format. Expected: QNET-XXXX-XXXX-XXXX".to_string());
     }
@@ -968,10 +968,22 @@ fn select_node_type(phase: u8, pricing: &PricingInfo) -> Result<NodeType, Box<dy
         Err(_) => return Ok(NodeType::Full),
     }
     
-    match input.trim() {
-        "1" => Ok(NodeType::Full),
-        "2" => Ok(NodeType::Super),
-        _ => Ok(NodeType::Full)
+    let choice = input.trim().chars().filter(|c| c.is_ascii_digit()).collect::<String>();
+    println!("Debug: cleaned input '{}'", choice);
+    
+    match choice.as_str() {
+        "1" => {
+            println!("✅ Full Node selected");
+            Ok(NodeType::Full)
+        },
+        "2" => {
+            println!("✅ Super Node selected");
+            Ok(NodeType::Super)
+        },
+        _ => {
+            println!("❌ Invalid choice '{}', defaulting to Full Node", choice);
+            Ok(NodeType::Full)
+        }
     }
 }
 
@@ -1138,6 +1150,23 @@ async fn find_available_port(preferred: u16) -> Result<u16, Box<dyn std::error::
 fn get_bootstrap_peers_for_region(region: &Region) -> Vec<String> {
     println!("[BOOTSTRAP] Multi-regional peer discovery for region: {:?}", region);
     
+    // Check for manually specified peer IPs
+    if let Ok(peer_ips) = std::env::var("QNET_PEER_IPS") {
+        let peers: Vec<String> = peer_ips
+            .split(',')
+            .map(|ip| {
+                let ip = ip.trim();
+                let port = get_regional_port(region);
+                format!("{}:{}", ip, port)
+            })
+            .collect();
+        
+        if !peers.is_empty() {
+            println!("[BOOTSTRAP] ✅ Using manual peer IPs: {:?}", peers);
+            return peers;
+        }
+    }
+    
     // Primary region port
     let primary_port = get_regional_port(region);
     println!("[BOOTSTRAP] Primary regional port: {}", primary_port);
@@ -1164,35 +1193,62 @@ fn get_regional_port(region: &Region) -> u16 {
     }
 }
 
-// Production-grade physical IP detection - PUBLIC IP ONLY
-fn get_physical_ip() -> Result<String, String> {
-    use std::net::{IpAddr};
+// Get real external IP address for Docker containers
+async fn get_physical_ip() -> Result<String, String> {
+    println!("[IP] Getting external IP address...");
     
-    // Method 1: Check network interfaces for PUBLIC IP only
-    if let Ok(interfaces) = get_all_network_interfaces() {
-        for interface in interfaces {
-            if let IpAddr::V4(ipv4) = interface {
-                // STRICT: Only accept public IP addresses
-                if !ipv4.is_loopback() && !ipv4.is_private() && !ipv4.is_link_local() && !ipv4.is_multicast() {
-                    println!("[IP] Found public IP: {}", ipv4);
-                    return Ok(ipv4.to_string());
-                }
+    // List of reliable IP detection services
+    let services = [
+        "https://api.ipify.org",
+        "https://ifconfig.me/ip", 
+        "https://icanhazip.com",
+    ];
+    
+    for service in services {
+        match get_external_ip_from_service(service).await {
+            Ok(ip) => {
+                println!("[IP] ✅ External IP detected: {}", ip);
+                return Ok(ip);
+            }
+            Err(e) => {
+                println!("[IP] ❌ Failed to get IP from {}: {}", service, e);
+                continue;
             }
         }
     }
     
-    // Method 2: Check gateway interface for PUBLIC IP
-    if let Ok(gateway_ip) = get_gateway_interface_ip() {
-        if let Ok(parsed_ip) = gateway_ip.parse::<std::net::Ipv4Addr>() {
-            if !parsed_ip.is_private() && !parsed_ip.is_loopback() && !parsed_ip.is_link_local() {
-                println!("[IP] Found public gateway IP: {}", gateway_ip);
-                return Ok(gateway_ip);
-            }
-        }
+    Err("Failed to detect external IP from all services".to_string())
+}
+
+// Get external IP from a specific service
+async fn get_external_ip_from_service(url: &str) -> Result<String, String> {
+    use std::time::Duration;
+    
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|e| format!("HTTP client error: {}", e))?;
+    
+    let response = client.get(url)
+        .send()
+        .await
+        .map_err(|e| format!("Request failed: {}", e))?;
+    
+    if !response.status().is_success() {
+        return Err(format!("HTTP error: {}", response.status()));
     }
     
-    // NO FALLBACK - Public IP required for region detection
-    Err("No public IP address found - production deployment requires public IP or manual QNET_REGION setting".to_string())
+    let ip_text = response.text().await
+        .map_err(|e| format!("Response read error: {}", e))?;
+    
+    let ip = ip_text.trim().to_string();
+    
+    // Basic IP validation
+    if ip.parse::<std::net::Ipv4Addr>().is_ok() {
+        Ok(ip)
+    } else {
+        Err(format!("Invalid IP format: {}", ip))
+    }
 }
 
 // Get all network interfaces without external dependencies
@@ -2096,10 +2152,18 @@ async fn detect_region_via_latency_test() -> Result<Region, String> {
     println!("[LATENCY] Starting decentralized region detection via port latency...");
     
     // Get our physical IP first for region hint
-    let our_ip = match get_physical_ip() {
+    let our_ip = match get_physical_ip().await {
         Ok(ip) => {
             if let Ok(parsed_ip) = ip.parse::<std::net::Ipv4Addr>() {
                 println!("[LATENCY] Physical IP: {}", ip);
+                
+                // Use GeoIP-style region detection
+                let region = determine_region_from_ip(&parsed_ip);
+                if let Some(detected_region) = region {
+                    println!("[LATENCY] ✅ Region detected from IP: {:?}", detected_region);
+                    return Ok(detected_region);
+                }
+                
                 Some(parsed_ip)
             } else {
                 None
@@ -2753,5 +2817,85 @@ async fn test_directory_permissions(path: &PathBuf) -> bool {
 }
 
 // Auto-detect available port
+
+// Accurate IP-to-region mapping using known server provider ranges
+fn determine_region_from_ip(ip: &std::net::Ipv4Addr) -> Option<Region> {
+    let octets = ip.octets();
+    let first_octet = octets[0];
+    let second_octet = octets[1];
+    
+    // Major server providers and their regions
+    match (first_octet, second_octet) {
+        // Hetzner (Europe) - 78.46.x.x, 88.99.x.x, 94.130.x.x, 95.216.x.x, 135.181.x.x, 159.69.x.x, 162.55.x.x, 168.119.x.x
+        (78, 46) | (88, 99) | (94, 130) | (95, 216) | (135, 181) | (159, 69) | (162, 55) | (168, 119) => Some(Region::Europe),
+        
+        // DigitalOcean
+        (104, 248) | (137, 184) | (138, 197) | (159, 89) | (161, 35) | (164, 68) | (164, 90) | (165, 22) | (167, 99) | (178, 62) => {
+            // DigitalOcean has global presence, need more specific detection
+            match (first_octet, second_octet) {
+                (104, 248) | (137, 184) => Some(Region::NorthAmerica), // NYC/SF
+                (138, 197) | (159, 89) => Some(Region::Europe), // Amsterdam/London
+                (161, 35) | (164, 90) => Some(Region::Asia), // Singapore
+                (164, 68) => Some(Region::NorthAmerica), // NYC datacenter
+                _ => Some(Region::NorthAmerica) // Default to US
+            }
+        },
+        
+        // AWS ranges
+        (3, _) | (13, _) | (15, _) | (18, _) | (34, _) | (35, _) | (52, _) | (54, _) => {
+            // AWS global - basic regional detection
+            match first_octet {
+                3 | 13 | 15 | 18 => Some(Region::NorthAmerica), // US-East
+                34 | 35 => Some(Region::NorthAmerica), // US-West  
+                52 | 54 => Some(Region::Europe), // EU regions
+                _ => Some(Region::NorthAmerica)
+            }
+        },
+        
+        // Google Cloud
+        (34, 67) | (34, 68) | (34, 69) | (34, 70) | (34, 71) | (34, 72) | (34, 73) | (34, 74) => Some(Region::NorthAmerica),
+        (34, 76) | (34, 77) | (34, 78) | (34, 79) => Some(Region::Europe),
+        (34, 80) | (34, 81) | (34, 82) => Some(Region::Asia),
+        
+        // Vultr
+        (45, 32) | (45, 63) | (45, 76) | (45, 77) => Some(Region::NorthAmerica),
+        (45, 83) | (45, 84) | (95, 179) => Some(Region::Europe),
+        (45, 32) => Some(Region::Asia),
+        
+        // Linode  
+        (139, 144) | (139, 162) | (172, 104) | (173, 255) => Some(Region::NorthAmerica),
+        (139, 144) | (172, 105) => Some(Region::Europe),
+        (139, 162) => Some(Region::Asia),
+        
+        // OVH
+        (51, 254) | (51, 255) | (137, 74) | (146, 59) | (151, 80) | (178, 32) => Some(Region::Europe),
+        (142, 44) | (167, 114) => Some(Region::NorthAmerica),
+        
+        // Contabo (Europe)
+        (161, 97) | (164, 68) | (207, 180) => Some(Region::Europe),
+        
+        // Major US providers
+        (192, 155) | (198, 23) | (199, 66) | (208, 94) => Some(Region::NorthAmerica),
+        
+        // Major European providers  
+        (62, 171) | (85, 214) | (91, 134) | (176, 31) => Some(Region::Europe),
+        
+        // Asian providers
+        (103, _) | (118, _) | (119, _) | (202, _) | (203, _) => Some(Region::Asia),
+        
+        // Default fallback based on general IP ranges
+        _ => {
+            match first_octet {
+                1..=24 => Some(Region::NorthAmerica),    // Mostly US
+                25..=49 => Some(Region::Europe),         // Europe
+                50..=100 => Some(Region::NorthAmerica),  // US
+                101..=150 => Some(Region::Asia),         // Asia-Pacific  
+                151..=200 => Some(Region::Europe),       // Europe
+                201..=223 => Some(Region::SouthAmerica), // South America
+                _ => None
+            }
+        }
+    }
+}
 
 
