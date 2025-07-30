@@ -107,9 +107,9 @@ def test_node_code_generation():
     print("🔑 Testing Node Code Generation...")
     
     test_eon_addresses = [
-        "7a9bk4f2eon8x3m5z1c7",
-        "abc123eonxyz789def0",
-        "test123eonproduction"
+        "7a9bk4f2eon8x3m5z1c",
+        "abc12345eonxyz789de",
+        "test1234eonproductn"
     ]
     
     for eon_address in test_eon_addresses:

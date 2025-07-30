@@ -1,6 +1,6 @@
 /**
  * QNet Mobile - EON Address Generator
- * Generates unique EON addresses in format: 7a9bk4f2eon8x3m5z1c7
+ * Generates unique EON addresses in format: 7a9bk4f2eon8x3m5z1c
  * Mobile-optimized version with React Native compatibility
  */
 
@@ -12,13 +12,13 @@ export class EONAddressGenerator {
     // EON address character set (excluding confusing characters)
     this.charset = '0123456789abcdefghijklmnopqrstuvwxyz';
     this.eonPrefix = 'eon';
-    this.addressLength = 20; // Total length including 'eon' prefix
+    this.addressLength = 19; // Total length: 8 + 3 + 8 = 19 characters
   }
 
   /**
    * Generate EON address from seed phrase
    * @param {string} seedPhrase - BIP39 seed phrase
-   * @returns {Promise<string>} - EON address (e.g., "7a9bk4f2eon8x3m5z1c7")
+   * @returns {Promise<string>} - EON address (e.g., "7a9bk4f2eon8x3m5z1c")
    */
   async generateFromSeed(seedPhrase) {
     try {
@@ -118,13 +118,13 @@ export class EONAddressGenerator {
   generateSuffix(bytes) {
     let suffix = '';
     
-    for (let i = 0; i < bytes.length && suffix.length < 9; i++) {
+    for (let i = 0; i < bytes.length && suffix.length < 8; i++) {
       const byte = bytes[i];
       const charIndex = byte % this.charset.length;
       suffix += this.charset[charIndex];
     }
     
-    return suffix.substring(0, 9); // Last 9 characters
+    return suffix.substring(0, 8); // Last 8 characters
   }
 
   /**
@@ -176,7 +176,7 @@ export class EONAddressGenerator {
         }
       }
 
-      // Check structure: 8 chars + 'eon' + 9 chars = 20 total
+      // Check structure: 8 chars + 'eon' + 8 chars = 19 total
       const eonIndex = address.indexOf(this.eonPrefix);
       if (eonIndex !== 8) {
         return false;
@@ -216,7 +216,7 @@ export class EONAddressGenerator {
       }
 
       const prefix = address.substring(0, 8);
-      const suffix = address.substring(11, 20);
+      const suffix = address.substring(11, 19);
       
       // Generate network info from address components
       const networkId = this.calculateNetworkId(prefix);
