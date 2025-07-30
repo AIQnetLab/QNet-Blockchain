@@ -16,7 +16,7 @@ RUN apt-get update && apt-get install -y \
 # Set working directory
 WORKDIR /build
 
-# Copy entire workspace from project root
+# Copy workspace from project root (context should be QNet-Project root)
 COPY . .
 
 # Build the specific binary with maximum optimization for production
@@ -26,6 +26,7 @@ ENV CARGO_HTTP_MULTIPLEXING=false
 ENV CARGO_NET_RETRY=10
 ENV CARGO_HTTP_TIMEOUT=300
 
+# Build from workspace root with correct binary path
 RUN cargo build --profile release-fast --bin qnet-node \
     && strip target/release-fast/qnet-node \
     && cp target/release-fast/qnet-node /usr/local/bin/
