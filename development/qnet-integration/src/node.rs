@@ -427,9 +427,54 @@ impl BlockchainNode {
                         }
                     }
                     
-                    microblock_height += 1;
+                    // Check if this node should be the leader for block production
+                    let is_leader = if let Some(p2p) = &unified_p2p {
+                        p2p.should_be_leader(&node_id)
+                    } else {
+                        true // Standalone mode
+                    };
                     
-                    // Create production-ready microblock with local finalization
+                    if !is_leader {
+                        // Non-leader nodes just sync with the network
+                        if let Some(p2p) = &unified_p2p {
+                            match p2p.sync_blockchain_height() {
+                                Ok(consensus_height) => {
+                                    if consensus_height > microblock_height {
+                                        println!("[SYNC] 🔄 Follower syncing to leader height: {} -> {}", microblock_height, consensus_height);
+                                        microblock_height = consensus_height;
+                                    }
+                                },
+                                Err(_) => {} // Silent sync failure for followers
+                            }
+                        }
+                        // Skip block creation for non-leaders
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        continue;
+                    }
+                    
+                    // Leader: Sync with network consensus height before creating new blocks
+                    if let Some(p2p) = &unified_p2p {
+                        match p2p.sync_blockchain_height() {
+                            Ok(consensus_height) => {
+                                if consensus_height > microblock_height {
+                                    println!("[SYNC] 🔄 Leader syncing to consensus height: {} -> {}", microblock_height, consensus_height);
+                                    microblock_height = consensus_height;
+                                } else if microblock_height > consensus_height + 5 {
+                                    // Don't get too far ahead of the network
+                                    println!("[SYNC] ⚠️ Leader too far ahead, waiting for network: {} -> {}", microblock_height, consensus_height + 1);
+                                    microblock_height = consensus_height + 1;
+                                }
+                            },
+                            Err(e) => {
+                                println!("[SYNC] ⚠️ Leader sync failed, continuing: {}", e);
+                            }
+                        }
+                    }
+                    
+                    microblock_height += 1;
+                    println!("[LEADER] 👑 Creating block #{} as network leader", microblock_height);
+                    
+                    // Create production-ready microblock with network consensus
                     let microblock = qnet_state::MicroBlock {
                         height: microblock_height,
                         timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),

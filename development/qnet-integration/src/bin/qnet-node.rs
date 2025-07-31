@@ -948,41 +948,48 @@ fn display_phase_info(phase: u8, pricing: &PricingInfo) {
 }
 
 fn select_node_type(phase: u8, pricing: &PricingInfo) -> Result<NodeType, Box<dyn std::error::Error>> {
-    println!("\n🖥️ Node Type:");
-    println!("1. Full Node   - Standard server");
-    println!("2. Super Node  - High-performance server");
-    
-    // Show pricing
-    for (i, node_type) in [NodeType::Full, NodeType::Super].iter().enumerate() {
-        let price = calculate_node_price(phase, *node_type, pricing);
-        let price_str = format_price(phase, price);
-        println!("   {}. {}", i + 1, price_str);
-    }
-    
-    print!("\nChoice (1-2): ");
-    io::stdout().flush()?;
-    
-    let mut input = String::new();
-    match io::stdin().read_line(&mut input) {
-        Ok(_) => {},
-        Err(_) => return Ok(NodeType::Full),
-    }
-    
-    let choice = input.trim().chars().filter(|c| c.is_ascii_digit()).collect::<String>();
-    println!("Debug: cleaned input '{}'", choice);
-    
-    match choice.as_str() {
-        "1" => {
-            println!("✅ Full Node selected");
-            Ok(NodeType::Full)
-        },
-        "2" => {
-            println!("✅ Super Node selected");
-            Ok(NodeType::Super)
-        },
-        _ => {
-            println!("❌ Invalid choice '{}', defaulting to Full Node", choice);
-            Ok(NodeType::Full)
+    loop {
+        println!("\n🖥️ Node Type:");
+        println!("1. Full Node   - Standard server");
+        println!("2. Super Node  - High-performance server");
+        
+        // Show pricing
+        for (i, node_type) in [NodeType::Full, NodeType::Super].iter().enumerate() {
+            let price = calculate_node_price(phase, *node_type, pricing);
+            let price_str = format_price(phase, price);
+            println!("   {}. {}", i + 1, price_str);
+        }
+        
+        print!("\nChoice (1-2): ");
+        io::stdout().flush()?;
+        
+        let mut input = String::new();
+        match io::stdin().read_line(&mut input) {
+            Ok(_) => {},
+            Err(_) => continue,
+        }
+        
+        // Take only the first digit from input
+        let choice = input.trim().chars()
+            .find(|c| c.is_ascii_digit())
+            .map(|c| c.to_string())
+            .unwrap_or_default();
+        
+        println!("Debug: cleaned input '{}'", choice);
+        
+        match choice.as_str() {
+            "1" => {
+                println!("✅ Full Node selected");
+                return Ok(NodeType::Full);
+            },
+            "2" => {
+                println!("✅ Super Node selected");
+                return Ok(NodeType::Super);
+            },
+            _ => {
+                println!("❌ Invalid choice '{}'. Please enter 1 or 2.", choice);
+                // Continue the loop to ask again
+            }
         }
     }
 }
