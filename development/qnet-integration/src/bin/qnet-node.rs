@@ -133,7 +133,7 @@ async fn decode_activation_code_quantum_secure(
 fn validate_activation_code_node_type(code: &str, expected_type: NodeType, current_phase: u8, current_pricing: &PricingInfo) -> Result<(), String> {
     println!("\n🔍 === Activation Code Validation (DEVELOPMENT MODE) ===");
     
-    // Production mode - validate QNET activation codes only  
+    // Production mode - validate QNET activation codes only
     if !code.starts_with("QNET-") || code.len() != 17 {
         return Err("Invalid activation code format. Expected: QNET-XXXX-XXXX-XXXX".to_string());
     }
@@ -954,17 +954,17 @@ fn select_node_type(phase: u8, pricing: &PricingInfo) -> Result<NodeType, Box<dy
         println!("2. Super Node  - High-performance server");
         
         // Show pricing
-        for (i, node_type) in [NodeType::Full, NodeType::Super].iter().enumerate() {
-            let price = calculate_node_price(phase, *node_type, pricing);
-            let price_str = format_price(phase, price);
+    for (i, node_type) in [NodeType::Full, NodeType::Super].iter().enumerate() {
+        let price = calculate_node_price(phase, *node_type, pricing);
+        let price_str = format_price(phase, price);
             println!("   {}. {}", i + 1, price_str);
-        }
-        
+    }
+    
         print!("\nChoice (1-2): ");
-        io::stdout().flush()?;
-        
-        let mut input = String::new();
-        match io::stdin().read_line(&mut input) {
+    io::stdout().flush()?;
+    
+    let mut input = String::new();
+    match io::stdin().read_line(&mut input) {
             Ok(_) => {},
             Err(_) => continue,
         }
@@ -978,15 +978,15 @@ fn select_node_type(phase: u8, pricing: &PricingInfo) -> Result<NodeType, Box<dy
         println!("Debug: cleaned input '{}'", choice);
         
         match choice.as_str() {
-            "1" => {
+        "1" => {
                 println!("✅ Full Node selected");
                 return Ok(NodeType::Full);
-            },
-            "2" => {
+        },
+        "2" => {
                 println!("✅ Super Node selected");
                 return Ok(NodeType::Super);
-            },
-            _ => {
+        },
+        _ => {
                 println!("❌ Invalid choice '{}'. Please enter 1 or 2.", choice);
                 // Continue the loop to ask again
             }
@@ -1727,6 +1727,12 @@ fn is_south_america_ip(ip: &Ipv4Addr) -> bool {
 fn is_africa_ip(ip: &Ipv4Addr) -> bool {
     let ip_u32 = u32::from(*ip);
     let first_octet = (ip_u32 >> 24) as u8;
+    let second_octet = ((ip_u32 >> 16) & 0xFF) as u8;
+    
+    // Special exception for known North American servers
+    if first_octet == 154 && second_octet == 38 {
+        return false; // Contabo North America server
+    }
     
     // Major African IP blocks (AfriNIC allocation)
     // 41.0.0.0/8, 102.0.0.0/8, 105.0.0.0/8, 154.0.0.0/8, 155.0.0.0/8, 156.0.0.0/8
@@ -2073,7 +2079,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     
     // DAEMON MODE: Run indefinitely with health checks
-    loop {
+            loop {
         tokio::time::sleep(Duration::from_secs(300)).await; // 5 minute health check
         
         // Optional: Silent health check (no spam)
@@ -2730,7 +2736,7 @@ fn parse_bootstrap_peers(peers_str: &Option<String>) -> Vec<String> {
         .as_ref()
         .map(|s| s.split(',').map(|p| p.trim().to_string()).collect())
         .unwrap_or_default()
-}
+} 
 
 
 
@@ -2854,8 +2860,11 @@ fn determine_region_from_ip(ip: &std::net::Ipv4Addr) -> Option<Region> {
     let first_octet = octets[0];
     let second_octet = octets[1];
     
-    // Major server providers and their regions
+    // Major server providers and their regions  
     match (first_octet, second_octet) {
+        // Contabo North America - specific server
+        (154, 38) => Some(Region::NorthAmerica),
+        
         // Hetzner (Europe) - 78.46.x.x, 88.99.x.x, 94.130.x.x, 95.216.x.x, 135.181.x.x, 159.69.x.x, 162.55.x.x, 168.119.x.x
         (78, 46) | (88, 99) | (94, 130) | (95, 216) | (135, 181) | (159, 69) | (162, 55) | (168, 119) => Some(Region::Europe),
         

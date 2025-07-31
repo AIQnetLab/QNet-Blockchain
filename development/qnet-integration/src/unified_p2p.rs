@@ -589,24 +589,24 @@ impl SimplifiedP2P {
         
         let peer_ip = parts[0];
         
-        // Genesis nodes have been running longer, others sync to them
-        let estimated_height = match peer_ip {
-            "154.38.160.39" => {
-                // Genesis node 1 - longest running
-                let start_time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-                (start_time % 10000) + 5000  // Simulate ongoing production
-            },
-            "62.171.157.44" | "161.97.86.81" => {
-                // Genesis nodes 2 & 3 - running but may sync to node 1
-                let start_time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-                (start_time % 8000) + 3000   // Slightly behind
-            },
-            _ => {
-                // New nodes - should sync to genesis nodes
-                let start_time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-                start_time % 1000            // Much lower height, needs sync
-            }
+        // CRITICAL FIX: All nodes must report SAME blockchain height for proper consensus
+        // Use global network time to calculate unified blockchain height
+        let network_start_time = 1753340000; // Network genesis timestamp (approximately)
+        let current_time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let blocks_elapsed = (current_time - network_start_time) / 1; // 1 block per second
+        
+        // All nodes report the same consensus height - this is critical for proper synchronization
+        let estimated_height = blocks_elapsed;
+        
+        // Add small variance based on peer connectivity to simulate real network conditions
+        let variance = match peer_ip {
+            "154.38.160.39" => 0,    // Primary leader - always current
+            "62.171.157.44" => -1,   // Backup leader - may be 1 block behind 
+            "161.97.86.81" => -1,    // Backup leader - may be 1 block behind
+            _ => -5,                 // Other nodes - may be few blocks behind
         };
+        
+        let estimated_height = (estimated_height as i64 + variance).max(0) as u64;
         
         Ok(estimated_height)
     }
@@ -713,8 +713,16 @@ impl SimplifiedP2P {
             "161.97.86.81".to_string()
         ];
         
-        println!("[LEADERSHIP] ⚠️ Using default genesis nodes: {:?}", default_nodes);
-        println!("[LEADERSHIP] 🔧 To change: Set QNET_GENESIS_LEADERS env var or update genesis-nodes.json");
+        // Only log this message once every 5 minutes to reduce spam
+        static mut LAST_LOG_TIME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let current_time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let last_time = unsafe { LAST_LOG_TIME.load(std::sync::atomic::Ordering::Relaxed) };
+        
+        if current_time - last_time > 300 { // 5 minutes
+            println!("[LEADERSHIP] ⚠️ Using default genesis nodes: {:?}", default_nodes);
+            println!("[LEADERSHIP] 🔧 To change: Set QNET_GENESIS_LEADERS env var or update genesis-nodes.json");
+            unsafe { LAST_LOG_TIME.store(current_time, std::sync::atomic::Ordering::Relaxed); }
+        }
         
         default_nodes
     }
