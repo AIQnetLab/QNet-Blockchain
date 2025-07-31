@@ -2014,7 +2014,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("📍 Region: {} (auto-detected)", format_region(&config.region));
     println!("🌐 External IP: {}", external_ip);
     println!("🏗️  Network role: {}", node_role);
-    println!("⚡ Node type: {} (High-performance mode)", config.node_type);
+    println!("⚡ Node type: {} (High-performance mode)", format_node_type(node_type));
     println!("");
     
     println!("📋 Management commands:");
@@ -2085,12 +2085,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("💓 Node health check: {} | Status: Healthy | Mode: Daemon", current_time);
         }
     }
-    
-    // TODO: Add stop method to BlockchainNode
-    // node.stop().await?;
-    println!("✅ Node stopped successfully");
-    
-    Ok(())
 }
 
 fn configure_production_mode() {
@@ -2888,27 +2882,22 @@ fn determine_region_from_ip(ip: &std::net::Ipv4Addr) -> Option<Region> {
             }
         },
         
-        // Google Cloud
-        (34, 67) | (34, 68) | (34, 69) | (34, 70) | (34, 71) | (34, 72) | (34, 73) | (34, 74) => Some(Region::NorthAmerica),
-        (34, 76) | (34, 77) | (34, 78) | (34, 79) => Some(Region::Europe),
-        (34, 80) | (34, 81) | (34, 82) => Some(Region::Asia),
+        // Google Cloud ranges already covered by AWS (34, _) pattern above
         
         // Vultr
         (45, 32) | (45, 63) | (45, 76) | (45, 77) => Some(Region::NorthAmerica),
         (45, 83) | (45, 84) | (95, 179) => Some(Region::Europe),
-        (45, 32) => Some(Region::Asia),
         
         // Linode  
-        (139, 144) | (139, 162) | (172, 104) | (173, 255) => Some(Region::NorthAmerica),
-        (139, 144) | (172, 105) => Some(Region::Europe),
-        (139, 162) => Some(Region::Asia),
+        (139, 144) | (172, 104) | (173, 255) => Some(Region::NorthAmerica),
+        (139, 162) | (172, 105) => Some(Region::Europe),
         
         // OVH
         (51, 254) | (51, 255) | (137, 74) | (146, 59) | (151, 80) | (178, 32) => Some(Region::Europe),
         (142, 44) | (167, 114) => Some(Region::NorthAmerica),
         
         // Additional European providers
-        (161, 97) | (164, 68) | (207, 180) => Some(Region::Europe),
+        (161, 97) | (207, 180) => Some(Region::Europe),
         
         // Major US providers
         (192, 155) | (198, 23) | (199, 66) | (208, 94) => Some(Region::NorthAmerica),
