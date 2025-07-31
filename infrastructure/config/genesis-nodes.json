@@ -1,0 +1,15 @@
+{
+  "genesis_nodes": [
+    "154.38.160.39",
+    "62.171.157.44", 
+    "161.97.86.81"
+  ],
+  "config_version": "1.0",
+  "updated_at": "2025-01-31T04:00:00Z",
+  "description": "QNet Genesis Leader Nodes Configuration - Update when changing VDS servers",
+  "instructions": {
+    "environment_override": "Set QNET_GENESIS_LEADERS=ip1,ip2,ip3 to override this config",
+    "reload": "Nodes automatically reload this config every 5 minutes",
+    "deployment": "Copy to node_data/genesis-nodes.json on each server"
+  }
+} 

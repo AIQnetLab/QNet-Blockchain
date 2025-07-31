@@ -110,6 +110,9 @@ pub struct SimplifiedP2P {
     
     /// Network status
     is_running: Arc<Mutex<bool>>,
+    
+    /// Leadership tracking for failover detection
+    previous_leader: Arc<Mutex<Option<String>>>,
 }
 
 impl SimplifiedP2P {
@@ -139,6 +142,7 @@ impl SimplifiedP2P {
             total_bytes_sent: Arc::new(Mutex::new(0)),
             total_bytes_received: Arc::new(Mutex::new(0)),
             is_running: Arc::new(Mutex::new(false)),
+            previous_leader: Arc::new(Mutex::new(None)),
         }
     }
     
@@ -607,27 +611,143 @@ impl SimplifiedP2P {
         Ok(estimated_height)
     }
     
-    /// Determine if this node should be the leader for block production
+    /// Determine if this node should be the leader for block production (Dynamic Leadership)
     pub fn should_be_leader(&self, node_id: &str) -> bool {
         let connected = self.connected_peers.lock().unwrap();
         
-        // Genesis node 1 (154.38.160.39) is always the leader
-        if node_id.contains("154.38.160.39") || node_id.ends_with("_9876_2") {
-            return true;
+        // Dynamic leadership with automatic failover
+        let my_ip = self.extract_node_ip(node_id);
+        
+        // Check if higher-priority leaders are available (PRODUCTION FIX)
+        let genesis_priority = self.load_genesis_nodes_config();
+        
+        for (index, priority_ip) in genesis_priority.iter().enumerate() {
+            if my_ip == priority_ip {
+                // Check if any higher-priority leaders are online
+                let higher_priority_online = genesis_priority[..index]
+                    .iter()
+                    .any(|ip| self.is_peer_online(ip, &connected));
+                
+                                 if !higher_priority_online {
+                     // Check if this is a leadership change
+                     let prev_leader = self.previous_leader.lock().unwrap();
+                     if prev_leader.as_ref() != Some(&my_ip.to_string()) {
+                         println!("[LEADERSHIP] 🔄 LEADERSHIP CHANGE: {} -> {} (Priority {})", 
+                             prev_leader.as_ref().unwrap_or(&"None".to_string()), my_ip, index + 1);
+                         drop(prev_leader);
+                         *self.previous_leader.lock().unwrap() = Some(my_ip.to_string());
+                     }
+                     return true;
+                 }
+            }
         }
         
-        // If genesis node 1 is not connected, genesis node 2 becomes leader
-        let has_genesis_1 = connected.iter().any(|p| p.addr.contains("154.38.160.39"));
-        if !has_genesis_1 && (node_id.contains("62.171.157.44") || node_id.ends_with("_9877_2")) {
-            return true;
-        }
-        
-        // If no genesis nodes, first connected peer becomes leader
-        if connected.is_empty() {
+        // If no genesis nodes are available, any connected node can become leader
+        if connected.is_empty() && !my_ip.is_empty() {
+            println!("[LEADERSHIP] 🆘 Emergency leadership: No genesis nodes available");
             return true;
         }
         
         false
+    }
+    
+    /// Extract IP address from node_id
+    fn extract_node_ip(&self, node_id: &str) -> &str {
+        // Extract IP from various node_id formats
+        if node_id.contains("154.38.160.39") { "154.38.160.39" }
+        else if node_id.contains("62.171.157.44") { "62.171.157.44" }
+        else if node_id.contains("161.97.86.81") { "161.97.86.81" }
+        else { "" }
+    }
+    
+    /// Check if a specific peer IP is online
+    fn is_peer_online(&self, target_ip: &str, connected: &std::sync::MutexGuard<Vec<PeerInfo>>) -> bool {
+        connected.iter().any(|peer| peer.addr.contains(target_ip))
+    }
+    
+    /// Get current network leader (for debugging)
+    pub fn get_current_leader(&self) -> Option<String> {
+        let connected = self.connected_peers.lock().unwrap();
+        
+        // PRODUCTION FIX: Load genesis nodes from environment or config file
+        let genesis_priority = self.load_genesis_nodes_config();
+        
+        // Find the highest-priority online genesis node
+        for ip in &genesis_priority {
+            if self.is_peer_online(ip, &connected) {
+                return Some(ip.to_string());
+            }
+        }
+        
+        // If no genesis nodes, return first connected peer
+        connected.first().map(|peer| peer.addr.clone())
+    }
+    
+    /// Load genesis nodes from environment or config file (PRODUCTION FIX)
+    fn load_genesis_nodes_config(&self) -> Vec<String> {
+        // Priority 1: Environment variable (for easy VDS changes)
+        if let Ok(env_nodes) = std::env::var("QNET_GENESIS_LEADERS") {
+            let nodes: Vec<String> = env_nodes.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            
+            if !nodes.is_empty() {
+                println!("[LEADERSHIP] 🔧 Using environment genesis nodes: {:?}", nodes);
+                return nodes;
+            }
+        }
+        
+        // Priority 2: Config file (persistent configuration)
+        if let Ok(config_nodes) = self.load_genesis_from_config_file() {
+            if !config_nodes.is_empty() {
+                println!("[LEADERSHIP] 📄 Using config file genesis nodes: {:?}", config_nodes);
+                return config_nodes;
+            }
+        }
+        
+        // Fallback: Default hardcoded nodes (for initial deployment only)
+        let default_nodes = vec![
+            "154.38.160.39".to_string(), 
+            "62.171.157.44".to_string(), 
+            "161.97.86.81".to_string()
+        ];
+        
+        println!("[LEADERSHIP] ⚠️ Using default genesis nodes: {:?}", default_nodes);
+        println!("[LEADERSHIP] 🔧 To change: Set QNET_GENESIS_LEADERS env var or update genesis-nodes.json");
+        
+        default_nodes
+    }
+    
+    /// Load genesis nodes from config file
+    fn load_genesis_from_config_file(&self) -> Result<Vec<String>, String> {
+        use std::fs;
+        
+        let config_paths = vec![
+            "genesis-nodes.json",
+            "node_data/genesis-nodes.json", 
+            "/etc/qnet/genesis-nodes.json",
+            "~/.qnet/genesis-nodes.json"
+        ];
+        
+        for path in config_paths {
+            if let Ok(content) = fs::read_to_string(path) {
+                if let Ok(config) = serde_json::from_str::<serde_json::Value>(&content) {
+                    if let Some(nodes) = config["genesis_nodes"].as_array() {
+                        let node_ips: Vec<String> = nodes.iter()
+                            .filter_map(|v| v.as_str())
+                            .map(|s| s.to_string())
+                            .collect();
+                        
+                        if !node_ips.is_empty() {
+                            return Ok(node_ips);
+                        }
+                    }
+                }
+            }
+        }
+        
+        Err("No config file found".to_string())
     }
     
     /// Broadcast transaction

@@ -47,38 +47,119 @@ cargo build --release --bin qnet-node
 docker build -t qnet-production -f development/qnet-integration/Dockerfile.production .
 ```
 
-### Step 3B: Genesis Bootstrap Network (Production)
-QNet uses built-in genesis nodes for automatic decentralized bootstrap:
-- **154.38.160.39:9876** - North America
-- **62.171.157.44:9877** - Europe
-- **161.97.86.81:9877** - Europe
+### Step 3B: Dynamic Leadership Network (Production)
+QNet uses **Dynamic Leadership with Auto-Failover** for maximum reliability:
 
-**✅ No manual configuration needed!** New nodes automatically discover the network through genesis bootstrap, then switch to full decentralized peer exchange.
+**Leadership Priority (Auto-Failover):**
+- **Priority 1: 154.38.160.39:9876** - Primary Leader (North America)
+- **Priority 2: 62.171.157.44:9877** - Backup Leader (Europe)  
+- **Priority 3: 161.97.86.81:9877** - Backup Leader (Europe)
 
-### Step 4: Launch Node (Interactive Setup - ONLY METHOD)
+**🔄 Failover Scenarios:**
+- If Primary goes offline → Backup #2 automatically becomes leader
+- If Primary returns → Leadership automatically returns to Primary  
+- If all Genesis nodes offline → Any node can become leader
+- **Zero downtime** during server transitions
+
+**✅ No manual configuration needed!** New nodes automatically discover the network through genesis bootstrap, then switch to full decentralized peer exchange with dynamic leadership failover.
+
+### Step 4: Launch Node (DAEMON MODE - Production Ready)
 ```bash
-# Launch interactive production node
-docker run -it --name qnet-node --restart=always \
+# Launch production node in DAEMON mode (24/7)
+docker run -d --name qnet-node --restart=always \
+  -p 9876:9876 -p 9877:9877 -p 8001:8001 \
+  -v $(pwd)/node_data:/app/node_data \
+  qnet-production
+
+# ✅ Node will start automatically with:
+# → Auto-detected region and optimal settings
+# → Interactive setup for node type and activation
+# → Automatic switch to daemon mode after setup
+# → 24/7 operation with automatic restarts
+```
+
+### Step 4B: Interactive Setup (First Time Only)
+```bash  
+# For first-time setup, use interactive mode:
+docker run -it --name qnet-node-setup --rm \
   -p 9876:9876 -p 9877:9877 -p 8001:8001 \
   -v $(pwd)/node_data:/app/node_data \
   qnet-production
 
 # Follow the interactive menu to:
-# 1. Select node type (Full/Super for servers)
+# 1. Select node type (Full/Super for servers)  
 # 2. Enter activation code (format: QNET-XXXX-XXXX-XXXX)
-# 3. Confirm configuration
+# 3. After setup, stop and run in daemon mode (Step 4)
 ```
 
-### Step 5: Verify Installation
+### Step 5: Node Management (Daemon Mode)
 ```bash
+# View real-time logs
+docker logs qnet-node -f
+
 # Check node status
-docker logs qnet-node
+docker logs qnet-node | tail -20
+
+# Node status via API
+curl http://localhost:9877/api/v1/status
+
+# Stop node
+docker stop qnet-node
+
+# Restart node  
+docker restart qnet-node
+
+# Remove node (careful!)
+docker stop qnet-node && docker rm qnet-node
 
 # Test API endpoint
 curl http://localhost:8001/api/v1/info
 
 # Check peer connections
 curl http://localhost:8001/api/v1/peers
+```
+
+### Step 6: Server Replacement & Failover (Production)
+
+#### Replacing Genesis Servers (Zero Downtime)
+```bash
+# Option 1: Same IP replacement (Recommended)
+# 1. Setup new server with same IP as old one
+# 2. Run standard installation (Steps 1-4)
+# 3. Network automatically recognizes and restores leadership
+
+# Option 2: Different IP replacement  
+# 1. Update genesis node IPs in network configuration
+# 2. Deploy updated config to all nodes
+# 3. Restart nodes to load new configuration
+```
+
+#### Testing Failover
+```bash
+# Simulate Primary Leader failure
+docker stop qnet-node  # On 154.38.160.39
+
+# Check logs on Backup Leader (62.171.157.44)
+docker logs qnet-node -f
+# Expected: "[LEADERSHIP] 🔄 LEADERSHIP CHANGE: 154.38.160.39 -> 62.171.157.44 (Priority 2)"
+
+# Restore Primary Leader  
+docker start qnet-node  # On 154.38.160.39
+
+# Check logs - leadership should return to Primary
+# Expected: "[LEADERSHIP] 🔄 LEADERSHIP CHANGE: 62.171.157.44 -> 154.38.160.39 (Priority 1)"
+```
+
+#### Network Health Monitoring
+```bash
+# Check current leader
+curl http://localhost:9877/api/v1/leader
+
+# Monitor leadership changes
+docker logs qnet-node -f | grep "LEADERSHIP"
+
+# Check failover readiness
+curl http://localhost:9877/api/v1/consensus/health
 ```
 
 ## 🏗️ Node Types & Architecture

@@ -427,12 +427,24 @@ impl BlockchainNode {
                         }
                     }
                     
-                    // Check if this node should be the leader for block production
+                    // Dynamic leadership check with failover detection
                     let is_leader = if let Some(p2p) = &unified_p2p {
                         p2p.should_be_leader(&node_id)
                     } else {
                         true // Standalone mode
                     };
+                    
+                    // Show current network leader for transparency
+                    if let Some(p2p) = &unified_p2p {
+                        if let Some(current_leader) = p2p.get_current_leader() {
+                            if microblock_height % 100 == 0 { // Log every 100 blocks
+                                println!("[NETWORK] 👑 Current leader: {} | My role: {}", 
+                                    current_leader, 
+                                    if is_leader { "LEADER" } else { "FOLLOWER" }
+                                );
+                            }
+                        }
+                    }
                     
                     if !is_leader {
                         // Non-leader nodes just sync with the network
