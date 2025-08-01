@@ -1,5 +1,38 @@
 # QNet Production Server Setup Guide
 
+## ⚡ Quick Start (Updated Daemon Mode)
+
+### 🚀 One-Command Production Deployment
+```bash
+# 1. Update and build
+cd ~/QNet-Project && git pull origin testnet
+docker build -f development/qnet-integration/Dockerfile.production -t qnet-production .
+
+# 2. Interactive setup (first time)
+docker run -it --name qnet-node-setup --rm \
+  -p 9876:9876 -p 9877:9877 -p 8001:8001 \
+  -v $(pwd)/node_data:/app/node_data \
+  qnet-production
+
+# 3. Start daemon mode (24/7)
+docker run -d --name qnet-node --restart=always \
+  -p 9876:9876 -p 9877:9877 -p 8001:8001 \
+  -v $(pwd)/node_data:/app/node_data \
+  qnet-production
+
+# 4. Monitor
+docker logs qnet-node -f  # Ctrl+C to exit, node keeps running
+```
+
+### 🔧 Key Features
+- **Interactive Setup**: One-time configuration (node type + activation)
+- **True Daemon Mode**: Background operation, terminal-independent
+- **Auto-Restart**: Docker handles crashes and reboots
+- **Log Management**: `docker logs qnet-node -f` (Ctrl+C safe)
+- **Zero Downtime**: Dynamic leadership with auto-failover
+
+---
+
 ## 🚀 Complete Setup from Scratch
 
 ### Prerequisites
@@ -63,71 +96,123 @@ QNet uses **Dynamic Leadership with Auto-Failover** for maximum reliability:
 
 **✅ No manual configuration needed!** New nodes automatically discover the network through genesis bootstrap, then switch to full decentralized peer exchange with dynamic leadership failover.
 
-### Step 4: Launch Node (DAEMON MODE - Production Ready)
+### Step 4: Launch Node (Interactive Setup + Daemon Mode)
+
+#### Step 4A: First Time Setup (Interactive)
 ```bash
-# Launch production node in DAEMON mode (24/7)
-docker run -d --name qnet-node --restart=always \
-  -p 9876:9876 -p 9877:9877 -p 8001:8001 \
-  -v $(pwd)/node_data:/app/node_data \
-  qnet-production
-
-# ✅ Node will start automatically with:
-# → Auto-detected region and optimal settings
-# → Interactive setup for node type and activation
-# → Automatic switch to daemon mode after setup
-# → 24/7 operation with automatic restarts
-```
-
-### Step 4B: Interactive Setup (First Time Only)
-```bash  
-# For first-time setup, use interactive mode:
+# Initial interactive setup (required once per server)
 docker run -it --name qnet-node-setup --rm \
   -p 9876:9876 -p 9877:9877 -p 8001:8001 \
   -v $(pwd)/node_data:/app/node_data \
   qnet-production
 
-# Follow the interactive menu to:
-# 1. Select node type (Full/Super for servers)  
+# Follow the interactive setup:
+# 1. Select node type (Full Node=1, Super Node=2 for servers)
 # 2. Enter activation code (format: QNET-XXXX-XXXX-XXXX)
-# 3. After setup completes, node automatically goes to daemon mode
-# 4. You can press Ctrl+C to disconnect terminal (node keeps running)
+# 3. Node will show daemon management commands
+# 4. Press Enter to continue or Ctrl+C to setup daemon mode
+
+# After setup, you'll see instructions for proper daemon mode
 ```
 
-### Step 5: Node Management (Daemon Mode)
+#### Step 4B: Production Daemon Mode (24/7 Operation)
+```bash
+# Option 1: Docker Daemon (Recommended)
+docker run -d --name qnet-node --restart=always \
+  -p 9876:9876 -p 9877:9877 -p 8001:8001 \
+  -v $(pwd)/node_data:/app/node_data \
+  qnet-production
 
-#### Option A: Docker Daemon Mode (Recommended)
+# Option 2: Native Daemon (Advanced)
+nohup ./target/release/qnet-node > qnet-node.log 2>&1 &
+```
+
+### Step 4C: Complete Production Workflow
+```bash
+# 1. Clean previous installations
+docker stop qnet-node 2>/dev/null || true
+docker rm qnet-node 2>/dev/null || true
+
+# 2. Run interactive setup (first time only)
+docker run -it --name qnet-node-setup --rm \
+  -p 9876:9876 -p 9877:9877 -p 8001:8001 \
+  -v $(pwd)/node_data:/app/node_data \
+  qnet-production
+
+# 3. After setup completes, start in daemon mode
+docker run -d --name qnet-node --restart=always \
+  -p 9876:9876 -p 9877:9877 -p 8001:8001 \
+  -v $(pwd)/node_data:/app/node_data \
+  qnet-production
+
+# ✅ Node now runs 24/7 in background with auto-restart
+```
+
+### Step 5: Node Management & Monitoring
+
+#### Docker Daemon Management (Default)
 ```bash
 # View real-time logs
 docker logs qnet-node -f
 # Press Ctrl+C to exit log viewer (node continues running)
 
-# Check node status
+# Check node status and health
 curl http://localhost:9877/api/v1/status
+curl http://localhost:8001/api/v1/info
+
+# Monitor peer connections
+curl http://localhost:8001/api/v1/peers
+
+# Check blockchain height
+curl http://localhost:9877/api/v1/height
 
 # Stop node
 docker stop qnet-node
 
-# Restart node  
+# Restart node (preserves configuration)
 docker restart qnet-node
+
+# View container status
+docker ps | grep qnet-node
 ```
 
-#### Option B: Native Daemon Mode
+#### Native Daemon Management (Advanced)
 ```bash
-# Start node in true daemon mode (detached from terminal)
-nohup ./qnet-node > qnet-node.log 2>&1 &
+# Start native daemon
+nohup ./target/release/qnet-node > qnet-node.log 2>&1 &
 
 # View logs
 tail -f qnet-node.log
 # Press Ctrl+C to exit log viewer (node continues running)
 
-# Check if node is running
+# Check process status
 ps aux | grep qnet-node
+
+# Monitor log file size
+ls -lh qnet-node.log
 
 # Stop node
 pkill -f qnet-node
 
-# Check node status via API
-curl http://localhost:9877/api/v1/status
+# Restart node
+nohup ./target/release/qnet-node > qnet-node.log 2>&1 &
+```
+
+#### Health Monitoring Commands
+```bash
+# Complete node health check
+echo "=== QNet Node Health Check ===" && \
+curl -s http://localhost:9877/api/v1/status | jq . && \
+echo -e "\n=== Peer Connections ===" && \
+curl -s http://localhost:8001/api/v1/peers | jq length && \
+echo -e "\n=== Blockchain Height ===" && \
+curl -s http://localhost:9877/api/v1/height
+
+# Check if all required ports are open
+netstat -tuln | grep -E ':(9876|9877|8001)'
+
+# View recent logs (last 50 lines)
+docker logs qnet-node --tail 50
 ```
 
 ### Step 6: Server Replacement & Failover (Production)
