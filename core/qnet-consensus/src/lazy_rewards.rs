@@ -209,19 +209,23 @@ impl PhaseAwareRewardManager {
         now - (now % (4 * 60 * 60))
     }
     
-    /// Calculate dynamic Pool 1 base emission with sharp drop halving
-    fn calculate_pool1_base_emission(&self) -> u64 {
+    /// Calculate years since genesis timestamp
+    fn calculate_years_since_genesis(&self) -> u64 {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
             
-        // Calculate years since genesis
-        let years_since_genesis = if now > self.genesis_timestamp {
+        if now > self.genesis_timestamp {
             (now - self.genesis_timestamp) / (365 * 24 * 60 * 60)
         } else {
             0
-        };
+        }
+    }
+    
+    /// Calculate dynamic Pool 1 base emission with sharp drop halving
+    fn calculate_pool1_base_emission(&self) -> u64 {
+        let years_since_genesis = self.calculate_years_since_genesis();
         
         let halving_cycles = years_since_genesis / 4;
         
@@ -244,10 +248,12 @@ impl PhaseAwareRewardManager {
     
     /// Determine current QNet phase
     fn get_current_phase(&self) -> QNetPhase {
+        let years_since_genesis = self.calculate_years_since_genesis();
+        
         // Phase 2 activates when EITHER condition is met:
         // 1. 90% of 1DEV supply burned
-        // 2. 5 years since launch
-        if self.dev_burn_percentage >= 90.0 || self.years_since_launch >= 5 {
+        // 2. 5 years since genesis (using actual genesis_timestamp)
+        if self.dev_burn_percentage >= 90.0 || years_since_genesis >= 5 {
             QNetPhase::Phase2
         } else {
             QNetPhase::Phase1
@@ -255,9 +261,11 @@ impl PhaseAwareRewardManager {
     }
     
     /// Update phase transition parameters
-    pub fn update_phase_parameters(&mut self, dev_burn_percentage: f64, years_since_launch: u64) {
+    /// Note: years_since_launch is now calculated automatically from genesis_timestamp
+    pub fn update_phase_parameters(&mut self, dev_burn_percentage: f64, _years_since_launch: u64) {
         self.dev_burn_percentage = dev_burn_percentage;
-        self.years_since_launch = years_since_launch;
+        // years_since_launch is now calculated automatically from genesis_timestamp
+        // in get_current_phase() and get_reward_stats(), so this parameter is ignored
     }
     
     /// Register node for current reward window
@@ -490,6 +498,11 @@ impl PhaseAwareRewardManager {
         self.genesis_timestamp
     }
     
+    /// Get years since genesis timestamp
+    pub fn get_years_since_genesis(&self) -> u64 {
+        self.calculate_years_since_genesis()
+    }
+    
     /// Get reward statistics
     pub fn get_reward_stats(&self) -> PhaseAwareRewardStats {
         let total_pending = self.pending_rewards.values()
@@ -498,6 +511,7 @@ impl PhaseAwareRewardManager {
         
         let current_phase = self.get_current_phase();
         let pool1_current_emission = self.calculate_pool1_base_emission();
+        let years_since_genesis = self.calculate_years_since_genesis();
             
         PhaseAwareRewardStats {
             current_phase,
@@ -509,7 +523,7 @@ impl PhaseAwareRewardManager {
             nodes_with_pending_rewards: self.pending_rewards.len(),
             active_ping_histories: self.ping_histories.len(),
             dev_burn_percentage: self.dev_burn_percentage,
-            years_since_launch: self.years_since_launch,
+            years_since_launch: years_since_genesis,
         }
     }
     

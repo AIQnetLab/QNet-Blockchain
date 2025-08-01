@@ -16,13 +16,19 @@ pub struct GenesisConfig {
 
 impl Default for GenesisConfig {
     fn default() -> Self {
+        // Use mainnet launch timestamp if set, otherwise current time
+        let genesis_timestamp = std::env::var("QNET_MAINNET_LAUNCH_TIMESTAMP")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or_else(|| Utc::now().timestamp() as u64);
+            
         Self {
             accounts: vec![
                 // QNC emission: 2^32 = 4,294,967,296 (quantum blockchain reference!)
                 // All tokens in rewards pool for fair distribution
                 ("rewards".to_string(), 4_294_967_296), // 2^32 QNC total supply
             ],
-            timestamp: Utc::now().timestamp() as u64,
+            timestamp: genesis_timestamp,
             network: "mainnet".to_string(),
         }
     }

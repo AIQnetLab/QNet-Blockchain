@@ -89,18 +89,19 @@ docker run -it --name qnet-node-setup --rm \
 # Follow the interactive menu to:
 # 1. Select node type (Full/Super for servers)  
 # 2. Enter activation code (format: QNET-XXXX-XXXX-XXXX)
-# 3. After setup, stop and run in daemon mode (Step 4)
+# 3. After setup completes, node automatically goes to daemon mode
+# 4. You can press Ctrl+C to disconnect terminal (node keeps running)
 ```
 
 ### Step 5: Node Management (Daemon Mode)
+
+#### Option A: Docker Daemon Mode (Recommended)
 ```bash
 # View real-time logs
 docker logs qnet-node -f
+# Press Ctrl+C to exit log viewer (node continues running)
 
 # Check node status
-docker logs qnet-node | tail -20
-
-# Node status via API
 curl http://localhost:9877/api/v1/status
 
 # Stop node
@@ -108,15 +109,25 @@ docker stop qnet-node
 
 # Restart node  
 docker restart qnet-node
+```
 
-# Remove node (careful!)
-docker stop qnet-node && docker rm qnet-node
+#### Option B: Native Daemon Mode
+```bash
+# Start node in true daemon mode (detached from terminal)
+nohup ./qnet-node > qnet-node.log 2>&1 &
 
-# Test API endpoint
-curl http://localhost:8001/api/v1/info
+# View logs
+tail -f qnet-node.log
+# Press Ctrl+C to exit log viewer (node continues running)
 
-# Check peer connections
-curl http://localhost:8001/api/v1/peers
+# Check if node is running
+ps aux | grep qnet-node
+
+# Stop node
+pkill -f qnet-node
+
+# Check node status via API
+curl http://localhost:9877/api/v1/status
 ```
 
 ### Step 6: Server Replacement & Failover (Production)

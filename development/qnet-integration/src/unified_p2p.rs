@@ -534,7 +534,8 @@ impl SimplifiedP2P {
     
     /// Sync blockchain height with peers for consensus
     pub fn sync_blockchain_height(&self) -> Result<u64, String> {
-        let connected = self.connected_peers.lock().unwrap();
+        let connected = self.connected_peers.lock()
+            .map_err(|e| format!("Failed to acquire peer lock: {}", e))?;
         
         if connected.is_empty() {
             // No peers - standalone mode, return 0 to start fresh
@@ -568,19 +569,16 @@ impl SimplifiedP2P {
             // Use median for byzantine fault tolerance
             peer_heights[peer_heights.len() / 2]
         } else {
-            // Use maximum height
-            *peer_heights.iter().max().unwrap_or(&0)
+            // Use maximum height - safe since we checked empty above
+            peer_heights.into_iter().max().unwrap_or(0)
         };
         
         println!("[SYNC] ✅ Consensus blockchain height: {}", consensus_height);
         Ok(consensus_height)
     }
     
-    /// Query individual peer for blockchain height
+    /// Query individual peer for blockchain height via HTTP API
     fn query_peer_height(&self, peer_addr: &str) -> Result<u64, String> {
-        // In production: HTTP request to peer's API endpoint /api/v1/height
-        // For MVP: Use network estimation based on uptime
-        
         // Extract IP and port from peer address
         let parts: Vec<&str> = peer_addr.split(':').collect();
         if parts.len() != 2 {
@@ -588,67 +586,176 @@ impl SimplifiedP2P {
         }
         
         let peer_ip = parts[0];
+        let peer_port = parts[1].parse::<u16>()
+            .map_err(|_| "Invalid port in peer address".to_string())?;
         
-        // CRITICAL FIX: All nodes must report SAME blockchain height for proper consensus
-        // Use global network time to calculate unified blockchain height
-        let network_start_time = 1753340000; // Network genesis timestamp (approximately)
-        let current_time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-        let blocks_elapsed = (current_time - network_start_time) / 1; // 1 block per second
+        // PRODUCTION: Real HTTP request to peer's API endpoint
+        // Try multiple API endpoints for redundancy
+        let api_endpoints = vec![
+            format!("http://{}:8001/api/v1/height", peer_ip), // Primary API port
+            format!("http://{}:{}/api/v1/height", peer_ip, peer_port + 1000), // P2P port + 1000
+            format!("http://{}:8080/api/v1/height", peer_ip), // Alternative API port
+        ];
         
-        // All nodes report the same consensus height - this is critical for proper synchronization
-        let estimated_height = blocks_elapsed;
-        
-        // Add small variance based on peer connectivity to simulate real network conditions
-        let variance = match peer_ip {
-            "154.38.160.39" => 0,    // Primary leader - always current
-            "62.171.157.44" => -1,   // Backup leader - may be 1 block behind 
-            "161.97.86.81" => -1,    // Backup leader - may be 1 block behind
-            _ => -5,                 // Other nodes - may be few blocks behind
-        };
-        
-        let estimated_height = (estimated_height as i64 + variance).max(0) as u64;
-        
-        Ok(estimated_height)
-    }
-    
-    /// Determine if this node should be the leader for block production (Dynamic Leadership)
-    pub fn should_be_leader(&self, node_id: &str) -> bool {
-        let connected = self.connected_peers.lock().unwrap();
-        
-        // Dynamic leadership with automatic failover
-        let my_ip = self.extract_node_ip(node_id);
-        
-        // Check if higher-priority leaders are available (PRODUCTION FIX)
-        let genesis_priority = self.load_genesis_nodes_config();
-        
-        for (index, priority_ip) in genesis_priority.iter().enumerate() {
-            if my_ip == priority_ip {
-                // Check if any higher-priority leaders are online
-                let higher_priority_online = genesis_priority[..index]
-                    .iter()
-                    .any(|ip| self.is_peer_online(ip, &connected));
-                
-                                 if !higher_priority_online {
-                     // Check if this is a leadership change
-                     let prev_leader = self.previous_leader.lock().unwrap();
-                     if prev_leader.as_ref() != Some(&my_ip.to_string()) {
-                         println!("[LEADERSHIP] 🔄 LEADERSHIP CHANGE: {} -> {} (Priority {})", 
-                             prev_leader.as_ref().unwrap_or(&"None".to_string()), my_ip, index + 1);
-                         drop(prev_leader);
-                         *self.previous_leader.lock().unwrap() = Some(my_ip.to_string());
-                     }
-                     return true;
-                 }
+        for endpoint in api_endpoints {
+            match self.query_peer_height_http(&endpoint) {
+                Ok(height) => return Ok(height),
+                Err(e) => {
+                    // Log but continue to next endpoint
+                    println!("[SYNC] Failed to query {}: {}", endpoint, e);
+                    continue;
+                }
             }
         }
         
-        // If no genesis nodes are available, any connected node can become leader
-        if connected.is_empty() && !my_ip.is_empty() {
-            println!("[LEADERSHIP] 🆘 Emergency leadership: No genesis nodes available");
-            return true;
+        // If all HTTP endpoints fail, fallback to consensus estimation
+        println!("[SYNC] All HTTP endpoints failed for {}, using consensus estimation", peer_ip);
+        self.estimate_peer_height_from_genesis()
+    }
+    
+    /// Query peer height via HTTP with timeout and error handling
+    fn query_peer_height_http(&self, endpoint: &str) -> Result<u64, String> {
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+        
+        let (tx, rx) = mpsc::channel();
+        let endpoint = endpoint.to_string();
+        
+        // Spawn HTTP request in separate thread with timeout
+        thread::spawn(move || {
+            let result = std::process::Command::new("curl")
+                .arg("-s")
+                .arg("-m")
+                .arg("3") // 3 second timeout
+                .arg(&endpoint)
+                .output();
+                
+            match result {
+                Ok(output) => {
+                    if output.status.success() {
+                        let response = String::from_utf8_lossy(&output.stdout);
+                        // Parse JSON response: {"height": 12345}
+                        if let Some(height_str) = response.split("\"height\":").nth(1) {
+                            if let Some(height_num) = height_str.split(',').next().or_else(|| height_str.split('}').next()) {
+                                if let Ok(height) = height_num.trim().parse::<u64>() {
+                                    let _ = tx.send(Ok(height));
+                                    return;
+                                }
+                            }
+                        }
+                        let _ = tx.send(Err("Invalid JSON response format".to_string()));
+                    } else {
+                        let _ = tx.send(Err("HTTP request failed".to_string()));
+                    }
+                },
+                Err(e) => {
+                    let _ = tx.send(Err(format!("Command execution failed: {}", e)));
+                }
+            }
+        });
+        
+        // Wait for response with timeout
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(result) => result,
+            Err(_) => Err("HTTP request timeout".to_string()),
+        }
+    }
+    
+    /// Fallback: Estimate peer height from genesis timestamp with error resilience
+    fn estimate_peer_height_from_genesis(&self) -> Result<u64, String> {
+        // Get QNet network genesis timestamp with multiple fallback strategies
+        let network_genesis_time = std::env::var("QNET_MAINNET_LAUNCH_TIMESTAMP")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .or_else(|| {
+                // Try alternative environment variable names
+                std::env::var("QNET_GENESIS_TIME")
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+            })
+            .or_else(|| {
+                std::env::var("GENESIS_TIMESTAMP")
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+            })
+            .unwrap_or_else(|| {
+                // Robust fallback: If no genesis timestamp is set, use network start heuristic
+                match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+                    Ok(duration) => {
+                        let current_time = duration.as_secs();
+                        
+                        // Use start of current day as genesis (reasonable for new networks)
+                        let day_start = current_time - (current_time % 86400);
+                        
+                        println!("[CONSENSUS] 🔧 Using fallback genesis time: {} (start of day)", day_start);
+                        day_start
+                    }
+                    Err(_) => {
+                        // Last resort: Use known QNet development start (adjust as needed)
+                        1735689600 // Jan 1, 2025 00:00:00 UTC - QNet launch
+                    }
+                }
+            });
+        
+        let current_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| format!("System time error: {:?}", e))?
+            .as_secs();
+        
+        // Calculate consensus height using QNet's microblock timing (1 block per second)
+        let base_height = if current_time > network_genesis_time {
+            (current_time - network_genesis_time) / 1 // 1 second per microblock
+        } else {
+            // Network hasn't started yet - return 0 but warn
+            println!("[CONSENSUS] ⚠️ Current time {} is before genesis {}, using height 0", 
+                    current_time, network_genesis_time);
+            0
+        };
+        
+        // Sanity check: Height shouldn't be unreasonably high
+        const MAX_REASONABLE_HEIGHT: u64 = 365 * 24 * 60 * 60; // 1 year of blocks
+        if base_height > MAX_REASONABLE_HEIGHT {
+            println!("[CONSENSUS] ⚠️ Calculated height {} seems too high, capping at {}", 
+                    base_height, MAX_REASONABLE_HEIGHT);
+            return Ok(MAX_REASONABLE_HEIGHT);
         }
         
-        false
+        Ok(base_height)
+    }
+    
+    /// Determine if node can participate in consensus validation (replaces single leader model)
+    /// QNet uses CommitReveal Byzantine consensus with multiple validators, not single leader
+    pub fn should_be_leader(&self, node_id: &str) -> bool {
+        // PRODUCTION NOTE: This function name is kept for compatibility with existing code
+        // In full QNet production, this would be: can_participate_in_consensus()
+        // Real consensus uses CommitRevealConsensus with validator selection algorithm
+        
+        let connected = match self.connected_peers.lock() {
+            Ok(peers) => peers,
+            Err(e) => {
+                println!("[CONSENSUS] ⚠️ Failed to acquire peer lock: {}, defaulting to false", e);
+                return false;
+            }
+        };
+        
+        // Minimum Byzantine consensus requirement: need 3f+1 nodes to tolerate f failures
+        if connected.len() < 2 {
+            return false; // Need at least 3 total nodes (2 peers + self) for Byzantine fault tolerance
+        }
+        
+        // Check if this node can participate based on network connectivity
+        let my_ip = self.extract_node_ip(node_id);
+        
+        // Production QNet: Genesis nodes are always validator candidates
+        let genesis_nodes = self.load_genesis_nodes_config();
+        if genesis_nodes.contains(&my_ip.to_string()) {
+            return true; // Genesis nodes can always participate in consensus
+        }
+        
+        // Non-genesis nodes can participate if sufficient network diversity exists
+        // In production: This would use reputation scores, stake amounts, and validator selection algorithm
+        connected.len() >= 3 // Allow participation with sufficient peer diversity
     }
     
     /// Extract IP address from node_id
@@ -665,22 +772,26 @@ impl SimplifiedP2P {
         connected.iter().any(|peer| peer.addr.contains(target_ip))
     }
     
-    /// Get current network leader (for debugging)
+    /// Get primary validator for consensus round (replaces single leader concept)
+    /// In production QNet, consensus uses multiple validators, not single leader
     pub fn get_current_leader(&self) -> Option<String> {
+        // COMPATIBILITY: Function name kept for existing code
+        // In production: This would return current round's primary validator
+        
         let connected = self.connected_peers.lock().unwrap();
         
-        // PRODUCTION FIX: Load genesis nodes from environment or config file
-        let genesis_priority = self.load_genesis_nodes_config();
+        // Return primary consensus participant based on network state
+        let genesis_nodes = self.load_genesis_nodes_config();
         
-        // Find the highest-priority online genesis node
-        for ip in &genesis_priority {
-            if self.is_peer_online(ip, &connected) {
-                return Some(ip.to_string());
+        // Find first available genesis node as primary validator
+        for genesis_ip in &genesis_nodes {
+            if self.is_peer_online(genesis_ip, &connected) {
+                return Some(format!("validator_{}", genesis_ip));
             }
         }
         
-        // If no genesis nodes, return first connected peer
-        connected.first().map(|peer| peer.addr.clone())
+        // If no genesis validators, return first connected validator
+        connected.first().map(|peer| format!("validator_{}", peer.addr))
     }
     
     /// Load genesis nodes from environment or config file (PRODUCTION FIX)
@@ -783,7 +894,28 @@ impl SimplifiedP2P {
     
     /// Get connected peer count
     pub fn get_peer_count(&self) -> usize {
-        self.connected_peers.lock().unwrap().len()
+        match self.connected_peers.lock() {
+            Ok(peers) => peers.len(),
+            Err(e) => {
+                println!("[P2P] ⚠️ Failed to get peer count: {}, returning 0", e);
+                0
+            }
+        }
+    }
+    
+    /// Get connected peer addresses for consensus participation
+    pub fn get_connected_peer_addresses(&self) -> Vec<String> {
+        match self.connected_peers.lock() {
+            Ok(peers) => {
+                peers.iter()
+                    .map(|peer| peer.addr.clone())
+                    .collect()
+            }
+            Err(e) => {
+                println!("[P2P] ⚠️ Failed to get peer addresses: {}, returning empty", e);
+                Vec::new()
+            }
+        }
     }
     
     /// Get regional health (simplified)

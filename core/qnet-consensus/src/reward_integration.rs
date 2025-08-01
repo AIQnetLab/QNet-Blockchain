@@ -197,15 +197,18 @@ impl RewardIntegrationManager {
     }
     
     /// Update phase transition parameters
-    pub fn update_phase_parameters(&mut self, dev_burn_percentage: f64, years_since_launch: u64) {
+    pub fn update_phase_parameters(&mut self, dev_burn_percentage: f64, _years_since_launch: u64) {
         let mut reward_manager = self.reward_manager.write().unwrap();
-        reward_manager.update_phase_parameters(dev_burn_percentage, years_since_launch);
+        reward_manager.update_phase_parameters(dev_burn_percentage, 0); // years parameter is now ignored
+        
+        // Get actual years since genesis from reward manager
+        let actual_years = reward_manager.get_years_since_genesis();
         
         // Update statistics
         self.pool_stats.current_phase = reward_manager.get_network_phase();
         
-        println!("[RewardIntegration] 📊 Phase parameters updated: {:.1}% burned, {} years", 
-                 dev_burn_percentage, years_since_launch);
+        println!("[RewardIntegration] 📊 Phase parameters updated: {:.1}% burned, {} years since genesis", 
+                 dev_burn_percentage, actual_years);
     }
     
     /// Get current pool statistics
