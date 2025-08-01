@@ -173,11 +173,15 @@ impl BlockchainNode {
         // Initialize PRODUCTION consensus engine - CommitRevealConsensus for Byzantine fault tolerance
         let node_id = format!("node_{}_{}", p2p_port, node_type as u8);
         let consensus_config = qnet_consensus::ConsensusConfig {
+            commit_phase_duration: Duration::from_secs(30),
+            reveal_phase_duration: Duration::from_secs(30),
             min_participants: 3,           // Minimum 3 nodes for Byzantine fault tolerance
+            max_participants: 1000,        // Maximum participants per round
             max_validators_per_round: 21,  // Like major blockchains
-            timeout_ms: 30000,            // 30 second consensus timeout
             enable_validator_sampling: true, // For scalability
-            reputation_threshold: 0.7,    // Minimum reputation for participation
+            reputation_threshold: 0.7,     // Minimum reputation for participation
+            super_node_guarantee: 7,       // Guaranteed super nodes per round
+            full_node_slots: 14,          // Full node slots per round
         };
         
         // Create real CommitRevealConsensus instead of simplified ConsensusEngine
@@ -397,6 +401,8 @@ impl BlockchainNode {
         let is_leader = self.is_leader.clone();
         let node_id = self.node_id.clone();
         let parallel_validator = self.parallel_validator.clone();
+        let node_type = self.node_type;
+        let consensus = self.consensus.clone();
         
         tokio::spawn(async move {
             let mut microblock_height = 0u64;
@@ -493,14 +499,7 @@ impl BlockchainNode {
                     
                     // Execute real CommitReveal consensus round
                     let consensus_result = {
-                        let mut consensus_engine = match consensus.write().await {
-                            Ok(engine) => engine,
-                            Err(e) => {
-                                println!("[CONSENSUS] ⚠️ Failed to acquire consensus lock: {}, skipping round", e);
-                                tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-                                continue;
-                            }
-                        };
+                        let mut consensus_engine = consensus.write().await;
                         
                         // Start consensus round with connected participants
                         match consensus_engine.start_round(participants.clone()) {

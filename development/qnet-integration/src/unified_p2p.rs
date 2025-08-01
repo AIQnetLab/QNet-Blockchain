@@ -825,14 +825,14 @@ impl SimplifiedP2P {
         ];
         
         // Only log this message once every 5 minutes to reduce spam
-        static mut LAST_LOG_TIME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static LAST_LOG_TIME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let current_time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-        let last_time = unsafe { LAST_LOG_TIME.load(std::sync::atomic::Ordering::Relaxed) };
+        let last_time = LAST_LOG_TIME.load(std::sync::atomic::Ordering::Relaxed);
         
         if current_time - last_time > 300 { // 5 minutes
             println!("[LEADERSHIP] ⚠️ Using default genesis nodes: {:?}", default_nodes);
             println!("[LEADERSHIP] 🔧 To change: Set QNET_GENESIS_LEADERS env var or update genesis-nodes.json");
-            unsafe { LAST_LOG_TIME.store(current_time, std::sync::atomic::Ordering::Relaxed); }
+            LAST_LOG_TIME.store(current_time, std::sync::atomic::Ordering::Relaxed);
         }
         
         default_nodes

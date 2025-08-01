@@ -173,7 +173,6 @@ pub struct PhaseAwareRewardManager {
     
     /// Phase transition parameters
     dev_burn_percentage: f64,  // Current 1DEV burn percentage
-    years_since_launch: u64,   // Years since QNet launch
     
     /// Minimum claim interval (prevent spam)
     min_claim_interval: Duration,
@@ -193,7 +192,7 @@ impl PhaseAwareRewardManager {
             pool2_transaction_fees: 0,
             pool3_activation_pool: 0,
             dev_burn_percentage: 0.0,
-            years_since_launch: 0,
+
             min_claim_interval: Duration::from_secs(3600), // 1 hour minimum
         }
     }
@@ -511,7 +510,7 @@ impl PhaseAwareRewardManager {
         
         let current_phase = self.get_current_phase();
         let pool1_current_emission = self.calculate_pool1_base_emission();
-        let years_since_genesis = self.calculate_years_since_genesis();
+        let _years_since_genesis = self.calculate_years_since_genesis();
             
         PhaseAwareRewardStats {
             current_phase,
@@ -523,7 +522,6 @@ impl PhaseAwareRewardManager {
             nodes_with_pending_rewards: self.pending_rewards.len(),
             active_ping_histories: self.ping_histories.len(),
             dev_burn_percentage: self.dev_burn_percentage,
-            years_since_launch: years_since_genesis,
         }
     }
     
@@ -545,7 +543,6 @@ pub struct PhaseAwareRewardStats {
     pub nodes_with_pending_rewards: usize,
     pub active_ping_histories: usize,
     pub dev_burn_percentage: f64,
-    pub years_since_launch: u64,
 }
 
 /// Production initialization

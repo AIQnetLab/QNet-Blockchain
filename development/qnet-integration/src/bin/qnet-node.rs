@@ -2999,7 +2999,7 @@ async fn scan_active_qnet_nodes() -> RealNodeCounts {
     println!("   ⚡ Super Nodes: {} (high-performance)", counts.super_nodes);
     
     // Save discovered peers for future sessions
-    save_decentralized_peers_cache(&counts).await;
+    let _ = save_decentralized_peers_cache(&counts).await;
     
     counts
 }
