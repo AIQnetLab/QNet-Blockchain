@@ -1656,12 +1656,12 @@ fn is_north_america_ip(ip: &Ipv4Addr) -> bool {
     // 48.0.0.0/8, 50.0.0.0/8, 52.0.0.0/8, 54.0.0.0/8, 55.0.0.0/8, 56.0.0.0/8, 63.0.0.0/8, 64.0.0.0/10
     // 66.0.0.0/8, 67.0.0.0/8, 68.0.0.0/8, 69.0.0.0/8, 70.0.0.0/8, 71.0.0.0/8, 72.0.0.0/8, 73.0.0.0/8
     // 74.0.0.0/8, 75.0.0.0/8, 76.0.0.0/8, 96.0.0.0/8, 97.0.0.0/8, 98.0.0.0/8, 99.0.0.0/8, 100.0.0.0/8
-    // 104.0.0.0/8, 107.0.0.0/8, 108.0.0.0/8, 173.0.0.0/8, 174.0.0.0/8, 184.0.0.0/8, 199.0.0.0/8, 208.0.0.0/8
+    // 104.0.0.0/8, 107.0.0.0/8, 108.0.0.0/8, 154.0.0.0/8 (OVH), 173.0.0.0/8, 174.0.0.0/8, 184.0.0.0/8, 199.0.0.0/8, 208.0.0.0/8
     // 209.0.0.0/8, 216.0.0.0/8
     let first_octet = (ip_u32 >> 24) as u8;
     match first_octet {
         3..=9 | 11..=24 | 26 | 28..=30 | 32..=35 | 38 | 40 | 44..=45 | 47..=48 | 50 | 52 | 54..=56 | 
-        63 | 68..=76 | 96..=100 | 104 | 107..=108 | 173..=174 | 184 | 199 | 208..=209 | 216 => true,
+        63 | 68..=76 | 96..=100 | 104 | 107..=108 | 154 | 173..=174 | 184 | 199 | 208..=209 | 216 => true,
         64..=67 => {
             // 64.0.0.0/10 range check (64.0.0.0 to 67.255.255.255)
             ip_u32 >= 0x40000000 && ip_u32 <= 0x43FFFFFF
@@ -1729,11 +1729,12 @@ fn is_africa_ip(ip: &Ipv4Addr) -> bool {
     let first_octet = (ip_u32 >> 24) as u8;
     
     // Major African IP blocks (AFRINIC allocation)
-    // 41.0.0.0/8, 102.0.0.0/8, 105.0.0.0/8, 154.0.0.0/8, 155.0.0.0/8, 156.0.0.0/8
+    // 41.0.0.0/8, 102.0.0.0/8, 105.0.0.0/8, 155.0.0.0/8, 156.0.0.0/8
     // 160.0.0.0/8, 161.0.0.0/8, 162.0.0.0/8, 164.0.0.0/8, 165.0.0.0/8, 196.0.0.0/8
     // 197.0.0.0/8
+    // NOTE: 154.0.0.0/8 is NOT AFRINIC - it's North American (OVH hosting)
     match first_octet {
-        41 | 102 | 105 | 154..=156 | 160..=162 | 164..=165 | 196..=197 => true,
+        41 | 102 | 105 | 155..=156 | 160..=162 | 164..=165 | 196..=197 => true,
         _ => false
     }
 }
@@ -2159,11 +2160,13 @@ async fn redirect_logs_to_file(log_path: &std::path::Path) -> Result<(), std::io
     writeln!(&log_file, "PID: {}", std::process::id())?;
     writeln!(&log_file, "==============================================")?;
     
-    // Note: In a full daemon implementation, we would redirect stdout/stderr here
-    // For now, this prepares the log file and future logging will be directed here
+    // NOTE: Real stdout/stderr redirection requires more complex implementation
+    // For true daemon mode, use: nohup ./qnet-node > qnet-node.log 2>&1 &
+    // Current implementation prepares log file and shows instructions
     
     println!("📝 Logs will be written to: {}", log_path_str);
     println!("📖 View logs with: tail -f {}", log_path_str);
+    println!("⚠️  For true background mode: nohup ./qnet-node > qnet-node.log 2>&1 &");
     
     Ok(())
 }

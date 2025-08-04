@@ -1512,7 +1512,7 @@ impl BlockchainNode {
         let first_octet = (ip_u32 >> 24) as u8;
         match first_octet {
             3..=9 | 11..=24 | 26 | 28..=30 | 32..=35 | 38 | 40 | 44..=45 | 47..=48 | 50 | 52 | 54..=56 | 
-            63 | 68..=76 | 96..=100 | 104 | 107..=108 | 173..=174 | 184 | 199 | 208..=209 | 216 => true,
+            63 | 68..=76 | 96..=100 | 104 | 107..=108 | 154 | 173..=174 | 184 | 199 | 208..=209 | 216 => true,
             64..=67 => ip_u32 >= 0x40000000 && ip_u32 <= 0x43FFFFFF,
             _ => false
         }
@@ -1551,7 +1551,8 @@ impl BlockchainNode {
         let ip_u32 = u32::from(*ip);
         let first_octet = (ip_u32 >> 24) as u8;
         match first_octet {
-            41 | 102 | 105 | 154..=156 | 160..=162 | 164..=165 | 196..=197 => true,
+            // NOTE: 154.0.0.0/8 is NOT AFRINIC - it's North American (OVH hosting)
+            41 | 102 | 105 | 155..=156 | 160..=162 | 164..=165 | 196..=197 => true,
             _ => false
         }
     }

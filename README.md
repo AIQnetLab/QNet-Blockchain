@@ -182,15 +182,12 @@ git pull origin testnet
 git clone https://github.com/AIQnetLab/QNet-Blockchain.git
 cd QNet-Blockchain
 git checkout testnet
-
-# Build Rust binary first (IMPORTANT!)
-# Build Rust binary from project root
-cargo build --release --bin qnet-node
+git pull origin testnet
 
 # Build production Docker image
-docker build -t qnet-production -f development/qnet-integration/Dockerfile.production .
+docker build -f development/qnet-integration/Dockerfile.production -t qnet-production .
 
-# Run interactive production node
+# Run interactive production node (ONLY activation method)
 docker run -it --name qnet-node --restart=always \
   -p 9876:9876 -p 9877:9877 -p 8001:8001 \
   -v $(pwd)/node_data:/app/node_data \
@@ -231,10 +228,10 @@ docker run -it --name qnet-node --restart=always \
 git clone https://github.com/AIQnetLab/QNet-Blockchain.git
 cd QNet-Blockchain
 git checkout testnet
+git pull origin testnet
 
 # Build production Docker image
-cargo build --release
-docker build -t qnet-production -f Dockerfile.production .
+docker build -f development/qnet-integration/Dockerfile.production -t qnet-production .
 
 # Run interactive production node
 docker run -it --name qnet-node --restart=always \
@@ -246,15 +243,11 @@ docker run -it --name qnet-node --restart=always \
 **Clean Build & Cache:**
 
 ```bash
-# Clean Rust build artifacts
-cargo clean
+# Clean Docker system cache
+docker system prune -f
 
-# Remove all target directories (saves ~1GB+ space)
-find . -name "target" -type d -exec rm -rf {} +
-
-# Clean Cargo cache (saves space)
-rm -rf ~/.cargo/registry/cache
-rm -rf ~/.cargo/git/db
+# Remove all unused Docker images
+docker image prune -a -f
 
 # Clean node_modules if present
 find . -name "node_modules" -type d -exec rm -rf {} +
@@ -263,8 +256,8 @@ find . -name "node_modules" -type d -exec rm -rf {} +
 find . -name ".next" -type d -exec rm -rf {} +
 find . -name "dist" -type d -exec rm -rf {} +
 
-# Full clean rebuild from project root
-cargo build --release --bin qnet-node
+# Rebuild Docker image from clean state
+docker build --no-cache -f development/qnet-integration/Dockerfile.production -t qnet-production .
 ```
 
 **Node Management:**
@@ -440,37 +433,23 @@ echo "* soft nofile 65536" | sudo tee -a /etc/security/limits.conf
 echo "* hard nofile 65536" | sudo tee -a /etc/security/limits.conf
 ```
 
-#### Auto-restart Service (Systemd)
+#### Docker Container Management
 
 ```bash
-# Create system user for QNet
-sudo useradd -r -s /bin/false qnet
-sudo chown -R qnet:qnet ~/QNet-Blockchain
+# Check running containers
+docker ps | grep qnet-node
 
-# Create systemd service
-sudo tee /etc/systemd/system/qnet-node.service << EOF
-[Unit]
-Description=QNet Blockchain Node
-After=network.target
+# View real-time logs
+docker logs qnet-node -f
 
-[Service]
-Type=simple
-User=qnet
-WorkingDirectory=/home/qnet/QNet-Blockchain
-ExecStart=/home/qnet/QNet-Blockchain/target/release/qnet-node
-Restart=always
-RestartSec=10
-Environment=RUST_LOG=info
-Environment=QNET_PRODUCTION=1
+# Stop node
+docker stop qnet-node
 
-[Install]
-WantedBy=multi-user.target
-EOF
+# Restart node
+docker restart qnet-node
 
-# Enable and start service
-sudo systemctl enable qnet-node
-sudo systemctl start qnet-node
-sudo systemctl status qnet-node
+# Remove container (keeps data volume)
+docker rm qnet-node
 ```
 
 ## 🔍 Node Management
@@ -478,33 +457,30 @@ sudo systemctl status qnet-node
 ### Check Node Status
 
 ```bash
-# Check if service is running
-sudo systemctl status qnet-node
+# Check if container is running
+docker ps | grep qnet-node
 
 # View real-time logs
-sudo journalctl -u qnet-node -f
+docker logs qnet-node -f
 
 # Check resource usage
-htop -p $(pgrep qnet-node)
+docker stats qnet-node --no-stream
 ```
 
 ### Test Node Connectivity
 
 ```bash
-# Test RPC endpoint
-curl -X POST http://localhost:9877/rpc \
-  -H "Content-Type: application/json" \
-  -d '{"method":"get_node_info","params":[],"id":1}'
+# Test REST API endpoint
+curl http://localhost:8001/api/v1/node/health
 
 # Check peer connections
-curl -s http://localhost:9877/rpc \
-  -H "Content-Type: application/json" \
-  -d '{"method":"get_peer_count","params":[],"id":1}' | jq
+curl http://localhost:8001/api/v1/peers
+
+# Check blockchain height
+curl http://localhost:9877/api/v1/height
 
 # Check sync status
-curl -s http://localhost:9877/rpc \
-  -H "Content-Type: application/json" \
-  -d '{"method":"get_sync_status","params":[],"id":1}' | jq
+curl http://localhost:8001/api/v1/node/info
 ```
 
 ### Update Node
@@ -516,12 +492,18 @@ cd ~/QNet-Blockchain
 # Pull latest changes
 git pull origin testnet
 
-# Rebuild binary
-RUSTFLAGS="-C target-cpu=native" cargo build --release --bin qnet-node --manifest-path development/qnet-integration/Cargo.toml
+# Stop and remove old container
+docker stop qnet-node
+docker rm qnet-node
 
-# Restart service
-sudo systemctl restart qnet-node
-sudo systemctl status qnet-node
+# Rebuild Docker image
+docker build -f development/qnet-integration/Dockerfile.production -t qnet-production .
+
+# Run updated container
+docker run -it --name qnet-node --restart=always \
+  -p 9876:9876 -p 9877:9877 -p 8001:8001 \
+  -v $(pwd)/node_data:/app/node_data \
+  qnet-production
 ```
 
 ### Backup Node Data
@@ -566,30 +548,33 @@ No manual configuration required - regions are detected and selected automatical
 ### Health Checks
 
 ```bash
-# Check node status
-curl http://localhost:9877/health
+# Check node health
+curl http://localhost:8001/api/v1/node/health
 
 # Check peer connections
-curl http://localhost:9877/peers
+curl http://localhost:8001/api/v1/peers
 
-# Check sync status
-curl http://localhost:9877/sync
+# Check blockchain height
+curl http://localhost:9877/api/v1/height
 
-# Check validator status
-curl http://localhost:9877/validator/status
+# Check node info
+curl http://localhost:8001/api/v1/node/info
 ```
 
 ### Log Analysis
 
 ```bash
 # View recent logs
-sudo journalctl -u qnet-node -f
+docker logs qnet-node -f
 
 # Search for errors
-sudo journalctl -u qnet-node | grep "ERROR"
+docker logs qnet-node | grep "ERROR"
 
 # Monitor performance
-sudo journalctl -u qnet-node | grep "TPS\|latency"
+docker logs qnet-node | grep "TPS\|latency"
+
+# View last 100 lines
+docker logs qnet-node --tail 100
 ```
 
 ### Backup & Recovery
