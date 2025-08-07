@@ -1090,7 +1090,7 @@ impl BlockchainNode {
                     return Ok(Region::NorthAmerica);
                 } else if Self::is_europe_ip(&physical_ip) {
                     println!("✅ Region detected: Europe");
-                    return Ok(Region::Europe);
+            return Ok(Region::Europe);
                 } else if Self::is_asia_ip(&physical_ip) {
                     println!("✅ Region detected: Asia");
                     return Ok(Region::Asia);
@@ -1445,7 +1445,51 @@ impl BlockchainNode {
         use std::net::{UdpSocket, IpAddr};
         use std::process::Command;
         
-        // Method 1: Check all network interfaces
+        // Method 1: Try to get external IP using curl (most reliable for region detection)
+        if let Ok(output) = tokio::process::Command::new("curl")
+            .arg("-s")
+            .arg("--max-time")
+            .arg("5")
+            .arg("--connect-timeout")
+            .arg("3")
+            .arg("https://api.ipify.org")
+            .output()
+            .await
+        {
+            if output.status.success() {
+                let ip_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if let Ok(ip) = ip_str.parse::<std::net::Ipv4Addr>() {
+                    if !ip.is_loopback() && !ip.is_private() && !ip.is_link_local() {
+                        println!("✅ External IP detected: {}", ip);
+                        return Ok(ip.to_string());
+                    }
+                }
+            }
+        }
+        
+        // Method 2: Try alternative external IP service
+        if let Ok(output) = tokio::process::Command::new("curl")
+            .arg("-s")
+            .arg("--max-time")
+            .arg("3")
+            .arg("http://checkip.amazonaws.com")
+            .output()
+            .await
+        {
+            if output.status.success() {
+                let ip_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if let Ok(ip) = ip_str.parse::<std::net::Ipv4Addr>() {
+                    if !ip.is_loopback() && !ip.is_private() && !ip.is_link_local() {
+                        println!("✅ External IP detected (AWS): {}", ip);
+                        return Ok(ip.to_string());
+                    }
+                }
+            }
+        }
+        
+        println!("⚠️ External IP detection failed, trying local network interfaces...");
+        
+        // Method 3: Check all network interfaces (fallback)
         #[cfg(target_os = "windows")]
         {
             if let Ok(output) = Command::new("ipconfig").output() {
@@ -1455,7 +1499,8 @@ impl BlockchainNode {
                         if let Some(ip_part) = line.split(':').nth(1) {
                             let ip_str = ip_part.trim();
                             if let Ok(ip) = ip_str.parse::<std::net::Ipv4Addr>() {
-                                if !ip.is_loopback() && !ip.is_private() && !ip.is_link_local() {
+                                if !ip.is_loopback() && !ip.is_link_local() {
+                                    println!("⚠️ Using local IP: {} (may affect region detection)", ip);
                                     return Ok(ip.to_string());
                                 }
                             }
@@ -1471,7 +1516,8 @@ impl BlockchainNode {
                 let output_str = String::from_utf8_lossy(&output.stdout);
                 for ip_str in output_str.split_whitespace() {
                     if let Ok(ip) = ip_str.parse::<std::net::Ipv4Addr>() {
-                        if !ip.is_loopback() && !ip.is_private() && !ip.is_link_local() {
+                        if !ip.is_loopback() && !ip.is_link_local() {
+                            println!("⚠️ Using local IP: {} (may affect region detection)", ip);
                             return Ok(ip.to_string());
                         }
                     }
@@ -1479,14 +1525,15 @@ impl BlockchainNode {
             }
         }
         
-        // Method 2: Use socket binding to determine local IP
+        // Method 4: Use socket binding to determine local IP (last resort)
         match UdpSocket::bind("0.0.0.0:0") {
             Ok(socket) => {
-                if let Ok(()) = socket.connect("10.0.0.1:9876") {
+                if let Ok(()) = socket.connect("8.8.8.8:80") {
                     if let Ok(addr) = socket.local_addr() {
                         let ip = addr.ip();
                         if let IpAddr::V4(ipv4) = ip {
                             if !ipv4.is_loopback() && !ipv4.is_link_local() {
+                                println!("⚠️ Using socket-detected IP: {} (may affect region detection)", ipv4);
                                 return Ok(ipv4.to_string());
                             }
                         }
@@ -1496,14 +1543,59 @@ impl BlockchainNode {
             Err(_) => {}
         }
         
-        Err("Could not determine physical IP address".to_string())
+        Err("Could not determine IP address for region detection".to_string())
     }
     
-    /// Simple latency-based region testing (disabled - IP-based detection only)
+    /// Simple latency-based region testing (enabled as fallback)
     async fn simple_latency_region_test() -> Result<Region, String> {
-        // Latency testing removed - only IP-based region detection for production
-        // In real decentralized network, nodes would use actual peer discovery
-        Err("Latency-based region testing disabled - use IP-based detection".to_string())
+        println!("🔄 Attempting latency-based region detection...");
+        
+        // Test connectivity to known regional endpoints
+        let regional_tests = vec![
+            (Region::NorthAmerica, "8.8.8.8:53"),     // Google DNS (US)
+            (Region::Europe, "1.1.1.1:53"),           // Cloudflare DNS (Global but EU-optimized)  
+            (Region::Asia, "208.67.222.222:53"),      // OpenDNS (Asia-Pacific)
+            (Region::SouthAmerica, "8.8.4.4:53"),     // Google DNS (Global)
+            (Region::Africa, "196.216.2.1:53"),       // AfriNIC DNS
+            (Region::Oceania, "203.119.4.1:53"),      // APNIC DNS (Oceania)
+        ];
+        
+        let mut best_region = None;
+        let mut best_latency = std::time::Duration::from_secs(10);
+        
+        for (region, endpoint) in regional_tests {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                tokio::net::TcpStream::connect(endpoint)
+            ).await {
+                Ok(Ok(_stream)) => {
+                    let start = std::time::Instant::now();
+                    match tokio::time::timeout(
+                        std::time::Duration::from_millis(500),
+                        tokio::net::TcpStream::connect(endpoint)
+                    ).await {
+                        Ok(Ok(_)) => {
+                            let latency = start.elapsed();
+                            println!("📡 {:?}: {}ms", region, latency.as_millis());
+                            
+                            if latency < best_latency {
+                                best_latency = latency;
+                                best_region = Some(region);
+                            }
+                        }
+                        _ => println!("📡 {:?}: timeout", region),
+                    }
+                }
+                _ => println!("📡 {:?}: connection failed", region),
+            }
+        }
+        
+        if let Some(region) = best_region {
+            println!("✅ Best region by latency: {:?} ({}ms)", region, best_latency.as_millis());
+            Ok(region)
+        } else {
+            Err("All latency tests failed - no regional connectivity".to_string())
+        }
     }
     
     // Regional IP detection functions (same as main binary)
@@ -1565,7 +1657,7 @@ impl BlockchainNode {
             _ => false
         }
     }
-} 
+}
 
 /// Peer information for RPC responses
 #[derive(Debug, Clone)]
