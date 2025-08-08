@@ -463,8 +463,8 @@ impl BlockchainNode {
                             Ok(network_height) => {
                                 if network_height > microblock_height {
                                     println!("[CONSENSUS] 🔄 Network height {} ahead of local {}. Attempting block download...", network_height, microblock_height);
-                                    p2p.download_missing_microblocks(&self.storage, microblock_height, network_height).await;
-                                    if let Ok(Some(_)) = self.storage.load_microblock(network_height) {
+                                    p2p.download_missing_microblocks(storage.as_ref(), microblock_height, network_height).await;
+                                    if let Ok(Some(_)) = storage.load_microblock(network_height) {
                                         println!("[SYNC] ✅ Downloaded up to #{}. Updating local cursor.", network_height);
                                         microblock_height = network_height;
                                     } else {
