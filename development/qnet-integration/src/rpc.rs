@@ -94,6 +94,54 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
     // REST API endpoints (new)
     let api_v1 = warp::path("api").and(warp::path("v1"));
     
+    // Height endpoint (for peer sync)
+    let chain_height = api_v1
+        .and(warp::path("height"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(blockchain_filter.clone())
+        .and_then(|blockchain: Arc<BlockchainNode>| async move {
+            let height = blockchain.get_height().await;
+            Ok::<_, Rejection>(warp::reply::json(&json!({"height": height})))
+        });
+    
+    // Microblock by height
+    let microblock_one = api_v1
+        .and(warp::path("microblock"))
+        .and(warp::path::param::<u64>())
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(blockchain_filter.clone())
+        .and_then(|height: u64, blockchain: Arc<BlockchainNode>| async move {
+            let data_opt = blockchain.storage.load_microblock(height)
+                .map_err(|_| warp::reject())?;
+            if let Some(data) = data_opt {
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+                Ok::<_, Rejection>(warp::reply::json(&json!({"height": height, "data": b64})))
+            } else {
+                Ok::<_, Rejection>(warp::reply::json(&json!({"height": height, "data": null})))
+            }
+        });
+    
+    // Microblocks by range
+    let microblocks_range = api_v1
+        .and(warp::path("microblocks"))
+        .and(warp::query::<std::collections::HashMap<String, String>>())
+        .and(warp::get())
+        .and(blockchain_filter.clone())
+        .and_then(|params: std::collections::HashMap<String, String>, blockchain: Arc<BlockchainNode>| async move {
+            let from = params.get("from").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+            let to = params.get("to").and_then(|s| s.parse::<u64>().ok()).unwrap_or(from);
+            let mut items = Vec::new();
+            for h in from..=to {
+                if let Ok(Some(data)) = blockchain.storage.load_microblock(h) {
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+                    items.push(json!({"height": h, "data": b64}));
+                }
+            }
+            Ok::<_, Rejection>(warp::reply::json(&json!({"from": from, "to": to, "items": items})))
+        });
+    
     // Account endpoints
     let account_info = api_v1
         .and(warp::path("account"))
@@ -235,6 +283,9 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
     // Combine all routes
     let routes = rpc_path
         .or(root_path)
+        .or(chain_height)
+        .or(microblock_one)
+        .or(microblocks_range)
         .or(account_info)
         .or(account_balance)
         .or(account_transactions)

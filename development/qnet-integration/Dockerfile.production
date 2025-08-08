@@ -68,5 +68,6 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
 EXPOSE 9876 9877 8001
 
 # Production startup command with proper signal handling
+ENV QNET_DATA_DIR=/app/data
 ENTRYPOINT ["/usr/local/bin/qnet-node"]
 CMD [] 

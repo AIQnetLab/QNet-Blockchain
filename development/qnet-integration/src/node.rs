@@ -462,10 +462,16 @@ impl BlockchainNode {
                         match p2p.sync_blockchain_height() {
                             Ok(network_height) => {
                                 if network_height > microblock_height {
-                                    println!("[CONSENSUS] 🔄 Syncing to network height: {} -> {}", microblock_height, network_height);
-                                    microblock_height = network_height;
+                                    println!("[CONSENSUS] 🔄 Network height {} ahead of local {}. Attempting block download...", network_height, microblock_height);
+                                    p2p.download_missing_microblocks(&storage, microblock_height, network_height).await;
+                                    // Re-read last stored microblock to adjust safely
+                                    if let Ok(Some(_)) = storage.load_microblock(network_height) {
+                                        println!("[SYNC] ✅ Downloaded up to #{}. Updating local cursor.", network_height);
+                                        microblock_height = network_height;
+                                    } else {
+                                        println!("[SYNC] ⚠️ Download incomplete. Continuing with local height {}.", microblock_height);
+                                    }
                                 } else if can_participate_consensus && microblock_height == network_height {
-                                    // Node is up-to-date and can participate in creating next block
                                     println!("[CONSENSUS] ✅ Node synchronized, height: {}", microblock_height);
                                 }
                             },

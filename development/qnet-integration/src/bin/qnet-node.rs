@@ -1114,7 +1114,8 @@ impl AutoConfig {
         println!("🔌 Selected ports: P2P={}, RPC={}", p2p_port, rpc_port);
         
         // Smart data directory selection for Linux servers
-        let data_dir = select_best_data_directory().await?;
+        // In Docker, prefer /app/data if writable
+        let data_dir = if let Ok(dir) = std::env::var("QNET_DATA_DIR") { PathBuf::from(dir) } else { select_best_data_directory().await? };
         println!("📁 Data directory: {:?}", data_dir);
         
         // Bootstrap peers based on region
@@ -2093,8 +2094,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // Show log viewing command prominently
     println!("🔍 === TO VIEW LOGS ===");
-    println!("Run this command in a NEW terminal:");
-    println!("   tail -f {}", log_file_path.display());
+    println!("tail -f {}", log_file_path.display());
     println!("");
     println!("Press Ctrl+C in the log viewer to exit (node keeps running)");
     println!("This terminal will now be free for other commands.");

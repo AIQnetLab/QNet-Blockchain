@@ -608,9 +608,8 @@ impl SimplifiedP2P {
             }
         }
         
-        // If all HTTP endpoints fail, fallback to consensus estimation
-        println!("[SYNC] All HTTP endpoints failed for {}, using consensus estimation", peer_ip);
-        self.estimate_peer_height_from_genesis()
+        // Strict production behavior: do NOT fabricate heights if APIs are unavailable
+        Err(format!("All HTTP endpoints failed for {}", peer_ip))
     }
     
     /// Query peer height via HTTP with timeout and error handling
@@ -1482,6 +1481,49 @@ impl SimplifiedP2P {
         
         // Fallback to localhost
         Ok("127.0.0.1".to_string())
+    }
+
+    /// Download missing microblocks from peers before consensus participation
+    pub async fn download_missing_microblocks(&self, storage: &crate::storage::PersistentStorage, current_height: u64, target_height: u64) {
+        if target_height <= current_height { return; }
+        let peers = self.connected_peers.lock().unwrap().clone();
+        if peers.is_empty() { return; }
+        let mut height = current_height + 1;
+        while height <= target_height {
+            let mut fetched = false;
+            for peer in &peers {
+                // Try primary API port first
+                let ip = peer.addr.split(':').next().unwrap_or("");
+                let urls = vec![
+                    format!("http://{}:8001/api/v1/microblock/{}", ip, height),
+                    format!("http://{}:{}/api/v1/microblock/{}", ip, self.port + 1000, height),
+                ];
+                for url in urls {
+                    if let Ok(resp) = std::process::Command::new("curl").arg("-s").arg("-m").arg("3").arg(&url).output() {
+                        if resp.status.success() {
+                            let body = String::from_utf8_lossy(&resp.stdout);
+                            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&body) {
+                                if let Some(b64) = val.get("data").and_then(|v| v.as_str()) {
+                                    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) {
+                                        if storage.save_microblock(height, &bytes).is_ok() {
+                                            println!("[SYNC] 📦 Downloaded microblock #{} from {}", height, ip);
+                                            fetched = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if fetched { break; }
+            }
+            if !fetched {
+                println!("[SYNC] ⚠️ Could not fetch microblock #{} from any peer", height);
+                break;
+            }
+            height += 1;
+        }
     }
 }
 
