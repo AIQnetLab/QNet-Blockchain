@@ -8,6 +8,7 @@ use warp::{Filter, Rejection, Reply};
 use crate::node::BlockchainNode;
 use chrono;
 use sha3::Digest; // Add missing Digest trait
+use base64::Engine;
 
 #[derive(Debug, Deserialize)]
 struct RpcRequest {
@@ -113,7 +114,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::get())
         .and(blockchain_filter.clone())
         .and_then(|height: u64, blockchain: Arc<BlockchainNode>| async move {
-            let data_opt = blockchain.storage.load_microblock(height)
+            let data_opt = blockchain.load_microblock_bytes(height)
                 .map_err(|_| warp::reject())?;
             if let Some(data) = data_opt {
                 let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
@@ -134,7 +135,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
             let to = params.get("to").and_then(|s| s.parse::<u64>().ok()).unwrap_or(from);
             let mut items = Vec::new();
             for h in from..=to {
-                if let Ok(Some(data)) = blockchain.storage.load_microblock(h) {
+                if let Ok(Some(data)) = blockchain.load_microblock_bytes(h) {
                     let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
                     items.push(json!({"height": h, "data": b64}));
                 }

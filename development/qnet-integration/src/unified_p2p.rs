@@ -10,6 +10,7 @@ use std::thread;
 use serde::{Serialize, Deserialize};
 use rand;
 use serde_json;
+use base64::Engine;
 
 // Import QNet consensus components for proper peer validation
 use qnet_consensus::reputation::{NodeReputation, ReputationConfig};
@@ -1484,7 +1485,7 @@ impl SimplifiedP2P {
     }
 
     /// Download missing microblocks from peers before consensus participation
-    pub async fn download_missing_microblocks(&self, storage: &crate::storage::PersistentStorage, current_height: u64, target_height: u64) {
+    pub async fn download_missing_microblocks(&self, storage: &crate::storage::Storage, current_height: u64, target_height: u64) {
         if target_height <= current_height { return; }
         let peers = self.connected_peers.lock().unwrap().clone();
         if peers.is_empty() { return; }

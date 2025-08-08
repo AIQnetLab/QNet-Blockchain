@@ -463,9 +463,8 @@ impl BlockchainNode {
                             Ok(network_height) => {
                                 if network_height > microblock_height {
                                     println!("[CONSENSUS] 🔄 Network height {} ahead of local {}. Attempting block download...", network_height, microblock_height);
-                                    p2p.download_missing_microblocks(&storage, microblock_height, network_height).await;
-                                    // Re-read last stored microblock to adjust safely
-                                    if let Ok(Some(_)) = storage.load_microblock(network_height) {
+                                    p2p.download_missing_microblocks(&self.storage, microblock_height, network_height).await;
+                                    if let Ok(Some(_)) = self.storage.load_microblock(network_height) {
                                         println!("[SYNC] ✅ Downloaded up to #{}. Updating local cursor.", network_height);
                                         microblock_height = network_height;
                                     } else {
@@ -1767,6 +1766,10 @@ impl BlockchainNode {
             1 | 27 | 58..=59 | 101 | 103 | 110 | 115..=116 | 118..=119 | 124..=125 | 150 | 202..=203 | 210 => true,
             _ => false
         }
+    }
+
+    pub fn load_microblock_bytes(&self, height: u64) -> Result<Option<Vec<u8>>, QNetError> {
+        self.storage.load_microblock(height).map_err(|e| QNetError::StorageError(e.to_string()))
     }
 }
 
