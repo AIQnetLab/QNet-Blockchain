@@ -1817,4 +1817,5 @@ impl Clone for BlockchainNode {
             parallel_validator: self.parallel_validator.clone(),
         }
     } 
+}
 
