@@ -1061,10 +1061,7 @@ impl BlockchainNode {
     
     /// Auto-detect region from IP geolocation
     pub async fn auto_detect_region() -> Result<Region, String> {
-        println!("🌍 Production auto-region detection - no defaults allowed...");
-        
-        // Production mode: No default regions - must detect accurately
-        // Use the same detection system as the main node binary
+        println!("🌍 Production auto-region detection using real geolocation services...");
         
         // Method 1: Check QNET_REGION environment variable
         if let Ok(region_hint) = std::env::var("QNET_REGION") {
@@ -1079,35 +1076,18 @@ impl BlockchainNode {
             }
         }
         
-        // Method 2: Get physical IP and check regional ranges
-        if let Ok(physical_ip_str) = Self::get_physical_ip_without_external_services().await {
-            if let Ok(physical_ip) = physical_ip_str.parse::<std::net::Ipv4Addr>() {
-                println!("🌍 Physical IP detected: {}", physical_ip);
-                
-                // Use the same regional IP detection as main binary
-                if Self::is_north_america_ip(&physical_ip) {
-                    println!("✅ Region detected: North America");
-                    return Ok(Region::NorthAmerica);
-                } else if Self::is_europe_ip(&physical_ip) {
-                    println!("✅ Region detected: Europe");
-            return Ok(Region::Europe);
-                } else if Self::is_asia_ip(&physical_ip) {
-                    println!("✅ Region detected: Asia");
-                    return Ok(Region::Asia);
-                } else if Self::is_south_america_ip(&physical_ip) {
-                    println!("✅ Region detected: South America");
-                    return Ok(Region::SouthAmerica);
-                } else if Self::is_africa_ip(&physical_ip) {
-                    println!("✅ Region detected: Africa");
-                    return Ok(Region::Africa);
-                } else if Self::is_oceania_ip(&physical_ip) {
-                    println!("✅ Region detected: Oceania");
-                    return Ok(Region::Oceania);
-                }
+        // Method 2: Get external IP and use real geolocation services
+        if let Ok(external_ip) = Self::get_physical_ip_without_external_services().await {
+            println!("🌍 Using external IP for geolocation: {}", external_ip);
+            
+            // Try multiple geolocation services for accuracy
+            if let Ok(region) = Self::detect_region_via_geolocation_api(&external_ip).await {
+                println!("✅ Region detected via geolocation API: {:?}", region);
+                return Ok(region);
             }
         }
         
-        // Method 3: Network latency testing (simplified version)
+        // Method 3: Network latency testing (fallback)
         match Self::simple_latency_region_test().await {
             Ok(region) => {
                 println!("✅ Region detected via latency test: {:?}", region);
@@ -1120,6 +1100,131 @@ impl BlockchainNode {
         
         // Production: MUST detect region - no fallback defaults allowed
         Err("Production region detection failed - manual QNET_REGION environment variable required".to_string())
+    }
+    
+    /// Detect region using real geolocation API services
+    async fn detect_region_via_geolocation_api(ip: &str) -> Result<Region, String> {
+        println!("🔍 Querying geolocation APIs for IP: {}", ip);
+        
+        // Try multiple geolocation services for reliability
+        let geolocation_services = vec![
+            format!("http://ip-api.com/json/{}", ip),
+            format!("https://ipapi.co/{}/json/", ip),
+            format!("http://api.ipstack.com/{}?access_key=free", ip),
+        ];
+        
+        for service_url in geolocation_services {
+            match Self::query_geolocation_service(&service_url).await {
+                Ok(region) => {
+                    println!("✅ Region detected from {}: {:?}", service_url, region);
+                    return Ok(region);
+                }
+                Err(e) => {
+                    println!("⚠️ Failed to get region from {}: {}", service_url, e);
+                    continue;
+                }
+            }
+        }
+        
+        Err("All geolocation services failed".to_string())
+    }
+    
+    /// Query a specific geolocation service
+    async fn query_geolocation_service(url: &str) -> Result<Region, String> {
+        use std::time::Duration;
+        
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .map_err(|e| format!("HTTP client error: {}", e))?;
+        
+        let response = client.get(url)
+            .send()
+            .await
+            .map_err(|e| format!("Request failed: {}", e))?;
+        
+        if !response.status().is_success() {
+            return Err(format!("HTTP error: {}", response.status()));
+        }
+        
+        let json_text = response.text().await
+            .map_err(|e| format!("Response read error: {}", e))?;
+        
+        println!("🔍 Geolocation API response: {}", json_text);
+        
+        // Parse JSON response
+        let json_value: serde_json::Value = serde_json::from_str(&json_text)
+            .map_err(|e| format!("JSON parse error: {}", e))?;
+        
+        // Extract continent/region information (try multiple fields)
+        let region = if let Some(continent) = json_value.get("continent").and_then(|v| v.as_str()) {
+            Self::map_continent_to_region(continent)
+        } else if let Some(continent_code) = json_value.get("continent_code").and_then(|v| v.as_str()) {
+            Self::map_continent_code_to_region(continent_code)
+        } else if let Some(continent_code) = json_value.get("continentCode").and_then(|v| v.as_str()) {
+            Self::map_continent_code_to_region(continent_code)
+        } else if let Some(country_code) = json_value.get("country_code").and_then(|v| v.as_str()) {
+            Self::map_country_code_to_region(country_code)
+        } else if let Some(country_code) = json_value.get("countryCode").and_then(|v| v.as_str()) {
+            Self::map_country_code_to_region(country_code)
+        } else {
+            return Err("No continent/country information in response".to_string());
+        };
+        
+        region.ok_or_else(|| "Unknown region".to_string())
+    }
+    
+    /// Map continent name to region
+    fn map_continent_to_region(continent: &str) -> Option<Region> {
+        match continent.to_lowercase().as_str() {
+            "north america" | "northern america" => Some(Region::NorthAmerica),
+            "europe" => Some(Region::Europe),
+            "asia" => Some(Region::Asia),
+            "south america" | "southern america" => Some(Region::SouthAmerica),
+            "africa" => Some(Region::Africa),
+            "oceania" | "australia" => Some(Region::Oceania),
+            _ => None,
+        }
+    }
+    
+    /// Map continent code to region
+    fn map_continent_code_to_region(code: &str) -> Option<Region> {
+        match code.to_uppercase().as_str() {
+            "NA" => Some(Region::NorthAmerica),
+            "EU" => Some(Region::Europe),
+            "AS" => Some(Region::Asia),
+            "SA" => Some(Region::SouthAmerica),
+            "AF" => Some(Region::Africa),
+            "OC" => Some(Region::Oceania),
+            _ => None,
+        }
+    }
+    
+    /// Map major country codes to regions (only essential ones)
+    fn map_country_code_to_region(code: &str) -> Option<Region> {
+        match code.to_uppercase().as_str() {
+            // North America
+            "US" | "CA" | "MX" => Some(Region::NorthAmerica),
+            
+            // Europe (major countries)
+            "DE" | "FR" | "GB" | "ES" | "IT" | "NL" | "PL" | "RO" | "BE" | "CZ" |
+            "PT" | "HU" | "SE" | "AT" | "CH" | "BG" | "DK" | "FI" | "NO" | "IE" => Some(Region::Europe),
+            
+            // Asia (major countries)  
+            "CN" | "IN" | "JP" | "KR" | "TH" | "VN" | "SG" | "MY" | "PH" | "ID" |
+            "TW" | "HK" | "BD" | "PK" => Some(Region::Asia),
+            
+            // South America
+            "BR" | "AR" | "CL" | "CO" | "PE" | "VE" => Some(Region::SouthAmerica),
+            
+            // Africa (major countries)
+            "ZA" | "NG" | "EG" | "KE" | "MA" => Some(Region::Africa),
+            
+            // Oceania
+            "AU" | "NZ" => Some(Region::Oceania),
+            
+            _ => None,
+        }
     }
     
     /// Save activation code to persistent storage with security validation
@@ -1711,6 +1816,5 @@ impl Clone for BlockchainNode {
             shard_coordinator: self.shard_coordinator.clone(),
             parallel_validator: self.parallel_validator.clone(),
         }
-    }
-} 
+    } 
 

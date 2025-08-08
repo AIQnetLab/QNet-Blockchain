@@ -2272,59 +2272,205 @@ async fn detect_region_by_system_info() -> Result<Region, String> {
 
 // Decentralized region detection via latency testing to regional QNet ports
 async fn detect_region_via_latency_test() -> Result<Region, String> {
-    println!("[LATENCY] Starting decentralized region detection via port latency...");
+    println!("[LATENCY] Starting real geolocation detection via API services...");
     
-    // Get our physical IP first for region hint
+    // Get our physical IP first
     let our_ip = match get_physical_ip().await {
         Ok(ip) => {
-            if let Ok(parsed_ip) = ip.parse::<std::net::Ipv4Addr>() {
-                println!("[LATENCY] Physical IP: {}", ip);
-                
-                // Use GeoIP-style region detection
-                let region = determine_region_from_ip(&parsed_ip);
-                if let Some(detected_region) = region {
-                    println!("[LATENCY] ✅ Region detected from IP: {:?}", detected_region);
-                    return Ok(detected_region);
-                }
-                
-                Some(parsed_ip)
-            } else {
-                None
-            }
+            println!("[GEOLOCATION] External IP detected: {}", ip);
+            ip
         },
         Err(e) => {
-            println!("[LATENCY] Could not get physical IP: {}", e);
-            None
+            println!("[GEOLOCATION] Could not get external IP: {}", e);
+            return Err("Cannot detect region without external IP".to_string());
         }
     };
     
-    // Primary method: Physical IP address analysis
-    if let Some(physical_ip) = our_ip {
-        if is_north_america_ip(&physical_ip) {
-            println!("[LATENCY] ✅ IP-based region detection: North America");
-            return Ok(Region::NorthAmerica);
-        } else if is_europe_ip(&physical_ip) {
-            println!("[LATENCY] ✅ IP-based region detection: Europe");
-            return Ok(Region::Europe);
-        } else if is_asia_ip(&physical_ip) {
-            println!("[LATENCY] ✅ IP-based region detection: Asia");
-            return Ok(Region::Asia);
-        } else if is_south_america_ip(&physical_ip) {
-            println!("[LATENCY] ✅ IP-based region detection: South America");
-            return Ok(Region::SouthAmerica);
-        } else if is_africa_ip(&physical_ip) {
-            println!("[LATENCY] ✅ IP-based region detection: Africa");
-            return Ok(Region::Africa);
-        } else if is_oceania_ip(&physical_ip) {
-            println!("[LATENCY] ✅ IP-based region detection: Oceania");
-            return Ok(Region::Oceania);
+    // Use real geolocation services
+    match detect_region_via_geolocation_api(&our_ip).await {
+        Ok(region) => {
+            println!("[GEOLOCATION] ✅ Region detected via API: {:?}", region);
+            return Ok(region);
         }
-        
-        println!("[LATENCY] ⚠️ IP {} not in known regional ranges", physical_ip);
+        Err(e) => {
+            println!("[GEOLOCATION] API detection failed: {}", e);
+        }
     }
     
-    // Fallback: Cannot determine region without proper IP
-    Err("Unable to determine region from physical IP address".to_string())
+    // Fallback: Network latency testing
+    println!("[LATENCY] Falling back to latency-based detection...");
+    
+    // Test connectivity to known regional endpoints
+    let regional_tests = vec![
+        (Region::NorthAmerica, "8.8.8.8:53"),     // Google DNS (US)
+        (Region::Europe, "1.1.1.1:53"),           // Cloudflare DNS (Global but EU-optimized)  
+        (Region::Asia, "208.67.222.222:53"),      // OpenDNS (Asia-Pacific)
+        (Region::SouthAmerica, "8.8.4.4:53"),     // Google DNS (Global)
+        (Region::Africa, "196.216.2.1:53"),       // AfriNIC DNS
+        (Region::Oceania, "203.119.4.1:53"),      // APNIC DNS (Oceania)
+    ];
+    
+    let mut best_region = None;
+    let mut best_latency = std::time::Duration::from_secs(10);
+    
+    for (region, endpoint) in regional_tests {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            tokio::net::TcpStream::connect(endpoint)
+        ).await {
+            Ok(Ok(_stream)) => {
+                let start = std::time::Instant::now();
+                match tokio::time::timeout(
+                    std::time::Duration::from_millis(500),
+                    tokio::net::TcpStream::connect(endpoint)
+                ).await {
+                    Ok(Ok(_)) => {
+                        let latency = start.elapsed();
+                        println!("[LATENCY] {:?}: {}ms", region, latency.as_millis());
+                        
+                        if latency < best_latency {
+                            best_latency = latency;
+                            best_region = Some(region);
+                        }
+                    }
+                    _ => println!("[LATENCY] {:?}: timeout", region),
+                }
+            }
+            _ => println!("[LATENCY] {:?}: connection failed", region),
+        }
+    }
+    
+    if let Some(region) = best_region {
+        println!("[LATENCY] ✅ Best region by latency: {:?} ({}ms)", region, best_latency.as_millis());
+        Ok(region)
+    } else {
+        Err("All latency tests failed - no regional connectivity".to_string())
+    }
+}
+
+/// Detect region using real geolocation API services
+async fn detect_region_via_geolocation_api(ip: &str) -> Result<Region, String> {
+    println!("[GEOLOCATION] Querying geolocation APIs for IP: {}", ip);
+    
+    // Try multiple geolocation services for reliability
+    let geolocation_services = vec![
+        format!("http://ip-api.com/json/{}", ip),
+        format!("https://ipapi.co/{}/json/", ip),
+        format!("http://api.ipstack.com/{}?access_key=free", ip),
+    ];
+    
+    for service_url in geolocation_services {
+        match query_geolocation_service(&service_url).await {
+            Ok(region) => {
+                println!("[GEOLOCATION] ✅ Region detected from API: {:?}", region);
+                return Ok(region);
+            }
+            Err(e) => {
+                println!("[GEOLOCATION] ⚠️ Failed to get region from API: {}", e);
+                continue;
+            }
+        }
+    }
+    
+    Err("All geolocation services failed".to_string())
+}
+
+/// Query a specific geolocation service
+async fn query_geolocation_service(url: &str) -> Result<Region, String> {
+    use std::time::Duration;
+    
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|e| format!("HTTP client error: {}", e))?;
+    
+    let response = client.get(url)
+        .send()
+        .await
+        .map_err(|e| format!("Request failed: {}", e))?;
+    
+    if !response.status().is_success() {
+        return Err(format!("HTTP error: {}", response.status()));
+    }
+    
+    let json_text = response.text().await
+        .map_err(|e| format!("Response read error: {}", e))?;
+    
+    println!("[GEOLOCATION] API response: {}", json_text);
+    
+    // Parse JSON response
+    let json_value: serde_json::Value = serde_json::from_str(&json_text)
+        .map_err(|e| format!("JSON parse error: {}", e))?;
+    
+    // Extract continent/region information (try multiple fields)
+    let region = if let Some(continent) = json_value.get("continent").and_then(|v| v.as_str()) {
+        map_continent_to_region(continent)
+    } else if let Some(continent_code) = json_value.get("continent_code").and_then(|v| v.as_str()) {
+        map_continent_code_to_region(continent_code)
+    } else if let Some(continent_code) = json_value.get("continentCode").and_then(|v| v.as_str()) {
+        map_continent_code_to_region(continent_code)
+    } else if let Some(country_code) = json_value.get("country_code").and_then(|v| v.as_str()) {
+        map_country_code_to_region(country_code)
+    } else if let Some(country_code) = json_value.get("countryCode").and_then(|v| v.as_str()) {
+        map_country_code_to_region(country_code)
+    } else {
+        return Err("No continent/country information in response".to_string());
+    };
+    
+    region.ok_or_else(|| "Unknown region".to_string())
+}
+
+/// Map continent name to region
+fn map_continent_to_region(continent: &str) -> Option<Region> {
+    match continent.to_lowercase().as_str() {
+        "north america" | "northern america" => Some(Region::NorthAmerica),
+        "europe" => Some(Region::Europe),
+        "asia" => Some(Region::Asia),
+        "south america" | "southern america" => Some(Region::SouthAmerica),
+        "africa" => Some(Region::Africa),
+        "oceania" | "australia" => Some(Region::Oceania),
+        _ => None,
+    }
+}
+
+/// Map continent code to region
+fn map_continent_code_to_region(code: &str) -> Option<Region> {
+    match code.to_uppercase().as_str() {
+        "NA" => Some(Region::NorthAmerica),
+        "EU" => Some(Region::Europe),
+        "AS" => Some(Region::Asia),
+        "SA" => Some(Region::SouthAmerica),
+        "AF" => Some(Region::Africa),
+        "OC" => Some(Region::Oceania),
+        _ => None,
+    }
+}
+
+/// Map major country codes to regions (only essential ones)
+fn map_country_code_to_region(code: &str) -> Option<Region> {
+    match code.to_uppercase().as_str() {
+        // North America
+        "US" | "CA" | "MX" => Some(Region::NorthAmerica),
+        
+        // Europe (major countries)
+        "DE" | "FR" | "GB" | "ES" | "IT" | "NL" | "PL" | "RO" | "BE" | "CZ" |
+        "PT" | "HU" | "SE" | "AT" | "CH" | "BG" | "DK" | "FI" | "NO" | "IE" => Some(Region::Europe),
+        
+        // Asia (major countries)  
+        "CN" | "IN" | "JP" | "KR" | "TH" | "VN" | "SG" | "MY" | "PH" | "ID" |
+        "TW" | "HK" | "BD" | "PK" => Some(Region::Asia),
+        
+        // South America
+        "BR" | "AR" | "CL" | "CO" | "PE" | "VE" => Some(Region::SouthAmerica),
+        
+        // Africa (major countries)
+        "ZA" | "NG" | "EG" | "KE" | "MA" => Some(Region::Africa),
+        
+        // Oceania
+        "AU" | "NZ" => Some(Region::Oceania),
+        
+        _ => None,
+    }
 }
 
 // Test all regional ports to find active nodes
