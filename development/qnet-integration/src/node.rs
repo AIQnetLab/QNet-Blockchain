@@ -1250,9 +1250,20 @@ impl BlockchainNode {
             return Err(QNetError::ValidationError("Empty activation code".to_string()));
         }
         
-        // Check basic format
-        if !code.starts_with("QNET-") || code.len() != 17 {
-            return Err(QNetError::ValidationError("Invalid activation code format".to_string()));
+        // Check for genesis bootstrap codes first (different format)
+        const BOOTSTRAP_WHITELIST: &[&str] = &[
+            "QNET-BOOT-0001-STRAP", "QNET-BOOT-0002-STRAP", "QNET-BOOT-0003-STRAP", 
+            "QNET-BOOT-0004-STRAP", "QNET-BOOT-0005-STRAP"
+        ];
+        
+        if BOOTSTRAP_WHITELIST.contains(&code) {
+            println!("✅ Genesis bootstrap code detected in node.rs: {}", code);
+            // Skip format validation for genesis codes
+        } else {
+            // Check basic format for regular codes
+            if !code.starts_with("QNET-") || code.len() != 17 {
+                return Err(QNetError::ValidationError("Invalid activation code format".to_string()));
+            }
         }
         
         // Initialize blockchain registry for production validation

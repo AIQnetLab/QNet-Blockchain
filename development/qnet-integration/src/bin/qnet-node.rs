@@ -403,15 +403,16 @@ async fn validate_activation_code_comprehensive(
         }
     }
     
-    // 2. Format validation - QNET-XXXX-XXXX-XXXX for production
-    if !code.starts_with("QNET-") || code.len() != 17 {
-        return Err("Invalid activation code format. Expected: QNET-XXXX-XXXX-XXXX".to_string());
-    }
-    
-    // 3. Bootstrap whitelist check (first 5 nodes)
+    // 2. Bootstrap whitelist check FIRST (genesis codes have different format)
     if BOOTSTRAP_WHITELIST.contains(&code) {
         println!("✅ Bootstrap whitelist code detected - Genesis network node");
+        println!("   [GENESIS] Code: {} (bootstrap format)", code);
         return Ok(());
+    }
+    
+    // 3. Format validation - QNET-XXXX-XXXX-XXXX for regular production codes
+    if !code.starts_with("QNET-") || code.len() != 17 {
+        return Err("Invalid activation code format. Expected: QNET-XXXX-XXXX-XXXX".to_string());
     }
     
             // 4. Phase and pricing validation with quantum decryption

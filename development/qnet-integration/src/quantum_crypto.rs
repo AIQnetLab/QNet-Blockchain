@@ -170,7 +170,25 @@ impl QNetQuantumCrypto {
         // Cache miss - perform full decryption
         self.record_cache_miss();
 
-        // 1. Validate code format (production compatible)
+        // 1. Check for genesis bootstrap codes first (different format)
+        const BOOTSTRAP_WHITELIST: &[&str] = &[
+            "QNET-BOOT-0001-STRAP", "QNET-BOOT-0002-STRAP", "QNET-BOOT-0003-STRAP", 
+            "QNET-BOOT-0004-STRAP", "QNET-BOOT-0005-STRAP"
+        ];
+        
+        if BOOTSTRAP_WHITELIST.contains(&activation_code) {
+            println!("✅ Genesis bootstrap code detected in quantum_crypto.rs: {}", activation_code);
+            // Return a dummy payload for genesis codes
+            return Ok(ActivationPayload {
+                burn_tx: "genesis_bootstrap".to_string(),
+                node_type: 2, // Super node
+                timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+                wallet: "genesis_wallet".to_string(),
+                signature: "genesis_signature".to_string(),
+            });
+        }
+        
+        // Validate code format (production compatible) for regular codes
         if !activation_code.starts_with("QNET-") || activation_code.len() < 17 || activation_code.len() > 19 {
             return Err(anyhow!("Invalid activation code format - expected QNET-XXXX-XXXX-XXXX (17-19 chars)"));
         }
@@ -536,7 +554,23 @@ impl QNetQuantumCrypto {
     fn decode_activation_code_compatible(&self, code: &str) -> Result<CompatibleActivationData> {
         // Use existing logic from the original decode_activation_code function
         
-        // Validate format: QNET-XXXX-XXXX-XXXX (production compatible)
+        // Check for genesis bootstrap codes first
+        const BOOTSTRAP_WHITELIST: &[&str] = &[
+            "QNET-BOOT-0001-STRAP", "QNET-BOOT-0002-STRAP", "QNET-BOOT-0003-STRAP", 
+            "QNET-BOOT-0004-STRAP", "QNET-BOOT-0005-STRAP"
+        ];
+        
+        if BOOTSTRAP_WHITELIST.contains(&code) {
+            // Return dummy data for genesis codes
+            return Ok(CompatibleActivationData {
+                node_type: NodeType::Super,
+                tx_hash: "genesis_bootstrap".to_string(),
+                wallet_address: "genesis_wallet".to_string(),
+                purchase_phase: 1,
+            });
+        }
+        
+        // Validate format: QNET-XXXX-XXXX-XXXX (production compatible) for regular codes
         if !code.starts_with("QNET-") || code.len() < 17 || code.len() > 19 {
             return Err(anyhow!("Invalid activation code format"));
         }
