@@ -297,14 +297,29 @@ const BOOTSTRAP_WHITELIST: &[&str] = &[
 
 // Check if this is a genesis bootstrap node
 fn is_genesis_bootstrap_node() -> bool {
-    // AUTOMATIC GENESIS DETECTION: First 5 nodes can start without activation code
+    // GENESIS NODE DETECTION: First 5 nodes can start without activation code
     
-    // Method 1: Check environment variable (manual override)
+    // Method 1: Check QNET_BOOTSTRAP_ID for genesis nodes (001-005)
+    if let Ok(bootstrap_id) = std::env::var("QNET_BOOTSTRAP_ID") {
+        match bootstrap_id.as_str() {
+            "001" | "002" | "003" | "004" | "005" => {
+                println!("🚀 Genesis bootstrap node #{} detected", bootstrap_id);
+                return true;
+            }
+            _ => {
+                println!("⚠️ Invalid QNET_BOOTSTRAP_ID: {}. Genesis IDs are 001-005", bootstrap_id);
+                return false;
+            }
+        }
+    }
+    
+    // Method 2: Check legacy environment variable (manual override)
     if std::env::var("QNET_GENESIS_BOOTSTRAP").unwrap_or_default() == "1" {
+        println!("🚀 Legacy genesis bootstrap detected");
         return true;
     }
     
-    // Method 2: Check if network is in genesis state (no other nodes exist)
+    // Method 3: Check if network is in genesis state (no other nodes exist)
     if is_network_in_genesis_state() {
         println!("🚀 Network in genesis state - allowing bootstrap node startup");
         return true;
@@ -533,37 +548,54 @@ async fn interactive_node_setup() -> Result<(NodeType, String), Box<dyn std::err
         _ => 10.0,
     };
 
-    // Request activation code
+    // Request and validate activation code with retry loop
     use std::io::Write;
-    print!("\n🔐 Activation Code: ");
-    std::io::stdout().flush().unwrap();
-    
-    let mut input = String::new();
-    let activation_code = match io::stdin().read_line(&mut input) {
-        Ok(_) => {
-            let code = input.trim().to_string();
-            
-            // Handle empty input for genesis bootstrap
-            if code.is_empty() && is_genesis_bootstrap_node() {
-                println!("✅ Generating genesis bootstrap code...");
-                let genesis_code = generate_genesis_activation_code()
-                    .map_err(|e| format!("Genesis code error: {}", e))?;
-                // For genesis nodes, we can default to Super node type
-                return Ok((NodeType::Super, genesis_code));
-            }
+    let activation_code = loop {
+        print!("\n🔐 Activation Code: ");
+        std::io::stdout().flush().unwrap();
+        
+        let mut input = String::new();
+        match io::stdin().read_line(&mut input) {
+            Ok(_) => {
+                let code = input.trim().to_string();
+                
+                // Handle empty input for genesis bootstrap (shouldn't happen here, but safety check)
+                if code.is_empty() && is_genesis_bootstrap_node() {
+                    println!("✅ Generating genesis bootstrap code...");
+                    let genesis_code = generate_genesis_activation_code()
+                        .map_err(|e| format!("Genesis code error: {}", e))?;
+                    break genesis_code;
+                }
 
-            if code.is_empty() {
-                return Err("Activation code cannot be empty for regular nodes".into());
-            }
+                if code.is_empty() {
+                    println!("❌ Activation code cannot be empty. Please enter a valid code.");
+                    continue;
+                }
 
-            // For regular nodes, always validate the code format strictly
-            if !code.starts_with("QNET-") {
-                return Err(format!("Invalid activation code format: {}", code).into());
+                // Basic format validation
+                if !code.starts_with("QNET-") {
+                    println!("❌ Invalid activation code format. Expected format: QNET-XXXX-XXXX-XXXX");
+                    continue;
+                }
+
+                // Comprehensive validation
+                match validate_activation_code_comprehensive(&code, node_type, current_phase, &pricing_info).await {
+                    Ok(_) => {
+                        println!("✅ Activation code validated successfully");
+                        break code;
+                    }
+                    Err(e) => {
+                        println!("❌ Activation failed: {}", e);
+                        println!("Please try again with a valid activation code.");
+                        continue;
+                    }
+                }
             }
-            
-            code
+            Err(e) => {
+                println!("❌ Error reading input: {}. Please try again.", e);
+                continue;
+            }
         }
-        Err(e) => return Err(format!("Error reading input: {}", e).into()),
     };
 
     println!("✅ Setup complete - starting {:?} node", node_type);
@@ -3510,6 +3542,67 @@ async fn load_cached_peers() -> Result<Vec<String>, Box<dyn std::error::Error>> 
     // For now, return empty - in full implementation would parse cached peer addresses
     println!("[CACHE] 📖 Loaded peer cache from previous session");
     Ok(vec![])
+}
+
+async fn request_activation_code() -> Result<(NodeType, String), Box<dyn std::error::Error>> {
+    // Try to initialize storage first
+    let temp_storage = match Storage::new("./temp_activation_check") {
+        Ok(storage) => storage,
+        Err(e) => {
+            println!("[WARNING] Storage not available: {}, running interactive setup", e);
+            return interactive_node_setup().await;
+        }
+    };
+    
+    // Check for existing activation code
+    println!("[DEBUG] Loading activation code from storage...");
+    match temp_storage.load_activation_code() {
+        Ok(Some((code, node_type_id, timestamp))) => {
+            println!("[DEBUG] Found existing activation code");
+            let node_type = match node_type_id {
+                0 => NodeType::Light,
+                1 => NodeType::Full,
+                2 => NodeType::Super,
+                _ => NodeType::Full,
+            };
+            
+            // Check if activation is still valid (codes never expire - tied to blockchain burns)
+            println!("[SUCCESS] Found valid activation code with cryptographic binding");
+            println!("   [CODE] Code: {}", mask_code(&code));
+            println!("   [TYPE] Node Type: {:?}", node_type);
+            let current_time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+            println!("   [TIME] Activated: {} days ago", (current_time - timestamp) / (24 * 60 * 60));
+            println!("   [UNIVERSAL] Works on VPS, VDS, PC, laptop, server");
+            println!("   [RESUMING] Resuming node with existing activation...\n");
+            return Ok((node_type, code));
+        }
+        Ok(None) => {
+            println!("[DEBUG] No existing activation found");
+        }
+        Err(e) => {
+            println!("[WARNING] Error checking activation: {}", e);
+        }
+    }
+    
+    // GENESIS NODE AUTO-ACTIVATION: Check if this is one of the first 5 genesis nodes
+    if is_genesis_bootstrap_node() {
+        println!("🚀 GENESIS NODE DETECTED - Auto-activating as Super Node");
+        println!("   [BOOTSTRAP] Node ID: {}", std::env::var("QNET_BOOTSTRAP_ID").unwrap_or("AUTO".to_string()));
+        println!("   [TYPE] Super Node (Genesis Bootstrap)");
+        println!("   [NETWORK] Initializing new QNet blockchain network");
+        
+        let genesis_code = generate_genesis_activation_code()
+            .map_err(|e| format!("Genesis code generation failed: {}", e))?;
+        
+        println!("   [CODE] Generated: {}", mask_code(&genesis_code));
+        println!("   [STATUS] ✅ Genesis activation complete - starting blockchain");
+        
+        return Ok((NodeType::Super, genesis_code));
+    }
+    
+    // For non-genesis nodes, run interactive setup
+    println!("[DEBUG] Regular node detected - starting interactive setup");
+    interactive_node_setup().await
 }
 
 
