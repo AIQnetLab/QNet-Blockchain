@@ -1877,6 +1877,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Critical: This must be the FIRST line to catch any issues
     println!("[DEBUG] QNet node binary started - checking basic functionality...");
     
+    // Prevent restart spam in case of errors
+    println!("[DEBUG] Startup delay to prevent restart loops...");
+    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+    
     // Test basic functionality before doing anything else
     println!("[DEBUG] Testing std::env...");
     if std::env::var("RUST_LOG").is_err() {
@@ -3544,8 +3548,24 @@ async fn get_activation_with_auto_genesis() -> Result<(NodeType, String), Box<dy
         println!("   [TYPE] Super Node (Genesis Bootstrap)");
         println!("   [NETWORK] Initializing new QNet blockchain network");
         
-        let genesis_code = generate_genesis_activation_code()
-            .map_err(|e| format!("Genesis code generation failed: {}", e))?;
+        let genesis_code = match generate_genesis_activation_code() {
+            Ok(code) => {
+                println!("[DEBUG] ✅ Genesis code generation SUCCESS: {}", code);
+                code
+            }
+            Err(e) => {
+                println!("[ERROR] ❌ Genesis code generation FAILED: {}", e);
+                println!("[ERROR] This should not happen for valid genesis nodes!");
+                println!("[ERROR] QNET_BOOTSTRAP_ID: {:?}", std::env::var("QNET_BOOTSTRAP_ID"));
+                println!("[ERROR] Falling back to emergency genesis mode...");
+                
+                // Emergency fallback - generate simple genesis code
+                let emergency_id = std::env::var("QNET_BOOTSTRAP_ID").unwrap_or("0001".to_string());
+                let emergency_code = format!("QNET-EMERGENCY-{}-GENESIS", emergency_id);
+                println!("[ERROR] Emergency code: {}", emergency_code);
+                emergency_code
+            }
+        };
         
         println!("   [CODE] Generated: {}", mask_code(&genesis_code));
         println!("   [STATUS] ✅ Genesis activation complete - starting blockchain");
