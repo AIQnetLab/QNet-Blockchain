@@ -252,10 +252,14 @@ const BOOTSTRAP_WHITELIST: &[&str] = &[
 
 // Check if this is a genesis bootstrap node
 fn is_genesis_bootstrap_node() -> bool {
+    println!("[DEBUG] === is_genesis_bootstrap_node() called ===");
+    
     // GENESIS NODE DETECTION: First 5 nodes can start without activation code
     
     // Method 1: Check QNET_BOOTSTRAP_ID for genesis nodes (001-005)
+    println!("[DEBUG] Method 1: Checking QNET_BOOTSTRAP_ID...");
     if let Ok(bootstrap_id) = std::env::var("QNET_BOOTSTRAP_ID") {
+        println!("[DEBUG] Found QNET_BOOTSTRAP_ID: {}", bootstrap_id);
         match bootstrap_id.as_str() {
             "001" | "002" | "003" | "004" | "005" => {
                 println!("🚀 Genesis bootstrap node #{} detected", bootstrap_id);
@@ -266,20 +270,29 @@ fn is_genesis_bootstrap_node() -> bool {
                 return false;
             }
         }
+    } else {
+        println!("[DEBUG] QNET_BOOTSTRAP_ID not found");
     }
     
     // Method 2: Check legacy environment variable (manual override)
+    println!("[DEBUG] Method 2: Checking QNET_GENESIS_BOOTSTRAP...");
     if std::env::var("QNET_GENESIS_BOOTSTRAP").unwrap_or_default() == "1" {
         println!("🚀 Legacy genesis bootstrap detected");
         return true;
+    } else {
+        println!("[DEBUG] QNET_GENESIS_BOOTSTRAP not set to '1'");
     }
     
     // Method 3: Check if network is in genesis state (no other nodes exist)
+    println!("[DEBUG] Method 3: Checking network genesis state...");
     if is_network_in_genesis_state() {
         println!("🚀 Network in genesis state - allowing bootstrap node startup");
         return true;
+    } else {
+        println!("[DEBUG] Network NOT in genesis state");
     }
     
+    println!("[DEBUG] === is_genesis_bootstrap_node() returning FALSE ===");
     false
 }
 
@@ -3506,6 +3519,32 @@ async fn load_cached_peers() -> Result<Vec<String>, Box<dyn std::error::Error>> 
 async fn get_activation_with_auto_genesis() -> Result<(NodeType, String), Box<dyn std::error::Error>> {
     use qnet_integration::storage::Storage;
     
+    // DEBUG: Check environment variables first
+    println!("[DEBUG] ========== GENESIS ACTIVATION DEBUG ==========");
+    println!("[DEBUG] QNET_BOOTSTRAP_ID: {:?}", std::env::var("QNET_BOOTSTRAP_ID"));
+    println!("[DEBUG] QNET_PRODUCTION: {:?}", std::env::var("QNET_PRODUCTION"));
+    println!("[DEBUG] QNET_GENESIS_BOOTSTRAP: {:?}", std::env::var("QNET_GENESIS_BOOTSTRAP"));
+    
+    // Check genesis detection BEFORE storage
+    println!("[DEBUG] Checking if this is a genesis bootstrap node...");
+    if is_genesis_bootstrap_node() {
+        println!("[DEBUG] ✅ GENESIS NODE CONFIRMED - Bypassing storage check");
+        println!("🚀 GENESIS NODE DETECTED - Auto-activating as Super Node");
+        println!("   [BOOTSTRAP] Node ID: {}", std::env::var("QNET_BOOTSTRAP_ID").unwrap_or("AUTO".to_string()));
+        println!("   [TYPE] Super Node (Genesis Bootstrap)");
+        println!("   [NETWORK] Initializing new QNet blockchain network");
+        
+        let genesis_code = generate_genesis_activation_code()
+            .map_err(|e| format!("Genesis code generation failed: {}", e))?;
+        
+        println!("   [CODE] Generated: {}", mask_code(&genesis_code));
+        println!("   [STATUS] ✅ Genesis activation complete - starting blockchain");
+        
+        return Ok((NodeType::Super, genesis_code));
+    } else {
+        println!("[DEBUG] ❌ NOT a genesis node - checking storage...");
+    }
+    
     // Try to initialize storage first
     let temp_storage = match Storage::new("./temp_activation_check") {
         Ok(storage) => storage,
@@ -3543,22 +3582,6 @@ async fn get_activation_with_auto_genesis() -> Result<(NodeType, String), Box<dy
         Err(e) => {
             println!("[WARNING] Error checking activation: {}", e);
         }
-    }
-    
-    // GENESIS NODE AUTO-ACTIVATION: Check if this is one of the first 5 genesis nodes
-    if is_genesis_bootstrap_node() {
-        println!("🚀 GENESIS NODE DETECTED - Auto-activating as Super Node");
-        println!("   [BOOTSTRAP] Node ID: {}", std::env::var("QNET_BOOTSTRAP_ID").unwrap_or("AUTO".to_string()));
-        println!("   [TYPE] Super Node (Genesis Bootstrap)");
-        println!("   [NETWORK] Initializing new QNet blockchain network");
-        
-        let genesis_code = generate_genesis_activation_code()
-            .map_err(|e| format!("Genesis code generation failed: {}", e))?;
-        
-        println!("   [CODE] Generated: {}", mask_code(&genesis_code));
-        println!("   [STATUS] ✅ Genesis activation complete - starting blockchain");
-        
-        return Ok((NodeType::Super, genesis_code));
     }
     
     // For non-genesis nodes, run interactive setup
