@@ -545,12 +545,28 @@ async fn interactive_node_setup() -> Result<(NodeType, String), Box<dyn std::err
             
             // Handle empty input for genesis bootstrap
             if code.is_empty() && is_genesis_bootstrap_node() {
-                generate_genesis_activation_code().map_err(|e| format!("Genesis code error: {}", e))?
-            } else if code.is_empty() {
-                return Err("Empty activation code not allowed".into());
-            } else {
-                code
+                println!("✅ Generating genesis bootstrap code...");
+                return match generate_genesis_activation_code() {
+                    Ok(genesis_code) => {
+                        println!("✅ Genesis bootstrap code generated: {}", genesis_code);
+                        Ok(genesis_code)
+                    }
+                    Err(e) => {
+                        Err(format!("Failed to generate genesis code: {}", e).into())
+                    }
+                };
             }
+
+            if code.is_empty() {
+                return Err("Activation code cannot be empty for regular nodes".into());
+            }
+
+            // For regular nodes, always validate the code format strictly
+            if !code.starts_with("QNET-") {
+                return Err(format!("Invalid activation code format: {}", code).into());
+            }
+            
+            code
         }
         Err(e) => return Err(format!("Error reading input: {}", e).into()),
     };
