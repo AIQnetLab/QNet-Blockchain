@@ -426,11 +426,13 @@ async fn validate_activation_code_comprehensive(
         }
     }
     
-    // 6. Burn verification for production
-    if std::env::var("QNET_PRODUCTION").unwrap_or_default() == "1" {
+    // 6. Burn verification for production (skip for genesis nodes)
+    if std::env::var("QNET_PRODUCTION").unwrap_or_default() == "1" && !is_genesis_bootstrap_node() {
         if let Err(e) = verify_activation_burn(code, &node_type).await {
             return Err(format!("Burn verification failed: {}", e));
         }
+    } else if is_genesis_bootstrap_node() {
+        println!("🚀 Genesis node - skipping burn verification");
     }
     
     println!("✅ All activation code validations passed");
@@ -1938,9 +1940,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("   🔐 Using quantum-secure activation codes with permanent validity");
     println!("   🛡️  Light node blocking: Enforced on server hardware");
     
-    // Verify 1DEV burn if required for production
-    if std::env::var("QNET_PRODUCTION").unwrap_or_default() == "1" {
+    // Verify 1DEV burn if required for production (skip for genesis nodes)
+    if std::env::var("QNET_PRODUCTION").unwrap_or_default() == "1" && !is_genesis_bootstrap_node() {
         verify_1dev_burn(&node_type).await?;
+    } else if is_genesis_bootstrap_node() {
+        println!("🚀 Genesis bootstrap node - skipping 1DEV burn verification for production startup");
     }
     
     // Create blockchain node with production optimizations
@@ -2620,6 +2624,14 @@ fn display_node_config(config: &AutoConfig, node_type: &NodeType, region: &Regio
 }
 
 async fn verify_1dev_burn(node_type: &NodeType) -> Result<(), String> {
+    // GENESIS NODES: Skip burn verification for bootstrap nodes
+    if is_genesis_bootstrap_node() {
+        println!("🚀 Genesis bootstrap node detected - skipping 1DEV burn verification");
+        println!("   [GENESIS] Bootstrap nodes don't require burn transactions");
+        println!("   [NETWORK] Initializing new blockchain network");
+        return Ok(());
+    }
+    
     // Production 1DEV burn verification - Universal pricing for all node types
     let required_burn = match node_type {
         NodeType::Light => 1500.0,
