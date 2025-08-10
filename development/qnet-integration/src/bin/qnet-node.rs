@@ -546,15 +546,10 @@ async fn interactive_node_setup() -> Result<(NodeType, String), Box<dyn std::err
             // Handle empty input for genesis bootstrap
             if code.is_empty() && is_genesis_bootstrap_node() {
                 println!("✅ Generating genesis bootstrap code...");
-                return match generate_genesis_activation_code() {
-                    Ok(genesis_code) => {
-                        println!("✅ Genesis bootstrap code generated: {}", genesis_code);
-                        Ok(genesis_code)
-                    }
-                    Err(e) => {
-                        Err(format!("Failed to generate genesis code: {}", e).into())
-                    }
-                };
+                let genesis_code = generate_genesis_activation_code()
+                    .map_err(|e| format!("Genesis code error: {}", e))?;
+                // For genesis nodes, we can default to Super node type
+                return Ok((NodeType::Super, genesis_code));
             }
 
             if code.is_empty() {
