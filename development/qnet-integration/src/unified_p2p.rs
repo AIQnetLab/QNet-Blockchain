@@ -821,7 +821,9 @@ impl SimplifiedP2P {
         let default_nodes = vec![
             "154.38.160.39".to_string(), 
             "62.171.157.44".to_string(), 
-            "161.97.86.81".to_string()
+            "161.97.86.81".to_string(),
+            "173.212.219.226".to_string(),
+            "164.68.108.218".to_string()
         ];
         
         // Only log this message once every 5 minutes to reduce spam
@@ -1600,6 +1602,8 @@ const GENESIS_BOOTSTRAP_NODES: &[(&str, &str)] = &[
     ("154.38.160.39", "NorthAmerica"), // Genesis Node #1
     ("62.171.157.44", "Europe"),       // Genesis Node #2 
     ("161.97.86.81", "Europe"),        // Genesis Node #3
+    ("173.212.219.226", "Europe"),     // Genesis Node #4
+    ("164.68.108.218", "NorthAmerica"), // Genesis Node #5
 ];
 
 impl SimplifiedP2P {

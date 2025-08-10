@@ -237,53 +237,8 @@ async fn validate_phase_and_pricing(phase: u8, node_type: NodeType, pricing: &Pr
 
 // Check for existing activation or run interactive setup
 async fn check_existing_activation_or_setup() -> Result<(NodeType, String), Box<dyn std::error::Error>> {
-    println!("[DEBUG] Checking for existing activation code...");
-    
-    // Create temporary storage to check for existing activation
-    println!("[DEBUG] Attempting to create storage at 'node_data'...");
-    let temp_storage = match qnet_integration::storage::PersistentStorage::new("node_data") {
-        Ok(storage) => {
-            println!("[DEBUG] Storage created successfully");
-            storage
-        },
-        Err(e) => {
-            println!("[WARNING] Storage not available: {}, running interactive setup", e);
-            return interactive_node_setup().await;
-        }
-    };
-    
-    // Check for existing activation code
-    println!("[DEBUG] Loading activation code from storage...");
-    match temp_storage.load_activation_code() {
-        Ok(Some((code, node_type_id, timestamp))) => {
-            println!("[DEBUG] Found existing activation code");
-            let node_type = match node_type_id {
-                0 => NodeType::Light,
-                1 => NodeType::Full,
-                2 => NodeType::Super,
-                _ => NodeType::Full,
-            };
-            
-            // Check if activation is still valid (codes never expire - tied to blockchain burns)
-            println!("[SUCCESS] Found valid activation code with cryptographic binding");
-            println!("   [CODE] Code: {}", mask_code(&code));
-            println!("   [TYPE] Node Type: {:?}", node_type);
-            let current_time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-            println!("   [TIME] Activated: {} days ago", (current_time - timestamp) / (24 * 60 * 60));
-            println!("   [UNIVERSAL] Works on VPS, VDS, PC, laptop, server");
-            println!("   [RESUMING] Resuming node with existing activation...\n");
-            return Ok((node_type, code));
-        }
-        Ok(None) => {
-            println!("[DEBUG] No existing activation found, running interactive setup");
-        }
-        Err(e) => {
-            println!("[WARNING] Error checking activation: {}, running interactive setup", e);
-        }
-    }
-    
-    println!("[DEBUG] Starting interactive_node_setup...");
-    interactive_node_setup().await
+    // Use the new activation function with auto-genesis detection
+    get_activation_with_auto_genesis().await
 }
 
 // Bootstrap whitelist for first 5 nodes (production network bootstrap)
@@ -328,37 +283,41 @@ fn is_genesis_bootstrap_node() -> bool {
     false
 }
 
-// Check if network is in genesis state (decentralized detection)
+// Check if network is in genesis state (check real genesis nodes)
 fn is_network_in_genesis_state() -> bool {
-    // Decentralized genesis state detection - no hardcoded addresses
-    // Check local network environment and regional port availability
+    // Check if any of the genesis nodes are already running
+    let genesis_ips = vec![
+        "154.38.160.39",
+        "62.171.157.44", 
+        "161.97.86.81",
+        "173.212.219.226",
+        "164.68.108.218"
+    ];
     
-    let regional_ports = vec![9876, 9877, 9878, 9879, 9880, 9881];
-    let mut active_regional_ports = 0;
+    let mut active_genesis_nodes = 0;
     
-    // Test if any regional QNet ports are active on local network
-    for port in regional_ports {
-        // Test various local network addresses for existing QNet nodes
+    // Test if any genesis nodes are already running
+    for ip in genesis_ips {
         let test_addresses = vec![
-            format!("127.0.0.1:{}", port),      // Localhost
-            format!("10.0.0.1:{}", port),       // Private network A
-            format!("192.168.1.1:{}", port),    // Private network C
-            format!("172.16.0.1:{}", port),     // Private network B
+            format!("{}:9876", ip),  // North America port
+            format!("{}:9877", ip),  // Europe port
+            format!("{}:8001", ip),  // RPC port
         ];
         
         for addr in test_addresses {
             if test_connection_quick(&addr) {
-                active_regional_ports += 1;
-                break; // One connection per port is enough
+                active_genesis_nodes += 1;
+                println!("[GENESIS] Found active genesis node at: {}", addr);
+                break; // One connection per IP is enough
             }
         }
     }
     
-    // Genesis state: No active QNet nodes found on any regional ports
-    println!("[GENESIS] Found {} active regional ports out of 6", active_regional_ports);
+    // Genesis state: No genesis nodes found running yet
+    println!("[GENESIS] Found {} active genesis nodes out of 5", active_genesis_nodes);
     
-    // If no regional ports are active, we're in genesis state
-    active_regional_ports == 0
+    // If no genesis nodes are active, we're in genesis state
+    active_genesis_nodes == 0
 }
 
 // Test quick connection to bootstrap peer
@@ -3544,7 +3503,9 @@ async fn load_cached_peers() -> Result<Vec<String>, Box<dyn std::error::Error>> 
     Ok(vec![])
 }
 
-async fn request_activation_code() -> Result<(NodeType, String), Box<dyn std::error::Error>> {
+async fn get_activation_with_auto_genesis() -> Result<(NodeType, String), Box<dyn std::error::Error>> {
+    use crate::storage::Storage;
+    
     // Try to initialize storage first
     let temp_storage = match Storage::new("./temp_activation_check") {
         Ok(storage) => storage,
@@ -3574,7 +3535,7 @@ async fn request_activation_code() -> Result<(NodeType, String), Box<dyn std::er
             println!("   [TIME] Activated: {} days ago", (current_time - timestamp) / (24 * 60 * 60));
             println!("   [UNIVERSAL] Works on VPS, VDS, PC, laptop, server");
             println!("   [RESUMING] Resuming node with existing activation...\n");
-            return Ok((node_type, code));
+            return Ok((node_type, code.to_string()));
         }
         Ok(None) => {
             println!("[DEBUG] No existing activation found");
