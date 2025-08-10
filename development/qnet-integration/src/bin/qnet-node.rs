@@ -3504,7 +3504,7 @@ async fn load_cached_peers() -> Result<Vec<String>, Box<dyn std::error::Error>> 
 }
 
 async fn get_activation_with_auto_genesis() -> Result<(NodeType, String), Box<dyn std::error::Error>> {
-    use crate::storage::Storage;
+    use qnet_integration::storage::Storage;
     
     // Try to initialize storage first
     let temp_storage = match Storage::new("./temp_activation_check") {
@@ -3535,7 +3535,7 @@ async fn get_activation_with_auto_genesis() -> Result<(NodeType, String), Box<dy
             println!("   [TIME] Activated: {} days ago", (current_time - timestamp) / (24 * 60 * 60));
             println!("   [UNIVERSAL] Works on VPS, VDS, PC, laptop, server");
             println!("   [RESUMING] Resuming node with existing activation...\n");
-            return Ok((node_type, code.to_string()));
+            return Ok((node_type, code));
         }
         Ok(None) => {
             println!("[DEBUG] No existing activation found");
