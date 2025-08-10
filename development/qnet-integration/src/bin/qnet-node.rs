@@ -353,15 +353,25 @@ fn generate_genesis_activation_code() -> Result<String, String> {
     let bootstrap_id = std::env::var("QNET_BOOTSTRAP_ID").unwrap_or_else(|_| {
         // Generate sequential ID based on existing nodes
         let existing_nodes = get_existing_bootstrap_nodes();
-        format!("{:04}", existing_nodes.len() + 1)
+        format!("{:03}", existing_nodes.len() + 1)
     });
     
+    // Ensure 4-digit format for bootstrap ID (pad with zeros)
+    let formatted_id = if bootstrap_id.len() < 4 {
+        format!("{:0>4}", bootstrap_id)  // Pad with leading zeros to 4 digits
+    } else {
+        bootstrap_id
+    };
+    
     // Generate bootstrap code
-    let bootstrap_code = format!("QNET-BOOT-{}-STRAP", bootstrap_id);
+    let bootstrap_code = format!("QNET-BOOT-{}-STRAP", formatted_id);
+    
+    println!("[DEBUG] Generated bootstrap code: {}", bootstrap_code);
+    println!("[DEBUG] Checking against whitelist: {:?}", BOOTSTRAP_WHITELIST);
     
     // Validate bootstrap code
     if !BOOTSTRAP_WHITELIST.contains(&bootstrap_code.as_str()) {
-        return Err("Maximum 5 bootstrap nodes allowed".to_string());
+        return Err(format!("Bootstrap code {} not in whitelist. Maximum 5 bootstrap nodes allowed", bootstrap_code));
     }
     
     Ok(bootstrap_code)
