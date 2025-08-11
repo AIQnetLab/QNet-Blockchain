@@ -462,20 +462,16 @@ impl BlockchainNode {
                         match p2p.sync_blockchain_height() {
                             Ok(network_height) => {
                                 if network_height > microblock_height {
-                                    println!("[CONSENSUS] 🔄 Network height {} ahead of local {}. Attempting block download...", network_height, microblock_height);
+                                    println!("Syncing: downloading blocks {}-{}", microblock_height, network_height);
                                     p2p.download_missing_microblocks(storage.as_ref(), microblock_height, network_height).await;
                                     if let Ok(Some(_)) = storage.load_microblock(network_height) {
-                                        println!("[SYNC] ✅ Downloaded up to #{}. Updating local cursor.", network_height);
                                         microblock_height = network_height;
-                                    } else {
-                                        println!("[SYNC] ⚠️ Download incomplete. Continuing with local height {}.", microblock_height);
+                                        println!("Synced to block #{}", network_height);
                                     }
-                                } else if can_participate_consensus && microblock_height == network_height {
-                                    println!("[CONSENSUS] ✅ Node synchronized, height: {}", microblock_height);
                                 }
                             },
-                            Err(e) => {
-                                println!("[CONSENSUS] ⚠️ Sync failed: {}, continuing with local height", e);
+                            Err(_) => {
+                                // Silent sync failure - normal for isolated nodes
                             }
                         }
                     }
@@ -488,7 +484,6 @@ impl BlockchainNode {
                     
                     // PRODUCTION: Real QNet CommitReveal Consensus for Block Creation
                     microblock_height += 1;
-                    println!("[CONSENSUS] 🏗️  Starting consensus round for block #{}", microblock_height);
                     
                     // Get connected peers for consensus participation
                     let participants = if let Some(p2p) = &unified_p2p {
@@ -509,19 +504,16 @@ impl BlockchainNode {
                         // Start consensus round with connected participants
                         match consensus_engine.start_round(participants.clone()) {
                             Ok(round_id) => {
-                                println!("[CONSENSUS] ✅ Started consensus round {} with {} participants", 
-                                        round_id, participants.len());
                                 
                                 // In production: This would involve network communication for commit-reveal
                                 // For now: Fast local consensus simulation for compatible block creation
                                 Some(round_id)
                             }
                             Err(ConsensusError::InsufficientNodes) => {
-                                println!("[CONSENSUS] ⚠️ Insufficient nodes for consensus, creating local block");
                                 None // Fallback to local block creation
                             }
                             Err(e) => {
-                                println!("[CONSENSUS] ❌ Consensus error: {:?}, skipping round", e);
+                                println!("Consensus error: {:?}, skipping", e);
                                 tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
                                 continue;
                             }
@@ -646,22 +638,22 @@ impl BlockchainNode {
                         }
                     }
                     
-                    // Enhanced logging with performance metrics
+                    // Clean blockchain logging
                     if txs.len() > 0 {
-                        println!("[Microblock] ✅ #{} created: {} tx, {:.2} TPS, {}ms interval, {} bytes, {} finalized", 
+                        println!("Block #{} | {} tx | {:.0} TPS | {} peers", 
                                  microblock.height, 
                                  txs.len(), 
                                  tps,
-                                 current_interval.as_millis(),
-                                 microblock_data.len(),
-                                 locally_finalized_count);
-                    } else if microblock_height % 10 == 0 {
-                        println!("[Microblock] ⏳ #{} empty (waiting for transactions)", microblock.height);
+                                 if let Some(ref p2p) = unified_p2p { p2p.get_peer_count() } else { 0 });
+                    } else if microblock_height % 30 == 0 {
+                        println!("Block #{} | No transactions | {} peers connected", 
+                                microblock.height,
+                                if let Some(ref p2p) = unified_p2p { p2p.get_peer_count() } else { 0 });
                     }
                     
                     // Trigger macroblock consensus every 90 microblocks
                     if microblock_height - last_macroblock_trigger >= 90 {
-                        println!("[Macroblock] 🏗️  Triggering consensus for blocks {}-{}", 
+                        println!("Macroblock consensus: blocks {}-{}", 
                                  last_macroblock_trigger + 1, microblock_height);
                         
                         tokio::spawn(Self::trigger_macroblock_consensus(

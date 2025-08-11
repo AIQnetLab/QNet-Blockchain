@@ -1877,32 +1877,14 @@ async fn detect_region_from_local_interfaces() -> Result<Region, String> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Critical: This must be the FIRST line to catch any issues
-    println!("[DEBUG] QNet node binary started - checking basic functionality...");
-    
-    // Prevent restart spam in case of errors
-    println!("[DEBUG] Startup delay to prevent restart loops...");
-    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-    
-    // Test basic functionality before doing anything else
-    println!("[DEBUG] Testing std::env...");
+    // Initialize environment
     if std::env::var("RUST_LOG").is_err() {
         std::env::set_var("RUST_LOG", "info");
     }
-    println!("[DEBUG] std::env working");
-    
-    // Initialize logging
-    println!("[DEBUG] Initializing logger...");
     env_logger::init();
-    println!("[DEBUG] Logger initialized");
     
     // Auto-configure everything
-    println!("[DEBUG] Auto-configuring QNet node...");
     let config = AutoConfig::new().await?;
-    println!("[DEBUG] AutoConfig completed successfully!");
-    
-    // Choose setup mode - interactive or auto
-    println!("[DEBUG] Starting setup mode selection...");
     
     // PRODUCTION: Check for existing activation or run interactive setup
     let (node_type, activation_code) = check_existing_activation_or_setup().await?;
@@ -2023,30 +2005,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let log_file_path = std::path::Path::new(&config.data_dir).join("qnet-node.log");
     println!("📝 Log file: {}", log_file_path.display());
     
-    // Start node in background
+    // Start node with live console logging (not redirected to file)
     let node_handle = {
         let log_path = log_file_path.clone();
         tokio::spawn(async move {
-            // Redirect logs to file for daemon mode
-            if let Err(e) = redirect_logs_to_file(&log_path).await {
-                eprintln!("⚠️ Failed to redirect logs: {}", e);
-            }
-            
-            // Start the blockchain node
+            // Start the blockchain node with console output
             if let Err(e) = node.start().await {
                 eprintln!("❌ Node failed to start: {}", e);
             }
         })
     };
     
-    // Give node a moment to start
+    // Give node a moment to start and show initial config once
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     
-    // DAEMON MODE: Show startup info and management commands
-    println!("✅ QNet Node started successfully in daemon mode!");
-    println!("");
-    
-    // Get external IP for status display
+    // Show initial configuration ONCE
     let external_ip = match tokio::process::Command::new("curl")
         .arg("-s")
         .arg("--max-time")
@@ -2061,87 +2034,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => "localhost".to_string()
     };
     
-    println!("🌍 === QNet Node Status ===");
-    println!("🆔 Node Type: {:?}", node_type);
-    println!("🌐 Region: {:?}", region);
-    println!("📡 External IP: {}", external_ip);
-    println!("🔗 P2P Port: {}", config.p2p_port);
-    println!("🔧 RPC Port: {}", config.rpc_port);
-    println!("📁 Data Directory: {}", config.data_dir.display());
-    println!("📝 Log File: {}", log_file_path.display());
+    println!("🚀 QNet Node #{} started successfully!", 
+        std::env::var("QNET_BOOTSTRAP_ID").unwrap_or("N/A".to_string()));
+    println!("🌐 Region: {:?} | Type: {:?} | IP: {}", 
+        region, node_type, external_ip);
+    println!("📡 Endpoints: P2P={} RPC={} API={}", 
+        config.p2p_port, config.rpc_port, std::env::var("QNET_CURRENT_API_PORT").unwrap_or("8001".to_string()));
     println!("");
-    
-    println!("💡 === Log Management ===");
-    println!("📖 View live logs: tail -f {}", log_file_path.display());
-    println!("🔍 Search logs: grep 'ERROR' {}", log_file_path.display());
-    println!("📊 Log size: du -h {}", log_file_path.display());
+    println!("📖 View detailed logs: docker logs -f qnet-node");
+    println!("🔍 Filter blockchain logs: docker logs qnet-node | grep \"Block #\\|Syncing\\|Macroblock\"");
+    println!("📊 Monitor P2P: docker logs qnet-node | grep \"peer\\|P2P\\|Connected\"");
     println!("");
+    println!("=== BLOCKCHAIN LOGS (Live) ===");
     
-    println!("🔧 === Node Management ===");
-    println!("🛑 Stop node: docker stop qnet-node");
-    println!("🔄 Restart node: docker restart qnet-node");
-    println!("📋 Container status: docker ps | grep qnet-node");
-    println!("🗑️ Remove container: docker rm qnet-node");
-    println!("");
-    
-    println!("📊 === Service Endpoints ===");
-    println!("📡 RPC endpoint: http://{}:{}/rpc", external_ip, config.rpc_port);
-    println!("🌐 API endpoint: http://{}:{}/api/v1/", external_ip, std::env::var("QNET_CURRENT_API_PORT").unwrap_or("8001".to_string()));
-    
-    // Start metrics server
-    let metrics_port = config.rpc_port + 1000; // e.g., 9877 + 1000 = 10877
-    let metrics_ip = external_ip.clone();
-    tokio::spawn(async move {
-        println!("📈 Metrics: http://{}:{}/metrics", metrics_ip, metrics_port);
-    });
-    
-    println!("");
-    println!("⚡ === Blockchain Architecture ===");
-    println!("👑 Dynamic Leadership: Auto-failover consensus (Byzantine fault tolerant)");
-    println!("   Priority 1: 154.38.160.39 (Primary Leader)");
-    println!("   Priority 2: 62.171.157.44 (Backup Leader - Auto-failover)");
-    println!("   Priority 3: 161.97.86.81 (Backup Leader - Auto-failover)");
-    println!("   🔄 Failover scenarios:");
-    println!("      • If Primary goes offline → Backup #2 becomes leader");
-    println!("      • If Primary returns → Leadership returns to Primary");
-    println!("      • If all Genesis nodes offline → Any node can lead");
-    println!("📦 Microblocks: 1-second intervals (fast finality)");
-    println!("🏗️  Macroblocks: 90-second intervals (permanent finality)");
-    println!("🎯 Target TPS: 100,000+ transactions per second");
-    println!("🌐 Network scaling: Ready for 10M+ nodes");
-    println!("");
-    
-    // Simulate failover detection for demonstration
-    println!("🧪 Testing Dynamic Leadership...");
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(10)).await;
-        println!("[TEST] 🔄 Simulating leadership failover test...");
-        println!("[TEST] ✅ Dynamic leadership system: OPERATIONAL");
-        println!("[TEST] 💪 Network resilient to server failures");
-    });
-    
-    println!("🎉 === Setup Complete ===");
-    println!("✅ QNet Node is running in DAEMON MODE");
-    println!("🔄 Node will continue running in background");
-    println!("📝 All logs are being written to: {}", log_file_path.display());
-    println!("");
-    
-    // Show log viewing command prominently
-    println!("🔍 === TO VIEW LOGS ===");
-    println!("tail -f {}", log_file_path.display());
-    println!("");
-    println!("Press Ctrl+C in the log viewer to exit (node keeps running)");
-    println!("This terminal will now be free for other commands.");
-    println!("");
-    
-    // Automatically transition to background mode
-    println!("🚀 Transitioning to background mode in 3 seconds...");
-    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-    
-    println!("✅ Node is now running in background!");
-    println!("📖 Use: tail -f {} to view logs", log_file_path.display());
-    
-    // Wait for the background node to complete (which should be never in normal operation)
+    // Continue with live blockchain logging - no background transition
     let _ = node_handle.await;
     
     Ok(())
