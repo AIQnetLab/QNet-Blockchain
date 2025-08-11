@@ -181,10 +181,18 @@ impl QNetQuantumCrypto {
             // Return a dummy payload for genesis codes
             return Ok(ActivationPayload {
                 burn_tx: "genesis_bootstrap".to_string(),
-                node_type: 2, // Super node
+                node_type: "super".to_string(),
                 timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
                 wallet: "genesis_wallet".to_string(),
-                signature: "genesis_signature".to_string(),
+                signature: DilithiumSignature {
+                    signature: "genesis_signature".to_string(),
+                    algorithm: "dilithium5".to_string(),
+                    timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+                    strength: "high".to_string(),
+                },
+                entropy: "genesis_entropy".to_string(),
+                version: "1.0.0".to_string(),
+                permanent: true,
             });
         }
         
@@ -564,9 +572,10 @@ impl QNetQuantumCrypto {
             // Return dummy data for genesis codes
             return Ok(CompatibleActivationData {
                 node_type: NodeType::Super,
+                qnc_amount: 0,
                 tx_hash: "genesis_bootstrap".to_string(),
                 wallet_address: "genesis_wallet".to_string(),
-                purchase_phase: 1,
+                phase: 1,
             });
         }
         
