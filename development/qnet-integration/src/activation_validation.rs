@@ -1166,8 +1166,13 @@ impl BlockchainActivationRegistry {
             return Err(IntegrationError::ValidationError("Activation code must start with QNET-".to_string()));
         }
         
-        if record.code.len() != 17 {
+        // Allow genesis bootstrap codes (20 chars) and regular codes (17 chars)
+        let is_genesis = record.code.contains("BOOT") && record.code.ends_with("STRAP");
+        if !is_genesis && record.code.len() != 17 {
             return Err(IntegrationError::ValidationError("Activation code must be 17 characters".to_string()));
+        }
+        if is_genesis && record.code.len() != 20 {
+            return Err(IntegrationError::ValidationError("Genesis bootstrap code must be 20 characters".to_string()));
         }
         
         // Submit to blockchain through consensus engine
