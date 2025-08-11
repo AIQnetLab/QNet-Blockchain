@@ -564,18 +564,66 @@ curl http://localhost:8001/api/v1/node/info
 ### Log Analysis
 
 ```bash
-# View recent logs
+# View recent logs (live monitoring)
 docker logs qnet-node -f
+
+# View detailed blockchain logs (if running in background)
+tail -f node_data/qnet-node.log
 
 # Search for errors
 docker logs qnet-node | grep "ERROR"
 
-# Monitor performance
-docker logs qnet-node | grep "TPS\|latency"
+# Monitor blockchain activity (blocks, consensus, P2P)
+docker logs qnet-node | grep "CONSENSUS\|BLOCK\|P2P\|SYNC"
+
+# Monitor performance metrics
+docker logs qnet-node | grep "TPS\|latency\|performance"
+
+# View peer connections and network status
+docker logs qnet-node | grep "peer\|connection\|discovery"
 
 # View last 100 lines
 docker logs qnet-node --tail 100
+
+# Filter by log level
+docker logs qnet-node | grep "\[DEBUG\]\|\[INFO\]\|\[WARN\]\|\[ERROR\]"
 ```
+
+### Genesis Node Deployment
+
+For genesis bootstrap nodes (production network initialization):
+
+```bash
+# Genesis Node #001 (NorthAmerica)
+docker run -d --name qnet-node --restart=always \
+  -e QNET_PRODUCTION=1 \
+  -e QNET_BOOTSTRAP_ID=001 \
+  -p 9876:9876 -p 9877:9877 -p 8001:8001 \
+  -v $(pwd)/node_data:/app/data \
+  qnet-production
+
+# Genesis Node #002 (Europe) 
+docker run -d --name qnet-node-002 --restart=always \
+  -e QNET_PRODUCTION=1 \
+  -e QNET_BOOTSTRAP_ID=002 \
+  -p 9878:9876 -p 9879:9877 -p 8002:8001 \
+  -v $(pwd)/node_data_002:/app/data \
+  qnet-production
+
+# Genesis Node #003 (Asia)
+docker run -d --name qnet-node-003 --restart=always \
+  -e QNET_PRODUCTION=1 \
+  -e QNET_BOOTSTRAP_ID=003 \
+  -p 9880:9876 -p 9881:9877 -p 8003:8001 \
+  -v $(pwd)/node_data_003:/app/data \
+  qnet-production
+```
+
+**Genesis Node Requirements:**
+- Set `QNET_BOOTSTRAP_ID` to 001-005 for genesis nodes
+- Use different ports for multiple nodes on same server
+- Create separate data directories for each node
+- Ensure proper file permissions: `chmod 777 node_data_XXX/`
 
 ### Backup & Recovery
 
