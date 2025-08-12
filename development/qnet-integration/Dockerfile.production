@@ -34,12 +34,12 @@ RUN cargo build --profile release-fast --bin qnet-node \
 # Production runtime image
 FROM debian:bookworm-slim
 
-# Install minimal runtime dependencies including su-exec for user switching
+# Install minimal runtime dependencies including gosu for user switching
 RUN apt-get update && apt-get install -y \
     libssl3 \
     ca-certificates \
     curl \
-    su-exec \
+    gosu \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd -r qnet \
     && useradd -r -g qnet -s /bin/false qnet
@@ -61,7 +61,7 @@ if [ "$(id -u)" = "0" ]; then\n\
   chown -R qnet:qnet "$DATA_DIR"\n\
   chmod -R 755 "$DATA_DIR"\n\
   echo "Starting QNet node as qnet user..."\n\
-  exec su-exec qnet /usr/local/bin/qnet-node "$@"\n\
+  exec gosu qnet /usr/local/bin/qnet-node "$@"\n\
 else\n\
   exec /usr/local/bin/qnet-node "$@"\n\
 fi' > /usr/local/bin/entrypoint.sh \
