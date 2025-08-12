@@ -280,8 +280,19 @@ impl SimplifiedP2P {
                  println!("[P2P] ✅ Genesis bootstrap enabled - true decentralized network");
              }
             
+            // Get our own external IP to avoid self-connection
+            let our_external_ip = match Self::get_our_ip_address().await {
+                Ok(ip) => ip,
+                Err(_) => "unknown".to_string(),
+            };
+            
             // Search on known server IPs with proper regional ports
             for ip in known_node_ips {
+                // CRITICAL: Skip our own IP to prevent self-connection
+                if ip == our_external_ip {
+                    println!("[P2P] 🚫 Skipping self-connection to own IP: {}", ip);
+                    continue;
+                }
                 // Determine correct regional ports for this IP
                 let target_ports = if let Some((_, region_name)) = GENESIS_BOOTSTRAP_NODES.iter().find(|(node_ip, _)| *node_ip == ip) {
                     match *region_name {
@@ -1355,38 +1366,10 @@ impl SimplifiedP2P {
                         }
                     };
                     
-                    // Find more peers in our region using dynamic discovery
-                    let peer_info = PeerInfo {
-                        id: format!("regional_{}_{}", region_string(&region), rand::random::<u32>()),
-                        addr: format!("{}:987{}", external_ip, 6 + rand::random::<u8>() % 10),
-                        node_type: NodeType::Full,
-                        region: region.clone(),
-                        last_seen: std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap()
-                            .as_secs(),
-                        is_stable: true,
-                        cpu_load: 0.4,
-                        latency_ms: 25,
-                        connection_count: 0,
-                        bandwidth_usage: 0,
-                    };
-                    
-                    // Add to regional peers
-                    {
-                        let mut regional_peers = regional_peers.lock().unwrap();
-                        regional_peers
-                            .entry(peer_info.region.clone())
-                            .or_insert_with(Vec::new)
-                            .push(peer_info.clone());
-                    }
-                    
-                    // Add to connected peers
-                    {
-                        let mut connected = connected_peers.lock().unwrap();
-                        connected.push(peer_info);
-                        println!("[P2P] ✅ Added regional peer to improve clustering");
-                    }
+                    // FIXED: Do not create fake peers with own IP and random ports
+                    // Regional clustering should only use real discovered peers
+                    println!("[P2P] 🔍 Region {} needs more peers, but not creating fake ones", region_string(&region));
+                    println!("[P2P] 💡 Waiting for real peer discovery through internet search");
                 }
                 
                 // Report regional distribution
