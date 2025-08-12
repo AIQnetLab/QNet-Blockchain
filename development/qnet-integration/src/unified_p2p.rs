@@ -466,14 +466,22 @@ impl SimplifiedP2P {
                          // Check peer reputation
                          let reputation = reputation_system.get_reputation(&peer.id);
                          
-                         // Remove peers with very low reputation
-                         if reputation < 10.0 {
+                         // PRODUCTION FIX: Don't remove genesis bootstrap peers during network initialization
+                         let is_genesis_peer = peer.id.contains("genesis_") || peer.addr.contains("154.38.160.39") || 
+                                             peer.addr.contains("62.171.157.44") || peer.addr.contains("161.97.86.81") ||
+                                             peer.addr.contains("173.212.219.226") || peer.addr.contains("164.68.108.218");
+                         
+                         // Remove peers with very low reputation (except genesis nodes)
+                         if reputation < 10.0 && !is_genesis_peer {
                              println!("[P2P] 🚫 Removing peer {} due to low reputation: {}", 
                                  peer.id, reputation);
                              to_remove.push(i);
                          } else {
                              // Update peer stability based on reputation
-                             peer.is_stable = reputation > 75.0;
+                             peer.is_stable = reputation > 75.0 || is_genesis_peer;
+                             if is_genesis_peer {
+                                 println!("[P2P] 🛡️ Genesis peer {} protected (reputation: {})", peer.id, reputation);
+                             }
                          }
                      }
                      
@@ -654,12 +662,10 @@ impl SimplifiedP2P {
                     if output.status.success() {
                         let response = String::from_utf8_lossy(&output.stdout);
                         // Parse JSON response: {"height": 12345}
-                        if let Some(height_str) = response.split("\"height\":").nth(1) {
-                            if let Some(height_num) = height_str.split(',').next().or_else(|| height_str.split('}').next()) {
-                                if let Ok(height) = height_num.trim().parse::<u64>() {
-                                    let _ = tx.send(Ok(height));
-                                    return;
-                                }
+                        if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&response) {
+                            if let Some(height) = json_val.get("height").and_then(|h| h.as_u64()) {
+                                let _ = tx.send(Ok(height));
+                                return;
                             }
                         }
                         let _ = tx.send(Err("Invalid JSON response format".to_string()));
