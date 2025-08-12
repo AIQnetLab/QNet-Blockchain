@@ -286,13 +286,20 @@ impl SimplifiedP2P {
                 Err(_) => "unknown".to_string(),
             };
             
+            println!("[P2P] 🔍 DEBUG: Our external IP: {}", our_external_ip);
+            println!("[P2P] 🔍 DEBUG: Known node IPs: {:?}", known_node_ips);
+            
             // Search on known server IPs with proper regional ports
             for ip in known_node_ips {
+                println!("[P2P] 🔍 DEBUG: Processing IP: {}", ip);
+                
                 // CRITICAL: Skip our own IP to prevent self-connection
                 if ip == our_external_ip {
                     println!("[P2P] 🚫 Skipping self-connection to own IP: {}", ip);
                     continue;
                 }
+                
+                println!("[P2P] 🌐 Attempting to connect to peer: {}", ip);
                 // Determine correct regional ports for this IP
                 let target_ports = if let Some((_, region_name)) = GENESIS_BOOTSTRAP_NODES.iter().find(|(node_ip, _)| *node_ip == ip) {
                     match *region_name {
