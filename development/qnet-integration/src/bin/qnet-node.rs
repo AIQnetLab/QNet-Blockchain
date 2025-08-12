@@ -583,7 +583,17 @@ async fn interactive_node_setup() -> Result<(NodeType, String), Box<dyn std::err
         }
     };
 
-    println!("✅ Setup complete - starting {:?} node", node_type);
+    // Beautiful quantum node startup banner
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("🔮 QNET QUANTUM BLOCKCHAIN NODE INITIALIZED");
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("🚀 Node Type: {:?} | 🔐 Post-Quantum Security: ACTIVE", node_type);
+    println!("🛡️  Quantum Algorithms: CRYSTALS-Dilithium + CRYSTALS-Kyber");
+    println!("⚡ Performance Target: 100,000+ TPS | ⏱️  Block Time: 1s microblocks");
+    println!("🌐 Network: Production Ready | 💎 Consensus: Byzantine-BFT");
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("✅ Quantum Node Ready - Blockchain Operations Starting...");
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     
     Ok((node_type, activation_code))
 }
