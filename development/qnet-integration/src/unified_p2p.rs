@@ -300,21 +300,9 @@ impl SimplifiedP2P {
                 }
                 
                 println!("[P2P] 🌐 Attempting to connect to peer: {}", ip);
-                // Determine correct regional ports for this IP
-                let target_ports = if let Some((_, region_name)) = GENESIS_BOOTSTRAP_NODES.iter().find(|(node_ip, _)| *node_ip == ip) {
-                    match *region_name {
-                        "NorthAmerica" => vec![9876],
-                        "Europe" => vec![9877],
-                        "Asia" => vec![9878],
-                        "SouthAmerica" => vec![9879], 
-                        "Africa" => vec![9880],
-                        "Oceania" => vec![9881],
-                        _ => vec![port, port + 1, port + 2], // Fallback scan
-                    }
-                } else {
-                    // For manual QNET_PEER_IPS, try regional ports
-                    vec![9876, 9877, 9878, 9879, 9880, 9881]
-                };
+                // PRODUCTION FIX: All genesis nodes listen on both 9876 and 9877
+                // Try both ports regardless of region for reliable discovery
+                let target_ports = vec![9876, 9877];
                 
                 for target_port in target_ports {
                     let target_addr = format!("{}:{}", ip, target_port);
