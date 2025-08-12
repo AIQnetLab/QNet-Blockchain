@@ -740,8 +740,14 @@ impl SimplifiedP2P {
         };
         
         // Minimum Byzantine consensus requirement: need 3f+1 nodes to tolerate f failures
+        // For genesis bootstrap: allow single node operation, otherwise need 2+ peers (3+ total)
         if connected.len() < 2 {
-            return false; // Need at least 3 total nodes (2 peers + self) for Byzantine fault tolerance
+            // Check if this is a genesis bootstrap node - they can operate solo initially
+            if std::env::var("QNET_BOOTSTRAP_ID").is_ok() {
+                println!("🚀 [CONSENSUS] Genesis bootstrap - solo quantum consensus activated");
+                return true; // Genesis nodes can start consensus alone
+            }
+            return false; // Regular nodes need at least 3 total nodes (2 peers + self)
         }
         
         // Check if this node can participate based on network connectivity

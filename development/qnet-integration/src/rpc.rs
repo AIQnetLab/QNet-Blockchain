@@ -103,6 +103,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(blockchain_filter.clone())
         .and_then(|blockchain: Arc<BlockchainNode>| async move {
             let height = blockchain.get_height().await;
+            println!("[API] 📊 Height request: returning height {}", height);
             Ok::<_, Rejection>(warp::reply::json(&json!({"height": height})))
         });
     

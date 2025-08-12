@@ -388,6 +388,13 @@ impl BlockchainNode {
         }
         
         println!("[Node] ✅ Blockchain node started successfully");
+        
+        // Keep the node running indefinitely - prevent process exit
+        while *self.is_running.read().await {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        }
+        
+        println!("[Node] 🛑 Blockchain node shutting down...");
         Ok(())
     }
     
@@ -638,15 +645,15 @@ impl BlockchainNode {
                         }
                     }
                     
-                    // Clean blockchain logging
+                    // Beautiful quantum blockchain logging
                     if txs.len() > 0 {
-                        println!("Block #{} | {} tx | {:.0} TPS | {} peers", 
+                        println!("⚡ Block #{} | 🔄 {} tx | 🚀 {:.0} TPS | 🌐 {} peers | 🔐 Quantum-secured", 
                                  microblock.height, 
                                  txs.len(), 
                                  tps,
                                  if let Some(ref p2p) = unified_p2p { p2p.get_peer_count() } else { 0 });
                     } else if microblock_height % 30 == 0 {
-                        println!("Block #{} | No transactions | {} peers connected", 
+                        println!("💤 Block #{} | 🔄 No transactions | 🌐 {} peers | ⏰ Waiting for activity", 
                                 microblock.height,
                                 if let Some(ref p2p) = unified_p2p { p2p.get_peer_count() } else { 0 });
                     }
