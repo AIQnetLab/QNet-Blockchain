@@ -300,9 +300,9 @@ impl SimplifiedP2P {
                 }
                 
                 println!("[P2P] 🌐 Attempting to connect to peer: {}", ip);
-                // PRODUCTION FIX: All genesis nodes listen on both 9876 and 9877
-                // Try both ports regardless of region for reliable discovery
-                let target_ports = vec![9876, 9877];
+                // PRODUCTION FIX: Test actual HTTP API ports where nodes listen
+                // 8001 = primary API port, 9877 = RPC port
+                let target_ports = vec![8001, 9877];
                 
                 for target_port in target_ports {
                     let target_addr = format!("{}:{}", ip, target_port);
@@ -315,16 +315,19 @@ impl SimplifiedP2P {
                         Ok(Ok(_)) => {
                             println!("🌟 [P2P] Quantum-secured connection established: {} | 🔐 Post-quantum encryption active", target_addr);
                             
-                            // Determine region based on IP and port
-                            let peer_region = match target_port {
-                                9876 => Region::NorthAmerica,
-                                9877 => Region::Europe,
-                                9878 => Region::Asia,
-                                9879 => Region::SouthAmerica,
-                                9880 => Region::Africa,
-                                9881 => Region::Oceania,
-                                _ => region.clone(),
-                            };
+                            // Determine region based on genesis node IP (not port)
+                            let peer_region = GENESIS_BOOTSTRAP_NODES.iter()
+                                .find(|(node_ip, _)| *node_ip == ip)
+                                .map(|(_, region_name)| match *region_name {
+                                    "NorthAmerica" => Region::NorthAmerica,
+                                    "Europe" => Region::Europe,
+                                    "Asia" => Region::Asia,
+                                    "SouthAmerica" => Region::SouthAmerica,
+                                    "Africa" => Region::Africa,
+                                    "Oceania" => Region::Oceania,
+                                    _ => region.clone(),
+                                })
+                                .unwrap_or_else(|| region.clone());
                             
                             let peer_info = PeerInfo {
                                 id: format!("genesis_{}", target_addr.replace(":", "_")),
