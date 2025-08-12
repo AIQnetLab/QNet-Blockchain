@@ -34,11 +34,12 @@ RUN cargo build --profile release-fast --bin qnet-node \
 # Production runtime image
 FROM debian:bookworm-slim
 
-# Install minimal runtime dependencies
+# Install minimal runtime dependencies including su-exec for user switching
 RUN apt-get update && apt-get install -y \
     libssl3 \
     ca-certificates \
     curl \
+    su-exec \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd -r qnet \
     && useradd -r -g qnet -s /bin/false qnet
@@ -51,8 +52,23 @@ RUN mkdir -p /app/data /app/logs \
     && chown -R qnet:qnet /app \
     && chmod 755 /app/data /app/logs
 
-# Switch to non-root user
-USER qnet
+# Create entrypoint script that fixes permissions and switches user
+RUN echo '#!/bin/bash\n\
+set -e\n\
+DATA_DIR="${QNET_DATA_DIR:-/app/data}"\n\
+if [ "$(id -u)" = "0" ]; then\n\
+  echo "Fixing data directory permissions..."\n\
+  chown -R qnet:qnet "$DATA_DIR"\n\
+  chmod -R 755 "$DATA_DIR"\n\
+  echo "Starting QNet node as qnet user..."\n\
+  exec su-exec qnet /usr/local/bin/qnet-node "$@"\n\
+else\n\
+  exec /usr/local/bin/qnet-node "$@"\n\
+fi' > /usr/local/bin/entrypoint.sh \
+    && chmod +x /usr/local/bin/entrypoint.sh
+
+# Keep as root to allow permission fixes
+USER root
 
 # Set environment variables for production
 ENV RUST_LOG=info
@@ -67,7 +83,6 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
 # Expose required ports (QNet specific)
 EXPOSE 9876 9877 8001
 
-# Production startup command with proper signal handling
-ENV QNET_DATA_DIR=/app/data
-ENTRYPOINT ["/usr/local/bin/qnet-node"]
+# Production startup command with automatic permission fixing
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD [] 
