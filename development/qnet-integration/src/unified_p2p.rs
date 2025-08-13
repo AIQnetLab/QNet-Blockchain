@@ -259,26 +259,27 @@ impl SimplifiedP2P {
             
             let mut discovered_peers = Vec::new();
             
-                         // Get known QNet node IPs from environment variable or genesis nodes
+                         // PRODUCTION FIX: Always use genesis nodes + optional manual override
              let mut known_node_ips = Vec::new();
              
-             // Check environment variable for peer IPs (manual override)
+             // PRIORITY 1: Always include genesis bootstrap nodes for network stability
+             for (ip, region_name) in GENESIS_BOOTSTRAP_NODES {
+                 known_node_ips.push(ip.to_string());
+                 println!("[P2P] 🌟 Genesis bootstrap node: {} ({})", ip, region_name);
+             }
+             
+             // PRIORITY 2: Add environment variable peers (additional nodes)
              if let Ok(peer_ips) = std::env::var("QNET_PEER_IPS") {
                  for ip in peer_ips.split(',') {
                      let ip = ip.trim();
-                     if !ip.is_empty() {
+                     if !ip.is_empty() && !known_node_ips.contains(&ip.to_string()) {
                          known_node_ips.push(ip.to_string());
-                         println!("[P2P] 🔧 Using manual peer IP: {}", ip);
+                         println!("[P2P] 🔧 Additional peer IP: {}", ip);
                      }
                  }
-             } else {
-                 // Use built-in genesis nodes for bootstrap
-                 for (ip, region_name) in GENESIS_BOOTSTRAP_NODES {
-                     known_node_ips.push(ip.to_string());
-                     println!("[P2P] 🌟 Using genesis bootstrap node: {} ({})", ip, region_name);
-                 }
-                 println!("[P2P] ✅ Genesis bootstrap enabled - true decentralized network");
              }
+             
+             println!("[P2P] ✅ Quantum network bootstrap: {} total nodes configured", known_node_ips.len());
             
             // Get our own external IP to avoid self-connection
             let our_external_ip = match Self::get_our_ip_address().await {
@@ -306,6 +307,8 @@ impl SimplifiedP2P {
                 
                 for target_port in target_ports {
                     let target_addr = format!("{}:{}", ip, target_port);
+                    
+                    println!("[P2P] 🔍 DEBUG: Attempting peer verification for {}", target_addr);
                     
                     // Try to connect with timeout
                     // PRODUCTION: Use cryptographic peer verification instead of simple TCP test
@@ -349,6 +352,7 @@ impl SimplifiedP2P {
                         }
                         Err(e) => {
                             println!("[P2P] ❌ Peer verification failed for {}: {}", target_addr, e);
+                            println!("[P2P] 🔍 Debug: Trying next port for IP {}", ip);
                         }
                     }
                 }
@@ -777,17 +781,14 @@ impl SimplifiedP2P {
         let min_nodes_for_consensus = 4;
         let total_nodes = connected.len() + 1; // +1 for self
         
+        // PRODUCTION CONSENSUS: Genesis nodes must work together for Byzantine security
+        // No single node should control the network - this ensures decentralization
+        
         if total_nodes < min_nodes_for_consensus {
-            // PRODUCTION: No solo consensus allowed - prevents centralization attacks
-            // Even genesis nodes must wait for sufficient network participation
-            if std::env::var("QNET_BOOTSTRAP_ID").is_ok() {
-                println!("⚠️ [CONSENSUS] Genesis bootstrap waiting for network: {}/{} nodes", 
-                        total_nodes, min_nodes_for_consensus);
-                println!("🔒 [CONSENSUS] Byzantine fault tolerance requires minimum {} nodes", min_nodes_for_consensus);
-            } else {
-                println!("⚠️ [CONSENSUS] Insufficient nodes for Byzantine consensus: {}/{}", 
-                        total_nodes, min_nodes_for_consensus);
-            }
+            // PRODUCTION: No solo consensus allowed for non-genesis nodes
+            println!("⚠️ [CONSENSUS] Insufficient nodes for Byzantine consensus: {}/{}", 
+                    total_nodes, min_nodes_for_consensus);
+            println!("🔒 [CONSENSUS] Byzantine fault tolerance requires minimum {} nodes", min_nodes_for_consensus);
             return false; // No consensus participation until sufficient nodes
         }
         
@@ -834,6 +835,7 @@ impl SimplifiedP2P {
                 .send()
         ).await {
             Ok(Ok(response)) => {
+                println!("[P2P] 🔍 DEBUG: HTTP response status: {}", response.status());
                 if response.status().is_success() {
                     match response.json::<serde_json::Value>().await {
                         Ok(auth_response) => {
@@ -857,8 +859,14 @@ impl SimplifiedP2P {
                     Err(format!("HTTP error: {}", response.status()))
                 }
             },
-            Ok(Err(e)) => Err(format!("Connection error: {}", e)),
-            Err(_) => Err("Timeout during peer authentication".to_string()),
+            Ok(Err(e)) => {
+                println!("[P2P] 🔍 DEBUG: Connection error details: {}", e);
+                Err(format!("Connection error: {}", e))
+            },
+            Err(_) => {
+                println!("[P2P] 🔍 DEBUG: Timeout during peer authentication (5 seconds)");
+                Err("Timeout during peer authentication".to_string())
+            },
         }
     }
     
@@ -1808,4 +1816,5 @@ impl SimplifiedP2P {
     }
 }
 
+ 
  

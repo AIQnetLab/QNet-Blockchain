@@ -307,17 +307,21 @@ impl BlockchainNode {
             unified_p2p.connect_to_bootstrap_peers(&self.bootstrap_peers);
         }
         
-        // Start microblock production if enabled
-        if env::var("QNET_ENABLE_MICROBLOCKS").unwrap_or_default() == "1" {
-            println!("[Node] Microblock production enabled");
-            self.start_microblock_production().await;
-        }
+        // PRODUCTION FIX: Always enable microblock production for blockchain operation
+        // Microblocks are core to QNet's 1-second block time architecture
+        println!("[Node] ⚡ Starting microblock production (1-second intervals)");
+        self.start_microblock_production().await;
         
-        // Start consensus if leader
-        if env::var("QNET_IS_LEADER").unwrap_or_default() == "1" {
-            *self.is_leader.write().await = true;
-            println!("[Node] Node designated as leader");
-            self.start_consensus_loop().await;
+        // PRODUCTION FIX: Dynamic leader selection based on P2P consensus
+        // All nodes participate in Byzantine consensus, not just manual leaders
+        if let Some(unified_p2p) = &self.unified_p2p {
+            if unified_p2p.should_be_leader(&self.node_id) {
+                *self.is_leader.write().await = true;
+                println!("[Node] 🏛️  Node selected as consensus participant");
+                self.start_consensus_loop().await;
+            } else {
+                println!("[Node] 👥 Node waiting for sufficient peers for Byzantine consensus");
+            }
         }
         
         // Start RPC server with production port detection

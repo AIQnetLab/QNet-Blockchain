@@ -1213,18 +1213,21 @@ fn get_bootstrap_peers_for_region(region: &Region) -> Vec<String> {
         }
     }
     
-    println!("[BOOTSTRAP] 🌐 Using decentralized internet-wide peer discovery");
-    println!("[BOOTSTRAP] 🔍 No hardcoded bootstrap nodes - true decentralization");
-    println!("[BOOTSTRAP] ⚡ Unified P2P module will handle peer discovery automatically");
+    // PRODUCTION FIX: Always provide genesis bootstrap nodes for network stability
+    // This ensures nodes can find each other for Byzantine consensus
+    let genesis_bootstrap_peers = vec![
+        "154.38.160.39:8001".to_string(),  // Genesis Node #1
+        "62.171.157.44:8001".to_string(),   // Genesis Node #2
+        "161.97.86.81:8001".to_string(),    // Genesis Node #3
+        "173.212.219.226:8001".to_string(), // Genesis Node #4
+        "164.68.108.218:8001".to_string(),  // Genesis Node #5
+    ];
     
-    // Return empty - let the decentralized P2P system handle everything
-    // The unified_p2p module implements:
-    // - Internet-wide peer discovery
-    // - Node announcement to network  
-    // - Reputation-based peer validation
-    // - Regional clustering
-    // - DHT-style peer exchange
-    vec![]
+    println!("[BOOTSTRAP] 🌟 Using genesis bootstrap nodes for network stability");
+    println!("[BOOTSTRAP] ✅ {} genesis nodes configured: {:?}", 
+             genesis_bootstrap_peers.len(), genesis_bootstrap_peers);
+    
+    genesis_bootstrap_peers
 }
 
 fn get_regional_port(region: &Region) -> u16 {
