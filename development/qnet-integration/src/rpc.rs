@@ -1,6 +1,8 @@
 //! JSON-RPC and REST API server for QNet node
 //! Each node provides full API functionality for decentralized access
 
+#![recursion_limit = "256"]
+
 use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -362,34 +364,47 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .allow_methods(vec!["POST", "GET", "OPTIONS"])
         .allow_headers(vec!["Content-Type", "Authorization", "User-Agent"]);
     
-    // Combine all routes
-    let routes = rpc_path
+    // Combine routes in smaller groups to avoid recursion overflow
+    let basic_routes = rpc_path
         .or(root_path)
         .or(chain_height)
         .or(peers_endpoint)
-        .or(microblock_one)
+        .or(node_health);
+        
+    let blockchain_routes = microblock_one
         .or(microblocks_range)
-        .or(account_info)
-        .or(account_balance)
-        .or(account_transactions)
         .or(block_latest)
         .or(block_by_height)
-        .or(block_by_hash)
-        .or(transaction_submit)
+        .or(block_by_hash);
+        
+    let account_routes = account_info
+        .or(account_balance)
+        .or(account_transactions)
+        .or(batch_claim_rewards)
+        .or(batch_transfer);
+        
+    let transaction_routes = transaction_submit
         .or(transaction_get)
         .or(mempool_status)
-        .or(mempool_transactions)
-        .or(batch_claim_rewards)
-        .or(batch_transfer)
-        .or(node_discovery)
-        .or(node_health)
+        .or(mempool_transactions);
+        
+    let node_routes = node_discovery
         .or(gas_recommendations)
         .or(auth_challenge)
         .or(network_ping)
-        .or(light_node_register)
+        .or(graceful_shutdown);
+        
+    let light_node_routes = light_node_register
         .or(light_node_ping_response)
-        .or(claim_rewards)
-        .or(graceful_shutdown)
+        .or(claim_rewards);
+    
+    // Combine route groups
+    let routes = basic_routes
+        .or(blockchain_routes)
+        .or(account_routes)
+        .or(transaction_routes)
+        .or(node_routes)
+        .or(light_node_routes)
         .with(cors);
     
     println!("🚀 Starting comprehensive API server on port {}", port);
