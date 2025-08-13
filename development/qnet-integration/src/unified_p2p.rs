@@ -1555,18 +1555,31 @@ impl SimplifiedP2P {
     async fn get_our_ip_address() -> Result<String, Box<dyn std::error::Error>> {
         use std::process::Command;
         
-        // Try to get public IP first
-        if let Ok(output) = Command::new("curl")
-            .arg("-s")
-            .arg("--max-time")
-            .arg("3")
-            .arg("https://api.ipify.org")
-            .output() {
-            if output.status.success() {
-                if let Ok(ip) = String::from_utf8(output.stdout) {
-                    let ip = ip.trim();
-                    if !ip.is_empty() && ip != "0.0.0.0" {
-                        return Ok(ip.to_string());
+        // PRODUCTION FIX: Try multiple IP detection services for Docker compatibility
+        let ip_services = vec![
+            "https://api.ipify.org",
+            "https://ipv4.icanhazip.com",
+            "https://checkip.amazonaws.com",
+            "https://ident.me",
+        ];
+        
+        // Try to get public IP from multiple services
+        for service in ip_services {
+            if let Ok(output) = Command::new("curl")
+                .arg("-s")
+                .arg("--max-time")
+                .arg("5")
+                .arg("--connect-timeout")
+                .arg("3")
+                .arg(service)
+                .output() {
+                if output.status.success() {
+                    if let Ok(ip) = String::from_utf8(output.stdout) {
+                        let ip = ip.trim();
+                        if !ip.is_empty() && ip != "0.0.0.0" && !ip.starts_with("172.") && !ip.starts_with("192.168.") {
+                            println!("[P2P] 🔍 External IP detected via {}: {}", service, ip);
+                            return Ok(ip.to_string());
+                        }
                     }
                 }
             }
