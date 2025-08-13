@@ -358,13 +358,8 @@ impl BlockchainNode {
                     8001 // fallback
                 });
             
-            // Start both RPC and API servers for Full/Super nodes
-            let node_clone_rpc = self.clone();
+            // Start unified API/RPC server for Full/Super nodes
             let node_clone_api = self.clone();
-            
-            tokio::spawn(async move {
-                crate::rpc::start_rpc_server(node_clone_rpc, rpc_port).await;
-            });
             
             println!("[Node] 🚀 API server starting on port {}", api_port);
             tokio::spawn(async move {
@@ -372,10 +367,10 @@ impl BlockchainNode {
             });
             
             // Store ports for external access
-            std::env::set_var("QNET_CURRENT_RPC_PORT", rpc_port.to_string());
+            std::env::set_var("QNET_CURRENT_RPC_PORT", api_port.to_string()); // Unified port
             std::env::set_var("QNET_CURRENT_API_PORT", api_port.to_string());
             
-            println!("[Node] 🔌 RPC server: port {}", rpc_port);
+            println!("[Node] 🔌 RPC server: port {}", api_port);
             println!("[Node] 🌐 API server: port {}", api_port);
         } else {
             // Light nodes: RPC only, no API server

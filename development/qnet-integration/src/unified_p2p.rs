@@ -300,6 +300,12 @@ impl SimplifiedP2P {
                     continue;
                 }
                 
+                // ADDITIONAL CHECK: Skip if IP matches any of our listening addresses
+                if ip == "127.0.0.1" || ip == "0.0.0.0" || ip == "localhost" {
+                    println!("[P2P] 🚫 Skipping local address: {}", ip);
+                    continue;
+                }
+                
                 println!("[P2P] 🌐 Attempting to connect to peer: {}", ip);
                 // PRODUCTION FIX: Test actual HTTP API ports where nodes listen
                 // 8001 = primary API port, 9877 = RPC port

@@ -231,6 +231,27 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(blockchain_filter.clone())
         .and_then(handle_mempool_transactions);
     
+    // Peer discovery endpoint (for P2P network)
+    let peers_endpoint = api_v1
+        .and(warp::path("peers"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(blockchain_filter.clone())
+        .and_then(|blockchain: Arc<BlockchainNode>| async move {
+            let peers = blockchain.get_connected_peers().await.unwrap_or_default();
+            let peer_list: Vec<serde_json::Value> = peers.iter().map(|peer| {
+                json!({
+                    "id": peer.id,
+                    "address": peer.address,
+                    "node_type": peer.node_type,
+                    "region": peer.region,
+                    "last_seen": peer.last_seen
+                })
+            }).collect();
+            println!("[API] 📊 Peers request: returning {} peers", peer_list.len());
+            Ok::<_, Rejection>(warp::reply::json(&json!({"peers": peer_list})))
+        });
+
     // Batch operations endpoints
     let batch_claim_rewards = api_v1
         .and(warp::path("batch"))
@@ -296,6 +317,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
     let routes = rpc_path
         .or(root_path)
         .or(chain_height)
+        .or(peers_endpoint)
         .or(microblock_one)
         .or(microblocks_range)
         .or(account_info)
