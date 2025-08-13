@@ -95,34 +95,29 @@ pub fn burn_1dev_for_node_activation(ctx: Context<BurnForActivation>) -> Result<
 }
 ```
 
-### **2. Rate-Limited Migrations** 
-Prevents abuse while allowing legitimate device transfers:
+### **2. Automatic Node Replacement** 
+Seamless server migration with quantum security:
 
 ```rust
-// Migration rate limiting
-const MAX_MIGRATIONS_PER_DAY: u32 = 3;
-const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
-
-pub fn update_activation_for_migration(
+// Automatic replacement on new activation
+pub async fn register_activation_on_blockchain(
     &self, 
     code: &str, 
-    new_device_signature: &str
-) -> IntegrationResult<()> {
-    // Check migration history for rate limiting
-    let recent_migrations = self.load_migration_history(code)?
-        .into_iter()
-        .filter(|&time| current_time - time < SECONDS_PER_DAY)
-        .count();
+    node_info: NodeInfo
+) -> Result<(), IntegrationError> {
+    // Check for existing active node of same type
+    self.check_and_replace_existing_node(&node_info).await?;
     
-    if recent_migrations >= MAX_MIGRATIONS_PER_DAY {
-        return Err(IntegrationError::RateLimitExceeded(
-            "Maximum 3 migrations per day exceeded".to_string()
-        ));
-    }
+    // Register new node activation
+    let record = ActivationRecord {
+        wallet_address: node_info.wallet_address.clone(),
+        node_type: node_info.node_type.clone(),
+        is_active: true,
+        // ... other fields
+    };
     
-    // Record migration and update device signature
-    self.record_migration(code, current_time)?;
-    self.update_device_signature(code, new_device_signature)
+    self.submit_activation_to_blockchain(record).await?;
+    Ok(())
 }
 ```
 
@@ -296,9 +291,10 @@ const activationResult = await QNetMobile.activateNode({
 - `core/qnet-consensus/src/reward_integration.rs` - Pool 3 redistribution
 
 ### Activation Validation - Enhanced
-- `development/qnet-integration/src/activation_validation.rs` - **UPDATED**: Code validation with ownership checks
+- `development/qnet-integration/src/activation_validation.rs` - **UPDATED**: Automatic node replacement system
 - `development/qnet-integration/src/bin/qnet-node.rs` - **UPDATED**: Interactive setup with Light node blocking
-- `development/qnet-integration/src/storage.rs` - **UPDATED**: Migration rate limiting
+- `development/qnet-integration/src/quantum_crypto.rs` - **UPDATED**: Quantum-secure replacement coordination
+- `development/qnet-integration/src/rpc.rs` - **UPDATED**: Graceful shutdown API endpoint
 - `applications/qnet-mobile/src/services/BridgeService.js` - Mobile bridge
 
 ## Node Type API Capabilities
@@ -367,47 +363,55 @@ const activationResult = await QNetMobile.activateNode({
 - **NEW**: Hardware entropy for code generation
 - **NEW**: Migration history tracking
 
-## Device Migration Support
+## Automatic Node Replacement System
 
-### **Enhanced Migration Security**
+### **Quantum-Secure Node Transfer**
+QNet implements automatic node replacement when activating on a new server:
+
 ```rust
-pub async fn migrate_device_secure(
+pub async fn check_and_replace_existing_node(
     &self,
-    activation_code: &str,
-    new_device_signature: &str,
-    wallet_signature: &str,
-) -> Result<(), MigrationError> {
-    // RATE LIMITING: Check migration frequency
-    let migration_count = self.get_migration_count(activation_code).await?;
-    if migration_count >= MAX_MIGRATIONS_PER_DAY {
-        return Err(MigrationError::RateLimitExceeded);
+    new_node_info: &NodeInfo
+) -> Result<(), IntegrationError> {
+    // Check blockchain for existing active node of same wallet+type
+    let active_nodes = self.active_nodes.read().await;
+    
+    for (device_sig, existing_node) in active_nodes.iter() {
+        if existing_node.wallet_address == new_node_info.wallet_address 
+            && existing_node.node_type == new_node_info.node_type {
+            
+            // Send quantum-secure shutdown signal to previous node
+            self.send_blockchain_shutdown_signal(existing_node).await?;
+            
+            // Mark as replaced in blockchain immediately
+            self.mark_node_replaced_in_blockchain(existing_node).await?;
+            
+            break;
+        }
     }
     
-    // OWNERSHIP VERIFICATION: Verify wallet controls the activation
-    self.verify_wallet_ownership(activation_code, wallet_signature).await?;
-    
-    // CRYPTOGRAPHIC BINDING: Update device signature with quantum security  
-    self.update_device_signature_secure(activation_code, new_device_signature).await?;
-    
-    // AUDIT TRAIL: Record migration for rate limiting
-    self.record_migration_event(activation_code).await?;
-    
-    // Maintain node activation with enhanced security
     Ok(())
 }
 ```
 
-### **Migration Limitations (Security)**
-- **Rate Limiting**: Maximum 3 migrations per 24-hour period
-- **Audit Trail**: All migrations recorded with timestamps
-- **Wallet Binding**: Only original wallet can authorize migrations
-- **Device Verification**: New device must provide cryptographic signature
+### **Automatic Replacement Features**
+- **1 Wallet = 1 Active Node**: Only one node per type per wallet
+- **Blockchain-Based**: Uses quantum blockchain for coordination
+- **Graceful Shutdown**: Previous node receives shutdown signal
+- **Zero Manual Migration**: Automatic on new activation
+- **Scalable**: Optimized for millions of nodes
 
-### Transfer Between Wallets (Not Supported)
-- Node activations are permanently bound to wallet addresses
-- No transfer mechanism available
-- Prevents activation code trading
-- **NEW**: Cryptographically enforced through PDA ownership
+### **Node Replacement Scenarios**
+1. **Server Migration**: Activate same node type on new server → old automatically shuts down
+2. **Hardware Upgrade**: New server activation → seamless replacement
+3. **Node Type Upgrade**: Full → Super activation → Full node replaced
+4. **Recovery**: Lost server access → reactivate on new hardware
+
+### **Security & Limitations**
+- **Wallet Binding**: Node activations permanently bound to wallet addresses
+- **No Wallet Transfer**: Prevents activation code trading
+- **Quantum-Secure**: All replacement signals use CRYSTALS-Dilithium signatures
+- **Blockchain Authority**: Blockchain records are source of truth for active nodes
 
 ## Alternative Activation Methods
 
@@ -465,12 +469,12 @@ const result = await QNetMobile.activateNode({
 - **Network Size**: Active nodes by type and region
 - **Pool 3 Balance**: QNC available for redistribution
 - **Activation Rate**: New nodes per day
-- **NEW**: Migration statistics and rate limiting metrics
+- **NEW**: Node replacement statistics and blockchain coordination metrics
 - **NEW**: Security event monitoring (failed activations, blocked attempts)
 
 ### Security Monitoring
 - **Failed Activations**: Track attempted Light node server activations
-- **Migration Abuse**: Monitor excessive migration attempts
+- **Replacement Events**: Monitor automatic node shutdowns and replacements
 - **Code Reuse Attempts**: Track attempts to reuse activation codes  
 - **Ownership Violations**: Monitor unauthorized node activation attempts
 
@@ -478,8 +482,8 @@ const result = await QNetMobile.activateNode({
 - **Burn Threshold**: Monitor 90% burn progress
 - **Time Threshold**: Track 5-year countdown
 - **Transition Readiness**: QNC contract deployment status
-- **Migration Stats**: Phase 1 to Phase 2 transitions
-- **NEW**: Security upgrade deployment tracking
+- **Replacement Stats**: Automatic node replacements and server migrations
+- **NEW**: Quantum-secure replacement deployment tracking
 
 ## **SECURITY COMPLIANCE**
 

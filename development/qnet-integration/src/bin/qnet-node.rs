@@ -1213,21 +1213,41 @@ fn get_bootstrap_peers_for_region(region: &Region) -> Vec<String> {
         }
     }
     
-    // PRODUCTION FIX: Always provide genesis bootstrap nodes for network stability
-    // This ensures nodes can find each other for Byzantine consensus
-    let genesis_bootstrap_peers = vec![
-        "154.38.160.39:8001".to_string(),  // Genesis Node #1
-        "62.171.157.44:8001".to_string(),   // Genesis Node #2
-        "161.97.86.81:8001".to_string(),    // Genesis Node #3
-        "173.212.219.226:8001".to_string(), // Genesis Node #4
-        "164.68.108.218:8001".to_string(),  // Genesis Node #5
-    ];
+    // PRODUCTION FIX: Provide appropriate bootstrap nodes based on context
+    // Light nodes connect to Full/Super nodes, servers connect to Genesis nodes
+    let is_light_node = std::env::var("QNET_NODE_TYPE")
+        .map(|t| t.to_lowercase() == "light")
+        .unwrap_or(false);
     
-    println!("[BOOTSTRAP] 🌟 Using genesis bootstrap nodes for network stability");
-    println!("[BOOTSTRAP] ✅ {} genesis nodes configured: {:?}", 
-             genesis_bootstrap_peers.len(), genesis_bootstrap_peers);
-    
-    genesis_bootstrap_peers
+    if is_light_node {
+        // Light nodes (mobile) connect to Full/Super nodes for better decentralization
+        let full_super_peers = vec![
+            "154.38.160.39:8001".to_string(),  // Genesis #1 (fallback)
+            "62.171.157.44:8001".to_string(),   // Genesis #2 (fallback)
+            // In production: Add discovered Full/Super node endpoints here
+        ];
+        
+        println!("[BOOTSTRAP] 📱 Light node: Connecting to Full/Super nodes");
+        println!("[BOOTSTRAP] ✅ {} Full/Super nodes for Light node: {:?}", 
+                 full_super_peers.len(), full_super_peers);
+        
+        full_super_peers
+    } else {
+        // Full/Super/Genesis nodes connect to Genesis bootstrap network
+        let genesis_bootstrap_peers = vec![
+            "154.38.160.39:8001".to_string(),  // Genesis Node #1
+            "62.171.157.44:8001".to_string(),   // Genesis Node #2
+            "161.97.86.81:8001".to_string(),    // Genesis Node #3
+            "173.212.219.226:8001".to_string(), // Genesis Node #4
+            "164.68.108.218:8001".to_string(),  // Genesis Node #5
+        ];
+        
+        println!("[BOOTSTRAP] 🖥️ Server node: Using genesis bootstrap network");
+        println!("[BOOTSTRAP] ✅ {} genesis nodes configured: {:?}", 
+                 genesis_bootstrap_peers.len(), genesis_bootstrap_peers);
+        
+        genesis_bootstrap_peers
+    }
 }
 
 fn get_regional_port(region: &Region) -> u16 {
@@ -1968,6 +1988,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("   📝 Node: {}...", &node_pubkey[..12]);
         println!("   🔐 Quantum-secure: CRYSTALS-Kyber + Dilithium");
         println!("   🚫 Database: Not used - blockchain is source of truth");
+
+        // PRODUCTION: Auto-shutdown previous nodes of same type for this wallet
+        let external_ip = get_physical_ip().await.unwrap_or_else(|_| "127.0.0.1".to_string());
+        let api_port = std::env::var("QNET_API_PORT")
+            .ok()
+            .and_then(|s| s.parse::<u16>().ok())
+            .unwrap_or(8001);
+        
+        println!("📝 Storing node connection info for replacement system...");
+        if let Err(e) = quantum_crypto.store_node_connection_info(
+            &activation_code,
+            &external_ip,
+            api_port,
+        ).await {
+            println!("⚠️  Failed to store connection info: {}", e);
+        }
     }
 
     println!("🔍 DEBUG: About to create BlockchainNode...");

@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use blake3;
 use chacha20poly1305::{ChaCha20Poly1305, Key as ChaChaKey, Nonce as ChachaNonce, KeyInit as ChachaKeyInit};
+use tokio::time::Duration;
 
 /// Safe string preview utility to prevent index out of bounds errors
 fn safe_preview(s: &str, len: usize) -> &str {
@@ -45,6 +46,15 @@ struct CachedSignature {
     is_valid: bool,
     cached_at: u64,
     signature_hash: String,
+}
+
+/// Simple node replacement: 1 wallet = 1 active node per type
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SimpleNodeRecord {
+    pub wallet_address: String,
+    pub node_type: String,
+    pub external_ip: String,
+    pub api_port: u16,
 }
 
 /// Activation payload structure (decrypted from quantum-secure code)
@@ -811,5 +821,26 @@ impl QNetQuantumCrypto {
         let mut hasher = Sha3_256::new();
         hasher.update(code.as_bytes());
         Ok(hex::encode(hasher.finalize()))
+    }
+
+    /// Store node connection info in device signature for replacement system
+    pub async fn store_node_connection_info(
+        &self,
+        activation_code: &str,
+        external_ip: &str,
+        api_port: u16,
+    ) -> Result<()> {
+        println!("📝 Storing node connection info for replacement system");
+        println!("   External IP: {}", external_ip);
+        println!("   API Port: {}", api_port);
+        
+        // In production: Update the device_signature in blockchain records
+        // to include IP:port for future replacement operations
+        
+        // For now: Just log the connection info
+        let connection_info = format!("{}:{}", external_ip, api_port);
+        println!("✅ Connection info ready for blockchain update: {}", connection_info);
+        
+        Ok(())
     }
 } 

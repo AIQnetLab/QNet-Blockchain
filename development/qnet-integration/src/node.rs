@@ -388,6 +388,10 @@ impl BlockchainNode {
         
         println!("[Node] ✅ Blockchain node started successfully");
         
+        // Blockchain-based node management (no heartbeat required)
+        println!("🔗 Node status managed via blockchain records");
+        println!("📡 No heartbeat system - scalable for millions of nodes");
+
         // Keep the node running indefinitely - prevent process exit
         while *self.is_running.read().await {
             tokio::time::sleep(Duration::from_secs(10)).await;
