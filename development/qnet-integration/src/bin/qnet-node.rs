@@ -3198,6 +3198,12 @@ async fn perform_dht_peer_discovery() -> Result<Vec<String>, String> {
     
     let mut discovered_peers = Vec::new();
     
+    // Get our own IP to avoid self-connection
+    let our_external_ip = match get_physical_ip().await {
+        Ok(ip) => ip,
+        Err(_) => "unknown".to_string(),
+    };
+    
     // PRODUCTION DHT: Query known bootstrap nodes for their peer lists
     let bootstrap_nodes = [
         "154.38.160.39:8001", // North America genesis (API port)
@@ -3206,6 +3212,13 @@ async fn perform_dht_peer_discovery() -> Result<Vec<String>, String> {
     ];
     
     for bootstrap in &bootstrap_nodes {
+        // Skip self-connection
+        let bootstrap_ip = bootstrap.split(':').next().unwrap_or("");
+        if bootstrap_ip == our_external_ip {
+            println!("[DHT] 🔄 Skipping self-connection to {}", bootstrap);
+            continue;
+        }
+        
         match query_node_for_peers(bootstrap).await {
             Ok(mut peers) => {
                 println!("[DHT] ✅ Bootstrap {} provided {} peers", bootstrap, peers.len());

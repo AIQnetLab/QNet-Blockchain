@@ -783,7 +783,9 @@ impl SimplifiedP2P {
         };
         
         // Check if this is a Genesis bootstrap node
-        let is_genesis_bootstrap = std::env::var("QNET_BOOTSTRAP_ID").is_ok();
+        let is_genesis_bootstrap = std::env::var("QNET_BOOTSTRAP_ID")
+            .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
+            .unwrap_or(false);
         
         // PRODUCTION: Strict Byzantine consensus requirement - need 3f+1 nodes to tolerate f failures
         // Minimum 4 nodes required for Byzantine fault tolerance (can tolerate 1 failure)
