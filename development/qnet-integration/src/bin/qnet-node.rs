@@ -3200,9 +3200,9 @@ async fn perform_dht_peer_discovery() -> Result<Vec<String>, String> {
     
     // PRODUCTION DHT: Query known bootstrap nodes for their peer lists
     let bootstrap_nodes = [
-        "154.38.160.39:9876", // North America genesis
-        "62.171.157.44:9877",  // Europe genesis  
-        "161.97.86.81:9877",   // Europe genesis
+        "154.38.160.39:8001", // North America genesis (API port)
+        "62.171.157.44:8001",  // Europe genesis (API port)  
+        "161.97.86.81:8001",   // Europe genesis (API port)
     ];
     
     for bootstrap in &bootstrap_nodes {

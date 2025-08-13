@@ -506,6 +506,42 @@ docker run -it --name qnet-node --restart=always \
   qnet-production
 ```
 
+### 🔄 Automatic Node Replacement
+
+**QNet features automatic node replacement when activating on a new server:**
+
+#### How It Works
+- **1 Wallet = 1 Active Node**: Only one node per type per wallet can be active
+- **Seamless Migration**: Activate on new server → old node automatically shuts down
+- **Quantum-Secure**: All replacement signals use CRYSTALS-Dilithium signatures
+- **Blockchain Authority**: Blockchain records are the source of truth
+
+#### Migration Scenarios
+1. **Server Migration**: Move Full/Super node to new hardware
+2. **Hardware Upgrade**: Seamless transition to more powerful server
+3. **Node Type Upgrade**: Full → Super activation replaces Full node
+4. **Disaster Recovery**: Reactivate on new server after hardware failure
+
+#### Example: Server Migration
+```bash
+# On NEW server - activate with same activation code
+docker run -it --name qnet-node --restart=always \
+  -e QNET_PRODUCTION=1 \
+  -e QNET_BOOTSTRAP_ID=YOUR_ID \
+  -p 9876:9876 -p 9877:9877 -p 8001:8001 \
+  -v $(pwd)/node_data:/app/node_data \
+  qnet-production
+
+# Result: Old server node receives shutdown signal and terminates
+# New server becomes the active node for your wallet
+```
+
+**⚠️ Important Notes:**
+- No manual migration required - fully automatic
+- Previous node data remains on old server (backup if needed)
+- Activation codes remain valid - bound to wallet, not hardware
+- Light nodes (mobile) work the same way across devices
+
 ### Backup Node Data
 
 ```bash

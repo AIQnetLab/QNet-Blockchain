@@ -782,20 +782,27 @@ impl SimplifiedP2P {
             }
         };
         
+        // Check if this is a Genesis bootstrap node
+        let is_genesis_bootstrap = std::env::var("QNET_BOOTSTRAP_ID").is_ok();
+        
         // PRODUCTION: Strict Byzantine consensus requirement - need 3f+1 nodes to tolerate f failures
         // Minimum 4 nodes required for Byzantine fault tolerance (can tolerate 1 failure)
-        let min_nodes_for_consensus = 4;
+        let min_nodes_for_consensus = if is_genesis_bootstrap { 1 } else { 4 };
         let total_nodes = connected.len() + 1; // +1 for self
         
-        // PRODUCTION CONSENSUS: Genesis nodes must work together for Byzantine security
-        // No single node should control the network - this ensures decentralization
+        // PRODUCTION CONSENSUS: Genesis nodes can start alone, others need Byzantine security
+        // Genesis nodes bootstrap the network, then more nodes join for decentralization
         
         if total_nodes < min_nodes_for_consensus {
-            // PRODUCTION: No solo consensus allowed for non-genesis nodes
-            println!("⚠️ [CONSENSUS] Insufficient nodes for Byzantine consensus: {}/{}", 
-                    total_nodes, min_nodes_for_consensus);
-            println!("🔒 [CONSENSUS] Byzantine fault tolerance requires minimum {} nodes", min_nodes_for_consensus);
-            return false; // No consensus participation until sufficient nodes
+            if is_genesis_bootstrap {
+                println!("🚀 [CONSENSUS] Genesis bootstrap node - starting blockchain initialization");
+                return true; // Genesis nodes can start alone
+            } else {
+                println!("⚠️ [CONSENSUS] Insufficient nodes for Byzantine consensus: {}/{}", 
+                        total_nodes, min_nodes_for_consensus);
+                println!("🔒 [CONSENSUS] Byzantine fault tolerance requires minimum {} nodes", min_nodes_for_consensus);
+                return false; // Non-genesis nodes need sufficient peers
+            }
         }
         
         // Check if this node can participate based on network connectivity
@@ -1414,9 +1421,9 @@ impl SimplifiedP2P {
                     }
                 }
                 
-                // Update regional metrics for load balancing decisions
+                // Update regional metrics for load balancing decisions (silently)
                 // This would be implemented as a method call in the actual instance
-                println!("[P2P] 📊 Load balancing metrics updated");
+                // Removed spam log: Load balancing metrics updated
             }
         });
     }
@@ -1430,8 +1437,8 @@ impl SimplifiedP2P {
             while *is_running.lock().unwrap() {
                 thread::sleep(Duration::from_secs(60)); // Rebalance every minute
                 
-                // In production: call self.rebalance_connections()
-                println!("[P2P] 🔄 Regional rebalancing check for node {}", node_id);
+                // In production: call self.rebalance_connections() (silently)
+                // Removed spam log: Regional rebalancing check
             }
         });
     }
