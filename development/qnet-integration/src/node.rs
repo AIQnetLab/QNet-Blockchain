@@ -367,7 +367,7 @@ impl BlockchainNode {
             });
             
             // Store ports for external access
-            std::env::set_var("QNET_CURRENT_RPC_PORT", api_port.to_string()); // Unified port
+            std::env::set_var("QNET_CURRENT_RPC_PORT", rpc_port.to_string()); // Correct RPC port
             std::env::set_var("QNET_CURRENT_API_PORT", api_port.to_string());
             
             println!("[Node] 🔌 RPC server: port {}", api_port);
