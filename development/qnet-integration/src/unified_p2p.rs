@@ -174,11 +174,22 @@ impl SimplifiedP2P {
         
         println!("[P2P] Connecting to {} bootstrap peers", peers.len());
         
+        let mut successful_parses = 0;
         for peer_addr in peers {
-            if let Ok(peer_info) = self.parse_peer_address(peer_addr) {
-                self.add_peer_to_region(peer_info);
+            println!("[P2P] 🔍 DEBUG: Parsing peer address: {}", peer_addr);
+            match self.parse_peer_address(peer_addr) {
+                Ok(peer_info) => {
+                    println!("[P2P] ✅ Successfully parsed peer: {} -> {}", peer_addr, peer_info.id);
+                    self.add_peer_to_region(peer_info);
+                    successful_parses += 1;
+                }
+                Err(e) => {
+                    println!("[P2P] ❌ Failed to parse peer {}: {}", peer_addr, e);
+                }
             }
         }
+        
+        println!("[P2P] 📊 Successfully parsed {}/{} bootstrap peers", successful_parses, peers.len());
         
         // Try to establish connections
         self.establish_regional_connections();
@@ -827,24 +838,22 @@ impl SimplifiedP2P {
             .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
             .unwrap_or(false);
         
-        // PRODUCTION: Strict Byzantine consensus requirement - need 3f+1 nodes to tolerate f failures
-        // Minimum 4 nodes required for Byzantine fault tolerance (can tolerate 1 failure)
-        let min_nodes_for_consensus = if is_genesis_bootstrap { 1 } else { 4 };
+        // PRODUCTION: Genesis nodes can ALWAYS start consensus (bootstrap network)
+        // Non-genesis nodes need Byzantine fault tolerance (3f+1 nodes)
+        if is_genesis_bootstrap {
+            println!("🚀 [CONSENSUS] Genesis bootstrap node - starting blockchain initialization");
+            return true; // Genesis nodes can ALWAYS start consensus
+        }
+        
+        // For non-genesis nodes: Strict Byzantine consensus requirement
+        let min_nodes_for_consensus = 4; // Need 3f+1 nodes to tolerate f failures
         let total_nodes = connected.len() + 1; // +1 for self
         
-        // PRODUCTION CONSENSUS: Genesis nodes can start alone, others need Byzantine security
-        // Genesis nodes bootstrap the network, then more nodes join for decentralization
-        
         if total_nodes < min_nodes_for_consensus {
-            if is_genesis_bootstrap {
-                println!("🚀 [CONSENSUS] Genesis bootstrap node - starting blockchain initialization");
-                return true; // Genesis nodes can start alone
-            } else {
-                println!("⚠️ [CONSENSUS] Insufficient nodes for Byzantine consensus: {}/{}", 
-                        total_nodes, min_nodes_for_consensus);
-                println!("🔒 [CONSENSUS] Byzantine fault tolerance requires minimum {} nodes", min_nodes_for_consensus);
-                return false; // Non-genesis nodes need sufficient peers
-            }
+            println!("⚠️ [CONSENSUS] Insufficient nodes for Byzantine consensus: {}/{}", 
+                    total_nodes, min_nodes_for_consensus);
+            println!("🔒 [CONSENSUS] Byzantine fault tolerance requires minimum {} nodes", min_nodes_for_consensus);
+            return false; // Non-genesis nodes need sufficient peers
         }
         
         // Check if this node can participate based on network connectivity
@@ -1185,17 +1194,36 @@ impl SimplifiedP2P {
         peers.iter().map(|p| p.id.clone()).collect()
     }
     
-    /// Parse peer address string
+    /// Parse peer address string - supports both "id@ip:port" and "ip:port" formats
     fn parse_peer_address(&self, addr: &str) -> Result<PeerInfo, String> {
-        // Simple format: "id@ip:port"
-        let parts: Vec<&str> = addr.split('@').collect();
-        if parts.len() != 2 {
-            return Err(format!("Invalid peer address format: {}", addr));
+        let (peer_id, peer_addr) = if addr.contains('@') {
+            // Format: "id@ip:port"
+            let parts: Vec<&str> = addr.split('@').collect();
+            if parts.len() != 2 {
+                return Err(format!("Invalid peer address format: {}", addr));
+            }
+            (parts[0].to_string(), parts[1].to_string())
+        } else {
+            // Format: "ip:port" - generate ID from address
+            let parts: Vec<&str> = addr.split(':').collect();
+            if parts.len() != 2 {
+                return Err(format!("Invalid peer address format: {}", addr));
+            }
+            
+            // Generate node ID from IP for bootstrap peers
+            let node_id = format!("node_{}", parts[0].replace('.', "_"));
+            (node_id, addr.to_string())
+        };
+        
+        // Validate port
+        let port_str = peer_addr.split(':').nth(1).unwrap_or("");
+        if port_str.parse::<u16>().is_err() {
+            return Err(format!("Invalid port in address: {}", addr));
         }
         
         Ok(PeerInfo {
-            id: parts[0].to_string(),
-            addr: parts[1].to_string(),
+            id: peer_id,
+            addr: peer_addr,
             node_type: NodeType::Full,  // Assume Full by default
             region: self.region.clone(),  // Assume same region initially
             last_seen: std::time::SystemTime::now()

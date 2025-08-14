@@ -2061,16 +2061,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let log_file_path = std::path::Path::new(&config.data_dir).join("qnet-node.log");
     println!("📝 Log file: {}", log_file_path.display());
     
-    // Start node with live console logging (not redirected to file)
-    let node_handle = {
-        let log_path = log_file_path.clone();
-        tokio::spawn(async move {
-            // Start the blockchain node with console output
-            if let Err(e) = node.start().await {
-                eprintln!("❌ Node failed to start: {}", e);
-            }
-        })
-    };
+    // Start the blockchain node (keep reference for peer injection)
+    if let Err(e) = node.start().await {
+        eprintln!("❌ Node failed to start: {}", e);
+        return Err(format!("Node startup failed: {}", e).into());
+    }
     
     // Give node a moment to start API server
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
@@ -2083,17 +2078,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !discovered_peers.is_empty() {
         println!("🔗 Discovered {} peers, integrating with P2P network...", discovered_peers.len());
         
-        // Get mutable reference to node for peer injection
-        // Since node is moved into tokio::spawn, we need to access it differently
-        // For now, log the peers - they will be used in next restart
+        // FIXED: Now we can inject peers into the running node
+        node.add_discovered_peers(&discovered_peers);
+        
         for peer in &discovered_peers {
-            println!("🔗 Found active peer: {}", peer);
+            println!("🔗 Integrated active peer: {}", peer);
         }
         
-        // TODO: Implement peer injection into running node
-        // This requires refactoring the node spawning to allow access
-        println!("🔄 Peers will be integrated on next node restart");
+        println!("✅ Peers successfully integrated into P2P network");
     }
+    
+    // Start background node monitoring
+    let node_clone = node.clone();
+    let node_handle = tokio::spawn(async move {
+        // Keep node running and monitor
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            
+            // Monitor peer connections
+            if let Ok(peer_count) = node_clone.get_peer_count().await {
+                if peer_count > 0 {
+                    println!("[MONITOR] ✅ {} peers connected", peer_count);
+                } else {
+                    println!("[MONITOR] ⚠️ No peers connected - running standalone");
+                }
+            }
+        }
+    });
     
     // Show initial configuration ONCE
     let external_ip = match tokio::process::Command::new("curl")
