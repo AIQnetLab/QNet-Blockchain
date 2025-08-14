@@ -84,24 +84,16 @@ pub async fn submit_transaction(
     let tx_type = match &req.tx_type {
         TransactionTypeRequest::Transfer { to, amount } => {
             TransactionType::Transfer {
+                from: req.from.clone(),
                 to: to.clone(),
                 amount: *amount,
             }
         }
-        TransactionTypeRequest::ContractDeploy { code, value } => {
-            TransactionType::ContractDeploy {
-                code: hex::decode(code)
-                    .map_err(|_| ApiError::BadRequest("Invalid code hex".to_string()))?,
-                value: *value,
-            }
+        TransactionTypeRequest::ContractDeploy { code: _, value: _ } => {
+            TransactionType::ContractDeploy
         }
-        TransactionTypeRequest::ContractCall { to, data, value } => {
-            TransactionType::ContractCall {
-                to: to.clone(),
-                data: hex::decode(data)
-                    .map_err(|_| ApiError::BadRequest("Invalid data hex".to_string()))?,
-                value: *value,
-            }
+        TransactionTypeRequest::ContractCall { to: _, data: _, value: _ } => {
+            TransactionType::ContractCall
         }
         TransactionTypeRequest::NodeActivation { node_type, burn_amount, phase } => {
             let node_type = match node_type.as_str() {
@@ -126,10 +118,23 @@ pub async fn submit_transaction(
         }
     };
     
+    // Extract to, amount, and data from tx_type for Transaction::new
+    let (to, amount, data) = match &req.tx_type {
+        TransactionTypeRequest::Transfer { to, amount } => 
+            (Some(to.clone()), *amount, None),
+        TransactionTypeRequest::ContractDeploy { code: _, value } => 
+            (None, *value, Some("contract_deploy".to_string())),
+        TransactionTypeRequest::ContractCall { to, data: _, value } => 
+            (Some(to.clone()), *value, Some("contract_call".to_string())),
+        TransactionTypeRequest::NodeActivation { burn_amount, .. } => 
+            (None, *burn_amount, Some("node_activation".to_string())),
+    };
+
     // Create transaction
     let tx = Transaction::new(
         req.from.clone(),
-        tx_type,
+        to,
+        amount,
         req.nonce,
         req.gas_price,
         req.gas_limit,
@@ -137,6 +142,9 @@ pub async fn submit_transaction(
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs(),
+        Some(req.signature.clone()),
+        tx_type,
+        data,
     );
     
     // Verify signature using production cryptography
@@ -268,21 +276,16 @@ fn create_transaction_message(req: &SubmitTransactionRequest, tx: &Transaction) 
     
     // Hash transaction type specific data
     match &tx.tx_type {
-        TransactionType::Transfer { to, amount } => {
+        TransactionType::Transfer { from: _, to, amount } => {
             hasher.update(b"transfer");
             hasher.update(to.as_bytes());
             hasher.update(&amount.to_le_bytes());
         },
-        TransactionType::ContractDeploy { code, value } => {
+        TransactionType::ContractDeploy => {
             hasher.update(b"contract_deploy");
-            hasher.update(code);
-            hasher.update(&value.to_le_bytes());
         },
-        TransactionType::ContractCall { to, data, value } => {
+        TransactionType::ContractCall => {
             hasher.update(b"contract_call");
-            hasher.update(to.as_bytes());
-            hasher.update(data);
-            hasher.update(&value.to_le_bytes());
         },
         TransactionType::NodeActivation { node_type, burn_amount, phase } => {
             hasher.update(b"node_activation");

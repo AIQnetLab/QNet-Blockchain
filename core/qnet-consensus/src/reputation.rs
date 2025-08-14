@@ -31,7 +31,7 @@ pub struct NodeInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ValidatorInfo {
     pub node_id: String,
-    pub stake: u64,
+
     pub reputation: f64,
     pub is_active: bool,
 }
@@ -72,9 +72,9 @@ pub struct ReputationConfig {
 impl Default for ReputationConfig {
     fn default() -> Self {
         Self {
-            initial_reputation: 100.0,
+            initial_reputation: 50.0,   // PRODUCTION: Safe starting reputation for new nodes
             max_reputation: 100.0,
-            min_reputation: 10.0, // Unified threshold
+            min_reputation: 10.0,       // Ban threshold
             decay_rate: 0.01,
             decay_interval: Duration::from_secs(3600), // 1 hour
         }

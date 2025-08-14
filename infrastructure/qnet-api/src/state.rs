@@ -34,7 +34,8 @@ impl AppState {
         
         // Initialize consensus
         let consensus_config = ConsensusConfig::default();
-        let consensus = Arc::new(CommitRevealConsensus::new(consensus_config));
+        let node_id = "api-node".to_string(); // API server node identifier
+        let consensus = Arc::new(CommitRevealConsensus::new(node_id, consensus_config));
         
         Ok(Self {
             state_db,
@@ -43,4 +44,6 @@ impl AppState {
             config: config.clone(),
         })
     }
+
+
 } 

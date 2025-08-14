@@ -24,9 +24,10 @@ serde = { version = "1.0.195", features = ["derive"] }
 serde_json = "1.0.111"
 bincode = "1.3.3"
 
-# Cryptography
+# Cryptography - Quantum-resistant algorithms for production
 blake3 = "1.5.0"
 sha2 = "0.10.8"
+sha3 = "0.10.8"
 hex = "0.4.3"
 
 # Random number generation

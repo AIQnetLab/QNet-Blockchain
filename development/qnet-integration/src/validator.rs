@@ -226,22 +226,7 @@ impl BlockValidator {
                 // Contract deployment validation - basic checks for testnet
                 // In production, would validate contract code and gas limits
             }
-            TransactionType::Stake { from, amount } => {
-                if from.is_empty() {
-                    return Err(IntegrationError::ValidationError("Stake from address cannot be empty".to_string()));
-                }
-                if *amount == 0 {
-                    return Err(IntegrationError::ValidationError("Stake amount cannot be zero".to_string()));
-                }
-            }
-            TransactionType::Unstake { from, amount } => {
-                if from.is_empty() {
-                    return Err(IntegrationError::ValidationError("Unstake from address cannot be empty".to_string()));
-                }
-                if *amount == 0 {
-                    return Err(IntegrationError::ValidationError("Unstake amount cannot be zero".to_string()));
-                }
-            }
+
             TransactionType::CreateAccount { address, .. } => {
                 if address.is_empty() {
                     return Err(IntegrationError::ValidationError("Account address cannot be empty".to_string()));

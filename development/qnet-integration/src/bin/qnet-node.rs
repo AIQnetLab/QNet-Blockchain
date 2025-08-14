@@ -298,14 +298,8 @@ fn is_genesis_bootstrap_node() -> bool {
 
 // Check if network is in genesis state (check real genesis nodes)
 fn is_network_in_genesis_state() -> bool {
-    // Check if any of the genesis nodes are already running
-    let genesis_ips = vec![
-        "154.38.160.39",
-        "62.171.157.44", 
-        "161.97.86.81",
-        "173.212.219.226",
-        "164.68.108.218"
-    ];
+    // Get Genesis node IPs dynamically from environment/config
+    let genesis_ips = get_genesis_node_ips_dynamic();
     
     let mut active_genesis_nodes = 0;
     
@@ -1224,11 +1218,11 @@ fn get_bootstrap_peers_for_region(region: &Region) -> Vec<String> {
     
     if is_light_node {
         // Light nodes (mobile) connect to Full/Super nodes for better decentralization
-        let full_super_peers = vec![
-            "154.38.160.39:8001".to_string(),  // Genesis #1 (fallback)
-            "62.171.157.44:8001".to_string(),   // Genesis #2 (fallback)
-            // In production: Add discovered Full/Super node endpoints here
-        ];
+        let genesis_ips = get_genesis_node_ips_dynamic();
+        let full_super_peers: Vec<String> = genesis_ips.iter()
+            .take(2)  // Use first 2 Genesis nodes as fallback for Light nodes
+            .map(|ip| format!("{}:8001", ip))
+            .collect();
         
         println!("[BOOTSTRAP] 📱 Light node: Connecting to Full/Super nodes");
         println!("[BOOTSTRAP] ✅ {} Full/Super nodes for Light node: {:?}", 
@@ -1237,13 +1231,10 @@ fn get_bootstrap_peers_for_region(region: &Region) -> Vec<String> {
         full_super_peers
     } else {
         // Full/Super/Genesis nodes connect to Genesis bootstrap network
-        let genesis_bootstrap_peers = vec![
-            "154.38.160.39:8001".to_string(),  // Genesis Node #1
-            "62.171.157.44:8001".to_string(),   // Genesis Node #2
-            "161.97.86.81:8001".to_string(),    // Genesis Node #3
-            "173.212.219.226:8001".to_string(), // Genesis Node #4
-            "164.68.108.218:8001".to_string(),  // Genesis Node #5
-        ];
+        let genesis_ips = get_genesis_node_ips_dynamic();
+        let genesis_bootstrap_peers: Vec<String> = genesis_ips.iter()
+            .map(|ip| format!("{}:8001", ip))
+            .collect();
         
         println!("[BOOTSTRAP] 🖥️ Server node: Using genesis bootstrap network");
         println!("[BOOTSTRAP] ✅ {} genesis nodes configured: {:?}", 
@@ -1263,6 +1254,149 @@ fn get_regional_port(region: &Region) -> u16 {
         Region::Africa => 9880,
         Region::Oceania => 9881,
     }
+}
+
+// PRODUCTION: Get Genesis node IPs dynamically from environment/config with SECURITY VALIDATION
+fn get_genesis_node_ips_dynamic() -> Vec<String> {
+    // Priority 1: Environment variable QNET_GENESIS_NODES
+    if let Ok(env_nodes) = std::env::var("QNET_GENESIS_NODES") {
+        let nodes: Vec<String> = env_nodes.split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .filter(|s| validate_ip_address_security(s)) // 🔒 SECURITY: IP validation
+            .collect();
+        if !nodes.is_empty() {
+            println!("[CONFIG] ✅ Using {} validated Genesis nodes from QNET_GENESIS_NODES", nodes.len());
+            return nodes;
+        } else {
+            println!("[CONFIG] ⚠️ QNET_GENESIS_NODES contains invalid IPs, using fallback");
+        }
+    }
+    
+    // Priority 2: Config file genesis-nodes.json (with security validation)
+    if let Ok(config_nodes) = load_genesis_nodes_from_config_secure() {
+        if !config_nodes.is_empty() {
+            println!("[CONFIG] ✅ Using {} validated Genesis nodes from config file", config_nodes.len());
+            return config_nodes;
+        }
+    }
+    
+    // Priority 3: Fallback to default nodes (only for initial deployment)
+    let default_nodes = vec![
+        "154.38.160.39".to_string(),
+        "62.171.157.44".to_string(), 
+        "161.97.86.81".to_string(),
+        "173.212.219.226".to_string(),
+        "164.68.108.218".to_string()
+    ];
+    
+    println!("[CONFIG] ⚠️ Using default Genesis nodes (set QNET_GENESIS_NODES to override): {:?}", default_nodes);
+    default_nodes
+}
+
+// SECURITY: Validate IP address format and security
+fn validate_ip_address_security(ip: &str) -> bool {
+    use std::net::Ipv4Addr;
+    
+    // Basic IP format validation
+    if let Ok(addr) = ip.parse::<Ipv4Addr>() {
+        // SECURITY: Block dangerous IP ranges for production blockchain
+        let octets = addr.octets();
+        
+        // Block localhost and loopback
+        if octets[0] == 127 {
+            println!("[SECURITY] ❌ Blocked localhost IP: {}", ip);
+            return false;
+        }
+        
+        // Block private networks (not suitable for Genesis nodes)
+        if (octets[0] == 10) ||
+           (octets[0] == 172 && octets[1] >= 16 && octets[1] <= 31) ||
+           (octets[0] == 192 && octets[1] == 168) {
+            println!("[SECURITY] ❌ Blocked private network IP: {}", ip);
+            return false;
+        }
+        
+        // Block multicast and reserved ranges
+        if octets[0] >= 224 {
+            println!("[SECURITY] ❌ Blocked reserved IP range: {}", ip);
+            return false;
+        }
+        
+        // Additional security: Block known malicious ranges (can be expanded)
+        if octets[0] == 0 || octets[0] == 255 {
+            println!("[SECURITY] ❌ Blocked invalid IP: {}", ip);
+            return false;
+        }
+        
+        println!("[SECURITY] ✅ Validated Genesis IP: {}", ip);
+        return true;
+    }
+    
+    println!("[SECURITY] ❌ Invalid IP format: {}", ip);
+    false
+}
+
+// SECURE: Load Genesis nodes from config file with security validation
+fn load_genesis_nodes_from_config_secure() -> Result<Vec<String>, String> {
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    
+    let config_paths = vec![
+        "genesis-nodes.json",
+        "config/genesis-nodes.json",
+        "/etc/qnet/genesis-nodes.json",
+        "~/.qnet/genesis-nodes.json"
+    ];
+    
+    for path in config_paths {
+        // SECURITY: Check file permissions before reading (Unix only)
+        #[cfg(unix)]
+        if let Ok(metadata) = fs::metadata(path) {
+            let permissions = metadata.permissions();
+            let mode = permissions.mode();
+            
+            // Check if file is world-readable (security risk)
+            if mode & 0o044 != 0 {
+                println!("[SECURITY] ⚠️ Config file {} has unsafe permissions: {:o}", path, mode);
+                println!("[SECURITY] 🔒 Recommended: chmod 600 {}", path);
+            }
+        }
+        
+        if let Ok(content) = fs::read_to_string(path) {
+            // SECURITY: Limit config file size (prevent DoS)
+            if content.len() > 10240 { // 10KB limit
+                println!("[SECURITY] ❌ Config file {} too large ({}B), max 10KB", path, content.len());
+                continue;
+            }
+            
+            if let Ok(config) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(nodes) = config["genesis_nodes"].as_array() {
+                    // SECURITY: Limit number of Genesis nodes
+                    if nodes.len() > 10 {
+                        println!("[SECURITY] ❌ Too many Genesis nodes in config ({}), max 10", nodes.len());
+                        continue;
+                    }
+                    
+                    let node_ips: Vec<String> = nodes.iter()
+                        .filter_map(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .filter(|ip| validate_ip_address_security(ip)) // 🔒 SECURITY: Validate each IP
+                        .collect();
+                    
+                    if !node_ips.is_empty() {
+                        println!("[SECURITY] ✅ Loaded {} validated Genesis nodes from {}", node_ips.len(), path);
+                        return Ok(node_ips);
+                    }
+                }
+            } else {
+                println!("[SECURITY] ❌ Invalid JSON in config file: {}", path);
+            }
+        }
+    }
+    
+    Err("No valid Genesis config file found".to_string())
 }
 
 // Get real external IP address for Docker containers
@@ -3247,11 +3381,11 @@ async fn perform_dht_peer_discovery() -> Result<Vec<String>, String> {
     };
     
     // PRODUCTION DHT: Query known bootstrap nodes for their peer lists
-    let bootstrap_nodes = [
-        "154.38.160.39:8001", // North America genesis (API port)
-        "62.171.157.44:8001",  // Europe genesis (API port)  
-        "161.97.86.81:8001",   // Europe genesis (API port)
-    ];
+    let genesis_ips = get_genesis_node_ips_dynamic();
+    let bootstrap_nodes: Vec<String> = genesis_ips.iter()
+        .take(3)  // Use first 3 Genesis nodes for DHT
+        .map(|ip| format!("{}:8001", ip))
+        .collect();
     
     for bootstrap in &bootstrap_nodes {
         // Skip self-connection

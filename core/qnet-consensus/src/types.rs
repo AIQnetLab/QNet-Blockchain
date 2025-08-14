@@ -222,8 +222,7 @@ pub struct RevealData {
 pub struct ValidatorInfo {
     /// Validator address
     pub address: String,
-    /// Stake amount
-    pub stake: u64,
+
     /// Reputation score (0-100)
     pub reputation: f64,
     /// Score for consensus participation (0-100)

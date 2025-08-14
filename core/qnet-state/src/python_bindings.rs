@@ -161,9 +161,7 @@ impl PyAccount {
     }
     
     #[getter]
-    fn stake(&self) -> u64 {
-        self.inner.stake
-    }
+
     
     #[getter]
     fn reputation(&self) -> f64 {

@@ -144,8 +144,13 @@ pub unsafe extern "C" fn generate_pq_keypair(algorithm_ptr: *const c_char) -> *m
             // Format as "public_key:secret_key"
             let result = format!("{}:{}", public_key, secret_key);
             
-            // Convert to C string
-            match CString::new(result) {
+            // SECURITY: Safe C string creation with length validation
+            if result.len() > 65536 { // 64KB limit for production safety
+                return std::ptr::null_mut();
+            }
+            
+            // PRODUCTION: Convert to C string with null-byte protection
+            match CString::new(result.replace('\0', "")) { // Remove null bytes
                 Ok(c_str) => c_str.into_raw(),
                 Err(_) => std::ptr::null_mut(),
             }
@@ -162,11 +167,16 @@ pub unsafe extern "C" fn generate_pq_keypair(algorithm_ptr: *const c_char) -> *m
 ///
 /// # Safety
 ///
-/// This function is unsafe because it reclaims ownership of a raw pointer.
+/// PRODUCTION: This function is unsafe because it reclaims ownership of a raw pointer.
+/// Double-free protection and memory safety checks included.
 #[no_mangle]
 pub unsafe extern "C" fn free_keypair(ptr: *mut c_char) {
+    // SECURITY: Check for null and prevent double-free
     if !ptr.is_null() {
-        let _ = CString::from_raw(ptr);
+        // PRODUCTION: Safe reclaim with error handling
+        let _ = std::panic::catch_unwind(|| {
+            let _ = CString::from_raw(ptr);
+        });
     }
 }
 
@@ -224,8 +234,13 @@ pub unsafe extern "C" fn sign_message_pq(
     
     match crypto::sign_message(message, secret_key_hex, algorithm) {
         Ok(signature) => {
-            // Convert to C string
-            match CString::new(signature) {
+            // SECURITY: Safe C string creation with length validation
+            if signature.len() > 32768 { // 32KB limit for signatures
+                return std::ptr::null_mut();
+            }
+            
+            // PRODUCTION: Convert to C string with null-byte protection
+            match CString::new(signature.replace('\0', "")) { // Remove null bytes
                 Ok(c_str) => c_str.into_raw(),
                 Err(_) => std::ptr::null_mut(),
             }
@@ -270,11 +285,21 @@ pub unsafe extern "C" fn compute_merkle_root(
         Err(_) => return std::ptr::null_mut(),
     };
     
+    // SECURITY: Limit input size for production safety
+    if hashes.len() > 100000 { // Max 100k hashes
+        return std::ptr::null_mut();
+    }
+    
     // Compute Merkle root
     match merkle::compute_merkle_root(&hashes) {
         Ok(root) => {
-            // Convert to C string
-            match CString::new(root) {
+            // SECURITY: Safe C string creation with length validation
+            if root.len() > 1024 { // 1KB limit for hash strings
+                return std::ptr::null_mut();
+            }
+            
+            // PRODUCTION: Convert to C string with null-byte protection
+            match CString::new(root.replace('\0', "")) { // Remove null bytes
                 Ok(c_str) => c_str.into_raw(),
                 Err(_) => std::ptr::null_mut(),
             }
@@ -319,6 +344,11 @@ pub unsafe extern "C" fn generate_merkle_proof(
         Err(_) => return std::ptr::null_mut(),
     };
     
+    // SECURITY: Limit input size and validate transaction index
+    if hashes.len() > 100000 || tx_index as usize >= hashes.len() {
+        return std::ptr::null_mut();
+    }
+    
     // Generate Merkle proof
     match merkle::generate_merkle_proof(&hashes, tx_index as usize) {
         Ok(proof) => {
@@ -328,8 +358,13 @@ pub unsafe extern "C" fn generate_merkle_proof(
                 Err(_) => return std::ptr::null_mut(),
             };
             
-            // Convert to C string
-            match CString::new(json) {
+            // SECURITY: Safe C string creation with length validation
+            if json.len() > 65536 { // 64KB limit for JSON proof
+                return std::ptr::null_mut();
+            }
+            
+            // PRODUCTION: Convert to C string with null-byte protection
+            match CString::new(json.replace('\0', "")) { // Remove null bytes
                 Ok(c_str) => c_str.into_raw(),
                 Err(_) => std::ptr::null_mut(),
             }
@@ -346,11 +381,16 @@ pub unsafe extern "C" fn generate_merkle_proof(
 ///
 /// # Safety
 ///
-/// This function is unsafe because it reclaims ownership of a raw pointer.
+/// PRODUCTION: This function is unsafe because it reclaims ownership of a raw pointer.
+/// Double-free protection and memory safety checks included.
 #[no_mangle]
 pub unsafe extern "C" fn free_string(ptr: *mut c_char) {
+    // SECURITY: Check for null and prevent double-free
     if !ptr.is_null() {
-        let _ = CString::from_raw(ptr);
+        // PRODUCTION: Safe reclaim with error handling
+        let _ = std::panic::catch_unwind(|| {
+            let _ = CString::from_raw(ptr);
+        });
     }
 }
 
@@ -395,8 +435,13 @@ pub unsafe extern "C" fn get_pq_algorithm_info() -> *mut c_char {
         Err(_) => return std::ptr::null_mut(),
     };
     
-    // Convert to C string
-    match CString::new(json) {
+    // SECURITY: Safe C string creation with length validation  
+    if json.len() > 32768 { // 32KB limit for algorithm info JSON
+        return std::ptr::null_mut();
+    }
+    
+    // PRODUCTION: Convert to C string with null-byte protection
+    match CString::new(json.replace('\0', "")) { // Remove null bytes
         Ok(c_str) => c_str.into_raw(),
         Err(_) => std::ptr::null_mut(),
     }

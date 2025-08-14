@@ -120,17 +120,7 @@ pub enum TransactionType {
         initial_balance: u64,
     },
     
-    /// Stake QNC
-    Stake {
-        from: String,
-        amount: u64,
-    },
     
-    /// Unstake QNC
-    Unstake {
-        from: String,
-        amount: u64,
-    },
     
     /// Batch reward claims
     BatchRewardClaims {
@@ -361,12 +351,7 @@ impl Transaction {
                     return Err("Initial balance must be greater than 0".to_string());
                 }
             }
-            TransactionType::Stake { from: _, amount } |
-            TransactionType::Unstake { from: _, amount } => {
-                if *amount == 0 {
-                    return Err("Stake amount must be greater than 0".to_string());
-                }
-            }
+
             TransactionType::BatchRewardClaims { node_ids, .. } => {
                 if node_ids.is_empty() {
                     return Err("Batch reward claims must have at least one node".to_string());
@@ -428,45 +413,7 @@ impl Transaction {
                 account.balance = *initial_balance;
                 accounts.insert(address.clone(), account);
             }
-            TransactionType::Stake { from, amount } => {
-                let account = accounts.get_mut(from)
-                    .ok_or_else(|| StateError::AccountNotFound(from.clone()))?;
-                
-                let total_amount = amount + self.gas_price * self.gas_limit;
-                if account.balance < total_amount {
-                    return Err(StateError::InsufficientBalance {
-                        have: account.balance,
-                        need: total_amount,
-                    });
-                }
-                
-                account.balance -= total_amount;
-                account.stake += amount;
-                account.nonce += 1;
-            }
-            TransactionType::Unstake { from, amount } => {
-                let account = accounts.get_mut(from)
-                    .ok_or_else(|| StateError::AccountNotFound(from.clone()))?;
-                
-                if account.stake < *amount {
-                    return Err(StateError::InsufficientBalance {
-                        have: account.stake,
-                        need: *amount,
-                    });
-                }
-                
-                let fee = self.gas_price * self.gas_limit;
-                if account.balance < fee {
-                    return Err(StateError::InsufficientBalance {
-                        have: account.balance,
-                        need: fee,
-                    });
-                }
-                
-                account.stake -= amount;
-                account.balance += amount - fee;
-                account.nonce += 1;
-            }
+
             TransactionType::NodeActivation { node_type, burn_amount, .. } => {
                 let sender = accounts.get_mut(&self.from)
                     .ok_or_else(|| StateError::AccountNotFound(self.from.clone()))?;

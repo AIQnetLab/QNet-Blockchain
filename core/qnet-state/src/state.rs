@@ -13,8 +13,7 @@ pub struct ChainState {
     pub height: u64,
     /// Total supply of QNC
     pub total_supply: u64,
-    /// Total staked amount
-    pub total_staked: u64,
+
     /// Current epoch
     pub epoch: u64,
     /// Last finalized block
@@ -26,7 +25,7 @@ impl Default for ChainState {
         Self {
             height: 0,
             total_supply: 1_000_000_000 * 10u64.pow(9), // 1 billion QNC
-            total_staked: 0,
+
             epoch: 0,
             last_finalized: 0,
         }
@@ -127,7 +126,7 @@ impl StateManager {
         for (address, account) in accounts {
             hasher.update(address.as_bytes());
             hasher.update(&account.balance.to_le_bytes());
-            hasher.update(&account.stake.to_le_bytes());
+
             hasher.update(&account.nonce.to_le_bytes());
         }
         
@@ -135,7 +134,7 @@ impl StateManager {
         let chain_state = self.chain_state.read();
         hasher.update(&chain_state.height.to_le_bytes());
         hasher.update(&chain_state.total_supply.to_le_bytes());
-        hasher.update(&chain_state.total_staked.to_le_bytes());
+
         
         let result = hasher.finalize();
         let mut hash = [0u8; 32];

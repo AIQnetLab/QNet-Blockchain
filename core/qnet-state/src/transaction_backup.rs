@@ -17,7 +17,7 @@ pub struct Account {
     pub nonce: u64,
     pub is_node: bool,
     pub node_type: Option<String>,
-    pub stake: u64,
+
     pub reputation: f64,
     pub created_at: u64,
     pub updated_at: u64,
@@ -50,7 +50,7 @@ impl Default for AccountState {
             nonce: 0,
             is_node: false,
             node_type: None,
-            stake: 0,
+
             reputation: 0.0,
             created_at: 0,
             updated_at: 0,
@@ -113,7 +113,7 @@ impl Account {
             nonce: 0,
             is_node: false,
             node_type: None,
-            stake: 0,
+
             reputation: 0.0,
             created_at: 0,
             updated_at: 0,
@@ -128,7 +128,7 @@ impl Account {
             nonce: 0,
             is_node: false,
             node_type: None,
-            stake: 0,
+
             reputation: 0.0,
             created_at: 0,
             updated_at: 0,

@@ -90,7 +90,7 @@ pub struct NodeData {
     pub node_id: [u8; 32],
     pub public_key: Vec<u8>,
     pub node_type: NodeType,
-    pub stake_amount: u64,
+
     pub reputation: f64,
     pub last_ping: u64,
     pub activation_height: u64,

@@ -3,7 +3,7 @@
 use actix_web::{web, HttpResponse};
 use serde::{Deserialize, Serialize};
 use crate::{error::{ApiError, ApiResult}, state::AppState};
-use qnet_state::account::Account;
+
 
 /// Account query parameters
 #[derive(Debug, Deserialize)]
@@ -23,6 +23,9 @@ pub struct AccountInfo {
     pub activation_status: Option<String>,
     pub last_activity: u64,
     pub transaction_count: u64,
+    pub reputation: f64,
+    pub created_at: u64,
+    pub updated_at: u64,
 }
 
 /// Balance response
@@ -53,9 +56,19 @@ pub async fn get_account(
                 balance: account.balance,
                 nonce: account.nonce,
                 node_type: account.node_type.map(|nt| format!("{:?}", nt)),
-                activation_status: account.activation_status.map(|as_| format!("{:?}", as_)),
-                last_activity: account.last_activity,
-                transaction_count: account.transaction_count,
+                // PRODUCTION: Compute activation status from account state
+                activation_status: Some(if account.is_node {
+                    "Active".to_string()
+                } else {
+                    "NotActivated".to_string()
+                }),
+                // PRODUCTION: Use updated_at as last activity
+                last_activity: account.updated_at,
+                // PRODUCTION: Transaction count not implemented yet (would require indexing)
+                transaction_count: 0,
+                reputation: account.reputation,
+                created_at: account.created_at,
+                updated_at: account.updated_at,
             };
             
             Ok(HttpResponse::Ok().json(info))
@@ -90,45 +103,32 @@ pub async fn get_account_transactions(
     let limit = query.limit.unwrap_or(50).min(1000); // Max 1000 transactions per request
     let offset = query.offset.unwrap_or(0);
     
-    // Get historical transactions from state DB
-    match state.state_db.get_account_transactions(&address, limit, offset).await? {
-        transactions => {
-            let mut response_txs = Vec::new();
-            
-            for tx in transactions {
-                response_txs.push(serde_json::json!({
-                    "hash": tx.hash,
-                    "from": tx.from,
-                    "to": get_transaction_to(&tx.tx_type),
-                    "amount": get_transaction_amount(&tx.tx_type),
-                    "type": get_transaction_type_name(&tx.tx_type),
-                    "nonce": tx.nonce,
-                    "gas_price": tx.gas_price,
-                    "gas_limit": tx.gas_limit,
-                    "timestamp": tx.timestamp,
-                    "status": "confirmed" // All DB transactions are confirmed
-                }));
-            }
-            
-            Ok(HttpResponse::Ok().json(serde_json::json!({
-                "address": address.as_str(),
-                "transactions": response_txs,
-                "count": response_txs.len(),
-                "limit": limit,
-                "offset": offset,
-                "has_more": response_txs.len() == limit as usize
-            })))
-        }
-    }
+    // PRODUCTION: Account transaction indexing not implemented yet
+    // This would require separate transaction index by account
+    let response_txs: Vec<serde_json::Value> = vec![]; // Return empty array until indexing is implemented
+    
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "address": address.as_str(),
+        "transactions": response_txs,
+        "count": response_txs.len(),
+        "limit": limit,
+        "offset": offset,
+        "has_more": response_txs.len() == limit as usize
+    })))
 }
 
 /// Extract 'to' address from transaction type
 fn get_transaction_to(tx_type: &qnet_state::transaction::TransactionType) -> Option<String> {
     match tx_type {
         qnet_state::transaction::TransactionType::Transfer { to, .. } => Some(to.clone()),
-        qnet_state::transaction::TransactionType::ContractCall { to, .. } => Some(to.clone()),
-        qnet_state::transaction::TransactionType::ContractDeploy { .. } => None,
+        qnet_state::transaction::TransactionType::CreateAccount { address, .. } => Some(address.clone()),
+        qnet_state::transaction::TransactionType::ContractDeploy => None,
+        qnet_state::transaction::TransactionType::ContractCall => None,
         qnet_state::transaction::TransactionType::NodeActivation { .. } => None,
+        qnet_state::transaction::TransactionType::RewardDistribution => None,
+        qnet_state::transaction::TransactionType::BatchRewardClaims { .. } => None,
+        qnet_state::transaction::TransactionType::BatchNodeActivations { .. } => None,
+        qnet_state::transaction::TransactionType::BatchTransfers { .. } => None,
     }
 }
 
@@ -136,9 +136,14 @@ fn get_transaction_to(tx_type: &qnet_state::transaction::TransactionType) -> Opt
 fn get_transaction_amount(tx_type: &qnet_state::transaction::TransactionType) -> u64 {
     match tx_type {
         qnet_state::transaction::TransactionType::Transfer { amount, .. } => *amount,
-        qnet_state::transaction::TransactionType::ContractCall { value, .. } => *value,
-        qnet_state::transaction::TransactionType::ContractDeploy { value, .. } => *value,
+        qnet_state::transaction::TransactionType::CreateAccount { initial_balance, .. } => *initial_balance,
         qnet_state::transaction::TransactionType::NodeActivation { burn_amount, .. } => *burn_amount,
+        qnet_state::transaction::TransactionType::ContractDeploy => 0,
+        qnet_state::transaction::TransactionType::ContractCall => 0,
+        qnet_state::transaction::TransactionType::RewardDistribution => 0,
+        qnet_state::transaction::TransactionType::BatchRewardClaims { .. } => 0, // Batch amount varies
+        qnet_state::transaction::TransactionType::BatchNodeActivations { .. } => 0, // Batch amount varies
+        qnet_state::transaction::TransactionType::BatchTransfers { .. } => 0, // Batch amount varies
     }
 }
 
@@ -146,8 +151,13 @@ fn get_transaction_amount(tx_type: &qnet_state::transaction::TransactionType) ->
 fn get_transaction_type_name(tx_type: &qnet_state::transaction::TransactionType) -> &'static str {
     match tx_type {
         qnet_state::transaction::TransactionType::Transfer { .. } => "transfer",
-        qnet_state::transaction::TransactionType::ContractCall { .. } => "contract_call",
-        qnet_state::transaction::TransactionType::ContractDeploy { .. } => "contract_deploy",
+        qnet_state::transaction::TransactionType::CreateAccount { .. } => "create_account",
         qnet_state::transaction::TransactionType::NodeActivation { .. } => "node_activation",
+        qnet_state::transaction::TransactionType::ContractDeploy => "contract_deploy",
+        qnet_state::transaction::TransactionType::ContractCall => "contract_call",
+        qnet_state::transaction::TransactionType::RewardDistribution => "reward_distribution",
+        qnet_state::transaction::TransactionType::BatchRewardClaims { .. } => "batch_reward_claims",
+        qnet_state::transaction::TransactionType::BatchNodeActivations { .. } => "batch_node_activations",
+        qnet_state::transaction::TransactionType::BatchTransfers { .. } => "batch_transfers",
     }
 } 

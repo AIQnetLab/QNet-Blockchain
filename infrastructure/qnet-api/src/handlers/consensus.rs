@@ -3,6 +3,7 @@
 use actix_web::{web, HttpResponse};
 use serde::{Deserialize, Serialize};
 use crate::{error::ApiResult, state::AppState};
+use qnet_consensus::commit_reveal::{Commit, Reveal};
 
 /// Commit request
 #[derive(Debug, Deserialize)]
@@ -39,14 +40,14 @@ pub async fn get_current_round(
     match state.consensus.get_round_state() {
         Some(round_state) => {
             let info = RoundInfo {
-                round: round_state.round,
+                round: round_state.round_number,
                 phase: format!("{:?}", round_state.phase),
-                start_time: round_state.start_time,
-                commit_end_time: round_state.commit_end_time,
-                reveal_end_time: round_state.reveal_end_time,
+                start_time: round_state.phase_start.elapsed().as_secs(),
+                commit_end_time: round_state.phase_start.elapsed().as_secs() + round_state.phase_duration.as_secs(),
+                reveal_end_time: round_state.phase_start.elapsed().as_secs() + (round_state.phase_duration.as_secs() * 2),
                 commits_count: round_state.commits.len(),
                 reveals_count: round_state.reveals.len(),
-                leader: round_state.round_winner.clone(),
+                leader: "TBD".to_string(), // Leader determined after reveal phase
             };
             Ok(HttpResponse::Ok().json(info))
         }

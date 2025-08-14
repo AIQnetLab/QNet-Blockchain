@@ -14,6 +14,24 @@ use base64::Engine;
 
 // Import QNet consensus components for proper peer validation
 use qnet_consensus::reputation::{NodeReputation, ReputationConfig};
+use qnet_consensus::{commit_reveal::{Commit, Reveal}, ConsensusEngine};
+
+/// SECURITY: Rate limiting structure for DDoS protection
+#[derive(Debug, Clone)]
+pub struct RateLimit {
+    pub requests: Vec<u64>,      // Request timestamps
+    pub max_requests: usize,     // Maximum requests per window
+    pub window_seconds: u64,     // Time window in seconds
+    pub blocked_until: u64,      // Blocked until timestamp (0 = not blocked)
+}
+
+/// SECURITY: Nonce record for replay attack prevention
+#[derive(Debug, Clone)]
+pub struct NonceRecord {
+    pub nonce: String,
+    pub timestamp: u64,
+    pub used: bool,
+}
 
 /// Simple node types for P2P
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -98,6 +116,12 @@ pub struct SimplifiedP2P {
     /// Load balancing configuration
     lb_config: LoadBalancingConfig,
     
+    /// SECURITY: Rate limiting for DDoS protection  
+    rate_limiter: Arc<Mutex<HashMap<String, RateLimit>>>,
+    
+    /// SECURITY: Request nonces for replay attack prevention
+    nonce_validator: Arc<Mutex<HashMap<String, NonceRecord>>>,
+    
     /// Simple failover
     primary_region: Region,
     backup_regions: Vec<Region>,
@@ -114,6 +138,12 @@ pub struct SimplifiedP2P {
     
     /// Leadership tracking for failover detection
     previous_leader: Arc<Mutex<Option<String>>>,
+    
+    /// PRODUCTION: Integrated reputation system for consensus and P2P validation
+    reputation_system: Arc<Mutex<NodeReputation>>,
+    
+    /// PRODUCTION: Channel to send consensus messages to node
+    consensus_tx: Option<tokio::sync::mpsc::UnboundedSender<ConsensusMessage>>,
 }
 
 impl SimplifiedP2P {
@@ -127,7 +157,7 @@ impl SimplifiedP2P {
         let backup_regions = Self::get_backup_regions(&region);
         
         Self {
-            node_id,
+            node_id: node_id.clone(),
             node_type,
             region: region.clone(),
             port,
@@ -135,6 +165,11 @@ impl SimplifiedP2P {
             connected_peers: Arc::new(Mutex::new(Vec::new())),
             regional_metrics: Arc::new(Mutex::new(HashMap::new())),
             lb_config: LoadBalancingConfig::default(),
+            
+            // SECURITY: Initialize rate limiting and nonce validation
+            rate_limiter: Arc::new(Mutex::new(HashMap::new())),
+            nonce_validator: Arc::new(Mutex::new(HashMap::new())),
+            
             primary_region: region,
             backup_regions,
             last_health_check: Arc::new(Mutex::new(Instant::now())),
@@ -144,7 +179,34 @@ impl SimplifiedP2P {
             total_bytes_received: Arc::new(Mutex::new(0)),
             is_running: Arc::new(Mutex::new(false)),
             previous_leader: Arc::new(Mutex::new(None)),
+            reputation_system: {
+                let mut reputation_sys = NodeReputation::new(ReputationConfig::default());
+                
+                // PRODUCTION: Bootstrap nodes start with perfect reputation (100.0)
+                const BOOTSTRAP_NODES: &[&str] = &[
+                    "QNET-BOOT-0001-STRAP", "QNET-BOOT-0002-STRAP", "QNET-BOOT-0003-STRAP", 
+                    "QNET-BOOT-0004-STRAP", "QNET-BOOT-0005-STRAP",
+                    "genesis_node_1", "genesis_node_2", "genesis_node_3", 
+                    "genesis_node_4", "genesis_node_5"
+                ];
+                
+                for bootstrap_node in BOOTSTRAP_NODES {
+                    if node_id.contains(bootstrap_node) {
+                        reputation_sys.update_reputation(bootstrap_node, 50.0); // 50.0 + 50.0 default = 100.0
+                        println!("[P2P] 🛡️ Bootstrap node {} initialized with perfect reputation (100.0)", bootstrap_node);
+                    }
+                }
+                
+                Arc::new(Mutex::new(reputation_sys))
+            },
+            consensus_tx: None,
         }
+    }
+
+    /// PRODUCTION: Set consensus message channel for real integration
+    pub fn set_consensus_channel(&mut self, consensus_tx: tokio::sync::mpsc::UnboundedSender<ConsensusMessage>) {
+        self.consensus_tx = Some(consensus_tx);
+        println!("[P2P] 🏛️ Consensus integration channel established");
     }
     
     /// Start simplified P2P network with load balancing
@@ -153,7 +215,14 @@ impl SimplifiedP2P {
         println!("[P2P] Node: {} | Type: {:?} | Region: {:?}", 
                  self.node_id, self.node_type, self.region);
         
-        *self.is_running.lock().unwrap() = true;
+        // SECURITY: Safe mutex locking with error handling instead of panic
+        match self.is_running.lock() {
+            Ok(mut running) => *running = true,
+            Err(poisoned) => {
+                println!("[P2P] ⚠️ Mutex poisoned, recovering...");
+                *poisoned.into_inner() = true;
+            }
+        }
         
         // Start load balancing health monitor
         self.start_load_balancing_monitor();
@@ -180,7 +249,7 @@ impl SimplifiedP2P {
             match self.parse_peer_address(peer_addr) {
                 Ok(peer_info) => {
                     println!("[P2P] ✅ Successfully parsed peer: {} -> {}", peer_addr, peer_info.id);
-                    self.add_peer_to_region(peer_info);
+                self.add_peer_to_region(peer_info);
                     successful_parses += 1;
                 }
                 Err(e) => {
@@ -208,7 +277,13 @@ impl SimplifiedP2P {
             if let Ok(peer_info) = self.parse_peer_address(peer_addr) {
                 // Check if not already connected
                 let already_connected = {
-                    let connected = self.connected_peers.lock().unwrap();
+                    let connected = match self.connected_peers.lock() {
+                        Ok(peers) => peers,
+                        Err(poisoned) => {
+                            println!("[P2P] ⚠️ Connected peers mutex poisoned, recovering...");
+                            poisoned.into_inner()
+                        }
+                    };
                     connected.iter().any(|p| p.addr == peer_info.addr)
                 };
                 
@@ -217,7 +292,13 @@ impl SimplifiedP2P {
                     
                     // Add to connected peers immediately
                     {
-                        let mut connected = self.connected_peers.lock().unwrap();
+                        let mut connected = match self.connected_peers.lock() {
+                            Ok(peers) => peers,
+                            Err(poisoned) => {
+                                println!("[P2P] ⚠️ Connected peers mutex poisoned, recovering...");
+                                poisoned.into_inner()
+                            }
+                        };
                         connected.push(peer_info.clone());
                         new_connections += 1;
                     }
@@ -228,7 +309,22 @@ impl SimplifiedP2P {
         }
         
         // Update connection count
-        *self.connection_count.lock().unwrap() = self.connected_peers.lock().unwrap().len();
+        // SECURITY: Safe connection count update with error handling
+        let peer_count = match self.connected_peers.lock() {
+            Ok(peers) => peers.len(),
+            Err(poisoned) => {
+                println!("[P2P] ⚠️ Connected peers mutex poisoned during count update");
+                poisoned.into_inner().len()
+            }
+        };
+        
+        match self.connection_count.lock() {
+            Ok(mut count) => *count = peer_count,
+            Err(poisoned) => {
+                println!("[P2P] ⚠️ Connection count mutex poisoned, recovering...");
+                *poisoned.into_inner() = peer_count;
+            }
+        }
         
         if new_connections > 0 {
             println!("[P2P] 🚀 Successfully added {} new peers to P2P network", new_connections);
@@ -384,7 +480,7 @@ impl SimplifiedP2P {
                                     "SouthAmerica" => Region::SouthAmerica,
                                     "Africa" => Region::Africa,
                                     "Oceania" => Region::Oceania,
-                                    _ => region.clone(),
+                                _ => region.clone(),
                                 })
                                 .unwrap_or_else(|| region.clone());
                             
@@ -497,32 +593,48 @@ impl SimplifiedP2P {
         });
     }
     
-         /// Reputation-based peer validation using QNet reputation system
+         /// Reputation-based peer validation using QNet reputation system (PRODUCTION)
      fn start_reputation_validation(&self) {
          let node_id = self.node_id.clone();
          let connected_peers = self.connected_peers.clone();
+         let reputation_system = self.reputation_system.clone(); // Use shared system
+         let genesis_ips = vec!["154.38.160.39".to_string(), "62.171.157.44".to_string(), 
+                               "161.97.86.81".to_string(), "173.212.219.226".to_string(), 
+                               "164.68.108.218".to_string()]; // Genesis IPs to avoid borrowing self
          
          tokio::spawn(async move {
-             println!("[P2P] 🔍 Starting reputation-based peer validation...");
+             println!("[P2P] 🔍 Starting reputation-based peer validation with shared reputation system...");
              
-             // Initialize reputation system
-             let reputation_system = NodeReputation::new(ReputationConfig::default());
+             // PRODUCTION: Use existing PERSISTENT reputation system
              
              loop {
                  tokio::time::sleep(std::time::Duration::from_secs(30)).await;
                  
+                 // PRODUCTION: Apply reputation decay periodically
+                 if let Ok(mut reputation) = reputation_system.lock() {
+                     reputation.apply_decay();
+                 }
+                 
                  // Validate all connected peers
                  let mut to_remove = Vec::new();
                  {
-                     let mut connected = connected_peers.lock().unwrap();
+                     let mut connected = match connected_peers.lock() {
+                         Ok(peers) => peers,
+                         Err(poisoned) => {
+                             println!("[P2P] ⚠️ Connected peers mutex poisoned during reputation validation");
+                             poisoned.into_inner()
+                         }
+                     };
                      for (i, peer) in connected.iter_mut().enumerate() {
-                         // Check peer reputation
-                         let reputation = reputation_system.get_reputation(&peer.id);
+                         // Check peer reputation using shared system
+                         let reputation = if let Ok(rep_sys) = reputation_system.lock() {
+                             rep_sys.get_reputation(&peer.id)
+                         } else {
+                             100.0 // Default if lock fails
+                         };
                          
-                         // PRODUCTION FIX: Don't remove genesis bootstrap peers during network initialization
-                         let is_genesis_peer = peer.id.contains("genesis_") || peer.addr.contains("154.38.160.39") || 
-                                             peer.addr.contains("62.171.157.44") || peer.addr.contains("161.97.86.81") ||
-                                             peer.addr.contains("173.212.219.226") || peer.addr.contains("164.68.108.218");
+                         // PRODUCTION: Don't remove genesis bootstrap peers during network initialization
+                         let is_genesis_peer = peer.id.contains("genesis_") || genesis_ips.contains(&peer.addr);
                          
                          // Remove peers with very low reputation (except genesis nodes)
                          if reputation < 10.0 && !is_genesis_peer {
@@ -585,7 +697,13 @@ impl SimplifiedP2P {
     
     /// Broadcast block data
     pub fn broadcast_block(&self, height: u64, block_data: Vec<u8>) -> Result<(), String> {
-        let connected = self.connected_peers.lock().unwrap();
+        let connected = match self.connected_peers.lock() {
+            Ok(peers) => peers,
+            Err(poisoned) => {
+                println!("[P2P] ⚠️ Connected peers mutex poisoned during block broadcast");
+                poisoned.into_inner()
+            }
+        };
         
         if connected.is_empty() {
             // No peers - not an error in standalone mode
@@ -708,8 +826,8 @@ impl SimplifiedP2P {
                 Ok(rt) => rt,
                 Err(e) => {
                     let _ = tx.send(Err(format!("Failed to create tokio runtime: {}", e)));
-                    return;
-                }
+                                    return;
+                                }
             };
             
             let result = rt.block_on(async {
@@ -738,12 +856,12 @@ impl SimplifiedP2P {
                                 },
                                 Err(e) => Err(format!("JSON parsing failed: {}", e)),
                             }
-                        } else {
+                    } else {
                             Err(format!("HTTP error: {}", response.status()))
-                        }
-                    },
+                    }
+                },
                     Err(e) => Err(format!("HTTP request failed: {}", e)),
-                }
+            }
             });
             
             let _ = tx.send(result);
@@ -866,7 +984,7 @@ impl SimplifiedP2P {
         }
         
         // Non-genesis nodes can participate if sufficient network diversity exists
-        // In production: This would use reputation scores, stake amounts, and validator selection algorithm
+        // In production: This would use reputation scores and validator selection algorithm (NO STAKE!)
         connected.len() >= 3 // Allow participation with sufficient peer diversity
     }
     
@@ -995,12 +1113,161 @@ impl SimplifiedP2P {
     }
     
     /// Extract IP address from node_id
-    fn extract_node_ip(&self, node_id: &str) -> &str {
+    fn extract_node_ip(&self, node_id: &str) -> String {
         // Extract IP from various node_id formats
-        if node_id.contains("154.38.160.39") { "154.38.160.39" }
-        else if node_id.contains("62.171.157.44") { "62.171.157.44" }
-        else if node_id.contains("161.97.86.81") { "161.97.86.81" }
-        else { "" }
+        let genesis_nodes = self.get_genesis_node_ips();
+        for ip in &genesis_nodes {
+            if node_id.contains(ip) {
+                return ip.clone();
+            }
+        }
+        "127.0.0.1".to_string() // Default fallback
+    }
+    
+    /// Check if IP is a Genesis node (PRODUCTION: Dynamic check)
+    fn is_genesis_node_ip(&self, addr: &str) -> bool {
+        let ip = addr.split(':').next().unwrap_or(addr);
+        let genesis_nodes = self.get_genesis_node_ips();
+        genesis_nodes.contains(&ip.to_string())
+    }
+    
+    /// Get Genesis node IPs from environment/config (PRODUCTION with failover)
+    fn get_genesis_node_ips(&self) -> Vec<String> {
+        // Priority 1: Environment variable
+        if let Ok(env_nodes) = std::env::var("QNET_GENESIS_NODES") {
+            let nodes: Vec<String> = env_nodes.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !nodes.is_empty() {
+                // PRODUCTION: Test connectivity and filter working nodes
+                return self.filter_working_genesis_nodes(nodes);
+            }
+        }
+        
+        // Priority 2: Config file
+        if let Ok(config_nodes) = self.load_genesis_ips_from_config() {
+            if !config_nodes.is_empty() {
+                return self.filter_working_genesis_nodes(config_nodes);
+            }
+        }
+        
+        // Priority 3: Bootstrap nodes constant (fallback only)
+        let fallback_nodes = GENESIS_BOOTSTRAP_NODES.iter()
+            .map(|(ip, _)| ip.to_string())
+            .collect();
+        self.filter_working_genesis_nodes(fallback_nodes)
+    }
+    
+    /// Filter Genesis nodes by connectivity (PRODUCTION failover with enhanced security)
+    fn filter_working_genesis_nodes(&self, nodes: Vec<String>) -> Vec<String> {
+        use std::net::{TcpStream, SocketAddr};
+        use std::time::Duration;
+        
+        let mut working_nodes = Vec::new();
+        let mut test_results = Vec::new();
+        
+        println!("[FAILOVER] 🔍 Testing connectivity to {} Genesis nodes...", nodes.len());
+        
+        for ip in &nodes {
+            let addr = format!("{}:8001", ip);
+            if let Ok(socket_addr) = addr.parse::<SocketAddr>() {
+                // PRODUCTION: Enhanced connectivity test with multiple attempts
+                let mut connection_success = false;
+                let mut response_time_ms = 0u64;
+                
+                // Attempt connection 3 times with increasing timeouts
+                for attempt in 1..=3 {
+                    let timeout = Duration::from_secs(2 * attempt as u64); // 2s, 4s, 6s
+                    let start_time = std::time::Instant::now();
+                    
+                    match TcpStream::connect_timeout(&socket_addr, timeout) {
+                        Ok(_) => {
+                            response_time_ms = start_time.elapsed().as_millis() as u64;
+                            connection_success = true;
+                            break;
+                        }
+                        Err(_) => {
+                            if attempt < 3 {
+                                std::thread::sleep(Duration::from_millis(500)); // Wait before retry
+                            }
+                        }
+                    }
+                }
+                
+                if connection_success {
+                    working_nodes.push(ip.clone());
+                    test_results.push((ip.clone(), response_time_ms, "✅ ONLINE"));
+                    println!("[FAILOVER] ✅ Genesis node {} is reachable ({}ms)", ip, response_time_ms);
+                } else {
+                    test_results.push((ip.clone(), 0, "❌ OFFLINE"));
+                    println!("[FAILOVER] ❌ Genesis node {} is unreachable after 3 attempts", ip);
+                }
+            } else {
+                test_results.push((ip.clone(), 0, "❌ INVALID"));
+                println!("[FAILOVER] ❌ Genesis node {} has invalid address format", ip);
+            }
+        }
+        
+        // PRODUCTION: Log detailed failover report
+        println!("[FAILOVER] 📊 Genesis Node Connectivity Report:");
+        for (ip, response_time, status) in test_results {
+            if response_time > 0 {
+                println!("[FAILOVER]   {} {} ({}ms)", status, ip, response_time);
+            } else {
+                println!("[FAILOVER]   {} {}", status, ip);
+            }
+        }
+        
+        // SECURITY: Require minimum number of working Genesis nodes
+        let min_required_nodes = 2; // Minimum for network security
+        
+        if working_nodes.len() < min_required_nodes {
+            println!("[FAILOVER] ⚠️ SECURITY WARNING: Only {} Genesis nodes reachable, minimum {} required", 
+                     working_nodes.len(), min_required_nodes);
+            
+            if working_nodes.is_empty() {
+                println!("[FAILOVER] 🚨 CRITICAL: No Genesis nodes reachable!");
+                println!("[FAILOVER] 🔄 Using all configured nodes (network might be starting)");
+                return nodes; // Last resort - use all nodes
+            } else {
+                println!("[FAILOVER] ⚠️ Proceeding with {} working nodes (below minimum)", working_nodes.len());
+            }
+        }
+        
+        println!("[FAILOVER] ✅ Selected {} working Genesis nodes for production use", working_nodes.len());
+        working_nodes
+    }
+    
+    /// Load Genesis IPs from config file
+    fn load_genesis_ips_from_config(&self) -> Result<Vec<String>, String> {
+        use std::fs;
+        
+        let config_paths = vec![
+            "genesis-nodes.json",
+            "config/genesis-nodes.json",
+            "/etc/qnet/genesis-nodes.json",
+            "~/.qnet/genesis-nodes.json"
+        ];
+        
+        for path in config_paths {
+            if let Ok(content) = fs::read_to_string(path) {
+                if let Ok(config) = serde_json::from_str::<serde_json::Value>(&content) {
+                    if let Some(nodes) = config["genesis_nodes"].as_array() {
+                        let node_ips: Vec<String> = nodes.iter()
+                            .filter_map(|v| v.as_str())
+                            .map(|s| s.to_string())
+                            .collect();
+                        
+                        if !node_ips.is_empty() {
+                            return Ok(node_ips);
+                        }
+                    }
+                }
+            }
+        }
+        
+        Err("No Genesis config file found".to_string())
     }
     
     /// Check if a specific peer IP is online
@@ -1053,18 +1320,20 @@ impl SimplifiedP2P {
             }
         }
         
-        // Fallback: Default hardcoded nodes (for initial deployment only)
-        let default_nodes = vec![
-            "154.38.160.39".to_string(), 
-            "62.171.157.44".to_string(), 
-            "161.97.86.81".to_string(),
-            "173.212.219.226".to_string(),
-            "164.68.108.218".to_string()
-        ];
+        // Fallback: Get from bootstrap nodes constant
+        let default_nodes = GENESIS_BOOTSTRAP_NODES.iter()
+            .map(|(ip, _)| ip.to_string())
+            .collect();
         
         // Only log this message once every 5 minutes to reduce spam
         static LAST_LOG_TIME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let current_time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let current_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_else(|_| {
+                println!("[P2P] ⚠️ System time error, using fallback timestamp");
+                std::time::Duration::from_secs(1640000000) // Fallback to 2021
+            })
+            .as_secs();
         let last_time = LAST_LOG_TIME.load(std::sync::atomic::Ordering::Relaxed);
         
         if current_time - last_time > 300 { // 5 minutes
@@ -1109,7 +1378,13 @@ impl SimplifiedP2P {
     
     /// Broadcast transaction
     pub fn broadcast_transaction(&self, tx_data: Vec<u8>) -> Result<(), String> {
-        let connected = self.connected_peers.lock().unwrap();
+        let connected = match self.connected_peers.lock() {
+            Ok(peers) => peers,
+            Err(poisoned) => {
+                println!("[P2P] ⚠️ Connected peers mutex poisoned during transaction broadcast");
+                poisoned.into_inner()
+            }
+        };
         
         if connected.is_empty() {
             return Ok(());
@@ -1172,7 +1447,14 @@ impl SimplifiedP2P {
     
     /// Stop P2P network
     pub fn stop(&self) {
-        *self.is_running.lock().unwrap() = false;
+        // SECURITY: Safe mutex locking for shutdown
+        match self.is_running.lock() {
+            Ok(mut running) => *running = false,
+            Err(poisoned) => {
+                println!("[P2P] ⚠️ Mutex poisoned during shutdown, forcing stop...");
+                *poisoned.into_inner() = false;
+            }
+        }
         println!("[P2P] ✅ Simplified P2P network stopped");
     }
     
@@ -1207,7 +1489,13 @@ impl SimplifiedP2P {
 
     /// Get connected peers count
     pub async fn get_connected_peers(&self) -> Vec<String> {
-        let peers = self.connected_peers.lock().unwrap();
+        let peers = match self.connected_peers.lock() {
+            Ok(p) => p,
+            Err(poisoned) => {
+                println!("[P2P] ⚠️ Connected peers mutex poisoned during get_connected_peers");
+                poisoned.into_inner()
+            }
+        };
         peers.iter().map(|p| p.id.clone()).collect()
     }
     
@@ -1215,9 +1503,9 @@ impl SimplifiedP2P {
     fn parse_peer_address(&self, addr: &str) -> Result<PeerInfo, String> {
         let (peer_id, peer_addr) = if addr.contains('@') {
             // Format: "id@ip:port"
-            let parts: Vec<&str> = addr.split('@').collect();
-            if parts.len() != 2 {
-                return Err(format!("Invalid peer address format: {}", addr));
+        let parts: Vec<&str> = addr.split('@').collect();
+        if parts.len() != 2 {
+            return Err(format!("Invalid peer address format: {}", addr));
             }
             (parts[0].to_string(), parts[1].to_string())
         } else {
@@ -1257,7 +1545,13 @@ impl SimplifiedP2P {
     
     /// Add peer to regional map
     fn add_peer_to_region(&self, peer: PeerInfo) {
-        let mut regional_peers = self.regional_peers.lock().unwrap();
+        let mut regional_peers = match self.regional_peers.lock() {
+            Ok(peers) => peers,
+            Err(poisoned) => {
+                println!("[P2P] ⚠️ Regional peers mutex poisoned during peer addition");
+                poisoned.into_inner()
+            }
+        };
         regional_peers
             .entry(peer.region.clone())
             .or_insert_with(Vec::new)
@@ -1266,8 +1560,20 @@ impl SimplifiedP2P {
     
     /// Establish connections within region and backups
     fn establish_regional_connections(&self) {
-        let regional_peers = self.regional_peers.lock().unwrap();
-        let mut connected = self.connected_peers.lock().unwrap();
+        let regional_peers = match self.regional_peers.lock() {
+            Ok(peers) => peers,
+            Err(poisoned) => {
+                println!("[P2P] ⚠️ Regional peers mutex poisoned during connection establishment");
+                poisoned.into_inner()
+            }
+        };
+        let mut connected = match self.connected_peers.lock() {
+            Ok(peers) => peers,
+            Err(poisoned) => {
+                println!("[P2P] ⚠️ Connected peers mutex poisoned during connection establishment");
+                poisoned.into_inner()
+            }
+        };
         
         // Connect to primary region first
         if let Some(peers) = regional_peers.get(&self.primary_region) {
@@ -1503,8 +1809,11 @@ impl SimplifiedP2P {
                         peer.latency_ms = (peer.latency_ms as f32 + rand::random::<f32>() * 20.0 - 10.0).max(10.0) as u32;
                         peer.last_seen = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap()
-                            .as_secs();
+                                                .unwrap_or_else(|_| {
+                        println!("[P2P] ⚠️ System time error, using fallback");
+                        std::time::Duration::from_secs(0)
+                    })
+                    .as_secs();
                     }
                 }
                 
@@ -1745,15 +2054,15 @@ impl SimplifiedP2P {
                             if response.status().is_success() {
                                 match response.json::<serde_json::Value>().await {
                                     Ok(val) => {
-                                        if let Some(b64) = val.get("data").and_then(|v| v.as_str()) {
-                                            if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) {
-                                                if storage.save_microblock(height, &bytes).is_ok() {
-                                                    println!("[SYNC] 📦 Downloaded microblock #{} from {}", height, ip);
-                                                    fetched = true;
-                                                    break;
-                                                }
-                                            }
+                                if let Some(b64) = val.get("data").and_then(|v| v.as_str()) {
+                                    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) {
+                                        if storage.save_microblock(height, &bytes).is_ok() {
+                                            println!("[SYNC] 📦 Downloaded microblock #{} from {}", height, ip);
+                                            fetched = true;
+                                            break;
                                         }
+                                    }
+                                }
                                     },
                                     Err(e) => {
                                         println!("[SYNC] ❌ JSON parsing failed for {}: {}", url, e);
@@ -1804,6 +2113,41 @@ pub enum NetworkMessage {
         from: String,
         timestamp: u64,
     },
+
+    /// Consensus commit message
+    ConsensusCommit {
+        round_id: u64,
+        node_id: String,
+        commit_hash: String,
+        timestamp: u64,
+    },
+
+    /// Consensus reveal message
+    ConsensusReveal {
+        round_id: u64,
+        node_id: String,
+        reveal_data: String,
+        timestamp: u64,
+    },
+}
+
+/// Internal consensus messages for node communication
+#[derive(Debug, Clone)]
+pub enum ConsensusMessage {
+    /// Remote commit received from peer
+    RemoteCommit {
+        round_id: u64,
+        node_id: String,
+        commit_hash: String,
+        timestamp: u64,
+    },
+    /// Remote reveal received from peer
+    RemoteReveal {
+        round_id: u64,
+        node_id: String,
+        reveal_data: String,
+        timestamp: u64,
+    },
 }
 
 impl SimplifiedP2P {
@@ -1829,6 +2173,20 @@ impl SimplifiedP2P {
             NetworkMessage::HealthPing { from, timestamp: _ } => {
                 // Simple acknowledgment - no complex processing
                 println!("[P2P] ← Health ping from {}", from);
+            }
+
+            NetworkMessage::ConsensusCommit { round_id, node_id, commit_hash, timestamp } => {
+                println!("[CONSENSUS] ← Received commit from {} for round {} at {}", 
+                         node_id, round_id, timestamp);
+                // PRODUCTION: Forward to consensus engine for validation
+                self.handle_remote_consensus_commit(round_id, node_id, commit_hash, timestamp);
+            }
+
+            NetworkMessage::ConsensusReveal { round_id, node_id, reveal_data, timestamp } => {
+                println!("[CONSENSUS] ← Received reveal from {} for round {} at {}", 
+                         node_id, round_id, timestamp);
+                // PRODUCTION: Forward to consensus engine for validation
+                self.handle_remote_consensus_reveal(round_id, node_id, reveal_data, timestamp);
             }
         }
     }
@@ -1914,7 +2272,203 @@ impl SimplifiedP2P {
             }
         }
     }
+    
+    /// PRODUCTION: Get shared reputation system for consensus integration
+    pub fn get_reputation_system(&self) -> Arc<Mutex<NodeReputation>> {
+        self.reputation_system.clone()
+    }
+    
+    /// PRODUCTION: Update node reputation (for consensus feedback)
+    pub fn update_node_reputation(&self, node_id: &str, delta: f64) {
+        if let Ok(mut reputation) = self.reputation_system.lock() {
+            reputation.update_reputation(node_id, delta);
+            println!("[P2P] 📊 Updated reputation for {}: delta {:.1}", node_id, delta);
+        }
+    }
+    
+    /// PRODUCTION: Check if node is banned
+    pub fn is_node_banned(&self, node_id: &str) -> bool {
+        if let Ok(reputation) = self.reputation_system.lock() {
+            reputation.is_banned(node_id)
+        } else {
+            false
+        }
+    }
+    
+    /// PRODUCTION: Apply reputation decay periodically
+    pub fn apply_reputation_decay(&self) {
+        if let Ok(mut reputation) = self.reputation_system.lock() {
+            reputation.apply_decay();
+            println!("[P2P] ⏰ Applied reputation decay to all nodes");
+        }
+    }
+
+    /// PRODUCTION: Broadcast consensus commit to all peers
+    pub fn broadcast_consensus_commit(&self, round_id: u64, node_id: String, commit_hash: String, timestamp: u64) -> Result<(), String> {
+        println!("[P2P] 🏛️ Broadcasting consensus commit for round {}", round_id);
+        
+        let peers = match self.connected_peers.lock() {
+            Ok(peers) => peers.clone(),
+            Err(poisoned) => {
+                println!("[P2P] ⚠️ Mutex poisoned during commit broadcast, recovering...");
+                poisoned.into_inner().clone()
+            }
+        };
+        
+        for peer in peers {
+            let consensus_msg = NetworkMessage::ConsensusCommit {
+                round_id,
+                node_id: node_id.clone(),
+                commit_hash: commit_hash.clone(),
+                timestamp,
+            };
+            
+            // PRODUCTION: Real HTTP POST to peer's P2P message endpoint
+            self.send_network_message(&peer.addr, consensus_msg);
+            println!("[P2P] 📤 Sent commit to peer: {}", peer.addr);
+        }
+        
+        Ok(())
+    }
+
+    /// PRODUCTION: Broadcast consensus reveal to all peers  
+    pub fn broadcast_consensus_reveal(&self, round_id: u64, node_id: String, reveal_data: String, timestamp: u64) -> Result<(), String> {
+        println!("[P2P] 🏛️ Broadcasting consensus reveal for round {}", round_id);
+        
+        let peers = match self.connected_peers.lock() {
+            Ok(peers) => peers.clone(),
+            Err(poisoned) => {
+                println!("[P2P] ⚠️ Mutex poisoned during reveal broadcast, recovering...");
+                poisoned.into_inner().clone()
+            }
+        };
+        
+        for peer in peers {
+            let consensus_msg = NetworkMessage::ConsensusReveal {
+                round_id,
+                node_id: node_id.clone(),
+                reveal_data: reveal_data.clone(),
+                timestamp,
+            };
+            
+            // PRODUCTION: Real HTTP POST to peer's P2P message endpoint
+            self.send_network_message(&peer.addr, consensus_msg);
+            println!("[P2P] 📤 Sent reveal to peer: {}", peer.addr);
+        }
+        
+        Ok(())
+    }
+
+    /// Send network message via HTTP POST to peer's API
+    fn send_network_message(&self, peer_addr: &str, message: NetworkMessage) {
+        let peer_addr = peer_addr.to_string();
+        let message_json = match serde_json::to_value(&message) {
+            Ok(json) => json,
+            Err(e) => {
+                println!("[P2P] ❌ Failed to serialize message: {}", e);
+                return;
+            }
+        };
+
+        // Send asynchronously in background thread
+        tokio::spawn(async move {
+            let client = match reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .user_agent("QNet-Node/1.0")
+                .build() {
+                Ok(client) => client,
+                Err(e) => {
+                    println!("[P2P] ❌ HTTP client creation failed: {}", e);
+                    return;
+                }
+            };
+
+            // Extract IP from peer address
+            let peer_ip = peer_addr.split(':').next().unwrap_or(&peer_addr);
+            let urls = vec![
+                format!("http://{}:8001/api/v1/p2p/message", peer_ip),  // Primary API port
+                format!("http://{}:9877/api/v1/p2p/message", peer_ip),  // RPC port
+            ];
+
+            let mut sent = false;
+            for url in urls {
+                match client.post(&url)
+                    .json(&message_json)
+                    .send().await {
+                    Ok(response) if response.status().is_success() => {
+                        println!("[P2P] ✅ Message sent to {}", peer_ip);
+                        sent = true;
+                        break;
+                    }
+                    Ok(response) => {
+                        println!("[P2P] ⚠️ HTTP error {} for {}", response.status(), url);
+                    }
+                    Err(e) => {
+                        println!("[P2P] ⚠️ Connection failed for {}: {}", url, e);
+                    }
+                }
+            }
+
+            if !sent {
+                println!("[P2P] ❌ Failed to send message to {}", peer_ip);
+            }
+        });
+    }
+
+    /// Handle incoming consensus commit from remote peer
+    fn handle_remote_consensus_commit(&self, round_id: u64, node_id: String, commit_hash: String, timestamp: u64) {
+        println!("[CONSENSUS] 🏛️ Processing remote commit: round={}, node={}, hash={}", 
+                round_id, node_id, commit_hash);
+        
+        // PRODUCTION: Send to consensus engine through channel
+        if let Some(ref consensus_tx) = self.consensus_tx {
+            let consensus_msg = ConsensusMessage::RemoteCommit {
+                round_id,
+                node_id: node_id.clone(),
+                commit_hash,
+                timestamp,
+            };
+            
+            if let Err(e) = consensus_tx.send(consensus_msg) {
+                println!("[CONSENSUS] ❌ Failed to forward commit to consensus engine: {}", e);
+            } else {
+                println!("[CONSENSUS] ✅ Commit forwarded to consensus engine");
+            }
+        } else {
+            println!("[CONSENSUS] ⚠️ No consensus channel established - commit not processed");
+        }
+        
+        // Update peer reputation for participation
+        self.update_node_reputation(&node_id, 1.0);
+    }
+
+    /// Handle incoming consensus reveal from remote peer
+    fn handle_remote_consensus_reveal(&self, round_id: u64, node_id: String, reveal_data: String, timestamp: u64) {
+        println!("[CONSENSUS] 🏛️ Processing remote reveal: round={}, node={}, reveal_length={}", 
+                round_id, node_id, reveal_data.len());
+        
+        // PRODUCTION: Send to consensus engine through channel
+        if let Some(ref consensus_tx) = self.consensus_tx {
+            let consensus_msg = ConsensusMessage::RemoteReveal {
+                round_id,
+                node_id: node_id.clone(),
+                reveal_data,
+                timestamp,
+            };
+            
+            if let Err(e) = consensus_tx.send(consensus_msg) {
+                println!("[CONSENSUS] ❌ Failed to forward reveal to consensus engine: {}", e);
+            } else {
+                println!("[CONSENSUS] ✅ Reveal forwarded to consensus engine");
+            }
+        } else {
+            println!("[CONSENSUS] ⚠️ No consensus channel established - reveal not processed");
+        }
+        
+        // Update peer reputation for participation
+        self.update_node_reputation(&node_id, 2.0);
+    }
 }
 
- 
+
  

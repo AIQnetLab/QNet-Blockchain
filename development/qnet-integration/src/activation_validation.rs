@@ -1278,7 +1278,7 @@ impl BlockchainActivationRegistry {
         }
         
         // Check L1 cache
-        if let Some(_) = self.l1_cache.read().await.get(code) {
+        if let Some(_) = self.l1_cache.write().await.get(&code.to_string()) {
             return Ok(true); // Code definitely used
         }
         

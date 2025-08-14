@@ -38,7 +38,7 @@ impl StateManager {
             hasher.update(&account.balance.to_le_bytes());
             hasher.update(&account.nonce.to_le_bytes());
             // Hash additional fields
-            hasher.update(&account.stake.to_le_bytes());
+
             hasher.update(&account.reputation.to_le_bytes());
             hasher.update(&(account.is_node as u8).to_le_bytes());
             if let Some(node_type) = &account.node_type {
