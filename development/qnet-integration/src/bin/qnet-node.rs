@@ -803,7 +803,10 @@ async fn fetch_burn_tracker_data() -> Result<BurnTrackerData, String> {
             println!("   📊 Burn Percentage: {:.2}%", supply_data.burn_percentage);
             
             // Get real node count from actual QNet network scan
-            let real_node_counts = scan_active_qnet_nodes().await;
+            let (real_node_counts, discovered_peers) = scan_active_qnet_nodes().await;
+            
+            // CRITICAL FIX: Pass discovered peers to P2P system
+            println!("🔗 Found {} peers for P2P integration", discovered_peers.len());
             
             Ok(BurnTrackerData {
                 total_1dev_burned: supply_data.total_burned,
@@ -1927,7 +1930,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // Use auto-configured values
     let region = config.region;
-    let bootstrap_peers = config.bootstrap_peers.clone();
+    let mut bootstrap_peers = config.bootstrap_peers.clone();
+    
+    // CRITICAL FIX: Add discovered peers to bootstrap list
+    println!("🔍 Scanning for additional peers to add to bootstrap...");
+    let (_, discovered_peers) = scan_active_qnet_nodes().await;
+    for peer in discovered_peers {
+        if !bootstrap_peers.contains(&peer) {
+            bootstrap_peers.push(peer);
+            println!("🔗 Added discovered peer to bootstrap: {}", bootstrap_peers.last().unwrap());
+        }
+    }
     
     // Store activation code for validation
     std::env::set_var("QNET_ACTIVATION_CODE", activation_code);
@@ -3105,7 +3118,7 @@ fn determine_region_from_ip(ip: &std::net::Ipv4Addr) -> Option<Region> {
 }
 
 // Scan actual QNet network using decentralized discovery
-async fn scan_active_qnet_nodes() -> RealNodeCounts {
+async fn scan_active_qnet_nodes() -> (RealNodeCounts, Vec<String>) {
     let mut counts = RealNodeCounts::default();
     
     println!("🔍 Scanning QNet decentralized network...");
@@ -3115,7 +3128,10 @@ async fn scan_active_qnet_nodes() -> RealNodeCounts {
     // Use the real decentralized discovery mechanisms
     let discovered_peers = discover_peers_via_decentralized_network().await;
     
-    for peer_addr in discovered_peers {
+    // CRITICAL FIX: Pass discovered peers to P2P system for actual connection
+    println!("[DISCOVERY] 🔗 Integrating {} discovered peers with P2P network", discovered_peers.len());
+    
+    for peer_addr in discovered_peers.clone() {
         if let Ok(node_info) = query_node_info(&peer_addr).await {
             match node_info.node_type.as_str() {
                 "Light" => counts.light += 1,
@@ -3137,7 +3153,8 @@ async fn scan_active_qnet_nodes() -> RealNodeCounts {
     // Save discovered peers for future sessions
     let _ = save_decentralized_peers_cache(&counts).await;
     
-    counts
+    // Return discovered peers for P2P integration
+    (counts, discovered_peers)
 }
 
 // Discover new peers from network through decentralized peer exchange
