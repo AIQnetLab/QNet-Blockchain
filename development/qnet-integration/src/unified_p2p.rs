@@ -184,6 +184,46 @@ impl SimplifiedP2P {
         self.establish_regional_connections();
     }
     
+    /// Add discovered peers to running P2P system (dynamic peer injection)
+    pub fn add_discovered_peers(&self, peer_addresses: &[String]) {
+        if peer_addresses.is_empty() {
+            return;
+        }
+        
+        println!("[P2P] 🔗 Adding {} discovered peers to running P2P system", peer_addresses.len());
+        
+        let mut new_connections = 0;
+        for peer_addr in peer_addresses {
+            if let Ok(peer_info) = self.parse_peer_address(peer_addr) {
+                // Check if not already connected
+                let already_connected = {
+                    let connected = self.connected_peers.lock().unwrap();
+                    connected.iter().any(|p| p.addr == peer_info.addr)
+                };
+                
+                if !already_connected {
+                    self.add_peer_to_region(peer_info.clone());
+                    
+                    // Add to connected peers immediately
+                    {
+                        let mut connected = self.connected_peers.lock().unwrap();
+                        connected.push(peer_info.clone());
+                        new_connections += 1;
+                    }
+                    
+                    println!("[P2P] ✅ Added discovered peer: {}", peer_info.addr);
+                }
+            }
+        }
+        
+        // Update connection count
+        *self.connection_count.lock().unwrap() = self.connected_peers.lock().unwrap().len();
+        
+        if new_connections > 0 {
+            println!("[P2P] 🚀 Successfully added {} new peers to P2P network", new_connections);
+        }
+    }
+    
     /// Start internet-wide peer discovery using external IP and peer registry
     fn start_internet_peer_discovery(&self) {
         println!("[P2P] 🔍 Starting internet-wide peer discovery...");

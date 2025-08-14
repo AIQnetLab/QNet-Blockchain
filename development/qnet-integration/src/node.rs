@@ -1061,6 +1061,13 @@ impl BlockchainNode {
         self.node_type
     }
     
+    /// Add discovered peers to P2P system (for dynamic peer injection)
+    pub fn add_discovered_peers(&self, peer_addresses: &[String]) {
+        if let Some(unified_p2p) = &self.unified_p2p {
+            unified_p2p.add_discovered_peers(peer_addresses);
+        }
+    }
+    
     pub fn get_region(&self) -> Region {
         self.region
     }
