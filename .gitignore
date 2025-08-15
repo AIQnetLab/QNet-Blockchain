@@ -498,3 +498,34 @@ fixed_upgrade.sh
 node_data/
 **/node_data/
 peer_cache.json
+
+# CRITICAL: Node activation storage (contains private keys and activation codes)
+temp_activation_check/
+**/temp_activation_check/
+activation_storage/
+**/activation_storage/
+
+# CRITICAL: RocksDB databases (contain local node state and private data)
+**/CURRENT
+**/IDENTITY
+**/LOCK
+**/LOG*
+**/MANIFEST-*
+**/OPTIONS-*
+*.rocksdb/
+**/*.rocksdb/
+
+# CRITICAL: Local node data directories
+node1_data/
+node2_data/
+**/node1_data/
+**/node2_data/
+**/kademlia_*/
+**/auto_test_*/
+**/production_node*/
+testing/integration/*/CURRENT
+testing/integration/*/IDENTITY
+testing/integration/*/LOCK
+testing/integration/*/LOG*
+testing/integration/*/MANIFEST-*
+testing/integration/*/OPTIONS-*
