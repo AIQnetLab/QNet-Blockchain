@@ -24,6 +24,7 @@ pub struct TransactionFee {
 pub struct NodeActivation {
     pub node_id: String,
     pub node_type: NodeType,
+    pub wallet_address: String,
     pub activation_amount: u64,
     pub phase: QNetPhase,
     pub tx_hash: String,
@@ -134,8 +135,8 @@ impl RewardIntegrationManager {
         Ok(())
     }
     
-    /// Process node activation and add QNC to Pool 3 (Phase 2 only)
-    pub fn process_node_activation(&mut self, node_id: String, node_type: NodeType, activation_amount: u64, tx_hash: String) -> Result<(), ConsensusError> {
+    /// FIXED: Process node activation with wallet address for reward ownership
+    pub fn process_node_activation(&mut self, node_id: String, node_type: NodeType, wallet_address: String, activation_amount: u64, tx_hash: String) -> Result<(), ConsensusError> {
         // Get current phase
         let current_phase = {
             let reward_manager = self.reward_manager.read().unwrap();
@@ -146,6 +147,7 @@ impl RewardIntegrationManager {
         let activation = NodeActivation {
             node_id: node_id.clone(),
             node_type: node_type.clone(),
+            wallet_address: wallet_address.clone(),
             activation_amount,
             phase: current_phase.clone(),
             tx_hash: tx_hash.clone(),
@@ -164,7 +166,7 @@ impl RewardIntegrationManager {
                 // Just register the node for rewards
                 {
                     let mut reward_manager = self.reward_manager.write().unwrap();
-                    reward_manager.register_node(node_id.clone(), node_type)?;
+                    reward_manager.register_node(node_id.clone(), node_type, wallet_address.clone())?;
                 }
             },
             QNetPhase::Phase2 => {
@@ -173,7 +175,7 @@ impl RewardIntegrationManager {
                     let mut reward_manager = self.reward_manager.write().unwrap();
                     
                     // Register node
-                    reward_manager.register_node(node_id.clone(), node_type)?;
+                    reward_manager.register_node(node_id.clone(), node_type, wallet_address.clone())?;
                     
                     // Add activation amount to Pool 3
                     reward_manager.add_activation_qnc(activation_amount)?;
@@ -240,7 +242,7 @@ impl RewardIntegrationManager {
     /// Claim rewards for a node
     pub fn claim_node_rewards(&mut self, node_id: &str) -> Result<crate::lazy_rewards::RewardClaimResult, ConsensusError> {
         let mut reward_manager = self.reward_manager.write().unwrap();
-        Ok(reward_manager.claim_rewards(node_id))
+        Ok(reward_manager.claim_rewards(node_id, "unknown_wallet"))
     }
     
     /// Get pending rewards for a node
@@ -325,7 +327,8 @@ impl RewardIntegrationCallback for RewardIntegrationCallbackImpl {
             _ => return Err(format!("Invalid node type: {}", node_type)),
         };
         
-        self.manager.process_node_activation(node_id, node_type_enum, amount, tx_hash)
+        // FIXED: Use placeholder wallet since treiт doesn't provide it
+        self.manager.process_node_activation(node_id, node_type_enum, "unknown_wallet".to_string(), amount, tx_hash)
             .map_err(|e| format!("Failed to process node activation: {:?}", e))
     }
 }

@@ -159,6 +159,9 @@ pub struct PhaseAwareRewardManager {
     /// Node ping histories by node_id
     ping_histories: HashMap<String, NodePingHistory>,
     
+    /// FIXED: Node ownership mapping - node_id -> wallet_address
+    node_ownership: HashMap<String, String>,
+    
     /// Pending rewards by node_id
     pending_rewards: HashMap<String, PhaseAwareReward>,
     
@@ -187,6 +190,7 @@ impl PhaseAwareRewardManager {
             genesis_timestamp,
             current_window_start,
             ping_histories: HashMap::new(),
+            node_ownership: HashMap::new(),
             pending_rewards: HashMap::new(),
             last_claim_time: HashMap::new(),
             pool2_transaction_fees: 0,
@@ -267,8 +271,8 @@ impl PhaseAwareRewardManager {
         // in get_current_phase() and get_reward_stats(), so this parameter is ignored
     }
     
-    /// Register node for current reward window
-    pub fn register_node(&mut self, node_id: String, node_type: NodeType) -> Result<(), ConsensusError> {
+    /// FIXED: Register node with wallet address for reward ownership
+    pub fn register_node(&mut self, node_id: String, node_type: NodeType, wallet_address: String) -> Result<(), ConsensusError> {
         let window_start = Self::get_current_window_start();
         
         // Check if we need to start a new reward window
@@ -277,9 +281,15 @@ impl PhaseAwareRewardManager {
             self.current_window_start = window_start;
         }
         
+        // FIXED: Store wallet ownership for reward claims
+        self.node_ownership.insert(node_id.clone(), wallet_address.clone());
+        
         // Create ping history for this node
         let ping_history = NodePingHistory::new(node_id.clone(), node_type, window_start);
-        self.ping_histories.insert(node_id, ping_history);
+        self.ping_histories.insert(node_id.clone(), ping_history);
+        
+        println!("✅ Node registered for rewards: {} owned by wallet: {}...", 
+                 node_id, &wallet_address[..8.min(wallet_address.len())]);
         
         Ok(())
     }
@@ -433,12 +443,37 @@ impl PhaseAwareRewardManager {
         }
     }
     
-    /// Claim rewards for a node
-    pub fn claim_rewards(&mut self, node_id: &str) -> RewardClaimResult {
+    /// FIXED: Claim rewards for a node - ONLY the owning wallet can claim
+    pub fn claim_rewards(&mut self, node_id: &str, claimant_wallet: &str) -> RewardClaimResult {
         let current_time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
+        
+        // CRITICAL: Verify wallet ownership FIRST
+        match self.node_ownership.get(node_id) {
+            Some(owner_wallet) => {
+                if owner_wallet != claimant_wallet {
+                    return RewardClaimResult {
+                        success: false,
+                        reward: None,
+                        message: format!("SECURITY VIOLATION: Node {} belongs to wallet {}..., not {}...", 
+                                       node_id, 
+                                       &owner_wallet[..8.min(owner_wallet.len())],
+                                       &claimant_wallet[..8.min(claimant_wallet.len())]),
+                        next_claim_time: current_time + self.min_claim_interval.as_secs(),
+                    };
+                }
+            }
+            None => {
+                return RewardClaimResult {
+                    success: false,
+                    reward: None,
+                    message: format!("Node {} not registered for rewards", node_id),
+                    next_claim_time: current_time + self.min_claim_interval.as_secs(),
+                };
+            }
+        }
         
         // Check minimum claim interval
         if let Some(last_claim) = self.last_claim_time.get(node_id) {

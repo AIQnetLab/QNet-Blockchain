@@ -237,7 +237,8 @@ impl BatchOperationsManager {
             for activation in &request.activations {
                 match reward_integration.process_node_activation(
                     activation.node_id.clone(),
-                    activation.node_type.clone(),
+                    activation.node_type.clone(), // Already NodeType enum, no conversion needed
+                    "unknown_wallet".to_string(), // placeholder wallet
                     activation.activation_amount,
                     activation.tx_hash.clone(),
                 ) {

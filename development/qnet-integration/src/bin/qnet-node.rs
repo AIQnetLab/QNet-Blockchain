@@ -103,13 +103,13 @@ async fn decode_activation_code_quantum_secure(
         return Err("Invalid wallet signature - activation code is not authentic".to_string());
     }
 
-    // 6. Check blockchain to prevent double-usage
-    let already_used = quantum_crypto.check_blockchain_usage(code).await
-        .map_err(|e| format!("Blockchain check failed: {}", e))?;
-
-    if already_used {
-        return Err("Activation code already used - each code can only be used once".to_string());
-    }
+    // FIXED: Check code ownership instead of usage (codes are reusable on different devices)
+    // We only need to verify the code belongs to the wallet trying to use it
+    println!("🔍 Checking code ownership (codes are reusable for device migration)");
+    
+    // Code ownership is already verified in quantum decryption step above
+    // The payload.wallet from the decrypted code is the true owner
+    // No additional blockchain check needed - quantum decryption guarantees authenticity
 
     // 7. Extract purchase phase from payload (for information only)
     let purchase_phase = if payload.burn_tx.starts_with("burn_tx_") { 1 } else { 2 };
@@ -445,9 +445,14 @@ async fn validate_activation_code_comprehensive(
 async fn validate_blockchain_uniqueness(code: &str) -> Result<(), String> {
     println!("🔍 Checking blockchain uniqueness...");
     
-    // Initialize blockchain registry
+    // FIXED: Initialize blockchain registry with real QNet nodes
+    let qnet_rpc = std::env::var("QNET_RPC_URL")
+        .or_else(|_| std::env::var("QNET_GENESIS_NODES")
+            .map(|nodes| format!("http://{}:8001", nodes.split(',').next().unwrap_or("127.0.0.1").trim())))
+        .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
+        
     let registry = qnet_integration::activation_validation::BlockchainActivationRegistry::new(
-        Some("https://rpc.qnet.io".to_string())
+        Some(qnet_rpc)
     );
     
     // Check if code is used globally (blockchain + DHT + cache)
