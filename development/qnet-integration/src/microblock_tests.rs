@@ -64,7 +64,7 @@ mod tests {
                 100,
                 i as u64,
                 10,
-                21000,
+                10_000, // QNet TRANSFER gas limit
                 chrono::Utc::now().timestamp() as u64,
                 None,
                 TransactionType::Transfer {
@@ -155,7 +155,7 @@ mod tests {
                 100,
                 i as u64,
                 10,
-                21000,
+                10_000, // QNet TRANSFER gas limit
                 chrono::Utc::now().timestamp() as u64,
                 None,
                 TransactionType::Transfer {
@@ -208,7 +208,7 @@ mod tests {
                 100,
                 i as u64,
                 10,
-                21000,
+                10_000, // QNet TRANSFER gas limit
                 chrono::Utc::now().timestamp() as u64,
                 None,
                 TransactionType::Transfer {

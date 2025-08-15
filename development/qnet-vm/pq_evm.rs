@@ -219,7 +219,7 @@ impl PostQuantumEVM {
         }
 
         // Execute transaction logic
-        let mut gas_used = 21000; // Base transaction cost
+        let mut gas_used = 10_000; // QNet base TRANSFER cost
         let mut logs = Vec::new();
         let mut state_changes = Vec::new();
 

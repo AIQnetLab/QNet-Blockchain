@@ -213,6 +213,13 @@ async fn validate_phase_and_pricing(phase: u8, node_type: NodeType, pricing: &Pr
             println!("   🔐 Quantum decryption successful for Phase 1");
             println!("   💰 Payment verified: Code purchased during Phase {}", decoded.purchase_phase);
             
+            // CRITICAL: Verify burn transaction on Solana blockchain
+            let burn_verified = verify_solana_burn_for_activation(&decoded.wallet_address, &decoded.tx_hash, price as u64).await?;
+            if !burn_verified {
+                return Err(format!("Solana burn verification failed: {} 1DEV burn not found for wallet {}", price as u64, &decoded.wallet_address[..8]));
+            }
+            
+            println!("   ✅ Solana burn verification passed: {} 1DEV burned", price as u64);
             println!("   ✅ Phase 1 validation passed with quantum security");
         },
         2 => {
@@ -2843,6 +2850,127 @@ async fn verify_solana_burn_transaction(wallet_address: &str, required_amount: f
     }
     
     println!("❌ No valid burn transaction found for required amount: {} 1DEV", required_amount);
+    Ok(false)
+}
+
+async fn verify_solana_burn_for_activation(wallet_address: &str, expected_tx_hash: &str, required_amount: u64) -> Result<bool, String> {
+    println!("📡 PRODUCTION: Verifying 1DEV burn on Solana for node activation...");
+    
+    // PRODUCTION: Use devnet RPC for our 1DEV token
+    let solana_rpc = "https://api.devnet.solana.com";
+    let onedev_mint = "62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ";  // Real 1DEV token mint
+    let burn_address = "1nc1nerator11111111111111111111111111111111";  // Official Solana incinerator
+    
+    // Convert to 6 decimals for comparison
+    let required_amount_decimals = required_amount * 1_000_000;
+    
+    // Build RPC request to check burn transactions
+    let request_body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getSignaturesForAddress",
+        "params": [
+            wallet_address,
+            {
+                "limit": 50,
+                "commitment": "finalized"
+            }
+        ]
+    });
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(solana_rpc)
+        .json(&request_body)
+        .send()
+        .await
+        .map_err(|e| format!("Solana RPC request failed: {}", e))?;
+
+    let data: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| format!("JSON parse failed: {}", e))?;
+
+    if let Some(result) = data.get("result") {
+        if let Some(signatures) = result.as_array() {
+            println!("📋 Found {} recent transactions for wallet {}", signatures.len(), &wallet_address[..8]);
+            
+            // Check each signature for burn transactions to incinerator
+            for sig_info in signatures {
+                if let Some(signature) = sig_info.get("signature").and_then(|s| s.as_str()) {
+                    
+                    // If specific TX hash expected from activation code, check it matches
+                    if !expected_tx_hash.is_empty() && signature != expected_tx_hash {
+                        continue;
+                    }
+                    
+                    // Get transaction details to verify burn
+                    let tx_request = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "getTransaction",
+                        "params": [
+                            signature,
+                            {
+                                "encoding": "jsonParsed",
+                                "commitment": "finalized",
+                                "maxSupportedTransactionVersion": 0
+                            }
+                        ]
+                    });
+                    
+                    if let Ok(tx_response) = client.post(solana_rpc).json(&tx_request).send().await {
+                        if let Ok(tx_data) = tx_response.json::<serde_json::Value>().await {
+                            if let Some(result) = tx_data.get("result") {
+                                if let Some(transaction) = result.get("transaction") {
+                                    // Check if this is a token transfer to burn address
+                                    if let Some(message) = transaction.get("message") {
+                                        if let Some(instructions) = message.get("instructions").and_then(|i| i.as_array()) {
+                                            for instruction in instructions {
+                                                if instruction.get("program").and_then(|p| p.as_str()) == Some("spl-token") {
+                                                    if let Some(parsed) = instruction.get("parsed") {
+                                                        if parsed.get("type").and_then(|t| t.as_str()) == Some("transfer") {
+                                                            if let Some(info) = parsed.get("info") {
+                                                                let mint_match = info.get("mint").and_then(|m| m.as_str()) == Some(onedev_mint);
+                                                                let dest_match = info.get("destination").and_then(|d| d.as_str()) == Some(burn_address);
+                                                                let amount_match = info.get("amount")
+                                                                    .and_then(|a| a.as_str())
+                                                                    .and_then(|a| a.parse::<u64>().ok())
+                                                                    .map(|a| a >= required_amount_decimals)
+                                                                    .unwrap_or(false);
+                                                                
+                                                                if mint_match && dest_match && amount_match {
+                                                                    let burned_amount = info.get("amount")
+                                                                        .and_then(|a| a.as_str())
+                                                                        .and_then(|a| a.parse::<u64>().ok())
+                                                                        .unwrap_or(0);
+                                                                    
+                                                                    println!("✅ VERIFIED: Valid burn transaction found!");
+                                                                    println!("   TX: {}", &signature[..16]);
+                                                                    println!("   Burned: {} 1DEV (required: {})", burned_amount / 1_000_000, required_amount);
+                                                                    println!("   Token: {} (1DEV mint)", onedev_mint);
+                                                                    println!("   Destination: {} (official incinerator)", burn_address);
+                                                                    return Ok(true);
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    println!("❌ VERIFICATION FAILED: No valid burn transaction found for {} 1DEV to incinerator", required_amount);
+    println!("   Required: {} 1DEV burned to {}", required_amount, burn_address);
+    println!("   Token: {} (1DEV mint)", onedev_mint);
     Ok(false)
 }
 

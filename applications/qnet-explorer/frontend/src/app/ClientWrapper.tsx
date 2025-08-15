@@ -75,41 +75,64 @@ export default function ClientWrapper({
   const [showFaucetAlert, setShowFaucetAlert] = useState(false);
   const [showSuccessAlert, setShowSuccessAlert] = useState(false);
 
-  // ---- Activation pricing logic ----
-  // Forcing Phase 1 as requested by user. Contract/API will drive this later.
+  // ---- Dynamic Activation pricing logic ----
   const currentPhase: 'phase1' | 'phase2' = 'phase1';
-  const burnedTokensPhase1 = 150_000_000;        // 150 million 1DEV burned (15% of 1B supply)
+  const [burnedTokensPhase1, setBurnedTokensPhase1] = useState(0);
+  const [currentPricing, setCurrentPricing] = useState({
+    light: [1500, 150],
+    full: [1500, 150], 
+    super: [1500, 150]
+  });
   const totalPhase1Supply = 1_000_000_000;        // 1 billion 1DEV total supply (pump.fun standard)
   const activeNodes = 156;                          // TODO: fetch real active node count
+  
+  // Fetch real-time pricing data
+  useEffect(() => {
+    fetch('/api/node/activate')
+      .then(response => response.json())
+      .then(data => {
+        if (data.dynamicPricing && data.dynamicPricing.enabled) {
+          const currentPrice = data.nodeTypes.light.burnAmount;
+          setCurrentPricing({
+            light: [currentPrice, 150],
+            full: [currentPrice, 150],
+            super: [currentPrice, 150]
+          });
+          
+          if (data.dynamicPricing.burnPercentage !== undefined) {
+            const burnedAmount = Math.floor((data.dynamicPricing.burnPercentage / 100) * totalPhase1Supply);
+            setBurnedTokensPhase1(burnedAmount);
+          }
+        }
+      })
+      .catch(error => console.error('Failed to fetch pricing data:', error));
+  }, []);
 
   const getCostRange = (type: 'light' | 'full' | 'super'): string => {
     if (currentPhase === 'phase1') {
-      const base: Record<'light' | 'full' | 'super', [number,number]> = {
-        light: [1500,150],
-        full: [1500,150],
-        super: [1500,150]
-      };
-      const burnedPercent = Math.min(1, burnedTokensPhase1 / totalPhase1Supply);
-      const [start,end] = base[type];
-      const cost= Math.round(start - (start-end)*burnedPercent);
-      return `Activation Cost: ${cost.toLocaleString()} 1DEV (burn)`;
+      // Use dynamic pricing data from API
+      const [currentPrice, minPrice] = currentPricing[type];
+      return `Activation Cost: ${currentPrice.toLocaleString()} 1DEV (burn)`;
     }
 
-    // Phase 2 dynamic QNC pricing
-    const baseRange: Record<'light' | 'full' | 'super', [number, number]> = {
-      light: [2500, 15000],
-      full: [3750, 22500],
-      super: [5000, 30000],
+    // Phase 2 dynamic QNC pricing - CORRECT implementation
+    const basePrices: Record<'light' | 'full' | 'super', number> = {
+      light: 5000,   // Base price for Light node
+      full: 7500,    // Base price for Full node
+      super: 10000,  // Base price for Super node
     };
 
-    let netMultiplier = 0.5;
-    if (activeNodes >= 10_000_000) netMultiplier = 3.0;
-    else if (activeNodes >= 1_000_000) netMultiplier = 2.0;
-    else if (activeNodes >= 100_000) netMultiplier = 1.0;
+    let netMultiplier = 0.5;   // 0-100k nodes
+    if (activeNodes >= 10_000_000) netMultiplier = 3.0;      // 10M+ nodes
+    else if (activeNodes >= 1_000_000) netMultiplier = 2.0;  // 1M-10M nodes
+    else if (activeNodes >= 100_000) netMultiplier = 1.0;    // 100k-1M nodes
 
-    const [low, high] = baseRange[type];
-    const [calcLow, calcHigh] = [low, high].map(v => Math.round(v * netMultiplier));
-    return `Activation Cost: ${calcLow.toLocaleString()} - ${calcHigh.toLocaleString()} QNC (dynamic)`;
+    const basePrice = basePrices[type];
+    const currentPrice = Math.round(basePrice * netMultiplier);
+    const minPrice = Math.round(basePrice * 0.5);
+    const maxPrice = Math.round(basePrice * 3.0);
+    
+    return `Current: ${currentPrice.toLocaleString()} QNC (${netMultiplier}x), Range: ${minPrice.toLocaleString()}-${maxPrice.toLocaleString()}`;
   };
 
   const createProposal = () => {

@@ -9,14 +9,15 @@ pub enum NodeType {
 }
 
 impl NodeType {
-    /// Get 1DEV burn amount for Phase 1 activation (decreasing by 10% per 10% burned)
+    /// Get 1DEV burn amount for Phase 1 activation (decreasing by 150 1DEV per 10% burned)
     pub fn get_1dev_burn_amount(&self, burn_percentage: f64) -> u64 {
         let base_amount = 1_500_000_000; // 1500 1DEV for ALL node types (6 decimals)
+        let min_amount = 150_000_000;    // 150 1DEV minimum (6 decimals)
         
-        // Dynamic pricing: decreases by 10% per 10% burned (from 1500 to 150 1DEV)
-        let reduction = (burn_percentage / 10.0) * 0.1; // 10% reduction per 10% burned
-        let multiplier = 1.0 - reduction;
-        let current_price = (base_amount as f64 * multiplier).max(150_000_000.0); // Min 150 1DEV
+        // CORRECT dynamic pricing: decreases by 150 1DEV per 10% burned
+        let completed_tiers = (burn_percentage / 10.0).floor();
+        let total_reduction = completed_tiers * PRICE_REDUCTION_PER_TIER as f64;
+        let current_price = (base_amount as f64 - total_reduction).max(min_amount as f64);
         
         current_price as u64
     }
@@ -225,7 +226,7 @@ pub const SECONDS_PER_DAY: i64 = 86400;
 // 1DEV pricing constants (Phase 1)
 pub const BASE_1DEV_PRICE: u64 = 1_500_000_000;   // 1500 1DEV base
 pub const MIN_1DEV_PRICE: u64 = 150_000_000;      // 150 1DEV minimum
-pub const PRICE_REDUCTION_PER_10_PERCENT: f64 = 0.1; // 10% reduction per 10% burned
+pub const PRICE_REDUCTION_PER_TIER: u64 = 150_000_000; // 150 1DEV reduction per 10% tier
 
 // QNC activation costs (Phase 2)
 pub const QNC_LIGHT_ACTIVATION: u64 = 5_000_000_000;   // 5000 QNC

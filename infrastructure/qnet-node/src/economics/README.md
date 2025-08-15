@@ -38,10 +38,10 @@ from economics.1dev_burn_model import OneDEVBurnCalculator, NodeType
 calculator = OneDEVBurnCalculator()
 burn_requirement = calculator.calculate_burn_requirement(
     NodeType.LIGHT,  # All node types have same price in Phase 1
-    total_burned=150_000_000  # 15% burned (150M out of 1B total supply)
+    total_burned=0  # PRODUCTION: 0% burned (token just launched)
 )
 print(f"Price: {burn_requirement['amount']} {burn_requirement['token']}")
-# Expected output: Price: 1350 1DEV (10% reduction tier = -150 from base 1500)
+# Expected output: Price: 1500 1DEV (0% burned = base price, no reduction)
 ```
 
 ## Configuration

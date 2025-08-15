@@ -27,7 +27,7 @@ class Transaction:
                  amount: float = 0,
                  fee: float = 0,
                  gas_price: int = 1,
-                 gas_limit: int = 21000,
+                 gas_limit: int = 10000,  # QNet TRANSFER gas limit
                  nonce: Optional[int] = None,
                  data: Optional[str] = None,
                  transaction_type: TransactionType = TransactionType.TRANSFER):
@@ -88,7 +88,7 @@ class Transaction:
             amount=data.get('amount', 0),
             fee=data.get('fee', 0),
             gas_price=data.get('gas_price', 1),
-            gas_limit=data.get('gas_limit', 21000),
+            gas_limit=data.get('gas_limit', 10000),  # QNet TRANSFER gas limit
             nonce=data.get('nonce', 0),
             data=data.get('data'),
             transaction_type=tx_type

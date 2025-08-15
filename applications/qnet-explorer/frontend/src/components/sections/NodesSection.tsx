@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 
 // Mock data, assuming it might be fetched or passed as props in a real app
 const mockNodes = [
@@ -14,31 +14,58 @@ const mockNodes = [
 const NodeActivation = React.memo(function NodeActivation() {
     const [selectedNodeType, setSelectedNodeType] = useState<'light' | 'full' | 'super'>('light');
     
-    // This logic should ideally be a pure function or a hook if it's more complex
+    // Dynamic pricing data
+    const [burnedTokensPhase1, setBurnedTokensPhase1] = useState(0);
+    const [currentPricing, setCurrentPricing] = useState({
+        light: [1500, 150],
+        full: [1500, 150],
+        super: [1500, 150]
+    });
+    
+    // Fetch real-time pricing data
+    useEffect(() => {
+        fetch('/api/node/activate')
+            .then(response => response.json())
+            .then(data => {
+                if (data.dynamicPricing && data.dynamicPricing.enabled) {
+                    const currentPrice = data.nodeTypes.light.burnAmount;
+                    setCurrentPricing({
+                        light: [currentPrice, 150],
+                        full: [currentPrice, 150],
+                        super: [currentPrice, 150]
+                    });
+                    
+                    if (data.dynamicPricing.burnPercentage !== undefined) {
+                        const totalPhase1Supply = 1_000_000_000;
+                        const burnedAmount = Math.floor((data.dynamicPricing.burnPercentage / 100) * totalPhase1Supply);
+                        setBurnedTokensPhase1(burnedAmount);
+                    }
+                }
+            })
+            .catch(error => console.error('Failed to fetch pricing data:', error));
+    }, []);
+    
     const getCostRange = (type: 'light' | 'full' | 'super'): string => {
-        // Hardcoded for demo as in the original file
         const currentPhase: 'phase1' | 'phase2' = 'phase1';
-        const burnedTokensPhase1 = 150_000_000; // 150 million burned (15% of 1B supply)
         const totalPhase1Supply = 1_000_000_000; // 1 billion 1DEV total supply (pump.fun standard)
         const activeNodes = 156;
       
         if (currentPhase === 'phase1') {
-            const base: Record<'light' | 'full' | 'super', [number,number]> = { 
-                light: [1500,150], 
-                full: [1500,150], 
-                super: [1500,150] 
-            };
-            const burnedPercent = Math.min(1, burnedTokensPhase1 / totalPhase1Supply);
-            const [start,end] = base[type];
-            const cost= Math.round(start - (start-end)*burnedPercent);
-            return `Activation Cost: ${cost.toLocaleString()} 1DEV (burn)`;
+            // Use dynamic pricing data from API
+            const [currentPrice, minPrice] = currentPricing[type];
+            return `Activation Cost: ${currentPrice.toLocaleString()} 1DEV (burn)`;
         }
     
-        const baseRange: Record<'light' | 'full' | 'super', [number, number]> = { light: [2500, 15000], full: [3750, 22500], super: [5000, 30000] };
+        // Phase 2 dynamic QNC pricing - CORRECT implementation
+        const basePrices: Record<'light' | 'full' | 'super', number> = { light: 5000, full: 7500, super: 10000 };
         let netMultiplier = activeNodes >= 10_000_000 ? 3.0 : activeNodes >= 1_000_000 ? 2.0 : activeNodes >= 100_000 ? 1.0 : 0.5;
-        const [low, high] = baseRange[type];
-        const [calcLow, calcHigh] = [low, high].map(v => Math.round(v * netMultiplier));
-        return `Activation Cost: ${calcLow.toLocaleString()} - ${calcHigh.toLocaleString()} QNC (dynamic)`;
+        
+        const basePrice = basePrices[type];
+        const currentPrice = Math.round(basePrice * netMultiplier);
+        const minPrice = Math.round(basePrice * 0.5);
+        const maxPrice = Math.round(basePrice * 3.0);
+        
+        return `Current: ${currentPrice.toLocaleString()} QNC (${netMultiplier}x), Range: ${minPrice.toLocaleString()}-${maxPrice.toLocaleString()}`;
     };
 
     return (

@@ -705,7 +705,7 @@ async fn tx_submit(
     })? as u64;
     
     let gas_price = params["gas_price"].as_u64().unwrap_or(1);
-    let gas_limit = params["gas_limit"].as_u64().unwrap_or(21000);
+    let gas_limit = params["gas_limit"].as_u64().unwrap_or(10_000); // QNet TRANSFER gas limit
     
     // Create transaction
     let mut tx = qnet_state::Transaction {
@@ -837,7 +837,7 @@ async fn mempool_submit(
             amount,
             nonce,
             gas_price: 1,
-            gas_limit: 21000,
+            gas_limit: 10_000, // QNet TRANSFER gas limit
             timestamp,
             signature: None, // will be added later
             tx_type: qnet_state::TransactionType::Transfer {

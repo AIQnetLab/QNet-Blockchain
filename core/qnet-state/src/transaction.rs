@@ -98,10 +98,10 @@ pub enum TransactionType {
         amount: u64,
     },
     
-    /// Node activation (token burn)
+    /// Node activation (Phase 1: 1DEV burn on Solana, Phase 2: QNC transfer to Pool 3)
     NodeActivation {
         node_type: NodeType,
-        burn_amount: u64,
+        amount: u64,  // Phase 1: 0 (1DEV burned externally), Phase 2: QNC transferred to Pool 3
         phase: ActivationPhase,
     },
     
@@ -327,9 +327,20 @@ impl Transaction {
                     return Err("Empty recipient address".to_string());
                 }
             }
-            TransactionType::NodeActivation { burn_amount, .. } => {
-                if *burn_amount == 0 {
-                    return Err("Burn amount must be greater than 0".to_string());
+            TransactionType::NodeActivation { amount, phase, .. } => {
+                // Phase 1: amount = 0 (only activation record, 1DEV burned externally on Solana)
+                // Phase 2: amount > 0 (QNC transferred to Pool 3 for redistribution to all nodes)
+                match phase {
+                    ActivationPhase::Phase1 => {
+                        if *amount != 0 {
+                            return Err("Phase 1 activation should have amount = 0 (1DEV burned on Solana, not QNC)".to_string());
+                        }
+                    }
+                    ActivationPhase::Phase2 => {
+                        if *amount == 0 {
+                            return Err("Phase 2 activation requires amount > 0 (QNC transferred to Pool 3)".to_string());
+                        }
+                    }
                 }
             }
             TransactionType::ContractDeploy => {
@@ -414,13 +425,13 @@ impl Transaction {
                 accounts.insert(address.clone(), account);
             }
 
-            TransactionType::NodeActivation { node_type, burn_amount, .. } => {
+            TransactionType::NodeActivation { node_type, amount, .. } => {
                 let sender = accounts.get_mut(&self.from)
                     .ok_or_else(|| StateError::AccountNotFound(self.from.clone()))?;
 
                 // Fee calculation
                 let fee = self.gas_price * self.gas_limit;
-                let total_amount = burn_amount + fee;
+                let total_amount = amount + fee;
 
                 if sender.balance < total_amount {
                     return Err(StateError::InsufficientBalance {
@@ -815,12 +826,12 @@ impl TransactionProcessor {
         }
         
         // Handle node activation for Pool 3
-        if let TransactionType::NodeActivation { node_type, burn_amount, .. } = &tx.tx_type {
+        if let TransactionType::NodeActivation { node_type, amount, .. } = &tx.tx_type {
             if let Some(ref mut integration) = self.reward_integration {
                 if let Err(e) = integration.process_node_activation(
                     tx.from.clone(),
                     format!("{:?}", node_type),
-                    *burn_amount,
+                    *amount,
                     tx.hash.clone(),
                 ) {
                     eprintln!("Warning: Failed to process node activation: {}", e);
@@ -1001,7 +1012,7 @@ mod tests {
             1000,
             1,
             10, // gas_price
-            21000, // gas_limit
+            10_000, // QNet TRANSFER gas limit
             1234567890,
             Some("signature1".to_string()),
             TransactionType::Transfer {
@@ -1018,7 +1029,7 @@ mod tests {
             1000,
             1,
             10, // gas_price
-            21000, // gas_limit
+            10_000, // QNet TRANSFER gas limit
             1234567890,
             Some("signature1".to_string()),
             TransactionType::Transfer {
@@ -1039,7 +1050,7 @@ mod tests {
             1000,
             2,
             10, // gas_price
-            21000, // gas_limit
+            10_000, // QNet TRANSFER gas limit
             1234567890,
             Some("signature1".to_string()),
             TransactionType::Transfer {
@@ -1061,7 +1072,7 @@ mod tests {
             1000,
             1,
             10, // gas_price
-            21000, // gas_limit
+            10_000, // QNet TRANSFER gas limit
             1234567890,
             Some("signature".to_string()),
             TransactionType::Transfer {
@@ -1081,7 +1092,7 @@ mod tests {
             0,
             1,
             10, // gas_price
-            21000, // gas_limit
+            10_000, // QNet TRANSFER gas limit
             1234567890,
             Some("signature".to_string()),
             TransactionType::Transfer {

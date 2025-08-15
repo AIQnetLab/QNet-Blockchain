@@ -574,7 +574,7 @@ impl Mempool {
             amount: 0,
             nonce: 0,
             gas_price: self.config.min_gas_price,
-            gas_limit: 21000,
+            gas_limit: 10_000, // QNet TRANSFER gas limit
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()

@@ -28,7 +28,7 @@ fn bench_mempool_operations(c: &mut Criterion) {
                     },
                     nonce / 100,
                     10,
-                    21000,
+                    10_000, // QNet TRANSFER gas limit
                     SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .unwrap()
@@ -52,7 +52,7 @@ fn bench_mempool_operations(c: &mut Criterion) {
                 },
                 i / 10,
                 10 + (i % 100),
-                21000,
+                10_000 // QNet TRANSFER gas limit,
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap()
@@ -105,7 +105,7 @@ fn bench_priority_queue(c: &mut Criterion) {
                         },
                         0,
                         (i % 1000) as u64,
-                        21000,
+                        10_000, // QNet TRANSFER gas limit
                         1234567890,
                     );
                     txs.push(tx);
@@ -149,7 +149,7 @@ fn bench_concurrent_access(c: &mut Criterion) {
                                 },
                                 i as u64,
                                 10,
-                                21000,
+                                10_000, // QNet TRANSFER gas limit
                                 SystemTime::now()
                                     .duration_since(UNIX_EPOCH)
                                     .unwrap()

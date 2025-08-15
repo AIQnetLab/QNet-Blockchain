@@ -27,7 +27,7 @@ function Send-Transaction {
             to = $To
             amount = $Amount
             gas_price = 1
-            gas_limit = 21000
+            gas_limit = 10000  # QNet TRANSFER gas limit
             nonce = Get-Random -Maximum 1000000
         }
         id = Get-Random -Maximum 1000000

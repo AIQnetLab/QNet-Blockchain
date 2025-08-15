@@ -420,7 +420,7 @@ class SolanaVerifier:
 
 
 class QNetVerifier:
-    """Verifies burn transactions on QNet (Phase 2)."""
+    """Verifies activation transactions on QNet (Phase 2)."""
     
     def __init__(self, state: State):
         """Initialize QNet verifier.

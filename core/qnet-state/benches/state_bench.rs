@@ -96,7 +96,7 @@ fn bench_transaction_execution(c: &mut Criterion) {
                     },
                     nonce,
                     10,
-                    21000,
+                    10_000, // QNet TRANSFER gas limit
                     1234567890,
                 );
                 
@@ -117,7 +117,7 @@ fn bench_transaction_execution(c: &mut Criterion) {
                     address.clone(),
                     TransactionType::NodeActivation {
                         node_type: NodeType::Light,
-                        burn_amount: 1000,
+                        amount: 1000,
                         phase: ActivationPhase::Phase2,
                     },
                     0,

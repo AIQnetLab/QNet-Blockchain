@@ -403,7 +403,7 @@ Enter your choice (1-2):
 #### Activation Code Requirements
 
 - **Get activation code**: Use QNet Browser Extension or Mobile App
-- **Purchase node license**: Burn 1DEV tokens (Phase 1) or transfer QNC tokens (Phase 2) 
+- **Purchase node license**: Burn 1DEV tokens (Phase 1) or transfer QNC to Pool 3 (Phase 2) 
 - **Server restriction**: Full and Super nodes only for servers
 - **Light nodes**: Mobile devices only - use QNet mobile app
 

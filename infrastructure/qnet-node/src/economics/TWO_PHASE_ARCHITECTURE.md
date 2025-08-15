@@ -23,7 +23,7 @@ QNet uses a two-phase system for node activation that transitions from external 
 - Every 10% burned reduces cost by 150 1DEV
 - Minimum cost: 150 1DEV at 90% burned
 
-## Phase 2: QNC Burns on QNet (After transition)
+## Phase 2: QNC Transfer to Pool 3 on QNet (After transition)
 
 ### Transition triggers when:
 - 90% of 1DEV supply is burned (900 million)

@@ -16,7 +16,7 @@ pub struct BlockInfo {
     pub proposer: [u8; 32],
     /// Timestamp
     pub timestamp: u64,
-    /// Phase 1: 1DEV burned amount, Phase 2: QNC transferred to Pool 3
+    /// Phase 1: 1DEV burned amount, Phase 2: QNC transferred to Pool 3 (not burned)
     pub activation_cost: u64,
 }
 

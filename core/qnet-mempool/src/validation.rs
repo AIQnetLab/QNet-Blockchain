@@ -143,7 +143,7 @@ impl TxValidator for DefaultValidator {
         // Additional checks based on transaction type
         use qnet_state::transaction::TransactionType;
         match &tx.tx_type {
-            TransactionType::NodeActivation { node_type: _, burn_amount: _, phase: _ } => {
+            TransactionType::NodeActivation { node_type: _, amount: _, phase: _ } => {
                 if account_state.is_node {
                     result.add_error("Account already activated as node".to_string());
                 }
@@ -179,7 +179,7 @@ impl TxValidator for DefaultValidator {
         }
         
         // Check gas limit
-        if tx.gas_limit < 21000 {
+        if tx.gas_limit < 10_000 { // QNet minimum: 10k for TRANSFER
             result.add_error("Gas limit too low".to_string());
         } else if tx.gas_limit > 10_000_000 {
             result.add_error("Gas limit too high".to_string());
@@ -238,7 +238,7 @@ impl TxValidator for SimpleValidator {
             ));
         }
         
-        if tx.gas_limit < 21000 {
+        if tx.gas_limit < 10_000 { // QNet minimum: 10k for TRANSFER
             result.add_error("Gas limit too low".to_string());
         }
         

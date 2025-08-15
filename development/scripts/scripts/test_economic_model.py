@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 QNet Economic Model Testing Script
-Tests Phase 1 (1DEV burn) → Phase 2 (QNC spend to Pool 3) transition
+Tests Phase 1 (1DEV burn) → Phase 2 (QNC transfer to Pool 3) transition
 Validates burn pricing, phase transitions, and Pool 3 redistribution
 """
 
@@ -365,7 +365,7 @@ class EconomicModelTester:
                         node_type="light",
                         activation_phase=1,
                         burn_tx_hash=duplicate_burn_tx,  # SAME burn TX!
-                        burn_amount=1500,
+                        activation_amount=1500,
                         activation_code="FAKE-CODE",
                         status="active"
                     )

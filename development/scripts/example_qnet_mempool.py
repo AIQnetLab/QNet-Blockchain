@@ -30,7 +30,7 @@ def main():
             "nonce": 1,
             "timestamp": int(time.time()),
             "gas_price": 10,
-            "gas_limit": 21000
+            "gas_limit": 10000  # QNet TRANSFER gas limit
         },
         {
             "from": "bob",
@@ -39,7 +39,7 @@ def main():
             "nonce": 1,
             "timestamp": int(time.time()),
             "gas_price": 15,
-            "gas_limit": 21000
+            "gas_limit": 10000  # QNet TRANSFER gas limit
         },
         {
             "from": "charlie",
@@ -48,7 +48,7 @@ def main():
             "nonce": 1,
             "timestamp": int(time.time()),
             "gas_price": 5,
-            "gas_limit": 21000
+            "gas_limit": 10000  # QNet TRANSFER gas limit
         }
     ]
     

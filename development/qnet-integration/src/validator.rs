@@ -151,10 +151,10 @@ impl BlockValidator {
                 message.extend_from_slice(to.as_bytes());
                 message.extend_from_slice(&amount.to_le_bytes());
             }
-            TransactionType::NodeActivation { node_type, burn_amount, .. } => {
+            TransactionType::NodeActivation { node_type, amount, .. } => {
                 message.extend_from_slice(b"node_activation");
                 message.extend_from_slice(format!("{:?}", node_type).as_bytes());
-                message.extend_from_slice(&burn_amount.to_le_bytes());
+                message.extend_from_slice(&amount.to_le_bytes());
             }
             _ => {
                 // For other transaction types, add type identifier
@@ -205,9 +205,19 @@ impl BlockValidator {
                     return Err(IntegrationError::ValidationError("Invalid address format".to_string()));
                 }
             }
-            TransactionType::NodeActivation { node_type, burn_amount, .. } => {
-                if *burn_amount == 0 {
-                    return Err(IntegrationError::ValidationError("Node activation burn amount cannot be zero".to_string()));
+            TransactionType::NodeActivation { node_type, amount, phase, .. } => {
+                // Phase-specific validation
+                match phase {
+                    qnet_state::account::ActivationPhase::Phase1 => {
+                        if *amount != 0 {
+                            return Err(IntegrationError::ValidationError("Phase 1 activation should have amount = 0 (1DEV burned externally)".to_string()));
+                        }
+                    }
+                    qnet_state::account::ActivationPhase::Phase2 => {
+                        if *amount == 0 {
+                            return Err(IntegrationError::ValidationError("Phase 2 activation requires amount > 0 (QNC transferred to Pool 3)".to_string()));
+                        }
+                    }
                 }
                 // Validate node type
                 match node_type {

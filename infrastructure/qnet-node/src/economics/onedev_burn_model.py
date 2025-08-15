@@ -34,8 +34,8 @@ class OneDEVBurnConfig:
     # Reduction formula: -150 1DEV per 10% burned
     reduction_per_tier: int = 150   # 150 1DEV reduction per 10% tier
     
-    # Round prices to nearest 50
-    round_to_nearest: int = 50  # Round prices to nearest 50 1DEV
+    # No rounding - use exact calculated prices
+    round_to_nearest: int = 1  # No rounding (was removed per user request)
 
 class OneDEVBurnCalculator:
     """Calculates 1DEV burn requirements based on current burn progress"""
@@ -76,8 +76,8 @@ class OneDEVBurnCalculator:
         current_price = base_price - total_reduction
         final_price = max(current_price, min_price)
         
-        # Round to nearest 50
-        final_burn = int(round(final_price / self.config.round_to_nearest) * self.config.round_to_nearest)
+        # Use exact price without rounding
+        final_burn = int(final_price)
         
         return {
             "phase": "1DEV_BURN",

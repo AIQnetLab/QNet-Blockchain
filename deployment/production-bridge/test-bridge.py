@@ -57,13 +57,13 @@ def test_phase1_pricing():
     reduction_per_10_percent = 150
     
     test_cases = [
-        (0, "0% burned", 1500),              # 0% → 1500 1DEV
-        (1_000_000_000, "10% burned", 1350), # 10% → 1350 1DEV  
-        (2_000_000_000, "20% burned", 1200), # 20% → 1200 1DEV
-        (3_000_000_000, "30% burned", 1050), # 30% → 1050 1DEV
-        (5_000_000_000, "50% burned", 750),  # 50% → 750 1DEV
-        (8_000_000_000, "80% burned", 300),  # 80% → 300 1DEV
-        (9_000_000_000, "90% burned", 150),  # 90% → 150 1DEV (minimum)
+        (0, "0% burned", 1500),                # 0% → 1500 1DEV
+        (100_000_000, "10% burned", 1350),     # 10% → 1350 1DEV  
+        (200_000_000, "20% burned", 1200),     # 20% → 1200 1DEV
+        (300_000_000, "30% burned", 1050),     # 30% → 1050 1DEV
+        (500_000_000, "50% burned", 750),      # 50% → 750 1DEV
+        (800_000_000, "80% burned", 300),      # 80% → 300 1DEV
+        (900_000_000, "90% burned", 150),      # 90% → 150 1DEV (minimum)
     ]
     
     for total_burned, description, expected_cost in test_cases:

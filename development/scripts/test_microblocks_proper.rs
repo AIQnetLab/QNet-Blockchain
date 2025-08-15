@@ -15,7 +15,7 @@ mod microblock_tests {
                 100 + i as u64,
                 i as u64,
                 10,
-                21000,
+                10_000, // QNet TRANSFER gas limit
                 SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
                 None,
                 TransactionType::Transfer {
@@ -114,7 +114,7 @@ mod microblock_tests {
                 100,
                 i as u64,
                 10,
-                21000,
+                10_000, // QNet TRANSFER gas limit
                 SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
                 None,
                 TransactionType::Transfer {

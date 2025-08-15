@@ -137,7 +137,7 @@ fn get_transaction_amount(tx_type: &qnet_state::transaction::TransactionType) ->
     match tx_type {
         qnet_state::transaction::TransactionType::Transfer { amount, .. } => *amount,
         qnet_state::transaction::TransactionType::CreateAccount { initial_balance, .. } => *initial_balance,
-        qnet_state::transaction::TransactionType::NodeActivation { burn_amount, .. } => *burn_amount,
+        qnet_state::transaction::TransactionType::NodeActivation { amount, .. } => *amount,
         qnet_state::transaction::TransactionType::ContractDeploy => 0,
         qnet_state::transaction::TransactionType::ContractCall => 0,
         qnet_state::transaction::TransactionType::RewardDistribution => 0,

@@ -53,7 +53,7 @@ pub enum NodeType {
 pub enum ActivationPhase {
     /// Phase 1 – 1DEV burn (external Solana token)
     Phase1,
-    /// Phase 2 – payment of QNC into Reward Pool #3 (no burning)
+    /// Phase 2 – QNC transferred to Pool 3 for redistribution (not burned)
     Phase2,
 }
 

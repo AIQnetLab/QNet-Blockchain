@@ -1,13 +1,8 @@
 import { type NextRequest, NextResponse } from 'next/server';
-import { PublicKey, Connection } from '@solana/web3.js';
-import { createHash, randomBytes } from 'crypto';
+import { createHash } from 'crypto';
 
-// Configuration
-const DEVNET_RPC = 'https://api.devnet.solana.com';
-const BURN_ADDRESS = '1nc1nerator11111111111111111111111111111111'; // Official Solana incinerator address
-const TOKEN_MINT_ADDRESS = process.env.TOKEN_MINT_ADDRESS || '62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ';
-
-const QNET_API_BASE = process.env.QNET_API_BASE || 'http://localhost:8080';
+// Configuration - delegating to existing bridge API
+const BRIDGE_API_BASE = process.env.BRIDGE_API_BASE || 'http://localhost:5000';
 
 interface ActivationRequest {
   walletAddress: string;
@@ -22,12 +17,6 @@ interface ActivationResponse {
   error?: string;
 }
 
-// Node type requirements (Phase 1: all same amount)
-const NODE_REQUIREMENTS = {
-  light: 1500,
-  full: 1500,
-  super: 1500
-};
 
 export async function POST(request: NextRequest): Promise<NextResponse<ActivationResponse>> {
   try {
@@ -39,37 +28,50 @@ export async function POST(request: NextRequest): Promise<NextResponse<Activatio
       return NextResponse.json({ success: false, error: 'Missing parameters' }, { status: 400 });
     }
 
-    // Build transaction request for QNet API
-    const txPayload = {
-      from: walletAddress, // Using wallet as sender
-      tx_type: {
-        type: 'node_activation',
-        node_type: nodeType,
-        burn_amount: burnAmount,
-        phase: 'phase1'
-      },
-      nonce: 1,
-      gas_price: 1,
-      gas_limit: 21000,
-      signature: 'PLACEHOLDER_SIGNATURE' // TODO: client-side signing
-    };
-
-    const apiResponse = await fetch(`${QNET_API_BASE}/api/v1/transactions`, {
+    // PHASE 1: Use existing OneDEVPhaseHandler system - NO QNC transactions!
+    // Call existing production activation system instead of reimplementing
+    
+    const nodeId = generateNodeId(walletAddress, nodeType);
+    
+    // Use existing Phase 1 activation handler via bridge API
+    const activationRequest = {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(txPayload)
-    });
-
-    const result = await apiResponse.json();
-
-    if (!apiResponse.ok || !result.hash) {
-      return NextResponse.json({ success: false, error: result.error || 'Activation failed' }, { status: 500 });
+      body: JSON.stringify({
+        wallet_address: walletAddress,
+        node_type: nodeType,
+        node_id: nodeId,
+        burn_amount: burnAmount
+      })
+    };
+    
+    const activationResult = await fetch(`${BRIDGE_API_BASE}/api/v1/phase1/activate`, activationRequest)
+      .catch(() => null);
+    
+    if (!activationResult || !activationResult.ok) {
+      return NextResponse.json({ 
+        success: false, 
+        error: 'Phase 1 activation system unavailable' 
+      }, { status: 500 });
+    }
+    
+    const activationData = await activationResult.json();
+    
+    if (!activationData.success) {
+      return NextResponse.json({ 
+        success: false, 
+        error: activationData.error || 'Phase 1 activation failed' 
+      }, { status: 400 });
     }
 
-    // Generate activation code with embedded wallet address
-    const activationCode = generateActivationCodeWithEmbeddedWallet(result.hash, walletAddress, nodeType, burnAmount);
+    // Return activation code from existing system
+    const activationCode = activationData.node_code;
 
-    return NextResponse.json({ success: true, activationCode, txHash: result.hash });
+    return NextResponse.json({ 
+      success: true, 
+      activationCode, 
+      txHash: activationData.burn_transaction || activationData.activation_id 
+    });
   } catch (error) {
     console.error('Activation error:', error);
     return NextResponse.json({ success: false, error: 'Unexpected server error' }, { status: 500 });
@@ -77,63 +79,61 @@ export async function POST(request: NextRequest): Promise<NextResponse<Activatio
 }
 
 export async function GET(): Promise<NextResponse> {
+  // Delegate to existing bridge API for dynamic pricing
+  try {
+    const bridgeResponse = await fetch(`${BRIDGE_API_BASE}/api/v1/1dev_burn_contract/info`);
+    
+    if (bridgeResponse.ok) {
+      const bridgeData = await bridgeResponse.json();
+      const currentPrice = bridgeData.current_burn_price;
+      
+      return NextResponse.json({
+        nodeTypes: {
+          light: {
+            burnAmount: currentPrice,
+            description: 'Mobile-optimized node for basic validation'
+          },
+          full: {
+            burnAmount: currentPrice,
+            description: 'Complete validation node for desktop/server'
+          },
+          super: {
+            burnAmount: currentPrice,
+            description: 'High-performance node for enterprise use'
+          }
+        },
+        phase: 1,
+        tokenType: '1DEV',
+        network: 'Solana Devnet',
+        dynamicPricing: bridgeData.dynamic_pricing
+      });
+    }
+  } catch (error) {
+    console.error('Bridge API unavailable:', error);
+  }
+  
+  // Fallback if bridge offline: Use current production baseline (0% burned = 1500 1DEV)
+  const productionBaselinePrice = 1500; // 0% burned baseline price
+  
   return NextResponse.json({
     nodeTypes: {
-      light: {
-        burnAmount: NODE_REQUIREMENTS.light,
-        description: 'Mobile-optimized node for basic validation'
-      },
-      full: {
-        burnAmount: NODE_REQUIREMENTS.full,
-        description: 'Complete validation node for desktop/server'
-      },
-      super: {
-        burnAmount: NODE_REQUIREMENTS.super,
-        description: 'High-performance node for enterprise use'
-      }
+      light: { burnAmount: productionBaselinePrice, description: 'Mobile-optimized node for basic validation' },
+      full: { burnAmount: productionBaselinePrice, description: 'Complete validation node for desktop/server' },
+      super: { burnAmount: productionBaselinePrice, description: 'High-performance node for enterprise use' }
     },
     phase: 1,
-    tokenType: '1DEV',
-    network: 'Solana Devnet'
+    tokenType: '1DEV', 
+    network: 'Solana Devnet (Bridge offline)',
+    dynamicPricing: { 
+      enabled: false, 
+      message: 'Bridge API unavailable - using production baseline',
+      fallbackPrice: productionBaselinePrice,
+      burnPercentage: 0
+    }
   });
 }
 
-function generateActivationCodeWithEmbeddedWallet(burnTx: string, wallet: string, nodeType: string, burnAmount: number): string {
-  // Generate quantum-secure activation code with embedded wallet address
-  const timestamp = Date.now();
-  const hardwareEntropy = randomBytes(8).toString('hex'); // Shorter for space
-  
-  // Create encryption key from burn transaction (deterministic)
-  const keyMaterial = `${burnTx}:${nodeType}:${burnAmount}`;
-  const encryptionKey = createHash('sha256').update(keyMaterial).digest('hex').substring(0, 32);
-  
-  // Encrypt wallet address with XOR (simple and reversible)
-  let encryptedWallet = '';
-  for (let i = 0; i < wallet.length; i++) {
-    const walletChar = wallet.charCodeAt(i);
-    const keyChar = encryptionKey.charCodeAt(i % encryptionKey.length);
-    encryptedWallet += String.fromCharCode(walletChar ^ keyChar);
-  }
-  
-  // Convert encrypted wallet to hex
-  const encryptedWalletHex = Buffer.from(encryptedWallet, 'binary').toString('hex');
-  
-  // Create structured code with embedded data
-  const nodeTypeMarker = nodeType.charAt(0).toUpperCase(); // L, F, S
-  const timestampHex = timestamp.toString(16).substring(-8); // Last 8 hex chars
-  const entropyShort = hardwareEntropy.substring(0, 4); // 4 hex chars
-  
-  // Embed wallet in the code structure: QNET-[TYPE+TIMESTAMP]-[WALLET_PART1]-[WALLET_PART2+ENTROPY]
-  const walletPart1 = encryptedWalletHex.substring(0, 8);
-  const walletPart2 = encryptedWalletHex.substring(8, 16);
-  
-  // Store metadata for decryption in first segment
-  const segment1 = (nodeTypeMarker + timestampHex).substring(0, 4).toUpperCase();
-  const segment2 = walletPart1.substring(0, 4).toUpperCase();  
-  const segment3 = (walletPart2 + entropyShort).substring(0, 4).toUpperCase();
-  
-  return `QNET-${segment1}-${segment2}-${segment3}`;
-}
+// Removed generateActivationCodeWithEmbeddedWallet - using bridge API generated codes
 
 function generateNodeId(walletAddress: string, nodeType: string): string {
   // Generate unique node ID

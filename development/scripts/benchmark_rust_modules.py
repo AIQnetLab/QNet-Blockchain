@@ -133,7 +133,7 @@ async def benchmark_mempool():
                 tx_data={"to": "recipient", "amount": 100},
                 nonce=i // 100,
                 gas_price=random.randint(1, 100),
-                gas_limit=21000,
+                gas_limit=10000,  # QNet TRANSFER gas limit
                 timestamp=int(time.time())
             )
             transactions.append(tx)

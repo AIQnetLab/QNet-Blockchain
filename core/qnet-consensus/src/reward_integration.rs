@@ -366,7 +366,7 @@ mod tests {
         let result = integration.process_transaction_fee(
             "tx_123".to_string(),
             1000, // amount
-            21000, // gas_used
+            10_000, // QNet TRANSFER gas used
             1, // gas_price
         );
         
@@ -374,7 +374,7 @@ mod tests {
         
         // Check statistics
         let stats = integration.get_pool_statistics();
-        assert_eq!(stats.pool2_total_fees, 21000);
+        assert_eq!(stats.pool2_total_fees, 10_000); // QNet TRANSFER gas
         assert_eq!(stats.total_transactions_processed, 1);
         
         println!("✅ Transaction fee processing test passed!");
@@ -437,7 +437,7 @@ mod tests {
             integration.process_transaction_fee(
                 format!("tx_{}", i),
                 1000,
-                21000,
+                10_000, // QNet TRANSFER gas
                 1,
             ).unwrap();
         }
@@ -452,7 +452,7 @@ mod tests {
         
         // Check final statistics
         let stats = integration.get_pool_statistics();
-        assert_eq!(stats.pool2_total_fees, 105000); // 5 * 21000
+        assert_eq!(stats.pool2_total_fees, 50_000); // 5 * 10_000 QNet TRANSFER gas
         assert_eq!(stats.total_transactions_processed, 5);
         assert_eq!(stats.total_nodes_activated, 1);
         

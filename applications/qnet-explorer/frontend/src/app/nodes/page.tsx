@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 
 const mockNodes = [
   { id: 1, name: 'Node Alpha', location: 'North America', uptime: 247, status: 'online' },
@@ -12,23 +12,47 @@ const mockNodes = [
 export default function NodesPage() {
   const [activeTab, setActiveTab] = useState('node-activation');
   const [selectedNodeType, setSelectedNodeType] = useState<'light' | 'full' | 'super'>('light');
+  
+  // Dynamic data from API
+  const [burnedTokensPhase1, setBurnedTokensPhase1] = useState(0);
+  const [currentPricing, setCurrentPricing] = useState({
+    light: [1500, 150],
+    full: [1500, 150], 
+    super: [1500, 150]
+  });
+  
+  // Fetch real-time data on component mount
+  useEffect(() => {
+    fetch('/api/node/activate')
+      .then(response => response.json())
+      .then(data => {
+        if (data.dynamicPricing && data.dynamicPricing.enabled) {
+          const currentPrice = data.nodeTypes.light.burnAmount;
+          setCurrentPricing({
+            light: [currentPrice, 150],
+            full: [currentPrice, 150],
+            super: [currentPrice, 150]
+          });
+          
+          if (data.dynamicPricing.burnPercentage !== undefined) {
+            const totalPhase1Supply = 1_000_000_000;
+            const burnedAmount = Math.floor((data.dynamicPricing.burnPercentage / 100) * totalPhase1Supply);
+            setBurnedTokensPhase1(burnedAmount);
+          }
+        }
+      })
+      .catch(error => console.error('Failed to fetch pricing data:', error));
+  }, []);
 
   const getCostRange = (type: 'light' | 'full' | 'super'): string => {
     const currentPhase: 'phase1' | 'phase2' = 'phase1';
-    const burnedTokensPhase1 = 150_000_000; // 150 million burned (15% of 1B supply)
     const totalPhase1Supply = 1_000_000_000; // 1 billion 1DEV total supply (pump.fun standard)
     const activeNodes = 156;
 
     if (currentPhase === 'phase1') {
-      const base: Record<typeof type, [number, number]> = {
-        light: [1500, 150],
-        full: [2250, 225],
-        super: [3000, 300]
-      };
-      const burnedPercent = Math.min(1, burnedTokensPhase1 / totalPhase1Supply);
-      const [start, end] = base[type];
-      const cost = Math.round(start - (start - end) * burnedPercent);
-      return `Activation Cost: ${cost.toLocaleString()} 1DEV (burn)`;
+      // Use dynamic pricing data from API
+      const [currentPrice, minPrice] = currentPricing[type];
+      return `Activation Cost: ${currentPrice.toLocaleString()} 1DEV (burn)`;
     }
 
     const baseRange: Record<typeof type, [number, number]> = {

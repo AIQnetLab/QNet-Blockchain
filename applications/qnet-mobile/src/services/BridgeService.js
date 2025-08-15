@@ -1,7 +1,7 @@
 /**
  * QNet Mobile - Bridge Service
  * Production-ready service for connecting to QNet activation bridge
- * Handles Phase 1 (1DEV burn) and Phase 2 (QNC spend-to-Pool3) activation
+ * Handles Phase 1 (1DEV burn) and Phase 2 (QNC transfer-to-Pool3) activation
  */
 
 import AsyncStorage from '@react-native-async-storage/async-storage';

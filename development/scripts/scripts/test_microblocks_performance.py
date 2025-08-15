@@ -66,7 +66,7 @@ class MicroblockPerformanceTester:
             "to": to_addr,
             "amount": amount,
             "gas_price": 1,
-            "gas_limit": 21000
+            "gas_limit": 10000  # QNet TRANSFER gas limit
         }
         
         start = time.time()

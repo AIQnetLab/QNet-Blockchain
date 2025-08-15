@@ -316,7 +316,7 @@ impl ParallelValidator {
         }
         
         // 5. Gas calculation
-        let base_gas = 21000; // Base transaction cost
+        let base_gas = 10_000; // QNet base TRANSFER cost
         let data_gas = tx.data.len() as u64 * 16; // 16 gas per byte
         let total_gas = base_gas + data_gas;
         

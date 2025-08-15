@@ -7,19 +7,46 @@ export default function ActivatePage() {
   const [nodeId, setNodeId] = useState('');
   const [activating, setActivating] = useState(false);
   
-  // CORRECT 1DEV SUPPLY VALUES (Fixed from wrong 10B to correct 1B)
+  // PRODUCTION VALUES: Real-time data from bridge API  
   const currentPhase: 'phase1' | 'phase2' = 'phase1';
-  const burnedTokensPhase1 = 150_000_000; // 150 million burned (15% of 1B supply)
+  const [burnedTokensPhase1, setBurnedTokensPhase1] = useState(0); // Real-time from blockchain
+  const [currentPricing, setCurrentPricing] = useState<Record<string, [number, number]>>({
+    light: [1500, 150], // [currentPrice, minimumPrice] - updated from API
+    full: [1500, 150],
+    super: [1500, 150]
+  });
   const activeNodes = 156;
 
   const totalPhase1Supply = 1_000_000_000; // 1 billion 1DEV total supply (pump.fun standard)
+  
+  // Fetch real-time pricing on component mount
+  useEffect(() => {
+    fetch('/api/node/activate')
+      .then(response => response.json())
+      .then(data => {
+        if (data.dynamicPricing && data.dynamicPricing.enabled) {
+          const currentPrice = data.nodeTypes.light.burnAmount;
+          setCurrentPricing({
+            light: [currentPrice, 150],
+            full: [currentPrice, 150], 
+            super: [currentPrice, 150]
+          });
+          
+          // Calculate burned tokens from pricing info
+          if (data.dynamicPricing.burnPercentage !== undefined) {
+            const burnedAmount = Math.floor((data.dynamicPricing.burnPercentage / 100) * totalPhase1Supply);
+            setBurnedTokensPhase1(burnedAmount);
+          }
+        }
+      })
+      .catch(error => {
+        console.error('Failed to fetch real-time pricing:', error);
+        // Keep default values on error
+      });
+  }, []);
 
-  // Phase 1: Universal pricing - ALL node types cost 1500 1DEV
-  const basePricing: Record<string, [number, number]> = {
-    light: [1500, 150],
-    full: [1500, 150],
-    super: [1500, 150]
-  };
+  // Use current pricing instead of static basePricing
+  const basePricing = currentPricing;
 
   const getCostInfo = (type: 'light' | 'full' | 'super') => {
     if (currentPhase === 'phase1') {
@@ -28,9 +55,11 @@ export default function ActivatePage() {
         full: [1500, 150],
         super: [1500, 150]
       };
+      // CORRECT Phase 1 pricing: 1500 base, -150 per each COMPLETE 10% burned, min 150
       const burnedPercent = Math.min(1, burnedTokensPhase1 / totalPhase1Supply);
-      const [start, end] = base[type];
-      const cost = Math.round(start - (start - end) * burnedPercent);
+      const completedTiers = Math.floor((burnedPercent * 100) / 10); // Each complete 10% = 1 tier
+      const reduction = completedTiers * 150; // 150 1DEV per tier
+      const cost = Math.max(1500 - reduction, 150); // Min 150 1DEV
       const percentBurned = Math.round(burnedPercent * 100);
       
       return {
@@ -42,20 +71,26 @@ export default function ActivatePage() {
       };
     }
 
-    // Phase 2 dynamic QNC pricing
-    const baseRange: Record<'light' | 'full' | 'super', [number, number]> = {
-      light: [2500, 15000],
-      full: [3750, 22500],
-      super: [5000, 30000],
+    // Phase 2 dynamic QNC pricing - CORRECT implementation
+    const basePrices: Record<'light' | 'full' | 'super', number> = {
+      light: 5000,   // Base price for Light node
+      full: 7500,    // Base price for Full node
+      super: 10000,  // Base price for Super node
     };
 
-    let netMultiplier = 0.5;
-    if (activeNodes >= 10_000_000) netMultiplier = 3.0;
-    else if (activeNodes >= 1_000_000) netMultiplier = 2.0;
-    else if (activeNodes >= 100_000) netMultiplier = 1.0;
+    // Determine network multiplier based on active nodes
+    let netMultiplier = 0.5;   // 0-100k nodes
+    if (activeNodes >= 10_000_000) netMultiplier = 3.0;      // 10M+ nodes
+    else if (activeNodes >= 1_000_000) netMultiplier = 2.0;  // 1M-10M nodes  
+    else if (activeNodes >= 100_000) netMultiplier = 1.0;    // 100k-1M nodes
 
-    const [low, high] = baseRange[type];
-    const [calcLow, calcHigh] = [low, high].map(v => Math.round(v * netMultiplier));
+    const basePrice = basePrices[type];
+    const currentPrice = Math.round(basePrice * netMultiplier);
+    
+    // Show range from minimum (0.5x) to maximum (3.0x) possible prices
+    const minPrice = Math.round(basePrice * 0.5);
+    const maxPrice = Math.round(basePrice * 3.0);
+    const [calcLow, calcHigh] = [minPrice, maxPrice];
     
     return {
       cost: `${calcLow.toLocaleString()} - ${calcHigh.toLocaleString()}`,

@@ -151,7 +151,7 @@ mod tests {
             },
             1,
             100, // Higher gas price
-            21000,
+            10_000, // QNet TRANSFER gas limit
             1234567890,
         );
         
@@ -163,7 +163,7 @@ mod tests {
             },
             1,
             50, // Lower gas price
-            21000,
+            10_000, // QNet TRANSFER gas limit
             1234567890,
         );
         
@@ -183,7 +183,7 @@ mod tests {
             },
             1,
             50,
-            21000,
+            10_000, // QNet TRANSFER gas limit
             1234567890,
         );
         

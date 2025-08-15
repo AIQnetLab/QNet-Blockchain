@@ -42,7 +42,7 @@ def send_transaction(from_addr, to_addr, amount, port=9877):
         "to_address": to_addr,
         "amount": float(amount),
         "gas_price": 1,
-        "gas_limit": 21000
+        "gas_limit": 10000  # QNet TRANSFER gas limit
     }, port)
     
     if result and 'result' in result:

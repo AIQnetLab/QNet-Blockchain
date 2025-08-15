@@ -27,7 +27,7 @@ pub struct SubmitTransactionRequest {
     pub gas_price: u64,
     
     /// Gas limit
-    #[validate(range(min = 21000, max = 10000000))]
+    #[validate(range(min = 10000, max = 10000000))] // QNet minimum: 10k for TRANSFER
     pub gas_limit: u64,
     
     /// Signature
@@ -54,7 +54,7 @@ pub enum TransactionTypeRequest {
     },
     NodeActivation {
         node_type: String,
-        burn_amount: u64,
+        amount: u64,
         phase: String,
     },
 }
@@ -95,7 +95,7 @@ pub async fn submit_transaction(
         TransactionTypeRequest::ContractCall { to: _, data: _, value: _ } => {
             TransactionType::ContractCall
         }
-        TransactionTypeRequest::NodeActivation { node_type, burn_amount, phase } => {
+        TransactionTypeRequest::NodeActivation { node_type, amount, phase } => {
             let node_type = match node_type.as_str() {
                 "light" => NodeType::Light,
                 "full" => NodeType::Full,
@@ -112,7 +112,7 @@ pub async fn submit_transaction(
             
             TransactionType::NodeActivation {
                 node_type,
-                burn_amount: *burn_amount,
+                amount: *amount,
                 phase: phase_enum,
             }
         }
@@ -126,8 +126,8 @@ pub async fn submit_transaction(
             (None, *value, Some("contract_deploy".to_string())),
         TransactionTypeRequest::ContractCall { to, data: _, value } => 
             (Some(to.clone()), *value, Some("contract_call".to_string())),
-        TransactionTypeRequest::NodeActivation { burn_amount, .. } => 
-            (None, *burn_amount, Some("node_activation".to_string())),
+        TransactionTypeRequest::NodeActivation { amount, .. } => 
+            (None, *amount, Some("node_activation".to_string())),
     };
 
     // Create transaction
@@ -287,10 +287,10 @@ fn create_transaction_message(req: &SubmitTransactionRequest, tx: &Transaction) 
         TransactionType::ContractCall => {
             hasher.update(b"contract_call");
         },
-        TransactionType::NodeActivation { node_type, burn_amount, phase } => {
+        TransactionType::NodeActivation { node_type, amount, phase } => {
             hasher.update(b"node_activation");
             hasher.update(&format!("{:?}", node_type).as_bytes());
-            hasher.update(&burn_amount.to_le_bytes());
+            hasher.update(&amount.to_le_bytes());
             hasher.update(&format!("{:?}", phase).as_bytes());
         },
     }

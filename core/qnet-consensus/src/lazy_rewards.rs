@@ -558,7 +558,7 @@ mod tests {
     fn test_phase_aware_rewards() {
         // Test Phase 1 (Pool 3 disabled)
         let mut manager = PhaseAwareRewardManager::new(1640995200); // 2022-01-01
-        manager.update_phase_parameters(15.0, 0); // 15% burned, 0 years
+        manager.update_phase_parameters(0.0, 0); // PRODUCTION: 0% burned, 0 years
         
         // Register nodes
         manager.register_node("light1".to_string(), NodeType::Light).unwrap();
