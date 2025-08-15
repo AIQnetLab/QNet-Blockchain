@@ -2,6 +2,7 @@
 #![allow(unused_variables)]
 #![allow(dead_code)]
 #![allow(unused_mut)]
+#![recursion_limit = "256"]
 
 //! QNet Integration - Full blockchain system
 //! This module integrates all QNet components into a cohesive blockchain system.

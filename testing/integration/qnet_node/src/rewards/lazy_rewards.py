@@ -156,14 +156,14 @@ class LazyRewardsManager:
         })
         self.state.set(self.CLAIM_HISTORY_KEY, claim_history)
         
-        # Create claim transaction
+        # Create claim transaction (direct smart contract call - no gas fees)
         tx = Transaction(
             sender="REWARDS_POOL",
             receiver=wallet_address,
             amount=float(claim_amount),
-            fee=0,  # No fee for reward claims
-            gas_price=1,  # Minimal gas price for reward claims
-            gas_limit=21000,  # Standard gas limit
+            fee=0,  # No fee for reward claims - quantum signature only
+            gas_price=0,  # No gas needed for reward claims
+            gas_limit=0,  # Direct pool withdrawal
             data=json.dumps({
                 'type': 'REWARD_CLAIM',
                 'node_id': node_id,
