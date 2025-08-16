@@ -84,7 +84,7 @@ docker run -it --name qnet-node --restart=always \
 **The interactive setup will:**
 1. **Auto-detect region** based on your IP
 2. **Choose node type** (Full Node or Super Node for servers)
-3. **Enter activation code** (QNET-XXXX-XXXX-XXXX format)
+3. **Enter activation code** (QNET-XXXXXX-XXXXXX-XXXXXX format, 26 characters)
 4. **Generate quantum-resistant keys**
 5. **Configure P2P network**
 6. **Start daemon mode** automatically

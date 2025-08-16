@@ -198,7 +198,7 @@ docker run -it --name qnet-node --restart=always \
 # 2. Enter activation code from wallet extension
 # 3. Node activates automatically
 
-# Get activation codes at: https://testnet-bridge.qnet.io (via wallet extension)
+# Get activation codes via QNet wallet extension or mobile app (P2P decentralized system)
 ```
 
 **Note**: All Solana contract configuration is embedded in the Docker image. No manual configuration required.
@@ -730,35 +730,42 @@ docker rm qnet-genesis-001 qnet-genesis-002 qnet-genesis-003 qnet-genesis-004 qn
 
 #### **1️⃣ Autonomous Solana Monitoring:**
 ```rust
-// Every QNet node independently monitors Solana
+// Every QNet node independently monitors Solana blockchain
 let burn_transactions = monitor_solana_burns().await;
 for burn_tx in burn_transactions {
     if burn_tx.amount >= required_1dev && burn_tx.target == INCINERATOR {
-        // Detected valid burn!
+        // Detected valid burn - process activation
+        process_burn_for_activation(&burn_tx).await;
     }
 }
 ```
 
 #### **2️⃣ Consensus-Based Code Generation:**
 ```rust
-// Quantum-secure deterministic generation
-let leader_node = consensus.select_leader_for_burn(&burn_tx_hash);
-if leader_node == self.node_id {
-    let activation_code = quantum_crypto.generate_code_deterministic(
+// Quantum-secure deterministic generation via consensus
+let consensus_leader = consensus.select_leader_for_burn(&burn_tx_hash);
+if consensus_leader == self.node_id {
+    let activation_code = quantum_crypto.generate_activation_code(
         &burn_tx_hash, 
         &wallet_address, 
-        node_type,
-        burn_amount
+        node_type
     );
-    dht_network.broadcast_code(activation_code).await;
+    // Store only hash in blockchain for security
+    let code_hash = blake3::hash(activation_code.as_bytes());
+    blockchain.store_activation_hash(code_hash, &burn_tx).await;
 }
 ```
 
-#### **3️⃣ P2P Distribution via DHT:**
+#### **3️⃣ Secure Hash Storage:**
 ```rust
-// Codes propagate through quantum DHT network
-dht_client.propagate_to_network(&activation_code, &burn_proof);
-// ANY node can now serve this code to users
+// Only activation code HASH stored on blockchain (not full code)
+let activation_record = ActivationRecord {
+    code_hash: blake3::hash(activation_code.as_bytes()),
+    wallet_address: burn_tx.wallet,
+    node_type: burn_tx.node_type,
+    is_active: true,
+};
+blockchain.submit_activation_record(activation_record).await;
 ```
 
 ### 🔐 **Cryptographic Security:**
@@ -786,36 +793,37 @@ dht_client.propagate_to_network(&activation_code, &burn_proof);
 
 ### 🌐 **How Users Get Codes:**
 
-#### **Method 1: Direct P2P Query**
+#### **Method 1: Wallet Extension (Recommended)**
+```javascript
+// QNet wallet extension generates codes locally after burn
+const burnTx = await solanaBurn.burn1DEV(amount, nodeType);
+const activationCode = await qnetWallet.generateActivationCode(burnTx);
+// Code stored locally in wallet, hash stored on blockchain
+```
+
+#### **Method 2: Mobile App Generation**
+```javascript
+// Mobile app generates codes after Solana burn transaction
+const activationCode = await qnetMobile.generateFromBurn(burnTxHash);
+// User keeps full code, only hash goes to blockchain
+```
+
+#### **Method 3: Node API (Secure)**  
 ```bash
-# Query any QNet node directly
-curl http://any-qnet-node:8001/api/v1/query-code \
-  -d '{"wallet": "...", "burn_tx": "..."}'
-```
-
-#### **Method 2: Wallet Extension P2P**
-```javascript
-// Wallet connects directly to QNet P2P network
-const code = await qnetP2P.requestActivationCode(burnTxHash);
-// No centralized servers involved!
-```
-
-#### **Method 3: Mobile DHT Client**  
-```javascript
-// Mobile app connects to DHT network
-const code = await dhtClient.findActivationCode(walletAddress);
-// Distributed across thousands of nodes!
+# Query local node for your activation code (authenticated)
+curl http://localhost:8001/api/v1/node/secure-info \
+  -H "Authorization: Bearer <wallet_signature>"
 ```
 
 ### 🎯 **Why This Is Superior:**
 
-- ✅ **True Decentralization**: No single points of failure
+- ✅ **True Decentralization**: No centralized code generation servers
 - ✅ **Quantum Security**: Post-quantum cryptography throughout  
-- ✅ **Consensus Driven**: Multiple nodes must agree on each code
-- ✅ **Blockchain Native**: Everything recorded on immutable ledger
-- ✅ **P2P Distribution**: Codes available from thousands of nodes
+- ✅ **Hash-Only Storage**: Codes cannot be recovered from blockchain
+- ✅ **Blockchain Native**: Only hashes stored on immutable ledger
+- ✅ **Privacy Enhanced**: Full codes never leave user's device
 - ✅ **Forgery Impossible**: Cryptographic proofs at every layer
-- ✅ **User Experience**: Seamless, fast, reliable
+- ✅ **User Experience**: Secure, private, reliable
 
 ### Backup & Recovery
 
