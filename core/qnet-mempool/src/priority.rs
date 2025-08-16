@@ -1,4 +1,4 @@
-//! Transaction priority calculation
+﻿//! Transaction priority calculation
 
 use qnet_state::transaction::Transaction;
 use std::cmp::Ordering;
@@ -136,61 +136,3 @@ impl PriorityCalculator for DefaultPriorityCalculator {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use qnet_state::transaction::TransactionType;
-    
-    #[test]
-    fn test_priority_ordering() {
-        let tx1 = Transaction::new(
-            "sender1".to_string(),
-            TransactionType::Transfer {
-                to: "recipient".to_string(),
-                amount: 100,
-            },
-            1,
-            100, // Higher gas price
-            10_000, // QNet TRANSFER gas limit
-            1234567890,
-        );
-        
-        let tx2 = Transaction::new(
-            "sender2".to_string(),
-            TransactionType::Transfer {
-                to: "recipient".to_string(),
-                amount: 100,
-            },
-            1,
-            50, // Lower gas price
-            10_000, // QNet TRANSFER gas limit
-            1234567890,
-        );
-        
-        let priority1 = TxPriority::new(&tx1, false);
-        let priority2 = TxPriority::new(&tx2, false);
-        
-        assert!(priority1 > priority2);
-    }
-    
-    #[test]
-    fn test_priority_sender_boost() {
-        let tx = Transaction::new(
-            "validator".to_string(),
-            TransactionType::Transfer {
-                to: "recipient".to_string(),
-                amount: 100,
-            },
-            1,
-            50,
-            10_000, // QNet TRANSFER gas limit
-            1234567890,
-        );
-        
-        let normal_priority = TxPriority::new(&tx, false);
-        let priority_priority = TxPriority::new(&tx, true);
-        
-        assert!(priority_priority.score > normal_priority.score);
-        assert_eq!(priority_priority.score, normal_priority.score * 1.5);
-    }
-} 

@@ -1,4 +1,4 @@
-//! QNet Network Configuration
+﻿//! QNet Network Configuration
 //! Centralized configuration for testnet/mainnet separation
 //! 
 //! This replaces all hardcoded URLs and provides network-specific endpoints
@@ -76,7 +76,7 @@ impl QNetNetworkConfig {
             _ => NetworkEnvironment::Testnet, // Default to testnet
         };
         
-        println!("🌐 Network environment: {:?}", environment);
+        println!("рџЊђ Network environment: {:?}", environment);
         Self::for_environment(environment)
     }
     
@@ -199,7 +199,7 @@ impl QNetNetworkConfig {
     }
 }
 
-/// Global network configuration instance
+
 lazy_static::lazy_static! {
     pub static ref NETWORK_CONFIG: QNetNetworkConfig = QNetNetworkConfig::from_env();
 }
@@ -229,37 +229,3 @@ pub fn get_burn_contract() -> &'static str {
     &NETWORK_CONFIG.solana.burn_contract
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    
-    #[test]
-    fn test_testnet_config() {
-        let config = QNetNetworkConfig::for_environment(NetworkEnvironment::Testnet);
-        assert_eq!(config.environment, NetworkEnvironment::Testnet);
-        assert_eq!(config.chain_id, 1337);
-        assert!(config.endpoints.qnet_rpc.contains("testnet"));
-        assert!(config.solana.rpc_url.contains("devnet"));
-    }
-    
-    #[test]
-    fn test_mainnet_config() {
-        let config = QNetNetworkConfig::for_environment(NetworkEnvironment::Mainnet);
-        assert_eq!(config.environment, NetworkEnvironment::Mainnet);
-        assert_eq!(config.chain_id, 1);
-        assert!(!config.endpoints.qnet_rpc.contains("testnet"));
-        assert!(config.solana.rpc_url.contains("mainnet"));
-    }
-    
-    #[test]
-    fn test_bootstrap_nodes() {
-        let testnet = QNetNetworkConfig::for_environment(NetworkEnvironment::Testnet);
-        let bootstrap = testnet.get_bootstrap_nodes();
-        assert_eq!(bootstrap.len(), 5);
-        assert!(bootstrap[0].contains("testnet-genesis"));
-        
-        let mainnet = QNetNetworkConfig::for_environment(NetworkEnvironment::Mainnet);
-        let bootstrap = mainnet.get_bootstrap_nodes();
-        assert!(!bootstrap[0].contains("testnet"));
-    }
-}

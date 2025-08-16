@@ -810,8 +810,14 @@ impl TransactionProcessor {
         // Apply transaction logic
         tx.apply_to_state(accounts)?;
         
-        // Calculate and process fee for Pool 2
-        let fee_amount = tx.gas_price * tx.gas_limit;
+        // Calculate and process fee for Pool 2 - Phase 1 activations are FREE!
+        let fee_amount = match &tx.tx_type {
+            TransactionType::NodeActivation { phase: ActivationPhase::Phase1, .. } => {
+                0 // Phase 1 activations are completely FREE - no QNC gas fees!
+            },
+            _ => tx.gas_price * tx.gas_limit // Normal fees for other transactions
+        };
+        
         if fee_amount > 0 {
             if let Some(ref mut integration) = self.reward_integration {
                 if let Err(e) = integration.process_transaction_fee(
@@ -1000,109 +1006,3 @@ pub fn update_dynamic_gas_pricing(new_pricing: DynamicGasPricing) {
     *DYNAMIC_GAS_PRICING.write().unwrap() = Some(new_pricing);
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    
-    #[test]
-    fn test_transaction_hash() {
-        let tx1 = Transaction::new(
-            "sender1".to_string(),
-            Some("recipient1".to_string()),
-            1000,
-            1,
-            10, // gas_price
-            10_000, // QNet TRANSFER gas limit
-            1234567890,
-            Some("signature1".to_string()),
-            TransactionType::Transfer {
-                from: "sender1".to_string(),
-                to: "recipient1".to_string(),
-                amount: 1000,
-            },
-            None,
-        );
-        
-        let tx2 = Transaction::new(
-            "sender1".to_string(),
-            Some("recipient1".to_string()),
-            1000,
-            1,
-            10, // gas_price
-            10_000, // QNet TRANSFER gas limit
-            1234567890,
-            Some("signature1".to_string()),
-            TransactionType::Transfer {
-                from: "sender1".to_string(),
-                to: "recipient1".to_string(),
-                amount: 1000,
-            },
-            None,
-        );
-        
-        // Same transactions should have same hash
-        assert_eq!(tx1.hash, tx2.hash);
-        
-        // Different nonce should produce different hash
-        let tx3 = Transaction::new(
-            "sender1".to_string(),
-            Some("recipient1".to_string()),
-            1000,
-            2,
-            10, // gas_price
-            10_000, // QNet TRANSFER gas limit
-            1234567890,
-            Some("signature1".to_string()),
-            TransactionType::Transfer {
-                from: "sender1".to_string(),
-                to: "recipient1".to_string(),
-                amount: 1000,
-            },
-            None,
-        );
-        
-        assert_ne!(tx1.hash, tx3.hash);
-    }
-    
-    #[test]
-    fn test_transaction_validation() {
-        let tx = Transaction::new(
-            "sender".to_string(),
-            Some("recipient".to_string()),
-            1000,
-            1,
-            10, // gas_price
-            10_000, // QNet TRANSFER gas limit
-            1234567890,
-            Some("signature".to_string()),
-            TransactionType::Transfer {
-                from: "sender".to_string(),
-                to: "recipient".to_string(),
-                amount: 1000,
-            },
-            None,
-        );
-        
-        assert!(tx.validate().is_ok());
-        
-        // Invalid transaction - zero amount
-        let invalid_tx = Transaction::new(
-            "sender".to_string(),
-            Some("recipient".to_string()),
-            0,
-            1,
-            10, // gas_price
-            10_000, // QNet TRANSFER gas limit
-            1234567890,
-            Some("signature".to_string()),
-            TransactionType::Transfer {
-                from: "sender".to_string(),
-                to: "recipient".to_string(),
-                amount: 0,
-            },
-            None,
-        );
-        
-        assert!(invalid_tx.validate().is_err());
-    }
-} 

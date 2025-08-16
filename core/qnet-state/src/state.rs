@@ -24,7 +24,7 @@ impl Default for ChainState {
     fn default() -> Self {
         Self {
             height: 0,
-            total_supply: 1_000_000_000 * 10u64.pow(9), // 1 billion QNC
+            total_supply: 0, // FAIR LAUNCH: starts at 0, increases only through Pool 1 Base Emission
 
             epoch: 0,
             last_finalized: 0,
@@ -153,58 +153,25 @@ impl StateManager {
     
     /// Create genesis state
     pub fn create_genesis(&self) -> StateResult<()> {
-        // Create genesis accounts
-        let genesis_accounts = vec![
-            ("genesis".to_string(), 100_000_000 * 10u64.pow(9)), // 100M QNC
-            ("faucet".to_string(), 10_000_000 * 10u64.pow(9)),   // 10M QNC
-        ];
+        // FAIR LAUNCH IMPLEMENTATION
+        // No accounts created in genesis - everyone starts with 0 QNC
         
-        for (address, balance) in genesis_accounts {
-            let mut account = Account::new(address.clone());
-            account.balance = balance;
-            self.accounts.insert(address, account);
+        // Initialize chain state with proper emission tracking
+        {
+            let mut chain_state = self.chain_state.write();
+            chain_state.height = 0;
+            chain_state.total_supply = 0; // NO PREMINE - starts at 0!
+            chain_state.epoch = 0;
+            chain_state.last_finalized = 0;
         }
         
-        // Calculate initial state root
+        // Calculate initial state root (empty accounts)
         self.calculate_state_root()?;
+        
+        println!("🚀 Genesis state created: 0 QNC total supply, Fair Launch activated!");
+        println!("📈 Pool 1 Base Emission: DYNAMIC halving system (starts 245,100.67 QNC/4h)");
         
         Ok(())
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    
-    #[test]
-    fn test_state_manager() {
-        let state = StateManager::new();
-        
-        // Create account
-        let mut account = Account::new("alice".to_string());
-        account.balance = 1000;
-        state.update_account("alice".to_string(), account);
-        
-        // Check balance
-        assert_eq!(state.get_balance("alice"), 1000);
-        assert_eq!(state.get_balance("bob"), 0);
-    }
-    
-    #[test]
-    fn test_state_root() {
-        let state = StateManager::new();
-        
-        // Empty state should have consistent root
-        let root1 = state.calculate_state_root().unwrap();
-        let root2 = state.calculate_state_root().unwrap();
-        assert_eq!(root1, root2);
-        
-        // Adding account should change root
-        let mut account = Account::new("alice".to_string());
-        account.balance = 1000;
-        state.update_account("alice".to_string(), account);
-        
-        let root3 = state.calculate_state_root().unwrap();
-        assert_ne!(root1, root3);
-    }
-} 

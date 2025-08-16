@@ -138,14 +138,12 @@ impl StateDB {
         Ok(tx_hash)
     }
     
-    /// Get initial balance for testnet addresses
+    /// Get initial balance for testnet addresses  
     fn get_initial_balance_for_testnet(&self, address: &str) -> u64 {
-        // For testnet, provide some initial balance to test addresses
-        if address.starts_with("test") || address.starts_with("faucet") {
-            1_000_000_000_000_000 // 1M QNC for testing
-        } else {
-            0
-        }
+        // FAIR LAUNCH IMPLEMENTATION
+        // Everyone starts with 0 QNC - no exceptions!
+        // QNC only through Pool 1 Base Emission rewards for active nodes
+        0
     }
     
     /// Process transaction fees for reward pools

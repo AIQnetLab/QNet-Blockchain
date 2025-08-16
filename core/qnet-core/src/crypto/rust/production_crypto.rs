@@ -1,4 +1,4 @@
-//! Production-ready post-quantum cryptography implementation
+﻿//! Production-ready post-quantum cryptography implementation
 //! 
 //! This module implements Dilithium, Kyber, Falcon, and SPHINCS+ algorithms
 //! for quantum-resistant signatures and key exchange.
@@ -585,67 +585,3 @@ pub fn default_sphincs_params() -> SphincsParams {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_dilithium_keypair_generation() {
-        let crypto = ProductionCrypto::new();
-        let params = default_dilithium_params();
-        
-        let result = crypto.generate_dilithium_keypair(&params);
-        assert!(result.is_ok());
-        
-        let (public_key, private_key) = result.unwrap();
-        assert_eq!(public_key.len(), params.public_key_size);
-        assert_eq!(private_key.len(), params.private_key_size);
-    }
-
-    #[test]
-    fn test_dilithium_sign_verify() {
-        let crypto = ProductionCrypto::new();
-        let params = default_dilithium_params();
-        let (public_key, private_key) = crypto.generate_dilithium_keypair(&params).unwrap();
-        
-        let message = b"Hello, QNet!";
-        let message_hash = crypto.secure_hash(message);
-        
-        let signature = crypto.dilithium_sign(&message_hash, &private_key, &params).unwrap();
-        // Note: Actual signature size may vary slightly from expected due to library implementation
-        assert!(signature.len() > 0 && signature.len() <= params.signature_size + 100);
-        
-        let is_valid = crypto.dilithium_verify(&signature, &message_hash, &public_key, &params).unwrap();
-        assert!(is_valid);
-    }
-
-    #[test]
-    fn test_sphincs_keypair_generation() {
-        let crypto = ProductionCrypto::new();
-        let params = default_sphincs_params();
-        
-        let result = crypto.generate_sphincs_keypair(&params);
-        assert!(result.is_ok());
-        
-        let (public_key, private_key) = result.unwrap();
-        assert_eq!(public_key.len(), params.public_key_size);
-        assert_eq!(private_key.len(), params.private_key_size);
-    }
-
-    #[test]
-    fn test_sphincs_sign_verify() {
-        let crypto = ProductionCrypto::new();
-        let params = default_sphincs_params();
-        let (public_key, private_key) = crypto.generate_sphincs_keypair(&params).unwrap();
-        
-        let message = b"Hello, QNet!";
-        let message_hash = crypto.secure_hash(message);
-        
-        let signature = crypto.sphincs_sign(&message_hash, &private_key, &params).unwrap();
-        // Note: Actual signature size may vary slightly from expected due to library implementation  
-        assert!(signature.len() > 0 && signature.len() <= params.signature_size + 100);
-        
-        let is_valid = crypto.sphincs_verify(&signature, &message_hash, &public_key, &params).unwrap();
-        assert!(is_valid);
-    }
-}

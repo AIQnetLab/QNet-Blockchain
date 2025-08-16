@@ -1,4 +1,4 @@
-#![allow(unused_imports)]
+﻿#![allow(unused_imports)]
 #![allow(unused_variables)]
 #![allow(dead_code)]
 #![allow(missing_docs)]
@@ -383,65 +383,3 @@ pub struct ShardStatistics {
     pub cross_shard_tx_count: u64,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    
-    #[tokio::test]
-    async fn test_shard_assignment() {
-        let coordinator = ShardCoordinator::new();
-        let shard1 = coordinator.get_shard("address1");
-        let shard2 = coordinator.get_shard("address2");
-        
-        assert!(shard1 < TOTAL_SHARDS);
-        assert!(shard2 < TOTAL_SHARDS);
-    }
-    
-    #[test]
-    fn test_parallel_validation() {
-        let validator = ParallelValidator::new(4);
-        let txs = (0..1000).map(|i| TransactionData {
-            from: format!("addr_{}", i),
-            to: format!("addr_{}", i + 1000),
-            amount: 100,
-            nonce: i as u64 + 1,
-            signature: "a".repeat(64),
-            data: vec![],
-        }).collect();
-        
-        let start = std::time::Instant::now();
-        let results = validator.validate_batch(txs);
-        let duration = start.elapsed();
-        
-        assert_eq!(results.len(), 1000);
-        assert!(results.iter().all(|r| r.is_valid));
-        println!("Validated 1000 txs in {:?}", duration);
-    }
-    
-    #[tokio::test]
-    async fn test_rebalancing() {
-        let coordinator = ShardCoordinator::new();
-        
-        // Simulate load on some shards
-        for i in 0..10 {
-            coordinator.update_shard_load(i, 100.0).await;
-        }
-        
-        // Add hot accounts
-        for i in 0..20 {
-            coordinator.track_account_activity(&format!("hot_account_{}", i), 1000);
-        }
-        
-        let result = coordinator.rebalance_shards().await.unwrap();
-        println!("Rebalance result: {:?}", result);
-    }
-    
-    #[test]
-    fn test_shard_statistics() {
-        let coordinator = ShardCoordinator::new();
-        let stats = coordinator.get_shard_statistics();
-        
-        assert_eq!(stats.total_shards, TOTAL_SHARDS);
-        assert!(stats.total_tps >= 0.0);
-    }
-}

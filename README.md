@@ -187,20 +187,18 @@ git pull origin testnet
 # Build production Docker image
 docker build -f development/qnet-integration/Dockerfile.production -t qnet-production .
 
-# Run interactive production node (ONLY activation method)
-# For TESTNET:
-docker run -it --name qnet-testnet-node --restart=always \
-  -e QNET_NETWORK=testnet \
+# Run interactive production node (ONLY command needed)
+docker run -it --name qnet-node --restart=always \
   -p 9876:9876 -p 9877:9877 -p 8001:8001 \
-  -v $(pwd)/testnet_node_data:/app/node_data \
+  -v $(pwd)/node_data:/app/node_data \
   qnet-production
 
-# For MAINNET:
-docker run -it --name qnet-mainnet-node --restart=always \
-  -e QNET_NETWORK=mainnet \
-  -p 9876:9876 -p 9877:9877 -p 8001:8001 \
-  -v $(pwd)/mainnet_node_data:/app/node_data \
-  qnet-production
+# During interactive setup:
+# 1. Select network (testnet/mainnet) 
+# 2. Enter activation code from wallet extension
+# 3. Node activates automatically
+
+# Get activation codes at: https://testnet-bridge.qnet.io (via wallet extension)
 ```
 
 **Note**: All Solana contract configuration is embedded in the Docker image. No manual configuration required.
@@ -680,23 +678,144 @@ docker run -d --name qnet-mainnet-genesis-001 --restart=always \
 For rapid testnet deployment with coordinated genesis nodes:
 
 ```bash
-# Launch complete testnet (5 genesis nodes + bridge)
-docker-compose -f docker-compose.testnet.yml up -d
+# Quick testnet startup for developers
+# Note: This is for QNet team development only
+# Regular users should only run individual nodes (see commands above)
 
-# Monitor testnet startup
-docker-compose -f docker-compose.testnet.yml logs -f
+# Start 5 genesis nodes manually:
+docker build -f development/qnet-integration/Dockerfile.production -t qnet-production .
 
-# Stop testnet
-docker-compose -f docker-compose.testnet.yml down
+# Genesis Node 1
+docker run -d --name qnet-genesis-001 --restart=always \
+  -e QNET_NETWORK=testnet \
+  -e QNET_PRODUCTION=1 \
+  -e QNET_BOOTSTRAP_ID=001 \
+  -p 9876:9876 -p 9877:9877 -p 8001:8001 \
+  -v $(pwd)/genesis_001:/app/data \
+  qnet-production
+
+# Genesis Node 2  
+docker run -d --name qnet-genesis-002 --restart=always \
+  -e QNET_NETWORK=testnet \
+  -e QNET_PRODUCTION=1 \
+  -e QNET_BOOTSTRAP_ID=002 \
+  -p 9878:9876 -p 9879:9877 -p 8002:8001 \
+  -v $(pwd)/genesis_002:/app/data \
+  qnet-production
+
+# Repeat for nodes 003, 004, 005...
+
+# Monitor nodes
+docker logs -f qnet-genesis-001
+
+# Stop all
+docker stop qnet-genesis-001 qnet-genesis-002 qnet-genesis-003 qnet-genesis-004 qnet-genesis-005
+docker rm qnet-genesis-001 qnet-genesis-002 qnet-genesis-003 qnet-genesis-004 qnet-genesis-005
 ```
 
-**Testnet Endpoints:**
+**Genesis Node Endpoints:**
 - Genesis Node 1: http://localhost:8001
 - Genesis Node 2: http://localhost:8002  
 - Genesis Node 3: http://localhost:8003
 - Genesis Node 4: http://localhost:8004
 - Genesis Node 5: http://localhost:8005
-- Bridge Server: http://localhost:8080
+
+**Note**: Activation codes are generated automatically by QNet consensus when burn transactions are detected on Solana.
+
+---
+
+## ⚛️ Quantum Decentralized Activation System
+
+### 🔬 **How Quantum Blockchain Generates Codes:**
+
+#### **1️⃣ Autonomous Solana Monitoring:**
+```rust
+// Every QNet node independently monitors Solana
+let burn_transactions = monitor_solana_burns().await;
+for burn_tx in burn_transactions {
+    if burn_tx.amount >= required_1dev && burn_tx.target == INCINERATOR {
+        // Detected valid burn!
+    }
+}
+```
+
+#### **2️⃣ Consensus-Based Code Generation:**
+```rust
+// Quantum-secure deterministic generation
+let leader_node = consensus.select_leader_for_burn(&burn_tx_hash);
+if leader_node == self.node_id {
+    let activation_code = quantum_crypto.generate_code_deterministic(
+        &burn_tx_hash, 
+        &wallet_address, 
+        node_type,
+        burn_amount
+    );
+    dht_network.broadcast_code(activation_code).await;
+}
+```
+
+#### **3️⃣ P2P Distribution via DHT:**
+```rust
+// Codes propagate through quantum DHT network
+dht_client.propagate_to_network(&activation_code, &burn_proof);
+// ANY node can now serve this code to users
+```
+
+### 🔐 **Cryptographic Security:**
+
+#### **✅ Tamper-Proof Code Generation:**
+- **CRYSTALS-Dilithium signatures** - quantum-resistant  
+- **BLAKE3 + SHA3-512 hashing** - deterministic from burn data
+- **Consensus verification** - multiple nodes must agree
+- **Blockchain immutability** - codes recorded on-chain
+
+#### **✅ Impossible to Forge:**
+```rust  
+// Code generation requires:
+// 1. Valid Solana burn transaction (on-chain proof)
+// 2. Consensus agreement from QNet validators  
+// 3. Quantum-secure cryptographic binding
+// 4. Blockchain recording with distributed validation
+
+// Even if attacker runs "fake bridge":
+// - Can't forge Solana burn transactions ❌
+// - Can't bypass quantum crypto validation ❌  
+// - Can't fake consensus signatures ❌
+// - Can't write to QNet blockchain without validation ❌
+```
+
+### 🌐 **How Users Get Codes:**
+
+#### **Method 1: Direct P2P Query**
+```bash
+# Query any QNet node directly
+curl http://any-qnet-node:8001/api/v1/query-code \
+  -d '{"wallet": "...", "burn_tx": "..."}'
+```
+
+#### **Method 2: Wallet Extension P2P**
+```javascript
+// Wallet connects directly to QNet P2P network
+const code = await qnetP2P.requestActivationCode(burnTxHash);
+// No centralized servers involved!
+```
+
+#### **Method 3: Mobile DHT Client**  
+```javascript
+// Mobile app connects to DHT network
+const code = await dhtClient.findActivationCode(walletAddress);
+// Distributed across thousands of nodes!
+```
+
+### 🎯 **Why This Is Superior:**
+
+- ✅ **True Decentralization**: No single points of failure
+- ✅ **Quantum Security**: Post-quantum cryptography throughout  
+- ✅ **Consensus Driven**: Multiple nodes must agree on each code
+- ✅ **Blockchain Native**: Everything recorded on immutable ledger
+- ✅ **P2P Distribution**: Codes available from thousands of nodes
+- ✅ **Forgery Impossible**: Cryptographic proofs at every layer
+- ✅ **User Experience**: Seamless, fast, reliable
 
 ### Backup & Recovery
 

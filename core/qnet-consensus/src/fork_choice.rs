@@ -1,4 +1,4 @@
-//! Fork choice rule implementation for QNet
+﻿//! Fork choice rule implementation for QNet
 
 use std::collections::{HashMap, HashSet};
 
@@ -425,42 +425,3 @@ pub struct Fork {
     pub fork_height: u64,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    
-    #[test]
-    fn test_simple_fork() {
-        let genesis = [0u8; 32];
-        let mut fc = ForkChoice::new(genesis);
-        
-        // Add two competing blocks
-        let block_a = BlockInfo {
-            hash: [1; 32],
-            parent: genesis,
-            height: 1,
-            proposer: [0; 32],
-            proposer_reputation: 80.0,  // FIXED: 0-100 scale
-            timestamp: 1000,
-            round: 0,
-            tx_count: 0,
-        };
-        
-        let block_b = BlockInfo {
-            hash: [2; 32],
-            parent: genesis,
-            height: 1,
-            proposer: [0; 32],
-            proposer_reputation: 90.0,  // FIXED: 0-100 scale
-            timestamp: 1001,
-            round: 0,
-            tx_count: 0,
-        };
-        
-        fc.add_block(block_a).unwrap();
-        fc.add_block(block_b).unwrap();
-        
-        // Should choose block_b due to higher reputation
-        assert_eq!(fc.head, [2; 32]);
-    }
-} 

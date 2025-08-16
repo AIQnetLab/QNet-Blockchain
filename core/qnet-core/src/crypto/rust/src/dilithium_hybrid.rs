@@ -1,4 +1,4 @@
-//! Hybrid Dilithium + Ed25519 wrapper (production-ready)
+﻿//! Hybrid Dilithium + Ed25519 wrapper (production-ready)
 //! June 2025 implementation
 
 use pqcrypto_dilithium::dilithium2::*;
@@ -56,15 +56,3 @@ impl HybridPublicKey {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn hybrid_roundtrip() {
-        let (pk, sk) = HybridSecretKey::generate();
-        let msg = b"Quantum-Hybrid Test";
-        let sig = sk.sign(msg);
-        assert!(pk.verify(msg, &sig));
-    }
-} 

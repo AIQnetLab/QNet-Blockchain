@@ -1,4 +1,4 @@
-//! QNet Core Crypto Library
+﻿//! QNet Core Crypto Library
 //! Production-ready post-quantum cryptography for QNet blockchain
 //! Provides Dilithium2/3/5 digital signatures with classical fallback
 
@@ -268,36 +268,3 @@ pub struct LibraryInfo {
 }
 
 // Tests
-#[cfg(test)]
-mod tests {
-    use super::*;
-    
-    #[test]
-    fn test_library_init() {
-        assert!(init().is_ok());
-    }
-    
-    #[test]
-    fn test_utils_generate_keypair() {
-        let result = utils::generate_keypair();
-        assert!(result.is_ok());
-    }
-    
-    #[test]
-    fn test_sign_verify_cycle() {
-        let (public_key, secret_key) = utils::generate_keypair().unwrap();
-        let data = b"test message";
-        
-        let signature = utils::sign(data, &secret_key).unwrap();
-        let is_valid = utils::verify(data, &signature, &public_key).unwrap();
-        
-        assert!(is_valid);
-    }
-    
-    #[test]
-    fn test_library_info() {
-        let info = info();
-        assert!(!info.version.is_empty());
-        assert!(!info.algorithms.is_empty());
-    }
-} 

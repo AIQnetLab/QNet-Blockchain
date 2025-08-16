@@ -61,7 +61,7 @@ function generateActivationCode(txHash: string): string {
   const fullHash = crypto.createHash('sha512').update(combinedData).digest();
   const quantumHash = crypto.createHash('sha3-256').update(fullHash).digest('hex');
   
-  // Format: QNET-XXXX-XXXX-XXXX (quantum-resistant)
+  // Format: QNET-XXXXXX-XXXXXX-XXXXXX (quantum-resistant, 26 chars)
   return formatActivationCode(quantumHash);
 }
 ```
@@ -238,7 +238,7 @@ cd development/qnet-integration
 
 # Interactive prompts:
 # 1. Economic phase detection (1 or 2)
-# 2. Activation code input: QNET-XXXX-XXXX-XXXX (quantum-secure)
+# 2. Activation code input: QNET-XXXXXX-XXXXXX-XXXXXX (quantum-secure, 26 chars)
 # 3. Node type validation (Full/Super only - Light nodes BLOCKED)
 # 4. Cryptographic ownership verification
 # 5. Region auto-detection
@@ -253,7 +253,7 @@ cd development/qnet-integration
 const activationResult = await QNetMobile.activateNode({
     nodeType: 'Light',
     phase: currentPhase,
-    activationCode: 'QNET-LXXX-XXXX-XXXX', // Quantum-secure generated
+    activationCode: 'QNET-LXXXXX-XXXXXX-XXXXXX', // Quantum-secure generated (26 chars)
     deviceSignature: getDeviceSignature(),
     walletAddress: wallet.address,
     migrationCount: 0 // Migration tracking
@@ -427,7 +427,7 @@ pub async fn check_and_replace_existing_node(
 ### Environment Variables (Production) - **ENHANCED**
 ```bash  
 # Production deployment with security
-export QNET_ACTIVATION_CODE=QNET-XXXX-XXXX-XXXX  # Quantum-secure code
+export QNET_ACTIVATION_CODE=QNET-XXXXXX-XXXXXX-XXXXXX  # Quantum-secure code (26 chars)
 export QNET_NODE_TYPE=full                        # Full/Super only
 export QNET_PRODUCTION=1                          # Enable all security checks
 ./target/release/qnet-node

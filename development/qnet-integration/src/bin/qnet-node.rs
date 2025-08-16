@@ -8,7 +8,7 @@
 //! PRODUCTION DEPLOYMENT: Interactive Setup Only
 //! - No command-line arguments for activation
 //! - Use built-in interactive menu for node configuration
-//! - Activation code required (format: QNET-XXXX-XXXX-XXXX)
+//! - Activation code required (format: QNET-XXXXXX-XXXXXX-XXXXXX)
 //! 
 //! Features:
 //! - Microblocks as default mode for 100k+ TPS
@@ -411,9 +411,9 @@ async fn validate_activation_code_comprehensive(
         return Ok(());
     }
     
-    // 3. Format validation - QNET-XXXX-XXXX-XXXX for regular production codes
-    if !code.starts_with("QNET-") || code.len() != 17 {
-        return Err("Invalid activation code format. Expected: QNET-XXXX-XXXX-XXXX".to_string());
+    // 3. Format validation - QNET-XXXXXX-XXXXXX-XXXXXX for regular production codes (enhanced security)
+    if !code.starts_with("QNET-") || code.len() != 26 {
+        return Err("Invalid activation code format. Expected: QNET-XXXXXX-XXXXXX-XXXXXX (26 chars)".to_string());
     }
     
             // 4. Phase and pricing validation with quantum decryption
@@ -565,7 +565,7 @@ async fn interactive_node_setup() -> Result<(NodeType, String), Box<dyn std::err
 
                 // Basic format validation
                 if !code.starts_with("QNET-") {
-                    println!("❌ Invalid activation code format. Expected format: QNET-XXXX-XXXX-XXXX");
+                    println!("❌ Invalid activation code format. Expected format: QNET-XXXXXX-XXXXXX-XXXXXX");
                     continue;
                 }
 

@@ -1764,9 +1764,9 @@ impl BlockchainNode {
             println!("✅ Genesis bootstrap code detected in node.rs: {}", code);
             // Skip format validation for genesis codes
         } else {
-            // Check basic format for regular codes
-            if !code.starts_with("QNET-") || code.len() != 17 {
-                return Err(QNetError::ValidationError("Invalid activation code format".to_string()));
+            // Check basic format for regular codes (26-char format only)
+            if !code.starts_with("QNET-") || code.len() != 26 {
+                return Err(QNetError::ValidationError("Invalid activation code format. Expected: QNET-XXXXXX-XXXXXX-XXXXXX (26 chars)".to_string()));
             }
         }
         
@@ -1777,7 +1777,7 @@ impl BlockchainNode {
             .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
             
         let registry = crate::activation_validation::BlockchainActivationRegistry::new(
-            Some(qnet_rpc)
+            Some(qnet_rpc.clone())
         );
         
         // FIXED: Check code ownership instead of usage (1 wallet = 1 code, but reusable on devices)
@@ -1805,9 +1805,15 @@ impl BlockchainNode {
             }
         };
             
-        // Create node info for blockchain registry
+        // Create node info for blockchain registry with secure hash
+        let registry = crate::activation_validation::BlockchainActivationRegistry::new(
+            Some(qnet_rpc.clone())
+        );
+        let code_hash = registry.hash_activation_code_for_blockchain(code)
+            .unwrap_or_else(|_| blake3::hash(code.as_bytes()).to_hex().to_string());
+        
         let node_info = crate::activation_validation::NodeInfo {
-            activation_code: code.to_string(),
+            activation_code: code_hash, // Use hash for secure blockchain storage
             wallet_address,
             device_signature: self.get_device_signature(),
             node_type: format!("{:?}", node_type),
@@ -1888,9 +1894,9 @@ impl BlockchainNode {
             return Err("Empty activation code is not allowed".to_string());
         }
         
-        // Validate format: QNET-XXXX-XXXX-XXXX
-        if !code.starts_with("QNET-") || code.len() != 17 {
-            return Err("Invalid activation code format. Expected: QNET-XXXX-XXXX-XXXX".to_string());
+        // Validate format: QNET-XXXXXX-XXXXXX-XXXXXX (26 chars)
+        if !code.starts_with("QNET-") || code.len() != 26 {
+            return Err("Invalid activation code format. Expected: QNET-XXXXXX-XXXXXX-XXXXXX (26 chars)".to_string());
         }
         
         // Use centralized ActivationValidator from activation_validation.rs

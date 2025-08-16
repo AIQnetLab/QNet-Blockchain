@@ -8,16 +8,28 @@ export class ActivationBridgeClient {
     constructor(networkManager) {
         this.networkManager = networkManager;
         
-        // Production bridge endpoints
-        this.bridgeEndpoints = {
-            mainnet: 'https://bridge.qnet.io',
-            testnet: 'https://testnet-bridge.qnet.io',
-            local: 'http://localhost:8080'
+        // QUANTUM P2P: Direct connection to QNet nodes (no bridge servers)
+        this.qnetEndpoints = {
+            mainnet: [
+                'https://rpc.qnet.io',              // Primary mainnet
+                'https://rpc-eu.qnet.io',           // Europe
+                'https://rpc-asia.qnet.io',         // Asia  
+                'https://rpc-us.qnet.io'            // US backup
+            ],
+            testnet: [
+                'https://testnet-rpc.qnet.io',      // Primary testnet
+                'http://localhost:8001',            // Local node 1
+                'http://localhost:8002',            // Local node 2
+                'http://localhost:8003'             // Local node 3
+            ],
+            local: ['http://localhost:8001', 'http://localhost:8002', 'http://localhost:8003']
         };
         
-        this.currentEndpoint = this.bridgeEndpoints.testnet;
+        this.currentEndpoint = null;
+        this.endpointIndex = 0;
         this.timeout = 30000;
         this.authToken = null;
+        this.maxRetries = 3;
         
         // Phase 2 QNC activation costs with network size multipliers
         this.qncActivationCosts = {
@@ -39,22 +51,22 @@ export class ActivationBridgeClient {
     }
 
     /**
-     * Request activation token from bridge
+     * Request activation code directly from QNet P2P network (no bridge needed)
      */
     async requestActivationToken(burnTx, nodeType, qnetPublicKey, solanaAddress) {
         try {
             const requestData = {
-                qnet_pubkey: qnetPublicKey,
-                solana_txid: burnTx.signature,
-                solana_pubkey_user: solanaAddress,
+                wallet_address: solanaAddress,
+                burn_tx_hash: burnTx.signature,
                 node_type: nodeType,
                 burn_amount: burnTx.amount,
-                timestamp: burnTx.timestamp
+                timestamp: burnTx.timestamp,
+                method: 'query_activation_code'
             };
 
-            console.log('Requesting activation token:', requestData);
+            console.log('[P2P] Requesting activation code from QNet nodes:', requestData);
 
-            const response = await this.makeRequest('/api/v1/request_activation_token', {
+            const response = await this.makeRequest('/api/v1/query-activation-code', {
                 method: 'POST',
                 body: JSON.stringify(requestData)
             });
@@ -580,60 +592,106 @@ export class ActivationBridgeClient {
     }
 
     /**
-     * Make HTTP request to bridge API
+     * Get current QNet P2P endpoints for active network  
+     */
+    getCurrentEndpoints() {
+        const network = this.networkManager.getCurrentNetwork();
+        return this.qnetEndpoints[network] || this.qnetEndpoints.testnet;
+    }
+
+    /**
+     * Get next available endpoint for failover
+     */
+    getNextEndpoint() {
+        const endpoints = this.getCurrentEndpoints();
+        this.endpointIndex = (this.endpointIndex + 1) % endpoints.length;
+        return endpoints[this.endpointIndex];
+    }
+
+    /**
+     * Make HTTP request to bridge API with failover support
      */
     async makeRequest(endpoint, options = {}) {
-        const url = `${this.currentEndpoint}${endpoint}`;
+        const endpoints = this.getCurrentEndpoints();
+        let lastError = null;
         
-        const defaultOptions = {
-            headers: {
-                'Content-Type': 'application/json',
-                'User-Agent': 'QNet-Wallet/2.0.0',
-                'X-Client-Type': 'desktop'
-            },
-            timeout: this.timeout
-        };
+        // Try each endpoint in sequence
+        for (let attempt = 0; attempt < endpoints.length; attempt++) {
+            const currentEndpoint = endpoints[(this.endpointIndex + attempt) % endpoints.length];
+            const url = `${currentEndpoint}${endpoint}`;
+            
+            console.log(`[P2P] Attempt ${attempt + 1}/${endpoints.length} - ${currentEndpoint}`);
+            
+            const defaultOptions = {
+                headers: {
+                    'Content-Type': 'application/json',
+                    'User-Agent': 'QNet-Wallet/2.0.0',
+                    'X-Client-Type': 'desktop',
+                    'X-P2P-Request': 'activation-code'
+                },
+                timeout: this.timeout
+            };
 
-        const requestOptions = {
-            ...defaultOptions,
-            ...options,
-            headers: {
-                ...defaultOptions.headers,
-                ...options.headers
+            const requestOptions = {
+                ...defaultOptions,
+                ...options,
+                headers: {
+                    ...defaultOptions.headers,
+                    ...options.headers
+                }
+            };
+
+            try {
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), this.timeout);
+
+                const response = await fetch(url, {
+                    ...requestOptions,
+                    signal: controller.signal
+                });
+
+                clearTimeout(timeoutId);
+
+                // Handle authentication errors
+                if (response.status === 401) {
+                    this.authToken = null;
+                    console.warn(`[P2P] Authentication expired on ${currentEndpoint}`);
+                    lastError = new Error('Authentication expired');
+                    continue; // Try next endpoint
+                }
+
+                if (!response.ok) {
+                    const errorText = await response.text();
+                    console.warn(`[P2P] HTTP error ${response.status} from ${currentEndpoint}: ${errorText}`);
+                    lastError = new Error(`HTTP ${response.status}: ${errorText}`);
+                    continue; // Try next endpoint
+                }
+
+                const data = await response.json();
+                console.log(`[P2P] Success from QNet node: ${currentEndpoint}`);
+                
+                // Update current endpoint index for next request
+                this.endpointIndex = (this.endpointIndex + attempt) % endpoints.length;
+                this.currentEndpoint = currentEndpoint;
+                
+                return data;
+
+            } catch (error) {
+                console.warn(`[P2P] Error from QNet node ${currentEndpoint}:`, error.message);
+                lastError = error;
+                
+                if (error.name === 'AbortError') {
+                    lastError = new Error(`Request timeout from QNet node ${currentEndpoint}`);
+                }
+                
+                // Continue to next endpoint
+                continue;
             }
-        };
-
-        try {
-            const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort(), this.timeout);
-
-            const response = await fetch(url, {
-                ...requestOptions,
-                signal: controller.signal
-            });
-
-            clearTimeout(timeoutId);
-
-            // Handle authentication errors
-            if (response.status === 401) {
-                this.authToken = null;
-                throw new Error('Authentication expired');
-            }
-
-            if (!response.ok) {
-                const errorText = await response.text();
-                throw new Error(`HTTP ${response.status}: ${errorText}`);
-            }
-
-            const data = await response.json();
-            return data;
-
-        } catch (error) {
-            if (error.name === 'AbortError') {
-                throw new Error('Request timeout');
-            }
-            throw error;
         }
+
+        // All endpoints failed
+        console.error(`[P2P] All ${endpoints.length} QNet nodes failed. Last error:`, lastError?.message);
+        throw lastError || new Error('All QNet P2P nodes unavailable');
     }
 
     /**

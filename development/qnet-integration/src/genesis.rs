@@ -24,9 +24,9 @@ impl Default for GenesisConfig {
             
         Self {
             accounts: vec![
-                // QNC emission: 2^32 = 4,294,967,296 (quantum blockchain reference!)
-                // All tokens in rewards pool for fair distribution
-                ("rewards".to_string(), 4_294_967_296), // 2^32 QNC total supply
+                // FAIR LAUNCH: Empty genesis - all QNC through Pool 1 Base Emission
+                // Pool 1: Dynamic halving system (245,100.67 QNC/4h initial)
+                // Sharp Drop Halving: ÷2 every 4 years, ÷10 at year 20-24
             ],
             timestamp: genesis_timestamp,
             network: "mainnet".to_string(),

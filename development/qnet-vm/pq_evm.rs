@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+﻿use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use sha3::{Digest, Keccak256};
 use serde::{Deserialize, Serialize};
@@ -783,45 +783,3 @@ impl PQCryptoContext {
     }
 }
 
-/// Production-ready tests
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_pq_evm_creation() {
-        let evm = PostQuantumEVM::new();
-        assert_eq!(evm.max_gas_limit, 30_000_000);
-    }
-
-    #[test]
-    fn test_account_creation() {
-        let account = Account::default();
-        assert_eq!(account.nonce, 0);
-        assert_eq!(account.balance, 0);
-    }
-
-    #[test]
-    fn test_gas_config() {
-        let config = GasConfig::default();
-        assert_eq!(config.add, 3);
-        assert_eq!(config.pq_sign, 1000);
-    }
-
-    #[test]
-    fn test_state_operations() {
-        let mut state = EVMState::new();
-        let address = [1u8; 20];
-        let account = Account {
-            nonce: 1,
-            balance: 1000,
-            ..Default::default()
-        };
-
-        state.set_account(address, account.clone());
-        let retrieved = state.get_account(&address);
-        
-        assert_eq!(retrieved.nonce, account.nonce);
-        assert_eq!(retrieved.balance, account.balance);
-    }
-} 

@@ -9,15 +9,27 @@ import { Alert } from 'react-native';
 
 class BridgeServiceClass {
   constructor() {
-    this.bridgeEndpoints = {
-      testnet: 'https://testnet-bridge.qnet.io',
-      mainnet: 'https://bridge.qnet.io',
-      local: 'http://localhost:8080' // For development
+    // QUANTUM P2P: Direct connection to QNet nodes (no bridge servers needed)
+    this.qnetEndpoints = {
+      testnet: [
+        'https://testnet-rpc.qnet.io',         // Primary testnet
+        'http://localhost:8001',              // Local node 1
+        'http://localhost:8002',              // Local node 2
+        'http://localhost:8003'               // Local node 3
+      ],
+      mainnet: [
+        'https://rpc.qnet.io',                // Primary mainnet
+        'https://rpc-eu.qnet.io',             // Europe
+        'https://rpc-asia.qnet.io',           // Asia
+        'https://rpc-us.qnet.io'              // US backup
+      ],
+      local: ['http://localhost:8001', 'http://localhost:8002', 'http://localhost:8003']
     };
     
     // Auto-detect network from environment
     const networkEnv = process.env.QNET_NETWORK || 'testnet';
-    this.currentEndpoint = this.bridgeEndpoints[networkEnv] || this.bridgeEndpoints.testnet;
+    this.currentEndpoints = this.qnetEndpoints[networkEnv] || this.qnetEndpoints.testnet;
+    this.endpointIndex = 0;
     this.isConnected = false;
     this.authToken = null;
     

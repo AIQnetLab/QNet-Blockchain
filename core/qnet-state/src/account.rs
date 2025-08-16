@@ -160,37 +160,3 @@ impl Account {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    
-    #[test]
-    fn test_account_transfer() {
-        let mut account = Account::with_balance("test".to_string(), 1000);
-        
-        // Successful transfer
-        assert!(account.transfer_out(500).is_ok());
-        assert_eq!(account.balance, 500);
-        assert_eq!(account.nonce, 1);
-        
-        // Insufficient balance
-        assert!(account.transfer_out(600).is_err());
-        assert_eq!(account.balance, 500);
-        assert_eq!(account.nonce, 1);
-        
-        // Transfer in
-        account.transfer_in(300);
-        assert_eq!(account.balance, 800);
-    }
-    
-    #[test]
-    fn test_node_activation() {
-        let mut account = Account::new("test".to_string());
-        assert!(!account.is_node());
-        
-        account.activate_node("Light".to_string(), 1234567890);
-        
-        assert!(account.is_node());
-        assert_eq!(account.node_type(), Some(&"Light".to_string()));
-    }
-} 

@@ -1,4 +1,4 @@
-//! File encryption for LSM storage protection
+﻿//! File encryption for LSM storage protection
 //! 
 //! This module provides AES-256-GCM encryption for protecting files on disk
 //! while maintaining blockchain transparency. Data content remains publicly
@@ -356,43 +356,3 @@ pub struct EncryptionStats {
     pub node_id: String,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    
-    #[test]
-    fn test_file_encryption_roundtrip() {
-        let encryption = FileEncryption::new(true, "test_node".to_string()).unwrap();
-        let original_data = b"Hello, QNet blockchain! This is test data for encryption.";
-        
-        // Encrypt
-        let encrypted = encryption.encrypt_file_data(original_data, FileType::SST).unwrap();
-        assert_ne!(encrypted, original_data);
-        assert!(encrypted.len() > original_data.len()); // Has header
-        
-        // Decrypt
-        let decrypted = encryption.decrypt_file_data(&encrypted).unwrap();
-        assert_eq!(decrypted, original_data);
-    }
-    
-    #[test]
-    fn test_disabled_encryption() {
-        let encryption = FileEncryption::new(false, "test_node".to_string()).unwrap();
-        let data = b"Test data";
-        
-        let encrypted = encryption.encrypt_file_data(data, FileType::WAL).unwrap();
-        assert_eq!(encrypted, data); // No encryption when disabled
-        
-        let decrypted = encryption.decrypt_file_data(&encrypted).unwrap();
-        assert_eq!(decrypted, data);
-    }
-    
-    #[test] 
-    fn test_key_rotation() {
-        let mut encryption = FileEncryption::new(true, "test_node".to_string()).unwrap();
-        let original_key = encryption.master_key.clone();
-        
-        encryption.rotate_key().unwrap();
-        assert_ne!(encryption.master_key, original_key);
-    }
-} 

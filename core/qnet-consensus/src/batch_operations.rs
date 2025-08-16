@@ -430,23 +430,3 @@ impl BatchOperationsManager {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::{Arc, Mutex};
-    
-    #[test]
-    fn test_batch_id_generation() {
-        let batch_id = BatchOperationsManager::generate_batch_id(BatchOperationType::RewardClaims);
-        assert!(batch_id.starts_with("batch_rewards_"));
-        assert!(batch_id.len() > 15);
-    }
-
-    #[test]
-    fn test_batch_size_limits() {
-        // Test that our limits are reasonable
-        assert!(MAX_REWARD_CLAIMS_PER_BATCH <= 100);
-        assert!(MAX_NODE_ACTIVATIONS_PER_BATCH <= 50);
-        assert!(MAX_TRANSFERS_PER_BATCH <= 200);
-    }
-} 

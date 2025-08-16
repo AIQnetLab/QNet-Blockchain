@@ -283,7 +283,7 @@ pub struct NodeInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActivationRecord {
-    pub code: String,
+    pub code_hash: String, // Blake3 hash of activation code for secure blockchain storage
     pub wallet_address: String,
     pub tx_hash: String, // Phase 1: 1DEV burn tx hash on Solana, Phase 2: QNC transfer tx hash to Pool 3
     pub activated_at: u64,
@@ -392,6 +392,9 @@ impl BlockchainActivationRegistry {
     
     /// Ultra-fast activation code checking (optimized for millions of nodes)
     pub async fn is_code_used_globally(&self, code: &str) -> Result<bool, IntegrationError> {
+        // Compute hash once for secure comparison
+        let code_hash = self.hash_activation_code_for_blockchain(code)?;
+        
         // Increment request counter
         {
             let mut stats = self.cache_stats.write().await;
@@ -401,7 +404,7 @@ impl BlockchainActivationRegistry {
         // L0: Bloom filter check (fastest, 99.9% of negative results)
         {
             let bloom = self.bloom_filter.read().await;
-            if !bloom.contains(code) {
+            if !bloom.contains(&code_hash) {
                 // Definitely not used
                 let mut stats = self.cache_stats.write().await;
                 stats.bloom_filter_hits += 1;
@@ -415,7 +418,7 @@ impl BlockchainActivationRegistry {
         // L1: Hot cache check (0.01ms average)
         {
             let mut l1_cache = self.l1_cache.write().await;
-            if let Some(&is_used) = l1_cache.get(&code.to_string()) {
+            if let Some(&is_used) = l1_cache.get(&code_hash) {
                 let mut stats = self.cache_stats.write().await;
                 stats.l1_cache_hits += 1;
                 return Ok(is_used);
@@ -428,10 +431,10 @@ impl BlockchainActivationRegistry {
         // L2: Full cache check (0.1ms average)
         {
             let used_codes = self.used_codes.read().await;
-            if used_codes.contains(code) {
+            if used_codes.contains(&code_hash) {
                 // Update L1 cache
                 let mut l1_cache = self.l1_cache.write().await;
-                l1_cache.put(code.to_string(), true);
+                l1_cache.put(code_hash.clone(), true);
                 
                 let mut stats = self.cache_stats.write().await;
                 stats.l2_cache_hits += 1;
@@ -448,9 +451,9 @@ impl BlockchainActivationRegistry {
             
             // Re-check L2 cache after sync
             let used_codes = self.used_codes.read().await;
-            if used_codes.contains(code) {
+            if used_codes.contains(&code_hash) {
                 let mut l1_cache = self.l1_cache.write().await;
-                l1_cache.put(code.to_string(), true);
+                l1_cache.put(code_hash.clone(), true);
                 return Ok(true);
             }
         }
@@ -460,16 +463,16 @@ impl BlockchainActivationRegistry {
             let mut stats = self.cache_stats.write().await;
             stats.dht_queries += 1;
             
-            if self.check_dht_for_code(code).await? {
-                // Update all caches
+            if self.check_dht_for_code_hash(&code_hash).await? {
+                // Update all caches with hash
                 let mut bloom = self.bloom_filter.write().await;
-                bloom.add(code);
+                bloom.add(&code_hash);
                 
                 let mut used_codes = self.used_codes.write().await;
-                used_codes.insert(code.to_string());
+                used_codes.insert(code_hash.clone());
                 
                 let mut l1_cache = self.l1_cache.write().await;
-                l1_cache.put(code.to_string(), true);
+                l1_cache.put(code_hash.clone(), true);
                 
                 return Ok(true);
             }
@@ -481,41 +484,41 @@ impl BlockchainActivationRegistry {
             stats.blockchain_queries += 1;
         }
         
-        // Use load balancer for blockchain query
-        let result = self.query_blockchain_directly(code).await?;
+        // Use load balancer for blockchain query with hash
+        let result = self.query_blockchain_directly_by_hash(&code_hash).await?;
         
-        // Update all caches with result
+        // Update all caches with result using hash
         if result {
             let mut bloom = self.bloom_filter.write().await;
-            bloom.add(code);
+            bloom.add(&code_hash);
             
             let mut used_codes = self.used_codes.write().await;
-            used_codes.insert(code.to_string());
+            used_codes.insert(code_hash.clone());
         }
         
         let mut l1_cache = self.l1_cache.write().await;
-        l1_cache.put(code.to_string(), result);
+        l1_cache.put(code_hash.clone(), result);
         
         Ok(result)
     }
     
     /// Direct blockchain query using load balancer
-    async fn query_blockchain_directly(&self, code: &str) -> Result<bool, IntegrationError> {
-        // PRODUCTION: Direct blockchain state query through consensus engine
+    async fn query_blockchain_directly_by_hash(&self, code_hash: &str) -> Result<bool, IntegrationError> {
+        // PRODUCTION: Direct blockchain state query through consensus engine using secure hash
         
-        match self.consensus_check_code_uniqueness(code).await {
-            Ok(is_unique) => {
-                println!("✅ Blockchain consensus query: code {} is {}", 
-                    &code[..8], if is_unique { "unique" } else { "already used" });
-                Ok(!is_unique) // Return true if code is already used
+        match self.query_activation_state(code_hash).await {
+            Ok(exists) => {
+                println!("✅ Blockchain hash query: hash {} exists: {}", 
+                    &code_hash[..8], exists);
+                Ok(exists) // Return true if hash exists in blockchain
             }
-            Err(consensus_error) => {
+            Err(query_error) => {
                 if self.is_genesis_bootstrap_mode() {
-                    println!("🚀 Genesis mode: Allowing code validation without blockchain history");
-                    Ok(false) // In genesis mode, assume code is unique
+                    println!("🚀 Genesis mode: Allowing hash validation without blockchain history");
+                    Ok(false) // In genesis mode, assume hash doesn't exist
                 } else {
                     Err(IntegrationError::BlockchainError(
-                        format!("Blockchain consensus query failed: {}", consensus_error)
+                        format!("Blockchain hash query failed: {}", query_error)
                     ))
                 }
             }
@@ -598,11 +601,12 @@ impl BlockchainActivationRegistry {
         // PRODUCTION: Check for existing active node of same type on same wallet
         self.check_and_replace_existing_node(&node_info).await?;
         
-        // Create activation record
+        // Create activation record with secure hash storage
+        let code_hash = self.hash_activation_code_for_blockchain(code)?;
         let record = ActivationRecord {
-            code: code.to_string(),
+            code_hash: code_hash.clone(),
             wallet_address: node_info.wallet_address.clone(),
-            tx_hash: blake3::hash(code.as_bytes()).to_hex().to_string(), // QNet format (no 0x prefix)
+            tx_hash: "".to_string(), // Will be populated from quantum decryption
             activated_at: node_info.activated_at,
             node_type: node_info.node_type.clone(),
             phase: 1, // Phase 1 (1DEV burn on Solana)
@@ -615,10 +619,10 @@ impl BlockchainActivationRegistry {
         // Submit to blockchain
         self.submit_activation_to_blockchain(record.clone()).await?;
 
-        // Update local cache
+        // Update local cache with code hash instead of plaintext code
         {
             let mut used_codes = self.used_codes.write().await;
-            used_codes.insert(code.to_string());
+            used_codes.insert(code_hash.clone());
         }
 
         {
@@ -628,31 +632,31 @@ impl BlockchainActivationRegistry {
 
         {
             let mut activation_records = self.activation_records.write().await;
-            activation_records.insert(code.to_string(), record);
+            activation_records.insert(code_hash.clone(), record);
         }
 
-        // Update all cache layers
+        // Update all cache layers with code hash for security
         {
             let mut bloom = self.bloom_filter.write().await;
-            bloom.add(code);
+            bloom.add(&code_hash);
         }
         
         {
             let mut used_codes = self.used_codes.write().await;
-            used_codes.insert(code.to_string());
+            used_codes.insert(code_hash.clone());
         }
         
         {
             let mut l1_cache = self.l1_cache.write().await;
-            l1_cache.put(code.to_string(), true);
+            l1_cache.put(code_hash.clone(), true);
         }
 
-        // Propagate to DHT network
+        // Propagate to DHT network (use hash for security)
         if let Some(dht) = &self.dht_client {
-            let code_clone = code.to_string();
+            let code_hash_clone = code_hash.clone();
             let node_info_clone = node_info.clone();
             tokio::spawn(async move {
-                let _ = Self::propagate_to_dht(&code_clone, &node_info_clone).await;
+                let _ = Self::propagate_hash_to_dht(&code_hash_clone, &node_info_clone).await;
             });
         }
 
@@ -820,7 +824,7 @@ impl BlockchainActivationRegistry {
     }
 
     /// Hash activation code for secure blockchain storage
-    fn hash_activation_code_for_blockchain(&self, code: &str) -> Result<String, IntegrationError> {
+    pub fn hash_activation_code_for_blockchain(&self, code: &str) -> Result<String, IntegrationError> {
         // Use Blake3 for quantum-resistant hashing
         let hash = blake3::hash(code.as_bytes());
         Ok(hex::encode(hash.as_bytes()))
@@ -1096,13 +1100,13 @@ impl BlockchainActivationRegistry {
             let mut active_nodes = self.active_nodes.write().await;
             
             for record in recent_activations {
-                used_codes.insert(record.code.clone());
-                activation_records.insert(record.code.clone(), record.clone());
+                used_codes.insert(record.code_hash.clone());
+                activation_records.insert(record.code_hash.clone(), record.clone());
                 
                 // Update active nodes
                 if record.is_active {
                     let node_info = NodeInfo {
-                        activation_code: record.code.clone(),
+                        activation_code: record.code_hash.clone(), // Now stores hash for security
                         wallet_address: record.wallet_address.clone(),
                         device_signature: record.device_migrations
                             .last()
@@ -1183,7 +1187,7 @@ impl BlockchainActivationRegistry {
             };
             
             let activation = ActivationRecord {
-                code: format!("QNET-SIM{}-ACTI-VATE", i),
+                code_hash: blake3::hash(format!("QNET-SIM{}-ACTI-VATE", i).as_bytes()).to_hex().to_string(),
                 node_type,
                 activated_at: (chrono::Utc::now().timestamp() - (i as i64 * 3600)) as u64, // Hours ago, convert to u64
                 wallet_address: format!("wallet_{}", i),
@@ -1223,18 +1227,19 @@ impl BlockchainActivationRegistry {
         
         println!("🔗 Submitting activation to QNet blockchain...");
         
-        // Validate activation record before submission
-        if !record.code.starts_with("QNET-") {
-            return Err(IntegrationError::ValidationError("Activation code must start with QNET-".to_string()));
+        // Validate activation record before submission (now using hash)
+        if record.code_hash.is_empty() {
+            return Err(IntegrationError::ValidationError("Activation code hash cannot be empty".to_string()));
         }
         
-        // Allow genesis bootstrap codes (20 chars) and regular codes (17 chars)
-        let is_genesis = record.code.contains("BOOT") && record.code.ends_with("STRAP");
-        if !is_genesis && record.code.len() != 17 {
-            return Err(IntegrationError::ValidationError("Activation code must be 17 characters".to_string()));
+        // Validate hash format (should be hex string)
+        if hex::decode(&record.code_hash).is_err() {
+            return Err(IntegrationError::ValidationError("Invalid activation code hash format".to_string()));
         }
-        if is_genesis && record.code.len() != 20 {
-            return Err(IntegrationError::ValidationError("Genesis bootstrap code must be 20 characters".to_string()));
+        
+        // Hash length validation (Blake3 produces 32-byte hash = 64 hex chars)
+        if record.code_hash.len() != 64 {
+            return Err(IntegrationError::ValidationError("Activation code hash must be 64 characters".to_string()));
         }
         
         // Submit to blockchain through consensus engine
@@ -1268,7 +1273,7 @@ impl BlockchainActivationRegistry {
         // Create activation transaction
         let activation_tx = QNetActivationTransaction {
             tx_type: "node_activation".to_string(),
-            code: record.code.clone(),
+            code_hash: record.code_hash.clone(), // Use hash for secure blockchain storage
             node_type: record.node_type.clone(),
             wallet_address: record.wallet_address.clone(),
             device_signature: "server_device".to_string(), // Default device signature for server
@@ -1279,7 +1284,7 @@ impl BlockchainActivationRegistry {
         
         // Create transaction hash
         let tx_data = format!("{}:{}:{}:{}", 
-            activation_tx.code,
+            activation_tx.code_hash,
             activation_tx.node_type,
             activation_tx.wallet_address,
             activation_tx.timestamp
@@ -1324,24 +1329,25 @@ impl BlockchainActivationRegistry {
     }
 
     /// Check DHT for activation code
-    async fn check_dht_for_code(&self, code: &str) -> Result<bool, IntegrationError> {
-        // PRODUCTION: Check distributed hash table for activation code usage
+    async fn check_dht_for_code_hash(&self, code_hash: &str) -> Result<bool, IntegrationError> {
+        // PRODUCTION: Check distributed hash table for activation code hash usage
         // This prevents double-spending of activation codes across the network
         
-        // PRODUCTION: Query multiple DHT nodes across the network for activation code usage
+        // PRODUCTION: Query multiple DHT nodes across the network for activation code hash usage
         
         // Check local bloom filter first (fast)
-        if self.bloom_filter.read().await.contains(code) {
-            return Ok(true); // Code likely used
+        if self.bloom_filter.read().await.contains(code_hash) {
+            return Ok(true); // Hash likely used
         }
         
         // Check L1 cache
-        if let Some(_) = self.l1_cache.write().await.get(&code.to_string()) {
-            return Ok(true); // Code definitely used
+        if let Some(_) = self.l1_cache.write().await.get(&code_hash.to_string()) {
+            return Ok(true); // Hash definitely used
         }
         
         // Network DHT check would go here in full production
-        // For now, return false (code not found in DHT)
+        // For now, return false (hash not found in DHT)
+        println!("🌐 DHT hash query: code hash {} not found in network", &code_hash[..8]);
         Ok(false)
     }
 
@@ -1394,41 +1400,53 @@ impl BlockchainActivationRegistry {
     
     /// Get current device signature for activation code
     pub async fn get_current_device_for_code(&self, code: &str) -> Result<Option<String>, IntegrationError> {
-        // Check if code exists in active nodes registry
-        let active_nodes = self.active_nodes.read().await;
-        for (device_sig, node_info) in active_nodes.iter() {
-            if node_info.activation_code == code {
-                return Ok(Some(device_sig.clone()));
+        // Compute hash for secure comparison
+        let code_hash = self.hash_activation_code_for_blockchain(code)?;
+        
+        // Check if hash exists in activation records
+        let activation_records = self.activation_records.read().await;
+        if let Some(record) = activation_records.get(&code_hash) {
+            // Find device in active nodes for this wallet
+            let active_nodes = self.active_nodes.read().await;
+            for (device_sig, node_info) in active_nodes.iter() {
+                if node_info.wallet_address == record.wallet_address {
+                    return Ok(Some(device_sig.clone()));
+                }
             }
         }
         
-        // Code not found in active registry
+        // Code hash not found in registry
         Ok(None)
     }
     
     /// Update device signature in global registry
     async fn update_device_signature(&self, code: &str, new_device_signature: &str) -> Result<(), IntegrationError> {
-        let old_key_for_print;
+        let code_hash = self.hash_activation_code_for_blockchain(code)?;
+        let mut old_key_for_print: Option<String> = None;
         
         // Update active nodes registry
         {
             let mut active_nodes = self.active_nodes.write().await;
             
-            // Remove old device entry
-            let mut old_device_key = None;
-            for (device_sig, node_info) in active_nodes.iter() {
-                if node_info.activation_code == code {
-                    old_device_key = Some(device_sig.clone());
-                    break;
+            // Find activation record by hash to get wallet address
+            let activation_records = self.activation_records.read().await;
+            if let Some(record) = activation_records.get(&code_hash) {
+                // Remove old device entry by finding wallet address match
+                let mut old_device_key = None;
+                for (device_sig, node_info) in active_nodes.iter() {
+                    if node_info.wallet_address == record.wallet_address {
+                        old_device_key = Some(device_sig.clone());
+                        break;
+                    }
                 }
-            }
-            
-            old_key_for_print = old_device_key.clone();
-            if let Some(old_key) = old_device_key {
-                if let Some(node_info) = active_nodes.remove(&old_key) {
-                    // Add with new device signature
-                    active_nodes.insert(new_device_signature.to_string(), node_info);
-                    println!("✅ Device signature updated in registry");
+                
+                old_key_for_print = old_device_key.clone();
+                if let Some(old_key) = old_device_key {
+                    if let Some(node_info) = active_nodes.remove(&old_key) {
+                        // Add with new device signature
+                        active_nodes.insert(new_device_signature.to_string(), node_info);
+                        println!("✅ Device signature updated in registry");
+                    }
                 }
             }
         }
@@ -1676,9 +1694,11 @@ impl BlockchainActivationRegistry {
     }
 
     /// Propagate to DHT network
-    async fn propagate_to_dht(code: &str, node_info: &NodeInfo) -> Result<(), IntegrationError> {
-        // Mock DHT propagation
+    async fn propagate_hash_to_dht(code_hash: &str, node_info: &NodeInfo) -> Result<(), IntegrationError> {
+        // Mock DHT hash propagation for secure distribution
+        println!("🌐 Propagating activation hash {} to DHT network", &code_hash[..8]);
         tokio::time::sleep(Duration::from_millis(5)).await;
+        println!("✅ Activation hash propagated to DHT successfully");
         Ok(())
     }
 
@@ -1921,15 +1941,17 @@ impl BlockchainActivationRegistry {
         println!("🔍 Querying activation by wallet: {} phase: {} type: {}", 
                  safe_preview(wallet_address, 8), phase, node_type);
         
-        // Search in local activation records first
+        // Search in local activation records first (now using hash keys)
         {
             let activation_records = self.activation_records.read().await;
-            for (code, record) in activation_records.iter() {
+            for (code_hash, record) in activation_records.iter() {
                 if record.wallet_address == wallet_address 
                     && record.phase == phase 
                     && record.node_type.to_lowercase() == node_type.to_lowercase() {
-                    println!("✅ Found existing activation in local records: {}", safe_preview(code, 8));
-                    return Ok(Some(code.clone()));
+                    println!("✅ Found existing activation hash in local records: {}", safe_preview(code_hash, 8));
+                    // Note: We can't return the original code since we only store hashes
+                    // In production, the code should be provided by the user for verification
+                    return Ok(Some(format!("HASH_FOUND:{}", code_hash)));
                 }
             }
         }
@@ -1988,7 +2010,7 @@ impl BlockchainActivationRegistry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct QNetActivationTransaction {
     pub tx_type: String,
-    pub code: String,
+    pub code_hash: String, // Secure hash storage instead of plaintext code
     pub node_type: String,
     pub wallet_address: String,
     pub device_signature: String,
