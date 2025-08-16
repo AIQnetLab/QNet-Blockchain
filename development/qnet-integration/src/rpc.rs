@@ -2494,7 +2494,7 @@ async fn handle_activations_by_wallet(
     };
     
     let phase = params.get("phase").and_then(|p| p.parse::<u8>().ok()).unwrap_or(1);
-    let node_type = params.get("node_type").unwrap_or("").to_string();
+    let node_type = params.get("node_type").map_or("", |v| v).to_string();
     
     if node_type.is_empty() {
         let error_response = json!({
