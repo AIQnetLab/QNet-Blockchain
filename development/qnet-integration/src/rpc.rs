@@ -369,6 +369,16 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(blockchain_filter.clone())
         .and_then(handle_claim_rewards);
 
+    // Activation codes by wallet endpoint for bridge-server queries
+    let activations_by_wallet = api_v1
+        .and(warp::path("activations"))
+        .and(warp::path("by-wallet"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::query::<HashMap<String, String>>())
+        .and(blockchain_filter.clone())
+        .and_then(handle_activations_by_wallet);
+
     // Graceful shutdown endpoint for node replacement
     let graceful_shutdown = api_v1
         .and(warp::path("shutdown"))
@@ -463,7 +473,8 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         
     let light_node_routes = light_node_register
         .or(light_node_ping_response)
-        .or(claim_rewards);
+        .or(claim_rewards)
+        .or(activations_by_wallet);
 
     let consensus_routes = consensus_commit
         .or(consensus_reveal)
@@ -2461,6 +2472,77 @@ async fn handle_graceful_shutdown(
         "reason": reason,
         "timestamp": current_time
     })))
+}
+
+/// Handle activation codes query by wallet address for bridge-server
+async fn handle_activations_by_wallet(
+    params: HashMap<String, String>,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    println!("[ACTIVATIONS] 🔍 Querying activations by wallet");
+    
+    // Extract parameters from query string
+    let wallet_address = match params.get("wallet_address") {
+        Some(addr) if !addr.is_empty() => addr,
+        _ => {
+            let error_response = json!({
+                "exists": false,
+                "error": "Missing or empty wallet_address parameter"
+            });
+            return Ok(warp::reply::json(&error_response));
+        }
+    };
+    
+    let phase = params.get("phase").and_then(|p| p.parse::<u8>().ok()).unwrap_or(1);
+    let node_type = params.get("node_type").unwrap_or("").to_string();
+    
+    if node_type.is_empty() {
+        let error_response = json!({
+            "exists": false,
+            "error": "Missing node_type parameter"
+        });
+        return Ok(warp::reply::json(&error_response));
+    }
+    
+    // Initialize activation registry for blockchain query
+    let registry = crate::activation_validation::BlockchainActivationRegistry::new(None);
+    
+    // Query blockchain for existing activation record
+    match registry.query_activation_by_wallet_and_type(wallet_address, phase, &node_type).await {
+        Ok(Some(activation_code)) => {
+            let response = json!({
+                "exists": true,
+                "activation_code": activation_code,
+                "wallet_address": wallet_address,
+                "phase": phase,
+                "node_type": node_type,
+                "reusable": true,
+                "message": "Existing activation code found for this wallet and node type"
+            });
+            Ok(warp::reply::json(&response))
+        }
+        Ok(None) => {
+            let response = json!({
+                "exists": false,
+                "wallet_address": wallet_address,
+                "phase": phase,
+                "node_type": node_type,
+                "message": "No existing activation found for this wallet and node type"
+            });
+            Ok(warp::reply::json(&response))
+        }
+        Err(e) => {
+            println!("[ACTIVATIONS] ❌ Query error: {}", e);
+            let error_response = json!({
+                "exists": false,
+                "error": format!("Blockchain query failed: {}", e),
+                "wallet_address": wallet_address,
+                "phase": phase,
+                "node_type": node_type
+            });
+            Ok(warp::reply::json(&error_response))
+        }
+    }
 }
 
 // PRODUCTION: Macroblock Consensus Handlers

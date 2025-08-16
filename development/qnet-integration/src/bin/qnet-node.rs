@@ -2096,18 +2096,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("No activation code provided".into());
     }
     
-    // Skip format validation - already done in setup phase
-    println!("🔐 Running in PRODUCTION MODE");
-    println!("   ✅ Activation code validated");
-    println!("   📝 Code: {}", mask_code(&activation_code));
-    println!("   🖥️  Server node type: {:?}", node_type);
-    println!("   💰 Dynamic pricing: Phase {} pricing active", {
-        // Get current phase for pricing display
-        let current_phase = get_current_phase_simple().await.unwrap_or(1);
-        current_phase
-    });
-    println!("   🔐 Using quantum-secure activation codes with permanent validity");
-    println!("   🛡️  Light node blocking: Enforced on server hardware");
+    // PRODUCTION: Full activation code validation in main for security
+    let (current_phase, pricing_info) = detect_current_phase().await;
+    
+    // Comprehensive validation for production security
+    match validate_activation_code_comprehensive(&activation_code, node_type, current_phase, &pricing_info).await {
+        Ok(_) => {
+            println!("🔐 Running in PRODUCTION MODE");
+            println!("   ✅ Activation code validated in main()");
+            println!("   📝 Code: {}", mask_code(&activation_code));
+            println!("   🖥️  Server node type: {:?}", node_type);
+            println!("   💰 Dynamic pricing: Phase {} pricing active", current_phase);
+            println!("   🔐 Using quantum-secure activation codes with permanent validity");
+            println!("   🛡️  Light node blocking: Enforced on server hardware");
+        }
+        Err(e) => {
+            println!("❌ CRITICAL: Activation validation failed in main():");
+            println!("   Error: {}", e);
+            println!("   This is a security check to prevent invalid nodes from starting");
+            return Err(format!("Activation validation failed: {}", e).into());
+        }
+    }
     
     // Verify 1DEV burn if required for production (skip for genesis nodes)
     if std::env::var("QNET_PRODUCTION").unwrap_or_default() == "1" && !is_genesis_bootstrap_node() {
@@ -2772,11 +2781,15 @@ async fn verify_1dev_burn(node_type: &NodeType) -> Result<(), String> {
         return Ok(());
     }
     
-    // Production 1DEV burn verification - Universal pricing for all node types
-    let required_burn = match node_type {
-        NodeType::Light => 1500.0,
-        NodeType::Full => 1500.0, 
-        NodeType::Super => 1500.0,
+    // Production 1DEV burn verification - Dynamic pricing based on current burn percentage
+    let (current_phase, pricing_info) = detect_current_phase().await;
+    let required_burn = if current_phase == 1 {
+        // Use dynamic pricing for Phase 1
+        calculate_node_price(1, *node_type, &pricing_info)
+    } else {
+        // Phase 2: No 1DEV burn required
+        println!("⚠️  Phase 2 detected - 1DEV burn verification skipped (QNC era)");
+        return Ok(());
     };
     
     println!("🔐 Verifying 1DEV burn on Solana blockchain...");

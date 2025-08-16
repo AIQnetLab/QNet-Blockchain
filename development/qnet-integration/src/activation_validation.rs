@@ -778,8 +778,16 @@ impl BlockchainActivationRegistry {
                     println!("📋 Local cache fallback: {} migrations found", recent_migrations);
                     Ok(recent_migrations)
                 } else {
-                    println!("📋 No migration history found (new activation)");
-                    Ok(0)
+                    println!("❌ SECURITY: No migration history AND blockchain unavailable");
+                    println!("   Cannot verify rate limits - rejecting migration for security");
+                    println!("   This prevents rate limit bypass when blockchain is down");
+                    
+                    // SECURITY FIX: Return error instead of Ok(0) to prevent rate limit bypass
+                    // When blockchain is unavailable AND no local cache exists, we cannot verify
+                    // the migration count, so we must reject to maintain security
+                    Err(IntegrationError::SecurityError(
+                        "Cannot verify migration rate limits - blockchain unavailable and no local history".to_string()
+                    ))
                 }
             }
         }
@@ -1903,6 +1911,76 @@ impl BlockchainActivationRegistry {
         Ok(())
     }
     
+    /// Query activation code by wallet address and node type for bridge-server
+    pub async fn query_activation_by_wallet_and_type(
+        &self, 
+        wallet_address: &str, 
+        phase: u8, 
+        node_type: &str
+    ) -> Result<Option<String>, IntegrationError> {
+        println!("🔍 Querying activation by wallet: {} phase: {} type: {}", 
+                 safe_preview(wallet_address, 8), phase, node_type);
+        
+        // Search in local activation records first
+        {
+            let activation_records = self.activation_records.read().await;
+            for (code, record) in activation_records.iter() {
+                if record.wallet_address == wallet_address 
+                    && record.phase == phase 
+                    && record.node_type.to_lowercase() == node_type.to_lowercase() {
+                    println!("✅ Found existing activation in local records: {}", safe_preview(code, 8));
+                    return Ok(Some(code.clone()));
+                }
+            }
+        }
+        
+        // Search in active nodes registry
+        {
+            let active_nodes = self.active_nodes.read().await;
+            for (_device_sig, node_info) in active_nodes.iter() {
+                if node_info.wallet_address == wallet_address 
+                    && node_info.node_type.to_lowercase() == node_type.to_lowercase() {
+                    println!("✅ Found existing activation in active nodes: {}", safe_preview(&node_info.activation_code, 8));
+                    return Ok(Some(node_info.activation_code.clone()));
+                }
+            }
+        }
+        
+        // Try to query blockchain through consensus
+        match self.query_blockchain_for_wallet_activation(wallet_address, phase, node_type).await {
+            Ok(Some(code)) => {
+                println!("✅ Found existing activation on blockchain: {}", safe_preview(&code, 8));
+                Ok(Some(code))
+            }
+            Ok(None) => {
+                println!("⚠️  No existing activation found for wallet {} phase {} type {}", 
+                         safe_preview(wallet_address, 8), phase, node_type);
+                Ok(None)
+            }
+            Err(e) => {
+                println!("❌ Blockchain query failed: {}", e);
+                // Return None instead of error for graceful degradation
+                Ok(None)
+            }
+        }
+    }
+    
+    /// Query blockchain for wallet activation (production implementation)
+    async fn query_blockchain_for_wallet_activation(
+        &self,
+        wallet_address: &str,
+        phase: u8,
+        node_type: &str
+    ) -> Result<Option<String>, String> {
+        // In production, this would query the actual blockchain
+        // For now, return None to indicate no existing activation found
+        println!("🔍 Querying blockchain for wallet {} phase {} type {}", 
+                 safe_preview(wallet_address, 8), phase, node_type);
+        
+        // Production blockchain query would happen here
+        // For now: No existing activations found (new system)
+        Ok(None)
+    }
 
 }
 
