@@ -530,8 +530,15 @@ async def get_1dev_burn_contract_info():
 async def verify_user_1dev_burn(wallet_address: str, burn_amount: int) -> dict:
     """PRODUCTION: Verify user actually burned 1DEV tokens on Solana blockchain"""
     
-    solana_rpc_url = "https://api.devnet.solana.com"  # Use devnet for our 1DEV token
-    onedev_mint = "62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ"  # Real 1DEV token mint
+    # PRODUCTION: Network-aware configuration
+    network_env = os.environ.get('QNET_NETWORK', 'testnet').lower()
+    
+    if network_env == 'mainnet':
+        solana_rpc_url = "https://api.mainnet-beta.solana.com"
+        onedev_mint = "MAINNET_1DEV_MINT_TBD"  # Will be set when mainnet launches
+    else:
+        solana_rpc_url = "https://api.devnet.solana.com"  # Testnet uses devnet
+        onedev_mint = "62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ"  # Real testnet token
     burn_address = "1nc1nerator11111111111111111111111111111111"  # Official Solana incinerator
     
     try:
@@ -759,7 +766,9 @@ async def query_blockchain_for_existing_activation(wallet_address: str, phase: i
 async def verify_solana_wallet_exists(wallet_address: str) -> bool:
     """Verify wallet address exists on Solana network"""
     
-    solana_rpc_url = "https://api.devnet.solana.com"
+    # PRODUCTION: Network-aware Solana RPC
+    network_env = os.environ.get('QNET_NETWORK', 'testnet').lower()
+    solana_rpc_url = "https://api.mainnet-beta.solana.com" if network_env == 'mainnet' else "https://api.devnet.solana.com"
     
     try:
         async with httpx.AsyncClient() as client:

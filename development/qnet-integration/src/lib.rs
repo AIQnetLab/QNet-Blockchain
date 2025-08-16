@@ -17,6 +17,7 @@ pub mod genesis;
 pub mod blockchain;
 pub mod activation_validation;
 pub mod quantum_crypto;
+pub mod network_config;
 
 use std::sync::Arc;
 use tokio::sync::RwLock;

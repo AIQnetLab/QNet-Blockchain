@@ -188,9 +188,18 @@ git pull origin testnet
 docker build -f development/qnet-integration/Dockerfile.production -t qnet-production .
 
 # Run interactive production node (ONLY activation method)
-docker run -it --name qnet-node --restart=always \
+# For TESTNET:
+docker run -it --name qnet-testnet-node --restart=always \
+  -e QNET_NETWORK=testnet \
   -p 9876:9876 -p 9877:9877 -p 8001:8001 \
-  -v $(pwd)/node_data:/app/node_data \
+  -v $(pwd)/testnet_node_data:/app/node_data \
+  qnet-production
+
+# For MAINNET:
+docker run -it --name qnet-mainnet-node --restart=always \
+  -e QNET_NETWORK=mainnet \
+  -p 9876:9876 -p 9877:9877 -p 8001:8001 \
+  -v $(pwd)/mainnet_node_data:/app/node_data \
   qnet-production
 ```
 
@@ -630,36 +639,64 @@ docker logs qnet-node | grep "\[DEBUG\]\|\[INFO\]\|\[WARN\]\|\[ERROR\]"
 For genesis bootstrap nodes (production network initialization):
 
 ```bash
+# TESTNET Genesis Nodes:
 # Genesis Node #001 (NorthAmerica)
-docker run -d --name qnet-node --restart=always \
+docker run -d --name qnet-testnet-genesis-001 --restart=always \
+  -e QNET_NETWORK=testnet \
   -e QNET_PRODUCTION=1 \
   -e QNET_BOOTSTRAP_ID=001 \
   -p 9876:9876 -p 9877:9877 -p 8001:8001 \
-  -v $(pwd)/node_data:/app/data \
+  -v $(pwd)/testnet_genesis_001:/app/data \
   qnet-production
 
 # Genesis Node #002 (Europe) 
-docker run -d --name qnet-node-002 --restart=always \
+docker run -d --name qnet-testnet-genesis-002 --restart=always \
+  -e QNET_NETWORK=testnet \
   -e QNET_PRODUCTION=1 \
   -e QNET_BOOTSTRAP_ID=002 \
   -p 9878:9876 -p 9879:9877 -p 8002:8001 \
-  -v $(pwd)/node_data_002:/app/data \
+  -v $(pwd)/testnet_genesis_002:/app/data \
   qnet-production
 
-# Genesis Node #003 (Asia)
-docker run -d --name qnet-node-003 --restart=always \
+# MAINNET Genesis Nodes:
+# Genesis Node #001 (NorthAmerica)
+docker run -d --name qnet-mainnet-genesis-001 --restart=always \
+  -e QNET_NETWORK=mainnet \
   -e QNET_PRODUCTION=1 \
-  -e QNET_BOOTSTRAP_ID=003 \
-  -p 9880:9876 -p 9881:9877 -p 8003:8001 \
-  -v $(pwd)/node_data_003:/app/data \
+  -e QNET_BOOTSTRAP_ID=001 \
+  -p 9876:9876 -p 9877:9877 -p 8001:8001 \
+  -v $(pwd)/mainnet_genesis_001:/app/data \
   qnet-production
 ```
 
 **Genesis Node Requirements:**
 - Set `QNET_BOOTSTRAP_ID` to 001-005 for genesis nodes
 - Use different ports for multiple nodes on same server
-- Create separate data directories for each node
+- Create separate data directories for each node  
 - Ensure proper file permissions: `chmod 777 node_data_XXX/`
+
+### Quick Testnet Launch (5 Genesis Nodes)
+
+For rapid testnet deployment with coordinated genesis nodes:
+
+```bash
+# Launch complete testnet (5 genesis nodes + bridge)
+docker-compose -f docker-compose.testnet.yml up -d
+
+# Monitor testnet startup
+docker-compose -f docker-compose.testnet.yml logs -f
+
+# Stop testnet
+docker-compose -f docker-compose.testnet.yml down
+```
+
+**Testnet Endpoints:**
+- Genesis Node 1: http://localhost:8001
+- Genesis Node 2: http://localhost:8002  
+- Genesis Node 3: http://localhost:8003
+- Genesis Node 4: http://localhost:8004
+- Genesis Node 5: http://localhost:8005
+- Bridge Server: http://localhost:8080
 
 ### Backup & Recovery
 

@@ -681,16 +681,25 @@ async fn detect_current_phase() -> (u8, PricingInfo) {
             println!("   Error: {}", e);
             println!("   Trying backup RPC nodes...");
             
-            // Try backup devnet RPC nodes
-            let backup_rpcs = vec![
-                "https://api.devnet.solana.com",
-                "https://devnet.helius-rpc.com",
-                "https://solana-devnet.g.alchemy.com/v2/demo",
-            ];
+            // Try backup RPC nodes (network-aware)
+            let network_config = qnet_integration::network_config::get_network_config();
+            let backup_rpcs = if network_config.is_testnet() {
+                vec![
+                    "https://api.devnet.solana.com",
+                    "https://devnet.helius-rpc.com", 
+                    "https://solana-devnet.g.alchemy.com/v2/demo",
+                ]
+            } else {
+                vec![
+                    "https://api.mainnet-beta.solana.com",
+                    "https://solana-mainnet.g.alchemy.com/v2/demo",
+                    "https://mainnet.helius-rpc.com",
+                ]
+            };
             
             for rpc_url in backup_rpcs {
                 println!("🔄 Trying backup RPC: {}", rpc_url);
-                match get_real_token_supply(rpc_url, "62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ").await {
+                match get_real_token_supply(rpc_url, &network_config.solana.onedev_mint).await {
                     Ok(supply_data) => {
                         println!("✅ Data retrieved from backup RPC!");
                         
@@ -774,9 +783,10 @@ struct RealNodeCounts {
 
 // Fetch real data from Solana contract
 async fn fetch_burn_tracker_data() -> Result<BurnTrackerData, String> {
-    // Testnet Solana RPC configuration (devnet)
+    // Network-aware Solana RPC configuration
+    let network_config = qnet_integration::network_config::get_network_config();
     let rpc_url = std::env::var("SOLANA_RPC_URL").unwrap_or_else(|_| {
-        "https://api.devnet.solana.com".to_string()
+        network_config.solana.rpc_url.clone()
     });
     
     let program_id = std::env::var("BURN_TRACKER_PROGRAM_ID").unwrap_or_else(|_| {
@@ -854,8 +864,9 @@ async fn get_real_token_supply(rpc_url: &str, token_mint: &str) -> Result<TokenS
             token_mint
         );
         
+        let network_config = qnet_integration::network_config::get_network_config();
         match tokio::process::Command::new("curl")
-            .args(&["-s", "-X", "POST", "https://api.devnet.solana.com"])
+            .args(&["-s", "-X", "POST", &network_config.solana.rpc_url])
             .args(&["-H", "Content-Type: application/json"])
             .args(&["-d", &payload])
             .output()
@@ -2096,6 +2107,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("No activation code provided".into());
     }
     
+    // PRODUCTION: Load network configuration based on QNET_NETWORK env
+    let network_config = qnet_integration::network_config::get_network_config();
+    println!("🌐 Network: {}", network_config.network_name());
+    println!("   Environment: {:?}", network_config.environment);
+    println!("   Chain ID: {}", network_config.chain_id);
+    println!("   QNet RPC: {}", network_config.endpoints.qnet_rpc);
+    println!("   Bridge API: {}", network_config.endpoints.bridge_api);
+    println!("   Solana RPC: {}", network_config.solana.rpc_url);
+    println!("   1DEV Token: {}", network_config.solana.onedev_mint);
+    
     // PRODUCTION: Full activation code validation in main for security
     let (current_phase, pricing_info) = detect_current_phase().await;
     
@@ -2816,8 +2837,9 @@ async fn verify_1dev_burn(node_type: &NodeType) -> Result<(), String> {
 async fn verify_solana_burn_transaction(wallet_address: &str, required_amount: f64) -> Result<bool, String> {
     println!("📡 Querying Solana devnet for burn transaction...");
     
-    // PRODUCTION: Use devnet RPC for our 1DEV token
-    let solana_rpc = "https://api.devnet.solana.com";
+    // PRODUCTION: Use network-aware RPC configuration  
+    let network_config = qnet_integration::network_config::get_network_config();
+    let solana_rpc = &network_config.solana.rpc_url;
     
     // Build RPC request to check burn transactions
     let request_body = serde_json::json!({
@@ -2874,10 +2896,11 @@ async fn verify_solana_burn_transaction(wallet_address: &str, required_amount: f
 async fn verify_solana_burn_for_activation(wallet_address: &str, expected_tx_hash: &str, required_amount: u64) -> Result<bool, String> {
     println!("📡 PRODUCTION: Verifying 1DEV burn on Solana for node activation...");
     
-    // PRODUCTION: Use devnet RPC for our 1DEV token
-    let solana_rpc = "https://api.devnet.solana.com";
-    let onedev_mint = "62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ";  // Real 1DEV token mint
-    let burn_address = "1nc1nerator11111111111111111111111111111111";  // Official Solana incinerator
+    // PRODUCTION: Use network-aware RPC configuration
+    let network_config = qnet_integration::network_config::get_network_config();
+    let solana_rpc = &network_config.solana.rpc_url;
+    let onedev_mint = &network_config.solana.onedev_mint;
+    let burn_address = &network_config.solana.burn_address;
     
     // Convert to 6 decimals for comparison
     let required_amount_decimals = required_amount * 1_000_000;
@@ -2994,7 +3017,8 @@ async fn verify_solana_burn_for_activation(wallet_address: &str, expected_tx_has
 
 async fn is_burn_transaction(signature: &str) -> Result<bool, String> {
     // Query transaction details to check if it's a burn to 1DEV burn address
-    let solana_rpc = "https://api.devnet.solana.com";
+    let network_config = qnet_integration::network_config::get_network_config();
+    let solana_rpc = &network_config.solana.rpc_url;
     
     let request_body = serde_json::json!({
         "jsonrpc": "2.0",
@@ -3039,7 +3063,8 @@ async fn is_burn_transaction(signature: &str) -> Result<bool, String> {
 
 async fn get_burned_amount(signature: &str) -> Result<f64, String> {
     // Parse burn amount from transaction
-    let solana_rpc = "https://api.devnet.solana.com";
+    let network_config = qnet_integration::network_config::get_network_config();
+    let solana_rpc = &network_config.solana.rpc_url;
     
     let request_body = serde_json::json!({
         "jsonrpc": "2.0",

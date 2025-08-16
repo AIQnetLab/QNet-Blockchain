@@ -15,7 +15,9 @@ class BridgeServiceClass {
       local: 'http://localhost:8080' // For development
     };
     
-    this.currentEndpoint = this.bridgeEndpoints.testnet;
+    // Auto-detect network from environment
+    const networkEnv = process.env.QNET_NETWORK || 'testnet';
+    this.currentEndpoint = this.bridgeEndpoints[networkEnv] || this.bridgeEndpoints.testnet;
     this.isConnected = false;
     this.authToken = null;
     

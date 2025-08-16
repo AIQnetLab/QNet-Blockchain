@@ -1,0 +1,274 @@
+services:
+  # QNet Testnet Genesis Node 1
+  qnet-testnet-genesis1:
+    build:
+      context: .
+      dockerfile: Dockerfile.production
+    container_name: qnet-testnet-genesis1
+    hostname: testnet-genesis1
+    environment:
+      - QNET_NETWORK=testnet
+      - QNET_BOOTSTRAP_ID=001
+      - QNET_GENESIS_BOOTSTRAP=1
+      - QNET_PRODUCTION=1
+      - RUST_LOG=info,qnet=debug
+      - QNET_ENABLE_MICROBLOCKS=1
+      - QNET_IS_LEADER=1
+      - QNET_MICROBLOCK_PRODUCER=1
+    command: >
+      qnet-node
+      --data-dir /app/data
+      --p2p-port 9876
+      --rpc-port 8001
+      --node-type super
+      --region auto
+      --enable-metrics
+    ports:
+      - "8001:8001"   # RPC API
+      - "9876:9876"   # P2P network
+      - "9001:9001"   # Metrics
+    volumes:
+      - ./testnet-data/genesis1:/app/data
+      - ./testnet-logs/genesis1:/app/logs
+    networks:
+      - qnet-testnet
+    restart: unless-stopped
+    mem_limit: 4g
+    cpus: '2.0'
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/api/v1/node/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # QNet Testnet Genesis Node 2
+  qnet-testnet-genesis2:
+    build:
+      context: .
+      dockerfile: Dockerfile.production
+    container_name: qnet-testnet-genesis2
+    hostname: testnet-genesis2
+    environment:
+      - QNET_NETWORK=testnet
+      - QNET_BOOTSTRAP_ID=002
+      - QNET_GENESIS_BOOTSTRAP=1
+      - QNET_PRODUCTION=1
+      - RUST_LOG=info,qnet=debug
+      - QNET_ENABLE_MICROBLOCKS=1
+    command: >
+      qnet-node
+      --data-dir /app/data
+      --p2p-port 9876
+      --rpc-port 8001
+      --node-type super
+      --region auto
+      --bootstrap-peers qnet-testnet-genesis1:9876
+      --enable-metrics
+    ports:
+      - "8002:8001"   # RPC API
+      - "9877:9876"   # P2P network
+      - "9002:9001"   # Metrics
+    volumes:
+      - ./testnet-data/genesis2:/app/data
+      - ./testnet-logs/genesis2:/app/logs
+    networks:
+      - qnet-testnet
+    restart: unless-stopped
+    mem_limit: 4g
+    cpus: '2.0'
+    depends_on:
+      - qnet-testnet-genesis1
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/api/v1/node/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
+
+  # QNet Testnet Genesis Node 3
+  qnet-testnet-genesis3:
+    build:
+      context: .
+      dockerfile: Dockerfile.production
+    container_name: qnet-testnet-genesis3
+    hostname: testnet-genesis3
+    environment:
+      - QNET_NETWORK=testnet
+      - QNET_BOOTSTRAP_ID=003
+      - QNET_GENESIS_BOOTSTRAP=1
+      - QNET_PRODUCTION=1
+      - RUST_LOG=info,qnet=debug
+      - QNET_ENABLE_MICROBLOCKS=1
+    command: >
+      qnet-node
+      --data-dir /app/data
+      --p2p-port 9876
+      --rpc-port 8001
+      --node-type super
+      --region auto
+      --bootstrap-peers qnet-testnet-genesis1:9876,qnet-testnet-genesis2:9876
+      --enable-metrics
+    ports:
+      - "8003:8001"   # RPC API
+      - "9878:9876"   # P2P network
+      - "9003:9001"   # Metrics
+    volumes:
+      - ./testnet-data/genesis3:/app/data
+      - ./testnet-logs/genesis3:/app/logs
+    networks:
+      - qnet-testnet
+    restart: unless-stopped
+    mem_limit: 4g
+    cpus: '2.0'
+    depends_on:
+      - qnet-testnet-genesis1
+      - qnet-testnet-genesis2
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/api/v1/node/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+
+  # QNet Testnet Genesis Node 4
+  qnet-testnet-genesis4:
+    build:
+      context: .
+      dockerfile: Dockerfile.production
+    container_name: qnet-testnet-genesis4
+    hostname: testnet-genesis4
+    environment:
+      - QNET_NETWORK=testnet
+      - QNET_BOOTSTRAP_ID=004
+      - QNET_GENESIS_BOOTSTRAP=1
+      - QNET_PRODUCTION=1
+      - RUST_LOG=info,qnet=debug
+      - QNET_ENABLE_MICROBLOCKS=1
+    command: >
+      qnet-node
+      --data-dir /app/data
+      --p2p-port 9876
+      --rpc-port 8001
+      --node-type super
+      --region auto
+      --bootstrap-peers qnet-testnet-genesis1:9876,qnet-testnet-genesis2:9876,qnet-testnet-genesis3:9876
+      --enable-metrics
+    ports:
+      - "8004:8001"   # RPC API
+      - "9879:9876"   # P2P network
+      - "9004:9001"   # Metrics
+    volumes:
+      - ./testnet-data/genesis4:/app/data
+      - ./testnet-logs/genesis4:/app/logs
+    networks:
+      - qnet-testnet
+    restart: unless-stopped
+    mem_limit: 4g
+    cpus: '2.0'
+    depends_on:
+      - qnet-testnet-genesis1
+      - qnet-testnet-genesis2
+      - qnet-testnet-genesis3
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/api/v1/node/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 150s
+
+  # QNet Testnet Genesis Node 5
+  qnet-testnet-genesis5:
+    build:
+      context: .
+      dockerfile: Dockerfile.production
+    container_name: qnet-testnet-genesis5
+    hostname: testnet-genesis5
+    environment:
+      - QNET_NETWORK=testnet
+      - QNET_BOOTSTRAP_ID=005
+      - QNET_GENESIS_BOOTSTRAP=1
+      - QNET_PRODUCTION=1
+      - RUST_LOG=info,qnet=debug
+      - QNET_ENABLE_MICROBLOCKS=1
+    command: >
+      qnet-node
+      --data-dir /app/data
+      --p2p-port 9876
+      --rpc-port 8001
+      --node-type super
+      --region auto
+      --bootstrap-peers qnet-testnet-genesis1:9876,qnet-testnet-genesis2:9876,qnet-testnet-genesis3:9876,qnet-testnet-genesis4:9876
+      --enable-metrics
+    ports:
+      - "8005:8001"   # RPC API
+      - "9880:9876"   # P2P network
+      - "9005:9001"   # Metrics
+    volumes:
+      - ./testnet-data/genesis5:/app/data
+      - ./testnet-logs/genesis5:/app/logs
+    networks:
+      - qnet-testnet
+    restart: unless-stopped
+    mem_limit: 4g
+    cpus: '2.0'
+    depends_on:
+      - qnet-testnet-genesis1
+      - qnet-testnet-genesis2
+      - qnet-testnet-genesis3
+      - qnet-testnet-genesis4
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/api/v1/node/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 180s
+
+  # QNet Testnet Bridge Server
+  qnet-testnet-bridge:
+    build:
+      context: deployment/production-bridge
+      dockerfile: Dockerfile
+    container_name: qnet-testnet-bridge
+    hostname: testnet-bridge
+    environment:
+      - QNET_NETWORK=testnet
+      - QNET_RPC_ENDPOINTS=http://qnet-testnet-genesis1:8001,http://qnet-testnet-genesis2:8001,http://qnet-testnet-genesis3:8001
+      - SOLANA_RPC_URL=https://api.devnet.solana.com
+      - ONEDEV_MINT_ADDRESS=62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ
+      - CORS_ORIGINS=https://testnet-wallet.qnet.io,http://localhost:3000
+      - JWT_SECRET=${JWT_SECRET:-$(openssl rand -hex 32)}
+      - ENVIRONMENT=testnet
+    ports:
+      - "8080:8080"   # Bridge API
+    volumes:
+      - ./testnet-data/bridge:/app/data
+      - ./testnet-logs/bridge:/app/logs
+    networks:
+      - qnet-testnet
+    restart: unless-stopped
+    mem_limit: 1g
+    cpus: '1.0'
+    depends_on:
+      - qnet-testnet-genesis1
+      - qnet-testnet-genesis2
+      - qnet-testnet-genesis3
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+networks:
+  qnet-testnet:
+    driver: bridge
+    name: qnet-testnet
+
+volumes:
+  testnet-data-genesis1:
+  testnet-data-genesis2:
+  testnet-data-genesis3:
+  testnet-data-genesis4:
+  testnet-data-genesis5:
+  testnet-data-bridge:

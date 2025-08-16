@@ -54,13 +54,27 @@ class NetworkServiceClass {
 
   async getSolanaEndpoint() {
     const saved = await AsyncStorage.getItem('solanaEndpoint');
-    return saved || this.endpoints.solana.devnet; // Default to devnet for testing
+    if (saved) return saved;
+    
+    // Auto-detect network from environment
+    const networkEnv = process.env.QNET_NETWORK || 'testnet';
+    return networkEnv === 'mainnet' 
+      ? this.endpoints.solana.mainnet 
+      : this.endpoints.solana.devnet; // Default to devnet for testnet
   }
 
   async initializeQNetConnection() {
     try {
       const qnetEndpoint = await AsyncStorage.getItem('qnetEndpoint');
-      const endpoint = qnetEndpoint || this.endpoints.qnet.testnet;
+      if (qnetEndpoint) {
+        var endpoint = qnetEndpoint;
+      } else {
+        // Auto-detect network from environment
+        const networkEnv = process.env.QNET_NETWORK || 'testnet';
+        var endpoint = networkEnv === 'mainnet' 
+          ? this.endpoints.qnet.mainnet 
+          : this.endpoints.qnet.testnet;
+      }
       
       // Initialize QNet connection (placeholder - will be replaced with actual QNet client)
       this.qnetConnection = {
@@ -274,7 +288,11 @@ class NetworkServiceClass {
   async getQNetData(eonAddress) {
     try {
       // Real QNet API calls using the actual network
-      const apiUrl = process.env.REACT_NATIVE_QNET_API_URL || 'https://api.qnet.io';
+      const networkEnv = process.env.QNET_NETWORK || 'testnet';
+      const defaultApiUrl = networkEnv === 'mainnet' 
+        ? this.endpoints.qnet.mainnet 
+        : this.endpoints.qnet.testnet;
+      const apiUrl = process.env.REACT_NATIVE_QNET_API_URL || defaultApiUrl;
       
       // Get QNC balance from QNet blockchain
       const balanceResponse = await fetch(`${apiUrl}/v1/balances/${eonAddress}`, {
