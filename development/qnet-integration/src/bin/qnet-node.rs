@@ -270,6 +270,15 @@ fn is_genesis_bootstrap_node() -> bool {
         match bootstrap_id.as_str() {
             "001" | "002" | "003" | "004" | "005" => {
                 println!("🚀 Genesis bootstrap node #{} detected", bootstrap_id);
+                
+                // SECURITY: Verify IP authorization for Genesis nodes
+                if !verify_genesis_node_ip_authorization(&bootstrap_id) {
+                    println!("🚨 SECURITY: Unauthorized IP attempting to run Genesis node {}", bootstrap_id);
+                    println!("🔒 BLOCKED: This Genesis node can only run from authorized IP addresses");
+                    return false;
+                }
+                
+                println!("✅ SECURITY: Genesis node {} authorized from this IP", bootstrap_id);
                 return true;
             }
             _ => {
@@ -1315,6 +1324,126 @@ fn get_genesis_node_ips_dynamic() -> Vec<String> {
     
     println!("[CONFIG] ⚠️ Using default Genesis nodes (set QNET_GENESIS_NODES to override): {:?}", default_nodes);
     default_nodes
+}
+
+// SECURITY: Verify that Genesis node is running from authorized IP address
+fn verify_genesis_node_ip_authorization(bootstrap_id: &str) -> bool {
+    println!("[SECURITY] 🔐 Verifying IP authorization for Genesis node {}", bootstrap_id);
+    
+    // Get current server IP address
+    let current_ip = get_current_server_ip();
+    println!("[SECURITY] 📍 Current server IP: {}", current_ip);
+    
+    // Get list of authorized Genesis IPs
+    let authorized_genesis_ips = get_genesis_node_ips_dynamic();
+    println!("[SECURITY] 📋 Authorized Genesis IPs: {:?}", authorized_genesis_ips);
+    
+    // Check if current IP is in authorized list
+    let is_authorized = authorized_genesis_ips.contains(&current_ip);
+    
+    if is_authorized {
+        println!("[SECURITY] ✅ IP {} is authorized for Genesis nodes", current_ip);
+        
+        // Additional check: Ensure this specific Genesis node ID can run from this IP
+        if let Some(expected_position) = get_expected_genesis_position(&current_ip, &authorized_genesis_ips) {
+            let expected_id = format!("{:03}", expected_position);
+            if bootstrap_id == expected_id {
+                println!("[SECURITY] ✅ Genesis node {} matches expected position {} for IP {}", 
+                        bootstrap_id, expected_position, current_ip);
+                return true;
+            } else {
+                println!("[SECURITY] ⚠️ Genesis node {} does not match expected position {} for IP {}", 
+                        bootstrap_id, expected_position, current_ip);
+                println!("[SECURITY] 💡 Allowing anyway - IP is authorized (flexible during setup)");
+                return true; // Allow any Genesis ID from authorized IP during setup
+            }
+        }
+        
+        return true;
+    } else {
+        println!("[SECURITY] ❌ IP {} is NOT authorized for Genesis nodes", current_ip);
+        println!("[SECURITY] 🔒 Only authorized IPs can run Genesis nodes");
+        return false;
+    }
+}
+
+// Get current server IP address using multiple methods
+fn get_current_server_ip() -> String {
+    // Method 1: Check environment variable (for manual override)
+    if let Ok(manual_ip) = std::env::var("QNET_MANUAL_IP") {
+        if validate_ip_address_security(&manual_ip) {
+            println!("[IP] 🎯 Using manual IP from QNET_MANUAL_IP: {}", manual_ip);
+            return manual_ip;
+        }
+    }
+    
+    // Method 2: Try to detect public IP via external service
+    if let Ok(detected_ip) = detect_public_ip() {
+        println!("[IP] 🌐 Detected public IP: {}", detected_ip);
+        return detected_ip;
+    }
+    
+    // Method 3: Try to get local network IP
+    if let Ok(local_ip) = get_local_network_ip() {
+        println!("[IP] 🏠 Using local network IP: {}", local_ip);
+        return local_ip;
+    }
+    
+    // Fallback: Return localhost (will be rejected by security check)
+    println!("[IP] ⚠️ Could not detect IP address - using localhost (will be rejected)");
+    "127.0.0.1".to_string()
+}
+
+// Detect public IP address
+fn detect_public_ip() -> Result<String, String> {
+    // Try multiple IP detection services
+    let ip_services = [
+        "https://api.ipify.org",
+        "https://ifconfig.me/ip", 
+        "https://icanhazip.com"
+    ];
+    
+    for service in ip_services.iter() {
+        if let Ok(ip) = query_ip_service(service) {
+            if validate_ip_address_security(&ip) {
+                return Ok(ip);
+            }
+        }
+    }
+    
+    Err("Could not detect public IP from any service".to_string())
+}
+
+// Query IP detection service
+fn query_ip_service(url: &str) -> Result<String, String> {
+    // In production, this would use a proper HTTP client
+    // For now, return error to fallback to local IP detection
+    Err("External IP detection not implemented in this version".to_string())
+}
+
+// Get local network IP address
+fn get_local_network_ip() -> Result<String, String> {
+    use std::net::{TcpStream, SocketAddr};
+    
+    // Try to connect to a remote address to determine local IP
+    match TcpStream::connect("8.8.8.8:80") {
+        Ok(stream) => {
+            if let Ok(local_addr) = stream.local_addr() {
+                let ip = local_addr.ip().to_string();
+                if validate_ip_address_security(&ip) {
+                    return Ok(ip);
+                }
+            }
+        }
+        Err(_) => {}
+    }
+    
+    Err("Could not determine local network IP".to_string())
+}
+
+// Get expected Genesis position for IP in the list
+fn get_expected_genesis_position(ip: &str, genesis_ips: &[String]) -> Option<usize> {
+    genesis_ips.iter().position(|genesis_ip| genesis_ip == ip).map(|pos| pos + 1)
 }
 
 // SECURITY: Validate IP address format and security

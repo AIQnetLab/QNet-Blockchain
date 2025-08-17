@@ -462,14 +462,9 @@ impl SimplifiedP2P {
                 }
                 
                 println!("[P2P] 🌐 Attempting to connect to peer: {}", ip);
-                // PRODUCTION FIX: Test actual HTTP API ports where nodes listen
-                // 8001 = Full/Super API port, 9877 = Light node RPC port (avoid)
-                // Light nodes should ONLY connect to Full/Super nodes (port 8001)
-                let target_ports = if matches!(node_type, NodeType::Light) {
-                    vec![8001]  // Light nodes connect ONLY to Full/Super API
-                } else {
-                    vec![8001, 9877]  // Full/Super can connect to both
-                };
+                // GENESIS PERIOD FIX: All nodes use unified API on port 8001
+                // Simplified connection strategy - all Genesis nodes listen on 8001
+                let target_ports = vec![8001];  // All nodes connect via unified API port only
                 
                 for target_port in target_ports {
                     let target_addr = format!("{}:{}", ip, target_port);
@@ -806,11 +801,10 @@ impl SimplifiedP2P {
             .map_err(|_| "Invalid port in peer address".to_string())?;
         
         // PRODUCTION: Real HTTP request to peer's API endpoint
-        // Try multiple API endpoints for redundancy
+        // GENESIS PERIOD FIX: Only try port 8001 to avoid connection confusion
+        // All Genesis nodes run unified API server on port 8001
         let api_endpoints = vec![
-            format!("http://{}:8001/api/v1/height", peer_ip), // Primary API port
-            format!("http://{}:{}/api/v1/height", peer_ip, peer_port + 1000), // P2P port + 1000
-            format!("http://{}:8080/api/v1/height", peer_ip), // Alternative API port
+            format!("http://{}:8001/api/v1/height", peer_ip), // Primary unified API port (genesis nodes)
         ];
         
         for endpoint in api_endpoints {

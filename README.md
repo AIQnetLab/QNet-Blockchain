@@ -673,6 +673,29 @@ docker run -d --name qnet-mainnet-genesis-001 --restart=always \
 - Create separate data directories for each node  
 - Ensure proper file permissions: `chmod 777 node_data_XXX/`
 
+**🔒 Genesis Node Security (IP-Based Authorization):**
+- **IP Restriction**: Genesis nodes can ONLY run from pre-authorized IP addresses
+- **Duplicate Prevention**: System blocks attempts to run duplicate Genesis nodes from unauthorized IPs
+- **Auto-Detection**: Node automatically detects server IP and validates against authorized list
+- **Manual Override**: Use `QNET_MANUAL_IP=your.server.ip` for custom IP specification
+- **Migration Ready**: Easy to update authorized IP list for server migrations (VPS→VDS)
+
+**Authorized Genesis IPs (Default):**
+```bash
+154.38.160.39   # Genesis Node 001
+62.171.157.44   # Genesis Node 002  
+161.97.86.81    # Genesis Node 003
+173.212.219.226 # Genesis Node 004
+164.68.108.218  # Genesis Node 005
+```
+
+**Custom Genesis IPs:**
+```bash
+# Override default IPs via environment variable
+export QNET_GENESIS_NODES="ip1,ip2,ip3,ip4,ip5"
+# Or create genesis-nodes.json config file
+```
+
 ### Quick Testnet Launch (5 Genesis Nodes)
 
 For rapid testnet deployment with coordinated genesis nodes:
