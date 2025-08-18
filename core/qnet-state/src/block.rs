@@ -15,8 +15,10 @@ pub type BlockHash = [u8; 32];
 pub enum BlockType {
     /// Traditional block (for backward compatibility)
     Standard(Block),
-    /// Microblock - created every second
+    /// Microblock - created every second (legacy format with full transactions)
     Micro(MicroBlock),
+    /// Efficient microblock - optimized storage with transaction hashes only
+    EfficientMicro(EfficientMicroBlock),
     /// Macroblock - created every 90 seconds with consensus
     Macro(MacroBlock),
 }
@@ -66,6 +68,26 @@ pub struct ConsensusData {
     pub reveals: HashMap<String, Vec<u8>>,
     /// Selected leader for next round
     pub next_leader: String,
+}
+
+/// Efficient microblock structure - stores only transaction hashes instead of full transactions
+/// Optimized for distributed storage architecture with separate transaction pool
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EfficientMicroBlock {
+    /// Block height
+    pub height: u64,
+    /// Timestamp
+    pub timestamp: u64,
+    /// Transaction hashes only - references to full transactions in separate pool
+    pub transaction_hashes: Vec<[u8; 32]>,
+    /// Producer node ID
+    pub producer: String,
+    /// Producer's signature
+    pub signature: Vec<u8>,
+    /// Hash of previous microblock
+    pub previous_hash: [u8; 32],
+    /// Merkle root of transaction hashes
+    pub merkle_root: [u8; 32],
 }
 
 /// Light microblock header for mobile nodes
@@ -300,6 +322,153 @@ impl MicroBlock {
         // Validate all transactions
         for tx in &self.transactions {
             tx.validate()?;
+        }
+        
+        Ok(())
+    }
+}
+
+// Implement methods for EfficientMicroBlock
+impl EfficientMicroBlock {
+    /// Create a new efficient microblock from transaction hashes
+    pub fn new(
+        height: u64,
+        timestamp: u64,
+        previous_hash: [u8; 32],
+        transaction_hashes: Vec<[u8; 32]>,
+        producer: String,
+    ) -> Self {
+        let merkle_root = Self::calculate_merkle_root_from_hashes(&transaction_hashes);
+        
+        Self {
+            height,
+            timestamp,
+            transaction_hashes,
+            producer,
+            signature: vec![],
+            previous_hash,
+            merkle_root,
+        }
+    }
+    
+    /// Create efficient microblock from full microblock (conversion for migration)
+    pub fn from_microblock(microblock: &MicroBlock) -> Self {
+        let transaction_hashes: Vec<[u8; 32]> = microblock.transactions
+            .iter()
+            .map(|tx| {
+                // Convert string hash to [u8; 32] 
+                if let Ok(hash_bytes) = hex::decode(&tx.hash) {
+                    if hash_bytes.len() == 32 {
+                        let mut hash_array = [0u8; 32];
+                        hash_array.copy_from_slice(&hash_bytes);
+                        hash_array
+                    } else {
+                        // If hex decode fails or wrong length, use blake3 hash of the transaction
+                        let mut hasher = Sha3_256::new();
+                        hasher.update(tx.hash.as_bytes());
+                        let result = hasher.finalize();
+                        let mut hash_array = [0u8; 32];
+                        hash_array.copy_from_slice(&result);
+                        hash_array
+                    }
+                } else {
+                    // Fallback: hash the transaction hash string
+                    let mut hasher = Sha3_256::new();
+                    hasher.update(tx.hash.as_bytes());
+                    let result = hasher.finalize();
+                    let mut hash_array = [0u8; 32];
+                    hash_array.copy_from_slice(&result);
+                    hash_array
+                }
+            })
+            .collect();
+            
+        Self {
+            height: microblock.height,
+            timestamp: microblock.timestamp,
+            transaction_hashes,
+            producer: microblock.producer.clone(),
+            signature: microblock.signature.clone(),
+            previous_hash: microblock.previous_hash,
+            merkle_root: microblock.merkle_root,
+        }
+    }
+    
+    /// Calculate merkle root from transaction hashes
+    fn calculate_merkle_root_from_hashes(transaction_hashes: &[[u8; 32]]) -> [u8; 32] {
+        if transaction_hashes.is_empty() {
+            return [0u8; 32];
+        }
+        
+        let mut hasher = Sha3_256::new();
+        for hash in transaction_hashes {
+            hasher.update(hash);
+        }
+        
+        let result = hasher.finalize();
+        let mut root = [0u8; 32];
+        root.copy_from_slice(&result);
+        root
+    }
+    
+    /// Calculate efficient microblock hash
+    pub fn hash(&self) -> [u8; 32] {
+        let mut hasher = Sha3_256::new();
+        hasher.update(&self.height.to_le_bytes());
+        hasher.update(&self.timestamp.to_le_bytes());
+        hasher.update(&self.previous_hash);
+        hasher.update(&self.merkle_root);
+        hasher.update(self.producer.as_bytes());
+        
+        let result = hasher.finalize();
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&result);
+        hash
+    }
+    
+    /// Convert to light header for mobile nodes
+    pub fn to_light_header(&self) -> LightMicroBlock {
+        LightMicroBlock {
+            height: self.height,
+            timestamp: self.timestamp,
+            tx_count: self.transaction_hashes.len() as u32,
+            merkle_root: self.merkle_root,
+            size_bytes: self.estimate_size(),
+            producer: self.producer.clone(),
+        }
+    }
+    
+    /// Estimate size in bytes for efficient microblock format
+    fn estimate_size(&self) -> u32 {
+        // Base size (metadata) + 32 bytes per transaction hash
+        let base_size = 8 + 8 + 4 + 32 + 32; // height + timestamp + producer_len + previous_hash + merkle_root
+        let hashes_size = self.transaction_hashes.len() * 32;
+        (base_size + hashes_size) as u32
+    }
+    
+    /// Validate efficient microblock
+    pub fn validate(&self) -> Result<(), StateError> {
+        // Check timestamp
+        if self.timestamp == 0 {
+            return Err(StateError::InvalidBlock("Invalid timestamp".to_string()));
+        }
+        
+        // Check transaction count (same limit as regular microblock)
+        if self.transaction_hashes.len() > 10_000 {
+            return Err(StateError::InvalidBlock("Too many transactions in microblock".to_string()));
+        }
+        
+        // Verify merkle root
+        let calculated_root = Self::calculate_merkle_root_from_hashes(&self.transaction_hashes);
+        if calculated_root != self.merkle_root {
+            return Err(StateError::InvalidBlock("Invalid merkle root".to_string()));
+        }
+        
+        // Check for duplicate transaction hashes
+        use std::collections::HashSet;
+        let unique_hashes: HashSet<_> = self.transaction_hashes.iter().collect();
+        if unique_hashes.len() != self.transaction_hashes.len() {
+            return Err(StateError::InvalidBlock("Duplicate transaction hashes".to_string()));
         }
         
         Ok(())

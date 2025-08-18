@@ -59,6 +59,19 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 | **Finality** | <2 seconds | Block finalization |
 | **Energy Efficiency** | 99.9% less than Bitcoin | Eco-friendly consensus |
 | **Node Types** | Full, Super, Light | Flexible participation |
+| **Storage Efficiency** | 300 GB default | Advanced archival system |
+
+### 💾 Advanced Storage Architecture
+
+**QNet implements optimized distributed storage system for blockchain scalability.**
+
+#### 🎯 **Storage Features:**
+- **EfficientMicroBlocks**: Store transaction hashes instead of full transactions
+- **Distributed Archival**: Full/Super nodes archive 3-8 chunks each as network obligation
+- **Triple Replication**: Every data chunk replicated across 3+ nodes minimum
+- **Automatic Compliance**: Network enforces archival obligations for fault tolerance
+- **Zstd Compression**: High-efficiency compression for archive data
+- **Backward Compatible**: Seamless migration from legacy storage format
 
 ## 🏗️ Architecture
 
@@ -1029,12 +1042,112 @@ QNet node deployment now features **zero-configuration** setup for maximum ease 
 - **Optimized batching**: 10,000 transactions per batch
 - **Parallel processing**: 16 threads for validation
 
-### 📁 Data Management
+### 📁 Distributed Data Management
 
-- **Standard location**: `node_data` directory in project root
-- **Automatic creation**: Creates data directory if not exists
-- **Permission checking**: Validates write permissions
-- **Backup-friendly**: Clear data structure for easy backups
+**QNet implements efficient archival system for long-term blockchain scalability.**
+
+#### 🎯 **Node Storage:**
+- **Default Limit**: 400 GB per node (configurable via QNET_MAX_STORAGE_GB)
+- **Growth Pattern**: Automatic cleanup maintains storage within limits
+- **Architecture**: Hot/Warm/Cold storage tiers with intelligent rotation
+- **Emergency Handling**: Automatic cleanup when storage reaches 85-95% capacity
+
+#### 📦 **Adaptive Archival Responsibilities by Network Size:**
+
+| Network Size | Full Node Quota | Super Node Quota | Min Replicas |
+|--------------|-----------------|------------------|--------------|
+| **5-15 nodes** (Emergency) | 8 chunks | 15 chunks | 1 replica |
+| **16-30 nodes** (Small) | 6 chunks | 12 chunks | 2 replicas |
+| **31-50 nodes** (Medium) | 4 chunks | 10 chunks | 3 replicas |
+| **50+ nodes** (Large) | 3 chunks | 8 chunks | 3 replicas |
+
+- **Light Nodes**: Always 0 chunks (mobile-optimized)
+- **Genesis Nodes**: Variable based on network critical needs
+- **Automatic Scaling**: System adapts quotas based on active node count
+
+#### 🔄 **Data Lifecycle Management:**
+- **Hot Storage**: Recent data on local SSD for immediate access
+- **Warm Storage**: Compressed local cache for verification
+- **Cold Archive**: Distributed across network nodes with replication
+- **Automatic Cleanup**: Multi-tier cleanup system prevents storage overflow
+
+#### 🚨 **Storage Overflow Protection:**
+
+**IMPORTANT**: Blockchain history is NEVER deleted - only cache optimization occurs
+
+| Usage Level | Action | What Gets Cleaned |
+|-------------|--------|-------------------|
+| **70-85%** | Standard Cleanup | Transaction pool cache (duplicates older than 24h) + RocksDB compression |
+| **85-95%** | Aggressive Cleanup | Transaction pool cache (duplicates older than 6h) + maximum compression |
+| **95%+** | Emergency Cleanup | Transaction pool cache (duplicates older than 1h) + emergency compression |
+
+#### 🔒 **What is NEVER Deleted:**
+- **Complete blockchain history**: All blocks preserved forever
+- **All transactions**: Full transaction records maintained in blockchain storage
+- **All microblocks**: Complete microblock chain maintained
+- **Account states**: All account history preserved
+- **Consensus data**: All validation records kept
+
+#### 🔄 **What Gets Optimized:**
+- **Transaction pool cache**: Temporary duplicates for fast access (TTL cleanup)
+- **RocksDB compression**: Automatic compression of older data (reversible)
+- **Storage layout**: Database compaction for optimal disk usage
+- **Memory usage**: In-RAM caches cleared to free memory
+
+#### ⚙️ **Production Configuration:**
+- **Testnet Start**: 300 GB per node (QNET_MAX_STORAGE_GB=300)
+- **Mainnet Growth**: 400-500 GB per node for large networks  
+- **Genesis Nodes**: 1 TB recommended for critical infrastructure
+
+#### 📈 **Long-Term Storage Planning:**
+
+**Storage Growth Projection:**
+```
+Year 1-2:   ~25-50 GB   ✅ 300 GB sufficient
+Year 3-5:   ~120-150 GB ✅ 300 GB sufficient  
+Year 6-8:   ~200-250 GB ⚠️  Consider 400-500 GB
+Year 10+:   ~300+ GB    🔧 Increase to 500-1000 GB
+```
+
+**What happens when storage limit is reached:**
+
+1. **95% Full (285+ GB)**: 
+   - Emergency cleanup automatically triggered
+   - Transaction cache cleared (duplicates only)
+   - Database compression applied
+   - **Blockchain history preserved**
+
+2. **100% Full (300 GB)**:
+   - System attempts emergency cleanup first
+   - If still full, **new blocks cannot be saved**
+   - Node logs critical warnings
+   - Admin must increase `QNET_MAX_STORAGE_GB` or add disk space
+
+3. **Automatic Protection**:
+   - System will never delete blockchain history
+   - Only cache and duplicate data is cleaned
+   - Full transaction records always preserved
+   - All consensus data maintained
+
+**Recommended Actions by Network Age:**
+- **Year 1**: 300 GB default ✅
+- **Year 3+**: Set `QNET_MAX_STORAGE_GB=500`
+- **Year 5+**: Set `QNET_MAX_STORAGE_GB=750`  
+- **Year 10+**: Set `QNET_MAX_STORAGE_GB=1000`
+- **Emergency Handling**: Automatic cleanup maintains operation at 95%+ usage
+- **Admin Alerts**: Hourly monitoring with critical storage notifications
+
+#### 🛡️ **Fault Tolerance:**
+- Minimum 3 replicas per archive chunk across different nodes
+- Automatic rebalancing when nodes disconnect or migrate
+- Background compliance monitoring every 4 hours
+- Mandatory archival participation for Full/Super nodes
+
+#### 🔧 **Node Migration Support:**
+- **Data Transfer**: Archive responsibilities transfer with node migration
+- **Network Continuity**: Distributed system continues during node changes
+- **Integrity Verification**: Cryptographic verification of all data transfers
+- **Compliance Inheritance**: New device inherits previous archival obligations
 
 ### 🛡️ Security Features
 

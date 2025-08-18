@@ -66,6 +66,7 @@ rocksdb = "0.21"
 
 # Compression
 flate2 = "1.0"
+zstd = "0.13"
 
 # Utilities
 rayon = "1.10"

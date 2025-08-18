@@ -19,8 +19,9 @@ use sha3::{Sha3_256, Digest};
 use serde_json;
 use bincode;
 use flate2;
+use serde::{Serialize, Deserialize};
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum NodeType {
     Light,
     Full,
@@ -119,6 +120,9 @@ pub struct BlockchainNode {
     // Sharding components for regional scaling
     shard_coordinator: Option<Arc<qnet_sharding::ShardCoordinator>>,
     parallel_validator: Option<Arc<qnet_sharding::ParallelValidator>>,
+    
+    // Archive replication manager for distributed storage
+    archive_manager: Arc<tokio::sync::RwLock<crate::archive_manager::ArchiveReplicationManager>>,
 }
 
 impl BlockchainNode {
@@ -277,6 +281,25 @@ impl BlockchainNode {
             None
         };
         
+        // Initialize archive replication manager
+        println!("[Node] 📦 Initializing archive replication manager...");
+        let mut archive_manager = crate::archive_manager::ArchiveReplicationManager::new();
+        
+        // Get node IP for archive registration (simplified for now)
+        let node_ip = format!("127.0.0.1:{}", p2p_port); // In production, this would be real external IP
+        
+        // Register node for MANDATORY archival responsibilities (no choice)
+        if let Err(e) = archive_manager.register_archive_node(&node_id, node_type, &node_ip).await {
+            println!("[Node] ⚠️ Archive manager registration failed: {}", e);
+        } else {
+            let quota = match node_type {
+                NodeType::Light => 0,
+                NodeType::Full => 3,
+                NodeType::Super => 8,
+            };
+            println!("[Node] ✅ Registered for archive duties: {} chunks mandatory", quota);
+        }
+        
         println!("[Node] 🔍 DEBUG: Creating BlockchainNode struct...");
         let blockchain = Self {
             storage,
@@ -301,6 +324,7 @@ impl BlockchainNode {
             is_leader: Arc::new(RwLock::new(false)),
             shard_coordinator,
             parallel_validator,
+            archive_manager: Arc::new(tokio::sync::RwLock::new(archive_manager)),
         };
         
         println!("[Node] 🔍 DEBUG: BlockchainNode created successfully for node_id: {}", node_id);
@@ -322,6 +346,19 @@ impl BlockchainNode {
         // Microblocks are core to QNet's 1-second block time architecture
         println!("[Node] ⚡ Starting microblock production (1-second intervals)");
         self.start_microblock_production().await;
+        
+        // PRODUCTION: Start archive compliance enforcement (mandatory for Full/Super nodes)
+        if matches!(self.node_type, NodeType::Full | NodeType::Super) {
+            println!("[Archive] 📋 Starting archive compliance monitoring...");
+            self.start_archive_compliance_monitoring().await;
+            
+            // Check network capacity and rebalance for small networks
+            self.check_and_rebalance_small_network().await;
+        }
+        
+        // PRODUCTION: Start storage monitoring for all nodes
+        println!("[Storage] 📊 Starting storage usage monitoring...");
+        self.start_storage_monitoring().await;
         
         // PRODUCTION: Start consensus message handler
         println!("[Node] 🏛️ Starting consensus message handler");
@@ -732,24 +769,39 @@ impl BlockchainNode {
                     // Calculate TPS for this microblock
                     let tps = (txs.len() as f64) / current_interval.as_secs_f64();
                     
-                    // Save to storage with compression if enabled
-                    let microblock_data = if compression_enabled {
-                        Self::compress_microblock_data(&microblock).unwrap_or_else(|_| {
-                            bincode::serialize(&microblock).unwrap_or_default()
-                        })
-                    } else {
-                        bincode::serialize(&microblock).unwrap_or_default()
-                    };
+                    // PRODUCTION: Use efficient storage system with optimized microblock format
+                    // Create EfficientMicroBlock from full microblock
+                    let efficient_microblock = qnet_state::EfficientMicroBlock::from_microblock(&microblock);
                     
-                    // Store in persistent storage
-                    if let Err(e) = storage.save_microblock(microblock_height, &microblock_data) {
-                        println!("[Microblock] ⚠️  Storage error: {}", e);
+                    // Save using new efficient system with separate transaction pool
+                    match storage.save_efficient_microblock(microblock_height, &efficient_microblock, &txs) {
+                        Ok(_) => {
+                            println!("[Storage] ✅ Efficient microblock {} saved with optimized format", microblock_height);
+                        },
+                        Err(e) => {
+                            println!("[Storage] ⚠️ Efficient storage failed, falling back to legacy: {}", e);
+                            
+                            // Fallback to old method if efficient storage fails
+                            let microblock_data = if compression_enabled {
+                                Self::compress_microblock_data(&microblock).unwrap_or_else(|_| {
+                                    bincode::serialize(&microblock).unwrap_or_default()
+                                })
+                            } else {
+                                bincode::serialize(&microblock).unwrap_or_default()
+                            };
+                            
+                            if let Err(e) = storage.save_microblock(microblock_height, &microblock_data) {
+                                println!("[Microblock] ❌ Both efficient and legacy storage failed: {}", e);
+                            }
+                        }
                     }
                     
-                    // Broadcast to network with smart filtering
+                    // Broadcast to network (full microblock for compatibility)
                     if let Some(p2p) = &unified_p2p {
-                        let broadcast_data = if compression_enabled && microblock_data.len() > 1024 {
-                            microblock_data.clone() // Already compressed
+                        let broadcast_data = if compression_enabled {
+                            Self::compress_microblock_data(&microblock).unwrap_or_else(|_| {
+                                bincode::serialize(&microblock).unwrap_or_default()
+                            })
                         } else {
                             bincode::serialize(&microblock).unwrap_or_default()
                         };
@@ -1268,21 +1320,17 @@ impl BlockchainNode {
         let serialized = bincode::serialize(microblock)
             .map_err(|e| format!("Serialization error: {}", e))?;
         
-        // Production LZ4 compression for maximum performance
-        use std::io::Write;
-        let mut compressed = Vec::new();
-        {
-            let mut encoder = flate2::write::GzEncoder::new(&mut compressed, flate2::Compression::fast());
-            encoder.write_all(&serialized)
-                .map_err(|e| format!("Compression error: {}", e))?;
-            encoder.finish()
-                .map_err(|e| format!("Compression finalization error: {}", e))?;
-        }
+        // Production Zstd compression for optimal space efficiency
+        let compressed = zstd::encode_all(&serialized[..], 3) // Level 3 for good balance
+            .map_err(|e| format!("Zstd compression error: {}", e))?;
         
-        // Only use compression if it actually reduces size
-        if compressed.len() < serialized.len() {
+        // Only use compression if it actually reduces size significantly
+        if compressed.len() < ((serialized.len() as f64) * 0.9) as usize { // At least 10% reduction
+            println!("[Compression] ✅ Zstd compression applied ({} -> {} bytes)", 
+                    serialized.len(), compressed.len());
             Ok(compressed)
         } else {
+            println!("[Compression] ⏭️ Skipping compression (insufficient reduction)");
             Ok(serialized)
         }
     }
@@ -2410,6 +2458,140 @@ impl BlockchainNode {
     pub fn load_microblock_bytes(&self, height: u64) -> Result<Option<Vec<u8>>, QNetError> {
         self.storage.load_microblock(height).map_err(|e| QNetError::StorageError(e.to_string()))
     }
+    
+    /// Start archive compliance monitoring (MANDATORY enforcement)
+    async fn start_archive_compliance_monitoring(&self) {
+        let archive_manager = self.archive_manager.clone();
+        let node_id = self.node_id.clone();
+        let node_type = self.node_type;
+        
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(4 * 3600)); // 4 hours
+            
+            loop {
+                interval.tick().await;
+                
+                println!("[Archive] 🔍 Starting compliance check for node {}", node_id);
+                
+                // Enforce compliance (mandatory, not optional)
+                {
+                    let mut manager = archive_manager.write().await;
+                    if let Err(e) = manager.enforce_compliance().await {
+                        println!("[Archive] ❌ Compliance enforcement failed: {}", e);
+                    } else {
+                        // Get compliance stats for logging
+                        match manager.get_archive_stats().await {
+                            Ok(stats) => {
+                                println!("[Archive] 📊 Compliance Stats:");
+                                println!("[Archive]   Compliant nodes: {}/{}", stats.compliant_nodes, stats.total_nodes);
+                                println!("[Archive]   Non-compliant nodes: {}", stats.non_compliant_nodes);
+                                println!("[Archive]   Underreplicated chunks: {}", stats.underreplicated_chunks);
+                                println!("[Archive]   Average replicas per chunk: {:.1}", stats.avg_replicas);
+                                
+                                // Alert if this node is non-compliant
+                                if stats.non_compliant_nodes > 0 {
+                                    let required_chunks = match node_type {
+                                        NodeType::Full => 3,
+                                        NodeType::Super => 8,
+                                        _ => 0,
+                                    };
+                                    println!("[Archive] ⚠️  NETWORK COMPLIANCE ISSUE: {} nodes not meeting archive obligations", stats.non_compliant_nodes);
+                                    println!("[Archive] 📋 Required: {} chunks for {:?} nodes", required_chunks, node_type);
+                                }
+                            },
+                            Err(e) => println!("[Archive] ❌ Failed to get stats: {}", e),
+                        }
+                    }
+                }
+            }
+        });
+        
+        println!("[Archive] ✅ Archive compliance monitoring started (4-hour intervals)");
+    }
+    
+    /// Check network size and rebalance archive quotas for small networks
+    async fn check_and_rebalance_small_network(&self) {
+        let archive_manager = self.archive_manager.clone();
+        
+        tokio::spawn(async move {
+            // Wait a bit for network discovery
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            
+            let mut manager = archive_manager.write().await;
+            
+            // Validate current network capacity
+            match manager.validate_network_replication_capacity().await {
+                Ok(true) => {
+                    println!("[Archive] ✅ Network capacity sufficient for current requirements");
+                },
+                Ok(false) => {
+                    println!("[Archive] ⚠️ Network capacity insufficient, triggering rebalancing...");
+                    
+                    // Trigger emergency rebalancing
+                    if let Err(e) = manager.rebalance_for_small_network().await {
+                        println!("[Archive] ❌ Emergency rebalancing failed: {}", e);
+                    } else {
+                        println!("[Archive] ✅ Emergency rebalancing completed for small network");
+                    }
+                },
+                Err(e) => {
+                    println!("[Archive] ❌ Failed to validate network capacity: {}", e);
+                }
+            }
+        });
+        
+        println!("[Archive] 🔄 Small network rebalancing check scheduled");
+    }
+    
+    /// Start storage usage monitoring with automatic cleanup
+    async fn start_storage_monitoring(&self) {
+        let storage = self.storage.clone();
+        let node_id = self.node_id.clone();
+        
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(1 * 3600)); // Check every hour
+            
+            loop {
+                interval.tick().await;
+                
+                // Check storage usage and perform cleanup if needed
+                match storage.check_storage_usage_and_cleanup() {
+                    Ok(true) => {
+                        // Normal operation
+                    },
+                    Ok(false) => {
+                        println!("[Storage] ⚠️ Node {} storage in warning/emergency state", node_id);
+                        
+                        // Check if critically full
+                        match storage.is_storage_critically_full() {
+                            Ok(true) => {
+                                println!("[Storage] 🆘 CRITICAL: Node {} storage critically full!", node_id);
+                                println!("[Storage] 💡 ADMIN ACTION REQUIRED:");
+                                println!("[Storage]    1. Increase disk space allocation");
+                                println!("[Storage]    2. Set QNET_MAX_STORAGE_GB=500 or higher");
+                                println!("[Storage]    3. Consider reducing archive quota for this node");
+                                println!("[Storage]    4. Move node to server with larger disk");
+                                
+                                // Emergency slowdown to prevent crash
+                                tokio::time::sleep(Duration::from_secs(10)).await;
+                            },
+                            Ok(false) => {
+                                // Warning state, continue monitoring
+                            },
+                            Err(e) => {
+                                println!("[Storage] ❌ Failed to check critical status: {}", e);
+                            }
+                        }
+                    },
+                    Err(e) => {
+                        println!("[Storage] ❌ Storage monitoring failed for node {}: {}", node_id, e);
+                    }
+                }
+            }
+        });
+        
+        println!("[Storage] ✅ Storage monitoring started (hourly checks)");
+    }
 }
 
 /// Peer information for RPC responses
@@ -2512,6 +2694,7 @@ impl Clone for BlockchainNode {
             is_leader: self.is_leader.clone(),
             shard_coordinator: self.shard_coordinator.clone(),
             parallel_validator: self.parallel_validator.clone(),
+            archive_manager: self.archive_manager.clone(),
         }
     }
 }

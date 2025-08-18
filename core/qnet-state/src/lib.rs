@@ -19,7 +19,7 @@ pub mod errors;
 mod python_bindings;
 
 pub use account::{Account, AccountState};
-pub use block::{Block, BlockHeader, ConsensusProof, BlockType, MicroBlock, MacroBlock, ConsensusData, LightMicroBlock, BlockHash};
+pub use block::{Block, BlockHeader, ConsensusProof, BlockType, MicroBlock, MacroBlock, ConsensusData, LightMicroBlock, BlockHash, EfficientMicroBlock};
 pub use transaction::{Transaction, TransactionReceipt, TransactionType};
 pub use state_db::StateDB;
 pub use state_manager::StateManager;
