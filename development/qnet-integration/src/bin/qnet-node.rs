@@ -1360,6 +1360,13 @@ fn get_genesis_node_ips_dynamic() -> Vec<String> {
 fn check_genesis_node_duplication(bootstrap_id: &str) -> bool {
     println!("[SECURITY] 🔍 Scanning network for duplicate Genesis node {}...", bootstrap_id);
     
+    // PRODUCTION OVERRIDE: Allow skipping duplication check if needed
+    if std::env::var("QNET_SKIP_GENESIS_DUPLICATION_CHECK").unwrap_or_default() == "1" {
+        println!("[SECURITY] ⚠️  DUPLICATION CHECK DISABLED via QNET_SKIP_GENESIS_DUPLICATION_CHECK");
+        println!("[SECURITY] 🔓 Allowing Genesis node startup without duplication verification");
+        return false;
+    }
+    
     // Get all Genesis node IPs to check
     let genesis_ips = get_genesis_node_ips_dynamic();
     let our_current_ip = get_current_server_ip();
@@ -1367,12 +1374,72 @@ fn check_genesis_node_duplication(bootstrap_id: &str) -> bool {
     println!("[SECURITY] 📋 Scanning Genesis IPs: {:?}", genesis_ips);
     println!("[SECURITY] 🔍 Our IP: {} (will be skipped)", our_current_ip);
     
+    // DOCKER/CONTAINER FIX: Smart IP detection for containerized environments
+    if our_current_ip == "auto-detected" || our_current_ip == "unknown" {
+        println!("[SECURITY] ⚠️  IP AUTO-DETECTION FAILED");
+        
+        // Try alternative IP detection using QNET_MANUAL_IP for Docker/Container
+        if let Ok(manual_ip) = std::env::var("QNET_MANUAL_IP") {
+            if !manual_ip.trim().is_empty() && manual_ip != "auto-detected" {
+                println!("[SECURITY] 🐳 Container external IP from QNET_MANUAL_IP: {}", manual_ip);
+                
+                // Use manual IP for duplication checking, but skip our own IP
+                if genesis_ips.contains(&manual_ip) {
+                    println!("[SECURITY] ⏭️  Our IP detected in Genesis list: {}", manual_ip);
+                    println!("[SECURITY] 🔓 Allowing Genesis node startup (our own IP detected)");
+                    return false;
+                }
+            }
+        }
+        
+        println!("[SECURITY] 🐳 Docker/Container mode: Cannot reliably detect duplicates");
+        println!("[SECURITY] 🔧 Set QNET_MANUAL_IP=your.public.ip for strict checking");
+        println!("[SECURITY] 🔓 Allowing Genesis node startup (IP detection failed)");
+        return false; // Allow startup when IP cannot be detected
+    }
+    
     // Check each Genesis IP for active nodes
     for ip in &genesis_ips {
         // Skip our own IP to avoid self-detection
-        if ip == &our_current_ip || (our_current_ip == "auto-detected" && ip.contains("127.0.0.1")) {
+        if ip == &our_current_ip {
             println!("[SECURITY] ⏭️ Skipping our own IP: {}", ip);
             continue;
+        }
+        
+        // CRITICAL FIX: If we can't detect our IP, we need to be more careful
+        // In Docker, the container might be running on the same external IP
+        if our_current_ip == "auto-detected" {
+            // Check if this IP might be our own by testing if we're already running there
+            let self_test_addr = format!("{}:8001", ip);
+            
+            // Try to detect if we're running on this IP by checking environment
+            let manual_ip = std::env::var("QNET_MANUAL_IP").unwrap_or_default();
+            if !manual_ip.is_empty() && manual_ip == *ip {
+                println!("[SECURITY] ⏭️ Skipping our own IP (manual): {}", ip);
+                continue;
+            }
+            
+            // DOCKER FIX: Smart Genesis IP mapping for all Genesis nodes (001-005)
+            let genesis_ip_mapping = vec![
+                ("001", "154.38.160.39"),
+                ("002", "62.171.157.44"),
+                ("003", "161.97.86.81"), 
+                ("004", "173.212.219.226"),
+                ("005", "164.68.108.218"),
+            ];
+            
+            // Check if this IP belongs to our Genesis node
+            let mut is_our_genesis_ip = false;
+            for (id, genesis_ip) in &genesis_ip_mapping {
+                if bootstrap_id == *id && ip == *genesis_ip {
+                    println!("[SECURITY] ⏭️ Skipping Genesis {} primary IP (likely our own): {}", id, genesis_ip);
+                    is_our_genesis_ip = true;
+                    break;
+                }
+            }
+            if is_our_genesis_ip {
+                continue;
+            }
         }
         
         let test_addresses = vec![
@@ -1387,12 +1454,34 @@ fn check_genesis_node_duplication(bootstrap_id: &str) -> bool {
             
             if test_connection_quick(&addr) {
                 println!("[SECURITY] 🚨 FOUND ACTIVE GENESIS NODE at: {}", addr);
-                println!("[SECURITY] ⚠️ Cannot determine exact Genesis ID via network scan");
-                println!("[SECURITY] 🔒 Assuming this could be Genesis {} - BLOCKING duplicate", bootstrap_id);
                 
-                // PRODUCTION NOTE: In full implementation, this would query RPC to get exact Genesis ID
-                // For now, any active Genesis node blocks new Genesis startup for security
-                return true; // Duplicate detected - block startup
+                // CRITICAL FIX: Only block if this is the SAME Genesis node ID
+                // Check if this IP belongs to our Genesis node using our mapping
+                let genesis_ip_mapping = vec![
+                    ("001", "154.38.160.39"),
+                    ("002", "62.171.157.44"),
+                    ("003", "161.97.86.81"), 
+                    ("004", "173.212.219.226"),
+                    ("005", "164.68.108.218"),
+                ];
+                
+                let mut is_our_genesis_node = false;
+                for (id, genesis_ip) in &genesis_ip_mapping {
+                    if bootstrap_id == *id && ip == *genesis_ip {
+                        println!("[SECURITY] 🔒 DUPLICATE: Found our Genesis {} running at: {}", id, addr);
+                        println!("[SECURITY] 🚨 BLOCKING: Genesis node {} already exists!", id);
+                        is_our_genesis_node = true;
+                        break;
+                    }
+                }
+                
+                if is_our_genesis_node {
+                    return true; // Duplicate of OUR Genesis node detected - block startup
+                } else {
+                    println!("[SECURITY] ✅ Different Genesis node active at: {} (not Genesis {})", addr, bootstrap_id);
+                    println!("[SECURITY] 🔓 Continuing startup - this is a different Genesis node");
+                    // Continue checking - this is just another Genesis node, not our duplicate
+                }
             } else {
                 println!("[SECURITY] 📍 No service at: {}", addr);
             }
