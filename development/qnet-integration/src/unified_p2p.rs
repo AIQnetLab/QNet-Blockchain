@@ -190,18 +190,32 @@ impl SimplifiedP2P {
             reputation_system: {
                 let mut reputation_sys = NodeReputation::new(ReputationConfig::default());
                 
-                // PRODUCTION: Bootstrap nodes start with perfect reputation (100.0)
-                const BOOTSTRAP_NODES: &[&str] = &[
-                    "QNET-BOOT-0001-STRAP", "QNET-BOOT-0002-STRAP", "QNET-BOOT-0003-STRAP", 
-                    "QNET-BOOT-0004-STRAP", "QNET-BOOT-0005-STRAP",
-                    "genesis_node_1", "genesis_node_2", "genesis_node_3", 
-                    "genesis_node_4", "genesis_node_5"
-                ];
+                // CRITICAL FIX: Genesis nodes get reputation based on environment variable, not node_id
+                // node_id format is "node_9876_2", but activation code is "QNET-BOOT-0001-STRAP"
                 
-                for bootstrap_node in BOOTSTRAP_NODES {
-                    if node_id.contains(bootstrap_node) {
-                        reputation_sys.update_reputation(bootstrap_node, 50.0); // 50.0 + 50.0 default = 100.0
-                        println!("[P2P] 🛡️ Bootstrap node {} initialized with perfect reputation (100.0)", bootstrap_node);
+                if let Ok(bootstrap_id) = std::env::var("QNET_BOOTSTRAP_ID") {
+                    match bootstrap_id.as_str() {
+                        "001" | "002" | "003" | "004" | "005" => {
+                            reputation_sys.update_reputation(&node_id, 90.0);
+                            println!("[P2P] 🛡️ Genesis node {} (ID: {}) initialized with high reputation (90.0)", bootstrap_id, node_id);
+                        }
+                        _ => {}
+                    }
+                } else if std::env::var("QNET_GENESIS_BOOTSTRAP").unwrap_or_default() == "1" {
+                    reputation_sys.update_reputation(&node_id, 90.0);
+                    println!("[P2P] 🛡️ Legacy Genesis node {} initialized with high reputation (90.0)", node_id);
+                } else {
+                    // Check activation code for Genesis codes
+                    if let Ok(activation_code) = std::env::var("QNET_ACTIVATION_CODE") {
+                        use crate::genesis_constants::GENESIS_BOOTSTRAP_CODES;
+                        
+                        for genesis_code in GENESIS_BOOTSTRAP_CODES {
+                            if activation_code == *genesis_code {
+                                reputation_sys.update_reputation(&node_id, 90.0);
+                                println!("[P2P] 🛡️ Genesis activation code {} (node: {}) initialized with high reputation (90.0)", genesis_code, node_id);
+                                break;
+                            }
+                        }
                     }
                 }
                 

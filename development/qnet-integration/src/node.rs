@@ -1027,42 +1027,39 @@ impl BlockchainNode {
         node_id: &str,
         unified_p2p: &Option<Arc<SimplifiedP2P>>,
     ) -> f64 {
-        if let Some(p2p) = unified_p2p {
-            // Use EXISTING reputation system from P2P - already integrated!
-            let reputation_system = p2p.get_reputation_system();
-            if let Ok(reputation) = reputation_system.lock() {
-                let score = reputation.get_reputation(node_id);
-                // P2P system uses 0-100 scale, convert to 0-1 for consensus
-                return (score / 100.0).max(0.0).min(1.0);
-            };
+        // CRITICAL FIX: Check Genesis status by environment variable FIRST
+        // node_id != activation_code, so we check QNET_BOOTSTRAP_ID instead
+        
+        if let Ok(bootstrap_id) = std::env::var("QNET_BOOTSTRAP_ID") {
+            match bootstrap_id.as_str() {
+                "001" | "002" | "003" | "004" | "005" => {
+                    println!("[REPUTATION] 🛡️ Genesis node {} detected - granting 90% reputation", bootstrap_id);
+                    return 0.90; // Genesis nodes get 90% reputation immediately
+                }
+                _ => {}
+            }
         }
         
-        // SECURITY: Genesis bootstrap nodes get perfect reputation (ONLY these 5 nodes)
-        // PRODUCTION: Exact matching prevents impersonation attacks
-        const GENESIS_BOOTSTRAP_NODES: &[&str] = &[
-            "QNET-BOOT-0001-STRAP", "QNET-BOOT-0002-STRAP", "QNET-BOOT-0003-STRAP",
-            "QNET-BOOT-0004-STRAP", "QNET-BOOT-0005-STRAP"
-        ];
+        // Check for legacy genesis environment variable
+        if std::env::var("QNET_GENESIS_BOOTSTRAP").unwrap_or_default() == "1" {
+            println!("[REPUTATION] 🛡️ Legacy Genesis node detected - granting 90% reputation");
+            return 0.90;
+        }
         
-        // CRITICAL FIX: Use exact matching instead of .contains() to prevent spoofing
-        for genesis_id in GENESIS_BOOTSTRAP_NODES {
-            if node_id == *genesis_id {
-                // PRODUCTION: Additional cryptographic verification for genesis nodes
-                if verify_genesis_node_certificate(node_id) {
-                    return 1.0; // Perfect reputation for VERIFIED genesis nodes only
-                } else {
-                    // SECURITY: Genesis node failed verification - treat as untrusted
-                    println!("[SECURITY] ⚠️ Genesis node {} failed certificate verification", node_id);
-                    return 0.1; // Very low reputation for failed genesis verification
+        // SECURITY: Check activation code directly if available
+        if let Ok(activation_code) = std::env::var("QNET_ACTIVATION_CODE") {
+            use crate::genesis_constants::GENESIS_BOOTSTRAP_CODES;
+            
+            for genesis_code in GENESIS_BOOTSTRAP_CODES {
+                if activation_code == *genesis_code {
+                    println!("[REPUTATION] 🛡️ Genesis activation code {} detected - granting 90% reputation", genesis_code);
+                    return 0.90;
                 }
             }
         }
         
         // SECURITY: Legacy genesis nodes with exact matching (backward compatibility)
-        const LEGACY_GENESIS_NODES: &[&str] = &[
-            "genesis_node_1", "genesis_node_2", "genesis_node_3", 
-            "genesis_node_4", "genesis_node_5"
-        ];
+        use crate::genesis_constants::LEGACY_GENESIS_NODES;
         
         for legacy_id in LEGACY_GENESIS_NODES {
             if node_id == *legacy_id {
@@ -1075,8 +1072,20 @@ impl BlockchainNode {
             }
         }
         
-        // PRODUCTION: Smart reputation system for network health
-        // Genesis bootstrap nodes get high reputation, regular nodes start at 70% for network participation
+        // FALLBACK: Use P2P reputation system for regular nodes
+        if let Some(p2p) = unified_p2p {
+            let reputation_system = p2p.get_reputation_system();
+            if let Ok(reputation) = reputation_system.lock() {
+                let score = reputation.get_reputation(node_id);
+                // P2P system uses 0-100 scale, convert to 0-1 for consensus
+                let p2p_reputation = (score / 100.0).max(0.0).min(1.0);
+                if p2p_reputation > 0.0 {
+                    return p2p_reputation;
+                }
+            };
+        }
+        
+        // DEFAULT: Starting reputation for new nodes based on type
         let is_genesis_bootstrap = std::env::var("QNET_BOOTSTRAP_ID").is_ok() || 
                                   std::env::var("QNET_GENESIS_BOOTSTRAP").unwrap_or_default() == "1";
         
@@ -1810,13 +1819,12 @@ impl BlockchainNode {
             return Err(QNetError::ValidationError("Empty activation code".to_string()));
         }
         
-        // Check for genesis bootstrap codes first (different format)
-        const BOOTSTRAP_WHITELIST: &[&str] = &[
-            "QNET-BOOT-0001-STRAP", "QNET-BOOT-0002-STRAP", "QNET-BOOT-0003-STRAP", 
-            "QNET-BOOT-0004-STRAP", "QNET-BOOT-0005-STRAP"
-        ];
+        // Check for genesis bootstrap codes first (different format)  
+        // IMPORT from shared constants to avoid duplication
+        use crate::genesis_constants::GENESIS_BOOTSTRAP_CODES;
+        let bootstrap_whitelist = GENESIS_BOOTSTRAP_CODES;
         
-        if BOOTSTRAP_WHITELIST.contains(&code) {
+        if bootstrap_whitelist.contains(&code) {
             println!("✅ Genesis bootstrap code detected in node.rs: {}", code);
             // Skip format validation for genesis codes
         } else {

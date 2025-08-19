@@ -249,13 +249,9 @@ async fn check_existing_activation_or_setup() -> Result<(NodeType, String), Box<
 }
 
 // Bootstrap whitelist for first 5 nodes (production network bootstrap)
-const BOOTSTRAP_WHITELIST: &[&str] = &[
-    "QNET-BOOT-0001-STRAP", // Genesis node 1
-    "QNET-BOOT-0002-STRAP", // Genesis node 2  
-    "QNET-BOOT-0003-STRAP", // Genesis node 3
-    "QNET-BOOT-0004-STRAP", // Genesis node 4
-    "QNET-BOOT-0005-STRAP", // Genesis node 5
-];
+// Import shared Genesis constants to avoid duplication
+use qnet_integration::genesis_constants::GENESIS_BOOTSTRAP_CODES;
+const BOOTSTRAP_WHITELIST: &[&str] = GENESIS_BOOTSTRAP_CODES;
 
 // Check if this is a genesis bootstrap node
 fn is_genesis_bootstrap_node() -> bool {
@@ -1497,21 +1493,59 @@ fn check_genesis_node_duplication(bootstrap_id: &str) -> bool {
 fn get_current_server_ip() -> String {
     // Method 1: Check environment variable (for manual override)
     if let Ok(manual_ip) = std::env::var("QNET_MANUAL_IP") {
-        println!("[IP] 🎯 Using manual IP from QNET_MANUAL_IP: {}", manual_ip);
-        return manual_ip;
+        if !manual_ip.trim().is_empty() && manual_ip != "auto-detected" {
+            println!("[IP] 🎯 Using manual IP from QNET_MANUAL_IP: {}", manual_ip);
+            return manual_ip.trim().to_string();
+        }
     }
     
-    // Method 2: Try to get local network IP
+    // Method 2: Try external IP detection for Docker containers
+    if let Ok(external_ip) = get_external_ip() {
+        println!("[IP] 🌐 Using external IP: {}", external_ip);
+        return external_ip;
+    }
+    
+    // Method 3: Try to get local network IP
     if let Ok(local_ip) = get_local_network_ip() {
         println!("[IP] 🏠 Using local network IP: {}", local_ip);
         return local_ip;
     }
     
-    // Fallback: Use detected container IP for Genesis bootstrap
+    // Fallback: Unable to detect IP in container environment
     println!("[IP] ⚠️ Could not auto-detect server IP");
     println!("[IP] 🔧 For production Genesis nodes: Set QNET_MANUAL_IP=your.public.ip");
     println!("[IP] 📝 Using container fallback IP for bootstrap phase");
     "auto-detected".to_string()  // Special marker for auto-detection failure
+}
+
+// Get external IP address (Docker/Container-friendly)
+fn get_external_ip() -> Result<String, String> {
+    use std::process::Command;
+    
+    let ip_services = vec![
+        "https://api.ipify.org",
+        "https://ifconfig.me/ip", 
+        "https://icanhazip.com",
+    ];
+    
+    for service in ip_services {
+        if let Ok(output) = Command::new("curl")
+            .args(&["-s", "--connect-timeout", "3", "--max-time", "5", service])
+            .output() 
+        {
+            if let Ok(ip) = String::from_utf8(output.stdout) {
+                let ip = ip.trim().to_string();
+                if !ip.is_empty() && ip.contains('.') && !ip.contains("error") && !ip.contains("timeout") {
+                    if validate_ip_address_security(&ip) {
+                        println!("[IP] 🌐 External IP detected via {}: {}", service, ip);
+                        return Ok(ip);
+                    }
+                }
+            }
+        }
+    }
+    
+    Err("Could not detect external IP".to_string())
 }
 
 // Get local network IP address
