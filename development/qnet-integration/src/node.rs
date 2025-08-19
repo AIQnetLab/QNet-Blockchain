@@ -1033,8 +1033,33 @@ impl BlockchainNode {
         if let Ok(bootstrap_id) = std::env::var("QNET_BOOTSTRAP_ID") {
             match bootstrap_id.as_str() {
                 "001" | "002" | "003" | "004" | "005" => {
-                    println!("[REPUTATION] 🛡️ Genesis node {} detected - granting 90% reputation", bootstrap_id);
-                    return 0.90; // Genesis nodes get 90% reputation immediately
+                    // SECURITY FIX: Genesis nodes can be penalized but have 70% floor for network stability
+                    // Simplified to avoid lifetime issues while maintaining penalty system
+                    println!("[REPUTATION] 🛡️ Genesis node {} - checking P2P penalties (floor: 70%)", bootstrap_id);
+                    
+                    if let Some(p2p) = unified_p2p {
+                        // Get current P2P reputation score for this node
+                        let p2p_score = match p2p.get_reputation_system().lock() {
+                            Ok(reputation) => reputation.get_reputation(node_id),
+                            Err(_) => 90.0, // Default if lock fails
+                        };
+                        
+                        let p2p_reputation = (p2p_score / 100.0).max(0.0).min(1.0);
+                        
+                        // Genesis nodes: 70% minimum floor but can be penalized for bad behavior
+                        let final_reputation = p2p_reputation.max(0.70);
+                        
+                        if final_reputation < 0.90 {
+                            println!("[REPUTATION] ⚠️ Genesis node {} penalized: {:.1}% (original P2P: {:.1}%)", 
+                                bootstrap_id, final_reputation * 100.0, p2p_reputation * 100.0);
+                        }
+                        
+                        return final_reputation;
+                    } else {
+                        // No P2P system available - use default
+                        println!("[REPUTATION] 🛡️ Genesis node {} detected - granting 90% reputation (default)", bootstrap_id);
+                        return 0.90;
+                    }
                 }
                 _ => {}
             }
@@ -1042,8 +1067,25 @@ impl BlockchainNode {
         
         // Check for legacy genesis environment variable
         if std::env::var("QNET_GENESIS_BOOTSTRAP").unwrap_or_default() == "1" {
-            println!("[REPUTATION] 🛡️ Legacy Genesis node detected - granting 90% reputation");
-            return 0.90;
+            // SECURITY FIX: Legacy Genesis nodes also subject to penalties (70% floor)
+            if let Some(p2p) = unified_p2p {
+                let p2p_score = match p2p.get_reputation_system().lock() {
+                    Ok(reputation) => reputation.get_reputation(node_id),
+                    Err(_) => 90.0, // Default if lock fails
+                };
+                
+                let p2p_reputation = (p2p_score / 100.0).max(0.0).min(1.0);
+                let final_reputation = p2p_reputation.max(0.70);
+                
+                if final_reputation < 0.90 {
+                    println!("[REPUTATION] ⚠️ Legacy Genesis node penalized: {:.1}% (floor: 70%)", final_reputation * 100.0);
+                }
+                
+                return final_reputation;
+            } else {
+                println!("[REPUTATION] 🛡️ Legacy Genesis node detected - granting 90% reputation (default)");
+                return 0.90;
+            }
         }
         
         // SECURITY: Check activation code directly if available
@@ -1052,8 +1094,25 @@ impl BlockchainNode {
             
             for genesis_code in GENESIS_BOOTSTRAP_CODES {
                 if activation_code == *genesis_code {
-                    println!("[REPUTATION] 🛡️ Genesis activation code {} detected - granting 90% reputation", genesis_code);
-                    return 0.90;
+                    // SECURITY FIX: Genesis activation codes also subject to penalties (70% floor)
+                    if let Some(p2p) = unified_p2p {
+                        let p2p_score = match p2p.get_reputation_system().lock() {
+                            Ok(reputation) => reputation.get_reputation(node_id),
+                            Err(_) => 90.0, // Default if lock fails
+                        };
+                        
+                        let p2p_reputation = (p2p_score / 100.0).max(0.0).min(1.0);
+                        let final_reputation = p2p_reputation.max(0.70);
+                        
+                        if final_reputation < 0.90 {
+                            println!("[REPUTATION] ⚠️ Genesis activation {} penalized: {:.1}% (floor: 70%)", genesis_code, final_reputation * 100.0);
+                        }
+                        
+                        return final_reputation;
+                    } else {
+                        println!("[REPUTATION] 🛡️ Genesis activation code {} detected - granting 90% reputation (default)", genesis_code);
+                        return 0.90;
+                    }
                 }
             }
         }

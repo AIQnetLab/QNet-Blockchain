@@ -1137,11 +1137,38 @@ Year 10+:   ~300+ GB    🔧 Increase to 500-1000 GB
 - **Emergency Handling**: Automatic cleanup maintains operation at 95%+ usage
 - **Admin Alerts**: Hourly monitoring with critical storage notifications
 
-#### 🛡️ **Fault Tolerance:**
+#### 🛡️ **Fault Tolerance & Security:**
 - Minimum 3 replicas per archive chunk across different nodes
 - Automatic rebalancing when nodes disconnect or migrate
 - Background compliance monitoring every 4 hours
 - Mandatory archival participation for Full/Super nodes
+
+#### 🚫 **Advanced Reputation & Penalty System:**
+
+**Automatic Penalties for Bad Behavior:**
+| Violation Type | Penalty | Description |
+|----------------|---------|-------------|
+| **Invalid Signature** | -5.0 points | Cryptographic security threat |
+| **Invalid Reveal** | -3.0 points | Consensus protocol violation |
+| **Technical Errors** | -0.5 points | Connection/protocol issues |
+| **Double Signing** | -50.0 points | Major Byzantine fault |
+| **General Failure** | -2.0 points | Generic operational failure |
+
+**Reputation Consequences:**
+- **<70% Reputation**: Excluded from consensus participation
+- **<10% Reputation**: Automatically banned from network
+- **Hourly Decay**: -1% automatic reputation decay for inactive nodes
+
+**Genesis Node Security:**
+- **Starting Reputation**: 90% (high trust)
+- **Penalty Floor**: 70% minimum (cannot be banned, critical infrastructure)
+- **Can Be Penalized**: 90% → 85% → 80% → 75% → 70% (floor)
+- **Cannot Go Below**: 70% (ensures network stability)
+
+**Regular Node Security:**
+- **Starting Reputation**: 70% (immediate consensus participation)
+- **Full Penalties**: Can be reduced to 0% and banned
+- **Merit-Based**: Must earn reputation through good behavior
 
 #### 🔧 **Node Migration Support:**
 - **Data Transfer**: Archive responsibilities transfer with node migration

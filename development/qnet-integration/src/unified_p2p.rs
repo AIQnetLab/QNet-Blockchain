@@ -655,21 +655,33 @@ impl SimplifiedP2P {
                              100.0 // Default if lock fails
                          };
                          
-                         // PRODUCTION: Don't remove genesis bootstrap peers during network initialization
-                         let is_genesis_peer = peer.id.contains("genesis_") || genesis_ips.contains(&peer.addr);
-                         
-                         // Remove peers with very low reputation (except genesis nodes)
-                         if reputation < 10.0 && !is_genesis_peer {
-                             println!("[P2P] 🚫 Removing peer {} due to low reputation: {}", 
-                                 peer.id, reputation);
-                             to_remove.push(i);
-                         } else {
-                             // Update peer stability based on reputation
-                             peer.is_stable = reputation > 75.0 || is_genesis_peer;
-                             if is_genesis_peer {
-                                 println!("[P2P] 🛡️ Genesis peer {} protected (reputation: {})", peer.id, reputation);
-                             }
-                         }
+                                                 // PRODUCTION: Genesis nodes have 10% ban threshold (same as others) but cannot be removed from P2P
+                        // This ensures Genesis nodes remain connected but still face reputation consequences
+                        let is_genesis_peer = peer.id.contains("genesis_") || genesis_ips.contains(&peer.addr);
+                        
+                        // SECURITY FIX: Remove peers with very low reputation (Genesis nodes stay connected but penalized)
+                        if reputation < 10.0 && !is_genesis_peer {
+                            println!("[P2P] 🚫 Removing peer {} due to low reputation: {}", 
+                                peer.id, reputation);
+                            to_remove.push(i);
+                        } else {
+                            // Update peer stability based on reputation
+                            if is_genesis_peer {
+                                // Genesis peers: Stay connected but can lose stability for bad behavior
+                                peer.is_stable = reputation > 70.0; // Must maintain 70% for stability
+                                
+                                if reputation < 70.0 {
+                                    println!("[P2P] ⚠️ Genesis peer {} unstable due to low reputation: {:.1}%", peer.id, reputation);
+                                } else if reputation < 90.0 {
+                                    println!("[P2P] 🔶 Genesis peer {} penalized but stable: {:.1}%", peer.id, reputation);
+                                } else {
+                                    println!("[P2P] 🛡️ Genesis peer {} excellent standing: {:.1}%", peer.id, reputation);
+                                }
+                            } else {
+                                // Regular peers: Standard reputation handling
+                                peer.is_stable = reputation > 75.0;
+                            }
+                        }
                      }
                      
                      // Remove low-reputation peers
