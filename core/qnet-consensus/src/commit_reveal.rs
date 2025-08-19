@@ -443,6 +443,24 @@ impl CommitRevealConsensus {
         Some(selected_leader)
     }
     
+    /// PRODUCTION: Get finalized consensus result if available
+    pub fn get_finalized_consensus(&self) -> Option<ConsensusResultData> {
+        if let Some(state) = &self.current_round {
+            if state.phase == ConsensusPhase::Finalize {
+                // Return finalized consensus data
+                Some(ConsensusResultData {
+                    round_number: state.round_number,
+                    leader_id: self.select_leader(&state.reveals).unwrap_or_else(|| "no_leader".to_string()),
+                    participants: state.participants.clone(),
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+    
     /// PRODUCTION: Check for double signing using signature database
     fn check_double_signing(&mut self, node_id: &str, current_signature: &str, round_number: u64, message_hash: &str) -> Result<(), ConsensusError> {
         // PRODUCTION: Real double signing detection

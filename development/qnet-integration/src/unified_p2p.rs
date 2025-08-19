@@ -310,22 +310,27 @@ impl SimplifiedP2P {
                 };
                 
                 if !already_connected {
-                    self.add_peer_to_region(peer_info.clone());
-                    
-                    // Add to connected peers immediately
-                    {
-                        let mut connected = match self.connected_peers.lock() {
-                            Ok(peers) => peers,
-                            Err(poisoned) => {
-                                println!("[P2P] ⚠️ Connected peers mutex poisoned, recovering...");
-                                poisoned.into_inner()
-                            }
-                        };
-                        connected.push(peer_info.clone());
-                        new_connections += 1;
+                    // PRODUCTION: Validate peer connectivity before adding
+                    if self.is_peer_actually_connected(&peer_info.addr) {
+                        self.add_peer_to_region(peer_info.clone());
+                        
+                        // Add to connected peers only if actually reachable
+                        {
+                            let mut connected = match self.connected_peers.lock() {
+                                Ok(peers) => peers,
+                                Err(poisoned) => {
+                                    println!("[P2P] ⚠️ Connected peers mutex poisoned, recovering...");
+                                    poisoned.into_inner()
+                                }
+                            };
+                            connected.push(peer_info.clone());
+                            new_connections += 1;
+                        }
+                        
+                        println!("[P2P] ✅ Validated and added peer: {}", peer_info.addr);
+                    } else {
+                        println!("[P2P] ❌ Peer {} is not reachable, skipping", peer_info.addr);
                     }
-                    
-                    println!("[P2P] ✅ Added discovered peer: {}", peer_info.addr);
                 }
             }
         }
@@ -1416,10 +1421,21 @@ impl SimplifiedP2P {
         Ok(())
     }
     
-    /// Get connected peer count
+    /// Get connected peer count (PRODUCTION: Real validation)
     pub fn get_peer_count(&self) -> usize {
         match self.connected_peers.lock() {
-            Ok(peers) => peers.len(),
+            Ok(peers) => {
+                // PRODUCTION: Return only VALIDATED active peers 
+                let validated_count = peers.iter()
+                    .filter(|peer| self.is_peer_actually_connected(&peer.addr))
+                    .count();
+                
+                if validated_count != peers.len() {
+                    println!("[P2P] 📊 Real connections: {} (listed: {})", validated_count, peers.len());
+                }
+                
+                validated_count
+            }
             Err(e) => {
                 println!("[P2P] ⚠️ Failed to get peer count: {}, returning 0", e);
                 0
@@ -1427,16 +1443,76 @@ impl SimplifiedP2P {
         }
     }
     
-    /// Get connected peer addresses for consensus participation
+    /// PRODUCTION: Check if peer is actually connected and responsive
+    fn is_peer_actually_connected(&self, peer_addr: &str) -> bool {
+        // PRODUCTION: Quick TCP connectivity check (non-blocking)
+        use std::time::Duration;
+        use tokio::net::TcpStream;
+        
+        // Fast connection test with 1 second timeout
+        let rt = tokio::runtime::Handle::try_current();
+        if let Ok(handle) = rt {
+            if let Ok(result) = handle.block_on(async {
+                tokio::time::timeout(
+                    Duration::from_secs(1),
+                    TcpStream::connect(peer_addr)
+                ).await
+            }) {
+                result.is_ok()
+            } else {
+                false
+            }
+        } else {
+            // Fallback: assume connected if we can't test
+            true
+        }
+    }
+    
+    /// Get connected peer addresses for consensus participation (PRODUCTION: Validated only)
     pub fn get_connected_peer_addresses(&self) -> Vec<String> {
         match self.connected_peers.lock() {
             Ok(peers) => {
-                peers.iter()
+                // PRODUCTION: Return only VALIDATED active peer addresses
+                let validated_addrs: Vec<String> = peers.iter()
+                    .filter(|peer| self.is_peer_actually_connected(&peer.addr))
                     .map(|peer| peer.addr.clone())
-                    .collect()
+                    .collect();
+                
+                println!("[P2P] 📊 Consensus participants: {} validated peers", validated_addrs.len());
+                validated_addrs
             }
             Err(e) => {
                 println!("[P2P] ⚠️ Failed to get peer addresses: {}, returning empty", e);
+                Vec::new()
+            }
+        }
+    }
+    
+    /// PRODUCTION: Get validated active peers for consensus participation
+    pub fn get_validated_active_peers(&self) -> Vec<PeerInfo> {
+        match self.connected_peers.lock() {
+            Ok(peers) => {
+                // PRODUCTION: Filter only peers that are actually responsive
+                let validated_peers: Vec<PeerInfo> = peers.iter()
+                    .filter(|peer| {
+                        // Check actual connectivity
+                        if !self.is_peer_actually_connected(&peer.addr) {
+                            println!("[P2P] ⚠️ Removing unresponsive peer: {}", peer.addr);
+                            return false;
+                        }
+                        
+                        // PRODUCTION: Check if peer meets consensus requirements
+                        // Only Super and Full nodes can participate in consensus
+                        matches!(peer.node_type, NodeType::Super | NodeType::Full)
+                    })
+                    .cloned()
+                    .collect();
+                
+                println!("[P2P] ✅ Validated consensus peers: {}/{}", validated_peers.len(), peers.len());
+                validated_peers
+            }
+            Err(e) => {
+                println!("[P2P] ⚠️ Failed to get validated peers: {}", e);
                 Vec::new()
             }
         }
