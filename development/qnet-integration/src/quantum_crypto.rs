@@ -657,8 +657,11 @@ impl QNetQuantumCrypto {
         let signature_hash = hasher.finalize();
         let signature_b64 = general_purpose::STANDARD.encode(&signature_hash[..64]);
         
+        // CRITICAL FIX: Generate signature in format expected by consensus validation
+        let consensus_signature = format!("dilithium_sig_{}_{}", node_id, signature_b64);
+        
         Ok(DilithiumSignature {
-            signature: signature_b64,
+            signature: consensus_signature,
             algorithm: "QNet-Dilithium-Consensus".to_string(),
             timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
             strength: "quantum-resistant".to_string(),

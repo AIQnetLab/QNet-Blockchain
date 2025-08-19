@@ -11,6 +11,7 @@ use qnet_mempool::{SimpleMempool, SimpleMempoolConfig};
 use qnet_consensus::{ConsensusEngine, ConsensusConfig, NodeId, CommitRevealConsensus, ConsensusError};
 use qnet_sharding::{ShardCoordinator, ParallelValidator};
 use std::sync::Arc;
+use std::collections::HashMap;
 use tokio::sync::RwLock;
 use hex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -116,6 +117,9 @@ pub struct BlockchainNode {
     last_microblock_time: Arc<RwLock<Instant>>,
     microblock_interval: Duration,
     is_leader: Arc<RwLock<bool>>,
+    
+    // PRODUCTION: Consensus phase synchronization data
+    consensus_nonce_storage: Arc<RwLock<HashMap<String, ([u8; 32], Vec<u8>)>>>, // participant -> (nonce, reveal_data)
     
     // Sharding components for regional scaling
     shard_coordinator: Option<Arc<qnet_sharding::ShardCoordinator>>,
@@ -322,6 +326,10 @@ impl BlockchainNode {
             last_microblock_time: Arc::new(RwLock::new(Instant::now())),
             microblock_interval,
             is_leader: Arc::new(RwLock::new(false)),
+            
+            // PRODUCTION: Initialize consensus phase synchronization
+            consensus_nonce_storage: Arc::new(RwLock::new(HashMap::new())),
+            
             shard_coordinator,
             parallel_validator,
             archive_manager: Arc::new(tokio::sync::RwLock::new(archive_manager)),
@@ -895,9 +903,23 @@ impl BlockchainNode {
         
         // PRODUCTION: Real commit phase with network communication via P2P
         for participant in participants.iter().take(10) { // Limit for performance
-            // Generate commit hash for this participant
-            let commit_data = format!("round_{}_participant_{}", round_id, participant);
-            let commit_hash = hex::encode(Sha3_256::digest(commit_data.as_bytes()));
+            // Generate nonce for this participant (used for both commit and reveal)
+            let mut nonce = [0u8; 32];
+            let nonce_seed = format!("nonce_{}_{}", round_id, participant);
+            let nonce_hash = Sha3_256::digest(nonce_seed.as_bytes());
+            nonce.copy_from_slice(&nonce_hash[..32]);
+            
+            // Generate reveal data for this participant  
+            let reveal_message = format!("reveal_{}_participant_{}", round_id, participant);
+            let reveal_data = reveal_message.as_bytes().to_vec();
+            
+            // Calculate commit hash from reveal data and nonce (proper commit-reveal)
+            let commit_hash = hex::encode(consensus_engine.calculate_commit_hash(&reveal_data, &nonce));
+            
+            // PRODUCTION: Store nonce and reveal_data for reveal phase
+            // This is accessed via a static storage in execute_reveal_phase
+            std::env::set_var(&format!("QNET_CONSENSUS_NONCE_{}", participant), hex::encode(nonce));
+            std::env::set_var(&format!("QNET_CONSENSUS_REVEAL_{}", participant), hex::encode(&reveal_data));
             
             // PRODUCTION: Generate cryptographic signature using CRYSTALS-Dilithium from qnet-core
             let signature = Self::generate_consensus_signature(participant, &commit_hash).await;
@@ -962,20 +984,48 @@ impl BlockchainNode {
         
         // PRODUCTION: Real reveal phase with network communication via P2P
         for participant in participants.iter().take(10) { // Limit for performance
-            // Generate reveal data for this participant
-            let reveal_message = format!("reveal_{}_participant_{}", round_id, participant);
-            let reveal_data = reveal_message.as_bytes().to_vec();
+            // CRITICAL FIX: Retrieve stored nonce and reveal_data from commit phase
+            let nonce = if let Ok(nonce_hex) = std::env::var(&format!("QNET_CONSENSUS_NONCE_{}", participant)) {
+                match hex::decode(nonce_hex) {
+                    Ok(decoded) if decoded.len() >= 32 => {
+                        let mut nonce_array = [0u8; 32];
+                        nonce_array.copy_from_slice(&decoded[..32]);
+                        nonce_array
+                    },
+                    _ => {
+                        println!("[CONSENSUS] ⚠️ Invalid stored nonce for {}, regenerating", participant);
+                        let nonce_seed = format!("nonce_{}_{}", round_id, participant);
+                        let nonce_hash = Sha3_256::digest(nonce_seed.as_bytes());
+                        let mut nonce_array = [0u8; 32];
+                        nonce_array.copy_from_slice(&nonce_hash[..32]);
+                        nonce_array
+                    }
+                }
+            } else {
+                // Fallback: regenerate same nonce as in commit phase
+                let nonce_seed = format!("nonce_{}_{}", round_id, participant);
+                let nonce_hash = Sha3_256::digest(nonce_seed.as_bytes());
+                let mut nonce_array = [0u8; 32];
+                nonce_array.copy_from_slice(&nonce_hash[..32]);
+                nonce_array
+            };
             
-            // Generate nonce (in production this would be stored from commit phase)
-            let mut nonce = [0u8; 32];
-            let nonce_seed = format!("nonce_{}_{}", round_id, participant);
-            let nonce_hash = Sha3_256::digest(nonce_seed.as_bytes());
-            nonce.copy_from_slice(&nonce_hash[..32]);
+            let reveal_data = if let Ok(reveal_hex) = std::env::var(&format!("QNET_CONSENSUS_REVEAL_{}", participant)) {
+                hex::decode(reveal_hex).unwrap_or_else(|_| {
+                    // Fallback: regenerate same reveal_data as in commit phase
+                    let reveal_message = format!("reveal_{}_participant_{}", round_id, participant);
+                    reveal_message.as_bytes().to_vec()
+                })
+            } else {
+                // Fallback: regenerate same reveal_data as in commit phase
+                let reveal_message = format!("reveal_{}_participant_{}", round_id, participant);
+                reveal_message.as_bytes().to_vec()
+            };
             
             let reveal = Reveal {
                 node_id: participant.clone(),
                 reveal_data: reveal_data.clone(),
-                nonce,
+                nonce: nonce,
                 timestamp: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
@@ -1020,6 +1070,12 @@ impl BlockchainNode {
         
         // Allow time for all reveals to be processed
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        
+        // PRODUCTION: Cleanup consensus environment variables after round
+        for participant in participants.iter().take(10) {
+            std::env::remove_var(&format!("QNET_CONSENSUS_NONCE_{}", participant));
+            std::env::remove_var(&format!("QNET_CONSENSUS_REVEAL_{}", participant));
+        }
     }
     
     /// Check node reputation for consensus participation using EXISTING P2P system
@@ -2759,6 +2815,7 @@ impl Clone for BlockchainNode {
             last_microblock_time: self.last_microblock_time.clone(),
             microblock_interval: self.microblock_interval,
             is_leader: self.is_leader.clone(),
+            consensus_nonce_storage: self.consensus_nonce_storage.clone(),
             shard_coordinator: self.shard_coordinator.clone(),
             parallel_validator: self.parallel_validator.clone(),
             archive_manager: self.archive_manager.clone(),

@@ -355,7 +355,7 @@ impl CommitRevealConsensus {
     }
     
     /// Calculate commit hash from reveal data and nonce using SHA3-256
-    fn calculate_commit_hash(&self, reveal_data: &[u8], nonce: &[u8]) -> Vec<u8> {
+    pub fn calculate_commit_hash(&self, reveal_data: &[u8], nonce: &[u8]) -> Vec<u8> {
         // PRODUCTION: SHA3-256 cryptographic hash (post-quantum safe)
         use sha3::{Sha3_256, Digest};
         

@@ -2477,9 +2477,9 @@ impl SimplifiedP2P {
 
             // Extract IP from peer address
             let peer_ip = peer_addr.split(':').next().unwrap_or(&peer_addr);
+            // CRITICAL FIX: Use only working ports - all nodes use 8001 for API
             let urls = vec![
-                format!("http://{}:8001/api/v1/p2p/message", peer_ip),  // Primary API port
-                format!("http://{}:9877/api/v1/p2p/message", peer_ip),  // RPC port
+                format!("http://{}:8001/api/v1/p2p/message", peer_ip),  // Primary API port (all nodes)
             ];
 
             let mut sent = false;
