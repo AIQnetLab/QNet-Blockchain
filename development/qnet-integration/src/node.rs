@@ -186,7 +186,7 @@ impl BlockchainNode {
         let consensus_config = qnet_consensus::ConsensusConfig {
             commit_phase_duration: Duration::from_secs(15),    // Faster phases for 1s blocks
             reveal_phase_duration: Duration::from_secs(15),    // Total consensus: 30s per round
-            min_participants: 1,           // Allow single node for genesis bootstrap
+            min_participants: 4,           // PRODUCTION: 4 nodes minimum for Byzantine safety (3f+1, f=1)
             max_participants: 1000,        // Maximum participants per round
             max_validators_per_round: 100, // PRODUCTION: 100 validators per round
             enable_validator_sampling: true, // Enable sampling for scalability

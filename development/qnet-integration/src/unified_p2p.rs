@@ -967,11 +967,18 @@ impl SimplifiedP2P {
             .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
             .unwrap_or(false);
         
-        // PRODUCTION: Genesis nodes can ALWAYS start consensus (bootstrap network)
-        // Non-genesis nodes need Byzantine fault tolerance (3f+1 nodes)
+        // PRODUCTION: Even Genesis nodes need Byzantine safety requirements
+        // Exception ONLY for initial network bootstrap with exactly 1 Genesis node total
         if is_genesis_bootstrap {
-            println!("🚀 [CONSENSUS] Genesis bootstrap node - starting blockchain initialization");
-            return true; // Genesis nodes can ALWAYS start consensus
+            let total_nodes = connected.len() + 1; // +1 for self
+            if total_nodes >= 4 {
+                println!("🏛️ [CONSENSUS] Genesis node with {} total nodes - Byzantine consensus enabled", total_nodes);
+                // Continue to normal Byzantine checks below
+            } else {
+                println!("⚠️ [CONSENSUS] Genesis bootstrap - insufficient nodes for Byzantine safety: {}/4", total_nodes);
+                println!("🔄 [CONSENSUS] Waiting for more Genesis nodes to join network...");
+                return false; // Even Genesis needs Byzantine safety
+            }
         }
         
         // For non-genesis nodes: Strict Byzantine consensus requirement

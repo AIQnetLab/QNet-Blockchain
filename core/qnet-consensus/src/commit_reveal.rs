@@ -182,11 +182,13 @@ impl CommitRevealConsensus {
         // Store commit
         state.commits.insert(commit.node_id.clone(), commit);
         
-        // Check if we have enough commits
-        if state.commits.len() >= self.config.min_participants {
-            // Advance to reveal phase
+        // Check if we have enough commits for Byzantine safety (2f+1 threshold)
+        let byzantine_threshold = (self.config.min_participants * 2 + 2) / 3; // 2f+1 where min_participants = 3f+1
+        if state.commits.len() >= byzantine_threshold {
+            // Advance to reveal phase with Byzantine safety
+            println!("[CONSENSUS] ✅ Byzantine threshold reached: {}/{} commits", 
+                     state.commits.len(), byzantine_threshold);
             state.phase = ConsensusPhase::Reveal;
-            // Use reveal_phase_duration instead of reveal_timeout
             state.phase_start = Instant::now();
             state.phase_duration = self.config.reveal_phase_duration;
         }
@@ -304,7 +306,7 @@ impl CommitRevealConsensus {
         }
     }
     
-    /// Finalize round (simplified)
+    /// PRODUCTION: Finalize round with Byzantine safety requirements
     pub fn finalize_round(&mut self) -> Result<String, ConsensusError> {
         // First get the leader without mutable borrow
         let leader = {
@@ -314,7 +316,19 @@ impl CommitRevealConsensus {
                 return Err(ConsensusError::InvalidPhase("Not in reveal phase".to_string()));
             }
             
-            // Simple leader selection
+            // PRODUCTION: Check Byzantine threshold for reveals (2f+1)
+            let byzantine_threshold = (self.config.min_participants * 2 + 2) / 3;
+            if state.reveals.len() < byzantine_threshold {
+                return Err(ConsensusError::InvalidCommit(
+                    format!("Insufficient reveals for Byzantine safety: {}/{}", 
+                           state.reveals.len(), byzantine_threshold)
+                ));
+            }
+            
+            println!("[CONSENSUS] ✅ Byzantine finalization threshold reached: {}/{} reveals", 
+                     state.reveals.len(), byzantine_threshold);
+            
+            // Byzantine-safe leader selection
             self.select_leader(&state.reveals)
                 .ok_or(ConsensusError::LeaderSelectionFailed)?
         };
