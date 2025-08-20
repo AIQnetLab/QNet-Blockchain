@@ -1541,7 +1541,7 @@ impl BlockchainNode {
         let consensus_data = {
             let consensus_engine = consensus.read().await;
             
-            // CRITICAL: Only proceed if we have finalized consensus
+            // CRITICAL: Check consensus OR allow Genesis bootstrap mode
             match consensus_engine.get_finalized_consensus() {
                 Some(data) => {
                     if data.participants.len() < 1 {
@@ -1551,8 +1551,24 @@ impl BlockchainNode {
                     data
                 }
                 None => {
-                    println!("[Macroblock] ❌ No finalized consensus available - skipping macroblock creation");
-                    return Err("Consensus not finalized".to_string());
+                    // PRODUCTION: Check if this is Genesis bootstrap mode
+                    let is_genesis_bootstrap = std::env::var("QNET_BOOTSTRAP_ID")
+                        .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
+                        .unwrap_or(false);
+                    
+                    if is_genesis_bootstrap {
+                        // GENESIS BOOTSTRAP: Allow single-node macroblock creation
+                        println!("[Macroblock] 🌱 Genesis bootstrap mode - creating local macroblock");
+                        qnet_consensus::commit_reveal::ConsensusResultData {
+                            round_number: end_height / 90,
+                            leader_id: format!("genesis_bootstrap_{}", 
+                                             std::env::var("QNET_BOOTSTRAP_ID").unwrap_or("001".to_string())),
+                            participants: vec![format!("genesis_bootstrap_single")],
+                        }
+                    } else {
+                        println!("[Macroblock] ❌ No finalized consensus available - skipping macroblock creation");
+                        return Err("Consensus not finalized".to_string());
+                    }
                 }
             }
         };
