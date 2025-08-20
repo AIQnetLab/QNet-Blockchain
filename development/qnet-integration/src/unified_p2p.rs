@@ -853,58 +853,55 @@ impl SimplifiedP2P {
         Err(format!("All HTTP endpoints failed for {}", peer_ip))
     }
     
-    /// Query peer height via HTTP with timeout and error handling
+    /// Query peer height via HTTP with timeout and error handling (async-safe)
     fn query_peer_height_http(&self, endpoint: &str) -> Result<u64, String> {
         use std::time::Duration;
         
-        // PRODUCTION: Use async runtime for HTTP requests with retry logic
-        let rt = tokio::runtime::Handle::current();
-        rt.block_on(async {
-            let client = reqwest::Client::builder()
-                .timeout(Duration::from_secs(15)) // PRODUCTION: Increased timeout
-                .build()
-                .map_err(|e| format!("HTTP client error: {}", e))?;
-            
-            // PRODUCTION: Retry logic for real network
-            for attempt in 1..=3 {
-                match client.get(endpoint).send().await {
-                    Ok(response) if response.status().is_success() => {
-                        match response.json::<serde_json::Value>().await {
-                            Ok(json) => {
-                                if let Some(height) = json.get("height").and_then(|h| h.as_u64()) {
-                                    return Ok(height);
-                                } else {
-                                    return Err("Invalid height format in response".to_string());
-                                }
-                            }
-                            Err(e) => {
-                                if attempt < 3 {
-                                    tokio::time::sleep(Duration::from_secs(1)).await;
-                                    continue;
-                                }
-                                return Err(format!("JSON parse error: {}", e));
+        // PRODUCTION: Use blocking HTTP client to avoid runtime conflicts
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(15)) // PRODUCTION: Increased timeout for real network
+            .build()
+            .map_err(|e| format!("HTTP client error: {}", e))?;
+        
+        // PRODUCTION: Retry logic for real network
+        for attempt in 1..=3 {
+            match client.get(endpoint).send() {
+                Ok(response) if response.status().is_success() => {
+                    match response.json::<serde_json::Value>() {
+                        Ok(json) => {
+                            if let Some(height) = json.get("height").and_then(|h| h.as_u64()) {
+                                return Ok(height);
+                            } else {
+                                return Err("Invalid height format in response".to_string());
                             }
                         }
-                    }
-                    Ok(response) => {
-                        if attempt < 3 {
-                            tokio::time::sleep(Duration::from_secs(1)).await;
-                            continue;
+                        Err(e) => {
+                            if attempt < 3 {
+                                std::thread::sleep(Duration::from_secs(1));
+                                continue;
+                            }
+                            return Err(format!("JSON parse error: {}", e));
                         }
-                        return Err(format!("HTTP error: {}", response.status()));
-                    }
-                    Err(e) => {
-                        if attempt < 3 {
-                            tokio::time::sleep(Duration::from_secs(1)).await;
-                            continue;
-                        }
-                        return Err(format!("Request failed: {}", e));
                     }
                 }
+                Ok(response) => {
+                    if attempt < 3 {
+                        std::thread::sleep(Duration::from_secs(1));
+                        continue;
+                    }
+                    return Err(format!("HTTP error: {}", response.status()));
+                }
+                Err(e) => {
+                    if attempt < 3 {
+                        std::thread::sleep(Duration::from_secs(1));
+                        continue;
+                    }
+                    return Err(format!("Request failed: {}", e));
+                }
             }
-            
-            Err("All retry attempts failed".to_string())
-        })
+        }
+        
+        Err("All retry attempts failed".to_string())
     }
     
     /// Fallback: Estimate peer height from genesis timestamp with error resilience
