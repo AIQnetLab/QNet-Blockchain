@@ -250,7 +250,7 @@ async fn check_existing_activation_or_setup() -> Result<(NodeType, String), Box<
 
 // Bootstrap whitelist for first 5 nodes (production network bootstrap)
 // Import shared Genesis constants to avoid duplication
-use qnet_integration::genesis_constants::GENESIS_BOOTSTRAP_CODES;
+use qnet_integration::genesis_constants::{GENESIS_BOOTSTRAP_CODES, GENESIS_NODE_IPS};
 const BOOTSTRAP_WHITELIST: &[&str] = GENESIS_BOOTSTRAP_CODES;
 
 // Check if this is a genesis bootstrap node
@@ -317,8 +317,31 @@ fn is_genesis_bootstrap_node() -> bool {
         println!("[DEBUG] QNET_GENESIS_BOOTSTRAP not set to '1'");
     }
     
-    // Method 3: Check if network is in genesis state (no other nodes exist)
-    println!("[DEBUG] Method 3: Checking network genesis state...");
+    // Method 3: Smart Genesis detection - check for Genesis environment
+    println!("[DEBUG] Method 3: Smart Genesis detection...");
+    
+    // Check if we're running on a Genesis IP (Docker mode)
+    let current_ip = get_current_server_ip();
+    if current_ip != "auto-detected" {
+        let genesis_ips = get_genesis_node_ips_dynamic();
+        if genesis_ips.contains(&current_ip) {
+            println!("🚀 SMART GENESIS: Detected Genesis IP {} - auto-enabling Genesis mode", current_ip);
+            println!("📝 DOCKER: If this is wrong, set QNET_BOOTSTRAP_ID explicitly");
+            
+            // Auto-detect bootstrap ID from IP mapping
+            for (genesis_ip, bootstrap_id) in GENESIS_NODE_IPS {
+                if *genesis_ip == current_ip {
+                    std::env::set_var("QNET_BOOTSTRAP_ID", bootstrap_id);
+                    println!("🔧 AUTO-SET: QNET_BOOTSTRAP_ID={} based on IP {}", bootstrap_id, current_ip);
+                    return true;
+                }
+            }
+            return true;
+        }
+    }
+    
+    // Method 4: Check if network is in genesis state (no other nodes exist)
+    println!("[DEBUG] Method 4: Checking network genesis state...");
     if is_network_in_genesis_state() {
         println!("🚀 Network in genesis state - allowing bootstrap node startup");
         return true;

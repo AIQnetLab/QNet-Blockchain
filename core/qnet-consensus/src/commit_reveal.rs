@@ -211,24 +211,30 @@ impl CommitRevealConsensus {
             return false;
         }
         
-        // Extract signature components with debug logging
-        let parts: Vec<&str> = signature.splitn(4, '_').collect();
+        // PRODUCTION: Extract node_id and signature from format: "dilithium_sig_{node_id}_{signature}"
+        let prefix = "dilithium_sig_";
+        let signature_part = &signature[prefix.len()..];
         
-        // PRODUCTION: Debug signature validation for troubleshooting
-        if parts.len() != 4 {
-            println!("[CONSENSUS] ❌ Signature format invalid: expected 4 parts, got {} in '{}'", parts.len(), signature);
+        // Find the last '_' to separate node_id from signature
+        let last_underscore_pos = signature_part.rfind('_');
+        if last_underscore_pos.is_none() {
+            println!("[CONSENSUS] ❌ Signature format invalid: missing separator in '{}'", signature);
             return false;
         }
         
-        if parts[2] != node_id {
+        let separator_pos = last_underscore_pos.unwrap();
+        let extracted_node_id = &signature_part[..separator_pos];
+        let signature_hex = &signature_part[separator_pos + 1..];
+        
+        // PRODUCTION: Validate extracted node_id matches expected
+        if extracted_node_id != node_id {
             println!("[CONSENSUS] ❌ Node ID mismatch: expected '{}', got '{}' in signature '{}'", 
-                     node_id, parts[2], signature);
+                     node_id, extracted_node_id, signature);
             return false;
         }
         
-        println!("[CONSENSUS] ✅ Signature format valid for node: {} (parts: {:?})", node_id, parts);
-        
-        let signature_hex = parts[3];
+        println!("[CONSENSUS] ✅ Signature validation: node_id='{}', signature_len={} bytes", 
+                 extracted_node_id, signature_hex.len());
         if signature_hex.len() < 200 || signature_hex.len() > 8192 { // Dilithium signature size range
             return false;
         }
