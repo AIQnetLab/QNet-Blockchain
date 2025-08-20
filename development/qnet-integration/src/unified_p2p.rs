@@ -857,32 +857,54 @@ impl SimplifiedP2P {
     fn query_peer_height_http(&self, endpoint: &str) -> Result<u64, String> {
         use std::time::Duration;
         
-        // PRODUCTION: Use proper blocking HTTP client for synchronous context
-        let client = reqwest::blocking::Client::new();
-        
-        match client
-            .get(endpoint)
-            .timeout(Duration::from_secs(5))
-            .send()
-        {
-            Ok(response) => {
-                if response.status().is_success() {
-                    match response.json::<serde_json::Value>() {
-                        Ok(data) => {
-                            if let Some(height) = data.get("height").and_then(|v| v.as_u64()) {
-                                Ok(height)
-                            } else {
-                                Err("Invalid height field in response".to_string())
+        // PRODUCTION: Use async runtime for HTTP requests with retry logic
+        let rt = tokio::runtime::Handle::current();
+        rt.block_on(async {
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(15)) // PRODUCTION: Increased timeout
+                .build()
+                .map_err(|e| format!("HTTP client error: {}", e))?;
+            
+            // PRODUCTION: Retry logic for real network
+            for attempt in 1..=3 {
+                match client.get(endpoint).send().await {
+                    Ok(response) if response.status().is_success() => {
+                        match response.json::<serde_json::Value>().await {
+                            Ok(json) => {
+                                if let Some(height) = json.get("height").and_then(|h| h.as_u64()) {
+                                    return Ok(height);
+                                } else {
+                                    return Err("Invalid height format in response".to_string());
+                                }
+                            }
+                            Err(e) => {
+                                if attempt < 3 {
+                                    tokio::time::sleep(Duration::from_secs(1)).await;
+                                    continue;
+                                }
+                                return Err(format!("JSON parse error: {}", e));
                             }
                         }
-                        Err(e) => Err(format!("Failed to parse JSON response: {}", e))
                     }
-                } else {
-                    Err(format!("HTTP error: {}", response.status()))
+                    Ok(response) => {
+                        if attempt < 3 {
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            continue;
+                        }
+                        return Err(format!("HTTP error: {}", response.status()));
+                    }
+                    Err(e) => {
+                        if attempt < 3 {
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            continue;
+                        }
+                        return Err(format!("Request failed: {}", e));
+                    }
                 }
             }
-            Err(e) => Err(format!("HTTP request failed: {}", e))
-        }
+            
+            Err("All retry attempts failed".to_string())
+        })
     }
     
     /// Fallback: Estimate peer height from genesis timestamp with error resilience
@@ -2626,7 +2648,7 @@ impl SimplifiedP2P {
         // Send asynchronously in background thread
         tokio::spawn(async move {
             let client = match reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(10))
+                .timeout(std::time::Duration::from_secs(30)) // PRODUCTION: Increased timeout for real network
                 .user_agent("QNet-Node/1.0")
                 .build() {
                 Ok(client) => client,
@@ -2645,21 +2667,31 @@ impl SimplifiedP2P {
 
             let mut sent = false;
             for url in urls {
-                match client.post(&url)
-                    .json(&message_json)
-                    .send().await {
-                    Ok(response) if response.status().is_success() => {
-                        println!("[P2P] ✅ Message sent to {}", peer_ip);
-                        sent = true;
-                        break;
-                    }
-                    Ok(response) => {
-                        println!("[P2P] ⚠️ HTTP error {} for {}", response.status(), url);
-                    }
-                    Err(e) => {
-                        println!("[P2P] ⚠️ Connection failed for {}: {}", url, e);
+                // PRODUCTION: HTTP retry logic for real network reliability
+                for attempt in 1..=3 {
+                    match client.post(&url)
+                        .json(&message_json)
+                        .send().await {
+                        Ok(response) if response.status().is_success() => {
+                            println!("[P2P] ✅ Message sent to {} (attempt {})", peer_ip, attempt);
+                            sent = true;
+                            break;
+                        }
+                        Ok(response) => {
+                            println!("[P2P] ⚠️ HTTP error {} for {} (attempt {})", response.status(), url, attempt);
+                            if attempt < 3 {
+                                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                            }
+                        }
+                        Err(e) => {
+                            println!("[P2P] ⚠️ Connection failed for {} (attempt {}): {}", url, attempt, e);
+                            if attempt < 3 {
+                                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                            }
+                        }
                     }
                 }
+                if sent { break; }
             }
 
             if !sent {
