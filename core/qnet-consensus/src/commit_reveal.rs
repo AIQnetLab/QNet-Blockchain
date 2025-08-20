@@ -211,11 +211,22 @@ impl CommitRevealConsensus {
             return false;
         }
         
-        // Extract signature components
+        // Extract signature components with debug logging
         let parts: Vec<&str> = signature.splitn(4, '_').collect();
-        if parts.len() != 4 || parts[2] != node_id {
-            return false; // Node ID must match exactly
+        
+        // PRODUCTION: Debug signature validation for troubleshooting
+        if parts.len() != 4 {
+            println!("[CONSENSUS] ❌ Signature format invalid: expected 4 parts, got {} in '{}'", parts.len(), signature);
+            return false;
         }
+        
+        if parts[2] != node_id {
+            println!("[CONSENSUS] ❌ Node ID mismatch: expected '{}', got '{}' in signature '{}'", 
+                     node_id, parts[2], signature);
+            return false;
+        }
+        
+        println!("[CONSENSUS] ✅ Signature format valid for node: {} (parts: {:?})", node_id, parts);
         
         let signature_hex = parts[3];
         if signature_hex.len() < 200 || signature_hex.len() > 8192 { // Dilithium signature size range
@@ -343,6 +354,24 @@ impl CommitRevealConsensus {
     /// Get current round status
     pub fn get_round_status(&self) -> Option<&RoundState> {
         self.current_round.as_ref()
+    }
+    
+    /// PRODUCTION: Get current commit count for Byzantine threshold checking
+    pub fn get_current_commit_count(&self) -> usize {
+        if let Some(state) = &self.current_round {
+            state.commits.len()
+        } else {
+            0
+        }
+    }
+    
+    /// PRODUCTION: Get current reveal count for Byzantine threshold checking  
+    pub fn get_current_reveal_count(&self) -> usize {
+        if let Some(state) = &self.current_round {
+            state.reveals.len()
+        } else {
+            0
+        }
     }
     
     /// PRODUCTION: Reputation-based validation using external reputation system
