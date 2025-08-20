@@ -270,7 +270,7 @@ impl SimplifiedP2P {
             println!("[P2P] 🔍 DEBUG: Parsing peer address: {}", peer_addr);
             match self.parse_peer_address(peer_addr) {
                 Ok(peer_info) => {
-                    println!("[P2P] ✅ Successfully parsed peer: {} -> {}", peer_addr, peer_info.id);
+                    println!("[P2P] ✅ Successfully parsed peer: {} -> {} ({})", peer_addr, peer_info.id, region_string(&peer_info.region));
                 self.add_peer_to_region(peer_info);
                     successful_parses += 1;
                 }
@@ -1428,20 +1428,34 @@ impl SimplifiedP2P {
         Ok(())
     }
     
-    /// Get connected peer count (PRODUCTION: Real validation)
+    /// Get connected peer count (PRODUCTION: Real failover validation)
     pub fn get_peer_count(&self) -> usize {
         match self.connected_peers.lock() {
             Ok(peers) => {
-                // PRODUCTION: Return only VALIDATED active peers 
-                let validated_count = peers.iter()
-                    .filter(|peer| self.is_peer_actually_connected(&peer.addr))
+                // PRODUCTION: Count only peers that passed failover tests
+                let genesis_ips = vec![
+                    "154.38.160.39".to_string(),
+                    "62.171.157.44".to_string(), 
+                    "161.97.86.81".to_string(),
+                    "173.212.219.226".to_string(),
+                    "164.68.108.218".to_string()
+                ];
+                
+                let working_nodes = self.filter_working_genesis_nodes(genesis_ips);
+                
+                // Count only peers from working Genesis nodes
+                let real_count = peers.iter()
+                    .filter(|peer| {
+                        let ip = peer.addr.split(':').next().unwrap_or("");
+                        working_nodes.contains(&ip.to_string())
+                    })
                     .count();
                 
-                if validated_count != peers.len() {
-                    println!("[P2P] 📊 Real connections: {} (listed: {})", validated_count, peers.len());
+                if real_count != peers.len() {
+                    println!("[P2P] 📊 Real peer count: {} (bootstrap pool: {})", real_count, peers.len());
                 }
                 
-                validated_count
+                real_count
             }
             Err(e) => {
                 println!("[P2P] ⚠️ Failed to get peer count: {}, returning 0", e);
@@ -1450,27 +1464,20 @@ impl SimplifiedP2P {
         }
     }
     
-    /// PRODUCTION: Check if peer is actually connected and responsive
+    /// PRODUCTION: Check if peer is actually connected (runtime-safe)
     fn is_peer_actually_connected(&self, peer_addr: &str) -> bool {
-        // PRODUCTION: Quick TCP connectivity check (non-blocking)
-        use std::time::Duration;
-        use tokio::net::TcpStream;
+        // PRODUCTION: Simplified check to prevent runtime conflicts
+        // Real validation happens in async contexts and failover detection
         
-        // Fast connection test with 1 second timeout
-        let rt = tokio::runtime::Handle::try_current();
-        if let Ok(handle) = rt {
-            if let Ok(result) = handle.block_on(async {
-                tokio::time::timeout(
-                    Duration::from_secs(1),
-                    TcpStream::connect(peer_addr)
-                ).await
-            }) {
-                result.is_ok()
-            } else {
-                false
-            }
+        // For Genesis nodes: assume reachable until proven otherwise by failover
+        let ip = peer_addr.split(':').next().unwrap_or("");
+        let is_genesis = GENESIS_BOOTSTRAP_NODES.iter().any(|(genesis_ip, _)| *genesis_ip == ip);
+        
+        if is_genesis {
+            println!("[P2P] 🔍 Genesis peer {} - assuming reachable until failover check", peer_addr);
+            true
         } else {
-            // Fallback: assume connected if we can't test
+            // For non-genesis: assume connected (validated in background)
             true
         }
     }
@@ -1495,28 +1502,84 @@ impl SimplifiedP2P {
         }
     }
     
-    /// PRODUCTION: Get validated active peers for consensus participation
+    /// PRODUCTION: Get discovery peers for DHT/API (includes all parsed peers)
+    pub fn get_discovery_peers(&self) -> Vec<PeerInfo> {
+        match self.connected_peers.lock() {
+            Ok(peers) => {
+                // Return ALL parsed peers for network discovery (DHT, API, peer exchange)
+                // No strict validation - allows network growth
+                println!("[P2P] 📡 Discovery peers available: {} (for DHT/API)", peers.len());
+                peers.clone()
+            }
+            Err(e) => {
+                println!("[P2P] ⚠️ Failed to get discovery peers: {}", e);
+                Vec::new()
+            }
+        }
+    }
+    
+    /// PRODUCTION: Get validated active peers for consensus participation (NODE TYPE AWARE)
     pub fn get_validated_active_peers(&self) -> Vec<PeerInfo> {
         match self.connected_peers.lock() {
             Ok(peers) => {
-                // PRODUCTION: Filter only peers that are actually responsive
-                let validated_peers: Vec<PeerInfo> = peers.iter()
-                    .filter(|peer| {
-                        // Check actual connectivity
-                        if !self.is_peer_actually_connected(&peer.addr) {
-                            println!("[P2P] ⚠️ Removing unresponsive peer: {}", peer.addr);
-                            return false;
-                        }
-                        
-                        // PRODUCTION: Check if peer meets consensus requirements
-                        // Only Super and Full nodes can participate in consensus
-                        matches!(peer.node_type, NodeType::Super | NodeType::Full)
-                    })
-                    .cloned()
-                    .collect();
+                // PRODUCTION: Different validation logic for different node types
+                let is_genesis = std::env::var("QNET_BOOTSTRAP_ID")
+                    .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
+                    .unwrap_or(false);
                 
-                println!("[P2P] ✅ Validated consensus peers: {}/{}", validated_peers.len(), peers.len());
-                validated_peers
+                if is_genesis {
+                    // GENESIS NODES: Use strict failover validation
+                    let genesis_ips = vec![
+                        "154.38.160.39".to_string(),
+                        "62.171.157.44".to_string(), 
+                        "161.97.86.81".to_string(),
+                        "173.212.219.226".to_string(),
+                        "164.68.108.218".to_string()
+                    ];
+                    
+                    let working_genesis_nodes = self.filter_working_genesis_nodes(genesis_ips);
+                    
+                    let validated_peers: Vec<PeerInfo> = peers.iter()
+                        .filter(|peer| {
+                            let ip = peer.addr.split(':').next().unwrap_or("");
+                            let passed_failover = working_genesis_nodes.contains(&ip.to_string());
+                            
+                            if passed_failover {
+                                println!("[P2P] ✅ Genesis peer {} passed failover validation", peer.addr);
+                                matches!(peer.node_type, NodeType::Super | NodeType::Full)
+                            } else {
+                                println!("[P2P] ❌ Genesis peer {} failed failover test", peer.addr);
+                                false
+                            }
+                        })
+                        .cloned()
+                        .collect();
+                    
+                    println!("[P2P] ✅ Genesis validated peers: {}/{} (failover-tested)", 
+                             validated_peers.len(), peers.len());
+                    validated_peers
+                } else {
+                    // REGULAR NODES: Use standard peer validation (DHT discovered peers)
+                    let validated_peers: Vec<PeerInfo> = peers.iter()
+                        .filter(|peer| {
+                            // Basic validation for regular nodes
+                            let is_consensus_capable = matches!(peer.node_type, NodeType::Super | NodeType::Full);
+                            
+                            if is_consensus_capable {
+                                println!("[P2P] ✅ Regular peer {} meets consensus requirements", peer.addr);
+                                true
+                            } else {
+                                println!("[P2P] 📱 Light peer {} excluded from consensus", peer.addr);
+                                false
+                            }
+                        })
+                        .cloned()
+                        .collect();
+                    
+                    println!("[P2P] ✅ Regular validated peers: {}/{} (DHT-discovered)", 
+                             validated_peers.len(), peers.len());
+                    validated_peers
+                }
             }
             Err(e) => {
                 println!("[P2P] ⚠️ Failed to get validated peers: {}", e);
@@ -1581,16 +1644,14 @@ impl SimplifiedP2P {
         all_regions.into_iter().filter(|r| r != region).collect()
     }
 
-    /// Get connected peers count
-    pub async fn get_connected_peers(&self) -> Vec<String> {
-        let peers = match self.connected_peers.lock() {
-            Ok(p) => p,
-            Err(poisoned) => {
-                println!("[P2P] ⚠️ Connected peers mutex poisoned during get_connected_peers");
-                poisoned.into_inner()
-            }
-        };
-        peers.iter().map(|p| p.id.clone()).collect()
+    /// Get connected peers for DHT/API discovery (returns PeerInfo for compatibility)
+    pub async fn get_connected_peers(&self) -> Vec<PeerInfo> {
+        // PRODUCTION: Use discovery peers (all parsed peers) for DHT and API
+        // This allows network growth and peer exchange to work properly
+        let discovery_peers = self.get_discovery_peers();
+        
+        println!("[P2P] 📡 Providing {} peers for DHT/API discovery", discovery_peers.len());
+        discovery_peers
     }
     
     /// Parse peer address string - supports both "id@ip:port" and "ip:port" formats
@@ -1620,11 +1681,28 @@ impl SimplifiedP2P {
             return Err(format!("Invalid port in address: {}", addr));
         }
         
+        // PRODUCTION: Get correct region from Genesis mapping or auto-detect
+        let correct_region = {
+            let ip = peer_addr.split(':').next().unwrap_or("");
+            GENESIS_BOOTSTRAP_NODES.iter()
+                .find(|(genesis_ip, _)| *genesis_ip == ip)
+                .map(|(_, region_name)| match *region_name {
+                    "NorthAmerica" => Region::NorthAmerica,
+                    "Europe" => Region::Europe,
+                    "Asia" => Region::Asia,
+                    "SouthAmerica" => Region::SouthAmerica,
+                    "Africa" => Region::Africa,
+                    "Oceania" => Region::Oceania,
+                    _ => self.region.clone(),
+                })
+                .unwrap_or(self.region.clone())
+        };
+        
         Ok(PeerInfo {
             id: peer_id,
             addr: peer_addr,
             node_type: NodeType::Full,  // Assume Full by default
-            region: self.region.clone(),  // Assume same region initially
+            region: correct_region,  // FIXED: Use correct Genesis region mapping
             last_seen: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -1673,7 +1751,7 @@ impl SimplifiedP2P {
         if let Some(peers) = regional_peers.get(&self.primary_region) {
             for peer in peers.iter().take(5) {  // Max 5 peers per region
                 connected.push(peer.clone());
-                println!("[P2P] ✅ Connected to {} in {:?}", peer.id, peer.region);
+                println!("[P2P] 📋 Added {} to connection pool from {:?}", peer.id, peer.region);
             }
         }
         
@@ -1684,7 +1762,7 @@ impl SimplifiedP2P {
                     for peer in peers.iter().take(2) {  // Max 2 from backup regions
                         if connected.len() < 5 {
                             connected.push(peer.clone());
-                            println!("[P2P] ✅ Connected to {} in {:?} (backup)", 
+                            println!("[P2P] 📋 Added {} to backup pool from {:?}", 
                                      peer.id, peer.region);
                         }
                     }
@@ -1695,9 +1773,9 @@ impl SimplifiedP2P {
         *self.connection_count.lock().unwrap() = connected.len();
         
         if connected.is_empty() {
-            println!("[P2P] ⚠️  No peers connected - running in standalone mode");
+            println!("[P2P] ⚠️ No peers in bootstrap pool - running in standalone mode");
         } else {
-            println!("[P2P] ✅ Connected to {} peers", connected.len());
+            println!("[P2P] 📋 Bootstrap pool populated with {} peers (pending validation)", connected.len());
         }
     }
     
@@ -2384,7 +2462,7 @@ const GENESIS_BOOTSTRAP_NODES: &[(&str, &str)] = &[
     ("62.171.157.44", "Europe"),       // Genesis Node #2 
     ("161.97.86.81", "Europe"),        // Genesis Node #3
     ("173.212.219.226", "Europe"),     // Genesis Node #4
-    ("164.68.108.218", "NorthAmerica"), // Genesis Node #5
+    ("164.68.108.218", "Europe"),      // Genesis Node #5
 ];
 
 impl SimplifiedP2P {

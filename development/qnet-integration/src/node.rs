@@ -2388,25 +2388,26 @@ impl BlockchainNode {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        let peers = if let Some(ref p2p) = self.unified_p2p {
-            p2p.get_connected_peers().await
+        // PRODUCTION: Get discovery peers directly (already proper format)
+        let peer_infos = if let Some(ref p2p) = self.unified_p2p {
+            let p2p_peers = p2p.get_connected_peers().await;
+            
+            // Convert from unified_p2p::PeerInfo to node::PeerInfo format
+            p2p_peers.iter().map(|p2p_peer| {
+                PeerInfo {
+                    id: p2p_peer.id.clone(),
+                    address: p2p_peer.addr.clone(),
+                    node_type: format!("{:?}", p2p_peer.node_type),
+                    region: format!("{:?}", p2p_peer.region),
+                    last_seen: p2p_peer.last_seen,
+                    connection_time: current_time - p2p_peer.last_seen,
+                    reputation: 90.0, // Default reputation for discovered peers
+                    version: Some("qnet-v1.0".to_string()),
+                }
+            }).collect()
         } else {
             vec![]
         };
-        
-        // Convert peer IDs to peer info format
-        let peer_infos: Vec<PeerInfo> = peers.iter().map(|peer_id: &String| {
-            PeerInfo {
-                id: peer_id.clone(),
-                address: "unknown".to_string(),
-                node_type: "unknown".to_string(),
-                region: "unknown".to_string(),
-                last_seen: current_time,
-                connection_time: 0,
-                reputation: 0.0,
-                version: Some("unknown".to_string()),
-            }
-        }).collect();
         
         Ok(peer_infos)
     }
