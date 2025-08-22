@@ -2789,6 +2789,16 @@ async fn handle_consensus_commit(
     println!("[CONSENSUS] 📝 Received commit from {} for round {}", 
              commit_request.node_id, commit_request.round);
     
+    // CRITICAL: Only process consensus for MACROBLOCK rounds (every 90 blocks)
+    // Microblocks use simple producer signatures, NOT Byzantine consensus
+    if !is_macroblock_consensus_round(commit_request.round) {
+        println!("[CONSENSUS] ⏭️ Rejecting commit for microblock - no consensus needed for round {}", commit_request.round);
+        return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": "Consensus not required for microblocks - only for macroblocks every 90 blocks"
+        })));
+    }
+    
     // Validate commit request
     if commit_request.commit_hash.len() != 64 { // SHA3-256 hex length
         return Ok(warp::reply::json(&json!({
@@ -2849,6 +2859,16 @@ async fn handle_consensus_reveal(
 ) -> Result<impl Reply, Rejection> {
     println!("[CONSENSUS] 🔓 Received reveal from {} for round {}", 
              reveal_request.node_id, reveal_request.round);
+    
+    // CRITICAL: Only process consensus for MACROBLOCK rounds (every 90 blocks)
+    // Microblocks use simple producer signatures, NOT Byzantine consensus
+    if !is_macroblock_consensus_round(reveal_request.round) {
+        println!("[CONSENSUS] ⏭️ Rejecting reveal for microblock - no consensus needed for round {}", reveal_request.round);
+        return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": "Consensus not required for microblocks - only for macroblocks every 90 blocks"
+        })));
+    }
     
     // Validate reveal request
     if reveal_request.reveal_hash.len() != 64 { // SHA3-256 hex length
@@ -3143,6 +3163,15 @@ fn generate_quantum_signature(node_id: &str, data: &str) -> String {
             format!("FALLBACK_{}", hex::encode(&hasher.finalize()[..32]))
         }
     }
+}
+
+/// CRITICAL: Determine if consensus round is for macroblock (every 90 blocks)
+/// Microblocks use simple producer signatures, macroblocks use Byzantine consensus
+fn is_macroblock_consensus_round(round_id: u64) -> bool {
+    // PRODUCTION: Macroblock consensus occurs every 90 microblocks
+    // Round ID should correspond to macroblock height (every 90 blocks)
+    // If round_id is divisible by 90, it's a macroblock consensus round
+    round_id > 0 && (round_id % 90 == 0)
 }
 
 /// Extract peer IP from HTTP headers (PRODUCTION ready)

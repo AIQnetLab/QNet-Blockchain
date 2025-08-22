@@ -933,6 +933,14 @@ impl BlockchainNode {
         nonce_storage: &Arc<RwLock<HashMap<String, ([u8; 32], Vec<u8>)>>>,
         _consensus_rx: &Option<tokio::sync::mpsc::UnboundedReceiver<ConsensusMessage>>, // For future use
     ) {
+        // CRITICAL: Only execute consensus for MACROBLOCK rounds (every 90 blocks)
+        // Microblocks use simple producer signatures, NOT Byzantine consensus
+        if round_id == 0 || (round_id % 90 != 0) {
+            println!("[CONSENSUS] ⏭️ BLOCKING commit phase for microblock round {} - no consensus needed", round_id);
+            return;
+        }
+        
+        println!("[CONSENSUS] ✅ Executing commit phase for MACROBLOCK round {}", round_id);
         use qnet_consensus::{commit_reveal::Commit, ConsensusError};
         use sha3::{Sha3_256, Digest};
         
@@ -1074,6 +1082,14 @@ impl BlockchainNode {
         nonce_storage: &Arc<RwLock<HashMap<String, ([u8; 32], Vec<u8>)>>>,
         _consensus_rx: &Option<tokio::sync::mpsc::UnboundedReceiver<ConsensusMessage>>, // For future use
     ) {
+        // CRITICAL: Only execute consensus for MACROBLOCK rounds (every 90 blocks)
+        // Microblocks use simple producer signatures, NOT Byzantine consensus
+        if round_id == 0 || (round_id % 90 != 0) {
+            println!("[CONSENSUS] ⏭️ BLOCKING reveal phase for microblock round {} - no consensus needed", round_id);
+            return;
+        }
+        
+        println!("[CONSENSUS] ✅ Executing reveal phase for MACROBLOCK round {}", round_id);
         use qnet_consensus::commit_reveal::Reveal;
         use sha3::{Sha3_256, Digest};
         

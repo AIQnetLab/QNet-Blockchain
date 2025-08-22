@@ -2449,15 +2449,29 @@ impl SimplifiedP2P {
             NetworkMessage::ConsensusCommit { round_id, node_id, commit_hash, timestamp } => {
                 println!("[CONSENSUS] ← Received commit from {} for round {} at {}", 
                          node_id, round_id, timestamp);
-                // PRODUCTION: Forward to consensus engine for validation
-                self.handle_remote_consensus_commit(round_id, node_id, commit_hash, timestamp);
+                
+                // CRITICAL: Only process consensus for MACROBLOCK rounds (every 90 blocks)
+                // Microblocks use simple producer signatures, NOT Byzantine consensus
+                if self.is_macroblock_consensus_round(round_id) {
+                    println!("[CONSENSUS] ✅ Processing commit for MACROBLOCK round {}", round_id);
+                    self.handle_remote_consensus_commit(round_id, node_id, commit_hash, timestamp);
+                } else {
+                    println!("[CONSENSUS] ⏭️ Ignoring commit for microblock - no consensus needed for round {}", round_id);
+                }
             }
 
             NetworkMessage::ConsensusReveal { round_id, node_id, reveal_data, timestamp } => {
                 println!("[CONSENSUS] ← Received reveal from {} for round {} at {}", 
                          node_id, round_id, timestamp);
-                // PRODUCTION: Forward to consensus engine for validation
-                self.handle_remote_consensus_reveal(round_id, node_id, reveal_data, timestamp);
+                
+                // CRITICAL: Only process consensus for MACROBLOCK rounds (every 90 blocks)  
+                // Microblocks use simple producer signatures, NOT Byzantine consensus
+                if self.is_macroblock_consensus_round(round_id) {
+                    println!("[CONSENSUS] ✅ Processing reveal for MACROBLOCK round {}", round_id);
+                    self.handle_remote_consensus_reveal(round_id, node_id, reveal_data, timestamp);
+                } else {
+                    println!("[CONSENSUS] ⏭️ Ignoring reveal for microblock - no consensus needed for round {}", round_id);
+                }
             }
         }
     }
@@ -2577,7 +2591,14 @@ impl SimplifiedP2P {
 
     /// PRODUCTION: Broadcast consensus commit to all peers
     pub fn broadcast_consensus_commit(&self, round_id: u64, node_id: String, commit_hash: String, timestamp: u64) -> Result<(), String> {
-        println!("[P2P] 🏛️ Broadcasting consensus commit for round {}", round_id);
+        // CRITICAL: Only broadcast consensus for MACROBLOCK rounds (every 90 blocks)
+        // Microblocks use simple producer signatures, NOT Byzantine consensus
+        if round_id == 0 || (round_id % 90 != 0) {
+            println!("[P2P] ⏭️ BLOCKING broadcast commit for microblock round {} - no consensus needed", round_id);
+            return Ok(());
+        }
+        
+        println!("[P2P] 🏛️ Broadcasting consensus commit for MACROBLOCK round {}", round_id);
         
         let peers = match self.connected_peers.lock() {
             Ok(peers) => peers.clone(),
@@ -2605,7 +2626,14 @@ impl SimplifiedP2P {
 
     /// PRODUCTION: Broadcast consensus reveal to all peers  
     pub fn broadcast_consensus_reveal(&self, round_id: u64, node_id: String, reveal_data: String, timestamp: u64) -> Result<(), String> {
-        println!("[P2P] 🏛️ Broadcasting consensus reveal for round {}", round_id);
+        // CRITICAL: Only broadcast consensus for MACROBLOCK rounds (every 90 blocks)
+        // Microblocks use simple producer signatures, NOT Byzantine consensus
+        if round_id == 0 || (round_id % 90 != 0) {
+            println!("[P2P] ⏭️ BLOCKING broadcast reveal for microblock round {} - no consensus needed", round_id);
+            return Ok(());
+        }
+        
+        println!("[P2P] 🏛️ Broadcasting consensus reveal for MACROBLOCK round {}", round_id);
         
         let peers = match self.connected_peers.lock() {
             Ok(peers) => peers.clone(),
@@ -2749,6 +2777,15 @@ impl SimplifiedP2P {
         
         // Update peer reputation for participation
         self.update_node_reputation(&node_id, 2.0);
+    }
+    
+    /// CRITICAL: Determine if consensus round is for macroblock (every 90 blocks)
+    /// Microblocks use simple producer signatures, macroblocks use Byzantine consensus
+    fn is_macroblock_consensus_round(&self, round_id: u64) -> bool {
+        // PRODUCTION: Macroblock consensus occurs every 90 microblocks
+        // Round ID should correspond to macroblock height (every 90 blocks)
+        // If round_id is divisible by 90, it's a macroblock consensus round
+        round_id > 0 && (round_id % 90 == 0)
     }
 }
 
