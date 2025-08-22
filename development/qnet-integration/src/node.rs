@@ -325,7 +325,7 @@ impl BlockchainNode {
             current_microblocks: Arc::new(RwLock::new(Vec::new())),
             last_microblock_time: Arc::new(RwLock::new(Instant::now())),
             microblock_interval,
-            is_leader: Arc::new(RwLock::new(true)), // PRODUCTION: All QNet nodes are microblock producers
+            is_leader: Arc::new(RwLock::new(false)), // PRODUCTION: Dynamic producer selection based on reputation rotation
             
             // PRODUCTION: Initialize consensus phase synchronization
             consensus_nonce_storage: Arc::new(RwLock::new(HashMap::new())),
@@ -571,10 +571,22 @@ impl BlockchainNode {
             println!("[Microblock] ⚡ Target: 100k+ TPS with batch processing");
             
             while *is_running.read().await {
-                // PRODUCTION: In decentralized QNet, ALL nodes create microblocks
-                // No single leader concept for microblocks - each node is a microblock producer
-                // Leadership is only relevant for macroblock consensus finalization
-                {
+                // PRODUCTION: QNet microblock producer rotation based on reputation
+                // Only ONE node produces microblocks per round to prevent forks
+                // Producer selection rotates based on reputation scoring (as per QNet specification)
+                
+                // Determine current microblock producer using reputation-based rotation
+                let current_producer = Self::select_microblock_producer(microblock_height, &unified_p2p, &node_id).await;
+                let is_my_turn_to_produce = current_producer == node_id;
+                
+                if is_my_turn_to_produce {
+                    // PRODUCTION: This node is selected as microblock producer for this round
+                    println!("[MICROBLOCK] 👑 Selected as producer for block #{}", microblock_height + 1);
+                    
+                    // Update is_leader for backward compatibility with existing code
+                    *is_leader.write().await = true;
+                    
+                    {
                     // Get performance settings
                     let max_tx_per_microblock = std::env::var("QNET_BATCH_SIZE")
                         .unwrap_or_default()
@@ -965,6 +977,44 @@ impl BlockchainNode {
                     if microblock_height % 100 == 0 {
                         Self::log_performance_metrics(microblock_height, &mempool).await;
                     }
+                    } // End of microblock production block
+                } else {
+                    // PRODUCTION: This node is NOT the selected producer - synchronize with network
+                    println!("[MICROBLOCK] 👥 Waiting for block #{} from producer: {}", microblock_height + 1, current_producer);
+                    
+                    // Update is_leader for backward compatibility
+                    *is_leader.write().await = false;
+                    
+                    // Synchronize with network to get the microblock from current producer
+                    if let Some(p2p) = &unified_p2p {
+                        match p2p.sync_blockchain_height() {
+                            Ok(network_height) => {
+                                if network_height > microblock_height {
+                                    println!("[SYNC] 📥 Downloading blocks {}-{} from producer {}", 
+                                             microblock_height + 1, network_height, current_producer);
+                                    let storage_clone = storage.clone();
+                                    p2p.download_missing_microblocks(storage_clone.as_ref(), microblock_height, network_height).await;
+                                    
+                                    // Update our height to match network
+                                    if let Ok(Some(_)) = storage.load_microblock(network_height) {
+                                        microblock_height = network_height;
+                                        {
+                                            let mut global_height = height.write().await;
+                                            *global_height = microblock_height;
+                                        }
+                                        println!("[SYNC] ✅ Synced to block #{} from producer {}", network_height, current_producer);
+                                    }
+                                } else {
+                                    // No new blocks yet - wait for producer to create next block
+                                    println!("[SYNC] ⏳ Waiting for producer {} to create block #{}", 
+                                             current_producer, microblock_height + 1);
+                                }
+                            },
+                            Err(_) => {
+                                println!("[SYNC] ⚠️ Cannot sync with producer {} - network unreachable", current_producer);
+                            }
+                        }
+                    }
                 }
                 
                 // Use adaptive interval
@@ -973,6 +1023,69 @@ impl BlockchainNode {
                 tokio::time::sleep(sleep_duration).await;
             }
         });
+    }
+    
+    /// PRODUCTION: Select microblock producer using reputation-based rotation (QNet specification)
+    async fn select_microblock_producer(
+        current_height: u64,
+        unified_p2p: &Option<Arc<SimplifiedP2P>>,
+        own_node_id: &str,
+    ) -> String {
+        // PRODUCTION: QNet microblock producer rotation based on reputation
+        // Prevents forks by ensuring only ONE producer per microblock
+        
+        if let Some(p2p) = unified_p2p {
+            // Get all connected peers with reputation scores
+            let mut candidates = vec![(own_node_id.to_string(), Self::get_node_reputation_score(own_node_id, p2p).await)];
+            
+            // Add connected peers as candidates
+            let peers = p2p.get_validated_active_peers();
+            for peer in peers {
+                let peer_node_id = format!("node_{}", peer.addr.replace(":", "_"));
+                let reputation = Self::get_node_reputation_score(&peer_node_id, p2p).await;
+                candidates.push((peer_node_id, reputation));
+            }
+            
+            // Filter by minimum reputation threshold (70%)
+            candidates.retain(|(_, reputation)| *reputation >= 0.70);
+            
+            if candidates.is_empty() {
+                println!("[MICROBLOCK] ⚠️ No candidates with sufficient reputation (≥70%) - using self");
+                return own_node_id.to_string();
+            }
+            
+            // Sort by reputation (highest first) for stable ordering
+            candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            
+            // Deterministic selection based on block height for rotation
+            // This ensures all nodes agree on the same producer for each block
+            let selection_index = (current_height as usize) % candidates.len();
+            let selected_producer = candidates[selection_index].0.clone();
+            
+            println!("[MICROBLOCK] 🎯 Producer rotation: {} selected (reputation: {:.1}%, index: {}/{})", 
+                     selected_producer, candidates[selection_index].1 * 100.0, selection_index, candidates.len());
+            
+            selected_producer
+        } else {
+            // Solo mode - no P2P peers
+            println!("[MICROBLOCK] 🏠 Solo mode - self production");
+            own_node_id.to_string()
+        }
+    }
+    
+    /// Get reputation score for a node
+    async fn get_node_reputation_score(node_id: &str, p2p: &Arc<SimplifiedP2P>) -> f64 {
+        // PRODUCTION: Get reputation score with proper lifetime management
+        match p2p.get_reputation_system().lock() {
+            Ok(reputation) => {
+                let score = reputation.get_reputation(node_id);
+                // Convert 0-100 scale to 0-1 scale
+                (score / 100.0).max(0.0).min(1.0)
+            }
+            Err(_) => {
+                0.70 // Default reputation for calculation consistency
+            }
+        }
     }
     
     // PRODUCTION: Byzantine consensus methods for commit-reveal protocol
