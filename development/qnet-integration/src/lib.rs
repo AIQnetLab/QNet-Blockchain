@@ -135,8 +135,9 @@ impl QNetBlockchain {
         
         info!("Starting QNet blockchain...");
         
-        // Start consensus rounds
-        self.start_consensus_rounds().await?;
+        // CRITICAL: Consensus rounds DISABLED - QNet uses microblock/macroblock architecture
+        // Consensus is handled by macroblock triggers every 90 blocks, NOT continuous rounds
+        // self.start_consensus_rounds().await?;
         
         // Start network message handling
         self.start_network_handler().await?;

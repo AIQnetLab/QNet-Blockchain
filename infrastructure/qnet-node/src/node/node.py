@@ -424,8 +424,10 @@ class Node:
         self.metrics_thread = threading.Thread(target=self._collect_metrics_loop, daemon=True)
         self.metrics_thread.start()
 
-        # Start mining/consensus if enabled
-        if self.mining_enabled:
+        # CRITICAL: Mining/consensus DISABLED - QNet uses microblock/macroblock architecture
+        # Mining and consensus are handled by Rust implementation in development/qnet-integration
+        # This Python mining conflicts with QNet's architecture
+        if False:  # Never start mining
             self._start_mining()
         
         logger.info("Node started successfully")
@@ -488,10 +490,18 @@ class Node:
         logger.info("Mining stopped")
 
     def _consensus_round_loop(self):
-        """Main loop for consensus rounds with Rust optimization."""
-        logger.info(f"Node {self.node_id} starting consensus loop")
+        """DISABLED: Consensus rounds - QNet uses microblock/macroblock architecture instead."""
+        logger.info(f"Node {self.node_id} consensus loop DISABLED - using microblock/macroblock architecture")
         
-        while self.is_running and self.is_mining:
+        # CRITICAL: QNet consensus is handled by:
+        # - Microblocks: Producer signatures every 1 second (NO consensus)
+        # - Macroblocks: Byzantine consensus every 90 blocks (handled by Rust)
+        # This Python consensus loop is NOT needed and conflicts with QNet architecture
+        
+        return  # Exit immediately - no consensus rounds
+        
+        # DISABLED OLD CODE:
+        while False:  # Never execute
             try:
                 current_round_num = self.blockchain.get_blockchain_height() + 1
                 logger.info(f"--- Starting Consensus Round {current_round_num} ---")
