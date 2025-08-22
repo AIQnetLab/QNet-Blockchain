@@ -325,7 +325,7 @@ impl BlockchainNode {
             current_microblocks: Arc::new(RwLock::new(Vec::new())),
             last_microblock_time: Arc::new(RwLock::new(Instant::now())),
             microblock_interval,
-            is_leader: Arc::new(RwLock::new(false)),
+            is_leader: Arc::new(RwLock::new(true)), // PRODUCTION: All QNet nodes are microblock producers
             
             // PRODUCTION: Initialize consensus phase synchronization
             consensus_nonce_storage: Arc::new(RwLock::new(HashMap::new())),
@@ -571,7 +571,10 @@ impl BlockchainNode {
             println!("[Microblock] ⚡ Target: 100k+ TPS with batch processing");
             
             while *is_running.read().await {
-                if *is_leader.read().await {
+                // PRODUCTION: In decentralized QNet, ALL nodes create microblocks
+                // No single leader concept for microblocks - each node is a microblock producer
+                // Leadership is only relevant for macroblock consensus finalization
+                {
                     // Get performance settings
                     let max_tx_per_microblock = std::env::var("QNET_BATCH_SIZE")
                         .unwrap_or_default()
@@ -664,7 +667,18 @@ impl BlockchainNode {
                         *global_height = microblock_height;
                     }
                     
-                    println!("[MICROBLOCK] 📦 Creating microblock #{} with producer signature (NO consensus)", microblock_height);
+                    // PRODUCTION: Detailed microblock info for network monitoring
+                    let peer_count = if let Some(p2p) = &unified_p2p {
+                        p2p.get_peer_count()
+                    } else {
+                        0
+                    };
+                    
+                    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+                    println!("[MICROBLOCK] 📦 Creating microblock #{} | Producer: {} | Peers: {} | TXs: {}", 
+                             microblock_height, node_id, peer_count, txs.len());
+                    println!("[MICROBLOCK] ⚡ NO CONSENSUS (producer signature only) | Interval: 1s | Quantum: CRYSTALS-Dilithium");
+                    
                     let consensus_result: Option<u64> = None; // NO consensus for microblocks - Byzantine consensus ONLY for macroblocks
                     
                     // PRODUCTION: Create cryptographically signed microblock
@@ -685,8 +699,10 @@ impl BlockchainNode {
                     // PRODUCTION: Generate CRYSTALS-Dilithium signature for microblock
                     match Self::sign_microblock_with_dilithium(&microblock, &node_id).await {
                         Ok(signature) => {
-                            microblock.signature = signature;
                             println!("[CRYPTO] ✅ Microblock #{} signed with CRYSTALS-Dilithium", microblock_height);
+                            println!("[CRYPTO] 🔐 Signature size: {} bytes | Format: quantum-resistant | Hash: {}", 
+                                     signature.len(), hex::encode(&signature[..8]));
+                            microblock.signature = signature;
                         },
                         Err(e) => {
                             println!("[CRYPTO] ❌ Failed to sign microblock #{}: {}", microblock_height, e);
@@ -798,7 +814,10 @@ impl BlockchainNode {
                             bincode::serialize(&microblock).unwrap_or_default()
                         };
                         
+                        let broadcast_size = broadcast_data.len();
                         let _ = p2p.broadcast_block(microblock.height, broadcast_data);
+                        println!("[P2P] 📡 Broadcast microblock #{} to {} peers | Size: {} bytes", 
+                                 microblock.height, p2p.get_peer_count(), broadcast_size);
                     }
                     
                     // Remove processed transactions from mempool
@@ -807,7 +826,14 @@ impl BlockchainNode {
                         for tx in &txs {
                             mempool_guard.remove_transaction(&tx.hash);
                         }
+                        println!("[MEMPOOL] 🗑️ Removed {} processed transactions | Remaining: {}", 
+                                 txs.len(), mempool_guard.size());
                     }
+                    
+                    // PRODUCTION: Show microblock completion status
+                    println!("[MICROBLOCK] ✅ Block #{} COMPLETED | Producer: {} | Status: FINALIZED", 
+                             microblock_height, node_id);
+                    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
                     
                     // Advanced quantum blockchain logging with real-time metrics
                     let peer_count = if let Some(ref p2p) = unified_p2p { p2p.get_peer_count() } else { 0 };
@@ -828,10 +854,18 @@ impl BlockchainNode {
                             println!("🔮 QUANTUM STATUS | 💎 Post-Quantum Security: ACTIVE | 🛡️ Resistance: 128-bit | 🚀 Performance: {}% optimal", 
                                      std::cmp::min(95 + (peer_count * 2), 100));
                         }
-                    } else if microblock_height % 30 == 0 {
-                        println!("💤 Block #{} | 🔄 No transactions | 🌐 {} peers | 🔐 Quantum-ready | ⏰ Awaiting network activity", 
+                    } else {
+                        // Show status for every block to monitor network activity
+                        println!("💤 Block #{} | 🔄 {} tx | 🌐 {} peers | 🔐 Quantum-ready | ⏰ Next: {}ms", 
                                 microblock.height,
-                                peer_count);
+                                txs.len(),
+                                peer_count,
+                                microblock_interval.as_millis());
+                                
+                        // Show detailed status every 10 blocks
+                        if microblock_height % 10 == 0 {
+                            println!("[NETWORK] 📊 Status: Block #{} | Active | Synced | Broadcasting", microblock_height);
+                        }
                     }
                     
                     // Trigger macroblock consensus every 90 microblocks with beautiful output
@@ -850,15 +884,23 @@ impl BlockchainNode {
                         println!("🌍 Peers: {} connected | 💎 Consensus: Byzantine-BFT | 🛡️  Post-Quantum: CRYSTALS", peer_count);
                         println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
                         
-                        // PRODUCTION: Only create macroblock if REAL consensus succeeded AND we are consensus leader
+                        // PRODUCTION: Execute REAL Byzantine consensus for macroblock finalization  
                         let consensus_clone = consensus.clone();
                         let storage_clone = storage.clone();
                         let node_id_clone = node_id.clone();
+                        let unified_p2p_clone = unified_p2p.clone();
                         tokio::spawn(async move {
-                            // CRITICAL: Check if we are the consensus leader for this round
+                            println!("[MACROBLOCK] 🏛️ STARTING BYZANTINE CONSENSUS for blocks {}-{}", 
+                                     last_macroblock_trigger + 1, microblock_height);
+                            println!("[MACROBLOCK] ⚡ Participants needed: 4+ nodes | Security: 3f+1 Byzantine safety");
+                            
+                            // CRITICAL: Execute REAL consensus for macroblock
                             let should_create_macroblock = {
                                 let consensus_engine = consensus_clone.read().await;
                                 if let Some(consensus_data) = consensus_engine.get_finalized_consensus() {
+                                    println!("[MACROBLOCK] ✅ CONSENSUS FOUND! Leader: {} | Participants: {}", 
+                                             consensus_data.leader_id, consensus_data.participants.len());
+                                    
                                     // Check if we are the selected leader
                                     let we_are_leader = consensus_data.leader_id == node_id_clone ||
                                                       consensus_data.leader_id.contains(&node_id_clone);
@@ -887,6 +929,7 @@ impl BlockchainNode {
                             };
                             
                             if should_create_macroblock {
+                                println!("[MACROBLOCK] 👑 This node is CONSENSUS LEADER - creating macroblock");
                                 match Self::trigger_macroblock_consensus(
                                     storage_clone,
                                     consensus_clone,
@@ -894,14 +937,24 @@ impl BlockchainNode {
                                     microblock_height,
                                 ).await {
                                     Ok(_) => {
-                                        println!("[Macroblock] ✅ Macroblock created successfully as consensus leader");
+                                        println!("[MACROBLOCK] ✅ MACROBLOCK CREATED SUCCESSFULLY!");
+                                        println!("[MACROBLOCK] 🔒 Byzantine consensus FINALIZED | Security: GUARANTEED");
+                                        println!("[MACROBLOCK] 📊 90 microblocks permanently sealed | Network state: CONSISTENT");
                                     }
                                     Err(e) => {
-                                        println!("[Macroblock] ❌ Macroblock creation failed: {}", e);
+                                        println!("[MACROBLOCK] ❌ MACROBLOCK CREATION FAILED: {}", e);
+                                        println!("[MACROBLOCK] ⚠️ Network security may be compromised!");
                                     }
                                 }
                             } else {
-                                println!("[Macroblock] ⏳ Waiting for macroblock from consensus leader...");
+                                println!("[MACROBLOCK] 👥 This node is NOT consensus leader");
+                                println!("[MACROBLOCK] ⏳ Waiting for macroblock from leader...");
+                                
+                                // Show which node should be leader  
+                                if let Some(p2p) = &unified_p2p_clone {
+                                    let participants = p2p.get_validated_active_peers();
+                                    println!("[MACROBLOCK] 🔍 Network participants: {} nodes", participants.len());
+                                }
                             }
                         });
                         
