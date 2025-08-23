@@ -182,7 +182,8 @@ impl BlockchainNode {
         let mempool = Arc::new(RwLock::new(qnet_mempool::SimpleMempool::new(mempool_config)));
         
         // Initialize PRODUCTION Byzantine consensus - CommitRevealConsensus for fault tolerance
-        let node_id = format!("node_{}_{}", p2p_port, node_type as u8);
+        // CRITICAL FIX: Generate UNIQUE node_id based on Genesis ID or IP address
+        let node_id = Self::generate_unique_node_id(node_type).await;
         let consensus_config = qnet_consensus::ConsensusConfig {
             commit_phase_duration: Duration::from_secs(15),    // Faster phases for 1s blocks
             reveal_phase_duration: Duration::from_secs(15),    // Total consensus: 30s per round
@@ -572,6 +573,19 @@ impl BlockchainNode {
             println!("[Microblock] ⚡ Target: 100k+ TPS with batch processing");
             
             while *is_running.read().await {
+                // CRITICAL: Check minimum nodes for Byzantine safety (4+ nodes required)
+                let active_node_count = if let Some(p2p) = &unified_p2p {
+                    p2p.get_validated_active_peers().len() + 1 // +1 for own node
+                } else {
+                    1 // Solo mode
+                };
+                
+                if active_node_count < 4 {
+                    println!("[MICROBLOCK] ⏳ Waiting for minimum 4 nodes for Byzantine safety (current: {})", active_node_count);
+                    println!("[MICROBLOCK] 🔒 Decentralized consensus requires 3f+1 nodes (f=1 fault tolerance)");
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
                 // PRODUCTION: QNet microblock producer rotation based on reputation
                 // Only ONE node produces microblocks per round to prevent forks
                 // Producer selection rotates based on reputation scoring (as per QNet specification)
@@ -3425,6 +3439,116 @@ impl BlockchainNode {
         });
         
         println!("[Storage] ✅ Storage monitoring started (hourly checks)");
+    }
+
+    /// CRITICAL FIX: Generate unique node_id based on Genesis ID or server IP
+    /// This ensures each node has a unique identifier for producer rotation
+    async fn generate_unique_node_id(node_type: NodeType) -> String {
+        // Priority 1: Use BOOTSTRAP_ID for Genesis nodes (001-005)
+        if let Ok(bootstrap_id) = std::env::var("QNET_BOOTSTRAP_ID") {
+            println!("[NODE_ID] 🔐 Genesis node detected: BOOTSTRAP_ID={}", bootstrap_id);
+            return format!("genesis_node_{}", bootstrap_id);
+        }
+        
+        // Priority 2: Use Genesis bootstrap flag (legacy support)
+        if std::env::var("QNET_GENESIS_BOOTSTRAP").unwrap_or_default() == "1" {
+            // Try to determine genesis ID from IP
+            if let Ok(ip) = Self::get_external_ip().await {
+                use crate::genesis_constants::GENESIS_NODE_IPS;
+                for (i, (genesis_ip, genesis_id)) in GENESIS_NODE_IPS.iter().enumerate() {
+                    if ip == *genesis_ip {
+                        println!("[NODE_ID] 🔐 Genesis node detected by IP: {}", genesis_id);
+                        return format!("genesis_node_{}", genesis_id);
+                    }
+                }
+            }
+            // Fallback for legacy genesis
+            println!("[NODE_ID] 🔐 Legacy genesis node (unknown ID)");
+            return format!("genesis_node_legacy_{}", std::process::id());
+        }
+        
+        // Priority 3: Use server IP for regular nodes
+        if let Ok(ip) = Self::get_external_ip().await {
+            let sanitized_ip = ip.replace(".", "_").replace(":", "_");
+            println!("[NODE_ID] 🌐 Regular node: IP-based ID={}", sanitized_ip);
+            return format!("node_{}", sanitized_ip);
+        }
+        
+        // Priority 4: Use hostname as fallback
+        if let Ok(hostname) = std::env::var("HOSTNAME") {
+            println!("[NODE_ID] 🏠 Hostname-based node: {}", hostname);
+            return format!("node_{}", hostname.replace(".", "_"));
+        }
+        
+        // Last resort: Process ID + node type (should not happen in production)
+        let fallback_id = format!("node_{}_{}", std::process::id(), node_type as u8);
+        println!("[NODE_ID] ⚠️ Fallback node ID: {} (not recommended for production)", fallback_id);
+        fallback_id
+    }
+    
+    /// Get external IP address for node identification
+    async fn get_external_ip() -> Result<String, String> {
+        // Try multiple methods to get external IP
+        
+        // Method 1: Environment variable (Docker/Kubernetes)
+        if let Ok(external_ip) = std::env::var("QNET_EXTERNAL_IP") {
+            println!("[IP] 📝 Using environment IP: {}", external_ip);
+            return Ok(external_ip);
+        }
+        
+        // Method 2: Check common network interfaces (production servers)
+        if let Ok(local_ip) = std::env::var("SERVER_IP") {
+            println!("[IP] 🖥️ Using server IP: {}", local_ip);
+            return Ok(local_ip);
+        }
+        
+        // Method 3: Query external service (fallback)
+        match Self::query_external_ip_service().await {
+            Ok(ip) => {
+                println!("[IP] 🌐 Detected external IP: {}", ip);
+                Ok(ip)
+            }
+            Err(_) => {
+                // Method 4: Use localhost as last resort
+                println!("[IP] ⚠️ Using localhost fallback");
+                Ok("127_0_0_1".to_string())
+            }
+        }
+    }
+    
+    /// Query external IP service as fallback
+    async fn query_external_ip_service() -> Result<String, String> {
+        use std::time::Duration;
+        
+        let client = match reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build() {
+            Ok(client) => client,
+            Err(e) => return Err(format!("HTTP client error: {}", e)),
+        };
+        
+        // Try multiple IP detection services
+        let services = [
+            "https://api.ipify.org",
+            "https://ipinfo.io/ip",
+            "https://icanhazip.com",
+        ];
+        
+        for service in &services {
+            match client.get(*service).send().await {
+                Ok(response) if response.status().is_success() => {
+                    if let Ok(ip) = response.text().await {
+                        let clean_ip = ip.trim().to_string();
+                        if !clean_ip.is_empty() {
+                            return Ok(clean_ip);
+                        }
+                    }
+                }
+                _ => continue,
+            }
+        }
+        
+        Err("Failed to detect external IP".to_string())
     }
 }
 
