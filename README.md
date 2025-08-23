@@ -87,7 +87,7 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 │  Consensus Layer with Enterprise Failover                  │
 │  ├── Microblock Production (1s intervals)                  │
 │  │   ├── Reputation-based producer rotation (30 blocks)    │
-│  │   ├── Adaptive timeout (5-15s) + emergency rotation     │
+│  │   ├── Fixed timeout (5s) + emergency rotation           │
 │  │   └── Full/Super nodes only (Light excluded)           │
 │  ├── Macroblock Consensus (90s intervals)                  │
 │  │   ├── Full Byzantine commit-reveal consensus            │
@@ -116,8 +116,7 @@ QNet implements production-grade failover mechanisms for zero-downtime operation
 - **Rotation Schedule**: Every 30 blocks (30 seconds) for stability
 - **Participant Filter**: Only Full and Super nodes (Light nodes excluded for mobile optimization)
 - **Producer Readiness Validation**: Pre-creation checks (reputation ≥70%, network health, connectivity)
-- **Adaptive Timeout Detection**: 5-15 seconds based on network latency measurements
-- **Performance Caching**: Qualified candidates cached per rotation round for faster emergency selection
+- **Fixed Timeout Detection**: 5 seconds (deterministic for consensus safety across all nodes)
 - **Emergency Selection**: Deterministic SHA3-256 based selection from qualified backup producers
 - **Enhanced Status Visibility**: Comprehensive failover dashboard with recovery metrics
 - **Network Recovery**: <7 seconds automatic recovery time with full broadcast success tracking

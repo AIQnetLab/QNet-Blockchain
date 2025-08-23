@@ -1068,14 +1068,14 @@ impl BlockchainNode {
                             Err(_) => {
                                 println!("[SYNC] ⚠️ Cannot sync with producer {} - network unreachable", current_producer);
                                 
-                                // CRITICAL: Check if producer timeout occurred (ADAPTIVE TIMEOUT)
-                                let adaptive_timeout = Self::calculate_adaptive_timeout(&unified_p2p, 5, "microblock").await;
+                                // CRITICAL: Check if producer timeout occurred (DETERMINISTIC TIMEOUT)
+                                // QNet CONSENSUS SAFETY: Fixed 5-second timeout ensures all nodes timeout simultaneously
                                 let time_since_last_block = last_block_time.elapsed().as_secs();
-                                if time_since_last_block >= adaptive_timeout { // Adaptive timeout threshold
+                                if time_since_last_block >= 5 { // Fixed deterministic timeout for consensus safety
                                     // ENHANCED FAILOVER STATUS DASHBOARD
                                     println!("[FAILOVER] 🚨 MICROBLOCK FAILOVER EVENT DETECTED:");
                                     println!("  ├── Failed Producer: {}", current_producer);
-                                    println!("  ├── Timeout Duration: {} seconds (adaptive threshold: {}s)", time_since_last_block, adaptive_timeout);
+                                    println!("  ├── Timeout Duration: {} seconds (fixed threshold: 5s)", time_since_last_block);
                                     println!("  ├── Block Height: {}", microblock_height + 1);
                                     println!("  ├── Network Status: {} active peers", if let Some(ref p2p) = unified_p2p { p2p.get_validated_active_peers().len() } else { 0 });
                                     println!("  └── Recovery Action: Emergency producer rotation initiated");
@@ -1147,33 +1147,11 @@ impl BlockchainNode {
         // Prevents forks by ensuring only ONE producer per microblock
         
         if let Some(p2p) = unified_p2p {
-            // PERFORMANCE OPTIMIZATION: Cache qualified candidates for rotation efficiency
-            static mut CANDIDATE_CACHE: Option<(u64, Vec<(String, f64)>)> = None;
+            // PRODUCTION: Direct calculation for consensus determinism (THREAD-SAFE)
+            // QNet requires consistent candidate lists across all nodes for Byzantine safety
+            let candidates = Self::calculate_qualified_candidates(p2p, own_node_id, own_node_type).await;
             
-            let rotation_interval = 30u64;
-            let leadership_round = current_height / rotation_interval;
-            
-            // Check cache validity and use cached candidates if available
-            let candidates = unsafe {
-                if let Some((cached_round, ref cached_candidates)) = CANDIDATE_CACHE {
-                    if cached_round == leadership_round && !cached_candidates.is_empty() {
-                        println!("[PERFORMANCE] ⚡ Using cached producer candidates for rotation round {}", leadership_round);
-                        cached_candidates.clone()
-                    } else {
-                        // Cache miss or new rotation - recalculate
-                        let fresh_candidates = Self::calculate_qualified_candidates(p2p, own_node_id, own_node_type).await;
-                        CANDIDATE_CACHE = Some((leadership_round, fresh_candidates.clone()));
-                        println!("[PERFORMANCE] 🔄 Cached {} fresh candidates for rotation round {}", fresh_candidates.len(), leadership_round);
-                        fresh_candidates
-                    }
-                } else {
-                    // First calculation - create cache
-                    let fresh_candidates = Self::calculate_qualified_candidates(p2p, own_node_id, own_node_type).await;
-                    CANDIDATE_CACHE = Some((leadership_round, fresh_candidates.clone()));
-                    println!("[PERFORMANCE] 🆕 Initial candidate cache: {} candidates for round {}", fresh_candidates.len(), leadership_round);
-                    fresh_candidates
-                }
-            };
+            println!("[PRODUCER_SELECTION] ✅ Calculated {} qualified candidates (deterministic for all nodes)", candidates.len());
             
             if candidates.is_empty() {
                 println!("[MICROBLOCK] ⚠️ No qualified candidates (≥70% reputation, Full/Super only) - using self");
@@ -1389,76 +1367,18 @@ impl BlockchainNode {
         true
     }
     
-    /// PRODUCTION: Calculate adaptive timeout based on network latency (Enterprise optimization)
-    async fn calculate_adaptive_timeout(
-        unified_p2p: &Option<Arc<SimplifiedP2P>>,
-        base_timeout: u64,
-        timeout_type: &str
-    ) -> u64 {
-        let latency_samples = if let Some(p2p) = unified_p2p {
-            // Sample network latency from active peers
-            let peers = p2p.get_validated_active_peers();
-            let mut total_latency = 0u64;
-            let mut successful_pings = 0;
-            
-            for peer in peers.iter().take(5) { // Sample max 5 peers for efficiency
-                if let Ok(latency) = Self::measure_peer_latency(&peer.addr).await {
-                    total_latency += latency;
-                    successful_pings += 1;
-                }
-            }
-            
-            if successful_pings > 0 {
-                total_latency / successful_pings // Average latency
-            } else {
-                1000 // Default 1s if no peers reachable
-            }
+    /// PRODUCTION: Monitor network health for informational purposes (NON-CONSENSUS)
+    async fn monitor_network_health(unified_p2p: &Option<Arc<SimplifiedP2P>>) -> String {
+        if let Some(p2p) = unified_p2p {
+            let active_peers = p2p.get_validated_active_peers().len();
+            match active_peers {
+                0..=2 => "BOOTSTRAP",
+                3..=4 => "ADEQUATE", 
+                5..=9 => "GOOD",
+                _ => "EXCELLENT"
+            }.to_string()
         } else {
-            500 // Default 0.5s for solo mode
-        };
-        
-        // Adaptive timeout calculation based on network conditions
-        let adaptive_timeout = match timeout_type {
-            "microblock" => {
-                // Microblock timeout: base 5s + (2 * average_latency) + network_buffer
-                let network_buffer = if latency_samples > 2000 { 3 } else { 1 }; // High latency buffer
-                base_timeout + (latency_samples / 500) + network_buffer // Convert ms to seconds
-            },
-            "macroblock" => {
-                // Macroblock timeout: base 30s + (5 * average_latency) + consensus_buffer  
-                let consensus_buffer = if latency_samples > 3000 { 10 } else { 5 }; // Consensus needs more time
-                base_timeout + (latency_samples / 200) + consensus_buffer
-            },
-            _ => base_timeout
-        };
-        
-        let final_timeout = adaptive_timeout.min(base_timeout * 3).max(base_timeout); // Bounds: 1x-3x base
-        
-        println!("[ADAPTIVE_TIMEOUT] 📊 {} timeout calculated:", timeout_type.to_uppercase());
-        println!("  ├── Base Timeout: {}s", base_timeout);
-        println!("  ├── Network Latency: {}ms (from {} peers)", latency_samples, if unified_p2p.is_some() { "active" } else { "0" });
-        println!("  ├── Adaptive Factor: {}x", final_timeout as f64 / base_timeout as f64);
-        println!("  └── Final Timeout: {}s", final_timeout);
-        
-        final_timeout
-    }
-    
-    /// PRODUCTION: Measure peer latency for adaptive timeout calculation
-    async fn measure_peer_latency(peer_addr: &str) -> Result<u64, String> {
-        let start = std::time::Instant::now();
-        
-        // Simple HTTP ping to measure latency
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_millis(2000)) // 2s max for latency measurement
-            .build()
-            .map_err(|e| format!("HTTP client error: {}", e))?;
-        
-        match client.get(&format!("http://{}/health", peer_addr)).send().await {
-            Ok(_) => {
-                let latency_ms = start.elapsed().as_millis() as u64;
-                Ok(latency_ms)
-            },
-            Err(_) => Err("Peer unreachable".to_string())
+            "SOLO".to_string()
         }
     }
     
