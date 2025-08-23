@@ -152,16 +152,43 @@ struct ConsensusRound {
 }
 
 fn select_validators(eligible_nodes: &[Node]) -> Vec<NodeId> {
-    // Weighted random selection
+    // QNet PRODUCTION: Simple reputation-based selection (NO WEIGHTS)
     let mut selected = Vec::new();
     
-    // Guarantee some super nodes
-    let super_nodes = filter_super_nodes(eligible_nodes);
-    selected.extend(weighted_sample(super_nodes, 200));
+    // Filter qualified candidates: Only Full and Super nodes with reputation ≥ 70%
+    let qualified_nodes: Vec<&Node> = eligible_nodes.iter()
+        .filter(|node| {
+            matches!(node.node_type, NodeType::Full | NodeType::Super) &&
+            node.reputation >= 0.70
+        })
+        .collect();
     
-    // Add full nodes
-    let full_nodes = filter_full_nodes(eligible_nodes);
-    selected.extend(weighted_sample(full_nodes, 800));
+    // Simple random selection from qualified candidates
+    selected.extend(simple_random_sample(qualified_nodes, 1000));
+    
+    selected
+}
+
+fn simple_random_sample(nodes: Vec<&Node>, count: usize) -> Vec<NodeId> {
+    // QNet approach: Simple selection from qualified candidates (same as consensus)
+    use sha3::{Sha3_256, Digest};
+    let mut selected = Vec::new();
+    
+    for i in 0..count.min(nodes.len()) {
+        let mut hasher = Sha3_256::new();
+        hasher.update(format!("selection_{}", i).as_bytes());
+        for node in &nodes {
+            hasher.update(node.id.as_bytes());
+        }
+        
+        let hash = hasher.finalize();
+        let selection_index = u64::from_le_bytes([
+            hash[0], hash[1], hash[2], hash[3],
+            hash[4], hash[5], hash[6], hash[7],
+        ]) as usize % nodes.len();
+        
+        selected.push(nodes[selection_index].id.clone());
+    }
     
     selected
 }

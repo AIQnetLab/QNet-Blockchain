@@ -2400,6 +2400,15 @@ pub enum NetworkMessage {
         reveal_data: String,
         timestamp: u64,
     },
+
+    /// Emergency producer change notification
+    EmergencyProducerChange {
+        failed_producer: String,
+        new_producer: String,
+        block_height: u64,
+        change_type: String, // "microblock" or "macroblock"
+        timestamp: u64,
+    },
 }
 
 /// Internal consensus messages for node communication
@@ -2472,6 +2481,12 @@ impl SimplifiedP2P {
                 } else {
                     println!("[CONSENSUS] ⏭️ Ignoring reveal for microblock - no consensus needed for round {}", round_id);
                 }
+            }
+
+            NetworkMessage::EmergencyProducerChange { failed_producer, new_producer, block_height, change_type, timestamp } => {
+                println!("[FAILOVER] 🚨 Emergency producer change: {} → {} at block #{} ({})", 
+                         failed_producer, new_producer, block_height, change_type);
+                self.handle_emergency_producer_change(failed_producer, new_producer, block_height, change_type, timestamp);
             }
         }
     }
@@ -2786,6 +2801,71 @@ impl SimplifiedP2P {
         // Round ID should correspond to macroblock height (every 90 blocks)
         // If round_id is divisible by 90, it's a macroblock consensus round
         round_id > 0 && (round_id % 90 == 0)
+    }
+    
+    /// Handle emergency producer change notifications
+    fn handle_emergency_producer_change(
+        &self, 
+        failed_producer: String, 
+        new_producer: String, 
+        block_height: u64,
+        change_type: String,
+        timestamp: u64
+    ) {
+        println!("[FAILOVER] 📨 Processing emergency {} producer change notification", change_type);
+        println!("[FAILOVER] 💀 Failed producer: {} at block #{}", failed_producer, block_height);
+        println!("[FAILOVER] 🆘 New producer: {} (emergency activation)", new_producer);
+        
+        // Update reputation of failed producer
+        self.update_node_reputation(&failed_producer, -20.0);
+        println!("[REPUTATION] ⚔️ Network-wide penalty for {}: -20.0 reputation (emergency change)", failed_producer);
+        
+        // Boost reputation of emergency producer for taking over
+        self.update_node_reputation(&new_producer, 5.0);
+        println!("[REPUTATION] ✅ Emergency producer {} rewarded: +5.0 reputation (network service)", new_producer);
+        
+        // Log emergency change for network transparency
+        println!("[NETWORK] 📊 Emergency producer change recorded | Type: {} | Height: {} | Time: {}", 
+                 change_type, block_height, timestamp);
+    }
+    
+    /// Broadcast emergency producer change to network
+    pub fn broadcast_emergency_producer_change(
+        &self, 
+        failed_producer: &str, 
+        new_producer: &str, 
+        block_height: u64,
+        change_type: &str
+    ) -> Result<(), String> {
+        println!("[FAILOVER] 📢 Broadcasting emergency {} producer change to network", change_type);
+        
+        let peers = match self.connected_peers.lock() {
+            Ok(peers) => peers.clone(),
+            Err(poisoned) => {
+                println!("[P2P] ⚠️ Mutex poisoned during emergency broadcast, recovering...");
+                poisoned.into_inner().clone()
+            }
+        };
+        
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        
+        for peer in peers {
+            let emergency_msg = NetworkMessage::EmergencyProducerChange {
+                failed_producer: failed_producer.to_string(),
+                new_producer: new_producer.to_string(),
+                block_height,
+                change_type: change_type.to_string(),
+                timestamp,
+            };
+            
+            self.send_network_message(&peer.addr, emergency_msg);
+            println!("[FAILOVER] 📤 Emergency notification sent to peer: {}", peer.addr);
+        }
+        
+        Ok(())
     }
 }
 

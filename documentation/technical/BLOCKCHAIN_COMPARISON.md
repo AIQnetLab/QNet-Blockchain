@@ -29,22 +29,22 @@
    - Reputation system tracks participation
 
 3. **Leader Selection**:
-   - Deterministic selection using SHA256
-   - Weighted by node reputation
-   - Higher reputation = higher chance of selection
+   - Deterministic selection using SHA3-256
+   - Simple qualification: reputation ≥ 70% threshold
+   - Equal chance for all qualified nodes (NO WEIGHTING)
 
 4. **Reputation System**:
-   - Participation: 40% weight
-   - Response time: 30% weight  
-   - Block quality: 30% weight
+   - Simple binary threshold: qualified (≥70%) or not qualified (<70%)
    - Real-time tracking and updates
+   - Penalty system: -25.0 for microblock failures, -30.0 for macroblock failures
+   - Reward system: +5.0 for emergency producer service
 
 ### Advantages Over Traditional Consensus:
 
 - **Front-running Protection**: Commit-reveal prevents value manipulation
 - **Adaptive Performance**: Dynamic timing adjusts to network conditions
-- **Fair Leader Selection**: Reputation-based, not just stake-based
-- **Sybil Resistance**: Reputation harder to fake than just stake
+- **Fair Leader Selection**: Simple qualification threshold (≥70% reputation), equal chances
+- **Sybil Resistance**: Reputation threshold prevents low-quality nodes from participating
 
 ## QNet Performance Analysis
 

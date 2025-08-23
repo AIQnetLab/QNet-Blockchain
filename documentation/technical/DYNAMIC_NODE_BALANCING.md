@@ -92,30 +92,73 @@ struct NetworkLimits {
     max_validators_per_round: u32,  // e.g., 1000
     
     // Validator rotation
-    validator_rotation_interval: u64, // every 100 blocks
+    microblock_rotation_interval: u64, // every 30 blocks (QNet optimization)
+    macroblock_consensus_interval: u64, // every 90 blocks
     
-    // Priority by node type
-    super_node_weight: f64,  // 3.0 (higher selection chance)
-    full_node_weight: f64,   // 2.0
-    light_node_weight: f64,  // 1.0
+    // Simple qualification requirements (NO WEIGHTS)
+    min_reputation_threshold: f64,  // 0.70 (70% minimum for participation)
+    node_type_filter: String,      // "full_and_super" (Light nodes excluded from microblock production)
+    emergency_failover_timeout: u64, // 5s for microblocks, 30s for macroblocks
 }
 ```
 
-### 6. Validator Selection Mechanism
+### 6. QNet Validator Selection Mechanism (Updated 2025)
 
 ```rust
-fn select_validators(round: u64) -> Vec<NodeId> {
-    let mut validators = Vec::new();
+fn select_microblock_producer(round: u64, current_height: u64) -> String {
+    // QNet PRODUCTION: Simple reputation-based selection (NO WEIGHTS)
     
-    // Guaranteed slots for super nodes (minimum 10%)
-    let guaranteed_super = max_validators * 0.1;
-    validators.extend(select_random_super_nodes(guaranteed_super));
+    // 1. Filter qualified candidates: Only Full and Super nodes
+    let qualified_candidates: Vec<Node> = all_nodes.iter()
+        .filter(|node| {
+            matches!(node.node_type, NodeType::Full | NodeType::Super) &&
+            node.reputation >= 0.70 // 70% minimum reputation threshold
+        })
+        .cloned()
+        .collect();
     
-    // Remaining slots - weighted random selection
-    let remaining = max_validators - validators.len();
-    validators.extend(weighted_random_selection(remaining));
+    // 2. Rotation every 30 blocks (3 producers per macroblock)
+    let rotation_interval = 30u64;
+    let leadership_round = current_height / rotation_interval;
     
-    validators
+    // 3. Deterministic but fair selection using SHA3-256
+    use sha3::{Sha3_256, Digest};
+    let mut hasher = Sha3_256::new();
+    hasher.update(format!("microblock_producer_selection_{}", leadership_round).as_bytes());
+    for node in &qualified_candidates {
+        hasher.update(node.id.as_bytes());
+    }
+    
+    let selection_hash = hasher.finalize();
+    let selection_number = u64::from_le_bytes([
+        selection_hash[0], selection_hash[1], selection_hash[2], selection_hash[3],
+        selection_hash[4], selection_hash[5], selection_hash[6], selection_hash[7],
+    ]);
+    
+    // 4. Simple modular selection (same algorithm as macroblock consensus)
+    let selection_index = (selection_number as usize) % qualified_candidates.len();
+    qualified_candidates[selection_index].id.clone()
+}
+
+fn select_macroblock_leader(participants: &[String]) -> String {
+    // QNet PRODUCTION: Same simple algorithm for macroblock leaders
+    // NO WEIGHTS - simple random from qualified participants (reputation ≥ 70%)
+    
+    use sha3::{Sha3_256, Digest};
+    let mut hasher = Sha3_256::new();
+    hasher.update(b"macroblock_leader_selection");
+    for participant in participants {
+        hasher.update(participant.as_bytes());
+    }
+    
+    let hash = hasher.finalize();
+    let selection_number = u64::from_le_bytes([
+        hash[0], hash[1], hash[2], hash[3],
+        hash[4], hash[5], hash[6], hash[7],
+    ]);
+    
+    let selection_index = (selection_number as usize) % participants.len();
+    participants[selection_index].clone()
 }
 ```
 

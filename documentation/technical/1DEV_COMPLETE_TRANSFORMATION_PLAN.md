@@ -22,7 +22,7 @@ Layer 2: QNet Quantum Blockchain
 Layer 3: QNC (QNetCoin - Native Token)
 ├── Purpose: Native network operations
 ├── Auto-transition: When 90% $1DEV burned
-├── Utility: Transaction fees, staking, governance
+├── Utility: Transaction fees, reputation-based consensus, governance
 ├── Distribution: To educational participants
 └── Economics: Deflationary, educational rewards
 ```
@@ -65,7 +65,7 @@ OLD → NEW
 "Node operators" → "Educational participants"
 "Earn money" → "Participate in learning"
 "Buy tokens" → "Support educational development"
-"Stake" → "Participate in network education"
+"Stake" → "Build reputation in network education"
 ```
 
 ### **1.2 Code Base Token Integration Updates**

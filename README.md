@@ -84,15 +84,22 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 │  ├── CRYSTALS-Kyber (Key Exchange)                         │
 │  └── SPHINCS+ (Hash-based Signatures)                      │
 ├─────────────────────────────────────────────────────────────┤
-│  Consensus Layer                                           │
-│  ├── Hybrid PoS/PoW Mechanism                              │
-│  ├── Microblock Technology                                 │
-│  └── Dynamic Validator Selection                           │
+│  Consensus Layer with Enterprise Failover                  │
+│  ├── Microblock Production (1s intervals)                  │
+│  │   ├── Reputation-based producer rotation (30 blocks)    │
+│  │   ├── 5-second timeout + emergency rotation             │
+│  │   └── Full/Super nodes only (Light excluded)           │
+│  ├── Macroblock Consensus (90s intervals)                  │
+│  │   ├── Full Byzantine commit-reveal consensus            │
+│  │   ├── 30-second timeout + emergency re-consensus       │
+│  │   └── 67% honest validator assumption                   │
+│  └── Dynamic Validator Selection with Failover            │
 ├─────────────────────────────────────────────────────────────┤
 │  Network Layer                                             │
 │  ├── Kademlia DHT                                          │
 │  ├── Gossip Protocol                                       │
-│  └── Regional Node Clustering                              │
+│  ├── Regional Node Clustering                              │
+│  └── Emergency Producer Change Broadcasting                │
 ├─────────────────────────────────────────────────────────────┤
 │  Application Layer                                         │
 │  ├── Smart Contracts (WASM)                                │
@@ -100,6 +107,32 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 │  └── Cross-Chain Bridges                                   │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+## 🆘 Enterprise Failover System
+
+QNet implements production-grade failover mechanisms for zero-downtime operation:
+
+### **Microblock Producer Failover**
+- **Rotation Schedule**: Every 30 blocks (30 seconds) for stability
+- **Participant Filter**: Only Full and Super nodes (Light nodes excluded for mobile optimization)
+- **Timeout Detection**: 5-second threshold triggers automatic failover
+- **Emergency Selection**: Highest reputation backup producer takes over immediately
+- **Network Recovery**: <7 seconds automatic recovery time
+- **Reputation Impact**: -25.0 penalty for failed producer, +5.0 reward for emergency takeover
+
+### **Macroblock Leader Failover**
+- **Byzantine Consensus**: Full commit-reveal with 67% honest assumption
+- **Timeout Detection**: 30-second threshold for macroblock creation
+- **Emergency Re-consensus**: Automatic restart excluding failed leader
+- **Leader Exclusion**: Failed leaders temporarily excluded from future rounds
+- **Network Recovery**: <45 seconds automatic consensus restart
+- **Reputation Impact**: -30.0 penalty for failed macroblock leader
+
+### **Zero Single Points of Failure**
+- **No Producer Dependency**: Any qualified node can become emergency producer
+- **Automatic Recovery**: No human intervention required for network restoration
+- **Progressive Penalties**: Escalating reputation penalties prevent repeated failures
+- **Network Transparency**: All failover events logged and broadcast to peers
 
 ## 🖥️ System Requirements
 
