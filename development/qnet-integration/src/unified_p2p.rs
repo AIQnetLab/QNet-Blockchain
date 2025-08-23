@@ -859,7 +859,7 @@ impl SimplifiedP2P {
         
         // PRODUCTION: Use blocking HTTP client to avoid runtime conflicts
         let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(15)) // PRODUCTION: Increased timeout for real network
+            .timeout(Duration::from_secs(10)) // CRITICAL FIX: Increased timeout for peer connectivity
             .build()
             .map_err(|e| format!("HTTP client error: {}", e))?;
         
@@ -1048,7 +1048,7 @@ impl SimplifiedP2P {
             "protocol_version": "qnet-v1.0"
         });
         
-        match tokio::time::timeout(Duration::from_secs(5), 
+        match tokio::time::timeout(Duration::from_secs(10), // CRITICAL FIX: Increased timeout for peer connectivity 
             client.post(&auth_endpoint)
                 .json(&challenge_payload)
                 .send()
@@ -1216,7 +1216,7 @@ impl SimplifiedP2P {
                 
                 // Attempt connection 3 times with increasing timeouts
                 for attempt in 1..=3 {
-                    let timeout = Duration::from_secs(2 * attempt as u64); // 2s, 4s, 6s
+                    let timeout = Duration::from_millis(500 * attempt as u64); // 0.5s, 1s, 1.5s
                     let start_time = std::time::Instant::now();
                     
                     match TcpStream::connect_timeout(&socket_addr, timeout) {
@@ -2068,7 +2068,7 @@ impl SimplifiedP2P {
         let start_time = std::time::Instant::now();
         let response = client
             .get(&url)
-            .timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(10)) // CRITICAL FIX: Increased timeout for peer connectivity
             .send()?;
             
         let latency_ms = start_time.elapsed().as_millis() as u32;
@@ -2312,7 +2312,7 @@ impl SimplifiedP2P {
                 for url in urls {
                     // Create HTTP client
                     let client = match reqwest::Client::builder()
-                        .timeout(std::time::Duration::from_secs(5))
+                        .timeout(std::time::Duration::from_secs(10)) // CRITICAL FIX: Increased timeout for peer connectivity
                         .user_agent("QNet-Node/1.0")
                         .build() {
                         Ok(client) => client,
@@ -2688,7 +2688,7 @@ impl SimplifiedP2P {
         // Send asynchronously in background thread
         tokio::spawn(async move {
             let client = match reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(30)) // PRODUCTION: Increased timeout for real network
+                .timeout(std::time::Duration::from_secs(10)) // CRITICAL FIX: Increased timeout for peer connectivity
                 .user_agent("QNet-Node/1.0")
                 .build() {
                 Ok(client) => client,

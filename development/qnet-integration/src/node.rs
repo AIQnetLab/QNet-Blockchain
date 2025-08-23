@@ -581,11 +581,8 @@ impl BlockchainNode {
                 let is_my_turn_to_produce = current_producer == node_id;
                 
                 if is_my_turn_to_produce {
-                    // PRODUCTION: This node is selected as microblock producer for this round
-                    println!("[MICROBLOCK] 👑 Selected as producer for block #{}", microblock_height + 1);
-                    
-                    // Update is_leader for backward compatibility with existing code
-                    *is_leader.write().await = true;
+                                    // PRODUCTION: This node is selected as microblock producer for this round
+                *is_leader.write().await = true;
                     
                     {
                     // Get performance settings
@@ -601,12 +598,7 @@ impl BlockchainNode {
                     // Adaptive interval based on mempool size
                     let current_interval = microblock_interval;
                     
-                    // PRODUCER READINESS PRE-VALIDATION (Enterprise-grade checks)
-                    if !Self::validate_producer_readiness(&node_id, &unified_p2p, microblock_height).await {
-                        println!("[PRODUCER] ⚠️ Producer readiness validation failed - skipping block creation cycle");
-                        tokio::time::sleep(microblock_interval).await;
-                        continue;
-                    }
+                    // PRODUCTION: Skip expensive readiness validation in microblock critical path
                     
                     // Get transactions from mempool using batch processing
                     let tx_jsons = {
@@ -625,54 +617,11 @@ impl BlockchainNode {
                     // PRODUCTION QNet Consensus Integration
                     // QNet uses CommitRevealConsensus + ShardedConsensusManager for Byzantine Fault Tolerance
                     
-                    // PRODUCTION: Determine consensus participation based on REPUTATION
-                    let can_participate_consensus = match node_type {
-                        NodeType::Super => {
-                            // Super nodes participate if reputation ≥ 70%
-                            Self::check_node_reputation(&node_id, &unified_p2p).await >= 0.70
-                        },
-                        NodeType::Full => {
-                            // Full nodes participate if selected by reputation-based algorithm
-                            if let Some(p2p) = &unified_p2p {
-                                let has_peers = p2p.get_peer_count() >= 3;
-                                let has_reputation = Self::check_node_reputation(&node_id, &unified_p2p).await >= 0.70;
-                                has_peers && has_reputation
-                            } else {
-                                false
-                            }
-                        },
-                        NodeType::Light => false, // Light nodes never participate in consensus
-                    };
+                    // PRODUCTION: Microblocks DON'T require consensus participation checks
+                    // Reputation is already verified in select_microblock_producer()
+                    // Consensus participation is ONLY checked for macroblock finalization (every 90 blocks)
                     
-                    if !can_participate_consensus {
-                        let reputation = Self::check_node_reputation(&node_id, &unified_p2p).await;
-                        println!("[CONSENSUS] ⚠️ Node excluded from consensus: reputation {:.1}% (need ≥70%)", reputation * 100.0);
-                    }
-                    
-                    // Synchronize with network consensus height
-                    if let Some(p2p) = &unified_p2p {
-                        match p2p.sync_blockchain_height() {
-                            Ok(network_height) => {
-                                if network_height > microblock_height {
-                                    println!("Syncing: downloading blocks {}-{}", microblock_height, network_height);
-                                    let storage_clone = storage.clone();
-                                    p2p.download_missing_microblocks(storage_clone.as_ref(), microblock_height, network_height).await;
-                                    if let Ok(Some(_)) = storage.load_microblock(network_height) {
-                                        microblock_height = network_height;
-                                        // CRITICAL FIX: Update global height after sync
-                                        {
-                                            let mut global_height = height.write().await;
-                                            *global_height = microblock_height;
-                                        }
-                                        println!("Synced to block #{}", network_height);
-                                    }
-                                }
-                            },
-                            Err(_) => {
-                                // Silent sync failure - normal for isolated nodes
-                            }
-                        }
-                    }
+                    // PRODUCTION: Skip blocking sync in microblock critical path - handled in background
                     
                     // PRODUCTION: Microblocks can be created by ANY node (no consensus requirement)
                     // Consensus participation is required ONLY for macroblock finalization every 90 blocks
@@ -719,9 +668,6 @@ impl BlockchainNode {
                     // PRODUCTION: Generate CRYSTALS-Dilithium signature for microblock
                     match Self::sign_microblock_with_dilithium(&microblock, &node_id).await {
                         Ok(signature) => {
-                            println!("[CRYPTO] ✅ Microblock #{} signed with CRYSTALS-Dilithium", microblock_height);
-                            println!("[CRYPTO] 🔐 Signature size: {} bytes | Format: quantum-resistant | Hash: {}", 
-                                     signature.len(), hex::encode(&signature[..8]));
                             microblock.signature = signature;
                         },
                         Err(e) => {
@@ -850,10 +796,10 @@ impl BlockchainNode {
                                  txs.len(), mempool_guard.size());
                     }
                     
-                    // PRODUCTION: Show microblock completion status
-                    println!("[MICROBLOCK] ✅ Block #{} COMPLETED | Producer: {} | Status: FINALIZED", 
-                             microblock_height, node_id);
-                    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+                    // PRODUCTION: Completion logging every 10 blocks only for 1-second intervals
+                    if microblock_height % 10 == 0 {
+                        println!("[MICROBLOCK] ✅ Block #{} completed | Producer: {}", microblock_height, node_id);
+                    }
                     
                     // CRITICAL: Update block creation time for timeout detection
                     last_block_time = std::time::Instant::now();
@@ -1151,7 +1097,15 @@ impl BlockchainNode {
             // QNet requires consistent candidate lists across all nodes for Byzantine safety
             let candidates = Self::calculate_qualified_candidates(p2p, own_node_id, own_node_type).await;
             
-            println!("[PRODUCER_SELECTION] ✅ Calculated {} qualified candidates (deterministic for all nodes)", candidates.len());
+            // DEBUG: Show candidate info to understand producer selection
+            println!("[DEBUG] 🔍 Producer selection debug:");
+            println!("  ├── Total candidates found: {}", candidates.len());
+            for (i, (candidate_id, reputation)) in candidates.iter().enumerate() {
+                println!("  ├── Candidate {}: {} (reputation: {:.1}%)", i, candidate_id, reputation * 100.0);
+            }
+            println!("  ├── Current height: {}", current_height);
+            println!("  ├── Leadership round: {}", current_height / 30);
+            println!("  └── Selection will be deterministic based on round");
             
             if candidates.is_empty() {
                 println!("[MICROBLOCK] ⚠️ No qualified candidates (≥70% reputation, Full/Super only) - using self");
@@ -1180,17 +1134,16 @@ impl BlockchainNode {
             let selection_index = (selection_number as usize) % candidates.len();
             let selected_producer = candidates[selection_index].0.clone();
             
-            // Enhanced rotation logging with full schedule visibility
-            let current_rotation_start = leadership_round * rotation_interval;
-            let current_rotation_end = (leadership_round + 1) * rotation_interval - 1;
-            let next_rotation_at = (leadership_round + 1) * rotation_interval;
+            println!("[DEBUG] 🎯 Selection result:");
+            println!("  ├── Selection hash number: {}", selection_number);
+            println!("  ├── Selection index: {} (of {} candidates)", selection_index, candidates.len());
+            println!("  └── Selected producer: {}", selected_producer);
             
-            println!("[MICROBLOCK] 🎯 PRODUCER ROTATION SCHEDULE:");
-            println!("  ├── Current Producer: {} (reputation: {:.1}%)", selected_producer, candidates[selection_index].1 * 100.0);
-            println!("  ├── Rotation Period: blocks {}-{} (round: {})", current_rotation_start, current_rotation_end, leadership_round);
-            println!("  ├── Next Rotation: block {} (in {} blocks)", next_rotation_at, next_rotation_at.saturating_sub(current_height));
-            println!("  ├── Qualified Candidates: {}/{} nodes", candidates.len(), candidates.len() + if unified_p2p.is_some() { 0 } else { 0 });
-            println!("  └── Network Status: {} peers active", if let Some(ref p2p) = unified_p2p { p2p.get_validated_active_peers().len() } else { 0 });
+            // PRODUCTION: Log rotation info only at rotation boundaries (every 30 blocks)
+            if current_height % rotation_interval == 0 {
+                println!("[MICROBLOCK] 🎯 Producer: {} (round: {}, next rotation: block {})", 
+                         selected_producer, leadership_round, (leadership_round + 1) * rotation_interval);
+            }
             
             selected_producer
         } else {
@@ -1207,9 +1160,29 @@ impl BlockchainNode {
             Ok(reputation) => {
                 let score = reputation.get_reputation(node_id);
                 // Convert 0-100 scale to 0-1 scale
-                (score / 100.0).max(0.0).min(1.0)
+                // CRITICAL ARCHITECTURAL FIX: QNet minimum reputation threshold enforcement
+                // Documentation: "Simple binary threshold: qualified (≥70%) or not qualified (<70%)"
+                let raw_reputation = (score / 100.0).max(0.0).min(1.0);
+                
+                // ENFORCE MINIMUM 70% THRESHOLD per QNet specification
+                let reputation_score = if raw_reputation < 0.70 {
+                    if score == 0.0 {
+                        // New peer: Start with 70% minimum
+                        println!("[REPUTATION] 🆕 New peer {} - assigned minimum threshold (70%)", node_id);
+                        0.70
+                    } else {
+                        // Below threshold: Not eligible for consensus
+                        println!("[REPUTATION] ⚠️ Peer {} below threshold: {:.1}% (min: 70%) - excluded", node_id, raw_reputation * 100.0);
+                        raw_reputation // Return actual low score for exclusion logic
+                    }
+                } else {
+                    raw_reputation // Above threshold: Use actual reputation
+                };
+                
+                reputation_score
             }
             Err(_) => {
+                println!("[REPUTATION] ⚠️ Failed to access reputation system for {} - using default", node_id);
                 0.70 // Default reputation for calculation consistency
             }
         }
@@ -1390,37 +1363,57 @@ impl BlockchainNode {
     ) -> Vec<(String, f64)> {
         let mut candidates = Vec::new();
         
+        println!("[DEBUG] 🔍 Calculating qualified candidates:");
+        println!("  ├── Own node: {} (type: {:?})", own_node_id, own_node_type);
+        
         // Check own node eligibility using SAME logic as original
         let can_participate_microblock = match own_node_type {
             NodeType::Super => {
                 let own_reputation = Self::get_node_reputation_score(own_node_id, p2p).await;
+                println!("  ├── Own Super node reputation: {:.1}%", own_reputation * 100.0);
                 own_reputation >= 0.70
             },
             NodeType::Full => {
                 let has_peers = p2p.get_peer_count() >= 3;
                 let own_reputation = Self::get_node_reputation_score(own_node_id, p2p).await;
                 let has_reputation = own_reputation >= 0.70;
+                println!("  ├── Own Full node: peers={}, reputation={:.1}%", has_peers, own_reputation * 100.0);
                 has_peers && has_reputation
             },
-            NodeType::Light => false, // Light nodes never participate
+            NodeType::Light => {
+                println!("  ├── Own Light node: excluded from microblock production");
+                false // Light nodes never participate
+            }
         };
         
         if can_participate_microblock {
             let own_reputation = Self::get_node_reputation_score(own_node_id, p2p).await;
             candidates.push((own_node_id.to_string(), own_reputation));
+            println!("  ├── ✅ Own node added as candidate");
+        } else {
+            println!("  ├── ❌ Own node excluded from candidates");
         }
         
         // Add peer candidates (already filtered by get_validated_active_peers)
         let peers = p2p.get_validated_active_peers();
+        println!("  ├── Checking {} active peers", peers.len());
+        
         for peer in peers {
             let peer_node_id = format!("node_{}", peer.addr.replace(":", "_"));
             let reputation = Self::get_node_reputation_score(&peer_node_id, p2p).await;
             
+            // Peer reputation is now handled by get_node_reputation_score with proper thresholds
+            println!("  ├── Peer {} ({}): reputation {:.1}%", peer_node_id, peer.addr, reputation * 100.0);
+            
             if reputation >= 0.70 {
-                candidates.push((peer_node_id, reputation));
+                candidates.push((peer_node_id.clone(), reputation));
+                println!("  │   └── ✅ Added as candidate");
+            } else {
+                println!("  │   └── ❌ Excluded (low reputation)");
             }
         }
         
+        println!("  └── Total qualified candidates: {}", candidates.len());
         candidates
     }
     
