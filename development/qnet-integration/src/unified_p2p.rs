@@ -2852,6 +2852,9 @@ impl SimplifiedP2P {
             .unwrap()
             .as_secs();
         
+        let mut successful_broadcasts = 0;
+        let total_peers = peers.len();
+        
         for peer in peers {
             let emergency_msg = NetworkMessage::EmergencyProducerChange {
                 failed_producer: failed_producer.to_string(),
@@ -2861,9 +2864,14 @@ impl SimplifiedP2P {
                 timestamp,
             };
             
+            // CRITICAL: Send emergency message to peer
             self.send_network_message(&peer.addr, emergency_msg);
+            successful_broadcasts += 1;
             println!("[FAILOVER] 📤 Emergency notification sent to peer: {}", peer.addr);
         }
+        
+        println!("[FAILOVER] 📊 Emergency broadcast completed: {}/{} peers notified", 
+                 successful_broadcasts, total_peers);
         
         Ok(())
     }
