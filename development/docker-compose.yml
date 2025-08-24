@@ -7,6 +7,12 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: qnet-node
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"     # Smaller files for faster log rotation
+        max-file: "2"       # Only 2 files max (20MB total)
+        compress: "true"    # Compress old logs to save space
     environment:
       - NODE_TYPE=full
       - NETWORK_ID=qnet-mainnet

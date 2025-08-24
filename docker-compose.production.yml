@@ -6,6 +6,12 @@ services:
       dockerfile: Dockerfile.production
     container_name: qnet-genesis
     hostname: genesis
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"     # Smaller files for faster log rotation
+        max-file: "2"       # Only 2 files max (20MB total)
+        compress: "true"    # Compress old logs to save space
     environment:
       - RUST_LOG=info,qnet=debug
       - QNET_TESTNET=1
@@ -32,7 +38,7 @@ services:
       - "9945:9945"   # Metrics (RPC port + 400)
     volumes:
       - ./genesis-data:/app/data
-      - ./genesis-logs:/app/logs
+      # Removed log volume mount - logs will be stored in container and auto-deleted
     networks:
       - qnet-testnet
     restart: unless-stopped
@@ -52,6 +58,12 @@ services:
       dockerfile: Dockerfile.production
     container_name: qnet-validator1
     hostname: validator1
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"     # Smaller files for faster log rotation
+        max-file: "2"       # Only 2 files max (20MB total)
+        compress: "true"    # Compress old logs to save space
     environment:
       - RUST_LOG=info,qnet=debug
       - QNET_TESTNET=1
@@ -77,7 +89,7 @@ services:
       - "9946:9946"   # Metrics (RPC port + 400)
     volumes:
       - ./validator1-data:/app/data
-      - ./validator1-logs:/app/logs
+      # Removed log volume mount - logs will be stored in container and auto-deleted
     networks:
       - qnet-testnet
     restart: unless-stopped
@@ -99,6 +111,12 @@ services:
       dockerfile: Dockerfile.production
     container_name: qnet-validator2
     hostname: validator2
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"     # Smaller files for faster log rotation
+        max-file: "2"       # Only 2 files max (20MB total)
+        compress: "true"    # Compress old logs to save space
     environment:
       - RUST_LOG=info,qnet=debug
       - QNET_TESTNET=1
@@ -124,7 +142,7 @@ services:
       - "9947:9947"   # Metrics (RPC port + 400)
     volumes:
       - ./validator2-data:/app/data
-      - ./validator2-logs:/app/logs
+      # Removed log volume mount - logs will be stored in container and auto-deleted
     networks:
       - qnet-testnet
     restart: unless-stopped

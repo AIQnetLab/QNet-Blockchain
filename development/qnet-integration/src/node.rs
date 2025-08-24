@@ -525,7 +525,18 @@ impl BlockchainNode {
                 // Create reveal from remote node data  
                 let reveal_bytes = hex::decode(&reveal_data)
                     .unwrap_or_else(|_| reveal_data.as_bytes().to_vec()); // Try hex decode first, fallback to direct bytes
-                let nonce = [0u8; 32]; // Placeholder nonce - real nonce handled by P2P validation
+                // PRODUCTION: Generate real cryptographic nonce for consensus reveal
+                let nonce = {
+                    use sha3::{Sha3_256, Digest};
+                    let mut hasher = Sha3_256::new();
+                    hasher.update(node_id.as_bytes());
+                    hasher.update(&round_id.to_le_bytes());
+                    hasher.update(&std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos().to_le_bytes());
+                    let hash = hasher.finalize();
+                    let mut nonce_array = [0u8; 32];
+                    nonce_array.copy_from_slice(&hash[..32]);
+                    nonce_array
+                };
                 
                 let remote_reveal = Reveal {
                     node_id: node_id.clone(),
@@ -547,7 +558,7 @@ impl BlockchainNode {
         }
     }
     
-    async fn start_microblock_production(&self) {
+    async fn start_microblock_production(&mut self) {
         let is_running = self.is_running.clone();
         let mempool = self.mempool.clone();
         let storage = self.storage.clone();
@@ -559,7 +570,11 @@ impl BlockchainNode {
         let parallel_validator = self.parallel_validator.clone();
         let node_type = self.node_type;
         let consensus = self.consensus.clone();
-        let consensus_nonce_storage = self.consensus_nonce_storage.clone(); // CRITICAL FIX: Clone nonce storage
+        let consensus_nonce_storage = self.consensus_nonce_storage.clone();
+        
+        // CRITICAL FIX: Take consensus_rx ownership for real P2P integration  
+        let mut consensus_rx = self.consensus_rx.take();
+        let consensus_rx = Arc::new(tokio::sync::Mutex::new(consensus_rx));
         
         tokio::spawn(async move {
             // CRITICAL FIX: Start from current global height, not 0
@@ -771,15 +786,15 @@ impl BlockchainNode {
                             println!("[Storage] ⚠️ Efficient storage failed, falling back to legacy: {}", e);
                             
                             // Fallback to old method if efficient storage fails
-                            let microblock_data = if compression_enabled {
-                                Self::compress_microblock_data(&microblock).unwrap_or_else(|_| {
-                                    bincode::serialize(&microblock).unwrap_or_default()
-                                })
-                            } else {
-                                bincode::serialize(&microblock).unwrap_or_default()
-                            };
-                            
-                            if let Err(e) = storage.save_microblock(microblock_height, &microblock_data) {
+                    let microblock_data = if compression_enabled {
+                        Self::compress_microblock_data(&microblock).unwrap_or_else(|_| {
+                            bincode::serialize(&microblock).unwrap_or_default()
+                        })
+                    } else {
+                        bincode::serialize(&microblock).unwrap_or_default()
+                    };
+                    
+                    if let Err(e) = storage.save_microblock(microblock_height, &microblock_data) {
                                 println!("[Microblock] ❌ Both efficient and legacy storage failed: {}", e);
                             }
                         }
@@ -872,42 +887,56 @@ impl BlockchainNode {
                         let consensus_clone = consensus.clone();
                         let storage_clone = storage.clone();
                         let node_id_clone = node_id.clone();
+                        let node_type_clone = node_type;
                         let unified_p2p_clone = unified_p2p.clone();
+                        let consensus_rx_clone = consensus_rx.clone();
                         tokio::spawn(async move {
                             println!("[MACROBLOCK] 🏛️ STARTING BYZANTINE CONSENSUS for blocks {}-{}", 
                                      last_macroblock_trigger + 1, microblock_height);
                             println!("[MACROBLOCK] ⚡ Participants needed: 4+ nodes | Security: 3f+1 Byzantine safety");
                             
-                            // CRITICAL: Execute REAL consensus for macroblock
+                            // CRITICAL: Only create macroblock if we are the CONSENSUS-SELECTED LEADER
                             let should_create_macroblock = {
                                 let consensus_engine = consensus_clone.read().await;
                                 if let Some(consensus_data) = consensus_engine.get_finalized_consensus() {
                                     println!("[MACROBLOCK] ✅ CONSENSUS FOUND! Leader: {} | Participants: {}", 
                                              consensus_data.leader_id, consensus_data.participants.len());
                                     
-                                    // Check if we are the selected leader
-                                    let we_are_leader = consensus_data.leader_id == node_id_clone ||
-                                                      consensus_data.leader_id.contains(&node_id_clone);
+                                    // Check if we are the Byzantine-selected leader (exact match)
+                                    let our_bootstrap_id = std::env::var("QNET_BOOTSTRAP_ID").unwrap_or_default();
+                                    let our_consensus_id = if !our_bootstrap_id.is_empty() {
+                                        format!("genesis_node_{}", our_bootstrap_id)
+                                    } else {
+                                        node_id_clone.clone()
+                                    };
+                                    
+                                    let we_are_leader = consensus_data.leader_id == our_consensus_id;
                                     
                                     if we_are_leader {
-                                        println!("[Macroblock] 👑 We are consensus leader - creating macroblock");
+                                        println!("[MACROBLOCK] 👑 We are BYZANTINE CONSENSUS LEADER - creating macroblock");
                                         true
                                     } else {
-                                        println!("[Macroblock] 👥 We are not leader ({}), waiting for leader's macroblock", 
-                                                 consensus_data.leader_id);
+                                        println!("[MACROBLOCK] 👥 We are NOT leader ({} != {}), waiting for leader's macroblock", 
+                                                 our_consensus_id, consensus_data.leader_id);
                                         false
                                     }
                                 } else {
-                                    // Genesis bootstrap mode - check if we should create
-                                    let is_genesis_bootstrap = std::env::var("QNET_BOOTSTRAP_ID")
-                                        .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
-                                        .unwrap_or(false);
+                                    println!("[MACROBLOCK] ⚠️ No finalized consensus - checking if we should initiate Byzantine consensus");
                                     
-                                    if is_genesis_bootstrap {
-                                        println!("[Macroblock] 🌱 Genesis bootstrap - creating local macroblock");
-                                        true
+                                    // CRITICAL: Only ONE node should initiate consensus to prevent duplicate rounds
+                                    // Use deterministic selection based on current qualified nodes
+                                    let should_initiate = if let Some(p2p) = &unified_p2p_clone {
+                                        Self::should_initiate_consensus(p2p, &node_id_clone, node_type_clone).await
                                     } else {
-                                        false
+                                        false // No P2P = no consensus initiation
+                                    };
+                                    
+                                    if should_initiate {
+                                        println!("[MACROBLOCK] 👑 We are CONSENSUS INITIATOR - starting Byzantine consensus");
+                                        true // Only the selected initiator triggers consensus
+                                    } else {
+                                        println!("[MACROBLOCK] 👥 We are NOT consensus initiator - waiting for consensus result");
+                                        false // Other nodes wait for consensus result
                                     }
                                 }
                             };
@@ -919,6 +948,10 @@ impl BlockchainNode {
                                     consensus_clone,
                                     last_macroblock_trigger + 1,
                                     microblock_height,
+                                    &unified_p2p_clone.unwrap(), // CRITICAL: Pass REAL P2P for participant discovery
+                                    &node_id_clone,
+                                    node_type_clone,
+                                    &consensus_rx_clone, // CRITICAL FIX: Pass REAL consensus_rx from BlockchainNode
                                 ).await {
                                     Ok(_) => {
                                         println!("[MACROBLOCK] ✅ MACROBLOCK CREATED SUCCESSFULLY!");
@@ -1564,6 +1597,50 @@ impl BlockchainNode {
         println!("  ├── Simple sampling complete: {} validators selected from {} qualified", 
                  selected.len(), all_qualified.len());
         selected
+        }
+    
+    /// CRITICAL: Deterministic selection of consensus initiator (only ONE node triggers consensus)
+    async fn should_initiate_consensus(
+        p2p: &Arc<SimplifiedP2P>,
+        our_node_id: &str, 
+        our_node_type: NodeType
+    ) -> bool {
+        println!("[CONSENSUS] 🎯 Determining consensus initiator...");
+        
+        // Get all qualified candidates using existing validator sampling system
+        let qualified_candidates = Self::calculate_qualified_candidates(p2p, our_node_id, our_node_type).await;
+        
+        if qualified_candidates.is_empty() {
+            println!("[CONSENSUS] ❌ No qualified candidates - cannot initiate consensus");
+            return false;
+        }
+        
+        // DETERMINISTIC: Select consensus initiator by lowest node_id (alphabetical order)
+        let mut sorted_candidates = qualified_candidates.clone();
+        sorted_candidates.sort_by(|a, b| a.0.cmp(&b.0));
+        
+        let consensus_initiator = &sorted_candidates[0].0;
+        println!("[CONSENSUS] 🎯 Consensus initiator selected: {} (from {} qualified nodes)", 
+                 consensus_initiator, sorted_candidates.len());
+        
+        // Check if we are the selected initiator
+        let our_bootstrap_id = std::env::var("QNET_BOOTSTRAP_ID").unwrap_or_default();
+        let our_consensus_id = if !our_bootstrap_id.is_empty() {
+            format!("genesis_node_{}", our_bootstrap_id)
+        } else {
+            our_node_id.to_string()
+        };
+        
+        let we_are_initiator = consensus_initiator == &our_consensus_id;
+        
+        if we_are_initiator {
+            println!("[CONSENSUS] ✅ We are the CONSENSUS INITIATOR - will trigger Byzantine consensus");
+        } else {
+            println!("[CONSENSUS] 👥 We are NOT the initiator ({} != {}), will wait for consensus", 
+                     our_consensus_id, consensus_initiator);
+        }
+        
+        we_are_initiator
     }
     
     /// CRITICAL: Emergency macroblock consensus when leader fails
@@ -1616,7 +1693,7 @@ impl BlockchainNode {
         round_id: u64,
         unified_p2p: &Option<Arc<SimplifiedP2P>>,
         nonce_storage: &Arc<RwLock<HashMap<String, ([u8; 32], Vec<u8>)>>>,
-        _consensus_rx: &Option<tokio::sync::mpsc::UnboundedReceiver<ConsensusMessage>>, // For future use
+        consensus_rx: &Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<ConsensusMessage>>>>, // REAL P2P integration
     ) {
         // CRITICAL: Only execute consensus for MACROBLOCK rounds (every 90 blocks)
         // Microblocks use simple producer signatures, NOT Byzantine consensus
@@ -1630,10 +1707,15 @@ impl BlockchainNode {
         use sha3::{Sha3_256, Digest};
         
         // PRODUCTION: REAL commit phase - each node generates only OWN commit
-        // CRITICAL FIX: Find our own node_id in participants list
-        let our_node_id = participants.iter()
-            .find(|&p| p.contains("node_9876_") || p.contains("_8001"))
-            .cloned();
+        // CRITICAL FIX: Find our own node_id in participants list (Genesis nodes)
+        let our_bootstrap_id = std::env::var("QNET_BOOTSTRAP_ID").unwrap_or_default();
+        let our_node_id = if !our_bootstrap_id.is_empty() {
+            Some(format!("genesis_node_{}", our_bootstrap_id))
+        } else {
+            participants.iter()
+                .find(|&p| p.contains("node_") && (p.contains("9876") || p.contains("8001")))
+                .cloned()
+        };
         
         if let Some(our_id) = our_node_id {
             println!("[CONSENSUS] 🏛️ Generating REAL commit for OWN node: {}", our_id);
@@ -1724,8 +1806,27 @@ impl BlockchainNode {
         let mut processed_messages = 0;
         
         while start_time.elapsed() < commit_timeout {
-            // CRITICAL: Process any pending consensus messages from P2P
-            // This integrates with existing quantum blockchain architecture
+            // CRITICAL: Process incoming consensus messages from P2P channel
+            if let Ok(mut consensus_rx_guard) = consensus_rx.try_lock() {
+                if let Some(consensus_rx_ref) = consensus_rx_guard.as_mut() {
+                    // Try to read messages from consensus channel (non-blocking)
+                    match consensus_rx_ref.try_recv() {
+                        Ok(message) => {
+                            println!("[CONSENSUS] 📥 Processing REAL consensus message from P2P channel");
+                            Self::process_consensus_message(consensus_engine, message).await;
+                            processed_messages += 1;
+                        }
+                        Err(_) => {
+                            // No message available, continue waiting
+                        }
+                    }
+                } else {
+                    // No consensus channel available - this should not happen in production
+                    if processed_messages == 0 {
+                        println!("[CONSENSUS] ⚠️ No consensus channel available - P2P messages won't be processed!");
+                    }
+                }
+            }
             
             // Give time for network messages to arrive
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -1738,12 +1839,10 @@ impl BlockchainNode {
                          current_commits, (participants.len() * 2 + 2) / 3);
             }
             
-            processed_messages += 1;
-            
-            // Break early if we have enough commits for Byzantine threshold
+            // Check if we have Byzantine threshold for advancing to reveal phase
             let byzantine_threshold = (participants.len() * 2 + 2) / 3;
             if current_commits >= byzantine_threshold {
-                println!("[CONSENSUS] ✅ Byzantine threshold reached with {} commits", current_commits);
+                println!("[CONSENSUS] 🎯 Byzantine threshold reached with {} commits! Advancing to reveal phase", current_commits);
                 break;
             }
         }
@@ -1765,7 +1864,7 @@ impl BlockchainNode {
         round_id: u64,
         unified_p2p: &Option<Arc<SimplifiedP2P>>,
         nonce_storage: &Arc<RwLock<HashMap<String, ([u8; 32], Vec<u8>)>>>,
-        _consensus_rx: &Option<tokio::sync::mpsc::UnboundedReceiver<ConsensusMessage>>, // For future use
+        consensus_rx: &Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<ConsensusMessage>>>>, // REAL P2P integration
     ) {
         // CRITICAL: Only execute consensus for MACROBLOCK rounds (every 90 blocks)
         // Microblocks use simple producer signatures, NOT Byzantine consensus
@@ -1779,10 +1878,15 @@ impl BlockchainNode {
         use sha3::{Sha3_256, Digest};
         
         // PRODUCTION: REAL reveal phase - each node reveals only OWN data
-        // CRITICAL FIX: Find our own node_id in participants list
-        let our_node_id = participants.iter()
-            .find(|&p| p.contains("node_9876_") || p.contains("_8001"))
-            .cloned();
+        // CRITICAL FIX: Find our own node_id in participants list (Genesis nodes)
+        let our_bootstrap_id = std::env::var("QNET_BOOTSTRAP_ID").unwrap_or_default();
+        let our_node_id = if !our_bootstrap_id.is_empty() {
+            Some(format!("genesis_node_{}", our_bootstrap_id))
+        } else {
+            participants.iter()
+                .find(|&p| p.contains("node_") && (p.contains("9876") || p.contains("8001")))
+                .cloned()
+        };
         
         if let Some(our_id) = our_node_id {
             println!("[CONSENSUS] 🔓 Generating REAL reveal for OWN node: {}", our_id);
@@ -1845,14 +1949,51 @@ impl BlockchainNode {
         let mut received_reveals = 0;
         let start_time = std::time::Instant::now();
         let reveal_timeout = std::time::Duration::from_secs(15); // Byzantine reveal phase timeout
+        let mut processed_messages = 0;
+        
+        println!("[CONSENSUS] ⏳ Waiting for reveals from {} other participants...", participants.len() - 1);
         
         while start_time.elapsed() < reveal_timeout && received_reveals < (participants.len() - 1) {
+            // CRITICAL: Process incoming reveal messages from P2P channel
+            if let Ok(mut consensus_rx_guard) = consensus_rx.try_lock() {
+                if let Some(consensus_rx_ref) = consensus_rx_guard.as_mut() {
+                    // Try to read messages from consensus channel (non-blocking)
+                    match consensus_rx_ref.try_recv() {
+                        Ok(message) => {
+                            println!("[CONSENSUS] 📥 Processing REAL reveal message from P2P channel");
+                            Self::process_consensus_message(consensus_engine, message).await;
+                            processed_messages += 1;
+                            received_reveals += 1; // Count real reveals
+                        }
+                        Err(_) => {
+                            // No message available, continue waiting
+                        }
+                    }
+                } else {
+                    // No consensus channel available - this should not happen in production
+                    if processed_messages == 0 {
+                        println!("[CONSENSUS] ⚠️ No consensus channel available for reveal phase!");
+                    }
+                }
+            }
+            
             // Check for incoming consensus messages (reveals from other nodes)
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             
-            // In production: this would be handled by a proper message receiver
-            // For now, just wait for the full reveal phase duration
-            received_reveals += 0; // Placeholder - real messages processed via P2P handler
+            // Check current reveal count in consensus engine
+            let current_reveals = consensus_engine.get_current_reveal_count();
+            
+            if processed_messages % 6 == 0 { // Log every 3 seconds 
+                println!("[CONSENSUS] 📊 Reveals in engine: {} (target: {} for Byzantine)", 
+                         current_reveals, (participants.len() * 2 + 2) / 3);
+            }
+            
+            // Check if we have enough reveals for Byzantine threshold
+            let byzantine_threshold = (participants.len() * 2 + 2) / 3;
+            if current_reveals >= byzantine_threshold {
+                println!("[CONSENSUS] 🎯 Byzantine reveal threshold reached with {} reveals!", current_reveals);
+                break;
+            }
         }
         
         println!("[CONSENSUS] ⏰ Reveal phase completed, consensus engine will finalize with received data");
@@ -2081,7 +2222,7 @@ impl BlockchainNode {
             }
         }
     }
-
+    
     /// PRODUCTION: Sign microblock with CRYSTALS-Dilithium post-quantum signature
     async fn sign_microblock_with_dilithium(microblock: &qnet_state::MicroBlock, node_id: &str) -> Result<Vec<u8>, String> {
         use sha3::{Sha3_256, Digest};
@@ -2115,7 +2256,7 @@ impl BlockchainNode {
                 println!("[CRYPTO] ❌ Quantum crypto microblock signing failed: {:?}, using fallback", e);
                 // Simple fallback for stability
                 let mut fallback_sig = Vec::with_capacity(2420);
-                for i in 0..2420 {
+        for i in 0..2420 {
                     fallback_sig.push(message_hash[i % 32]);
                 }
                 println!("[CRYPTO] ⚠️ Microblock #{} signed with fallback (size: {} bytes)", 
@@ -2266,6 +2407,10 @@ impl BlockchainNode {
         consensus: Arc<RwLock<qnet_consensus::CommitRevealConsensus>>,
         start_height: u64,
         end_height: u64,
+        p2p: &Arc<SimplifiedP2P>,
+        node_id: &str,
+        node_type: NodeType,
+        consensus_rx: &Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<ConsensusMessage>>>>, // CRITICAL: REAL channel
     ) -> Result<(), String> {
         // ENHANCED MACROBLOCK CONSENSUS DASHBOARD
         println!("[MACROBLOCK] 🏛️ BYZANTINE CONSENSUS INITIATED:");
@@ -2276,41 +2421,67 @@ impl BlockchainNode {
         println!("  └── Phase: Initializing consensus participants...");
         
         // PRODUCTION: Execute REAL Byzantine consensus for macroblock creation
-        // TODO: This needs to be implemented with proper inter-node consensus
-        // For now, allow Genesis bootstrap mode for network initialization
         let consensus_data = {
-            let consensus_engine = consensus.read().await;
+            let mut consensus_engine = consensus.write().await;
             
-            // CRITICAL: Check if Genesis bootstrap mode
-            let is_genesis_bootstrap = std::env::var("QNET_BOOTSTRAP_ID")
-                .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
-                .unwrap_or(false);
+            // CRITICAL: Execute REAL INTER-NODE CONSENSUS instead of Genesis bootstrap fake
+            let round_id = end_height; // Macroblock height as round ID
             
-            if is_genesis_bootstrap {
-                // GENESIS BOOTSTRAP: Allow single-node macroblock creation during network bootstrap
-                println!("[Macroblock] 🌱 Genesis bootstrap mode - creating local macroblock");
-                qnet_consensus::commit_reveal::ConsensusResultData {
-                    round_number: end_height / 90,
-                    leader_id: format!("genesis_bootstrap_{}", 
-                                     std::env::var("QNET_BOOTSTRAP_ID").unwrap_or("001".to_string())),
-                    participants: vec![format!("genesis_bootstrap_single")],
+            // STEP 1: Use EXISTING qualified candidates system with validator sampling (1000 max)
+            let qualified_candidates = Self::calculate_qualified_candidates(p2p, node_id, node_type).await;
+            let all_participants: Vec<String> = qualified_candidates.into_iter()
+                .map(|(node_id, _reputation)| node_id)
+                .collect();
+            println!("[CONSENSUS] 🏛️ Initializing Byzantine consensus round {} with {} participants", 
+                     round_id, all_participants.len());
+            
+            if all_participants.len() < 4 {
+                return Err(format!("Insufficient nodes for Byzantine safety: {}/4", all_participants.len()));
+            }
+            
+            // STEP 2: Start consensus round with proper participants
+            match consensus_engine.start_round(all_participants.clone()) {
+                Ok(actual_round_id) => println!("[CONSENSUS] ✅ Consensus round {} started (height: {})", actual_round_id, round_id),
+                Err(e) => return Err(format!("Failed to start consensus round: {}", e)),
+            }
+            
+            // STEP 3: Execute REAL COMMIT phase with P2P communication
+            println!("[CONSENSUS] 📝 Starting COMMIT phase...");
+            let consensus_nonce_storage = std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+            let unified_p2p_option = Some(p2p.clone()); // Pass REAL P2P system
+            
+            Self::execute_real_commit_phase(
+                &mut consensus_engine,
+                &all_participants,
+                round_id,
+                &unified_p2p_option,
+                &consensus_nonce_storage,
+                consensus_rx,
+            ).await;
+            
+            // STEP 4: Execute REAL REVEAL phase with P2P communication  
+            println!("[CONSENSUS] 🔓 Starting REVEAL phase...");
+            Self::execute_real_reveal_phase(
+                &mut consensus_engine,
+                &all_participants,
+                round_id,
+                &unified_p2p_option,
+                &consensus_nonce_storage,
+                consensus_rx,
+            ).await;
+            
+            // STEP 5: Finalize consensus and get result
+            match consensus_engine.finalize_round() {
+                Ok(leader_id) => {
+                    println!("[CONSENSUS] 🎯 Byzantine consensus FINALIZED! Leader: {}", leader_id);
+                    qnet_consensus::commit_reveal::ConsensusResultData {
+                        round_number: end_height / 90,
+                        leader_id,
+                        participants: all_participants,
+                    }
                 }
-            } else {
-                // PRODUCTION: Should execute full Byzantine consensus here
-                // TODO: Implement proper macroblock consensus with commit-reveal
-                match consensus_engine.get_finalized_consensus() {
-                    Some(data) => {
-                        if data.participants.len() < 1 {
-                            return Err("No consensus participants - cannot create macroblock".to_string());
-                        }
-                        println!("[Macroblock] ✅ Using REAL consensus data from {} participants", data.participants.len());
-                        data
-                    }
-                    None => {
-                        println!("[Macroblock] ❌ No finalized consensus available - cannot create macroblock without consensus");
-                        println!("[Macroblock] 💡 Network needs sufficient nodes for Byzantine consensus (3f+1 = 4+ nodes)");
-                        return Err("Consensus not finalized - insufficient network nodes".to_string());
-                    }
+                Err(e) => {
+                    return Err(format!("Consensus finalization failed: {}", e));
                 }
             }
         };
@@ -2793,7 +2964,7 @@ impl BlockchainNode {
             return Err(QNetError::ValidationError("Empty activation code".to_string()));
         }
         
-        // Check for genesis bootstrap codes first (different format)  
+        // Check for genesis bootstrap codes first (different format)
         // IMPORT from shared constants to avoid duplication
         use crate::genesis_constants::GENESIS_BOOTSTRAP_CODES;
         let bootstrap_whitelist = GENESIS_BOOTSTRAP_CODES;
