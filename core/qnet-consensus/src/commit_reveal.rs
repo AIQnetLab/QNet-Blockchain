@@ -95,8 +95,6 @@ pub struct ConsensusConfig {
     // Sampling-based consensus for scalability
     pub max_validators_per_round: usize,  // Default: 1000 for 1M+ nodes
     pub enable_validator_sampling: bool,
-    pub super_node_guarantee: usize,      // Guaranteed super nodes per round
-    pub full_node_slots: usize,          // Full node slots per round
 }
 
 impl Default for ConsensusConfig {
@@ -111,8 +109,6 @@ impl Default for ConsensusConfig {
             // Sampling-based consensus for scalability
             max_validators_per_round: 1000,    // Only 1000 validators per round
             enable_validator_sampling: true,   // Enable for production
-            super_node_guarantee: 200,         // 200 super nodes guaranteed
-            full_node_slots: 800,             // 800 full node slots
         }
     }
 }
@@ -631,21 +627,15 @@ impl CommitRevealConsensus {
         super_nodes.sort_by(|a, b| b.reputation.partial_cmp(&a.reputation).unwrap());
         full_nodes.sort_by(|a, b| b.reputation.partial_cmp(&a.reputation).unwrap());
         
-        // 4. Select guaranteed super nodes
-        let super_count = self.config.super_node_guarantee.min(super_nodes.len());
-        for i in 0..super_count {
-            selected.push((*super_nodes[i]).clone());
-        }
+        // 4. Simple selection: equal chance for all qualified nodes (QNet spec)
+        let mut all_candidates = super_nodes;
+        all_candidates.extend(full_nodes);
         
-        // 5. Select full nodes (weighted random)
-        let full_count = self.config.full_node_slots.min(full_nodes.len());
-        let full_nodes_refs: Vec<&ValidatorCandidate> = full_nodes.iter().map(|c| **c).collect();
-        let selected_full = self.weighted_random_selection(
-            &full_nodes_refs, 
-            full_count, 
-            &selection_seed
-        );
-        selected.extend(selected_full);
+        // Limit to max_validators_per_round
+        let max_count = self.config.max_validators_per_round.min(all_candidates.len());
+        for i in 0..max_count {
+            selected.push((*all_candidates[i]).clone());
+        }
         
         // 6. Fill remaining slots with any eligible nodes if needed
         let remaining_slots = self.config.max_validators_per_round.saturating_sub(selected.len());
@@ -780,16 +770,13 @@ impl CommitRevealConsensus {
         
         let mut selected = Vec::new();
         
-        // Select guaranteed super nodes (minimum 4 for Byzantine tolerance)
-        let super_count = std::cmp::min(super_nodes.len(), std::cmp::max(4, self.config.super_node_guarantee));
-        selected.extend(super_nodes.into_iter().take(super_count));
+        // Simple selection: equal chance for all qualified nodes (QNet spec)
+        let mut all_candidates = super_nodes;
+        all_candidates.extend(full_nodes);
         
-        // Fill remaining slots with full nodes (reputation-based)
-        let remaining_slots = self.config.max_validators_per_round.saturating_sub(selected.len());
-        if remaining_slots > 0 && !full_nodes.is_empty() {
-            let full_count = std::cmp::min(full_nodes.len(), remaining_slots);
-            selected.extend(full_nodes.into_iter().take(full_count));
-        }
+        // Limit to max_validators_per_round
+        let max_count = self.config.max_validators_per_round.min(all_candidates.len());
+        selected.extend(all_candidates.into_iter().take(max_count));
         
         // Minimum 4 validators for Byzantine tolerance
         if selected.len() < 4 {

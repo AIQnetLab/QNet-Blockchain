@@ -189,11 +189,9 @@ impl BlockchainNode {
             reveal_phase_duration: Duration::from_secs(15),    // Total consensus: 30s per round
             min_participants: 4,           // PRODUCTION: 4 nodes minimum for Byzantine safety (3f+1, f=1)
             max_participants: 1000,        // Maximum participants per round
-            max_validators_per_round: 100, // PRODUCTION: 100 validators per round
+            max_validators_per_round: 1000, // PRODUCTION: 1000 validators per round (per NETWORK_LOAD_ANALYSIS.md)
             enable_validator_sampling: true, // Enable sampling for scalability
             reputation_threshold: 0.70,    // 70% minimum reputation for participation
-            super_node_guarantee: 30,      // 30% guaranteed super nodes
-            full_node_slots: 70,          // 70% slots for full nodes
         };
         
         // Create REAL Byzantine consensus engine with commit-reveal protocol
@@ -590,6 +588,9 @@ impl BlockchainNode {
                 // Only ONE node produces microblocks per round to prevent forks
                 // Producer selection rotates based on reputation scoring (as per QNet specification)
                 
+                // CRITICAL: Set current block height for deterministic validator sampling
+                std::env::set_var("CURRENT_BLOCK_HEIGHT", microblock_height.to_string());
+                
                 // Determine current microblock producer using reputation-based rotation (with REAL node type)
                 let current_producer = Self::select_microblock_producer(microblock_height, &unified_p2p, &node_id, node_type).await;
                 let is_my_turn_to_produce = current_producer == node_id;
@@ -973,11 +974,14 @@ impl BlockchainNode {
                                     }
                                 });
                                 
-                                // Show network state while waiting
+                                // Show network state while waiting - with validator sampling
                                 if let Some(p2p) = &unified_p2p_clone {
-                                    let participants = p2p.get_validated_active_peers();
-                                    println!("[MACROBLOCK] 🔍 Network participants: {} nodes | Waiting for consensus leader", 
-                                             participants.len());
+                                    // CRITICAL: Apply same validator sampling for macroblock consensus
+                                    let sampled_validators = Self::calculate_qualified_candidates(
+                                        p2p, &node_id_clone, node_type
+                                    ).await;
+                                    println!("[MACROBLOCK] 🔍 Sampled validators: {} nodes (from all qualified) | Waiting for consensus leader", 
+                                             sampled_validators.len());
                                 }
                             }
                         });
@@ -1109,6 +1113,7 @@ impl BlockchainNode {
         if let Some(p2p) = unified_p2p {
             // PRODUCTION: Direct calculation for consensus determinism (THREAD-SAFE)
             // QNet requires consistent candidate lists across all nodes for Byzantine safety
+            // CRITICAL: Now includes validator sampling for millions of nodes
             let candidates = Self::calculate_qualified_candidates(p2p, own_node_id, own_node_type).await;
             
             // DEBUG: Show candidate info to understand producer selection
@@ -1251,12 +1256,34 @@ impl BlockchainNode {
             // NOTE: get_validated_active_peers() ALREADY filters out Light nodes for consensus capability
             let peers = p2p.get_validated_active_peers();
             for peer in peers {
-                let peer_node_id = format!("node_{}", peer.addr.replace(":", "_"));
+                // CRITICAL FIX: Use same Genesis peer matching logic as in calculate_qualified_candidates
+                let peer_ip = peer.addr.split(':').next().unwrap_or(&peer.addr);
+                
+                let peer_node_id = if let Some(genesis_id) = crate::genesis_constants::get_genesis_id_by_ip(peer_ip) {
+                    // This is a Genesis node - use proper Genesis node_id format
+                    format!("genesis_node_{}", genesis_id)
+                } else {
+                    // Regular node - use IP-based format  
+                    format!("node_{}", peer.addr.replace(":", "_"))
+                };
                 
                 // Exclude failed producer (Light nodes already filtered by P2P layer)
                 if peer_node_id == failed_producer {
                     println!("[EMERGENCY_SELECTION] 💀 Excluding failed producer {} from emergency candidates", peer_node_id);
                     continue;
+                }
+                
+                // Initialize Genesis peer reputation if needed
+                if peer_node_id.starts_with("genesis_node_") {
+                    let current_rep = match p2p.get_reputation_system().lock() {
+                        Ok(reputation) => reputation.get_reputation(&peer_node_id),
+                        Err(_) => 0.0,
+                    };
+                    
+                    if current_rep == 0.0 {
+                        p2p.update_node_reputation(&peer_node_id, 90.0);
+                        println!("[EMERGENCY_SELECTION] 🔐 Genesis peer {} initialized with 90% reputation", peer_node_id);
+                    }
                 }
                 
                 // All peers from get_validated_active_peers() are already Full/Super nodes
@@ -1369,15 +1396,16 @@ impl BlockchainNode {
         }
     }
     
-    /// PERFORMANCE: Calculate qualified candidates for caching optimization
+    /// PRODUCTION: Calculate qualified candidates with validator sampling for scalability
+    /// Implements sampling to prevent millions of validators from participating in consensus
     async fn calculate_qualified_candidates(
         p2p: &Arc<SimplifiedP2P>,
         own_node_id: &str,
         own_node_type: NodeType,
     ) -> Vec<(String, f64)> {
-        let mut candidates = Vec::new();
+        let mut all_qualified = Vec::new();
         
-        println!("[DEBUG] 🔍 Calculating qualified candidates:");
+        println!("[DEBUG] 🔍 Calculating qualified candidates with sampling:");
         println!("  ├── Own node: {} (type: {:?})", own_node_id, own_node_type);
         
         // Check own node eligibility using SAME logic as original
@@ -1402,10 +1430,10 @@ impl BlockchainNode {
         
         if can_participate_microblock {
             let own_reputation = Self::get_node_reputation_score(own_node_id, p2p).await;
-            candidates.push((own_node_id.to_string(), own_reputation));
-            println!("  ├── ✅ Own node added as candidate");
+            all_qualified.push((own_node_id.to_string(), own_reputation));
+            println!("  ├── ✅ Own node added as qualified");
         } else {
-            println!("  ├── ❌ Own node excluded from candidates");
+            println!("  ├── ❌ Own node excluded from qualified nodes");
         }
         
         // Add peer candidates (already filtered by get_validated_active_peers)
@@ -1413,22 +1441,129 @@ impl BlockchainNode {
         println!("  ├── Checking {} active peers", peers.len());
         
         for peer in peers {
-            let peer_node_id = format!("node_{}", peer.addr.replace(":", "_"));
+            // CRITICAL FIX: Determine correct peer node_id for Genesis nodes
+            // Use IP-to-Genesis mapping to get correct node_id format
+            let peer_ip = peer.addr.split(':').next().unwrap_or(&peer.addr);
+            
+            let peer_node_id = if let Some(genesis_id) = crate::genesis_constants::get_genesis_id_by_ip(peer_ip) {
+                // This is a Genesis node - use proper Genesis node_id format
+                format!("genesis_node_{}", genesis_id)
+            } else {
+                // Regular node - use IP-based format  
+                format!("node_{}", peer.addr.replace(":", "_"))
+            };
+            
+            // CRITICAL FIX: Initialize Genesis peer reputation if not already set
+            if peer_node_id.starts_with("genesis_node_") {
+                // Check current reputation
+                let current_rep = match p2p.get_reputation_system().lock() {
+                    Ok(reputation) => reputation.get_reputation(&peer_node_id),
+                    Err(_) => 0.0,
+                };
+                
+                // If Genesis peer has no reputation record, initialize with 90%
+                if current_rep == 0.0 {
+                    p2p.update_node_reputation(&peer_node_id, 90.0);
+                    println!("  ├── 🔐 Genesis peer {} initialized with 90% reputation", peer_node_id);
+                }
+            }
+            
             let reputation = Self::get_node_reputation_score(&peer_node_id, p2p).await;
             
-            // Peer reputation is now handled by get_node_reputation_score with proper thresholds
-            println!("  ├── Peer {} ({}): reputation {:.1}%", peer_node_id, peer.addr, reputation * 100.0);
+            println!("  ├── Peer {} ({}): reputation {:.1}% [{}]", 
+                     peer_node_id, peer.addr, reputation * 100.0,
+                     if peer_node_id.starts_with("genesis_") { "GENESIS" } else { "REGULAR" });
             
             if reputation >= 0.70 {
-                candidates.push((peer_node_id.clone(), reputation));
-                println!("  │   └── ✅ Added as candidate");
+                all_qualified.push((peer_node_id.clone(), reputation));
+                println!("  │   └── ✅ Added as qualified");
             } else {
                 println!("  │   └── ❌ Excluded (low reputation)");
             }
         }
         
-        println!("  └── Total qualified candidates: {}", candidates.len());
-        candidates
+        println!("  ├── Total qualified nodes: {}", all_qualified.len());
+        
+        // CRITICAL: Apply validator sampling for scalability (prevent millions of validators)
+        // QNet configuration: 1000 validators per round for optimal Byzantine safety + performance
+        const MAX_VALIDATORS_PER_ROUND: usize = 1000; // Per NETWORK_LOAD_ANALYSIS.md specification
+        
+        let sampled_candidates = if all_qualified.len() <= MAX_VALIDATORS_PER_ROUND {
+            // Small network: Use all qualified candidates
+            println!("  ├── Small network: using all {} qualified validators", all_qualified.len());
+            all_qualified
+        } else {
+            // Large network: Apply deterministic sampling for Byzantine consensus
+            println!("  ├── Large network: sampling {} validators from {} qualified", 
+                     MAX_VALIDATORS_PER_ROUND, all_qualified.len());
+            
+            Self::deterministic_validator_sampling(&all_qualified, MAX_VALIDATORS_PER_ROUND).await
+        };
+        
+        println!("  └── Final sampled candidates: {}", sampled_candidates.len());
+        sampled_candidates
+    }
+    
+     /// PRODUCTION: Simple deterministic validator sampling per QNet specification
+    /// Implements "Simple reputation-based selection (NO WEIGHTS)" from NETWORK_LOAD_ANALYSIS.md
+    /// All qualified nodes (Full + Super, reputation ≥70%) have equal chance
+    async fn deterministic_validator_sampling(
+        all_qualified: &[(String, f64)],
+        max_count: usize,
+    ) -> Vec<(String, f64)> {
+        use sha3::{Sha3_256, Digest};
+        let mut selected = Vec::new();
+        
+        if all_qualified.is_empty() || max_count == 0 {
+            return selected;
+        }
+        
+        // Include current block height for rotation
+        let current_height = std::env::var("CURRENT_BLOCK_HEIGHT")
+            .unwrap_or_default()
+            .parse::<u64>()
+            .unwrap_or(0);
+        
+        // QNet specification: "Equal chance for all qualified nodes"
+        // No distinction between Full and Super nodes in consensus participation
+        for i in 0..max_count.min(all_qualified.len()) {
+            let mut hasher = Sha3_256::new();
+            
+            // Deterministic seed for validator sampling with rotation
+            hasher.update(format!("validator_sampling_{}_{}", current_height / 30, i).as_bytes());
+            
+            // Include all qualified validators for Byzantine consistency
+            for (node_id, reputation) in all_qualified {
+                hasher.update(node_id.as_bytes());
+                hasher.update(&reputation.to_le_bytes());
+            }
+            
+            let selection_hash = hasher.finalize();
+            let selection_number = u64::from_le_bytes([
+                selection_hash[0], selection_hash[1], selection_hash[2], selection_hash[3],
+                selection_hash[4], selection_hash[5], selection_hash[6], selection_hash[7],
+            ]);
+            
+            let selection_index = (selection_number as usize) % all_qualified.len();
+            let selected_validator = all_qualified[selection_index].clone();
+            
+            // Avoid duplicates
+            if !selected.iter().any(|(id, _)| id == &selected_validator.0) {
+                selected.push(selected_validator);
+                
+                if i < 5 || i >= max_count - 5 {
+                    // Log first 5 and last 5 selections for debugging
+                    println!("  │     Validator {}: {} (reputation: {:.1}%)", 
+                             i + 1, selected.last().unwrap().0, selected.last().unwrap().1 * 100.0);
+                } else if i == 5 {
+                    println!("  │     ... (sampling {} more validators) ...", max_count - 10);
+                }
+            }
+        }
+        
+        println!("  ├── Simple sampling complete: {} validators selected from {} qualified", 
+                 selected.len(), all_qualified.len());
+        selected
     }
     
     /// CRITICAL: Emergency macroblock consensus when leader fails
