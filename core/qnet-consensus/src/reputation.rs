@@ -112,10 +112,25 @@ impl NodeReputation {
             .unwrap_or(self.config.initial_reputation)
     }
     
-    /// Update reputation for a node
+    /// Update reputation for a node (delta-based)
     pub fn update_reputation(&mut self, node_id: &str, delta: f64) {
         let current = self.get_reputation(node_id);
         let new_reputation = (current + delta)
+            .max(0.0)
+            .min(self.config.max_reputation);
+        
+        self.reputations.insert(node_id.to_string(), new_reputation);
+        self.last_update.insert(node_id.to_string(), Instant::now());
+        
+        // Ban if reputation too low
+        if new_reputation < self.config.min_reputation {
+            self.ban_node(node_id);
+        }
+    }
+    
+    /// Set absolute reputation for a node (PRODUCTION: Genesis initialization)
+    pub fn set_reputation(&mut self, node_id: &str, reputation: f64) {
+        let new_reputation = reputation
             .max(0.0)
             .min(self.config.max_reputation);
         

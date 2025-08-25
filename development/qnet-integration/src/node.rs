@@ -1194,35 +1194,42 @@ impl BlockchainNode {
         None // Not a Genesis node
     }
 
-    /// CRITICAL: Initialize all Genesis node reputations deterministically at startup
-    /// Prevents race conditions where nodes see different candidate lists due to timing
+    /// PRODUCTION: Initialize only ACTIVE Genesis node reputations discovered via P2P
+    /// Prevents phantom candidates for unoperated Genesis nodes
     async fn initialize_genesis_reputations(p2p: &SimplifiedP2P) {
-        println!("[REPUTATION] 🔐 Initializing Genesis node reputations deterministically...");
+        println!("[REPUTATION] 🔐 Initializing ACTIVE Genesis node reputations...");
         
-        // All Genesis node IDs that might be encountered
-        let genesis_node_ids = vec![
-            "genesis_node_001".to_string(),
-            "genesis_node_002".to_string(), 
-            "genesis_node_003".to_string(),
-            "genesis_node_004".to_string(),
-            "genesis_node_005".to_string(),
-        ];
+        // PRODUCTION: Wait briefly for P2P discovery to find active Genesis nodes
+        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
         
-        for genesis_id in genesis_node_ids {
-            // PRODUCTION: Unconditionally set Genesis reputation to 90% for network stability
-            // Genesis nodes must have consistent high reputation across all nodes for decentralized consensus
-            p2p.update_node_reputation(&genesis_id, 90.0);
+        // Get currently active peers from P2P discovery
+        let active_peers = p2p.get_validated_active_peers();
+        let mut genesis_nodes_found = 0;
+        
+        println!("[REPUTATION] 🔍 Scanning {} active peers for Genesis nodes", active_peers.len());
+        
+        for peer in active_peers {
+            let peer_ip = peer.addr.split(':').next().unwrap_or(&peer.addr);
             
-            let final_reputation = match p2p.get_reputation_system().lock() {
-                Ok(reputation) => reputation.get_reputation(&genesis_id),
-                Err(_) => 90.0,
-            };
-            
-            println!("[REPUTATION] 🔐 Genesis {} set to {}% reputation (quantum consensus requirement)", 
-                     genesis_id, final_reputation);
+            // Check if this peer is a Genesis node using IP mapping
+            if let Some(genesis_id_suffix) = crate::genesis_constants::get_genesis_id_by_ip(peer_ip) {
+                let genesis_id = format!("genesis_node_{}", genesis_id_suffix);
+                
+                // Set reputation only for DISCOVERED Genesis nodes
+                p2p.set_node_reputation(&genesis_id, 90.0);
+                
+                let final_reputation = match p2p.get_reputation_system().lock() {
+                    Ok(reputation) => reputation.get_reputation(&genesis_id),
+                    Err(_) => 90.0,
+                };
+                
+                println!("[REPUTATION] 🔐 ACTIVE Genesis {} set to {}% reputation ({})", 
+                         genesis_id, final_reputation, peer.addr);
+                genesis_nodes_found += 1;
+            }
         }
         
-        println!("[REPUTATION] ✅ All Genesis reputations initialized consistently");
+        println!("[REPUTATION] ✅ Initialized {} ACTIVE Genesis nodes (no phantom reputation)", genesis_nodes_found);
     }
     
     /// PRODUCTION: Select microblock producer using reputation-based rotation (QNet specification)
@@ -1265,14 +1272,20 @@ impl BlockchainNode {
             let rotation_interval = 30u64;
             let leadership_round = current_height / rotation_interval;
             
-            // Simple random selection from qualified candidates (like macroblock consensus)
-            // Use leadership_round for deterministic selection across network
+            // PRODUCTION: Deterministic leader selection using cryptographic hash
+            // All nodes MUST get identical results (Byzantine consensus requirement)
             use sha3::{Sha3_256, Digest};
             let mut selection_hasher = Sha3_256::new();
-            selection_hasher.update(format!("microblock_producer_selection_{}", leadership_round).as_bytes());
-            for (node_id, _) in &candidates {
-                selection_hasher.update(node_id.as_bytes());
-            }
+            
+            // CRITICAL: Ensure deterministic input data across all nodes
+            let consensus_seed = format!("microblock_producer_selection_{}", leadership_round);
+            selection_hasher.update(consensus_seed.as_bytes());
+            
+            // Hash all candidate node_ids in GUARANTEED sorted order (already sorted + deduplicated)
+            let candidate_ids: Vec<String> = candidates.iter().map(|(id, _)| id.clone()).collect();
+            let candidate_hash_input = candidate_ids.join("|"); // Deterministic separator
+            selection_hasher.update(candidate_hash_input.as_bytes());
+            
             let selection_hash = selection_hasher.finalize();
             let selection_number = u64::from_le_bytes([
                 selection_hash[0], selection_hash[1], selection_hash[2], selection_hash[3],
@@ -1281,6 +1294,11 @@ impl BlockchainNode {
             
             let selection_index = (selection_number as usize) % candidates.len();
             let selected_producer = candidates[selection_index].0.clone();
+            
+            println!("[DEBUG] 🔒 Consensus determinism check:");
+            println!("  ├── Seed: {}", consensus_seed);
+            println!("  ├── Candidates: {}", candidate_hash_input);
+            println!("  └── Hash ensures identical selection across ALL nodes");
             
             println!("[DEBUG] 🎯 Selection result:");
             println!("  ├── Selection hash number: {}", selection_number);
@@ -1406,7 +1424,7 @@ impl BlockchainNode {
                     };
                     
                     if current_rep == 0.0 {
-                        p2p.update_node_reputation(&peer_node_id, 90.0);
+                        p2p.set_node_reputation(&peer_node_id, 90.0);
                         println!("[EMERGENCY_SELECTION] 🔐 Genesis peer {} initialized with 90% reputation", peer_node_id);
                     }
                 }
@@ -1594,10 +1612,12 @@ impl BlockchainNode {
         
         println!("  ├── Total qualified nodes: {}", all_qualified.len());
         
-        // CRITICAL: Sort candidates deterministically to ensure consistent order across all nodes
-        // This prevents different nodes from having different producer selection due to order differences
-        all_qualified.sort_by(|a, b| a.0.cmp(&b.0)); // Sort by node_id alphabetically
-        println!("  ├── Candidates sorted deterministically by node_id");
+        // PRODUCTION: Remove duplicate candidates (using same logic as DHT peer discovery)
+        // Each node might appear twice: once as own_node and once as peer
+        all_qualified.sort_by(|a, b| a.0.cmp(&b.0)); // Sort first for deduplication
+        all_qualified.dedup_by(|a, b| a.0 == b.0); // Remove duplicates by node_id
+        
+        println!("  ├── Candidates sorted deterministically and deduplicated: {}", all_qualified.len());
         
         // CRITICAL: Apply validator sampling for scalability (prevent millions of validators)
         // QNet configuration: 1000 validators per round for optimal Byzantine safety + performance
@@ -2932,7 +2952,7 @@ impl BlockchainNode {
         use std::time::Duration;
         
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(15)) // PRODUCTION: Increased for Genesis node connectivity
             .build()
             .map_err(|e| format!("HTTP client error: {}", e))?;
         
@@ -3595,7 +3615,7 @@ impl BlockchainNode {
         
         for (region, endpoint) in regional_tests {
             match tokio::time::timeout(
-                std::time::Duration::from_secs(3),
+                std::time::Duration::from_secs(8), // PRODUCTION: Increased for international Genesis nodes
                 tokio::net::TcpStream::connect(endpoint)
             ).await {
                 Ok(Ok(_stream)) => {
@@ -3906,7 +3926,7 @@ impl BlockchainNode {
         use std::time::Duration;
         
         let client = match reqwest::Client::builder()
-            .timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(15)) // PRODUCTION: Increased for Genesis peer HTTP API connectivity  
             .build() {
             Ok(client) => client,
             Err(e) => return Err(format!("HTTP client error: {}", e)),

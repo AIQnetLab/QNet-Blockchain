@@ -547,7 +547,7 @@ impl SimplifiedP2P {
                         for cached_peer in cached_peer_list {
                             // Test if cached peer is still alive
                             match tokio::time::timeout(
-                                std::time::Duration::from_secs(3),
+                                std::time::Duration::from_secs(10), // PRODUCTION: Increased for Genesis node TCP connectivity
                                 tokio::net::TcpStream::connect(&cached_peer.addr)
                             ).await {
                                 Ok(Ok(_)) => {
@@ -859,7 +859,7 @@ impl SimplifiedP2P {
         
         // PRODUCTION: Use blocking HTTP client to avoid runtime conflicts
         let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(10)) // CRITICAL FIX: Increased timeout for peer connectivity
+            .timeout(Duration::from_secs(20)) // PRODUCTION: Increased timeout for Genesis peer HTTP queries
             .build()
             .map_err(|e| format!("HTTP client error: {}", e))?;
         
@@ -2536,6 +2536,14 @@ impl SimplifiedP2P {
         if let Ok(mut reputation) = self.reputation_system.lock() {
             reputation.update_reputation(node_id, delta);
             println!("[P2P] 📊 Updated reputation for {}: delta {:.1}", node_id, delta);
+        }
+    }
+    
+    /// PRODUCTION: Set absolute reputation (for Genesis initialization)
+    pub fn set_node_reputation(&self, node_id: &str, reputation: f64) {
+        if let Ok(mut rep_system) = self.reputation_system.lock() {
+            rep_system.set_reputation(node_id, reputation);
+            println!("[P2P] 🔐 Set absolute reputation for {}: {:.1}%", node_id, reputation);
         }
     }
     
