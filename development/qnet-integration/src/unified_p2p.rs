@@ -152,6 +152,9 @@ pub struct SimplifiedP2P {
     
     /// PRODUCTION: Channel to send consensus messages to node
     consensus_tx: Option<tokio::sync::mpsc::UnboundedSender<ConsensusMessage>>,
+    
+    /// PRODUCTION: Channel to send blocks to node for processing
+    block_tx: Option<tokio::sync::mpsc::UnboundedSender<ReceivedBlock>>,
 }
 
 impl SimplifiedP2P {
@@ -193,17 +196,17 @@ impl SimplifiedP2P {
                 // CRITICAL FIX: Genesis nodes get reputation based on environment variable, not node_id
                 // node_id format is "node_9876_2", but activation code is "QNET-BOOT-0001-STRAP"
                 
+                // PRODUCTION: Genesis reputation will be set by initialize_genesis_reputations()
+                // This prevents self-reputation bias where each node gives itself 100%
                 if let Ok(bootstrap_id) = std::env::var("QNET_BOOTSTRAP_ID") {
                     match bootstrap_id.as_str() {
                         "001" | "002" | "003" | "004" | "005" => {
-                            reputation_sys.update_reputation(&node_id, 90.0);
-                            println!("[P2P] 🛡️ Genesis node {} (ID: {}) initialized with high reputation (90.0)", bootstrap_id, node_id);
+                            println!("[P2P] 🛡️ Genesis node {} (ID: {}) detected - reputation will be initialized by consensus system", bootstrap_id, node_id);
                         }
                         _ => {}
                     }
                 } else if std::env::var("QNET_GENESIS_BOOTSTRAP").unwrap_or_default() == "1" {
-                    reputation_sys.update_reputation(&node_id, 90.0);
-                    println!("[P2P] 🛡️ Legacy Genesis node {} initialized with high reputation (90.0)", node_id);
+                    println!("[P2P] 🛡️ Legacy Genesis node {} detected - reputation will be initialized by consensus system", node_id);
                 } else {
                     // Check activation code for Genesis codes
                     if let Ok(activation_code) = std::env::var("QNET_ACTIVATION_CODE") {
@@ -211,8 +214,7 @@ impl SimplifiedP2P {
                         
                         for genesis_code in GENESIS_BOOTSTRAP_CODES {
                             if activation_code == *genesis_code {
-                                reputation_sys.update_reputation(&node_id, 90.0);
-                                println!("[P2P] 🛡️ Genesis activation code {} (node: {}) initialized with high reputation (90.0)", genesis_code, node_id);
+                                println!("[P2P] 🛡️ Genesis activation code {} (node: {}) detected - reputation will be initialized by consensus system", genesis_code, node_id);
                                 break;
                             }
                         }
@@ -222,6 +224,7 @@ impl SimplifiedP2P {
                 Arc::new(Mutex::new(reputation_sys))
             },
             consensus_tx: None,
+            block_tx: None,
         }
     }
 
@@ -229,6 +232,12 @@ impl SimplifiedP2P {
     pub fn set_consensus_channel(&mut self, consensus_tx: tokio::sync::mpsc::UnboundedSender<ConsensusMessage>) {
         self.consensus_tx = Some(consensus_tx);
         println!("[P2P] 🏛️ Consensus integration channel established");
+    }
+    
+    /// PRODUCTION: Set block processing channel for storage integration
+    pub fn set_block_channel(&mut self, block_tx: tokio::sync::mpsc::UnboundedSender<ReceivedBlock>) {
+        self.block_tx = Some(block_tx);
+        println!("[P2P] 📦 Block processing channel established for storage integration");
     }
     
     /// Start simplified P2P network with load balancing
@@ -1103,8 +1112,12 @@ impl SimplifiedP2P {
     /// Create secure HTTP client for peer communication
     fn create_secure_http_client() -> Result<reqwest::Client, String> {
         reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30)) // PRODUCTION: Extended timeout for international Genesis nodes
+            .connect_timeout(Duration::from_secs(15)) // Separate connection timeout
             .user_agent("QNet-Node/1.0")
+            .tcp_nodelay(true) // Disable Nagle's algorithm for faster responses
+            .tcp_keepalive(Duration::from_secs(60)) // Keep connections alive
+            .pool_idle_timeout(Duration::from_secs(90)) // Reuse connections
             .build()
             .map_err(|e| format!("HTTP client creation failed: {}", e))
     }
@@ -2262,10 +2275,13 @@ impl SimplifiedP2P {
                 ];
                 // PRODUCTION: Use proper HTTP client instead of curl
                 for url in urls {
-                    // Create HTTP client
+                    // Create HTTP client with production-ready configuration
                     let client = match reqwest::Client::builder()
-                        .timeout(std::time::Duration::from_secs(10)) // CRITICAL FIX: Increased timeout for peer connectivity
+                        .timeout(std::time::Duration::from_secs(25)) // PRODUCTION: Extended timeout for international nodes
+                        .connect_timeout(std::time::Duration::from_secs(12)) // Connection timeout
                         .user_agent("QNet-Node/1.0")
+                        .tcp_nodelay(true) // Faster responses
+                        .tcp_keepalive(std::time::Duration::from_secs(60)) // Keep connections alive
                         .build() {
                         Ok(client) => client,
                         Err(_) => continue,
@@ -2382,6 +2398,16 @@ pub enum ConsensusMessage {
     },
 }
 
+/// Block received from P2P network for processing
+#[derive(Debug, Clone)]
+pub struct ReceivedBlock {
+    pub height: u64,
+    pub data: Vec<u8>,
+    pub block_type: String,
+    pub from_peer: String,
+    pub timestamp: u64,
+}
+
 impl SimplifiedP2P {
     /// Handle incoming network message
     pub fn handle_message(&self, from_peer: &str, message: NetworkMessage) {
@@ -2389,6 +2415,31 @@ impl SimplifiedP2P {
             NetworkMessage::Block { height, data, block_type } => {
                 println!("[P2P] ← Received {} block #{} from {} ({} bytes)", 
                          block_type, height, from_peer, data.len());
+                
+                // PRODUCTION: Send block to main node for processing via storage
+                if let Some(ref block_tx) = self.block_tx {
+                    let received_block = ReceivedBlock {
+                        height,
+                        data,
+                        block_type: block_type.clone(),
+                        from_peer: from_peer.to_string(),
+                        timestamp: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
+                    };
+                    
+                    match block_tx.send(received_block) {
+                        Ok(_) => {
+                            println!("[P2P] ✅ {} block #{} queued for processing", block_type, height);
+                        }
+                        Err(e) => {
+                            println!("[P2P] ❌ Failed to queue {} block #{}: {}", block_type, height, e);
+                        }
+                    }
+                } else {
+                    println!("[P2P] ⚠️ Block processing channel not available - block #{} discarded", height);
+                }
             }
             
             NetworkMessage::Transaction { data } => {
@@ -2648,8 +2699,11 @@ impl SimplifiedP2P {
         // Send asynchronously in background thread
         tokio::spawn(async move {
             let client = match reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(10)) // CRITICAL FIX: Increased timeout for peer connectivity
-                .user_agent("QNet-Node/1.0")
+                .timeout(std::time::Duration::from_secs(20)) // PRODUCTION: Timeout for Genesis node P2P messages
+                .connect_timeout(std::time::Duration::from_secs(10)) // Connection timeout
+                .user_agent("QNet-Node/1.0") 
+                .tcp_nodelay(true) // Faster message delivery
+                .tcp_keepalive(std::time::Duration::from_secs(30)) // P2P connection persistence
                 .build() {
                 Ok(client) => client,
                 Err(e) => {

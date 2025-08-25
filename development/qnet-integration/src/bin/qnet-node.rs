@@ -4013,7 +4013,10 @@ async fn query_peers_http(endpoint: &str) -> Result<Vec<String>, String> {
     use std::time::Duration;
     
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(3))
+        .timeout(Duration::from_secs(15)) // PRODUCTION: Extended timeout for peer discovery
+        .connect_timeout(Duration::from_secs(8)) // Connection timeout for peer queries
+        .user_agent("QNet-Node/1.0")
+        .tcp_nodelay(true) // Faster peer discovery
         .build()
         .map_err(|e| format!("HTTP client error: {}", e))?;
     
