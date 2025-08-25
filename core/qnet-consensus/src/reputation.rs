@@ -72,7 +72,7 @@ pub struct ReputationConfig {
 impl Default for ReputationConfig {
     fn default() -> Self {
         Self {
-            initial_reputation: 50.0,   // PRODUCTION: Safe starting reputation for new nodes
+            initial_reputation: 70.0,   // PRODUCTION: Minimum consensus participation threshold
             max_reputation: 100.0,
             min_reputation: 10.0,       // Ban threshold
             decay_rate: 0.01,

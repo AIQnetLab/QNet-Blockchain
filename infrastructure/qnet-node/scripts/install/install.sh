@@ -249,7 +249,7 @@ wallet_address = test_wallet1
 # min_balance = 1
 
 [Reputation]
-default_reputation = 50.0
+default_reputation = 70.0
 history_size = 100
 min_data_points = 5
 weight_participation = 0.4

@@ -1209,20 +1209,17 @@ impl BlockchainNode {
         ];
         
         for genesis_id in genesis_node_ids {
-            // Check if reputation already exists
-            let current_reputation = match p2p.get_reputation_system().lock() {
+            // PRODUCTION: Unconditionally set Genesis reputation to 90% for network stability
+            // Genesis nodes must have consistent high reputation across all nodes for decentralized consensus
+            p2p.update_node_reputation(&genesis_id, 90.0);
+            
+            let final_reputation = match p2p.get_reputation_system().lock() {
                 Ok(reputation) => reputation.get_reputation(&genesis_id),
-                Err(_) => 0.0,
+                Err(_) => 90.0,
             };
             
-            // Initialize with 90% if not already set
-            if current_reputation == 0.0 {
-                p2p.update_node_reputation(&genesis_id, 90.0);
-                println!("[REPUTATION] 🔐 Genesis {} initialized with 90% reputation", genesis_id);
-            } else {
-                println!("[REPUTATION] 🔐 Genesis {} already has {}% reputation", 
-                         genesis_id, current_reputation);
-            }
+            println!("[REPUTATION] 🔐 Genesis {} set to {}% reputation (quantum consensus requirement)", 
+                     genesis_id, final_reputation);
         }
         
         println!("[REPUTATION] ✅ All Genesis reputations initialized consistently");
@@ -1317,17 +1314,11 @@ impl BlockchainNode {
                 // Documentation: "Simple binary threshold: qualified (≥70%) or not qualified (<70%)"
                 let raw_reputation = (score / 100.0).max(0.0).min(1.0);
                 
-                // ENFORCE MINIMUM 70% THRESHOLD per QNet specification
+                // PRODUCTION: QNet quantum consensus participation eligibility
                 let reputation_score = if raw_reputation < 0.70 {
-                    if score == 0.0 {
-                        // New peer: Start with 70% minimum
-                        println!("[REPUTATION] 🆕 New peer {} - assigned minimum threshold (70%)", node_id);
-                        0.70
-                    } else {
-                        // Below threshold: Not eligible for consensus
-                        println!("[REPUTATION] ⚠️ Peer {} below threshold: {:.1}% (min: 70%) - excluded", node_id, raw_reputation * 100.0);
-                        raw_reputation // Return actual low score for exclusion logic
-                    }
+                    // Below consensus threshold: Exclude from qualified candidates
+                    println!("[REPUTATION] ⚠️ Peer {} below consensus threshold: {:.1}% (min: 70%) - excluded", node_id, raw_reputation * 100.0);
+                    raw_reputation // Return actual low score for exclusion logic
                 } else {
                     raw_reputation // Above threshold: Use actual reputation
                 };

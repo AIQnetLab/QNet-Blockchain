@@ -37,8 +37,12 @@ services:
       - "9876:9876"   # P2P network
       - "9945:9945"   # Metrics (RPC port + 400)
     volumes:
-      - ./genesis-data:/app/data
-      # Removed log volume mount - logs will be stored in container and auto-deleted
+      # Use named volume for blockchain data persistence, tmpfs for logs
+      - genesis-blockchain-data:/app/data/blockchain
+      # Logs stored in container tmpfs - auto-deleted on container removal
+    tmpfs:
+      - /app/data/logs:noexec,nosuid,size=500m
+      - /app/data/temp:noexec,nosuid,size=200m
     networks:
       - qnet-testnet
     restart: unless-stopped
@@ -88,8 +92,12 @@ services:
       - "9877:9877"   # P2P network
       - "9946:9946"   # Metrics (RPC port + 400)
     volumes:
-      - ./validator1-data:/app/data
-      # Removed log volume mount - logs will be stored in container and auto-deleted
+      # Use named volume for blockchain data persistence, tmpfs for logs
+      - validator1-blockchain-data:/app/data/blockchain
+      # Logs stored in container tmpfs - auto-deleted on container removal
+    tmpfs:
+      - /app/data/logs:noexec,nosuid,size=500m
+      - /app/data/temp:noexec,nosuid,size=200m
     networks:
       - qnet-testnet
     restart: unless-stopped
@@ -141,8 +149,12 @@ services:
       - "9878:9878"   # P2P network
       - "9947:9947"   # Metrics (RPC port + 400)
     volumes:
-      - ./validator2-data:/app/data
-      # Removed log volume mount - logs will be stored in container and auto-deleted
+      # Use named volume for blockchain data persistence, tmpfs for logs
+      - validator2-blockchain-data:/app/data/blockchain
+      # Logs stored in container tmpfs - auto-deleted on container removal
+    tmpfs:
+      - /app/data/logs:noexec,nosuid,size=500m
+      - /app/data/temp:noexec,nosuid,size=200m
     networks:
       - qnet-testnet
     restart: unless-stopped
@@ -202,4 +214,8 @@ networks:
 
 volumes:
   prometheus-data:
-  grafana-data: 
+  grafana-data:
+  # Named volumes for blockchain data (persistent)
+  genesis-blockchain-data:
+  validator1-blockchain-data:
+  validator2-blockchain-data: 

@@ -3621,7 +3621,16 @@ async fn try_query_node(addr: &str) -> Result<NodeInfo, String> {
 async fn select_best_data_directory() -> Result<PathBuf, Box<dyn std::error::Error>> {
     println!("🔍 Selecting optimal data directory for server deployment...");
     
-    // Option 1: Current directory (preferred)
+    // PRODUCTION: Docker container - use container filesystem
+    if std::env::var("DOCKER_ENV").is_ok() {
+        let docker_blockchain_dir = PathBuf::from("/app/data/blockchain");
+        println!("🐳 Docker environment detected - using container filesystem");
+        std::fs::create_dir_all(&docker_blockchain_dir)?;
+        println!("✅ Using Docker container directory: {:?}", docker_blockchain_dir);
+        return Ok(docker_blockchain_dir);
+    }
+    
+    // Option 1: Current directory (preferred for bare metal)
     let current_dir = PathBuf::from("node_data");
     if test_directory_permissions(&current_dir).await {
         println!("✅ Using current directory: {:?}", current_dir);

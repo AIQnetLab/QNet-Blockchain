@@ -37,7 +37,7 @@ def benchmark_consensus():
     config = qnet_consensus_rust.ConsensusConfig(
         commit_duration_ms=1000,
         reveal_duration_ms=500,
-                        reputation_threshold=50.0
+                        reputation_threshold=70.0
     )
     consensus = qnet_consensus_rust.CommitRevealConsensus(config)
     

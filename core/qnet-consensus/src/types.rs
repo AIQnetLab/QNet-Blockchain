@@ -162,7 +162,7 @@ impl Default for ReputationConfig {
             weight_participation: 0.4,
             weight_response_time: 0.3,
             weight_block_quality: 0.3,
-            default_reputation: 50.0,          // FIXED: 0-100 scale
+            default_reputation: 70.0,          // PRODUCTION: Minimum consensus participation threshold
             min_data_points: 5,
             decay_factor: 0.95,
             penalty_invalid_reveal: 20.0,      // FIXED: 0-100 scale

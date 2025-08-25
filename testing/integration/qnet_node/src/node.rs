@@ -79,7 +79,7 @@ impl Node {
         let consensus_config = CConfig {
             commit_phase_ms: config.consensus.block_time_ms / 2,
             reveal_phase_ms: config.consensus.block_time_ms / 2,
-            reputation_threshold: 50.0,  // FIXED: 0-100 scale
+            reputation_threshold: 70.0,  // PRODUCTION: Quantum consensus participation threshold
             max_validators: 100,
         };
         let consensus = Arc::new(Mutex::new(

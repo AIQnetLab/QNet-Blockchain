@@ -112,7 +112,7 @@ class TestPenaltySystemLogic(unittest.TestCase):
         status = self.penalty_system.get_node_status("light_test")
         
         # Light node should lose reputation but still be eligible initially
-        self.assertLess(status["reputation"], 50.0)
+        self.assertLess(status["reputation"], 70.0)
         self.assertTrue(status["eligible_for_rewards"])  # Still above 40.0 threshold
         
         print(f"✅ Light node missed ping: reputation = {status['reputation']:.1f}")

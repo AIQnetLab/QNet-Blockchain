@@ -288,7 +288,7 @@ class PoolDistributor:
             # Determine restoration reputation and quarantine
             if paid_reactivation:
                 # Paid reactivation = normal reputation, no quarantine
-                restoration_reputation = 50.0
+                restoration_reputation = 70.0
                 quarantine_until = None
                 reason = "Paid reactivation successful"
             else:
@@ -307,7 +307,7 @@ class PoolDistributor:
                     "quarantine_until": None
                 }
             
-            restoration_reputation = 50.0
+            restoration_reputation = 70.0
             quarantine_until = None
             reason = "New paid activation successful"
         
