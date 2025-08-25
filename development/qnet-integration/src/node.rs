@@ -1239,6 +1239,8 @@ impl BlockchainNode {
         // Prevents forks by ensuring only ONE producer per microblock
         
         if let Some(p2p) = unified_p2p {
+            println!("[DEBUG] 🌐 P2P system available - using network-based producer selection");
+            
             // PRODUCTION: Direct calculation for consensus determinism (THREAD-SAFE)
             // QNet requires consistent candidate lists across all nodes for Byzantine safety
             // CRITICAL: Now includes validator sampling for millions of nodes
@@ -1256,6 +1258,8 @@ impl BlockchainNode {
             
             if candidates.is_empty() {
                 println!("[MICROBLOCK] ⚠️ No qualified candidates (≥70% reputation, Full/Super only) - using self");
+                println!("[DEBUG] 🚨 CRITICAL: All nodes will become producers - network fork risk!");
+                println!("[DEBUG] 💡 Check P2P connectivity, peer discovery, and reputation system");
                 return own_node_id.to_string();
             }
             
@@ -1296,6 +1300,8 @@ impl BlockchainNode {
         } else {
             // Solo mode - no P2P peers
             println!("[MICROBLOCK] 🏠 Solo mode - self production");
+            println!("[DEBUG] 🚨 CRITICAL: P2P system not available - network fork risk!");
+            println!("[DEBUG] 💡 Check unified_p2p initialization and P2P network setup");
             own_node_id.to_string()
         }
     }
