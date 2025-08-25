@@ -321,8 +321,8 @@ impl SimplifiedP2P {
                 if !already_connected {
                     // PRODUCTION: Validate peer connectivity before adding
                     if self.is_peer_actually_connected(&peer_info.addr) {
-                    self.add_peer_to_region(peer_info.clone());
-                    
+                        self.add_peer_to_region(peer_info.clone());
+                        
                         // Add to connected peers only if actually reachable
                         {
                             let mut connected = match self.connected_peers.lock() {
@@ -332,10 +332,10 @@ impl SimplifiedP2P {
                                     poisoned.into_inner()
                                 }
                             };
-                        connected.push(peer_info.clone());
-                        new_connections += 1;
-                    }
-                    
+                            connected.push(peer_info.clone());
+                            new_connections += 1;
+                        }
+                        
                         println!("[P2P] ✅ Validated and added peer: {}", peer_info.addr);
                     } else {
                         println!("[P2P] ❌ Peer {} is not reachable, skipping", peer_info.addr);
@@ -590,12 +590,17 @@ impl SimplifiedP2P {
                 }
             }
             
-            // Add to connected peers and save cache for true decentralization
+            // Add to connected peers and save cache for true decentralization - WITH REAL validation
             {
                 let mut connected = connected_peers.lock().unwrap();
                 for peer in discovered_peers.clone() {
-                    connected.push(peer.clone());
-                    println!("[P2P] ✅ Connected to internet peer: {}", peer.id);
+                    // CRITICAL FIX: Real connectivity check using static method (lifetime-safe)
+                    if Self::test_peer_connectivity_static(&peer.addr) {
+                        connected.push(peer.clone());
+                        println!("[P2P] ✅ Connected to internet peer: {} (REAL connection verified)", peer.id);
+                    } else {
+                        println!("[P2P] ❌ Skipped internet peer: {} (connection failed)", peer.id);
+                    }
                 }
             }
             
@@ -1461,19 +1466,31 @@ impl SimplifiedP2P {
     
     /// PRODUCTION: Check if peer is actually connected (runtime-safe)
     fn is_peer_actually_connected(&self, peer_addr: &str) -> bool {
-        // PRODUCTION: Simplified check to prevent runtime conflicts
-        // Real validation happens in async contexts and failover detection
+        // PRODUCTION: Real connectivity check using existing HTTP validation method
+        // Byzantine consensus requires ONLY verified active peers
         
-        // For Genesis nodes: assume reachable until proven otherwise by failover
         let ip = peer_addr.split(':').next().unwrap_or("");
         let is_genesis = GENESIS_BOOTSTRAP_NODES.iter().any(|(genesis_ip, _)| *genesis_ip == ip);
         
         if is_genesis {
-            println!("[P2P] 🔍 Genesis peer {} - assuming reachable until failover check", peer_addr);
-            true
+            // CRITICAL FIX: Use REAL connectivity check for Genesis nodes
+            // No more phantom peer validation - only live nodes count
+            match self.query_peer_height(peer_addr) {
+                Ok(_height) => {
+                    println!("[P2P] ✅ Genesis peer {} - REAL connection verified", peer_addr);
+                    true
+                }
+                Err(_) => {
+                    println!("[P2P] ❌ Genesis peer {} - connection failed, excluding from consensus", peer_addr);
+                    false
+                }
+            }
         } else {
-            // For non-genesis: assume connected (validated in background)
-            true
+            // For non-genesis: use same real validation
+            match self.query_peer_height(peer_addr) {
+                Ok(_) => true,
+                Err(_) => false,
+            }
         }
     }
     
@@ -1523,24 +1540,39 @@ impl SimplifiedP2P {
                     .unwrap_or(false);
                 
                 if is_genesis {
-                    // GENESIS NODES: Use dynamic discovery validation (no hardcoded IPs)
-                    // All peers in connected_peers are already validated by dynamic peer discovery
+                    // GENESIS NODES: Use REAL connectivity validation - no phantom peers
+                    // Byzantine consensus requires minimum 4+ LIVE nodes for security
                     let validated_peers: Vec<PeerInfo> = peers.iter()
                         .filter(|peer| {
                             // Only Full and Super nodes participate in consensus
                             let is_consensus_capable = matches!(peer.node_type, NodeType::Super | NodeType::Full);
                             
-                            if is_consensus_capable {
-                                println!("[P2P] ✅ Genesis peer {} validated for consensus", peer.addr);
+                            // CRITICAL: Real connectivity check - no more phantom validation
+                            let is_really_connected = if is_consensus_capable {
+                                self.is_peer_actually_connected(&peer.addr)
+                            } else {
+                                false
+                            };
+                            
+                            if is_really_connected {
+                                println!("[P2P] ✅ Genesis peer {} - REAL connection + consensus capable", peer.addr);
+                            } else if is_consensus_capable {
+                                println!("[P2P] ❌ Genesis peer {} - consensus capable but NOT connected", peer.addr);
                             }
                             
-                            is_consensus_capable
+                            is_really_connected
                         })
                         .cloned()
                         .collect();
                     
-                    println!("[P2P] ✅ Genesis validated peers: {}/{} (dynamic discovery)", 
+                    // CRITICAL: Show REAL count vs minimum required (4+ for Byzantine safety)
+                    println!("[P2P] 🔍 Genesis REAL validated peers: {}/{} (minimum 4+ required for Byzantine consensus)", 
                              validated_peers.len(), peers.len());
+                    
+                    if validated_peers.len() < 4 {
+                        println!("[P2P] ⚠️ WARNING: Only {} real peers - Byzantine consensus requires 4+ active nodes", validated_peers.len());
+                    }
+                    
                     validated_peers
                 } else {
                     // REGULAR NODES: Use standard peer validation (DHT discovered peers)
@@ -1731,23 +1763,34 @@ impl SimplifiedP2P {
             }
         };
         
-        // Connect to primary region first
+        // Connect to primary region first - WITH REAL connectivity validation
         if let Some(peers) = regional_peers.get(&self.primary_region) {
             for peer in peers.iter().take(5) {  // Max 5 peers per region
-                connected.push(peer.clone());
-                println!("[P2P] 📋 Added {} to connection pool from {:?}", peer.id, peer.region);
+                // CRITICAL FIX: Real connectivity check before adding to connected_peers
+                if self.is_peer_actually_connected(&peer.addr) {
+                    connected.push(peer.clone());
+                    println!("[P2P] ✅ Added {} to connection pool from {:?} (REAL connection verified)", peer.id, peer.region);
+                } else {
+                    println!("[P2P] ❌ Skipped {} from {:?} (connection failed)", peer.id, peer.region);
+                }
             }
         }
         
-        // If not enough peers, try backup regions
+        // If not enough peers, try backup regions - WITH REAL connectivity validation
         if connected.len() < 3 {
             for backup_region in &self.backup_regions {
                 if let Some(peers) = regional_peers.get(backup_region) {
                     for peer in peers.iter().take(2) {  // Max 2 from backup regions
                         if connected.len() < 5 {
-                            connected.push(peer.clone());
-                            println!("[P2P] 📋 Added {} to backup pool from {:?}", 
-                                     peer.id, peer.region);
+                            // CRITICAL FIX: Real connectivity check for backup peers too
+                            if self.is_peer_actually_connected(&peer.addr) {
+                                connected.push(peer.clone());
+                                println!("[P2P] ✅ Added {} to backup pool from {:?} (REAL connection verified)", 
+                                         peer.id, peer.region);
+                            } else {
+                                println!("[P2P] ❌ Skipped backup peer {} from {:?} (connection failed)", 
+                                         peer.id, peer.region);
+                            }
                         }
                     }
                 }
@@ -2021,6 +2064,33 @@ impl SimplifiedP2P {
         stats.insert("regional_metrics".to_string(), serde_json::Value::Object(regional_stats));
         
         stats
+    }
+    
+    /// Static method for testing peer connectivity (lifetime-safe for async contexts)
+    fn test_peer_connectivity_static(peer_addr: &str) -> bool {
+        use std::net::{TcpStream, SocketAddr};
+        use std::time::Duration;
+        
+        // Extract IP from peer address
+        let ip = peer_addr.split(':').next().unwrap_or("");
+        let addr = format!("{}:8001", ip);
+        
+        if let Ok(socket_addr) = addr.parse::<SocketAddr>() {
+            // Quick TCP connection test with 2-second timeout
+            match TcpStream::connect_timeout(&socket_addr, Duration::from_secs(2)) {
+                Ok(_) => {
+                    println!("[P2P] 🔍 Connectivity test PASSED for {}", peer_addr);
+                    true
+                }
+                Err(_) => {
+                    println!("[P2P] 🔍 Connectivity test FAILED for {}", peer_addr);
+                    false
+                }
+            }
+        } else {
+            println!("[P2P] 🔍 Invalid address format: {}", peer_addr);
+            false
+        }
     }
     
     /// Query peer metrics via HTTP for real network monitoring
