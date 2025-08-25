@@ -1166,14 +1166,16 @@ impl BlockchainNode {
     /// PRODUCTION: Get consistent Genesis node ID from BOOTSTRAP_ID or IP mapping
     /// Unifies all Genesis node ID detection across the codebase
     fn get_genesis_node_id(node_identifier: &str) -> Option<String> {
-        // Method 1: Direct BOOTSTRAP_ID environment variable
-        if let Ok(bootstrap_id) = std::env::var("QNET_BOOTSTRAP_ID") {
-            if ["001", "002", "003", "004", "005"].contains(&bootstrap_id.as_str()) {
-                return Some(format!("genesis_node_{}", bootstrap_id));
+        // Method 1: Direct BOOTSTRAP_ID environment variable (for local node only)
+        if node_identifier.is_empty() {
+            if let Ok(bootstrap_id) = std::env::var("QNET_BOOTSTRAP_ID") {
+                if ["001", "002", "003", "004", "005"].contains(&bootstrap_id.as_str()) {
+                    return Some(format!("genesis_node_{}", bootstrap_id));
+                }
             }
         }
         
-        // Method 2: IP-to-Genesis mapping for peer identification
+        // Method 2: IP-to-Genesis mapping for peer identification (CRITICAL FIX)
         let clean_ip = if node_identifier.contains(':') {
             node_identifier.split(':').next().unwrap_or(node_identifier)
         } else {
@@ -1567,9 +1569,10 @@ impl BlockchainNode {
         println!("  ├── Checking {} active peers", peers.len());
         
         for peer in peers {
-            // CRITICAL: Use unified Genesis node ID detection
-            let peer_node_id = if let Some(genesis_id) = Self::get_genesis_node_id(&peer.addr) {
-                genesis_id // Genesis node with proper ID format
+            // CRITICAL: Use IP-to-Genesis mapping for peer identification
+            let peer_ip = peer.addr.split(':').next().unwrap_or(&peer.addr);
+            let peer_node_id = if let Some(genesis_id) = crate::genesis_constants::get_genesis_id_by_ip(peer_ip) {
+                format!("genesis_node_{}", genesis_id) // Use IP mapping directly
             } else {
                 // Regular node - use IP-based format  
                 format!("node_{}", peer.addr.replace(":", "_"))
