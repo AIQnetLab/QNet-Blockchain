@@ -1139,6 +1139,59 @@ impl BlockchainActivationRegistry {
         Ok(())
     }
 
+    /// Get eligible nodes for consensus (public interface)
+    pub async fn get_eligible_nodes(&self) -> Vec<(String, f64, String)> {
+        let active_nodes = self.active_nodes.read().await;
+        
+        // Filter nodes by type (Full/Super only) and reputation (≥70%)
+        let eligible: Vec<(String, f64, String)> = active_nodes
+            .values()
+            .filter(|node| {
+                (node.node_type == "full" || node.node_type == "super") &&
+                // Calculate reputation based on activity and uptime
+                self.calculate_node_reputation(node) >= 0.70
+            })
+            .map(|node| {
+                let reputation = self.calculate_node_reputation(node);
+                (
+                    format!("registry_node_{}", node.device_signature), // Node ID
+                    reputation,                                         // Reputation score
+                    node.node_type.clone(),                            // Node type
+                )
+            })
+            .collect();
+        
+        println!("[REGISTRY] 📊 Found {} eligible nodes from {} total active", 
+                 eligible.len(), active_nodes.len());
+        eligible
+    }
+    
+    /// Calculate reputation score for a node
+    fn calculate_node_reputation(&self, node: &NodeInfo) -> f64 {
+        // PRODUCTION: Calculate reputation based on activity, uptime, and performance
+        let current_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        
+        // Base reputation starts at 70% for new nodes
+        let mut reputation = 0.70;
+        
+        // Boost reputation based on uptime (max +30%)
+        let uptime_days = (current_time - node.activated_at) / 86400; // seconds to days
+        let uptime_bonus = (uptime_days as f64 * 0.01).min(0.30); // 1% per day, max 30%
+        reputation += uptime_bonus;
+        
+        // Reduce reputation if node was inactive recently
+        let days_since_active = (current_time - node.last_seen) / 86400;
+        if days_since_active > 1 {
+            reputation -= (days_since_active as f64 * 0.05).min(0.40); // -5% per inactive day
+        }
+        
+        // Ensure reputation stays within valid bounds
+        reputation.max(0.0).min(1.0)
+    }
+
     /// Fetch recent activations from blockchain
     async fn fetch_recent_activations(&self) -> Result<Vec<ActivationRecord>, IntegrationError> {
         // PRODUCTION: Query QNet blockchain for recent activation records
