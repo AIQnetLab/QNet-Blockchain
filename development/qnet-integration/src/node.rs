@@ -543,6 +543,10 @@ impl BlockchainNode {
                 crate::rpc::start_rpc_server(node_clone_api, api_port).await;
             });
             
+            // CRITICAL FIX: Wait for API server to be ready before P2P discovery
+            println!("[Node] ⏳ Waiting for API server to be ready...");
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            
             // Store ports for external access
             std::env::set_var("QNET_CURRENT_RPC_PORT", rpc_port.to_string()); // Correct RPC port
             std::env::set_var("QNET_CURRENT_API_PORT", api_port.to_string());
@@ -1732,12 +1736,23 @@ impl BlockchainNode {
     ) -> Vec<(String, f64)> {
         let mut all_qualified = Vec::new();
         
-        // Check own node eligibility using SAME logic as original
+        // CRITICAL FIX: For Genesis phase, ALL Genesis nodes use IDENTICAL deterministic reputation
+        // This ensures consistent candidate lists and hashes across all nodes
+        let is_own_genesis = own_node_id.starts_with("genesis_node_");
+        
         let can_participate_microblock = match own_node_type {
             NodeType::Super => {
-                let own_reputation = Self::get_node_reputation_score(own_node_id, p2p).await;
-                println!("  ├── Own Super node reputation: {:.1}%", own_reputation * 100.0);
-                own_reputation >= 0.70
+                if is_own_genesis {
+                    // Genesis Super nodes: Always 90% for deterministic consensus
+                    const GENESIS_STATIC_REPUTATION: f64 = 0.90;
+                    println!("  ├── Own Genesis Super node: deterministic reputation {:.1}%", GENESIS_STATIC_REPUTATION * 100.0);
+                    GENESIS_STATIC_REPUTATION >= 0.70
+                } else {
+                    // Regular Super nodes: Use P2P reputation
+                    let own_reputation = Self::get_node_reputation_score(own_node_id, p2p).await;
+                    println!("  ├── Own Super node reputation: {:.1}%", own_reputation * 100.0);
+                    own_reputation >= 0.70
+                }
             },
             NodeType::Full => {
                 let has_peers = p2p.get_peer_count() >= 3;
@@ -1753,9 +1768,17 @@ impl BlockchainNode {
         };
         
         if can_participate_microblock {
-            let own_reputation = Self::get_node_reputation_score(own_node_id, p2p).await;
-            all_qualified.push((own_node_id.to_string(), own_reputation));
-            println!("  ├── ✅ Own node added as qualified");
+            if is_own_genesis {
+                // Genesis nodes: Use deterministic 90% reputation for consistent consensus
+                const GENESIS_STATIC_REPUTATION: f64 = 0.90;
+                all_qualified.push((own_node_id.to_string(), GENESIS_STATIC_REPUTATION));
+                println!("  ├── ✅ Own Genesis node added with deterministic reputation (90%)");
+            } else {
+                // Regular nodes: Use P2P reputation
+                let own_reputation = Self::get_node_reputation_score(own_node_id, p2p).await;
+                all_qualified.push((own_node_id.to_string(), own_reputation));
+                println!("  ├── ✅ Own node added as qualified");
+            }
         } else {
             println!("  ├── ❌ Own node excluded from qualified nodes");
         }
@@ -1779,14 +1802,17 @@ impl BlockchainNode {
                 continue;
             }
             
-            let reputation = Self::get_node_reputation_score(genesis_id, p2p).await;
+            // CRITICAL FIX: ALL Genesis nodes must have IDENTICAL reputation (90%) for deterministic consensus
+            // Using get_node_reputation_score causes each node to see different reputations (self=90%, others=70%)
+            // This breaks deterministic producer selection as each node calculates different candidate hashes
+            const GENESIS_STATIC_REPUTATION: f64 = 0.90;
             
-            println!("  ├── Genesis {} ({}): reputation {:.1}% [STATIC]", 
-                     genesis_id, genesis_ip, reputation * 100.0);
+            println!("  ├── Genesis {} ({}): reputation {:.1}% [STATIC-FIXED]", 
+                     genesis_id, genesis_ip, GENESIS_STATIC_REPUTATION * 100.0);
             
-            if reputation >= 0.70 {
-                all_qualified.push((genesis_id.to_string(), reputation));
-                println!("  │   └── ✅ Added as qualified (static Genesis)");
+            if GENESIS_STATIC_REPUTATION >= 0.70 {
+                all_qualified.push((genesis_id.to_string(), GENESIS_STATIC_REPUTATION));
+                println!("  │   └── ✅ Added as qualified (static Genesis - deterministic 90%)");
             } else {
                 println!("  │   └── ❌ Excluded (low reputation)");
             }

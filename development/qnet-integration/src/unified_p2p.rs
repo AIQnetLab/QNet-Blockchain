@@ -246,6 +246,7 @@ impl SimplifiedP2P {
     pub fn set_block_channel(&mut self, block_tx: tokio::sync::mpsc::UnboundedSender<ReceivedBlock>) {
         self.block_tx = Some(block_tx);
         println!("[P2P] 📦 Block processing channel established for storage integration");
+        println!("[DIAGNOSTIC] 🔧 Block channel state: AVAILABLE (sender established)");
     }
     
     /// Start simplified P2P network with load balancing
@@ -253,6 +254,17 @@ impl SimplifiedP2P {
         println!("[P2P] Starting P2P network with intelligent load balancing");
         println!("[P2P] Node: {} | Type: {:?} | Region: {:?}", 
                  self.node_id, self.node_type, self.region);
+        
+        // DIAGNOSTIC: Check channel states at startup
+        println!("[DIAGNOSTIC] 🔧 P2P start() - checking channel states:");
+        match &self.consensus_tx {
+            Some(_) => println!("[DIAGNOSTIC] ✅ Consensus channel: AVAILABLE"),
+            None => println!("[DIAGNOSTIC] ❌ Consensus channel: MISSING"),
+        }
+        match &self.block_tx {
+            Some(_) => println!("[DIAGNOSTIC] ✅ Block channel: AVAILABLE"),
+            None => println!("[DIAGNOSTIC] ❌ Block channel: MISSING - blocks will be discarded!"),
+        }
         
         // SECURITY: Safe mutex locking with error handling instead of panic
         match self.is_running.lock() {
@@ -2519,6 +2531,13 @@ impl SimplifiedP2P {
                 println!("[P2P] ← Received {} block #{} from {} ({} bytes)", 
                          block_type, height, from_peer, data.len());
                 
+                // DIAGNOSTIC: Check block channel state
+                println!("[DIAGNOSTIC] 🔧 Checking block channel availability...");
+                match &self.block_tx {
+                    Some(_) => println!("[DIAGNOSTIC] ✅ Block channel is AVAILABLE"),
+                    None => println!("[DIAGNOSTIC] ❌ Block channel is MISSING - this explains discarded blocks"),
+                }
+                
                 // PRODUCTION: Send block to main node for processing via storage
                 if let Some(ref block_tx) = self.block_tx {
                     let received_block = ReceivedBlock {
@@ -2542,6 +2561,7 @@ impl SimplifiedP2P {
                     }
                 } else {
                     println!("[P2P] ⚠️ Block processing channel not available - block #{} discarded", height);
+                    println!("[DIAGNOSTIC] 💥 CRITICAL: Block channel was LOST after setup!");
                 }
             }
             
