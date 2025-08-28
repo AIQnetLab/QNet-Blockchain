@@ -438,6 +438,11 @@ impl BlockchainNode {
         
         // Connect to bootstrap peers for regional clustering
         if let Some(unified_p2p) = &self.unified_p2p {
+            println!("[DIAGNOSTIC] 🔧 Bootstrap peers count: {}", self.bootstrap_peers.len());
+            for (i, peer) in self.bootstrap_peers.iter().enumerate() {
+                println!("[DIAGNOSTIC] 🔧 Bootstrap peer {}: {}", i+1, peer);
+            }
+            
             unified_p2p.connect_to_bootstrap_peers(&self.bootstrap_peers);
             
             // CRITICAL FIX: Initial blockchain synchronization before microblock production
@@ -1736,9 +1741,14 @@ impl BlockchainNode {
     ) -> Vec<(String, f64)> {
         let mut all_qualified = Vec::new();
         
+        println!("[DIAGNOSTIC] 🔧 get_genesis_qualified_candidates DEBUG:");
+        println!("[DIAGNOSTIC] 🔧   own_node_id: {}", own_node_id);
+        println!("[DIAGNOSTIC] 🔧   own_node_type: {:?}", own_node_type);
+        
         // CRITICAL FIX: For Genesis phase, ALL Genesis nodes use IDENTICAL deterministic reputation
         // This ensures consistent candidate lists and hashes across all nodes
         let is_own_genesis = own_node_id.starts_with("genesis_node_");
+        println!("[DIAGNOSTIC] 🔧   is_own_genesis: {}", is_own_genesis);
         
         let can_participate_microblock = match own_node_type {
             NodeType::Super => {
@@ -1844,6 +1854,19 @@ impl BlockchainNode {
         };
         
         println!("  └── Final sampled candidates: {} (deterministically ordered)", sampled_candidates.len());
+        
+        // DIAGNOSTIC: Show final candidate list for debugging empty candidates issue
+        if sampled_candidates.is_empty() {
+            println!("[DIAGNOSTIC] ❌ EMPTY CANDIDATES - ROOT CAUSES:");
+            println!("[DIAGNOSTIC]   - can_participate_microblock: {}", can_participate_microblock);
+            println!("[DIAGNOSTIC]   - This will cause fork - each node becomes producer!");
+        } else {
+            println!("[DIAGNOSTIC] ✅ CANDIDATES FOUND:");
+            for (i, (node_id, rep)) in sampled_candidates.iter().enumerate() {
+                println!("[DIAGNOSTIC]   {}. {} (rep: {:.1}%)", i+1, node_id, rep * 100.0);
+            }
+        }
+        
         sampled_candidates
     }
     
@@ -4134,34 +4157,59 @@ impl BlockchainNode {
     /// CRITICAL FIX: Generate unique node_id based on Genesis ID or server IP
     /// This ensures each node has a unique identifier for producer rotation
     async fn generate_unique_node_id(node_type: NodeType) -> String {
+        println!("[DIAGNOSTIC] 🔧 generate_unique_node_id() called with type: {:?}", node_type);
+        println!("[DIAGNOSTIC] 🔧 Checking environment variables:");
+        println!("[DIAGNOSTIC] 🔧   QNET_BOOTSTRAP_ID: {:?}", std::env::var("QNET_BOOTSTRAP_ID"));
+        println!("[DIAGNOSTIC] 🔧   QNET_GENESIS_BOOTSTRAP: {:?}", std::env::var("QNET_GENESIS_BOOTSTRAP"));
+        
         // Priority 1: Use BOOTSTRAP_ID for Genesis nodes (001-005)
         if let Ok(bootstrap_id) = std::env::var("QNET_BOOTSTRAP_ID") {
             println!("[NODE_ID] 🔐 Genesis node detected: BOOTSTRAP_ID={}", bootstrap_id);
+            println!("[DIAGNOSTIC] ✅ Priority 1: Using BOOTSTRAP_ID -> genesis_node_{}", bootstrap_id);
             return format!("genesis_node_{}", bootstrap_id);
+        } else {
+            println!("[DIAGNOSTIC] ❌ Priority 1: QNET_BOOTSTRAP_ID not found");
         }
         
         // Priority 2: Use Genesis bootstrap flag (legacy support)
-        if std::env::var("QNET_GENESIS_BOOTSTRAP").unwrap_or_default() == "1" {
+        println!("[DIAGNOSTIC] 🔧 Priority 2: Checking QNET_GENESIS_BOOTSTRAP");
+        let genesis_bootstrap = std::env::var("QNET_GENESIS_BOOTSTRAP").unwrap_or_default();
+        if genesis_bootstrap == "1" {
+            println!("[DIAGNOSTIC] ✅ Priority 2: QNET_GENESIS_BOOTSTRAP=1, trying IP detection");
             // Try to determine genesis ID from IP
             if let Ok(ip) = Self::get_external_ip().await {
+                println!("[DIAGNOSTIC] 🔧 Priority 2: external_ip={}", ip);
                 use crate::genesis_constants::GENESIS_NODE_IPS;
                 for (i, (genesis_ip, genesis_id)) in GENESIS_NODE_IPS.iter().enumerate() {
                     if ip == *genesis_ip {
                         println!("[NODE_ID] 🔐 Genesis node detected by IP: {}", genesis_id);
+                        println!("[DIAGNOSTIC] ✅ Priority 2: IP matched, using genesis_node_{}", genesis_id);
                         return format!("genesis_node_{}", genesis_id);
                     }
                 }
+                println!("[DIAGNOSTIC] ❌ Priority 2: IP {} not found in GENESIS_NODE_IPS", ip);
+            } else {
+                println!("[DIAGNOSTIC] ❌ Priority 2: Could not get external IP");
             }
             // Fallback for legacy genesis
             println!("[NODE_ID] 🔐 Legacy genesis node (unknown ID)");
+            println!("[DIAGNOSTIC] ✅ Priority 2: Using legacy fallback");
             return format!("genesis_node_legacy_{}", std::process::id());
+        } else {
+            println!("[DIAGNOSTIC] ❌ Priority 2: QNET_GENESIS_BOOTSTRAP='{}', not '1'", genesis_bootstrap);
         }
         
+
+        
         // Priority 3: Use server IP for regular nodes
+        println!("[DIAGNOSTIC] 🔧 Priority 3: Falling back to regular node ID generation");
         if let Ok(ip) = Self::get_external_ip().await {
             let sanitized_ip = ip.replace(".", "_").replace(":", "_");
             println!("[NODE_ID] 🌐 Regular node: IP-based ID={}", sanitized_ip);
+            println!("[DIAGNOSTIC] ✅ Priority 3: Using regular node -> node_{}", sanitized_ip);
             return format!("node_{}", sanitized_ip);
+        } else {
+            println!("[DIAGNOSTIC] ❌ Priority 3: Could not get external IP");
         }
         
         // Priority 4: Use hostname as fallback
