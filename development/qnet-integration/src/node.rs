@@ -449,8 +449,11 @@ impl BlockchainNode {
             // This prevents each node from creating its own isolated blockchain
             println!("[SYNC] ⏳ Waiting for peer connections and blockchain synchronization...");
             
-            // Wait briefly for peer connections to establish
-            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            // TIMING FIX: Wait longer for Genesis nodes API servers to start
+            // Genesis nodes need time for API servers to be ready on port 8001
+            let wait_time = if std::env::var("QNET_BOOTSTRAP_ID").is_ok() { 8 } else { 5 };
+            println!("[SYNC] ⏳ Waiting {} seconds for Genesis API servers to be ready...", wait_time);
+            tokio::time::sleep(std::time::Duration::from_secs(wait_time)).await;
             
             // Synchronize with network height before starting production
             match unified_p2p.sync_blockchain_height() {
@@ -1797,14 +1800,12 @@ impl BlockchainNode {
         // This ensures ALL Genesis nodes see IDENTICAL candidate lists
         println!("  ├── Using static Genesis node list for consistent candidate selection");
         
-        // Static list of all Genesis nodes (deterministic order)
-        let genesis_nodes = vec![
-            ("genesis_node_001", "154.38.160.39"),
-            ("genesis_node_002", "62.171.157.44"), 
-            ("genesis_node_003", "161.97.86.81"),
-            ("genesis_node_004", "173.212.219.226"),
-            ("genesis_node_005", "164.68.108.218"),
-        ];
+        // Use shared Genesis constants to eliminate duplication
+        let genesis_ips = crate::unified_p2p::get_genesis_bootstrap_ips();
+        let genesis_nodes: Vec<(String, String)> = genesis_ips.iter()
+            .enumerate()
+            .map(|(i, ip)| (format!("genesis_node_{:03}", i + 1), ip.clone()))
+            .collect();
         
         for (genesis_id, genesis_ip) in genesis_nodes {
             // Skip self to avoid duplicate (already added above)

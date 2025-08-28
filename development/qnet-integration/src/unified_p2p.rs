@@ -904,12 +904,23 @@ impl SimplifiedP2P {
         
         // PRODUCTION: Use blocking HTTP client to avoid runtime conflicts
         let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(20)) // PRODUCTION: Increased timeout for Genesis peer HTTP queries
+            .timeout(Duration::from_secs(15)) // PRODUCTION: Reasonable timeout for peer queries
             .build()
             .map_err(|e| format!("HTTP client error: {}", e))?;
         
-        // PRODUCTION: Retry logic for real network
-        for attempt in 1..=3 {
+        // GENESIS STARTUP FIX: Extended retry logic during network bootstrap
+        let is_genesis_startup = {
+            let current_time = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            current_time < QNET_GENESIS_TIMESTAMP + 600 // 10 minutes grace period
+        };
+        
+        let max_attempts = if is_genesis_startup { 6 } else { 3 };
+        let retry_delay = if is_genesis_startup { 2 } else { 1 };
+        
+        for attempt in 1..=max_attempts {
             match client.get(endpoint).send() {
                 Ok(response) if response.status().is_success() => {
                     match response.json::<serde_json::Value>() {
@@ -921,8 +932,8 @@ impl SimplifiedP2P {
                             }
                         }
                 Err(e) => {
-                            if attempt < 3 {
-                                std::thread::sleep(Duration::from_secs(1));
+                            if attempt < max_attempts {
+                                std::thread::sleep(Duration::from_secs(retry_delay));
                                 continue;
                             }
                             return Err(format!("JSON parse error: {}", e));
@@ -930,15 +941,15 @@ impl SimplifiedP2P {
                     }
                 }
                     Ok(response) => {
-                    if attempt < 3 {
-                        std::thread::sleep(Duration::from_secs(1));
+                    if attempt < max_attempts {
+                        std::thread::sleep(Duration::from_secs(retry_delay));
                         continue;
                     }
                     return Err(format!("HTTP error: {}", response.status()));
                 }
                 Err(e) => {
-                    if attempt < 3 {
-                        std::thread::sleep(Duration::from_secs(1));
+                    if attempt < max_attempts {
+                        std::thread::sleep(Duration::from_secs(retry_delay));
                         continue;
                     }
                     return Err(format!("Request failed: {}", e));
@@ -2688,6 +2699,13 @@ const GENESIS_BOOTSTRAP_NODES: &[(&str, &str)] = &[
     ("173.212.219.226", "Europe"),     // Genesis Node #4
     ("164.68.108.218", "Europe"),      // Genesis Node #5
 ];
+
+/// PUBLIC: Get Genesis bootstrap IPs for external use (eliminates duplication)
+pub fn get_genesis_bootstrap_ips() -> Vec<String> {
+    GENESIS_BOOTSTRAP_NODES.iter()
+        .map(|(ip, _)| ip.to_string())
+        .collect()
+}
 
 impl SimplifiedP2P {
     /// Start peer exchange protocol for decentralized network growth

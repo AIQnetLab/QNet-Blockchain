@@ -1367,17 +1367,12 @@ fn get_genesis_node_ips_dynamic() -> Vec<String> {
         }
     }
     
-    // Priority 3: Fallback to default nodes (only for initial deployment)
-    let default_nodes = vec![
-        "154.38.160.39".to_string(),
-        "62.171.157.44".to_string(), 
-        "161.97.86.81".to_string(),
-        "173.212.219.226".to_string(),
-        "164.68.108.218".to_string()
-    ];
+    // Priority 3: Use shared Genesis constants to avoid duplication
+    use qnet_integration::unified_p2p::get_genesis_bootstrap_ips;
+    let genesis_nodes = get_genesis_bootstrap_ips();
     
-    println!("[CONFIG] ⚠️ Using default Genesis nodes (set QNET_GENESIS_NODES to override): {:?}", default_nodes);
-    default_nodes
+    println!("[CONFIG] ⚠️ Using shared Genesis constants (set QNET_GENESIS_NODES to override): {:?}", genesis_nodes);
+    genesis_nodes
 }
 
 // SECURITY: Check if Genesis node with same ID already exists in network
@@ -1550,12 +1545,14 @@ fn get_current_server_ip() -> String {
 fn get_external_ip() -> Result<String, String> {
     println!("[DEBUG] 🔧 get_external_ip() called - attempting IP detection");
     
-    // CRITICAL FIX: Use Rust HTTP client instead of curl (Docker containers don't have curl)
-    let rt = match tokio::runtime::Runtime::new() {
-        Ok(rt) => rt,
+    // CRITICAL FIX: Use blocking HTTP client to avoid Tokio runtime conflicts
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build() {
+        Ok(client) => client,
         Err(e) => {
-            println!("[DEBUG] ❌ Failed to create tokio runtime: {}", e);
-            return Err(format!("Failed to create async runtime: {}", e));
+            println!("[DEBUG] ❌ Failed to create HTTP client: {}", e);
+            return Err(format!("HTTP client error: {}", e));
         }
     };
     
@@ -1568,48 +1565,34 @@ fn get_external_ip() -> Result<String, String> {
     for service in ip_services {
         println!("[DEBUG] 🔧 Trying IP service: {}", service);
         
-        let result = rt.block_on(async {
-            let client = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(5))
-                .build()
-                .map_err(|e| format!("HTTP client error: {}", e))?;
-                
-            let response = client.get(service)
-                .send()
-                .await
-                .map_err(|e| format!("Request failed: {}", e))?;
-                
-            if !response.status().is_success() {
-                return Err(format!("HTTP error: {}", response.status()));
-            }
-            
-            let ip_text = response.text().await
-                .map_err(|e| format!("Response read error: {}", e))?;
-                
-            let ip = ip_text.trim().to_string();
-            
-            if !ip.is_empty() && ip.contains('.') && !ip.contains("error") && !ip.contains("timeout") {
-                if validate_ip_address_security(&ip) {
-                    println!("[DEBUG] ✅ IP detected via {}: {}", service, ip);
-                    return Ok::<String, String>(ip);
-                } else {
-                    println!("[DEBUG] ❌ IP failed security validation: {}", ip);
+        match client.get(service).send() {
+            Ok(response) if response.status().is_success() => {
+                match response.text() {
+                    Ok(ip_text) => {
+                        let ip = ip_text.trim().to_string();
+                        
+                        if !ip.is_empty() && ip.contains('.') && !ip.contains("error") && !ip.contains("timeout") {
+                            if validate_ip_address_security(&ip) {
+                                println!("[DEBUG] ✅ IP detected via {}: {}", service, ip);
+                                println!("[IP] 🌐 External IP detected via {}: {}", service, ip);
+                                return Ok(ip);
+                            } else {
+                                println!("[DEBUG] ❌ IP failed security validation: {}", ip);
+                            }
+                        } else {
+                            println!("[DEBUG] ❌ Invalid IP response: {}", ip);
+                        }
+                    }
+                    Err(e) => {
+                        println!("[DEBUG] ❌ Response read error from {}: {}", service, e);
+                    }
                 }
-            } else {
-                println!("[DEBUG] ❌ Invalid IP response: {}", ip);
             }
-            
-            Err("Invalid IP response".to_string())
-        });
-        
-        match result {
-            Ok(ip) => {
-                println!("[IP] 🌐 External IP detected via {}: {}", service, ip);
-                return Ok(ip);
+            Ok(response) => {
+                println!("[DEBUG] ❌ HTTP error {} from {}", response.status(), service);
             }
             Err(e) => {
-                println!("[DEBUG] ❌ Service {} failed: {}", service, e);
-                continue;
+                println!("[DEBUG] ❌ Request failed for {}: {}", service, e);
             }
         }
     }
