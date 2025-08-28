@@ -445,18 +445,29 @@ impl SimplifiedP2P {
         let port = self.port;
         let node_type = self.node_type.clone();
         
+        // CRITICAL FIX: Filter working genesis nodes BEFORE tokio::spawn to avoid lifetime issues
+        let all_genesis_ips: Vec<String> = GENESIS_BOOTSTRAP_NODES.iter()
+            .map(|(ip, _)| ip.to_string())
+            .collect();
+        let working_genesis_ips = self.filter_working_genesis_nodes(all_genesis_ips);
+        
         tokio::spawn(async move {
             println!("[P2P] 🌐 Searching for QNet peers with cryptographic verification...");
             
             let mut discovered_peers = Vec::new();
             
-                         // PRODUCTION FIX: Always use genesis nodes + optional manual override
-             let mut known_node_ips = Vec::new();
+            // PRODUCTION FIX: Always use genesis nodes + optional manual override
+            let mut known_node_ips = Vec::new();
+            
+            // PRIORITY 1: Include ONLY WORKING genesis bootstrap nodes for network stability
              
-             // PRIORITY 1: Always include genesis bootstrap nodes for network stability
-             for (ip, region_name) in GENESIS_BOOTSTRAP_NODES {
-                 known_node_ips.push(ip.to_string());
-                 println!("[P2P] 🌟 Genesis bootstrap node: {} ({})", ip, region_name);
+             for ip in working_genesis_ips {
+                 known_node_ips.push(ip.clone());
+                 let region_name = GENESIS_BOOTSTRAP_NODES.iter()
+                     .find(|(genesis_ip, _)| *genesis_ip == ip)
+                     .map(|(_, region)| *region)
+                     .unwrap_or("Unknown");
+                 println!("[P2P] 🌟 Working Genesis bootstrap node: {} ({})", ip, region_name);
              }
              
              // PRIORITY 2: Add environment variable peers (additional nodes)
@@ -629,7 +640,7 @@ impl SimplifiedP2P {
                 // Start peer exchange protocol for continued growth
                 let exchange_peers = discovered_peers.clone();
                 tokio::spawn(async move {
-                    Self::start_peer_exchange_protocol(exchange_peers).await;
+                    SimplifiedP2P::start_peer_exchange_protocol(exchange_peers).await;
                 });
             }
             
@@ -2364,7 +2375,6 @@ impl SimplifiedP2P {
                 let ip = peer.addr.split(':').next().unwrap_or("");
                 let urls = vec![
                     format!("http://{}:8001/api/v1/microblock/{}", ip, height),
-                    format!("http://{}:{}/api/v1/microblock/{}", ip, self.port + 1000, height),
                 ];
                 // PRODUCTION: Use proper HTTP client instead of curl
                 for url in urls {

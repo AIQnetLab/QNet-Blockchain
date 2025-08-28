@@ -439,6 +439,39 @@ impl BlockchainNode {
         // Connect to bootstrap peers for regional clustering
         if let Some(unified_p2p) = &self.unified_p2p {
             unified_p2p.connect_to_bootstrap_peers(&self.bootstrap_peers);
+            
+            // CRITICAL FIX: Initial blockchain synchronization before microblock production
+            // This prevents each node from creating its own isolated blockchain
+            println!("[SYNC] ⏳ Waiting for peer connections and blockchain synchronization...");
+            
+            // Wait briefly for peer connections to establish
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            
+            // Synchronize with network height before starting production
+            match unified_p2p.sync_blockchain_height() {
+                Ok(network_height) => {
+                    let current_height = *self.height.read().await;
+                    println!("[SYNC] 📊 Current height: {}, Network height: {}", current_height, network_height);
+                    
+                    if network_height > current_height {
+                        println!("[SYNC] 📥 Downloading {} missing blocks from network...", network_height - current_height);
+                        unified_p2p.download_missing_microblocks(
+                            &*self.storage,
+                            current_height,
+                            network_height
+                        ).await;
+                        
+                        // Update local height to match network
+                        *self.height.write().await = network_height;
+                        println!("[SYNC] ✅ Synchronized to network height: {}", network_height);
+                    } else {
+                        println!("[SYNC] ✅ Node is synchronized with network");
+                    }
+                },
+                Err(e) => {
+                    println!("[SYNC] ⚠️ Could not sync with network (Genesis mode): {}", e);
+                }
+            }
         }
         
         // PRODUCTION FIX: Always enable microblock production for blockchain operation
@@ -1727,32 +1760,33 @@ impl BlockchainNode {
             println!("  ├── ❌ Own node excluded from qualified nodes");
         }
         
-        // Add peer candidates (already filtered by get_validated_active_peers)
-        let peers = p2p.get_validated_active_peers();
-        println!("  ├── Checking {} active peers", peers.len());
+        // CRITICAL FIX: Use STATIC Genesis node list for consistent candidate selection
+        // This ensures ALL Genesis nodes see IDENTICAL candidate lists
+        println!("  ├── Using static Genesis node list for consistent candidate selection");
         
-        for peer in peers {
-            // CRITICAL: Use IP-to-Genesis mapping for peer identification
-            let peer_ip = peer.addr.split(':').next().unwrap_or(&peer.addr);
-            let peer_node_id = if let Some(genesis_id) = crate::genesis_constants::get_genesis_id_by_ip(peer_ip) {
-                format!("genesis_node_{}", genesis_id) // Use IP mapping directly
-            } else {
-                // Regular node - use IP-based format  
-                format!("node_{}", peer.addr.replace(":", "_"))
-            };
+        // Static list of all Genesis nodes (deterministic order)
+        let genesis_nodes = vec![
+            ("genesis_node_001", "154.38.160.39"),
+            ("genesis_node_002", "62.171.157.44"), 
+            ("genesis_node_003", "161.97.86.81"),
+            ("genesis_node_004", "173.212.219.226"),
+            ("genesis_node_005", "164.68.108.218"),
+        ];
+        
+        for (genesis_id, genesis_ip) in genesis_nodes {
+            // Skip self to avoid duplicate (already added above)
+            if genesis_id == own_node_id {
+                continue;
+            }
             
-            // NOTE: Genesis reputation already initialized at startup (initialize_genesis_reputations)
-            // No need for runtime initialization here - prevents race conditions
+            let reputation = Self::get_node_reputation_score(genesis_id, p2p).await;
             
-            let reputation = Self::get_node_reputation_score(&peer_node_id, p2p).await;
-            
-            println!("  ├── Peer {} ({}): reputation {:.1}% [{}]", 
-                     peer_node_id, peer.addr, reputation * 100.0,
-                     if peer_node_id.starts_with("genesis_") { "GENESIS" } else { "REGULAR" });
+            println!("  ├── Genesis {} ({}): reputation {:.1}% [STATIC]", 
+                     genesis_id, genesis_ip, reputation * 100.0);
             
             if reputation >= 0.70 {
-                all_qualified.push((peer_node_id.clone(), reputation));
-                println!("  │   └── ✅ Added as qualified");
+                all_qualified.push((genesis_id.to_string(), reputation));
+                println!("  │   └── ✅ Added as qualified (static Genesis)");
             } else {
                 println!("  │   └── ❌ Excluded (low reputation)");
             }
@@ -3641,9 +3675,9 @@ impl BlockchainNode {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        // PRODUCTION: Get discovery peers directly (already proper format)
+        // PRODUCTION: Get only REAL validated active peers (no phantom peers)
         let peer_infos = if let Some(ref p2p) = self.unified_p2p {
-            let p2p_peers = p2p.get_connected_peers().await;
+            let p2p_peers = p2p.get_validated_active_peers();
             
             // Convert from unified_p2p::PeerInfo to node::PeerInfo format
             p2p_peers.iter().map(|p2p_peer| {
