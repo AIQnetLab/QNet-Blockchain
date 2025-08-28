@@ -12,6 +12,9 @@ use chrono;
 use sha3::Digest; // Add missing Digest trait
 use base64::Engine;
 
+// QNET GENESIS CONSTANTS
+const QNET_GENESIS_TIMESTAMP: u64 = 1756359322; // Aug 28, 2025 05:35:22 UTC - 40 min test
+
 /// Get system CPU load for monitoring
 fn get_system_cpu_load() -> f32 {
     // PRODUCTION: Use sysinfo or similar crate for real CPU monitoring
@@ -1824,7 +1827,7 @@ lazy_static::lazy_static! {
     static ref LIGHT_NODE_REGISTRY: Mutex<HashMap<String, LightNodeInfo>> = Mutex::new(HashMap::new());
     static ref REWARD_MANAGER: Mutex<PhaseAwareRewardManager> = {
         // Genesis timestamp: January 1, 2025 (production launch)
-        let genesis_timestamp = 1735689600; // 2025-01-01 00:00:00 UTC
+        let genesis_timestamp = QNET_GENESIS_TIMESTAMP;
         Mutex::new(PhaseAwareRewardManager::new(genesis_timestamp))
     };
 }

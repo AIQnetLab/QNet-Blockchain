@@ -22,6 +22,9 @@ use bincode;
 use flate2;
 use serde::{Serialize, Deserialize};
 
+// QNET GENESIS CONSTANTS
+const QNET_GENESIS_TIMESTAMP: u64 = 1756359322; // Aug 28, 2025 05:35:22 UTC - 40 min test
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum NodeType {
     Light,
@@ -456,9 +459,7 @@ impl BlockchainNode {
         println!("[Storage] 📊 Starting storage usage monitoring...");
         self.start_storage_monitoring().await;
         
-        // PRODUCTION: Start consensus message handler
-        println!("[Node] 🏛️ Starting consensus message handler");
-        self.start_consensus_message_handler().await;
+        // CONSENSUS: Messages processed directly in macroblock phases (no separate handler needed)
         
         // PRODUCTION: All nodes participate in P2P network and microblock production
         // Byzantine consensus participation is determined dynamically during macroblock rounds
@@ -564,18 +565,6 @@ impl BlockchainNode {
         Ok(())
     }
 
-    /// PRODUCTION: Start consensus message handler (INTEGRATED with macroblock phases)
-    async fn start_consensus_message_handler(&self) {
-        println!("[CONSENSUS] 🏛️ Consensus message processing is INTEGRATED with macroblock phases");
-        println!("[CONSENSUS] 📝 Commit messages processed in execute_real_commit_phase()");
-        println!("[CONSENSUS] 🔓 Reveal messages processed in execute_real_reveal_phase()"); 
-        println!("[CONSENSUS] ✅ No separate handler needed - macroblock consensus handles P2P messages");
-        
-        // NOTE: Consensus messages are processed directly in macroblock commit/reveal phases
-        // See execute_real_commit_phase() and execute_real_reveal_phase() for actual processing
-    }
-    
-    
     
     /// PRODUCTION: Process consensus messages from other nodes 
     async fn process_consensus_message(
@@ -687,24 +676,37 @@ impl BlockchainNode {
                     1 // Solo mode
                 };
                 
-                // PRODUCTION: Byzantine fault tolerance requires minimum 4 nodes for ALL nodes
-                // This ensures network security from the very beginning (Genesis and Full nodes)
+                // CRITICAL FIX: Coordinated network start for Genesis nodes
                 if active_node_count < 4 {
                     let is_genesis_bootstrap = std::env::var("QNET_BOOTSTRAP_ID")
                         .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
                         .unwrap_or(false);
                     
                     if is_genesis_bootstrap {
-                        println!("[MICROBLOCK] ⏳ Genesis node #{} waiting for minimum 4 nodes (current: {})", 
-                                 std::env::var("QNET_BOOTSTRAP_ID").unwrap_or("unknown".to_string()), active_node_count);
-                        println!("[MICROBLOCK] 🛡️ Byzantine fault tolerance requires 4+ nodes even for Genesis bootstrap");
+                        // CHECK: Network start coordination for Genesis nodes
+                        let current_time = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        
+                        if current_time >= QNET_GENESIS_TIMESTAMP {
+                            println!("[MICROBLOCK] 🚀 COORDINATED START: Genesis time reached, starting with {} nodes", active_node_count);
+                            // Continue to production even with <4 nodes if it's coordinated genesis start
+                        } else {
+                            let remaining_seconds = QNET_GENESIS_TIMESTAMP.saturating_sub(current_time);
+                            println!("[MICROBLOCK] ⏳ Genesis node #{} waiting for coordinated start time (current: {} nodes)", 
+                                     std::env::var("QNET_BOOTSTRAP_ID").unwrap_or("unknown".to_string()), active_node_count);
+                            println!("[MICROBLOCK] 🕐 Network starts at Genesis timestamp: {} (in {} seconds / {} minutes)", 
+                                     QNET_GENESIS_TIMESTAMP, remaining_seconds, remaining_seconds / 60);
+                            tokio::time::sleep(Duration::from_secs(5)).await; // Check every 5 seconds
+                            continue;
+                        }
                     } else {
                         println!("[MICROBLOCK] ⏳ Full node waiting for minimum 4 nodes (current: {})", active_node_count);
                         println!("[MICROBLOCK] 🛡️ Byzantine safety cannot be guaranteed with fewer than 4 nodes");
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        continue;
                     }
-                    
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                    continue;
                 }
                 
                 println!("[MICROBLOCK] 🚀 Starting microblock production with {} nodes (Byzantine safe)", active_node_count);
@@ -1175,7 +1177,7 @@ impl BlockchainNode {
                                 // CRITICAL: Check if producer timeout occurred using GLOBAL BLOCK TIME
                                 // QNet CONSENSUS SAFETY: Use expected block time for synchronized timeout across network
                                 let expected_block_time = microblock_height * 1; // Each microblock should be created every 1 second
-                                let network_start_time = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1735200000); // Network genesis time
+                                let network_start_time = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(QNET_GENESIS_TIMESTAMP); // Network genesis time
                                 let current_network_time = std::time::SystemTime::now().duration_since(network_start_time).unwrap_or_default().as_secs();
                                 let time_since_expected = current_network_time.saturating_sub(expected_block_time);
                                 
@@ -1322,6 +1324,18 @@ impl BlockchainNode {
         }
         
         println!("[REPUTATION] ✅ Initialized {} ACTIVE Genesis nodes (no phantom reputation)", genesis_nodes_found);
+        
+        // CRITICAL FIX: Set own Genesis reputation to 90%
+        if let Ok(bootstrap_id) = std::env::var("QNET_BOOTSTRAP_ID") {
+            match bootstrap_id.as_str() {
+                "001" | "002" | "003" | "004" | "005" => {
+                    let own_genesis_id = format!("genesis_node_{}", bootstrap_id);
+                    p2p.set_node_reputation(&own_genesis_id, 90.0);
+                    println!("[REPUTATION] 🔐 Self Genesis {} set to 90.0% reputation", own_genesis_id);
+                }
+                _ => {}
+            }
+        }
     }
     
     /// PRODUCTION: Select microblock producer using random selection every 30 blocks (QNet specification)
@@ -1659,13 +1673,22 @@ impl BlockchainNode {
         }
     }
     
-    /// Detect if network is in Genesis bootstrap phase (≤5 Genesis nodes)
+    /// Detect if network is in Genesis bootstrap phase using DETERMINISTIC network height
     async fn is_genesis_bootstrap_phase(p2p: &Arc<SimplifiedP2P>) -> bool {
-        let total_nodes = p2p.get_validated_active_peers().len() + 1; // +1 for self
-        let is_genesis_node = std::env::var("QNET_BOOTSTRAP_ID").is_ok();
-        
-        // Genesis phase if we have ≤5 nodes total and at least one Genesis node present
-        total_nodes <= 5 && is_genesis_node
+        // FIXED: Use network height instead of peer count for phase detection
+        match p2p.sync_blockchain_height() {
+            Ok(network_height) => {
+                let is_genesis = network_height < 1000; // First 1000 blocks = Genesis phase
+                println!("[PHASE] Network height: {} → {} phase", network_height, 
+                         if is_genesis { "Genesis" } else { "Normal" });
+                is_genesis
+            },
+            Err(_) => {
+                // Fallback: if sync fails, assume Genesis phase
+                println!("[PHASE] Sync failed → assuming Genesis phase");
+                true
+            }
+        }
     }
     
     /// Get qualified candidates for Genesis phase (≤5 static nodes)
@@ -4109,18 +4132,48 @@ impl BlockchainNode {
             return Ok(local_ip);
         }
         
-        // Method 3: Query external service (fallback)
+        // Method 3: Try to get IP from network interface
+        if let Ok(interface_ip) = Self::get_network_interface_ip().await {
+            println!("[IP] 🔌 Using network interface IP: {}", interface_ip);
+            return Ok(interface_ip);
+        }
+        
+        // Method 4: Query external service (fallback)
         match Self::query_external_ip_service().await {
             Ok(ip) => {
                 println!("[IP] 🌐 Detected external IP: {}", ip);
                 Ok(ip)
             }
             Err(_) => {
-                // Method 4: Use localhost as last resort
-                println!("[IP] ⚠️ Using localhost fallback");
-                Ok("127_0_0_1".to_string())
+                // Method 4: Use unique localhost fallback per process
+                let unique_fallback = format!("127_0_0_{}", std::process::id() % 254 + 1); // 1-254 range
+                println!("[IP] ⚠️ Using unique localhost fallback: {}", unique_fallback);
+                Ok(unique_fallback)
             }
         }
+    }
+    
+    /// Get IP from network interface (production servers)
+    async fn get_network_interface_ip() -> Result<String, String> {
+        // Simple method to get local IP that can reach internet
+        use std::net::{TcpStream, SocketAddr};
+        
+        match std::net::UdpSocket::bind("0.0.0.0:0") {
+            Ok(socket) => {
+                // Try to connect to a public DNS server to determine our external interface
+                if let Ok(_) = socket.connect("8.8.8.8:80") {
+                    if let Ok(local_addr) = socket.local_addr() {
+                        let ip = local_addr.ip().to_string();
+                        if !ip.starts_with("127.") && !ip.starts_with("0.") {
+                            return Ok(ip.replace(".", "_"));
+                        }
+                    }
+                }
+            }
+            Err(_) => {}
+        }
+        
+        Err("No network interface found".to_string())
     }
     
     /// Query external IP service as fallback

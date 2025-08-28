@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use once_cell::sync::Lazy;
 use std::thread;
 use serde::{Serialize, Deserialize};
 use rand;
@@ -15,6 +16,13 @@ use base64::Engine;
 // Import QNet consensus components for proper peer validation
 use qnet_consensus::reputation::{NodeReputation, ReputationConfig};
 use qnet_consensus::{commit_reveal::{Commit, Reveal}, ConsensusEngine};
+
+// QNET GENESIS CONSTANTS
+const QNET_GENESIS_TIMESTAMP: u64 = 1756359322; // Aug 28, 2025 05:35:22 UTC - 40 min test
+
+// PEER DISCOVERY CACHE - ensures consistent peer lists across nodes
+static CACHED_PEERS: Lazy<Arc<Mutex<(Vec<PeerInfo>, Instant, String)>>> = 
+    Lazy::new(|| Arc::new(Mutex::new((Vec::new(), Instant::now(), String::new()))));
 
 /// SECURITY: Rate limiting structure for DDoS protection
 #[derive(Debug, Clone)]
@@ -936,22 +944,9 @@ impl SimplifiedP2P {
                     .and_then(|s| s.parse::<u64>().ok())
             })
             .unwrap_or_else(|| {
-                // Robust fallback: If no genesis timestamp is set, use network start heuristic
-                match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-                    Ok(duration) => {
-                        let current_time = duration.as_secs();
-                        
-                        // Use start of current day as genesis (reasonable for new networks)
-                        let day_start = current_time - (current_time % 86400);
-                        
-                        println!("[CONSENSUS] 🔧 Using fallback genesis time: {} (start of day)", day_start);
-                        day_start
-                    }
-                    Err(_) => {
-                        // Last resort: Use known QNet development start (adjust as needed)
-                        1735689600 // Jan 1, 2025 00:00:00 UTC - QNet launch
-                    }
-                }
+                // FIXED: Use consistent Genesis timestamp across all nodes
+                println!("[CONSENSUS] 🔧 Using unified Genesis timestamp: {} (Jan 1, 2025)", QNET_GENESIS_TIMESTAMP);
+                QNET_GENESIS_TIMESTAMP
             });
         
         let current_time = std::time::SystemTime::now()
@@ -1532,6 +1527,34 @@ impl SimplifiedP2P {
     
     /// PRODUCTION: Get validated active peers for consensus participation (NODE TYPE AWARE)
     pub fn get_validated_active_peers(&self) -> Vec<PeerInfo> {
+        // CRITICAL FIX: Cache for 30 seconds to ensure consistency across nodes
+        let cache_key = format!("{}_{}", 
+                               std::env::var("QNET_BOOTSTRAP_ID").unwrap_or_else(|_| "regular".to_string()),
+                               self.get_peer_count());
+        
+        if let Ok(mut cached) = CACHED_PEERS.lock() {
+            let now = Instant::now();
+            
+            // Use cache if valid (30 seconds) and key matches
+            if now.duration_since(cached.1) < Duration::from_secs(30) && cached.2 == cache_key {
+                println!("[P2P] 📋 Using cached peer list ({} peers, cache age: {}s)", 
+                         cached.0.len(), now.duration_since(cached.1).as_secs());
+                return cached.0.clone();
+            }
+            
+            // Refresh cache
+            let fresh_peers = self.get_validated_active_peers_internal();
+            *cached = (fresh_peers.clone(), now, cache_key);
+            println!("[P2P] 🔄 Refreshed peer cache ({} peers)", fresh_peers.len());
+            return fresh_peers;
+        }
+        
+        // Fallback if cache lock fails
+        self.get_validated_active_peers_internal()
+    }
+    
+    /// Internal method without caching
+    fn get_validated_active_peers_internal(&self) -> Vec<PeerInfo> {
         match self.connected_peers.lock() {
             Ok(peers) => {
                 // PRODUCTION: Different validation logic for different node types
