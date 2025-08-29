@@ -3864,12 +3864,13 @@ async fn perform_dht_peer_discovery() -> Result<Vec<String>, String> {
         Err(_) => "unknown".to_string(),
     };
     
-    // PRODUCTION DHT: Query known bootstrap nodes for their peer lists
+    // PRODUCTION DHT: Query ALL genesis bootstrap nodes for their peer lists
     let genesis_ips = get_genesis_node_ips_dynamic();
     let bootstrap_nodes: Vec<String> = genesis_ips.iter()
-        .take(3)  // Use first 3 Genesis nodes for DHT
         .map(|ip| format!("{}:8001", ip))
         .collect();
+    
+    println!("[DHT] 🌐 DHT will query {} Genesis nodes for peer discovery", bootstrap_nodes.len());
     
     for bootstrap in &bootstrap_nodes {
         // Skip self-connection
@@ -3882,6 +3883,14 @@ async fn perform_dht_peer_discovery() -> Result<Vec<String>, String> {
         match query_node_for_peers(bootstrap).await {
             Ok(mut peers) => {
                 println!("[DHT] ✅ Bootstrap {} provided {} peers", bootstrap, peers.len());
+                
+                // DIAGNOSTIC: Show peer details to debug phantom peers
+                if peers.len() > 5 {
+                    println!("[DHT] 🔍 DIAGNOSTIC: Large peer list detected ({} peers)", peers.len());
+                    println!("[DHT] 🔍 First 5 peers: {:?}", peers.iter().take(5).collect::<Vec<_>>());
+                    println!("[DHT] 🔍 This may indicate stale DHT cache or phantom peers");
+                }
+                
                 discovered_peers.append(&mut peers);
             }
             Err(e) => {
@@ -3917,6 +3926,15 @@ async fn perform_dht_peer_discovery() -> Result<Vec<String>, String> {
     
     println!("[DHT] 📊 DHT discovery complete: {} initial peers, {} total after propagation", 
              initial_count, discovered_peers.len());
+    
+    // DIAGNOSTIC: Show final peer summary
+    if discovered_peers.len() > 8 {
+        println!("[DHT] ⚠️  DIAGNOSTIC: Unusually high peer count ({}) detected", discovered_peers.len());
+        println!("[DHT] ⚠️  Expected ~4-5 Genesis peers for current network");
+        println!("[DHT] ⚠️  This suggests stale DHT cache or connectivity issues");
+    } else {
+        println!("[DHT] ✅ DHT peer count looks normal for Genesis network: {}", discovered_peers.len());
+    }
     
     Ok(discovered_peers)
 }

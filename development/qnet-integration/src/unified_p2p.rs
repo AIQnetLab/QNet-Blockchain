@@ -789,12 +789,15 @@ impl SimplifiedP2P {
             }
         };
         
+        println!("[P2P] 🔍 DIAGNOSTIC: broadcast_block called for height {}", height);
+        println!("[P2P] 🔍 DIAGNOSTIC: connected peers count: {}", connected.len());
+        
         if connected.is_empty() {
-            // No peers - not an error in standalone mode
+            println!("[P2P] ⚠️ DIAGNOSTIC: No peers connected - block #{} not broadcasted", height);
             return Ok(());
         }
         
-        println!("[P2P] Broadcasting block #{} to {} peers", height, connected.len());
+        println!("[P2P] 📡 Broadcasting block #{} to {} peers", height, connected.len());
         
         // In production: Actually send block data to peers
         for peer in connected.iter() {
@@ -812,6 +815,7 @@ impl SimplifiedP2P {
                     data: block_data.clone(),
                     block_type: "micro".to_string(),
                 };
+                println!("[P2P] 🔍 DIAGNOSTIC: Sending block #{} to peer {} ({})", height, peer.id, peer.addr);
                 self.send_network_message(&peer.addr, block_msg);
                 println!("[P2P] → Sent block #{} to {} ({})", height, peer.id, peer.addr);
             }
@@ -904,7 +908,9 @@ impl SimplifiedP2P {
         
         // PRODUCTION: Use blocking HTTP client to avoid runtime conflicts
         let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(15)) // PRODUCTION: Reasonable timeout for peer queries
+            .timeout(Duration::from_secs(30)) // INCREASED: Extended timeout for international Genesis nodes
+            .connect_timeout(Duration::from_secs(15)) // Separate connection timeout
+            .tcp_keepalive(Duration::from_secs(30)) // Keep connections alive
             .build()
             .map_err(|e| format!("HTTP client error: {}", e))?;
         
@@ -917,7 +923,7 @@ impl SimplifiedP2P {
             current_time < QNET_GENESIS_TIMESTAMP + 600 // 10 minutes grace period
         };
         
-        let max_attempts = if is_genesis_startup { 6 } else { 3 };
+        let max_attempts = if is_genesis_startup { 10 } else { 3 }; // MORE attempts during Genesis
         let retry_delay = if is_genesis_startup { 2 } else { 1 };
         
         for attempt in 1..=max_attempts {
@@ -1843,13 +1849,22 @@ impl SimplifiedP2P {
         // Connect to primary region first - WITH REAL connectivity validation
         if let Some(peers) = regional_peers.get(&self.primary_region) {
             for peer in peers.iter().take(5) {  // Max 5 peers per region
-                // CRITICAL FIX: Check if this is Genesis bootstrap phase
+                // CRITICAL FIX: Check if this is Genesis bootstrap phase  
                 let is_genesis_startup = {
                     let current_time = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_secs();
-                    current_time < QNET_GENESIS_TIMESTAMP + 300 // 5 minutes after Genesis start
+                    let grace_period_end = QNET_GENESIS_TIMESTAMP + 600; // 10 minutes after Genesis start
+                    let is_startup = current_time < grace_period_end;
+                    
+                    // DIAGNOSTIC: Log timing details
+                    if is_startup {
+                        let remaining = grace_period_end - current_time;
+                        println!("[P2P] 🔍 DIAGNOSTIC: Genesis startup active - {} seconds remaining", remaining);
+                    }
+                    
+                    is_startup
                 };
                 
                 let ip = peer.addr.split(':').next().unwrap_or("");
@@ -1863,7 +1878,37 @@ impl SimplifiedP2P {
                     connected.push(peer.clone());
                     println!("[P2P] ✅ Added {} to connection pool from {:?} (REAL connection verified)", peer.id, peer.region);
                 } else {
+                    // DIAGNOSTIC: Log why peer was skipped
                     println!("[P2P] ❌ Skipped {} from {:?} (connection failed)", peer.id, peer.region);
+                    println!("[P2P] 🔍 DIAGNOSTIC: Genesis startup: {}, Genesis peer: {}", is_genesis_startup, is_genesis_peer);
+                }
+            }
+        }
+        
+        // CRITICAL GENESIS FIX: During Genesis startup, try to connect to ALL Genesis nodes regardless of region
+        let current_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let is_genesis_startup = current_time < QNET_GENESIS_TIMESTAMP + 600; // 10 minutes
+        
+        if is_genesis_startup {
+            println!("[P2P] 🌟 GENESIS MODE: Attempting to connect to all Genesis peers regardless of region");
+            
+            // Try all regions for Genesis peers
+            for (region, peers_in_region) in regional_peers.iter() {
+                for peer in peers_in_region.iter().take(5) {
+                    let ip = peer.addr.split(':').next().unwrap_or("");
+                    let is_genesis_peer = GENESIS_BOOTSTRAP_NODES.iter().any(|(genesis_ip, _)| *genesis_ip == ip);
+                    
+                    if is_genesis_peer {
+                        // Skip if already connected
+                        let already_connected = connected.iter().any(|p| p.addr == peer.addr);
+                        if !already_connected {
+                            connected.push(peer.clone());
+                            println!("[P2P] 🌟 Added Genesis peer {} from region {:?} (startup mode)", peer.addr, region);
+                        }
+                    }
                 }
             }
         }
@@ -2879,6 +2924,17 @@ impl SimplifiedP2P {
     /// Send network message via HTTP POST to peer's API
     fn send_network_message(&self, peer_addr: &str, message: NetworkMessage) {
         let peer_addr = peer_addr.to_string();
+        
+        // DIAGNOSTIC: Log message type being sent
+        let message_type = match &message {
+            NetworkMessage::Block { height, .. } => format!("Block #{}", height),
+            NetworkMessage::Transaction { .. } => "Transaction".to_string(),
+            NetworkMessage::ConsensusCommit { round_id, .. } => format!("ConsensusCommit round {}", round_id),
+            NetworkMessage::ConsensusReveal { round_id, .. } => format!("ConsensusReveal round {}", round_id),
+            _ => "Other".to_string(),
+        };
+        println!("[P2P] 🔍 DIAGNOSTIC: Sending {} to peer {}", message_type, peer_addr);
+        
         let message_json = match serde_json::to_value(&message) {
             Ok(json) => json,
             Err(e) => {
@@ -2909,9 +2965,12 @@ impl SimplifiedP2P {
             let urls = vec![
                 format!("http://{}:8001/api/v1/p2p/message", peer_ip),  // Primary API port (all nodes)
             ];
+            
+            println!("[P2P] 🔍 DIAGNOSTIC: Trying {} URLs for peer {}", urls.len(), peer_ip);
 
             let mut sent = false;
             for url in urls {
+                println!("[P2P] 🔍 DIAGNOSTIC: Attempting HTTP POST to {}", url);
                 // PRODUCTION: HTTP retry logic for real network reliability
                 for attempt in 1..=3 {
                     match client.post(&url)

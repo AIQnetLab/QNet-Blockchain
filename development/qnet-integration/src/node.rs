@@ -958,6 +958,9 @@ impl BlockchainNode {
                     
                     // Broadcast to network (full microblock for compatibility)
                     if let Some(p2p) = &unified_p2p {
+                        let peer_count = p2p.get_peer_count();
+                        println!("[P2P] 🔍 DIAGNOSTIC: About to broadcast block #{} - peer count: {}", microblock.height, peer_count);
+                        
                         let broadcast_data = if compression_enabled {
                             Self::compress_microblock_data(&microblock).unwrap_or_else(|_| {
                                 bincode::serialize(&microblock).unwrap_or_default()
@@ -967,9 +970,12 @@ impl BlockchainNode {
                         };
                         
                         let broadcast_size = broadcast_data.len();
+                        println!("[P2P] 🔍 DIAGNOSTIC: Calling broadcast_block for height {}", microblock.height);
                         let _ = p2p.broadcast_block(microblock.height, broadcast_data);
                         println!("[P2P] 📡 Broadcast microblock #{} to {} peers | Size: {} bytes", 
-                                 microblock.height, p2p.get_peer_count(), broadcast_size);
+                                 microblock.height, peer_count, broadcast_size);
+                    } else {
+                        println!("[P2P] ⚠️ DIAGNOSTIC: P2P system not available - cannot broadcast block #{}", microblock.height);
                     }
                     
                     // Remove processed transactions from mempool
