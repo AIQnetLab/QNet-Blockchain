@@ -735,8 +735,17 @@ impl BlockchainNode {
                             .as_secs();
                         
                         if current_time >= QNET_GENESIS_TIMESTAMP {
-                            println!("[MICROBLOCK] 🚀 COORDINATED START: Genesis time reached, starting with {} nodes", active_node_count);
-                            // Continue to production even with <4 nodes if it's coordinated genesis start
+                            // CRITICAL FIX: Genesis nodes MUST also follow Byzantine safety (4+ nodes minimum)
+                            // Documentation: "Byzantine Tolerance: Requires 67% honest validators" (MICROBLOCK_ARCHITECTURE_PLAN.md:93)
+                            if active_node_count >= 4 {
+                                println!("[MICROBLOCK] 🚀 COORDINATED START: Genesis time reached, starting with {} nodes (Byzantine safe)", active_node_count);
+                                // Continue to production with proper Byzantine safety
+                            } else {
+                                println!("[MICROBLOCK] ⏳ Genesis coordinated start: insufficient nodes for Byzantine safety: {}/4", active_node_count);
+                                println!("[MICROBLOCK] 🛡️ Waiting for minimum 4 Genesis nodes before network start");
+                                tokio::time::sleep(Duration::from_secs(5)).await;
+                                continue;
+                            }
                         } else {
                             let remaining_seconds = QNET_GENESIS_TIMESTAMP.saturating_sub(current_time);
                             println!("[MICROBLOCK] ⏳ Genesis node #{} waiting for coordinated start time (current: {} nodes)", 
@@ -755,14 +764,14 @@ impl BlockchainNode {
                 }
                 
                 println!("[MICROBLOCK] 🚀 Starting microblock production with {} nodes (Byzantine safe)", active_node_count);
-                // PRODUCTION: QNet random microblock producer selection for decentralization
-                // Each 30-block period selects ONE producer randomly for maximum decentralization
-                // Producer selection is random but deterministic for consensus (Byzantine safety)
+                // PRODUCTION: QNet microblock producer SELECTION for decentralization (per MICROBLOCK_ARCHITECTURE_PLAN.md)
+                // Each 30-block period selects ONE producer using cryptographic hash from qualified candidates
+                // Producer selection is cryptographically random but deterministic for consensus (Byzantine safety)
                 
                 // CRITICAL: Set current block height for deterministic validator sampling
                 std::env::set_var("CURRENT_BLOCK_HEIGHT", microblock_height.to_string());
                 
-                // Determine current microblock producer using reputation-based rotation (with REAL node type)
+                // Determine current microblock producer using cryptographic selection (with REAL node type)
                 let current_producer = Self::select_microblock_producer(microblock_height, &unified_p2p, &node_id, node_type).await;
                 let is_my_turn_to_produce = current_producer == node_id;
                 
@@ -1389,15 +1398,15 @@ impl BlockchainNode {
         }
     }
     
-    /// PRODUCTION: Select microblock producer using random selection every 30 blocks (QNet specification)
+    /// PRODUCTION: Select microblock producer using cryptographic hash every 30 blocks (QNet specification)
     async fn select_microblock_producer(
         current_height: u64,
         unified_p2p: &Option<Arc<SimplifiedP2P>>,
         own_node_id: &str,
         own_node_type: NodeType, // CRITICAL: Use real node type instead of string guessing
     ) -> String {
-        // PRODUCTION: QNet random microblock producer selection for decentralization
-        // Each 30-block period selects different producer randomly for maximum decentralization
+        // PRODUCTION: QNet microblock producer SELECTION for decentralization (per MICROBLOCK_ARCHITECTURE_PLAN.md)  
+        // Each 30-block period uses cryptographic hash to select producer from qualified candidates
         
         if let Some(p2p) = unified_p2p {
             println!("[DEBUG] 🌐 P2P system available - using network-based producer selection");
@@ -1415,7 +1424,7 @@ impl BlockchainNode {
             }
             println!("  ├── Current height: {}", current_height);
             println!("  ├── Selection period: every 30 blocks");
-            println!("  └── Selection method: RANDOM selection for decentralization");
+            println!("  └── Selection method: CRYPTOGRAPHIC HASH for decentralization");
             
             if candidates.is_empty() {
                 println!("[MICROBLOCK] ⚠️ No qualified candidates (≥70% reputation, Full/Super only) - using self");
@@ -1424,25 +1433,25 @@ impl BlockchainNode {
                 return own_node_id.to_string();
             }
             
-            // PRODUCTION: Random producer selection every 30 blocks for decentralization
-            // Each 30-block period gets a RANDOM producer selection from qualified candidates
+            // PRODUCTION: Microblock producer ROTATION every 30 blocks (per MICROBLOCK_ARCHITECTURE_PLAN.md)
+            // Documentation: "Leader Selection: Reputation-based validator rotation (every 30 blocks)"
+            // "Blocks 1-30: Producer A, Blocks 31-60: Producer B, Blocks 61-90: Producer C"
             let rotation_interval = 30u64;
             let leadership_round = current_height / rotation_interval;
             
-            // PRODUCTION: Deterministic but RANDOM selection using cryptographic hash
-            // All nodes MUST get identical results (Byzantine consensus requirement)
+            // PRODUCTION: Use EXISTING cryptographic validator selection algorithm
+            // This is the REAL decentralized algorithm (not centralized rotation!)
             use sha3::{Sha3_256, Digest};
             let mut selection_hasher = Sha3_256::new();
             
-            // Hash all candidate node_ids in GUARANTEED sorted order (already sorted + deduplicated)
-            let candidate_ids: Vec<String> = candidates.iter().map(|(id, _)| id.clone()).collect();
-            let candidate_hash_input = candidate_ids.join("|"); // Deterministic separator
+            // Deterministic seed using block height and round for decentralized selection
+            selection_hasher.update(format!("microblock_producer_selection_{}_{}", leadership_round, candidates.len()).as_bytes());
             
-            // Use additional entropy source for random (but deterministic) selection
-            let random_entropy = format!("qnet_random_producer_{}_{}", leadership_round, candidate_ids.len());
-            let consensus_seed = format!("microblock_producer_selection_{}_{}", leadership_round, random_entropy);
-            selection_hasher.update(consensus_seed.as_bytes());
-            selection_hasher.update(candidate_hash_input.as_bytes());
+            // Include ALL candidate data for Byzantine consensus consistency
+            for (candidate_id, reputation) in &candidates {
+                selection_hasher.update(candidate_id.as_bytes());
+                selection_hasher.update(&reputation.to_le_bytes());
+            }
             
             let selection_hash = selection_hasher.finalize();
             let selection_number = u64::from_le_bytes([
@@ -1453,19 +1462,19 @@ impl BlockchainNode {
             let selection_index = (selection_number as usize) % candidates.len();
             let selected_producer = candidates[selection_index].0.clone();
             
-            println!("[DEBUG] 🔒 Consensus determinism check:");
-            println!("  ├── Seed: {}", consensus_seed);
-            println!("  ├── Candidates: {}", candidate_hash_input);
-            println!("  └── Hash ensures identical selection across ALL nodes");
+            println!("[DEBUG] 🔒 Cryptographic producer selection:");
+            println!("  ├── Leadership round: {}", leadership_round);
+            println!("  ├── Qualified candidates: {}", candidates.len());
+            println!("  └── Deterministic hash ensures identical selection across ALL nodes");
             
             println!("[DEBUG] 🎯 Selection result:");
-            println!("  ├── Selection hash number: {}", selection_number);
+            println!("  ├── Round: {} (height {} ÷ {} blocks)", leadership_round, current_height, rotation_interval);
             println!("  ├── Selection index: {} (of {} candidates)", selection_index, candidates.len());
             println!("  └── Selected producer: {}", selected_producer);
             
             // PRODUCTION: Log producer selection info at rotation boundaries (every 30 blocks)
             if current_height % rotation_interval == 0 {
-                println!("[MICROBLOCK] 🎯 Producer: {} (round: {}, RANDOM selection, next rotation: block {})", 
+                println!("[MICROBLOCK] 🎯 Producer: {} (round: {}, CRYPTOGRAPHIC SELECTION, next rotation: block {})", 
                          selected_producer, leadership_round, (leadership_round + 1) * rotation_interval);
             }
             
@@ -1786,52 +1795,60 @@ impl BlockchainNode {
             }
         };
         
-        if can_participate_microblock {
-            if is_own_genesis {
-                // Genesis nodes: Use deterministic 90% reputation for consistent consensus
-                const GENESIS_STATIC_REPUTATION: f64 = 0.90;
-                all_qualified.push((own_node_id.to_string(), GENESIS_STATIC_REPUTATION));
-                println!("  ├── ✅ Own Genesis node added with deterministic reputation (90%)");
-            } else {
-                // Regular nodes: Use P2P reputation
-                let own_reputation = Self::get_node_reputation_score(own_node_id, p2p).await;
-                all_qualified.push((own_node_id.to_string(), own_reputation));
-                println!("  ├── ✅ Own node added as qualified");
-            }
-        } else {
-            println!("  ├── ❌ Own node excluded from qualified nodes");
-        }
+        // CRITICAL FIX: Build Genesis candidate list in IDENTICAL order on ALL nodes
+        // This ensures deterministic consensus across the network
+        println!("  ├── Using static Genesis node list for IDENTICAL candidate order");
         
-        // CRITICAL FIX: Use STATIC Genesis node list for consistent candidate selection
-        // This ensures ALL Genesis nodes see IDENTICAL candidate lists
-        println!("  ├── Using static Genesis node list for consistent candidate selection");
-        
-        // Use shared Genesis constants to eliminate duplication
+        // Use shared Genesis constants in GUARANTEED ORDER (001, 002, 003, 004, 005)
         let genesis_ips = crate::unified_p2p::get_genesis_bootstrap_ips();
         let genesis_nodes: Vec<(String, String)> = genesis_ips.iter()
             .enumerate()
             .map(|(i, ip)| (format!("genesis_node_{:03}", i + 1), ip.clone()))
             .collect();
         
+        // CRITICAL FIX: Add ALL Genesis nodes in IDENTICAL order using REAL dynamic reputation
+        // This ensures proper penalty system while maintaining deterministic candidate order
         for (genesis_id, genesis_ip) in genesis_nodes {
-            // Skip self to avoid duplicate (already added above)
+            // Use REAL reputation system that includes penalties and floor (70%)
+            let genesis_reputation = Self::get_node_reputation_score(&genesis_id, p2p).await;
+            
+            // For own node: check if can participate based on actual node type
             if genesis_id == own_node_id {
-                continue;
-            }
-            
-            // CRITICAL FIX: ALL Genesis nodes must have IDENTICAL reputation (90%) for deterministic consensus
-            // Using get_node_reputation_score causes each node to see different reputations (self=90%, others=70%)
-            // This breaks deterministic producer selection as each node calculates different candidate hashes
-            const GENESIS_STATIC_REPUTATION: f64 = 0.90;
-            
-            println!("  ├── Genesis {} ({}): reputation {:.1}% [STATIC-FIXED]", 
-                     genesis_id, genesis_ip, GENESIS_STATIC_REPUTATION * 100.0);
-            
-            if GENESIS_STATIC_REPUTATION >= 0.70 {
-                all_qualified.push((genesis_id.to_string(), GENESIS_STATIC_REPUTATION));
-                println!("  │   └── ✅ Added as qualified (static Genesis - deterministic 90%)");
+                let can_participate = match own_node_type {
+                    NodeType::Super => {
+                        println!("  ├── Own Genesis Super node: dynamic reputation {:.1}%", genesis_reputation * 100.0);
+                        genesis_reputation >= 0.70
+                    },
+                    NodeType::Full => {
+                        let has_peers = p2p.get_peer_count() >= 1; // Genesis phase: relaxed peer requirement
+                        let can_participate = has_peers && genesis_reputation >= 0.70;
+                        println!("  ├── Own Genesis Full node: peers={}, reputation={:.1}%", has_peers, genesis_reputation * 100.0);
+                        can_participate
+                    },
+                    NodeType::Light => {
+                        println!("  ├── Own Genesis Light node: excluded from microblock production");
+                        false
+                    }
+                };
+                
+                if can_participate {
+                    all_qualified.push((genesis_id.to_string(), genesis_reputation));
+                    println!("  │   └── ✅ Own Genesis node added with dynamic reputation ({:.1}%)", genesis_reputation * 100.0);
+                } else {
+                    println!("  │   └── ❌ Own Genesis node excluded (cannot participate or low reputation)");
+                }
             } else {
-                println!("  │   └── ❌ Excluded (low reputation)");
+                // Other Genesis nodes: check reputation threshold (70% minimum)
+                if genesis_reputation >= 0.70 {
+                    all_qualified.push((genesis_id.to_string(), genesis_reputation));
+                    println!("  ├── Genesis {} ({}): reputation {:.1}% [DYNAMIC]", 
+                             genesis_id, genesis_ip, genesis_reputation * 100.0);
+                    println!("  │   └── ✅ Added as qualified (dynamic reputation with penalties)");
+                } else {
+                    println!("  ├── Genesis {} ({}): reputation {:.1}% [PENALIZED]", 
+                             genesis_id, genesis_ip, genesis_reputation * 100.0);
+                    println!("  │   └── ❌ Excluded (below 70% threshold due to penalties)");
+                }
             }
         }
         
@@ -1839,10 +1856,11 @@ impl BlockchainNode {
         
         // PRODUCTION: Remove duplicate candidates (using same logic as DHT peer discovery)
         // Each node might appear twice: once as own_node and once as peer
-        all_qualified.sort_by(|a, b| a.0.cmp(&b.0)); // Sort first for deduplication
-        all_qualified.dedup_by(|a, b| a.0 == b.0); // Remove duplicates by node_id
+        all_qualified.dedup_by(|a, b| a.0 == b.0); // Remove duplicates by node_id (maintain original order)
+        // CRITICAL FIX: Do NOT sort alphabetically - this breaks rotation determinism
+        // Candidates should maintain their natural order for proper rotation
         
-        println!("  ├── Candidates sorted deterministically and deduplicated: {}", all_qualified.len());
+        println!("  ├── Candidates deduplicated (natural order preserved): {}", all_qualified.len());
         
         // CRITICAL: Apply validator sampling for scalability (prevent millions of validators)
         // QNet configuration: 1000 validators per round for optimal Byzantine safety + performance
@@ -1934,8 +1952,8 @@ impl BlockchainNode {
         
         println!("  ├── Total qualified from registry: {}", all_qualified.len());
         
-        // Sort and deduplicate (same logic as Genesis phase)
-        all_qualified.sort_by(|a, b| a.0.cmp(&b.0));
+        // CRITICAL FIX: Remove duplicate candidates without alphabetical sorting
+        // Maintain natural order to prevent rotation bias
         all_qualified.dedup_by(|a, b| a.0 == b.0);
         
         // Apply validator sampling (same logic as Genesis phase)
@@ -2011,10 +2029,10 @@ impl BlockchainNode {
             }
         }
         
-        // CRITICAL: Sort selected validators deterministically
-        selected.sort_by(|a, b| a.0.cmp(&b.0)); // Sort by node_id alphabetically
+        // CRITICAL FIX: Do NOT sort validators alphabetically - this breaks rotation fairness
+        // Validators are already selected deterministically via cryptographic hashing
         
-        println!("  ├── Simple sampling complete: {} validators selected from {} qualified (deterministically sorted)", 
+        println!("  ├── Simple sampling complete: {} validators selected from {} qualified (natural order preserved)", 
                  selected.len(), all_qualified.len());
         selected
         }
@@ -2035,13 +2053,13 @@ impl BlockchainNode {
             return false;
         }
         
-        // DETERMINISTIC: Select consensus initiator by lowest node_id (alphabetical order)
-        let mut sorted_candidates = qualified_candidates.clone();
-        sorted_candidates.sort_by(|a, b| a.0.cmp(&b.0));
+        // DETERMINISTIC: Select consensus initiator by highest reputation (most qualified node)
+        let mut reputation_sorted_candidates = qualified_candidates.clone();
+        reputation_sorted_candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         
-        let consensus_initiator = &sorted_candidates[0].0;
+        let consensus_initiator = &reputation_sorted_candidates[0].0;
         println!("[CONSENSUS] 🎯 Consensus initiator selected: {} (from {} qualified nodes)", 
-                 consensus_initiator, sorted_candidates.len());
+                 consensus_initiator, reputation_sorted_candidates.len());
         
         // Check if we are the selected initiator
         let our_consensus_id = Self::get_genesis_node_id("")

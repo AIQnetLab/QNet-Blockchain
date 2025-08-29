@@ -339,11 +339,27 @@ impl SimplifiedP2P {
                 };
                 
                 if !already_connected {
-                    // PRODUCTION: Validate peer connectivity before adding
-                    if self.is_peer_actually_connected(&peer_info.addr) {
-                        self.add_peer_to_region(peer_info.clone());
-                        
-                        // Add to connected peers only if actually reachable
+                    // CRITICAL FIX: During Genesis startup, use relaxed validation for peer addition
+                    let current_time = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    let is_genesis_startup = current_time < QNET_GENESIS_TIMESTAMP + 600; // 10 minutes
+                    let peer_ip = peer_info.addr.split(':').next().unwrap_or("");
+                    let is_genesis_peer = GENESIS_BOOTSTRAP_NODES.iter().any(|(genesis_ip, _)| *genesis_ip == peer_ip);
+                    
+                    // Use relaxed validation during Genesis startup for Genesis peers
+                    let should_add = if is_genesis_startup && is_genesis_peer {
+                        println!("[P2P] 🌟 Genesis startup: adding peer {} with relaxed validation", peer_info.addr);
+                        true
+                    } else {
+                        self.is_peer_actually_connected(&peer_info.addr)
+                    };
+                    
+                    if should_add {
+                    self.add_peer_to_region(peer_info.clone());
+                    
+                        // Add to connected peers
                         {
                             let mut connected = match self.connected_peers.lock() {
                                 Ok(peers) => peers,
@@ -352,11 +368,11 @@ impl SimplifiedP2P {
                                     poisoned.into_inner()
                                 }
                             };
-                            connected.push(peer_info.clone());
-                            new_connections += 1;
-                        }
-                        
-                        println!("[P2P] ✅ Validated and added peer: {}", peer_info.addr);
+                        connected.push(peer_info.clone());
+                        new_connections += 1;
+                    }
+                    
+                        println!("[P2P] ✅ Added peer: {}", peer_info.addr);
                     } else {
                         println!("[P2P] ❌ Peer {} is not reachable, skipping", peer_info.addr);
                     }
@@ -468,9 +484,9 @@ impl SimplifiedP2P {
             
             let mut discovered_peers = Vec::new();
             
-            // PRODUCTION FIX: Always use genesis nodes + optional manual override
-            let mut known_node_ips = Vec::new();
-            
+                         // PRODUCTION FIX: Always use genesis nodes + optional manual override
+             let mut known_node_ips = Vec::new();
+             
             // PRIORITY 1: Include ONLY WORKING genesis bootstrap nodes for network stability
              
              for ip in working_genesis_ips {
@@ -627,7 +643,7 @@ impl SimplifiedP2P {
                 for peer in discovered_peers.clone() {
                     // CRITICAL FIX: Real connectivity check using static method (lifetime-safe)
                     if Self::test_peer_connectivity_static(&peer.addr) {
-                        connected.push(peer.clone());
+                    connected.push(peer.clone());
                         println!("[P2P] ✅ Connected to internet peer: {} (REAL connection verified)", peer.id);
                     } else {
                         println!("[P2P] ❌ Skipped internet peer: {} (connection failed)", peer.id);
@@ -781,26 +797,24 @@ impl SimplifiedP2P {
     
     /// Broadcast block data
     pub fn broadcast_block(&self, height: u64, block_data: Vec<u8>) -> Result<(), String> {
-        let connected = match self.connected_peers.lock() {
-            Ok(peers) => peers,
-            Err(poisoned) => {
-                println!("[P2P] ⚠️ Connected peers mutex poisoned during block broadcast");
-                poisoned.into_inner()
-            }
-        };
+        // CRITICAL FIX: Use validated active peers instead of raw connected_peers list
+        // This ensures we broadcast to all REAL peers, not phantom ones
+        let validated_peers = self.get_validated_active_peers_internal();
+        
+        println!("[P2P] 🔍 DIAGNOSTIC: Using validated peers for broadcast (phantom peer fix)");
+        println!("[P2P] 🔍 DIAGNOSTIC: validated peer count: {}", validated_peers.len());
         
         println!("[P2P] 🔍 DIAGNOSTIC: broadcast_block called for height {}", height);
-        println!("[P2P] 🔍 DIAGNOSTIC: connected peers count: {}", connected.len());
         
-        if connected.is_empty() {
-            println!("[P2P] ⚠️ DIAGNOSTIC: No peers connected - block #{} not broadcasted", height);
+        if validated_peers.is_empty() {
+            println!("[P2P] ⚠️ DIAGNOSTIC: No validated peers available - block #{} not broadcasted", height);
             return Ok(());
         }
         
-        println!("[P2P] 📡 Broadcasting block #{} to {} peers", height, connected.len());
+        println!("[P2P] 📡 Broadcasting block #{} to {} validated peers", height, validated_peers.len());
         
         // In production: Actually send block data to peers
-        for peer in connected.iter() {
+        for peer in validated_peers.iter() {
             // Filter by node type for efficiency
             let should_send = match (&self.node_type, &peer.node_type) {
                 (NodeType::Light, _) => false,  // Light nodes don't broadcast
@@ -933,7 +947,7 @@ impl SimplifiedP2P {
                         Ok(json) => {
                             if let Some(height) = json.get("height").and_then(|h| h.as_u64()) {
                                 return Ok(height);
-                            } else {
+                                    } else {
                                 return Err("Invalid height format in response".to_string());
                             }
                         }
@@ -1569,14 +1583,19 @@ impl SimplifiedP2P {
         }
     }
     
-    /// PRODUCTION: Get discovery peers for DHT/API (includes all parsed peers)
+    /// PRODUCTION: Get discovery peers for DHT/API (VALIDATED peers only to prevent phantom peers)
     pub fn get_discovery_peers(&self) -> Vec<PeerInfo> {
         match self.connected_peers.lock() {
             Ok(peers) => {
-                // Return ALL parsed peers for network discovery (DHT, API, peer exchange)
-                // No strict validation - allows network growth
-                println!("[P2P] 📡 Discovery peers available: {} (for DHT/API)", peers.len());
-                peers.clone()
+                // CRITICAL FIX: Return only VALIDATED peers to prevent phantom peer counts in DHT
+                // This fixes the "6 peers reported but only 4 nodes running" problem
+                let validated_peers: Vec<PeerInfo> = peers.iter()
+                    .filter(|peer| self.is_peer_actually_connected(&peer.addr))
+                    .cloned()
+                    .collect();
+                
+                println!("[P2P] 📡 Discovery peers available: {} validated (DHT phantom peer fix)", validated_peers.len());
+                validated_peers
             }
             Err(e) => {
                 println!("[P2P] ⚠️ Failed to get discovery peers: {}", e);
@@ -1780,9 +1799,11 @@ impl SimplifiedP2P {
             return Err(format!("Invalid port in address: {}", addr));
         }
         
+        // Extract IP for region and node type detection
+        let ip = peer_addr.split(':').next().unwrap_or("");
+        
         // PRODUCTION: Get correct region from Genesis mapping or auto-detect
         let correct_region = {
-            let ip = peer_addr.split(':').next().unwrap_or("");
             GENESIS_BOOTSTRAP_NODES.iter()
                 .find(|(genesis_ip, _)| *genesis_ip == ip)
                 .map(|(_, region_name)| match *region_name {
@@ -1797,10 +1818,20 @@ impl SimplifiedP2P {
                 .unwrap_or(self.region.clone())
         };
         
+        // CRITICAL FIX: Only Genesis nodes can be auto-detected as Super
+        // Regular Super nodes must be detected through other means (API, environment, etc.)
+        let correct_node_type = if GENESIS_BOOTSTRAP_NODES.iter().any(|(genesis_ip, _)| *genesis_ip == ip) {
+            NodeType::Super  // All Genesis nodes are Super nodes  
+        } else {
+            // For non-Genesis peers, we cannot assume node type
+            // They could be Full OR Super - would need API query to determine
+            NodeType::Full   // Default assumption (can be upgraded later via API discovery)
+        };
+        
         Ok(PeerInfo {
             id: peer_id,
             addr: peer_addr,
-            node_type: NodeType::Full,  // Assume Full by default
+            node_type: correct_node_type,
             region: correct_region,  // FIXED: Use correct Genesis region mapping
             last_seen: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1848,31 +1879,24 @@ impl SimplifiedP2P {
         
         // Connect to primary region first - WITH REAL connectivity validation
         if let Some(peers) = regional_peers.get(&self.primary_region) {
-            for peer in peers.iter().take(5) {  // Max 5 peers per region
-                // CRITICAL FIX: Check if this is Genesis bootstrap phase  
-                let is_genesis_startup = {
-                    let current_time = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-                    let grace_period_end = QNET_GENESIS_TIMESTAMP + 600; // 10 minutes after Genesis start
-                    let is_startup = current_time < grace_period_end;
-                    
-                    // DIAGNOSTIC: Log timing details
-                    if is_startup {
-                        let remaining = grace_period_end - current_time;
-                        println!("[P2P] 🔍 DIAGNOSTIC: Genesis startup active - {} seconds remaining", remaining);
-                    }
-                    
-                    is_startup
-                };
+            // Check Genesis startup phase for connection limits
+            let current_time = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let is_genesis_startup = current_time < QNET_GENESIS_TIMESTAMP + 600; // 10 minutes
+            
+            // CRITICAL FIX: During Genesis startup, connect to ALL peers in region (no 5-peer limit)
+            let peer_limit = if is_genesis_startup { peers.len() } else { 5 };
+            for peer in peers.iter().take(peer_limit) {
+                // Use previously defined is_genesis_startup variable
                 
                 let ip = peer.addr.split(':').next().unwrap_or("");
                 let is_genesis_peer = GENESIS_BOOTSTRAP_NODES.iter().any(|(genesis_ip, _)| *genesis_ip == ip);
                 
                 // CRITICAL FIX: For Genesis peers during startup, use relaxed validation
                 if is_genesis_startup && is_genesis_peer {
-                    connected.push(peer.clone());
+                connected.push(peer.clone());
                     println!("[P2P] ✅ Added Genesis {} during startup (bootstrap connectivity)", peer.addr);
                 } else if self.is_peer_actually_connected(&peer.addr) {
                     connected.push(peer.clone());
@@ -1915,25 +1939,27 @@ impl SimplifiedP2P {
         
         // If not enough peers, try backup regions - WITH REAL connectivity validation
         if connected.len() < 3 {
-            // CRITICAL FIX: Check Genesis startup phase for backup regions too
-            let is_genesis_startup = {
-                let current_time = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                current_time < QNET_GENESIS_TIMESTAMP + 300 // 5 minutes after Genesis start
-            };
+            // Check Genesis startup phase for backup regions too
+            let current_time = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let is_genesis_startup = current_time < QNET_GENESIS_TIMESTAMP + 600; // 10 minutes (unified grace period)
             
             for backup_region in &self.backup_regions {
                 if let Some(peers) = regional_peers.get(backup_region) {
-                    for peer in peers.iter().take(2) {  // Max 2 from backup regions
-                        if connected.len() < 5 {
+                    // CRITICAL FIX: During Genesis startup, connect to ALL backup peers (no 2-peer limit)
+                    let backup_limit = if is_genesis_startup { peers.len() } else { 2 };
+                    for peer in peers.iter().take(backup_limit) {
+                        // CRITICAL FIX: During Genesis startup, remove connection limit (need full mesh)
+                        let should_connect = if is_genesis_startup { true } else { connected.len() < 5 };
+                        if should_connect {
                             let ip = peer.addr.split(':').next().unwrap_or("");
                             let is_genesis_peer = GENESIS_BOOTSTRAP_NODES.iter().any(|(genesis_ip, _)| *genesis_ip == ip);
                             
                             // CRITICAL FIX: For Genesis peers during startup, use relaxed validation
                             if is_genesis_startup && is_genesis_peer {
-                                connected.push(peer.clone());
+                            connected.push(peer.clone());
                                 println!("[P2P] ✅ Added Genesis backup {} during startup (bootstrap connectivity)", peer.addr);
                             } else if self.is_peer_actually_connected(&peer.addr) {
                                 connected.push(peer.clone());
@@ -1941,7 +1967,7 @@ impl SimplifiedP2P {
                                          peer.id, peer.region);
                             } else {
                                 println!("[P2P] ❌ Skipped backup peer {} from {:?} (connection failed)", 
-                                         peer.id, peer.region);
+                                     peer.id, peer.region);
                             }
                         }
                     }
