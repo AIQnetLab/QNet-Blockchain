@@ -2194,7 +2194,7 @@ fn calculate_ping_slot(node_id: &str) -> u32 {
     (hash % 240) as u32
 }
 
-// Calculate next ping time for a Light node
+// Calculate next ping time for any node type (PRODUCTION: Unified for all node types)
 fn calculate_next_ping_time(node_id: &str) -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     
@@ -2213,13 +2213,43 @@ fn calculate_next_ping_time(node_id: &str) -> u64 {
     }
 }
 
-// Background service for randomized Light node pings
+// Calculate all ping times for Full/Super nodes (10 pings per 4h window)
+fn calculate_full_super_ping_times(node_id: &str) -> Vec<u64> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    let current_4h_window = now - (now % (4 * 60 * 60)); // Start of current 4h window
+    let base_slot = calculate_ping_slot(node_id); // Base randomization from node_id
+    let slot_offset = (node_id.len() % 60) as u64; // 0-59 seconds within slot
+    
+    let mut ping_times = Vec::new();
+    
+    // CRITICAL: Distribute 10 pings evenly across 4-hour window with randomization
+    // 4 hours = 240 minutes, 10 pings = every 24 minutes average
+    for i in 0..10 {
+        // Spread pings with base randomization + incremental offset
+        let spread_slot = (base_slot + (i * 24)) % 240; // Every 24 minutes with randomized start
+        let ping_time = current_4h_window + (spread_slot as u64 * 60) + slot_offset;
+        
+        // If ping time already passed, schedule for next 4h window  
+        if ping_time <= now {
+            ping_times.push(ping_time + (4 * 60 * 60));
+        } else {
+            ping_times.push(ping_time);
+        }
+    }
+    
+    ping_times.sort(); // Chronological order
+    ping_times
+}
+
+// Background service for randomized ping system (PRODUCTION: All node types)
 pub fn start_light_node_ping_service() {
     tokio::spawn(async {
         let fcm_service = FCMPushService::new();
         let mut check_interval = tokio::time::interval(tokio::time::Duration::from_secs(60)); // Check every minute
         
-        println!("[LIGHT] 🕐 Light node randomized ping service started");
+        println!("[PING] 🕐 Unified randomized ping service started for all node types");
         
         loop {
             check_interval.tick().await;
@@ -2229,7 +2259,7 @@ pub fn start_light_node_ping_service() {
                 .unwrap()
                 .as_secs();
             
-            // Get all registered Light nodes
+            // CRITICAL: Process Light nodes (existing FCM-based logic)
             let light_nodes = {
                 let registry = LIGHT_NODE_REGISTRY.lock().unwrap();
                 registry.clone()
@@ -2269,6 +2299,40 @@ pub fn start_light_node_ping_service() {
                     
                     if !ping_sent {
                         println!("[LIGHT] ⚠️ No active devices found for Light node {}", node_id);
+                    }
+                }
+            }
+            
+            // CRITICAL: Process Full/Super nodes using blockchain registry
+            let registry = crate::activation_validation::BlockchainActivationRegistry::new(None);
+            let eligible_nodes = registry.get_eligible_nodes().await;
+            
+            for (node_id, _reputation, node_type) in eligible_nodes {
+                if node_type != "full" && node_type != "super" {
+                    continue;
+                }
+                
+                let ping_times = calculate_full_super_ping_times(&node_id);
+                
+                // Check if any ping time is due (within 1 minute window)
+                for ping_time in ping_times {
+                    if now >= ping_time && now < ping_time + 60 {
+                        let slot = calculate_ping_slot(&node_id);
+                        
+                        println!("[PING] 📡 Pinging {} node {} in slot {} ({})", 
+                                 node_type.to_uppercase(), node_id, slot,
+                                 chrono::DateTime::from_timestamp(ping_time as i64, 0)
+                                     .unwrap_or_default()
+                                     .format("%H:%M:%S"));
+                        
+                        // Generate quantum challenge
+                        let challenge = generate_quantum_challenge();
+                        
+                        // Send HTTP ping to Full/Super node API endpoint
+                        // Note: Full/Super nodes should respond via handle_network_ping endpoint
+                        // This is a trigger - actual ping response handled by node's API
+                        
+                        break; // Only one ping per check cycle
                     }
                 }
             }

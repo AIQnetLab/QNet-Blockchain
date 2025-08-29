@@ -42,13 +42,13 @@ impl PingRequirements {
                 timeout_seconds: 60,         // 60 seconds to respond
             },
             NodeType::Full => Self {
-                pings_per_4h_window: 60,     // 60 pings per 4 hours (every 4 minutes)
-                success_rate_threshold: 0.95, // 95% (57+ out of 60)
+                pings_per_4h_window: 10,     // 10 pings per 4 hours (every 24 minutes) - REDUCED for scalability
+                success_rate_threshold: 0.8, // 80% (8+ out of 10) - ADJUSTED for new ping count
                 timeout_seconds: 30,         // 30 seconds to respond
             },
             NodeType::Super => Self {
-                pings_per_4h_window: 60,     // 60 pings per 4 hours (every 4 minutes)
-                success_rate_threshold: 0.98, // 98% (59+ out of 60)
+                pings_per_4h_window: 10,     // 10 pings per 4 hours (every 24 minutes) - REDUCED for scalability
+                success_rate_threshold: 0.9, // 90% (9+ out of 10) - ADJUSTED for new ping count  
                 timeout_seconds: 30,         // 30 seconds to respond
             },
         }

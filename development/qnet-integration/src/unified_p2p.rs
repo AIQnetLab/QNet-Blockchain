@@ -1528,24 +1528,23 @@ impl SimplifiedP2P {
             .unwrap_or_default()
             .as_secs();
         
-        let is_startup_phase = current_time < QNET_GENESIS_TIMESTAMP + 300; // 5 minutes grace period
+        let is_startup_phase = current_time < QNET_GENESIS_TIMESTAMP + 600; // 10 minutes grace period (UNIFIED)
         
         if is_genesis {
-            // CRITICAL FIX: Use REAL connectivity check for Genesis nodes
-            // But allow grace period during startup
-            match self.query_peer_height(peer_addr) {
-                Ok(_height) => {
-                    println!("[P2P] ✅ Genesis peer {} - REAL connection verified", peer_addr);
-                    true
-                }
-                Err(e) => {
-                    if is_startup_phase {
-                        println!("[P2P] ⏳ Genesis peer {} - startup grace period, assuming connected ({})", peer_addr, e);
-                        true // Allow during startup
-                    } else {
-                        println!("[P2P] ❌ Genesis peer {} - connection failed, excluding from consensus", peer_addr);
-                        false
-                    }
+            // CRITICAL FIX: Use FAST TCP connectivity check instead of slow HTTP
+            // Use existing test_peer_connectivity_static() method for 2-second validation
+            let is_connected = Self::test_peer_connectivity_static(peer_addr);
+            
+            if is_connected {
+                println!("[P2P] ✅ Genesis peer {} - FAST TCP connection verified", peer_addr);
+                true
+            } else {
+                if is_startup_phase {
+                    println!("[P2P] ⏳ Genesis peer {} - startup grace period, assuming connected", peer_addr);
+                    true // Allow during startup
+                } else {
+                    println!("[P2P] ❌ Genesis peer {} - TCP connection failed, excluding from consensus", peer_addr);
+                    false
                 }
             }
         } else {
@@ -1606,16 +1605,49 @@ impl SimplifiedP2P {
     
     /// PRODUCTION: Get validated active peers for consensus participation (NODE TYPE AWARE)
     pub fn get_validated_active_peers(&self) -> Vec<PeerInfo> {
-        // CRITICAL FIX: Cache for 30 seconds to ensure consistency across nodes
-        let cache_key = format!("{}_{}", 
-                               std::env::var("QNET_BOOTSTRAP_ID").unwrap_or_else(|_| "regular".to_string()),
-                               self.get_peer_count());
+        // CRITICAL FIX: Light nodes DO NOT participate in consensus - return empty list
+        // Only Full and Super nodes need validated peers for consensus/emergency producer selection
+        match self.node_type {
+            NodeType::Light => {
+                println!("[P2P] 📱 Light node: no consensus participation, returning empty peer list");
+                return Vec::new(); // Light nodes don't participate in consensus
+            },
+            _ => {} // Continue with Full/Super node logic
+        }
+        
+        // CRITICAL FIX: Validation frequency depends on node type for millions-scale deployment  
+        // Per NETWORK_LOAD_ANALYSIS.md: Full=10s, Super=3s for optimal performance
+        let validation_interval = match self.node_type {
+            NodeType::Super => Duration::from_secs(3),   // Super: Fast validation (consensus critical)
+            NodeType::Full => Duration::from_secs(10),   // Full: Medium validation (regional participation)  
+            NodeType::Light => unreachable!(),           // Already handled above
+        };
+        
+        // CRITICAL FIX: Cache with topology-aware key to prevent stale cache on topology changes
+        let (peer_count, cache_key) = {
+            let connected_peers = self.connected_peers.lock().unwrap();
+            let mut peer_addrs: Vec<String> = connected_peers.iter()
+                .map(|peer| peer.addr.clone())
+                .collect();
+            peer_addrs.sort(); // Deterministic order for consistent hashing
+            
+            // Create topology signature from sorted peer addresses
+            let peer_topology = peer_addrs.join("|");
+            let peer_topology_hash = format!("{:x}", peer_topology.len() + peer_addrs.len());
+            
+            let cache_key = format!("{}_{}_{}", 
+                                   std::env::var("QNET_BOOTSTRAP_ID").unwrap_or_else(|_| "regular".to_string()),
+                                   connected_peers.len(),
+                                   peer_topology_hash);
+            
+            (connected_peers.len(), cache_key)
+        }; // Release lock before cache operations
         
         if let Ok(mut cached) = CACHED_PEERS.lock() {
             let now = Instant::now();
             
-            // Use cache if valid (30 seconds) and key matches
-            if now.duration_since(cached.1) < Duration::from_secs(30) && cached.2 == cache_key {
+            // Use cache if valid (node-type-specific interval) and key matches
+            if now.duration_since(cached.1) < validation_interval && cached.2 == cache_key {
                 println!("[P2P] 📋 Using cached peer list ({} peers, cache age: {}s)", 
                          cached.0.len(), now.duration_since(cached.1).as_secs());
                 return cached.0.clone();
@@ -2257,8 +2289,17 @@ impl SimplifiedP2P {
             // Quick TCP connection test with 2-second timeout
             match TcpStream::connect_timeout(&socket_addr, Duration::from_secs(2)) {
                 Ok(_) => {
-                    println!("[P2P] 🔍 Connectivity test PASSED for {}", peer_addr);
-                    true
+                    // API READINESS CHECK: Verify API server is ready, not just TCP port open
+                    // Try a quick HTTP health check to avoid race conditions
+                    let api_ready = Self::check_api_readiness_static(ip);
+                    
+                    if api_ready {
+                        println!("[P2P] 🔍 Connectivity & API test PASSED for {}", peer_addr);
+                        true
+                    } else {
+                        println!("[P2P] 🔍 TCP OK but API not ready for {}", peer_addr);
+                        false
+                    }
                 }
                 Err(_) => {
                     println!("[P2P] 🔍 Connectivity test FAILED for {}", peer_addr);
@@ -2268,6 +2309,31 @@ impl SimplifiedP2P {
         } else {
             println!("[P2P] 🔍 Invalid address format: {}", peer_addr);
             false
+        }
+    }
+    
+    /// Check if API server is ready (lightweight check for race condition prevention)
+    fn check_api_readiness_static(ip: &str) -> bool {
+        use std::time::Duration;
+        
+        // Quick check for API readiness with short timeout
+        let client = match reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(1)) // Very short timeout for readiness check
+            .connect_timeout(Duration::from_secs(1))
+            .build() {
+            Ok(client) => client,
+            Err(_) => return false,
+        };
+        
+        let url = format!("http://{}:8001/api/v1/status", ip);
+        
+        // Try to get a simple status response
+        match client.get(&url).send() {
+            Ok(response) => {
+                let is_ready = response.status().is_success() || response.status() == reqwest::StatusCode::NOT_FOUND;
+                is_ready // API is ready if we get any valid HTTP response
+            }
+            Err(_) => false, // API not ready yet
         }
     }
     

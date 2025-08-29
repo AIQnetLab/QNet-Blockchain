@@ -244,13 +244,13 @@ The network-initiated ping system works as follows:
 - 🔒 **Privacy**: IP/tokens hashed - no personal data collection
 
 🖥️ **FULL/SUPER NODES (Server Only)**:
-- 🎯 **Direct server pings**: Network pings server HTTP endpoint every 4 minutes
+- 🎯 **Direct server pings**: Network pings server HTTP endpoint every 24 minutes
 - ⚡ **30-second response window**: Server has 30 seconds to respond  
-- 🔄 **95%/98% success rate**: 57+/59+ out of 60 pings in current 4-hour window
+- 🔄 **80%/90% success rate**: 8+/9+ out of 10 pings in current 4-hour window
 - 🖥️ **Server infrastructure**: Dedicated server with HTTP ping endpoint
 - 📱 **Mobile monitoring**: UNLIMITED mobile devices for monitoring only
 - 🚫 **No mobile pings**: Full/Super nodes NEVER pinged through mobile devices
-- 📊 **Ping frequency**: 60 times per 4-hour reward window (every 4 minutes)
+- 📊 **Ping frequency**: 10 times per 4-hour reward window (every 24 minutes)
 - 🧹 **Auto-cleanup**: Monitoring devices cleaned up automatically
 - 🔒 **Privacy**: All device data hashed for compliance
 

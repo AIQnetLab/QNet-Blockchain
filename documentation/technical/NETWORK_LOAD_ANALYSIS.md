@@ -5,7 +5,7 @@
 ### 1. Ping System Load
 
 #### Current Design
-- Nodes must ping once every 4 hours
+- Light nodes must ping once every 4 hours, Full/Super nodes ping 10 times every 4 hours
 - Rewards distributed every 4 hours
 - All nodes ping to claim rewards
 

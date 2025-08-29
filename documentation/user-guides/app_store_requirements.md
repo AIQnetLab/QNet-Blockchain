@@ -276,8 +276,8 @@ without the energy consumption of traditional mining.
 ### **Server Full/Super Nodes (Mobile Apps for Monitoring Only)**
 ```
 🖥️ What gets pinged: Dedicated servers (NOT mobile apps)
-🖥️ Success rate: 95%/98% (57+/59+ out of 60 pings in current 4-hour window)
-🖥️ Ping mechanism: Direct HTTP pings to server endpoints every 4 minutes
+🖥️ Success rate: 80%/90% (8+/9+ out of 10 pings in current 4-hour window)
+🖥️ Ping mechanism: Direct HTTP pings to server endpoints every 24 minutes
 📱 Mobile devices: UNLIMITED quantity for monitoring server node status
 📱 Mobile functionality: View balances, rewards, server performance metrics
 🖥️ No mobile pings: Server handles pings, mobile only monitors
