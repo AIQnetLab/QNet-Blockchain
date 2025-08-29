@@ -771,15 +771,24 @@ impl BlockchainNode {
                             .as_secs();
                         
                         if current_time >= QNET_GENESIS_TIMESTAMP {
-                            // DEADLOCK FIX: Allow selected producer to start even with <4 nodes
-                            // Microblocks only need producer signature, not full consensus
-                            if is_selected_producer {
-                                println!("[MICROBLOCK] 🎯 PRODUCER OVERRIDE: Starting as selected producer with {} nodes (microblock production only)", active_node_count);
+                            // CONSERVATIVE PRODUCER OVERRIDE: Allow selected producer to start ONLY after grace period
+                            // This prevents premature block creation with insufficient network connectivity
+                            let grace_period_seconds = 300; // 5 minutes grace period for network formation
+                            let network_ready_time = QNET_GENESIS_TIMESTAMP + grace_period_seconds;
+                            
+                            if is_selected_producer && current_time >= network_ready_time {
+                                println!("[MICROBLOCK] 🎯 PRODUCER OVERRIDE: Starting as selected producer with {} nodes (after {}min grace period)", active_node_count, grace_period_seconds / 60);
                                 println!("[MICROBLOCK] ⚡ Producer can create blocks without full Byzantine consensus for microblocks");
-                                // Continue to production - producer can work with reduced nodes
+                                // Continue to production - producer can work with reduced nodes after grace period
                             } else if active_node_count >= 4 {
                                 println!("[MICROBLOCK] 🚀 COORDINATED START: Genesis time reached, starting with {} nodes (Byzantine safe)", active_node_count);
                                 // Continue to production with proper Byzantine safety
+                            } else if is_selected_producer {
+                                let remaining_grace = network_ready_time.saturating_sub(current_time);
+                                println!("[MICROBLOCK] ⏳ Producer waiting for grace period: {}s remaining before override allowed", remaining_grace);
+                                println!("[MICROBLOCK] 🛡️ Grace period prevents premature block creation with insufficient network");
+                                tokio::time::sleep(Duration::from_secs(5)).await;
+                                continue;
                             } else {
                                 println!("[MICROBLOCK] ⏳ Genesis coordinated start: insufficient nodes for Byzantine safety: {}/4", active_node_count);
                                 println!("[MICROBLOCK] 🛡️ Waiting for minimum 4 Genesis nodes before network start (not producer)");
@@ -1392,38 +1401,20 @@ impl BlockchainNode {
     async fn initialize_genesis_reputations(p2p: &SimplifiedP2P) {
         println!("[REPUTATION] 🔐 Initializing ACTIVE Genesis node reputations...");
         
-        // PRODUCTION: Wait briefly for P2P discovery to find active Genesis nodes
-        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+        // CRITICAL FIX: Initialize ALL Genesis nodes deterministically regardless of discovery status
+        // This ensures consistent candidate lists across all nodes for Byzantine consensus
+        let genesis_ips = crate::unified_p2p::get_genesis_bootstrap_ips();
         
-        // Get currently active peers from P2P discovery
-        let active_peers = p2p.get_validated_active_peers();
-        let mut genesis_nodes_found = 0;
-        
-        println!("[REPUTATION] 🔍 Scanning {} active peers for Genesis nodes", active_peers.len());
-        
-        for peer in active_peers {
-            let peer_ip = peer.addr.split(':').next().unwrap_or(&peer.addr);
+        for (i, _genesis_ip) in genesis_ips.iter().enumerate() {
+            let genesis_id = format!("genesis_node_{:03}", i + 1);
             
-            // Check if this peer is a Genesis node using IP mapping
-            if let Some(genesis_id_suffix) = crate::genesis_constants::get_genesis_id_by_ip(peer_ip) {
-                let genesis_id = format!("genesis_node_{}", genesis_id_suffix);
-                
-                println!("[DIAGNOSTIC] 🔧 Setting reputation for Genesis node: {} -> 90.0", genesis_id);
-                // Set reputation only for DISCOVERED Genesis nodes
-                p2p.set_node_reputation(&genesis_id, 90.0);
-                
-                let final_reputation = match p2p.get_reputation_system().lock() {
-                    Ok(reputation) => reputation.get_reputation(&genesis_id),
-                    Err(_) => 90.0,
-                };
-                
-                println!("[REPUTATION] 🔐 ACTIVE Genesis {} set to {}% reputation ({})", 
-                         genesis_id, final_reputation, peer.addr);
-                genesis_nodes_found += 1;
-            }
+            // Set 90% reputation for ALL Genesis nodes on ALL nodes
+            p2p.set_node_reputation(&genesis_id, 90.0);
+            
+            println!("[REPUTATION] 🔐 Genesis {} initialized to 90% reputation (deterministic)", genesis_id);
         }
         
-        println!("[REPUTATION] ✅ Initialized {} ACTIVE Genesis nodes (no phantom reputation)", genesis_nodes_found);
+        println!("[REPUTATION] ✅ All 5 Genesis nodes initialized with 90% reputation on ALL nodes");
         
         // CRITICAL FIX: Set own Genesis reputation to 90%
         if let Ok(bootstrap_id) = std::env::var("QNET_BOOTSTRAP_ID") {
