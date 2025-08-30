@@ -715,27 +715,34 @@ impl BlockchainNode {
                 // CRITICAL FIX: Use network-wide consensus instead of asymmetric peer counting
                 // Each node was seeing different peer counts causing deadlock
                 let active_node_count = if let Some(p2p) = &unified_p2p {
-                    // Try to get network-wide consensus on active Genesis nodes count
-                    let local_peers = p2p.get_validated_active_peers().len();
-                    let genesis_nodes_online = std::cmp::min(local_peers + 1, 5); // Max 5 Genesis nodes
+                    // CRITICAL FIX: Use phase-aware node counting for consistent startup
+                    // During Genesis phase, use deterministic counting instead of unreliable P2P discovery
                     
-                    // CONSENSUS FIX: Use actual Genesis node availability from network
-                    // If we can't determine exact count, use conservative approach
-                    if genesis_nodes_online >= 4 {
-                        genesis_nodes_online // Use network consensus
-                    } else {
-                        // During startup, check if we should wait or proceed based on time
+                    let is_genesis_phase = Self::is_genesis_bootstrap_phase(p2p).await;
+                    
+                    if is_genesis_phase {
+                        // Genesis phase: Use deterministic Genesis node counting
+                        // Count actual Genesis nodes that should be running based on time
                         let current_time = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_secs();
                         
-                        if current_time >= QNET_GENESIS_TIMESTAMP + 180 { // 3 minutes after start
-                            // Force start with available nodes after grace period
-                            std::cmp::max(genesis_nodes_online, 1)
+                        if current_time >= QNET_GENESIS_TIMESTAMP + 600 { // 10 minutes after Genesis
+                            // After grace period: assume all 5 Genesis nodes should be active
+                            5
+                        } else if current_time >= QNET_GENESIS_TIMESTAMP + 300 { // 5 minutes after Genesis
+                            // Mid grace period: assume 4 Genesis nodes active for Byzantine safety
+                            4
                         } else {
-                            genesis_nodes_online
+                            // Early startup: use conservative P2P discovery
+                            let local_peers = p2p.get_validated_active_peers().len();
+                            std::cmp::min(local_peers + 1, 5)
                         }
+                    } else {
+                        // Normal phase: Use actual P2P peer discovery
+                        let local_peers = p2p.get_validated_active_peers().len();
+                        std::cmp::min(local_peers + 1, 1000) // Scale to network size
                     }
                 } else {
                     1 // Solo mode
@@ -1283,6 +1290,13 @@ impl BlockchainNode {
                             Err(_) => {
                                 println!("[SYNC] ⚠️ Cannot sync with producer {} - network unreachable", current_producer);
                                 
+                                // CRITICAL FIX: Refresh peer connections before timeout to improve connectivity
+                                if let Some(p2p) = &unified_p2p {
+                                    // Force peer cache refresh to get latest connections
+                                    let _ = p2p.get_validated_active_peers();
+                                    println!("[SYNC] 🔄 Refreshed peer connections for better sync reliability");
+                                }
+                                
                                 // CRITICAL: Check if producer timeout occurred using GLOBAL BLOCK TIME
                                 // QNet CONSENSUS SAFETY: Use expected block time for synchronized timeout across network
                                 let expected_block_time = microblock_height * 1; // Each microblock should be created every 1 second
@@ -1290,11 +1304,13 @@ impl BlockchainNode {
                                 let current_network_time = std::time::SystemTime::now().duration_since(network_start_time).unwrap_or_default().as_secs();
                                 let time_since_expected = current_network_time.saturating_sub(expected_block_time);
                                 
-                                if time_since_expected >= 5 { // Fixed deterministic timeout based on network time
+                                // PRODUCTION: Extended timeout for international Genesis nodes (higher latency)
+                                let timeout_threshold = if std::env::var("QNET_BOOTSTRAP_ID").is_ok() { 15 } else { 5 };
+                                if time_since_expected >= timeout_threshold {
                                     // ENHANCED FAILOVER STATUS DASHBOARD
                                     println!("[FAILOVER] 🚨 MICROBLOCK FAILOVER EVENT DETECTED:");
                                     println!("  ├── Failed Producer: {}", current_producer);
-                                    println!("  ├── Timeout Duration: {} seconds (fixed threshold: 5s)", time_since_expected);
+                                    println!("  ├── Timeout Duration: {} seconds (threshold: {}s)", time_since_expected, timeout_threshold);
                                     println!("  ├── Block Height: {}", microblock_height + 1);
                                     println!("  ├── Network Status: {} active peers", if let Some(ref p2p) = unified_p2p { p2p.get_validated_active_peers().len() } else { 0 });
                                     println!("  └── Recovery Action: Emergency producer rotation initiated");
@@ -1399,34 +1415,28 @@ impl BlockchainNode {
     /// PRODUCTION: Initialize only ACTIVE Genesis node reputations discovered via P2P
     /// Prevents phantom candidates for unoperated Genesis nodes
     async fn initialize_genesis_reputations(p2p: &SimplifiedP2P) {
-        println!("[REPUTATION] 🔐 Initializing ACTIVE Genesis node reputations...");
+        println!("[REPUTATION] 🔐 Initializing own Genesis node reputation...");
         
-        // CRITICAL FIX: Initialize ALL Genesis nodes deterministically regardless of discovery status
-        // This ensures consistent candidate lists across all nodes for Byzantine consensus
-        let genesis_ips = crate::unified_p2p::get_genesis_bootstrap_ips();
+        // PRODUCTION: Only initialize reputation for own Genesis node, not all 5 preemptively
+        // Other Genesis nodes get reputation dynamically when they actually connect via P2P
+        // This prevents "phantom reputation" for nodes that haven't started yet
         
-        for (i, _genesis_ip) in genesis_ips.iter().enumerate() {
-            let genesis_id = format!("genesis_node_{:03}", i + 1);
-            
-            // Set 90% reputation for ALL Genesis nodes on ALL nodes
-            p2p.set_node_reputation(&genesis_id, 90.0);
-            
-            println!("[REPUTATION] 🔐 Genesis {} initialized to 90% reputation (deterministic)", genesis_id);
-        }
-        
-        println!("[REPUTATION] ✅ All 5 Genesis nodes initialized with 90% reputation on ALL nodes");
-        
-        // CRITICAL FIX: Set own Genesis reputation to 90%
         if let Ok(bootstrap_id) = std::env::var("QNET_BOOTSTRAP_ID") {
             match bootstrap_id.as_str() {
                 "001" | "002" | "003" | "004" | "005" => {
                     let own_genesis_id = format!("genesis_node_{}", bootstrap_id);
                     p2p.set_node_reputation(&own_genesis_id, 90.0);
-                    println!("[REPUTATION] 🔐 Self Genesis {} set to 90.0% reputation", own_genesis_id);
+                    println!("[REPUTATION] ✅ Own Genesis {} initialized to 90% reputation", own_genesis_id);
                 }
-                _ => {}
+                _ => {
+                    println!("[REPUTATION] ⚠️ Invalid QNET_BOOTSTRAP_ID: {}", bootstrap_id);
+                }
             }
+        } else {
+            println!("[REPUTATION] 📝 Non-Genesis node - reputation will be set by P2P discovery");
         }
+        
+        println!("[REPUTATION] ✅ Genesis reputation initialization completed");
     }
     
     /// PRODUCTION: Select microblock producer using cryptographic hash every 30 blocks (QNet specification)
@@ -1837,11 +1847,12 @@ impl BlockchainNode {
             .map(|(i, ip)| (format!("genesis_node_{:03}", i + 1), ip.clone()))
             .collect();
         
-        // CRITICAL FIX: Add ALL Genesis nodes in IDENTICAL order using REAL dynamic reputation
-        // This ensures proper penalty system while maintaining deterministic candidate order
+        // CRITICAL FIX: Add ALL Genesis nodes in IDENTICAL order using DETERMINISTIC reputation
+        // This ensures consistent candidate lists across ALL nodes for Byzantine consensus
         for (genesis_id, genesis_ip) in genesis_nodes {
-            // Use REAL reputation system that includes penalties and floor (70%)
-            let genesis_reputation = Self::get_node_reputation_score(&genesis_id, p2p).await;
+            // Use DETERMINISTIC reputation for Genesis phase (same as microblock producer logic)
+            const GENESIS_DETERMINISTIC_REPUTATION: f64 = 0.90;
+            let genesis_reputation = GENESIS_DETERMINISTIC_REPUTATION;
             
             // For own node: check if can participate based on actual node type
             if genesis_id == own_node_id {

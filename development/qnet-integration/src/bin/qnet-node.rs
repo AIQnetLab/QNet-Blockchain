@@ -4035,11 +4035,10 @@ async fn query_node_for_peers(node_addr: &str) -> Result<Vec<String>, String> {
     // Extract IP from address
     let ip = node_addr.split(':').next().unwrap_or(node_addr);
     
-    // Try multiple API endpoints
+    // CRITICAL FIX: Use only actual listening port (8001) 
+    // All QNet nodes run unified API on port 8001 only - no 8080/9876
     let endpoints = vec![
-        format!("http://{}:8001/api/v1/peers", ip),     // Primary API
-        format!("http://{}:8080/api/v1/peers", ip),     // Alternative API  
-        format!("http://{}:9876/api/peers", ip),        // P2P endpoint
+        format!("http://{}:8001/api/v1/peers", ip),     // Unified API port
     ];
     
     for endpoint in endpoints {
