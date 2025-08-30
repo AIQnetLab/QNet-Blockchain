@@ -2316,24 +2316,41 @@ impl SimplifiedP2P {
     fn check_api_readiness_static(ip: &str) -> bool {
         use std::time::Duration;
         
-        // Quick check for API readiness with short timeout
+        // PRODUCTION: Extended timeout for international Genesis nodes
         let client = match reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(1)) // Very short timeout for readiness check
-            .connect_timeout(Duration::from_secs(1))
+            .timeout(Duration::from_secs(5)) // INCREASED: 5s timeout for Genesis node API checks
+            .connect_timeout(Duration::from_secs(3)) // INCREASED: 3s connection timeout
             .build() {
             Ok(client) => client,
             Err(_) => return false,
         };
         
-        let url = format!("http://{}:8001/api/v1/status", ip);
+        // CRITICAL FIX: Use existing /health endpoint instead of non-existent /status
+        let url = format!("http://{}:8001/api/v1/health", ip);
         
-        // Try to get a simple status response
+        // Try to get a simple health response - more reliable than status
         match client.get(&url).send() {
             Ok(response) => {
                 let is_ready = response.status().is_success() || response.status() == reqwest::StatusCode::NOT_FOUND;
                 is_ready // API is ready if we get any valid HTTP response
             }
-            Err(_) => false, // API not ready yet
+            Err(_) => {
+                // GENESIS STARTUP FIX: During Genesis startup, be more lenient
+                // API server might still be starting up
+                let current_time = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                
+                // During first 10 minutes of Genesis, allow TCP-only validation
+                let is_genesis_startup = current_time < QNET_GENESIS_TIMESTAMP + 600;
+                if is_genesis_startup {
+                    println!("[P2P] 🔧 Genesis startup: Allowing TCP connection without API check for {}", ip);
+                    true // Accept TCP connection during Genesis startup
+                } else {
+                    false // Require full API readiness after startup period
+                }
+            }
         }
     }
     

@@ -714,39 +714,46 @@ impl BlockchainNode {
             while *is_running.read().await {
                 // CRITICAL FIX: Use network-wide consensus instead of asymmetric peer counting
                 // Each node was seeing different peer counts causing deadlock
+                println!("[DEBUG-FIX] 🔧 Starting active_node_count calculation");
+                
                 let active_node_count = if let Some(p2p) = &unified_p2p {
+                    println!("[DEBUG-FIX] 🔧 P2P system available, checking genesis phase...");
                     // CRITICAL FIX: Use phase-aware node counting for consistent startup
                     // During Genesis phase, use deterministic counting instead of unreliable P2P discovery
                     
                     let is_genesis_phase = Self::is_genesis_bootstrap_phase(p2p).await;
+                    println!("[DEBUG-FIX] 🔧 is_genesis_phase = {}", is_genesis_phase);
                     
                     if is_genesis_phase {
-                        // Genesis phase: Use deterministic Genesis node counting
-                        // Count actual Genesis nodes that should be running based on time
-                        let current_time = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs();
+                        println!("[DEBUG-FIX] 🔧 Genesis phase detected - using REAL peer discovery");
+                        // CRITICAL FIX: Always use REAL peer discovery - no time-based assumptions
+                        // System must check actual connected peers, not assume based on time
+                        let local_peers = p2p.get_validated_active_peers().len();
+                        let real_node_count = local_peers + 1; // +1 for own node
                         
-                        if current_time >= QNET_GENESIS_TIMESTAMP + 600 { // 10 minutes after Genesis
-                            // After grace period: assume all 5 Genesis nodes should be active
-                            5
-                        } else if current_time >= QNET_GENESIS_TIMESTAMP + 300 { // 5 minutes after Genesis
-                            // Mid grace period: assume 4 Genesis nodes active for Byzantine safety
-                            4
+                        println!("[NETWORK] 🔍 REAL active node count: {} ({}+1 peers)", real_node_count, local_peers);
+                        
+                        // CRITICAL: Only allow block production if Byzantine safety is met
+                        if real_node_count >= 4 {
+                            println!("[NETWORK] ✅ Byzantine safety MET: {} nodes ≥ 4", real_node_count);
+                            real_node_count
                         } else {
-                            // Early startup: use conservative P2P discovery
-                            let local_peers = p2p.get_validated_active_peers().len();
-                            std::cmp::min(local_peers + 1, 5)
+                            println!("[NETWORK] ❌ Byzantine safety NOT met: {} nodes < 4", real_node_count);
+                            // Return actual count but system will wait for more nodes
+                            real_node_count
                         }
                     } else {
+                        println!("[DEBUG-FIX] 🔧 Normal phase detected - using registry discovery");
                         // Normal phase: Use actual P2P peer discovery
                         let local_peers = p2p.get_validated_active_peers().len();
                         std::cmp::min(local_peers + 1, 1000) // Scale to network size
                     }
                 } else {
+                    println!("[DEBUG-FIX] 🔧 No P2P system - solo mode");
                     1 // Solo mode
                 };
+                
+                println!("[DEBUG-FIX] 🔧 Final active_node_count = {}", active_node_count);
                 
                 // CRITICAL FIX: Coordinated network start for Genesis nodes
                 let is_genesis_bootstrap = std::env::var("QNET_BOOTSTRAP_ID")
@@ -778,27 +785,20 @@ impl BlockchainNode {
                             .as_secs();
                         
                         if current_time >= QNET_GENESIS_TIMESTAMP {
-                            // CONSERVATIVE PRODUCER OVERRIDE: Allow selected producer to start ONLY after grace period
-                            // This prevents premature block creation with insufficient network connectivity
-                            let grace_period_seconds = 300; // 5 minutes grace period for network formation
-                            let network_ready_time = QNET_GENESIS_TIMESTAMP + grace_period_seconds;
+                            // CRITICAL: STRICT Byzantine safety enforcement - NO exceptions for microblocks
+                            // Even selected producers must wait for minimum 4 nodes for decentralized consensus
                             
-                            if is_selected_producer && current_time >= network_ready_time {
-                                println!("[MICROBLOCK] 🎯 PRODUCER OVERRIDE: Starting as selected producer with {} nodes (after {}min grace period)", active_node_count, grace_period_seconds / 60);
-                                println!("[MICROBLOCK] ⚡ Producer can create blocks without full Byzantine consensus for microblocks");
-                                // Continue to production - producer can work with reduced nodes after grace period
-                            } else if active_node_count >= 4 {
-                                println!("[MICROBLOCK] 🚀 COORDINATED START: Genesis time reached, starting with {} nodes (Byzantine safe)", active_node_count);
+                            if active_node_count >= 4 {
+                                println!("[MICROBLOCK] 🚀 COORDINATED START: Genesis time reached with {} nodes (Byzantine safe)", active_node_count);
                                 // Continue to production with proper Byzantine safety
-                            } else if is_selected_producer {
-                                let remaining_grace = network_ready_time.saturating_sub(current_time);
-                                println!("[MICROBLOCK] ⏳ Producer waiting for grace period: {}s remaining before override allowed", remaining_grace);
-                                println!("[MICROBLOCK] 🛡️ Grace period prevents premature block creation with insufficient network");
-                                tokio::time::sleep(Duration::from_secs(5)).await;
-                                continue;
                             } else {
-                                println!("[MICROBLOCK] ⏳ Genesis coordinated start: insufficient nodes for Byzantine safety: {}/4", active_node_count);
-                                println!("[MICROBLOCK] 🛡️ Waiting for minimum 4 Genesis nodes before network start (not producer)");
+                                println!("[MICROBLOCK] ⏳ STRICT Byzantine safety: {} nodes < 4 required", active_node_count);
+                                if is_selected_producer {
+                                    println!("[MICROBLOCK] 🎯 Selected producer '{}' WAITING for Byzantine safety", own_node_id);
+                                } else {
+                                    println!("[MICROBLOCK] 🛡️ Non-producer node waiting for network formation");
+                                }
+                                println!("[MICROBLOCK] 🔒 QNet requires minimum 4 nodes for ALL block production");
                                 tokio::time::sleep(Duration::from_secs(5)).await;
                                 continue;
                             }
