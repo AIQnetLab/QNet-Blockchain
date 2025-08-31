@@ -400,6 +400,10 @@ impl SimplifiedP2P {
         
         if new_connections > 0 {
             println!("[P2P] 🚀 Successfully added {} new peers to P2P network", new_connections);
+            
+            // SCALABILITY FIX: Use existing rebalance_connections() instead of peer propagation storm
+            // System already handles peer distribution through load balancing (max 8 peers per region)
+            self.rebalance_connections();
         }
     }
     
@@ -3025,6 +3029,8 @@ impl SimplifiedP2P {
             false
         }
     }
+    
+
     
     /// PRODUCTION: Apply reputation decay periodically
     pub fn apply_reputation_decay(&self) {

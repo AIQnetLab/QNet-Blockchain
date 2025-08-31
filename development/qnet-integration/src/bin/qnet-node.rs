@@ -3860,8 +3860,15 @@ async fn perform_dht_peer_discovery() -> Result<Vec<String>, String> {
     
     // Get our own IP to avoid self-connection
     let our_external_ip = match get_physical_ip().await {
-        Ok(ip) => ip,
-        Err(_) => "unknown".to_string(),
+        Ok(ip) => {
+            println!("[DHT] 🔍 DIAGNOSTIC: Our external IP detected: {}", ip);
+            ip
+        },
+        Err(e) => {
+            println!("[DHT] ⚠️ DIAGNOSTIC: External IP detection failed: {}", e);
+            println!("[DHT] 🔍 DIAGNOSTIC: Using 'unknown' - this may cause ALL Genesis nodes to be queried");
+            "unknown".to_string()
+        },
     };
     
     // PRODUCTION DHT: Query ALL genesis bootstrap nodes for their peer lists
@@ -3873,12 +3880,22 @@ async fn perform_dht_peer_discovery() -> Result<Vec<String>, String> {
     println!("[DHT] 🌐 DHT will query {} Genesis nodes for peer discovery", bootstrap_nodes.len());
     
     for bootstrap in &bootstrap_nodes {
-        // Skip self-connection
         let bootstrap_ip = bootstrap.split(':').next().unwrap_or("");
+        
+        // DIAGNOSTIC: Show comparison for debugging producer isolation
+        println!("[DHT] 🔍 DIAGNOSTIC: Comparing our_external_ip='{}' with bootstrap_ip='{}'", our_external_ip, bootstrap_ip);
+        
+        // CRITICAL FIX: Only skip self-connection, but ensure producer participates in discovery
         if bootstrap_ip == our_external_ip {
-            println!("[DHT] 🔄 Skipping self-connection to {}", bootstrap);
+            println!("[DHT] 🔄 Skipping self-query to {} (matches our external IP)", bootstrap);
             continue;
         }
+        
+        println!("[DHT] 📡 Querying Genesis bootstrap node: {}", bootstrap);
+        
+        // SCALABILITY FIX: Use EXISTING bidirectional registration in /api/v1/peers API
+        // query_node_for_peers() already calls HTTP GET to /api/v1/peers which handles bidirectional registration
+        // No need for separate announcement - this would create double requests during millions-scale deployment
         
         match query_node_for_peers(bootstrap).await {
             Ok(mut peers) => {

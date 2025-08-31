@@ -267,13 +267,43 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(blockchain_filter.clone())
         .and_then(handle_mempool_transactions);
     
-    // Peer discovery endpoint (for P2P network)
+        // Peer discovery endpoint (for P2P network) - BIDIRECTIONAL REGISTRATION
     let peers_endpoint = api_v1
         .and(warp::path("peers"))
         .and(warp::path::end())
         .and(warp::get())
+        .and(warp::header::headers_cloned())
+        .and(warp::addr::remote())
         .and(blockchain_filter.clone())
-        .and_then(|blockchain: Arc<BlockchainNode>| async move {
+        .and_then(|headers: warp::http::HeaderMap, remote_addr: Option<std::net::SocketAddr>, blockchain: Arc<BlockchainNode>| async move {
+            // CRITICAL FIX: Bidirectional peer registration - register requester as peer
+            if let Some(addr) = remote_addr {
+                let requester_ip = addr.ip().to_string();
+                
+                // Only register if it's a real external IP (not localhost)
+                if !requester_ip.starts_with("127.") && !requester_ip.starts_with("::1") && requester_ip != "0.0.0.0" {
+                    let requester_addr = format!("{}:8001", requester_ip);
+                    
+                    // SCALABILITY FIX: Use existing P2P system with built-in rate limiting and peer limits
+                    // System already handles max_peers_per_region through load balancing (8 peers per region max)
+                    if let Some(p2p) = blockchain.get_unified_p2p() {
+                        // SCALABILITY FIX: Use existing system peer limits - Genesis=5 max, Normal=1000 max
+                        let current_peers = p2p.get_validated_active_peers();
+                        let is_genesis = std::env::var("QNET_BOOTSTRAP_ID")
+                            .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
+                            .unwrap_or(false);
+                        let max_peer_limit = if is_genesis { 5 } else { 1000 }; // Use existing system limits
+                        if current_peers.len() < max_peer_limit {
+                            p2p.add_discovered_peers(&[requester_addr.clone()]);
+                            println!("[API] 🔄 BIDIRECTIONAL: Registered peer discovery requester: {}", requester_addr);
+                        } else {
+                            println!("[API] ⚠️ BIDIRECTIONAL: Peer limit reached, skipping registration: {}", requester_addr);
+                        }
+                    }
+                }
+            }
+            
+            // Return current peer list as before
             let peers = blockchain.get_connected_peers().await.unwrap_or_default();
             let peer_list: Vec<serde_json::Value> = peers.iter().map(|peer| {
                 json!({
@@ -284,7 +314,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
                     "last_seen": peer.last_seen
                 })
             }).collect();
-            println!("[API] 📊 Peers request: returning {} peers", peer_list.len());
+            println!("[API] 📊 Peers request: returning {} peers (bidirectional registration enabled)", peer_list.len());
             Ok::<_, Rejection>(warp::reply::json(&json!({"peers": peer_list})))
         });
 
