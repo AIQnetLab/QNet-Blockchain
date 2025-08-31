@@ -728,6 +728,19 @@ impl BlockchainNode {
                         println!("[DEBUG-FIX] 🔧 Genesis phase detected - using REAL peer discovery");
                         // CRITICAL FIX: Always use REAL peer discovery - no time-based assumptions
                         // System must check actual connected peers, not assume based on time
+                        
+                        // PRODUCER FIX: Force cache refresh for Byzantine safety check
+                        // Ensure producer has latest peer information before blocking production
+                        let is_producer_candidate = std::env::var("QNET_BOOTSTRAP_ID")
+                            .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
+                            .unwrap_or(false);
+                        
+                        if is_producer_candidate {
+                            // Clear cache to force fresh peer validation for Byzantine safety
+                            p2p.force_peer_cache_refresh();
+                            println!("[DEBUG-FIX] 🔧 PRODUCER: Forced peer cache refresh for Byzantine safety check");
+                        }
+                        
                         let local_peers = p2p.get_validated_active_peers().len();
                         let real_node_count = local_peers + 1; // +1 for own node
                         
@@ -1765,7 +1778,19 @@ impl BlockchainNode {
         // PRODUCTION: Determine network phase (Genesis vs Normal operation)
         let is_genesis_phase = Self::is_genesis_bootstrap_phase(p2p).await;
         
-        if is_genesis_phase {
+        // CRITICAL FIX: Additional fallback for Genesis nodes that can't sync
+        // If QNET_BOOTSTRAP_ID is set for Genesis nodes (001-005), force Genesis phase
+        let is_genesis_node = std::env::var("QNET_BOOTSTRAP_ID")
+            .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
+            .unwrap_or(false);
+        
+        let force_genesis_phase = is_genesis_phase || is_genesis_node;
+        
+        if force_genesis_phase {
+            if is_genesis_node && !is_genesis_phase {
+                println!("  ├── 🚨 FALLBACK: Genesis node {} forced into Genesis phase (P2P sync failed)", 
+                        std::env::var("QNET_BOOTSTRAP_ID").unwrap_or_default());
+            }
             println!("  ├── 🌱 Genesis Phase: Using static Genesis nodes (≤5 nodes)");
             return Self::get_genesis_qualified_candidates(p2p, own_node_id, own_node_type).await;
         } else {

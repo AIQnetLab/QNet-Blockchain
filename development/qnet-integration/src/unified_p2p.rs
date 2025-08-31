@@ -1530,10 +1530,18 @@ impl SimplifiedP2P {
         
         let is_startup_phase = current_time < QNET_GENESIS_TIMESTAMP + 600; // 10 minutes grace period (UNIFIED)
         
+        // DIAGNOSTIC: Log detailed validation process to debug phantom peers
+        println!("[DEBUG-PHANTOM] 🔍 Validating peer: {} (IP: {}, Genesis: {}, Startup: {})", 
+                 peer_addr, ip, is_genesis, is_startup_phase);
+        println!("[DEBUG-PHANTOM] 🕐 Current time: {}, Genesis+600: {}", 
+                 current_time, QNET_GENESIS_TIMESTAMP + 600);
+        
         if is_genesis {
             // CRITICAL FIX: Use FAST TCP connectivity check instead of slow HTTP
             // Use existing test_peer_connectivity_static() method for 2-second validation
             let is_connected = Self::test_peer_connectivity_static(peer_addr);
+            
+            println!("[DEBUG-PHANTOM] 📡 TCP connectivity test result for {}: {}", peer_addr, is_connected);
             
             if is_connected {
                 println!("[P2P] ✅ Genesis peer {} - FAST TCP connection verified", peer_addr);
@@ -1541,20 +1549,29 @@ impl SimplifiedP2P {
             } else {
                 if is_startup_phase {
                     println!("[P2P] ⏳ Genesis peer {} - startup grace period, assuming connected", peer_addr);
+                    println!("[DEBUG-PHANTOM] 🚨 PHANTOM PEER ALLOWED: {} (startup grace)", peer_addr);
                     true // Allow during startup
                 } else {
                     println!("[P2P] ❌ Genesis peer {} - TCP connection failed, excluding from consensus", peer_addr);
+                    println!("[DEBUG-PHANTOM] ✅ PHANTOM PEER BLOCKED: {} (post-startup)", peer_addr);
                     false
                 }
             }
         } else {
             // For non-genesis: use same logic with startup tolerance
+            println!("[DEBUG-PHANTOM] 🔍 Non-Genesis peer validation for: {}", peer_addr);
             match self.query_peer_height(peer_addr) {
-                Ok(_) => true,
-                Err(_) => {
+                Ok(height) => {
+                    println!("[DEBUG-PHANTOM] ✅ Non-Genesis peer {} height query OK: {}", peer_addr, height);
+                    true
+                },
+                Err(e) => {
+                    println!("[DEBUG-PHANTOM] ❌ Non-Genesis peer {} height query failed: {}", peer_addr, e);
                     if is_startup_phase {
+                        println!("[DEBUG-PHANTOM] 🚨 PHANTOM NON-GENESIS ALLOWED: {} (startup grace)", peer_addr);
                         true // Tolerate during startup
                     } else {
+                        println!("[DEBUG-PHANTOM] ✅ PHANTOM NON-GENESIS BLOCKED: {} (post-startup)", peer_addr);
                         false
                     }
                 }
@@ -1615,12 +1632,23 @@ impl SimplifiedP2P {
             _ => {} // Continue with Full/Super node logic
         }
         
-        // CRITICAL FIX: Validation frequency depends on node type for millions-scale deployment  
-        // Per NETWORK_LOAD_ANALYSIS.md: Full=10s, Super=3s for optimal performance
-        let validation_interval = match self.node_type {
-            NodeType::Super => Duration::from_secs(3),   // Super: Fast validation (consensus critical)
-            NodeType::Full => Duration::from_secs(10),   // Full: Medium validation (regional participation)  
-            NodeType::Light => unreachable!(),           // Already handled above
+        // CRITICAL FIX: Genesis phase needs UNIFIED validation interval to prevent temporal inconsistency
+        // During Genesis phase, ALL nodes must validate peers at SAME frequency for consistent network view
+        let is_genesis = std::env::var("QNET_BOOTSTRAP_ID")
+            .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
+            .unwrap_or(false);
+        
+        let validation_interval = if is_genesis {
+            // GENESIS FIX: UNIFIED interval for all Genesis nodes to prevent peer count inconsistency
+            Duration::from_secs(5)   // UNIFIED: All Genesis nodes validate every 5s
+        } else {
+            // NORMAL PHASE: Node-type-specific validation for millions-scale deployment  
+            // Per NETWORK_LOAD_ANALYSIS.md: Full=10s, Super=3s for optimal performance
+            match self.node_type {
+                NodeType::Super => Duration::from_secs(3),   // Super: Fast validation (consensus critical)
+                NodeType::Full => Duration::from_secs(10),   // Full: Medium validation (regional participation)  
+                NodeType::Light => unreachable!(),           // Already handled above
+            }
         };
         
         // CRITICAL FIX: Cache with topology-aware key to prevent stale cache on topology changes
@@ -1666,7 +1694,7 @@ impl SimplifiedP2P {
     
     /// Internal method without caching
     fn get_validated_active_peers_internal(&self) -> Vec<PeerInfo> {
-        match self.connected_peers.lock() {
+        let validated_result = match self.connected_peers.lock() {
             Ok(peers) => {
                 // PRODUCTION: Different validation logic for different node types
                 let is_genesis = std::env::var("QNET_BOOTSTRAP_ID")
@@ -1735,6 +1763,52 @@ impl SimplifiedP2P {
                 println!("[P2P] ⚠️ Failed to get validated peers: {}", e);
                 Vec::new()
             }
+        };
+        
+        // CRITICAL FIX: Stale peer cleanup to prevent phantom peers in DHT discovery
+        // Remove peers that failed validation to keep connected_peers list accurate
+         if let Ok(mut connected) = self.connected_peers.lock() {
+            let original_count = connected.len();
+            
+            // Keep only peers that passed validation or are still connecting
+            connected.retain(|peer| {
+                // Keep if peer passed validation (is in validated list)
+                if validated_result.iter().any(|validated| validated.addr == peer.addr) {
+                    return true;
+                }
+                
+                // For Genesis nodes: also check if peer is still actually connected
+                let is_genesis = std::env::var("QNET_BOOTSTRAP_ID")
+                    .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
+                    .unwrap_or(false);
+                
+                if is_genesis {
+                    let still_connected = self.is_peer_actually_connected(&peer.addr);
+                    if !still_connected {
+                        println!("[P2P] 🗑️  CLEANUP: Removing stale peer {} (connection lost)", peer.addr);
+                    }
+                    still_connected
+                } else {
+                    // For regular nodes, more lenient cleanup
+                    true
+                }
+            });
+            
+            let cleaned_count = original_count - connected.len();
+            if cleaned_count > 0 {
+                println!("[P2P] 🧹 Stale peer cleanup: removed {} phantom peers, {} active remain", 
+                         cleaned_count, connected.len());
+            }
+        }
+        
+        validated_result
+    }
+    
+    /// CRITICAL: Force peer cache refresh for Byzantine safety checks (Producer nodes)
+    pub fn force_peer_cache_refresh(&self) {
+        if let Ok(mut cached) = CACHED_PEERS.lock() {
+            *cached = (Vec::new(), Instant::now(), String::new());
+            println!("[P2P] 🔄 FORCED: Peer cache cleared for fresh validation");
         }
     }
     
