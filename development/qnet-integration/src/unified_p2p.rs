@@ -589,10 +589,9 @@ impl SimplifiedP2P {
              
              for ip in working_genesis_ips {
                  known_node_ips.push(ip.clone());
-                 // EXISTING: Use GENESIS_NODE_IPS for region lookup (already imported above)
-                 let region_name = GENESIS_NODE_IPS.iter()
-                     .find(|(genesis_ip, _)| *genesis_ip == ip)
-                     .map(|(_, _)| "Genesis") // Genesis nodes have mixed regions - use generic label
+                 // EXISTING: Use get_genesis_region_by_ip() to get correct region
+                 use crate::genesis_constants::get_genesis_region_by_ip;
+                 let region_name = get_genesis_region_by_ip(&ip)
                      .unwrap_or("Unknown");
                  println!("[P2P] 🌟 Working Genesis bootstrap node: {} ({})", ip, region_name);
              }
@@ -658,9 +657,18 @@ impl SimplifiedP2P {
                             println!("🌟 [P2P] Quantum-secured peer verified: {} | 🔐 Dilithium signature validated | Key: {}...", 
                                    target_addr, &peer_pubkey[..16]);
                             
-                            // EXISTING: Use default region for Genesis peers (simplified region logic)
-                            // All Genesis nodes use unified validation regardless of geographic region
-                            let peer_region = region.clone(); // EXISTING: Use current region context
+                            // EXISTING: Use get_genesis_region_by_ip() to get correct Genesis peer region
+                            use crate::genesis_constants::get_genesis_region_by_ip;
+                            let genesis_region_str = get_genesis_region_by_ip(&ip).unwrap_or("Europe");
+                            let peer_region = match genesis_region_str {
+                                "NorthAmerica" => Region::NorthAmerica,
+                                "Europe" => Region::Europe,
+                                "Asia" => Region::Asia,
+                                "SouthAmerica" => Region::SouthAmerica,
+                                "Africa" => Region::Africa,
+                                "Oceania" => Region::Oceania,
+                                _ => region.clone(), // EXISTING: Use current region as fallback
+                            };
                             
                             let peer_info = PeerInfo {
                                 id: format!("genesis_{}", target_addr.replace(":", "_")),
@@ -1933,9 +1941,22 @@ impl SimplifiedP2P {
         // Extract IP for region and node type detection
         let ip = peer_addr.split(':').next().unwrap_or("");
         
-        // EXISTING: Use default region for Genesis nodes (simplified)
-        // Genesis nodes use unified validation regardless of geographic region
-        let correct_region = Region::Europe; // EXISTING: Default region for Genesis nodes
+        // EXISTING: Use get_genesis_region_by_ip() for correct Genesis node regions
+        use crate::genesis_constants::get_genesis_region_by_ip;
+        let correct_region = if is_genesis_node_ip(ip) {
+            let genesis_region_str = get_genesis_region_by_ip(&ip).unwrap_or("Europe");
+            match genesis_region_str {
+                "NorthAmerica" => Region::NorthAmerica,
+                "Europe" => Region::Europe,
+                "Asia" => Region::Asia,
+                "SouthAmerica" => Region::SouthAmerica,
+                "Africa" => Region::Africa,
+                "Oceania" => Region::Oceania,
+                _ => Region::Europe, // EXISTING: Default fallback
+            }
+        } else {
+            Region::Europe // EXISTING: Default for non-Genesis nodes
+        };
         
         // Use EXISTING node type logic
         let correct_node_type = if is_genesis_node_ip(ip) {
