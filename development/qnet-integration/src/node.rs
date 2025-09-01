@@ -22,8 +22,7 @@ use bincode;
 use flate2;
 use serde::{Serialize, Deserialize};
 
-// QNET GENESIS CONSTANTS
-const QNET_GENESIS_TIMESTAMP: u64 = 1756653543; // Aug 31, 2025 15:19:03 UTC - CORRECTED for active Genesis period
+// DYNAMIC NETWORK DETECTION - No timestamp dependency for robust deployment
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum NodeType {
@@ -120,6 +119,9 @@ pub struct BlockchainNode {
     last_microblock_time: Arc<RwLock<Instant>>,
     microblock_interval: Duration,
     is_leader: Arc<RwLock<bool>>,
+    
+    // DYNAMIC: Block production timing (no timestamp dependency)
+    last_block_attempt: Arc<tokio::sync::Mutex<Option<Instant>>>,
     
     // PRODUCTION: Consensus phase synchronization data
     consensus_nonce_storage: Arc<RwLock<HashMap<String, ([u8; 32], Vec<u8>)>>>, // participant -> (nonce, reveal_data)
@@ -351,6 +353,9 @@ impl BlockchainNode {
             last_microblock_time: Arc::new(RwLock::new(Instant::now())),
             microblock_interval,
             is_leader: Arc::new(RwLock::new(false)), // PRODUCTION: Dynamic producer selection based on reputation rotation
+            
+            // DYNAMIC: Block production timing (no timestamp dependency)  
+            last_block_attempt: Arc::new(tokio::sync::Mutex::new(None)),
             
             // PRODUCTION: Initialize consensus phase synchronization
             consensus_nonce_storage: Arc::new(RwLock::new(HashMap::new())),
@@ -693,6 +698,7 @@ impl BlockchainNode {
         let node_type = self.node_type;
         let consensus = self.consensus.clone();
         let consensus_nonce_storage = self.consensus_nonce_storage.clone();
+        let last_block_attempt = self.last_block_attempt.clone();
         
         // CRITICAL FIX: Take consensus_rx ownership for MACROBLOCK consensus phases
         // Macroblock commit/reveal phases NEED exclusive access to process P2P messages  
@@ -728,16 +734,37 @@ impl BlockchainNode {
                         // CRITICAL FIX: Always use REAL peer discovery - no time-based assumptions
                         // System must check actual connected peers, not assume based on time
                         
-                        // PRODUCER FIX: Force cache refresh for Byzantine safety check
-                        // Ensure producer has latest peer information before blocking production
+                        // PRODUCER FIX: Force immediate peer discovery for Genesis nodes before producer selection
+                        // Ensure ALL Genesis nodes discover each other before ANY producer selection
                         let is_producer_candidate = std::env::var("QNET_BOOTSTRAP_ID")
                             .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
                             .unwrap_or(false);
                         
                         if is_producer_candidate {
-                            // Clear cache to force fresh peer validation for Byzantine safety
+                            println!("[DEBUG-FIX] 🔧 GENESIS: Forcing immediate peer discovery before producer selection");
+                            
+                            // CRITICAL: Force peer discovery and connection establishment
                             p2p.force_peer_cache_refresh();
-                            println!("[DEBUG-FIX] 🔧 PRODUCER: Forced peer cache refresh for Byzantine safety check");
+                            
+                            // CRITICAL: Wait for peer connections to establish before producer selection
+                            for attempt in 1..=3 {
+                                println!("[DEBUG-FIX] 🔧 GENESIS: Peer discovery attempt {} of 3...", attempt);
+                                tokio::time::sleep(Duration::from_secs(2)).await;
+                                
+                                // Check if we have sufficient peer connections
+                                let peer_count = p2p.get_validated_active_peers().len();
+                                println!("[DEBUG-FIX] 🔧 GENESIS: Found {} peers after attempt {}", peer_count, attempt);
+                                
+                                if peer_count >= 3 {
+                                    println!("[DEBUG-FIX] 🔧 GENESIS: Sufficient peers found ({}), proceeding", peer_count);
+                                    break;
+                                }
+                                
+                                // Force another peer discovery cycle
+                                p2p.force_peer_discovery_cycle().await;
+                            }
+                            
+                            println!("[DEBUG-FIX] 🔧 PRODUCER: Forced peer discovery completed for Byzantine safety check");
                         }
                         
                         let local_peers = p2p.get_validated_active_peers().len();
@@ -790,37 +817,21 @@ impl BlockchainNode {
                 
                 if active_node_count < 4 {
                     if is_genesis_bootstrap {
-                        // CHECK: Network start coordination for Genesis nodes
-                        let current_time = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs();
+                        // DYNAMIC: STRICT Byzantine safety enforcement - NO timestamp dependency
+                        // Even selected producers must wait for minimum 4 nodes for decentralized consensus
                         
-                        if current_time >= QNET_GENESIS_TIMESTAMP {
-                            // CRITICAL: STRICT Byzantine safety enforcement - NO exceptions for microblocks
-                            // Even selected producers must wait for minimum 4 nodes for decentralized consensus
-                            
-                            if active_node_count >= 4 {
-                                println!("[MICROBLOCK] 🚀 COORDINATED START: Genesis time reached with {} nodes (Byzantine safe)", active_node_count);
-                                // Continue to production with proper Byzantine safety
-                            } else {
-                                println!("[MICROBLOCK] ⏳ STRICT Byzantine safety: {} nodes < 4 required", active_node_count);
-                                if is_selected_producer {
-                                    println!("[MICROBLOCK] 🎯 Selected producer '{}' WAITING for Byzantine safety", own_node_id);
-                                } else {
-                                    println!("[MICROBLOCK] 🛡️ Non-producer node waiting for network formation");
-                                }
-                                println!("[MICROBLOCK] 🔒 QNet requires minimum 4 nodes for ALL block production");
-                                tokio::time::sleep(Duration::from_secs(5)).await;
-                                continue;
-                            }
+                        if active_node_count >= 4 {
+                            println!("[MICROBLOCK] 🚀 NETWORK READY: {} nodes available (Byzantine safe)", active_node_count);
+                            // Continue to production with proper Byzantine safety
                         } else {
-                            let remaining_seconds = QNET_GENESIS_TIMESTAMP.saturating_sub(current_time);
-                            println!("[MICROBLOCK] ⏳ Genesis node #{} waiting for coordinated start time (current: {} nodes)", 
-                                     std::env::var("QNET_BOOTSTRAP_ID").unwrap_or("unknown".to_string()), active_node_count);
-                            println!("[MICROBLOCK] 🕐 Network starts at Genesis timestamp: {} (in {} seconds / {} minutes)", 
-                                     QNET_GENESIS_TIMESTAMP, remaining_seconds, remaining_seconds / 60);
-                            tokio::time::sleep(Duration::from_secs(5)).await; // Check every 5 seconds
+                            println!("[MICROBLOCK] ⏳ STRICT Byzantine safety: {} nodes < 4 required", active_node_count);
+                            if is_selected_producer {
+                                println!("[MICROBLOCK] 🎯 Selected producer '{}' WAITING for Byzantine safety", own_node_id);
+                            } else {
+                                println!("[MICROBLOCK] 🛡️ Non-producer node waiting for network formation");
+                            }
+                            println!("[MICROBLOCK] 🔒 QNet requires minimum 4 nodes for ALL block production");
+                            tokio::time::sleep(Duration::from_secs(5)).await;
                             continue;
                         }
                     } else {
@@ -1307,20 +1318,27 @@ impl BlockchainNode {
                                     println!("[SYNC] 🔄 Refreshed peer connections for better sync reliability");
                                 }
                                 
-                                // CRITICAL: Check if producer timeout occurred using GLOBAL BLOCK TIME
-                                // QNet CONSENSUS SAFETY: Use expected block time for synchronized timeout across network
-                                let expected_block_time = microblock_height * 1; // Each microblock should be created every 1 second
-                                let network_start_time = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(QNET_GENESIS_TIMESTAMP); // Network genesis time
-                                let current_network_time = std::time::SystemTime::now().duration_since(network_start_time).unwrap_or_default().as_secs();
-                                let time_since_expected = current_network_time.saturating_sub(expected_block_time);
+                                // DYNAMIC: Check if producer timeout occurred using relative block timing
+                                // QNet CONSENSUS SAFETY: Use relative timeout tracking for robust failover
+                                let block_production_start = std::time::Instant::now();
+                                let time_since_last_attempt = {
+                                    let mut last_attempt_guard = last_block_attempt.lock().await;
+                                    let time_diff = if let Some(last_attempt) = last_attempt_guard.as_ref() {
+                                        block_production_start.duration_since(*last_attempt).as_secs()
+                                    } else {
+                                        0 // First attempt
+                                    };
+                                    *last_attempt_guard = Some(block_production_start);
+                                    time_diff
+                                };
                                 
                                 // PRODUCTION: Extended timeout for international Genesis nodes (higher latency)
                                 let timeout_threshold = if std::env::var("QNET_BOOTSTRAP_ID").is_ok() { 15 } else { 5 };
-                                if time_since_expected >= timeout_threshold {
+                                if time_since_last_attempt >= timeout_threshold {
                                     // ENHANCED FAILOVER STATUS DASHBOARD
                                     println!("[FAILOVER] 🚨 MICROBLOCK FAILOVER EVENT DETECTED:");
                                     println!("  ├── Failed Producer: {}", current_producer);
-                                    println!("  ├── Timeout Duration: {} seconds (threshold: {}s)", time_since_expected, timeout_threshold);
+                                    println!("  ├── Timeout Duration: {} seconds (threshold: {}s)", time_since_last_attempt, timeout_threshold);
                                     println!("  ├── Block Height: {}", microblock_height + 1);
                                     println!("  ├── Network Status: {} active peers", if let Some(ref p2p) = unified_p2p { p2p.get_validated_active_peers().len() } else { 0 });
                                     println!("  └── Recovery Action: Emergency producer rotation initiated");
@@ -1339,7 +1357,7 @@ impl BlockchainNode {
                                         println!("[FAILOVER] 🆘 EMERGENCY TAKEOVER SUCCESSFUL:");
                                         println!("  ├── New Producer: {} (this node)", node_id);
                                         println!("  ├── Takeover Type: Emergency rotation");
-                                        println!("  ├── Recovery Time: {} seconds", time_since_expected);
+                                        println!("  ├── Recovery Time: {} seconds", time_since_last_attempt);
                                         println!("  └── Status: Production resumed immediately");
                                         *is_leader.write().await = true;
                                         
@@ -4506,6 +4524,10 @@ impl Clone for BlockchainNode {
             last_microblock_time: self.last_microblock_time.clone(),
             microblock_interval: self.microblock_interval,
             is_leader: self.is_leader.clone(),
+            
+            // DYNAMIC: Block production timing (thread-safe for async tasks)
+            last_block_attempt: self.last_block_attempt.clone(),
+            
             consensus_nonce_storage: self.consensus_nonce_storage.clone(),
             shard_coordinator: self.shard_coordinator.clone(),
             parallel_validator: self.parallel_validator.clone(),

@@ -12,8 +12,7 @@ use chrono;
 use sha3::Digest; // Add missing Digest trait
 use base64::Engine;
 
-// QNET GENESIS CONSTANTS
-const QNET_GENESIS_TIMESTAMP: u64 = 1756653543; // Aug 31, 2025 15:19:03 UTC - CORRECTED for active Genesis period
+// DYNAMIC NETWORK DETECTION - No timestamp dependency for robust deployment
 
 /// Get system CPU load for monitoring
 fn get_system_cpu_load() -> f32 {
@@ -1848,8 +1847,11 @@ use qnet_consensus::lazy_rewards::{PhaseAwareRewardManager, NodeType as RewardNo
 lazy_static::lazy_static! {
     static ref LIGHT_NODE_REGISTRY: Mutex<HashMap<String, LightNodeInfo>> = Mutex::new(HashMap::new());
     static ref REWARD_MANAGER: Mutex<PhaseAwareRewardManager> = {
-        // Genesis timestamp: January 1, 2025 (production launch)
-        let genesis_timestamp = QNET_GENESIS_TIMESTAMP;
+        // DYNAMIC: Use current time for reward manager (no fixed genesis dependency)
+        let genesis_timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         Mutex::new(PhaseAwareRewardManager::new(genesis_timestamp))
     };
 }

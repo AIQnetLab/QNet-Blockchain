@@ -17,8 +17,7 @@ use base64::Engine;
 use qnet_consensus::reputation::{NodeReputation, ReputationConfig};
 use qnet_consensus::{commit_reveal::{Commit, Reveal}, ConsensusEngine};
 
-// QNET GENESIS CONSTANTS
-const QNET_GENESIS_TIMESTAMP: u64 = 1756653543; // Aug 31, 2025 15:19:03 UTC - CORRECTED for active Genesis period
+// DYNAMIC NETWORK DETECTION - No timestamp dependency for robust deployment
 
 // PEER DISCOVERY CACHE - ensures consistent peer lists across nodes
 static CACHED_PEERS: Lazy<Arc<Mutex<(Vec<PeerInfo>, Instant, String)>>> = 
@@ -371,18 +370,17 @@ impl SimplifiedP2P {
                 };
                 
                 if !already_connected {
-                    // CRITICAL FIX: During Genesis startup, use relaxed validation for peer addition
-                    let current_time = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-                    let is_genesis_startup = current_time < QNET_GENESIS_TIMESTAMP + 600; // 10 minutes
+                    // DYNAMIC: Genesis peers use bootstrap trust based on network conditions, not time
                     let peer_ip = peer_info.addr.split(':').next().unwrap_or("");
                     let is_genesis_peer = is_genesis_node_ip(peer_ip);
+                    let is_bootstrap_node = std::env::var("QNET_BOOTSTRAP_ID").is_ok();
+                    let active_peers = self.get_peer_count();
+                    let is_small_network = active_peers < 10; // Dynamic network size detection
                     
-                    // FIXED: Genesis peers ALWAYS use relaxed validation (no time dependency!)
-                    let should_add = if is_genesis_peer {
-                        println!("[P2P] 🌟 Genesis peer: adding {} with relaxed validation (always)", peer_info.addr);
+                    // ROBUST: Use bootstrap trust for Genesis peers when we're bootstrapping OR in small network
+                    let should_add = if is_genesis_peer && (is_bootstrap_node || is_small_network) {
+                        println!("[P2P] 🌟 Genesis peer: adding {} with bootstrap trust (small network: {}, bootstrap node: {})", 
+                                peer_info.addr, is_small_network, is_bootstrap_node);
                         true
                     } else {
                         self.is_peer_actually_connected(&peer_info.addr)
@@ -997,17 +995,12 @@ impl SimplifiedP2P {
             .build()
             .map_err(|e| format!("HTTP client error: {}", e))?;
         
-        // GENESIS STARTUP FIX: Extended retry logic during network bootstrap
-        let is_genesis_startup = {
-            let current_time = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            current_time < QNET_GENESIS_TIMESTAMP + 600 // 10 minutes grace period
-        };
+        // DYNAMIC: Extended retry logic for bootstrap nodes and small networks
+        let is_bootstrap_node = std::env::var("QNET_BOOTSTRAP_ID").is_ok();
+        let is_extended_retry = is_bootstrap_node; // Bootstrap nodes need more retries for network formation
         
-        let max_attempts = if is_genesis_startup { 10 } else { 3 }; // MORE attempts during Genesis
-        let retry_delay = if is_genesis_startup { 2 } else { 1 };
+        let max_attempts = if is_extended_retry { 10 } else { 3 }; // MORE attempts for bootstrap nodes
+        let retry_delay = if is_extended_retry { 2 } else { 1 };
         
         for attempt in 1..=max_attempts {
             match client.get(endpoint).send() {
@@ -1049,53 +1042,34 @@ impl SimplifiedP2P {
         Err("All retry attempts failed".to_string())
     }
     
-    /// Fallback: Estimate peer height from genesis timestamp with error resilience
+    /// DYNAMIC: Estimate peer height using network-based heuristics (no timestamp dependency)
     fn estimate_peer_height_from_genesis(&self) -> Result<u64, String> {
-        // Get QNet network genesis timestamp with multiple fallback strategies
-        let network_genesis_time = std::env::var("QNET_MAINNET_LAUNCH_TIMESTAMP")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .or_else(|| {
-                // Try alternative environment variable names
-                std::env::var("QNET_GENESIS_TIME")
-                    .ok()
-                    .and_then(|s| s.parse::<u64>().ok())
-            })
-            .or_else(|| {
-                std::env::var("GENESIS_TIMESTAMP")
-                    .ok()
-                    .and_then(|s| s.parse::<u64>().ok())
-            })
-            .unwrap_or_else(|| {
-                // FIXED: Use consistent Genesis timestamp across all nodes
-                println!("[CONSENSUS] 🔧 Using unified Genesis timestamp: {} (Jan 1, 2025)", QNET_GENESIS_TIMESTAMP);
-                QNET_GENESIS_TIMESTAMP
-            });
+        // ROBUST: Use network size and node type to estimate reasonable height
+        let active_peers = self.get_peer_count();
+        let is_bootstrap_node = std::env::var("QNET_BOOTSTRAP_ID").is_ok();
         
-        let current_time = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| format!("System time error: {:?}", e))?
-            .as_secs();
-        
-        // Calculate consensus height using QNet's microblock timing (1 block per second)
-        let base_height = if current_time > network_genesis_time {
-            (current_time - network_genesis_time) / 1 // 1 second per microblock
-        } else {
-            // Network hasn't started yet - return 0 but warn
-            println!("[CONSENSUS] ⚠️ Current time {} is before genesis {}, using height 0", 
-                    current_time, network_genesis_time);
+        // Heuristic height estimation based on network conditions
+        let estimated_height = if is_bootstrap_node && active_peers < 5 {
+            // Early network formation - very low height
             0
+        } else if active_peers < 20 {
+            // Small network - low height range
+            active_peers as u64 * 10 // ~10-200 blocks
+        } else if active_peers < 100 {
+            // Medium network - moderate height
+            active_peers as u64 * 50 // ~1000-5000 blocks  
+        } else {
+            // Large network - higher height estimate
+            active_peers as u64 * 100 // 10000+ blocks
         };
         
-        // Sanity check: Height shouldn't be unreasonably high
+        // Cap at reasonable maximum to prevent overflow
         const MAX_REASONABLE_HEIGHT: u64 = 365 * 24 * 60 * 60; // 1 year of blocks
-        if base_height > MAX_REASONABLE_HEIGHT {
-            println!("[CONSENSUS] ⚠️ Calculated height {} seems too high, capping at {}", 
-                    base_height, MAX_REASONABLE_HEIGHT);
-            return Ok(MAX_REASONABLE_HEIGHT);
-        }
+        let capped_height = std::cmp::min(estimated_height, MAX_REASONABLE_HEIGHT);
         
-        Ok(base_height)
+        println!("[CONSENSUS] 📊 Estimated network height from peers: {} (peers: {}, bootstrap: {})", 
+                capped_height, active_peers, is_bootstrap_node);
+        Ok(capped_height)
     }
     
     /// Determine if node can participate in consensus validation (replaces single leader model)
@@ -1594,20 +1568,16 @@ impl SimplifiedP2P {
         let ip = peer_addr.split(':').next().unwrap_or("");
         let is_genesis = is_genesis_node_ip(ip);
         
-        // CRITICAL FIX: During Genesis startup phase, use relaxed validation
-        // Allow temporary connection failures during API server startup
-        let current_time = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        
-        let is_startup_phase = current_time < QNET_GENESIS_TIMESTAMP + 600; // 10 minutes grace period (UNIFIED)
+        // DYNAMIC: Use relaxed validation for Genesis peers in small networks
+        // Allow temporary connection failures during network formation
+        let is_bootstrap_node = std::env::var("QNET_BOOTSTRAP_ID").is_ok();
+        let active_peers = self.get_peer_count();
+        let is_small_network = active_peers < 10;
+        let use_relaxed_validation = is_bootstrap_node || is_small_network;
         
         // DIAGNOSTIC: Log detailed validation process to debug phantom peers
-        println!("[DEBUG-PHANTOM] 🔍 Validating peer: {} (IP: {}, Genesis: {}, Startup: {})", 
-                 peer_addr, ip, is_genesis, is_startup_phase);
-        println!("[DEBUG-PHANTOM] 🕐 Current time: {}, Genesis+600: {}", 
-                 current_time, QNET_GENESIS_TIMESTAMP + 600);
+        println!("[DEBUG-PHANTOM] 🔍 Validating peer: {} (IP: {}, Genesis: {}, Small network: {}, Bootstrap: {})", 
+                 peer_addr, ip, is_genesis, is_small_network, is_bootstrap_node);
         
         if is_genesis {
             // CRITICAL FIX: Use FAST TCP connectivity check instead of slow HTTP
@@ -1620,13 +1590,13 @@ impl SimplifiedP2P {
                 println!("[P2P] ✅ Genesis peer {} - FAST TCP connection verified", peer_addr);
                 true
             } else {
-                if is_startup_phase {
-                    println!("[P2P] ⏳ Genesis peer {} - startup grace period, assuming connected", peer_addr);
-                    println!("[DEBUG-PHANTOM] 🚨 PHANTOM PEER ALLOWED: {} (startup grace)", peer_addr);
-                    true // Allow during startup
+                if use_relaxed_validation {
+                    println!("[P2P] ⏳ Genesis peer {} - using relaxed validation for network formation", peer_addr);
+                    println!("[DEBUG-PHANTOM] 🚨 PHANTOM PEER ALLOWED: {} (relaxed validation)", peer_addr);
+                    true // Allow for bootstrap/small networks
                 } else {
                     println!("[P2P] ❌ Genesis peer {} - TCP connection failed, excluding from consensus", peer_addr);
-                    println!("[DEBUG-PHANTOM] ✅ PHANTOM PEER BLOCKED: {} (post-startup)", peer_addr);
+                    println!("[DEBUG-PHANTOM] ✅ PHANTOM PEER BLOCKED: {} (strict validation)", peer_addr);
                     false
                 }
             }
@@ -1640,11 +1610,11 @@ impl SimplifiedP2P {
                 },
                 Err(e) => {
                     println!("[DEBUG-PHANTOM] ❌ Non-Genesis peer {} height query failed: {}", peer_addr, e);
-                    if is_startup_phase {
-                        println!("[DEBUG-PHANTOM] 🚨 PHANTOM NON-GENESIS ALLOWED: {} (startup grace)", peer_addr);
-                        true // Tolerate during startup
+                    if use_relaxed_validation {
+                        println!("[DEBUG-PHANTOM] 🚨 PHANTOM NON-GENESIS ALLOWED: {} (relaxed validation)", peer_addr);
+                        true // Tolerate during network formation
                     } else {
-                        println!("[DEBUG-PHANTOM] ✅ PHANTOM NON-GENESIS BLOCKED: {} (post-startup)", peer_addr);
+                        println!("[DEBUG-PHANTOM] ✅ PHANTOM NON-GENESIS BLOCKED: {} (strict validation)", peer_addr);
                         false
                     }
                 }
@@ -1870,6 +1840,43 @@ impl SimplifiedP2P {
         }
     }
     
+    /// CRITICAL: Force immediate peer discovery cycle for Genesis nodes
+    pub async fn force_peer_discovery_cycle(&self) {
+        println!("[P2P] 🔍 FORCED: Starting immediate peer discovery cycle for Genesis");
+        
+        // CRITICAL: Use existing Genesis bootstrap discovery logic
+        let genesis_bootstrap_ips = get_genesis_bootstrap_ips();
+        
+        for genesis_ip in genesis_bootstrap_ips {
+            let peer_addr = format!("{}:8001", genesis_ip);
+            
+            // Skip self to prevent self-connection
+            if let Ok(our_ip) = Self::get_our_ip_address().await {
+                if genesis_ip == our_ip {
+                    println!("[P2P] 🔄 Skipping self-connection to {}", peer_addr);
+                    continue;
+                }
+            }
+            
+            println!("[P2P] 📡 FORCED: Attempting connection to Genesis peer: {}", peer_addr);
+            
+            // CRITICAL: Use existing TCP connectivity check (FAST)
+            if Self::check_api_readiness_static(&peer_addr) {
+                // Parse and add peer using existing method
+                if let Ok(peer_info) = SimplifiedP2P::parse_peer_address_static(&peer_addr) {
+                        println!("[P2P] ✅ FORCED: Genesis peer discovered: {}", peer_addr);
+                        
+                        // Add to connected_peers using existing add_discovered_peers method
+                        self.add_discovered_peers(&[peer_addr.clone()]);
+                }
+            } else {
+                println!("[P2P] ❌ FORCED: Genesis peer not ready: {}", peer_addr);
+            }
+        }
+        
+        println!("[P2P] ✅ FORCED: Peer discovery cycle completed");
+    }
+    
     /// Get regional health (simplified)
     pub fn get_regional_health(&self) -> f64 {
         let connected_count = self.get_peer_count();
@@ -2044,15 +2051,14 @@ impl SimplifiedP2P {
         
         // Connect to primary region first - WITH REAL connectivity validation
         if let Some(peers) = regional_peers.get(&self.primary_region) {
-            // Check Genesis startup phase for connection limits
-            let current_time = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            let is_genesis_startup = current_time < QNET_GENESIS_TIMESTAMP + 600; // 10 minutes
+            // DYNAMIC: Use flexible connection limits based on network conditions
+            let is_bootstrap_node = std::env::var("QNET_BOOTSTRAP_ID").is_ok();
+            let active_peers = connected.len();
+            let is_small_network = active_peers < 10;
+            let use_all_peers = is_bootstrap_node || is_small_network;
             
-            // CRITICAL FIX: During Genesis startup, connect to ALL peers in region (no 5-peer limit)
-            let peer_limit = if is_genesis_startup { peers.len() } else { 5 };
+            // ROBUST: Connect to ALL peers during bootstrap or small network formation
+            let peer_limit = if use_all_peers { peers.len() } else { 5 };
             for peer in peers.iter().take(peer_limit) {
                 // Use previously defined is_genesis_startup variable
                 
@@ -2074,14 +2080,13 @@ impl SimplifiedP2P {
             }
         }
         
-        // CRITICAL GENESIS FIX: During Genesis startup, try to connect to ALL Genesis nodes regardless of region
-        let current_time = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let is_genesis_startup = current_time < QNET_GENESIS_TIMESTAMP + 600; // 10 minutes
+        // DYNAMIC: For bootstrap nodes or small networks, connect to ALL Genesis nodes regardless of region
+        let is_bootstrap_node = std::env::var("QNET_BOOTSTRAP_ID").is_ok();
+        let active_peers = connected.len();
+        let is_small_network = active_peers < 10;
+        let should_connect_all_genesis = is_bootstrap_node || is_small_network;
         
-        if is_genesis_startup {
+        if should_connect_all_genesis {
             println!("[P2P] 🌟 GENESIS MODE: Attempting to connect to all Genesis peers regardless of region");
             
             // Try all regions for Genesis peers
@@ -2104,20 +2109,19 @@ impl SimplifiedP2P {
         
         // If not enough peers, try backup regions - WITH REAL connectivity validation
         if connected.len() < 3 {
-            // Check Genesis startup phase for backup regions too
-            let current_time = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            let is_genesis_startup = current_time < QNET_GENESIS_TIMESTAMP + 600; // 10 minutes (unified grace period)
+            // DYNAMIC: For backup regions, use flexible limits based on network conditions
+            let is_bootstrap_node = std::env::var("QNET_BOOTSTRAP_ID").is_ok();
+            let current_peers = connected.len();
+            let is_small_network = current_peers < 10;
+            let use_all_backup_peers = is_bootstrap_node || is_small_network;
             
             for backup_region in &self.backup_regions {
                 if let Some(peers) = regional_peers.get(backup_region) {
-                    // CRITICAL FIX: During Genesis startup, connect to ALL backup peers (no 2-peer limit)
-                    let backup_limit = if is_genesis_startup { peers.len() } else { 2 };
+                    // ROBUST: Connect to ALL backup peers during bootstrap or small network formation
+                    let backup_limit = if use_all_backup_peers { peers.len() } else { 2 };
                     for peer in peers.iter().take(backup_limit) {
-                        // CRITICAL FIX: During Genesis startup, remove connection limit (need full mesh)
-                        let should_connect = if is_genesis_startup { true } else { connected.len() < 5 };
+                        // DYNAMIC: Remove connection limit for small networks or bootstrap nodes
+                        let should_connect = if use_all_backup_peers { true } else { connected.len() < 5 };
                         if should_connect {
                             let ip = peer.addr.split(':').next().unwrap_or("");
                             let is_genesis_peer = is_genesis_node_ip(ip);
