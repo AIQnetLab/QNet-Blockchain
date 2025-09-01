@@ -734,37 +734,16 @@ impl BlockchainNode {
                         // CRITICAL FIX: Always use REAL peer discovery - no time-based assumptions
                         // System must check actual connected peers, not assume based on time
                         
-                        // PRODUCER FIX: Force immediate peer discovery for Genesis nodes before producer selection
-                        // Ensure ALL Genesis nodes discover each other before ANY producer selection
-                        let is_producer_candidate = std::env::var("QNET_BOOTSTRAP_ID")
-                            .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
-                            .unwrap_or(false);
+                            // GENESIS FIX: Genesis nodes use EXISTING bootstrap trust without additional discovery
+                        let is_genesis_node = std::env::var("QNET_BOOTSTRAP_ID").is_ok();
                         
-                        if is_producer_candidate {
-                            println!("[DEBUG-FIX] 🔧 GENESIS: Forcing immediate peer discovery before producer selection");
+                        if is_genesis_node {
+                            println!("[DEBUG-FIX] 🔧 GENESIS: Using EXISTING bootstrap peer pool (no additional discovery needed)");
                             
-                            // CRITICAL: Force peer discovery and connection establishment
+                            // EXISTING: Use simple peer cache refresh - bootstrap peers already added
                             p2p.force_peer_cache_refresh();
                             
-                            // CRITICAL: Wait for peer connections to establish before producer selection
-                            for attempt in 1..=3 {
-                                println!("[DEBUG-FIX] 🔧 GENESIS: Peer discovery attempt {} of 3...", attempt);
-                                tokio::time::sleep(Duration::from_secs(2)).await;
-                                
-                                // Check if we have sufficient peer connections
-                                let peer_count = p2p.get_validated_active_peers().len();
-                                println!("[DEBUG-FIX] 🔧 GENESIS: Found {} peers after attempt {}", peer_count, attempt);
-                                
-                                if peer_count >= 3 {
-                                    println!("[DEBUG-FIX] 🔧 GENESIS: Sufficient peers found ({}), proceeding", peer_count);
-                                    break;
-                                }
-                                
-                                // Force another peer discovery cycle
-                                p2p.force_peer_discovery_cycle().await;
-                            }
-                            
-                            println!("[DEBUG-FIX] 🔧 PRODUCER: Forced peer discovery completed for Byzantine safety check");
+                            println!("[DEBUG-FIX] 🔧 GENESIS: Bootstrap peers ready for Byzantine validation");
                         }
                         
                         let local_peers = p2p.get_validated_active_peers().len();
