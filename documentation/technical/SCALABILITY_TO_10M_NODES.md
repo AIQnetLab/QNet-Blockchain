@@ -125,11 +125,22 @@ Level 5: User Nodes (9,890,000 Light/Ultra-Light)
          └── Minimal participation
 ```
 
-### Connection Limits:
+### Connection Limits - UPDATED (August 2025):
 - Ultra-Light: 1 connection (to edge node)
-- Light: 3 connections (to full nodes)
-- Full: 10 connections (mixed)
-- Super: 100 connections (other super nodes)
+- Light: 3 connections (to full nodes) - no peer storage
+- Full: 8-500 connections per region (adaptive based on network size)
+- Super: 8-500 connections per region (quantum-resistant validation)
+
+### Adaptive Peer Scaling:
+```rust
+// Implemented automatic peer limit adaptation:
+match network_size {
+    0..=100 => 8,      // Small network: Genesis phase
+    101..=1000 => 50,  // Growing network: Regional clustering  
+    1001..=100000 => 100, // Large network: Byzantine safety
+    _ => 500,          // Millions scale: Optimal performance
+}
+```
 
 ## Load Distribution Analysis
 

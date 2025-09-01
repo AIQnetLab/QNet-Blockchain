@@ -23,7 +23,7 @@ use flate2;
 use serde::{Serialize, Deserialize};
 
 // QNET GENESIS CONSTANTS
-const QNET_GENESIS_TIMESTAMP: u64 = 1756359322; // Aug 28, 2025 05:35:22 UTC - 40 min test
+const QNET_GENESIS_TIMESTAMP: u64 = 1756653543; // Aug 31, 2025 15:19:03 UTC - CORRECTED for active Genesis period
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum NodeType {
@@ -703,7 +703,6 @@ impl BlockchainNode {
             // CRITICAL FIX: Start from current global height, not 0
             let mut microblock_height = *height.read().await;
             let mut last_macroblock_trigger = 0u64;
-            let mut last_block_time = std::time::Instant::now(); // Track actual time for timeout detection
             
             // PRECISION TIMING: Track exact 1-second intervals to prevent drift
             let mut next_block_time = std::time::Instant::now() + microblock_interval;
@@ -1071,9 +1070,8 @@ impl BlockchainNode {
                         println!("[MICROBLOCK] ✅ Block #{} completed | Producer: {}", microblock_height, node_id);
                     }
                     
-                    // CRITICAL: Update timing for both timeout detection and precision timing
-                    last_block_time = std::time::Instant::now();
-                    next_block_time = last_block_time + microblock_interval;
+                    // CRITICAL: Update timing for precision timing
+                    next_block_time = std::time::Instant::now() + microblock_interval;
                     
                     // Advanced quantum blockchain logging with real-time metrics
                     let peer_count = if let Some(ref p2p) = unified_p2p { p2p.get_peer_count() } else { 0 };
@@ -1290,9 +1288,8 @@ impl BlockchainNode {
                                         }
                                         println!("[SYNC] ✅ Synced to block #{} from producer {}", network_height, current_producer);
                                         
-                                        // CRITICAL: Update timing after successful sync to reset timeout
-                                        last_block_time = std::time::Instant::now();
-                                        next_block_time = last_block_time + microblock_interval;
+                                        // CRITICAL: Update timing after successful sync
+                                        next_block_time = std::time::Instant::now() + microblock_interval;
                                     }
                                 } else {
                                     // No new blocks yet - wait for producer to create next block
@@ -1365,8 +1362,7 @@ impl BlockchainNode {
                                         }
                                         
                                         // CRITICAL: Reset timing for emergency production
-                                        last_block_time = std::time::Instant::now();
-                                        next_block_time = last_block_time + microblock_interval;
+                                        next_block_time = std::time::Instant::now() + microblock_interval;
                                         
                                         // Break to start emergency production immediately
                                         continue;

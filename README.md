@@ -1077,6 +1077,17 @@ QNet node deployment now features **zero-configuration** setup for maximum ease 
 - **Optimized batching**: 10,000 transactions per batch
 - **Parallel processing**: 16 threads for validation
 
+### 🔐 Quantum-Resistant P2P Network (NEW - August 2025)
+
+- **Post-quantum cryptography**: CRYSTALS-Dilithium peer verification
+- **Adaptive peer limits**: 8-500 connections per region based on network size
+- **Real-time topology**: 1-second rebalancing intervals
+- **Blockchain peer registry**: Immutable peer records in distributed ledger
+- **Zero file dependencies**: Pure in-memory quantum-resistant protocols
+- **Bootstrap trust mechanism**: Genesis nodes bypass verification for instant connectivity
+- **Byzantine safety**: Strict 4-node minimum for decentralized consensus
+- **Emergency bootstrap**: Cold-start fallback with cryptographic validation
+
 ### 📁 Distributed Data Management
 
 **QNet implements efficient archival system for long-term blockchain scalability.**

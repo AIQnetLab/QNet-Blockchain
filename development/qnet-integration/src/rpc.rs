@@ -13,7 +13,7 @@ use sha3::Digest; // Add missing Digest trait
 use base64::Engine;
 
 // QNET GENESIS CONSTANTS
-const QNET_GENESIS_TIMESTAMP: u64 = 1756359322; // Aug 28, 2025 05:35:22 UTC - 40 min test
+const QNET_GENESIS_TIMESTAMP: u64 = 1756653543; // Aug 31, 2025 15:19:03 UTC - CORRECTED for active Genesis period
 
 /// Get system CPU load for monitoring
 fn get_system_cpu_load() -> f32 {
@@ -287,18 +287,10 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
                     // SCALABILITY FIX: Use existing P2P system with built-in rate limiting and peer limits
                     // System already handles max_peers_per_region through load balancing (8 peers per region max)
                     if let Some(p2p) = blockchain.get_unified_p2p() {
-                        // SCALABILITY FIX: Use existing system peer limits - Genesis=5 max, Normal=1000 max
-                        let current_peers = p2p.get_validated_active_peers();
-                        let is_genesis = std::env::var("QNET_BOOTSTRAP_ID")
-                            .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
-                            .unwrap_or(false);
-                        let max_peer_limit = if is_genesis { 5 } else { 1000 }; // Use existing system limits
-                        if current_peers.len() < max_peer_limit {
-                            p2p.add_discovered_peers(&[requester_addr.clone()]);
-                            println!("[API] 🔄 BIDIRECTIONAL: Registered peer discovery requester: {}", requester_addr);
-                        } else {
-                            println!("[API] ⚠️ BIDIRECTIONAL: Peer limit reached, skipping registration: {}", requester_addr);
-                        }
+                        // QUANTUM: Unlimited peer scalability with cryptographic validation
+                        // Use EXISTING add_discovered_peers() with built-in quantum-resistant verification
+                        p2p.add_discovered_peers(&[requester_addr.clone()]);
+                        println!("[API] 🔄 QUANTUM: Registered peer via cryptographic verification: {}", requester_addr);
                     }
                 }
             }
@@ -1801,7 +1793,7 @@ fn verify_dilithium_signature(node_id: &str, challenge: &str, signature: &str) -
 }
 
 // Generate quantum-resistant challenge
-fn generate_quantum_challenge() -> String {
+pub fn generate_quantum_challenge() -> String {
     use rand::Rng;
     let mut rng = rand::thread_rng();
     let challenge_bytes: [u8; 32] = rng.gen();

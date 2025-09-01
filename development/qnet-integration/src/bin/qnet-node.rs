@@ -3793,8 +3793,8 @@ async fn scan_active_qnet_nodes() -> (RealNodeCounts, Vec<String>) {
     println!("   🖥️  Full Nodes: {} (servers)", counts.full);
     println!("   ⚡ Super Nodes: {} (high-performance)", counts.super_nodes);
     
-    // Save discovered peers for future sessions
-    let _ = save_decentralized_peers_cache(&counts).await;
+    // QUANTUM DECENTRALIZED: No file persistence - use real-time network discovery only
+    println!("[DISCOVERY] 🔗 QUANTUM: Peer discovery completed via decentralized protocol (no cache persistence)");
     
     // Return discovered peers for P2P integration
     (counts, discovered_peers)
@@ -3807,15 +3807,9 @@ async fn discover_peers_via_decentralized_network() -> Vec<String> {
     println!("[DISCOVERY] 🔄 Starting decentralized peer exchange protocol...");
     println!("[DISCOVERY] 🌐 Using quantum-resistant decentralized discovery");
     
-    // Load cached peers from previous sessions (truly decentralized)
-    if let Ok(cached_peers) = load_cached_peers().await {
-        for peer in cached_peers {
-            if !discovered_peers.contains(&peer) {
-                println!("[DISCOVERY] 📖 Loaded cached peer: {}", peer);
-                discovered_peers.push(peer.clone());
-            }
-        }
-    }
+    // QUANTUM DECENTRALIZED: No file caching - use real-time DHT discovery only
+    // Quantum blockchain requires cryptographic peer verification without persistent local state
+    println!("[DISCOVERY] 🔗 QUANTUM: Using real-time DHT discovery (no file cache)");
     
     // Use unified P2P module for internet-wide discovery
     // This implements DHT-style peer discovery without central servers
@@ -4168,45 +4162,8 @@ async fn get_peers_from_node(node_ip: &str) -> Result<Vec<String>, String> {
     Err(format!("No active QNet API found on {}", node_ip))
 }
 
-// Save discovered active peers to cache for future sessions
-async fn save_decentralized_peers_cache(counts: &RealNodeCounts) -> Result<(), Box<dyn std::error::Error>> {
-    let cache_path = std::path::Path::new("node_data/peer_cache.json");
-    
-    // Create directory if not exists
-    if let Some(parent) = cache_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    
-    let cache_data = serde_json::json!({
-        "timestamp": chrono::Utc::now().timestamp(),
-        "total_nodes": counts.total,
-        "light_nodes": counts.light,
-        "full_nodes": counts.full,
-        "super_nodes": counts.super_nodes,
-        "last_scan": "network_discovery"
-    });
-    
-    std::fs::write(cache_path, cache_data.to_string())?;
-    println!("[CACHE] 💾 Saved peer cache with {} nodes", counts.total);
-    
-    Ok(())
-}
-
-// Load cached peers from previous sessions  
-async fn load_cached_peers() -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    let cache_path = std::path::Path::new("node_data/peer_cache.json");
-    
-    if !cache_path.exists() {
-        return Ok(vec![]);
-    }
-    
-    let cache_content = std::fs::read_to_string(cache_path)?;
-    let cache_data: serde_json::Value = serde_json::from_str(&cache_content)?;
-    
-    // For now, return empty - in full implementation would parse cached peer addresses
-    println!("[CACHE] 📖 Loaded peer cache from previous session");
-    Ok(vec![])
-}
+// QUANTUM DECENTRALIZED: File caching functions removed
+// Quantum blockchain uses only real-time cryptographic peer discovery
 
 async fn get_activation_with_auto_genesis() -> Result<(NodeType, String), Box<dyn std::error::Error>> {
     use qnet_integration::storage::Storage;
