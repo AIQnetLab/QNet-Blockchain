@@ -3062,46 +3062,17 @@ async fn register_peer_in_blockchain(peer_info: PeerInfo) -> Result<(), String> 
 
 /// QUANTUM: Discover Genesis node IP from blockchain activation registry
 fn discover_genesis_node_ip_from_blockchain(node_id: &str) -> Option<String> {
-    // Use EXISTING BlockchainActivationRegistry for quantum-resistant lookup
-    let registry = crate::activation_validation::BlockchainActivationRegistry::new(None);
-    
-    // Query blockchain state for Genesis node information using EXISTING methods
-    if let Ok(rt) = tokio::runtime::Runtime::new() {
-        // Query EXISTING active_nodes registry for Genesis node info
-        if let Ok(genesis_device) = rt.block_on(async {
-            registry.get_current_device_for_code(&format!("genesis_cert_{}", node_id)).await
-        }) {
-            if let Some(device_signature) = genesis_device {
-                // Use EXISTING active_nodes HashMap to get node information
-                if let Ok(ip) = extract_ip_from_device_signature(&device_signature) {
-                    return Some(ip);
-                }
-            }
-        }
+    // FIXED: Use environment variables for Genesis node IPs (no async/blockchain lookup in sync context)
+    // This prevents tokio runtime conflicts in synchronous bootstrap functions
+    let ip_key = format!("QNET_GENESIS_IP_{}", node_id);
+    if let Ok(genesis_ip) = std::env::var(&ip_key) {
+        return Some(genesis_ip);
     }
     
     None
 }
 
-/// Extract IP address from device signature (device signatures often contain IP info)
-fn extract_ip_from_device_signature(device_signature: &str) -> Result<String, String> {
-    // Device signatures in QNet often contain IP addresses in various formats
-    // Examples: "device_192.168.1.1_timestamp", "genesis_154.38.160.39_cert", etc.
-    
-    // Simple IP pattern search without regex dependency
-    let parts: Vec<&str> = device_signature.split('_').collect();
-    for part in parts {
-        // Check if part looks like IP address
-        if part.contains('.') && part.split('.').count() == 4 {
-            let is_valid_ip = part.split('.').all(|octet| octet.parse::<u8>().is_ok());
-            if is_valid_ip && !part.starts_with("127.") && !part.starts_with("0.") {
-                return Ok(part.to_string());
-            }
-        }
-    }
-    
-    Err("No valid IP found in device signature".to_string())
-}
+
 
 /// QUANTUM: Discover Genesis nodes via DHT protocol
 fn discover_genesis_nodes_via_dht() -> Vec<String> {
