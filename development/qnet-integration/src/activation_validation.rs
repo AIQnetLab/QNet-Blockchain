@@ -882,9 +882,46 @@ impl BlockchainActivationRegistry {
     
     /// Check if node is running in genesis bootstrap mode
     fn is_genesis_bootstrap_mode(&self) -> bool {
-        // Check environment variable or genesis detection
+        // EXISTING: Check for QNET_BOOTSTRAP_ID which Genesis nodes actually use
+        std::env::var("QNET_BOOTSTRAP_ID")
+            .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
+            .unwrap_or(false) ||
+        // EXISTING: Legacy environment variables for compatibility  
         std::env::var("QNET_GENESIS_MODE").unwrap_or_default() == "1" ||
         std::env::var("QNET_BOOTSTRAP_NODE").unwrap_or_default() == "1"
+    }
+    
+    /// Populate active_nodes with Genesis nodes for Genesis bootstrap mode
+    async fn populate_genesis_active_nodes(&self) {
+        println!("[REGISTRY] 🌱 Populating Genesis active nodes for bootstrap phase");
+        
+        // EXISTING: Use genesis_constants::GENESIS_NODE_IPS for Genesis nodes
+        use crate::genesis_constants::GENESIS_NODE_IPS;
+        
+        let current_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        
+        let mut active_nodes = self.active_nodes.write().await;
+        
+        for (ip, bootstrap_id) in GENESIS_NODE_IPS {
+            let device_signature = format!("genesis_device_{}", bootstrap_id);
+            let node_info = NodeInfo {
+                activation_code: format!("genesis_activation_{}", bootstrap_id),
+                wallet_address: format!("genesis_wallet_{}", bootstrap_id),
+                device_signature: device_signature.clone(),
+                node_type: "super".to_string(), // EXISTING: All Genesis nodes are Super nodes
+                activated_at: current_time,
+                last_seen: current_time,
+                migration_count: 0,
+            };
+            
+            active_nodes.insert(device_signature.clone(), node_info);
+            println!("[REGISTRY] ✅ Added Genesis node: {} ({})", bootstrap_id, ip);
+        }
+        
+        println!("[REGISTRY] 🚀 Genesis bootstrap: {} active nodes populated", GENESIS_NODE_IPS.len());
     }
 }
 
@@ -1141,6 +1178,16 @@ impl BlockchainActivationRegistry {
 
     /// Get eligible nodes for consensus (public interface)
     pub async fn get_eligible_nodes(&self) -> Vec<(String, f64, String)> {
+        // GENESIS FIX: In Genesis mode, populate with Genesis nodes if active_nodes is empty
+        if self.is_genesis_bootstrap_mode() {
+            let active_nodes_read = self.active_nodes.read().await;
+            if active_nodes_read.is_empty() {
+                drop(active_nodes_read);
+                println!("[REGISTRY] 🚀 Genesis mode: Populating with Genesis nodes");
+                self.populate_genesis_active_nodes().await;
+            }
+        }
+        
         let active_nodes = self.active_nodes.read().await;
         
         // Filter nodes by type (Full/Super only) and reputation (≥70%)
