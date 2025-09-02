@@ -1305,8 +1305,31 @@ impl BlockchainNode {
                                     time_diff
                                 };
                                 
-                                // PRODUCTION: Extended timeout for international Genesis nodes (higher latency)
-                                let timeout_threshold = if std::env::var("QNET_BOOTSTRAP_ID").is_ok() { 15 } else { 5 };
+                                // CRITICAL FIX: Shorter timeout for unreachable producers in Genesis phase
+                                // For Genesis phase, check if producer is actually reachable before using long timeout
+                                let timeout_threshold = if std::env::var("QNET_BOOTSTRAP_ID").is_ok() {
+                                    // EXISTING: Use filter_working_genesis_nodes_static to check if producer is reachable
+                                    let producer_ip = if current_producer.starts_with("genesis_node_") {
+                                        // Extract IP from Genesis node ID using EXISTING constants
+                                        let producer_id = current_producer.replace("genesis_node_", "");
+                                        crate::genesis_constants::get_genesis_ip_by_id(&producer_id)
+                                            .unwrap_or("127.0.0.1")
+                                    } else {
+                                        "127.0.0.1" // Non-Genesis producer
+                                    };
+                                    
+                                    let producer_reachable = crate::unified_p2p::SimplifiedP2P::filter_working_genesis_nodes_static(
+                                        vec![producer_ip.to_string()]
+                                    ).len() > 0;
+                                    
+                                    if producer_reachable {
+                                        15 // Normal Genesis timeout for reachable nodes
+                                    } else {
+                                        3  // Fast failover for unreachable Genesis nodes
+                                    }
+                                } else {
+                                    5  // Normal timeout for non-Genesis
+                                };
                                 if time_since_last_attempt >= timeout_threshold {
                                     // ENHANCED FAILOVER STATUS DASHBOARD
                                     println!("[FAILOVER] 🚨 MICROBLOCK FAILOVER EVENT DETECTED:");
@@ -1574,83 +1597,31 @@ impl BlockchainNode {
         own_node_type: NodeType, // CRITICAL: Use real node type for accurate filtering
     ) -> String {
         if let Some(p2p) = unified_p2p {
-            // Get qualified candidates excluding the failed producer
-            let mut candidates = Vec::new();
+            // CRITICAL FIX: For Genesis phase, use SAME candidate source as normal producer selection
+            let is_genesis_phase = Self::is_genesis_bootstrap_phase(p2p).await;
+            let is_genesis_node = std::env::var("QNET_BOOTSTRAP_ID")
+                .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
+                .unwrap_or(false);
             
-            // CRITICAL: Use SAME emergency eligibility logic as normal microblock production
-            let can_participate_emergency = match own_node_type {
-                NodeType::Super => {
-                    // Super nodes always eligible for emergency (if reputation ≥ 70%)
-                    let own_reputation = Self::get_node_reputation_score(own_node_id, p2p).await;
-                    own_reputation >= 0.70
-                },
-                NodeType::Full => {
-                    // Full nodes eligible for emergency (same as normal production)
-                    let has_peers = p2p.get_peer_count() >= 3;
-                    let own_reputation = Self::get_node_reputation_score(own_node_id, p2p).await;
-                    let has_reputation = own_reputation >= 0.70;
-                    has_peers && has_reputation
-                },
-                NodeType::Light => false, // Light nodes never participate in emergency production (same as consensus)
+            let mut all_candidates = if is_genesis_phase || is_genesis_node {
+                println!("[EMERGENCY_SELECTION] 🌱 Genesis phase: Using REACHABLE Genesis nodes for emergency");
+                // EXISTING: Use same logic as normal producer selection for Genesis
+                Self::get_genesis_qualified_candidates(p2p, own_node_id, own_node_type).await
+            } else {
+                println!("[EMERGENCY_SELECTION] 🌍 Normal phase: Using Registry for emergency");
+                // EXISTING: Use same logic as normal producer selection for Normal
+                Self::get_registry_qualified_candidates(own_node_id, own_node_type).await
             };
             
-            if own_node_id != failed_producer && can_participate_emergency {
-                let own_reputation = Self::get_node_reputation_score(own_node_id, p2p).await;
-                candidates.push((own_node_id.to_string(), own_reputation));
-                println!("[EMERGENCY_SELECTION] ✅ Own node {} eligible for emergency production (type: {:?}, reputation: {:.1}%)", 
-                         own_node_id, own_node_type, own_reputation * 100.0);
-            } else if own_node_id == failed_producer {
-                println!("[EMERGENCY_SELECTION] 💀 Own node {} is the failed producer - excluding", own_node_id);
-            } else {
-                println!("[EMERGENCY_SELECTION] 📱 Own node {} excluded from emergency production (type: {:?})", 
-                         own_node_id, own_node_type);
-            }
+            // CRITICAL FIX: Filter out the failed producer from candidates
+            let candidates: Vec<(String, f64)> = all_candidates.into_iter()
+                .filter(|(node_id, _)| node_id != failed_producer)
+                .collect();
+                
+            println!("[EMERGENCY_SELECTION] 🔍 Emergency candidates: {} available (excluding failed: {})", 
+                     candidates.len(), failed_producer);
             
-            // Add peer candidates for emergency selection
-            // NOTE: get_validated_active_peers() ALREADY filters out Light nodes for consensus capability
-            let peers = p2p.get_validated_active_peers();
-            for peer in peers {
-                // CRITICAL FIX: Use same Genesis peer matching logic as in calculate_qualified_candidates
-                let peer_ip = peer.addr.split(':').next().unwrap_or(&peer.addr);
-                
-                let peer_node_id = if let Some(genesis_id) = crate::genesis_constants::get_genesis_id_by_ip(peer_ip) {
-                    // This is a Genesis node - use proper Genesis node_id format
-                    format!("genesis_node_{}", genesis_id)
-                } else {
-                    // Regular node - use IP-based format  
-                    format!("node_{}", peer.addr.replace(":", "_"))
-                };
-                
-                // Exclude failed producer (Light nodes already filtered by P2P layer)
-                if peer_node_id == failed_producer {
-                    println!("[EMERGENCY_SELECTION] 💀 Excluding failed producer {} from emergency candidates", peer_node_id);
-                    continue;
-                }
-                
-                // Initialize Genesis peer reputation if needed
-                if peer_node_id.starts_with("genesis_node_") {
-                    let current_rep = match p2p.get_reputation_system().lock() {
-                        Ok(reputation) => reputation.get_reputation(&peer_node_id),
-                        Err(_) => 0.0,
-                    };
-                    
-                    if current_rep == 0.0 {
-                        p2p.set_node_reputation(&peer_node_id, 90.0);
-                        println!("[EMERGENCY_SELECTION] 🔐 Genesis peer {} initialized with 90% reputation", peer_node_id);
-                    }
-                }
-                
-                // All peers from get_validated_active_peers() are already Full/Super nodes
-                let reputation = Self::get_node_reputation_score(&peer_node_id, p2p).await;
-                if reputation >= 0.70 {
-                    candidates.push((peer_node_id.clone(), reputation));
-                    println!("[EMERGENCY_SELECTION] ✅ Emergency candidate {} added (type: {:?}, reputation: {:.1}%)", 
-                             peer_node_id, peer.node_type, reputation * 100.0);
-                } else {
-                    println!("[EMERGENCY_SELECTION] ⚠️ Peer {} excluded - low reputation: {:.1}%", 
-                             peer_node_id, reputation * 100.0);
-                }
-            }
+            // OLD P2P peer discovery logic removed - we now use Registry/Genesis candidates
             
             if candidates.is_empty() {
                 println!("[FAILOVER] 💀 CRITICAL: No backup producers available!");

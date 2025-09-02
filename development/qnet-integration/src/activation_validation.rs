@@ -898,6 +898,12 @@ impl BlockchainActivationRegistry {
         // EXISTING: Use genesis_constants::GENESIS_NODE_IPS for Genesis nodes
         use crate::genesis_constants::GENESIS_NODE_IPS;
         
+        // CRITICAL FIX: Use EXISTING method to check which Genesis nodes are actually working
+        let all_genesis_ips: Vec<String> = GENESIS_NODE_IPS.iter().map(|(ip, _)| ip.to_string()).collect();
+        let working_genesis_ips = crate::unified_p2p::SimplifiedP2P::filter_working_genesis_nodes_static(all_genesis_ips);
+        
+        println!("[REGISTRY] 🔍 Checked {} Genesis nodes, {} are reachable", GENESIS_NODE_IPS.len(), working_genesis_ips.len());
+        
         let current_time = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -905,23 +911,29 @@ impl BlockchainActivationRegistry {
         
         let mut active_nodes = self.active_nodes.write().await;
         
+        // CRITICAL FIX: Only add Genesis nodes that are actually reachable
         for (ip, bootstrap_id) in GENESIS_NODE_IPS {
-            let device_signature = format!("genesis_device_{}", bootstrap_id);
-            let node_info = NodeInfo {
-                activation_code: format!("genesis_activation_{}", bootstrap_id),
-                wallet_address: format!("genesis_wallet_{}", bootstrap_id),
-                device_signature: device_signature.clone(),
-                node_type: "super".to_string(), // EXISTING: All Genesis nodes are Super nodes
-                activated_at: current_time,
-                last_seen: current_time,
-                migration_count: 0,
-            };
-            
-            active_nodes.insert(device_signature.clone(), node_info);
-            println!("[REGISTRY] ✅ Added Genesis node: {} ({})", bootstrap_id, ip);
+            if working_genesis_ips.contains(&ip.to_string()) {
+                let device_signature = format!("genesis_device_{}", bootstrap_id);
+                let node_info = NodeInfo {
+                    activation_code: format!("genesis_activation_{}", bootstrap_id),
+                    wallet_address: format!("genesis_wallet_{}", bootstrap_id),
+                    device_signature: device_signature.clone(),
+                    node_type: "super".to_string(), // EXISTING: All Genesis nodes are Super nodes
+                    activated_at: current_time,
+                    last_seen: current_time,
+                    migration_count: 0,
+                };
+                
+                active_nodes.insert(device_signature.clone(), node_info);
+                println!("[REGISTRY] ✅ Added REACHABLE Genesis node: {} ({})", bootstrap_id, ip);
+            } else {
+                println!("[REGISTRY] ⚠️ Skipping UNREACHABLE Genesis node: {} ({})", bootstrap_id, ip);
+            }
         }
         
-        println!("[REGISTRY] 🚀 Genesis bootstrap: {} active nodes populated", GENESIS_NODE_IPS.len());
+        let actual_count = active_nodes.len();
+        println!("[REGISTRY] 🚀 Genesis bootstrap: {} REACHABLE nodes populated (out of {} total)", actual_count, GENESIS_NODE_IPS.len());
     }
 }
 
@@ -1186,15 +1198,25 @@ impl BlockchainActivationRegistry {
                 println!("[REGISTRY] 🚀 Genesis mode: Populating with Genesis nodes");
                 self.populate_genesis_active_nodes().await;
             } else {
-                // CRITICAL FIX: Don't spam logs if Genesis nodes already populated
-                // Registry is called every 60s by ping service - only log once
+                // CRITICAL FIX: Don't spam logs - Registry is called frequently
                 let genesis_count = active_nodes_read.len();
                 drop(active_nodes_read);
-                if genesis_count == 5 {
-                    // Silent success - Genesis nodes already populated
-                } else {
-                    println!("[REGISTRY] 📊 Genesis bootstrap active: {} nodes available", genesis_count);
+                
+                // EXISTING: Use cache_ttl to prevent too frequent refreshes
+                let last_sync = *self.last_sync.read().await;
+                let current_time = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                
+                // PERFORMANCE FIX: Only re-check Genesis nodes every 60 seconds (cache_ttl/5)
+                if current_time - last_sync > 60 {
+                    // Silent refresh - too many logs in production
+                    let _ = self.active_nodes.write().await.clear(); // Clear to force refresh
+                    self.populate_genesis_active_nodes().await;
+                    *self.last_sync.write().await = current_time;
                 }
+                // Silent success - no spam logs
             }
         }
         

@@ -1292,7 +1292,7 @@ impl SimplifiedP2P {
     }
     
     /// Static version for use in async contexts
-    fn filter_working_genesis_nodes_static(nodes: Vec<String>) -> Vec<String> {
+    pub fn filter_working_genesis_nodes_static(nodes: Vec<String>) -> Vec<String> {
         use std::net::{TcpStream, SocketAddr};
         use std::time::Duration;
         
