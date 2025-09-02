@@ -998,20 +998,17 @@ impl SimplifiedP2P {
     fn query_peer_height_http(&self, endpoint: &str) -> Result<u64, String> {
         use std::time::Duration;
         
-        // PRODUCTION: Use blocking HTTP client to avoid runtime conflicts
+        // EXISTING: Use same quick timeouts as check_api_readiness_static for microblock compatibility
         let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(30)) // INCREASED: Extended timeout for international Genesis nodes
-            .connect_timeout(Duration::from_secs(15)) // Separate connection timeout
+            .timeout(Duration::from_secs(5)) // EXISTING: Same as check_api_readiness_static (quick API checks)
+            .connect_timeout(Duration::from_secs(3)) // EXISTING: Same as check_api_readiness_static (quick connect)
             .tcp_keepalive(Duration::from_secs(30)) // Keep connections alive
             .build()
             .map_err(|e| format!("HTTP client error: {}", e))?;
         
-        // DYNAMIC: Extended retry logic for bootstrap nodes and small networks
-        let is_bootstrap_node = std::env::var("QNET_BOOTSTRAP_ID").is_ok();
-        let is_extended_retry = is_bootstrap_node; // Bootstrap nodes need more retries for network formation
-        
-        let max_attempts = if is_extended_retry { 10 } else { 3 }; // MORE attempts for bootstrap nodes
-        let retry_delay = if is_extended_retry { 2 } else { 1 };
+        // EXISTING: Use same single-attempt pattern as check_api_readiness_static for microblock speed
+        let max_attempts = 1; // EXISTING: Single attempt (same as check_api_readiness_static)
+        let retry_delay = Duration::from_secs(0); // EXISTING: No delays for quick operations
         
         for attempt in 1..=max_attempts {
             match client.get(endpoint).send() {
@@ -1026,7 +1023,7 @@ impl SimplifiedP2P {
                         }
                 Err(e) => {
                             if attempt < max_attempts {
-                                std::thread::sleep(Duration::from_secs(retry_delay));
+                                // EXISTING: No delays for single-attempt quick operations
                                 continue;
                             }
                             return Err(format!("JSON parse error: {}", e));
@@ -1035,14 +1032,14 @@ impl SimplifiedP2P {
                 }
                     Ok(response) => {
                     if attempt < max_attempts {
-                        std::thread::sleep(Duration::from_secs(retry_delay));
+                        // EXISTING: No delays for single-attempt quick operations
                         continue;
                     }
                     return Err(format!("HTTP error: {}", response.status()));
                 }
                 Err(e) => {
                     if attempt < max_attempts {
-                        std::thread::sleep(Duration::from_secs(retry_delay));
+                        // EXISTING: No delays for single-attempt quick operations
                         continue;
                     }
                     return Err(format!("Request failed: {}", e));
@@ -2035,11 +2032,8 @@ impl SimplifiedP2P {
                 let ip = peer.addr.split(':').next().unwrap_or("");
                 let is_genesis_peer = is_genesis_node_ip(ip);
                 
-                // FIXED: Genesis peers ALWAYS use relaxed validation (no time dependency)
-                if is_genesis_peer {
-                    connected.push(peer.clone());
-                    println!("[P2P] ✅ Added Genesis {} (bootstrap trust)", peer.addr);
-                } else if self.is_peer_actually_connected(&peer.addr) {
+                // EXISTING: All peers use same validation logic for consistency
+                if self.is_peer_actually_connected(&peer.addr) {
                     connected.push(peer.clone());
                     println!("[P2P] ✅ Added {} to connection pool from {:?} (REAL connection verified)", peer.id, peer.region);
                 } else {

@@ -454,38 +454,8 @@ impl BlockchainNode {
             // This prevents each node from creating its own isolated blockchain
             println!("[SYNC] ⏳ Waiting for peer connections and blockchain synchronization...");
             
-            // TIMING FIX: Wait longer for Genesis nodes API servers to start
-            // Genesis nodes need time for API servers to be ready on port 8001
-            // EXISTING: Genesis nodes start simultaneously - need coordination time
-            let wait_time = if std::env::var("QNET_BOOTSTRAP_ID").is_ok() { 8 } else { 5 };
-            println!("[SYNC] ⏳ Waiting {} seconds for Genesis API servers to be ready...", wait_time);
-            tokio::time::sleep(std::time::Duration::from_secs(wait_time)).await;
-            
-            // Synchronize with network height before starting production
-            match unified_p2p.sync_blockchain_height() {
-                Ok(network_height) => {
-                    let current_height = *self.height.read().await;
-                    println!("[SYNC] 📊 Current height: {}, Network height: {}", current_height, network_height);
-                    
-                    if network_height > current_height {
-                        println!("[SYNC] 📥 Downloading {} missing blocks from network...", network_height - current_height);
-                        unified_p2p.download_missing_microblocks(
-                            &*self.storage,
-                            current_height,
-                            network_height
-                        ).await;
-                        
-                        // Update local height to match network
-                        *self.height.write().await = network_height;
-                        println!("[SYNC] ✅ Synchronized to network height: {}", network_height);
-                    } else {
-                        println!("[SYNC] ✅ Node is synchronized with network");
-                    }
-                },
-                Err(e) => {
-                    println!("[SYNC] ⚠️ Could not sync with network (Genesis mode): {}", e);
-                }
-            }
+            // EXISTING: Bootstrap peer connections without initial sync delay
+            // Sync will happen later after API servers are ready
         }
         
         // PRODUCTION FIX: Always enable microblock production for blockchain operation
@@ -559,7 +529,9 @@ impl BlockchainNode {
             
             // CRITICAL FIX: Wait for API server to be ready before P2P discovery  
             println!("[Node] ⏳ Waiting for API server to be ready...");
-            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            // EXISTING: Use same wait time as Genesis coordination (8s for Genesis, 5s for regular)
+            let api_wait_time = if std::env::var("QNET_BOOTSTRAP_ID").is_ok() { 8 } else { 5 };
+            tokio::time::sleep(std::time::Duration::from_secs(api_wait_time)).await;
             
             // Store ports for external access
             std::env::set_var("QNET_CURRENT_RPC_PORT", rpc_port.to_string()); // Correct RPC port
@@ -567,6 +539,34 @@ impl BlockchainNode {
             
             println!("[Node] 🔌 Unified RPC+API server: port {}", api_port);
             println!("[Node] 🌐 All endpoints available on single port");
+            
+            // EXISTING: Now sync blockchain height AFTER API server is ready
+            if let Some(unified_p2p) = &self.unified_p2p {
+                match unified_p2p.sync_blockchain_height() {
+                    Ok(network_height) => {
+                        let current_height = *self.height.read().await;
+                        println!("[SYNC] 📊 Current height: {}, Network height: {}", current_height, network_height);
+                        
+                        if network_height > current_height {
+                            println!("[SYNC] 📥 Downloading {} missing blocks from network...", network_height - current_height);
+                            unified_p2p.download_missing_microblocks(
+                                &*self.storage,
+                                current_height,
+                                network_height
+                            ).await;
+                            
+                            // Update local height to match network
+                            *self.height.write().await = network_height;
+                            println!("[SYNC] ✅ Synchronized to network height: {}", network_height);
+                        } else {
+                            println!("[SYNC] ✅ Node is synchronized with network");
+                        }
+                    },
+                    Err(e) => {
+                        println!("[SYNC] ⚠️ Could not sync with network (Genesis mode): {}", e);
+                    }
+                }
+            }
         } else {
             // Light nodes: RPC only, no API server
             let node_clone_rpc = self.clone();
@@ -1250,138 +1250,55 @@ impl BlockchainNode {
                     // Update is_leader for backward compatibility
                     *is_leader.write().await = false;
                     
-                    // Synchronize with network to get the microblock from current producer
+                    // EXISTING: Non-blocking background sync as promised in line 868 comments
                     if let Some(p2p) = &unified_p2p {
-                        match p2p.sync_blockchain_height() {
-                            Ok(network_height) => {
-                                if network_height > microblock_height {
-                                    println!("[SYNC] 📥 Downloading blocks {}-{} from producer {}", 
-                                             microblock_height + 1, network_height, current_producer);
-                                    let storage_clone = storage.clone();
-                                    p2p.download_missing_microblocks(storage_clone.as_ref(), microblock_height, network_height).await;
+                        // PRODUCTION: Background sync without blocking microblock timing
+                        let p2p_clone = p2p.clone();
+                        let storage_clone = storage.clone();
+                        let height_clone = height.clone();
+                        let current_height = microblock_height;
+                        
+                        tokio::spawn(async move {
+                            // EXISTING: Background sync pattern - no blocking of main loop
+                            if let Ok(network_height) = p2p_clone.sync_blockchain_height() {
+                                if network_height > current_height {
+                                    println!("[SYNC] 📥 Background sync: downloading blocks {}-{}", 
+                                             current_height + 1, network_height);
+                                    p2p_clone.download_missing_microblocks(storage_clone.as_ref(), current_height, network_height).await;
                                     
-                                    // Update our height to match network
-                                    if let Ok(Some(_)) = storage.load_microblock(network_height) {
-                                        microblock_height = network_height;
-                                        {
-                                            let mut global_height = height.write().await;
-                                            *global_height = microblock_height;
-                                        }
-                                        println!("[SYNC] ✅ Synced to block #{} from producer {}", network_height, current_producer);
-                                        
-                                        // CRITICAL: Update timing after successful sync
-                                        next_block_time = std::time::Instant::now() + microblock_interval;
-                                    }
-                                } else {
-                                    // No new blocks yet - wait for producer to create next block
-                                    println!("[SYNC] ⏳ Waiting for producer {} to create block #{}", 
-                                             current_producer, microblock_height + 1);
-                                }
-                            },
-                            Err(_) => {
-                                println!("[SYNC] ⚠️ Cannot sync with producer {} - network unreachable", current_producer);
-                                
-                                // CRITICAL FIX: Refresh peer connections before timeout to improve connectivity
-                                if let Some(p2p) = &unified_p2p {
-                                    // Force peer cache refresh to get latest connections
-                                    let _ = p2p.get_validated_active_peers();
-                                    println!("[SYNC] 🔄 Refreshed peer connections for better sync reliability");
-                                }
-                                
-                                // DYNAMIC: Check if producer timeout occurred using relative block timing
-                                // QNet CONSENSUS SAFETY: Use relative timeout tracking for robust failover
-                                let block_production_start = std::time::Instant::now();
-                                let time_since_last_attempt = {
-                                    let mut last_attempt_guard = last_block_attempt.lock().await;
-                                    let time_diff = if let Some(last_attempt) = last_attempt_guard.as_ref() {
-                                        block_production_start.duration_since(*last_attempt).as_secs()
-                                    } else {
-                                        0 // First attempt
-                                    };
-                                    *last_attempt_guard = Some(block_production_start);
-                                    time_diff
-                                };
-                                
-                                // CRITICAL FIX: Shorter timeout for unreachable producers in Genesis phase
-                                // For Genesis phase, check if producer is actually reachable before using long timeout
-                                let timeout_threshold = if std::env::var("QNET_BOOTSTRAP_ID").is_ok() {
-                                    // EXISTING: Use filter_working_genesis_nodes_static to check if producer is reachable
-                                    let producer_ip = if current_producer.starts_with("genesis_node_") {
-                                        // Extract IP from Genesis node ID using EXISTING constants
-                                        let producer_id = current_producer.replace("genesis_node_", "");
-                                        crate::genesis_constants::get_genesis_ip_by_id(&producer_id)
-                                            .unwrap_or("127.0.0.1")
-                                    } else {
-                                        "127.0.0.1" // Non-Genesis producer
-                                    };
-                                    
-                                    let producer_reachable = crate::unified_p2p::SimplifiedP2P::filter_working_genesis_nodes_static(
-                                        vec![producer_ip.to_string()]
-                                    ).len() > 0;
-                                    
-                                    if producer_reachable {
-                                        15 // Normal Genesis timeout for reachable nodes
-                                    } else {
-                                        3  // Fast failover for unreachable Genesis nodes
-                                    }
-                                } else {
-                                    5  // Normal timeout for non-Genesis
-                                };
-                                if time_since_last_attempt >= timeout_threshold {
-                                    // ENHANCED FAILOVER STATUS DASHBOARD
-                                    println!("[FAILOVER] 🚨 MICROBLOCK FAILOVER EVENT DETECTED:");
-                                    println!("  ├── Failed Producer: {}", current_producer);
-                                    println!("  ├── Timeout Duration: {} seconds (threshold: {}s)", time_since_last_attempt, timeout_threshold);
-                                    println!("  ├── Block Height: {}", microblock_height + 1);
-                                    println!("  ├── Network Status: {} active peers", if let Some(ref p2p) = unified_p2p { p2p.get_validated_active_peers().len() } else { 0 });
-                                    println!("  └── Recovery Action: Emergency producer rotation initiated");
-                                    
-                                    // Trigger emergency producer selection
-                                    let emergency_producer = Self::select_emergency_producer(
-                                        &current_producer, 
-                                        microblock_height + 1, 
-                                        &unified_p2p,
-                                        &node_id, // CRITICAL: Include own node as emergency candidate
-                                        node_type  // CRITICAL: Pass real node type for accurate filtering
-                                    ).await;
-                                    
-                                    // If we are the emergency producer, take over production
-                                    if emergency_producer == node_id {
-                                        println!("[FAILOVER] 🆘 EMERGENCY TAKEOVER SUCCESSFUL:");
-                                        println!("  ├── New Producer: {} (this node)", node_id);
-                                        println!("  ├── Takeover Type: Emergency rotation");
-                                        println!("  ├── Recovery Time: {} seconds", time_since_last_attempt);
-                                        println!("  └── Status: Production resumed immediately");
-                                        *is_leader.write().await = true;
-                                        
-                                        // Penalize failed producer and broadcast change to network
-                                        if let Some(p2p) = &unified_p2p {
-                                            p2p.update_node_reputation(&current_producer, -25.0);
-                                            println!("[REPUTATION] ⚔️ Producer {} penalized for timeout: -25.0 reputation", current_producer);
-                                            
-                                            // Notify network of emergency producer change (non-blocking)
-                                            if let Err(e) = p2p.broadcast_emergency_producer_change(
-                                                &current_producer,
-                                                &node_id,
-                                                microblock_height + 1,
-                                                "microblock"
-                                            ) {
-                                                println!("[FAILOVER] ⚠️ Emergency broadcast failed: {}", e);
-                                            } else {
-                                                println!("[FAILOVER] ✅ Emergency producer change broadcasted to network");
-                                            }
-                                        }
-                                        
-                                        // CRITICAL: Reset timing for emergency production
-                                        next_block_time = std::time::Instant::now() + microblock_interval;
-                                        
-                                        // Break to start emergency production immediately
-                                        continue;
+                                    // Update global height atomically
+                                    if let Ok(Some(_)) = storage_clone.load_microblock(network_height) {
+                                        *height_clone.write().await = network_height;
+                                        println!("[SYNC] ✅ Background sync completed to block #{}", network_height);
                                     }
                                 }
                             }
+                        });
+                        
+                        // EXISTING: Non-blocking - continue immediately without waiting
+                        println!("[SYNC] 🔄 Background sync started for producer {}", current_producer);
+                        
+                        // CRITICAL: Check if we already have the next block locally
+                        let expected_height = microblock_height + 1;
+                        if let Ok(Some(_)) = storage.load_microblock(expected_height) {
+                            microblock_height = expected_height;
+                            {
+                                let mut global_height = height.write().await;
+                                *global_height = microblock_height;
+                            }
+                            println!("[SYNC] ✅ Found local block #{} - no network sync needed", expected_height);
+                            
+                            // CRITICAL: Update timing after local sync
+                            next_block_time = std::time::Instant::now() + microblock_interval;
+                        } else {
+                            // No local block - background sync will handle it
+                            println!("[SYNC] ⏳ Waiting for background sync of block #{}", expected_height);
                         }
+                    } else {
+                        // No P2P available - standalone mode
+                        println!("[SYNC] ⚠️ No P2P connection - running in standalone mode");
                     }
+
                 }
                 
                 // PRECISION TIMING: Sleep until exact next block time (no drift accumulation)
