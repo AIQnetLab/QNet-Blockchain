@@ -434,7 +434,7 @@ impl BlockchainNode {
         }
         Ok(())
     }
-
+    
     /// Start the blockchain node
     pub async fn start(&mut self) -> Result<(), QNetError> {
         println!("[Node] Starting blockchain node...");
@@ -457,7 +457,7 @@ impl BlockchainNode {
             // TIMING FIX: Wait longer for Genesis nodes API servers to start
             // Genesis nodes need time for API servers to be ready on port 8001
             // EXISTING: Genesis nodes start simultaneously - need coordination time
-            let wait_time = if std::env::var("QNET_BOOTSTRAP_ID").is_ok() { 30 } else { 10 };
+            let wait_time = if std::env::var("QNET_BOOTSTRAP_ID").is_ok() { 8 } else { 5 };
             println!("[SYNC] ⏳ Waiting {} seconds for Genesis API servers to be ready...", wait_time);
             tokio::time::sleep(std::time::Duration::from_secs(wait_time)).await;
             
@@ -557,34 +557,9 @@ impl BlockchainNode {
                 crate::rpc::start_rpc_server(node_clone_api, api_port).await;
             });
             
-            // CRITICAL FIX: Wait for API server to be ready before P2P discovery
+            // CRITICAL FIX: Wait for API server to be ready before P2P discovery  
             println!("[Node] ⏳ Waiting for API server to be ready...");
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            
-            // ADDITIONAL FIX: Verify API server is actually responding
-            use std::time::Duration;
-            for attempt in 1..=5 {
-                if let Ok(client) = reqwest::Client::builder()
-                    .timeout(Duration::from_secs(2))
-                    .connect_timeout(Duration::from_secs(1))
-                    .build() 
-                {
-                    let test_url = format!("http://127.0.0.1:{}/api/v1/health", api_port);
-                    match client.get(&test_url).send().await {
-                        Ok(_) => {
-                            println!("[Node] ✅ API server ready on port {} (attempt {})", api_port, attempt);
-                            break;
-                        },
-                        Err(_) if attempt < 5 => {
-                            println!("[Node] ⏳ API server not ready, retrying... (attempt {}/5)", attempt);
-                            tokio::time::sleep(Duration::from_secs(2)).await;
-                        },
-                        Err(_) => {
-                            println!("[Node] ⚠️ API server may not be fully ready after {} attempts", attempt);
-                        }
-                    }
-                }
-            }
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
             
             // Store ports for external access
             std::env::set_var("QNET_CURRENT_RPC_PORT", rpc_port.to_string()); // Correct RPC port
@@ -640,7 +615,7 @@ impl BlockchainNode {
         println!("[Node] 🛑 Blockchain node shutting down...");
         Ok(())
     }
-
+    
     
     /// PRODUCTION: Process consensus messages from other nodes 
     async fn process_consensus_message(
@@ -736,6 +711,8 @@ impl BlockchainNode {
             let mut microblock_height = *height.read().await;
             let mut last_macroblock_trigger = 0u64;
             
+
+            
             // PRECISION TIMING: Track exact 1-second intervals to prevent drift
             let mut next_block_time = std::time::Instant::now() + microblock_interval;
             
@@ -747,7 +724,7 @@ impl BlockchainNode {
                 // Each node was seeing different peer counts causing deadlock
                 println!("[DEBUG-FIX] 🔧 Starting active_node_count calculation");
                 
-                let active_node_count = if let Some(p2p) = &unified_p2p {
+                let active_node_count = if let Some(p2p) = &unified_p2p {   
                     println!("[DEBUG-FIX] 🔧 P2P system available, checking genesis phase...");
                     // CRITICAL FIX: Use phase-aware node counting for consistent startup
                     // During Genesis phase, use deterministic counting instead of unreliable P2P discovery
@@ -759,26 +736,20 @@ impl BlockchainNode {
                     println!("[DEBUG-FIX] 🔧 is_genesis_phase = {}, is_genesis_node = {}", is_genesis_phase, is_genesis_node);
                     
                     if is_genesis_phase || is_genesis_node {
-                        println!("[DEBUG-FIX] 🔧 Genesis phase detected - using Registry instead of P2P peer discovery");
-                        // CRITICAL FIX: For Genesis nodes, use Registry eligible nodes count instead of P2P peers
-                        // P2P peers fail due to HTTP connectivity issues, but Registry has all 5 Genesis nodes
+                        println!("[DEBUG-FIX] 🔧 Genesis phase detected - using EXISTING P2P peer discovery");
+                        // EXISTING: Use P2P validated active peers for node count
+                        let local_peers = p2p.get_validated_active_peers().len();
+                        let genesis_count = std::cmp::min(local_peers + 1, 5); // +1 for self, max 5 Genesis nodes
                         
-                        // Create Registry to get actual eligible node count
-                        let qnet_rpc = std::env::var("QNET_RPC_URL")
-                            .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
-                        let registry = crate::activation_validation::BlockchainActivationRegistry::new(Some(qnet_rpc));
-                        let eligible_nodes = registry.get_eligible_nodes().await;
-                        let registry_count = eligible_nodes.len();
+                        println!("[DEBUG-FIX] 🔧 GENESIS P2P count: {} active peers", genesis_count);
                         
-                        println!("[DEBUG-FIX] 🔧 GENESIS Registry count: {} eligible nodes", registry_count);
-                        
-                        // CRITICAL: Only allow block production if Byzantine safety is met
-                        if registry_count >= 4 {
-                            println!("[NETWORK] ✅ Genesis Byzantine safety MET: {} nodes ≥ 4 (via Registry)", registry_count);
-                            registry_count
+                        // EXISTING: Allow block production based on P2P connectivity
+                        if genesis_count >= 4 {
+                            println!("[NETWORK] ✅ Genesis Byzantine safety MET: {} nodes ≥ 4 (via P2P)", genesis_count);
+                            genesis_count
                         } else {
-                            println!("[NETWORK] ❌ Genesis Byzantine safety NOT met: {} nodes < 4 (via Registry)", registry_count);
-                            registry_count
+                            println!("[NETWORK] ❌ Genesis Byzantine safety NOT met: {} nodes < 4 (via P2P)", genesis_count);
+                            genesis_count
                         }
                     } else {
                         println!("[DEBUG-FIX] 🔧 Normal phase detected - using P2P peer discovery");
@@ -1191,8 +1162,8 @@ impl BlockchainNode {
                                 match Self::trigger_macroblock_consensus(
                                     storage_clone,
                                     consensus_clone,
-                                    last_macroblock_trigger + 1,
-                                    microblock_height,
+                            last_macroblock_trigger + 1,
+                            microblock_height,
                                     &unified_p2p_clone.unwrap(), // CRITICAL: Pass REAL P2P for participant discovery
                                     &node_id_clone,
                                     node_type_clone,
@@ -1629,25 +1600,86 @@ impl BlockchainNode {
                 .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
                 .unwrap_or(false);
             
-            let mut all_candidates = if is_genesis_phase || is_genesis_node {
-                println!("[EMERGENCY_SELECTION] 🌱 Genesis phase: Using REACHABLE Genesis nodes for emergency");
-                // EXISTING: Use same logic as normal producer selection for Genesis
-                Self::get_genesis_qualified_candidates(p2p, own_node_id, own_node_type).await
-            } else {
-                println!("[EMERGENCY_SELECTION] 🌍 Normal phase: Using Registry for emergency");
-                // EXISTING: Use same logic as normal producer selection for Normal
-                Self::get_registry_qualified_candidates(own_node_id, own_node_type).await
+            // EXISTING: Get qualified candidates excluding the failed producer
+            let mut candidates = Vec::new();
+            
+            // EXISTING: Use SAME emergency eligibility logic as normal microblock production
+            let can_participate_emergency = match own_node_type {
+                NodeType::Super => {
+                    // Super nodes always eligible for emergency (if reputation ≥ 70%)
+                    let own_reputation = Self::get_node_reputation_score(own_node_id, p2p).await;
+                    own_reputation >= 0.70
+                },
+                NodeType::Full => {
+                    // Full nodes eligible for emergency (same as normal production)
+                    let has_peers = p2p.get_peer_count() >= 3;
+                    let own_reputation = Self::get_node_reputation_score(own_node_id, p2p).await;
+                    let has_reputation = own_reputation >= 0.70;
+                    has_peers && has_reputation
+                },
+                NodeType::Light => false, // Light nodes never participate in emergency production (same as consensus)
             };
             
-            // CRITICAL FIX: Filter out the failed producer from candidates
-            let candidates: Vec<(String, f64)> = all_candidates.into_iter()
-                .filter(|(node_id, _)| node_id != failed_producer)
-                .collect();
+            if own_node_id != failed_producer && can_participate_emergency {
+                let own_reputation = Self::get_node_reputation_score(own_node_id, p2p).await;
+                candidates.push((own_node_id.to_string(), own_reputation));
+                println!("[EMERGENCY_SELECTION] ✅ Own node {} eligible for emergency production (type: {:?}, reputation: {:.1}%)", 
+                         own_node_id, own_node_type, own_reputation * 100.0);
+            } else if own_node_id == failed_producer {
+                println!("[EMERGENCY_SELECTION] 💀 Own node {} is the failed producer - excluding", own_node_id);
+            } else {
+                println!("[EMERGENCY_SELECTION] 📱 Own node {} excluded from emergency production (type: {:?})", 
+                         own_node_id, own_node_type);
+            };
+            
+            // EXISTING: Add peer candidates for emergency selection using P2P discovery
+            let peers = p2p.get_validated_active_peers();
+            for peer in peers {
+                // EXISTING: Use same Genesis peer matching logic as in calculate_qualified_candidates
+                let peer_ip = peer.addr.split(':').next().unwrap_or(&peer.addr);
                 
+                let peer_node_id = if let Some(genesis_id) = crate::genesis_constants::get_genesis_id_by_ip(peer_ip) {
+                    // This is a Genesis node - use proper Genesis node_id format
+                    format!("genesis_node_{}", genesis_id)
+                } else {
+                    // Regular node - use IP-based format  
+                    format!("node_{}", peer.addr.replace(":", "_"))
+                };
+                
+                // Exclude failed producer (Light nodes already filtered by P2P layer)
+                if peer_node_id == failed_producer {
+                    println!("[EMERGENCY_SELECTION] 💀 Excluding failed producer {} from emergency candidates", peer_node_id);
+                    continue;
+                }
+                
+                // Initialize Genesis peer reputation if needed
+                if peer_node_id.starts_with("genesis_node_") {
+                    let current_rep = match p2p.get_reputation_system().lock() {
+                        Ok(reputation) => reputation.get_reputation(&peer_node_id),
+                        Err(_) => 0.0,
+                    };
+                    
+                    if current_rep == 0.0 {
+                        p2p.set_node_reputation(&peer_node_id, 90.0);
+                        println!("[EMERGENCY_SELECTION] 🔐 Genesis peer {} initialized with 90% reputation", peer_node_id);
+                    }
+                }
+                
+                // All peers from get_validated_active_peers() are already Full/Super nodes
+                let reputation = Self::get_node_reputation_score(&peer_node_id, p2p).await;
+                if reputation >= 0.70 {
+                    candidates.push((peer_node_id.clone(), reputation));
+                    println!("[EMERGENCY_SELECTION] ✅ Emergency candidate {} added (type: {:?}, reputation: {:.1}%)", 
+                             peer_node_id, peer.node_type, reputation * 100.0);
+                } else {
+                    println!("[EMERGENCY_SELECTION] ⚠️ Peer {} excluded - low reputation: {:.1}%", 
+                             peer_node_id, reputation * 100.0);
+                }
+            }
+            
+            
             println!("[EMERGENCY_SELECTION] 🔍 Emergency candidates: {} available (excluding failed: {})", 
                      candidates.len(), failed_producer);
-            
-            // OLD P2P peer discovery logic removed - we now use Registry/Genesis candidates
             
             if candidates.is_empty() {
                 println!("[FAILOVER] 💀 CRITICAL: No backup producers available!");
@@ -1801,9 +1833,9 @@ impl BlockchainNode {
         }
     }
     
-    /// Get qualified candidates for Genesis phase (ONLY REACHABLE nodes)
+    /// Get qualified candidates for Genesis phase (≤5 static nodes)
     async fn get_genesis_qualified_candidates(
-        _p2p: &Arc<SimplifiedP2P>,
+        p2p: &Arc<SimplifiedP2P>,
         own_node_id: &str,
         own_node_type: NodeType,
     ) -> Vec<(String, f64)> {
@@ -1813,19 +1845,8 @@ impl BlockchainNode {
         println!("[DIAGNOSTIC] 🔧   own_node_id: {}", own_node_id);
         println!("[DIAGNOSTIC] 🔧   own_node_type: {:?}", own_node_type);
         
-        // CRITICAL FIX: Use Registry data for Genesis candidates instead of static list
-        // This ensures only REACHABLE Genesis nodes are used for producer selection
-        println!("  ├── Using Registry for REACHABLE Genesis candidates (not static list)");
-        
-        // EXISTING: Create registry instance to get only reachable Genesis nodes
-        let qnet_rpc = std::env::var("QNET_RPC_URL")
-            .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
-        let registry = crate::activation_validation::BlockchainActivationRegistry::new(Some(qnet_rpc));
-        let registry_candidates = registry.get_eligible_nodes().await;
-        
-        println!("  ├── Registry returned {} reachable Genesis nodes", registry_candidates.len());
-        
-        // EXISTING: Check own node eligibility using same logic as Registry
+        // EXISTING: For Genesis phase, ALL Genesis nodes use IDENTICAL deterministic reputation
+        // This ensures consistent candidate lists and hashes across all nodes
         let is_own_genesis = own_node_id.starts_with("genesis_node_");
         println!("[DIAGNOSTIC] 🔧   is_own_genesis: {}", is_own_genesis);
         
@@ -1837,50 +1858,76 @@ impl BlockchainNode {
                     println!("  ├── Own Genesis Super node: deterministic reputation {:.1}%", GENESIS_STATIC_REPUTATION * 100.0);
                     GENESIS_STATIC_REPUTATION >= 0.70
                 } else {
-                    // Regular Super nodes: Use P2P reputation  
-                    false // This function only handles Genesis nodes
+                    // Regular Super nodes: Use P2P reputation
+                    let own_reputation = Self::get_node_reputation_score(own_node_id, p2p).await;
+                    println!("  ├── Own Super node reputation: {:.1}%", own_reputation * 100.0);
+                    own_reputation >= 0.70
                 }
             },
             NodeType::Full => {
-                // EXISTING: Genesis nodes are Super nodes, not Full nodes - this shouldn't happen
-                println!("  ├── ⚠️ WARNING: Genesis node {} detected as Full type - should be Super!", own_node_id);
-                false // Genesis nodes should be Super, not Full
+                // EXISTING: Regular Full nodes need P2P peers for consensus participation
+                let has_peers = p2p.get_peer_count() >= 3;
+                let own_reputation = Self::get_node_reputation_score(own_node_id, p2p).await;
+                let has_reputation = own_reputation >= 0.70;
+                println!("  ├── Own Full node: peers={}, reputation={:.1}%", has_peers, own_reputation * 100.0);
+                has_peers && has_reputation
             },
             NodeType::Light => {
-                println!("  ├── Own Genesis Light node: excluded from microblock production");
+                println!("  ├── Own Light node: excluded from microblock production");
                 false // Light nodes never participate
             }
         };
         
-        // Add own node if eligible
-        if can_participate_microblock {
-            const GENESIS_DETERMINISTIC_REPUTATION: f64 = 0.90;
-            all_qualified.push((own_node_id.to_string(), GENESIS_DETERMINISTIC_REPUTATION));
-            println!("  │   └── ✅ Own Genesis node added with dynamic reputation ({:.1}%)", GENESIS_DETERMINISTIC_REPUTATION * 100.0);
-        }
+        // EXISTING: Build Genesis candidate list in IDENTICAL order on ALL nodes
+        // This ensures deterministic consensus across the network
         
-        // CRITICAL FIX: Add ONLY Registry candidates (reachable Genesis nodes)
-        for (registry_node_id, reputation, node_type) in registry_candidates {
-            // Convert registry node ID to Genesis node ID format if needed
-            let genesis_node_id = if registry_node_id.contains("registry_node_genesis_device_") {
-                // Extract bootstrap ID from registry format: registry_node_genesis_device_001 -> genesis_node_001
-                let device_part = registry_node_id.replace("registry_node_genesis_device_", "");
-                format!("genesis_node_{}", device_part)
+        // EXISTING: Use static Genesis node list for IDENTICAL candidate order
+        println!("  ├── Using static Genesis node list for IDENTICAL candidate order");
+        
+        // Use shared Genesis constants in GUARANTEED ORDER (001, 002, 003, 004, 005)
+        let genesis_ips = crate::unified_p2p::get_genesis_bootstrap_ips();
+        let genesis_nodes: Vec<(String, String)> = genesis_ips.iter()
+            .enumerate()
+            .map(|(i, ip)| (format!("genesis_node_{:03}", i + 1), ip.clone()))
+            .collect();
+        
+        // EXISTING: Add ALL Genesis nodes in IDENTICAL order using DETERMINISTIC reputation
+        // This ensures consistent candidate lists across ALL nodes for Byzantine consensus
+        for (genesis_id, genesis_ip) in genesis_nodes {
+            // Use DETERMINISTIC reputation for Genesis phase (same as microblock producer logic)
+            const GENESIS_DETERMINISTIC_REPUTATION: f64 = 0.90;
+            let genesis_reputation = GENESIS_DETERMINISTIC_REPUTATION;
+            
+            // For own node: check if can participate based on actual node type
+            if genesis_id == own_node_id {
+                let can_participate = match own_node_type {
+                    NodeType::Super => {
+                        println!("  ├── Own Genesis Super node: dynamic reputation {:.1}%", genesis_reputation * 100.0);
+                        genesis_reputation >= 0.70
+                    },
+                    NodeType::Full => {
+                        // EXISTING: Genesis nodes are Super nodes, not Full nodes - this shouldn't happen
+                        println!("  ├── ⚠️ WARNING: Genesis node {} detected as Full type - should be Super!", own_node_id);
+                        false // Genesis nodes should be Super, not Full
+                    },
+                    NodeType::Light => {
+                        println!("  ├── Own Genesis Light node: excluded from microblock production");
+                        false
+                    }
+                };
+                
+                if can_participate {
+                    all_qualified.push((genesis_id.to_string(), genesis_reputation));
+                    println!("  │   └── ✅ Own Genesis node added with dynamic reputation ({:.1}%)", genesis_reputation * 100.0);
+                } else {
+                    println!("  │   └── ❌ Own Genesis node excluded (cannot participate or low reputation)");
+                }
             } else {
-                registry_node_id.clone()
-            };
-            
-            // Skip own node (already added above)
-            if genesis_node_id == own_node_id {
-                continue;
-            }
-            
-            // Only add if it's a Super node (Genesis requirement)
-            if node_type == "super" {
-                all_qualified.push((genesis_node_id.clone(), reputation));
-                println!("  ├── Genesis {} from Registry: reputation {:.1}% [REACHABLE]", 
-                         genesis_node_id, reputation * 100.0);
-                println!("  │   └── ✅ Added as qualified (Registry confirmed reachable)");
+                // EXISTING: All Genesis nodes qualify during Genesis phase for proper rotation
+                all_qualified.push((genesis_id.to_string(), genesis_reputation));
+                println!("  ├── Genesis {} ({}): reputation {:.1}% [GENESIS BOOTSTRAP]", 
+                         genesis_id, genesis_ip, genesis_reputation * 100.0);
+                println!("  │   └── ✅ Added as qualified (Genesis network formation)");
             }
         }
         

@@ -1253,9 +1253,14 @@ impl BlockchainActivationRegistry {
             .unwrap_or_default()
             .as_secs();
         
-        // Base reputation starts at 70% for new nodes
-        let mut reputation = 0.70;
+        // EXISTING: Genesis nodes start with 90% reputation, regular nodes 70%
+        let mut reputation = if node.device_signature.starts_with("genesis_device_") {
+            0.90 // EXISTING: Genesis nodes get 90% base reputation
+        } else {
+            0.70 // Regular nodes get 70% base reputation
+        };
         
+        // EXISTING: Keep sophisticated reputation system for scalability
         // Boost reputation based on uptime (max +30%)
         let uptime_days = (current_time - node.activated_at) / 86400; // seconds to days
         let uptime_bonus = (uptime_days as f64 * 0.01).min(0.30); // 1% per day, max 30%

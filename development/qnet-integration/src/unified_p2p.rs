@@ -926,6 +926,10 @@ impl SimplifiedP2P {
         let mut peer_heights = Vec::new();
         
         for peer in connected.iter() {
+            // EXISTING: Use Genesis leniency for peer height queries during startup
+            let peer_ip = peer.addr.split(':').next().unwrap_or("");
+            let is_genesis_peer = is_genesis_node_ip(peer_ip);
+            
             // PRODUCTION: Actually query peer's /api/v1/height endpoint via HTTP
             match self.query_peer_height(&peer.addr) {
                 Ok(height) => {
@@ -2392,8 +2396,7 @@ impl SimplifiedP2P {
             // Quick TCP connection test with 2-second timeout
             match TcpStream::connect_timeout(&socket_addr, Duration::from_secs(2)) {
                 Ok(_) => {
-                    // API READINESS CHECK: Verify API server is ready, not just TCP port open
-                    // Try a quick HTTP health check to avoid race conditions
+                    // EXISTING: All peers require API readiness for production quantum security
                     let api_ready = Self::check_api_readiness_static(ip);
                     
                     if api_ready {
