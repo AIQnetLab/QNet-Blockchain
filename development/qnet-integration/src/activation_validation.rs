@@ -1185,6 +1185,16 @@ impl BlockchainActivationRegistry {
                 drop(active_nodes_read);
                 println!("[REGISTRY] 🚀 Genesis mode: Populating with Genesis nodes");
                 self.populate_genesis_active_nodes().await;
+            } else {
+                // CRITICAL FIX: Don't spam logs if Genesis nodes already populated
+                // Registry is called every 60s by ping service - only log once
+                let genesis_count = active_nodes_read.len();
+                drop(active_nodes_read);
+                if genesis_count == 5 {
+                    // Silent success - Genesis nodes already populated
+                } else {
+                    println!("[REGISTRY] 📊 Genesis bootstrap active: {} nodes available", genesis_count);
+                }
             }
         }
         

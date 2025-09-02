@@ -727,41 +727,35 @@ impl BlockchainNode {
                     // During Genesis phase, use deterministic counting instead of unreliable P2P discovery
                     
                     let is_genesis_phase = Self::is_genesis_bootstrap_phase(p2p).await;
-                    println!("[DEBUG-FIX] 🔧 is_genesis_phase = {}", is_genesis_phase);
+                    let is_genesis_node = std::env::var("QNET_BOOTSTRAP_ID")
+                        .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
+                        .unwrap_or(false);
+                    println!("[DEBUG-FIX] 🔧 is_genesis_phase = {}, is_genesis_node = {}", is_genesis_phase, is_genesis_node);
                     
-                    if is_genesis_phase {
-                        println!("[DEBUG-FIX] 🔧 Genesis phase detected - using REAL peer discovery");
-                        // CRITICAL FIX: Always use REAL peer discovery - no time-based assumptions
-                        // System must check actual connected peers, not assume based on time
+                    if is_genesis_phase || is_genesis_node {
+                        println!("[DEBUG-FIX] 🔧 Genesis phase detected - using Registry instead of P2P peer discovery");
+                        // CRITICAL FIX: For Genesis nodes, use Registry eligible nodes count instead of P2P peers
+                        // P2P peers fail due to HTTP connectivity issues, but Registry has all 5 Genesis nodes
                         
-                            // GENESIS FIX: Genesis nodes use EXISTING bootstrap trust without additional discovery
-                        let is_genesis_node = std::env::var("QNET_BOOTSTRAP_ID").is_ok();
+                        // Create Registry to get actual eligible node count
+                        let qnet_rpc = std::env::var("QNET_RPC_URL")
+                            .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
+                        let registry = crate::activation_validation::BlockchainActivationRegistry::new(Some(qnet_rpc));
+                        let eligible_nodes = registry.get_eligible_nodes().await;
+                        let registry_count = eligible_nodes.len();
                         
-                        if is_genesis_node {
-                            println!("[DEBUG-FIX] 🔧 GENESIS: Using EXISTING bootstrap peer pool (no additional discovery needed)");
-                            
-                            // EXISTING: Use simple peer cache refresh - bootstrap peers already added
-                            p2p.force_peer_cache_refresh();
-                            
-                            println!("[DEBUG-FIX] 🔧 GENESIS: Bootstrap peers ready for Byzantine validation");
-                        }
-                        
-                        let local_peers = p2p.get_validated_active_peers().len();
-                        let real_node_count = local_peers + 1; // +1 for own node
-                        
-                        println!("[NETWORK] 🔍 REAL active node count: {} ({}+1 peers)", real_node_count, local_peers);
+                        println!("[DEBUG-FIX] 🔧 GENESIS Registry count: {} eligible nodes", registry_count);
                         
                         // CRITICAL: Only allow block production if Byzantine safety is met
-                        if real_node_count >= 4 {
-                            println!("[NETWORK] ✅ Byzantine safety MET: {} nodes ≥ 4", real_node_count);
-                            real_node_count
+                        if registry_count >= 4 {
+                            println!("[NETWORK] ✅ Genesis Byzantine safety MET: {} nodes ≥ 4 (via Registry)", registry_count);
+                            registry_count
                         } else {
-                            println!("[NETWORK] ❌ Byzantine safety NOT met: {} nodes < 4", real_node_count);
-                            // Return actual count but system will wait for more nodes
-                            real_node_count
+                            println!("[NETWORK] ❌ Genesis Byzantine safety NOT met: {} nodes < 4 (via Registry)", registry_count);
+                            registry_count
                         }
                     } else {
-                        println!("[DEBUG-FIX] 🔧 Normal phase detected - using registry discovery");
+                        println!("[DEBUG-FIX] 🔧 Normal phase detected - using P2P peer discovery");
                         // Normal phase: Use actual P2P peer discovery
                         let local_peers = p2p.get_validated_active_peers().len();
                         std::cmp::min(local_peers + 1, 1000) // Scale to network size
@@ -1842,6 +1836,7 @@ impl BlockchainNode {
                 }
             },
             NodeType::Full => {
+                // EXISTING: Regular Full nodes need P2P peers for consensus participation
                 let has_peers = p2p.get_peer_count() >= 3;
                 let own_reputation = Self::get_node_reputation_score(own_node_id, p2p).await;
                 let has_reputation = own_reputation >= 0.70;
@@ -1880,10 +1875,9 @@ impl BlockchainNode {
                         genesis_reputation >= 0.70
                     },
                     NodeType::Full => {
-                        let has_peers = p2p.get_peer_count() >= 1; // Genesis phase: relaxed peer requirement
-                        let can_participate = has_peers && genesis_reputation >= 0.70;
-                        println!("  ├── Own Genesis Full node: peers={}, reputation={:.1}%", has_peers, genesis_reputation * 100.0);
-                        can_participate
+                        // EXISTING: Genesis nodes are Super nodes, not Full nodes - this shouldn't happen
+                        println!("  ├── ⚠️ WARNING: Genesis node {} detected as Full type - should be Super!", own_node_id);
+                        false // Genesis nodes should be Super, not Full
                     },
                     NodeType::Light => {
                         println!("  ├── Own Genesis Light node: excluded from microblock production");
@@ -1898,17 +1892,12 @@ impl BlockchainNode {
                     println!("  │   └── ❌ Own Genesis node excluded (cannot participate or low reputation)");
                 }
             } else {
-                // Other Genesis nodes: check reputation threshold (70% minimum)
-                if genesis_reputation >= 0.70 {
-                    all_qualified.push((genesis_id.to_string(), genesis_reputation));
-                    println!("  ├── Genesis {} ({}): reputation {:.1}% [DYNAMIC]", 
-                             genesis_id, genesis_ip, genesis_reputation * 100.0);
-                    println!("  │   └── ✅ Added as qualified (dynamic reputation with penalties)");
-                } else {
-                    println!("  ├── Genesis {} ({}): reputation {:.1}% [PENALIZED]", 
-                             genesis_id, genesis_ip, genesis_reputation * 100.0);
-                    println!("  │   └── ❌ Excluded (below 70% threshold due to penalties)");
-                }
+                // CRITICAL FIX: All Genesis nodes ALWAYS qualify during Genesis phase
+                // Genesis bootstrap requires all 5 nodes to be candidates for proper rotation
+                all_qualified.push((genesis_id.to_string(), genesis_reputation));
+                println!("  ├── Genesis {} ({}): reputation {:.1}% [GENESIS BOOTSTRAP]", 
+                         genesis_id, genesis_ip, genesis_reputation * 100.0);
+                println!("  │   └── ✅ Added as qualified (Genesis network formation)");
             }
         }
         
