@@ -342,8 +342,8 @@ impl SimplifiedP2P {
         
         println!("[P2P] 📊 Successfully parsed {}/{} bootstrap peers", successful_parses, peers.len());
         
-        // Try to establish connections
-        self.establish_regional_connections();
+        // STARTUP FIX: Establish connections asynchronously to prevent blocking startup
+        self.start_regional_connection_establishment();
     }
     
     /// Add discovered peers to running P2P system (dynamic peer injection)
@@ -2048,122 +2048,254 @@ impl SimplifiedP2P {
             .push(peer);
     }
     
-    /// Establish connections within region and backups
-    fn establish_regional_connections(&self) {
-        let regional_peers = match self.regional_peers.lock() {
-            Ok(peers) => peers,
-            Err(poisoned) => {
-                println!("[P2P] ⚠️ Regional peers mutex poisoned during connection establishment");
-                poisoned.into_inner()
-            }
-        };
-        let mut connected = match self.connected_peers.lock() {
-            Ok(peers) => peers,
-            Err(poisoned) => {
-                println!("[P2P] ⚠️ Connected peers mutex poisoned during connection establishment");
-                poisoned.into_inner()
-            }
-        };
+    /// STARTUP FIX: Start regional connection establishment asynchronously (non-blocking startup)  
+    fn start_regional_connection_establishment(&self) {
+        let regional_peers = self.regional_peers.clone();
+        let connected_peers = self.connected_peers.clone();
+        let primary_region = self.primary_region.clone();
+        let backup_regions = self.backup_regions.clone();
         
-        // Connect to primary region first - WITH REAL connectivity validation
-        if let Some(peers) = regional_peers.get(&self.primary_region) {
-            // DYNAMIC: Use flexible connection limits based on network conditions
-            let is_bootstrap_node = std::env::var("QNET_BOOTSTRAP_ID").is_ok();
-            let active_peers = connected.len();
-            let is_small_network = active_peers < 10;
-            let use_all_peers = is_bootstrap_node || is_small_network;
+        // EXISTING PATTERN: Use tokio::spawn like search_internet_peers for non-blocking startup
+        tokio::spawn(async move {
+            println!("[P2P] 🔧 Starting regional connection establishment (background)...");
             
-            // ROBUST: Connect to ALL peers during bootstrap or small network formation
-            let peer_limit = if use_all_peers { peers.len() } else { 5 };
-            for peer in peers.iter().take(peer_limit) {
-                // Use previously defined is_genesis_startup variable
-                
-                let ip = peer.addr.split(':').next().unwrap_or("");
-                let is_genesis_peer = is_genesis_node_ip(ip);
-                
-                // EXISTING: All peers use same validation logic for consistency
-                if self.is_peer_actually_connected(&peer.addr) {
-                connected.push(peer.clone());
-                    println!("[P2P] ✅ Added {} to connection pool from {:?} (REAL connection verified)", peer.id, peer.region);
-                } else {
-                    // DIAGNOSTIC: Log why peer was skipped
-                    println!("[P2P] ❌ Skipped {} from {:?} (connection failed)", peer.id, peer.region);
-                    println!("[P2P] 🔍 DIAGNOSTIC: Genesis peer: {}", is_genesis_peer);
+            let regional_peers_data = match regional_peers.lock() {
+                Ok(peers) => peers.clone(), // Clone the data to avoid lifetime issues
+                Err(poisoned) => {
+                    println!("[P2P] ⚠️ Regional peers mutex poisoned during connection establishment");
+                    poisoned.into_inner().clone()
                 }
-            }
-        }
-        
-        // DYNAMIC: For bootstrap nodes or small networks, connect to ALL Genesis nodes regardless of region
-        let is_bootstrap_node = std::env::var("QNET_BOOTSTRAP_ID").is_ok();
-        let active_peers = connected.len();
-        let is_small_network = active_peers < 10;
-        let should_connect_all_genesis = is_bootstrap_node || is_small_network;
-        
-        if should_connect_all_genesis {
-            println!("[P2P] 🌟 GENESIS MODE: Attempting to connect to all Genesis peers regardless of region");
+            };
             
-            // Try all regions for Genesis peers
-            for (region, peers_in_region) in regional_peers.iter() {
-                for peer in peers_in_region.iter().take(5) {
+            let mut connected_data = match connected_peers.lock() {
+                Ok(peers) => peers.clone(), // Clone the data
+                Err(poisoned) => {
+                    println!("[P2P] ⚠️ Connected peers mutex poisoned during connection establishment");
+                    poisoned.into_inner().clone()
+                }
+            };
+        
+            // Connect to primary region first - WITH REAL connectivity validation
+            if let Some(peers) = regional_peers_data.get(&primary_region) {
+                // DYNAMIC: Use flexible connection limits based on network conditions
+                let is_bootstrap_node = std::env::var("QNET_BOOTSTRAP_ID").is_ok();
+                let active_peers = connected_data.len();
+                let is_small_network = active_peers < 10;
+                let use_all_peers = is_bootstrap_node || is_small_network;
+                
+                // ROBUST: Connect to ALL peers during bootstrap or small network formation
+                let peer_limit = if use_all_peers { peers.len() } else { 5 };
+                for peer in peers.iter().take(peer_limit) {
+                    // Use previously defined is_genesis_startup variable
+                    
                     let ip = peer.addr.split(':').next().unwrap_or("");
                     let is_genesis_peer = is_genesis_node_ip(ip);
                     
-                    if is_genesis_peer {
-                        // Skip if already connected
-                        let already_connected = connected.iter().any(|p| p.addr == peer.addr);
-                        if !already_connected {
-                            connected.push(peer.clone());
-                            println!("[P2P] 🌟 Added Genesis peer {} from region {:?} (startup mode)", peer.addr, region);
-                        }
+                                        // EXISTING: Use static connectivity check for async context
+                    if Self::is_peer_actually_connected_static(&peer.addr, active_peers) {
+                        connected_data.push(peer.clone());
+                        println!("[P2P] ✅ Added {} to connection pool from {:?} (REAL connection verified)", peer.id, peer.region);
+                    } else {
+                        // DIAGNOSTIC: Log why peer was skipped
+                        println!("[P2P] ❌ Skipped {} from {:?} (connection failed)", peer.id, peer.region);
+                        println!("[P2P] 🔍 DIAGNOSTIC: Genesis peer: {}", is_genesis_peer);
                     }
                 }
-            }
         }
         
-        // If not enough peers, try backup regions - WITH REAL connectivity validation
-        if connected.len() < 3 {
-            // DYNAMIC: For backup regions, use flexible limits based on network conditions
+            // DYNAMIC: For bootstrap nodes or small networks, connect to ALL Genesis nodes regardless of region
             let is_bootstrap_node = std::env::var("QNET_BOOTSTRAP_ID").is_ok();
-            let current_peers = connected.len();
-            let is_small_network = current_peers < 10;
-            let use_all_backup_peers = is_bootstrap_node || is_small_network;
+            let active_peers = connected_data.len();
+            let is_small_network = active_peers < 10;
+            let should_connect_all_genesis = is_bootstrap_node || is_small_network;
             
-            for backup_region in &self.backup_regions {
-                if let Some(peers) = regional_peers.get(backup_region) {
-                    // ROBUST: Connect to ALL backup peers during bootstrap or small network formation
-                    let backup_limit = if use_all_backup_peers { peers.len() } else { 2 };
-                    for peer in peers.iter().take(backup_limit) {
-                        // DYNAMIC: Remove connection limit for small networks or bootstrap nodes
-                        let should_connect = if use_all_backup_peers { true } else { connected.len() < 5 };
-                        if should_connect {
-                            let ip = peer.addr.split(':').next().unwrap_or("");
-                            let is_genesis_peer = is_genesis_node_ip(ip);
-                            
-                            // FIXED: Genesis peers ALWAYS use relaxed validation (no time dependency) 
-                            if is_genesis_peer {
-                            connected.push(peer.clone());
-                                println!("[P2P] ✅ Added Genesis backup {} (bootstrap trust)", peer.addr);
-                            } else if self.is_peer_actually_connected(&peer.addr) {
-                                connected.push(peer.clone());
-                                println!("[P2P] ✅ Added {} to backup pool from {:?} (REAL connection verified)", 
-                                         peer.id, peer.region);
-                            } else {
-                                println!("[P2P] ❌ Skipped backup peer {} from {:?} (connection failed)", 
-                                     peer.id, peer.region);
+            if should_connect_all_genesis {
+                println!("[P2P] 🌟 GENESIS MODE: Attempting to connect to all Genesis peers regardless of region");
+                
+                // Try all regions for Genesis peers
+                for (region, peers_in_region) in regional_peers_data.iter() {
+                    for peer in peers_in_region.iter().take(5) {
+                        let ip = peer.addr.split(':').next().unwrap_or("");
+                        let is_genesis_peer = is_genesis_node_ip(ip);
+                        
+                        if is_genesis_peer {
+                            // Skip if already connected
+                            let already_connected = connected_data.iter().any(|p| p.addr == peer.addr);
+                            if !already_connected {
+                                connected_data.push(peer.clone());
+                                println!("[P2P] 🌟 Added Genesis peer {} from region {:?} (startup mode)", peer.addr, region);
                             }
                         }
                     }
                 }
             }
-        }
         
-        *self.connection_count.lock().unwrap() = connected.len();
+            // If not enough peers, try backup regions - WITH REAL connectivity validation
+            if connected_data.len() < 3 {
+                // DYNAMIC: For backup regions, use flexible limits based on network conditions
+                let is_bootstrap_node = std::env::var("QNET_BOOTSTRAP_ID").is_ok();
+                let current_peers = connected_data.len();
+                let is_small_network = current_peers < 10;
+                let use_all_backup_peers = is_bootstrap_node || is_small_network;
+            
+                for backup_region in &backup_regions {
+                    if let Some(peers) = regional_peers_data.get(backup_region) {
+                    // ROBUST: Connect to ALL backup peers during bootstrap or small network formation
+                    let backup_limit = if use_all_backup_peers { peers.len() } else { 2 };
+                    for peer in peers.iter().take(backup_limit) {
+                            // DYNAMIC: Remove connection limit for small networks or bootstrap nodes
+                            let should_connect = if use_all_backup_peers { true } else { connected_data.len() < 5 };
+                        if should_connect {
+                            let ip = peer.addr.split(':').next().unwrap_or("");
+                            let is_genesis_peer = is_genesis_node_ip(ip);
+                            
+                                    // FIXED: Genesis peers ALWAYS use relaxed validation (no time dependency) 
+                                    if is_genesis_peer {
+                                        connected_data.push(peer.clone());
+                                        println!("[P2P] ✅ Added Genesis backup {} (bootstrap trust)", peer.addr);
+                                    } else if Self::is_peer_actually_connected_static(&peer.addr, current_peers) {
+                                        connected_data.push(peer.clone());
+                                        println!("[P2P] ✅ Added {} to backup pool from {:?} (REAL connection verified)", 
+                                                 peer.id, peer.region);
+                                    } else {
+                                        println!("[P2P] ❌ Skipped backup peer {} from {:?} (connection failed)", 
+                                         peer.id, peer.region);
+                                    }
+                        }
+                    }
+                }
+                }
+            }
+            
+            // Update real connected_peers with results from background establishment
+            if let Ok(mut connected) = connected_peers.lock() {
+                *connected = connected_data;
+                println!("[P2P] 📋 Regional connection establishment completed: {} peers connected", connected.len());
+            } else {
+                println!("[P2P] ⚠️ Failed to update connected_peers after establishment");
+            }
+        });
         
-        if connected.is_empty() {
-            println!("[P2P] ⚠️ No peers in bootstrap pool - running in standalone mode");
+        println!("[P2P] ⚡ Regional connection establishment started (non-blocking startup)");
+    }
+    
+    /// STATIC VERSION: Check if peer is actually connected (async-safe)
+    fn is_peer_actually_connected_static(peer_addr: &str, active_peers: usize) -> bool {
+        // PRODUCTION: Real connectivity check using EXISTING static methods
+        let ip = peer_addr.split(':').next().unwrap_or("");
+        let is_genesis = is_genesis_node_ip(ip);
+        
+        // DYNAMIC: Use relaxed validation for Genesis peers in small networks
+        let is_bootstrap_node = std::env::var("QNET_BOOTSTRAP_ID").is_ok();
+        let is_small_network = active_peers < 10;
+        let use_relaxed_validation = is_bootstrap_node || is_small_network;
+        
+        // DIAGNOSTIC: Log detailed validation process to debug phantom peers
+        println!("[DEBUG-PHANTOM] 🔍 Static validating peer: {} (IP: {}, Genesis: {}, Small network: {}, Bootstrap: {})", 
+                 peer_addr, ip, is_genesis, is_small_network, is_bootstrap_node);
+        
+        if is_genesis {
+            // EXISTING: Use FAST TCP connectivity check (same as instance method)
+            let is_connected = Self::test_peer_connectivity_static(peer_addr);
+            
+            if is_connected {
+                println!("[P2P] ✅ Genesis peer {} - FAST TCP connection verified", peer_addr);
+                true
         } else {
-            println!("[P2P] 📋 Bootstrap pool populated with {} peers (pending validation)", connected.len());
+                if use_relaxed_validation {
+                    println!("[P2P] ⏳ Genesis peer {} - using relaxed validation for network formation", peer_addr);
+                    true // Allow for bootstrap/small networks
+                } else {
+                    println!("[P2P] ❌ Genesis peer {} - TCP connection failed, excluding from consensus", peer_addr);
+                    false
+                }
+            }
+        } else {
+            // For non-genesis: use existing query_peer_height_http through static methods
+            println!("[DEBUG-PHANTOM] 🔍 Non-Genesis peer validation for: {}", peer_addr);
+            
+            // EXISTING: Use same pattern as query_peer_height but static
+            let api_endpoints = vec![
+                format!("http://{}:8001/api/v1/height", ip), // EXISTING: Same endpoint as query_peer_height
+            ];
+            
+            for endpoint in api_endpoints {
+                match Self::query_peer_height_http_static(&endpoint) {
+                    Ok(_height) => {
+                        println!("[DEBUG-PHANTOM] ✅ Non-Genesis peer {} height query OK", peer_addr);
+                        return true;
+                    }
+                    Err(e) => {
+                        println!("[DEBUG-PHANTOM] ❌ Non-Genesis peer {} height query failed: {}", peer_addr, e);
+                        continue;
+                    }
+                }
+            }
+            
+            if use_relaxed_validation {
+                println!("[DEBUG-PHANTOM] 🚨 PHANTOM NON-GENESIS ALLOWED: {} (relaxed validation)", peer_addr);
+                true // Tolerate during network formation
+            } else {
+                println!("[DEBUG-PHANTOM] ✅ PHANTOM NON-GENESIS BLOCKED: {} (strict validation)", peer_addr);
+                false
+            }
         }
+    }
+    
+    /// STATIC VERSION: Query peer height via HTTP (async-safe, same logic as instance method)
+    fn query_peer_height_http_static(endpoint: &str) -> Result<u64, String> {
+        use std::time::Duration;
+        
+        // EXISTING: Use same quick timeouts as check_api_readiness_static for microblock compatibility
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(5)) // EXISTING: Same as check_api_readiness_static (quick API checks)
+            .connect_timeout(Duration::from_secs(3)) // EXISTING: Same as check_api_readiness_static (quick connect)
+            .tcp_keepalive(Duration::from_secs(30)) // Keep connections alive
+            .build()
+            .map_err(|e| format!("HTTP client error: {}", e))?;
+        
+        // EXISTING: Use same single-attempt pattern as check_api_readiness_static for microblock speed
+        let max_attempts = 1; // EXISTING: Single attempt (same as check_api_readiness_static)
+        let retry_delay = Duration::from_secs(0); // EXISTING: No delays for quick operations
+        
+        for attempt in 1..=max_attempts {
+            match client.get(endpoint).send() {
+                Ok(response) if response.status().is_success() => {
+                    match response.json::<serde_json::Value>() {
+                        Ok(json) => {
+                            if let Some(height) = json.get("height").and_then(|h| h.as_u64()) {
+                                return Ok(height);
+                            } else {
+                                return Err("Invalid height format in response".to_string());
+                            }
+                        }
+                        Err(e) => {
+                            if attempt < max_attempts {
+                                // EXISTING: No delays for single-attempt quick operations
+                                continue;
+                            }
+                            return Err(format!("JSON parse error: {}", e));
+                        }
+                    }
+                }
+                Ok(response) => {
+                    if attempt < max_attempts {
+                        // EXISTING: No delays for single-attempt quick operations
+                        continue;
+                    }
+                    return Err(format!("HTTP error: {}", response.status()));
+                }
+                Err(e) => {
+                    if attempt < max_attempts {
+                        // EXISTING: No delays for single-attempt quick operations
+                        continue;
+                    }
+                    return Err(format!("Request failed: {}", e));
+                }
+            }
+        }
+        
+        Err("All retry attempts failed".to_string())
     }
     
     /// Intelligent peer selection with load balancing
