@@ -345,6 +345,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(blockchain_filter.clone())
         .and_then(handle_node_health);
     
+
     // Gas recommendation endpoints
     let gas_recommendations = api_v1
         .and(warp::path("gas"))
@@ -488,8 +489,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
     let basic_routes = rpc_path
         .or(root_path)
         .or(chain_height)
-        .or(peers_endpoint)
-        .or(node_health);
+        .or(peers_endpoint);
         
     let blockchain_routes = microblock_one
         .or(microblocks_range)
@@ -509,6 +509,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .or(mempool_transactions);
         
     let node_routes = node_discovery
+        .or(node_health)
         .or(gas_recommendations)
         .or(auth_challenge)
         .or(network_ping)
@@ -1400,7 +1401,7 @@ async fn handle_mempool_status(
         "size": mempool_size,
         "max_size": 500_000,
         "status": "healthy",
-        "node_id": blockchain.get_node_id(),
+        "node_id": blockchain.get_public_display_name(),
         "timestamp": chrono::Utc::now().timestamp()
     });
     Ok(warp::reply::json(&response))
@@ -1414,7 +1415,7 @@ async fn handle_mempool_transactions(
     let response = json!({
         "transactions": txs,
         "count": txs.len(),
-        "node_id": blockchain.get_node_id()
+        "node_id": blockchain.get_public_display_name()
     });
     Ok(warp::reply::json(&response))
 }
@@ -1568,7 +1569,7 @@ async fn handle_node_discovery(
     
     let response = json!({
         "current_node": {
-            "node_id": blockchain.get_node_id(),
+            "node_id": blockchain.get_public_display_name(),
             "node_type": format!("{:?}", blockchain.get_node_type()),
             "region": format!("{:?}", blockchain.get_region()),
             "api_endpoint": format!("http://0.0.0.0:8001/api/v1/")
@@ -1592,7 +1593,7 @@ async fn handle_node_health(
     
     let response = json!({
         "status": "healthy",
-        "node_id": blockchain.get_node_id(),
+        "node_id": blockchain.get_public_display_name(),
         "height": height,
         "peers": peer_count,
         "mempool_size": mempool_size,
@@ -1892,9 +1893,12 @@ async fn handle_light_node_register(
 ) -> Result<impl Reply, Rejection> {
     use std::time::{SystemTime, UNIX_EPOCH};
     
-    // Verify quantum signature
+    // PRIVACY: Generate quantum-secure pseudonym for Light node (mobile privacy protection)
+    let light_node_pseudonym = generate_light_node_pseudonym(&register_request.wallet_address);
+    
+    // Verify quantum signature using pseudonym instead of raw node_id
     let signature_valid = verify_dilithium_signature(
-        &register_request.node_id, 
+        &light_node_pseudonym, 
         &register_request.device_token, 
         &register_request.quantum_signature
     );
@@ -1925,11 +1929,11 @@ async fn handle_light_node_register(
         is_active: true,
     };
     
-    // Register Light node or add device to existing node
+    // Register Light node or add device to existing node using pseudonym
     let registration_result = {
         let mut registry = LIGHT_NODE_REGISTRY.lock().unwrap();
         
-        if let Some(existing_node) = registry.get_mut(&register_request.node_id) {
+        if let Some(existing_node) = registry.get_mut(&light_node_pseudonym) {
             // Check device limit (max 3 devices per Light node)
             if existing_node.devices.len() >= 3 {
                 // Remove oldest inactive device if needed
@@ -1947,27 +1951,28 @@ async fn handle_light_node_register(
             existing_node.devices.push(new_device);
             "device_added"
         } else {
-            // Create new Light node
-            let light_node = LightNodeInfo {
-                node_id: register_request.node_id.clone(),
-                devices: vec![new_device],
-                quantum_pubkey: register_request.quantum_pubkey,
-                registered_at: now,
-                last_ping: 0,
-                ping_count: 0,
-                reward_eligible: true,
-            };
-            registry.insert(register_request.node_id.clone(), light_node);
+                    // Create new Light node using privacy-preserving pseudonym
+        let light_node = LightNodeInfo {
+            node_id: light_node_pseudonym.clone(),
+            devices: vec![new_device],
+            quantum_pubkey: register_request.quantum_pubkey,
+            registered_at: now,
+            last_ping: 0,
+            ping_count: 0,
+            reward_eligible: true,
+        };
+        registry.insert(light_node_pseudonym.clone(), light_node);
             "node_created"
         }
     };
     
-    println!("[LIGHT] 📱 Light node registered: {} (quantum-secured)", register_request.node_id);
+    println!("[LIGHT] 📱 Light node registered: {} (quantum-secured privacy)", light_node_pseudonym);
     
     Ok(warp::reply::json(&json!({
         "success": true,
-        "message": "Light node registered successfully",
-        "node_id": register_request.node_id,
+        "message": "Light node registered successfully with privacy protection",
+        "node_id": light_node_pseudonym,
+        "privacy_enabled": true,
         "next_ping_window": now + (4 * 60 * 60), // Next 4-hour window
         "quantum_secured": true
     })))
@@ -3235,6 +3240,23 @@ fn extract_peer_ip_from_request() -> Option<String> {
     // The function extract_peer_ip_from_headers() below implements the real logic
     
     None // Headers not available in this context - would be passed from request filter
+}
+
+
+/// PRIVACY: Generate quantum-secure pseudonym for Light node (mobile privacy protection)
+fn generate_light_node_pseudonym(wallet_address: &str) -> String {
+    // EXISTING PATTERN: Use blake3 hash like other node identity functions
+    let pseudonym_hash = blake3::hash(format!("LIGHT_NODE_PRIVACY_{}", wallet_address).as_bytes());
+    
+    // PRIVACY: Generate mobile-friendly pseudonym without revealing IP or location
+    // Format: light_[region_hint]_[8_hex_chars] - no personal data exposed
+    let region_hint = std::env::var("QNET_REGION")
+        .unwrap_or_else(|_| "mobile".to_string())
+        .to_lowercase();
+    
+    format!("light_{}_{}", 
+            region_hint, 
+            &pseudonym_hash.to_hex()[..8])
 }
 
 /// PRODUCTION: Generate quantum-secure signature using EXISTING QNetQuantumCrypto

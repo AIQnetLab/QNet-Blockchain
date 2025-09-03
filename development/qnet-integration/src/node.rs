@@ -3077,6 +3077,49 @@ impl BlockchainNode {
         self.node_id.clone()
     }
     
+    /// PRIVACY: Get public display name for API responses (preserves consensus node_id)
+    pub fn get_public_display_name(&self) -> String {
+        match self.node_type {
+            NodeType::Light => {
+                // Light nodes already use pseudonyms from registration
+                self.node_id.clone()
+            },
+            _ => {
+                // CRITICAL: Genesis nodes keep original ID for consensus stability
+                if self.node_id.starts_with("genesis_node_") {
+                    return self.node_id.clone();
+                }
+                
+                // Full/Super nodes: Generate privacy-preserving display name
+                self.generate_full_super_display_name()
+            }
+        }
+    }
+    
+    /// PRIVACY: Generate display name for Full/Super nodes (preserves IP privacy)
+    fn generate_full_super_display_name(&self) -> String {
+        // EXISTING PATTERN: Use blake3 hash like other identity functions
+        let wallet_address = self.get_wallet_address();
+        let display_hash = blake3::hash(format!("FULL_SUPER_DISPLAY_{}_{}", 
+                                                wallet_address, 
+                                                format!("{:?}", self.node_type)).as_bytes());
+        
+        // PRIVACY: Generate server-friendly display name without revealing IP
+        let node_type_prefix = match self.node_type {
+            NodeType::Super => "super",
+            NodeType::Full => "full", 
+            _ => "node"
+        };
+        
+        let region_hint = format!("{:?}", self.region).to_lowercase();
+        
+        format!("{}_{}_{}", 
+                node_type_prefix,
+                region_hint, 
+                &display_hash.to_hex()[..8])
+    }
+    
+
     /// PRODUCTION: Get unified P2P instance for external access (RPC, etc.)
     pub fn get_unified_p2p(&self) -> Option<Arc<SimplifiedP2P>> {
         self.unified_p2p.clone()
@@ -4192,56 +4235,85 @@ impl BlockchainNode {
             println!("[DIAGNOSTIC] ❌ Priority 1: QNET_BOOTSTRAP_ID not found");
         }
         
-        // Priority 2: Use Genesis bootstrap flag (legacy support)
-        println!("[DIAGNOSTIC] 🔧 Priority 2: Checking QNET_GENESIS_BOOTSTRAP");
+        // Priority 2: Check for Genesis activation code (QNET-BOOT-000X-STRAP)
+        println!("[DIAGNOSTIC] 🔧 Priority 2: Checking QNET_ACTIVATION_CODE");
+        if let Ok(activation_code) = std::env::var("QNET_ACTIVATION_CODE") {
+            use crate::genesis_constants::GENESIS_BOOTSTRAP_CODES;
+            
+            for (i, genesis_code) in GENESIS_BOOTSTRAP_CODES.iter().enumerate() {
+                if activation_code == *genesis_code {
+                    let genesis_id = format!("{:03}", i + 1);
+                    println!("[NODE_ID] 🛡️ Genesis activation code {} detected -> genesis_node_{}", genesis_code, genesis_id);
+                    println!("[DIAGNOSTIC] ✅ Priority 2: Using activation code -> genesis_node_{}", genesis_id);
+                    return format!("genesis_node_{}", genesis_id);
+                }
+            }
+            println!("[DIAGNOSTIC] ❌ Priority 2: Activation code '{}' not a Genesis code", activation_code);
+        } else {
+            println!("[DIAGNOSTIC] ❌ Priority 2: QNET_ACTIVATION_CODE not found");
+        }
+        
+        // Priority 3: Use Genesis bootstrap flag (legacy support) - FAST MODE
+        println!("[DIAGNOSTIC] 🔧 Priority 3: Checking QNET_GENESIS_BOOTSTRAP");
         let genesis_bootstrap = std::env::var("QNET_GENESIS_BOOTSTRAP").unwrap_or_default();
         if genesis_bootstrap == "1" {
-            println!("[DIAGNOSTIC] ✅ Priority 2: QNET_GENESIS_BOOTSTRAP=1, trying IP detection");
-            // Try to determine genesis ID from IP
-            if let Ok(ip) = Self::get_external_ip().await {
-                println!("[DIAGNOSTIC] 🔧 Priority 2: external_ip={}", ip);
+            println!("[DIAGNOSTIC] ✅ Priority 3: QNET_GENESIS_BOOTSTRAP=1, checking environment IP first");
+            
+            // FAST MODE: Check environment IP first (no blocking calls)
+            if let Ok(env_ip) = std::env::var("QNET_EXTERNAL_IP") {
                 use crate::genesis_constants::GENESIS_NODE_IPS;
                 for (i, (genesis_ip, genesis_id)) in GENESIS_NODE_IPS.iter().enumerate() {
-                    if ip == *genesis_ip {
-                        println!("[NODE_ID] 🔐 Genesis node detected by IP: {}", genesis_id);
-                        println!("[DIAGNOSTIC] ✅ Priority 2: IP matched, using genesis_node_{}", genesis_id);
+                    if env_ip == *genesis_ip {
+                        println!("[NODE_ID] 🔐 Genesis node detected by env IP: {}", genesis_id);
+                        println!("[DIAGNOSTIC] ✅ Priority 3: Env IP matched, using genesis_node_{}", genesis_id);
                         return format!("genesis_node_{}", genesis_id);
                     }
                 }
-                println!("[DIAGNOSTIC] ❌ Priority 2: IP {} not found in GENESIS_NODE_IPS", ip);
-            } else {
-                println!("[DIAGNOSTIC] ❌ Priority 2: Could not get external IP");
+                println!("[DIAGNOSTIC] ❌ Priority 3: Env IP {} not found in GENESIS_NODE_IPS", env_ip);
             }
-            // Fallback for legacy genesis
-            println!("[NODE_ID] 🔐 Legacy genesis node (unknown ID)");
-            println!("[DIAGNOSTIC] ✅ Priority 2: Using legacy fallback");
-            return format!("genesis_node_legacy_{}", std::process::id());
+            
+            // Fallback for legacy genesis (avoid external IP detection)
+            println!("[NODE_ID] 🔐 Legacy genesis node (fast mode)");
+            println!("[DIAGNOSTIC] ⚡ Priority 3: Using fast legacy fallback (no external calls)");
+            return format!("genesis_node_legacy_{}", std::process::id() % 1000);
         } else {
-            println!("[DIAGNOSTIC] ❌ Priority 2: QNET_GENESIS_BOOTSTRAP='{}', not '1'", genesis_bootstrap);
+            println!("[DIAGNOSTIC] ❌ Priority 3: QNET_GENESIS_BOOTSTRAP='{}', not '1'", genesis_bootstrap);
         }
         
-
+        // Priority 4: Use server IP for regular nodes (FAST MODE: env vars first)
+        println!("[DIAGNOSTIC] 🔧 Priority 4: Regular node ID generation (FAST MODE)");
         
-        // Priority 3: Use server IP for regular nodes
-        println!("[DIAGNOSTIC] 🔧 Priority 3: Falling back to regular node ID generation");
+        // Check environment IP first (Docker/Kubernetes deployment)
+        if let Ok(external_ip) = std::env::var("QNET_EXTERNAL_IP") {
+            let sanitized_ip = external_ip.replace(".", "_").replace(":", "_");
+            println!("[NODE_ID] 📝 Regular node (env IP): {}", sanitized_ip);
+            println!("[DIAGNOSTIC] ✅ Priority 4a: Using env IP -> node_{}", sanitized_ip);
+            return format!("node_{}", sanitized_ip);
+        }
+        
+        // Priority 5: Use hostname as immediate fallback (no network calls)
+        if let Ok(hostname) = std::env::var("HOSTNAME") {
+            let sanitized_hostname = hostname.replace(".", "_");
+            println!("[NODE_ID] 🏠 Hostname-based node: {}", sanitized_hostname);
+            println!("[DIAGNOSTIC] ✅ Priority 5: Using hostname -> node_{}", sanitized_hostname);
+            return format!("node_{}", sanitized_hostname);
+        }
+        
+        // Priority 6: Network IP detection (only as last resort)
+        println!("[DIAGNOSTIC] 🔧 Priority 6: Last resort - network IP detection");
         if let Ok(ip) = Self::get_external_ip().await {
             let sanitized_ip = ip.replace(".", "_").replace(":", "_");
-            println!("[NODE_ID] 🌐 Regular node: IP-based ID={}", sanitized_ip);
-            println!("[DIAGNOSTIC] ✅ Priority 3: Using regular node -> node_{}", sanitized_ip);
+            println!("[NODE_ID] 🌐 Regular node (detected IP): {}", sanitized_ip);
+            println!("[DIAGNOSTIC] ✅ Priority 6: Using detected IP -> node_{}", sanitized_ip);
             return format!("node_{}", sanitized_ip);
         } else {
-            println!("[DIAGNOSTIC] ❌ Priority 3: Could not get external IP");
-        }
-        
-        // Priority 4: Use hostname as fallback
-        if let Ok(hostname) = std::env::var("HOSTNAME") {
-            println!("[NODE_ID] 🏠 Hostname-based node: {}", hostname);
-            return format!("node_{}", hostname.replace(".", "_"));
+            println!("[DIAGNOSTIC] ❌ Priority 6: Network IP detection failed");
         }
         
         // Last resort: Process ID + node type (should not happen in production)
         let fallback_id = format!("node_{}_{}", std::process::id(), node_type as u8);
         println!("[NODE_ID] ⚠️ Fallback node ID: {} (not recommended for production)", fallback_id);
+        println!("[DIAGNOSTIC] ⚡ FINAL FALLBACK: Using process ID -> {}", fallback_id);
         fallback_id
     }
     
@@ -4267,19 +4339,28 @@ impl BlockchainNode {
             return Ok(interface_ip);
         }
         
-        // Method 4: Query external service (fallback)
+        // Method 4: Use unique localhost fallback BEFORE external services (avoid blocking)
+        let unique_fallback = format!("127_0_0_{}", std::process::id() % 254 + 1); // 1-254 range
+        println!("[IP] ⚡ Using fast localhost fallback (avoiding external services): {}", unique_fallback);
+        println!("[IP] 📝 External IP services skipped to prevent startup blocking");
+        Ok(unique_fallback)
+        
+        // Method 5: Query external service (disabled to prevent blocking)
+        // NOTE: External IP detection disabled to prevent Docker networking issues
+        // If needed, set QNET_EXTERNAL_IP environment variable instead
+        /*
         match Self::query_external_ip_service().await {
             Ok(ip) => {
                 println!("[IP] 🌐 Detected external IP: {}", ip);
                 Ok(ip)
             }
             Err(_) => {
-                // Method 4: Use unique localhost fallback per process
-                let unique_fallback = format!("127_0_0_{}", std::process::id() % 254 + 1); // 1-254 range
+                let unique_fallback = format!("127_0_0_{}", std::process::id() % 254 + 1);
                 println!("[IP] ⚠️ Using unique localhost fallback: {}", unique_fallback);
                 Ok(unique_fallback)
             }
         }
+        */
     }
     
     /// Get IP from network interface (production servers)
@@ -4310,7 +4391,8 @@ impl BlockchainNode {
         use std::time::Duration;
         
         let client = match reqwest::Client::builder()
-            .timeout(Duration::from_secs(15)) // PRODUCTION: Increased for Genesis peer HTTP API connectivity  
+            .timeout(Duration::from_secs(3)) // FAST MODE: Quick timeout to avoid blocking startup
+            .connect_timeout(Duration::from_secs(2)) // Fast connection timeout
             .build() {
             Ok(client) => client,
             Err(e) => return Err(format!("HTTP client error: {}", e)),

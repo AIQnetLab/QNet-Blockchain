@@ -1188,6 +1188,39 @@ impl BlockchainActivationRegistry {
         Ok(())
     }
 
+    /// PRIVACY: Resolve pseudonym to peer address using EXISTING active_nodes registry
+    pub async fn resolve_peer_pseudonym(&self, pseudonym: &str) -> Option<String> {
+        let active_nodes = self.active_nodes.read().await;
+        
+        // Search through EXISTING peer registry records
+        for (device_sig, node_info) in active_nodes.iter() {
+            // EXISTING PATTERN: Check peer registry records (from register_peer_in_blockchain)
+            if node_info.activation_code.starts_with("peer_registry_") {
+                // Extract pseudonym from activation_code: "peer_registry_[pseudonym]" 
+                let stored_pseudonym = node_info.activation_code.strip_prefix("peer_registry_")
+                    .unwrap_or("");
+                
+                if stored_pseudonym == pseudonym {
+                    // EXISTING PATTERN: Extract IP from device_signature
+                    // Format: "peer_device_154.38.160.39:8001_pseudonym"
+                    if device_sig.starts_with("peer_device_") {
+                        let addr_part = device_sig.strip_prefix("peer_device_")
+                            .unwrap_or("")
+                            .split('_')
+                            .next()
+                            .unwrap_or("");
+                        
+                        if addr_part.contains(':') {
+                            return Some(addr_part.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        
+        None // Pseudonym not found in registry
+    }
+    
     /// Get eligible nodes for consensus (public interface)
     pub async fn get_eligible_nodes(&self) -> Vec<(String, f64, String)> {
         // GENESIS FIX: In Genesis mode, populate with Genesis nodes if active_nodes is empty

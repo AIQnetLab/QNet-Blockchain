@@ -113,7 +113,7 @@ impl Default for LoadBalancingConfig {
             max_cpu_threshold: 0.80,      // 80% CPU threshold
             max_latency_threshold: 150,   // 150ms latency threshold
             rebalance_interval_secs: 1,   // QUANTUM: Real-time rebalancing
-            min_peers_per_region: 2,      // Minimum 2 peers per region  
+            min_peers_per_region: 2,      // Minimum 2 peers per region
             max_peers_per_region: adaptive_peer_limit, // ADAPTIVE: Based on network size detection
         }
     }
@@ -412,8 +412,8 @@ impl SimplifiedP2P {
                         
                         if peer_verified {
                             // SINGLE CODE PATH: Add verified peer (no duplication!)
-                            self.add_peer_to_region(peer_info.clone());
-                            
+                    self.add_peer_to_region(peer_info.clone());
+                    
                             // Add to connected peers
                             {
                                 let mut connected = match self.connected_peers.lock() {
@@ -423,10 +423,10 @@ impl SimplifiedP2P {
                                         poisoned.into_inner()
                                     }
                                 };
-                                connected.push(peer_info.clone());
-                                new_connections += 1;
-                            }
-                            
+                        connected.push(peer_info.clone());
+                        new_connections += 1;
+                    }
+                    
                             // QUANTUM: Register peer in blockchain for persistent peer registry
                             tokio::spawn({
                                 let peer_info_clone = peer_info.clone();
@@ -524,6 +524,7 @@ impl SimplifiedP2P {
     fn announce_node_to_internet(&self) {
         let node_id = self.node_id.clone();
         let region = self.region.clone();
+        let node_type = self.node_type.clone();
         let port = self.port;
         
         tokio::spawn(async move {
@@ -541,9 +542,39 @@ impl SimplifiedP2P {
             println!("[P2P] 🌐 External IP: {}", external_ip);
             println!("[P2P] 🌐 Node announcement: {}:{} in {:?}", external_ip, port, region);
             
+            // PRIVACY: Use display name for public P2P announcement (preserves consensus ID)
+            let public_display_name = {
+                // Generate display name using EXISTING pattern
+                match &node_type {
+                    NodeType::Light => node_id.clone(), // Light nodes use pseudonyms already
+                    _ => {
+                        // Genesis nodes keep original ID for stability
+                        if node_id.starts_with("genesis_node_") {
+                            node_id.clone()
+                        } else {
+                            // Full/Super: Privacy display name
+                            let display_hash = blake3::hash(format!("P2P_DISPLAY_{}_{}", 
+                                                                    node_id, 
+                                                                    format!("{:?}", node_type)).as_bytes());
+                            
+                            let node_type_prefix = match node_type {
+                                NodeType::Super => "super",
+                                NodeType::Full => "full", 
+                                _ => "node"
+                            };
+                            
+                            format!("{}_{}_{}", 
+                                    node_type_prefix,
+                                    format!("{:?}", region).to_lowercase(), 
+                                    &display_hash.to_hex()[..8])
+                        }
+                    }
+                }
+            };
+            
             // Create our node announcement
             let announcement = serde_json::json!({
-                "node_id": node_id,
+                "node_id": public_display_name,
                 "external_ip": external_ip,
                 "port": port,
                 "region": format!("{:?}", region),
@@ -661,12 +692,12 @@ impl SimplifiedP2P {
                             use crate::genesis_constants::get_genesis_region_by_ip;
                             let genesis_region_str = get_genesis_region_by_ip(&ip).unwrap_or("Europe");
                             let peer_region = match genesis_region_str {
-                                "NorthAmerica" => Region::NorthAmerica,
-                                "Europe" => Region::Europe,
-                                "Asia" => Region::Asia,
-                                "SouthAmerica" => Region::SouthAmerica,
-                                "Africa" => Region::Africa,
-                                "Oceania" => Region::Oceania,
+                                    "NorthAmerica" => Region::NorthAmerica,
+                                    "Europe" => Region::Europe,
+                                    "Asia" => Region::Asia,
+                                    "SouthAmerica" => Region::SouthAmerica,
+                                    "Africa" => Region::Africa,
+                                    "Oceania" => Region::Oceania,
                                 _ => region.clone(), // EXISTING: Use current region as fallback
                             };
                             
@@ -1907,8 +1938,26 @@ impl SimplifiedP2P {
         discovery_peers
     }
     
-    /// Parse peer address string - supports both "id@ip:port" and "ip:port" formats
+    /// Parse peer address string - supports "id@ip:port", "ip:port" and pseudonym formats  
     fn parse_peer_address(&self, addr: &str) -> Result<PeerInfo, String> {
+        // PRIVACY: Try pseudonym resolution first using EXISTING registry
+        if !addr.contains(':') && !addr.contains('@') {
+            // Might be a pseudonym - try to resolve
+            let registry = crate::activation_validation::BlockchainActivationRegistry::new(None);
+            if let Some(resolved_addr) = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    registry.resolve_peer_pseudonym(addr).await
+                })
+            }) {
+                println!("[P2P] 🔍 Resolved pseudonym {} to {} for parsing", addr, resolved_addr);
+                return Self::parse_peer_address_static(&resolved_addr);
+            } else {
+                println!("[P2P] ❌ Failed to resolve pseudonym: {}", addr);
+                return Err(format!("Cannot resolve pseudonym: {}", addr));
+            }
+        }
+        
+        // EXISTING: Use static parser for IP:port and id@ip:port formats
         Self::parse_peer_address_static(addr)
     }
     
@@ -2034,7 +2083,7 @@ impl SimplifiedP2P {
                 
                 // EXISTING: All peers use same validation logic for consistency
                 if self.is_peer_actually_connected(&peer.addr) {
-                    connected.push(peer.clone());
+                connected.push(peer.clone());
                     println!("[P2P] ✅ Added {} to connection pool from {:?} (REAL connection verified)", peer.id, peer.region);
                 } else {
                     // DIAGNOSTIC: Log why peer was skipped
@@ -2092,7 +2141,7 @@ impl SimplifiedP2P {
                             
                             // FIXED: Genesis peers ALWAYS use relaxed validation (no time dependency) 
                             if is_genesis_peer {
-                                connected.push(peer.clone());
+                            connected.push(peer.clone());
                                 println!("[P2P] ✅ Added Genesis backup {} (bootstrap trust)", peer.addr);
                             } else if self.is_peer_actually_connected(&peer.addr) {
                                 connected.push(peer.clone());
@@ -2968,11 +3017,34 @@ async fn register_peer_in_blockchain(peer_info: PeerInfo) -> Result<(), String> 
     // Use EXISTING BlockchainActivationRegistry to store peer information
     let registry = crate::activation_validation::BlockchainActivationRegistry::new(None);
     
+    // PRIVACY: Use public display name for registry (preserves consensus node_id)
+    let public_node_id = if peer_info.id.starts_with("genesis_node_") {
+        peer_info.id.clone() // Genesis nodes keep original ID
+    } else {
+        // Generate display name for privacy (same pattern as P2P announcement)
+        let display_hash = blake3::hash(format!("P2P_DISPLAY_{}_{}", 
+                                                peer_info.id, 
+                                                format!("{:?}", peer_info.node_type)).as_bytes());
+        
+        let node_type_prefix = match peer_info.node_type {
+            NodeType::Super => "super",
+            NodeType::Full => "full", 
+            _ => "node"
+        };
+        
+        let region_hint = format!("{:?}", peer_info.region).to_lowercase();
+        
+        format!("{}_{}_{}", 
+                node_type_prefix,
+                region_hint, 
+                &display_hash.to_hex()[..8])
+    };
+    
     // Create peer registration as special activation record in blockchain
     let peer_node_info = crate::activation_validation::NodeInfo {
-        activation_code: format!("peer_registry_{}", peer_info.id), // Special peer registry code
+        activation_code: format!("peer_registry_{}", public_node_id), // Use display name for registry
         wallet_address: format!("peer_wallet_{}", peer_info.addr), // Peer wallet derived from address  
-        device_signature: format!("peer_device_{}_{}", peer_info.addr, peer_info.id),
+        device_signature: format!("peer_device_{}_{}", peer_info.addr, public_node_id), // Include display name
         node_type: format!("{:?}", peer_info.node_type),
         activated_at: peer_info.last_seen,
         last_seen: peer_info.last_seen,
@@ -2981,11 +3053,11 @@ async fn register_peer_in_blockchain(peer_info: PeerInfo) -> Result<(), String> 
     
     // Use EXISTING register_activation_on_blockchain for peer registry
     registry.register_activation_on_blockchain(
-        &format!("peer_registry_{}", peer_info.id), 
+        &format!("peer_registry_{}", public_node_id), 
         peer_node_info
     ).await.map_err(|e| format!("Blockchain peer registration failed: {}", e))?;
     
-    println!("[BLOCKCHAIN] ✅ Peer {} registered in quantum blockchain registry", peer_info.addr);
+    println!("[BLOCKCHAIN] ✅ Peer {} registered with pseudonym {} in quantum blockchain registry", peer_info.addr, public_node_id);
     Ok(())
 }
 
@@ -3077,7 +3149,7 @@ impl SimplifiedP2P {
                         };
                         
                         let mut added_count = 0;
-                        for new_peer in new_peers {
+                                for new_peer in new_peers {
                             // Check if not already connected and add to active list  
                             if !connected.iter().any(|p| p.addr == new_peer.addr) {
                                 connected.push(new_peer.clone());
@@ -3196,6 +3268,48 @@ impl SimplifiedP2P {
         }
     }
     
+    /// PRIVACY: Get public display name for P2P announcements (preserves consensus node_id)
+    pub fn get_public_display_name(&self) -> String {
+        match self.node_type {
+            NodeType::Light => {
+                // Light nodes already use pseudonyms
+                self.node_id.clone()
+            },
+            _ => {
+                // CRITICAL: Genesis nodes keep original ID for consensus stability
+                if self.node_id.starts_with("genesis_node_") {
+                    return self.node_id.clone();
+                }
+                
+                // Full/Super nodes: Generate privacy-preserving display name
+                self.generate_p2p_display_name()
+            }
+        }
+    }
+    
+    /// PRIVACY: Generate display name for P2P announcements (Full/Super nodes)
+    fn generate_p2p_display_name(&self) -> String {
+        // EXISTING PATTERN: Use same pattern as other display name functions
+        // SECURITY: Use node_id as source for consistency (not wallet for P2P layer)
+        let display_hash = blake3::hash(format!("P2P_DISPLAY_{}_{}", 
+                                                self.node_id, 
+                                                format!("{:?}", self.node_type)).as_bytes());
+        
+        // PRIVACY: Generate P2P-friendly display name without revealing IP
+        let node_type_prefix = match self.node_type {
+            NodeType::Super => "super",
+            NodeType::Full => "full", 
+            _ => "node"
+        };
+        
+        let region_hint = format!("{:?}", self.region).to_lowercase();
+        
+        format!("{}_{}_{}", 
+                node_type_prefix,
+                region_hint, 
+                &display_hash.to_hex()[..8])
+    }
+    
 
     
     /// PRODUCTION: Apply reputation decay periodically
@@ -3276,7 +3390,7 @@ impl SimplifiedP2P {
         Ok(())
     }
 
-    /// Send network message via HTTP POST to peer's API
+    /// Send network message via HTTP POST to peer's API (with pseudonym resolution)
     fn send_network_message(&self, peer_addr: &str, message: NetworkMessage) {
         let peer_addr = peer_addr.to_string();
         
@@ -3298,6 +3412,29 @@ impl SimplifiedP2P {
             }
         };
 
+        // PRIVACY: Resolve pseudonym to IP if needed using EXISTING registry
+        let resolved_addr = if peer_addr.contains(':') {
+            // Already has IP:port format
+            peer_addr.clone()
+        } else {
+            // Might be a pseudonym - try to resolve using EXISTING BlockchainActivationRegistry
+            let registry = crate::activation_validation::BlockchainActivationRegistry::new(None);
+            match tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    registry.resolve_peer_pseudonym(&peer_addr).await
+                })
+            }) {
+                Some(resolved_ip) => {
+                    println!("[P2P] 🔍 Resolved pseudonym {} to {}", peer_addr, resolved_ip);
+                    resolved_ip
+                },
+                None => {
+                    println!("[P2P] ❌ Failed to resolve pseudonym: {}", peer_addr);
+                    return; // Cannot send to unresolved pseudonym
+                }
+            }
+        };
+        
         // Send asynchronously in background thread
         tokio::spawn(async move {
             let client = match reqwest::Client::builder()
@@ -3314,14 +3451,14 @@ impl SimplifiedP2P {
                 }
             };
 
-            // Extract IP from peer address
-            let peer_ip = peer_addr.split(':').next().unwrap_or(&peer_addr);
+            // Extract IP from resolved address (may have been pseudonym originally)
+            let peer_ip = resolved_addr.split(':').next().unwrap_or(&resolved_addr);
             // CRITICAL FIX: Use only working ports - all nodes use 8001 for API
             let urls = vec![
                 format!("http://{}:8001/api/v1/p2p/message", peer_ip),  // Primary API port (all nodes)
             ];
             
-            println!("[P2P] 🔍 DIAGNOSTIC: Trying {} URLs for peer {}", urls.len(), peer_ip);
+            println!("[P2P] 🔍 DIAGNOSTIC: Trying {} URLs for peer {} (original: {})", urls.len(), peer_ip, peer_addr);
 
             let mut sent = false;
             for url in urls {
