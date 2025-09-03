@@ -704,7 +704,7 @@ impl SimplifiedP2P {
                             let peer_info = PeerInfo {
                                 id: format!("genesis_{}", target_addr.replace(":", "_")),
                                 addr: target_addr.clone(),
-                                node_type: NodeType::Full,
+                                node_type: NodeType::Super,
                                 region: peer_region,
                                 last_seen: std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
@@ -1073,6 +1073,20 @@ impl SimplifiedP2P {
                         // EXISTING: No delays for single-attempt quick operations
                         continue;
                     }
+                    
+                    // CRITICAL FIX: Add Genesis leniency consistent with check_api_readiness_static
+                    // Extract IP from endpoint for Genesis peer check
+                    let ip = endpoint.split("://").nth(1)
+                        .and_then(|s| s.split(':').next())
+                        .unwrap_or("");
+                    
+                    let is_genesis_peer = is_genesis_node_ip(ip);
+                    if is_genesis_peer {
+                        // EXISTING: Same Genesis leniency pattern as check_api_readiness_static
+                        println!("[SYNC] 🔧 Genesis peer height query: Using leniency for API startup race condition ({})", ip);
+                        return Ok(0); // Return height 0 for Genesis peers during startup (consistent with network formation)
+                    }
+                    
                     return Err(format!("Request failed: {}", e));
                 }
             }
@@ -2159,14 +2173,14 @@ impl SimplifiedP2P {
                                                  peer.id, peer.region);
                                     } else {
                                         println!("[P2P] ❌ Skipped backup peer {} from {:?} (connection failed)", 
-                                         peer.id, peer.region);
+                                     peer.id, peer.region);
                                     }
                         }
                     }
                 }
-                }
             }
-            
+        }
+        
             // Update real connected_peers with results from background establishment
             if let Ok(mut connected) = connected_peers.lock() {
                 *connected = connected_data;
@@ -2290,6 +2304,20 @@ impl SimplifiedP2P {
                         // EXISTING: No delays for single-attempt quick operations
                         continue;
                     }
+                    
+                    // CRITICAL FIX: Add Genesis leniency consistent with check_api_readiness_static
+                    // Extract IP from endpoint for Genesis peer check
+                    let ip = endpoint.split("://").nth(1)
+                        .and_then(|s| s.split(':').next())
+                        .unwrap_or("");
+                    
+                    let is_genesis_peer = is_genesis_node_ip(ip);
+                    if is_genesis_peer {
+                        // EXISTING: Same Genesis leniency pattern as check_api_readiness_static
+                        println!("[SYNC] 🔧 Genesis peer height query (static): Using leniency for API startup race condition ({})", ip);
+                        return Ok(0); // Return height 0 for Genesis peers during startup (consistent with network formation)
+                    }
+                    
                     return Err(format!("Request failed: {}", e));
                 }
             }
