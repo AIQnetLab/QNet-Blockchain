@@ -728,7 +728,8 @@ impl BlockchainNode {
                 // Each node was seeing different peer counts causing deadlock
                 
                 // PERFORMANCE FIX: Cache active node count to prevent excessive Registry calls
-                static CACHED_NODE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                // EXISTING: Pre-populate with Genesis default (5 nodes) to prevent initial cache miss blocking
+                static CACHED_NODE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(5);
                 static LAST_COUNT_UPDATE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 
                 let current_time = std::time::SystemTime::now()
@@ -1395,6 +1396,35 @@ impl BlockchainNode {
         // Each 30-block period uses cryptographic hash to select producer from qualified candidates
         
         if let Some(p2p) = unified_p2p {
+            // PERFORMANCE FIX: Cache producer selection for entire 30-block period to prevent HTTP spam
+            // Producer is SAME for all blocks in rotation period (blocks 0-29, 30-59, etc.)
+            let rotation_interval = 30u64; // EXISTING: 30-block rotation from MICROBLOCK_ARCHITECTURE_PLAN.md
+            let leadership_round = current_height / rotation_interval;
+            
+            // Static cache for producer selection per round
+            use std::sync::{Arc as StdArc, Mutex};
+            use std::collections::HashMap;
+            static CACHED_PRODUCER_SELECTION: std::sync::OnceLock<Mutex<HashMap<u64, (String, Vec<(String, f64)>)>>> = std::sync::OnceLock::new();
+            
+            let producer_cache = CACHED_PRODUCER_SELECTION.get_or_init(|| Mutex::new(HashMap::new()));
+            
+            // Check if we have cached result for this round
+            if let Ok(cache) = producer_cache.lock() {
+                if let Some((cached_producer, cached_candidates)) = cache.get(&leadership_round) {
+                    // EXISTING: Log only at rotation boundaries for performance
+                    if current_height % rotation_interval == 0 {
+                        println!("[DEBUG] 🔒 CACHED ROUND: Using cached producer selection for round {}", leadership_round);
+                        println!("[DEBUG] 🎯 Cached producer: {} ({} candidates)", cached_producer, cached_candidates.len());
+                        println!("[MICROBLOCK] 🎯 Producer: {} (round: {}, CACHED SELECTION, next rotation: block {})", 
+                                 cached_producer, leadership_round, (leadership_round + 1) * rotation_interval);
+                    }
+                    return cached_producer.clone();
+                }
+            }
+            
+            // Cache miss - need to calculate candidates (only once per 30-block period)
+            println!("[DEBUG] 🔄 CACHE MISS: Calculating producer for new round {}", leadership_round);
+            
             // PRODUCTION: Direct calculation for consensus determinism (THREAD-SAFE)
             // QNet requires consistent candidate lists across all nodes for Byzantine safety
             // CRITICAL: Now includes validator sampling for millions of nodes
@@ -1406,12 +1436,6 @@ impl BlockchainNode {
                 println!("[DEBUG] 💡 Check P2P connectivity, peer discovery, and reputation system");
                 return own_node_id.to_string();
             }
-            
-            // PRODUCTION: Microblock producer ROTATION every 30 blocks (per MICROBLOCK_ARCHITECTURE_PLAN.md)
-            // Documentation: "Leader Selection: Reputation-based validator rotation (every 30 blocks)"
-            // "Blocks 1-30: Producer A, Blocks 31-60: Producer B, Blocks 61-90: Producer C"
-            let rotation_interval = 30u64;
-            let leadership_round = current_height / rotation_interval;
             
             // PRODUCTION: Use EXISTING cryptographic validator selection algorithm
             // This is the REAL decentralized algorithm (not centralized rotation!)
@@ -1435,6 +1459,18 @@ impl BlockchainNode {
             
             let selection_index = (selection_number as usize) % candidates.len();
             let selected_producer = candidates[selection_index].0.clone();
+            
+            // PERFORMANCE FIX: Cache the result for this entire 30-block period
+            if let Ok(mut cache) = producer_cache.lock() {
+                cache.insert(leadership_round, (selected_producer.clone(), candidates.clone()));
+                
+                // PRODUCTION: Cleanup old cached rounds (keep only last 3 rounds to prevent memory leak)
+                let rounds_to_keep: Vec<u64> = cache.keys()
+                    .filter(|&&round| round + 3 >= leadership_round)
+                    .cloned()
+                    .collect();
+                cache.retain(|k, _| rounds_to_keep.contains(k));
+            }
             
             // PRODUCTION: Log producer selection info ONLY at rotation boundaries (every 30 blocks) for performance
             if current_height % rotation_interval == 0 {
@@ -1721,17 +1757,56 @@ impl BlockchainNode {
     
     /// Detect if network is in Genesis bootstrap phase using DETERMINISTIC network height
     async fn is_genesis_bootstrap_phase(p2p: &Arc<SimplifiedP2P>) -> bool {
+        // PERFORMANCE FIX: Cache phase detection to prevent HTTP spam every microblock
+        // Network phase changes very rarely (only once at height 1000)
+        use std::sync::{Arc as StdArc, Mutex};
+        static CACHED_PHASE_DETECTION: std::sync::OnceLock<Mutex<(bool, u64, std::time::SystemTime)>> = std::sync::OnceLock::new();
+        
+        let phase_cache = CACHED_PHASE_DETECTION.get_or_init(|| Mutex::new((true, 0, std::time::SystemTime::UNIX_EPOCH)));
+        
+        let current_time = std::time::SystemTime::now();
+        
+        // Check cache first (refresh every 30 seconds to reduce HTTP calls)
+        if let Ok(cache) = phase_cache.lock() {
+            let (cached_is_genesis, cached_height, cached_time) = *cache;
+            
+            // Use cache if less than 30 seconds old and we're still in Genesis phase
+            // OR if we're in Normal phase (very unlikely to change back)
+            if let Ok(cache_age) = current_time.duration_since(cached_time) {
+                if cache_age.as_secs() < 30 || !cached_is_genesis {
+                    // EXISTING: Log only when transitioning or first time
+                    if cached_time == std::time::SystemTime::UNIX_EPOCH {
+                        println!("[PHASE] Network height: {} → {} phase (CACHED)", cached_height, 
+                                 if cached_is_genesis { "Genesis" } else { "Normal" });
+                    }
+                    return cached_is_genesis;
+                }
+            }
+        }
+        
+        // Cache miss or expired - query network height
         // FIXED: Use network height instead of peer count for phase detection
         match p2p.sync_blockchain_height() {
             Ok(network_height) => {
-                let is_genesis = network_height < 1000; // First 1000 blocks = Genesis phase
-                println!("[PHASE] Network height: {} → {} phase", network_height, 
+                let is_genesis = network_height < 1000; // EXISTING: First 1000 blocks = Genesis phase
+                
+                // Update cache
+                if let Ok(mut cache) = phase_cache.lock() {
+                    *cache = (is_genesis, network_height, current_time);
+                }
+                
+                println!("[PHASE] Network height: {} → {} phase (REFRESHED)", network_height, 
                          if is_genesis { "Genesis" } else { "Normal" });
                 is_genesis
             },
             Err(_) => {
                 // Fallback: if sync fails, assume Genesis phase
-                println!("[PHASE] Sync failed → assuming Genesis phase");
+                // Update cache with fallback
+                if let Ok(mut cache) = phase_cache.lock() {
+                    *cache = (true, 0, current_time);
+                }
+                
+                println!("[PHASE] Sync failed → assuming Genesis phase (FALLBACK)");
                 true
             }
         }

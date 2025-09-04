@@ -1341,11 +1341,40 @@ impl SimplifiedP2P {
     pub fn filter_working_genesis_nodes_static(nodes: Vec<String>) -> Vec<String> {
         use std::net::{TcpStream, SocketAddr};
         use std::time::Duration;
+        use std::sync::{Arc, Mutex};
+        use std::collections::HashMap;
         
+        // PERFORMANCE FIX: Cache connectivity results to prevent 20+ second delays every microblock
+        // Genesis topology is stable - no need to test every few seconds
+        static CACHED_GENESIS_CONNECTIVITY: std::sync::OnceLock<Mutex<HashMap<String, (Vec<String>, std::time::SystemTime)>>> = std::sync::OnceLock::new();
+        
+        let connectivity_cache = CACHED_GENESIS_CONNECTIVITY.get_or_init(|| Mutex::new(HashMap::new()));
+        
+        // Create cache key from sorted node list for consistent results
+        let mut cache_key_nodes = nodes.clone();
+        cache_key_nodes.sort();
+        let cache_key = cache_key_nodes.join("|");
+        
+        let current_time = std::time::SystemTime::now();
+        
+        // Check cache first (refresh every 120 seconds for Genesis stability)
+        if let Ok(cache) = connectivity_cache.lock() {
+            if let Some((cached_working_nodes, cached_time)) = cache.get(&cache_key) {
+                if let Ok(cache_age) = current_time.duration_since(*cached_time) {
+                    if cache_age.as_secs() < 120 { // EXISTING: Longer cache for stable Genesis topology
+                        println!("[FAILOVER] 📋 Using cached Genesis connectivity ({} working, cache age: {}s)", 
+                                 cached_working_nodes.len(), cache_age.as_secs());
+                        return cached_working_nodes.clone();
+                    }
+                }
+            }
+        }
+        
+        // Cache miss or expired - perform connectivity tests
         let mut working_nodes = Vec::new();
         let mut test_results = Vec::new();
         
-        println!("[FAILOVER] 🔍 Testing connectivity to {} Genesis nodes...", nodes.len());
+        println!("[FAILOVER] 🔍 Testing connectivity to {} Genesis nodes... (REFRESHING CACHE)", nodes.len());
         
         for ip in &nodes {
             let addr = format!("{}:8001", ip);
@@ -1407,9 +1436,36 @@ impl SimplifiedP2P {
             if working_nodes.is_empty() {
                 println!("[FAILOVER] 🚨 CRITICAL: No Genesis nodes reachable!");
                 println!("[FAILOVER] 🔄 Using all configured nodes (network might be starting)");
+                
+                // Cache the fallback result (all nodes) for short period to prevent repeated failures
+                if let Ok(mut cache) = connectivity_cache.lock() {
+                    cache.insert(cache_key, (nodes.clone(), current_time));
+                }
+                
                 return nodes; // Last resort - use all nodes
             } else {
                 println!("[FAILOVER] ⚠️ Proceeding with {} working nodes (below minimum)", working_nodes.len());
+            }
+        }
+        
+        // PERFORMANCE FIX: Cache the successful connectivity results
+        if let Ok(mut cache) = connectivity_cache.lock() {
+            cache.insert(cache_key, (working_nodes.clone(), current_time));
+            
+            // PRODUCTION: Cleanup old cache entries to prevent memory leak (keep last 5)
+            if cache.len() > 5 {
+                let mut keys_to_remove = Vec::new();
+                let cutoff_time = current_time - std::time::Duration::from_secs(300); // Remove entries older than 5 minutes
+                
+                for (key, (_, cached_time)) in cache.iter() {
+                    if *cached_time < cutoff_time {
+                        keys_to_remove.push(key.clone());
+                    }
+                }
+                
+                for key in keys_to_remove {
+                    cache.remove(&key);
+                }
             }
         }
         
