@@ -909,7 +909,7 @@ impl SimplifiedP2P {
         // PRODUCTION: Silent broadcast operations for scalability (essential logs only)
         
         if validated_peers.is_empty() {
-            println!("[P2P] ⚠️ DIAGNOSTIC: No validated peers available - block #{} not broadcasted", height);
+            println!("[P2P] ⚠️ No validated peers available - block #{} not broadcasted", height);
             return Ok(());
         }
         
@@ -3024,13 +3024,25 @@ impl SimplifiedP2P {
     pub fn handle_message(&self, from_peer: &str, message: NetworkMessage) {
         match message {
             NetworkMessage::Block { height, data, block_type } => {
+                // PRODUCTION: Add visual separator for received blocks (same format as creation)
+                println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
                 println!("[P2P] ← Received {} block #{} from {} ({} bytes)", 
                          block_type, height, from_peer, data.len());
                 
-                // DIAGNOSTIC: Check block channel state
-                println!("[DIAGNOSTIC] 🔧 Checking block channel availability...");
+                // PRODUCTION: Byzantine safety validation for received blocks
+                // Only accept blocks if network has sufficient Byzantine safety
+                let validated_peers = self.get_validated_active_peers();
+                let network_node_count = validated_peers.len() + 1; // +1 for self
+                
+                if network_node_count < 4 {
+                    println!("[SECURITY] ⚠️ REJECTING block #{} - insufficient network Byzantine safety: {} nodes < 4", height, network_node_count);
+                    println!("[SECURITY] 🔒 Block from {} discarded - network must have 4+ validated nodes", from_peer);
+                    return; // Reject block without processing
+                }
+                
+                // PRODUCTION: Silent diagnostic check for scalability  
                 match &self.block_tx {
-                    Some(_) => println!("[DIAGNOSTIC] ✅ Block channel is AVAILABLE"),
+                    Some(_) => {}, // Silent success
                     None => println!("[DIAGNOSTIC] ❌ Block channel is MISSING - this explains discarded blocks"),
                 }
                 

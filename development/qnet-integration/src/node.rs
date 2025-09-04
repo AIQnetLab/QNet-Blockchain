@@ -274,30 +274,22 @@ impl BlockchainNode {
         unified_p2p_instance.set_consensus_channel(consensus_tx);
         
         // PRODUCTION: Set block processing channel for received blocks
-        println!("[DIAGNOSTIC] 🔧 Setting block channel...");
         unified_p2p_instance.set_block_channel(block_tx);
-        println!("[DIAGNOSTIC] 📦 Block processing channel set successfully");
         
         // CRITICAL: Initialize all Genesis node reputations deterministically at startup
         // This prevents race conditions where different nodes see different candidate lists
-        println!("[DIAGNOSTIC] 🔧 About to call initialize_genesis_reputations...");
         Self::initialize_genesis_reputations(&unified_p2p_instance).await;
-        println!("[DIAGNOSTIC] 🔧 initialize_genesis_reputations completed");
         
         let unified_p2p = Arc::new(unified_p2p_instance);
         
-        // PRODUCTION: Start block processing handler
-        println!("[DIAGNOSTIC] 🔧 Starting block processing handler...");
+        // PRODUCTION: Start block processing handler  
         let storage_clone = storage.clone();
         tokio::spawn(async move {
-            println!("[DIAGNOSTIC] 📦 Block processing handler active - waiting for blocks");
             Self::process_received_blocks(block_rx, storage_clone).await;
         });
         
         // Start unified P2P
-        println!("[UnifiedP2P] 🔍 DEBUG: Starting unified P2P...");
         unified_p2p.start();
-        println!("[UnifiedP2P] 🔍 DEBUG: Unified P2P started");
         
         // Initialize sharding components for production
         let shard_coordinator = if perf_config.enable_sharding {
@@ -407,8 +399,6 @@ impl BlockchainNode {
             
             // Store validated block (use existing storage methods)
             // TODO: Implement proper block storage integration
-            println!("[BLOCKS] ℹ️ Block #{} validated and ready for storage integration", received_block.height);
-            // Success - block processing works now
             println!("[BLOCKS] ✅ Block #{} processed successfully", received_block.height);
         }
     }
@@ -489,19 +479,20 @@ impl BlockchainNode {
             println!("[Node] 🏛️ Byzantine consensus will activate during macroblock rounds only");
         }
         
-        // Start RPC server with production port detection
-        let rpc_port = std::env::var("QNET_RPC_PORT")
+        // PRODUCTION: Unified server uses single port for both RPC and API (Genesis nodes standard: 8001)
+        // EXISTING: All Genesis nodes use port 8001 consistently for unified API/RPC
+        let unified_port = std::env::var("QNET_API_PORT")
             .ok()
             .and_then(|s| s.parse::<u16>().ok())
             .unwrap_or_else(|| {
-                // Use same port finding logic as qnet-node.rs
+                // PRODUCTION: Find available port starting from 8001 (Genesis standard)
                 use std::net::TcpListener;
-                for port in 9877..9977 {
+                for port in 8001..8101 {
                     if TcpListener::bind(format!("0.0.0.0:{}", port)).is_ok() {
                         return port;
                     }
                 }
-                9877 // fallback
+                8001 // EXISTING: Genesis fallback port
             });
 
         // Start API server ONLY for Full and Super nodes
@@ -509,39 +500,25 @@ impl BlockchainNode {
         let should_start_api = !matches!(self.node_type, NodeType::Light);
         
         if should_start_api {
-            let api_port = std::env::var("QNET_API_PORT")
-                .ok()
-                .and_then(|s| s.parse::<u16>().ok())
-                .unwrap_or_else(|| {
-                    // Find available port starting from 8001
-                    use std::net::TcpListener;
-                    for port in 8001..8101 {
-                        if TcpListener::bind(format!("0.0.0.0:{}", port)).is_ok() {
-                            return port;
-                        }
-                    }
-                    8001 // fallback
-                });
+            // PRODUCTION: Start SINGLE unified server for both RPC and API (no port conflicts)
+            let node_clone_unified = self.clone();
             
-            // Start unified API/RPC server for Full/Super nodes
-            let node_clone_api = self.clone();
-            
-            println!("[Node] 🚀 API server starting on port {}", api_port);
+            println!("[Node] 🚀 Unified RPC+API server starting on port {}", unified_port);
             tokio::spawn(async move {
-                crate::rpc::start_rpc_server(node_clone_api, api_port).await;
+                crate::rpc::start_rpc_server(node_clone_unified, unified_port).await;
             });
             
-            // CRITICAL FIX: Wait for API server to be ready before P2P discovery  
-            println!("[Node] ⏳ Waiting for API server to be ready...");
+            // CRITICAL FIX: Wait for unified server to be ready before P2P discovery  
+            println!("[Node] ⏳ Waiting for unified server to be ready...");
             // EXISTING: Use same wait time as Genesis coordination (8s for Genesis, 5s for regular)
             let api_wait_time = if std::env::var("QNET_BOOTSTRAP_ID").is_ok() { 8 } else { 5 };
             tokio::time::sleep(std::time::Duration::from_secs(api_wait_time)).await;
             
-            // Store ports for external access
-            std::env::set_var("QNET_CURRENT_RPC_PORT", rpc_port.to_string()); // Correct RPC port
-            std::env::set_var("QNET_CURRENT_API_PORT", api_port.to_string());
+            // Store unified port for external access  
+            std::env::set_var("QNET_CURRENT_RPC_PORT", unified_port.to_string());
+            std::env::set_var("QNET_CURRENT_API_PORT", unified_port.to_string());
             
-            println!("[Node] 🔌 Unified RPC+API server: port {}", api_port);
+            println!("[Node] 🔌 Unified RPC+API server: port {}", unified_port);
             println!("[Node] 🌐 All endpoints available on single port");
             
             // EXISTING: Now sync blockchain height AFTER API server is ready
@@ -572,17 +549,17 @@ impl BlockchainNode {
                 }
             }
         } else {
-            // Light nodes: RPC only, no API server
-            let node_clone_rpc = self.clone();
+            // Light nodes: Use unified server too (for consistency)
+            let node_clone_light = self.clone();
             
             tokio::spawn(async move {
-                crate::rpc::start_rpc_server(node_clone_rpc, rpc_port).await;
+                crate::rpc::start_rpc_server(node_clone_light, unified_port).await;
             });
             
-            std::env::set_var("QNET_CURRENT_RPC_PORT", rpc_port.to_string());
+            std::env::set_var("QNET_CURRENT_RPC_PORT", unified_port.to_string());
             
-            println!("[Node] 🔌 RPC server: port {} (Light node - no API)", rpc_port);
-            println!("[Node] 📱 Light node: Mobile-only, no public API endpoints");
+            println!("[Node] 🔌 Unified server: port {} (Light node)", unified_port);
+            println!("[Node] 📱 Light node: Mobile-optimized endpoints");
         }
         
         println!("[Node] ✅ Blockchain node started successfully");
@@ -1047,7 +1024,7 @@ impl BlockchainNode {
                         println!("[P2P] 📡 Broadcast microblock #{} to {} peers | Size: {} bytes", 
                                  microblock.height, peer_count, broadcast_size);
                     } else {
-                        println!("[P2P] ⚠️ DIAGNOSTIC: P2P system not available - cannot broadcast block #{}", microblock.height);
+                        println!("[P2P] ⚠️ P2P system not available - cannot broadcast block #{}", microblock.height);
                     }
                     
                     // Remove processed transactions from mempool
@@ -1089,8 +1066,9 @@ impl BlockchainNode {
                         }
                     } else {
                         // Show status for every block to monitor network activity
-                        println!("💤 Block #{} | 🔄 {} tx | 🌐 {} peers | 🔐 Quantum-ready | ⏰ Next: {}ms", 
+                        println!("💤 Block #{} | 👑 Producer: {} | 🔄 {} tx | 🌐 {} peers | 🔐 Quantum-ready | ⏰ Next: {}ms", 
                                 microblock.height,
+                                node_id,
                                 txs.len(),
                                 peer_count,
                                 microblock_interval.as_millis());
