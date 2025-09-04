@@ -1933,7 +1933,7 @@ impl BlockchainNode {
         // This ensures only LIVE nodes participate in producer selection
         for peer in validated_peers {
             // EXISTING: Only Full and Super nodes participate in consensus  
-            let is_consensus_capable = matches!(peer.node_type, NodeType::Super | NodeType::Full);
+            let is_consensus_capable = matches!(peer.node_type, crate::unified_p2p::NodeType::Super | crate::unified_p2p::NodeType::Full);
             
             if is_consensus_capable {
                 // EXISTING: Use deterministic Genesis reputation for consistent consensus
