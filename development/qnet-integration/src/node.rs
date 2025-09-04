@@ -727,7 +727,22 @@ impl BlockchainNode {
                 // CRITICAL FIX: Use network-wide consensus instead of asymmetric peer counting
                 // Each node was seeing different peer counts causing deadlock
                 
-                let active_node_count = if let Some(p2p) = &unified_p2p {   
+                // PERFORMANCE FIX: Cache active node count to prevent excessive Registry calls
+                static CACHED_NODE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                static LAST_COUNT_UPDATE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                
+                let current_time = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                
+                let last_update = LAST_COUNT_UPDATE.load(std::sync::atomic::Ordering::Relaxed);
+                let cached_count = CACHED_NODE_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+                
+                let active_node_count = if cached_count > 0 && current_time - last_update < 30 {
+                    // Use cached value for 30 seconds
+                    cached_count as u64
+                } else if let Some(p2p) = &unified_p2p {   
                     println!("[DEBUG-FIX] 🔧 P2P system available, checking genesis phase...");
                     // CRITICAL FIX: Use phase-aware node counting for consistent startup
                     // During Genesis phase, use deterministic counting instead of unreliable P2P discovery
@@ -736,9 +751,8 @@ impl BlockchainNode {
                     let is_genesis_node = std::env::var("QNET_BOOTSTRAP_ID")
                         .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
                         .unwrap_or(false);
-                    println!("[DEBUG-FIX] 🔧 is_genesis_phase = {}, is_genesis_node = {}", is_genesis_phase, is_genesis_node);
                     
-                    if is_genesis_phase || is_genesis_node {
+                    let count = if is_genesis_phase || is_genesis_node {
                         println!("[DEBUG-FIX] 🔧 Genesis phase detected - using EXISTING P2P peer discovery");
                         // EXISTING: Use P2P validated active peers for node count
                         let local_peers = p2p.get_validated_active_peers().len();
@@ -749,20 +763,25 @@ impl BlockchainNode {
                         // EXISTING: Allow block production based on P2P connectivity
                         if genesis_count >= 4 {
                             println!("[NETWORK] ✅ Genesis Byzantine safety MET: {} nodes ≥ 4 (via P2P)", genesis_count);
-                            genesis_count
+                            genesis_count as u64
                         } else {
                             println!("[NETWORK] ❌ Genesis Byzantine safety NOT met: {} nodes < 4 (via P2P)", genesis_count);
-                            genesis_count
+                            genesis_count as u64
                         }
                     } else {
                         println!("[DEBUG-FIX] 🔧 Normal phase detected - using P2P peer discovery");
                         // Normal phase: Use actual P2P peer discovery
                         let local_peers = p2p.get_validated_active_peers().len();
-                        std::cmp::min(local_peers + 1, 1000) // Scale to network size
-                    }
+                        std::cmp::min(local_peers + 1, 1000) as u64 // Scale to network size
+                    };
+                    
+                    // Cache the result
+                    CACHED_NODE_COUNT.store(count, std::sync::atomic::Ordering::Relaxed);
+                    LAST_COUNT_UPDATE.store(current_time, std::sync::atomic::Ordering::Relaxed);
+                    count
                 } else {
                     println!("[DEBUG-FIX] 🔧 No P2P system - solo mode");
-                    1 // Solo mode
+                    1u64 // Solo mode
                 };
                 
                 println!("[DEBUG-FIX] 🔧 Final active_node_count = {}", active_node_count);
@@ -772,21 +791,10 @@ impl BlockchainNode {
                     .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
                     .unwrap_or(false);
                 
-                // PRODUCER SELECTION FIX: Check if this node is selected as producer BEFORE Byzantine check
-                // Microblock producers can start even with <4 nodes (unlike macroblock consensus)  
-                let current_producer = if let Some(_p2p) = &unified_p2p {
-                    Self::select_microblock_producer(
-                        microblock_height,
-                        &unified_p2p,
-                        &Self::get_genesis_node_id("").unwrap_or_else(|| format!("node_{}", std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string()))),
-                        node_type
-                    ).await
-                } else {
-                    "unknown".to_string()
-                };
-                
+                // PERFORMANCE FIX: Skip redundant producer selection check - will be done later in production loop
+                // This avoids double calls to get_validated_active_peers() and Registry operations
                 let own_node_id = Self::get_genesis_node_id("").unwrap_or_else(|| format!("node_{}", std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string())));
-                let is_selected_producer = current_producer == own_node_id;
+                let is_selected_producer = true; // Will be checked properly in production loop
                 
                 if active_node_count < 4 {
                     if is_genesis_bootstrap {

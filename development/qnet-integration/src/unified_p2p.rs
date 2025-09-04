@@ -1655,7 +1655,14 @@ impl SimplifiedP2P {
         
         // QUANTUM: Use cryptographic validation instead of time-based intervals
         // EXISTING verify_peer_authenticity() provides quantum-resistant peer verification
-        let validation_interval = Duration::from_secs(1); // Real-time cryptographic validation
+        // GENESIS FIX: Use longer cache interval for Genesis phase to prevent Registry spam
+        let validation_interval = if std::env::var("QNET_BOOTSTRAP_ID")
+            .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
+            .unwrap_or(false) {
+            Duration::from_secs(30) // Genesis nodes: 30-second cache (static topology)
+        } else {
+            Duration::from_secs(5) // Regular nodes: 5-second cache (dynamic topology)
+        };
         
         // CRITICAL FIX: Cache with topology-aware key to prevent stale cache on topology changes
         let (peer_count, cache_key) = {
