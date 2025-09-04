@@ -906,10 +906,7 @@ impl SimplifiedP2P {
         // This ensures we broadcast to all REAL peers, not phantom ones
         let validated_peers = self.get_validated_active_peers_internal();
         
-        println!("[P2P] 🔍 DIAGNOSTIC: Using validated peers for broadcast (phantom peer fix)");
-        println!("[P2P] 🔍 DIAGNOSTIC: validated peer count: {}", validated_peers.len());
-        
-        println!("[P2P] 🔍 DIAGNOSTIC: broadcast_block called for height {}", height);
+        // PRODUCTION: Silent broadcast operations for scalability (essential logs only)
         
         if validated_peers.is_empty() {
             println!("[P2P] ⚠️ DIAGNOSTIC: No validated peers available - block #{} not broadcasted", height);
@@ -934,9 +931,8 @@ impl SimplifiedP2P {
                     data: block_data.clone(),
                     block_type: "micro".to_string(),
                 };
-                println!("[P2P] 🔍 DIAGNOSTIC: Sending block #{} to peer {} ({})", height, peer.id, peer.addr);
+                // PRODUCTION: Silent block sending for scalability (no spam logs per peer)
                 self.send_network_message(&peer.addr, block_msg);
-                println!("[P2P] → Sent block #{} to {} ({})", height, peer.id, peer.addr);
             }
         }
         
@@ -1786,8 +1782,10 @@ impl SimplifiedP2P {
                             };
                             
                             if is_really_connected {
-                                println!("[P2P] ✅ Genesis peer {} - REAL connection + consensus capable", peer.addr);
+                                // PRODUCTION: Silent success for scalability (essential logs only)
+                                // Only log connectivity issues, not every successful validation
                             } else if is_consensus_capable {
+                                // PRODUCTION: Log connectivity failures (critical for Byzantine consensus monitoring)
                                 println!("[P2P] ❌ Genesis peer {} - consensus capable but NOT connected", peer.addr);
                             }
                             
@@ -1797,11 +1795,13 @@ impl SimplifiedP2P {
                         .collect();
                     
                     // CRITICAL: Show REAL count vs minimum required (4+ for Byzantine safety)
+                    // PRODUCTION: Critical Byzantine safety logging for real peer count
                     println!("[P2P] 🔍 Genesis REAL validated peers: {}/{} (minimum 4+ required for Byzantine consensus)", 
                              validated_peers.len(), peers.len());
                     
                     if validated_peers.len() < 4 {
-                        println!("[P2P] ⚠️ WARNING: Only {} real peers - Byzantine consensus requires 4+ active nodes", validated_peers.len());
+                        println!("[P2P] ⚠️ CRITICAL: Only {} real peers - Byzantine consensus requires 4+ active nodes", validated_peers.len());
+                        println!("[P2P] 🚨 BLOCK PRODUCTION MUST WAIT until 4+ nodes are actually connected and validated");
                     }
                     
                     validated_peers
@@ -2178,14 +2178,14 @@ impl SimplifiedP2P {
         let ip = peer_addr.split(':').next().unwrap_or("");
         let is_genesis = is_genesis_node_ip(ip);
         
-        // DYNAMIC: Use relaxed validation for Genesis peers in small networks
+        // PRODUCTION: Strict Byzantine consensus - NO relaxed validation for offline peers
+        // Genesis phase requires REAL connectivity for Byzantine fault tolerance
         let is_bootstrap_node = std::env::var("QNET_BOOTSTRAP_ID").is_ok();
         let is_small_network = active_peers < 10;
-        let use_relaxed_validation = is_bootstrap_node || is_small_network;
+        let use_relaxed_validation = false; // PRODUCTION: Always use strict validation for Byzantine safety
         
-        // DIAGNOSTIC: Log detailed validation process to debug phantom peers
-        println!("[DEBUG-PHANTOM] 🔍 Static validating peer: {} (IP: {}, Genesis: {}, Small network: {}, Bootstrap: {})", 
-                 peer_addr, ip, is_genesis, is_small_network, is_bootstrap_node);
+        // PRODUCTION: Remove debug logs from hot path for scalability (millions of nodes)
+        // Validation logs only for critical issues, not every peer check
         
         if is_genesis {
             // EXISTING: Use FAST TCP connectivity check (same as instance method)
@@ -2205,8 +2205,6 @@ impl SimplifiedP2P {
             }
         } else {
             // For non-genesis: use existing query_peer_height_http through static methods
-            println!("[DEBUG-PHANTOM] 🔍 Non-Genesis peer validation for: {}", peer_addr);
-            
             // EXISTING: Use same pattern as query_peer_height but static
             let api_endpoints = vec![
                 format!("http://{}:8001/api/v1/height", ip), // EXISTING: Same endpoint as query_peer_height
@@ -2215,23 +2213,18 @@ impl SimplifiedP2P {
             for endpoint in api_endpoints {
                 match Self::query_peer_height_http_static(&endpoint) {
                     Ok(_height) => {
-                        println!("[DEBUG-PHANTOM] ✅ Non-Genesis peer {} height query OK", peer_addr);
+                        // PRODUCTION: Silent success for scalability (no debug spam)
                         return true;
                     }
-                    Err(e) => {
-                        println!("[DEBUG-PHANTOM] ❌ Non-Genesis peer {} height query failed: {}", peer_addr, e);
+                    Err(_e) => {
+                        // PRODUCTION: Silent failure for scalability (no debug spam)  
                         continue;
                     }
                 }
             }
             
-            if use_relaxed_validation {
-                println!("[DEBUG-PHANTOM] 🚨 PHANTOM NON-GENESIS ALLOWED: {} (relaxed validation)", peer_addr);
-                true // Tolerate during network formation
-            } else {
-                println!("[DEBUG-PHANTOM] ✅ PHANTOM NON-GENESIS BLOCKED: {} (strict validation)", peer_addr);
-                false
-            }
+            // PRODUCTION: Strict validation always (no relaxed validation for Byzantine safety)
+            false // Non-Genesis peer failed validation
         }
     }
     

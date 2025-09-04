@@ -744,7 +744,7 @@ impl BlockchainNode {
                     // Use cached value for 30 seconds
                     cached_count as u64
                 } else if let Some(p2p) = &unified_p2p {   
-                    println!("[DEBUG-FIX] 🔧 P2P system available, checking genesis phase...");
+                    // PRODUCTION: Silent phase checking for scalability (no debug spam in microblock loop)
                     // CRITICAL FIX: Use phase-aware node counting for consistent startup
                     // During Genesis phase, use deterministic counting instead of unreliable P2P discovery
                     
@@ -754,23 +754,25 @@ impl BlockchainNode {
                         .unwrap_or(false);
                     
                     let count = if is_genesis_phase || is_genesis_node {
-                        println!("[DEBUG-FIX] 🔧 Genesis phase detected - using EXISTING P2P peer discovery");
+                        // PRODUCTION: Silent peer counting for scalability (no debug spam every microblock)
                         // EXISTING: Use P2P validated active peers for node count
                         let local_peers = p2p.get_validated_active_peers().len();
                         let genesis_count = std::cmp::min(local_peers + 1, 5); // +1 for self, max 5 Genesis nodes
                         
-                        println!("[DEBUG-FIX] 🔧 GENESIS P2P count: {} active peers", genesis_count);
-                        
                         // EXISTING: Allow block production based on P2P connectivity
+                        // Log Byzantine safety status only on changes or first check
                         if genesis_count >= 4 {
-                            println!("[NETWORK] ✅ Genesis Byzantine safety MET: {} nodes ≥ 4 (via P2P)", genesis_count);
+                            // Only log Byzantine safety MET if not cached (first time or change)
+                            if cached_count != genesis_count as u64 {
+                                println!("[NETWORK] ✅ Genesis Byzantine safety MET: {} nodes ≥ 4 (via P2P)", genesis_count);
+                            }
                             genesis_count as u64
                         } else {
+                            // Always log Byzantine safety violations (critical for monitoring)
                             println!("[NETWORK] ❌ Genesis Byzantine safety NOT met: {} nodes < 4 (via P2P)", genesis_count);
                             genesis_count as u64
                         }
                     } else {
-                        println!("[DEBUG-FIX] 🔧 Normal phase detected - using P2P peer discovery");
                         // Normal phase: Use actual P2P peer discovery
                         let local_peers = p2p.get_validated_active_peers().len();
                         std::cmp::min(local_peers + 1, 1000) as u64 // Scale to network size
@@ -781,11 +783,14 @@ impl BlockchainNode {
                     LAST_COUNT_UPDATE.store(current_time, std::sync::atomic::Ordering::Relaxed);
                     count
                 } else {
-                    println!("[DEBUG-FIX] 🔧 No P2P system - solo mode");
+                    // PRODUCTION: Silent solo mode detection for scalability
                     1u64 // Solo mode
                 };
                 
-                println!("[DEBUG-FIX] 🔧 Final active_node_count = {}", active_node_count);
+                // PRODUCTION: Log active node count only when it changes or for Byzantine violations
+                if active_node_count < 4 || cached_count != active_node_count {
+                    println!("[DEBUG-FIX] 🔧 Final active_node_count = {}", active_node_count);
+                }
                 
                 // CRITICAL FIX: Coordinated network start for Genesis nodes
                 let is_genesis_bootstrap = std::env::var("QNET_BOOTSTRAP_ID")
@@ -1300,8 +1305,62 @@ impl BlockchainNode {
                             // CRITICAL FIX: Do NOT reset timing - breaks precision intervals
                             // Timing controlled at end of loop only
                         } else {
-                            // No local block - background sync will handle it
+                            // No local block - background sync will handle it with timeout detection
                             println!("[SYNC] ⏳ Waiting for background sync of block #{}", expected_height);
+                            
+                            // PRODUCTION: Add microblock producer timeout detection using EXISTING patterns
+                            // EXISTING timeout values: macroblock=30s, commit=15s, http=5s, interval=1s
+                            let microblock_timeout = std::time::Duration::from_secs(5); // PRODUCTION: 5× microblock interval for network latency
+                            let timeout_start = std::time::Instant::now();
+                            
+                            // Wait with timeout for producer block (same pattern as macroblock timeout in line 1201)
+                            let mut timeout_triggered = false;
+                            let expected_height_timeout = expected_height;
+                            let current_producer_timeout = current_producer.clone();
+                            let storage_timeout = storage.clone();
+                            let p2p_timeout = p2p.clone();
+                            let height_timeout = height.clone();
+                            let node_id_timeout = node_id.clone();
+                            let node_type_timeout = node_type;
+                            
+                            // EXISTING: Use same async timeout pattern as macroblock failover (line 1205)
+                            tokio::spawn(async move {
+                                tokio::time::sleep(microblock_timeout).await;
+                                
+                                // Check if block was received during timeout period
+                                let block_exists = match storage_timeout.load_microblock(expected_height_timeout) {
+                                    Ok(Some(_)) => true,
+                                    _ => false,
+                                };
+                                
+                                if !block_exists {
+                                    println!("[FAILOVER] 🚨 Microblock #{} not received after 5s timeout from producer: {}", 
+                                             expected_height_timeout, current_producer_timeout);
+                                    
+                                    // EXISTING: Use same emergency selection as implemented in select_emergency_producer (line 1534)
+                                    let emergency_producer = crate::node::BlockchainNode::select_emergency_producer(
+                                        &current_producer_timeout,
+                                        expected_height_timeout - 1, // Current height for selection
+                                        &Some(p2p_timeout.clone()),
+                                        &node_id_timeout,
+                                        node_type_timeout
+                                    ).await;
+                                    
+                                    println!("[FAILOVER] 🆘 Emergency microblock producer selected: {}", emergency_producer);
+                                    
+                                    // EXISTING: Use same emergency broadcast as macroblock (line 2114)
+                                    if let Err(e) = p2p_timeout.broadcast_emergency_producer_change(
+                                        &current_producer_timeout,
+                                        &emergency_producer,
+                                        expected_height_timeout,
+                                        "microblock"
+                                    ) {
+                                        println!("[FAILOVER] ⚠️ Emergency microblock broadcast failed: {}", e);
+                                    } else {
+                                        println!("[FAILOVER] ✅ Emergency microblock producer change broadcasted to network");
+                                    }
+                                }
+                            });
                         }
                     } else {
                         // No P2P available - standalone mode
@@ -1859,34 +1918,31 @@ impl BlockchainNode {
             .map(|(i, ip)| (format!("genesis_node_{:03}", i + 1), ip.clone()))
             .collect();
         
-        // EXISTING: Add ALL Genesis nodes in IDENTICAL order using DETERMINISTIC reputation
-        // This ensures consistent candidate lists across ALL nodes for Byzantine consensus
-        for (genesis_id, _genesis_ip) in genesis_nodes {
-            // Use DETERMINISTIC reputation for Genesis phase (same as microblock producer logic)
-            const GENESIS_DETERMINISTIC_REPUTATION: f64 = 0.90;
-            let genesis_reputation = GENESIS_DETERMINISTIC_REPUTATION;
+        // PRODUCTION FIX: Use REAL validated peers for producer candidates instead of static list
+        // Byzantine consensus requires ACTUAL connected nodes, not phantom offline peers
+        let validated_peers = p2p.get_validated_active_peers();
+        
+        // CRITICAL: Add own node first if it can participate (for deterministic ordering)
+        if can_participate_microblock {
+            // EXISTING: Genesis Super nodes use deterministic reputation from line 1831
+            const GENESIS_STATIC_REPUTATION: f64 = 0.90;
+            all_qualified.push((own_node_id.to_string(), GENESIS_STATIC_REPUTATION));
+        }
+        
+        // PRODUCTION: Add ONLY real validated peers with EXISTING Genesis reputation
+        // This ensures only LIVE nodes participate in producer selection
+        for peer in validated_peers {
+            // EXISTING: Only Full and Super nodes participate in consensus  
+            let is_consensus_capable = matches!(peer.node_type, NodeType::Super | NodeType::Full);
             
-            // For own node: check if can participate based on actual node type
-            if genesis_id == own_node_id {
-                let can_participate = match own_node_type {
-                    NodeType::Super => {
-                        genesis_reputation >= 0.70
-                    },
-                    NodeType::Full => {
-                        // EXISTING: Genesis nodes are Super nodes, not Full nodes - this shouldn't happen
-                        false // Genesis nodes should be Super, not Full
-                    },
-                    NodeType::Light => {
-                        false
-                    }
-                };
+            if is_consensus_capable {
+                // EXISTING: Use deterministic Genesis reputation for consistent consensus
+                const GENESIS_DETERMINISTIC_REPUTATION: f64 = 0.90; // EXISTING: Same value as above
                 
-                if can_participate {
-                    all_qualified.push((genesis_id.to_string(), genesis_reputation));
+                // Only add if not already in list (avoid duplicates with own_node)
+                if !all_qualified.iter().any(|(id, _)| id == &peer.id) {
+                    all_qualified.push((peer.id, GENESIS_DETERMINISTIC_REPUTATION));
                 }
-            } else {
-                // EXISTING: All Genesis nodes qualify during Genesis phase for proper rotation
-                all_qualified.push((genesis_id.to_string(), genesis_reputation));
             }
         }
         
