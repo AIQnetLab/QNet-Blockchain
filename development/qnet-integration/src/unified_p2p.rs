@@ -375,7 +375,7 @@ impl SimplifiedP2P {
                     let is_genesis_peer = is_genesis_node_ip(peer_ip);
                     let is_bootstrap_node = std::env::var("QNET_BOOTSTRAP_ID").is_ok();
                     let active_peers = self.get_peer_count();
-                    let is_small_network = active_peers < 10; // Dynamic network size detection
+                    let is_small_network = active_peers < 6; // PRODUCTION: Bootstrap trust for Genesis network (1-5 nodes, all Genesis bootstrap nodes)
                     
                     // ROBUST: Use bootstrap trust for Genesis peers when we're bootstrapping OR in small network
                     let should_add = if is_genesis_peer && (is_bootstrap_node || is_small_network) {
@@ -2089,7 +2089,7 @@ impl SimplifiedP2P {
                 // DYNAMIC: Use flexible connection limits based on network conditions
                 let is_bootstrap_node = std::env::var("QNET_BOOTSTRAP_ID").is_ok();
                 let active_peers = connected_data.len();
-                let is_small_network = active_peers < 10;
+                let is_small_network = active_peers < 6; // PRODUCTION: Bootstrap trust for Genesis network (1-5 nodes, all Genesis bootstrap nodes)
                 let use_all_peers = is_bootstrap_node || is_small_network;
                 
                 // ROBUST: Connect to ALL peers during bootstrap or small network formation
@@ -2115,7 +2115,7 @@ impl SimplifiedP2P {
             // DYNAMIC: For bootstrap nodes or small networks, connect to ALL Genesis nodes regardless of region
             let is_bootstrap_node = std::env::var("QNET_BOOTSTRAP_ID").is_ok();
             let active_peers = connected_data.len();
-            let is_small_network = active_peers < 10;
+            let is_small_network = active_peers < 6; // PRODUCTION: Bootstrap trust for Genesis network (1-5 nodes, all Genesis bootstrap nodes)
             let should_connect_all_genesis = is_bootstrap_node || is_small_network;
             
             if should_connect_all_genesis {
@@ -2144,7 +2144,7 @@ impl SimplifiedP2P {
                 // DYNAMIC: For backup regions, use flexible limits based on network conditions
                 let is_bootstrap_node = std::env::var("QNET_BOOTSTRAP_ID").is_ok();
                 let current_peers = connected_data.len();
-                let is_small_network = current_peers < 10;
+                let is_small_network = current_peers < 6; // PRODUCTION: Bootstrap trust for Genesis network (1-5 nodes, all Genesis bootstrap nodes)
                 let use_all_backup_peers = is_bootstrap_node || is_small_network;
             
                 for backup_region in &backup_regions {
@@ -2197,7 +2197,7 @@ impl SimplifiedP2P {
         // PRODUCTION: Strict Byzantine consensus - NO relaxed validation for offline peers
         // Genesis phase requires REAL connectivity for Byzantine fault tolerance
         let is_bootstrap_node = std::env::var("QNET_BOOTSTRAP_ID").is_ok();
-        let is_small_network = active_peers < 10;
+        let is_small_network = active_peers < 6; // PRODUCTION: Bootstrap trust for Genesis network (1-5 nodes, all Genesis bootstrap nodes)
         let use_relaxed_validation = false; // PRODUCTION: Always use strict validation for Byzantine safety
         
         // PRODUCTION: Remove debug logs from hot path for scalability (millions of nodes)
