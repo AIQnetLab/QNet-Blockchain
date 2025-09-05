@@ -1221,6 +1221,45 @@ impl BlockchainActivationRegistry {
         None // Pseudonym not found in registry
     }
     
+    /// PRIVACY: Find pseudonym by IP address using EXISTING registry pattern
+    pub async fn find_pseudonym_by_ip(&self, target_ip: &str) -> Option<String> {
+        let active_nodes = self.active_nodes.read().await;
+        
+        // Clean input IP (remove port if present for comparison) 
+        let clean_target_ip = target_ip.split(':').next().unwrap_or(target_ip);
+        
+        // Search through EXISTING peer registry records using EXISTING pattern
+        for (device_sig, node_info) in active_nodes.iter() {
+            // EXISTING PATTERN: Check peer registry records (from register_peer_in_blockchain)
+            if node_info.activation_code.starts_with("peer_registry_") {
+                // EXISTING PATTERN: Extract IP from device_signature (same logic as resolve_peer_pseudonym)
+                // Format: "peer_device_154.38.160.39:8001_pseudonym"
+                if device_sig.starts_with("peer_device_") {
+                    let addr_part = device_sig.strip_prefix("peer_device_")
+                        .unwrap_or("")
+                        .split('_')
+                        .next()
+                        .unwrap_or("");
+                    
+                    // Extract IP from address part
+                    let stored_ip = addr_part.split(':').next().unwrap_or(addr_part);
+                    
+                    if stored_ip == clean_target_ip {
+                        // Extract pseudonym from activation_code: "peer_registry_[pseudonym]"
+                        let pseudonym = node_info.activation_code.strip_prefix("peer_registry_")
+                            .unwrap_or("");
+                        
+                        if !pseudonym.is_empty() {
+                            return Some(pseudonym.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        
+        None // No pseudonym found for this IP
+    }
+    
     /// Get eligible nodes for consensus (public interface)
     pub async fn get_eligible_nodes(&self) -> Vec<(String, f64, String)> {
         // GENESIS FIX: In Genesis mode, populate with Genesis nodes if active_nodes is empty

@@ -733,10 +733,9 @@ impl BlockchainNode {
                         .unwrap_or(false);
                     
                     let count = if current_phase || is_genesis_node {
-                        // EXISTING: FAST Byzantine safety logic - use existing fast peer counting
-                        // PERFORMANCE: get_peer_count() uses simple lock, not expensive validation
-                        let peer_count = p2p.get_peer_count();
-                        let total_network_nodes = std::cmp::min(peer_count + 1, 5); // EXISTING: Add self to peer count, max 5 Genesis nodes
+                        // EXISTING: Use validated peers for Byzantine safety - has 30s cache for Genesis
+                        let validated_peers = p2p.get_validated_active_peers();
+                        let total_network_nodes = std::cmp::min(validated_peers.len() + 1, 5); // EXISTING: Add self to peer count, max 5 Genesis nodes
                         
                         // EXISTING: Byzantine safety requires 4+ TOTAL nodes in network
                         // This matches P2P validation logic and consensus config
@@ -752,9 +751,9 @@ impl BlockchainNode {
                             total_network_nodes as u64
                         }
                     } else {
-                        // Normal phase: Use fast P2P peer counting
-                        let peer_count = p2p.get_peer_count(); // EXISTING: Fast method, not expensive validation
-                        std::cmp::min(peer_count + 1, 1000) as u64 // Scale to network size
+                        // Normal phase: Use validated peers for Byzantine safety - with sophisticated caching
+                        let validated_peers = p2p.get_validated_active_peers();
+                        std::cmp::min(validated_peers.len() + 1, 1000) as u64 // Scale to network size
                     };
                     
                     // Cache the result
@@ -1604,7 +1603,8 @@ impl BlockchainNode {
                 },
                 NodeType::Full => {
                     // Full nodes eligible for emergency (same as normal production)
-                    let has_peers = p2p.get_peer_count() >= 3;
+                    let validated_peers = p2p.get_validated_active_peers();
+                    let has_peers = validated_peers.len() >= 3; // EXISTING: 3f+1 Byzantine formula
                     let own_reputation = Self::get_node_reputation_score(own_node_id, p2p).await;
                     let has_reputation = own_reputation >= 0.70;
                     has_peers && has_reputation
@@ -1889,8 +1889,9 @@ impl BlockchainNode {
                 }
             },
             NodeType::Full => {
-                // EXISTING: Regular Full nodes need P2P peers for consensus participation
-                let has_peers = p2p.get_peer_count() >= 3;
+                // EXISTING: Regular Full nodes need validated peers for consensus participation
+                let validated_peers = p2p.get_validated_active_peers();
+                let has_peers = validated_peers.len() >= 3; // EXISTING: 3f+1 Byzantine formula
                 let own_reputation = Self::get_node_reputation_score(own_node_id, p2p).await;
                 let has_reputation = own_reputation >= 0.70;
                 has_peers && has_reputation

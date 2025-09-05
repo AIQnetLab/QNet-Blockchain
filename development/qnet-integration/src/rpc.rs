@@ -476,6 +476,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::path::end())
         .and(warp::post())
         .and(warp::body::json())
+        .and(warp::addr::remote())
         .and(blockchain_filter.clone())
         .and_then(handle_p2p_message);
     
@@ -3179,6 +3180,7 @@ async fn handle_consensus_sync(
 /// PRODUCTION: Handle incoming P2P messages from network
 async fn handle_p2p_message(
     p2p_message: Value,
+    remote_addr: Option<std::net::SocketAddr>,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
     use crate::unified_p2p::NetworkMessage;
@@ -3188,8 +3190,31 @@ async fn handle_p2p_message(
     
     match message_result {
         Ok(message) => {
-            // PRODUCTION: Extract real peer IP from HTTP request
-            let peer_addr = extract_peer_ip_from_request().unwrap_or_else(|| "unknown_peer".to_string());
+            // PRODUCTION: Extract peer IP using EXISTING pattern from peers endpoint
+            let peer_addr = if let Some(addr) = remote_addr {
+                let raw_ip = addr.ip().to_string();
+                
+                // PRIVACY: Convert IP to pseudonym for ALL node types using EXISTING registry
+                // First check Genesis nodes (fast path)
+                if let Some(genesis_id) = crate::genesis_constants::get_genesis_id_by_ip(&raw_ip) {
+                    format!("genesis_node_{}", genesis_id)
+                } else {
+                    // EXISTING: Use blockchain registry for Super/Full/Light pseudonym lookup
+                    let registry = crate::activation_validation::BlockchainActivationRegistry::new(None);
+                    if let Some(pseudonym) = tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(async {
+                            registry.find_pseudonym_by_ip(&raw_ip).await
+                        })
+                    }) {
+                        pseudonym
+                    } else {
+                        // Fallback: peer not registered yet or registry sync lag
+                        "unknown_peer".to_string()
+                    }
+                }
+            } else {
+                "unknown_peer".to_string()
+            };
             
             // Forward to P2P handler
             if let Some(p2p) = blockchain.get_unified_p2p() {

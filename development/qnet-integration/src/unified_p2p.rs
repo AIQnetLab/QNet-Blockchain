@@ -377,11 +377,17 @@ impl SimplifiedP2P {
                     let active_peers = self.get_peer_count();
                     let is_small_network = active_peers < 6; // PRODUCTION: Bootstrap trust for Genesis network (1-5 nodes, all Genesis bootstrap nodes)
                     
-                    // ROBUST: Use bootstrap trust for Genesis peers when we're bootstrapping OR in small network
+                    // ROBUST: Use bootstrap trust for Genesis peers with FAST connectivity check
                     let should_add = if is_genesis_peer && (is_bootstrap_node || is_small_network) {
-                        println!("[P2P] 🌟 Genesis peer: adding {} with bootstrap trust (small network: {}, bootstrap node: {})", 
-                                peer_info.addr, is_small_network, is_bootstrap_node);
-                        true
+                        // EXISTING: Use FAST connectivity check even for bootstrap trust
+                        let is_reachable = Self::test_peer_connectivity_static(&peer_info.addr);
+                        if is_reachable {
+                            println!("[P2P] 🌟 Genesis peer: adding {} with bootstrap trust (verified reachable)", peer_info.addr);
+                            true
+                        } else {
+                            println!("[P2P] ⚠️ Genesis peer: {} not reachable - skipping bootstrap trust", peer_info.addr);
+                            false
+                        }
                     } else {
                         self.is_peer_actually_connected(&peer_info.addr)
                     };
@@ -902,9 +908,9 @@ impl SimplifiedP2P {
     
     /// Broadcast block data
     pub fn broadcast_block(&self, height: u64, block_data: Vec<u8>) -> Result<(), String> {
-        // CRITICAL FIX: Use validated active peers instead of raw connected_peers list
-        // This ensures we broadcast to all REAL peers, not phantom ones
-        let validated_peers = self.get_validated_active_peers_internal();
+        // CRITICAL FIX: Use CACHED validated active peers for broadcast performance
+        // This ensures we broadcast to all REAL peers, with 30s cache for performance
+        let validated_peers = self.get_validated_active_peers();
         
         // PRODUCTION: Silent broadcast operations for scalability (essential logs only)
         
@@ -941,10 +947,9 @@ impl SimplifiedP2P {
     
     /// Sync blockchain height with peers for consensus
     pub fn sync_blockchain_height(&self) -> Result<u64, String> {
-        let connected = self.connected_peers.lock()
-            .map_err(|e| format!("Failed to acquire peer lock: {}", e))?;
+        let validated_peers = self.get_validated_active_peers(); // Use cached version for performance
         
-        if connected.is_empty() {
+        if validated_peers.is_empty() {
             // No peers - standalone mode, return 0 to start fresh
             return Ok(0);
         }
@@ -952,7 +957,7 @@ impl SimplifiedP2P {
         // Query peers for their current blockchain height
         let mut peer_heights = Vec::new();
         
-        for peer in connected.iter() {
+        for peer in validated_peers.iter() {
             // EXISTING: Use Genesis leniency for peer height queries during startup
             let peer_ip = peer.addr.split(':').next().unwrap_or("");
             let is_genesis_peer = is_genesis_node_ip(peer_ip);
@@ -1128,13 +1133,8 @@ impl SimplifiedP2P {
         // In full QNet production, this would be: can_participate_in_consensus()
         // Real consensus uses CommitRevealConsensus with validator selection algorithm
         
-        let connected = match self.connected_peers.lock() {
-            Ok(peers) => peers,
-            Err(e) => {
-                println!("[CONSENSUS] ⚠️ Failed to acquire peer lock: {}, defaulting to false", e);
-                return false;
-            }
-        };
+        // PERFORMANCE FIX: Remove unnecessary connected_peers lock
+        // All Byzantine safety checks use get_validated_active_peers() which has its own locking
         
         // Check if this is a Genesis bootstrap node
         let is_genesis_bootstrap = std::env::var("QNET_BOOTSTRAP_ID")
@@ -1144,9 +1144,9 @@ impl SimplifiedP2P {
         // EXISTING: CORRECT Byzantine safety logic for consensus participation
         // EXISTING: min_participants: 4 from consensus config (3f+1 where f=1)
         if is_genesis_bootstrap {
-            // EXISTING: Use fast peer count for consensus participation check
-            let peer_count = self.get_peer_count(); // EXISTING: Fast simple lock, no expensive validation
-            let total_network_nodes = std::cmp::min(peer_count + 1, 5); // EXISTING: Add self, max 5 Genesis
+            // EXISTING: Use validated peers for consensus participation (real connectivity only)
+            let validated_peers = self.get_validated_active_peers();
+            let total_network_nodes = std::cmp::min(validated_peers.len() + 1, 5); // EXISTING: Add self, max 5 Genesis
             
             if total_network_nodes >= 4 {
                 println!("🏛️ [CONSENSUS] Genesis node with {} total nodes - Byzantine consensus enabled", total_network_nodes);
@@ -1158,10 +1158,10 @@ impl SimplifiedP2P {
             }
         }
         
-        // For non-genesis nodes: Strict Byzantine consensus requirement using EXISTING fast methods
+        // For non-genesis nodes: Strict Byzantine consensus requirement using validated peers
         let min_nodes_for_consensus = 4; // EXISTING: Need 3f+1 nodes to tolerate f failures  
-        let peer_count = self.get_peer_count(); // EXISTING: Fast peer count method
-        let total_network_nodes = std::cmp::min(peer_count + 1, 1000); // EXISTING: Scale to network size
+        let validated_peers = self.get_validated_active_peers();
+        let total_network_nodes = std::cmp::min(validated_peers.len() + 1, 1000); // EXISTING: Scale to network size
         
         if total_network_nodes < min_nodes_for_consensus {
             println!("⚠️ [CONSENSUS] Insufficient nodes for Byzantine consensus: {}/{}", 
@@ -1184,7 +1184,7 @@ impl SimplifiedP2P {
         
         // Non-genesis nodes can participate if sufficient network diversity exists
         // In production: This would use reputation scores and validator selection algorithm (NO STAKE!)
-        connected.len() >= 3 // Allow participation with sufficient peer diversity
+        validated_peers.len() >= 3 // Allow participation with sufficient peer diversity
     }
     
     /// PRODUCTION: Cryptographic peer verification using post-quantum signatures
@@ -1751,7 +1751,8 @@ impl SimplifiedP2P {
             (connected_peers.len(), cache_key)
         }; // Release lock before cache operations
         
-        if let Ok(mut cached) = CACHED_PEERS.lock() {
+        // CRITICAL FIX: Check cache WITHOUT holding lock during expensive validation
+        let should_refresh = if let Ok(cached) = CACHED_PEERS.lock() {
             let now = Instant::now();
             
             // Use cache if valid (node-type-specific interval) and key matches
@@ -1761,10 +1762,32 @@ impl SimplifiedP2P {
                 return cached.0.clone();
             }
             
-            // Refresh cache
+            true // Cache expired, need refresh
+        } else {
+            true // Lock failed, need fallback
+        };
+        
+        if should_refresh {
+            // RACE CONDITION FIX: Double-check cache before expensive validation
+            // Another thread might have refreshed while we were checking
+            if let Ok(cached) = CACHED_PEERS.lock() {
+                let now = Instant::now();
+                if now.duration_since(cached.1) < validation_interval && cached.2 == cache_key {
+                    println!("[P2P] 📋 Cache refreshed by another thread ({} peers)", cached.0.len());
+                    return cached.0.clone();
+                }
+            }
+            
+            // PERFORMANCE FIX: Do expensive validation WITHOUT holding cache lock
             let fresh_peers = self.get_validated_active_peers_internal();
-            *cached = (fresh_peers.clone(), now, cache_key);
-            println!("[P2P] 🔄 Refreshed peer cache ({} peers)", fresh_peers.len());
+            
+            // QUICK UPDATE: Only hold lock briefly to update cache
+            if let Ok(mut cached) = CACHED_PEERS.lock() {
+                let now = Instant::now();
+                *cached = (fresh_peers.clone(), now, cache_key);
+                println!("[P2P] 🔄 Refreshed peer cache ({} peers)", fresh_peers.len());
+            }
+            
             return fresh_peers;
         }
         
@@ -2131,8 +2154,13 @@ impl SimplifiedP2P {
                             // Skip if already connected
                             let already_connected = connected_data.iter().any(|p| p.addr == peer.addr);
                             if !already_connected {
-                                connected_data.push(peer.clone());
-                                println!("[P2P] 🌟 Added Genesis peer {} from region {:?} (startup mode)", peer.addr, region);
+                                // EXISTING: Use FAST connectivity check for Genesis startup
+                                if Self::is_peer_actually_connected_static(&peer.addr, active_peers) {
+                                    connected_data.push(peer.clone());
+                                    println!("[P2P] 🌟 Added Genesis peer {} from region {:?} (verified)", peer.addr, region);
+                                } else {
+                                    println!("[P2P] ❌ Skipped Genesis peer {} from region {:?} (not reachable)", peer.addr, region);
+                                }
                             }
                         }
                     }
@@ -2158,10 +2186,14 @@ impl SimplifiedP2P {
                             let ip = peer.addr.split(':').next().unwrap_or("");
                             let is_genesis_peer = is_genesis_node_ip(ip);
                             
-                                    // FIXED: Genesis peers ALWAYS use relaxed validation (no time dependency) 
+                                    // FIXED: Genesis peers use FAST connectivity check for bootstrap trust
                                     if is_genesis_peer {
-                                        connected_data.push(peer.clone());
-                                        println!("[P2P] ✅ Added Genesis backup {} (bootstrap trust)", peer.addr);
+                                        if Self::is_peer_actually_connected_static(&peer.addr, current_peers) {
+                                            connected_data.push(peer.clone());
+                                            println!("[P2P] ✅ Added Genesis backup {} (verified)", peer.addr);
+                                        } else {
+                                            println!("[P2P] ❌ Skipped Genesis backup {} (not reachable)", peer.addr);
+                                        }
                                     } else if Self::is_peer_actually_connected_static(&peer.addr, current_peers) {
                                         connected_data.push(peer.clone());
                                         println!("[P2P] ✅ Added {} to backup pool from {:?} (REAL connection verified)", 
@@ -3053,10 +3085,9 @@ impl SimplifiedP2P {
                 
                 // EXISTING: Byzantine safety validation ONLY when required (Genesis ALL blocks, Normal ONLY macroblocks)
                 if is_genesis_phase || is_macroblock {
-                    // EXISTING: Use fast peer count for Byzantine safety - sophisticated caching already implemented
-                    // PERFORMANCE: get_peer_count() uses simple lock, not expensive validation
-                    let peer_count = self.get_peer_count();
-                    let network_node_count = std::cmp::min(peer_count + 1, 5); // EXISTING: Add self, max 5 Genesis
+                    // EXISTING: Use validated peers for Byzantine safety - with sophisticated caching
+                    let validated_peers = self.get_validated_active_peers();
+                    let network_node_count = std::cmp::min(validated_peers.len() + 1, 5); // EXISTING: Add self, max 5 Genesis
                     
                     if network_node_count < 4 {
                         if is_genesis_phase {
