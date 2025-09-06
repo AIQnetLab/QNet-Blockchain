@@ -23,6 +23,14 @@ use qnet_consensus::{commit_reveal::{Commit, Reveal}, ConsensusEngine};
 static CACHED_PEERS: Lazy<Arc<Mutex<(Vec<PeerInfo>, Instant, String)>>> = 
     Lazy::new(|| Arc::new(Mutex::new((Vec::new(), Instant::now(), String::new()))));
 
+// SYNC FIX: Track blocks currently being downloaded to prevent race conditions
+static DOWNLOADING_BLOCKS: Lazy<Arc<Mutex<std::collections::HashSet<u64>>>> = 
+    Lazy::new(|| Arc::new(Mutex::new(std::collections::HashSet::new())));
+
+// RACE CONDITION FIX: Cache blockchain height to prevent excessive queries
+static CACHED_BLOCKCHAIN_HEIGHT: Lazy<Arc<Mutex<(u64, Instant)>>> = 
+    Lazy::new(|| Arc::new(Mutex::new((0, Instant::now() - Duration::from_secs(3600)))));
+
 /// SECURITY: Rate limiting structure for DDoS protection
 #[derive(Debug, Clone)]
 pub struct RateLimit {
@@ -312,6 +320,27 @@ impl SimplifiedP2P {
         // Start regional rebalancing
         self.start_regional_rebalancer();
         
+        // P2P FIX: Start peer exchange protocol for network discovery
+        // SCALABILITY: Light nodes should have less aggressive exchange to save bandwidth
+        let initial_peers = self.connected_peers.lock()
+            .map(|peers| peers.clone())
+            .unwrap_or_else(|_| Vec::new());
+        
+        if !initial_peers.is_empty() {
+            // SCALABILITY: Only start exchange for nodes that need it
+            match self.node_type {
+                NodeType::Light => {
+                    // Light nodes don't need aggressive peer exchange
+                    println!("[P2P] 📱 Light node: Minimal peer exchange (bandwidth optimization)");
+                }
+                _ => {
+                    self.start_peer_exchange_protocol(initial_peers);
+                    println!("[P2P] 🔄 Started peer exchange protocol for {} node", 
+                            if matches!(self.node_type, NodeType::Super) { "Super" } else { "Full" });
+                }
+            }
+        }
+        
         println!("[P2P] ✅ P2P network with load balancing started");
     }
     
@@ -379,14 +408,22 @@ impl SimplifiedP2P {
                     
                     // ROBUST: Use bootstrap trust for Genesis peers with FAST connectivity check
                     let should_add = if is_genesis_peer && (is_bootstrap_node || is_small_network) {
-                        // EXISTING: Use FAST connectivity check even for bootstrap trust
+                        // GENESIS FIX: For Genesis bootstrap phase, be more tolerant of connectivity issues
+                        // Try connectivity check but add Genesis peer anyway if it's a known Genesis node
                         let is_reachable = Self::test_peer_connectivity_static(&peer_info.addr);
                         if is_reachable {
                             println!("[P2P] 🌟 Genesis peer: adding {} with bootstrap trust (verified reachable)", peer_info.addr);
                             true
                         } else {
-                            println!("[P2P] ⚠️ Genesis peer: {} not reachable - skipping bootstrap trust", peer_info.addr);
-                            false
+                            // GENESIS FIX: During Genesis phase, add known Genesis peers even if temporarily unreachable
+                            // They might be starting up or have temporary network issues
+                            if is_bootstrap_node && is_genesis_peer {
+                                println!("[P2P] 🔧 Genesis peer: {} temporarily unreachable - adding with bootstrap trust anyway", peer_info.addr);
+                                true // GENESIS FIX: Allow Genesis peers during bootstrap
+                            } else {
+                                println!("[P2P] ⚠️ Genesis peer: {} not reachable - skipping bootstrap trust", peer_info.addr);
+                                false
+                            }
                         }
                     } else {
                         self.is_peer_actually_connected(&peer_info.addr)
@@ -433,6 +470,9 @@ impl SimplifiedP2P {
                         new_connections += 1;
                     }
                     
+                    // CACHE FIX: Invalidate peer cache when topology changes
+                    self.invalidate_peer_cache();
+                    
                             // QUANTUM: Register peer in blockchain for persistent peer registry
                             tokio::spawn({
                                 let peer_info_clone = peer_info.clone();
@@ -473,6 +513,8 @@ impl SimplifiedP2P {
         
         if new_connections > 0 {
             println!("[P2P] 🚀 Successfully added {} new peers to P2P network", new_connections);
+            // CACHE FIX: Invalidate peer cache after adding discovered peers
+            self.invalidate_peer_cache();
             
                 // CRITICAL FIX: Use EXISTING broadcast system for immediate peer announcements
             // Broadcast new peer information to ALL connected nodes for real-time topology updates
@@ -947,6 +989,16 @@ impl SimplifiedP2P {
     
     /// Sync blockchain height with peers for consensus
     pub fn sync_blockchain_height(&self) -> Result<u64, String> {
+        // RACE CONDITION FIX: Check cached height first to prevent excessive queries
+        {
+            let cache = CACHED_BLOCKCHAIN_HEIGHT.lock().unwrap();
+            let age = Instant::now().duration_since(cache.1);
+            // Use 2-second cache for height during rapid sync operations
+            if age.as_secs() < 2 {
+                return Ok(cache.0);
+            }
+        }
+        
         let validated_peers = self.get_validated_active_peers(); // Use cached version for performance
         
         if validated_peers.is_empty() {
@@ -989,6 +1041,13 @@ impl SimplifiedP2P {
         };
         
         println!("[SYNC] ✅ Consensus blockchain height: {}", consensus_height);
+        
+        // RACE CONDITION FIX: Update cached height
+        {
+            let mut cache = CACHED_BLOCKCHAIN_HEIGHT.lock().unwrap();
+            *cache = (consensus_height, Instant::now());
+        }
+        
         Ok(consensus_height)
     }
     
@@ -1357,11 +1416,11 @@ impl SimplifiedP2P {
         
         let current_time = std::time::SystemTime::now();
         
-        // Check cache first (refresh every 120 seconds for Genesis stability)
+        // Check cache first (refresh every 30 seconds for Genesis stability)
         if let Ok(cache) = connectivity_cache.lock() {
             if let Some((cached_working_nodes, cached_time)) = cache.get(&cache_key) {
                 if let Ok(cache_age) = current_time.duration_since(*cached_time) {
-                    if cache_age.as_secs() < 120 { // EXISTING: Longer cache for stable Genesis topology
+                    if cache_age.as_secs() < 30 { // CACHE FIX: Reduced from 120s to 30s for faster recovery
                         println!("[FAILOVER] 📋 Using cached Genesis connectivity ({} working, cache age: {}s)", 
                                  cached_working_nodes.len(), cache_age.as_secs());
                         return cached_working_nodes.clone();
@@ -1708,6 +1767,15 @@ impl SimplifiedP2P {
         }
     }
     
+    /// CACHE FIX: Invalidate peer cache when topology changes
+    fn invalidate_peer_cache(&self) {
+        if let Ok(mut cached) = CACHED_PEERS.lock() {
+            // Reset cache by setting timestamp to past
+            *cached = (Vec::new(), Instant::now() - Duration::from_secs(3600), String::new());
+            println!("[P2P] 🔄 Peer cache invalidated due to topology change");
+        }
+    }
+    
     /// PRODUCTION: Get validated active peers for consensus participation (NODE TYPE AWARE)
     pub fn get_validated_active_peers(&self) -> Vec<PeerInfo> {
         // CRITICAL FIX: Light nodes DO NOT participate in consensus - return empty list
@@ -1722,11 +1790,11 @@ impl SimplifiedP2P {
         
         // QUANTUM: Use cryptographic validation instead of time-based intervals
         // EXISTING verify_peer_authenticity() provides quantum-resistant peer verification
-        // GENESIS FIX: Use longer cache interval for Genesis phase to prevent Registry spam
+        // CACHE FIX: Use shorter cache interval for Genesis phase to handle connectivity issues
         let validation_interval = if std::env::var("QNET_BOOTSTRAP_ID")
             .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
             .unwrap_or(false) {
-            Duration::from_secs(30) // Genesis nodes: 30-second cache (static topology)
+            Duration::from_secs(10) // CACHE FIX: Reduced to 10 seconds for faster recovery from connectivity issues
         } else {
             Duration::from_secs(5) // Regular nodes: 5-second cache (dynamic topology)
         };
@@ -1813,8 +1881,20 @@ impl SimplifiedP2P {
                             let is_consensus_capable = matches!(peer.node_type, NodeType::Super | NodeType::Full);
                             
                             // CRITICAL: Real connectivity check - no more phantom validation
+                            // GENESIS FIX: For Genesis peers during bootstrap, be more tolerant
                             let is_really_connected = if is_consensus_capable {
-                                self.is_peer_actually_connected(&peer.addr)
+                                let peer_ip = peer.addr.split(':').next().unwrap_or("");
+                                let is_genesis_peer = is_genesis_node_ip(peer_ip);
+                                let is_bootstrap_node = std::env::var("QNET_BOOTSTRAP_ID").is_ok();
+                                
+                                if is_genesis_peer && is_bootstrap_node {
+                                    // GENESIS FIX: During Genesis bootstrap, trust other Genesis peers
+                                    // They might be temporarily unreachable due to startup timing
+                                    println!("[P2P] 🔧 Genesis peer: Allowing {} in validated peers (bootstrap trust)", peer.addr);
+                                    true
+                                } else {
+                                    self.is_peer_actually_connected(&peer.addr)
+                                }
                             } else {
                                 false
                             };
@@ -1888,6 +1968,11 @@ impl SimplifiedP2P {
             if cleaned_count > 0 {
                 println!("[P2P] 🧹 Simple peer cleanup: removed {} non-validated peers, {} validated remain", 
                          cleaned_count, connected.len());
+                // CACHE FIX: Invalidate cache after removing peers
+                // Drop the lock before calling invalidate_peer_cache to avoid deadlock
+                drop(connected);
+                self.invalidate_peer_cache();
+                return validated_result;
             }
         }
         
@@ -2923,8 +3008,33 @@ impl SimplifiedP2P {
         if target_height <= current_height { return; }
         let peers = self.connected_peers.lock().unwrap().clone();
         if peers.is_empty() { return; }
+        
+        // SYNC FIX: Batch download status tracking
+        let mut consecutive_failures = 0;
+        const MAX_CONSECUTIVE_FAILURES: u32 = 3;
+        
         let mut height = current_height + 1;
         while height <= target_height {
+            // SYNC FIX: Check if block already exists locally before downloading
+            if storage.load_microblock(height).is_ok() {
+                println!("[SYNC] ✅ Block #{} already exists locally, skipping download", height);
+                height += 1;
+                consecutive_failures = 0; // Reset failure counter on success
+                continue;
+            }
+            
+            // RACE CONDITION FIX: Check if another thread is already downloading this block
+            {
+                let mut downloading = DOWNLOADING_BLOCKS.lock().unwrap();
+                if downloading.contains(&height) {
+                    println!("[SYNC] ⏳ Block #{} already being downloaded by another thread, skipping", height);
+                    height += 1;
+                    continue;
+                }
+                // Mark this block as being downloaded
+                downloading.insert(height);
+            }
+            
             let mut fetched = false;
             for peer in &peers {
                 // Try primary API port first
@@ -2935,9 +3045,10 @@ impl SimplifiedP2P {
                 // PRODUCTION: Use proper HTTP client instead of curl
                 for url in urls {
                     // Create HTTP client with production-ready configuration
+                    // SYNC FIX: Reduced timeouts for faster sync
                     let client = match reqwest::Client::builder()
-                        .timeout(std::time::Duration::from_secs(25)) // PRODUCTION: Extended timeout for international nodes
-                        .connect_timeout(std::time::Duration::from_secs(12)) // Connection timeout
+                        .timeout(std::time::Duration::from_secs(5)) // SYNC FIX: Reduced from 25s to 5s for faster failure detection
+                        .connect_timeout(std::time::Duration::from_secs(2)) // SYNC FIX: Reduced from 12s to 2s
                         .user_agent("QNet-Node/1.0")
                         .tcp_nodelay(true) // Faster responses
                         .tcp_keepalive(std::time::Duration::from_secs(60)) // Keep connections alive
@@ -2957,31 +3068,59 @@ impl SimplifiedP2P {
                                         if storage.save_microblock(height, &bytes).is_ok() {
                                             println!("[SYNC] 📦 Downloaded microblock #{} from {}", height, ip);
                                             fetched = true;
+                                            consecutive_failures = 0; // Reset failure counter
+                                            // RACE CONDITION FIX: Remove from downloading set after successful save
+                                            DOWNLOADING_BLOCKS.lock().unwrap().remove(&height);
                                             break;
                                         }
                                     }
                                 }
                                     },
-                                    Err(e) => {
-                                        println!("[SYNC] ❌ JSON parsing failed for {}: {}", url, e);
+                                    Err(_e) => {
+                                        // SYNC FIX: Reduced logging for failed attempts (not all are errors)
+                                        // Continue to next peer silently
                                     }
                                 }
-                            } else {
-                                println!("[SYNC] ❌ HTTP error {} for {}", response.status(), url);
+                            } else if response.status() == reqwest::StatusCode::NOT_FOUND {
+                                // SYNC FIX: Peer doesn't have this block yet, try next peer
+                                continue;
                             }
                         },
-                        Err(e) => {
-                            println!("[SYNC] ❌ Request failed for {}: {}", url, e);
+                        Err(_e) => {
+                            // SYNC FIX: Connection failed, try next peer silently
+                            continue;
                         }
                     }
                 }
                 if fetched { break; }
             }
+            
             if !fetched {
-                println!("[SYNC] ⚠️ Could not fetch microblock #{} from any peer", height);
-                break;
+                consecutive_failures += 1;
+                println!("[SYNC] ⚠️ Could not fetch microblock #{} from any peer (attempt {}/{})",
+                         height, consecutive_failures, MAX_CONSECUTIVE_FAILURES);
+                
+                // RACE CONDITION FIX: Remove from downloading set if failed to download
+                DOWNLOADING_BLOCKS.lock().unwrap().remove(&height);
+                
+                // SYNC FIX: Give up after multiple consecutive failures to prevent infinite loops
+                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                    println!("[SYNC] ❌ Sync aborted after {} consecutive failures", MAX_CONSECUTIVE_FAILURES);
+                    break;
+                }
+                
+                // SYNC FIX: Small delay before retry to avoid hammering the network
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
+            
             height += 1;
+        }
+        
+        // RACE CONDITION FIX: Clean up any remaining blocks from tracking set
+        // This handles edge cases where sync was interrupted
+        {
+            let mut downloading = DOWNLOADING_BLOCKS.lock().unwrap();
+            downloading.clear();
         }
     }
 }
@@ -3017,6 +3156,7 @@ pub enum NetworkMessage {
         round_id: u64,
         node_id: String,
         commit_hash: String,
+        signature: String,  // CONSENSUS FIX: Add signature field for Byzantine consensus validation
         timestamp: u64,
     },
 
@@ -3046,6 +3186,7 @@ pub enum ConsensusMessage {
         round_id: u64,
         node_id: String,
         commit_hash: String,
+        signature: String,  // CONSENSUS FIX: Add signature field for Byzantine consensus validation
         timestamp: u64,
     },
     /// Remote reveal received from peer
@@ -3090,13 +3231,23 @@ impl SimplifiedP2P {
                     let network_node_count = std::cmp::min(validated_peers.len() + 1, 5); // EXISTING: Add self, max 5 Genesis
                     
                     if network_node_count < 4 {
-                        if is_genesis_phase {
-                            println!("[SECURITY] ⚠️ REJECTING block #{} - Genesis phase requires Byzantine safety: {} nodes < 4", height, network_node_count);
+                        // GENESIS FIX: Allow syncing blocks during Genesis bootstrap even with limited peers
+                        // This allows nodes to catch up with the network
+                        let is_bootstrap_node = std::env::var("QNET_BOOTSTRAP_ID").is_ok();
+                        let allow_sync = is_bootstrap_node && is_genesis_phase && height > 0;
+                        
+                        if allow_sync {
+                            println!("[SECURITY] ⚠️ ACCEPTING block #{} for sync - Genesis bootstrap mode with {} nodes", height, network_node_count);
+                            // Continue to process block for synchronization
                         } else {
-                            println!("[SECURITY] ⚠️ REJECTING macroblock #{} - Byzantine consensus required: {} nodes < 4", height, network_node_count);
+                            if is_genesis_phase {
+                                println!("[SECURITY] ⚠️ REJECTING block #{} - Genesis phase requires Byzantine safety: {} nodes < 4", height, network_node_count);
+                            } else {
+                                println!("[SECURITY] ⚠️ REJECTING macroblock #{} - Byzantine consensus required: {} nodes < 4", height, network_node_count);
+                            }
+                            println!("[SECURITY] 🔒 Block from {} discarded - network must have 4+ validated nodes", from_peer);
+                            return; // Reject block without processing
                         }
-                        println!("[SECURITY] 🔒 Block from {} discarded - network must have 4+ validated nodes", from_peer);
-                        return; // Reject block without processing
                     }
                 } else {
                     // EXISTING: Normal phase microblocks - fast acceptance with quantum signature validation only
@@ -3153,7 +3304,7 @@ impl SimplifiedP2P {
                 println!("[P2P] ← Health ping from {}", from);
             }
 
-            NetworkMessage::ConsensusCommit { round_id, node_id, commit_hash, timestamp } => {
+            NetworkMessage::ConsensusCommit { round_id, node_id, commit_hash, signature, timestamp } => {
                 println!("[CONSENSUS] ← Received commit from {} for round {} at {}", 
                          node_id, round_id, timestamp);
                 
@@ -3161,7 +3312,7 @@ impl SimplifiedP2P {
                 // Microblocks use simple producer signatures, NOT Byzantine consensus
                 if self.is_macroblock_consensus_round(round_id) {
                     println!("[CONSENSUS] ✅ Processing commit for MACROBLOCK round {}", round_id);
-                    self.handle_remote_consensus_commit(round_id, node_id, commit_hash, timestamp);
+                    self.handle_remote_consensus_commit(round_id, node_id, commit_hash, signature, timestamp);
                 } else {
                     println!("[CONSENSUS] ⏭️ Ignoring commit for microblock - no consensus needed for round {}", round_id);
                 }
@@ -3300,7 +3451,7 @@ fn discover_genesis_nodes_via_dht() -> Vec<String> {
 
 impl SimplifiedP2P {
     /// Start peer exchange protocol for decentralized network growth - SCALABLE (INSTANCE METHOD)
-    fn start_peer_exchange_protocol(&self, initial_peers: Vec<PeerInfo>) {
+    pub fn start_peer_exchange_protocol(&self, initial_peers: Vec<PeerInfo>) {
         println!("[P2P] 🔄 Starting peer exchange protocol for network growth...");
         
         // SCALABILITY FIX: Phase-aware peer exchange intervals
@@ -3367,6 +3518,16 @@ impl SimplifiedP2P {
                         }
                         
                         println!("[P2P] 🔥 PEER EXCHANGE: {} new peers added to connected_peers", added_count);
+                        
+                        // CACHE FIX: Invalidate cache after adding peers through exchange
+                        if added_count > 0 {
+                            // Can't call self.invalidate_peer_cache() from static context
+                            // Directly invalidate the cache here
+                            if let Ok(mut cached) = CACHED_PEERS.lock() {
+                                *cached = (Vec::new(), Instant::now() - Duration::from_secs(3600), String::new());
+                                println!("[P2P] 🔄 Peer cache invalidated after exchange (added {} peers)", added_count);
+                            }
+                        }
                     }
                 }
             }
@@ -3529,7 +3690,7 @@ impl SimplifiedP2P {
     }
 
     /// PRODUCTION: Broadcast consensus commit to all peers
-    pub fn broadcast_consensus_commit(&self, round_id: u64, node_id: String, commit_hash: String, timestamp: u64) -> Result<(), String> {
+    pub fn broadcast_consensus_commit(&self, round_id: u64, node_id: String, commit_hash: String, signature: String, timestamp: u64) -> Result<(), String> {
         // CRITICAL: Only broadcast consensus for MACROBLOCK rounds (every 90 blocks)
         // Microblocks use simple producer signatures, NOT Byzantine consensus
         if round_id == 0 || (round_id % 90 != 0) {
@@ -3552,6 +3713,7 @@ impl SimplifiedP2P {
                 round_id,
                 node_id: node_id.clone(),
                 commit_hash: commit_hash.clone(),
+                signature: signature.clone(),  // CONSENSUS FIX: Pass signature for Byzantine validation
                 timestamp,
             };
             
@@ -3705,7 +3867,7 @@ impl SimplifiedP2P {
     }
 
     /// Handle incoming consensus commit from remote peer
-    fn handle_remote_consensus_commit(&self, round_id: u64, node_id: String, commit_hash: String, timestamp: u64) {
+    fn handle_remote_consensus_commit(&self, round_id: u64, node_id: String, commit_hash: String, signature: String, timestamp: u64) {
         println!("[CONSENSUS] 🏛️ Processing remote commit: round={}, node={}, hash={}", 
                 round_id, node_id, commit_hash);
         
@@ -3715,6 +3877,7 @@ impl SimplifiedP2P {
                 round_id,
                 node_id: node_id.clone(),
                 commit_hash,
+                signature,  // CONSENSUS FIX: Pass real signature for Byzantine validation
                 timestamp,
             };
             

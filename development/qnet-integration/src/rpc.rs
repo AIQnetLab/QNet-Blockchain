@@ -138,8 +138,28 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(blockchain_filter.clone())
         .and_then(|blockchain: Arc<BlockchainNode>| async move {
             let height = blockchain.get_height().await;
-            println!("[API] 📊 Height request: returning height {}", height);
-            Ok::<_, Rejection>(warp::reply::json(&json!({"height": height})))
+            
+            // API FIX: Also include network sync status
+            let mut network_height = height;
+            let mut is_syncing = false;
+            
+            if let Some(p2p) = blockchain.get_unified_p2p() {
+                // API FIX: Get real network height for sync status
+                if let Ok(net_height) = p2p.sync_blockchain_height() {
+                    network_height = net_height;
+                    is_syncing = height < network_height;
+                }
+            }
+            
+            println!("[API] 📊 Height request: local={}, network={}, syncing={}", 
+                     height, network_height, is_syncing);
+            
+            Ok::<_, Rejection>(warp::reply::json(&json!({
+                "height": height,
+                "network_height": network_height, // API FIX: Include network height
+                "is_syncing": is_syncing, // API FIX: Include sync status
+                "blocks_behind": network_height.saturating_sub(height) // API FIX: How many blocks behind
+            })))
         });
     
     // Microblock by height
@@ -150,13 +170,71 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::get())
         .and(blockchain_filter.clone())
         .and_then(|height: u64, blockchain: Arc<BlockchainNode>| async move {
-            let data_opt = blockchain.load_microblock_bytes(height)
-                .map_err(|_| warp::reject())?;
-            if let Some(data) = data_opt {
-                let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
-                Ok::<_, Rejection>(warp::reply::json(&json!({"height": height, "data": b64})))
-            } else {
-                Ok::<_, Rejection>(warp::reply::json(&json!({"height": height, "data": null})))
+            // API FIX: Check if height is valid
+            let current_height = blockchain.get_height().await;
+            if height > current_height {
+                // API FIX: Return proper error for future blocks
+                return Ok::<_, Rejection>(warp::reply::with_status(
+                    warp::reply::json(&json!({
+                        "error": "Block not yet produced",
+                        "requested_height": height,
+                        "current_height": current_height
+                    })),
+                    warp::http::StatusCode::NOT_FOUND
+                ));
+            }
+            
+            match blockchain.load_microblock_bytes(height) {
+                Ok(Some(data)) => {
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+                    // API FIX: Include metadata about the block
+                    Ok::<_, Rejection>(warp::reply::with_status(
+                        warp::reply::json(&json!({
+                            "height": height,
+                            "data": b64,
+                            "size": data.len(),
+                            "exists": true
+                        })),
+                        warp::http::StatusCode::OK
+                    ))
+                },
+                Ok(None) => {
+                    // API FIX: Distinguish between not found and not synced
+                    if height == 0 {
+                        // Genesis block doesn't exist yet
+                        Ok::<_, Rejection>(warp::reply::with_status(
+                            warp::reply::json(&json!({
+                                "height": height,
+                                "data": null,
+                                "exists": false,
+                                "reason": "Genesis block"
+                            })),
+                            warp::http::StatusCode::OK
+                        ))
+                    } else {
+                        // Block should exist but not found
+                        Ok::<_, Rejection>(warp::reply::with_status(
+                            warp::reply::json(&json!({
+                                "error": "Block not found",
+                                "height": height,
+                                "exists": false
+                            })),
+                            warp::http::StatusCode::NOT_FOUND
+                        ))
+                    }
+                },
+                Err(e) => {
+                    // API FIX: Return proper error message
+                    println!("[API] ❌ Error loading microblock {}: {}", height, e);
+                    Ok::<_, Rejection>(warp::reply::with_status(
+                        warp::reply::json(&json!({
+                            "error": "Storage error",
+                            "height": height,
+                            "message": e.to_string()
+                        })),
+                        warp::http::StatusCode::INTERNAL_SERVER_ERROR
+                    ))
+                }
             }
         });
     
@@ -296,17 +374,89 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
             
             // Return current peer list as before
             let peers = blockchain.get_connected_peers().await.unwrap_or_default();
-            let peer_list: Vec<serde_json::Value> = peers.iter().map(|peer| {
-                json!({
-                    "id": peer.id,
-                    "address": peer.address,
-                    "node_type": peer.node_type,
-                    "region": peer.region,
-                    "last_seen": peer.last_seen
+            
+            // API FIX: Filter out invalid peers and calculate correct last_seen
+            let current_time = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            
+            let mut peer_list: Vec<serde_json::Value> = peers.iter()
+                .filter(|peer| {
+                    // API FIX: Filter out peers with invalid addresses
+                    !peer.address.is_empty() && 
+                    peer.address.contains(':') &&
+                    !peer.address.starts_with("0.0.0.0")
                 })
-            }).collect();
-            println!("[API] 📊 Peers request: returning {} peers (bidirectional registration enabled)", peer_list.len());
-            Ok::<_, Rejection>(warp::reply::json(&json!({"peers": peer_list})))
+                .map(|peer| {
+                    // API FIX: Calculate proper last_seen as seconds ago, not absolute timestamp
+                    let last_seen_ago = if peer.last_seen > 0 && peer.last_seen <= current_time {
+                        current_time - peer.last_seen
+                    } else {
+                        0 // Just connected or invalid timestamp
+                    };
+                    
+                    json!({
+                        "id": peer.id,
+                        "address": peer.address,
+                        "node_type": peer.node_type,
+                        "region": peer.region,
+                        "last_seen": last_seen_ago, // API FIX: Return seconds since last contact
+                        "reputation": peer.reputation, // API FIX: Include reputation score
+                        "version": peer.version // API FIX: Include node version
+                    })
+                }).collect();
+            
+            // P2P FIX: Include Genesis bootstrap peers ONLY for initial bootstrap
+            // SCALABILITY: Only help nodes with very few peers to avoid Genesis overload
+            // In production with millions of nodes, Genesis nodes should NOT be contacted by everyone
+            if peers.len() < 3 {  // SCALABILITY: Only for nodes with < 3 peers (initial bootstrap)
+                use crate::unified_p2p::get_genesis_bootstrap_ips;
+                let genesis_ips = get_genesis_bootstrap_ips();
+                
+                // SCALABILITY: Only return 2 random Genesis nodes, not all 5
+                // This prevents Genesis nodes from being overwhelmed when millions join
+                let mut selected_genesis = Vec::new();
+                let max_genesis_to_return = std::cmp::min(2, genesis_ips.len());
+                
+                for (idx, ip) in genesis_ips.iter().enumerate().take(max_genesis_to_return) {
+                    let genesis_addr = format!("{}:8001", ip);
+                    // Check if not already in list
+                    let already_exists = peers.iter().any(|p| p.address == genesis_addr);
+                    if !already_exists {
+                        selected_genesis.push(json!({
+                            "id": format!("genesis_node_{:03}", idx + 1),
+                            "address": genesis_addr,
+                            "node_type": "Super",
+                            "region": "Global",
+                            "last_seen": 0, // API FIX: Genesis nodes always fresh
+                            "reputation": 100.0, // API FIX: Genesis nodes have max reputation
+                            "version": Some("qnet-v1.0") // API FIX: Include version
+                        }));
+                    }
+                }
+                
+                peer_list.extend(selected_genesis);
+            }
+            
+            // API FIX: Include summary statistics
+            let total_peers = peer_list.len();
+            let super_nodes = peer_list.iter().filter(|p| p["node_type"] == "Super").count();
+            let full_nodes = peer_list.iter().filter(|p| p["node_type"] == "Full").count();
+            let light_nodes = peer_list.iter().filter(|p| p["node_type"] == "Light").count();
+            
+            println!("[API] 📊 Peers request: returning {} peers (Super:{}, Full:{}, Light:{})", 
+                     total_peers, super_nodes, full_nodes, light_nodes);
+            
+            Ok::<_, Rejection>(warp::reply::json(&json!({
+                "peers": peer_list,
+                "total": total_peers, // API FIX: Include total count
+                "statistics": { // API FIX: Include node type breakdown
+                    "super_nodes": super_nodes,
+                    "full_nodes": full_nodes,
+                    "light_nodes": light_nodes
+                }
+            })))
         });
 
     // Batch operations endpoints
@@ -1592,17 +1742,61 @@ async fn handle_node_health(
     // Get system CPU load for P2P monitoring
     let cpu_load = get_system_cpu_load();
     
+    // API FIX: Get actual network status
+    let mut network_height = height;
+    let mut sync_status = "synchronized";
+    let mut validated_peers = 0;
+    
+    if let Some(p2p) = blockchain.get_unified_p2p() {
+        // API FIX: Get real validated peers count (for consensus safety)
+        let validated = p2p.get_validated_active_peers();
+        validated_peers = validated.len();
+        
+        // API FIX: Check sync status
+        if let Ok(net_height) = p2p.sync_blockchain_height() {
+            network_height = net_height;
+            if height < network_height {
+                sync_status = "syncing";
+            }
+        }
+    }
+    
+    // API FIX: Determine node health based on real metrics
+    let health_status = if peer_count == 0 {
+        "isolated"
+    } else if height < network_height {
+        "syncing"
+    } else if validated_peers < 4 {
+        "degraded" // Not enough peers for Byzantine consensus
+    } else {
+        "healthy"
+    };
+    
+    // API FIX: Calculate actual uptime from node start
+    let uptime = if let Ok(start_time) = std::env::var("QNET_NODE_START_TIME") {
+        if let Ok(start) = start_time.parse::<i64>() {
+            chrono::Utc::now().timestamp() - start
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+    
     let response = json!({
-        "status": "healthy",
+        "status": health_status, // API FIX: Real health status
         "node_id": blockchain.get_public_display_name(),
         "height": height,
+        "network_height": network_height, // API FIX: Network height
+        "sync_status": sync_status, // API FIX: Sync status
         "peers": peer_count,
+        "validated_peers": validated_peers, // API FIX: Validated peers for consensus
         "mempool_size": mempool_size,
         "node_type": format!("{:?}", blockchain.get_node_type()),
         "region": format!("{:?}", blockchain.get_region()),
-        "uptime": chrono::Utc::now().timestamp(),
+        "uptime_seconds": uptime, // API FIX: Actual uptime in seconds
         "cpu_load": cpu_load,
-        "version": "0.1.0",
+        "version": "1.0.0", // API FIX: Correct version
         "api_version": "v1"
     });
     Ok(warp::reply::json(&response))

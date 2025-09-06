@@ -280,6 +280,46 @@ impl BlockchainNode {
         // This prevents race conditions where different nodes see different candidate lists
         Self::initialize_genesis_reputations(&unified_p2p_instance).await;
         
+        // P2P FIX: Add Genesis bootstrap peers ONLY for Genesis nodes themselves
+        // SCALABILITY: Regular nodes (Full/Light) should discover peers via DHT, not direct Genesis connection
+        // This prevents Genesis nodes from being overwhelmed when millions of nodes join
+        if std::env::var("QNET_BOOTSTRAP_ID").is_ok() {
+            use crate::unified_p2p::get_genesis_bootstrap_ips;
+            let genesis_ips = get_genesis_bootstrap_ips();
+            let genesis_peers: Vec<String> = genesis_ips.iter()
+                .map(|ip| format!("{}:8001", ip))
+                .collect();
+            
+            println!("[P2P] 🌟 Genesis node: Adding {} Genesis bootstrap peers for initial network", genesis_peers.len());
+            unified_p2p_instance.add_discovered_peers(&genesis_peers);
+            
+            // P2P FIX: Start peer exchange after adding Genesis peers
+            // This ensures the exchange protocol has peers to work with
+            let initial_peers = unified_p2p_instance.get_discovery_peers();
+            let peer_count = initial_peers.len();
+            
+            if !initial_peers.is_empty() {
+                unified_p2p_instance.start_peer_exchange_protocol(initial_peers);
+                println!("[P2P] 🔄 Genesis node: Started peer exchange protocol with {} peers", peer_count);
+            }
+        } else {
+            // SCALABILITY: Regular nodes (Full/Light) in production with millions of nodes
+            // Should NOT directly connect to Genesis nodes to avoid overload
+            // They will discover peers through DHT and peer exchange protocol
+            match node_type {
+                NodeType::Light => {
+                    println!("[P2P] 📱 Light node: Will discover peers through DHT (no direct Genesis connection)");
+                },
+                NodeType::Full => {
+                    println!("[P2P] 💻 Full node: Will discover peers through DHT (no direct Genesis connection)");
+                },
+                NodeType::Super => {
+                    // Super nodes might need some Genesis connections for consensus
+                    println!("[P2P] 🖥️ Super node: Will discover peers through DHT with limited Genesis fallback");
+                }
+            }
+        }
+        
         let unified_p2p = Arc::new(unified_p2p_instance);
         
         // PRODUCTION: Start block processing handler  
@@ -521,6 +561,9 @@ impl BlockchainNode {
             println!("[Node] 🔌 Unified RPC+API server: port {}", unified_port);
             println!("[Node] 🌐 All endpoints available on single port");
             
+            // API FIX: Set node start time for uptime calculation
+            std::env::set_var("QNET_NODE_START_TIME", chrono::Utc::now().timestamp().to_string());
+            
             // EXISTING: Now sync blockchain height AFTER API server is ready
             if let Some(unified_p2p) = &self.unified_p2p {
                 match unified_p2p.sync_blockchain_height() {
@@ -606,7 +649,7 @@ impl BlockchainNode {
         use qnet_consensus::commit_reveal::{Commit, Reveal};
         
         match message {
-            ConsensusMessage::RemoteCommit { round_id, node_id, commit_hash, timestamp } => {
+            ConsensusMessage::RemoteCommit { round_id, node_id, commit_hash, signature, timestamp } => {
                 println!("[CONSENSUS] 📥 Processing REAL commit from remote node: {} (round {})", node_id, round_id);
                 
                 // Create commit from remote node data
@@ -614,7 +657,7 @@ impl BlockchainNode {
                     node_id: node_id.clone(),
                     commit_hash,
                     timestamp,
-                    signature: format!("remote_signature_{}", node_id), // Signature already validated by P2P
+                    signature,  // CONSENSUS FIX: Use real signature from remote node for Byzantine validation
                 };
                 
                 // Submit remote commit to consensus engine
@@ -701,6 +744,46 @@ impl BlockchainNode {
             println!("[Microblock] ⚡ Target: 100k+ TPS with batch processing");
             
             while *is_running.read().await {
+                // SYNC FIX: Fast catch-up mode for nodes that are far behind
+                // RACE CONDITION FIX: Track fast sync state to prevent multiple concurrent fast syncs
+                static FAST_SYNC_IN_PROGRESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                
+                if let Some(p2p) = &unified_p2p {
+                    if let Ok(network_height) = p2p.sync_blockchain_height() {
+                        let height_difference = network_height.saturating_sub(microblock_height);
+                        
+                        // If we're more than 50 blocks behind, enter fast sync mode
+                        if height_difference > 50 {
+                            // RACE CONDITION FIX: Only start fast sync if not already running
+                            if !FAST_SYNC_IN_PROGRESS.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                                println!("[SYNC] ⚡ FAST SYNC MODE: {} blocks behind, catching up...", height_difference);
+                                
+                                // Update our height to catch up quickly
+                                microblock_height = network_height;
+                                *height.write().await = microblock_height;
+                                
+                                // Trigger immediate sync download
+                                let p2p_clone = p2p.clone();
+                                let storage_clone = storage.clone();
+                                let current_height = microblock_height.saturating_sub(10); // Sync last 10 blocks
+                                
+                                tokio::spawn(async move {
+                                    println!("[SYNC] 🚀 Fast downloading blocks {}-{}", current_height, network_height);
+                                    p2p_clone.download_missing_microblocks(storage_clone.as_ref(), current_height, network_height).await;
+                                    // Clear fast sync flag when done
+                                    FAST_SYNC_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
+                                });
+                            } else {
+                                println!("[SYNC] ⏳ Fast sync already in progress, skipping");
+                            }
+                            
+                            // Skip this production cycle to focus on syncing
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            continue;
+                        }
+                    }
+                }
+                
                 // CRITICAL FIX: Use network-wide consensus instead of asymmetric peer counting
                 // Each node was seeing different peer counts causing deadlock
                 
@@ -1257,31 +1340,45 @@ impl BlockchainNode {
                     
                     // EXISTING: Non-blocking background sync as promised in line 868 comments
                     if let Some(p2p) = &unified_p2p {
-                        // PRODUCTION: Background sync without blocking microblock timing
-                        let p2p_clone = p2p.clone();
-                        let storage_clone = storage.clone();
-                        let height_clone = height.clone();
-                        let current_height = microblock_height;
+                        // SYNC FIX: Prevent multiple parallel syncs using atomic flag
+                        static SYNC_IN_PROGRESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
                         
-                        tokio::spawn(async move {
-                            // EXISTING: Background sync pattern - no blocking of main loop
-                            if let Ok(network_height) = p2p_clone.sync_blockchain_height() {
-                                if network_height > current_height {
-                                    println!("[SYNC] 📥 Background sync: downloading blocks {}-{}", 
-                                             current_height + 1, network_height);
-                                    p2p_clone.download_missing_microblocks(storage_clone.as_ref(), current_height, network_height).await;
-                                    
-                                    // Update global height atomically
-                                    if let Ok(Some(_)) = storage_clone.load_microblock(network_height) {
-                                        *height_clone.write().await = network_height;
-                                        println!("[SYNC] ✅ Background sync completed to block #{}", network_height);
+                        // Only start new sync if not already running
+                        if !SYNC_IN_PROGRESS.load(std::sync::atomic::Ordering::SeqCst) {
+                            // PRODUCTION: Background sync without blocking microblock timing
+                            let p2p_clone = p2p.clone();
+                            let storage_clone = storage.clone();
+                            let height_clone = height.clone();
+                            let current_height = microblock_height;
+                            
+                            // Mark sync as in progress
+                            SYNC_IN_PROGRESS.store(true, std::sync::atomic::Ordering::SeqCst);
+                            
+                            tokio::spawn(async move {
+                                // EXISTING: Background sync pattern - no blocking of main loop
+                                if let Ok(network_height) = p2p_clone.sync_blockchain_height() {
+                                    if network_height > current_height {
+                                        println!("[SYNC] 📥 Background sync: downloading blocks {}-{}", 
+                                                 current_height + 1, network_height);
+                                        p2p_clone.download_missing_microblocks(storage_clone.as_ref(), current_height, network_height).await;
+                                        
+                                        // Update global height atomically
+                                        if let Ok(Some(_)) = storage_clone.load_microblock(network_height) {
+                                            *height_clone.write().await = network_height;
+                                            println!("[SYNC] ✅ Background sync completed to block #{}", network_height);
+                                        }
                                     }
                                 }
-                            }
-                        });
-                        
-                        // EXISTING: Non-blocking - continue immediately without waiting
-                        println!("[SYNC] 🔄 Background sync started for producer {}", current_producer);
+                                // Clear sync flag when done
+                                SYNC_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
+                            });
+                            
+                            // EXISTING: Non-blocking - continue immediately without waiting
+                            println!("[SYNC] 🔄 Background sync started for producer {}", current_producer);
+                        } else {
+                            // SYNC FIX: Skip if sync already in progress
+                            println!("[SYNC] ⏳ Background sync already in progress, skipping");
+                        }
                         
                         // CRITICAL: Check if we already have the next block locally
                         let expected_height = microblock_height + 1;
@@ -2272,6 +2369,7 @@ impl BlockchainNode {
                             round_id,
                             our_id.clone(),
                             commit.commit_hash.clone(),
+                            commit.signature.clone(),  // CONSENSUS FIX: Pass signature for Byzantine validation
                             commit.timestamp
                         );
                         println!("[CONSENSUS] 📤 Broadcasted OWN commit to {} peers", participants.len() - 1);
