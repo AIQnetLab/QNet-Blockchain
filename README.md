@@ -1249,11 +1249,9 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 🔗 Links
 
-- **Website**: https://qnet.io
-- **Documentation**: https://docs.qnet.io
-- **Explorer**: https://explorer.qnet.io
-- **Discord**: https://discord.gg/qnet
-- **Twitter**: https://twitter.com/QNetBlockchain
+Website: https://aiqnet.io
+Telegram: https://t.me/AiQnetLab
+Twitter: https://x.com/AIQnetLab
 
 ## ⚠️ Disclaimer
 
