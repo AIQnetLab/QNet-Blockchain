@@ -326,9 +326,13 @@ Ping architecture:
 
 ## 7. Economic Model
 
-## 7.1 Tokenomics
+### 7.1 Tokenomics
 
 **⚠️ TWO-PHASE ACTIVATION SYSTEM:**
+
+- **QNC** = Native token of QNet blockchain
+- **Maximum Supply**: 2^32 = 4,294,967,296 QNC (exactly 4.295 billion)
+- **Why 2^32**: Represents maximum 32-bit unsigned integer, aligning with quantum computing principles
 
 **Phase 1: 1DEV Token (NOT QNet's native token!):**
 - **1DEV** = SPL token on Solana for node activation
@@ -338,15 +342,16 @@ Ping architecture:
 - **Testnet address**: `62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ` (devnet)
 - **Burn contract**: `D7g7mkL8o1YEex6ZgETJEQyyHV7uuUMvV3Fy3u83igJ7` (devnet)
 - **Burn address**: `1nc1nerator11111111111111111111111111111111`
+- **Mainnet address**: `pump` (Mainnet)
+- **Burn contract**: `` (Mainnet)
 
 **Phase 2: QNC Token (NATIVE QNet token):**
-- **QNC** = Native token of QNet blockchain
-- **Appears after**: 90% 1DEV burn OR after 5 years
+- **Initial Supply**: 0 QNC (no pre-mine, created through emission only)
+- **Appears after**: 90% 1DEV burn OR 5 years from genesis
 - **Pool #3**: Activation QNC redistributed to all nodes
-- **Total supply**: Controlled by emission schedule
 - **Decimals**: 8
 
-## 7.2 Sharp Drop Halving Innovation
+### 7.2 Sharp Drop Halving Innovation
 
 **Revolutionary Emission Schedule:**
 
@@ -354,36 +359,53 @@ QNet implements a unique "Sharp Drop" halving mechanism that ensures eternal rew
 
 ```
 Standard Period (Years 0-20):
-├── Year 0-4: 245,100.67 QNC per 4h (÷2 at year 4)
-├── Year 4-8: 122,550.34 QNC per 4h (÷2 at year 8)  
-├── Year 8-12: 61,275.17 QNC per 4h (÷2 at year 12)
-├── Year 12-16: 30,637.58 QNC per 4h (÷2 at year 16)
-└── Year 16-20: 15,318.79 QNC per 4h (÷2 at year 20)
+├── Year 0-4: 251,432.34 QNC per 4h (÷2 at year 4) 
+├── Year 4-8: 125,716.17 QNC per 4h (÷2 at year 8)  
+├── Year 8-12: 62,858.09 QNC per 4h (÷2 at year 12)
+├── Year 12-16: 31,429.04 QNC per 4h (÷2 at year 16)
+└── Year 16-20: 15,714.52 QNC per 4h (÷2 at year 20)
 
 Sharp Drop Period (Years 20-24):
-└── Year 20-24: 1,531.88 QNC per 4h (÷10 SHARP DROP)
+└── Year 20-24: 1,571.45 QNC per 4h (÷10 SHARP DROP)
 
 Recovery Period (Years 24+):
-├── Year 24-28: 765.94 QNC per 4h (÷2 resumes)
-├── Year 28-32: 382.97 QNC per 4h (÷2 continues)
+├── Year 24-28: 785.73 QNC per 4h (÷2 resumes)
+├── Year 28-32: 392.86 QNC per 4h (÷2 continues)
+├── Year 32-36: 196.43 QNC per 4h
+├── Year 36-40: 98.22 QNC per 4h
 └── Continues with ÷2 every 4 years indefinitely
 ```
 
+**Total QNC Supply Calculation:**
+
+```
+├── 2^32 = 4,294,967,296 QNC (exactly)
+Emission Schedule (6 periods/day × 365 days/year):
+├── Years 0-4:    ~2,203,000,000 QNC (51.3% of total)
+├── Years 4-8:    ~1,101,000,000 QNC 
+├── Years 8-12:   ~551,000,000 QNC
+├── Years 12-16:  ~275,000,000 QNC
+├── Years 16-20:  ~138,000,000 QNC
+├── Years 20-24:  ~14,000,000 QNC (Sharp Drop)
+├── Years 24-100: ~1,000,000 QNC (diminishing)
+└── Total Cap: 4,294,967,296 QNC (2^32 exactly)
+```
+
 **Mathematical Benefits:**
-- **Total Savings**: 107M QNC over 100 years vs traditional model
+- **Total Supply Cap**: 2^32 = 4,294,967,296 QNC maximum
 - **Eternal Rewards**: Never reaches zero, ensures perpetual incentives
 - **Economic Balance**: Sharp correction prevents late-stage inflation
-- **Sustainability**: Higher long-term rewards after correction
+- **Sustainability**: ~26K QNC reserved for rewards beyond year 100
 
-## 7.3 Three-Pool Reward Architecture
+### 7.3 Three-Pool Reward Architecture
 
 **Pool #1 - Base Emission Rewards:**
 ```
 Source: Network inflation (sharp drop halving schedule)
 Distribution: All active nodes proportionally
-Current Rate: 245,100.67 QNC per 4-hour period
+Current Rate: 251,432.34 QNC per 4-hour period (Years 0-4)
 Eligibility: Reputation score ≥40 points
-Next Halving: Year 4 (reduces to 122,550.34 QNC)
+Next Halving: Year 4 (reduces to 125,716.17 QNC)
 Distribution Formula: Individual_Reward = (Pool_Total / Active_Nodes) × Node_Weight
 ```
 
@@ -411,7 +433,7 @@ Eligibility: Reputation score ≥40 points
 Innovation: Every new node activation benefits the entire network
 ```
 
-## 7.4 Dynamic Pricing System
+### 7.4 Dynamic Pricing System
 
 **Phase 1 (1DEV Burn-to-Activate):**
 
@@ -450,9 +472,11 @@ Final Price Ranges:
 ├── Light: 2,500-15,000 QNC
 ├── Full: 3,750-22,500 QNC
 └── Super: 5,000-30,000 QNC
+
+ALL activation QNC → Pool #3 → Redistributed to network
 ```
 
-## 7.5 Reputation-Based Economic Security
+### 7.5 Reputation-Based Economic Security
 
 **Revolutionary No-Staking Model:**
 
@@ -467,7 +491,7 @@ Reputation System Benefits:
 └── Energy Efficient: Behavior-based trust vs computational proof
 
 Reputation Score Mechanics:
-├── Initial Score: 70 points (neutral start)
+├── Initial Score: 50 points (neutral start)
 ├── Range: 0-100 points
 ├── Success Bonus: +1 per successful ping
 ├── Failure Penalty: -1 per missed ping (NOT -2)
@@ -506,7 +530,7 @@ Restoration Features:
 └── Grace period: 24 hours before penalties begin
 ```
 
-## 7.6 Ping-Based Participation System
+### 7.6 Ping-Based Participation System
 
 **Network-Initiated Ping Architecture:**
 
@@ -527,6 +551,11 @@ Ping Distribution System:
 ├── Multiple Device Support: Up to 3 devices per wallet
 └── Push Notifications: 5-minute advance warning
 
+Response Requirements by Node Type:
+├── Light Nodes: 100% response rate (binary)
+├── Full Nodes: 80% success rate minimum
+└── Super Nodes: 90% success rate minimum
+
 Mobile Recovery Features:
 ├── Offline <24h: Reputation preserved
 ├── Offline 24h-365d: FREE restoration (7-day quarantine at 25 reputation)
@@ -536,7 +565,7 @@ Mobile Recovery Features:
 └── Quarantine Period: No rewards until reputation >40
 ```
 
-## 7.7 Dynamic Fee System
+### 7.7 Dynamic Fee System
 
 **Transaction Fee Structure:**
 
@@ -560,7 +589,7 @@ Smart Contract Fees:
 └── Storage Operations: Per-byte pricing
 ```
 
-## 7.8 Batch Operations Economics
+### 7.8 Batch Operations Economics
 
 **Cost Optimization Through Batching:**
 
@@ -578,71 +607,7 @@ Economic Benefits:
 └── User Experience: Simplified management
 ```
 
-## 7.9 Long-Term Economic Sustainability
-
-**100-Year Economic Projection with Sharp Drop:**
-
-```
-Sharp Drop Model Benefits (vs Traditional Halving):
-├── Year 20: 15,318 QNC/4h (last standard halving)
-├── Year 24: 1,531 QNC/4h (after ÷10 sharp drop)
-├── Year 40: 191 QNC/4h (sustainable rewards)
-├── Year 60: 47 QNC/4h (continued incentives)
-├── Year 80: 11 QNC/4h (perpetual rewards)
-└── Year 100: 2.9 QNC/4h (never reaches zero)
-
-Economic Impact:
-├── Total Saved: 107M QNC over century
-├── Inflation Control: Prevents late-stage hyperinflation
-├── Perpetual Incentives: Ensures eternal network security
-└── Fair Distribution: More rewards for future participants
-```
-
-**Network Growth Economic Effects:**
-
-```
-Early Stage (0-100K nodes):
-├── High individual rewards from Pool #1
-├── 0.5x activation cost multiplier (discount)
-├── Rapid Pool #3 accumulation
-└── Strong early adopter incentives
-
-Growth Stage (100K-1M nodes):
-├── Balanced reward distribution
-├── 1.0x standard activation pricing
-├── Mature Pool #3 redistribution
-└── Optimal network effects
-
-Scale Stage (1M+ nodes):
-├── Massive Pool #3 benefits
-├── 2.0-3.0x activation premiums
-├── Transaction fee dominance (Pool #2)
-└── Self-sustaining economy
-```
-
-**Reward Distribution Examples:**
-
-```
-Conservative Scenario (100K nodes, Year 1):
-├── Pool #1 per node: ~2,141 QNC/year
-├── Pool #2 per node: ~50 QNC/year (low activity)
-├── Pool #3 per node: ~100 QNC/year (growing)
-└── Total per node: ~2,291 QNC/year
-
-Moderate Scenario (1M nodes, Year 5):
-├── Pool #1 per node: ~122 QNC/year (post-halving)
-├── Pool #2 per node: ~500 QNC/year (medium activity)
-├── Pool #3 per node: ~1,000 QNC/year (mature)
-└── Total per node: ~1,622 QNC/year
-
-Aggressive Scenario (10M nodes, Year 10):
-├── Pool #1 per node: ~6 QNC/year (reduced emission)
-├── Pool #2 per node: ~2,000 QNC/year (high activity)
-├── Pool #3 per node: ~5,000 QNC/year (dominant)
-└── Total per node: ~7,006 QNC/year
-```
-
-## 7.10 Node Activation Process
+### 7.9 Node Activation Process
 
 **Phase 1 - Browser Extension Activation:**
 
@@ -668,14 +633,14 @@ Aggressive Scenario (10M nodes, Year 10):
 6. Begin earning from all three reward pools
 ```
 
-## 7.11 Economic Testing and Validation
+### 7.10 Economic Testing and Validation
 
 **Production Readiness Metrics:**
 
 ```
 Testing Results (June 2025):
 ├── Nodes Tested: 104 successfully activated
-├── QNC Distributed: 370,863.32 total
+├── QNC Distributed: 741,726.64 total (adjusted for new emission)
 ├── 1DEV Burned: 156,000 tokens
 ├── Phase Transition: Successful at 95% burn
 ├── Scalability: Validated to 100,000+ nodes
@@ -690,7 +655,7 @@ Attack Resistance Validation:
 └── Economic Manipulation: PASSED (Pool #3 design)
 ```
 
-## 7.12 Regulatory Compliance Framework
+### 7.11 Regulatory Compliance Framework
 
 **Legal Protection Structure:**
 
@@ -700,7 +665,7 @@ Classification: Experimental Research Network
 ├── No investment returns promised
 ├── Utility token only (not security)
 ├── Open source transparent development
-├── Small-scale research
+├── Small-scale research (<$10k funding)
 └── Clear risk disclosures provided
 
 Participant Agreement:
@@ -711,7 +676,7 @@ Participant Agreement:
 └── Full personal responsibility
 ```
 
-## 7.13 Economic Security and Attack Resistance
+### 7.12 Economic Security and Attack Resistance
 
 **Attack Prevention Mechanisms:**
 
@@ -741,7 +706,18 @@ Economic Manipulation Defense:
 └── Deterministic reward calculations
 ```
 
-## 7.14 Phase Transition Economics
+**Rate Limiting Economics:**
+
+```
+Token Bucket System:
+├── Capacity: 30 requests per minute
+├── Violation penalty: -10 reputation points
+├── Recovery: 1 token per 2 seconds
+├── DDoS protection: Automatic at network level
+└── Economic impact: Prevents spam while allowing legitimate use
+```
+
+### 7.13 Phase Transition Economics
 
 **Transition Triggers:**
 
@@ -750,6 +726,20 @@ Primary Trigger: 90% of 1DEV supply burned (900M tokens)
 Secondary Trigger: 5 years from genesis block
 Activation: Whichever occurs first
 
+Transition Process:
+1. Trigger condition met → 30-day warning period
+2. QNC token activation on mainnet
+3. Pool #3 system launches
+4. Phase 1 nodes receive migration window
+5. Browser extension updates automatically
+6. Full QNC economy becomes active
+
+Economic Continuity:
+├── All Phase 1 nodes retain activation status
+├── Reputation scores carry over
+├── Reward accumulation continues uninterrupted
+├── No reactivation required for existing nodes
+└── Smooth transition guaranteed
 ```
 
 ---
