@@ -342,7 +342,7 @@ Ping architecture:
 - **Testnet address**: `62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ` (devnet)
 - **Burn contract**: `D7g7mkL8o1YEex6ZgETJEQyyHV7uuUMvV3Fy3u83igJ7` (devnet)
 - **Burn address**: `1nc1nerator11111111111111111111111111111111`
-- **Mainnet address**: `pump` (Mainnet)
+- **Mainnet address**: `4R3DPW4BY97kJRfv8J5wgTtbDpoXpRv92W957tXMpump` (Mainnet)
 - **Burn contract**: `` (Mainnet)
 
 **Phase 2: QNC Token (NATIVE QNet token):**
