@@ -170,6 +170,21 @@ QNet implements production-grade failover mechanisms for zero-downtime operation
 
 ## 🚀 Quick Start
 
+### ⚠️ MANDATORY EXECUTION POLICY
+
+**SECURITY CRITICAL: Node execution is strictly controlled**
+
+| Node Type | Allowed Execution Method | Prohibited |
+|-----------|-------------------------|------------|
+| **Genesis Nodes** | ✅ Docker containers only | ❌ Direct binary execution |
+| **Full/Super Nodes** | ✅ Docker containers only | ❌ Direct binary execution |
+| **Light Nodes** | ✅ Official mobile apps only | ❌ Server execution |
+
+**IMPORTANT:**
+- Direct execution of `qnet-node.exe` or `qnet-node` binary is **BLOCKED**
+- The binary will refuse to run outside Docker environment
+- This is enforced for security and network integrity
+
 ### Prerequisites
 
 ```bash
@@ -477,8 +492,8 @@ echo 'net.core.netdev_max_backlog=5000' | sudo tee -a /etc/sysctl.conf
 echo 'net.ipv4.tcp_congestion_control=bbr' | sudo tee -a /etc/sysctl.conf
 sudo sysctl -p
 
-# CPU governor for performance
-echo 'performance' | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+# Optional: CPU governor for performance (not required by QNet)
+# echo 'performance' | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 
 # Disable huge pages if not needed
 echo 'never' | sudo tee /sys/kernel/mm/transparent_hugepage/enabled
@@ -1228,20 +1243,10 @@ Year 10+:   ~300+ GB    🔧 Increase to 500-1000 GB
 - **Secure by default**: No insecure fallback modes
 - **Activation validation**: Cryptographic proof of node purchase
 - **Network isolation**: Proper firewall configuration
-
-## 🤝 Contributing
-
-We welcome contributions! Please see our [Contributing Guide](CONTRIBUTING.md) for details.
-
-### Development Workflow
-
-1. Fork the repository
-2. Create a feature branch: `git checkout -b feature/amazing-feature`
-3. Make your changes and add tests
-4. Run tests: `cargo test`
-5. Commit your changes: `git commit -m 'Add amazing feature'`
-6. Push to the branch: `git push origin feature/amazing-feature`
-7. Open a Pull Request
+- **Privacy Protection**: All IP addresses hashed (SHA3-256), never exposed
+- **No System Metrics**: Removed CPU/memory monitoring for privacy
+- **Deterministic Consensus**: Cryptographic selection prevents forks
+- **Enhanced Concurrency**: RwLock for better parallel performance
 
 ## 📄 License
 

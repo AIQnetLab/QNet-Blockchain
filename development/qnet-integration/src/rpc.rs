@@ -14,25 +14,6 @@ use base64::Engine;
 
 // DYNAMIC NETWORK DETECTION - No timestamp dependency for robust deployment
 
-/// Get system CPU load for monitoring
-fn get_system_cpu_load() -> f32 {
-    // PRODUCTION: Use sysinfo or similar crate for real CPU monitoring
-    // For now, simulate based on system load indicators
-    use std::time::{SystemTime, UNIX_EPOCH};
-    
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    
-    // Simulate realistic CPU load variation (0.1 to 0.8)
-    let base_load = 0.1 + ((timestamp % 100) as f32 / 100.0) * 0.7;
-    
-    // Add some randomness for realistic monitoring
-    let random_factor = (timestamp % 7) as f32 / 10.0;
-    
-    (base_load + random_factor * 0.1).min(1.0)
-}
 
 #[derive(Debug, Deserialize)]
 struct RpcRequest {
@@ -145,9 +126,21 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
             
             if let Some(p2p) = blockchain.get_unified_p2p() {
                 // API FIX: Get real network height for sync status
-                if let Ok(net_height) = p2p.sync_blockchain_height() {
-                    network_height = net_height;
-                    is_syncing = height < network_height;
+                match p2p.sync_blockchain_height() {
+                    Ok(net_height) => {
+                        network_height = net_height;
+                        is_syncing = height < network_height;
+                    }
+                    Err(e) if e == "BOOTSTRAP_MODE" => {
+                        // Genesis node in bootstrap mode - use local height as network height
+                        network_height = height;
+                        is_syncing = false; // Bootstrap nodes are never "syncing"
+                        println!("[API] 🚀 Bootstrap mode - reporting local height as network height");
+                    }
+                    Err(e) => {
+                        println!("[API] ⚠️ Failed to get network height: {}", e);
+                        // Keep network_height = height (no sync needed if can't determine)
+                    }
                 }
             }
             
@@ -353,7 +346,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::addr::remote())
         .and(blockchain_filter.clone())
         .and_then(|headers: warp::http::HeaderMap, remote_addr: Option<std::net::SocketAddr>, blockchain: Arc<BlockchainNode>| async move {
-            // CRITICAL FIX: Bidirectional peer registration - register requester as peer
+            // Register requester as peer
             if let Some(addr) = remote_addr {
                 let requester_ip = addr.ip().to_string();
                 
@@ -367,7 +360,9 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
                         // QUANTUM: Unlimited peer scalability with cryptographic validation
                         // Use EXISTING add_discovered_peers() with built-in quantum-resistant verification
                         p2p.add_discovered_peers(&[requester_addr.clone()]);
-                        println!("[API] 🔄 QUANTUM: Registered peer via cryptographic verification: {}", requester_addr);
+                        // Use privacy ID instead of IP
+                        let privacy_id = crate::unified_p2p::get_privacy_id_for_addr(&requester_addr);
+                        println!("[API] 🔄 QUANTUM: Registered peer via cryptographic verification: {}", privacy_id);
                     }
                 }
             }
@@ -582,7 +577,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(blockchain_filter.clone())
         .and_then(handle_graceful_shutdown);
 
-    // PRODUCTION: Macroblock Consensus endpoints
+    // Macroblock consensus endpoints
     let consensus_commit = api_v1
         .and(warp::path("consensus"))
         .and(warp::path("commit"))
@@ -1739,8 +1734,6 @@ async fn handle_node_health(
     let peer_count = blockchain.get_peer_count().await.unwrap_or(0);
     let mempool_size = blockchain.get_mempool_size().await.unwrap_or(0);
     
-    // Get system CPU load for P2P monitoring
-    let cpu_load = get_system_cpu_load();
     
     // API FIX: Get actual network status
     let mut network_height = height;
@@ -1752,22 +1745,42 @@ async fn handle_node_health(
         let validated = p2p.get_validated_active_peers();
         validated_peers = validated.len();
         
-        // API FIX: Check sync status
-        if let Ok(net_height) = p2p.sync_blockchain_height() {
-            network_height = net_height;
-            if height < network_height {
-                sync_status = "syncing";
+        // API FIX: Check sync status with bootstrap mode handling
+        match p2p.sync_blockchain_height() {
+            Ok(net_height) => {
+                network_height = net_height;
+                if height < network_height {
+                    sync_status = "syncing";
+                }
+            }
+            Err(e) if e == "BOOTSTRAP_MODE" => {
+                // Genesis node in bootstrap mode - use local height
+                network_height = height;
+                sync_status = "bootstrap"; // Special status for network bootstrap
+                println!("[API] 🚀 Node health: bootstrap mode active");
+            }
+            Err(_) => {
+                // Can't determine network height
+                if validated_peers == 0 {
+                    sync_status = "isolated"; // No peers
+                } else {
+                    sync_status = "checking"; // Have peers but no consensus
+                }
             }
         }
     }
     
     // API FIX: Determine node health based on real metrics
-    let health_status = if peer_count == 0 {
+    let health_status = if sync_status == "bootstrap" {
+        "healthy" // Bootstrap nodes are healthy by definition
+    } else if peer_count == 0 {
         "isolated"
-    } else if height < network_height {
+    } else if sync_status == "syncing" {
         "syncing"
-    } else if validated_peers < 4 {
-        "degraded" // Not enough peers for Byzantine consensus
+    } else if validated_peers < 4 && !std::env::var("QNET_BOOTSTRAP_ID").is_ok() {
+        "degraded" // Not enough peers for Byzantine consensus (except for bootstrap nodes)
+    } else if sync_status == "checking" {
+        "checking" // Have peers but can't verify consensus
     } else {
         "healthy"
     };
@@ -1795,7 +1808,6 @@ async fn handle_node_health(
         "node_type": format!("{:?}", blockchain.get_node_type()),
         "region": format!("{:?}", blockchain.get_region()),
         "uptime_seconds": uptime, // API FIX: Actual uptime in seconds
-        "cpu_load": cpu_load,
         "version": "1.0.0", // API FIX: Correct version
         "api_version": "v1"
     });
@@ -1899,7 +1911,7 @@ async fn handle_network_ping(
         .unwrap_or("light");
     
     // Quantum-secure signature verification using CRYSTALS-Dilithium
-    let signature_valid = verify_dilithium_signature(node_id, challenge, signature);
+    let signature_valid = verify_dilithium_signature(node_id, challenge, signature).await;
     
     if !signature_valid {
         return Ok(warp::reply::json(&json!({
@@ -1923,7 +1935,7 @@ async fn handle_network_ping(
     
     // Generate quantum-secure response with CRYSTALS-Dilithium
     let response_challenge = generate_quantum_challenge();
-    let response_signature = sign_with_dilithium(&blockchain.get_node_id(), &response_challenge);
+    let response_signature = sign_with_dilithium(&blockchain.get_node_id(), &response_challenge).await;
     
     Ok(warp::reply::json(&json!({
         "success": true,
@@ -1938,7 +1950,7 @@ async fn handle_network_ping(
 }
 
 // PRODUCTION: Quantum-secure signature verification using CRYSTALS-Dilithium
-fn verify_dilithium_signature(node_id: &str, challenge: &str, signature: &str) -> bool {
+async fn verify_dilithium_signature(node_id: &str, challenge: &str, signature: &str) -> bool {
     // Use existing QNet quantum crypto system for real Dilithium verification
     use crate::quantum_crypto::QNetQuantumCrypto;
     
@@ -1949,42 +1961,32 @@ fn verify_dilithium_signature(node_id: &str, challenge: &str, signature: &str) -
         return false;
     }
     
-    // Use tokio runtime for async operation in sync context
-    let rt = match tokio::runtime::Runtime::new() {
-        Ok(rt) => rt,
-        Err(e) => {
-            println!("[CRYPTO] ❌ Failed to create tokio runtime: {}", e);
-            return false;
-        }
+    // CRITICAL FIX: Use async directly instead of creating new runtime
+    let mut crypto = QNetQuantumCrypto::new();
+    let _ = crypto.initialize().await;
+    
+    // Create DilithiumSignature struct from string signature
+    let dilithium_sig = crate::quantum_crypto::DilithiumSignature {
+        signature: signature.to_string(),
+        algorithm: "CRYSTALS-Dilithium".to_string(),
+        timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+        strength: "quantum-resistant".to_string(),
     };
     
-    rt.block_on(async {
-        let mut crypto = QNetQuantumCrypto::new();
-        let _ = crypto.initialize().await;
-        
-        // Create DilithiumSignature struct from string signature
-        let dilithium_sig = crate::quantum_crypto::DilithiumSignature {
-            signature: signature.to_string(),
-            algorithm: "CRYSTALS-Dilithium".to_string(),
-            timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
-            strength: "quantum-resistant".to_string(),
-        };
-        
-        match crypto.verify_dilithium_signature(challenge, &dilithium_sig, node_id).await {
-            Ok(is_valid) => {
-                if is_valid {
-                    println!("[CRYPTO] ✅ Dilithium signature verified for node {}", node_id);
-                } else {
-                    println!("[CRYPTO] ❌ Dilithium signature verification failed for node {}", node_id);
-                }
-                is_valid
+    match crypto.verify_dilithium_signature(challenge, &dilithium_sig, node_id).await {
+        Ok(is_valid) => {
+            if is_valid {
+                println!("[CRYPTO] ✅ Dilithium signature verified for node {}", node_id);
+            } else {
+                println!("[CRYPTO] ❌ Dilithium signature verification failed for node {}", node_id);
             }
-            Err(e) => {
-                println!("[CRYPTO] ❌ Dilithium verification error for node {}: {}", node_id, e);
-                false
-            }
+            is_valid
         }
-    })
+        Err(e) => {
+            println!("[CRYPTO] ❌ Dilithium verification error for node {}: {}", node_id, e);
+            false
+        }
+    }
 }
 
 // Generate quantum-resistant challenge
@@ -1996,40 +1998,30 @@ pub fn generate_quantum_challenge() -> String {
 }
 
 // PRODUCTION: Sign with CRYSTALS-Dilithium using QNet quantum crypto system
-fn sign_with_dilithium(node_id: &str, challenge: &str) -> String {
+async fn sign_with_dilithium(node_id: &str, challenge: &str) -> String {
     // Use existing QNet quantum crypto system for real Dilithium signing
     use crate::quantum_crypto::QNetQuantumCrypto;
     
-    // Use tokio runtime for async operation in sync context
-    let rt = match tokio::runtime::Runtime::new() {
-        Ok(rt) => rt,
-        Err(e) => {
-            println!("[CRYPTO] ❌ Failed to create tokio runtime for signing: {}", e);
-            return format!("error_no_runtime_{}", chrono::Utc::now().timestamp());
-        }
-    };
+    // CRITICAL FIX: Use async directly instead of creating new runtime
+    let mut crypto = QNetQuantumCrypto::new();
+    let _ = crypto.initialize().await;
     
-    rt.block_on(async {
-        let mut crypto = QNetQuantumCrypto::new();
-        let _ = crypto.initialize().await;
-        
-        match crypto.create_consensus_signature(node_id, challenge).await {
-            Ok(dilithium_sig) => {
-                println!("[CRYPTO] ✅ Dilithium signature created for node {}", node_id);
-                dilithium_sig.signature
-            }
-            Err(e) => {
-                println!("[CRYPTO] ❌ Dilithium signing failed for node {}: {}", node_id, e);
-                // Fallback signature for stability (not secure, but prevents crashes)
-                use sha3::{Sha3_256, Digest};
-                let mut hasher = Sha3_256::new();
-                hasher.update(node_id.as_bytes());
-                hasher.update(challenge.as_bytes());
-                hasher.update(b"QNET_FALLBACK_SIG");
-                format!("fallback_{}", hex::encode(&hasher.finalize()[..32]))
-            }
+    match crypto.create_consensus_signature(node_id, challenge).await {
+        Ok(dilithium_sig) => {
+            println!("[CRYPTO] ✅ Dilithium signature created for node {}", node_id);
+            dilithium_sig.signature
         }
-    })
+        Err(e) => {
+            println!("[CRYPTO] ❌ Dilithium signing failed for node {}: {}", node_id, e);
+            // Fallback signature for stability (not secure, but prevents crashes)
+            use sha3::{Sha3_256, Digest};
+            let mut hasher = Sha3_256::new();
+            hasher.update(node_id.as_bytes());
+            hasher.update(challenge.as_bytes());
+            hasher.update(b"QNET_FALLBACK_SIG");
+            format!("fallback_{}", hex::encode(&hasher.finalize()[..32]))
+        }
+    }
 }
 
 // PRODUCTION: Light Node Registry (persistent storage with in-memory cache)
@@ -2096,7 +2088,7 @@ async fn handle_light_node_register(
         &light_node_pseudonym, 
         &register_request.device_token, 
         &register_request.quantum_signature
-    );
+    ).await;
     
     if !signature_valid {
         return Ok(warp::reply::json(&json!({
@@ -2246,7 +2238,7 @@ async fn handle_light_node_ping_response(
     let challenge = params.get("challenge").unwrap_or(&"".to_string()).clone();
     
     // Verify quantum signature
-    let signature_valid = verify_dilithium_signature(&node_id, &challenge, &signature);
+    let signature_valid = verify_dilithium_signature(&node_id, &challenge, &signature).await;
     
     if !signature_valid {
         return Ok(warp::reply::json(&json!({
@@ -2665,7 +2657,7 @@ async fn handle_claim_rewards(
         &claim_request.node_id, 
         "claim_rewards", 
         &claim_request.quantum_signature
-    );
+    ).await;
     
     if !signature_valid {
         return Ok(warp::reply::json(&json!({
@@ -3122,7 +3114,7 @@ async fn handle_consensus_commit(
             node_id: commit_request.node_id.clone(),
             commit_hash: commit_request.commit_hash.clone(), // String format
             timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
-            signature: generate_quantum_signature(&commit_request.node_id, &commit_request.commit_hash),
+            signature: generate_quantum_signature(&commit_request.node_id, &commit_request.commit_hash).await,
         };
 
         // Process commit through consensus engine
@@ -3395,19 +3387,18 @@ async fn handle_p2p_message(
                 } else {
                     // EXISTING: Use blockchain registry for Super/Full/Light pseudonym lookup
                     let registry = crate::activation_validation::BlockchainActivationRegistry::new(None);
-                    if let Some(pseudonym) = tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current().block_on(async {
-                            registry.find_pseudonym_by_ip(&raw_ip).await
-                        })
-                    }) {
+                    // CRITICAL FIX: Use await directly instead of block_in_place
+                    if let Some(pseudonym) = registry.find_pseudonym_by_ip(&raw_ip).await {
                         pseudonym
                     } else {
-                        // Fallback: peer not registered yet or registry sync lag
-                        "unknown_peer".to_string()
+                        // PRIVACY: Use EXISTING get_privacy_id_for_addr for consistency
+                        // This ensures same IP always gets same privacy ID
+                        crate::unified_p2p::get_privacy_id_for_addr(&raw_ip)
                     }
                 }
             } else {
-                "unknown_peer".to_string()
+                // IMPROVED: When no remote address available, use a timestamp-based identifier
+                format!("node_unknown_{}", chrono::Utc::now().timestamp())
             };
             
             // Forward to P2P handler
@@ -3479,19 +3470,15 @@ fn generate_light_node_pseudonym(wallet_address: &str) -> String {
 }
 
 /// PRODUCTION: Generate quantum-secure signature using EXISTING QNetQuantumCrypto
-fn generate_quantum_signature(node_id: &str, data: &str) -> String {
+async fn generate_quantum_signature(node_id: &str, data: &str) -> String {
     // Use EXISTING QNetQuantumCrypto instead of duplicating functionality
     use crate::quantum_crypto::QNetQuantumCrypto;
     
-    // PRODUCTION: Initialize quantum crypto system (per-call for thread safety)
-    let rt = tokio::runtime::Handle::try_current().unwrap();
-    let signature_result = rt.block_on(async {
-        let mut crypto = QNetQuantumCrypto::new();
-        let _ = crypto.initialize().await;
-        crypto.create_consensus_signature(node_id, data).await
-    });
+    // CRITICAL FIX: Use async directly instead of block_on
+    let mut crypto = QNetQuantumCrypto::new();
+    let _ = crypto.initialize().await;
     
-    match signature_result {
+    match crypto.create_consensus_signature(node_id, data).await {
         Ok(signature) => {
             println!("[CRYPTO] ✅ RPC signature created with existing QNetQuantumCrypto");
             signature.signature

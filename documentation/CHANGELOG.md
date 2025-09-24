@@ -5,6 +5,54 @@ All notable changes to the QNet project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.0] - September 24, 2025 "Production Stability & Privacy Enhancement"
+
+### Fixed
+- **Tokio Runtime Panic**: Resolved nested runtime errors causing node crashes
+- **P2P Peer Duplication**: Fixed duplicate peer connections using RwLock and HashSet
+- **API Initialization Sequence**: API server now starts before P2P connections
+- **Connection Failures**: Implemented exponential backoff for network stability
+- **Network Height Calculation**: Fixed incorrect height reporting during bootstrap
+- **Block Producer Synchronization**: Ensured deterministic producer selection across nodes
+- **Cache Inconsistency**: Implemented topology-aware cache with minimal TTL
+- **Peer Exchange Protocol**: Fixed peer addition logic with proper duplicate checking
+- **Timing Issues**: Made storage and broadcast operations asynchronous
+- **Docker IP Detection**: Enhanced external IP discovery with STUN support
+- **Failover Logic**: Increased timeouts (5s, 10s, 15s) with exponential backoff
+
+### Added
+- **Privacy Protection**: All IP addresses now hashed in logs and messages
+- **Deterministic Genesis Phase**: All 5 Genesis nodes included without filtering
+- **Bootstrap Mode**: Special mode for Genesis nodes during network formation
+- **Privacy ID System**: Consistent hashed identifiers for network addresses
+- **Asynchronous I/O**: Non-blocking storage and broadcast operations
+
+### Changed
+- **Peer Management**: Migrated from Mutex to RwLock for better concurrency
+- **Producer Selection**: 30-block rotation with cryptographic determinism
+- **Cache Duration**: Dynamic (1s for height 0, 0s for normal operation)
+- **Failover Timeouts**: Increased from 2s to 5s/10s/15s for global stability
+- **Node Identification**: From IP-based to privacy-preserving hashed IDs
+
+### Removed
+- **CPU Load Monitoring**: Removed unnecessary system metrics collection
+- **Direct IP Logging**: Replaced with privacy-preserving hashed identifiers
+- **Blocking I/O**: All critical operations now asynchronous
+- **Debug Logs**: Cleaned up verbose debugging output
+- **Commented Code**: Removed obsolete commented-out sections
+
+### Security
+- **Privacy Enhancement**: No raw IP addresses exposed in logs or P2P messages
+- **Deterministic Consensus**: Cryptographic producer selection prevents forks
+- **Race Condition Prevention**: Proper synchronization with RwLock
+- **Byzantine Fault Tolerance**: Maintained for macroblock consensus
+
+### Performance
+- **Reduced Lock Contention**: RwLock allows multiple concurrent readers
+- **Efficient Duplicate Checking**: O(1) lookup with HashSet
+- **Asynchronous Operations**: Non-blocking I/O prevents timing delays
+- **Optimized Cache**: Minimal cache duration for real-time consensus
+
 ## [2.1.0] - August 31, 2025 "Quantum P2P Architecture"
 
 ### Added

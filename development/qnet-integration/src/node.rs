@@ -160,6 +160,9 @@ impl BlockchainNode {
         node_type: NodeType,
         region: Region,
     ) -> Result<Self, QNetError> {
+        // NOTE: Light node server blocking is already implemented in bin/qnet-node.rs (lines 78-83, 173-184)
+        // No need to duplicate the check here
+        
         // Initialize storage
         println!("[Node] 🔍 DEBUG: Initializing storage at '{}'", data_dir);
         let storage = match Storage::new(data_dir) {
@@ -188,8 +191,7 @@ impl BlockchainNode {
         
         let mempool = Arc::new(RwLock::new(qnet_mempool::SimpleMempool::new(mempool_config)));
         
-        // Initialize PRODUCTION Byzantine consensus - CommitRevealConsensus for fault tolerance
-        // CRITICAL FIX: Generate UNIQUE node_id based on Genesis ID or IP address
+        // Generate unique node_id for Byzantine consensus
         let node_id = Self::generate_unique_node_id(node_type).await;
         let consensus_config = qnet_consensus::ConsensusConfig {
             commit_phase_duration: Duration::from_secs(15),    // Faster phases for 1s blocks
@@ -205,8 +207,7 @@ impl BlockchainNode {
         let consensus_engine = qnet_consensus::CommitRevealConsensus::new(node_id.clone(), consensus_config);
         let consensus = Arc::new(RwLock::new(consensus_engine));
         
-        // Initialize validator (disabled for compilation)
-        // let validator = Arc::new(Validator::new());
+        // Validator disabled for now
         
         // Get current height from storage
         println!("[Node] 🔍 DEBUG: Getting chain height from storage...");
@@ -279,6 +280,13 @@ impl BlockchainNode {
         // CRITICAL: Initialize all Genesis node reputations deterministically at startup
         // This prevents race conditions where different nodes see different candidate lists
         Self::initialize_genesis_reputations(&unified_p2p_instance).await;
+        
+        // GENESIS BOOTSTRAP LOGIC:
+        // - 5 Genesis nodes use special codes QNET-BOOT-000X-STRAP or QNET_BOOTSTRAP_ID env var
+        // - They don't require standard activation, they bootstrap the network
+        // - All Genesis nodes MUST run on port 8001
+        // - Regular nodes require standard activation codes QNET-XXXXXX-XXXXXX-XXXXXX
+        // - Light nodes are mobile-only and cannot run on servers
         
         // P2P FIX: Add Genesis bootstrap peers ONLY for Genesis nodes themselves
         // SCALABILITY: Regular nodes (Full/Light) should discover peers via DHT, not direct Genesis connection
@@ -475,8 +483,65 @@ impl BlockchainNode {
         
         *self.is_running.write().await = true;
         
-        // Connect to bootstrap peers for regional clustering
+        // Start API server first to handle peer auth
+        let should_start_api = !matches!(self.node_type, NodeType::Light);
+        
+        if should_start_api {
+            // PRODUCTION: Start SINGLE unified server for both RPC and API (no port conflicts)
+            // All nodes use standard port 8001
+            let unified_port = std::env::var("QNET_API_PORT")
+                .ok()
+                .and_then(|s| s.parse::<u16>().ok())
+                .unwrap_or(8001); // EXISTING: All nodes use standard port 8001
+
+            let node_clone_unified = self.clone();
+            
+            println!("[Node] 🚀 Starting unified RPC+API server on port {} BEFORE P2P", unified_port);
+            tokio::spawn(async move {
+                crate::rpc::start_rpc_server(node_clone_unified, unified_port).await;
+            });
+            
+            // Wait for server readiness  
+            println!("[Node] ⏳ Waiting for unified server to be ready...");
+            // EXISTING: Use same wait time as Genesis coordination (8s for Genesis, 5s for regular)
+            let api_wait_time = if std::env::var("QNET_BOOTSTRAP_ID").is_ok() { 8 } else { 5 };
+            tokio::time::sleep(std::time::Duration::from_secs(api_wait_time)).await;
+            
+            // Health check to ensure API is ready
+            let health_check_url = format!("http://127.0.0.1:{}/api/v1/node/health", unified_port);
+            println!("[Node] 🏥 Checking API health at {}", health_check_url);
+            
+            // Try health check with retries
+            for attempt in 1..=5 {
+                match reqwest::get(&health_check_url).await {
+                    Ok(response) if response.status().is_success() => {
+                        println!("[Node] ✅ API health check passed on attempt {}", attempt);
+                        break;
+                    }
+                    _ => {
+                        if attempt < 5 {
+                            println!("[Node] ⏳ API not ready yet, retrying in 2s (attempt {}/5)", attempt);
+                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        } else {
+                            println!("[Node] ⚠️ API health check failed after 5 attempts, continuing anyway");
+                        }
+                    }
+                }
+            }
+            
+            // Store unified port for external access  
+            std::env::set_var("QNET_CURRENT_RPC_PORT", unified_port.to_string());
+            std::env::set_var("QNET_CURRENT_API_PORT", unified_port.to_string());
+            
+            println!("[Node] 🔌 API server ready on port {}", unified_port);
+            
+            // API FIX: Set node start time for uptime calculation
+            std::env::set_var("QNET_NODE_START_TIME", chrono::Utc::now().timestamp().to_string());
+        }
+        
+        // NOW connect to bootstrap peers AFTER API is ready
         if let Some(unified_p2p) = &self.unified_p2p {
+            println!("[P2P] 🌐 Starting P2P connections AFTER API is ready");
             println!("[DIAGNOSTIC] 🔧 Bootstrap peers count: {}", self.bootstrap_peers.len());
             for (i, peer) in self.bootstrap_peers.iter().enumerate() {
                 println!("[DIAGNOSTIC] 🔧 Bootstrap peer {}: {}", i+1, peer);
@@ -484,8 +549,7 @@ impl BlockchainNode {
             
             unified_p2p.connect_to_bootstrap_peers(&self.bootstrap_peers);
             
-            // CRITICAL FIX: Initial blockchain synchronization before microblock production
-            // This prevents each node from creating its own isolated blockchain
+            // Initial blockchain sync
             println!("[SYNC] ⏳ Waiting for peer connections and blockchain synchronization...");
             
             // EXISTING: Bootstrap peer connections without initial sync delay
@@ -519,89 +583,54 @@ impl BlockchainNode {
             println!("[Node] 🏛️ Byzantine consensus will activate during macroblock rounds only");
         }
         
-        // PRODUCTION: Unified server uses single port for both RPC and API (Genesis nodes standard: 8001)
-        // EXISTING: All Genesis nodes use port 8001 consistently for unified API/RPC
-        let unified_port = std::env::var("QNET_API_PORT")
-            .ok()
-            .and_then(|s| s.parse::<u16>().ok())
-            .unwrap_or_else(|| {
-                // PRODUCTION: Find available port starting from 8001 (Genesis standard)
-                use std::net::TcpListener;
-                for port in 8001..8101 {
-                    if TcpListener::bind(format!("0.0.0.0:{}", port)).is_ok() {
-                        return port;
-                    }
-                }
-                8001 // EXISTING: Genesis fallback port
-            });
-
-        // Start API server ONLY for Full and Super nodes
-        // Light nodes are mobile-only and don't provide API
-        let should_start_api = !matches!(self.node_type, NodeType::Light);
+        // MOVED: API initialization moved to beginning of start() method
+        // to ensure it's ready before P2P connections begin
         
-        if should_start_api {
-            // PRODUCTION: Start SINGLE unified server for both RPC and API (no port conflicts)
-            let node_clone_unified = self.clone();
-            
-            println!("[Node] 🚀 Unified RPC+API server starting on port {}", unified_port);
-            tokio::spawn(async move {
-                crate::rpc::start_rpc_server(node_clone_unified, unified_port).await;
-            });
-            
-            // CRITICAL FIX: Wait for unified server to be ready before P2P discovery  
-            println!("[Node] ⏳ Waiting for unified server to be ready...");
-            // EXISTING: Use same wait time as Genesis coordination (8s for Genesis, 5s for regular)
-            let api_wait_time = if std::env::var("QNET_BOOTSTRAP_ID").is_ok() { 8 } else { 5 };
-            tokio::time::sleep(std::time::Duration::from_secs(api_wait_time)).await;
-            
-            // Store unified port for external access  
-            std::env::set_var("QNET_CURRENT_RPC_PORT", unified_port.to_string());
-            std::env::set_var("QNET_CURRENT_API_PORT", unified_port.to_string());
-            
-            println!("[Node] 🔌 Unified RPC+API server: port {}", unified_port);
-            println!("[Node] 🌐 All endpoints available on single port");
-            
-            // API FIX: Set node start time for uptime calculation
-            std::env::set_var("QNET_NODE_START_TIME", chrono::Utc::now().timestamp().to_string());
-            
-            // EXISTING: Now sync blockchain height AFTER API server is ready
-            if let Some(unified_p2p) = &self.unified_p2p {
-                match unified_p2p.sync_blockchain_height() {
-                    Ok(network_height) => {
-                        let current_height = *self.height.read().await;
-                        println!("[SYNC] 📊 Current height: {}, Network height: {}", current_height, network_height);
+        // EXISTING: Now sync blockchain height AFTER API server is ready
+        if let Some(unified_p2p) = &self.unified_p2p {
+            match unified_p2p.sync_blockchain_height() {
+                Ok(network_height) => {
+                    let current_height = *self.height.read().await;
+                    println!("[SYNC] 📊 Current height: {}, Network height: {}", current_height, network_height);
+                    
+                    if network_height > current_height {
+                        println!("[SYNC] 📥 Downloading {} missing blocks from network...", network_height - current_height);
+                        unified_p2p.download_missing_microblocks(
+                            &*self.storage,
+                            current_height,
+                            network_height
+                        ).await;
                         
-                        if network_height > current_height {
-                            println!("[SYNC] 📥 Downloading {} missing blocks from network...", network_height - current_height);
-                            unified_p2p.download_missing_microblocks(
-                                &*self.storage,
-                                current_height,
-                                network_height
-                            ).await;
-                            
-                            // Update local height to match network
-                            *self.height.write().await = network_height;
-                            println!("[SYNC] ✅ Synchronized to network height: {}", network_height);
-                        } else {
-                            println!("[SYNC] ✅ Node is synchronized with network");
-                        }
-                    },
-                    Err(e) => {
-                        println!("[SYNC] ⚠️ Could not sync with network (Genesis mode): {}", e);
+                        // Update local height to match network
+                        *self.height.write().await = network_height;
+                        println!("[SYNC] ✅ Synchronized to network height: {}", network_height);
+                    } else {
+                        println!("[SYNC] ✅ Node is synchronized with network");
                     }
+                },
+                Err(e) if e == "BOOTSTRAP_MODE" => {
+                    // Genesis node in bootstrap mode - no sync needed
+                    let current_height = *self.height.read().await;
+                    println!("[SYNC] 🚀 Bootstrap mode active - using local height {} as network consensus", current_height);
+                },
+                Err(e) => {
+                    println!("[SYNC] ⚠️ Could not sync with network: {}", e);
                 }
             }
-        } else {
+        }
+        
+        if self.node_type == NodeType::Light {
             // Light nodes: Use unified server too (for consistency)
             let node_clone_light = self.clone();
+            let light_port = self.p2p_port; // Use node's p2p_port
             
             tokio::spawn(async move {
-                crate::rpc::start_rpc_server(node_clone_light, unified_port).await;
+                crate::rpc::start_rpc_server(node_clone_light, light_port).await;
             });
             
-            std::env::set_var("QNET_CURRENT_RPC_PORT", unified_port.to_string());
+            std::env::set_var("QNET_CURRENT_RPC_PORT", light_port.to_string());
             
-            println!("[Node] 🔌 Unified server: port {} (Light node)", unified_port);
+            println!("[Node] 🔌 Unified server: port {} (Light node)", light_port);
             println!("[Node] 📱 Light node: Mobile-optimized endpoints");
         }
         
@@ -749,11 +778,12 @@ impl BlockchainNode {
                 static FAST_SYNC_IN_PROGRESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
                 
                 if let Some(p2p) = &unified_p2p {
-                    if let Ok(network_height) = p2p.sync_blockchain_height() {
-                        let height_difference = network_height.saturating_sub(microblock_height);
-                        
-                        // If we're more than 50 blocks behind, enter fast sync mode
-                        if height_difference > 50 {
+                    match p2p.sync_blockchain_height() {
+                        Ok(network_height) => {
+                            let height_difference = network_height.saturating_sub(microblock_height);
+                            
+                            // If we're more than 50 blocks behind, enter fast sync mode
+                            if height_difference > 50 {
                             // RACE CONDITION FIX: Only start fast sync if not already running
                             if !FAST_SYNC_IN_PROGRESS.swap(true, std::sync::atomic::Ordering::SeqCst) {
                                 println!("[SYNC] ⚡ FAST SYNC MODE: {} blocks behind, catching up...", height_difference);
@@ -780,6 +810,14 @@ impl BlockchainNode {
                             // Skip this production cycle to focus on syncing
                             tokio::time::sleep(Duration::from_millis(100)).await;
                             continue;
+                        }
+                        }
+                        Err(e) if e == "BOOTSTRAP_MODE" => {
+                            // Bootstrap mode - continue with local block production
+                            // No fast sync needed as we're bootstrapping the network
+                        }
+                        Err(_) => {
+                            // Can't determine network height - continue with local production
                         }
                     }
                 }
@@ -1075,30 +1113,43 @@ impl BlockchainNode {
                     // Create EfficientMicroBlock from full microblock
                     let efficient_microblock = qnet_state::EfficientMicroBlock::from_microblock(&microblock);
                     
-                    // Save using new efficient system with separate transaction pool
-                    match storage.save_efficient_microblock(microblock_height, &efficient_microblock, &txs) {
-                        Ok(_) => {
-                            println!("[Storage] ✅ Efficient microblock {} saved with optimized format", microblock_height);
-                        },
-                        Err(e) => {
-                            println!("[Storage] ⚠️ Efficient storage failed, falling back to legacy: {}", e);
-                            
-                            // Fallback to old method if efficient storage fails
-                    let microblock_data = if compression_enabled {
-                        Self::compress_microblock_data(&microblock).unwrap_or_else(|_| {
-                            bincode::serialize(&microblock).unwrap_or_default()
-                        })
-                    } else {
-                        bincode::serialize(&microblock).unwrap_or_default()
-                    };
+                    // QUANTUM: Always use async storage for consistent timing
+                    // Both efficient and legacy storage are non-blocking
+                    let storage_clone = storage.clone();
+                    let efficient_block = efficient_microblock.clone();
+                    let txs_clone = txs.clone(); 
+                    let microblock_clone = microblock.clone();
+                    let height_for_storage = microblock_height;
+                    let compression = compression_enabled;
                     
-                    if let Err(e) = storage.save_microblock(microblock_height, &microblock_data) {
-                                println!("[Microblock] ❌ Both efficient and legacy storage failed: {}", e);
+                    tokio::spawn(async move {
+                        // Try efficient storage first
+                        match storage_clone.save_efficient_microblock(height_for_storage, &efficient_block, &txs_clone) {
+                            Ok(_) => {
+                                println!("[Storage] ✅ Efficient microblock {} saved asynchronously", height_for_storage);
+                            },
+                            Err(e) => {
+                                println!("[Storage] ⚠️ Efficient storage failed, falling back to legacy: {}", e);
+                                
+                                // Fallback to legacy method
+                                let microblock_data = if compression {
+                                    Self::compress_microblock_data(&microblock_clone).unwrap_or_else(|_| {
+                                        bincode::serialize(&microblock_clone).unwrap_or_default()
+                                    })
+                                } else {
+                                    bincode::serialize(&microblock_clone).unwrap_or_default()
+                                };
+                                
+                                if let Err(e) = storage_clone.save_microblock(height_for_storage, &microblock_data) {
+                                    println!("[Microblock] ❌ Storage save failed for block #{}: {}", height_for_storage, e);
+                                } else {
+                                    println!("[Storage] 💾 Block #{} saved (legacy format)", height_for_storage);
+                                }
                             }
                         }
-                    }
+                    });
                     
-                    // Broadcast to network (full microblock for compatibility)
+                    // Broadcast to network asynchronously for quantum-speed propagation
                     if let Some(p2p) = &unified_p2p {
                         let peer_count = p2p.get_peer_count();
                         let broadcast_data = if compression_enabled {
@@ -1110,9 +1161,15 @@ impl BlockchainNode {
                         };
                         
                         let broadcast_size = broadcast_data.len();
-                        let _ = p2p.broadcast_block(microblock.height, broadcast_data);
-                        println!("[P2P] 📡 Broadcast microblock #{} to {} peers | Size: {} bytes", 
-                                 microblock.height, peer_count, broadcast_size);
+                        let p2p_clone = p2p.clone();
+                        let height_for_broadcast = microblock.height;
+                        
+                        // Non-blocking broadcast for real-time performance
+                        tokio::spawn(async move {
+                            let _ = p2p_clone.broadcast_block(height_for_broadcast, broadcast_data);
+                            println!("[P2P] 📡 Broadcast microblock #{} to {} peers | Size: {} bytes (async)", 
+                                     height_for_broadcast, peer_count, broadcast_size);
+                        });
                     } else {
                         println!("[P2P] ⚠️ P2P system not available - cannot broadcast block #{}", microblock.height);
                     }
@@ -1560,8 +1617,7 @@ impl BlockchainNode {
                 if let Some((cached_producer, cached_candidates)) = cache.get(&leadership_round) {
                     // EXISTING: Log only at rotation boundaries for performance
                     if current_height % rotation_interval == 0 {
-                        println!("[DEBUG] 🔒 CACHED ROUND: Using cached producer selection for round {}", leadership_round);
-                        println!("[DEBUG] 🎯 Cached producer: {} ({} candidates)", cached_producer, cached_candidates.len());
+                        // Using cached producer selection
                         println!("[MICROBLOCK] 🎯 Producer: {} (round: {}, CACHED SELECTION, next rotation: block {})", 
                                  cached_producer, leadership_round, (leadership_round + 1) * rotation_interval);
                     }
@@ -1570,7 +1626,7 @@ impl BlockchainNode {
             }
             
             // Cache miss - need to calculate candidates (only once per 30-block period)
-            println!("[DEBUG] 🔄 CACHE MISS: Calculating producer for new round {}", leadership_round);
+            // Cache miss - calculating new producer
             
             // PRODUCTION: Direct calculation for consensus determinism (THREAD-SAFE)
             // QNet requires consistent candidate lists across all nodes for Byzantine safety
@@ -1579,8 +1635,7 @@ impl BlockchainNode {
             
             if candidates.is_empty() {
                 println!("[MICROBLOCK] ⚠️ No qualified candidates (≥70% reputation, Full/Super only) - using self");
-                println!("[DEBUG] 🚨 CRITICAL: All nodes will become producers - network fork risk!");
-                println!("[DEBUG] 💡 Check P2P connectivity, peer discovery, and reputation system");
+                // Warning: No qualified candidates - network may fork
                 return own_node_id.to_string();
             }
             
@@ -1621,8 +1676,7 @@ impl BlockchainNode {
             
             // PRODUCTION: Log producer selection info ONLY at rotation boundaries (every 30 blocks) for performance
             if current_height % rotation_interval == 0 {
-                println!("[DEBUG] 🔒 NEW ROUND: Cryptographic producer selection for round {}", leadership_round);
-                println!("[DEBUG] 🎯 Selected producer: {} (index {}/{} candidates)", selected_producer, selection_index, candidates.len());
+                // New round - cryptographic producer selection
                 println!("[MICROBLOCK] 🎯 Producer: {} (round: {}, CRYPTOGRAPHIC SELECTION, next rotation: block {})", 
                          selected_producer, leadership_round, (leadership_round + 1) * rotation_interval);
             }
@@ -1631,8 +1685,7 @@ impl BlockchainNode {
         } else {
             // Solo mode - no P2P peers
             println!("[MICROBLOCK] 🏠 Solo mode - self production");
-            println!("[DEBUG] 🚨 CRITICAL: P2P system not available - network fork risk!");
-            println!("[DEBUG] 💡 Check unified_p2p initialization and P2P network setup");
+            // Warning: P2P not available - running in solo mode
             own_node_id.to_string()
         }
     }
@@ -1948,9 +2001,16 @@ impl BlockchainNode {
                          if is_genesis { "Genesis" } else { "Normal" });
                 is_genesis
             },
+            Err(e) if e == "BOOTSTRAP_MODE" => {
+                // Bootstrap mode means we're in Genesis phase by definition
+                if let Ok(mut cache) = phase_cache.lock() {
+                    *cache = (true, 0, current_time);
+                }
+                println!("[PHASE] Bootstrap mode active → Genesis phase");
+                true // Bootstrap mode = Genesis phase
+            },
             Err(_) => {
-                // Fallback: if sync fails, assume Genesis phase
-                // Update cache with fallback
+                // Other errors: assume Genesis phase for safety
                 if let Ok(mut cache) = phase_cache.lock() {
                     *cache = (true, 0, current_time);
                 }
@@ -2008,12 +2068,9 @@ impl BlockchainNode {
             .map(|(i, ip)| (format!("genesis_node_{:03}", i + 1), ip.clone()))
             .collect();
         
-        // CRITICAL FIX: For Genesis phase, use STATIC deterministic candidate list for consensus consistency
-        // Dynamic validated peers cause different candidate lists on different nodes → producer selection chaos
-        // EXISTING: Filter using STATIC Genesis connectivity check for deterministic results  
-        let working_genesis_ips = crate::unified_p2p::SimplifiedP2P::filter_working_genesis_nodes_static(
-            genesis_ips.clone()
-        );
+        // CRITICAL FIX: For Genesis phase, use ALL Genesis nodes in DETERMINISTIC order
+        // Do NOT filter by connectivity - this causes different candidate lists on different nodes
+        // Instead, all 5 Genesis nodes are ALWAYS candidates (deterministic consensus)
         
         // CRITICAL: Add own node first if it can participate (deterministic ordering) 
         if can_participate_microblock {
@@ -2022,10 +2079,10 @@ impl BlockchainNode {
             all_qualified.push((own_node_id.to_string(), GENESIS_STATIC_REPUTATION));
         }
         
-        // PRODUCTION: Add ONLY working Genesis nodes in DETERMINISTIC order for consensus consistency
-        // This ensures ALL nodes have IDENTICAL candidate lists regardless of P2P sync timing
-        for (node_id, ip) in static_genesis_nodes {
-            if working_genesis_ips.contains(&ip) && node_id != *own_node_id {
+        // PRODUCTION: Add ALL Genesis nodes in DETERMINISTIC order for consensus consistency
+        // This ensures ALL nodes have IDENTICAL candidate lists regardless of connectivity
+        for (node_id, _ip) in static_genesis_nodes {
+            if node_id != *own_node_id {
                 // EXISTING: Use deterministic Genesis reputation for consistent consensus
                 const GENESIS_DETERMINISTIC_REPUTATION: f64 = 0.90; // EXISTING: Same value as above
                 
@@ -2197,7 +2254,7 @@ impl BlockchainNode {
         println!("  ├── Simple sampling complete: {} validators selected from {} qualified (natural order preserved)", 
                  selected.len(), all_qualified.len());
         selected
-        }
+    }
     
     /// CRITICAL: Deterministic selection of consensus initiator (only ONE node triggers consensus)
     async fn should_initiate_consensus(
@@ -3195,7 +3252,7 @@ impl BlockchainNode {
                     0
                 };
                 
-                println!("[DEBUG] peer_count() called, returning: {}", peer_count);
+                // Returning cached peer count
                 
                 if tick % 30 == 0 {
                     let current_height = *height.read().await;
@@ -3748,10 +3805,6 @@ impl BlockchainNode {
         
         // Use centralized ActivationValidator from activation_validation.rs
         // Activation validation integrated into consensus
-        // let validator = crate::activation_validation::ActivationValidator::new();
-        
-        // Check if code is already used
-        // if validator.is_code_used(code).await.unwrap_or(false) {
         //     return Err("Activation code is already in use".to_string());
         // }
         
@@ -4491,19 +4544,25 @@ impl BlockchainNode {
         
         // Method 1: Environment variable (Docker/Kubernetes)
         if let Ok(external_ip) = std::env::var("QNET_EXTERNAL_IP") {
-            println!("[IP] 📝 Using environment IP: {}", external_ip);
+            // PRIVACY: Don't show raw IP in logs
+            let privacy_id = crate::unified_p2p::get_privacy_id_for_addr(&external_ip);
+            println!("[IP] 📝 Using environment IP: {}", privacy_id);
             return Ok(external_ip);
         }
         
         // Method 2: Check common network interfaces (production servers)
         if let Ok(local_ip) = std::env::var("SERVER_IP") {
-            println!("[IP] 🖥️ Using server IP: {}", local_ip);
+            // PRIVACY: Don't show raw IP in logs  
+            let privacy_id = crate::unified_p2p::get_privacy_id_for_addr(&local_ip);
+            println!("[IP] 🖥️ Using server IP: {}", privacy_id);
             return Ok(local_ip);
         }
         
         // Method 3: Try to get IP from network interface
         if let Ok(interface_ip) = Self::get_network_interface_ip().await {
-            println!("[IP] 🔌 Using network interface IP: {}", interface_ip);
+            // PRIVACY: Don't show raw IP in logs
+            let privacy_id = crate::unified_p2p::get_privacy_id_for_addr(&interface_ip);
+            println!("[IP] 🔌 Using network interface IP: {}", privacy_id);
             return Ok(interface_ip);
         }
         

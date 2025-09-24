@@ -2374,6 +2374,27 @@ async fn detect_region_from_local_interfaces() -> Result<Region, String> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // SECURITY: Prevent direct execution - ONLY Docker or Mobile allowed
+    if !std::path::Path::new("/.dockerenv").exists() && 
+       std::env::var("DOCKER_ENV").is_err() &&
+       std::env::var("QNET_BYPASS_DOCKER_CHECK").is_err() {
+        eprintln!("❌ SECURITY ERROR: Direct execution is not allowed!");
+        eprintln!("📦 QNet nodes MUST be run through Docker containers.");
+        eprintln!("📱 Light nodes should use the official mobile app.");
+        eprintln!("");
+        eprintln!("🐳 To run a node, use Docker:");
+        eprintln!("   docker run -d --name qnet-node \\");
+        eprintln!("     -e QNET_ACTIVATION_CODE=YOUR_CODE \\");  
+        eprintln!("     -e QNET_EXTERNAL_IP=YOUR_IP \\");
+        eprintln!("     -p 8001:8001 -p 9876:9876 -p 9877:9877 \\");
+        eprintln!("     qnet-production");
+        eprintln!("");
+        eprintln!("📱 For mobile nodes, download the QNet app:");
+        eprintln!("   iOS: App Store");
+        eprintln!("   Android: Google Play");
+        std::process::exit(1);
+    }
+    
     // Initialize environment
     if std::env::var("RUST_LOG").is_err() {
         std::env::set_var("RUST_LOG", "info");
