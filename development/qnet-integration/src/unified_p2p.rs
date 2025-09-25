@@ -522,33 +522,61 @@ impl SimplifiedP2P {
     /// CRITICAL FIX: Centralized method to add peer with duplicate prevention
     /// Returns true if peer was added, false if already exists
     pub fn add_peer_safe(&self, mut peer_info: PeerInfo) -> bool {
+        // Calculate Kademlia bucket index 
+        peer_info.bucket_index = self.get_bucket_index(&peer_info.id);
+        
+        // Delegate to static version for the actual logic
+        Self::add_peer_safe_static(
+            peer_info,
+            self.node_id.clone(),
+            self.connected_peers.clone(),
+            self.connected_peer_addrs.clone()
+        )
+    }
+    
+    /// STATIC VERSION: Thread-safe peer addition for use in tokio::spawn blocks
+    /// This is the MAIN implementation - add_peer_safe just delegates to this
+    fn add_peer_safe_static(
+        mut peer_info: PeerInfo,
+        node_id: String,
+        connected_peers: Arc<RwLock<Vec<PeerInfo>>>,
+        connected_peer_addrs: Arc<RwLock<HashSet<String>>>
+    ) -> bool {
         // First check if peer address already exists
         {
-            let peer_addrs = self.connected_peer_addrs.read().unwrap();
+            let peer_addrs = connected_peer_addrs.read().unwrap();
             if peer_addrs.contains(&peer_info.addr) {
                 return false; // Peer already exists
             }
         }
         
-        // IMPROVED: Calculate Kademlia DHT fields
+        // Calculate Kademlia DHT fields if missing
         if peer_info.node_id_hash.is_empty() {
             let mut hasher = Sha3_256::new();
             hasher.update(peer_info.id.as_bytes());
             peer_info.node_id_hash = hasher.finalize().to_vec();
         }
-        peer_info.bucket_index = self.get_bucket_index(&peer_info.id);
+        
+        // Calculate bucket index if not set
+        if peer_info.bucket_index == 0 {
+            let mut hasher = Sha3_256::new();
+            hasher.update(node_id.as_bytes());
+            hasher.update(peer_info.id.as_bytes());
+            let hash = hasher.finalize();
+            peer_info.bucket_index = (hash[0] as usize) % KADEMLIA_BITS;
+        }
         
         // Add to both collections atomically
         {
-            let mut peer_addrs = self.connected_peer_addrs.write().unwrap();
-            let mut connected_peers = self.connected_peers.write().unwrap();
+            let mut peer_addrs = connected_peer_addrs.write().unwrap();
+            let mut connected_peers = connected_peers.write().unwrap();
             
             // Double-check in write lock (prevent race condition)
             if peer_addrs.contains(&peer_info.addr) {
                 return false;
             }
             
-            // IMPROVED: K-bucket management - limit peers per bucket
+            // K-bucket management - limit peers per bucket
             let peers_in_bucket = connected_peers.iter()
                 .filter(|p| p.bucket_index == peer_info.bucket_index)
                 .count();
@@ -580,8 +608,7 @@ impl SimplifiedP2P {
             connected_peers.push(peer_info.clone());
         }
         
-        println!("[P2P] ✅ UNIQUE: Added peer {} (bucket: {}, reputation: {:.1}/100)", 
-                peer_info.addr, peer_info.bucket_index, peer_info.reputation_score);
+        println!("[P2P] ✅ Added peer {} successfully (bucket: {})", peer_info.id, peer_info.bucket_index);
         true
     }
     
@@ -650,15 +677,10 @@ impl SimplifiedP2P {
                             println!("[P2P] 🌟 Genesis peer: adding {} with bootstrap trust (verified reachable)", get_privacy_id_for_addr(&peer_info.addr));
                             true
                         } else {
-                            // GENESIS FIX: During Genesis phase, add known Genesis peers even if temporarily unreachable
-                            // They might be starting up or have temporary network issues
-                            if is_bootstrap_node && is_genesis_peer {
-                                println!("[P2P] 🔧 Genesis peer: {} temporarily unreachable - adding with bootstrap trust anyway", get_privacy_id_for_addr(&peer_info.addr));
-                                true // GENESIS FIX: Allow Genesis peers during bootstrap
-                            } else {
-                                println!("[P2P] ⚠️ Genesis peer: {} not reachable - skipping bootstrap trust", get_privacy_id_for_addr(&peer_info.addr));
-                                false
-                            }
+                            // BYZANTINE FIX: DO NOT add unreachable peers - it breaks consensus safety!
+                            // Even Genesis peers must be actually reachable to participate
+                            println!("[P2P] ⚠️ Genesis peer: {} not reachable - NOT adding (Byzantine safety requires real nodes)", get_privacy_id_for_addr(&peer_info.addr));
+                            false // CRITICAL: Never add unreachable peers, even during bootstrap
                         }
                     } else {
                         self.is_peer_actually_connected(&peer_info.addr)
@@ -1052,42 +1074,13 @@ impl SimplifiedP2P {
                         };
                         
                         if !already_exists {
-                            // EXISTING: Calculate Kademlia fields (from add_peer_safe line 541-546)
-                            if peer.node_id_hash.is_empty() {
-                                let mut hasher = Sha3_256::new();
-                                hasher.update(peer.id.as_bytes());
-                                peer.node_id_hash = hasher.finalize().to_vec();
-                            }
-                            // Calculate bucket index
-                            peer.bucket_index = {
-                                let mut hasher = Sha3_256::new();
-                                hasher.update(node_id.as_bytes());
-                                hasher.update(peer.id.as_bytes());
-                                let hash = hasher.finalize();
-                                (hash[0] as usize) % KADEMLIA_BITS
-                            };
-                            
-                            // Atomic add with double-check (from add_peer_safe line 549-574)
-                            let mut peer_addrs = connected_peer_addrs.write().unwrap();
-                            let mut peers = connected_peers.write().unwrap();
-                            
-                            // Double-check after acquiring write locks
-                            if !peer_addrs.contains(&peer.addr) {
-                                // K-bucket management
-                                let peers_in_bucket = peers.iter()
-                                    .filter(|p| p.bucket_index == peer.bucket_index)
-                                    .count();
-                                
-                                if peers_in_bucket < KADEMLIA_K {
-                                    peer_addrs.insert(peer.addr.clone());
-                                    peers.push(peer.clone());
-                                    println!("[P2P] ✅ Connected to internet peer: {} (bucket: {})", 
-                                            peer.id, peer.bucket_index);
-                                } else {
-                                    println!("[P2P] ⚠️ K-bucket {} full, skipping peer {}", 
-                                            peer.bucket_index, peer.id);
-                                }
-                            }
+                            // Use centralized add_peer_safe_static to avoid code duplication
+                            Self::add_peer_safe_static(
+                                peer.clone(),
+                                node_id.clone(),
+                                connected_peers.clone(),
+                                connected_peer_addrs.clone()
+                            );
                         } else {
                             println!("[P2P] ⚠️ Internet peer {} already connected", peer.id);
                         }
@@ -1118,6 +1111,7 @@ impl SimplifiedP2P {
      fn start_reputation_validation(&self) {
          let node_id = self.node_id.clone();
          let connected_peers = self.connected_peers.clone();
+        let connected_peer_addrs = self.connected_peer_addrs.clone(); // CRITICAL: Clone for phantom cleanup
          let reputation_system = self.reputation_system.clone(); // Use shared system
          let genesis_ips = vec!["154.38.160.39".to_string(), "62.171.157.44".to_string(), 
                                "161.97.86.81".to_string(), "173.212.219.226".to_string(), 
@@ -1128,8 +1122,15 @@ impl SimplifiedP2P {
              
              // PRODUCTION: Use existing PERSISTENT reputation system
              
-             loop {
-                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            loop {
+                // CRITICAL: For Genesis phase, check more frequently (5 sec) for Byzantine safety
+                // For normal phase with millions of nodes, check every 30 sec
+                let is_genesis_phase = std::env::var("QNET_BOOTSTRAP_ID")
+                    .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
+                    .unwrap_or(false);
+                
+                let check_interval = if is_genesis_phase { 5 } else { 30 };
+                tokio::time::sleep(std::time::Duration::from_secs(check_interval)).await;
                  
                  // PRODUCTION: Apply reputation decay periodically
                  if let Ok(mut reputation) = reputation_system.lock() {
@@ -1147,16 +1148,23 @@ impl SimplifiedP2P {
                          }
                      };
                      for (i, peer) in connected.iter_mut().enumerate() {
+                        // SCALABILITY: For Genesis peers, check TCP connectivity every 5s (Genesis) or 30s (normal)
+                        // This prevents phantom Genesis peers from accumulating
+                        let is_genesis_peer = peer.id.contains("genesis_") || genesis_ips.contains(&peer.addr);
+                        
+                        // Check if peer is still reachable (Genesis only, others use reputation)
+                        if is_genesis_peer && !Self::test_peer_connectivity_static(&peer.addr) {
+                            println!("[P2P] ❌ Genesis peer {} no longer reachable, removing", peer.id);
+                            to_remove.push(i);
+                            continue; // Skip reputation check for unreachable peers
+                        }
+                        
                          // Check peer reputation using shared system
                          let reputation = if let Ok(rep_sys) = reputation_system.lock() {
                              rep_sys.get_reputation(&peer.id)
                          } else {
                              100.0 // Default if lock fails
                          };
-                         
-                                                 // PRODUCTION: Genesis nodes have 10% ban threshold (same as others) but cannot be removed from P2P
-                        // This ensures Genesis nodes remain connected but still face reputation consequences
-                         let is_genesis_peer = peer.id.contains("genesis_") || genesis_ips.contains(&peer.addr);
                          
                         // SECURITY FIX: Remove peers with very low reputation (Genesis nodes stay connected but penalized)
                          if reputation < 10.0 && !is_genesis_peer {
@@ -1183,9 +1191,13 @@ impl SimplifiedP2P {
                          }
                      }
                      
-                     // Remove low-reputation peers
+                    // Remove low-reputation peers from BOTH collections
                      for &i in to_remove.iter().rev() {
-                         connected.remove(i);
+                        let removed_peer = connected.remove(i);
+                        // CRITICAL: Also remove from connected_peer_addrs to prevent phantom peers!
+                        if let Ok(mut peer_addrs) = connected_peer_addrs.write() {
+                            peer_addrs.remove(&removed_peer.addr);
+                        }
                      }
                  }
                  
@@ -2132,14 +2144,14 @@ impl SimplifiedP2P {
         } else {
             // Normal phase: Use all connected peers
             match self.connected_peers.read() {
-                Ok(connected_peers) => {
-                    let peer_list = connected_peers.clone();
-                    println!("[P2P] 📡 Discovery peers available: {} connected (fast DHT response)", peer_list.len());
-                    peer_list
-                }
-                Err(_) => {
-                    println!("[P2P] ⚠️ Failed to get discovery peers - lock error");
-                    Vec::new()
+            Ok(connected_peers) => {
+                let peer_list = connected_peers.clone();
+                println!("[P2P] 📡 Discovery peers available: {} connected (fast DHT response)", peer_list.len());
+                peer_list
+            }
+            Err(_) => {
+                println!("[P2P] ⚠️ Failed to get discovery peers - lock error");
+                Vec::new()
                 }
             }
         }
@@ -2192,7 +2204,9 @@ impl SimplifiedP2P {
                 
                 // Skip self to avoid duplication
                 if !self.node_id.contains(&node_id) && !self.node_id.contains(&format!("{:03}", i + 1)) {
-                    // CRITICAL: Only include if ACTUALLY CONNECTED
+                    // OPTIMIZATION: For Genesis phase, trust connected_addrs which is cleaned every 5s
+                    // TCP check on every block (1s) would cause 8s delay with 4 unreachable peers!
+                    // Byzantine safety is maintained by reputation_validation cleanup (max 5s window)
                     if connected_addrs.contains(&peer_addr) {
                         genesis_peers.push(PeerInfo {
                             id: node_id.clone(),
@@ -2408,14 +2422,26 @@ impl SimplifiedP2P {
         // Keep only peers that successfully passed validation in current validation cycle
         if let Ok(mut connected) = self.connected_peers.write() {
             let original_count = connected.len();
+            let mut removed_addrs = Vec::new();
             
             // EXISTING: Simple cleanup - keep only validated peers (prevents recursive deadlock)
             connected.retain(|peer| {
-                validated_result.iter().any(|validated| validated.addr == peer.addr)
+                let should_keep = validated_result.iter().any(|validated| validated.addr == peer.addr);
+                if !should_keep {
+                    removed_addrs.push(peer.addr.clone());
+                }
+                should_keep
             });
             
             let cleaned_count = original_count - connected.len();
             if cleaned_count > 0 {
+                // CRITICAL: Also remove from connected_peer_addrs to prevent phantom accumulation!
+                if let Ok(mut peer_addrs) = self.connected_peer_addrs.write() {
+                    for addr in removed_addrs {
+                        peer_addrs.remove(&addr);
+                    }
+                }
+                
                 println!("[P2P] 🧹 Simple peer cleanup: removed {} non-validated peers, {} validated remain", 
                          cleaned_count, connected.len());
                 // CACHE FIX: Invalidate cache after removing peers
@@ -4092,28 +4118,15 @@ impl SimplifiedP2P {
                                     (hash[0] as usize) % 256
                                 };
                                 
-                                // EXISTING: Atomic add with K-bucket check (from add_peer_safe)
-                                let mut peer_addrs = connected_peer_addrs.write().unwrap();
-                                let mut peers = connected_peers.write().unwrap();
-                                
-                                // Double-check after acquiring write locks
-                                if !peer_addrs.contains(&new_peer.addr) {
-                                    // K-bucket management
-                                    const KADEMLIA_K: usize = 20;
-                                    let peers_in_bucket = peers.iter()
-                                        .filter(|p| p.bucket_index == new_peer.bucket_index)
-                                        .count();
-                                    
-                                    if peers_in_bucket < KADEMLIA_K {
-                                        peer_addrs.insert(new_peer.addr.clone());
-                                        peers.push(new_peer.clone());
-                                added_count += 1;
-                                        println!("[P2P] ✅ EXCHANGE: Added peer {} (K-bucket: {}, reputation: {:.1})", 
-                                                new_peer.addr, new_peer.bucket_index, new_peer.reputation_score);
-                                    } else {
-                                        println!("[P2P] ⚠️ K-bucket {} full, skipping peer {}", 
-                                                new_peer.bucket_index, new_peer.addr);
-                                    }
+                                // Use centralized add_peer_safe_static to avoid code duplication
+                                if Self::add_peer_safe_static(
+                                    new_peer.clone(),
+                                    node_id.clone(),
+                                    connected_peers.clone(),
+                                    connected_peer_addrs.clone()
+                                ) {
+                                    added_count += 1;
+                                    println!("[P2P] ✅ EXCHANGE: Added peer {} via peer exchange", new_peer.addr);
                                 }
                             }
                         }
