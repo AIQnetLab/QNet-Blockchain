@@ -277,9 +277,19 @@ impl PersistentStorage {
     pub fn save_microblock(&self, height: u64, data: &[u8]) -> IntegrationResult<()> {
         let microblocks_cf = self.db.cf_handle("microblocks")
             .ok_or_else(|| IntegrationError::StorageError("microblocks column family not found".to_string()))?;
+        let metadata_cf = self.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
         
         let key = format!("microblock_{}", height);
-        self.db.put_cf(&microblocks_cf, key.as_bytes(), data)?;
+        
+        // Use batch write to update both microblock and chain height atomically
+        let mut batch = WriteBatch::default();
+        batch.put_cf(&microblocks_cf, key.as_bytes(), data);
+        
+        // CRITICAL FIX: Update chain height when saving microblock
+        batch.put_cf(&metadata_cf, b"chain_height", &height.to_be_bytes());
+        
+        self.db.write(batch)?;
         Ok(())
     }
     

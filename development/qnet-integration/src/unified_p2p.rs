@@ -355,8 +355,7 @@ impl SimplifiedP2P {
     /// PRODUCTION: Set block processing channel for storage integration
     pub fn set_block_channel(&mut self, block_tx: tokio::sync::mpsc::UnboundedSender<ReceivedBlock>) {
         self.block_tx = Some(block_tx);
-        println!("[P2P] 📦 Block processing channel established for storage integration");
-        println!("[DIAGNOSTIC] 🔧 Block channel state: AVAILABLE (sender established)");
+        // Block processing channel established
     }
     
     /// Start simplified P2P network with load balancing
@@ -365,11 +364,10 @@ impl SimplifiedP2P {
         println!("[P2P] Node: {} | Type: {:?} | Region: {:?}", 
                  self.node_id, self.node_type, self.region);
         
-        // DIAGNOSTIC: Check channel states at startup
-        println!("[DIAGNOSTIC] 🔧 P2P start() - checking channel states:");
+        // Check channel states at startup (logging removed for performance)
         match &self.consensus_tx {
-            Some(_) => println!("[DIAGNOSTIC] ✅ Consensus channel: AVAILABLE"),
-            None => println!("[DIAGNOSTIC] ❌ Consensus channel: MISSING"),
+            Some(_) => {},
+            None => {},
         }
         match &self.block_tx {
             Some(_) => println!("[DIAGNOSTIC] ✅ Block channel: AVAILABLE"),
@@ -2078,17 +2076,71 @@ impl SimplifiedP2P {
     
     /// PRODUCTION: Get discovery peers for DHT/API (Fast method for millions of nodes)  
     pub fn get_discovery_peers(&self) -> Vec<PeerInfo> {
-        // EXISTING: Use fast connected_peers access for DHT discovery
-        // PERFORMANCE: Simple lock instead of expensive validation for API responses
-        match self.connected_peers.read() {
-            Ok(connected_peers) => {
-                let peer_list = connected_peers.clone();
-                println!("[P2P] 📡 Discovery peers available: {} connected (fast DHT response)", peer_list.len());
-                peer_list
+        // CRITICAL FIX: During Genesis phase, return ONLY Genesis nodes (not all connected peers)
+        // This prevents exponential peer growth (5→8→16→35 peers)
+        
+        // Check if we're in Genesis phase (network height < 1000)
+        // CRITICAL: Use cached height to avoid recursion
+        let is_genesis_phase = {
+            // Check cached height directly (no network calls)
+            if let Some(cached_data) = CACHE_ACTOR.height_cache.read().unwrap().as_ref() {
+                cached_data.data < 1000
+            } else {
+                // No cached height = assume Genesis phase
+                true
             }
-            Err(_) => {
-                println!("[P2P] ⚠️ Failed to get discovery peers - lock error");
-                Vec::new()
+        };
+        
+        if is_genesis_phase {
+            // Genesis phase: Return ONLY verified Genesis nodes
+            let mut genesis_peers = Vec::new();
+            
+            // Get Genesis IPs from constants
+            use crate::genesis_constants::GENESIS_NODE_IPS;
+            
+            for (ip, id) in GENESIS_NODE_IPS {
+                let addr = format!("{}:8001", ip);
+                let node_id = format!("genesis_node_{}", id);
+                
+                // Only include if we can reach them
+                if let Ok(connected) = self.connected_peer_addrs.read() {
+                    if connected.contains(&addr) {
+                        genesis_peers.push(PeerInfo {
+                            id: node_id,
+                            addr: addr.clone(),
+                            node_type: NodeType::Super,
+                            region: get_genesis_region_by_index(id.parse::<usize>().unwrap_or(0).saturating_sub(1)),
+                            last_seen: chrono::Utc::now().timestamp() as u64,
+                            is_stable: true,
+                            latency_ms: 10,
+                            connection_count: 5,
+                            bandwidth_usage: 1000,
+                            node_id_hash: Vec::new(),
+                            bucket_index: 0,
+                            reputation_score: 90.0, // Genesis nodes: 90% reputation
+                            successful_pings: 100,
+                            failed_pings: 0,
+                        });
+                    }
+                }
+            }
+            
+            println!("[P2P] 🌱 Genesis mode: returning {} Genesis peers only (not {} total connected)", 
+                     genesis_peers.len(), 
+                     self.connected_peers.read().map(|p| p.len()).unwrap_or(0));
+            genesis_peers
+        } else {
+            // Normal phase: Use all connected peers
+            match self.connected_peers.read() {
+                Ok(connected_peers) => {
+                    let peer_list = connected_peers.clone();
+                    println!("[P2P] 📡 Discovery peers available: {} connected (fast DHT response)", peer_list.len());
+                    peer_list
+                }
+                Err(_) => {
+                    println!("[P2P] ⚠️ Failed to get discovery peers - lock error");
+                    Vec::new()
+                }
             }
         }
     }
@@ -2122,39 +2174,47 @@ impl SimplifiedP2P {
             _ => {} // Continue with Full/Super node logic
         }
         
-        // CRITICAL FIX: For Genesis nodes, return DETERMINISTIC peer list
-        // This ensures all Genesis nodes have identical views of the network
+        // CRITICAL FIX: For Genesis nodes, return ONLY CONNECTED peers
+        // This ensures Byzantine safety requires REAL nodes, not phantom ones
         if std::env::var("QNET_BOOTSTRAP_ID")
             .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
             .unwrap_or(false) {
-            // Genesis nodes: Return ALL Genesis peers for deterministic consensus
+            // Genesis nodes: Return ONLY ACTUALLY CONNECTED Genesis peers
             let genesis_ips = get_genesis_bootstrap_ips();
             let mut genesis_peers = Vec::new();
             
+            // Get actually connected peers
+            let connected_addrs = self.connected_peer_addrs.read().unwrap();
+            
             for (i, ip) in genesis_ips.iter().enumerate() {
                 let node_id = format!("genesis_node_{:03}", i + 1);
+                let peer_addr = format!("{}:8001", ip);
+                
                 // Skip self to avoid duplication
                 if !self.node_id.contains(&node_id) && !self.node_id.contains(&format!("{:03}", i + 1)) {
-                    genesis_peers.push(PeerInfo {
-                        id: node_id.clone(),
-                        addr: format!("{}:8001", ip),
-                        node_type: NodeType::Super,
-                        region: get_genesis_region_by_index(i),
-                        last_seen: chrono::Utc::now().timestamp() as u64,
-                        is_stable: true,
-                        latency_ms: 10,
-                        connection_count: 5,
-                        bandwidth_usage: 1000,
-                        node_id_hash: Vec::new(),
-                        bucket_index: 0,
-                        reputation_score: 90.0, // Genesis nodes: 90% reputation
-                        successful_pings: 100,
-                        failed_pings: 0,
-                    });
+                    // CRITICAL: Only include if ACTUALLY CONNECTED
+                    if connected_addrs.contains(&peer_addr) {
+                        genesis_peers.push(PeerInfo {
+                            id: node_id.clone(),
+                            addr: peer_addr,
+                            node_type: NodeType::Super,
+                            region: get_genesis_region_by_index(i),
+                            last_seen: chrono::Utc::now().timestamp() as u64,
+                            is_stable: true,
+                            latency_ms: 10,
+                            connection_count: 5,
+                            bandwidth_usage: 1000,
+                            node_id_hash: Vec::new(),
+                            bucket_index: 0,
+                            reputation_score: 90.0, // Genesis nodes: 90% reputation
+                            successful_pings: 100,
+                            failed_pings: 0,
+                        });
+                    }
                 }
             }
             
-            println!("[P2P] 🌱 Genesis mode: returning deterministic peer list ({} peers)", genesis_peers.len());
+            println!("[P2P] 🌱 Genesis mode: returning {} CONNECTED peers (not phantom)", genesis_peers.len());
             return genesis_peers;
         }
         
@@ -3966,9 +4026,9 @@ impl SimplifiedP2P {
         // Use EXISTING Genesis node detection logic - unified with microblock production
         
         let exchange_interval = if is_genesis_node {
-            // QUANTUM: Fast peer exchange for decentralized quantum blockchain
-            // Quick discovery for rapid consensus formation
-            std::time::Duration::from_secs(5) // Quantum-speed peer discovery
+            // Genesis phase: Less frequent exchange (5 nodes don't change often)
+            // Reduces network spam and improves block production timing
+            std::time::Duration::from_secs(60) // Once per minute for Genesis stability
         } else {
             // Normal phase: Slower exchange for millions-scale stability  
             std::time::Duration::from_secs(300) // 5 minutes for scale - EXISTING system value
@@ -4369,11 +4429,11 @@ impl SimplifiedP2P {
                 format!("http://{}:8001/api/v1/p2p/message", peer_ip),  // Primary API port (all nodes)
             ];
             
-            println!("[P2P] 🔍 DIAGNOSTIC: Trying {} URLs for peer {} (original: {})", urls.len(), peer_ip, peer_addr);
+            // Trying URLs for peer (logging removed for performance)
 
             let mut sent = false;
             for url in urls {
-                println!("[P2P] 🔍 DIAGNOSTIC: Attempting HTTP POST to {}", url);
+                // Attempting HTTP POST
                 // PRODUCTION: HTTP retry logic for real network reliability
                 for attempt in 1..=3 {
                     match client.post(&url)

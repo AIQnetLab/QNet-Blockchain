@@ -542,10 +542,7 @@ impl BlockchainNode {
         // NOW connect to bootstrap peers AFTER API is ready
         if let Some(unified_p2p) = &self.unified_p2p {
             println!("[P2P] 🌐 Starting P2P connections AFTER API is ready");
-            println!("[DIAGNOSTIC] 🔧 Bootstrap peers count: {}", self.bootstrap_peers.len());
-            for (i, peer) in self.bootstrap_peers.iter().enumerate() {
-                println!("[DIAGNOSTIC] 🔧 Bootstrap peer {}: {}", i+1, peer);
-            }
+            // Bootstrap peers configured (logging removed for performance)
             
             unified_p2p.connect_to_bootstrap_peers(&self.bootstrap_peers);
             
@@ -2079,16 +2076,19 @@ impl BlockchainNode {
             all_qualified.push((own_node_id.to_string(), GENESIS_STATIC_REPUTATION));
         }
         
-        // PRODUCTION: Add ALL Genesis nodes in DETERMINISTIC order for consensus consistency
-        // This ensures ALL nodes have IDENTICAL candidate lists regardless of connectivity
-        for (node_id, _ip) in static_genesis_nodes {
-            if node_id != *own_node_id {
+        // PRODUCTION: Add ONLY CONNECTED Genesis nodes for Byzantine safety
+        // CRITICAL: Must check actual connectivity to prevent phantom candidates
+        let validated_peers = p2p.get_validated_active_peers();
+        
+        for peer in validated_peers {
+            // Only add Genesis peers (not random nodes)
+            if peer.id.starts_with("genesis_node_") {
                 // EXISTING: Use deterministic Genesis reputation for consistent consensus
-                const GENESIS_DETERMINISTIC_REPUTATION: f64 = 0.90; // EXISTING: Same value as above
+                const GENESIS_DETERMINISTIC_REPUTATION: f64 = 0.90;
                 
-                // Only add if not already in list (avoid duplicates with own_node) 
-                if !all_qualified.iter().any(|(id, _)| id == &node_id) {
-                    all_qualified.push((node_id, GENESIS_DETERMINISTIC_REPUTATION));
+                // Only add if not already in list (avoid duplicates with own_node)
+                if !all_qualified.iter().any(|(id, _)| id == &peer.id) {
+                    all_qualified.push((peer.id, GENESIS_DETERMINISTIC_REPUTATION));
                 }
             }
         }
@@ -4442,15 +4442,12 @@ impl BlockchainNode {
     /// CRITICAL FIX: Generate unique node_id based on Genesis ID or server IP
     /// This ensures each node has a unique identifier for producer rotation
     async fn generate_unique_node_id(node_type: NodeType) -> String {
-        println!("[DIAGNOSTIC] 🔧 generate_unique_node_id() called with type: {:?}", node_type);
-        println!("[DIAGNOSTIC] 🔧 Checking environment variables:");
-        println!("[DIAGNOSTIC] 🔧   QNET_BOOTSTRAP_ID: {:?}", std::env::var("QNET_BOOTSTRAP_ID"));
-        println!("[DIAGNOSTIC] 🔧   QNET_GENESIS_BOOTSTRAP: {:?}", std::env::var("QNET_GENESIS_BOOTSTRAP"));
+        // Generating unique node ID based on environment
         
         // Priority 1: Use BOOTSTRAP_ID for Genesis nodes (001-005)
         if let Ok(bootstrap_id) = std::env::var("QNET_BOOTSTRAP_ID") {
             println!("[NODE_ID] 🔐 Genesis node detected: BOOTSTRAP_ID={}", bootstrap_id);
-            println!("[DIAGNOSTIC] ✅ Priority 1: Using BOOTSTRAP_ID -> genesis_node_{}", bootstrap_id);
+            // Using BOOTSTRAP_ID for Genesis node
             return format!("genesis_node_{}", bootstrap_id);
         } else {
             println!("[DIAGNOSTIC] ❌ Priority 1: QNET_BOOTSTRAP_ID not found");
