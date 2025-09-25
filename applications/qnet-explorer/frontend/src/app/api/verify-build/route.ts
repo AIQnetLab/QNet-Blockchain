@@ -2,17 +2,15 @@ import { NextRequest, NextResponse } from 'next/server';
 
 export async function GET(request: NextRequest) {
   const buildInfo = {
-    // Build information (will be populated automatically in CI/CD)
-    commit: process.env.NEXT_PUBLIC_GIT_COMMIT || 'ab7f2e1',
-    branch: process.env.NEXT_PUBLIC_GIT_BRANCH || 'main',
-    buildTime: process.env.NEXT_PUBLIC_BUILD_TIME || '2025-06-14T12:34:56Z',
-    buildNumber: process.env.NEXT_PUBLIC_BUILD_NUMBER || '1',
+    // Build information
+    version: '2.2.0',
+    environment: process.env.NODE_ENV || 'development',
     
     // GitHub links for verification
     github: {
-      repository: 'https://github.com/AIQnetLab/QNet-Blockchain',
-      commitUrl: `https://github.com/AIQnetLab/QNet-Blockchain/commit/${process.env.NEXT_PUBLIC_GIT_COMMIT || 'main'}`,
-      sourceTree: `https://github.com/AIQnetLab/QNet-Blockchain/tree/${process.env.NEXT_PUBLIC_GIT_COMMIT || 'main'}/applications/qnet-explorer/frontend`,
+      repository: 'https://github.com/AIQnetLab/QNet-Blockchain/tree/testnet',
+      commitUrl: `https://github.com/AIQnetLab/QNet-Blockchain/commit/${process.env.NEXT_PUBLIC_GIT_COMMIT || 'testnet'}`,
+      sourceTree: `https://github.com/AIQnetLab/QNet-Blockchain/tree/${process.env.NEXT_PUBLIC_GIT_COMMIT || 'testnet'}/applications/qnet-explorer/frontend`,
     },
     
     // Hashes for verification

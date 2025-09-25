@@ -422,7 +422,7 @@ export default function WalletConnection() {
         >
           <span className="wallet-icon">💎</span>
           <span className="wallet-text">
-            {isConnecting ? 'Connecting...' : 'Connect QNet Wallet'}
+            {isConnecting ? 'Connecting...' : 'CONNECT WALLET'}
           </span>
         </Button>
 
