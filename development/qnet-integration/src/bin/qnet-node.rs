@@ -2401,6 +2401,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     env_logger::init();
     
+    // Check if data cleanup is requested
+    if std::env::var("QNET_CLEAN_DATA").unwrap_or_default() == "1" {
+        println!("🧹 CLEANING NODE DATA...");
+        
+        // Clean data directories
+        let data_dirs = vec![
+            PathBuf::from("node_data"),
+            PathBuf::from("./node_data"),
+            PathBuf::from("/app/node_data"),
+            PathBuf::from("/app/data"),
+            PathBuf::from("data"),
+        ];
+        
+        for dir in data_dirs {
+            if dir.exists() {
+                match std::fs::remove_dir_all(&dir) {
+                    Ok(_) => println!("   ✅ Removed: {:?}", dir),
+                    Err(e) => println!("   ⚠️ Failed to remove {:?}: {}", dir, e),
+                }
+            }
+        }
+        
+        // Clean cache files
+        let cache_files = vec![
+            PathBuf::from("peer_cache.json"),
+            PathBuf::from("./peer_cache.json"),
+        ];
+        
+        for file in cache_files {
+            if file.exists() {
+                match std::fs::remove_file(&file) {
+                    Ok(_) => println!("   ✅ Removed: {:?}", file),
+                    Err(e) => println!("   ⚠️ Failed to remove {:?}: {}", file, e),
+                }
+            }
+        }
+        
+        println!("🧹 DATA CLEANUP COMPLETE!");
+        println!("📝 Starting with fresh data...\n");
+    }
+    
     // Auto-configure everything
     let config = AutoConfig::new().await?;
     

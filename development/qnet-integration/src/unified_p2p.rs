@@ -654,16 +654,26 @@ impl SimplifiedP2P {
         let mut new_connections = 0;
         for peer_addr in peer_addresses {
             if let Ok(peer_info) = self.parse_peer_address(peer_addr) {
-                // Check if not already connected
+                // CRITICAL: Never add self as a peer!
+                if peer_info.id == self.node_id || peer_info.addr.contains(&self.port.to_string()) {
+                    println!("[P2P] 🚫 Skipping self-connection: {}", peer_info.id);
+                    continue;
+                }
+                
+                // BYZANTINE FIX: For Genesis peers, ALWAYS verify connectivity even if "already connected"
+                // This prevents phantom Genesis peers from persisting across restarts
+                let peer_ip = peer_info.addr.split(':').next().unwrap_or("");
+                let is_genesis_peer = is_genesis_node_ip(peer_ip);
+                
+                // Check if not already connected (or if Genesis peer - always re-verify)
                 let already_connected = {
                     let connected = self.connected_peers.read().unwrap();
                     connected.iter().any(|p| p.addr == peer_info.addr)
                 };
                 
-                if !already_connected {
+                // CRITICAL: Genesis peers must ALWAYS be re-verified for Byzantine safety
+                if !already_connected || is_genesis_peer {
                     // DYNAMIC: Genesis peers use bootstrap trust based on network conditions, not time
-                    let peer_ip = peer_info.addr.split(':').next().unwrap_or("");
-                    let is_genesis_peer = is_genesis_node_ip(peer_ip);
                     let is_bootstrap_node = std::env::var("QNET_BOOTSTRAP_ID").is_ok();
                     let active_peers = self.get_peer_count();
                     let is_small_network = active_peers < 6; // PRODUCTION: Bootstrap trust for Genesis network (1-5 nodes, all Genesis bootstrap nodes)
@@ -680,6 +690,20 @@ impl SimplifiedP2P {
                             // BYZANTINE FIX: DO NOT add unreachable peers - it breaks consensus safety!
                             // Even Genesis peers must be actually reachable to participate
                             println!("[P2P] ⚠️ Genesis peer: {} not reachable - NOT adding (Byzantine safety requires real nodes)", get_privacy_id_for_addr(&peer_info.addr));
+                            
+                            // CRITICAL: If Genesis peer was already connected but now unreachable - REMOVE IT!
+                            if already_connected && is_genesis_peer {
+                                println!("[P2P] 🧹 REMOVING unreachable Genesis peer {} from connected lists", get_privacy_id_for_addr(&peer_info.addr));
+                                if let Ok(mut connected) = self.connected_peers.write() {
+                                    connected.retain(|p| p.addr != peer_info.addr);
+                                }
+                                if let Ok(mut addrs) = self.connected_peer_addrs.write() {
+                                    addrs.remove(&peer_info.addr);
+                                }
+                                // Invalidate cache after removal
+                                self.invalidate_peer_cache();
+                            }
+                            
                             false // CRITICAL: Never add unreachable peers, even during bootstrap
                         }
                     } else {
@@ -1477,10 +1501,11 @@ impl SimplifiedP2P {
                         
                         let elapsed = chrono::Utc::now().timestamp() - startup_time;
                         
-                        // Allow 60 seconds grace period for Genesis nodes to start their API
-                        if elapsed < 60 {
+                        // BYZANTINE FIX: Reduced grace period to 10 seconds for Byzantine safety
+                        // Long grace periods allow phantom peers to participate in consensus!
+                        if elapsed < 10 {
                             println!("[SYNC] 🔧 Genesis peer height query: Grace period active ({}s elapsed) for {}", elapsed, ip);
-                            return Ok(0); // Return 0 during grace period
+                            return Ok(0); // Return 0 during reduced grace period
                         } else {
                             println!("[SYNC] ⚠️ Genesis peer {} not responding after grace period ({}s) - treating as offline", ip, elapsed);
                             // After grace period, treat as real error to avoid infinite loops
@@ -2653,6 +2678,8 @@ impl SimplifiedP2P {
         let connected_peers = self.connected_peers.clone();
         let primary_region = self.primary_region.clone();
         let backup_regions = self.backup_regions.clone();
+        let node_id = self.node_id.clone();
+        let port = self.port;
         
         // EXISTING PATTERN: Use tokio::spawn like search_internet_peers for non-blocking startup
         tokio::spawn(async move {
@@ -2685,8 +2712,13 @@ impl SimplifiedP2P {
                 // ROBUST: Connect to ALL peers during bootstrap or small network formation
                 let peer_limit = if use_all_peers { peers.len() } else { 5 };
                 for peer in peers.iter().take(peer_limit) {
-                    // Use previously defined is_genesis_startup variable
+                    // CRITICAL: Never add self as a peer in regional connections!
+                    if peer.id == node_id || peer.addr.contains(&port.to_string()) {
+                        println!("[P2P] 🚫 Skipping self in regional connection: {}", peer.id);
+                        continue;
+                    }
                     
+                    // Use previously defined is_genesis_startup variable
                     let ip = peer.addr.split(':').next().unwrap_or("");
                     let is_genesis_peer = is_genesis_node_ip(ip);
                     
@@ -2714,6 +2746,12 @@ impl SimplifiedP2P {
                 // Try all regions for Genesis peers
                 for (region, peers_in_region) in regional_peers_data.iter() {
                     for peer in peers_in_region.iter().take(5) {
+                        // CRITICAL: Never add self as a peer!
+                        if peer.id == node_id || peer.addr.contains(&port.to_string()) {
+                            println!("[P2P] 🚫 Skipping self in Genesis all-region scan: {}", peer.id);
+                            continue;
+                        }
+                        
                         let ip = peer.addr.split(':').next().unwrap_or("");
                         let is_genesis_peer = is_genesis_node_ip(ip);
                         
@@ -2908,10 +2946,11 @@ impl SimplifiedP2P {
                         
                         let elapsed = chrono::Utc::now().timestamp() - startup_time;
                         
-                        // Allow 60 seconds grace period for Genesis nodes to start their API
-                        if elapsed < 60 {
+                        // BYZANTINE FIX: Reduced grace period to 10 seconds for Byzantine safety
+                        // Long grace periods allow phantom peers to participate in consensus!
+                        if elapsed < 10 {
                             println!("[SYNC] 🔧 Genesis peer height query (static): Grace period active ({}s elapsed) for {}", elapsed, ip);
-                            return Ok(0); // Return 0 during grace period
+                            return Ok(0); // Return 0 during reduced grace period
                         } else {
                             println!("[SYNC] ⚠️ Genesis peer {} not responding after grace period ({}s) - treating as offline", ip, elapsed);
                             // After grace period, treat as real error to avoid infinite loops
