@@ -22,20 +22,19 @@ services:
       - QNET_MICROBLOCK_PRODUCER=1
       - QNET_PRODUCTION_ENABLED=1
       - QNET_SKIP_BURN_CHECK=1
-    command: >
-      qnet-node
-      --data-dir /app/data
-      --p2p-port 9876
-      --rpc-port 8545
-      --node-type super
-      --region na
-      --producer
-      --high-performance
-      --enable-metrics
+      - QNET_NODE_TYPE=super
+      - QNET_DATA_DIR=/app/data
+      - QNET_BOOTSTRAP_ID=001
+      - QNET_GENESIS_BOOTSTRAP=1
+      - QNET_P2P_PORT=9876
+      - QNET_API_PORT=8001
+      - QNET_REGION=na
+      - DOCKER_ENV=1
+    command: qnet-node
     ports:
-      - "8545:8545"   # RPC API
+      - "8001:8001"   # Unified API/RPC
       - "9876:9876"   # P2P network
-      - "9945:9945"   # Metrics (RPC port + 400)
+      - "8401:8401"   # Metrics (API port + 400)
     volumes:
       # Use named volume for blockchain data persistence, tmpfs for logs
       - genesis-blockchain-data:/app/data/blockchain
@@ -49,7 +48,7 @@ services:
     mem_limit: 4g
     cpus: '2.0'
     healthcheck:
-      test: ["CMD", "sh", "-c", "curl -f http://localhost:8545/rpc -d '{\"method\":\"ping\",\"params\":[],\"id\":1}' -H 'Content-Type: application/json' || exit 1"]
+      test: ["CMD", "curl", "-f", "http://localhost:8001/api/v1/node/health"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -77,20 +76,17 @@ services:
       - QNET_FULL_SYNC=1
       - QNET_SYNC_ALL_MICROBLOCKS=1
       - QNET_SKIP_BURN_CHECK=1
-    command: >
-      qnet-node
-      --data-dir /app/data
-      --p2p-port 9877
-      --rpc-port 8546
-      --node-type full
-      --region na
-      --bootstrap-peers genesis:9876
-      --high-performance
-      --enable-metrics
+      - QNET_NODE_TYPE=full
+      - QNET_DATA_DIR=/app/data
+      - QNET_P2P_PORT=9877
+      - QNET_API_PORT=8001
+      - QNET_REGION=eu
+      - DOCKER_ENV=1
+    command: qnet-node
     ports:
-      - "8546:8546"   # RPC API
+      - "8002:8001"   # Unified API/RPC (mapped to 8002 on host)
       - "9877:9877"   # P2P network
-      - "9946:9946"   # Metrics (RPC port + 400)
+      - "8402:8401"   # Metrics (mapped to 8402 on host)
     volumes:
       # Use named volume for blockchain data persistence, tmpfs for logs
       - validator1-blockchain-data:/app/data/blockchain
@@ -106,7 +102,7 @@ services:
     depends_on:
       - qnet-genesis
     healthcheck:
-      test: ["CMD", "sh", "-c", "curl -f http://localhost:8546/rpc -d '{\"method\":\"ping\",\"params\":[],\"id\":1}' -H 'Content-Type: application/json' || exit 1"]
+      test: ["CMD", "curl", "-f", "http://localhost:8001/api/v1/node/health"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -134,20 +130,17 @@ services:
       - QNET_FULL_SYNC=1
       - QNET_SYNC_ALL_MICROBLOCKS=1
       - QNET_SKIP_BURN_CHECK=1
-    command: >
-      qnet-node
-      --data-dir /app/data
-      --p2p-port 9878
-      --rpc-port 8547
-      --node-type full
-      --region na
-      --bootstrap-peers genesis:9876,validator1:9877
-      --high-performance
-      --enable-metrics
+      - QNET_NODE_TYPE=full
+      - QNET_DATA_DIR=/app/data
+      - QNET_P2P_PORT=9878
+      - QNET_API_PORT=8001
+      - QNET_REGION=asia
+      - DOCKER_ENV=1
+    command: qnet-node
     ports:
-      - "8547:8547"   # RPC API
+      - "8003:8001"   # Unified API/RPC (mapped to 8003 on host)
       - "9878:9878"   # P2P network
-      - "9947:9947"   # Metrics (RPC port + 400)
+      - "8403:8401"   # Metrics (mapped to 8403 on host)
     volumes:
       # Use named volume for blockchain data persistence, tmpfs for logs
       - validator2-blockchain-data:/app/data/blockchain
@@ -164,7 +157,7 @@ services:
       - qnet-genesis
       - qnet-validator1
     healthcheck:
-      test: ["CMD", "sh", "-c", "curl -f http://localhost:8547/rpc -d '{\"method\":\"ping\",\"params\":[],\"id\":1}' -H 'Content-Type: application/json' || exit 1"]
+      test: ["CMD", "curl", "-f", "http://localhost:8001/api/v1/node/health"]
       interval: 30s
       timeout: 10s
       retries: 3

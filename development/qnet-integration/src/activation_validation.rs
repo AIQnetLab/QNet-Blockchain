@@ -19,6 +19,15 @@ fn safe_preview(s: &str, len: usize) -> &str {
 
 // REMOVED: BlockchainMigrationRecord - migration is just normal node activation!
 
+/// Network statistics for dynamic pricing calculations
+#[derive(Debug, Clone)]
+struct NetworkStats {
+    total_nodes: u64,
+    light_nodes: u64,
+    full_nodes: u64,
+    super_nodes: u64,
+}
+
 /// High-performance activation registry optimized for millions of nodes
 #[derive(Debug)]
 pub struct BlockchainActivationRegistry {
@@ -1262,6 +1271,12 @@ impl BlockchainActivationRegistry {
     
     /// Get eligible nodes for consensus (public interface)
     pub async fn get_eligible_nodes(&self) -> Vec<(String, f64, String)> {
+        // CONSENSUS FIX: Use block height for cache invalidation instead of wall clock
+        let current_height = std::env::var("CURRENT_BLOCK_HEIGHT")
+            .unwrap_or_default()
+            .parse::<u64>()
+            .unwrap_or(0);
+        
         // GENESIS FIX: In Genesis mode, populate with Genesis nodes if active_nodes is empty
         if self.is_genesis_bootstrap_mode() {
             let active_nodes_read = self.active_nodes.read().await;
@@ -1274,19 +1289,16 @@ impl BlockchainActivationRegistry {
                 let genesis_count = active_nodes_read.len();
                 drop(active_nodes_read);
                 
-                // EXISTING: Use cache_ttl to prevent too frequent refreshes
+                // CONSENSUS FIX: Use block-based cache invalidation (every 30 blocks)
                 let last_sync = *self.last_sync.read().await;
-                let current_time = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
+                let blocks_since_sync = current_height.saturating_sub(last_sync);
                 
-                // PERFORMANCE FIX: Only re-check Genesis nodes every 60 seconds (cache_ttl/5)
-                if current_time - last_sync > 60 {
+                // Sync every 30 blocks for deterministic updates
+                if blocks_since_sync >= 30 {
                     // Silent refresh - too many logs in production
                     let _ = self.active_nodes.write().await.clear(); // Clear to force refresh
                     self.populate_genesis_active_nodes().await;
-                    *self.last_sync.write().await = current_time;
+                    *self.last_sync.write().await = current_height;
                 }
                 // Silent success - no spam logs
             }
@@ -1295,7 +1307,7 @@ impl BlockchainActivationRegistry {
         let active_nodes = self.active_nodes.read().await;
         
         // Filter nodes by type (Full/Super only) and reputation (≥70%)
-        let eligible: Vec<(String, f64, String)> = active_nodes
+        let mut eligible: Vec<(String, f64, String)> = active_nodes
             .values()
             .filter(|node| {
                 (node.node_type == "full" || node.node_type == "super") &&
@@ -1312,6 +1324,10 @@ impl BlockchainActivationRegistry {
             })
             .collect();
         
+        // CONSENSUS FIX: Sort by node ID for deterministic ordering across all nodes
+        // This ensures all nodes have the same ordered list for consensus
+        eligible.sort_by(|a, b| a.0.cmp(&b.0));
+        
         println!("[REGISTRY] 📊 Found {} eligible nodes from {} total active", 
                  eligible.len(), active_nodes.len());
         eligible
@@ -1319,11 +1335,15 @@ impl BlockchainActivationRegistry {
     
     /// Calculate reputation score for a node
     fn calculate_node_reputation(&self, node: &NodeInfo) -> f64 {
-        // PRODUCTION: Calculate reputation based on activity, uptime, and performance
-        let current_time = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        // CONSENSUS FIX: Use block height instead of wall clock for deterministic reputation
+        // This ensures all nodes calculate the same reputation at the same block height
+        let current_height = std::env::var("CURRENT_BLOCK_HEIGHT")
             .unwrap_or_default()
-            .as_secs();
+            .parse::<u64>()
+            .unwrap_or(0);
+        
+        // Convert block height to deterministic "time" (1 block = ~1 second)
+        let current_time = node.activated_at + current_height;
         
         // EXISTING: Genesis nodes start with 90% reputation, regular nodes 70%
         let mut reputation = if node.device_signature.starts_with("genesis_device_") {
@@ -1374,25 +1394,48 @@ impl BlockchainActivationRegistry {
     
     /// Get recent activations through blockchain consensus
     async fn consensus_get_recent_activations(&self) -> Result<Vec<ActivationRecord>, String> {
-        // PRODUCTION: Query blockchain state for recent activation records
-        // This would query the last N blocks for activation transactions
+        // CONSENSUS FIX: Use deterministic block range based on current block height
+        // All nodes must read the same blocks to get the same activation list
         
-        // Access blockchain state through consensus engine
-        let current_height = self.get_blockchain_height().await?;
-        let recent_blocks = 100; // Query last 100 blocks
-        let from_height = current_height.saturating_sub(recent_blocks);
+        // Use the block height from environment (set by microblock producer)
+        let current_height = std::env::var("CURRENT_BLOCK_HEIGHT")
+            .unwrap_or_default()
+            .parse::<u64>()
+            .unwrap_or(0);
+        
+        // Read activations from deterministic range (aligned to 30-block boundaries)
+        // This ensures all nodes see the same data at the same round
+        let round = current_height / 30; // Same round as producer selection
+        let snapshot_height = round * 30; // Snapshot at round boundary
+        let recent_blocks = 100; // Query last 100 blocks from snapshot
+        let from_height = snapshot_height.saturating_sub(recent_blocks);
         
         // Query activation records from recent blocks
         let mut activations = Vec::new();
         
+        // PRODUCTION: Get current phase and network stats for dynamic pricing
+        let current_phase = self.get_current_activation_phase();
+        let network_stats = self.get_network_statistics().await;
+        
         // In real implementation: iterate through blocks and extract activation transactions
-        // For now: simulate some recent activations based on current state
-        for i in 0..3 { // Simulate 3 recent activations (ONE FOR EACH NODE TYPE)
-            let (node_type, phase, amount) = match i {
-                0 => ("light".to_string(), 2, 5000), // Phase 2: Light node, 5000 QNC transferred to Pool 3
-                1 => ("full".to_string(), 2, 7500), // Phase 2: Full node, 7500 QNC transferred to Pool 3
-                2 => ("super".to_string(), 2, 10000), // Phase 2: Super node, 10000 QNC transferred to Pool 3
+        // TODO: Replace with actual blockchain query when storage integration is complete
+        // For now: simulate with dynamic pricing based on network state
+        for i in 0..3 { // Temporary simulation until blockchain query is ready
+            let node_type = match i {
+                0 => "light".to_string(),
+                1 => "full".to_string(),
+                2 => "super".to_string(),
                 _ => unreachable!("Only 3 node types exist"),
+            };
+            
+            // Calculate dynamic price based on phase and network size
+            let (phase, amount) = if current_phase == 1 {
+                // Phase 1: 1DEV burn (external on Solana)
+                (1, 0) // Amount is 0 because 1DEV is burned on Solana, not QNC
+            } else {
+                // Phase 2: QNC transfer to Pool 3 with dynamic pricing
+                let qnc_amount = self.calculate_dynamic_price(&node_type, network_stats.total_nodes);
+                (2, qnc_amount)
             };
             
             let activation = ActivationRecord {
@@ -1422,12 +1465,15 @@ impl BlockchainActivationRegistry {
     
     /// Get current blockchain height
     async fn get_blockchain_height(&self) -> Result<u64, String> {
-        // PRODUCTION: Get current blockchain height from consensus
-        // In real implementation: query consensus engine for latest block height
+        // CONSENSUS FIX: Use deterministic block height from environment
+        // This is set by the microblock producer and ensures all nodes use the same height
         
-        // For now: simulate reasonable blockchain height
-        let simulated_height = 125_000 + (chrono::Utc::now().timestamp() % 10_000) as u64;
-        Ok(simulated_height)
+        let current_height = std::env::var("CURRENT_BLOCK_HEIGHT")
+            .unwrap_or_default()
+            .parse::<u64>()
+            .unwrap_or(0);
+        
+        Ok(current_height)
     }
 
     /// Submit activation to blockchain
@@ -2211,6 +2257,81 @@ impl BlockchainActivationRegistry {
         // Production blockchain query would happen here
         // For now: No existing activations found (new system)
         Ok(None)
+    }
+    
+    /// Calculate dynamic price for Phase 2 node activation based on network size
+    fn calculate_dynamic_price(&self, node_type: &str, total_nodes: u64) -> u64 {
+        // PRODUCTION: Dynamic pricing based on network size (matching dynamic_pricing.py)
+        
+        // Base prices in QNC (Phase 2)
+        let base_price = match node_type {
+            "light" => 5_000,   // Light node base cost
+            "full" => 7_500,    // Full node base cost
+            "super" => 10_000,  // Super node base cost
+            _ => 5_000,         // Default to light node price
+        };
+        
+        // Network size multipliers (CORRECT implementation from dynamic_pricing.py)
+        let multiplier = if total_nodes < 100_000 {
+            0.5  // 0-100k nodes: 0.5x (early adopter discount)
+        } else if total_nodes < 1_000_000 {
+            1.0  // 100k-1M nodes: 1.0x (standard price)
+        } else if total_nodes < 10_000_000 {
+            2.0  // 1M-10M nodes: 2.0x (growing network)
+        } else {
+            3.0  // 10M+ nodes: 3.0x (mature network)
+        };
+        
+        // Calculate final price
+        let final_price = (base_price as f64 * multiplier) as u64;
+        
+        println!("[PRICING] 💰 {} node: {} QNC (base: {}, multiplier: {}x for {} nodes)",
+                 node_type, final_price, base_price, multiplier, total_nodes);
+        
+        final_price
+    }
+    
+    /// Get current activation phase (1: 1DEV burn, 2: QNC pool transfer)
+    fn get_current_activation_phase(&self) -> u8 {
+        // PRODUCTION: Phase detection logic
+        // Phase 1: Active until 90% of 1DEV supply is burned (900M out of 1B) OR 5 years pass
+        // Phase 2: Starts after Phase 1 completes (whichever condition comes first)
+        
+        // Check environment variable for phase override (for testing)
+        if let Ok(phase) = std::env::var("QNET_ACTIVATION_PHASE") {
+            return phase.parse::<u8>().unwrap_or(2); // Default to Phase 2
+        }
+        
+        // TODO: Query Solana blockchain for actual burn percentage
+        // For now: default to Phase 2 (mainnet is in Phase 2)
+        2
+    }
+    
+    /// Get network statistics for dynamic pricing
+    async fn get_network_statistics(&self) -> NetworkStats {
+        let active_nodes = self.active_nodes.read().await;
+        let total = active_nodes.len() as u64;
+        
+        // Count by type
+        let mut light_count = 0u64;
+        let mut full_count = 0u64;
+        let mut super_count = 0u64;
+        
+        for node in active_nodes.values() {
+            match node.node_type.as_str() {
+                "light" => light_count += 1,
+                "full" => full_count += 1,
+                "super" => super_count += 1,
+                _ => {}
+            }
+        }
+        
+        NetworkStats {
+            total_nodes: total,
+            light_nodes: light_count,
+            full_nodes: full_count,
+            super_nodes: super_count,
+        }
     }
 
 }

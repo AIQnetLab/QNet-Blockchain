@@ -1225,14 +1225,62 @@ impl AutoConfig {
     async fn new() -> Result<Self, Box<dyn std::error::Error>> {
         println!("🔧 Auto-configuring QNet node...");
         
-        // Auto-detect region via decentralized methods
-        let region = auto_detect_region().await?;
-        println!("🌍 Detected region: {:?}", region);
+        // PRODUCTION FIX: Allow region override for Genesis nodes to ensure stable P2P ports
+        let region = if let Ok(region_str) = std::env::var("QNET_REGION") {
+            match region_str.to_lowercase().as_str() {
+                "na" | "northamerica" | "north_america" => {
+                    println!("🌍 Using fixed region from QNET_REGION: North America");
+                    Region::NorthAmerica
+                },
+                "eu" | "europe" => {
+                    println!("🌍 Using fixed region from QNET_REGION: Europe");
+                    Region::Europe
+                },
+                "asia" | "ap" | "asia_pacific" => {
+                    println!("🌍 Using fixed region from QNET_REGION: Asia");
+                    Region::Asia
+                },
+                "sa" | "southamerica" | "south_america" => {
+                    println!("🌍 Using fixed region from QNET_REGION: South America");
+                    Region::SouthAmerica
+                },
+                "africa" | "af" => {
+                    println!("🌍 Using fixed region from QNET_REGION: Africa");
+                    Region::Africa
+                },
+                "oceania" | "oc" => {
+                    println!("🌍 Using fixed region from QNET_REGION: Oceania");
+                    Region::Oceania
+                },
+                _ => {
+                    println!("⚠️ Unknown QNET_REGION: {}, auto-detecting...", region_str);
+                    auto_detect_region().await?
+                }
+            }
+        } else {
+            // Auto-detect region if not specified
+            let region = auto_detect_region().await?;
+            println!("🌍 Auto-detected region: {:?}", region);
+            region
+        };
         
-        // Auto-select available ports
-        let p2p_port = find_available_port(9876).await?;
-        let rpc_port = find_available_port(9877).await?;
-        println!("🔌 Selected ports: P2P={}, RPC={}", p2p_port, rpc_port);
+        // PRODUCTION FIX: Use fixed P2P port from environment for Docker deployments
+        // This ensures Docker port mapping works correctly
+        let p2p_port = if let Ok(port_str) = std::env::var("QNET_P2P_PORT") {
+            let port = port_str.parse::<u16>().unwrap_or(9876);
+            println!("🔌 Using fixed P2P port from QNET_P2P_PORT: {}", port);
+            port
+        } else {
+            // Auto-detect only if not in Docker
+            find_available_port(9876).await?
+        };
+        
+        // RPC port is deprecated - all use unified API on 8001
+        let rpc_port = std::env::var("QNET_API_PORT")
+            .ok()
+            .and_then(|s| s.parse::<u16>().ok())
+            .unwrap_or(8001);
+        println!("🔌 Selected ports: P2P={}, API={}", p2p_port, rpc_port);
         
         // Smart data directory selection for Linux servers
         // In Docker, prefer /app/data if writable

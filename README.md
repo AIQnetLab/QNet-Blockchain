@@ -43,7 +43,7 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 - **⚡ Ultra-High Performance**: 424,411 TPS with sub-100ms latency
 - **🔥 Phase 1 Active**: 1DEV burn-to-join (1,500 → 150 1DEV universal pricing)
 - **💎 Phase 2 Ready**: QNC Pool 3 system (5k-30k QNC dynamic pricing)
-- **🌐 Scalable Architecture**: Sharding and microblock technology
+- **🌐 Scalable Architecture**: 256 shards, microblocks, lock-free operations (10M+ nodes)
 - **🔗 Cross-Chain Compatibility**: Solana integration for Phase 1
 - **🏛️ Decentralized Governance**: Community-driven decision making
 - **📱 Mobile-First Design**: Light nodes on phones & tablets
@@ -95,8 +95,12 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 │  │   └── 67% honest validator assumption                   │
 │  └── Dynamic Validator Selection with Failover            │
 ├─────────────────────────────────────────────────────────────┤
-│  Network Layer                                             │
-│  ├── Kademlia DHT                                          │
+│  Network Layer (Optimized for 10M+ nodes)                  │
+│  ├── Kademlia DHT with K-bucket management                 │
+│  ├── Lock-Free DashMap for O(1) operations                 │
+│  ├── Dual Indexing (by address & ID)                       │
+│  ├── 256 Shards with Cross-Shard Routing                   │
+│  ├── Auto-Scaling (5→100→10K→1M+ nodes)                    │
 │  ├── Gossip Protocol                                       │
 │  ├── Regional Node Clustering                              │
 │  └── Emergency Producer Change Broadcasting                │
@@ -1092,8 +1096,16 @@ QNet node deployment now features **zero-configuration** setup for maximum ease 
 - **Optimized batching**: 10,000 transactions per batch
 - **Parallel processing**: 16 threads for validation
 
-### 🔐 Quantum-Resistant P2P Network (NEW - August 2025)
+### 🔐 Quantum-Resistant P2P Network (UPDATED - December 2025)
 
+#### Advanced Scalability Features:
+- **Lock-Free Operations**: DashMap for concurrent access without blocking (10M+ nodes)
+- **Auto-Scaling Mode**: Automatic switching between HashMap (5 nodes) → DashMap (100+ nodes)
+- **O(1) Performance**: Dual indexing by address and node ID for instant lookups
+- **256 Shards**: Distributed load across shards with cross-shard routing
+- **K-bucket Management**: Max 20 peers per bucket with reputation-based replacement
+
+#### Core Features:
 - **Post-quantum cryptography**: CRYSTALS-Dilithium peer verification
 - **Adaptive peer limits**: 8-500 connections per region based on network size
 - **Real-time topology**: 1-second rebalancing intervals
@@ -1102,6 +1114,13 @@ QNet node deployment now features **zero-configuration** setup for maximum ease 
 - **Bootstrap trust mechanism**: Genesis nodes bypass verification for instant connectivity
 - **Byzantine safety**: Strict 4-node minimum for decentralized consensus
 - **Emergency bootstrap**: Cold-start fallback with cryptographic validation
+
+#### Auto-Scaling Thresholds:
+| Node Type | Lock-Free Activation | Sharding Activation | Max Capacity |
+|-----------|---------------------|---------------------|--------------|
+| Light | 500+ peers | 10,000+ peers | 1M+ peers |
+| Full | 100+ peers | 5,000+ peers | 10M+ peers |
+| Super | 50+ peers | 5,000+ peers | 10M+ peers |
 
 ### 📁 Distributed Data Management
 

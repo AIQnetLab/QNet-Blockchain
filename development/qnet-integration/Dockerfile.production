@@ -100,7 +100,7 @@ ENV QNET_LOG_DIR=/app/logs
 
 # Health check for production monitoring
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:9877/health || exit 1
+    CMD curl -f http://localhost:8001/api/v1/node/health || exit 1
 
 # Expose required ports (QNet specific)
 EXPOSE 9876 9877 8001

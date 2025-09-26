@@ -120,26 +120,25 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and_then(|blockchain: Arc<BlockchainNode>| async move {
             let height = blockchain.get_height().await;
             
-            // API FIX: Also include network sync status
+            // API DEADLOCK FIX: Use cached network height to avoid circular HTTP calls
             let mut network_height = height;
             let mut is_syncing = false;
             
             if let Some(p2p) = blockchain.get_unified_p2p() {
-                // API FIX: Get real network height for sync status
-                match p2p.sync_blockchain_height() {
-                    Ok(net_height) => {
-                        network_height = net_height;
-                        is_syncing = height < network_height;
-                    }
-                    Err(e) if e == "BOOTSTRAP_MODE" => {
+                // API DEADLOCK FIX: Get cached height without network calls
+                if let Some(cached_height) = p2p.get_cached_network_height() {
+                    network_height = cached_height;
+                    is_syncing = height < network_height;
+                } else {
+                    // No cache available - check if we're bootstrap node
+                    if std::env::var("QNET_BOOTSTRAP_ID").is_ok() || 
+                       std::env::var("QNET_GENESIS_BOOTSTRAP").unwrap_or_default() == "1" {
                         // Genesis node in bootstrap mode - use local height as network height
                         network_height = height;
                         is_syncing = false; // Bootstrap nodes are never "syncing"
-                        println!("[API] 🚀 Bootstrap mode - reporting local height as network height");
-                    }
-                    Err(e) => {
-                        println!("[API] ⚠️ Failed to get network height: {}", e);
-                        // Keep network_height = height (no sync needed if can't determine)
+                    } else {
+                        // Regular node without cache - assume not syncing
+                        println!("[API] ⚠️ No cached network height available, using local height");
                     }
                 }
             }
@@ -1745,27 +1744,24 @@ async fn handle_node_health(
         let validated = p2p.get_validated_active_peers();
         validated_peers = validated.len();
         
-        // API FIX: Check sync status with bootstrap mode handling
-        match p2p.sync_blockchain_height() {
-            Ok(net_height) => {
-                network_height = net_height;
-                if height < network_height {
-                    sync_status = "syncing";
-                }
+        // API DEADLOCK FIX: Use cached height to avoid circular calls
+        if let Some(cached_height) = p2p.get_cached_network_height() {
+            network_height = cached_height;
+            if height < network_height {
+                sync_status = "syncing";
             }
-            Err(e) if e == "BOOTSTRAP_MODE" => {
-                // Genesis node in bootstrap mode - use local height
-                network_height = height;
-                sync_status = "bootstrap"; // Special status for network bootstrap
-                println!("[API] 🚀 Node health: bootstrap mode active");
-            }
-            Err(_) => {
-                // Can't determine network height
-                if validated_peers == 0 {
-                    sync_status = "isolated"; // No peers
-                } else {
-                    sync_status = "checking"; // Have peers but no consensus
-                }
+        } else if std::env::var("QNET_BOOTSTRAP_ID").is_ok() || 
+                  std::env::var("QNET_GENESIS_BOOTSTRAP").unwrap_or_default() == "1" {
+            // Genesis node in bootstrap mode - use local height
+            network_height = height;
+            sync_status = "bootstrap"; // Special status for network bootstrap
+            println!("[API] 🚀 Node health: bootstrap mode active");
+        } else {
+            // Can't determine network height
+            if validated_peers == 0 {
+                sync_status = "isolated"; // No peers
+            } else {
+                sync_status = "checking"; // Have peers but no consensus
             }
         }
     }

@@ -233,6 +233,47 @@ impl PersistentStorage {
         }
     }
     
+    /// DATA CONSISTENCY: Reset chain height to 0 (DANGEROUS - requires explicit confirmation)
+    /// This function will ONLY work if QNET_FORCE_RESET=1 AND QNET_CONFIRM_RESET=YES
+    pub fn reset_chain_height(&self) -> IntegrationResult<()> {
+        // SAFETY: Double-check that user REALLY wants to reset
+        let force_reset = std::env::var("QNET_FORCE_RESET").unwrap_or_default();
+        let confirm_reset = std::env::var("QNET_CONFIRM_RESET").unwrap_or_default();
+        
+        if force_reset != "1" || confirm_reset != "YES" {
+            println!("[Storage] ⚠️ REFUSING to reset chain height!");
+            println!("[Storage]    To reset, set BOTH:");
+            println!("[Storage]    - QNET_FORCE_RESET=1");
+            println!("[Storage]    - QNET_CONFIRM_RESET=YES");
+            return Err(IntegrationError::StorageError(
+                "Chain height reset blocked - missing confirmation flags".to_string()
+            ));
+        }
+        
+        // Additional safety: Log the reset with timestamp
+        let timestamp = chrono::Utc::now();
+        println!("[Storage] ⚠️⚠️⚠️ CHAIN HEIGHT RESET INITIATED ⚠️⚠️⚠️");
+        println!("[Storage]    Timestamp: {}", timestamp);
+        println!("[Storage]    Requested by: QNET_FORCE_RESET + QNET_CONFIRM_RESET");
+        
+        let metadata_cf = self.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
+        
+        // Get current height before reset for logging
+        let current_height = match self.get_chain_height() {
+            Ok(h) => h,
+            Err(_) => 0,
+        };
+        
+        // Set height to 0
+        let height_bytes = 0u64.to_be_bytes();
+        self.db.put_cf(&metadata_cf, b"chain_height", height_bytes)?;
+        
+        println!("[Storage] ✅ Chain height reset: {} -> 0", current_height);
+        println!("[Storage] ⚠️  Data loss: {} blocks deleted", current_height);
+        Ok(())
+    }
+    
     pub fn get_block_hash(&self, height: u64) -> IntegrationResult<Option<String>> {
         let block_cf = self.db.cf_handle("blocks")
             .ok_or_else(|| IntegrationError::StorageError("blocks column family not found".to_string()))?;
@@ -838,6 +879,11 @@ impl Storage {
     
     pub fn get_chain_height(&self) -> IntegrationResult<u64> {
         self.persistent.get_chain_height()
+    }
+    
+    /// DATA CONSISTENCY: Reset chain height to 0 (wrapper for persistent storage)
+    pub fn reset_chain_height(&self) -> IntegrationResult<()> {
+        self.persistent.reset_chain_height()
     }
     
     pub fn get_block_hash(&self, height: u64) -> IntegrationResult<Option<String>> {
