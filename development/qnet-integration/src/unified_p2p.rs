@@ -1642,11 +1642,16 @@ impl SimplifiedP2P {
         // PRODUCTION: Silent broadcast operations for scalability (essential logs only)
         
         if validated_peers.is_empty() {
-            println!("[P2P] ⚠️ No validated peers available - block #{} not broadcasted", height);
+            if height % 10 == 0 {
+                println!("[P2P] ⚠️ No validated peers available - block #{} not broadcasted", height);
+            }
             return Ok(());
         }
         
-        println!("[P2P] 📡 Broadcasting block #{} to {} validated peers", height, validated_peers.len());
+        // Log broadcast only every 10 blocks
+        if height % 10 == 0 {
+            println!("[P2P] 📡 Broadcasting block #{} to {} validated peers", height, validated_peers.len());
+        }
         
         // In production: Actually send block data to peers
         for peer in validated_peers.iter() {
@@ -4316,10 +4321,11 @@ impl SimplifiedP2P {
     pub fn handle_message(&self, from_peer: &str, message: NetworkMessage) {
         match message {
             NetworkMessage::Block { height, data, block_type } => {
-                // PRODUCTION: Add visual separator for received blocks (same format as creation)
-                println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-                println!("[P2P] ← Received {} block #{} from {} ({} bytes)", 
-                         block_type, height, from_peer, data.len());
+                // Log only every 10th block
+                if height % 10 == 0 {
+                    println!("[P2P] ← Received {} block #{} from {} ({} bytes)", 
+                             block_type, height, from_peer, data.len());
+                }
                 
                 // EXISTING: Fast received block validation for millions of nodes scalability  
                 // PERFORMANCE: Use block height for phase detection - NO HTTP calls
@@ -4933,15 +4939,22 @@ impl SimplifiedP2P {
     fn send_network_message(&self, peer_addr: &str, message: NetworkMessage) {
         let peer_addr = peer_addr.to_string();
         
-        // DIAGNOSTIC: Log message type being sent
-        let message_type = match &message {
-            NetworkMessage::Block { height, .. } => format!("Block #{}", height),
-            NetworkMessage::Transaction { .. } => "Transaction".to_string(),
-            NetworkMessage::ConsensusCommit { round_id, .. } => format!("ConsensusCommit round {}", round_id),
-            NetworkMessage::ConsensusReveal { round_id, .. } => format!("ConsensusReveal round {}", round_id),
-            _ => "Other".to_string(),
+        // Log only important messages (consensus) and every 10th block
+        let should_log = match &message {
+            NetworkMessage::Block { height, .. } => height % 10 == 0,
+            NetworkMessage::ConsensusCommit { .. } | NetworkMessage::ConsensusReveal { .. } => true,
+            _ => false,
         };
-        println!("[P2P] 🔍 DIAGNOSTIC: Sending {} to peer {}", message_type, peer_addr);
+        
+        if should_log {
+            let message_type = match &message {
+                NetworkMessage::Block { height, .. } => format!("Block #{}", height),
+                NetworkMessage::ConsensusCommit { round_id, .. } => format!("Consensus round {}", round_id),
+                NetworkMessage::ConsensusReveal { round_id, .. } => format!("Reveal round {}", round_id),
+                _ => "Message".to_string(),
+            };
+            println!("[P2P] → Sending {} to {}", message_type, peer_addr);
+        }
         
         let message_json = match serde_json::to_value(&message) {
             Ok(json) => json,
@@ -4975,7 +4988,9 @@ impl SimplifiedP2P {
         };
         
         // Send asynchronously in background thread
+        let should_log_clone = should_log;
         tokio::spawn(async move {
+            let should_log = should_log_clone;
             let client = match reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(20)) // PRODUCTION: Timeout for Genesis node P2P messages
                 .connect_timeout(std::time::Duration::from_secs(10)) // Connection timeout
@@ -5008,7 +5023,10 @@ impl SimplifiedP2P {
                         .json(&message_json)
                         .send().await {
                         Ok(response) if response.status().is_success() => {
-                            println!("[P2P] ✅ Message sent to {} (attempt {})", peer_ip, attempt);
+                            // Log success only for important messages (consensus) or failures
+                            if should_log {
+                                println!("[P2P] ✅ Message sent to {}", peer_ip);
+                            }
                             sent = true;
                             break;
                         }

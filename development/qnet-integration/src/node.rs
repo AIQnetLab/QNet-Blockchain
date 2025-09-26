@@ -516,18 +516,27 @@ impl BlockchainNode {
         storage: Arc<Storage>,
     ) {
         while let Some(received_block) = block_rx.recv().await {
-            println!("[BLOCKS] Processing {} block #{} from {} ({} bytes)",
-                     received_block.block_type, received_block.height, 
-                     received_block.from_peer, received_block.data.len());
+            // Log only every 10th block or errors
+            let should_log = received_block.height % 10 == 0;
+            if should_log {
+                println!("[BLOCKS] Processing {} block #{} from {} ({} bytes)",
+                         received_block.block_type, received_block.height, 
+                         received_block.from_peer, received_block.data.len());
+            }
             
             // PRODUCTION: Validate and store received block
-            match received_block.block_type.as_str() {
+            let store_result = match received_block.block_type.as_str() {
                 "micro" => {
                     // Validate microblock signature and structure
                     if let Err(e) = Self::validate_received_microblock(&received_block, &storage).await {
                         println!("[BLOCKS] ❌ Invalid microblock #{}: {}", received_block.height, e);
                         continue;
                     }
+                    
+                    // CRITICAL FIX: Actually SAVE the microblock to storage!
+                    // Storage expects raw bytes, not deserialized struct
+                    storage.save_microblock(received_block.height, &received_block.data)
+                        .map_err(|e| format!("Storage error: {:?}", e))
                 },
                 "macro" => {
                     // Validate macroblock consensus and finality
@@ -535,16 +544,37 @@ impl BlockchainNode {
                         println!("[BLOCKS] ❌ Invalid macroblock #{}: {}", received_block.height, e);
                         continue;
                     }
+                    
+                    // CRITICAL FIX: Actually SAVE the macroblock to storage!
+                    // First deserialize to get the macroblock struct
+                    match bincode::deserialize::<qnet_state::MacroBlock>(&received_block.data) {
+                        Ok(macroblock) => {
+                            // save_macroblock IS async
+                            storage.save_macroblock(macroblock.height, &macroblock).await
+                                .map_err(|e| format!("Storage error: {:?}", e))
+                        },
+                        Err(e) => {
+                            Err(format!("Failed to deserialize macroblock: {}", e))
+                        }
+                    }
                 },
                 _ => {
                     println!("[BLOCKS] ⚠️ Unknown block type: {}", received_block.block_type);
                     continue;
                 }
-            }
+            };
             
-            // Store validated block (use existing storage methods)
-            // TODO: Implement proper block storage integration
-            println!("[BLOCKS] ✅ Block #{} processed successfully", received_block.height);
+            // Log storage results
+            match store_result {
+                Ok(_) => {
+                    if should_log {
+                        println!("[BLOCKS] ✅ Block #{} stored successfully", received_block.height);
+                    }
+                },
+                Err(e) => {
+                    println!("[BLOCKS] ❌ Failed to store block #{}: {}", received_block.height, e);
+                }
+            }
         }
     }
     
@@ -1096,10 +1126,11 @@ impl BlockchainNode {
                         0
                     };
                     
-                    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-                    println!("[MICROBLOCK] 📦 Creating microblock #{} | Producer: {} | Peers: {} | TXs: {}", 
+                    // Log only every 10 blocks or when there are transactions
+                    if microblock_height % 10 == 0 || !txs.is_empty() {
+                        println!("[BLOCK] 📦 Microblock #{} | Producer: {} | Peers: {} | TXs: {}", 
                              microblock_height, node_id, peer_count, txs.len());
-                    println!("[MICROBLOCK] ⚡ NO CONSENSUS (producer signature only) | Interval: 1s | Quantum: CRYSTALS-Dilithium");
+                    }
                     
                     let consensus_result: Option<u64> = None; // NO consensus for microblocks - Byzantine consensus ONLY for macroblocks
                     
@@ -1253,9 +1284,12 @@ impl BlockchainNode {
                         
                         // Non-blocking broadcast for real-time performance
                         tokio::spawn(async move {
-                            let _ = p2p_clone.broadcast_block(height_for_broadcast, broadcast_data);
-                            println!("[P2P] 📡 Broadcast microblock #{} to {} peers | Size: {} bytes (async)", 
-                                     height_for_broadcast, peer_count, broadcast_size);
+                            let result = p2p_clone.broadcast_block(height_for_broadcast, broadcast_data);
+                            // Log only errors or every 10th block
+                            if result.is_err() || height_for_broadcast % 10 == 0 {
+                                println!("[P2P] 📡 Block #{} broadcast: {:?} | {} peers | {} bytes", 
+                                         height_for_broadcast, result.is_ok(), peer_count, broadcast_size);
+                            }
                         });
                     } else {
                         println!("[P2P] ⚠️ P2P system not available - cannot broadcast block #{}", microblock.height);
@@ -1277,9 +1311,9 @@ impl BlockchainNode {
                                  txs.len(), remaining_size);
                     }
                     
-                    // PRODUCTION: Completion logging every 10 blocks only for 1-second intervals
-                    if microblock_height % 10 == 0 {
-                        println!("[MICROBLOCK] ✅ Block #{} completed | Producer: {}", microblock_height, node_id);
+                    // Log completion only every 30 blocks (rotation boundary)
+                    if microblock_height % 30 == 0 {
+                        println!("[BLOCK] ✅ Rotation complete at #{} | Next producer will be selected", microblock_height);
                     }
                     
                     // CRITICAL FIX: Do NOT reset timing here - breaks precision timing
@@ -1326,14 +1360,7 @@ impl BlockchainNode {
                         
                         // Show network health dashboard every macroblock
                         let network_health = std::cmp::min(85 + (peer_count * 3), 100);
-                        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-                        println!("🔮 QNET QUANTUM BLOCKCHAIN NETWORK STATUS");
-                        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-                        println!("⚡ Current Block: #{} | 🌐 Network Health: {}% | 🔐 Quantum Security: ACTIVE", 
-                                 microblock_height, network_health);
-                        println!("🚀 Microblocks: 1s intervals | 🏗️  Macroblocks: 90s intervals | ⏱️  Avg Finality: 1.2s");
-                        println!("🌍 Peers: {} connected | 💎 Consensus: Byzantine-BFT | 🛡️  Post-Quantum: CRYSTALS", peer_count);
-                        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+                        println!("[MACROBLOCK] 🏗️ Triggering consensus at height {} (90-block interval)", microblock_height);
                         
                         // PRODUCTION: Execute REAL Byzantine consensus for macroblock finalization  
                         let consensus_clone = consensus.clone();
@@ -1479,7 +1506,7 @@ impl BlockchainNode {
                     // PRODUCTION: This node is NOT the selected producer - synchronize with network
                     // CPU OPTIMIZATION: Only log every 10th block to reduce IO load
                     if microblock_height % 10 == 0 {
-                        println!("[MICROBLOCK] 👥 Waiting for block #{} from producer: {}", microblock_height + 1, current_producer);
+                    println!("[MICROBLOCK] 👥 Waiting for block #{} from producer: {}", microblock_height + 1, current_producer);
                     }
                     
                     // Update is_leader for backward compatibility
