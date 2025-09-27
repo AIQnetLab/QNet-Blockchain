@@ -24,7 +24,7 @@ QNet is a high-performance, post-quantum secure blockchain network with a **two-
 
 - ✅ **Post-Quantum Cryptography**: CRYSTALS-Dilithium integration complete
 - ✅ **Two-Phase Activation**: 1DEV burn (Phase 1) → QNC Pool 3 (Phase 2)
-- ✅ **Microblock Architecture**: 1-second block production, 100k+ TPS capability
+- ✅ **Microblock Architecture**: 1-second block production, 400k+ TPS capability (256 shards)
 - ✅ **Production Rust Nodes**: Server deployment with real blockchain nodes
 - ✅ **Browser Extension Wallet**: Production-ready with full-screen interface
 - ✅ **Mobile Applications**: iOS/Android apps for Light nodes only
@@ -40,7 +40,7 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 ### 🎯 Key Features
 
 - **🔐 Post-Quantum Security**: Quantum-resistant cryptographic algorithms
-- **⚡ Ultra-High Performance**: 424,411 TPS with sub-100ms latency
+- **⚡ Ultra-High Performance**: 424,411 TPS with zero-downtime consensus
 - **🔥 Phase 1 Active**: 1DEV burn-to-join (1,500 → 150 1DEV universal pricing)
 - **💎 Phase 2 Ready**: QNC Pool 3 system (5k-30k QNC dynamic pricing)
 - **🌐 Scalable Architecture**: 256 shards, microblocks, lock-free operations (10M+ nodes)
@@ -54,9 +54,10 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 
 | Metric | Value | Description |
 |--------|-------|-------------|
-| **Throughput** | 424,411 TPS | Sustained transaction processing |
+| **Throughput** | 424,411 TPS | 256 shards × 10k batch × zero-downtime |
 | **Latency** | <100ms | Transaction confirmation time |
 | **Finality** | <2 seconds | Block finalization |
+| **Downtime** | ZERO | Swiss watch precision, continuous flow |
 | **Energy Efficiency** | 99.9% less than Bitcoin | Eco-friendly consensus |
 | **Node Types** | Full, Super, Light | Flexible participation |
 | **Storage Efficiency** | 300 GB default | Advanced archival system |

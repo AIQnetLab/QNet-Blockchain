@@ -1345,12 +1345,8 @@ impl BlockchainActivationRegistry {
         // Convert block height to deterministic "time" (1 block = ~1 second)
         let current_time = node.activated_at + current_height;
         
-        // EXISTING: Genesis nodes start with 90% reputation, regular nodes 70%
-        let mut reputation = if node.device_signature.starts_with("genesis_device_") {
-            0.90 // EXISTING: Genesis nodes get 90% base reputation
-        } else {
-            0.70 // Regular nodes get 70% base reputation
-        };
+        // PRODUCTION: All nodes start equal, earn reputation through participation
+        let mut reputation = 0.70; // Universal consensus threshold for all nodes
         
         // EXISTING: Keep sophisticated reputation system for scalability
         // Boost reputation based on uptime (max +30%)
