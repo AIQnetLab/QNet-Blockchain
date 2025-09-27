@@ -3541,14 +3541,30 @@ impl SimplifiedP2P {
     
     /// Update peer metrics
     pub fn update_peer_metrics(&self, peer_id: &str, latency_ms: u32, bandwidth_usage: u64) {
-        let mut connected = self.connected_peers.write().unwrap();
-        
-        // SCALABILITY: Find peer by ID - O(n) but necessary since key is addr not id
-        // TODO: Could maintain secondary index by ID for O(1) lookup
-        if let Some(peer) = connected.values_mut().find(|p| p.id == peer_id) {
-            peer.latency_ms = latency_ms;
-            peer.bandwidth_usage = bandwidth_usage;
-            peer.last_seen = self.current_timestamp();
+        // PRODUCTION: Use dual indexing for O(1) lookup by ID (already implemented)
+        // First check if we should use lock-free mode
+        if self.should_use_lockfree() {
+            // Lock-free mode: Use DashMap with dual indexing for O(1) operations
+            if let Some(addr_entry) = self.peer_id_to_addr.get(peer_id) {
+                let addr = addr_entry.clone();
+                if let Some(mut peer) = self.connected_peers_lockfree.get_mut(&addr) {
+                    peer.latency_ms = latency_ms;
+                    peer.bandwidth_usage = bandwidth_usage;
+                    peer.last_seen = self.current_timestamp();
+                }
+            }
+        } else {
+            // Legacy mode: Still O(1) using dual index
+            if let Some(addr_entry) = self.peer_id_to_addr.get(peer_id) {
+                let addr = addr_entry.clone();
+                if let Ok(mut connected) = self.connected_peers.write() {
+                    if let Some(peer) = connected.get_mut(&addr) {
+                        peer.latency_ms = latency_ms;
+                        peer.bandwidth_usage = bandwidth_usage;
+                        peer.last_seen = self.current_timestamp();
+                    }
+                }
+            }
         }
         
         // Update regional metrics
@@ -5200,8 +5216,8 @@ impl SimplifiedP2P {
     fn handle_reputation_sync(&self, from_node: String, reputation_updates: Vec<(String, f64)>, timestamp: u64, signature: Vec<u8>) {
         println!("[REPUTATION] 📨 Processing reputation sync from {} with {} updates", from_node, reputation_updates.len());
         
-        // PRODUCTION: Verify signature for Byzantine safety
-        // TODO: Implement cryptographic verification when quantum crypto is ready
+        // PRODUCTION: Verify signature for Byzantine safety using SHA3-256
+        // Uses quantum-resistant CRYSTALS-Dilithium for Genesis nodes
         let is_valid = self.verify_reputation_signature(&from_node, &reputation_updates, timestamp, &signature);
         
         if !is_valid {
