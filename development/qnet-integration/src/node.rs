@@ -1181,9 +1181,15 @@ impl BlockchainNode {
                         *global_height = microblock_height;
                     }
                     
-                    // EXISTING: Use P2P get_peer_count() method - system already optimized
+                    // PRODUCTION: Use validated active peers for accurate count
                     let peer_count = if let Some(p2p) = &unified_p2p {
-                        p2p.get_peer_count()
+                        // For Genesis phase, use validated peers (matches Byzantine safety checks)
+                        if microblock_height < 1000 {
+                            let validated = p2p.get_validated_active_peers();
+                            validated.len()
+                        } else {
+                            p2p.get_peer_count()
+                        }
                     } else {
                         0
                     };
@@ -1360,6 +1366,16 @@ impl BlockchainNode {
                         });
                     } else {
                         println!("[P2P] ⚠️ P2P system not available - cannot broadcast block #{}", microblock.height);
+                    }
+                    
+                    // PRODUCTION: Reward producer for successful block creation
+                    if let Some(p2p) = &unified_p2p {
+                        if let Ok(mut reputation_system) = p2p.get_reputation_system().lock() {
+                            reputation_system.record_success(&node_id); // +1.0 reputation
+                            let new_reputation = reputation_system.get_reputation(&node_id);
+                            println!("[REPUTATION] ✅ Producer {} earned +1% reputation for block #{} (new: {:.1}%)", 
+                                     node_id, microblock.height, new_reputation);
+                        }
                     }
                     
                     // CRITICAL FIX: Optimized mempool cleanup - batch removal for performance 
@@ -3413,11 +3429,15 @@ impl BlockchainNode {
         // PRODUCTION: Save macroblock to storage only after REAL consensus
         match storage.save_macroblock(macroblock.height, &macroblock).await {
             Ok(_) => {
-                println!("[Macroblock] ✅ Macroblock #{} saved with {} microblocks (REAL consensus)", 
-                         macroblock.height, end_height - start_height + 1);
-                println!("[Macroblock] 📊 State root: {}", hex::encode(macroblock.state_root));
-                println!("[Macroblock] 🏛️ Leader: {} | Participants: {}", 
-                         consensus_data.leader_id, consensus_data.participants.len());
+                println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+                println!("[MACROBLOCK] ✅ MACROBLOCK #{} SUCCESSFULLY CREATED", macroblock.height);
+                println!("[MACROBLOCK] 📦 Aggregated {} microblocks (heights {}-{})", 
+                         end_height - start_height + 1, start_height, end_height);
+                println!("[MACROBLOCK] 📊 State root: {}", hex::encode(macroblock.state_root));
+                println!("[MACROBLOCK] 🏛️ Consensus leader: {}", consensus_data.leader_id);
+                println!("[MACROBLOCK] 👥 Byzantine participants: {}", consensus_data.participants.len());
+                println!("[MACROBLOCK] ⏰ Timestamp: {}", macroblock.timestamp);
+                println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
                 Ok(())
             },
             Err(e) => {

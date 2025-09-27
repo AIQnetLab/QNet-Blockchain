@@ -110,24 +110,7 @@ once_cell = "1.21.3"
 criterion = "0.5"
 tempfile = "3.8.1"
 
-# Production build profiles
-[profile.release]
-opt-level = 3
-debug = false
-strip = true
-lto = "fat"
-codegen-units = 1
-panic = "abort"
-
-[profile.release-fast]
-inherits = "release"
-opt-level = 3
-debug = false
-strip = true
-lto = "fat"
-codegen-units = 1
-panic = "abort"
-overflow-checks = false
+# Production build profiles are defined in workspace Cargo.toml
 
 [features]
 default = []
