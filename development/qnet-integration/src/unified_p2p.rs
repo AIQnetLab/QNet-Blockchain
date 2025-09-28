@@ -4369,6 +4369,42 @@ pub enum NetworkMessage {
         timestamp: u64,
         signature: Vec<u8>, // Cryptographic signature for Byzantine safety
     },
+    
+    /// Request blocks for sync
+    RequestBlocks {
+        from_height: u64,
+        to_height: u64,
+        requester_id: String,
+    },
+    
+    /// Response with batch of blocks
+    BlocksBatch {
+        blocks: Vec<(u64, Vec<u8>)>,  // (height, data) pairs
+        from_height: u64,
+        to_height: u64,
+        sender_id: String,
+    },
+    
+    /// Sync status query
+    SyncStatus {
+        current_height: u64,
+        target_height: u64,
+        syncing: bool,
+        node_id: String,
+    },
+    
+    /// Request consensus state for recovery
+    RequestConsensusState {
+        round: u64,
+        requester_id: String,
+    },
+    
+    /// Response with consensus state
+    ConsensusState {
+        round: u64,
+        state_data: Vec<u8>,
+        sender_id: String,
+    },
 }
 
 /// Internal consensus messages for node communication
@@ -4550,7 +4586,303 @@ impl SimplifiedP2P {
                 // PRODUCTION: Process reputation synchronization from other nodes
                 self.handle_reputation_sync(node_id, reputation_updates, timestamp, signature);
             }
+            
+            NetworkMessage::RequestBlocks { from_height, to_height, requester_id } => {
+                // Handle block request for sync
+                println!("[SYNC] 📥 Received block request from {} for heights {}-{}", 
+                         requester_id, from_height, to_height);
+                self.handle_block_request(from_peer, from_height, to_height, requester_id);
+            }
+            
+            NetworkMessage::BlocksBatch { blocks, from_height, to_height, sender_id } => {
+                // Handle batch of blocks for sync
+                println!("[SYNC] 📦 Received {} blocks from {} (heights {}-{})", 
+                         blocks.len(), sender_id, from_height, to_height);
+                self.handle_blocks_batch(blocks, from_height, to_height, sender_id);
+            }
+            
+            NetworkMessage::SyncStatus { current_height, target_height, syncing, node_id } => {
+                // Handle sync status update
+                if syncing {
+                    println!("[SYNC] 📊 Peer {} syncing: {} / {}", node_id, current_height, target_height);
+                }
+                self.handle_sync_status(node_id, current_height, target_height, syncing);
+            }
+            
+            NetworkMessage::RequestConsensusState { round, requester_id } => {
+                // Handle consensus state request
+                println!("[CONSENSUS] 📥 Consensus state request for round {} from {}", round, requester_id);
+                self.handle_consensus_state_request(from_peer, round, requester_id);
+            }
+            
+            NetworkMessage::ConsensusState { round, state_data, sender_id } => {
+                // Handle consensus state response
+                println!("[CONSENSUS] 📦 Received consensus state for round {} from {}", round, sender_id);
+                self.handle_consensus_state(round, state_data, sender_id);
+            }
         }
+    }
+}
+
+/// Implementation of sync and catch-up methods for SimplifiedP2P
+impl SimplifiedP2P {
+    /// Handle block request from peer for sync
+    pub fn handle_block_request(&self, from_peer: &str, from_height: u64, to_height: u64, requester_id: String) {
+        // Update last_seen for requesting peer
+        self.update_peer_last_seen(from_peer);
+        
+        // RATE LIMITING: Check if peer is making too many sync requests
+        let current_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        
+        // Check rate limit (max 10 sync requests per minute per peer)
+        let rate_limited = {
+            let mut rate_limiter = self.rate_limiter.lock().unwrap();
+            let rate_key = format!("sync_{}", from_peer);
+            
+            let rate_limit = rate_limiter.entry(rate_key).or_insert_with(|| RateLimit {
+                requests: Vec::new(),
+                max_requests: 10,  // 10 sync requests per minute
+                window_seconds: 60,
+                blocked_until: 0,
+            });
+            
+            // Check if currently blocked
+            if rate_limit.blocked_until > current_time {
+                println!("[SYNC] ⛔ Rate limit: {} blocked for {} more seconds", 
+                         from_peer, rate_limit.blocked_until - current_time);
+                return;
+            }
+            
+            // Clean old requests outside window
+            rate_limit.requests.retain(|&req_time| req_time > current_time - rate_limit.window_seconds);
+            
+            // Check if limit exceeded
+            if rate_limit.requests.len() >= rate_limit.max_requests {
+                rate_limit.blocked_until = current_time + 60; // Block for 1 minute
+                println!("[SYNC] ⛔ Rate limit exceeded for {} ({}+ requests/minute)", 
+                         from_peer, rate_limit.max_requests);
+                true
+            } else {
+                // Add this request
+                rate_limit.requests.push(current_time);
+                false
+            }
+        };
+        
+        if rate_limited {
+            return;
+        }
+        
+        // Validate request range (max 100 blocks per batch for performance)
+        let max_batch = 100;
+        let actual_to = if to_height - from_height > max_batch {
+            from_height + max_batch - 1
+        } else {
+            to_height
+        };
+        
+        println!("[SYNC] 📤 Preparing blocks {}-{} for {}", from_height, actual_to, requester_id);
+        
+        // This will be connected to storage when node.rs calls it
+        // For now, just log the request
+    }
+    
+    /// Handle blocks batch received for sync
+    pub fn handle_blocks_batch(&self, blocks: Vec<(u64, Vec<u8>)>, from_height: u64, to_height: u64, sender_id: String) {
+        println!("[SYNC] ✅ Processing {} blocks from {} (heights {}-{})", 
+                 blocks.len(), sender_id, from_height, to_height);
+        
+        // Update last_seen for sender
+        self.update_peer_last_seen(&sender_id);
+        
+        // CRITICAL: Send blocks to block receiver for processing
+        if let Some(ref block_tx) = self.block_tx {
+            for (height, data) in blocks {
+                // Create ReceivedBlock for processing
+                let received_block = ReceivedBlock {
+                    height,
+                    data,
+                    block_type: "micro".to_string(), // Batch sync is for microblocks
+                    from_peer: sender_id.clone(),
+                    timestamp: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
+                };
+                
+                // Send to block processor
+                if let Err(e) = block_tx.send(received_block) {
+                    println!("[SYNC] ❌ Failed to queue block {} for processing: {}", height, e);
+                }
+            }
+            println!("[SYNC] 📥 Queued {} blocks for processing", to_height - from_height + 1);
+        } else {
+            println!("[SYNC] ⚠️ Block processor not available, cannot save synced blocks!");
+        }
+    }
+    
+    /// Handle sync status update from peer
+    pub fn handle_sync_status(&self, node_id: String, current_height: u64, target_height: u64, syncing: bool) {
+        // Update peer's sync status for network awareness
+        if let Ok(mut peers) = self.connected_peers.write() {
+            if let Some(peer) = peers.get_mut(&node_id) {
+                // Store sync status in peer info (could add sync_status field to PeerInfo)
+                peer.last_seen = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+            }
+        }
+    }
+    
+    /// Handle consensus state request
+    pub fn handle_consensus_state_request(&self, from_peer: &str, round: u64, requester_id: String) {
+        // Update last_seen for requesting peer
+        self.update_peer_last_seen(from_peer);
+        
+        // RATE LIMITING: Check consensus state request rate (stricter than sync)
+        let current_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        
+        // Check rate limit (max 5 consensus requests per minute per peer)
+        let rate_limited = {
+            let mut rate_limiter = self.rate_limiter.lock().unwrap();
+            let rate_key = format!("consensus_{}", from_peer);
+            
+            let rate_limit = rate_limiter.entry(rate_key).or_insert_with(|| RateLimit {
+                requests: Vec::new(),
+                max_requests: 5,  // Only 5 consensus state requests per minute
+                window_seconds: 60,
+                blocked_until: 0,
+            });
+            
+            // Check if currently blocked
+            if rate_limit.blocked_until > current_time {
+                println!("[CONSENSUS] ⛔ Rate limit: {} blocked for {} more seconds", 
+                         from_peer, rate_limit.blocked_until - current_time);
+                return;
+            }
+            
+            // Clean old requests
+            rate_limit.requests.retain(|&req_time| req_time > current_time - rate_limit.window_seconds);
+            
+            // Check if limit exceeded
+            if rate_limit.requests.len() >= rate_limit.max_requests {
+                rate_limit.blocked_until = current_time + 120; // Block for 2 minutes (stricter)
+                println!("[CONSENSUS] ⛔ Rate limit exceeded for {} ({}+ requests/minute)", 
+                         from_peer, rate_limit.max_requests);
+                true
+            } else {
+                rate_limit.requests.push(current_time);
+                false
+            }
+        };
+        
+        if rate_limited {
+            return;
+        }
+        
+        println!("[CONSENSUS] 📤 Preparing consensus state for round {} for {}", round, requester_id);
+        
+        // This will be connected to consensus storage when node.rs implements it
+    }
+    
+    /// Handle consensus state received
+    pub fn handle_consensus_state(&self, round: u64, state_data: Vec<u8>, sender_id: String) {
+        // Update last_seen for sender
+        self.update_peer_last_seen(&sender_id);
+        
+        println!("[CONSENSUS] ✅ Processing consensus state for round {} from {} ({} bytes)", 
+                 round, sender_id, state_data.len());
+        
+        // This will be connected to consensus recovery when node.rs implements it
+    }
+    
+    /// Request blocks from peers for sync
+    pub async fn sync_blocks(&self, from_height: u64, to_height: u64) -> Result<(), String> {
+        println!("[SYNC] 🔄 Starting block sync from {} to {}", from_height, to_height);
+        
+        let peers = self.get_validated_active_peers();
+        if peers.is_empty() {
+            return Err("No peers available for sync".to_string());
+        }
+        
+        // Select best peer for sync (highest reputation)
+        let best_peer = peers.iter()
+            .max_by(|a, b| a.reputation_score.partial_cmp(&b.reputation_score).unwrap())
+            .ok_or("No valid peer for sync")?;
+        
+        println!("[SYNC] 📡 Requesting blocks from peer {} (reputation: {:.1}%)", 
+                 best_peer.id, best_peer.reputation_score * 100.0);
+        
+        // Create request message
+        let request = NetworkMessage::RequestBlocks {
+            from_height,
+            to_height,
+            requester_id: self.node_id.clone(),
+        };
+        
+        // Send request
+        self.send_network_message(&best_peer.addr, request);
+        
+        Ok(())
+    }
+    
+    /// Batch sync for catch-up - request blocks in batches
+    pub async fn batch_sync(&self, from_height: u64, to_height: u64, batch_size: u64) -> Result<(), String> {
+        println!("[SYNC] 🚀 Starting batch sync from {} to {} (batch size: {})", 
+                 from_height, to_height, batch_size);
+        
+        let mut current = from_height;
+        
+        while current <= to_height {
+            let batch_to = std::cmp::min(current + batch_size - 1, to_height);
+            
+            println!("[SYNC] 📦 Syncing batch {}-{}", current, batch_to);
+            self.sync_blocks(current, batch_to).await?;
+            
+            // Wait a bit between batches to avoid overwhelming the network
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            
+            current = batch_to + 1;
+        }
+        
+        println!("[SYNC] ✅ Batch sync complete!");
+        Ok(())
+    }
+    
+    /// Request consensus state from peers for recovery
+    pub async fn sync_consensus_state(&self, round: u64) -> Result<(), String> {
+        println!("[CONSENSUS] 🔄 Requesting consensus state for round {}", round);
+        
+        let peers = self.get_validated_active_peers();
+        if peers.is_empty() {
+            return Err("No peers available for consensus sync".to_string());
+        }
+        
+        // Select peer with highest reputation
+        let best_peer = peers.iter()
+            .max_by(|a, b| a.reputation_score.partial_cmp(&b.reputation_score).unwrap())
+            .ok_or("No valid peer for consensus sync")?;
+        
+        println!("[CONSENSUS] 📡 Requesting from peer {} (reputation: {:.1}%)", 
+                 best_peer.id, best_peer.reputation_score * 100.0);
+        
+        // Create request message
+        let request = NetworkMessage::RequestConsensusState {
+            round,
+            requester_id: self.node_id.clone(),
+        };
+        
+        // Send request
+        self.send_network_message(&best_peer.addr, request);
+        
+        Ok(())
     }
 }
 
@@ -5037,7 +5369,7 @@ impl SimplifiedP2P {
     }
 
     /// Send network message via HTTP POST to peer's API (with pseudonym resolution)
-    fn send_network_message(&self, peer_addr: &str, message: NetworkMessage) {
+    pub fn send_network_message(&self, peer_addr: &str, message: NetworkMessage) {
         let peer_addr = peer_addr.to_string();
         
         // Log only important messages (consensus) and every 10th block

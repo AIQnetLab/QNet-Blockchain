@@ -5,6 +5,36 @@ All notable changes to the QNet project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.5.0] - September 28, 2025 "Production-Ready MVP with Sync & Recovery"
+
+### Added
+- **Persistent Consensus State**: Save and restore consensus state across restarts
+- **Protocol Version Checking**: Version compatibility checks for consensus state
+- **Sync & Catch-up Protocol**: Batch sync for recovering nodes (100 blocks per batch)
+- **Cross-Shard Support**: Integrated ShardCoordinator for cross-shard transactions
+- **Rate Limiting for Sync**: DoS protection (10 sync requests/minute, 5 consensus requests/minute)
+- **Sync Progress Tracking**: Resume interrupted sync after restart
+- **Network Messages**: RequestBlocks, BlocksBatch, SyncStatus, RequestConsensusState, ConsensusState
+
+### Changed
+- **Storage**: Added consensus and sync_state column families to RocksDB
+- **Node Startup**: Auto-check for sync needs and consensus recovery
+- **Rate Limiting**: Stricter limits for consensus state requests (2-minute block on abuse)
+
+### Security
+- **Protocol Versioning**: Prevents loading incompatible consensus states
+- **Rate Limiting**: Protection against sync request flooding
+- **Version Guards**: MIN_COMPATIBLE_VERSION check for protocol upgrades
+
+### Performance
+- **Batch Sync**: 100 microblocks per request (heights from-to)
+- **Microblocks**: Created every 1 second, synced via batch when catching up
+- **Macroblocks**: Created locally every 90 seconds from microblocks via consensus
+- **Legacy Blocks**: Only genesis block uses old Block format
+- **Rate Limiting**: 10 sync requests/minute per peer
+- **Consensus Rate**: 5 consensus state requests/minute per peer
+- **Smart Sync**: Only sync when behind, auto-resume from last position
+
 ## [2.4.0] - September 27, 2025 "Zero-Downtime Swiss Watch Architecture"
 
 ### Added

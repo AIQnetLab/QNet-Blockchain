@@ -165,6 +165,8 @@ impl PersistentStorage {
             ColumnFamilyDescriptor::new("accounts", Options::default()),
             ColumnFamilyDescriptor::new("metadata", Options::default()),
             ColumnFamilyDescriptor::new("microblocks", Options::default()),
+            ColumnFamilyDescriptor::new("consensus", Options::default()),
+            ColumnFamilyDescriptor::new("sync_state", Options::default()),
         ];
         
         let db = match DB::open_cf_descriptors(&opts, path, cfs) {
@@ -765,6 +767,106 @@ impl PersistentStorage {
         Ok(stats)
     }
 
+    /// Save consensus round state for recovery after restart
+    pub fn save_consensus_state(&self, round: u64, state: &[u8]) -> IntegrationResult<()> {
+        let consensus_cf = self.db.cf_handle("consensus")
+            .ok_or_else(|| IntegrationError::StorageError("consensus column family not found".to_string()))?;
+        
+        let key = format!("round_{}", round);
+        self.db.put_cf(&consensus_cf, key.as_bytes(), state)?;
+        
+        // Update latest round for quick lookup
+        self.db.put_cf(&consensus_cf, b"latest_round", &round.to_be_bytes())?;
+        
+        Ok(())
+    }
+    
+    /// Load consensus round state for recovery
+    pub fn load_consensus_state(&self, round: u64) -> IntegrationResult<Option<Vec<u8>>> {
+        let consensus_cf = self.db.cf_handle("consensus")
+            .ok_or_else(|| IntegrationError::StorageError("consensus column family not found".to_string()))?;
+        
+        let key = format!("round_{}", round);
+        Ok(self.db.get_cf(&consensus_cf, key.as_bytes())?)
+    }
+    
+    /// Get latest consensus round from storage
+    pub fn get_latest_consensus_round(&self) -> IntegrationResult<u64> {
+        let consensus_cf = self.db.cf_handle("consensus")
+            .ok_or_else(|| IntegrationError::StorageError("consensus column family not found".to_string()))?;
+        
+        match self.db.get_cf(&consensus_cf, b"latest_round")? {
+            Some(bytes) => {
+                let round = u64::from_be_bytes(bytes.try_into()
+                    .map_err(|_| IntegrationError::StorageError("Invalid round data".to_string()))?);
+                Ok(round)
+            },
+            None => Ok(0), // No consensus state saved yet
+        }
+    }
+    
+    /// Save sync progress for resuming after restart
+    pub fn save_sync_progress(&self, from_height: u64, to_height: u64, current: u64) -> IntegrationResult<()> {
+        let sync_cf = self.db.cf_handle("sync_state")
+            .ok_or_else(|| IntegrationError::StorageError("sync_state column family not found".to_string()))?;
+        
+        let data = bincode::serialize(&(from_height, to_height, current))
+            .map_err(|e| IntegrationError::SerializationError(e.to_string()))?;
+        
+        self.db.put_cf(&sync_cf, b"sync_progress", &data)?;
+        Ok(())
+    }
+    
+    /// Load sync progress for resuming
+    pub fn load_sync_progress(&self) -> IntegrationResult<Option<(u64, u64, u64)>> {
+        let sync_cf = self.db.cf_handle("sync_state")
+            .ok_or_else(|| IntegrationError::StorageError("sync_state column family not found".to_string()))?;
+        
+        match self.db.get_cf(&sync_cf, b"sync_progress")? {
+            Some(data) => {
+                let progress = bincode::deserialize(&data)
+                    .map_err(|e| IntegrationError::DeserializationError(e.to_string()))?;
+                Ok(Some(progress))
+            },
+            None => Ok(None),
+        }
+    }
+    
+    /// Clear sync progress after completion
+    pub fn clear_sync_progress(&self) -> IntegrationResult<()> {
+        let sync_cf = self.db.cf_handle("sync_state")
+            .ok_or_else(|| IntegrationError::StorageError("sync_state column family not found".to_string()))?;
+        
+        self.db.delete_cf(&sync_cf, b"sync_progress")?;
+        Ok(())
+    }
+    
+    /// Get microblock range for batch sync
+    pub async fn get_microblocks_range(&self, from: u64, to: u64) -> IntegrationResult<Vec<(u64, Vec<u8>)>> {
+        let mut microblocks = Vec::new();
+        
+        for height in from..=to {
+            if let Some(data) = self.load_microblock(height)? {
+                microblocks.push((height, data));
+            }
+        }
+        
+        Ok(microblocks)
+    }
+    
+    /// Legacy: Get block range for old Block format (only genesis)  
+    pub async fn get_blocks_range(&self, from: u64, to: u64) -> IntegrationResult<Vec<qnet_state::Block>> {
+        let mut blocks = Vec::new();
+        
+        for height in from..=to {
+            if let Some(block) = self.load_block_by_height(height).await? {
+                blocks.push(block);
+            }
+        }
+        
+        Ok(blocks)
+    }
+
     /// Find transaction by hash in blockchain storage
     pub async fn find_transaction_by_hash(&self, tx_hash: &str) -> IntegrationResult<Option<qnet_state::Transaction>> {
         // PRODUCTION: Search for transaction in blockchain storage
@@ -981,6 +1083,46 @@ impl Storage {
 
     pub fn update_activation_for_migration(&self, code: &str, node_type: u8, timestamp: u64, new_device_signature: &str) -> IntegrationResult<()> {
         self.persistent.update_activation_for_migration(code, node_type, timestamp, new_device_signature)
+    }
+    
+    /// Save consensus state for persistence
+    pub fn save_consensus_state(&self, round: u64, state: &[u8]) -> IntegrationResult<()> {
+        self.persistent.save_consensus_state(round, state)
+    }
+    
+    /// Load consensus state after restart
+    pub fn load_consensus_state(&self, round: u64) -> IntegrationResult<Option<Vec<u8>>> {
+        self.persistent.load_consensus_state(round)
+    }
+    
+    /// Get latest consensus round
+    pub fn get_latest_consensus_round(&self) -> IntegrationResult<u64> {
+        self.persistent.get_latest_consensus_round()
+    }
+    
+    /// Save sync progress
+    pub fn save_sync_progress(&self, from_height: u64, to_height: u64, current: u64) -> IntegrationResult<()> {
+        self.persistent.save_sync_progress(from_height, to_height, current)
+    }
+    
+    /// Load sync progress
+    pub fn load_sync_progress(&self) -> IntegrationResult<Option<(u64, u64, u64)>> {
+        self.persistent.load_sync_progress()
+    }
+    
+    /// Clear sync progress
+    pub fn clear_sync_progress(&self) -> IntegrationResult<()> {
+        self.persistent.clear_sync_progress()
+    }
+    
+    /// Get microblocks range for batch sync  
+    pub async fn get_microblocks_range(&self, from: u64, to: u64) -> IntegrationResult<Vec<(u64, Vec<u8>)>> {
+        self.persistent.get_microblocks_range(from, to).await
+    }
+    
+    /// Legacy: Get blocks range for old Block format
+    pub async fn get_blocks_range(&self, from: u64, to: u64) -> IntegrationResult<Vec<qnet_state::Block>> {
+        self.persistent.get_blocks_range(from, to).await
     }
     
     /// Save efficient microblock with separate transaction storage

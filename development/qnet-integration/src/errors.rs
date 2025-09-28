@@ -74,6 +74,9 @@ pub enum QNetError {
     #[error("Network error: {0}")]
     NetworkError(String),
     
+    #[error("Sync error: {0}")]
+    SyncError(String),
+    
     #[error("Validation error: {0}")]
     ValidationError(String),
     

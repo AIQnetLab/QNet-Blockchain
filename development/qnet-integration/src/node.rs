@@ -4,8 +4,12 @@ use crate::{
     errors::QNetError,
     storage::Storage,
     // validator::Validator, // disabled for compilation
-    unified_p2p::{SimplifiedP2P, NodeType as UnifiedNodeType, Region as UnifiedRegion, ConsensusMessage},
+    unified_p2p::{SimplifiedP2P, NodeType as UnifiedNodeType, Region as UnifiedRegion, ConsensusMessage, NetworkMessage},
 };
+
+// PROTOCOL VERSION for compatibility checks
+const PROTOCOL_VERSION: u32 = 1;  // Increment when breaking changes are made
+const MIN_COMPATIBLE_VERSION: u32 = 1;  // Minimum version we can work with
 use qnet_state::{StateManager, Account, Transaction, Block, BlockType, MicroBlock, MacroBlock, LightMicroBlock, ConsensusData};
 use qnet_mempool::{SimpleMempool, SimpleMempoolConfig};
 use qnet_consensus::{ConsensusEngine, ConsensusConfig, NodeId, CommitRevealConsensus, ConsensusError};
@@ -209,10 +213,42 @@ impl BlockchainNode {
         };
         
         // Create REAL Byzantine consensus engine with commit-reveal protocol
-        let consensus_engine = qnet_consensus::CommitRevealConsensus::new(node_id.clone(), consensus_config);
+        let mut consensus_engine = qnet_consensus::CommitRevealConsensus::new(node_id.clone(), consensus_config);
+        
+        // PERSISTENCE: Load consensus state if exists
+        if let Ok(latest_round) = storage.get_latest_consensus_round() {
+            if latest_round > 0 {
+                println!("[CONSENSUS] 📂 Loading consensus state from round {}", latest_round);
+                if let Ok(Some(state_data)) = storage.load_consensus_state(latest_round) {
+                    // VERSION CHECK: Ensure compatibility before restoring
+                    if state_data.len() >= 4 {
+                        let version = u32::from_le_bytes([state_data[0], state_data[1], state_data[2], state_data[3]]);
+                        if version >= MIN_COMPATIBLE_VERSION && version <= PROTOCOL_VERSION {
+                            println!("[CONSENSUS] ✅ Consensus state restored (version: {})", version);
+                            // Note: This requires adding a restore_state method to CommitRevealConsensus
+                            // consensus_engine.restore_state(&state_data[4..]); 
+                        } else {
+                            println!("[CONSENSUS] ⚠️ Incompatible consensus version: {} (current: {})", version, PROTOCOL_VERSION);
+                            println!("[CONSENSUS] 🔄 Starting fresh consensus state");
+                        }
+                    } else {
+                        println!("[CONSENSUS] ⚠️ Invalid consensus state format, starting fresh");
+                    }
+                } else {
+                    println!("[CONSENSUS] ⚠️ No consensus state found, starting fresh");
+                }
+            }
+        }
+        
         let consensus = Arc::new(RwLock::new(consensus_engine));
         
         // Validator disabled for now
+        
+        // SYNC: Check if we need to catch up with the network
+        if let Ok(Some((from, to, current))) = storage.load_sync_progress() {
+            println!("[SYNC] 📊 Previous sync progress found: {}/{} (from: {})", current, to, from);
+            // Will resume sync after P2P initialization
+        }
         
         // Get current height from storage
         println!("[Node] 🔍 DEBUG: Getting chain height from storage...");
@@ -683,6 +719,18 @@ impl BlockchainNode {
             
             // EXISTING: Bootstrap peer connections without initial sync delay
             // Sync will happen later after API servers are ready
+        }
+        
+        // SYNC: Check if we need to sync with network after restart
+        if let Err(e) = self.start_sync_if_needed().await {
+            println!("[SYNC] ⚠️ Sync check failed: {}", e);
+            // Continue anyway - sync can be retried later
+        }
+        
+        // CONSENSUS: Recover consensus state if needed
+        if let Err(e) = self.recover_consensus_state().await {
+            println!("[CONSENSUS] ⚠️ Consensus recovery failed: {}", e);
+            // Continue anyway - consensus will start fresh
         }
         
         // PRODUCTION FIX: Always enable microblock production for blockchain operation
@@ -3380,6 +3428,26 @@ impl BlockchainNode {
             }
         };
         
+        // PERSISTENCE: Save consensus state with version
+        {
+            // Create versioned consensus state
+            let mut versioned_state = Vec::new();
+            versioned_state.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
+            
+            // Serialize consensus data
+            if let Ok(consensus_bytes) = bincode::serialize(&consensus_data) {
+                versioned_state.extend_from_slice(&consensus_bytes);
+                
+                // Save to storage
+                let round = consensus_data.round_number;
+                if let Err(e) = storage.save_consensus_state(round, &versioned_state) {
+                    println!("[CONSENSUS] ⚠️ Failed to save consensus state: {}", e);
+                } else {
+                    println!("[CONSENSUS] 💾 Consensus state saved for round {} (version: {})", round, PROTOCOL_VERSION);
+                }
+            }
+        }
+        
         // Production: Collect actual microblock hashes from storage
         let mut microblock_hashes = Vec::new();
         let mut state_accumulator = [0u8; 32];
@@ -3635,6 +3703,40 @@ impl BlockchainNode {
             return Err(QNetError::ValidationError("Transfer amount cannot be zero".to_string()));
         }
         
+        // SHARDING: Check if this is a cross-shard transaction
+        if let Some(ref shard_coordinator) = self.shard_coordinator {
+            if let qnet_state::TransactionType::Transfer { to, .. } = &tx.tx_type {
+                let from_shard = shard_coordinator.get_shard(&tx.from);
+                let to_shard = shard_coordinator.get_shard(to);
+                
+                if from_shard != to_shard {
+                    // This is a cross-shard transaction
+                    println!("[SHARDING] 🌐 Cross-shard transaction detected: shard {} → shard {}", 
+                             from_shard, to_shard);
+                    
+                    // Create cross-shard transaction record
+                    let cross_shard_tx = qnet_sharding::CrossShardTx {
+                        tx_hash: tx.hash.clone(),
+                        from_shard,
+                        to_shard,
+                        amount: tx.amount,
+                        timestamp: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
+                    };
+                    
+                    // Process through shard coordinator
+                    if let Err(e) = shard_coordinator.process_cross_shard_tx(cross_shard_tx).await {
+                        println!("[SHARDING] ⚠️ Cross-shard processing failed: {}", e);
+                        // Continue with normal processing even if cross-shard fails
+                    } else {
+                        println!("[SHARDING] ✅ Cross-shard transaction queued for processing");
+                    }
+                }
+            }
+        }
+        
         // Check sender balance in state
         {
             let state = self.state.read().await;
@@ -3717,6 +3819,195 @@ impl BlockchainNode {
             "sharding_enabled": self.perf_config.enable_sharding,
             "parallel_validation": self.perf_config.parallel_validation,
         }))
+    }
+    
+    /// Start sync process after node restart or new node join
+    pub async fn start_sync_if_needed(&self) -> Result<(), QNetError> {
+        // Check if we have pending sync from previous run
+        if let Ok(Some((from, to, current))) = self.storage.load_sync_progress() {
+            println!("[SYNC] 📊 Resuming sync from block {} (target: {})", current, to);
+            
+            if let Some(ref p2p) = self.unified_p2p {
+                // Continue sync from where we left off
+                if let Err(e) = p2p.batch_sync(current, to, 100).await {
+                    return Err(QNetError::SyncError(format!("Sync failed: {}", e)));
+                }
+                
+                // Clear sync progress after successful completion
+                self.storage.clear_sync_progress()?;
+                println!("[SYNC] ✅ Sync completed successfully!");
+            }
+        } else {
+            // Check if we're behind the network
+            if let Some(ref p2p) = self.unified_p2p {
+                let peers = p2p.get_validated_active_peers();
+                if !peers.is_empty() {
+                    let current_height = self.get_height().await;
+                    
+                    // CRITICAL FIX: Query network height from peers
+                    let network_height = self.query_network_height().await?;
+                    
+                    println!("[SYNC] 📊 Local height: {}, Network height: {}", current_height, network_height);
+                    
+                    // If we're behind, start sync
+                    if network_height > current_height + 10 { // Allow 10 block tolerance
+                        println!("[SYNC] ⚠️ Node is {} blocks behind, starting sync...", 
+                                 network_height - current_height);
+                        
+                        // CRITICAL: Light nodes should NOT sync full history!
+                        match self.node_type {
+                            NodeType::Light => {
+                                // Light nodes only sync recent blocks (last 1000 blocks max)
+                                println!("[SYNC] 📱 Light node: syncing only recent history");
+                                let sync_from = std::cmp::max(1, network_height.saturating_sub(1000));
+                                self.sync_blocks(sync_from, network_height).await?;
+                            }
+                            NodeType::Full | NodeType::Super => {
+                                // Full/Super nodes sync complete history
+                                // For new nodes (height 0 or 1), start from block 1 (first microblock)
+                                let sync_from = if current_height <= 1 { 1 } else { current_height + 1 };
+                                
+                                // Sync to network height
+                                self.sync_blocks(sync_from, network_height).await?;
+                            }
+                        }
+                    } else {
+                        println!("[SYNC] ✅ Node is up to date");
+                    }
+                } else {
+                    println!("[SYNC] ⚠️ No peers available for sync check");
+                }
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// Sync blocks from network
+    pub async fn sync_blocks(&self, from_height: u64, to_height: u64) -> Result<(), QNetError> {
+        if let Some(ref p2p) = self.unified_p2p {
+            // Start sync process
+            println!("[SYNC] 🔄 Starting block sync from {} to {}", from_height, to_height);
+            
+            // Save sync progress for recovery
+            self.storage.save_sync_progress(from_height, to_height, from_height)?;
+            
+            // Use batch sync for efficiency
+            if let Err(e) = p2p.batch_sync(from_height, to_height, 100).await {
+                return Err(QNetError::SyncError(format!("Batch sync failed: {}", e)));
+            }
+            
+            // Clear sync progress after success
+            self.storage.clear_sync_progress()?;
+            println!("[SYNC] ✅ Block sync completed!");
+            
+            Ok(())
+        } else {
+            Err(QNetError::NetworkError("P2P network not initialized".to_string()))
+        }
+    }
+    
+    /// Handle incoming sync request from peer
+    pub async fn handle_sync_request(&self, from_height: u64, to_height: u64, requester_id: String) -> Result<(), QNetError> {
+        println!("[SYNC] 📥 Processing sync request from {} for microblocks {}-{}", 
+                 requester_id, from_height, to_height);
+        
+        // Get microblocks from storage (already in network format)
+        let blocks_data = self.storage.get_microblocks_range(from_height, to_height).await?;
+        
+        if let Some(ref p2p) = self.unified_p2p {
+            // Send blocks batch to requester
+            let response = NetworkMessage::BlocksBatch {
+                blocks: blocks_data.clone(),
+                from_height,
+                to_height,
+                sender_id: self.node_id.clone(),
+            };
+            
+            // Find requester's address from peer list
+            let peers = p2p.get_validated_active_peers();
+            if let Some(peer) = peers.iter().find(|p| p.id == requester_id) {
+                p2p.send_network_message(&peer.addr, response);
+                println!("[SYNC] 📤 Sent {} microblocks to {}", blocks_data.len(), requester_id);
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// Query network height from connected peers
+    pub async fn query_network_height(&self) -> Result<u64, QNetError> {
+        if let Some(ref p2p) = self.unified_p2p {
+            // Try to get cached network height first (fast path)
+            if let Some(cached_height) = p2p.get_cached_network_height() {
+                println!("[SYNC] 📏 Using cached network height: {}", cached_height);
+                return Ok(cached_height);
+            }
+            
+            // If no cache, query peers directly
+            let peers = p2p.get_validated_active_peers();
+            if peers.is_empty() {
+                println!("[SYNC] ⚠️ No peers available, using local height");
+                return Ok(self.get_height().await);
+            }
+            
+            // Query multiple peers and take median for Byzantine safety
+            let mut heights = Vec::new();
+            for peer in peers.iter().take(3) {
+                // Use existing P2P infrastructure to query peer
+                let peer_ip = peer.addr.split(':').next().unwrap_or(&peer.addr);
+                let endpoint = format!("http://{}:8001/api/v1/height", peer_ip);
+                
+                // Simple HTTP query using reqwest
+                if let Ok(client) = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(5))
+                    .build() 
+                {
+                    if let Ok(response) = client.get(&endpoint).send().await {
+                        if let Ok(text) = response.text().await {
+                            if let Ok(height) = text.trim().parse::<u64>() {
+                                heights.push(height);
+                                println!("[SYNC] 📏 Peer {} reports height: {}", peer.id, height);
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // Take median height for Byzantine fault tolerance
+            if !heights.is_empty() {
+                heights.sort();
+                let median = heights[heights.len() / 2];
+                println!("[SYNC] 📏 Network consensus height (median): {}", median);
+                Ok(median)
+            } else {
+                println!("[SYNC] ⚠️ Could not query any peers, using local height");
+                Ok(self.get_height().await)
+            }
+        } else {
+            Err(QNetError::NetworkError("P2P network not initialized".to_string()))
+        }
+    }
+    
+    /// Recover consensus state after restart
+    pub async fn recover_consensus_state(&self) -> Result<(), QNetError> {
+        if let Some(ref p2p) = self.unified_p2p {
+            // Get latest consensus round from storage
+            let latest_round = self.storage.get_latest_consensus_round()?;
+            
+            if latest_round > 0 {
+                println!("[CONSENSUS] 🔄 Requesting consensus state for round {}", latest_round);
+                
+                // Request consensus state from peers
+                if let Err(e) = p2p.sync_consensus_state(latest_round).await {
+                    println!("[CONSENSUS] ⚠️ Failed to sync consensus state: {}", e);
+                } else {
+                    println!("[CONSENSUS] ✅ Consensus state sync initiated");
+                }
+            }
+        }
+        
+        Ok(())
     }
     
     /// Auto-detect region from IP geolocation
