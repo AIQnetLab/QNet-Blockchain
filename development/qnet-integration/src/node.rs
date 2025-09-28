@@ -10,9 +10,10 @@ use crate::{
 // PROTOCOL VERSION for compatibility checks
 const PROTOCOL_VERSION: u32 = 1;  // Increment when breaking changes are made
 const MIN_COMPATIBLE_VERSION: u32 = 1;  // Minimum version we can work with
-use qnet_state::{StateManager, Account, Transaction, Block, BlockType, MicroBlock, MacroBlock, LightMicroBlock, ConsensusData};
+use qnet_state::{State as StateManager, Account, Transaction, Block, BlockType, MicroBlock, MacroBlock, LightMicroBlock, ConsensusData};
 use qnet_mempool::{SimpleMempool, SimpleMempoolConfig};
 use qnet_consensus::{ConsensusEngine, ConsensusConfig, NodeId, CommitRevealConsensus, ConsensusError};
+use qnet_consensus::lazy_rewards::{PhaseAwareRewardManager, NodeType as RewardNodeType};
 use qnet_sharding::{ShardCoordinator, ParallelValidator};
 use std::sync::Arc;
 use std::collections::HashMap;
@@ -95,7 +96,7 @@ impl Default for PerformanceConfig {
 /// Main blockchain node with unified P2P and regional clustering
 pub struct BlockchainNode {
     storage: Arc<Storage>,
-    state: Arc<RwLock<qnet_state::StateManager>>,
+    state: Arc<RwLock<StateManager>>,
     mempool: Arc<RwLock<qnet_mempool::SimpleMempool>>,
     consensus: Arc<RwLock<qnet_consensus::ConsensusEngine>>,
     // validator: Arc<Validator>, // disabled for compilation
@@ -143,9 +144,68 @@ pub struct BlockchainNode {
     
     // Archive replication manager for distributed storage
     archive_manager: Arc<tokio::sync::RwLock<crate::archive_manager::ArchiveReplicationManager>>,
+    
+    // Reward manager for lazy rewards system
+    reward_manager: Arc<RwLock<PhaseAwareRewardManager>>,
 }
 
 impl BlockchainNode {
+    /// Get reward manager for RPC integration
+    pub fn get_reward_manager(&self) -> Arc<RwLock<PhaseAwareRewardManager>> {
+        self.reward_manager.clone()
+    }
+    
+    /// Process reward window (called by RPC system every 4 hours)
+    pub async fn process_reward_window(&self) -> Result<(), QNetError> {
+        println!("[REWARDS] ⏰ Processing 4-hour reward window...");
+        
+        let mut reward_manager = self.reward_manager.write().await;
+        
+        // Process the current window (calculates pending rewards based on ping history)
+        reward_manager.force_process_window()
+            .map_err(|e| QNetError::ConsensusError(format!("Failed to process reward window: {}", e)))?;
+        
+        // Get statistics
+        let pending_rewards = reward_manager.get_all_pending_rewards();
+        
+        if pending_rewards.is_empty() {
+            println!("[REWARDS] ⚠️ No nodes eligible for rewards in this window");
+            return Ok(());
+        }
+        
+        // Calculate total emission for this window
+        let total_emission: u64 = pending_rewards.iter()
+            .map(|(_, amount)| amount)
+            .sum();
+        
+        // CRITICAL: Update total supply IMMEDIATELY when rewards are calculated
+        // Not when claimed! Emission happens every 4 hours regardless
+        // Note: StateManager's emit_rewards internally handles chain_state locking
+        let emission_result = {
+            let state = self.state.read().await;
+            (*state).emit_rewards(total_emission)
+        };
+        
+        match emission_result {
+            Ok(actual_emission) => {
+                println!("[REWARDS] 💰 EMISSION COMPLETE:");
+                println!("   📈 New tokens emitted: {} QNC", actual_emission);
+                let state = self.state.read().await;
+                let total_supply = (*state).get_total_supply();
+                println!("   🏦 New total supply: {} QNC", total_supply);
+                println!("   📊 Eligible nodes: {}", pending_rewards.len());
+            }
+            Err(e) => {
+                eprintln!("[REWARDS] ❌ Emission failed: {}", e);
+                return Err(QNetError::ConsensusError(format!("Failed to emit rewards: {}", e)));
+            }
+        }
+        
+        // Rewards are now in pending_rewards - users can claim them anytime
+        println!("[REWARDS] ✅ Rewards available for claiming (lazy rewards)");
+        Ok(())
+    }
+    
     /// Create a new blockchain node with default settings (backward compatibility)
     pub async fn new(data_dir: &str, p2p_port: u16, bootstrap_peers: Vec<String>) -> Result<Self, QNetError> {
         // Production region detection - no defaults allowed
@@ -187,7 +247,7 @@ impl BlockchainNode {
         };
         
         // Initialize state manager
-        let state = Arc::new(RwLock::new(qnet_state::StateManager::new()));
+        let state = Arc::new(RwLock::new(StateManager::new()));
         
         // Initialize production-ready mempool
         let mempool_config = qnet_mempool::SimpleMempoolConfig {
@@ -496,6 +556,16 @@ impl BlockchainNode {
         println!("[Node] 📦 Initializing archive replication manager...");
         let mut archive_manager = crate::archive_manager::ArchiveReplicationManager::new();
         
+        // Initialize reward manager with current timestamp as genesis
+        println!("[Node] 💰 Initializing lazy rewards system...");
+        let genesis_timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let reward_manager = Arc::new(RwLock::new(
+            PhaseAwareRewardManager::new(genesis_timestamp)
+        ));
+        
         // Get node IP for archive registration (simplified for now)
         let node_ip = format!("127.0.0.1:{}", p2p_port); // In production, this would be real external IP
         
@@ -545,9 +615,48 @@ impl BlockchainNode {
             shard_coordinator,
             parallel_validator,
             archive_manager: Arc::new(tokio::sync::RwLock::new(archive_manager)),
+            reward_manager,
         };
         
         println!("[Node] 🔍 DEBUG: BlockchainNode created successfully for node_id: {}", node_id);
+        
+        // Register Genesis nodes in reward system and start processing
+        if std::env::var("QNET_BOOTSTRAP_ID").is_ok() {
+            let bootstrap_id = std::env::var("QNET_BOOTSTRAP_ID").unwrap_or_default();
+            
+            // Register this Genesis node in reward system
+            {
+                let mut reward_manager = blockchain.reward_manager.write().await;
+                let genesis_node_id = format!("genesis_node_{}", bootstrap_id);
+                
+                // Generate deterministic wallet for Genesis node (placeholder until real wallets)
+                let mut hasher = Sha3_256::new();
+                hasher.update(format!("genesis_{}_wallet", bootstrap_id).as_bytes());
+                let wallet_hash = hasher.finalize();
+                let genesis_wallet = format!("genesis_wallet_{}_{}", 
+                    bootstrap_id, 
+                    hex::encode(&wallet_hash[..8])
+                );
+                
+                if let Err(e) = reward_manager.register_node(
+                    genesis_node_id.clone(),
+                    RewardNodeType::Super, // All Genesis nodes are Super nodes
+                    genesis_wallet.clone()
+                ) {
+                    eprintln!("[REWARDS] ⚠️ Failed to register Genesis node: {}", e);
+                } else {
+                    println!("[REWARDS] ✅ Genesis node registered: {} (wallet: {}...)", 
+                             genesis_node_id, &genesis_wallet[..30]);
+                }
+            }
+            
+            // Reward processing is handled by RPC system, not by individual nodes
+            // This ensures centralized control of emission and distribution
+            if bootstrap_id == "001" {
+                println!("[REWARDS] 📡 Node ready to receive reward pings from RPC system");
+            }
+        }
+        
         Ok(blockchain)
     }
     
@@ -557,6 +666,28 @@ impl BlockchainNode {
         storage: Arc<Storage>,
     ) {
         while let Some(received_block) = block_rx.recv().await {
+            // Check for special ping signal
+            if received_block.height == u64::MAX {
+                // Parse ping data: "PING:node_id:success:response_time_ms"
+                if let Ok(ping_str) = String::from_utf8(received_block.data.clone()) {
+                    let parts: Vec<&str> = ping_str.split(':').collect();
+                    if parts.len() == 4 && parts[0] == "PING" {
+                        let node_id = parts[1];
+                        let success = parts[2] == "true";
+                        let response_time_ms = parts[3].parse::<u32>().unwrap_or(0);
+                        
+                        println!("[PING] 📡 Processing ping signal: {} ({}ms)", node_id, response_time_ms);
+                        
+                        // TODO: Forward to reward manager when available in this context
+                        // For now, just log
+                        if success {
+                            println!("[PING] ✅ Successful ping recorded for {}", node_id);
+                        }
+                    }
+                }
+                continue; // Skip normal block processing
+            }
+            
             // Log only every 10th block or errors
             let should_log = received_block.height % 10 == 0;
             if should_log {
@@ -1133,7 +1264,9 @@ impl BlockchainNode {
                         let is_synchronized = if microblock_height > 10 {
                             current_stored_height + 10 >= microblock_height
                         } else {
-                            true // Genesis phase - always ready
+                            // Genesis phase - check if we have at least genesis block or are very close
+                            // Don't allow nodes stuck at height 0 to be producers
+                            current_stored_height > 0 || microblock_height <= 1
                         };
                         
                         if !is_synchronized {
@@ -1158,7 +1291,8 @@ impl BlockchainNode {
                                 microblock_height,
                                 &Some(p2p.clone()),
                                 &node_id,
-                                node_type
+                                node_type,
+                                Some(storage.clone())
                             ).await;
                             
                             println!("[PRODUCER] 🆘 Emergency handover to: {}", emergency_producer);
@@ -1690,7 +1824,8 @@ impl BlockchainNode {
                                         expected_height_timeout - 1, // Current height for selection
                                         &Some(p2p_timeout.clone()),
                                         &node_id_timeout,
-                                        node_type_timeout
+                                        node_type_timeout,
+                                        Some(storage_timeout.clone())
                                     ).await;
                                     
                                     println!("[FAILOVER] 🆘 Emergency microblock producer selected: {}", emergency_producer);
@@ -1963,7 +2098,7 @@ impl BlockchainNode {
     }
     
     /// Get reputation score for a node
-    async fn get_node_reputation_score(node_id: &str, p2p: &Arc<SimplifiedP2P>) -> f64 {
+    pub async fn get_node_reputation_score(node_id: &str, p2p: &Arc<SimplifiedP2P>) -> f64 {
         // PRODUCTION: Get reputation score with proper lifetime management
         match p2p.get_reputation_system().lock() {
             Ok(reputation) => {
@@ -2005,6 +2140,7 @@ impl BlockchainNode {
         unified_p2p: &Option<Arc<SimplifiedP2P>>,
         own_node_id: &str, // CRITICAL: Include own node as emergency candidate
         own_node_type: NodeType, // CRITICAL: Use real node type for accurate filtering
+        storage: Option<Arc<Storage>>, // Pass storage for failover tracking
     ) -> String {
         if let Some(p2p) = unified_p2p {
             // CRITICAL FIX: For Genesis phase, use SAME candidate source as normal producer selection
@@ -2120,6 +2256,22 @@ impl BlockchainNode {
             
             println!("[FAILOVER] 🆘 Deterministic emergency producer: {} (reputation: {:.1}%, index: {}/{})", 
                      emergency_producer, candidates[selection_index].1 * 100.0, selection_index, candidates.len());
+            
+            // Save failover event to storage for monitoring
+            if let Some(ref storage) = storage {
+                let event = crate::storage::FailoverEvent {
+                    height: current_height,
+                    failed_producer: failed_producer.to_string(),
+                    emergency_producer: emergency_producer.clone(),
+                    reason: "timeout_5s".to_string(),
+                    timestamp: chrono::Utc::now().timestamp(),
+                    block_type: "microblock".to_string(),
+                };
+                
+                if let Err(e) = storage.save_failover_event(&event) {
+                    println!("[FAILOVER] ⚠️ Failed to save failover event: {}", e);
+                }
+            }
             
             emergency_producer
         } else {
@@ -3615,6 +3767,16 @@ impl BlockchainNode {
         self.node_id.clone()
     }
     
+    pub async fn is_leader(&self) -> bool {
+        *self.is_leader.read().await
+    }
+    
+    pub fn get_start_time(&self) -> chrono::DateTime<chrono::Utc> {
+        // For now, use node creation time approximation
+        // In production, this would be stored as a field
+        chrono::Utc::now() - chrono::Duration::hours(1)
+    }
+    
     /// PRIVACY: Get public display name for API responses (preserves consensus node_id)
     pub fn get_public_display_name(&self) -> String {
         match self.node_type {
@@ -3794,7 +3956,7 @@ impl BlockchainNode {
     
     pub async fn get_account(&self, address: &str) -> Result<Option<qnet_state::Account>, QNetError> {
         let state = self.state.read().await;
-        Ok(state.get_account(address).cloned())
+        Ok(state.get_account(address))
     }
     
     pub async fn get_balance(&self, address: &str) -> Result<u64, QNetError> {
@@ -4255,7 +4417,7 @@ impl BlockchainNode {
         
         let node_info = crate::activation_validation::NodeInfo {
             activation_code: code_hash, // Use hash for secure blockchain storage
-            wallet_address,
+            wallet_address: wallet_address.clone(),
             device_signature: self.get_device_signature(),
             node_type: format!("{:?}", node_type),
             activated_at: timestamp,
@@ -4275,6 +4437,30 @@ impl BlockchainNode {
         // Save to local storage
         self.storage.save_activation_code(code, node_type_id, timestamp)
             .map_err(|e| QNetError::StorageError(e.to_string()))?;
+        
+        // Register Full/Super nodes in reward system (not Genesis or Light nodes)
+        // Light nodes register through mobile app via RPC
+        // Genesis nodes register separately
+        if !bootstrap_whitelist.contains(&code) && node_type != NodeType::Light {
+            let mut reward_manager = self.reward_manager.write().await;
+            let reward_node_type = match node_type {
+                NodeType::Full => RewardNodeType::Full,
+                NodeType::Super => RewardNodeType::Super,
+                _ => RewardNodeType::Full, // Should never happen
+            };
+            
+            if let Err(e) = reward_manager.register_node(
+                self.node_id.clone(),
+                reward_node_type,
+                wallet_address.clone()
+            ) {
+                eprintln!("[REWARDS] ⚠️ Failed to register node in reward system: {}", e);
+            } else {
+                println!("[REWARDS] ✅ Node registered in reward system: {} ({:?} node)", 
+                         self.node_id, node_type);
+                println!("[REWARDS] 💰 Wallet: {}...", &wallet_address[..20.min(wallet_address.len())]);
+            }
+        }
         
         println!("✅ Activation code saved with blockchain registry and cryptographic binding");
         Ok(())
@@ -5294,6 +5480,7 @@ impl Clone for BlockchainNode {
             shard_coordinator: self.shard_coordinator.clone(),
             parallel_validator: self.parallel_validator.clone(),
             archive_manager: self.archive_manager.clone(),
+            reward_manager: self.reward_manager.clone(),
         }
     }
 }

@@ -349,7 +349,7 @@ Ping architecture:
 - **Initial Supply**: 0 QNC (no pre-mine, created through emission only)
 - **Appears after**: 90% 1DEV burn OR 5 years from genesis
 - **Pool #3**: Activation QNC redistributed to all nodes
-- **Decimals**: 8
+- **Decimals**: 9 (1 QNC = 10^9 nanoQNC)
 
 ### 7.2 Sharp Drop Halving Innovation
 
@@ -491,18 +491,18 @@ Reputation System Benefits:
 └── Energy Efficient: Behavior-based trust vs computational proof
 
 Reputation Score Mechanics:
-├── Initial Score: 50 points (neutral start)
-├── Range: 0-100 points
-├── Success Bonus: +1 per successful ping
-├── Failure Penalty: -1 per missed ping (NOT -2)
-├── Protocol Violations: -5 to -30 points
-└── Recovery: Gradual improvement through good behavior
+├── Light Nodes: No reputation system (mobile devices)
+├── Full/Super Initial Score: 70 points (consensus minimum)
+├── Full/Super Range: 0-100 points
+├── Success Bonus: +1 per successful ping (Full/Super only)
+├── Failure Penalty: -1 per missed ping (Full/Super only)
+└── Protocol Violations: -5 to -30 points (Full/Super only)
 
 Economic Thresholds:
-├── 70+ points: Consensus participation rights
-├── 40+ points: Eligible for all three reward pools
-├── 10-39 points: Network access only, no rewards
-└── <10 points: Complete network ban
+├── Light Nodes: No reputation requirements (mobile-friendly)
+├── Full/Super: 70+ points for consensus and rewards
+├── Full/Super: 10-69 points - network access only, no rewards
+└── Full/Super: <10 points - complete network ban
 
 Penalties by Violation Type:
 ├── Missed Ping: -1.0 reputation
@@ -519,7 +519,7 @@ Recovery Windows:
 ├── 24h-365d offline: FREE restoration
 │   ├── Reputation reset to: 25.0 points (NOT 50)
 │   ├── Quarantine period: 7 days
-│   └── No rewards until reputation ≥40
+│   └── Light: always eligible | Full/Super: need reputation >= 70 for rewards
 ├── >365 days offline: Paid reactivation required
 └── Banned (<10 rep): Paid reactivation only
 
@@ -562,7 +562,7 @@ Mobile Recovery Features:
 ├── Offline >365d: Requires paid reactivation
 ├── Restoration Limit: 10 free per 30 days
 ├── Auto-Reset: Counter resets monthly
-└── Quarantine Period: No rewards until reputation >40
+└── Quarantine Period: 7 days (no new rewards, can claim old ones)
 ```
 
 ### 7.7 Dynamic Fee System
@@ -887,9 +887,9 @@ Recovery Windows:
 
 Quarantine Period:
 ├── Duration: 7 days at 25 reputation
-├── No rewards during quarantine
+├── No rewards during 7-day quarantine period
 ├── Gradual reputation building required
-└── Full access restored at 40+ reputation
+└── Light nodes: no reputation system | Full/Super nodes: require reputation >= 70
 ```
 
 ### 10.2 Regional Optimization

@@ -210,7 +210,7 @@ python test_rpc.py
 
 #### Pool 1: Base Emission
 - Source: New token emission every 4 hours
-- Distribution: 245,100.67 QNC initially (halving every 4 years)
+- Distribution: 251,432.34 QNC initially (halving every 4 years)
 - Allocation: Equal share to all active nodes
 
 #### Pool 2: Transaction Fees

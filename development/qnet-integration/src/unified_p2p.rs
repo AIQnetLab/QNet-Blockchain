@@ -4538,6 +4538,7 @@ impl SimplifiedP2P {
                 // Update last_seen for the peer who sent the ping
                 self.update_peer_last_seen(&from);
                 // Simple acknowledgment - no complex processing
+                // NOTE: This is P2P health check, NOT reward system ping!
                 println!("[P2P] ← Health ping from {}", from);
             }
 

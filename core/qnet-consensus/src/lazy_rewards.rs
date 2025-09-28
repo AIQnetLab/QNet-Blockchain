@@ -10,6 +10,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use crate::errors::ConsensusError;
 
+/// Minimum claim amount (1 QNC in nanoQNC) to prevent spam
+const MIN_CLAIM_AMOUNT: u64 = 1_000_000_000; // 1 QNC = 10^9 nanoQNC
+
 /// QNet economic phases
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum QNetPhase {
@@ -162,11 +165,14 @@ pub struct PhaseAwareRewardManager {
     /// FIXED: Node ownership mapping - node_id -> wallet_address
     node_ownership: HashMap<String, String>,
     
-    /// Pending rewards by node_id
+    /// Pending rewards by node_id (in-memory cache, synced with RocksDB when available)
     pending_rewards: HashMap<String, PhaseAwareReward>,
     
     /// Last claim time by node_id
     last_claim_time: HashMap<String, u64>,
+    
+    /// Storage handler path for RocksDB persistence
+    storage_path: Option<String>,
     
     /// Pool 2: Transaction fees
     pool2_transaction_fees: u64,
@@ -193,6 +199,7 @@ impl PhaseAwareRewardManager {
             node_ownership: HashMap::new(),
             pending_rewards: HashMap::new(),
             last_claim_time: HashMap::new(),
+            storage_path: None,
             pool2_transaction_fees: 0,
             pool3_activation_pool: 0,
             dev_burn_percentage: 0.0,
@@ -235,18 +242,18 @@ impl PhaseAwareRewardManager {
         // Sharp drop halving model
         let base_rate = if halving_cycles == 5 {
             // 5th halving (year 20-24): Sharp drop by 10x instead of 2x
-            245_100.67 / (2.0_f64.powi(4) * 10.0) // Previous 4 halvings (÷2) then sharp drop (÷10)
+            251_432.34 / (2.0_f64.powi(4) * 10.0) // Previous 4 halvings (÷2) then sharp drop (÷10)
         } else if halving_cycles > 5 {
             // After sharp drop: Resume normal halving from new low base
             let normal_halvings = halving_cycles - 5;
-            245_100.67 / (2.0_f64.powi(4) * 10.0 * 2.0_f64.powi(normal_halvings as i32))
+            251_432.34 / (2.0_f64.powi(4) * 10.0 * 2.0_f64.powi(normal_halvings as i32))
         } else {
-            // Normal halving for first 5 cycles (20 years)
-            245_100.67 / (2.0_f64.powi(halving_cycles as i32))
+            // Normal halving for first 5 cycles (20 years) - CORRECTED to match whitepaper
+            251_432.34 / (2.0_f64.powi(halving_cycles as i32))
         };
         
-        // Convert to microQNC (10^6 precision)
-        (base_rate * 1_000_000.0) as u64
+        // Convert to nanoQNC (10^9 precision)
+        (base_rate * 1_000_000_000.0) as u64
     }
     
     /// Determine current QNet phase
@@ -272,6 +279,12 @@ impl PhaseAwareRewardManager {
     }
     
     /// FIXED: Register node with wallet address for reward ownership
+    /// Set storage path for RocksDB persistence (for scalability)
+    pub fn set_storage_path(&mut self, path: String) {
+        self.storage_path = Some(path);
+    }
+    
+    /// Register a node for rewards
     pub fn register_node(&mut self, node_id: String, node_type: NodeType, wallet_address: String) -> Result<(), ConsensusError> {
         let window_start = Self::get_current_window_start();
         
@@ -489,8 +502,21 @@ impl PhaseAwareRewardManager {
         }
         
         // Get pending reward
-        let reward = match self.pending_rewards.remove(node_id) {
-            Some(reward) => reward,
+        let reward = match self.pending_rewards.get(node_id) {
+            Some(reward) => {
+                // Check minimum claim amount to prevent spam
+                if reward.total_reward < MIN_CLAIM_AMOUNT {
+                    return RewardClaimResult {
+                        success: false,
+                        reward: None,
+                        message: format!("Amount too small: {:.9} QNC (minimum: 1 QNC)",
+                                       reward.total_reward as f64 / 1_000_000_000.0),
+                        next_claim_time: current_time + self.min_claim_interval.as_secs(),
+                    };
+                }
+                // Remove only after validation passed
+                self.pending_rewards.remove(node_id).unwrap()
+            },
             None => {
                 return RewardClaimResult {
                     success: false,
@@ -532,6 +558,16 @@ impl PhaseAwareRewardManager {
         self.genesis_timestamp
     }
     
+    /// Get Pool #2 transaction fees accumulated
+    pub fn get_pool2_fees(&self) -> u64 {
+        self.pool2_transaction_fees
+    }
+    
+    /// Reset Pool #2 fees after distribution
+    pub fn reset_pool2_fees(&mut self) {
+        self.pool2_transaction_fees = 0;
+    }
+    
     /// Get years since genesis timestamp
     pub fn get_years_since_genesis(&self) -> u64 {
         self.calculate_years_since_genesis()
@@ -563,6 +599,19 @@ impl PhaseAwareRewardManager {
     /// Force process current reward window (for testing)
     pub fn force_process_window(&mut self) -> Result<(), ConsensusError> {
         self.process_reward_window()
+    }
+    
+    /// Get all pending rewards for automatic distribution
+    pub fn get_all_pending_rewards(&self) -> Vec<(String, u64)> {
+        self.pending_rewards.iter()
+            .filter(|(_, reward)| reward.total_reward > 0)
+            .map(|(node_id, reward)| (node_id.clone(), reward.total_reward))
+            .collect()
+    }
+    
+    /// Get wallet address for a node
+    pub fn get_node_wallet_address(&self, node_id: &str) -> Option<String> {
+        self.node_ownership.get(node_id).cloned()
     }
 }
 

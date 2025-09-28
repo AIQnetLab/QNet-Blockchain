@@ -468,7 +468,7 @@ class ComprehensiveSecurityMonitor:
                 description=f"{metrics.rate_limit_violations} rate limit violations detected",
                 timestamp=metrics.timestamp,
                 details={"rate_limit_violations": metrics.rate_limit_violations},
-                remediation="Check for spam attacks, verify Pool #3 access requirements (reputation 40+)"
+                remediation="Check for spam attacks, verify Pool #3 access requirements"
             ))
         
         if metrics.peer_score_violations > thresholds['peer_score_violations_per_hour']:

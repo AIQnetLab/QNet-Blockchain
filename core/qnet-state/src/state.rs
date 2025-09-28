@@ -6,6 +6,9 @@ use dashmap::DashMap;
 use crate::{Account, Block, Transaction, StateError, StateResult};
 use sha3::{Sha3_256, Digest};
 
+/// Maximum supply of QNC tokens (2^32)
+pub const MAX_QNC_SUPPLY: u64 = 4_294_967_296;
+
 /// Chain state information
 #[derive(Debug, Clone)]
 pub struct ChainState {
@@ -151,6 +154,40 @@ impl StateManager {
         *self.state_root.read()
     }
     
+    /// Emit rewards with MAX_SUPPLY control
+    pub fn emit_rewards(&self, amount: u64) -> StateResult<u64> {
+        let mut chain_state = self.chain_state.write();
+        
+        // Check if we would exceed MAX_SUPPLY
+        let remaining_supply = MAX_QNC_SUPPLY.saturating_sub(chain_state.total_supply);
+        let actual_emission = amount.min(remaining_supply);
+        
+        if actual_emission == 0 {
+            println!("⚠️ MAX_SUPPLY reached: {} QNC. No more emissions possible!", MAX_QNC_SUPPLY);
+            return Ok(0);
+        }
+        
+        // Update total supply
+        chain_state.total_supply += actual_emission;
+        
+        if actual_emission < amount {
+            println!("⚠️ Emission limited: requested {} QNC, emitted {} QNC (remaining: {} QNC)",
+                     amount, actual_emission, MAX_QNC_SUPPLY - chain_state.total_supply);
+        }
+        
+        Ok(actual_emission)
+    }
+    
+    /// Get current total supply
+    pub fn get_total_supply(&self) -> u64 {
+        self.chain_state.read().total_supply
+    }
+    
+    /// Get remaining supply until MAX_SUPPLY
+    pub fn get_remaining_supply(&self) -> u64 {
+        MAX_QNC_SUPPLY.saturating_sub(self.get_total_supply())
+    }
+    
     /// Create genesis state
     pub fn create_genesis(&self) -> StateResult<()> {
         // FAIR LAUNCH IMPLEMENTATION
@@ -169,7 +206,8 @@ impl StateManager {
         self.calculate_state_root()?;
         
         println!("🚀 Genesis state created: 0 QNC total supply, Fair Launch activated!");
-        println!("📈 Pool 1 Base Emission: DYNAMIC halving system (starts 245,100.67 QNC/4h)");
+        println!("📈 Pool 1 Base Emission: DYNAMIC halving system (starts 251,432.34 QNC/4h)");
+        println!("💎 Maximum Supply: {} QNC (2^32)", MAX_QNC_SUPPLY);
         
         Ok(())
     }

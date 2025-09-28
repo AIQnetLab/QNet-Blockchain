@@ -52,7 +52,7 @@ class TokenConfig:
     
     # QNC (Native phase)
     qnc_total_supply: int = 4_294_967_296  # 2^32 for quantum reference
-    qnc_decimals: int = 6
+    qnc_decimals: int = 9  # 1 QNC = 10^9 nanoQNC
     
     # QNC phase - spending mechanism (tokens go to Pool 3 redistribution)
     qnc_spending_requirements = {

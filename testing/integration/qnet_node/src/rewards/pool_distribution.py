@@ -51,14 +51,17 @@ class PoolDistributor:
         # Distribution history
         self.distribution_history: List[Dict] = []
         
-        # Base emission parameters (starts at 245,100.67 QNC every 4 hours)
-        self.initial_emission = 245_100.67
+        # Base emission parameters (CORRECTED: starts at 251,432.34 QNC every 4 hours to match whitepaper)
+        self.initial_emission = 251_432.34
         self.emission_start = int(time.time())
         self.halving_interval = 4 * 365 * 24 * 60 * 60  # 4 years in seconds
         self.distribution_interval = 4 * 60 * 60  # 4 hours in seconds
         
-        # Minimum reputation for rewards
-        self.min_reputation = 40.0
+        # Minimum reputation for NEW rewards by node type:
+        # Light nodes: 0.0 (any reputation, mobile-friendly)
+        # Full/Super nodes: 70.0 (must maintain network quality)
+        self.min_reputation_light = 0.0
+        self.min_reputation_full_super = 70.0
         
         # CORRECT LOGIC: Network pings nodes in randomized slots 
         self.reward_window = 4 * 60 * 60  # 4 hours: reward distribution window
@@ -127,8 +130,10 @@ class PoolDistributor:
     
     def add_active_node(self, node_id: str, node_type: NodeType, reputation: float) -> bool:
         """Add active node to reward distribution"""
-        if reputation < self.min_reputation:
-            logger.warning(f"Node {node_id} reputation {reputation} below minimum {self.min_reputation}")
+        # Check minimum reputation based on node type
+        min_rep = self.min_reputation_light if node_type == NodeType.LIGHT else self.min_reputation_full_super
+        if reputation < min_rep:
+            logger.warning(f"Node {node_id} ({node_type.value}) reputation {reputation} below minimum {min_rep}")
             return False
         
         self.active_nodes[node_id] = ActiveNode(
@@ -150,13 +155,14 @@ class PoolDistributor:
         return False
     
     def get_eligible_nodes(self) -> List[ActiveNode]:
-        """Get nodes eligible for rewards (reputation 40+, not in quarantine, responded to ping)"""
+        """Get nodes eligible for NEW rewards (Light: any rep | Full/Super: rep >= 70, not in quarantine, responded to ping)"""
         current_time = int(time.time())
         eligible = []
         
         for node in self.active_nodes.values():
-            # Check reputation
-            if node.reputation < self.min_reputation:
+            # Check reputation requirement based on node type
+            min_rep = self.min_reputation_light if node.node_type == NodeType.LIGHT else self.min_reputation_full_super
+            if node.reputation < min_rep:
                 continue
             
             # Check quarantine status
@@ -347,8 +353,9 @@ class PoolDistributor:
             return {
                 "active": True,
                 "reputation": node.reputation,
-                "eligible_for_rewards": node.reputation >= self.min_reputation and (
-                    quarantine_until is None or current_time >= quarantine_until
+                "eligible_for_rewards": (
+                    node.reputation >= (self.min_reputation_light if node.node_type == NodeType.LIGHT else self.min_reputation_full_super)
+                    and (quarantine_until is None or current_time >= quarantine_until)
                 ),
                 "last_ping": node.last_ping,
                 "quarantine_until": quarantine_until,

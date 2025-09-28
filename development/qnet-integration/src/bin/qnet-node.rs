@@ -3661,14 +3661,14 @@ async fn calculate_base_reward() -> Result<f64, String> {
     
     let base_rate = if halving_cycles == 5 {
         // 5th halving (year 20-24): Sharp drop by 10x instead of 2x
-        245_100.67 / (2.0_f64.powi(4) * 10.0) // Previous 4 halvings (÷2) then sharp drop (÷10)
+        251_432.34 / (2.0_f64.powi(4) * 10.0) // Previous 4 halvings (÷2) then sharp drop (÷10)
     } else if halving_cycles > 5 {
         // After sharp drop: Resume normal halving from new low base
         let normal_halvings = halving_cycles - 5;
-        245_100.67 / (2.0_f64.powi(4) * 10.0 * 2.0_f64.powi(normal_halvings as i32))
+        251_432.34 / (2.0_f64.powi(4) * 10.0 * 2.0_f64.powi(normal_halvings as i32))
     } else {
-        // Normal halving for first 5 cycles (20 years)
-        245_100.67 / (2.0_f64.powi(halving_cycles as i32))
+        // Normal halving for first 5 cycles (20 years) - CORRECTED to match whitepaper
+        251_432.34 / (2.0_f64.powi(halving_cycles as i32))
     };
     
     Ok(base_rate)

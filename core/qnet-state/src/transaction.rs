@@ -498,13 +498,18 @@ impl Transaction {
                     return Err(StateError::InvalidTransaction("Only system can distribute rewards".to_string()));
                 }
                 
+                // EMISSION: This is where QNC is created from Pool #1 Base Emission
+                // The total_supply is updated in node.rs when creating these transactions
+                // This transaction just distributes the already-emitted QNC
+                
                 // Reward distribution logic
                 if let Some(to) = &self.to {
                     let recipient = accounts.entry(to.clone())
                         .or_insert_with(|| Account::new(to.clone()));
                     recipient.balance += self.amount;
                     
-                    println!("Reward distributed: {} QNC to {}", self.amount, to);
+                    println!("[EMISSION] 💰 Reward distributed: {} QNC to {} (lazy claim)", 
+                             self.amount, to);
                 }
             }
             TransactionType::BatchRewardClaims { node_ids, .. } => {

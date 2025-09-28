@@ -14,6 +14,7 @@ pub mod transaction;
 pub mod state_db;
 pub mod state_manager;
 pub mod errors;
+pub mod state;
 
 #[cfg(feature = "python")]
 mod python_bindings;
@@ -24,6 +25,7 @@ pub use transaction::{Transaction, TransactionReceipt, TransactionType};
 pub use state_db::StateDB;
 pub use state_manager::StateManager;
 pub use errors::{StateError, StateResult};
+pub use state::{StateManager as State, MAX_QNC_SUPPLY};
 
 #[cfg(feature = "python")]
 pub use python_bindings::*;

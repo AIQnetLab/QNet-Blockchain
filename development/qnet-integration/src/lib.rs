@@ -20,6 +20,7 @@ pub mod quantum_crypto;
 pub mod network_config;
 pub mod archive_manager;
 pub mod genesis_constants;
+pub mod reward_sharding;
 
 use std::sync::Arc;
 use tokio::sync::RwLock;

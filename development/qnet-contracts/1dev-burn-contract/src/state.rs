@@ -228,10 +228,10 @@ pub const BASE_1DEV_PRICE: u64 = 1_500_000_000;   // 1500 1DEV base
 pub const MIN_1DEV_PRICE: u64 = 150_000_000;      // 150 1DEV minimum
 pub const PRICE_REDUCTION_PER_TIER: u64 = 150_000_000; // 150 1DEV reduction per 10% tier
 
-// QNC activation costs (Phase 2)
-pub const QNC_LIGHT_ACTIVATION: u64 = 5_000_000_000;   // 5000 QNC
-pub const QNC_FULL_ACTIVATION: u64 = 7_500_000_000;    // 7500 QNC  
-pub const QNC_SUPER_ACTIVATION: u64 = 10_000_000_000;  // 10000 QNC
+// QNC activation costs (Phase 2) - 9 decimals
+pub const QNC_LIGHT_ACTIVATION: u64 = 5_000_000_000_000;   // 5000 QNC (in nanoQNC)
+pub const QNC_FULL_ACTIVATION: u64 = 7_500_000_000_000;    // 7500 QNC (in nanoQNC)
+pub const QNC_SUPER_ACTIVATION: u64 = 10_000_000_000_000;  // 10000 QNC (in nanoQNC)
 
 /// Seeds for PDA derivation
 pub const BURN_TRACKER_SEED: &[u8] = b"burn_tracker";

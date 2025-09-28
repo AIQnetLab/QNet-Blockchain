@@ -11,6 +11,20 @@ use hex;
 use sha3;
 use bincode;
 use futures;
+use serde_json::{json, Value};
+use serde::{Serialize, Deserialize};
+use chrono;
+
+/// Failover event for tracking producer failures
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FailoverEvent {
+    pub height: u64,
+    pub failed_producer: String,
+    pub emergency_producer: String,
+    pub reason: String,
+    pub timestamp: i64,
+    pub block_type: String, // "microblock" or "macroblock"
+}
 
 pub struct PersistentStorage {
     db: DB,
@@ -159,6 +173,10 @@ impl PersistentStorage {
         opts.set_max_background_jobs(4);
         opts.set_disable_auto_compactions(false);
         
+        // Optimize for failover events storage
+        let mut failover_opts = Options::default();
+        failover_opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+        
         let cfs = vec![
             ColumnFamilyDescriptor::new("blocks", Options::default()),
             ColumnFamilyDescriptor::new("transactions", Options::default()),
@@ -167,6 +185,10 @@ impl PersistentStorage {
             ColumnFamilyDescriptor::new("microblocks", Options::default()),
             ColumnFamilyDescriptor::new("consensus", Options::default()),
             ColumnFamilyDescriptor::new("sync_state", Options::default()),
+            ColumnFamilyDescriptor::new("pending_rewards", Options::default()),
+            ColumnFamilyDescriptor::new("node_registry", Options::default()),
+            ColumnFamilyDescriptor::new("ping_history", Options::default()),
+            ColumnFamilyDescriptor::new("failover_events", failover_opts),
         ];
         
         let db = match DB::open_cf_descriptors(&opts, path, cfs) {
@@ -1690,5 +1712,348 @@ impl Storage {
         }
         
         Ok(recommended)
+    }
+    
+    // ============================================
+    // SCALABILITY: PENDING REWARDS IN ROCKSDB
+    // ============================================
+    
+    /// Save pending reward for a node
+    pub fn save_pending_reward(&self, node_id: &str, reward: &qnet_consensus::lazy_rewards::PhaseAwareReward) -> IntegrationResult<()> {
+        let rewards_cf = self.persistent.db.cf_handle("pending_rewards")
+            .ok_or_else(|| IntegrationError::StorageError("pending_rewards column family not found".to_string()))?;
+        
+        let key = format!("reward_{}", node_id);
+        let data = bincode::serialize(reward)
+            .map_err(|e| IntegrationError::SerializationError(e.to_string()))?;
+        
+        self.persistent.db.put_cf(&rewards_cf, key.as_bytes(), &data)?;
+        Ok(())
+    }
+    
+    /// Load pending reward for a node
+    pub fn load_pending_reward(&self, node_id: &str) -> IntegrationResult<Option<qnet_consensus::lazy_rewards::PhaseAwareReward>> {
+        let rewards_cf = self.persistent.db.cf_handle("pending_rewards")
+            .ok_or_else(|| IntegrationError::StorageError("pending_rewards column family not found".to_string()))?;
+        
+        let key = format!("reward_{}", node_id);
+        match self.persistent.db.get_cf(&rewards_cf, key.as_bytes())? {
+            Some(data) => {
+                let reward = bincode::deserialize(&data)
+                    .map_err(|e| IntegrationError::DeserializationError(e.to_string()))?;
+                Ok(Some(reward))
+            },
+            None => Ok(None),
+        }
+    }
+    
+    /// Delete pending reward after claim
+    pub fn delete_pending_reward(&self, node_id: &str) -> IntegrationResult<()> {
+        let rewards_cf = self.persistent.db.cf_handle("pending_rewards")
+            .ok_or_else(|| IntegrationError::StorageError("pending_rewards column family not found".to_string()))?;
+        
+        let key = format!("reward_{}", node_id);
+        self.persistent.db.delete_cf(&rewards_cf, key.as_bytes())?;
+        Ok(())
+    }
+    
+    /// Get all pending rewards (for batch processing)
+    pub fn get_all_pending_rewards(&self) -> IntegrationResult<Vec<(String, qnet_consensus::lazy_rewards::PhaseAwareReward)>> {
+        let rewards_cf = self.persistent.db.cf_handle("pending_rewards")
+            .ok_or_else(|| IntegrationError::StorageError("pending_rewards column family not found".to_string()))?;
+        
+        let mut rewards = Vec::new();
+        let iter = self.persistent.db.iterator_cf(&rewards_cf, rocksdb::IteratorMode::Start);
+        
+        for item in iter {
+            let (key, value) = item?;
+            if let Ok(key_str) = std::str::from_utf8(&key) {
+                if key_str.starts_with("reward_") {
+                    let node_id = key_str.strip_prefix("reward_").unwrap().to_string();
+                    let reward: qnet_consensus::lazy_rewards::PhaseAwareReward = bincode::deserialize(&value)
+                        .map_err(|e| IntegrationError::DeserializationError(e.to_string()))?;
+                    rewards.push((node_id, reward));
+                }
+            }
+        }
+        
+        Ok(rewards)
+    }
+    
+    // ============================================
+    // SCALABILITY: NODE REGISTRY IN ROCKSDB
+    // ============================================
+    
+    /// Save node registration information
+    pub fn save_node_registration(&self, node_id: &str, node_type: &str, wallet: &str, reputation: f64) -> IntegrationResult<()> {
+        let registry_cf = self.persistent.db.cf_handle("node_registry")
+            .ok_or_else(|| IntegrationError::StorageError("node_registry column family not found".to_string()))?;
+        
+        let key = format!("node_{}", node_id);
+        let data = json!({
+            "node_type": node_type,
+            "wallet": wallet,
+            "reputation": reputation,
+            "timestamp": SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+        });
+        
+        self.persistent.db.put_cf(&registry_cf, key.as_bytes(), data.to_string().as_bytes())?;
+        Ok(())
+    }
+    
+    /// Load node registration
+    pub fn load_node_registration(&self, node_id: &str) -> IntegrationResult<Option<(String, String, f64)>> {
+        let registry_cf = self.persistent.db.cf_handle("node_registry")
+            .ok_or_else(|| IntegrationError::StorageError("node_registry column family not found".to_string()))?;
+        
+        let key = format!("node_{}", node_id);
+        match self.persistent.db.get_cf(&registry_cf, key.as_bytes())? {
+            Some(data) => {
+                let json_str = std::str::from_utf8(&data)
+                    .map_err(|e| IntegrationError::DeserializationError(e.to_string()))?;
+                let parsed: serde_json::Value = serde_json::from_str(json_str)
+                    .map_err(|e| IntegrationError::DeserializationError(e.to_string()))?;
+                
+                Ok(Some((
+                    parsed["node_type"].as_str().unwrap_or("light").to_string(),
+                    parsed["wallet"].as_str().unwrap_or("").to_string(),
+                    parsed["reputation"].as_f64().unwrap_or(70.0)
+                )))
+            },
+            None => Ok(None),
+        }
+    }
+    
+    // ============================================
+    // SCALABILITY: PING HISTORY IN ROCKSDB
+    // ============================================
+    
+    /// Save ping attempt result
+    pub fn save_ping_attempt(&self, node_id: &str, timestamp: u64, success: bool, response_time_ms: u32) -> IntegrationResult<()> {
+        let ping_cf = self.persistent.db.cf_handle("ping_history")
+            .ok_or_else(|| IntegrationError::StorageError("ping_history column family not found".to_string()))?;
+        
+        // Use timestamp in key for ordering
+        let key = format!("ping_{}_{}", node_id, timestamp);
+        let data = json!({
+            "success": success,
+            "response_time_ms": response_time_ms,
+            "timestamp": timestamp
+        });
+        
+        self.persistent.db.put_cf(&ping_cf, key.as_bytes(), data.to_string().as_bytes())?;
+        
+        // Cleanup old pings (older than 24 hours)
+        self.cleanup_old_pings(node_id, timestamp - 86400)?;
+        
+        Ok(())
+    }
+    
+    /// Get ping history for a node
+    pub fn get_ping_history(&self, node_id: &str, since_timestamp: u64) -> IntegrationResult<Vec<(u64, bool, u32)>> {
+        let ping_cf = self.persistent.db.cf_handle("ping_history")
+            .ok_or_else(|| IntegrationError::StorageError("ping_history column family not found".to_string()))?;
+        
+        let mut pings = Vec::new();
+        let prefix = format!("ping_{}_", node_id);
+        let iter = self.persistent.db.iterator_cf(&ping_cf, rocksdb::IteratorMode::From(prefix.as_bytes(), rocksdb::Direction::Forward));
+        
+        for item in iter {
+            let (key, value) = item?;
+            let key_str = std::str::from_utf8(&key).unwrap_or("");
+            
+            if !key_str.starts_with(&prefix) {
+                break; // Reached end of this node's pings
+            }
+            
+            if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&value) {
+                let timestamp = parsed["timestamp"].as_u64().unwrap_or(0);
+                if timestamp >= since_timestamp {
+                    let success = parsed["success"].as_bool().unwrap_or(false);
+                    let response_time = parsed["response_time_ms"].as_u64().unwrap_or(0) as u32;
+                    pings.push((timestamp, success, response_time));
+                }
+            }
+        }
+        
+        Ok(pings)
+    }
+    
+    /// Cleanup old ping records
+    fn cleanup_old_pings(&self, node_id: &str, cutoff_timestamp: u64) -> IntegrationResult<()> {
+        let ping_cf = self.persistent.db.cf_handle("ping_history")
+            .ok_or_else(|| IntegrationError::StorageError("ping_history column family not found".to_string()))?;
+        
+        let prefix = format!("ping_{}_", node_id);
+        let iter = self.persistent.db.iterator_cf(&ping_cf, rocksdb::IteratorMode::From(prefix.as_bytes(), rocksdb::Direction::Forward));
+        
+        let mut batch = WriteBatch::default();
+        for item in iter {
+            let (key, value) = item?;
+            let key_str = std::str::from_utf8(&key).unwrap_or("");
+            
+            if !key_str.starts_with(&prefix) {
+                break;
+            }
+            
+            if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&value) {
+                let timestamp = parsed["timestamp"].as_u64().unwrap_or(0);
+                if timestamp < cutoff_timestamp {
+                    batch.delete_cf(&ping_cf, &key);
+                }
+            }
+        }
+        
+        if batch.len() > 0 {
+            self.persistent.db.write(batch)?;
+        }
+        
+        Ok(())
+    }
+    
+    // ===== FAILOVER EVENT METHODS =====
+    
+    /// Save a failover event (optimized with bincode serialization and LZ4 compression)
+    /// NOTE: Light nodes should NOT call this method - they don't store failover history
+    pub fn save_failover_event(&self, event: &FailoverEvent) -> IntegrationResult<()> {
+        // OPTIMIZATION: Light nodes don't store failover events
+        if std::env::var("QNET_NODE_TYPE").unwrap_or_default() == "light" {
+            return Ok(()); // Skip storage for light nodes
+        }
+        
+        let failover_cf = self.persistent.db.cf_handle("failover_events")
+            .ok_or_else(|| IntegrationError::StorageError("failover_events column family not found".to_string()))?;
+        
+        // Use height as key for efficient range queries
+        // Format: failover_<height>_<timestamp> for uniqueness
+        let key = format!("failover_{:012}_{}", event.height, event.timestamp);
+        
+        // Serialize with bincode (more efficient than JSON)
+        let value = bincode::serialize(event)
+            .map_err(|e| IntegrationError::StorageError(format!("Failed to serialize failover event: {}", e)))?;
+        
+        self.persistent.db.put_cf(&failover_cf, key.as_bytes(), &value)?;
+        
+        // Auto-cleanup old events based on time relevance, not node type
+        // Keep ~30 days of history (assuming ~100 failovers per day worst case)
+        let max_events = match std::env::var("QNET_NODE_TYPE").unwrap_or_default().as_str() {
+            "super" => 10_000,   // Super nodes: ~30 days (400KB) - enough for analysis
+            "full" => 10_000,    // Full nodes: same as Super - they participate in consensus
+            _ => 0,              // Light nodes: don't store (mobile devices)
+        };
+        
+        // Only cleanup if we're not a light node
+        if max_events > 0 {
+            self.cleanup_old_failovers(max_events)?;
+        }
+        
+        Ok(())
+    }
+    
+    /// Get failover history (optimized with range queries and limit)
+    pub fn get_failover_history(&self, from_height: u64, limit: usize) -> IntegrationResult<Vec<FailoverEvent>> {
+        let failover_cf = self.persistent.db.cf_handle("failover_events")
+            .ok_or_else(|| IntegrationError::StorageError("failover_events column family not found".to_string()))?;
+        
+        let mut events = Vec::new();
+        let start_key = format!("failover_{:012}_", from_height);
+        
+        let iter = self.persistent.db.iterator_cf(
+            &failover_cf,
+            rocksdb::IteratorMode::From(start_key.as_bytes(), rocksdb::Direction::Forward)
+        );
+        
+        for item in iter.take(limit) {
+            let (_, value) = item?;
+            
+            if let Ok(event) = bincode::deserialize::<FailoverEvent>(&value) {
+                if event.height >= from_height {
+                    events.push(event);
+                }
+            }
+        }
+        
+        Ok(events)
+    }
+    
+    /// Get failover statistics for monitoring
+    pub fn get_failover_stats(&self) -> IntegrationResult<serde_json::Value> {
+        let failover_cf = self.persistent.db.cf_handle("failover_events")
+            .ok_or_else(|| IntegrationError::StorageError("failover_events column family not found".to_string()))?;
+        
+        let mut total_count = 0;
+        let mut by_producer = HashMap::<String, u32>::new();
+        let mut by_reason = HashMap::<String, u32>::new();
+        
+        let iter = self.persistent.db.iterator_cf(&failover_cf, rocksdb::IteratorMode::Start);
+        
+        for item in iter {
+            let (_, value) = item?;
+            
+            if let Ok(event) = bincode::deserialize::<FailoverEvent>(&value) {
+                total_count += 1;
+                *by_producer.entry(event.failed_producer).or_insert(0) += 1;
+                *by_reason.entry(event.reason).or_insert(0) += 1;
+            }
+        }
+        
+        Ok(json!({
+            "total_failovers": total_count,
+            "by_producer": by_producer,
+            "by_reason": by_reason
+        }))
+    }
+    
+    /// Cleanup old failover events with smart retention policy
+    fn cleanup_old_failovers(&self, max_events: usize) -> IntegrationResult<()> {
+        let failover_cf = self.persistent.db.cf_handle("failover_events")
+            .ok_or_else(|| IntegrationError::StorageError("failover_events column family not found".to_string()))?;
+        
+        // Two-phase cleanup strategy:
+        // 1. Remove events older than 30 days (primary)
+        // 2. Keep max_events limit (secondary safety)
+        
+        let thirty_days_ago = chrono::Utc::now().timestamp() - (30 * 24 * 3600);
+        let mut batch = WriteBatch::default();
+        let mut count = 0;
+        let mut old_count = 0;
+        
+        // First pass: count and remove old events
+        let iter = self.persistent.db.iterator_cf(&failover_cf, rocksdb::IteratorMode::Start);
+        for item in iter {
+            let (key, value) = item?;
+            count += 1;
+            
+            // Try to deserialize to check timestamp
+            if let Ok(event) = bincode::deserialize::<FailoverEvent>(&value) {
+                if event.timestamp < thirty_days_ago {
+                    batch.delete_cf(&failover_cf, &key);
+                    old_count += 1;
+                }
+            }
+        }
+        
+        // Apply time-based cleanup
+        if old_count > 0 {
+            self.persistent.db.write(batch)?;
+            println!("[STORAGE] Cleaned up {} failover events older than 30 days", old_count);
+        }
+        
+        // Second safety check: if still too many events, trim oldest
+        if count - old_count > max_events {
+            let to_delete = (count - old_count) - max_events;
+            let mut batch = WriteBatch::default();
+            let iter = self.persistent.db.iterator_cf(&failover_cf, rocksdb::IteratorMode::Start);
+            
+            for item in iter.take(to_delete) {
+                let (key, _) = item?;
+                batch.delete_cf(&failover_cf, &key);
+            }
+            
+            self.persistent.db.write(batch)?;
+            println!("[STORAGE] Trimmed {} oldest failover events to maintain {} limit", to_delete, max_events);
+        }
+        
+        Ok(())
     }
 } 
