@@ -709,6 +709,55 @@ impl SimplifiedP2P {
         }
     }
     
+    /// Update peer last_seen timestamp when we receive data from them
+    pub fn update_peer_last_seen(&self, peer_id_or_addr: &str) {
+        let current_time = self.current_timestamp();
+        
+        // CRITICAL FIX: Handle both peer ID (e.g., "genesis_node_003") and address (e.g., "161.97.86.81:8001")
+        // First try to find by ID using dual indexing
+        let peer_addr = if let Some(addr_entry) = self.peer_id_to_addr.get(peer_id_or_addr) {
+            addr_entry.clone()
+        } else if peer_id_or_addr.contains(':') {
+            // Already an address
+            peer_id_or_addr.to_string()
+        } else {
+            // Try to construct address for Genesis nodes
+            if peer_id_or_addr.starts_with("genesis_node_") {
+                let genesis_ips = get_genesis_bootstrap_ips();
+                if let Some(num) = peer_id_or_addr.strip_prefix("genesis_node_") {
+                    if let Ok(idx) = num.parse::<usize>() {
+                        if idx > 0 && idx <= genesis_ips.len() {
+                            format!("{}:8001", genesis_ips[idx - 1])
+                        } else {
+                            return; // Invalid Genesis node index
+                        }
+                    } else {
+                        return; // Invalid format
+                    }
+                } else {
+                    return; // Invalid format
+                }
+            } else {
+                return; // Unknown peer format
+            }
+        };
+        
+        // QUANTUM ROUTING: Try lock-free first if should use it
+        if self.should_use_lockfree() {
+            if let Some(mut peer) = self.connected_peers_lockfree.get_mut(&peer_addr) {
+                peer.last_seen = current_time;
+                return;
+            }
+        }
+        
+        // Fallback to legacy
+        if let Ok(mut peers) = self.connected_peers.write() {
+            if let Some(peer) = peers.get_mut(&peer_addr) {
+                peer.last_seen = current_time;
+            }
+        }
+    }
+    
     /// QUANTUM OPTIMIZATION: Lock-free peer addition for millions of nodes
     /// Uses DashMap for concurrent operations without blocking
     pub fn add_peer_lockfree(&self, mut peer_info: PeerInfo) -> bool {
@@ -2512,6 +2561,16 @@ impl SimplifiedP2P {
     
     /// Get connected peer count (PRODUCTION: Real failover validation)
     pub fn get_peer_count(&self) -> usize {
+        // GENESIS FIX: During Genesis phase, use validated peers count
+        // This ensures correct peer count reporting in API during bootstrap
+        if std::env::var("QNET_BOOTSTRAP_ID")
+            .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
+            .unwrap_or(false) {
+            // Genesis node: Count actual connected Genesis peers
+            let validated_peers = self.get_validated_active_peers();
+            return validated_peers.len();
+        }
+        
         // QUANTUM AUTO-SCALING: Automatically choose optimal method
         if self.should_use_lockfree() {
             return self.get_peer_count_lockfree();
@@ -4347,6 +4406,9 @@ impl SimplifiedP2P {
     pub fn handle_message(&self, from_peer: &str, message: NetworkMessage) {
         match message {
             NetworkMessage::Block { height, data, block_type } => {
+                // Update last_seen for the peer who sent the block
+                self.update_peer_last_seen(from_peer);
+                
                 // Log only every 10th block
                 if height % 10 == 0 {
                 println!("[P2P] ← Received {} block #{} from {} ({} bytes)", 
@@ -4424,6 +4486,8 @@ impl SimplifiedP2P {
             }
             
             NetworkMessage::Transaction { data } => {
+                // Update last_seen for the peer who sent the transaction
+                self.update_peer_last_seen(from_peer);
                 println!("[P2P] ← Received transaction from {} ({} bytes)", 
                          from_peer, data.len());
             }
@@ -4435,18 +4499,22 @@ impl SimplifiedP2P {
             }
             
             NetworkMessage::HealthPing { from, timestamp: _ } => {
+                // Update last_seen for the peer who sent the ping
+                self.update_peer_last_seen(&from);
                 // Simple acknowledgment - no complex processing
                 println!("[P2P] ← Health ping from {}", from);
             }
 
             NetworkMessage::ConsensusCommit { round_id, node_id, commit_hash, signature, timestamp } => {
+                // Update last_seen for the peer who sent the commit
+                self.update_peer_last_seen(&node_id);
                 println!("[CONSENSUS] ← Received commit from {} for round {} at {}", 
                          node_id, round_id, timestamp);
                 
                 // CRITICAL: Only process consensus for MACROBLOCK rounds (every 90 blocks)
                 // Microblocks use simple producer signatures, NOT Byzantine consensus
                 if self.is_macroblock_consensus_round(round_id) {
-                    println!("[CONSENSUS] ✅ Processing commit for MACROBLOCK round {}", round_id);
+                    println!("[MACROBLOCK] ✅ Processing commit for consensus round {}", round_id);
                     self.handle_remote_consensus_commit(round_id, node_id, commit_hash, signature, timestamp);
                 } else {
                     println!("[CONSENSUS] ⏭️ Ignoring commit for microblock - no consensus needed for round {}", round_id);
@@ -4454,13 +4522,15 @@ impl SimplifiedP2P {
             }
 
             NetworkMessage::ConsensusReveal { round_id, node_id, reveal_data, timestamp } => {
+                // Update last_seen for the peer who sent the reveal
+                self.update_peer_last_seen(&node_id);
                 println!("[CONSENSUS] ← Received reveal from {} for round {} at {}", 
                          node_id, round_id, timestamp);
                 
                 // CRITICAL: Only process consensus for MACROBLOCK rounds (every 90 blocks)  
                 // Microblocks use simple producer signatures, NOT Byzantine consensus
                 if self.is_macroblock_consensus_round(round_id) {
-                    println!("[CONSENSUS] ✅ Processing reveal for MACROBLOCK round {}", round_id);
+                    println!("[MACROBLOCK] ✅ Processing reveal for consensus round {}", round_id);
                     self.handle_remote_consensus_reveal(round_id, node_id, reveal_data, timestamp);
                 } else {
                     println!("[CONSENSUS] ⏭️ Ignoring reveal for microblock - no consensus needed for round {}", round_id);

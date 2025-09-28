@@ -1453,7 +1453,7 @@ impl BlockchainNode {
                         let macroblock_trigger = last_macroblock_trigger;
                         
                         tokio::spawn(async move {
-                            println!("[MACROBLOCK] 🏛️ Background consensus starting for blocks {}-90", macroblock_trigger + 1);
+                            println!("[MACROBLOCK] 🏛️ Background consensus starting for blocks {}-{}", macroblock_trigger + 1, macroblock_trigger + 90);
                             
                             // Run consensus in background
                             if let Some(ref p2p) = unified_p2p_clone {
@@ -1833,24 +1833,38 @@ impl BlockchainNode {
                 
                 if let Some(peer) = producer_peer {
                     // Check if peer has been seen recently (within last 30 seconds)
-                    let last_seen_secs = peer.last_seen / 1000; // Convert ms to seconds
+                    let last_seen_secs = peer.last_seen; // Already in seconds from Unix epoch
                     let current_time = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_secs();
                     
                     let is_recent = if last_seen_secs > 0 {
-                        (current_time - last_seen_secs) < 30
+                        let time_since_seen = if current_time > last_seen_secs {
+                            current_time - last_seen_secs
+                        } else {
+                            // Invalid timestamp (future time), treat as just seen
+                            0
+                        };
+                        time_since_seen < 30 // Active if seen within 30 seconds
                     } else {
-                        // CRITICAL FIX: last_seen=0 doesn't mean active!
-                        // Genesis nodes might have last_seen=0 but still be inactive
-                        // Check additional criteria for Genesis nodes
-                        false // Don't assume active without positive confirmation
+                        // CRITICAL FIX: last_seen=0 for Genesis nodes during bootstrap
+                        // For Genesis phase, be more tolerant
+                        if current_height < 1000 {
+                            true // During Genesis phase (first 1000 blocks), assume active
+                        } else {
+                            false // After Genesis, require real timestamps
+                        }
                     };
                     
-                    if !is_recent {
+                    if !is_recent && last_seen_secs > 0 {
+                        let time_since = if current_time > last_seen_secs { 
+                            current_time - last_seen_secs 
+                        } else { 
+                            0 
+                        };
                         println!("[CONSENSUS] ⚠️ Producer {} last seen {}s ago - may be offline", 
-                                selected_producer, current_time - last_seen_secs);
+                                selected_producer, time_since);
                     }
                     is_recent
                 } else {
@@ -2008,7 +2022,7 @@ impl BlockchainNode {
             let peers = p2p.get_validated_active_peers();
             for peer in peers {
                 let peer_ip = peer.addr.split(':').next().unwrap_or(&peer.addr);
-                    let peer_node_id = format!("node_{}", peer.addr.replace(":", "_"));
+                    let peer_node_id = peer.id.clone(); // Use actual peer ID, not generated one
                     
                     // Exclude failed producer
                 if peer_node_id == failed_producer {
@@ -2523,7 +2537,7 @@ impl BlockchainNode {
         current_height: u64,
         unified_p2p: Option<Arc<SimplifiedP2P>>,
     ) {
-        println!("[FAILOVER] 🚨 Initiating emergency macroblock consensus due to failed leader: {}", failed_leader);
+        println!("[MACROBLOCK] 🚨 EMERGENCY: Initiating consensus due to failed leader: {}", failed_leader);
         
         // CRITICAL FIX: Only penalize valid failed leaders, not placeholders
         if let Some(p2p) = &unified_p2p {
@@ -2557,8 +2571,8 @@ impl BlockchainNode {
             let mut consensus_engine = consensus.write().await;
             
             // Simplified emergency consensus - just log the attempt
-            println!("[FAILOVER] 🔄 Emergency macroblock consensus will be handled by next scheduled round");
-            println!("[FAILOVER] ⏰ Network will retry macroblock creation in next 90-block cycle");
+            println!("[MACROBLOCK] 🔄 EMERGENCY: Consensus will be handled by next scheduled round");
+            println!("[MACROBLOCK] ⏰ EMERGENCY: Network will retry creation in next 90-block cycle");
             
             // Log failed leader for tracking
             println!("[FAILOVER] 📊 Failed leader logged: {} (will be excluded from future leadership)", failed_leader);
@@ -4253,8 +4267,12 @@ impl BlockchainNode {
                     node_type: format!("{:?}", p2p_peer.node_type),
                     region: format!("{:?}", p2p_peer.region),
                     last_seen: p2p_peer.last_seen,
-                    connection_time: current_time - p2p_peer.last_seen,
-                    reputation: 90.0, // EXISTING: Default reputation for discovered peers
+                    connection_time: if current_time > p2p_peer.last_seen { 
+                        current_time - p2p_peer.last_seen 
+                    } else { 
+                        0 
+                    },
+                    reputation: p2p_peer.reputation_score, // Use actual reputation from P2P system
                     version: Some("qnet-v1.0".to_string()), // EXISTING: Default version
                 }
             }).collect()

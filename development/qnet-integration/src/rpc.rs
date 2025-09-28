@@ -384,20 +384,17 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
                 })
                 .map(|peer| {
                     // API FIX: Calculate proper last_seen as seconds ago, not absolute timestamp
-                    let last_seen_ago = if peer.last_seen > 0 && peer.last_seen <= current_time {
-                        current_time - peer.last_seen
-                    } else {
-                        0 // Just connected or invalid timestamp
-                    };
+                    // Keep absolute timestamp - it's already in seconds since Unix epoch
+                    let last_seen_timestamp = peer.last_seen;
                     
                     json!({
                         "id": peer.id,
                         "address": peer.address,
                         "node_type": peer.node_type,
                         "region": peer.region,
-                        "last_seen": last_seen_ago, // API FIX: Return seconds since last contact
-                        "reputation": peer.reputation, // API FIX: Include reputation score
-                        "version": peer.version // API FIX: Include node version
+                        "last_seen": last_seen_timestamp, // Return absolute timestamp (seconds since Unix epoch)
+                        "reputation": peer.reputation, // Include actual reputation score
+                        "version": peer.version // Include node version
                     })
                 }).collect();
             
@@ -423,9 +420,9 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
                             "address": genesis_addr,
                             "node_type": "Super",
                             "region": "Global",
-                            "last_seen": 0, // API FIX: Genesis nodes always fresh
-                            "reputation": 100.0, // API FIX: Genesis nodes have max reputation
-                            "version": Some("qnet-v1.0") // API FIX: Include version
+                            "last_seen": current_time, // Genesis nodes are always active
+                            "reputation": 70.0, // Genesis nodes start at 70% reputation like all nodes
+                            "version": "qnet-v1.0" // Include version
                         }));
                     }
                 }
