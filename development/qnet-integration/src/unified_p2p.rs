@@ -218,7 +218,7 @@ impl LoadBalancingConfig {
 /// Combines lock-free DashMap, dual indexing, and existing sharding
 pub struct SimplifiedP2P {
     /// Node identification
-    node_id: String,
+    pub node_id: String,
     node_type: NodeType,
     region: Region,
     port: u16,
@@ -4188,7 +4188,137 @@ impl SimplifiedP2P {
         Ok("127.0.0.1".to_string())
     }
 
-    /// Download missing microblocks from peers before consensus participation
+    /// Download missing microblocks in parallel for faster synchronization
+    pub async fn parallel_download_microblocks(&self, storage: &Arc<crate::storage::Storage>, current_height: u64, target_height: u64) {
+        if target_height <= current_height { return; }
+        
+        // PRODUCTION: Parallel download configuration
+        const PARALLEL_WORKERS: usize = 10; // Number of parallel download workers
+        const CHUNK_SIZE: u64 = 100; // Blocks per chunk
+        
+        println!("[SYNC] ⚡ Starting parallel sync: {} blocks with {} workers", 
+                 target_height - current_height, PARALLEL_WORKERS);
+        
+        // Split range into chunks for parallel processing
+        let mut chunks = Vec::new();
+        let mut start = current_height + 1;
+        
+        while start <= target_height {
+            let end = std::cmp::min(start + CHUNK_SIZE - 1, target_height);
+            chunks.push((start, end));
+            start = end + 1;
+        }
+        
+        // Create parallel download tasks
+        let storage_arc = Arc::new(storage.clone());
+        let mut tasks = Vec::new();
+        
+        // Use semaphore to limit concurrent workers
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(PARALLEL_WORKERS));
+        
+        // Pre-fetch peers for all workers to use
+        let peers = self.connected_peers.read().unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<String>>();
+        
+        for (chunk_start, chunk_end) in chunks {
+            let storage_clone = storage_arc.clone();
+            let sem_clone = semaphore.clone();
+            let peers_clone = peers.clone();
+            
+            let task = tokio::spawn(async move {
+                let _permit = sem_clone.acquire().await.unwrap();
+                
+                println!("[SYNC] 🔄 Worker started for blocks {}-{}", chunk_start, chunk_end);
+                let start_time = std::time::Instant::now();
+                
+                // Download blocks in this chunk directly without self reference
+                Self::download_block_range_static(&peers_clone, &**storage_clone, chunk_start, chunk_end).await;
+                
+                let duration = start_time.elapsed();
+                println!("[SYNC] ✅ Worker completed blocks {}-{} in {:.2}s", 
+                         chunk_start, chunk_end, duration.as_secs_f64());
+            });
+            
+            tasks.push(task);
+        }
+        
+        // Wait for all tasks to complete
+        let start_time = std::time::Instant::now();
+        futures::future::join_all(tasks).await;
+        
+        let duration = start_time.elapsed();
+        let blocks_synced = target_height - current_height;
+        let blocks_per_sec = blocks_synced as f64 / duration.as_secs_f64();
+        
+        println!("[SYNC] 🎯 Parallel sync complete: {} blocks in {:.2}s ({:.1} blocks/sec)", 
+                 blocks_synced, duration.as_secs_f64(), blocks_per_sec);
+    }
+    
+    /// Download a range of blocks (helper for parallel sync)
+    async fn download_block_range_static(peers: &[String], storage: &crate::storage::Storage, start_height: u64, end_height: u64) {
+        if peers.is_empty() { return; }
+        
+        let mut consecutive_failures = 0;
+        const MAX_CONSECUTIVE_FAILURES: u32 = 3;
+        
+        for height in start_height..=end_height {
+            // Check if block already exists
+            if storage.load_microblock(height).is_ok() {
+                consecutive_failures = 0;
+                continue;
+            }
+            
+            // Try downloading from peers
+            let mut fetched = false;
+            for peer_addr in peers {
+                let ip = peer_addr.split(':').next().unwrap_or("");
+                let url = format!("http://{}:8001/api/v1/microblock/{}", ip, height);
+                
+                let client = match reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(5))
+                    .connect_timeout(std::time::Duration::from_secs(2))
+                    .user_agent("QNet-Node/1.0")
+                    .tcp_nodelay(true)
+                    .build() {
+                    Ok(client) => client,
+                    Err(_) => continue,
+                };
+                
+                match client.get(&url).send().await {
+                    Ok(response) => {
+                        if response.status().is_success() {
+                            if let Ok(val) = response.json::<serde_json::Value>().await {
+                                if let Some(b64) = val.get("data").and_then(|v| v.as_str()) {
+                                    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) {
+                                        if storage.save_microblock(height, &bytes).is_ok() {
+                                            fetched = true;
+                                            consecutive_failures = 0;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    Err(_) => continue,
+                }
+            }
+            
+            if !fetched {
+                consecutive_failures += 1;
+                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                    println!("[SYNC] ❌ Range {}-{} aborted after {} failures at block {}", 
+                             start_height, end_height, MAX_CONSECUTIVE_FAILURES, height);
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+    }
+    
+    /// Download missing microblocks from peers (legacy sequential version)
     pub async fn download_missing_microblocks(&self, storage: &crate::storage::Storage, current_height: u64, target_height: u64) {
         if target_height <= current_height { return; }
         let peers = self.connected_peers.read().unwrap().clone();
@@ -4334,6 +4464,13 @@ pub enum NetworkMessage {
     HealthPing {
         from: String,
         timestamp: u64,
+    },
+    
+    /// State snapshot announcement
+    StateSnapshot {
+        height: u64,
+        ipfs_cid: String,
+        sender_id: String,
     },
 
     /// Consensus commit message
@@ -4620,6 +4757,13 @@ impl SimplifiedP2P {
                 // Handle consensus state response
                 println!("[CONSENSUS] 📦 Received consensus state for round {} from {}", round, sender_id);
                 self.handle_consensus_state(round, state_data, sender_id);
+            }
+            
+            NetworkMessage::StateSnapshot { height, ipfs_cid, sender_id } => {
+                // Handle state snapshot announcement
+                println!("[SNAPSHOT] 📸 Received snapshot announcement for height {} with CID {} from {}", height, ipfs_cid, sender_id);
+                // In production: Store CID for potential snapshot download
+                // For now, just log the announcement
             }
         }
     }
