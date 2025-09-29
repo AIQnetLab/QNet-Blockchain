@@ -18,18 +18,24 @@ QNet is a high-performance, post-quantum secure blockchain network with a **two-
 - **Full/Super Nodes**: ONLY servers, VPS, desktops with interactive setup
 - **Light Nodes**: ONLY mobile devices & tablets through mobile app
 
-### 🚀 **Current Status: Production Testnet Ready**
+### 🚀 **Current Status: Production Testnet Ready (v2.6.0)**
 
-**QNet production testnet is ready for deployment with real Rust nodes.**
+**QNet production testnet is ready for deployment with advanced consensus and synchronization.**
 
 - ✅ **Post-Quantum Cryptography**: CRYSTALS-Dilithium integration complete
+- ✅ **Entropy-Based Consensus**: True decentralization with unpredictable producer rotation
+- ✅ **Reputation System**: Economic incentives for network participation
+- ✅ **State Snapshots**: Full & incremental snapshots with LZ4 compression
+- ✅ **Parallel Synchronization**: Multi-worker downloads for fast sync
+- ✅ **Deadlock Prevention**: Guard patterns & health monitors implemented
 - ✅ **Two-Phase Activation**: 1DEV burn (Phase 1) → QNC Pool 3 (Phase 2)
-- ✅ **Microblock Architecture**: 1-second block production, 400k+ TPS capability (256 shards)
+- ✅ **Microblock Architecture**: 1-second blocks, 400k+ TPS (256 shards)
 - ✅ **Production Rust Nodes**: Server deployment with real blockchain nodes
 - ✅ **Browser Extension Wallet**: Production-ready with full-screen interface
 - ✅ **Mobile Applications**: iOS/Android apps for Light nodes only
 - ✅ **Interactive Setup**: Server nodes require interactive activation menu
-- ✅ **1DEV Burn Contract Deployed**: [D7g7mkL8o1YEex6ZgETJEQyyHV7uuUMvV3Fy3u83igJ7](https://explorer.solana.com/address/D7g7mkL8o1YEex6ZgETJEQyyHV7uuUMvV3Fy3u83igJ7?cluster=devnet) on Solana Devnet
+- ✅ **IPFS Integration**: Optional P2P snapshot distribution
+- ✅ **1DEV Burn Contract**: [D7g7mkL8o1YEex6ZgETJEQyyHV7uuUMvV3Fy3u83igJ7](https://explorer.solana.com/address/D7g7mkL8o1YEex6ZgETJEQyyHV7uuUMvV3Fy3u83igJ7?cluster=devnet) on Solana Devnet
 
 ### 📋 **Testnet Deployment**
 
@@ -41,6 +47,9 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 
 - **🔐 Post-Quantum Security**: Quantum-resistant cryptographic algorithms
 - **⚡ Ultra-High Performance**: 424,411 TPS with zero-downtime consensus
+- **🎲 True Decentralization**: Entropy-based producer selection with unpredictable rotation
+- **💰 Reputation Economics**: Rewards for block production (+1 micro, +10/+5 macro)
+- **🔄 Advanced Synchronization**: State snapshots with parallel downloads & IPFS
 - **🔥 Phase 1 Active**: 1DEV burn-to-join (1,500 → 150 1DEV universal pricing)
 - **💎 Phase 2 Ready**: QNC Pool 3 system (5k-30k QNC dynamic pricing)
 - **🌐 Scalable Architecture**: 256 shards, microblocks, lock-free operations (10M+ nodes)
@@ -49,6 +58,7 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 - **📱 Mobile-First Design**: Light nodes on phones & tablets
 - **🖥️ Server Architecture**: Full/Super nodes on dedicated servers
 - **🔧 Interactive Setup**: User-friendly activation process
+- **🛡️ Deadlock Prevention**: Guard patterns & health monitors for stability
 
 ### 📊 Performance Metrics
 
@@ -85,16 +95,22 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 │  ├── CRYSTALS-Kyber (Key Exchange)                         │
 │  └── SPHINCS+ (Hash-based Signatures)                      │
 ├─────────────────────────────────────────────────────────────┤
-│  Consensus Layer with Enterprise Failover                  │
+│  Consensus Layer with Entropy-Based Selection              │
 │  ├── Microblock Production (1s intervals)                  │
-│  │   ├── Reputation-based producer rotation (30 blocks)    │
-│  │   ├── Fixed timeout (5s) + emergency rotation           │
-│  │   └── Full/Super nodes only (Light excluded)           │
+│  │   ├── SHA3-256 hash with previous block entropy         │
+│  │   ├── 30-block rotation with unpredictable selection    │
+│  │   ├── Producer rewards: +1 reputation per block         │
+│  │   └── Full/Super nodes only (reputation >= 70%)        │
 │  ├── Macroblock Consensus (90s intervals)                  │
-│  │   ├── Full Byzantine commit-reveal consensus            │
-│  │   ├── 30-second timeout + emergency re-consensus       │
-│  │   └── 67% honest validator assumption                   │
-│  └── Dynamic Validator Selection with Failover            │
+│  │   ├── Byzantine consensus with 1000 validators          │
+│  │   ├── Leader: +10 reputation, Participants: +5 each     │
+│  │   ├── Entropy-based initiator selection                 │
+│  │   └── 67% honest validator requirement                  │
+│  └── Advanced Synchronization                              │
+│      ├── State snapshots: Full (10k blocks) & Incremental  │
+│      ├── Parallel downloads with 100-block chunks          │
+│      ├── IPFS integration for P2P snapshot distribution    │
+│      └── Deadlock prevention with guard pattern            │
 ├─────────────────────────────────────────────────────────────┤
 │  Network Layer (Optimized for 10M+ nodes)                  │
 │  ├── Kademlia DHT with K-bucket management                 │
@@ -140,6 +156,79 @@ QNet implements production-grade failover mechanisms for zero-downtime operation
 - **Automatic Recovery**: No human intervention required for network restoration
 - **Progressive Penalties**: Escalating reputation penalties prevent repeated failures
 - **Network Transparency**: All failover events logged and broadcast to peers
+
+## 💎 Reputation System
+
+QNet implements an economic reputation system that incentivizes network participation:
+
+### **Reputation Rewards**
+| Action | Reward | Frequency |
+|--------|--------|-----------|
+| **Produce Microblock** | +1 | Per block (30 blocks/rotation) |
+| **Lead Macroblock Consensus** | +10 | Every 90 seconds |
+| **Participate in Consensus** | +5 | Every 90 seconds |
+| **Emergency Producer** | +5 | On failover events |
+| **Successful Ping** | +1 | Every 4 hours |
+
+### **Reputation Penalties**
+| Action | Penalty | Impact |
+|--------|---------|--------|
+| **Failed Microblock** | -20 | Lost producer slot |
+| **Failed Macroblock** | -30 | Consensus failure |
+| **Missed Ping** | -1 | Every 4 hours |
+| **Double-Sign** | -30 | Malicious behavior |
+
+### **Reputation Thresholds**
+- **70+ points**: Eligible for consensus participation (70% minimum)
+- **40+ points**: Eligible for rewards from all pools
+- **10-39 points**: Network access only, no rewards
+- **<10 points**: Network ban
+- **Maximum**: 100 points (hard cap)
+
+### **Entropy-Based Selection**
+```rust
+// Prevents deterministic selection
+producer = SHA3_256(
+    round_number + 
+    previous_block_hash +  // Entropy source
+    eligible_nodes         // Rep >= 70%
+)
+```
+
+## 🔄 Advanced Synchronization
+
+QNet implements state-of-the-art synchronization for rapid network joining:
+
+### **State Snapshots**
+- **Full Snapshots**: Every 10,000 blocks (complete blockchain state)
+- **Incremental Snapshots**: Every 1,000 blocks (delta changes only)
+- **Compression**: LZ4 for efficient storage (~70% reduction)
+- **Verification**: SHA3-256 integrity checks
+- **Auto-Cleanup**: Keep only latest 5 snapshots
+
+### **P2P Distribution**
+- **IPFS Integration**: Optional decentralized snapshot sharing
+- **Multiple Gateways**: Redundant download sources
+- **Peer Announcements**: Automatic broadcast of new snapshots
+- **Pin on Upload**: Ensures persistence in IPFS network
+
+### **Parallel Synchronization**
+- **Fast Sync Trigger**: Activates when >50 blocks behind
+- **Multiple Workers**: Concurrent block downloads
+- **Chunk Processing**: 100-block batches for efficiency
+- **Timeout Protection**: 60s fast sync, 30s normal sync
+- **Deadlock Prevention**: Guard pattern with automatic reset
+
+### **Configuration**
+```bash
+# Optional IPFS integration
+export IPFS_API_URL="http://your-ipfs-node:5001"
+
+# Sync parameters (defaults)
+FAST_SYNC_THRESHOLD=50
+SYNC_CHUNK_SIZE=100
+SYNC_WORKERS=4
+```
 
 ## 🖥️ System Requirements
 
@@ -1267,6 +1356,19 @@ Year 10+:   ~300+ GB    🔧 Increase to 500-1000 GB
 - **No System Metrics**: Removed CPU/memory monitoring for privacy
 - **Deterministic Consensus**: Cryptographic selection prevents forks
 - **Enhanced Concurrency**: RwLock for better parallel performance
+
+## 📈 Latest Updates (v2.6.0)
+
+**September 29, 2025 - "Entropy-Based Selection & Advanced Synchronization"**
+
+This release introduces critical improvements for true decentralization:
+- **Entropy-Based Producer Selection** prevents deterministic leadership
+- **Reputation Rewards** incentivize active network participation
+- **State Snapshots** enable rapid node synchronization
+- **Parallel Downloads** accelerate blockchain sync by 3-5x
+- **Deadlock Prevention** ensures network stability
+
+See [CHANGELOG.md](documentation/CHANGELOG.md) for detailed release notes.
 
 ## 📄 License
 

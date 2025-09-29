@@ -5,6 +5,45 @@ All notable changes to the QNet project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.6.0] - September 29, 2025 "Entropy-Based Selection & Advanced Synchronization"
+
+### Added
+- **Entropy-Based Producer Selection**: SHA3-256 hash with previous block hash as entropy source
+- **Microblock Reputation Rewards**: +1 reputation per microblock produced
+- **Macroblock Reputation Rewards**: +10 for leader, +5 for participants
+- **State Snapshots System**: Full (every 10k blocks) and incremental (every 1k blocks)
+- **IPFS Integration**: Optional P2P snapshot distribution via IPFS
+- **Parallel Block Synchronization**: Multiple workers download blocks concurrently
+- **Deadlock Prevention**: Guard pattern for sync flags with auto-reset
+- **Sync Health Monitor**: Background task to detect and clear stuck sync flags
+
+### Changed
+- **Producer Selection**: Now uses entropy from previous round's last block hash
+- **Macroblock Initiator**: Also uses entropy instead of deterministic selection
+- **Emergency Producer**: Includes entropy to prevent repeated selection
+- **Sync Timeouts**: 60s for fast sync, 30s for normal background sync
+- **IPFS Optional**: Requires explicit IPFS_API_URL configuration (no default)
+
+### Fixed
+- **Network Collapse Prevention**: Fixed deterministic producer selection causing leadership vacuum
+- **Fast Sync Deadlock**: Resolved FAST_SYNC_IN_PROGRESS flag getting stuck
+- **Background Sync Deadlock**: Fixed SYNC_IN_PROGRESS flag persistence issues
+- **Producer Rotation**: Ensured true randomness in 30-block rotation cycles
+- **Genesis Node Diversity**: Prevented single node domination for 14+ hours
+
+### Security
+- **True Decentralization**: Unpredictable producer rotation via entropy
+- **Multi-Level Failover**: Better resilience against node failures
+- **Timeout Protection**: Prevents indefinite sync operations
+- **Reputation Incentives**: Economic rewards for block production
+
+### Performance
+- **Parallel Downloads**: 100-block chunks with multiple workers
+- **LZ4 Compression**: Efficient snapshot storage
+- **SHA3-256 Verification**: Integrity checks for snapshots
+- **Auto-Cleanup**: Keep only latest 5 snapshots
+- **IPFS Gateways**: Multiple redundant download sources
+
 ## [2.5.0] - September 28, 2025 "Production-Ready MVP with Sync & Recovery"
 
 ### Added

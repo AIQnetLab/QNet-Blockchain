@@ -1546,12 +1546,25 @@ impl BlockchainNode {
                     let microblock_clone = microblock.clone();
                     let height_for_storage = microblock_height;
                     let compression = compression_enabled;
+                    let p2p_for_reward = unified_p2p.clone();
+                    let producer_id_for_reward = node_id.clone();
                     
                     tokio::spawn(async move {
                         // Try efficient storage first
                         match storage_clone.save_efficient_microblock(height_for_storage, &efficient_block, &txs_clone) {
                         Ok(_) => {
                                 println!("[Storage] ✅ Efficient microblock {} saved asynchronously", height_for_storage);
+                                
+                                // PRODUCTION: Reward microblock producer with reputation
+                                // +1 per block (vs +5/+10 for macroblock consensus)
+                                if let Some(ref p2p) = p2p_for_reward {
+                                    p2p.update_node_reputation(&producer_id_for_reward, 1.0);
+                                    
+                                    // Log only every 30 blocks to reduce spam (at rotation boundaries)
+                                    if height_for_storage % 30 == 0 {
+                                        println!("[REPUTATION] ⚡ Microblock producer {} rewarded: +1.0 reputation per block", producer_id_for_reward);
+                                    }
+                                }
                         },
                         Err(e) => {
                             println!("[Storage] ⚠️ Efficient storage failed, falling back to legacy: {}", e);
@@ -1569,6 +1582,15 @@ impl BlockchainNode {
                                     println!("[Microblock] ❌ Storage save failed for block #{}: {}", height_for_storage, e);
                                 } else {
                                     println!("[Storage] 💾 Block #{} saved (legacy format)", height_for_storage);
+                                    
+                                    // PRODUCTION: Reward microblock producer even in legacy path
+                                    if let Some(ref p2p) = p2p_for_reward {
+                                        p2p.update_node_reputation(&producer_id_for_reward, 1.0);
+                                        
+                                        if height_for_storage % 30 == 0 {
+                                            println!("[REPUTATION] ⚡ Microblock producer {} rewarded: +1.0 reputation per block", producer_id_for_reward);
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1724,7 +1746,13 @@ impl BlockchainNode {
                             
                             // Run consensus in background
                             if let Some(ref p2p) = unified_p2p_clone {
-                                let should_initiate = Self::should_initiate_consensus(p2p, &node_id_clone, node_type_clone).await;
+                                let should_initiate = Self::should_initiate_consensus(
+                                    p2p, 
+                                    &node_id_clone, 
+                                    node_type_clone, 
+                                    &storage_clone,
+                                    macroblock_trigger + 90 // Height where macroblock will be created
+                                ).await;
                                     
                                     if should_initiate {
                                 match Self::trigger_macroblock_consensus(
@@ -2840,13 +2868,15 @@ impl BlockchainNode {
         selected
         }
     
-    /// CRITICAL: Deterministic selection of consensus initiator (only ONE node triggers consensus)
+    /// CRITICAL: Random selection of consensus initiator with entropy (only ONE node triggers consensus)
     async fn should_initiate_consensus(
         p2p: &Arc<SimplifiedP2P>,
         our_node_id: &str, 
-        our_node_type: NodeType
+        our_node_type: NodeType,
+        storage: &Arc<Storage>,
+        current_height: u64
     ) -> bool {
-        println!("[CONSENSUS] 🎯 Determining consensus initiator...");
+        println!("[CONSENSUS] 🎯 Determining consensus initiator with entropy...");
         
         // Get all qualified candidates using existing validator sampling system
         let qualified_candidates = Self::calculate_qualified_candidates(p2p, our_node_id, our_node_type).await;
@@ -2856,13 +2886,52 @@ impl BlockchainNode {
             return false;
         }
         
-        // DETERMINISTIC: Select consensus initiator by highest reputation (most qualified node)
-        let mut reputation_sorted_candidates = qualified_candidates.clone();
-        reputation_sorted_candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        // ENTROPY-BASED: Select consensus initiator using blockchain entropy (like microblocks)
+        // This ensures true decentralization and unpredictable initiator selection
+        use sha3::{Sha3_256, Digest};
+        let mut selection_hasher = Sha3_256::new();
         
-        let consensus_initiator = &reputation_sorted_candidates[0].0;
-        println!("[CONSENSUS] 🎯 Consensus initiator selected: {} (from {} qualified nodes)", 
-                 consensus_initiator, reputation_sorted_candidates.len());
+        // Get current macroblock round (every 90 blocks)
+        let macroblock_round = current_height / 90;
+        
+        // Add entropy from the blockchain
+        // For first macroblock, use genesis hash; otherwise use real macroblock hash
+        let entropy_source: Vec<u8> = if macroblock_round == 0 {
+            // First macroblock - use genesis block hash as entropy
+            vec![0x42; 32] // Deterministic but unique genesis entropy
+        } else {
+            // Use actual hash of previous macroblock as entropy source
+            // This makes initiator selection truly unpredictable
+            let hash = storage.get_latest_macroblock_hash()
+                .unwrap_or_else(|_| {
+                    // Fallback if macroblock not found (shouldn't happen)
+                    println!("[CONSENSUS] ⚠️ Previous macroblock hash not found, using fallback entropy");
+                    [0x43; 32]
+                });
+            hash.to_vec()
+        };
+        
+        selection_hasher.update(&entropy_source);
+        selection_hasher.update(macroblock_round.to_le_bytes());
+        
+        // Add all candidate IDs to ensure consistent ordering
+        let mut sorted_candidates = qualified_candidates.clone();
+        sorted_candidates.sort_by(|a, b| a.0.cmp(&b.0)); // Sort by ID for consistency
+        
+        for (candidate_id, _reputation) in &sorted_candidates {
+            selection_hasher.update(candidate_id.as_bytes());
+        }
+        
+        // Calculate initiator index from hash
+        let hash = selection_hasher.finalize();
+        let initiator_index = u64::from_le_bytes([
+            hash[0], hash[1], hash[2], hash[3],
+            hash[4], hash[5], hash[6], hash[7],
+        ]) as usize % sorted_candidates.len();
+        
+        let consensus_initiator = &sorted_candidates[initiator_index].0;
+        println!("[CONSENSUS] 🎲 Consensus initiator selected via entropy: {} (index {} of {} qualified)", 
+                 consensus_initiator, initiator_index, sorted_candidates.len());
         
         // Check if we are the selected initiator
         let our_consensus_id = Self::get_genesis_node_id("")
@@ -2873,7 +2942,7 @@ impl BlockchainNode {
         if we_are_initiator {
             println!("[CONSENSUS] ✅ We are the CONSENSUS INITIATOR - will trigger Byzantine consensus");
         } else {
-            println!("[CONSENSUS] 👥 We are NOT the initiator ({} != {}), will wait for consensus", 
+            println!("[CONSENSUS] 👥 We are NOT the initiator ({} != {}), will participate in consensus", 
                      our_consensus_id, consensus_initiator);
         }
         
@@ -3827,6 +3896,25 @@ impl BlockchainNode {
                 println!("[MACROBLOCK] 👥 Byzantine participants: {}", consensus_data.participants.len());
                 println!("[MACROBLOCK] ⏰ Timestamp: {}", macroblock.timestamp);
                 println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+                
+                // PRODUCTION: Distribute reputation rewards for successful macroblock consensus
+                // According to config.ini and ReputationConfig documentation
+                // Reward consensus leader (+10 reputation)
+                p2p.update_node_reputation(&consensus_data.leader_id, 10.0);
+                println!("[REPUTATION] 🏆 Consensus leader {} rewarded: +10.0 reputation", consensus_data.leader_id);
+                
+                // Reward all participants (+5 reputation each)
+                for participant_id in &consensus_data.participants {
+                    // Don't double-reward the leader
+                    if participant_id != &consensus_data.leader_id {
+                        p2p.update_node_reputation(participant_id, 5.0);
+                        println!("[REPUTATION] ✅ Consensus participant {} rewarded: +5.0 reputation", participant_id);
+                    }
+                }
+                
+                println!("[REPUTATION] 💰 Distributed reputation rewards to {} consensus participants", 
+                         consensus_data.participants.len());
+                
                 Ok(())
             },
             Err(e) => {

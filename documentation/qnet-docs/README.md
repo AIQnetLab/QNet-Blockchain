@@ -9,6 +9,14 @@ Comprehensive documentation for the QNet blockchain ecosystem.
 - **API reference** for integration
 - **Tutorials** for getting started
 
+## Latest Updates (v2.6.0)
+
+- **Entropy-Based Consensus**: True decentralization with unpredictable producer selection
+- **Reputation System**: Economic incentives for network participation
+- **State Snapshots**: Fast synchronization with LZ4 compression
+- **Parallel Sync**: Multi-worker block downloads
+- **IPFS Integration**: Optional P2P snapshot distribution
+
 ## Repository Structure
 
 - `technical/`: Technical specifications and architecture details

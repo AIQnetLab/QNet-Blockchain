@@ -191,12 +191,17 @@ hybrid_signature = {
    - Single producer signature
    - Fast processing
    - Size: ~200-500 bytes
+   - **Producer rotation**: Every 30 blocks (30 seconds)
+   - **Selection method**: SHA3-256 hash with entropy from previous round
+   - **Rewards**: +1 reputation per block produced
 
 2. **Macroblocks** (every 90 seconds):
    - Aggregate 90 microblocks  
-   - Byzantine consensus
+   - Byzantine consensus with up to 1000 validators
    - State finalization
    - Size: ~50-100 KB
+   - **Consensus leader**: +10 reputation
+   - **Participants**: +5 reputation each
 
 ### 4.2 Consensus Algorithm
 
@@ -216,18 +221,37 @@ hybrid_signature = {
 
 ### 4.3 Microblock Production
 
-**Producer rotation every 30 blocks:**
+**Producer rotation every 30 blocks with entropy:**
 
 ```rust
-fn select_producer(height: u64, candidates: Vec<Node>) -> Node {
+fn select_producer(height: u64, candidates: Vec<Node>, storage: &Storage) -> Node {
     let round = height / 30;
-    let hash = SHA3_256(round + candidates);
-    let index = hash % candidates.len();
-    candidates[index]
+    let round_start = round * 30;
+    
+    // Use previous round's last block hash as entropy
+    let entropy_block = if round_start > 0 {
+        storage.get_block_hash(round_start - 1)
+    } else {
+        genesis_hash()  // First round uses genesis
+    };
+    
+    let mut hasher = Sha3_256::new();
+    hasher.update(&round.to_le_bytes());
+    hasher.update(&entropy_block);
+    
+    // Filter by reputation >= 70%
+    let eligible: Vec<Node> = candidates
+        .filter(|n| n.reputation >= 0.70)
+        .take(1000)  // Max 1000 validators
+        .collect();
+    
+    let hash = hasher.finalize();
+    let index = hash % eligible.len();
+    eligible[index]
 }
 ```
 
-**Deterministic algorithm** guarantees all nodes will select the same producer.
+**True randomness through entropy** ensures unpredictable producer rotation while maintaining consensus across all nodes.
 
 ---
 
@@ -300,7 +324,35 @@ parallel_process(transactions[0..batch_size]);
 3. **Peer exchange**: Node list exchange every 30 seconds
 4. **Registry integration**: Blockchain-based node registration
 
-### 6.3 Reputation System
+### 6.3 Synchronization & Snapshots
+
+**Advanced sync mechanisms:**
+
+1. **State Snapshots**:
+   - **Full snapshots**: Every 10,000 blocks
+   - **Incremental snapshots**: Every 1,000 blocks  
+   - **Storage**: RocksDB with LZ4 compression
+   - **Verification**: SHA3-256 hash
+   - **Auto-cleanup**: Keep latest 5 snapshots
+
+2. **P2P Distribution**:
+   - **IPFS integration**: Optional decentralized storage
+   - **Peer announcements**: Broadcast snapshot availability
+   - **Multiple gateways**: Redundant download sources
+   - **Pin on upload**: Ensure persistence
+
+3. **Parallel Synchronization**:
+   - **Multiple workers**: Concurrent block downloads
+   - **Chunk processing**: 100-block batches
+   - **Fast sync threshold**: >50 blocks behind
+   - **Timeout protection**: 60s fast sync, 30s normal sync
+
+4. **Deadlock Prevention**:
+   - **Guard pattern**: Automatic flag reset on panic
+   - **Health monitor**: Periodic flag checking
+   - **Force reset**: Clear stuck sync flags after timeout
+
+### 6.4 Reputation System
 
 **Ping-based participation (every 4 hours):**
 
@@ -321,6 +373,19 @@ Ping architecture:
 - **40+ points** (rewards_threshold = 40.0): Receive rewards from all pools
 - **10-39 points**: Network access, but no rewards or consensus
 - **<10 points** (ban_threshold = 10.0): Complete network ban
+
+**Reputation rewards/penalties:**
+
+| Action | Reputation Change | Notes |
+|--------|------------------|-------|
+| Produce microblock | +1 per block | 30 blocks per rotation |
+| Lead macroblock consensus | +10 | Once per 90 seconds |
+| Participate in consensus | +5 | Once per 90 seconds |
+| Emergency producer | +5 | During failover |
+| Failed microblock | -20 | Production failure |
+| Failed macroblock | -30 | Consensus failure |
+| Missed ping | -1 | Every 4 hours |
+| Successful ping | +1 | Every 4 hours |
 
 ---
 

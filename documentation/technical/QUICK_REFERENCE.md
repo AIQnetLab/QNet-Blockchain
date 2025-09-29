@@ -236,6 +236,52 @@ python test_rpc.py
 
 **RISK WARNING**: Economic parameters subject to governance changes. Token values may fluctuate significantly. Network may be discontinued without notice.
 
+## Network Parameters & Reputation
+
+### Core Network Parameters
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| Microblock Time | 1 second | Fast transaction processing |
+| Macroblock Time | 90 seconds | Byzantine consensus finalization |
+| Rotation Period | 30 blocks | Producer rotation with entropy |
+| Maximum Validators | 1000 | Per consensus round |
+| Reputation Threshold | 70% | Minimum for consensus |
+| Full Snapshot | 10,000 blocks | Complete state backup |
+| Incremental Snapshot | 1,000 blocks | Delta state backup |
+| Fast Sync Trigger | 50 blocks | Parallel download activation |
+| Sync Timeout | 60s/30s | Fast sync/Normal sync |
+| IPFS Integration | Optional | Set IPFS_API_URL env var |
+
+### Reputation System
+| Action | Reward/Penalty | Frequency |
+|--------|----------------|-----------|
+| **Microblock Production** | +1 per block | Every second |
+| **Macroblock Leader** | +10 | Every 90 seconds |
+| **Macroblock Participant** | +5 | Every 90 seconds |
+| **Emergency Producer** | +5 | On failover |
+| **Failed Microblock** | -20 | On failure |
+| **Failed Macroblock** | -30 | On failure |
+| **Successful Ping** | +1 | Every 4 hours |
+| **Missed Ping** | -1 | Every 4 hours |
+| **Maximum Reputation** | 100 | Hard cap |
+
+### Entropy-Based Selection
+```rust
+// Producer selection with unpredictability
+selection_hash = SHA3_256(
+    round_number +
+    previous_block_hash +  // Entropy source
+    eligible_nodes         // Rep >= 70%
+)
+```
+
+### Synchronization Features
+- **State Snapshots**: LZ4 compressed, SHA3-256 verified
+- **Parallel Downloads**: Multiple workers, 100-block chunks
+- **Deadlock Prevention**: Guard pattern with auto-reset
+- **IPFS Distribution**: Optional P2P snapshot sharing
+- **Auto Cleanup**: Keep only latest 5 snapshots
+
 ## 📝 Next Steps
 
 1. **Today**
