@@ -21,6 +21,17 @@ const SNAPSHOT_FULL_INTERVAL: u64 = 10000; // Full snapshot every 10k blocks
 const SNAPSHOT_INCREMENTAL_INTERVAL: u64 = 1000; // Incremental snapshot every 1k blocks
 const API_HEALTH_CHECK_RETRIES: u32 = 5; // API health check attempts
 const API_HEALTH_CHECK_DELAY_SECS: u64 = 2; // Delay between health checks
+
+// CRITICAL: Module for shared producer cache to prevent duplicate static declarations
+mod producer_cache {
+    use std::sync::{Mutex, OnceLock};
+    use std::collections::HashMap;
+    
+    // PRODUCTION: Single shared cache for producer selection across entire module
+    // This cache stores (producer_id, candidates) per leadership round
+    pub static CACHED_PRODUCER_SELECTION: OnceLock<Mutex<HashMap<u64, (String, Vec<(String, f64)>)>>> = OnceLock::new();
+}
+
 use qnet_state::{State as StateManager, Account, Transaction, Block, BlockType, MicroBlock, MacroBlock, LightMicroBlock, ConsensusData};
 use qnet_mempool::{SimpleMempool, SimpleMempoolConfig};
 use qnet_consensus::{ConsensusEngine, ConsensusConfig, NodeId, CommitRevealConsensus, ConsensusError};
@@ -1560,9 +1571,13 @@ impl BlockchainNode {
                                 if let Some(ref p2p) = p2p_for_reward {
                                     p2p.update_node_reputation(&producer_id_for_reward, 1.0);
                                     
-                                    // Log only every 30 blocks to reduce spam (at rotation boundaries)
-                                    if height_for_storage % 30 == 0 {
-                                        println!("[REPUTATION] ⚡ Microblock producer {} rewarded: +1.0 reputation per block", producer_id_for_reward);
+                                    // Log every 10 blocks for better visibility during Genesis phase
+                                    if height_for_storage % 10 == 0 || height_for_storage <= 10 {
+                                        let current_rep = p2p.get_reputation_system().lock()
+                                            .map(|r| r.get_reputation(&producer_id_for_reward))
+                                            .unwrap_or(70.0);
+                                        println!("[REPUTATION] ⚡ Microblock #{} producer {} rewarded: +1.0 (total: {:.1}%)", 
+                                                 height_for_storage, producer_id_for_reward, current_rep);
                                     }
                                 }
                         },
@@ -1629,8 +1644,11 @@ impl BlockchainNode {
                         if let Ok(mut reputation_system) = p2p.get_reputation_system().lock() {
                             reputation_system.record_success(&node_id); // +1.0 reputation
                             let new_reputation = reputation_system.get_reputation(&node_id);
-                            println!("[REPUTATION] ✅ Producer {} earned +1% reputation for block #{} (new: {:.1}%)", 
-                                     node_id, microblock.height, new_reputation);
+                            // Log every 10 blocks or first 10 blocks for better visibility
+                            if microblock.height % 10 == 0 || microblock.height <= 10 {
+                                println!("[REPUTATION] ✅ Producer {} earned +1.0 reputation for block #{} (total: {:.1}%)", 
+                                         node_id, microblock.height, new_reputation);
+                            }
                         }
                     }
                     
@@ -1790,43 +1808,87 @@ impl BlockchainNode {
                         println!("🚀 QUANTUM OPTIMIZATIONS: Lock-free + Sharding + Parallel validation");
                         println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
                         
-                        // Update trigger immediately - microblocks keep flowing
-                        last_macroblock_trigger = microblock_height;
-                        consensus_started = false; // Reset for next round
-                        
                         // PRODUCTION: Check macroblock status asynchronously (non-blocking)
                         let storage_check = storage.clone();
                         let consensus_check = consensus.clone();
                         let p2p_check = unified_p2p.clone();
                         let expected_macroblock = microblock_height / 90;
                         let check_height = microblock_height;
+                        // Store current trigger value for async check (before update)
+                        let current_trigger = last_macroblock_trigger;
                         
                         tokio::spawn(async move {
                             // Give consensus 5 more seconds to complete (total 35s from block 60)
                             tokio::time::sleep(Duration::from_secs(5)).await;
                             
                             // Check if macroblock was created
-                            let macroblock_exists = storage_check.load_microblock(expected_macroblock * 90 + 1).is_ok();
+                            // Macroblock is saved with key "macroblock_{height}" where height is macroblock number
+                            // For example, first macroblock (at block 90) is saved as "macroblock_1"
+                            let macroblock_exists = storage_check.load_microblock(expected_macroblock * 90 + 1)
+                                .map(|mb| mb.is_some())
+                                .unwrap_or(false);
                             
                             if macroblock_exists {
                                 println!("[MACROBLOCK] ✅ Macroblock #{} successfully created in background", expected_macroblock);
+                                // SUCCESS: Macroblock created - trigger was updated correctly
                             } else {
-                                println!("[MACROBLOCK] ⚠️ Macroblock #{} not ready, triggering failover", expected_macroblock);
+                                // FAILURE: Calculate blocks without finalization using ORIGINAL trigger
+                                let blocks_without_finalization = check_height - current_trigger;
+                                println!("[MACROBLOCK] ⚠️ Macroblock #{} not ready after {} blocks since last success", 
+                                         expected_macroblock, blocks_without_finalization);
                                 
-                                // Trigger emergency consensus asynchronously
-                                let failed_leader = format!("consensus_round_{}", check_height / 90);
-                                            Self::trigger_emergency_macroblock_consensus(
+                                // CRITICAL: Progressive Finalization with degradation
+                                Self::activate_progressive_finalization_with_level(
                                     storage_check,
                                     consensus_check,
-                                    failed_leader,
                                     check_height,
-                                    p2p_check
-                                            ).await;
+                                    p2p_check,
+                                    blocks_without_finalization
+                                ).await;
                             }
                         });
                         
+                        // CRITICAL: Update trigger for NEXT round calculation
+                        // This ensures next macroblock attempt at block 180, not 90 again
+                        last_macroblock_trigger = microblock_height;
+                        consensus_started = false; // Reset for next round
+                        
                         // CRITICAL: Microblocks continue immediately without ANY pause
                         println!("[MICROBLOCK] ⚡ Continuing with block #{} - ZERO DOWNTIME", microblock_height + 1);
+                    }
+                    
+                    // CRITICAL: Progressive retry for failed macroblocks
+                    // Check every 30 blocks after macroblock boundary
+                    let blocks_since_trigger = microblock_height - last_macroblock_trigger;
+                    // Retry at blocks 120, 150, 180, 210, 240, 270 (every 30 after 90)
+                    if blocks_since_trigger >= 30 && blocks_since_trigger % 30 == 0 && blocks_since_trigger != 90 {
+                        // Check if macroblock still missing
+                        let expected_macroblock = last_macroblock_trigger / 90;
+                        // Check if macroblock was created by looking for the next microblock
+                        let macroblock_exists = storage.load_microblock(expected_macroblock * 90 + 1)
+                            .map(|mb| mb.is_some())
+                            .unwrap_or(false);
+                        
+                        if !macroblock_exists {
+                            println!("[PFP] ⚠️ {} blocks without macroblock, attempting progressive recovery", blocks_since_trigger);
+                            
+                            let storage_recovery = storage.clone();
+                            let consensus_recovery = consensus.clone();
+                            let p2p_recovery = unified_p2p.clone();
+                            let recovery_height = microblock_height;
+                            
+                            tokio::spawn(async move {
+                                Self::activate_progressive_finalization_with_level(
+                                    storage_recovery,
+                                    consensus_recovery,
+                                    recovery_height,
+                                    p2p_recovery,
+                                    blocks_since_trigger
+                                ).await;
+                            });
+                        } else {
+                            println!("[PFP] ✅ Macroblock #{} found - no recovery needed", expected_macroblock);
+                        }
                     }
                     
                     // Performance monitoring
@@ -2079,12 +2141,14 @@ impl BlockchainNode {
             let rotation_interval = 30u64; // EXISTING: 30-block rotation from MICROBLOCK_ARCHITECTURE_PLAN.md
             let leadership_round = current_height / rotation_interval;
             
-            // Static cache for producer selection per round
-            use std::sync::{Arc as StdArc, Mutex};
-            use std::collections::HashMap;
-            static CACHED_PRODUCER_SELECTION: std::sync::OnceLock<Mutex<HashMap<u64, (String, Vec<(String, f64)>)>>> = std::sync::OnceLock::new();
+            // CRITICAL: Use shared module-level cache to prevent duplication
+            use producer_cache::CACHED_PRODUCER_SELECTION;
             
-            let producer_cache = CACHED_PRODUCER_SELECTION.get_or_init(|| Mutex::new(HashMap::new()));
+            let producer_cache = CACHED_PRODUCER_SELECTION.get_or_init(|| {
+                use std::sync::Mutex;
+                use std::collections::HashMap;
+                Mutex::new(HashMap::new())
+            });
             
             // Check if we have cached result for this round
             if let Ok(cache) = producer_cache.lock() {
@@ -2260,6 +2324,22 @@ impl BlockchainNode {
             println!("[MICROBLOCK] 🏠 Solo mode - self production");
             // Warning: P2P not available - running in solo mode
             own_node_id.to_string()
+        }
+    }
+    
+    /// CRITICAL FIX: Invalidate producer cache during emergency failover
+    /// This prevents the network from selecting failed producers repeatedly
+    pub fn invalidate_producer_cache() {
+        // CRITICAL: Must use SAME static that select_microblock_producer uses
+        // Move static declaration OUTSIDE to module level for shared access
+        use producer_cache::CACHED_PRODUCER_SELECTION;
+        
+        if let Some(cache) = CACHED_PRODUCER_SELECTION.get() {
+            if let Ok(mut cache_guard) = cache.lock() {
+                let old_size = cache_guard.len();
+                cache_guard.clear();
+                println!("[PRODUCER_CACHE] 🔄 Producer cache invalidated ({} entries cleared) - forcing new selection", old_size);
+            }
         }
     }
     
@@ -2879,11 +2959,30 @@ impl BlockchainNode {
         println!("[CONSENSUS] 🎯 Determining consensus initiator with entropy...");
         
         // Get all qualified candidates using existing validator sampling system
-        let qualified_candidates = Self::calculate_qualified_candidates(p2p, our_node_id, our_node_type).await;
+        let mut qualified_candidates = Self::calculate_qualified_candidates(p2p, our_node_id, our_node_type).await;
         
+        // CRITICAL FIX: Genesis fallback when no validated peers available
+        // This ensures consensus can still work during network bootstrap
         if qualified_candidates.is_empty() {
-            println!("[CONSENSUS] ❌ No qualified candidates - cannot initiate consensus");
-            return false;
+            let is_genesis_node = std::env::var("QNET_BOOTSTRAP_ID")
+                .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
+                .unwrap_or(false);
+            
+            if is_genesis_node {
+                // GENESIS FALLBACK: Use static Genesis nodes for consensus
+                println!("[CONSENSUS] ⚠️ No validated peers - using Genesis fallback for bootstrap");
+                qualified_candidates = vec![
+                    ("genesis_node_001".to_string(), 0.70),
+                    ("genesis_node_002".to_string(), 0.70),
+                    ("genesis_node_003".to_string(), 0.70),
+                    ("genesis_node_004".to_string(), 0.70),
+                    ("genesis_node_005".to_string(), 0.70),
+                ];
+                println!("[CONSENSUS] 🔧 Genesis fallback: using {} static Genesis nodes", qualified_candidates.len());
+            } else {
+                println!("[CONSENSUS] ❌ No qualified candidates - cannot initiate consensus");
+                return false;
+            }
         }
         
         // ENTROPY-BASED: Select consensus initiator using blockchain entropy (like microblocks)
@@ -2949,7 +3048,216 @@ impl BlockchainNode {
         we_are_initiator
     }
     
-    /// CRITICAL: Emergency macroblock consensus when leader fails
+    /// CRITICAL: Progressive Finalization Protocol activation
+    async fn activate_progressive_finalization(
+        storage: Arc<Storage>,
+        consensus: Arc<RwLock<qnet_consensus::CommitRevealConsensus>>,
+        current_height: u64,
+        unified_p2p: Option<Arc<SimplifiedP2P>>,
+    ) {
+        // Default to 90 blocks without finalization for backward compatibility
+        Self::activate_progressive_finalization_with_level(
+            storage,
+            consensus,
+            current_height,
+            unified_p2p,
+            90
+        ).await;
+    }
+    
+    /// CRITICAL: Progressive Finalization with degradation level
+    async fn activate_progressive_finalization_with_level(
+        storage: Arc<Storage>,
+        consensus: Arc<RwLock<qnet_consensus::CommitRevealConsensus>>,
+        current_height: u64,
+        unified_p2p: Option<Arc<SimplifiedP2P>>,
+        blocks_without_finalization: u64,
+    ) {
+        println!("[PFP] 🚀 PROGRESSIVE FINALIZATION PROTOCOL");
+        println!("[PFP]    Height: {} | Blocks without macroblock: {}", 
+                 current_height, blocks_without_finalization);
+        println!("[PFP]    Expected macroblock: #{}", current_height / 90);
+        
+        if let Some(p2p) = unified_p2p {
+            let validated_peers = p2p.get_validated_active_peers();
+            let available_nodes = validated_peers.len() + 1; // Include self
+            let is_genesis_phase = current_height < 1000;
+            
+            println!("[PFP]    Phase: {} | Available nodes: {}", 
+                     if is_genesis_phase { "Genesis" } else { "Normal" },
+                     available_nodes);
+            
+            // Progressive degradation based on blocks without finalization
+            let (required_nodes, timeout, finalization_type) = if is_genesis_phase {
+                // Genesis phase (5 nodes max)
+                match blocks_without_finalization {
+                    0..=90 => (4, 30, "standard"),      // 80% of 5 = 4 nodes
+                    91..=180 => (3, 10, "checkpoint"),  // 60% of 5 = 3 nodes
+                    181..=270 => (2, 5, "emergency"),   // 40% of 5 = 2 nodes
+                    _ => (1, 2, "critical"),             // Single node
+                }
+            } else {
+                // Normal phase (potentially millions of nodes)
+                // Calculate percentages but cap at 1000 for performance
+                let total_for_consensus = std::cmp::min(available_nodes, 1000);
+                match blocks_without_finalization {
+                    0..=90 => {
+                        // Standard: 80% of available (max 800)
+                        let required = std::cmp::min((total_for_consensus * 80) / 100, 800);
+                        (std::cmp::max(required, 1), 30, "standard")
+                    }
+                    91..=180 => {
+                        // Checkpoint: 60% of available (max 600)
+                        let required = std::cmp::min((total_for_consensus * 60) / 100, 600);
+                        (std::cmp::max(required, 1), 10, "checkpoint")
+                    }
+                    181..=270 => {
+                        // Emergency: 40% of available (max 400)
+                        let required = std::cmp::min((total_for_consensus * 40) / 100, 400);
+                        (std::cmp::max(required, 1), 5, "emergency")
+                    }
+                    _ => {
+                        // Critical: 1% of available (min 1, max 10)
+                        let required = std::cmp::min((total_for_consensus * 1) / 100, 10);
+                        (std::cmp::max(required, 1), 2, "critical")
+                    }
+                }
+            };
+            
+            println!("[PFP]    Mode: {} finalization", finalization_type);
+            println!("[PFP]    Required nodes: {}/{} | Timeout: {} seconds", 
+                     required_nodes, available_nodes, timeout);
+            
+            // Execute progressive finalization
+            let storage_finalize = storage.clone();
+            let consensus_finalize = consensus.clone();
+            let p2p_finalize = p2p.clone();
+            
+            tokio::spawn(async move {
+                // Wait for shortened timeout
+                tokio::time::sleep(Duration::from_secs(timeout)).await;
+                
+                // Collect available participants
+                let mut participants = p2p_finalize.get_validated_active_peers()
+                    .into_iter()
+                    .take(required_nodes)
+                    .map(|peer| peer.id)
+                    .collect::<Vec<_>>();
+                
+                // Add self if needed
+                if participants.len() < required_nodes {
+                    participants.push(p2p_finalize.get_node_id());
+                }
+                
+                if participants.len() >= required_nodes {
+                    // Create emergency macroblock with reduced requirements
+                    match Self::create_emergency_macroblock_internal(
+                        storage_finalize,
+                        consensus_finalize,
+                        current_height,
+                        participants.clone(),
+                        finalization_type
+                    ).await {
+                        Ok(_) => {
+                            println!("[PFP] ✅ {} macroblock created with {} nodes", 
+                                     finalization_type, participants.len());
+                            
+                            // Broadcast success
+                            let _ = p2p_finalize.broadcast_emergency_producer_change(
+                                "failed_consensus",
+                                &format!("{}_finalization", finalization_type),
+                                current_height,
+                                "macroblock"
+                            );
+                        }
+                        Err(e) => {
+                            println!("[PFP] ❌ {} finalization failed: {}", finalization_type, e);
+                        }
+                    }
+                } else {
+                    println!("[PFP] ❌ Not enough nodes: {}/{}", participants.len(), required_nodes);
+                }
+            });
+        }
+    }
+    
+    /// Create emergency macroblock with reduced consensus requirements
+    async fn create_emergency_macroblock_internal(
+        storage: Arc<Storage>,
+        consensus: Arc<RwLock<qnet_consensus::CommitRevealConsensus>>,
+        height: u64,
+        participants: Vec<String>,
+        finalization_type: &str,
+    ) -> Result<(), String> {
+        use sha3::{Sha3_256, Digest};
+        
+        println!("[PFP] 🔨 Creating {} macroblock with {} participants", 
+                 finalization_type, participants.len());
+        
+        // Calculate state root from microblocks
+        let start_height = (height / 90) * 90 + 1;
+        let end_height = ((height / 90) + 1) * 90;
+        
+        let mut microblock_hashes = Vec::new();
+        let mut state_accumulator = [0u8; 32];
+        
+        for h in start_height..=end_height.min(height) {
+            if let Ok(Some(block_data)) = storage.load_microblock(h) {
+                let mut hasher = Sha3_256::new();
+                hasher.update(&block_data);
+                let result = hasher.finalize();
+                let mut hash = [0u8; 32];
+                hash.copy_from_slice(&result);
+                microblock_hashes.push(hash);
+                
+                // Accumulate state
+                for (i, &byte) in result.iter().take(32).enumerate() {
+                    state_accumulator[i] ^= byte;
+                }
+            }
+        }
+        
+        // Create simplified consensus data
+        let consensus_data = qnet_state::ConsensusData {
+            commits: participants.iter()
+                .map(|p| (p.clone(), format!("{}_commit_{}", finalization_type, height).into_bytes()))
+                .collect(),
+            reveals: participants.iter()
+                .map(|p| (p.clone(), format!("{}_reveal_{}", finalization_type, height).into_bytes()))
+                .collect(),
+            next_leader: participants.first().cloned().unwrap_or_default(),
+        };
+        
+        // Count microblocks before moving
+        let microblock_count = microblock_hashes.len();
+        
+        // Create emergency macroblock
+        let macroblock = qnet_state::MacroBlock {
+            height: height / 90,
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            micro_blocks: microblock_hashes,
+            state_root: state_accumulator,
+            consensus_data,
+            previous_hash: storage.get_latest_macroblock_hash()
+                .unwrap_or([0u8; 32]),
+        };
+        
+        // Save macroblock
+        storage.save_macroblock(macroblock.height, &macroblock).await
+            .map_err(|e| format!("Failed to save macroblock: {:?}", e))?;
+        
+        println!("[PFP] ✅ {} macroblock #{} saved successfully", 
+                 finalization_type, macroblock.height);
+        println!("[PFP]    Finalized {} microblocks", microblock_count);
+        println!("[PFP]    Participants: {:?}", participants);
+        
+        Ok(())
+    }
+    
+    /// DEPRECATED: Old emergency function - redirects to PFP
     async fn trigger_emergency_macroblock_consensus(
         storage: Arc<Storage>,
         consensus: Arc<RwLock<qnet_consensus::CommitRevealConsensus>>,
@@ -2957,46 +3265,18 @@ impl BlockchainNode {
         current_height: u64,
         unified_p2p: Option<Arc<SimplifiedP2P>>,
     ) {
-        println!("[MACROBLOCK] 🚨 EMERGENCY: Initiating consensus due to failed leader: {}", failed_leader);
+        println!("[MACROBLOCK] 🚨 EMERGENCY: Failed leader {} - activating PFP", failed_leader);
         
-        // CRITICAL FIX: Only penalize valid failed leaders, not placeholders
-        if let Some(p2p) = &unified_p2p {
-            // Check if this is a real node or a placeholder
-            if failed_leader != "unknown_leader" && 
-               failed_leader != "no_leader_selected" && 
-               failed_leader != "consensus_lock_failed" &&
-               failed_leader != "emergency_consensus" {
-                // This is a real node that failed - apply penalty
-            p2p.update_node_reputation(&failed_leader, -30.0);
-            println!("[REPUTATION] ⚔️ Failed macroblock leader {} penalized: -30.0 reputation", failed_leader);
-            } else {
-                println!("[REPUTATION] ⚠️ Skipping penalty for placeholder leader: {}", failed_leader);
-            }
-            
-            // Broadcast emergency macroblock leader change to network (non-blocking)
-            if let Err(e) = p2p.broadcast_emergency_producer_change(
-                &failed_leader,
-                "emergency_consensus",
-                current_height,
-                "macroblock"
-            ) {
-                println!("[FAILOVER] ⚠️ Emergency macroblock broadcast failed: {}", e);
-            } else {
-                println!("[FAILOVER] ✅ Emergency macroblock leader change broadcasted to network");
+        // Penalize failed leader if valid
+        if let Some(ref p2p) = unified_p2p {
+            if !failed_leader.starts_with("unknown") && !failed_leader.starts_with("no_leader") {
+                p2p.update_node_reputation(&failed_leader, -30.0);
+                println!("[REPUTATION] ⚔️ Failed leader {} penalized: -30.0", failed_leader);
             }
         }
         
-        // Reset consensus state and trigger new consensus round
-        {
-            let mut consensus_engine = consensus.write().await;
-            
-            // Simplified emergency consensus - just log the attempt
-            println!("[MACROBLOCK] 🔄 EMERGENCY: Consensus will be handled by next scheduled round");
-            println!("[MACROBLOCK] ⏰ EMERGENCY: Network will retry creation in next 90-block cycle");
-            
-            // Log failed leader for tracking
-            println!("[FAILOVER] 📊 Failed leader logged: {} (will be excluded from future leadership)", failed_leader);
-        }
+        // Use Progressive Finalization Protocol instead of waiting
+        Self::activate_progressive_finalization(storage, consensus, current_height, unified_p2p).await;
     }
     
     // PRODUCTION: Byzantine consensus methods for commit-reveal protocol
@@ -3746,7 +4026,26 @@ impl BlockchainNode {
             let round_id = end_height; // Macroblock height as round ID
             
             // STEP 1: Use EXISTING qualified candidates system with validator sampling (1000 max)
-            let qualified_candidates = Self::calculate_qualified_candidates(p2p, node_id, node_type).await;
+            let mut qualified_candidates = Self::calculate_qualified_candidates(p2p, node_id, node_type).await;
+            
+            // CRITICAL FIX: Genesis fallback for consensus participants
+            if qualified_candidates.is_empty() {
+                let is_genesis_node = std::env::var("QNET_BOOTSTRAP_ID")
+                    .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
+                    .unwrap_or(false);
+                
+                if is_genesis_node {
+                    println!("[CONSENSUS] 🔧 Using Genesis fallback for consensus participants");
+                    qualified_candidates = vec![
+                        ("genesis_node_001".to_string(), 0.70),
+                        ("genesis_node_002".to_string(), 0.70),
+                        ("genesis_node_003".to_string(), 0.70),
+                        ("genesis_node_004".to_string(), 0.70),
+                        ("genesis_node_005".to_string(), 0.70),
+                    ];
+                }
+            }
+            
             let all_participants: Vec<String> = qualified_candidates.into_iter()
                 .map(|(node_id, _reputation)| node_id)
                 .collect();

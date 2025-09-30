@@ -21,6 +21,7 @@ pub mod network_config;
 pub mod archive_manager;
 pub mod genesis_constants;
 pub mod reward_sharding;
+pub mod p2p_extensions;
 
 use std::sync::Arc;
 use tokio::sync::RwLock;

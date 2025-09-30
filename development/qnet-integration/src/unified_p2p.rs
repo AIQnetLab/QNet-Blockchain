@@ -3861,8 +3861,8 @@ impl SimplifiedP2P {
             Err(_) => return false,
         };
         
-        // CRITICAL FIX: Use existing /health endpoint instead of non-existent /status
-        let url = format!("http://{}:8001/api/v1/health", ip);
+        // CRITICAL FIX: Use existing /api/v1/node/health endpoint (registered in rpc.rs:483-489)
+        let url = format!("http://{}:8001/api/v1/node/health", ip);
         
         // Try to get a simple health response - more reliable than status
         match client.get(&url).send() {
@@ -5757,6 +5757,10 @@ impl SimplifiedP2P {
         // Log emergency change for network transparency
         println!("[NETWORK] 📊 Emergency producer change recorded | Type: {} | Height: {} | Time: {}", 
                  change_type, block_height, timestamp);
+        
+        // CRITICAL FIX: Invalidate producer cache to prevent selecting failed producer again
+        // This ensures the network will select a new producer in the next round
+        crate::node::BlockchainNode::invalidate_producer_cache();
     }
     
     /// PRODUCTION: Handle reputation synchronization from peers

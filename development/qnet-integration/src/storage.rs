@@ -1061,6 +1061,37 @@ impl Storage {
         self.persistent.get_latest_macroblock_hash()
     }
     
+    /// Save checkpoint block for Progressive Finalization
+    pub async fn save_checkpoint(&self, height: u64, block: &qnet_state::MacroBlock) -> Result<(), String> {
+        // Serialize and save as checkpoint
+        let serialized = bincode::serialize(block)
+            .map_err(|e| format!("Failed to serialize checkpoint: {}", e))?;
+        
+        let key = format!("checkpoint_{}", height);
+        self.persistent.db.put(key, serialized)
+            .map_err(|e| format!("Failed to save checkpoint: {}", e))?;
+        
+        println!("[STORAGE] 📍 Checkpoint saved at height {}", height);
+        Ok(())
+    }
+    
+    /// Set a flag in storage (for emergency/critical markers)
+    pub fn set_flag(&self, key: &str, value: bool) -> Result<(), String> {
+        let flag_value = if value { vec![1u8] } else { vec![0u8] };
+        self.persistent.db.put(key, flag_value)
+            .map_err(|e| format!("Failed to set flag {}: {}", key, e))
+    }
+    
+    /// Save data with a custom key
+    pub fn save_data<T: serde::Serialize>(&self, key: &str, data: &T) -> Result<(), String> {
+        let serialized = bincode::serialize(data)
+            .map_err(|e| format!("Failed to serialize data: {}", e))?;
+        
+        self.persistent.db.put(key, serialized)
+            .map_err(|e| format!("Failed to save data: {}", e))
+    }
+    
+    
     pub async fn save_macroblock(&self, height: u64, macroblock: &qnet_state::MacroBlock) -> IntegrationResult<()> {
         // Check if storage is critically full before accepting new macroblocks
         if self.is_storage_critically_full()? {
