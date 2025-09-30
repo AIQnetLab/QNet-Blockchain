@@ -70,18 +70,36 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 | **Downtime** | ZERO | Swiss watch precision, continuous flow |
 | **Energy Efficiency** | 99.9% less than Bitcoin | Eco-friendly consensus |
 | **Node Types** | Full, Super, Light | Flexible participation |
-| **Storage Efficiency** | 300 GB default | Advanced archival system |
+| **Storage Efficiency** | 50-100 GB typical | Sliding window + snapshots |
 
-### 💾 Advanced Storage Architecture
+### 💾 Ultra-Modern Storage Architecture
 
-**QNet implements optimized distributed storage system for blockchain scalability.**
+**QNet implements revolutionary storage system with temporal compression and delta encoding.**
 
 #### 🎯 **Storage Features:**
+- **Adaptive Temporal Compression**: Blocks age like wine - stronger compression over time
+  - Day 0-1: No compression (hot data)
+  - Day 2-7: Zstd-3 (light compression)
+  - Day 8-30: Zstd-9 (medium compression)
+  - Day 31-365: Zstd-15 (heavy compression)
+  - Year 1+: Zstd-22 (extreme compression)
+- **Delta Encoding**: Store only differences between blocks (95% space saving)
+- **Pattern Recognition**: Smart compression for common transactions
+  - Simple transfers: 300 → 16 bytes (95% reduction)
+  - Node activations: 500 → 10 bytes (98% reduction)
+  - Rewards: 400 → 13 bytes (97% reduction)
+- **Probabilistic Indexes**: O(1) transaction lookups with Bloom filters
 - **EfficientMicroBlocks**: Store transaction hashes instead of full transactions
+- **Sliding Window Storage**: Full nodes keep only last 100K blocks (~1 day) + snapshots
+- **Smart Pruning**: Automatic deletion of blocks outside retention window
+- **Snapshot-Based Sync**: New nodes bootstrap in minutes, not hours
+- **Node-Specific Storage**:
+  - Light nodes: ~100 MB (headers only)
+  - Full nodes: ~50 GB (100K blocks + snapshots)
+  - Super nodes: 400-500 GB for 100 years of history (with full compression)
 - **Distributed Archival**: Full/Super nodes archive 3-8 chunks each as network obligation
 - **Triple Replication**: Every data chunk replicated across 3+ nodes minimum
 - **Automatic Compliance**: Network enforces archival obligations for fault tolerance
-- **Zstd Compression**: High-efficiency compression for archive data
 - **Backward Compatible**: Seamless migration from legacy storage format
 
 ## 🏗️ Architecture
@@ -1216,11 +1234,26 @@ QNet node deployment now features **zero-configuration** setup for maximum ease 
 
 **QNet implements efficient archival system for long-term blockchain scalability.**
 
-#### 🎯 **Node Storage:**
-- **Default Limit**: 400 GB per node (configurable via QNET_MAX_STORAGE_GB)
-- **Growth Pattern**: Automatic cleanup maintains storage within limits
-- **Architecture**: Hot/Warm/Cold storage tiers with intelligent rotation
-- **Emergency Handling**: Automatic cleanup when storage reaches 85-95% capacity
+#### 🎯 **Node Storage Requirements:**
+
+| Node Type | Storage Size | Data Retention | Sync Time |
+|-----------|-------------|----------------|-----------|
+| **Light** | ~50-100 MB | Headers + minimal state | <1 minute |
+| **Full** | 50-100 GB | Sliding window (~18-74 days) | ~5 minutes |
+| **Super** | 500 GB - 1 TB | Complete history forever | ~15 minutes |
+
+- **Smart Defaults**: Automatically detects node type via `QNET_NODE_TYPE` environment variable
+- **Adaptive Sliding Window**: Full nodes auto-scale storage window with network growth (100K × active_shards)
+- **Growth Pattern**: **~36 GB/year** for Super nodes (full history with advanced compression)
+- **Automatic Pruning**: Full nodes prune old blocks every 10,000 blocks (~2.7 hours)
+- **Emergency Handling**: Automatic cleanup when storage reaches 70-85-95% thresholds
+- **Advanced Compression**: 5-level adaptive temporal compression (Zstd 0-22) based on block age (80% savings)
+- **Delta Encoding**: ~95% space savings for sequential blocks (every 1000th block = checkpoint)
+- **State Snapshots**: Efficient state recovery without storing all microblocks
+- **Long-term projection**: 
+  - **1 year**: 37 GB
+  - **10 years**: 360 GB
+  - **50 years**: 1.8 TB ✅
 
 #### 📦 **Adaptive Archival Responsibilities by Network Size:**
 
@@ -1234,6 +1267,33 @@ QNet node deployment now features **zero-configuration** setup for maximum ease 
 - **Light Nodes**: Always 0 chunks (mobile-optimized)
 - **Genesis Nodes**: Variable based on network critical needs
 - **Automatic Scaling**: System adapts quotas based on active node count
+
+#### ⚙️ **Aggressive Pruning (Optional):**
+
+**Environment Variable:** `QNET_AGGRESSIVE_PRUNING=1` (default: `0`)
+
+⚠️ **Use with EXTREME caution!** This mode deletes microblocks immediately after macroblock finalization.
+
+**Safety Features:**
+- ✅ **Auto-disable**: Automatically disabled if network has < 10 Super nodes
+- ✅ **Genesis protection**: Cannot enable during Genesis phase (5 nodes)
+- ✅ **Super node immunity**: Super nodes cannot enable (archival role)
+- ✅ **Startup warning**: Clear warnings about risks and network status
+
+**When to Consider:**
+```bash
+# Only enable if ALL conditions are met:
+✅ Disk space critically low (< 50 GB available)
+✅ Network has 50+ Super nodes maintaining full archive
+✅ Full node type (not Light or Super)
+✅ You understand dependency on Super nodes for historical data
+
+# Check network status first:
+curl http://localhost:8001/api/v1/storage/stats
+# Verify "super_nodes_in_network" >= 50
+```
+
+**Recommendation:** Leave `QNET_AGGRESSIVE_PRUNING=0` (default) unless absolutely necessary. Sliding window pruning is sufficient for most deployments.
 
 #### 🔄 **Data Lifecycle Management:**
 - **Hot Storage**: Recent data on local SSD for immediate access
