@@ -1191,11 +1191,22 @@ impl Storage {
         }
         
         // Initialize probabilistic index for expected transactions
-        // For 100 years: ~150 billion transactions
-        let expected_txs = match storage_mode {
-            StorageMode::Light => 1_000_000,      // Light nodes: minimal index
-            StorageMode::Full => 100_000_000,     // Full nodes: last 100K blocks
-            StorageMode::Super => 1_000_000_000,  // Super nodes: full history
+        // OPTIMIZED: Start small and grow dynamically in production
+        let is_genesis = std::env::var("QNET_BOOTSTRAP_ID").is_ok();
+        let expected_txs = if is_genesis {
+            // Genesis phase: Start with minimal index, will grow as needed
+            match storage_mode {
+                StorageMode::Light => 10_000,       // Genesis: tiny index
+                StorageMode::Full => 100_000,       // Genesis: small index  
+                StorageMode::Super => 1_000_000,    // Genesis: moderate index (1MB)
+            }
+        } else {
+            // Production phase: Scale with actual network size
+            match storage_mode {
+                StorageMode::Light => 1_000_000,      // Light nodes: minimal index
+                StorageMode::Full => 10_000_000,      // Full nodes: 10M transactions (100MB)
+                StorageMode::Super => 100_000_000,    // Super nodes: 100M transactions (capped at 500MB)
+            }
         };
         
         let tx_index = Self::init_probabilistic_index(expected_txs);
@@ -2373,9 +2384,30 @@ impl Storage {
     
     /// Initialize probabilistic index with optimal size
     pub fn init_probabilistic_index(expected_elements: usize) -> ProbabilisticIndex {
-        // Optimal size for 0.01% false positive rate
-        let size = (expected_elements as f64 * 20.0) as usize;
-        let num_hashes = 7; // Optimal for this false positive rate
+        // CRITICAL FIX: Cap maximum Bloom filter size to prevent OOM
+        // 500 MB max for Super nodes (500M bits = ~500MB RAM)
+        const MAX_BLOOM_SIZE: usize = 500_000_000; // 500 million bits max
+        
+        // Optimal size for 0.01% false positive rate (but capped)
+        let optimal_size = (expected_elements as f64 * 20.0) as usize;
+        let size = if optimal_size > MAX_BLOOM_SIZE {
+            println!("[Storage] ⚠️ Bloom filter size capped at {}MB (requested: {}MB)", 
+                     MAX_BLOOM_SIZE / 1_000_000, optimal_size / 1_000_000);
+            MAX_BLOOM_SIZE
+        } else {
+            optimal_size
+        };
+        
+        // Adjust hash functions based on actual vs optimal size
+        let num_hashes = if optimal_size > MAX_BLOOM_SIZE {
+            // More hash functions when filter is undersized
+            10  // Compensate for higher collision rate
+        } else {
+            7   // Optimal for proper-sized filter
+        };
+        
+        println!("[Storage] 📊 Initializing Bloom filter: {} MB for {} expected transactions", 
+                 size / 1_000_000, expected_elements);
         
         ProbabilisticIndex {
             bits: vec![false; size],
