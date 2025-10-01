@@ -190,6 +190,7 @@ impl PersistentStorage {
             ColumnFamilyDescriptor::new("ping_history", Options::default()),
             ColumnFamilyDescriptor::new("failover_events", failover_opts),
             ColumnFamilyDescriptor::new("snapshots", Options::default()),
+            ColumnFamilyDescriptor::new("tx_index", Options::default()), // O(1) transaction lookups
         ];
         
         let db = match DB::open_cf_descriptors(&opts, path, cfs) {
@@ -208,6 +209,8 @@ impl PersistentStorage {
             .ok_or_else(|| IntegrationError::StorageError("blocks column family not found".to_string()))?;
         let tx_cf = self.db.cf_handle("transactions")
             .ok_or_else(|| IntegrationError::StorageError("transactions column family not found".to_string()))?;
+        let tx_index_cf = self.db.cf_handle("tx_index")
+            .ok_or_else(|| IntegrationError::StorageError("tx_index column family not found".to_string()))?;
         
         let block_key = format!("block_{}", block.height);
         let block_data = bincode::serialize(block)
@@ -222,13 +225,16 @@ impl PersistentStorage {
             .map_err(|e| IntegrationError::SerializationError(e.to_string()))?;
         batch.put_cf(&block_cf, hash_key.as_bytes(), &hash_data);
         
-        // Store transactions
+        // Store transactions and index them for O(1) lookups
         for tx in &block.transactions {
             let tx_key = format!("tx_{}", tx.hash);
             let tx_data = bincode::serialize(tx)
                 .map_err(|e| IntegrationError::SerializationError(e.to_string()))?;
             
             batch.put_cf(&tx_cf, tx_key.as_bytes(), &tx_data);
+            
+            // INDEX: tx_hash -> block_height for O(1) transaction location
+            batch.put_cf(&tx_index_cf, tx_key.as_bytes(), &block.height.to_be_bytes());
         }
         
         // Update chain height
@@ -910,30 +916,25 @@ impl PersistentStorage {
         }
     }
 
-    /// Get transaction block height from blockchain
+    /// Get transaction block height from blockchain - O(1) with index
     pub async fn get_transaction_block_height(&self, tx_hash: &str) -> IntegrationResult<u64> {
-        // PRODUCTION: Search through blocks to find transaction height
-        let block_cf = self.db.cf_handle("blocks")
-            .ok_or_else(|| IntegrationError::StorageError("blocks column family not found".to_string()))?;
+        // OPTIMIZED: Use tx_index for O(1) lookup instead of O(n) iteration
+        let tx_index_cf = self.db.cf_handle("tx_index")
+            .ok_or_else(|| IntegrationError::StorageError("tx_index column family not found".to_string()))?;
         
-        // Iterate through blocks to find transaction
-        let iter = self.db.iterator_cf(&block_cf, rocksdb::IteratorMode::Start);
-        for item in iter {
-            let (key, data) = item.map_err(|e| IntegrationError::StorageError(e.to_string()))?;
-            let key_str = std::str::from_utf8(&key).unwrap_or("");
-            
-            if key_str.starts_with("block_") {
-                if let Ok(block) = bincode::deserialize::<qnet_state::Block>(&data) {
-                    for tx in &block.transactions {
-                        if tx.hash == tx_hash {
-                            return Ok(block.height);
-                        }
-                    }
+        let tx_key = format!("tx_{}", tx_hash);
+        match self.db.get_cf(&tx_index_cf, tx_key.as_bytes())? {
+            Some(data) => {
+                if data.len() >= 8 {
+                    let height_bytes: [u8; 8] = data[0..8].try_into()
+                        .map_err(|_| IntegrationError::StorageError("Invalid height data".to_string()))?;
+                    Ok(u64::from_be_bytes(height_bytes))
+                } else {
+                    Err(IntegrationError::StorageError(format!("Invalid index data for transaction {}", tx_hash)))
                 }
-            }
-        }
-        
-        // Check microblocks as fallback
+            },
+            None => {
+                // Fallback: Check microblocks for legacy data (will be removed in future)
         let microblocks_cf = self.db.cf_handle("microblocks")
             .ok_or_else(|| IntegrationError::StorageError("microblocks column family not found".to_string()))?;
         
@@ -966,7 +967,10 @@ impl PersistentStorage {
             }
         }
         
-        Ok(0) // Transaction not found, return genesis height
+                // Transaction not found
+                Err(IntegrationError::StorageError(format!("Transaction {} not found in blockchain", tx_hash)))
+            }
+        }
     }
 }
 
@@ -1060,19 +1064,6 @@ pub struct PatternRecognizer {
     pattern_stats: HashMap<TransactionPattern, u64>,
 }
 
-/// Probabilistic filter for fast transaction existence checks
-/// Uses simplified Bloom filter approach for O(1) lookups
-pub struct ProbabilisticIndex {
-    /// Bit array for the filter
-    bits: Vec<bool>,
-    /// Number of hash functions to use
-    num_hashes: usize,
-    /// Size of the bit array
-    size: usize,
-    /// Number of elements inserted
-    count: usize,
-}
-
 pub struct Storage {
     persistent: PersistentStorage,
     /// Transaction pool for efficient storage without duplication
@@ -1087,8 +1078,6 @@ pub struct Storage {
     storage_mode: StorageMode,
     /// Sliding window size for pruning (blocks to keep)
     sliding_window_size: u64,
-    /// Probabilistic index for O(1) transaction lookups
-    tx_index: Arc<RwLock<ProbabilisticIndex>>,
     /// Pattern recognizer for transaction compression
     pattern_recognizer: Arc<RwLock<PatternRecognizer>>,
 }
@@ -1190,26 +1179,6 @@ impl Storage {
             println!("");
         }
         
-        // Initialize probabilistic index for expected transactions
-        // OPTIMIZED: Start small and grow dynamically in production
-        let is_genesis = std::env::var("QNET_BOOTSTRAP_ID").is_ok();
-        let expected_txs = if is_genesis {
-            // Genesis phase: Start with minimal index, will grow as needed
-            match storage_mode {
-                StorageMode::Light => 10_000,       // Genesis: tiny index
-                StorageMode::Full => 100_000,       // Genesis: small index  
-                StorageMode::Super => 1_000_000,    // Genesis: moderate index (1MB)
-            }
-        } else {
-            // Production phase: Scale with actual network size
-            match storage_mode {
-                StorageMode::Light => 1_000_000,      // Light nodes: minimal index
-                StorageMode::Full => 10_000_000,      // Full nodes: 10M transactions (100MB)
-                StorageMode::Super => 100_000_000,    // Super nodes: 100M transactions (capped at 500MB)
-            }
-        };
-        
-        let tx_index = Self::init_probabilistic_index(expected_txs);
         let pattern_recognizer = PatternRecognizer {
             pattern_stats: HashMap::new(),
         };
@@ -1222,7 +1191,6 @@ impl Storage {
             emergency_cleanup_enabled: true,
             storage_mode,
             sliding_window_size,
-            tx_index: Arc::new(RwLock::new(tx_index)),
             pattern_recognizer: Arc::new(RwLock::new(pattern_recognizer)),
         })
     }
@@ -2228,12 +2196,7 @@ impl Storage {
                         // Update pattern stats
                         if let Ok(mut recognizer) = self.pattern_recognizer.write() {
                             *recognizer.pattern_stats.entry(pattern).or_insert(0) += 1;
-                        }
                     }
-                    
-                    // Add to probabilistic index for O(1) lookups
-                    if let Ok(mut index) = self.tx_index.write() {
-                    Self::add_to_index_static(&mut index, &tx_hash);
                 }
             }
         }
@@ -2380,141 +2343,6 @@ impl Storage {
         }
         
         Ok(compressed_tx)
-    }
-    
-    /// Initialize probabilistic index with optimal size
-    pub fn init_probabilistic_index(expected_elements: usize) -> ProbabilisticIndex {
-        // CRITICAL FIX: Cap maximum Bloom filter size to prevent OOM
-        // 500 MB max for Super nodes (500M bits = ~500MB RAM)
-        const MAX_BLOOM_SIZE: usize = 500_000_000; // 500 million bits max
-        
-        // Optimal size for 0.01% false positive rate (but capped)
-        let optimal_size = (expected_elements as f64 * 20.0) as usize;
-        let size = if optimal_size > MAX_BLOOM_SIZE {
-            println!("[Storage] ⚠️ Bloom filter size capped at {}MB (requested: {}MB)", 
-                     MAX_BLOOM_SIZE / 1_000_000, optimal_size / 1_000_000);
-            MAX_BLOOM_SIZE
-        } else {
-            optimal_size
-        };
-        
-        // Adjust hash functions based on actual vs optimal size
-        let num_hashes = if optimal_size > MAX_BLOOM_SIZE {
-            // More hash functions when filter is undersized
-            10  // Compensate for higher collision rate
-        } else {
-            7   // Optimal for proper-sized filter
-        };
-        
-        println!("[Storage] 📊 Initializing Bloom filter: {} MB for {} expected transactions", 
-                 size / 1_000_000, expected_elements);
-        
-        ProbabilisticIndex {
-            bits: vec![false; size],
-            num_hashes,
-            size,
-            count: 0,
-        }
-    }
-    
-    /// Add transaction to probabilistic index (static helper)
-    fn add_to_index_static(index: &mut ProbabilisticIndex, tx_hash: &[u8; 32]) {
-        // No need to import again, already imported at top
-        
-        for i in 0..index.num_hashes {
-            let mut hasher = Sha3_256::new();
-            hasher.update(tx_hash);
-            hasher.update(&[i as u8]);
-            let result = hasher.finalize();
-            
-            // Use first 8 bytes as index
-            let hash_value = u64::from_le_bytes(result[0..8].try_into().unwrap());
-            let bit_index = (hash_value as usize) % index.size;
-            
-            index.bits[bit_index] = true;
-        }
-        
-        index.count += 1;
-        
-        // Log statistics periodically
-        if index.count % 10000 == 0 {
-            let fill_rate = index.bits.iter().filter(|&&b| b).count() as f64 / index.size as f64;
-            println!("[INDEX] 📊 Probabilistic index: {} transactions, {:.1}% fill rate",
-                    index.count, fill_rate * 100.0);
-        }
-    }
-    
-    /// Check if transaction might exist (O(1) operation)
-    pub fn might_contain(index: &ProbabilisticIndex, tx_hash: &[u8; 32]) -> bool {
-        use sha3::{Sha3_256, Digest};
-        
-        for i in 0..index.num_hashes {
-            let mut hasher = Sha3_256::new();
-            hasher.update(tx_hash);
-            hasher.update(&[i as u8]);
-            let result = hasher.finalize();
-            
-            let hash_value = u64::from_le_bytes(result[0..8].try_into().unwrap());
-            let bit_index = (hash_value as usize) % index.size;
-            
-            if !index.bits[bit_index] {
-                return false; // Definitely not in set
-            }
-        }
-        
-        true // Might be in set (or false positive)
-    }
-    
-    /// Estimate memory usage of probabilistic index
-    pub fn index_memory_usage(index: &ProbabilisticIndex) -> usize {
-        // Each bit takes 1 bit, but Vec<bool> uses 1 byte per bool in Rust
-        index.size + std::mem::size_of::<ProbabilisticIndex>()
-    }
-    
-    /// Serialize probabilistic index for persistence
-    pub fn serialize_index(index: &ProbabilisticIndex) -> IntegrationResult<Vec<u8>> {
-        // Convert bits to bytes for efficient storage
-        let mut bytes = Vec::with_capacity(index.size / 8 + 1);
-        
-        // Pack bits into bytes
-        for chunk in index.bits.chunks(8) {
-            let mut byte = 0u8;
-            for (i, &bit) in chunk.iter().enumerate() {
-                if bit {
-                    byte |= 1 << i;
-                }
-            }
-            bytes.push(byte);
-        }
-        
-        // Serialize metadata and packed bits
-        let data = (index.num_hashes, index.size, index.count, bytes);
-        bincode::serialize(&data)
-            .map_err(|e| IntegrationError::SerializationError(e.to_string()))
-    }
-    
-    /// Deserialize probabilistic index
-    pub fn deserialize_index(data: &[u8]) -> IntegrationResult<ProbabilisticIndex> {
-        let (num_hashes, size, count, bytes): (usize, usize, usize, Vec<u8>) = 
-            bincode::deserialize(data)
-                .map_err(|e| IntegrationError::DeserializationError(e.to_string()))?;
-        
-        // Unpack bytes to bits
-        let mut bits = Vec::with_capacity(size);
-        for byte in bytes {
-            for i in 0..8 {
-                if bits.len() < size {
-                    bits.push((byte & (1 << i)) != 0);
-                }
-            }
-        }
-        
-        Ok(ProbabilisticIndex {
-            bits,
-            num_hashes,
-            size,
-            count,
-        })
     }
     
     /// Decompress transaction from pattern
@@ -3849,6 +3677,3 @@ impl Storage {
         }
     }
 } 
-
-// Advanced compression module
-    // Advanced compression is integrated into main storage logic 

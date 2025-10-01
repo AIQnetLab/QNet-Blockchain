@@ -88,7 +88,7 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
   - Simple transfers: 300 → 16 bytes (95% reduction)
   - Node activations: 500 → 10 bytes (98% reduction)
   - Rewards: 400 → 13 bytes (97% reduction)
-- **Probabilistic Indexes**: O(1) transaction lookups with Bloom filters
+- **RocksDB Transaction Index**: O(1) transaction lookups with native key-value indexing
 - **Hardware Auto-Tuning**: Automatically optimizes for available resources
   - **CPU Detection**: Uses all available cores (minimum 4 threads)
   - **Smart Validation**: Auto-enables parallel validation on 8+ core systems
