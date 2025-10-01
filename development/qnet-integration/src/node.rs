@@ -377,6 +377,35 @@ impl BlockchainNode {
         
         // Generate unique node_id for Byzantine consensus
         let node_id = Self::generate_unique_node_id(node_type).await;
+        
+        // CRITICAL VALIDATION: Ensure Genesis nodes have proper IDs, not fallbacks
+        if std::env::var("QNET_BOOTSTRAP_ID").is_ok() || std::env::var("DOCKER_ENV").is_ok() {
+            // This is a Genesis node - MUST have proper genesis_node_XXX ID
+            if !node_id.starts_with("genesis_node_") {
+                eprintln!("[CRITICAL] ❌ Genesis node has incorrect ID: {}", node_id);
+                eprintln!("[CRITICAL] ❌ Expected: genesis_node_XXX, got fallback ID!");
+                eprintln!("[CRITICAL] 🔧 Check environment variables:");
+                eprintln!("  QNET_BOOTSTRAP_ID = {:?}", std::env::var("QNET_BOOTSTRAP_ID"));
+                eprintln!("  QNET_ACTIVATION_CODE = {:?}", std::env::var("QNET_ACTIVATION_CODE"));
+                eprintln!("  DOCKER_ENV = {:?}", std::env::var("DOCKER_ENV"));
+                
+                // For Docker Genesis nodes, this is a critical error
+                if std::env::var("DOCKER_ENV").is_ok() && std::env::var("QNET_BOOTSTRAP_ID").is_ok() {
+                    panic!("[FATAL] Genesis node cannot start with fallback ID! Check QNET_BOOTSTRAP_ID environment variable!");
+                }
+            } else {
+                println!("[NODE_ID] ✅ Genesis node ID validated: {}", node_id);
+            }
+        }
+        
+        // Validate no process ID in production node IDs (fallback detection)
+        if node_id.contains(&std::process::id().to_string()) {
+            println!("[NODE_ID] ⚠️ WARNING: Using process-based fallback ID: {}", node_id);
+            println!("[NODE_ID] ⚠️ This is not recommended for production!");
+            println!("[NODE_ID] 🔧 Set proper environment variables:");
+            println!("  - QNET_BOOTSTRAP_ID for Genesis nodes");
+            println!("  - QNET_EXTERNAL_IP for regular nodes");
+        }
         let consensus_config = qnet_consensus::ConsensusConfig {
             commit_phase_duration: Duration::from_secs(15),    // Faster phases for 1s blocks
             reveal_phase_duration: Duration::from_secs(15),    // Total consensus: 30s per round
@@ -1366,22 +1395,69 @@ impl BlockchainNode {
                 // EXISTING: Normal phase microblocks use producer signatures only (no Byzantine consensus)
                 // EXISTING: Macroblocks handled separately in macroblock consensus trigger (line ~1100)
                 
-                if byzantine_safety_required && active_node_count < 4 {
+                // PROGRESSIVE DEGRADATION: Allow reduced node count after initial blocks
+                // This prevents network deadlock in small networks or when nodes are unavailable
+                let network_size = active_node_count as usize;
+                let is_small_network = network_size <= 10; // Small network threshold
+                
+                let required_byzantine_nodes = if is_genesis_bootstrap || is_small_network {
+                    // Genesis phase OR small network: Progressive degradation
                     if is_genesis_bootstrap {
-                        // EXISTING: STRICT Byzantine safety enforcement for Genesis
-                        println!("[MICROBLOCK] ⏳ STRICT Byzantine safety: {} nodes < 4 required", active_node_count);
-                        println!("[MICROBLOCK] 🌱 Genesis phase: ALL microblocks require Byzantine consensus");
+                        // Genesis: Height-based degradation
+                        match microblock_height {
+                            0..=30 => std::cmp::min(4, network_size as u64),  // Standard but capped by network size
+                            31..=90 => std::cmp::min(3, network_size as u64),  // Checkpoint mode
+                            91..=180 => std::cmp::min(2, network_size as u64), // Emergency mode
+                            _ => 1,  // Critical: single node allowed
+                        }
+                    } else {
+                        // Small production network: Size-based requirements
+                        match network_size {
+                            0..=1 => 1,   // Solo node
+                            2 => 2,       // Two nodes can proceed
+                            3 => 3,       // Three nodes can proceed
+                            _ => 4,       // Four or more: full safety
+                        }
+                    }
+                } else {
+                    4  // Large network: Always require full Byzantine safety
+                };
+                
+                if byzantine_safety_required && active_node_count < required_byzantine_nodes {
+                    if is_genesis_bootstrap {
+                        // Progressive safety enforcement for Genesis
+                        let degradation_mode = match microblock_height {
+                            0..=30 => "STANDARD",
+                            31..=90 => "CHECKPOINT", 
+                            91..=180 => "EMERGENCY",
+                            _ => "CRITICAL",
+                        };
+                        
+                        println!("[MICROBLOCK] ⏳ {} Byzantine safety: {} nodes < {} required (height: {})", 
+                                degradation_mode, active_node_count, required_byzantine_nodes, microblock_height);
+                        println!("[MICROBLOCK] 🌱 Genesis phase: Progressive degradation active");
+                        
                         if is_selected_producer {
                             println!("[MICROBLOCK] 🎯 Selected producer '{}' WAITING for Byzantine safety", own_node_id);
                         } else {
                             println!("[MICROBLOCK] 🛡️ Non-producer node waiting for network formation");
                         }
-                        println!("[MICROBLOCK] 🔒 QNet requires minimum 4 nodes for Byzantine safety");
-                        tokio::time::sleep(Duration::from_secs(5)).await; // EXISTING: 5-second timeout
+                        
+                        // Shorter wait time for degraded modes
+                        let wait_time = match microblock_height {
+                            0..=30 => 5,   // Standard: 5 seconds
+                            31..=90 => 3,  // Checkpoint: 3 seconds
+                            91..=180 => 2, // Emergency: 2 seconds
+                            _ => 1,        // Critical: 1 second
+                        };
+                        
+                        tokio::time::sleep(Duration::from_secs(wait_time)).await;
                         continue;
                     } else {
-                        println!("[MICROBLOCK] ⏳ Full node waiting for minimum 4 nodes (current: {})", active_node_count);
-                        println!("[MICROBLOCK] 🛡️ Byzantine safety cannot be guaranteed with fewer than 4 nodes");
+                        println!("[MICROBLOCK] ⏳ Full node waiting for minimum {} nodes (current: {})", 
+                                required_byzantine_nodes, active_node_count);
+                        println!("[MICROBLOCK] 🛡️ Byzantine safety cannot be guaranteed with fewer than {} nodes", 
+                                required_byzantine_nodes);
                         tokio::time::sleep(Duration::from_secs(2)).await; // EXISTING: 2-second timeout
                         continue;
                     }
@@ -2276,11 +2352,32 @@ impl BlockchainNode {
             // CRITICAL: Now includes validator sampling for millions of nodes
             let candidates = Self::calculate_qualified_candidates(p2p, own_node_id, own_node_type).await;
             
-            if candidates.is_empty() {
-                println!("[MICROBLOCK] ⚠️ No qualified candidates (≥70% reputation, Full/Super only) - using self");
-                // Warning: No qualified candidates - network may fork
+            // VALIDATION: Filter out invalid fallback IDs from candidates
+            let valid_candidates: Vec<(String, f64)> = candidates.into_iter()
+                .filter(|(id, _)| {
+                    // Reject fallback IDs that look like process IDs
+                    if id.contains("_legacy_") || 
+                       (id.starts_with("node_") && id.chars().filter(|c| c.is_ascii_digit()).count() > 8) {
+                        println!("[MICROBLOCK] ⚠️ Filtering out invalid fallback ID from candidates: {}", id);
+                        false
+                    } else {
+                        true
+                    }
+                })
+                .collect();
+            
+            if valid_candidates.is_empty() {
+                println!("[MICROBLOCK] ⚠️ No valid qualified candidates - using self as fallback");
+                // For Genesis phase, ensure we use proper Genesis ID
+                if own_node_id.starts_with("genesis_node_") {
+                    return own_node_id.to_string();
+                }
+                // Warning: Using fallback, network may have issues
+                println!("[MICROBLOCK] ⚠️ WARNING: Using potentially invalid node ID: {}", own_node_id);
                 return own_node_id.to_string();
             }
+            
+            let candidates = valid_candidates;
             
             // PRODUCTION: Use EXISTING cryptographic validator selection algorithm
             // This is the REAL decentralized algorithm (not centralized rotation!)
@@ -2579,13 +2676,33 @@ impl BlockchainNode {
             }
             
             
-            println!("[EMERGENCY_SELECTION] 🔍 Emergency candidates: {} available (excluding failed: {})", 
-                     candidates.len(), failed_producer);
+            // VALIDATION: Filter out any fallback IDs (process-based) from candidates
+            let valid_candidates: Vec<(String, f64)> = candidates.into_iter()
+                .filter(|(id, _)| {
+                    // Reject fallback IDs that contain process IDs
+                    if id.contains("_legacy_") || id.chars().any(|c| c.is_ascii_hexdigit() && id.len() > 20) {
+                        println!("[EMERGENCY_SELECTION] ⚠️ Filtering out invalid fallback ID: {}", id);
+                        false
+                    } else {
+                        true
+                    }
+                })
+                .collect();
             
-            if candidates.is_empty() {
-                println!("[FAILOVER] 💀 CRITICAL: No backup producers available!");
+            println!("[EMERGENCY_SELECTION] 🔍 Emergency candidates: {} valid (excluding failed: {})", 
+                     valid_candidates.len(), failed_producer);
+            
+            if valid_candidates.is_empty() {
+                println!("[FAILOVER] 💀 CRITICAL: No valid backup producers available!");
+                // For Genesis phase with invalid IDs, try to recover with Genesis defaults
+                if is_genesis_phase {
+                    println!("[FAILOVER] 🆘 GENESIS RECOVERY: Using default genesis_node_001");
+                    return "genesis_node_001".to_string();
+                }
                 return failed_producer.to_string(); // Fallback to failed (might recover)
             }
+            
+            let candidates = valid_candidates;
             
             // CRITICAL: Deterministic emergency selection to prevent race conditions
             // Use the same selection algorithm as normal rotation but with emergency seed
@@ -4159,8 +4276,41 @@ impl BlockchainNode {
             println!("[CONSENSUS] 🏛️ Initializing Byzantine consensus round {} with {} participants", 
                      round_id, all_participants.len());
             
-            if all_participants.len() < 4 {
-                return Err(format!("Insufficient nodes for Byzantine safety: {}/4", all_participants.len()));
+            // CRITICAL FIX: Progressive degradation for macroblock consensus
+            // Matches microblock logic to prevent deadlock in small/Genesis networks
+            let is_genesis_network = std::env::var("QNET_BOOTSTRAP_ID").is_ok();
+            let network_size = p2p.get_validated_active_peers().len() + 1; // Include self
+            
+            // Determine required nodes based on network state
+            let required_byzantine_nodes = if is_genesis_network || network_size <= 10 {
+                // Small network or Genesis: Progressive requirements
+                match end_height {
+                    0..=900 => {
+                        // First 10 macroblocks: Allow degradation
+                        if network_size >= 4 { 4 }
+                        else if network_size >= 3 { 3 }
+                        else if network_size >= 2 { 2 }
+                        else { 1 } // Emergency: single node consensus
+                    },
+                    _ => {
+                        // After initial phase: Standard requirement but with flexibility
+                        std::cmp::min(4, network_size)
+                    }
+                }
+            } else {
+                // Large production network: Full Byzantine safety
+                4
+            };
+            
+            if all_participants.len() < required_byzantine_nodes {
+                if is_genesis_network || network_size <= 10 {
+                    println!("[CONSENSUS] ⚠️ DEGRADED Byzantine consensus: {}/{} nodes (small/Genesis network)", 
+                             all_participants.len(), required_byzantine_nodes);
+                    println!("[CONSENSUS] 🔧 Proceeding with reduced safety for network continuity");
+                    // Continue with degraded consensus rather than blocking
+                } else {
+                    return Err(format!("Insufficient nodes for Byzantine safety: {}/4", all_participants.len()));
+                }
             }
             
             // STEP 2: Start consensus round with proper participants
@@ -5880,7 +6030,31 @@ impl BlockchainNode {
     async fn generate_unique_node_id(node_type: NodeType) -> String {
         // Generating unique node ID based on environment
         
-        // Priority 1: Use BOOTSTRAP_ID for Genesis nodes (001-005)
+        // DOCKER FIX: For Docker environments, retry environment variable access
+        // Sometimes Docker env vars are not immediately available
+        if std::env::var("DOCKER_ENV").is_ok() {
+            println!("[NODE_ID] 🐳 Docker environment detected, checking for BOOTSTRAP_ID...");
+            
+            // Retry up to 5 times with 100ms delay for Docker env propagation
+            for attempt in 1..=5 {
+                if let Ok(bootstrap_id) = std::env::var("QNET_BOOTSTRAP_ID") {
+                    println!("[NODE_ID] ✅ Genesis BOOTSTRAP_ID found on attempt {}: {}", attempt, bootstrap_id);
+                    let node_id = format!("genesis_node_{}", bootstrap_id);
+                    println!("[NODE_ID] 🔐 Genesis node ID: {}", node_id);
+                    return node_id;
+                }
+                
+                if attempt < 5 {
+                    println!("[NODE_ID] 🔄 Attempt {}/5: QNET_BOOTSTRAP_ID not found, retrying...", attempt);
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                }
+            }
+            
+            // Docker + no BOOTSTRAP_ID = regular node
+            println!("[NODE_ID] 📦 Docker node without BOOTSTRAP_ID - using regular node ID");
+        }
+        
+        // Priority 1: Use BOOTSTRAP_ID for Genesis nodes (001-005) 
         if let Ok(bootstrap_id) = std::env::var("QNET_BOOTSTRAP_ID") {
             println!("[NODE_ID] 🔐 Genesis node detected: BOOTSTRAP_ID={}", bootstrap_id);
             // Using BOOTSTRAP_ID for Genesis node
