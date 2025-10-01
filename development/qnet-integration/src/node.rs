@@ -1148,29 +1148,37 @@ impl BlockchainNode {
                 }
             }
             
-            ConsensusMessage::RemoteReveal { round_id, node_id, reveal_data, timestamp } => {
+            ConsensusMessage::RemoteReveal { round_id, node_id, reveal_data, nonce, timestamp } => {
                 println!("[CONSENSUS] 📥 Processing REAL reveal from remote node: {} (round {})", node_id, round_id);
                 
                 // Create reveal from remote node data  
                 let reveal_bytes = hex::decode(&reveal_data)
                     .unwrap_or_else(|_| reveal_data.as_bytes().to_vec()); // Try hex decode first, fallback to direct bytes
-                // PRODUCTION: Generate real cryptographic nonce for consensus reveal
-                let nonce = {
-                    use sha3::{Sha3_256, Digest};
-                    let mut hasher = Sha3_256::new();
-                    hasher.update(node_id.as_bytes());
-                    hasher.update(&round_id.to_le_bytes());
-                    hasher.update(&std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos().to_le_bytes());
-                    let hash = hasher.finalize();
-                    let mut nonce_array = [0u8; 32];
-                    nonce_array.copy_from_slice(&hash[..32]);
-                    nonce_array
-                };
+                
+                // CRITICAL: Use the nonce transmitted from the remote node, NOT a new one!
+                // The nonce must match what was used in the commit phase for verification
+                let nonce_bytes = hex::decode(&nonce)
+                    .map_err(|e| {
+                        println!("[CONSENSUS] ❌ Failed to decode nonce hex: {}", e);
+                        e
+                    })
+                    .ok()
+                    .and_then(|bytes| {
+                        if bytes.len() == 32 {
+                            let mut array = [0u8; 32];
+                            array.copy_from_slice(&bytes);
+                            Some(array)
+                        } else {
+                            println!("[CONSENSUS] ❌ Invalid nonce length: {} (expected 32)", bytes.len());
+                            None
+                        }
+                    })
+                    .unwrap_or([0u8; 32]); // Fallback to zeros if decoding fails
                 
                 let remote_reveal = Reveal {
                     node_id: node_id.clone(),
                     reveal_data: reveal_bytes,
-                    nonce,
+                    nonce: nonce_bytes,  // Use the decoded nonce bytes
                     timestamp,
                 };
                 
@@ -3776,9 +3784,10 @@ impl BlockchainNode {
                             round_id,
                             our_id.clone(),
                             hex::encode(&reveal.reveal_data), // Convert Vec<u8> to String
+                            hex::encode(&reveal.nonce),        // CRITICAL: Include nonce for verification
                             reveal.timestamp
                         );
-                        println!("[CONSENSUS] 📤 Broadcasted OWN reveal to {} peers", participants.len() - 1);
+                        println!("[CONSENSUS] 📤 Broadcasted OWN reveal with nonce to {} peers", participants.len() - 1);
                     }
                 }
                 Err(e) => {

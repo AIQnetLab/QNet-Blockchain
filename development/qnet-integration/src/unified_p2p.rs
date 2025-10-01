@@ -4487,6 +4487,7 @@ pub enum NetworkMessage {
         round_id: u64,
         node_id: String,
         reveal_data: String,
+        nonce: String,  // CRITICAL: Include nonce for reveal verification
         timestamp: u64,
     },
 
@@ -4560,6 +4561,7 @@ pub enum ConsensusMessage {
         round_id: u64,
         node_id: String,
         reveal_data: String,
+        nonce: String,  // CRITICAL: Include nonce for reveal verification
         timestamp: u64,
     },
 }
@@ -4695,7 +4697,7 @@ impl SimplifiedP2P {
                 }
             }
 
-            NetworkMessage::ConsensusReveal { round_id, node_id, reveal_data, timestamp } => {
+            NetworkMessage::ConsensusReveal { round_id, node_id, reveal_data, nonce, timestamp } => {
                 // Update last_seen for the peer who sent the reveal
                 self.update_peer_last_seen(&node_id);
                 println!("[CONSENSUS] ← Received reveal from {} for round {} at {}", 
@@ -4705,7 +4707,7 @@ impl SimplifiedP2P {
                 // Microblocks use simple producer signatures, NOT Byzantine consensus
                 if self.is_macroblock_consensus_round(round_id) {
                     println!("[MACROBLOCK] ✅ Processing reveal for consensus round {}", round_id);
-                    self.handle_remote_consensus_reveal(round_id, node_id, reveal_data, timestamp);
+                    self.handle_remote_consensus_reveal(round_id, node_id, reveal_data, nonce, timestamp);
                 } else {
                     println!("[CONSENSUS] ⏭️ Ignoring reveal for microblock - no consensus needed for round {}", round_id);
                 }
@@ -5479,7 +5481,7 @@ impl SimplifiedP2P {
     }
 
     /// PRODUCTION: Broadcast consensus reveal to all peers  
-    pub fn broadcast_consensus_reveal(&self, round_id: u64, node_id: String, reveal_data: String, timestamp: u64) -> Result<(), String> {
+    pub fn broadcast_consensus_reveal(&self, round_id: u64, node_id: String, reveal_data: String, nonce: String, timestamp: u64) -> Result<(), String> {
         // CRITICAL: Only broadcast consensus for MACROBLOCK rounds (every 90 blocks)
         // Microblocks use simple producer signatures, NOT Byzantine consensus
         if round_id == 0 || (round_id % 90 != 0) {
@@ -5502,6 +5504,7 @@ impl SimplifiedP2P {
                 round_id,
                 node_id: node_id.clone(),
                 reveal_data: reveal_data.clone(),
+                nonce: nonce.clone(),  // CRITICAL: Include nonce for reveal verification
                 timestamp,
             };
             
@@ -5680,9 +5683,9 @@ impl SimplifiedP2P {
     }
 
     /// Handle incoming consensus reveal from remote peer
-    fn handle_remote_consensus_reveal(&self, round_id: u64, node_id: String, reveal_data: String, timestamp: u64) {
-        println!("[CONSENSUS] 🏛️ Processing remote reveal: round={}, node={}, reveal_length={}", 
-                round_id, node_id, reveal_data.len());
+    fn handle_remote_consensus_reveal(&self, round_id: u64, node_id: String, reveal_data: String, nonce: String, timestamp: u64) {
+        println!("[CONSENSUS] 🏛️ Processing remote reveal: round={}, node={}, reveal_length={}, nonce_length={}", 
+                round_id, node_id, reveal_data.len(), nonce.len());
         
         // PRODUCTION: Send to consensus engine through channel
         if let Some(ref consensus_tx) = self.consensus_tx {
@@ -5690,6 +5693,7 @@ impl SimplifiedP2P {
                 round_id,
                 node_id: node_id.clone(),
                 reveal_data,
+                nonce,  // CRITICAL: Pass nonce for reveal verification
                 timestamp,
             };
             
