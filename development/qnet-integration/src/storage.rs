@@ -1101,11 +1101,26 @@ impl Storage {
         // Detect node type from environment or config
         let node_type = std::env::var("QNET_NODE_TYPE").unwrap_or_else(|_| "full".to_string());
         
-        // Get estimated active shards (default conservative estimate)
-        let active_shards = std::env::var("QNET_ACTIVE_SHARDS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(16); // Conservative default: 16 shards
+        // DYNAMIC SHARD CALCULATION: Automatically scales with network growth
+        // Uses existing calculate_optimal_shards() from reward_sharding module
+        // NOTE: Shard count is calculated ONCE at startup and remains fixed during operation
+        // This ensures storage consistency. Recalculation happens on node restart/update.
+        // Production workflow: Rolling restart updates shard count across network.
+        let active_shards = if let Ok(manual_shards) = std::env::var("QNET_ACTIVE_SHARDS") {
+            // Manual override for testing or specific deployment needs
+            manual_shards.parse::<u64>().unwrap_or_else(|_| {
+                let network_size = Self::estimate_network_size_from_storage(&persistent);
+                crate::reward_sharding::calculate_optimal_shards(network_size) as u64
+            })
+        } else {
+            // AUTO-DETECTION: Calculate based on blockchain registry and heuristics
+            let network_size = Self::estimate_network_size_from_storage(&persistent);
+            let optimal_shards = crate::reward_sharding::calculate_optimal_shards(network_size) as u64;
+            
+            println!("[Storage] ⚡ AUTO-SCALING: Calculated optimal shards: {}", optimal_shards);
+            
+            optimal_shards
+        };
         
         let (storage_mode, max_storage_gb, base_window) = match node_type.as_str() {
             "light" => (StorageMode::Light, 1, 0), // 1 GB for headers only
@@ -1386,6 +1401,47 @@ impl Storage {
         // Normal operation: rely on sliding window pruning in prune_old_blocks()
         
         Ok(())
+    }
+    
+    /// Public wrapper for network size estimation (used by node configuration)
+    pub fn estimate_network_size_for_config(&self) -> usize {
+        Self::estimate_network_size_from_storage(&self.persistent)
+    }
+    
+    /// Estimate total network size for dynamic shard calculation
+    /// Uses multi-source detection: blockchain, environment, heuristics
+    fn estimate_network_size_from_storage(persistent: &PersistentStorage) -> usize {
+        // Priority 1: Explicit network size from monitoring/orchestration
+        if let Ok(size_str) = std::env::var("QNET_TOTAL_NETWORK_NODES") {
+            if let Ok(size) = size_str.parse::<usize>() {
+                println!("[Storage] 📊 Network size from monitoring: {} nodes", size);
+                return size;
+            }
+        }
+        
+        // Priority 2: Genesis phase detection (5 bootstrap nodes)
+        if std::env::var("QNET_BOOTSTRAP_ID").is_ok() {
+            println!("[Storage] 🌱 Genesis phase: 5 bootstrap nodes");
+            return 5;
+        }
+        
+        // Priority 3: Read actual node activations from blockchain storage
+        if let Some(activations_cf) = persistent.db.cf_handle("activations") {
+            let mut count = 0;
+            let iter = persistent.db.iterator_cf(activations_cf, rocksdb::IteratorMode::Start);
+            for _ in iter {
+                count += 1;
+            }
+            
+            if count > 0 {
+                println!("[Storage] 🔗 Blockchain registry: {} activated nodes", count);
+                return count;
+            }
+        }
+        
+        // Priority 4: Conservative default (small network assumption)
+        println!("[Storage] ⚠️ No network data found, using conservative default: 100 nodes");
+        100 // Conservative: assume small network to avoid over-sharding
     }
     
     /// Estimate Super node count in the network (conservative approximation)
@@ -2077,10 +2133,10 @@ impl Storage {
             if !parent_tx_hashes.contains(&tx_hash) {
                 // This is a new transaction
                 let tx_data = bincode::serialize(tx).unwrap_or_default();
-                changes.push(DeltaChange::NewTransaction {
-                    hash: tx_hash.to_vec(),
+                    changes.push(DeltaChange::NewTransaction {
+                        hash: tx_hash.to_vec(),
                     data: tx_data,
-                });
+                    });
             }
         }
         
@@ -2151,7 +2207,7 @@ impl Storage {
                 // Store transaction in pool
                 let _ = self.transaction_pool.store_transaction(tx_hash, tx.clone());
                 
-                // Recognize pattern and compress
+                    // Recognize pattern and compress
                 let pattern = self.recognize_transaction_pattern(tx);
                 if let Ok(compressed_tx) = self.compress_transaction_by_pattern(tx, pattern) {
                         // Store compressed transaction
@@ -2163,9 +2219,9 @@ impl Storage {
                             *recognizer.pattern_stats.entry(pattern).or_insert(0) += 1;
                         }
                     }
-                
-                // Add to probabilistic index for O(1) lookups
-                if let Ok(mut index) = self.tx_index.write() {
+                    
+                    // Add to probabilistic index for O(1) lookups
+                    if let Ok(mut index) = self.tx_index.write() {
                     Self::add_to_index_static(&mut index, &tx_hash);
                 }
             }
@@ -3506,12 +3562,12 @@ impl Storage {
                             macro_number, height);
                 }
             }
-            
-            // Apply batch every 1000 blocks to avoid memory issues
-            if pruned_count % 1000 == 0 {
-                self.persistent.db.write(batch)?;
-                batch = WriteBatch::default();
-                println!("[PRUNING] Pruned {} blocks...", pruned_count);
+                
+                // Apply batch every 1000 blocks to avoid memory issues
+                if pruned_count % 1000 == 0 {
+                    self.persistent.db.write(batch)?;
+                    batch = WriteBatch::default();
+                    println!("[PRUNING] Pruned {} blocks...", pruned_count);
             }
         }
         
@@ -3612,7 +3668,7 @@ impl Storage {
         // Check for latest snapshot pointer
         if let Ok(Some(data)) = self.persistent.db.get_cf(&snapshots_cf, b"latest_snapshot") {
             let height = u64::from_le_bytes(data[..8].try_into()
-                .map_err(|_| IntegrationError::StorageError("Invalid snapshot height format".to_string()))?); 
+                .map_err(|_| IntegrationError::StorageError("Invalid snapshot height format".to_string()))?);
             return Ok(Some(height));
         }
         
@@ -3760,7 +3816,7 @@ impl Storage {
             }
         }
     }
-}
+} 
 
 // Advanced compression module
     // Advanced compression is integrated into main storage logic 

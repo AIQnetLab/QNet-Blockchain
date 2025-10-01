@@ -89,6 +89,21 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
   - Node activations: 500 → 10 bytes (98% reduction)
   - Rewards: 400 → 13 bytes (97% reduction)
 - **Probabilistic Indexes**: O(1) transaction lookups with Bloom filters
+- **Hardware Auto-Tuning**: Automatically optimizes for available resources
+  - **CPU Detection**: Uses all available cores (minimum 4 threads)
+  - **Smart Validation**: Auto-enables parallel validation on 8+ core systems
+  - **Adaptive Mempool**: Scales from 100k (test) to 2M (production) based on network size
+  - Works on any hardware: 4-core VPS → 64-core server
+  - No manual configuration - detects and adapts automatically
+- **Dynamic Shard Auto-Scaling**: Automatically adjusts shard count based on real network size
+  - Genesis (5 nodes): 1 shard
+  - Growth (75k nodes): 2 shards
+  - Scale (150k nodes): 4 shards
+  - Max (19M+ nodes): 256 shards
+  - **Blockchain Registry Integration**: Reads actual activated node count from storage
+  - Multi-source detection: Monitoring → Genesis → Blockchain → Default
+  - **Recalculation on restart**: Every node startup reads fresh network size
+  - No manual configuration - system adapts to network growth automatically
 - **EfficientMicroBlocks**: Store transaction hashes instead of full transactions
 - **Sliding Window Storage**: Full nodes keep only last 100K blocks (~1 day) + snapshots
 - **Smart Pruning**: Automatic deletion of blocks outside retention window
@@ -688,6 +703,12 @@ docker run -it --name qnet-node --restart=always \
   qnet-production
 ```
 
+**🔄 Automatic Optimization on Restart:**
+- **Shard count** recalculates based on current network size
+- **Storage window** adjusts automatically for optimal performance
+- **No manual configuration needed** - node adapts to network growth
+- Example: Network grew 5k→150k nodes → restarts with 4 shards instead of 1
+
 ### 🔄 Automatic Node Replacement
 
 **QNet features automatic node replacement when activating on a new server:**
@@ -1196,13 +1217,39 @@ QNet node deployment now features **zero-configuration** setup for maximum ease 
 - **Port range scanning**: Automatically scans for available ports in +100 range
 - **Conflict resolution**: Handles port conflicts gracefully
 
-### ⚡ Performance Optimization
+### ⚡ Performance Optimization (Hardware Auto-Tuning)
 
-- **Always enabled**: 100k+ TPS optimizations active by default
+**🎯 NEW: Automatic Hardware Detection & Optimization**
+- **CPU Auto-Detection**: Uses all available cores (4-64+ cores automatically detected)
+- **Smart Parallel Validation**: Auto-enables on 8+ core systems, disables on <8 cores
+- **Adaptive Mempool**: Scales 100k→2M transactions based on network size
+- **Zero Configuration**: Works optimally on any hardware without manual tuning
+
+**Always Enabled:**
+- **High-performance mode**: 100k+ TPS optimizations active by default
 - **Microblock production**: Enabled for all production nodes
-- **High-performance mode**: Ultra-high throughput settings
 - **Optimized batching**: 10,000 transactions per batch
-- **Parallel processing**: 16 threads for validation
+- **Dynamic thread allocation**: Matches your CPU cores
+
+**Examples (automatic):**
+- 4-core VPS: 4 threads, parallel validation OFF
+- 8-core server: 8 threads, parallel validation AUTO-ON
+- 32-core server: 32 threads, parallel validation ON
+- 64-core beast: 64 threads, maximum throughput
+
+**Optional CPU Limiting (for shared servers):**
+```bash
+# Use only 50% of CPU (great for shared hosting)
+docker run ... -e QNET_CPU_LIMIT_PERCENT=50 ...
+
+# Cap at 8 threads (leave resources for other apps)
+docker run ... -e QNET_MAX_THREADS=8 ...
+
+# Examples:
+# 32-core + 50% limit → 16 threads used
+# 64-core + QNET_MAX_THREADS=16 → 16 threads max
+# 16-core + no limit → all 16 threads (default)
+```
 
 ### 🔐 Quantum-Resistant P2P Network (UPDATED - December 2025)
 

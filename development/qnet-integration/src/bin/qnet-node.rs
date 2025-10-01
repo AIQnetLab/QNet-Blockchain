@@ -2507,8 +2507,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // This prevents "All endpoints failed" errors during bootstrap
     println!("🔍 DHT peer discovery will run after API server startup...");
     
-    // Store activation code for validation
+    // Store activation code and node type for validation and storage configuration
     std::env::set_var("QNET_ACTIVATION_CODE", activation_code);
+    std::env::set_var("QNET_NODE_TYPE", match node_type {
+        NodeType::Light => "light",
+        NodeType::Full => "full",
+        NodeType::Super => "super",
+    });
     
     // Display configuration
     display_node_config(&config, &node_type, &region);

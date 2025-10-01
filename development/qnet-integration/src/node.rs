@@ -90,6 +90,79 @@ pub struct PerformanceConfig {
 
 impl Default for PerformanceConfig {
     fn default() -> Self {
+        // AUTO-DETECT: CPU cores for optimal performance
+        let cpu_count = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4); // Fallback: 4 cores
+        
+        // OPTIONAL: CPU usage limit (percentage or absolute number)
+        let cpu_limit_percent = env::var("QNET_CPU_LIMIT_PERCENT")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&p| p > 0 && p <= 100)
+            .unwrap_or(100); // Default: use 100% of available CPU
+        
+        let max_threads_allowed = env::var("QNET_MAX_THREADS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok());
+        
+        // Calculate effective CPU allocation
+        let effective_cpu_count = if let Some(max_threads) = max_threads_allowed {
+            // Manual cap takes priority
+            max_threads.min(cpu_count)
+        } else if cpu_limit_percent < 100 {
+            // Apply percentage limit
+            let limited = (cpu_count * cpu_limit_percent) / 100;
+            limited.max(2) // Minimum 2 threads even with limit
+        } else {
+            // Use all available
+            cpu_count
+        };
+        
+        // AUTO-TUNE: Parallel validation only makes sense on multi-core systems
+        let auto_parallel_validation = if env::var("QNET_PARALLEL_VALIDATION").is_ok() {
+            env::var("QNET_PARALLEL_VALIDATION").unwrap_or_default() == "1"
+        } else {
+            // AUTO-ENABLE if effective CPU >= 8 cores
+            effective_cpu_count >= 8
+        };
+        
+        // AUTO-TUNE: Thread count = effective CPUs (minimum 2, recommended 4)
+        let auto_parallel_threads = env::var("QNET_PARALLEL_THREADS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| {
+                // Use effective cores, but respect CPU limit
+                // Minimum 2 threads, recommended 4+ for production
+                if effective_cpu_count >= 4 {
+                    effective_cpu_count // Use all allocated cores
+                } else {
+                    effective_cpu_count.max(2) // Minimum 2, don't force 4 on limited systems
+                }
+            });
+        
+        println!("[Performance] 🔧 AUTO-TUNE: Detected {} CPU cores", cpu_count);
+        if cpu_limit_percent < 100 {
+            println!("[Performance] 🎚️ CPU limit: {}% → using {} cores", 
+                    cpu_limit_percent, effective_cpu_count);
+            
+            // WARNING: Extremely low CPU allocation
+            if effective_cpu_count < 4 {
+                println!("[Performance] ⚠️  WARNING: Very low CPU allocation ({} cores)", 
+                        effective_cpu_count);
+                println!("[Performance]    Recommended minimum: 4 cores for production");
+                println!("[Performance]    Current allocation may impact performance");
+            }
+        } else if let Some(max) = max_threads_allowed {
+            println!("[Performance] 🎚️ Thread cap: {} (of {} available)", max, cpu_count);
+            if max < 4 {
+                println!("[Performance] ⚠️  WARNING: Low thread cap ({}), recommended ≥4", max);
+            }
+        }
+        println!("[Performance] ⚡ Parallel validation: {} (threshold: ≥8 cores)", 
+                if auto_parallel_validation { "ENABLED" } else { "DISABLED" });
+        println!("[Performance] 🧵 Parallel threads: {}", auto_parallel_threads);
+        
         Self {
             enable_sharding: env::var("QNET_ENABLE_SHARDING").unwrap_or_default() == "1",
             // PRODUCTION: 256 shards for 400k+ TPS (aligns with existing P2P sharding)
@@ -99,9 +172,9 @@ impl Default for PerformanceConfig {
             // PRODUCTION: Super nodes handle more shards for network stability
             super_node_shards: env::var("QNET_SUPER_NODE_SHARDS").unwrap_or_default().parse().unwrap_or(32),
             
-            parallel_validation: env::var("QNET_PARALLEL_VALIDATION").unwrap_or_default() == "1",
-            // PRODUCTION: Use all CPU cores for maximum throughput
-            parallel_threads: env::var("QNET_PARALLEL_THREADS").unwrap_or_default().parse().unwrap_or(16),
+            parallel_validation: auto_parallel_validation,
+            // AUTO-TUNE: Use all available CPU cores for maximum throughput
+            parallel_threads: auto_parallel_threads,
             
             p2p_compression: env::var("QNET_P2P_COMPRESSION").unwrap_or_default() == "1",
             // PRODUCTION: 10k batch for optimal throughput (tested in local benchmarks)
@@ -271,12 +344,32 @@ impl BlockchainNode {
         // Initialize state manager
         let state = Arc::new(RwLock::new(StateManager::new()));
         
-        // Initialize production-ready mempool
+        // Initialize production-ready mempool with AUTO-SCALING
+        let auto_mempool_size = if let Some(manual_size) = std::env::var("QNET_MEMPOOL_SIZE")
+            .ok()
+            .and_then(|s| s.parse().ok()) {
+            // Manual override
+            manual_size
+        } else {
+            // AUTO-TUNE: Scale mempool based on network size
+            // Use same network size estimation as storage sharding
+            let network_size = storage.estimate_network_size_for_config();
+            
+            let calculated_size = match network_size {
+                0..=100 => 100_000,        // Genesis/test: 100k
+                101..=10_000 => 500_000,   // Small network: 500k
+                10_001..=100_000 => 1_000_000,  // Medium network: 1M
+                _ => 2_000_000,            // Large network: 2M
+            };
+            
+            println!("[Mempool] 🔄 AUTO-SCALING: Network size {} nodes → {} tx capacity", 
+                    network_size, calculated_size);
+            
+            calculated_size
+        };
+        
         let mempool_config = qnet_mempool::SimpleMempoolConfig {
-            max_size: std::env::var("QNET_MEMPOOL_SIZE")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(500_000), // 500k for production (unified with qnet-node.rs)
+            max_size: auto_mempool_size,
             min_gas_price: 1,
         };
         

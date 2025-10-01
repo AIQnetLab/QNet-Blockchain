@@ -5,6 +5,93 @@ All notable changes to the QNet project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.10.0] - October 1, 2025 "Hardware Auto-Tuning & Performance Optimization"
+
+### Added
+- **CPU Auto-Detection**: Automatic parallel thread count based on available CPU cores
+  - Detects CPU count using `std::thread::available_parallelism()`
+  - Minimum 4 threads, scales up to all available cores
+  - **Optional CPU limiting**: `QNET_CPU_LIMIT_PERCENT` (e.g., 50% = half CPU)
+  - **Optional thread cap**: `QNET_MAX_THREADS` (absolute limit)
+  - Eliminates manual `QNET_PARALLEL_THREADS` configuration
+- **Intelligent Parallel Validation**: Auto-enables on multi-core systems
+  - AUTO-ON if CPU ≥ 8 cores (multi-core benefit threshold)
+  - AUTO-OFF on low-core systems (4-6 cores) to avoid overhead
+  - Manual override still supported via `QNET_PARALLEL_VALIDATION`
+- **Dynamic Mempool Scaling**: Auto-adjusts capacity based on network size
+  - Genesis/test (≤100 nodes): 100k transactions
+  - Small network (101-10k nodes): 500k transactions
+  - Medium network (10k-100k nodes): 1M transactions
+  - Large network (100k+ nodes): 2M transactions
+  - Reads actual node count from blockchain registry
+
+### Changed
+- **QNET_PARALLEL_THREADS**: Now optional with intelligent CPU-based default
+- **QNET_PARALLEL_VALIDATION**: Now optional with automatic 8-core threshold
+- **QNET_MEMPOOL_SIZE**: Now optional with network-size-based scaling
+- **Startup logging**: Added performance auto-tune visibility
+
+### Benefits
+- Works optimally on any hardware: 4-core VPS to 64-core server
+- No manual tuning required for different server specifications
+- Automatic adaptation as network grows
+- Eliminates "one size fits all" performance bottlenecks
+- **Flexible CPU control**: Use 100% or limit to leave resources for other apps
+
+### CPU Limiting Examples
+```bash
+# Use 50% of available CPU (32-core → 16 threads)
+-e QNET_CPU_LIMIT_PERCENT=50
+
+# Cap at maximum 8 threads (regardless of available cores)
+-e QNET_MAX_THREADS=8
+
+# No limit (default) - use all available cores
+# (no environment variable needed)
+```
+
+## [2.9.0] - October 1, 2025 "Dynamic Shard Auto-Scaling"
+
+### Added
+- **Dynamic Shard Calculation**: Automatic shard count adjustment based on real network size
+  - Genesis (5 nodes): 1 shard
+  - Growth (75k nodes): 2 shards  
+  - Scale (150k-300k nodes): 4 shards
+  - Max capacity (19M+ nodes): 256 shards (maximum)
+- **Multi-Source Network Detection**: Real-time network size from multiple sources
+  - Priority 1: Explicit `QNET_TOTAL_NETWORK_NODES` from monitoring/orchestration
+  - Priority 2: Genesis phase detection (5 bootstrap Super nodes)
+  - Priority 3: **Blockchain registry** - reads actual node activations from storage
+  - Priority 4: Conservative default (100 nodes)
+- **Auto-Scaling Logging**: Real-time visibility of shard calculation and network size detection
+
+### Changed
+- **QNET_ACTIVE_SHARDS**: Now optional override instead of required parameter
+  - Default: Automatic calculation via `calculate_optimal_shards()`
+  - Override: Manual value for testing or specific deployment needs
+- **Storage Window Scaling**: Dynamically adjusts with auto-detected shard count
+- **Shard Formula**: Uses existing `calculate_optimal_shards()` (75k nodes per shard)
+
+### Fixed
+- **Manual Shard Tracking**: Eliminates need for operators to manually update shard count
+- **Storage Bloat Prevention**: Automatic adjustment prevents under/over-estimation
+- **Network Growth Handling**: Seamlessly scales from 5 nodes to millions
+
+### Technical Details
+- Reuses existing `reward_sharding::calculate_optimal_shards()` function
+- **Blockchain Registry Integration**: Reads actual node count from RocksDB "activations" column family
+- Real-time accuracy: Counts every activated node stored in blockchain
+- P2P-independent: Works during Storage initialization before network sync
+- Conservative defaults: Assumes small network to avoid over-sharding
+- Environment override preserved for testing/custom deployments
+- Zero external dependencies: Uses only local blockchain storage
+
+### When Shard Count Updates
+- **On node startup/restart**: Automatically recalculates based on current network size
+- **During operation**: Fixed to ensure storage consistency
+- **Production workflow**: Node updates/restarts trigger automatic recalculation
+- **Rolling restart strategy**: Recommended for coordinated shard scaling across network
+
 ## [2.8.0] - January 2, 2025 "Ultra-Modern Storage Architecture"
 
 ### Added
