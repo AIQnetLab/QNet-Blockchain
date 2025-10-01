@@ -22,7 +22,7 @@
 
 ### Current Distribution
 - **Circulating Supply:** ~750,000,000 1DEV (75%)
-- **Developer Holdings:** 250,000,000 1DEV (25%)
+- **Developer Allocation:** 250,000,000 1DEV (25%)
 - **Burned Supply:** Variable (increases as tokens are used for node activation)
 
 ## Initial Token Allocation
@@ -33,19 +33,34 @@
 - **Vesting:** None - immediately tradeable
 - **Purpose:** Fair distribution to community participants
 
-### Developer Holdings (25% - 250,000,000 1DEV)
+### Developer Allocation (25% - 250,000,000 1DEV)
 - **Total Allocation:** 250,000,000 1DEV (25%)
-- **Distribution:**
-  - **Long-term Vesting:** 150,000,000 1DEV (15% of total supply)
-    - **Vesting Period:** 24 months
-    - **Release Schedule:** Quarterly (every 3 months)
-    - **Cliff Period:** 0 months
-    - **Contract:** `AEfkhkpTeAgVz15f5avNoE1EnyPy86RUt7wtv3Xew2x2`
-  - **Short-term Vesting:** 90,000,000 1DEV (9% of total supply)
-    - **Vesting Period:** 2 weeks
-    - **Release Schedule:** Linear daily
-    - **Contract:** `5cpMZt5xftxPoFLeoXehcoQNe2z9RKtZZ3mzrKnYn97L`
-  - **Liquid Holdings:** 10,000,000 1DEV (1% of total supply)
+- **Total locked long-term:** 20% of total supply
+- **Purpose:** Anti-sniper protection and sustainable development funding
+- **All vesting contracts publicly verifiable on Streamflow Finance**
+
+## Vesting Contracts
+
+### Long-term Developer Vesting
+- **Contract Address:** `AEfkhkpTeAgVz15f5avNoE1EnyPy86RUt7wtv3Xew2x2`
+- **Platform:** Streamflow Finance
+- **Amount:** 150,000,000 1DEV
+- **Schedule:** Quarterly releases over 24 months
+- **Purpose:** Long-term project commitment and stability
+
+### Short-term Developer Vesting
+- **Contract Address:** `5cpMZt5xftxPoFLeoXehcoQNe2z9RKtZZ3mzrKnYn97L`
+- **Platform:** Streamflow Finance
+- **Amount:** 90,000,000 1DEV
+- **Schedule:** Daily linear vesting over 2 weeks
+- **Purpose:** Initial project funding and development
+
+### Pool 3 - Strategic Reserve
+- **Contract Address:** `BQZvm5cBWFnKBVHVYZf63wM96YqtQM6V5vMiCDFXUEvz`
+- **Platform:** Streamflow Finance
+- **Amount:** 50,000,000 1DEV
+- **Schedule:** Quarterly releases over 24 months
+- **Purpose:** Long-term project commitment and stability
 
 ## Utility and Burn Mechanism
 
@@ -55,7 +70,6 @@
 - **Current Activation Cost:** 1,500 1DEV (for all node types)
 - **Node Types:** Light Node, Full Node, Super Node
 - **Burn Process:** Tokens are permanently removed from circulation when used for activation
-- **Burn Address:** `1nc1nerator11111111111111111111111111111111`
 
 ### Dynamic Pricing Model
 Activation cost decreases as more supply is burned:
@@ -85,29 +99,6 @@ Activation cost decreases as more supply is burned:
 - **Platform:** Native QNET blockchain
 - **Supply:** 4,294,967,296 QNC (2^32 exactly)
 - **Transition:** Automatic migration for existing node operators
-
-## Vesting Contracts
-
-### Long-term Developer Vesting
-- **Contract Address:** `AEfkhkpTeAgVz15f5avNoE1EnyPy86RUt7wtv3Xew2x2`
-- **Platform:** Streamflow Finance
-- **Amount:** 150,000,000 1DEV
-- **Schedule:** Quarterly releases over 24 months
-- **Purpose:** Long-term project commitment and stability
-
-### Short-term Developer Vesting
-- **Contract Address:** `5cpMZt5xftxPoFLeoXehcoQNe2z9RKtZZ3mzrKnYn97L`
-- **Platform:** Streamflow Finance
-- **Amount:** 90,000,000 1DEV
-- **Schedule:** Daily linear vesting over 2 weeks
-- **Purpose:** Initial project funding and development
-
-### Pool 3 - Strategic Reserve
-- **Contract Address:** `BQZvm5cBWFnKBVHVYZf63wM96YqtQM6V5vMiCDFXUEvz`
-- **Platform:** Streamflow Finance
-- **Amount:** 50,000,000 1DEV
-- **Schedule:** Quarterly releases over 24 months
-- **Purpose:** Long-term project commitment and stability
 
 ## Economic Model
 
