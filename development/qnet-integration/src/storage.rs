@@ -2053,6 +2053,21 @@ impl Storage {
         }
     }
     
+    /// Decompress block data if it's compressed
+    pub fn decompress_block(&self, data: &[u8]) -> IntegrationResult<Vec<u8>> {
+        // Try to decompress with zstd - if it fails, data is not compressed
+        match zstd::decode_all(data) {
+            Ok(decompressed) => {
+                println!("[Compression] ✅ Decompressed {} -> {} bytes", data.len(), decompressed.len());
+                Ok(decompressed)
+            },
+            Err(_) => {
+                // Not compressed, return as-is
+                Ok(data.to_vec())
+            }
+        }
+    }
+    
     /// Calculate delta between two blocks
     pub fn calculate_block_delta(&self, parent_block: &[u8], new_block: &[u8], height: u64) -> IntegrationResult<BlockDelta> {
         // Deserialize blocks for comparison
@@ -2201,46 +2216,38 @@ impl Storage {
             }
         }
         
-        // Every 1000th block is saved as full block (checkpoint)
+        // GENESIS PHASE: Delta encoding disabled for first 100 blocks
+        // This ensures stable foundation during network bootstrap
+        // Full nodes: 100 blocks = ~25KB (minimal storage impact)
+        // Provides clean baseline for delta calculations
+        if height <= 100 {
+            // Use adaptive compression but no delta encoding
+            let compressed = self.compress_block_adaptive(data, height)?;
+            return self.persistent.save_microblock(height, &compressed);
+        }
+        
+        // CHECKPOINT BLOCKS: Every 1000th block saved as full (for recovery)
         if height % 1000 == 0 {
-            // Save as full block
-            return self.save_microblock(height, data);
+            let compressed = self.compress_block_adaptive(data, height)?;
+            return self.persistent.save_microblock(height, &compressed);
         }
         
-        // Try to load parent block
-        if height > 1 {
-            if let Ok(Some(parent_data)) = self.load_microblock(height - 1) {
-                // Calculate delta
-                match self.calculate_block_delta(&parent_data, data, height) {
-                    Ok(delta) => {
-                        let delta_serialized = bincode::serialize(&delta)
-                            .map_err(|e| IntegrationError::SerializationError(e.to_string()))?;
-                        
-                        // Only use delta if it's significantly smaller (50% or less)
-                        if delta_serialized.len() < data.len() / 2 {
-                            // Save delta with special prefix
-                            let mut delta_data = vec![0xDE, 0x17, 0xA0]; // "DELTA" magic bytes
-                            delta_data.extend_from_slice(&delta_serialized);
-                            
-                            // Compress and save
-                            let compressed = self.compress_block_adaptive(&delta_data, height)?;
-                            self.persistent.save_microblock(height, &compressed)?;
-                            
-                            println!("[DELTA] ✅ Block {} saved as delta ({} -> {} bytes, {:.1}% reduction)",
-                                    height, data.len(), delta_serialized.len(),
-                                    (1.0 - delta_serialized.len() as f64 / data.len() as f64) * 100.0);
-                            return Ok(());
-                        }
-                    },
-                    Err(e) => {
-                        println!("[DELTA] ⚠️ Failed to calculate delta: {:?}", e);
-                    }
-                }
-            }
+        // DELTA ENCODING: Only for blocks > 100 and non-checkpoint
+        // NOTE: Currently delta is DISABLED due to deserialization issues
+        // TODO: Implement proper delta reconstruction before enabling
+        
+        // For now, use standard compression only
+        let compressed = self.compress_block_adaptive(data, height)?;
+        self.persistent.save_microblock(height, &compressed)?;
+        
+        // Log compression results for monitoring
+        if compressed.len() < data.len() {
+            println!("[Compression] ✅ Zstd compression applied ({} -> {} bytes, {:.1}% reduction)",
+                     data.len(), compressed.len(),
+                     (1.0 - compressed.len() as f64 / data.len() as f64) * 100.0);
         }
         
-        // Fallback to normal save
-        self.save_microblock(height, data)
+        Ok(())
     }
     
     /// Pattern recognition for transaction compression
