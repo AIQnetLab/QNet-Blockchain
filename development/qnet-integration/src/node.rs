@@ -1622,13 +1622,22 @@ impl BlockchainNode {
                     let consensus_result: Option<u64> = None; // NO consensus for microblocks - Byzantine consensus ONLY for macroblocks
                     
                     // PRODUCTION: Create cryptographically signed microblock
+                    // CRITICAL: Deterministic timestamp calculation for consensus integrity
+                    // Producer sets timestamp based on block height to ensure all nodes agree
+                    let deterministic_timestamp = {
+                        // Genesis timestamp: January 1, 2024 00:00:00 UTC
+                        const GENESIS_TIMESTAMP: u64 = 1704067200;
+                        // 1 second per microblock (deterministic interval)
+                        const BLOCK_INTERVAL_SECONDS: u64 = 1;
+                        
+                        // Calculate deterministic timestamp: genesis + (height * interval)
+                        // This ensures ALL nodes calculate the SAME timestamp for the SAME block
+                        GENESIS_TIMESTAMP + (microblock_height * BLOCK_INTERVAL_SECONDS)
+                    };
+                    
                     let mut microblock = qnet_state::MicroBlock {
                         height: microblock_height,
-                        timestamp: SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .map_err(|e| println!("[CONSENSUS] ⚠️ System time error: {}", e))
-                            .unwrap_or_default()
-                            .as_secs(),
+                        timestamp: deterministic_timestamp,  // DETERMINISTIC: Same on all nodes
                         transactions: txs.clone(),
                         producer: format!("microblock_producer_{}", node_id), // Simple producer signature for microblocks
                         signature: vec![0u8; 64], // Will be filled with real signature
@@ -1924,153 +1933,7 @@ impl BlockchainNode {
                         }
                     }
                     
-                    // PRODUCTION: Start consensus SUPER EARLY at block 60 for ZERO downtime
-                    // Consensus takes 30s (commit 15s + reveal 15s), so starting at 60 means it completes by block 90
-                    // This ensures macroblock is ready EXACTLY when needed - Swiss watch precision!
-                    if microblock_height - last_macroblock_trigger == 60 && !consensus_started {
-                        println!("[MACROBLOCK] 🚀 ULTRA-EARLY CONSENSUS START at block {} for ZERO downtime", microblock_height);
-                        consensus_started = true;
-                        
-                        // Start consensus in BACKGROUND while microblocks continue
-                        let consensus_clone = consensus.clone();
-                        let storage_clone = storage.clone();
-                        let node_id_clone = node_id.clone();
-                        let node_type_clone = node_type;
-                        let unified_p2p_clone = unified_p2p.clone();
-                        let consensus_rx_clone = consensus_rx.clone();
-                        let macroblock_trigger = last_macroblock_trigger;
-                        
-                        tokio::spawn(async move {
-                            println!("[MACROBLOCK] 🏛️ Background consensus starting for blocks {}-{}", macroblock_trigger + 1, macroblock_trigger + 90);
-                            
-                            // Run consensus in background
-                            if let Some(ref p2p) = unified_p2p_clone {
-                                let should_initiate = Self::should_initiate_consensus(
-                                    p2p, 
-                                    &node_id_clone, 
-                                    node_type_clone, 
-                                    &storage_clone,
-                                    macroblock_trigger + 90 // Height where macroblock will be created
-                                ).await;
-                                    
-                                    if should_initiate {
-                                match Self::trigger_macroblock_consensus(
-                                    storage_clone,
-                                    consensus_clone,
-                                        macroblock_trigger + 1,
-                                        macroblock_trigger + 90, // Will be block 90
-                                        p2p,
-                                    &node_id_clone,
-                                    node_type_clone,
-                                        &consensus_rx_clone,
-                                ).await {
-                                        Ok(_) => println!("[MACROBLOCK] ✅ Background consensus completed"),
-                                        Err(e) => println!("[MACROBLOCK] ❌ Background consensus failed: {}", e),
-                                    }
-                                }
-                            }
-                        });
-                    }
-                    
-                    // PRODUCTION: NON-BLOCKING MACROBLOCK - Swiss watch precision without stops!
-                    // Microblocks continue flowing while macroblock consensus runs in background
-                    if microblock_height - last_macroblock_trigger == 90 {
-                        // PRODUCTION: Performance report every macroblock
-                        let shard_count = perf_config.shard_count;
-                        let blocks_per_second = 1.0; // 1 microblock per second
-                        let avg_tx_per_block = perf_config.batch_size;
-                        let theoretical_tps = blocks_per_second * avg_tx_per_block as f64 * shard_count as f64;
-                        
-                        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-                        println!("🏗️  MACROBLOCK BOUNDARY | Block {} | Consensus finalizing in background", microblock_height);
-                        println!("⚡ MICROBLOCKS CONTINUE | Zero downtime architecture");
-                        println!("📊 PERFORMANCE: {:.0} TPS capacity ({} shards × {} tx/block)", 
-                                 theoretical_tps, shard_count, avg_tx_per_block);
-                        println!("🚀 QUANTUM OPTIMIZATIONS: Lock-free + Sharding + Parallel validation");
-                        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-                        
-                        // PRODUCTION: Check macroblock status asynchronously (non-blocking)
-                        let storage_check = storage.clone();
-                        let consensus_check = consensus.clone();
-                        let p2p_check = unified_p2p.clone();
-                        let expected_macroblock = microblock_height / 90;
-                        let check_height = microblock_height;
-                        // Store current trigger value for async check (before update)
-                        let current_trigger = last_macroblock_trigger;
-                        
-                        tokio::spawn(async move {
-                            // Give consensus 5 more seconds to complete (total 35s from block 60)
-                            tokio::time::sleep(Duration::from_secs(5)).await;
-                            
-                            // Check if macroblock was created
-                            // Macroblock is saved with key "macroblock_{height}" where height is macroblock number
-                            // For example, first macroblock (at block 90) is saved as "macroblock_1"
-                            let macroblock_exists = storage_check.load_microblock(expected_macroblock * 90 + 1)
-                                .map(|mb| mb.is_some())
-                                .unwrap_or(false);
-                            
-                            if macroblock_exists {
-                                println!("[MACROBLOCK] ✅ Macroblock #{} successfully created in background", expected_macroblock);
-                                // SUCCESS: Macroblock created - trigger was updated correctly
-                            } else {
-                                // FAILURE: Calculate blocks without finalization using ORIGINAL trigger
-                                let blocks_without_finalization = check_height - current_trigger;
-                                println!("[MACROBLOCK] ⚠️ Macroblock #{} not ready after {} blocks since last success", 
-                                         expected_macroblock, blocks_without_finalization);
-                                
-                                // CRITICAL: Progressive Finalization with degradation
-                                Self::activate_progressive_finalization_with_level(
-                                    storage_check,
-                                    consensus_check,
-                                    check_height,
-                                    p2p_check,
-                                    blocks_without_finalization
-                                    ).await;
-                            }
-                        });
-                        
-                        // CRITICAL: Update trigger for NEXT round calculation
-                        // This ensures next macroblock attempt at block 180, not 90 again
-                        last_macroblock_trigger = microblock_height;
-                        consensus_started = false; // Reset for next round
-                        
-                        // CRITICAL: Microblocks continue immediately without ANY pause
-                        println!("[MICROBLOCK] ⚡ Continuing with block #{} - ZERO DOWNTIME", microblock_height + 1);
-                    }
-                    
-                    // CRITICAL: Progressive retry for failed macroblocks
-                    // Check every 30 blocks after macroblock boundary
-                    let blocks_since_trigger = microblock_height - last_macroblock_trigger;
-                    // Retry at blocks 120, 150, 180, 210, 240, 270 (every 30 after 90)
-                    if blocks_since_trigger >= 30 && blocks_since_trigger % 30 == 0 && blocks_since_trigger != 90 {
-                        // Check if macroblock still missing
-                        let expected_macroblock = last_macroblock_trigger / 90;
-                        // Check if macroblock was created by looking for the next microblock
-                        let macroblock_exists = storage.load_microblock(expected_macroblock * 90 + 1)
-                            .map(|mb| mb.is_some())
-                            .unwrap_or(false);
-                        
-                        if !macroblock_exists {
-                            println!("[PFP] ⚠️ {} blocks without macroblock, attempting progressive recovery", blocks_since_trigger);
-                            
-                            let storage_recovery = storage.clone();
-                            let consensus_recovery = consensus.clone();
-                            let p2p_recovery = unified_p2p.clone();
-                            let recovery_height = microblock_height;
-                            
-                            tokio::spawn(async move {
-                                Self::activate_progressive_finalization_with_level(
-                                    storage_recovery,
-                                    consensus_recovery,
-                                    recovery_height,
-                                    p2p_recovery,
-                                    blocks_since_trigger
-                                ).await;
-                            });
-                        } else {
-                            println!("[PFP] ✅ Macroblock #{} found - no recovery needed", expected_macroblock);
-                        }
-                    }
+                    // MOVED: All macroblock logic moved outside producer block (see line ~2248)
                     
                     // Performance monitoring
                     if microblock_height % 100 == 0 {
@@ -2228,6 +2091,167 @@ impl BlockchainNode {
                         println!("[SYNC] ⚠️ No P2P connection - running in standalone mode");
                     }
 
+                }
+                
+                // ══════════════════════════════════════════════════════════════════
+                // CRITICAL: MACROBLOCK CONSENSUS FOR ALL NODES (not just producer!)
+                // ══════════════════════════════════════════════════════════════════
+                
+                // PRODUCTION: Start consensus SUPER EARLY at block 60 for ZERO downtime
+                // Consensus takes 30s (commit 15s + reveal 15s), so starting at 60 means it completes by block 90
+                // This ensures macroblock is ready EXACTLY when needed - Swiss watch precision!
+                if microblock_height - last_macroblock_trigger == 60 && !consensus_started {
+                    println!("[MACROBLOCK] 🚀 ULTRA-EARLY CONSENSUS START at block {} for ZERO downtime", microblock_height);
+                    println!("[MACROBLOCK] 📍 Node: {} | Type: {:?} | ALL NODES PARTICIPATE", node_id, node_type);
+                    consensus_started = true;
+                    
+                    // Start consensus in BACKGROUND while microblocks continue
+                    let consensus_clone = consensus.clone();
+                    let storage_clone = storage.clone();
+                    let node_id_clone = node_id.clone();
+                    let node_type_clone = node_type;
+                    let unified_p2p_clone = unified_p2p.clone();
+                    let consensus_rx_clone = consensus_rx.clone();
+                    let macroblock_trigger = last_macroblock_trigger;
+                    
+                    tokio::spawn(async move {
+                        println!("[MACROBLOCK] 🏛️ Background consensus starting for blocks {}-{}", macroblock_trigger + 1, macroblock_trigger + 90);
+                        
+                        // Run consensus in background
+                        if let Some(ref p2p) = unified_p2p_clone {
+                            let should_initiate = Self::should_initiate_consensus(
+                                p2p, 
+                                &node_id_clone, 
+                                node_type_clone, 
+                                &storage_clone,
+                                macroblock_trigger + 90 // Height where macroblock will be created
+                            ).await;
+                                
+                            // CRITICAL FIX: ALL nodes participate in consensus, not just initiator
+                            // Initiator starts the process, others join when they receive commits
+                            if should_initiate {
+                                println!("[MACROBLOCK] 🎯 We are CONSENSUS INITIATOR - starting macroblock consensus");
+                            } else {
+                                println!("[MACROBLOCK] 👥 We are PARTICIPANT - joining macroblock consensus");
+                            }
+                            
+                            // ALL nodes run consensus (initiator starts, others participate)
+                            match Self::trigger_macroblock_consensus(
+                                storage_clone,
+                                consensus_clone,
+                                    macroblock_trigger + 1,
+                                    macroblock_trigger + 90, // Will be block 90
+                                    p2p,
+                                &node_id_clone,
+                                node_type_clone,
+                                    &consensus_rx_clone,
+                            ).await {
+                                    Ok(_) => println!("[MACROBLOCK] ✅ Background consensus completed"),
+                                    Err(e) => println!("[MACROBLOCK] ❌ Background consensus failed: {}", e),
+                            }
+                        }
+                    });
+                }
+                
+                // PRODUCTION: NON-BLOCKING MACROBLOCK - Swiss watch precision without stops!
+                // Microblocks continue flowing while macroblock consensus runs in background
+                if microblock_height - last_macroblock_trigger == 90 {
+                    // PRODUCTION: Performance report every macroblock
+                    let shard_count = perf_config.shard_count;
+                    let blocks_per_second = 1.0; // 1 microblock per second
+                    let avg_tx_per_block = perf_config.batch_size;
+                    let theoretical_tps = blocks_per_second * avg_tx_per_block as f64 * shard_count as f64;
+                    
+                    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+                    println!("🏗️  MACROBLOCK BOUNDARY | Block {} | Consensus finalizing in background", microblock_height);
+                    println!("⚡ MICROBLOCKS CONTINUE | Zero downtime architecture");
+                    println!("📊 PERFORMANCE: {:.0} TPS capacity ({} shards × {} tx/block)", 
+                             theoretical_tps, shard_count, avg_tx_per_block);
+                    println!("🚀 QUANTUM OPTIMIZATIONS: Lock-free + Sharding + Parallel validation");
+                    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+                    println!("[MACROBLOCK] 🌐 ALL NODES see this boundary - not just producer!");
+                    
+                    // PRODUCTION: Check macroblock status asynchronously (non-blocking)
+                    let storage_check = storage.clone();
+                    let consensus_check = consensus.clone();
+                    let p2p_check = unified_p2p.clone();
+                    let expected_macroblock = microblock_height / 90;
+                    let check_height = microblock_height;
+                    // Store current trigger value for async check (before update)
+                    let current_trigger = last_macroblock_trigger;
+                    
+                    tokio::spawn(async move {
+                        // Give consensus 5 more seconds to complete (total 35s from block 60)
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        
+                        // Check if macroblock was created
+                        // Macroblock is saved with key "macroblock_{height}" where height is macroblock number
+                        // For example, first macroblock (at block 90) is saved as "macroblock_1"
+                        let macroblock_exists = storage_check.load_microblock(expected_macroblock * 90 + 1)
+                            .map(|mb| mb.is_some())
+                            .unwrap_or(false);
+                        
+                        if macroblock_exists {
+                            println!("[MACROBLOCK] ✅ Macroblock #{} successfully created in background", expected_macroblock);
+                            // SUCCESS: Macroblock created - trigger was updated correctly
+                        } else {
+                            // FAILURE: Calculate blocks without finalization using ORIGINAL trigger
+                            let blocks_without_finalization = check_height - current_trigger;
+                            println!("[MACROBLOCK] ⚠️ Macroblock #{} not ready after {} blocks since last success", 
+                                     expected_macroblock, blocks_without_finalization);
+                            
+                            // CRITICAL: Progressive Finalization with degradation
+                            Self::activate_progressive_finalization_with_level(
+                                storage_check,
+                                consensus_check,
+                                check_height,
+                                p2p_check,
+                                blocks_without_finalization
+                                ).await;
+                        }
+                    });
+                    
+                    // CRITICAL: Update trigger for NEXT round calculation
+                    // This ensures next macroblock attempt at block 180, not 90 again
+                    last_macroblock_trigger = microblock_height;
+                    consensus_started = false; // Reset for next round
+                    
+                    // CRITICAL: Microblocks continue immediately without ANY pause
+                    println!("[MICROBLOCK] ⚡ Continuing with block #{} - ZERO DOWNTIME", microblock_height + 1);
+                }
+                
+                // CRITICAL: Progressive retry for failed macroblocks
+                // Check every 30 blocks after macroblock boundary
+                let blocks_since_trigger = microblock_height - last_macroblock_trigger;
+                // Retry at blocks 120, 150, 180, 210, 240, 270 (every 30 after 90)
+                if blocks_since_trigger >= 30 && blocks_since_trigger % 30 == 0 && blocks_since_trigger != 90 {
+                    // Check if macroblock still missing
+                    let expected_macroblock = last_macroblock_trigger / 90;
+                    // Check if macroblock was created by looking for the next microblock
+                    let macroblock_exists = storage.load_microblock(expected_macroblock * 90 + 1)
+                        .map(|mb| mb.is_some())
+                        .unwrap_or(false);
+                    
+                    if !macroblock_exists {
+                        println!("[PFP] ⚠️ {} blocks without macroblock, attempting progressive recovery", blocks_since_trigger);
+                        
+                        let storage_recovery = storage.clone();
+                        let consensus_recovery = consensus.clone();
+                        let p2p_recovery = unified_p2p.clone();
+                        let recovery_height = microblock_height;
+                        
+                        tokio::spawn(async move {
+                            Self::activate_progressive_finalization_with_level(
+                                storage_recovery,
+                                consensus_recovery,
+                                recovery_height,
+                                p2p_recovery,
+                                blocks_since_trigger
+                            ).await;
+                        });
+                    } else {
+                        println!("[PFP] ✅ Macroblock #{} found - no recovery needed", expected_macroblock);
+                    }
                 }
                 
                 // PRECISION TIMING: Sleep until exact next block time (no drift accumulation)
@@ -3454,12 +3478,19 @@ impl BlockchainNode {
         let microblock_count = microblock_hashes.len();
         
         // Create emergency macroblock
+        // CRITICAL: Deterministic timestamp for macroblock consensus
+        let deterministic_timestamp = {
+            const GENESIS_TIMESTAMP: u64 = 1704067200;  // January 1, 2024 00:00:00 UTC
+            const MACROBLOCK_INTERVAL_SECONDS: u64 = 90;  // 90 seconds per macroblock (90 microblocks)
+            
+            // Macroblock timestamp = genesis + (macroblock_height * 90 seconds)
+            let macroblock_height = height / 90;
+            GENESIS_TIMESTAMP + (macroblock_height * MACROBLOCK_INTERVAL_SECONDS)
+        };
+        
         let macroblock = qnet_state::MacroBlock {
             height: height / 90,
-            timestamp: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
+            timestamp: deterministic_timestamp,  // DETERMINISTIC: Same on all nodes
             micro_blocks: microblock_hashes,
             state_root: state_accumulator,
             consensus_data,
@@ -4427,9 +4458,18 @@ impl BlockchainNode {
             .unwrap_or([0u8; 32]);
         
         // Create production macroblock with REAL consensus data
+        // CRITICAL: Deterministic timestamp for macroblock consensus
+        let deterministic_timestamp = {
+            const GENESIS_TIMESTAMP: u64 = 1704067200;  // January 1, 2024 00:00:00 UTC
+            const MACROBLOCK_INTERVAL_SECONDS: u64 = 90;  // 90 seconds per macroblock
+            
+            // Use consensus round number as macroblock height
+            GENESIS_TIMESTAMP + (consensus_data.round_number * MACROBLOCK_INTERVAL_SECONDS)
+        };
+        
         let macroblock = qnet_state::MacroBlock {
             height: consensus_data.round_number,
-            timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            timestamp: deterministic_timestamp,  // DETERMINISTIC: Same on all nodes
             micro_blocks: microblock_hashes,
             state_root: state_accumulator, // Real accumulated state
             consensus_data: qnet_state::ConsensusData {
