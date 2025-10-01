@@ -102,6 +102,13 @@ Activation cost decreases as more supply is burned:
 - **Schedule:** Daily linear vesting over 2 weeks
 - **Purpose:** Initial project funding and development
 
+### Pool 3 - Strategic Reserve
+- **Contract Address:** `BQZvm5cBWFnKBVHVYZf63wM96YqtQM6V5vMiCDFXUEvz`
+- **Platform:** Streamflow Finance
+- **Amount:** 50,000,000 1DEV
+- **Schedule:** Quarterly releases over 24 months
+- **Purpose:** Long-term project commitment and stability
+
 ## Economic Model
 
 ### No Traditional Staking
@@ -113,7 +120,7 @@ Activation cost decreases as more supply is burned:
 ### Developer Commitment
 - **Total Investment:** $4,000+ personal funds since March 2025
 - **Development Time:** 6+ months full-time development
-- **Code Written:** 500,000+ lines of code
+- **Code Written:** 200,000+ lines of code
 - **Sales Policy:** Zero tokens sold since launch
 
 ### Burn Economics
