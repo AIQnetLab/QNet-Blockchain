@@ -16,7 +16,7 @@ use base64::Engine;
 use sha3::{Sha3_256, Digest};
 
 // Import QNet consensus components for proper peer validation
-use qnet_consensus::reputation::{NodeReputation, ReputationConfig};
+use qnet_consensus::reputation::{NodeReputation, ReputationConfig, MaliciousBehavior};
 use qnet_consensus::{commit_reveal::{Commit, Reveal}, ConsensusEngine};
 
 // DYNAMIC NETWORK DETECTION - No timestamp dependency for robust deployment
@@ -5767,6 +5767,37 @@ impl SimplifiedP2P {
         timestamp: u64
     ) {
         println!("[FAILOVER] 📨 Processing emergency {} producer change notification", change_type);
+        
+        // CHECK FOR CRITICAL ATTACKS
+        let is_critical_attack = change_type.contains("CRITICAL") || 
+                                  change_type == "CRITICAL_STORAGE_DELETION" ||
+                                  change_type == "DATABASE_SUBSTITUTION" ||
+                                  change_type == "CHAIN_FORK";
+        
+        if is_critical_attack {
+            println!("[SECURITY] 🚨🚨🚨 CRITICAL ATTACK DETECTED! 🚨🚨🚨");
+            println!("[SECURITY] 🚨 Producer: {} committed CRITICAL violation!", failed_producer);
+            println!("[SECURITY] 🚨 Attack type: {} at block #{}", change_type, block_height);
+            println!("[SECURITY] 🚨 APPLYING INSTANT MAXIMUM BAN (1 YEAR)!");
+            
+            // Apply instant reputation destruction
+            self.update_node_reputation(&failed_producer, -100.0);
+            
+            // Report to reputation system for jail
+            if let Ok(mut reputation) = self.reputation_system.lock() {
+                let behavior = match change_type.as_str() {
+                    "CRITICAL_STORAGE_DELETION" => MaliciousBehavior::StorageDeletion,
+                    "DATABASE_SUBSTITUTION" => MaliciousBehavior::DatabaseSubstitution,
+                    "CHAIN_FORK" => MaliciousBehavior::ChainFork,
+                    _ => MaliciousBehavior::ProtocolViolation,
+                };
+                reputation.jail_node(&failed_producer, behavior);
+            }
+            
+            println!("[SECURITY] ✅ Node {} banned for 1 year, reputation destroyed", failed_producer);
+            return;
+        }
+        
         // PRIVACY: Use privacy-preserving identifiers in logs
         println!("[FAILOVER] 💀 Failed producer: {} at block #{}", get_privacy_id_for_addr(&failed_producer), block_height);
         println!("[FAILOVER] 🆘 New producer: {} (emergency activation)", get_privacy_id_for_addr(&new_producer));
@@ -6047,6 +6078,66 @@ impl SimplifiedP2P {
                 }
             }
         });
+    }
+    
+    /// Report critical attack to network for instant ban
+    pub fn report_critical_attack(
+        &self,
+        attacker: &str,
+        attack_type: MaliciousBehavior,
+        block_height: u64,
+        evidence: &str
+    ) -> Result<(), String> {
+        println!("[SECURITY] 🚨🚨🚨 REPORTING CRITICAL ATTACK TO NETWORK! 🚨🚨🚨");
+        println!("[SECURITY] 🚨 Attacker: {}", attacker);
+        println!("[SECURITY] 🚨 Attack type: {:?}", attack_type);
+        println!("[SECURITY] 🚨 Evidence: {}", evidence);
+        
+        // Determine emergency message type based on attack
+        let change_type = match attack_type {
+            MaliciousBehavior::DatabaseSubstitution => "DATABASE_SUBSTITUTION",
+            MaliciousBehavior::ChainFork => "CHAIN_FORK",
+            MaliciousBehavior::StorageDeletion => "CRITICAL_STORAGE_DELETION",
+            _ => "CRITICAL_ATTACK",
+        };
+        
+        // Select new emergency producer (anyone but the attacker)
+        let new_producer = self.select_emergency_producer_excluding(attacker, block_height);
+        
+        // Broadcast critical attack to all peers
+        self.broadcast_emergency_producer_change(
+            attacker,
+            &new_producer,
+            block_height,
+            change_type
+        )?;
+        
+        // Apply instant ban locally
+        self.update_node_reputation(attacker, -100.0);
+        
+        // Jail for 1 year
+        if let Ok(mut reputation) = self.reputation_system.lock() {
+            reputation.jail_node(attacker, attack_type);
+        }
+        
+        println!("[SECURITY] ✅ Critical attack reported, {} banned network-wide", attacker);
+        Ok(())
+    }
+    
+    fn select_emergency_producer_excluding(&self, exclude: &str, height: u64) -> String {
+        // Select any other active peer as emergency producer
+        for entry in self.connected_peers_lockfree.iter() {
+            let peer = entry.value();
+            if peer.id != exclude && peer.reputation_score > 70.0 {  // Use minimum consensus threshold
+                return peer.id.clone();
+            }
+        }
+        // Fallback to self if no other peers
+        if self.node_id != exclude {
+            self.node_id.clone()
+        } else {
+            "emergency_consensus".to_string()
+        }
     }
     
     /// Broadcast emergency producer change to network

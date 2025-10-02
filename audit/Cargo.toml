@@ -67,6 +67,10 @@ path = "tests/consensus_audit.rs"
 name = "consensus_scalability"
 path = "tests/consensus_scalability_tests.rs"
 
+[[test]]
+name = "critical_attacks"
+path = "tests/critical_attacks_test.rs"
+
 [[bench]]
 name = "storage_benchmarks"
 harness = false

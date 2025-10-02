@@ -14,7 +14,16 @@ QNet is a high-performance, post-quantum secure blockchain network with a **two-
 - **Phase 2 (Future)**: ONLY QNC token activation on QNet blockchain
 - **Transition**: 90% 1DEV burned OR 5 years from genesis block (whichever comes first)
 
-### 🛡️ **LATEST UPDATES (v2.13.0)**
+### 🛡️ **LATEST UPDATES (v2.14.0)**
+- **Chain Integrity Validation**: Full verification of previous_hash in all blocks
+- **Database Substitution Protection**: Detects and rejects forked/manipulated chains
+- **Enhanced Synchronization Protection**: New nodes must fully sync before consensus participation
+- **Storage Failure Handling**: Immediate failover if database fails during block production
+- **Stricter Genesis Phase**: Only 1 block tolerance during first 10 blocks (prevents attacks)
+- **Data Persistence Fix**: Removed /tmp fallback, enforces persistent Docker volumes
+- **Global Sync Flag**: NODE_IS_SYNCHRONIZED prevents unsynchronized consensus participation
+
+### **Previous Updates (v2.13.0)**
 - **Atomic Rotation Rewards**: One +30 reward per full 30-block rotation (not 30x +1)
 - **Activity-Based Recovery**: Reputation only recovers if node had recent ping activity
 - **Self-Penalty Fix**: All failovers now apply -20 penalty, even voluntary ones

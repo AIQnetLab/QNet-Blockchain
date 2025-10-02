@@ -26,7 +26,7 @@ pub use batch_operations::{
 };
 pub use commit_reveal::{CommitRevealConsensus, ConsensusConfig};
 pub use errors::ConsensusError;
-pub use reputation::{NodeReputation, ReputationConfig};
+pub use reputation::{NodeReputation, ReputationConfig, MaliciousBehavior};
 pub use kademlia::{KademliaDht, KademliaNode, generate_node_id};
 
 // Common types used across modules

@@ -3773,13 +3773,33 @@ async fn try_query_node(addr: &str) -> Result<NodeInfo, String> {
 async fn select_best_data_directory() -> Result<PathBuf, Box<dyn std::error::Error>> {
     println!("🔍 Selecting optimal data directory for server deployment...");
     
-    // PRODUCTION: Docker container - use container filesystem
+    // PRODUCTION: Docker container - use mounted volume
     if std::env::var("DOCKER_ENV").is_ok() {
-        let docker_blockchain_dir = PathBuf::from("/app/data/blockchain");
-        println!("🐳 Docker environment detected - using container filesystem");
-        std::fs::create_dir_all(&docker_blockchain_dir)?;
-        println!("✅ Using Docker container directory: {:?}", docker_blockchain_dir);
-        return Ok(docker_blockchain_dir);
+        // First check if QNET_DATA_DIR is explicitly set
+        if let Ok(data_dir) = std::env::var("QNET_DATA_DIR") {
+            let path = PathBuf::from(data_dir);
+            if test_directory_permissions(&path).await {
+                println!("✅ Using Docker volume (QNET_DATA_DIR): {:?}", path);
+                return Ok(path);
+            }
+        }
+        
+        // Check standard Docker mount points
+        let docker_data = PathBuf::from("/app/data");
+        if test_directory_permissions(&docker_data).await {
+            println!("✅ Using Docker volume: {:?}", docker_data);
+            return Ok(docker_data);
+        }
+        
+        // Fallback to /app/node_data for backward compatibility
+        let docker_node_data = PathBuf::from("/app/node_data");
+        if test_directory_permissions(&docker_node_data).await {
+            println!("✅ Using Docker volume: {:?}", docker_node_data);
+            return Ok(docker_node_data);
+        }
+        
+        // If Docker but no mounted volume, error out
+        return Err("Docker environment detected but no volume mounted! Mount a volume to /app/data".into());
     }
     
     // Option 1: Current directory (preferred for bare metal)
@@ -3805,13 +3825,9 @@ async fn select_best_data_directory() -> Result<PathBuf, Box<dyn std::error::Err
         return Ok(system_dir);
     }
     
-    // Option 4: Temporary directory (last resort)
-    let temp_dir = PathBuf::from("/tmp/qnet_node_data");
-    if test_directory_permissions(&temp_dir).await {
-        println!("⚠️  Using temporary directory: {:?}", temp_dir);
-        println!("   💡 For production, please create /var/lib/qnet with proper permissions");
-        return Ok(temp_dir);
-    }
+    // CRITICAL: Never use /tmp for production data!
+    // Data in /tmp will be lost on container restart or system reboot
+    // Removed /tmp fallback to prevent data loss
     
     // If all options fail, show help
     println!("❌ Cannot find writable directory for QNet node data!");

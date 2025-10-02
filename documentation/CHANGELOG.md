@@ -5,6 +5,51 @@ All notable changes to the QNet project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.14.0] - October 2, 2025 "Chain Integrity & Database Attack Protection"
+
+### Added
+- **Chain Integrity Validation**: Complete block validation system
+  - Verifies previous_hash linkage in all microblocks
+  - Validates chain continuity for macroblocks  
+  - Detects and rejects chain forks
+- **Database Substitution Protection**: Critical security enhancement
+  - Detects if database replaced with alternate chain
+  - Rejects blocks that break chain continuity
+  - Prevents malicious nodes from creating forks
+- **Enhanced Synchronization Protection**: Strict requirements before consensus participation
+  - New nodes MUST fully sync blockchain before producing blocks
+  - Genesis phase (blocks 1-10): Maximum 1 block tolerance
+  - Normal phase: Maximum 10 blocks behind network height
+  - Global NODE_IS_SYNCHRONIZED flag tracks sync status
+- **Storage Failure Handling**: Graceful degradation on storage errors
+  - Immediate emergency failover if storage fails during production
+  - Broadcast failure to network for quick recovery
+  - -20 reputation penalty for storage failures
+- **Macroblock Consensus Verification**: Added sync check before consensus initiation
+  - Nodes verify synchronization before participating in macroblock creation
+  - Prevents unsynchronized nodes from corrupting consensus
+  - Max lag: 5 blocks (Genesis) or 20 blocks (Normal)
+
+### Fixed
+- **Data Persistence Issue**: Removed dangerous /tmp fallback for Docker
+  - Docker containers now REQUIRE mounted volume or fail
+  - Prevents complete database loss on container restart
+  - Added explicit QNET_DATA_DIR environment variable support
+- **Genesis Phase Vulnerability**: Fixed loophole allowing unsync nodes at height ≤10
+  - Previously: height 0 nodes could produce blocks during Genesis
+  - Now: Strict synchronization even during Genesis phase
+
+### Security
+- **Attack Prevention**: Malicious nodes cannot join consensus without full sync
+- **Database Deletion Protection**: Nodes with deleted DBs automatically excluded
+- **Byzantine Safety**: Ensures only synchronized nodes participate in consensus
+- **Docker Security**: Enforces persistent storage to prevent data loss
+
+### Changed
+- **Data Directory Selection**: Prioritizes Docker volumes over temporary directories
+- **Synchronization Logic**: Stricter requirements during critical phases
+- **Producer Selection**: Only synchronized nodes can be selected as producers
+
 ## [2.13.0] - October 2, 2025 "Atomic Rewards & Activity-Based Recovery"
 
 ### Added

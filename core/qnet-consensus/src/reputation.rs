@@ -101,6 +101,11 @@ pub enum MaliciousBehavior {
     NetworkFlooding,      // DDoS-like behavior
     InvalidConsensus,     // Malformed consensus messages
     ProtocolViolation,    // Other protocol violations
+    
+    // CRITICAL ATTACKS - Instant maximum ban
+    DatabaseSubstitution, // Attempted to substitute DB with alternate chain
+    ChainFork,           // Created or promoted a fork of the chain
+    StorageDeletion,     // Deleted database while being active producer
 }
 
 /// Node reputation manager - PRODUCTION: Optimized for millions of nodes
@@ -379,20 +384,37 @@ impl NodeReputation {
             .or_insert_with(Vec::new)
             .push((behavior.clone(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()));
         
+        // CRITICAL: Check for instant max ban offenses
+        let is_critical_attack = matches!(behavior, 
+            MaliciousBehavior::DatabaseSubstitution | 
+            MaliciousBehavior::ChainFork | 
+            MaliciousBehavior::StorageDeletion
+        );
+        
         // Get jail count
-        let jail_count = self.jailed_nodes
-            .get(node_id)
-            .map(|js| js.jail_count + 1)
-            .unwrap_or(1);
+        let jail_count = if is_critical_attack {
+            // Critical attacks get instant max jail count
+            999  // This will trigger maximum jail duration
+        } else {
+            self.jailed_nodes
+                .get(node_id)
+                .map(|js| js.jail_count + 1)
+                .unwrap_or(1)
+        };
         
         // Calculate jail duration based on offense count - SAME FOR ALL NODES
-        let jail_hours = match jail_count {
-            1 => 1,           // First offense: 1 hour
-            2 => 24,          // Second: 24 hours
-            3 => 168,         // Third: 7 days
-            4 => 720,         // Fourth: 30 days
-            5 => 2160,        // Fifth: 3 months
-            _ => 8760,        // 6+ offenses: 1 year max for ALL nodes (full equality)
+        let jail_hours = if is_critical_attack {
+            // CRITICAL ATTACKS: Instant maximum ban (1 year)
+            8760
+        } else {
+            match jail_count {
+                1 => 1,           // First offense: 1 hour
+                2 => 24,          // Second: 24 hours
+                3 => 168,         // Third: 7 days
+                4 => 720,         // Fourth: 30 days
+                5 => 2160,        // Fifth: 3 months
+                _ => 8760,        // 6+ offenses: 1 year max for ALL nodes (full equality)
+            }
         };
         
         let jailed_until = SystemTime::now()
@@ -421,6 +443,11 @@ impl NodeReputation {
             MaliciousBehavior::NetworkFlooding => 10.0,
             MaliciousBehavior::InvalidConsensus => 5.0,
             MaliciousBehavior::ProtocolViolation => 15.0,
+            
+            // CRITICAL ATTACKS - Maximum penalty (instant reputation destruction)
+            MaliciousBehavior::DatabaseSubstitution => 100.0,  // Full reputation loss
+            MaliciousBehavior::ChainFork => 100.0,             // Full reputation loss
+            MaliciousBehavior::StorageDeletion => 100.0,       // Full reputation loss
         };
         
         // Apply penalty equally to ALL nodes - no special protection
