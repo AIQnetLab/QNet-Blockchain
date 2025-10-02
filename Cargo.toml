@@ -5,7 +5,8 @@ members = [
     "core/qnet-mempool",
     "core/qnet-state",
     "core/qnet-sharding",
-    "development/qnet-integration"
+    "development/qnet-integration",
+    "audit"
 ]
 resolver = "2"
 
