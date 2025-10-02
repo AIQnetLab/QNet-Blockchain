@@ -4731,8 +4731,19 @@ impl SimplifiedP2P {
 
             NetworkMessage::EmergencyProducerChange { failed_producer, new_producer, block_height, change_type, timestamp } => {
                 // PRIVACY: Use privacy-preserving IDs for producer changes
-                let failed_id = get_privacy_id_for_addr(&failed_producer);
-                let new_id = get_privacy_id_for_addr(&new_producer);
+                // CRITICAL FIX: Don't double-convert if already a pseudonym (genesis_node_XXX or node_XXX)
+                let failed_id = if failed_producer.starts_with("genesis_node_") || failed_producer.starts_with("node_") {
+                    failed_producer.clone()  // Already a pseudonym, keep as-is
+                } else {
+                    get_privacy_id_for_addr(&failed_producer)  // Convert IP to pseudonym
+                };
+                
+                let new_id = if new_producer.starts_with("genesis_node_") || new_producer.starts_with("node_") {
+                    new_producer.clone()  // Already a pseudonym, keep as-is
+                } else {
+                    get_privacy_id_for_addr(&new_producer)  // Convert IP to pseudonym
+                };
+                
                 println!("[FAILOVER] 🚨 Emergency producer change: {} → {} at block #{} ({})", 
                          failed_id, new_id, block_height, change_type);
                 self.handle_emergency_producer_change(failed_producer, new_producer, block_height, change_type, timestamp);
@@ -5387,7 +5398,14 @@ impl SimplifiedP2P {
     pub fn update_node_reputation(&self, node_id: &str, delta: f64) {
         if let Ok(mut reputation) = self.reputation_system.lock() {
             reputation.update_reputation(node_id, delta);
-            println!("[P2P] 📊 Updated reputation for {}: delta {:.1}", node_id, delta);
+            
+            // PRIVACY: Use pseudonym for logging (don't double-convert if already pseudonym)
+            let display_id = if node_id.starts_with("genesis_node_") || node_id.starts_with("node_") {
+                node_id.to_string()
+            } else {
+                get_privacy_id_for_addr(node_id)
+            };
+            println!("[P2P] 📊 Updated reputation for {}: delta {:.1}", display_id, delta);
         }
     }
     
@@ -5395,7 +5413,14 @@ impl SimplifiedP2P {
     pub fn set_node_reputation(&self, node_id: &str, reputation: f64) {
         if let Ok(mut rep_system) = self.reputation_system.lock() {
             rep_system.set_reputation(node_id, reputation);
-            println!("[P2P] 🔐 Set absolute reputation for {}: {:.1}%", node_id, reputation);
+            
+            // PRIVACY: Use pseudonym for logging (don't double-convert if already pseudonym)
+            let display_id = if node_id.starts_with("genesis_node_") || node_id.starts_with("node_") {
+                node_id.to_string()
+            } else {
+                get_privacy_id_for_addr(node_id)
+            };
+            println!("[P2P] 🔐 Set absolute reputation for {}: {:.1}%", display_id, reputation);
         }
     }
     
@@ -5799,8 +5824,20 @@ impl SimplifiedP2P {
         }
         
         // PRIVACY: Use privacy-preserving identifiers in logs
-        println!("[FAILOVER] 💀 Failed producer: {} at block #{}", get_privacy_id_for_addr(&failed_producer), block_height);
-        println!("[FAILOVER] 🆘 New producer: {} (emergency activation)", get_privacy_id_for_addr(&new_producer));
+        // CRITICAL FIX: Don't double-convert if already a pseudonym
+        let failed_display = if failed_producer.starts_with("genesis_node_") || failed_producer.starts_with("node_") {
+            failed_producer.clone()
+        } else {
+            get_privacy_id_for_addr(&failed_producer)
+        };
+        let new_display = if new_producer.starts_with("genesis_node_") || new_producer.starts_with("node_") {
+            new_producer.clone()
+        } else {
+            get_privacy_id_for_addr(&new_producer)
+        };
+        
+        println!("[FAILOVER] 💀 Failed producer: {} at block #{}", failed_display, block_height);
+        println!("[FAILOVER] 🆘 New producer: {} (emergency activation)", new_display);
         
         // CRITICAL FIX: Don't penalize placeholder nodes only
         if failed_producer == "unknown_leader" || 
@@ -5817,13 +5854,26 @@ impl SimplifiedP2P {
         if failed_producer == self.node_id {
             println!("[REPUTATION] ⚔️ Self-penalty applied: -20.0 reputation (failover)");
         } else {
-            println!("[REPUTATION] ⚔️ Network-wide penalty for {}: -20.0 reputation (emergency change)", failed_producer);
+            // PRIVACY: Use pseudonym for logging (don't double-convert if already pseudonym)
+            let display_id = if failed_producer.starts_with("genesis_node_") || failed_producer.starts_with("node_") {
+                failed_producer.clone()
+            } else {
+                get_privacy_id_for_addr(&failed_producer)
+            };
+            println!("[REPUTATION] ⚔️ Network-wide penalty for {}: -20.0 reputation (emergency change)", display_id);
         }
         
         // Boost reputation of emergency producer for taking over
         if new_producer != "emergency_consensus" && new_producer != self.node_id {
             self.update_node_reputation(&new_producer, 5.0);
-            println!("[REPUTATION] ✅ Emergency producer {} rewarded: +5.0 reputation (network service)", new_producer);
+            
+            // PRIVACY: Use pseudonym for logging (don't double-convert if already pseudonym)
+            let display_id = if new_producer.starts_with("genesis_node_") || new_producer.starts_with("node_") {
+                new_producer.clone()
+            } else {
+                get_privacy_id_for_addr(&new_producer)
+            };
+            println!("[REPUTATION] ✅ Emergency producer {} rewarded: +5.0 reputation (network service)", display_id);
         }
         
         // Log emergency change for network transparency
