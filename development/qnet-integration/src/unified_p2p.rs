@@ -343,12 +343,19 @@ impl SimplifiedP2P {
                 if let Ok(bootstrap_id) = std::env::var("QNET_BOOTSTRAP_ID") {
                     match bootstrap_id.as_str() {
                         "001" | "002" | "003" | "004" | "005" => {
-                            println!("[P2P] 🛡️ Genesis node {} (ID: {}) detected - reputation will be initialized by consensus system", bootstrap_id, node_id);
+                            // PRIVACY: Don't show node_id even in local logs
+                            println!("[P2P] 🛡️ Genesis node {} detected - reputation will be initialized by consensus system", bootstrap_id);
                         }
                         _ => {}
                     }
                 } else if std::env::var("QNET_GENESIS_BOOTSTRAP").unwrap_or_default() == "1" {
-                    println!("[P2P] 🛡️ Legacy Genesis node {} detected - reputation will be initialized by consensus system", node_id);
+                    // PRIVACY: Show pseudonym instead of node_id
+                    let display_id = if node_id.starts_with("genesis_node_") || node_id.starts_with("node_") {
+                        node_id.clone()
+                    } else {
+                        get_privacy_id_for_addr(&node_id)
+                    };
+                    println!("[P2P] 🛡️ Legacy Genesis node {} detected - reputation will be initialized by consensus system", display_id);
                 } else {
                     // Check activation code for Genesis codes
                     if let Ok(activation_code) = std::env::var("QNET_ACTIVATION_CODE") {
@@ -356,7 +363,8 @@ impl SimplifiedP2P {
                         
                         for genesis_code in GENESIS_BOOTSTRAP_CODES {
                             if activation_code == *genesis_code {
-                                println!("[P2P] 🛡️ Genesis activation code {} (node: {}) detected - reputation will be initialized by consensus system", genesis_code, node_id);
+                                // PRIVACY: Don't show node_id even in local logs
+                                println!("[P2P] 🛡️ Genesis activation code {} detected - reputation will be initialized by consensus system", genesis_code);
                                 break;
                             }
                         }
@@ -385,8 +393,16 @@ impl SimplifiedP2P {
     /// Start simplified P2P network with load balancing
     pub fn start(&self) {
         println!("[P2P] Starting P2P network with intelligent load balancing");
+        
+        // PRIVACY: Use pseudonym even in startup logs
+        let display_id = if self.node_id.starts_with("genesis_node_") || self.node_id.starts_with("node_") {
+            self.node_id.clone()
+        } else {
+            get_privacy_id_for_addr(&self.node_id)
+        };
+        
         println!("[P2P] Node: {} | Type: {:?} | Region: {:?}", 
-                 self.node_id, self.node_type, self.region);
+                 display_id, self.node_type, self.region);
         
         // Check channel states at startup (logging removed for performance)
         match &self.consensus_tx {
@@ -5819,7 +5835,13 @@ impl SimplifiedP2P {
                 reputation.jail_node(&failed_producer, behavior);
             }
             
-            println!("[SECURITY] ✅ Node {} banned for 1 year, reputation destroyed", failed_producer);
+            // PRIVACY: Use pseudonym for logging
+            let display_id = if failed_producer.starts_with("genesis_node_") || failed_producer.starts_with("node_") {
+                failed_producer.clone()
+            } else {
+                get_privacy_id_for_addr(&failed_producer)
+            };
+            println!("[SECURITY] ✅ Node {} banned for 1 year, reputation destroyed", display_id);
             return;
         }
         
@@ -5887,14 +5909,21 @@ impl SimplifiedP2P {
     
     /// PRODUCTION: Handle reputation synchronization from peers
     fn handle_reputation_sync(&self, from_node: String, reputation_updates: Vec<(String, f64)>, timestamp: u64, signature: Vec<u8>) {
-        println!("[REPUTATION] 📨 Processing reputation sync from {} with {} updates", from_node, reputation_updates.len());
+        // PRIVACY: Use pseudonym for logging
+        let from_display = if from_node.starts_with("genesis_node_") || from_node.starts_with("node_") {
+            from_node.clone()
+        } else {
+            get_privacy_id_for_addr(&from_node)
+        };
+        
+        println!("[REPUTATION] 📨 Processing reputation sync from {} with {} updates", from_display, reputation_updates.len());
         
         // PRODUCTION: Verify signature for Byzantine safety using SHA3-256
         // Uses quantum-resistant CRYSTALS-Dilithium for Genesis nodes
         let is_valid = self.verify_reputation_signature(&from_node, &reputation_updates, timestamp, &signature);
         
         if !is_valid {
-            println!("[REPUTATION] ❌ Invalid signature from {} - ignoring reputation updates", from_node);
+            println!("[REPUTATION] ❌ Invalid signature from {} - ignoring reputation updates", from_display);
             return;
         }
         
@@ -5909,8 +5938,16 @@ impl SimplifiedP2P {
                 // Only update if change is significant (>1%)
                 if (weighted_reputation - current).abs() > 1.0 {
                     reputation_system.set_reputation(&node_id, weighted_reputation);
+                    
+                    // PRIVACY: Use pseudonyms for logging
+                    let node_display = if node_id.starts_with("genesis_node_") || node_id.starts_with("node_") {
+                        node_id.clone()
+                    } else {
+                        get_privacy_id_for_addr(&node_id)
+                    };
+                    
                     println!("[REPUTATION] 📊 Updated {} reputation: {:.1} → {:.1} (sync from {})", 
-                            node_id, current, weighted_reputation, from_node);
+                            node_display, current, weighted_reputation, from_display);
                 }
             }
         }
@@ -6031,7 +6068,14 @@ impl SimplifiedP2P {
         let peer_shards = self.peer_shards.clone();
         
         thread::spawn(move || {
-            println!("[REPUTATION] 🔄 Starting reputation sync task for {}", node_id);
+            // PRIVACY: Use pseudonym for logging
+            let display_id = if node_id.starts_with("genesis_node_") || node_id.starts_with("node_") {
+                node_id.clone()
+            } else {
+                get_privacy_id_for_addr(&node_id)
+            };
+            
+            println!("[REPUTATION] 🔄 Starting reputation sync task for {}", display_id);
             let mut iteration = 0u64;
             
             loop {

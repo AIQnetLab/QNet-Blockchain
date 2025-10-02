@@ -14,14 +14,21 @@ QNet is a high-performance, post-quantum secure blockchain network with a **two-
 - **Phase 2 (Future)**: ONLY QNC token activation on QNet blockchain
 - **Transition**: 90% 1DEV burned OR 5 years from genesis block (whichever comes first)
 
-### 🛡️ **LATEST UPDATES (v2.14.0)**
+### 🛡️ **LATEST UPDATES (v2.15.0)**
+- **AES-256-GCM Database Encryption**: Quantum-resistant protection for activation codes
+- **No Encryption Keys in Database**: Keys derived from activation code only
+- **Critical Attack Protection**: Instant 1-year ban for database attacks (substitution, deletion, fork)
+- **Privacy-Preserving Pseudonyms**: Enhanced network topology protection (14 log locations)
+- **Genesis Bootstrap Grace**: 15-second timeout for first block (prevents false failover)
+- **Genesis Wallet Synchronization**: Unified wallet format across all modules
+- **Comprehensive Security Tests**: 52 total tests (9 new activation security tests)
+
+### **Previous Updates (v2.14.0)**
 - **Chain Integrity Validation**: Full verification of previous_hash in all blocks
 - **Database Substitution Protection**: Detects and rejects forked/manipulated chains
 - **Enhanced Synchronization Protection**: New nodes must fully sync before consensus participation
 - **Storage Failure Handling**: Immediate failover if database fails during block production
-- **Stricter Genesis Phase**: Only 1 block tolerance during first 10 blocks (prevents attacks)
 - **Data Persistence Fix**: Removed /tmp fallback, enforces persistent Docker volumes
-- **Global Sync Flag**: NODE_IS_SYNCHRONIZED prevents unsynchronized consensus participation
 
 ### **Previous Updates (v2.13.0)**
 - **Atomic Rotation Rewards**: One +30 reward per full 30-block rotation (not 30x +1)
@@ -1519,9 +1526,14 @@ Year 10+:   ~300+ GB    🔧 Increase to 500-1000 GB
 
 ### 🛡️ Security Features
 
-- **Post-quantum crypto**: Always enabled
+- **Post-quantum crypto**: Always enabled (CRYSTALS-Dilithium, AES-256-GCM)
+- **AES-256-GCM Database Encryption**: Activation codes encrypted, key never stored
+- **Database Theft Protection**: Cannot decrypt without activation code
+- **Critical Attack Protection**: Instant 1-year ban for database/chain attacks
+- **Privacy-Preserving Pseudonyms**: Network topology protection in all logs
 - **Secure by default**: No insecure fallback modes
 - **Activation validation**: Cryptographic proof of node purchase
+- **Device Migration Security**: Automatic old device deactivation, rate limiting
 - **Network isolation**: Proper firewall configuration
 - **Privacy Protection**: All IP addresses hashed (SHA3-256), never exposed
 - **No System Metrics**: Removed CPU/memory monitoring for privacy

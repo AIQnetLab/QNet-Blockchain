@@ -175,7 +175,7 @@ For comprehensive technical details, see:
 
 ---
 
-**Audit Conducted By:** QNet Security Team  
+**Audit Conducted By:** AI-assisted comprehensive analysis  
 **Test Environment:** Windows 10, Rust 1.82.0, Release Mode  
 **Next Audit:** January 2026
 

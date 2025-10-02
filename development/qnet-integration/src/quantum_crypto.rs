@@ -224,12 +224,26 @@ impl QNetQuantumCrypto {
         
         if BOOTSTRAP_WHITELIST.contains(&activation_code) {
             println!("✅ Genesis bootstrap code detected in quantum_crypto.rs: {}", activation_code);
+            
+            // Extract bootstrap ID from code: QNET-BOOT-0003-STRAP → "003"
+            let bootstrap_id = activation_code
+                .split('-')
+                .nth(2)
+                .unwrap_or("000")
+                .trim_start_matches('0');  // "0003" → "3"
+            
+            // CRITICAL: Use same wallet format as get_wallet_address() stub
+            // get_wallet_address() returns: format!("{}...eon", &self.node_id[..8])
+            // For genesis_node_003 → "genesis_...eon"
+            let genesis_node_id = format!("genesis_node_{:03}", bootstrap_id.parse::<u32>().unwrap_or(1));
+            let wallet = format!("{}...eon", &genesis_node_id[..8]);  // "genesis_...eon"
+            
             // Return a dummy payload for genesis codes
             return Ok(ActivationPayload {
                 burn_tx: "genesis_bootstrap".to_string(),
                 node_type: "super".to_string(),
                 timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
-                wallet: "genesis_wallet".to_string(),
+                wallet,  // Now matches get_wallet_address() format!
                 signature: DilithiumSignature {
                     signature: "genesis_signature".to_string(),
                     algorithm: "dilithium5".to_string(),
@@ -561,12 +575,22 @@ impl QNetQuantumCrypto {
         ];
         
         if BOOTSTRAP_WHITELIST.contains(&code) {
+            // Extract bootstrap ID and create consistent wallet format
+            let bootstrap_id = code
+                .split('-')
+                .nth(2)
+                .unwrap_or("000")
+                .trim_start_matches('0');
+            
+            let genesis_node_id = format!("genesis_node_{:03}", bootstrap_id.parse::<u32>().unwrap_or(1));
+            let wallet_address = format!("{}...eon", &genesis_node_id[..8]);  // Same format as get_wallet_address()
+            
             // Return dummy data for genesis codes
             return Ok(CompatibleActivationData {
                 node_type: NodeType::Super,
                 qnc_amount: 0,
                 tx_hash: "genesis_bootstrap".to_string(),
-                wallet_address: "genesis_wallet".to_string(),
+                wallet_address,  // Now consistent!
                 phase: 1,
             });
         }

@@ -2365,7 +2365,13 @@ impl BlockchainNode {
                             
                             // PRODUCTION: Add microblock producer timeout detection using EXISTING patterns
                             // EXISTING timeout values: macroblock=30s, commit=15s, http=5s, interval=1s
-                            let microblock_timeout = std::time::Duration::from_secs(5); // PRODUCTION: 5× microblock interval for network latency
+                            // GENESIS FIX: Longer grace period for first microblock (simultaneous startup)
+                            let microblock_timeout = if expected_height == 1 {
+                                println!("[SYNC] ⏰ First microblock - using 15s grace period for network bootstrap");
+                                std::time::Duration::from_secs(15)  // First block: 15s grace for network bootstrap
+                            } else {
+                                std::time::Duration::from_secs(5)   // Normal blocks: 5s timeout
+                            };
                             let timeout_start = std::time::Instant::now();
                             
                             // Wait with timeout for producer block (same pattern as macroblock timeout in line 1201)
@@ -2389,8 +2395,9 @@ impl BlockchainNode {
                                 };
                                 
                                 if !block_exists {
-                                    println!("[FAILOVER] 🚨 Microblock #{} not received after 5s timeout from producer: {}", 
-                                             expected_height_timeout, current_producer_timeout);
+                                    let timeout_duration = if expected_height_timeout == 1 { 15 } else { 5 };
+                                    println!("[FAILOVER] 🚨 Microblock #{} not received after {}s timeout from producer: {}", 
+                                             expected_height_timeout, timeout_duration, current_producer_timeout);
                                     
                                     // EXISTING: Use same emergency selection as implemented in select_emergency_producer (line 1534)
                                     let emergency_producer = crate::node::BlockchainNode::select_emergency_producer(
@@ -5741,37 +5748,41 @@ impl BlockchainNode {
         use crate::genesis_constants::GENESIS_BOOTSTRAP_CODES;
         let bootstrap_whitelist = GENESIS_BOOTSTRAP_CODES;
         
-        if bootstrap_whitelist.contains(&code) {
+        let is_genesis_code = bootstrap_whitelist.contains(&code);
+        
+        // PRODUCTION: Initialize blockchain registry with real QNet nodes
+        let qnet_rpc = std::env::var("QNET_RPC_URL")
+            .or_else(|_| std::env::var("QNET_GENESIS_NODES")
+                .map(|nodes| format!("http://{}:8001", nodes.split(',').next().unwrap_or("127.0.0.1").trim())))
+            .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
+        
+        if is_genesis_code {
             println!("✅ Genesis bootstrap code detected in node.rs: {}", code);
-            // Skip format validation for genesis codes
+            // Skip format validation AND ownership check for genesis codes
+            // Genesis codes are shared bootstrap codes with IP-based authentication
+            println!("✅ Genesis code - skipping ownership verification (IP-based auth)");
         } else {
             // Check basic format for regular codes (26-char format only)
             if !code.starts_with("QNET-") || code.len() != 26 {
                 return Err(QNetError::ValidationError("Invalid activation code format. Expected: QNET-XXXXXX-XXXXXX-XXXXXX (26 chars)".to_string()));
             }
-        }
-        
-        // FIXED: Initialize blockchain registry with real QNet nodes
-        let qnet_rpc = std::env::var("QNET_RPC_URL")
-            .or_else(|_| std::env::var("QNET_GENESIS_NODES")
-                .map(|nodes| format!("http://{}:8001", nodes.split(',').next().unwrap_or("127.0.0.1").trim())))
-            .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
             
-        let registry = crate::activation_validation::BlockchainActivationRegistry::new(
-            Some(qnet_rpc.clone())
-        );
-        
-        // FIXED: Check code ownership instead of usage (1 wallet = 1 code, but reusable on devices)
-        match registry.verify_code_ownership(code, &self.get_wallet_address()).await {
-            Ok(true) => {
-                println!("✅ Activation code verified - belongs to this wallet");
-            }
-            Ok(false) => {
-                return Err(QNetError::ValidationError("Activation code does not belong to this wallet".to_string()));
-            }
-            Err(e) => {
-                println!("⚠️  Warning: Code ownership verification failed: {}", e);
-                // Continue with local validation only - graceful degradation
+            let registry = crate::activation_validation::BlockchainActivationRegistry::new(
+                Some(qnet_rpc.clone())
+            );
+            
+            // FIXED: Check code ownership for REGULAR codes (1 wallet = 1 code, but reusable on devices)
+            match registry.verify_code_ownership(code, &self.get_wallet_address()).await {
+                Ok(true) => {
+                    println!("✅ Activation code verified - belongs to this wallet");
+                }
+                Ok(false) => {
+                    return Err(QNetError::ValidationError("Activation code does not belong to this wallet".to_string()));
+                }
+                Err(e) => {
+                    println!("⚠️  Warning: Code ownership verification failed: {}", e);
+                    // Continue with local validation only - graceful degradation
+                }
             }
         }
         

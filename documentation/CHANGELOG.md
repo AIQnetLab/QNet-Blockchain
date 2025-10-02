@@ -5,6 +5,61 @@ All notable changes to the QNet project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.15.0] - October 2, 2025 "Advanced Security & Privacy Protection"
+
+### Added
+- **AES-256-GCM Database Encryption**: Quantum-resistant symmetric encryption
+  - Replaced weak XOR encryption with industry-standard AES-256-GCM
+  - Encryption key derived from activation code (NEVER stored in database)
+  - Authenticated encryption (AEAD) prevents tampering
+  - Supports seamless device migration (same code = same key)
+- **Critical Attack Protection**: Instant maximum penalties
+  - DatabaseSubstitution: Attempting to substitute DB with alternate chain
+  - StorageDeletion: Deleting database during active block production
+  - ChainFork: Creating or promoting a fork of the blockchain
+  - Penalty: Instant 1-year ban + reputation destruction (100% → 0%)
+- **Privacy-Preserving Pseudonyms**: Enhanced node ID protection
+  - Prevents double-conversion of pseudonyms in logs (genesis_node_XXX stays genesis_node_XXX)
+  - Applied to 14 reputation and failover log locations
+  - Protects network topology from analysis
+- **Genesis Bootstrap Grace Period**: Prevents false failover at network startup
+  - First microblock: 15-second timeout (vs 5s normal)
+  - Allows simultaneous Genesis node startup without false positives
+  - Normal blocks retain 5-second timeout
+- **Comprehensive Security Test Suite**: 9 new activation security tests
+  - AES-256 encryption validation
+  - Database theft protection
+  - Device migration detection
+  - Pseudonym conversion prevention
+  - Grace period timing verification
+
+### Fixed
+- **Genesis Activation Ownership**: Skip ownership check for Genesis codes
+  - Genesis codes use IP-based authentication (not wallet ownership)
+  - Allows Genesis nodes to save activation codes without validation errors
+  - Enables proper Genesis node restart and migration
+- **Genesis Wallet Format Sync**: Unified wallet format across all modules
+  - quantum_crypto, get_wallet_address, and reward_system now use consistent format
+  - Genesis wallets: "genesis_...eon" (placeholder until real wallet system)
+  - Eliminates "Code ownership failed" errors for Genesis nodes
+- **Database Key Storage**: Removed encryption key from database
+  - state_key no longer saved alongside encrypted data
+  - Key derived on-demand from activation code
+  - Protects against database theft (cannot decrypt without code)
+
+### Security
+- **Database Theft Protection**: Stealing database requires activation code to decrypt
+- **No Encryption Key Exposure**: Keys never written to disk
+- **Wallet Immutability**: Rewards always go to wallet in activation code (cannot be changed)
+- **Device Migration Security**: Automatic tracking prevents multiple active devices
+- **Rate Limiting**: 1 server migration per 24 hours (prevents abuse)
+
+### Changed
+- **Encryption Algorithm**: XOR → AES-256-GCM (NIST-approved quantum-resistant)
+- **Key Derivation**: SHA3(activation_code + salt) instead of state_key storage
+- **Pseudonym Handling**: Smart detection prevents re-conversion of existing pseudonyms
+- **Audit Attribution**: Updated to "AI-assisted analysis" for transparency
+
 ## [2.14.0] - October 2, 2025 "Chain Integrity & Database Attack Protection"
 
 ### Added

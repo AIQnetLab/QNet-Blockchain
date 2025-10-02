@@ -365,130 +365,127 @@ impl PersistentStorage {
         Ok(())
     }
     
-    /// Save activation code to persistent storage with code-based binding
+    /// PRODUCTION: Save activation code with AES-256-GCM encryption
+    /// Key is derived from activation code and NEVER stored in database
     pub fn save_activation_code(&self, code: &str, node_type: u8, timestamp: u64) -> IntegrationResult<()> {
         let metadata_cf = self.db.cf_handle("metadata")
             .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
         
-        // Generate cryptographic node identity from activation code
-        let node_identity = Self::generate_node_identity(code, node_type, timestamp)?;
+        // Get device signature for migration tracking (NOT for encryption!)
+        let device_signature = Self::get_device_signature_for_tracking();
         let server_ip = Self::get_server_ip();
         
-        // Create secure state binding
-        let state_key = Self::derive_state_key(code, &node_identity)?;
-        
-        // Save with cryptographic binding to activation code
+        // SECURITY: Create activation data (includes code for self-validation)
         let activation_data = format!("{}:{}:{}:{}:{}", 
-            code, node_type, timestamp, node_identity, server_ip);
+            code, node_type, timestamp, device_signature, server_ip);
         
-        // Encrypt entire record with code-derived key
-        let encrypted_data = Self::encrypt_with_code_key(&activation_data, &state_key)?;
+        // PRODUCTION: Encrypt with AES-256-GCM (quantum-resistant)
+        // Key is derived from activation code - NOT stored in database!
+        let (encrypted_data, nonce) = Self::encrypt_with_aes_gcm(&activation_data, code)?;
         
-        self.db.put_cf(&metadata_cf, b"activation_code", encrypted_data.as_bytes())?;
+        // Create storage record (nonce is public, encryption_key is NOT stored!)
+        let storage_record = format!("{}:{}", 
+            hex::encode(&nonce),  // Nonce (12 bytes, can be public)
+            hex::encode(&encrypted_data)  // Encrypted data
+        );
         
-        // Save state key for validation
-        self.db.put_cf(&metadata_cf, b"state_key", state_key.as_bytes())?;
+        self.db.put_cf(&metadata_cf, b"activation_code", storage_record.as_bytes())?;
         
+        // CRITICAL: Do NOT save encryption key to database!
+        // Key is derived from activation code when needed
+        
+        println!("[Storage] 🔐 Activation code encrypted with AES-256-GCM (key NOT stored)");
         Ok(())
     }
     
-    /// Load activation code from persistent storage with code-based validation
+    /// PRODUCTION: Load activation code with AES-256-GCM decryption
+    /// Key is derived from activation code (env var or Genesis BOOTSTRAP_ID)
     pub fn load_activation_code(&self) -> IntegrationResult<Option<(String, u8, u64)>> {
         let metadata_cf = self.db.cf_handle("metadata")
             .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
         
         match self.db.get_cf(&metadata_cf, b"activation_code")? {
             Some(encrypted_data) => {
-                // Load state key for decryption
-                let state_key = match self.db.get_cf(&metadata_cf, b"state_key")? {
-                    Some(key) => String::from_utf8_lossy(&key).to_string(),
-                    None => {
-                        // Try legacy format
-                        return self.load_legacy_activation_code(&encrypted_data);
+                let encrypted_str = String::from_utf8_lossy(&encrypted_data);
+                
+                // Check if this is NEW format (nonce:encrypted) or LEGACY format (has state_key)
+                if encrypted_str.contains(':') && encrypted_str.split(':').count() == 2 {
+                    // NEW FORMAT: AES-256-GCM encrypted
+                    let parts: Vec<&str> = encrypted_str.split(':').collect();
+                    let nonce_hex = parts[0];
+                    let encrypted_hex = parts[1];
+                    
+                    // Get activation code for decryption key
+                    let activation_code = Self::get_activation_code_for_decryption()?;
+                    
+                    // Parse nonce and encrypted data
+                    let nonce_bytes = hex::decode(nonce_hex)
+                        .map_err(|e| IntegrationError::SecurityError(format!("Invalid nonce: {}", e)))?;
+                    let encrypted_bytes = hex::decode(encrypted_hex)
+                        .map_err(|e| IntegrationError::SecurityError(format!("Invalid encrypted data: {}", e)))?;
+                    
+                    if nonce_bytes.len() != 12 {
+                        return Err(IntegrationError::SecurityError("Invalid nonce length".to_string()));
                     }
-                };
-                
-                // Decrypt with code-derived key
-                let decrypted_data = Self::decrypt_with_code_key(&String::from_utf8_lossy(&encrypted_data), &state_key)?;
-                
-                let parts: Vec<&str> = decrypted_data.split(':').collect();
-                
-                // New secure format: code:node_type:timestamp:node_identity:server_ip[:migration:new_device_signature]
-                if parts.len() == 5 || parts.len() == 7 {
-                    let code = parts[0];
-                    let node_type = parts[1].parse::<u8>().unwrap_or(1);
-                    let timestamp = parts[2].parse::<u64>().unwrap_or(0);
-                    let stored_node_identity = parts[3];
-                    let stored_server_ip = parts[4];
                     
-                    // Check if this is a migrated device
-                    let is_migrated = parts.len() == 7 && parts[5] == "migration";
-                    let device_signature = if is_migrated { Some(parts[6]) } else { None };
+                    let mut nonce_array = [0u8; 12];
+                    nonce_array.copy_from_slice(&nonce_bytes);
                     
-                    // Validate node identity (considering migration)
-                    let current_node_identity = if is_migrated {
-                        Self::generate_migration_identity(code, node_type, timestamp, device_signature.unwrap())?
-                    } else {
-                        Self::generate_node_identity(code, node_type, timestamp)?
-                    };
+                    // PRODUCTION: Decrypt with AES-256-GCM
+                    let decrypted_data = Self::decrypt_with_aes_gcm(&encrypted_bytes, &nonce_array, &activation_code)?;
                     
-                    // GENESIS PERIOD FIX: Allow more flexible identity checking during bootstrap
-                    let is_genesis_bootstrap = std::env::var("QNET_BOOTSTRAP_ID").is_ok() || 
-                                              std::env::var("QNET_GENESIS_BOOTSTRAP").unwrap_or_default() == "1";
+                    let decrypted_parts: Vec<&str> = decrypted_data.split(':').collect();
                     
-                    if current_node_identity != stored_node_identity {
-                        if is_genesis_bootstrap {
-                            eprintln!("⚠️  GENESIS: Node identity changed during bootstrap - allowing migration");
-                            eprintln!("   Expected: {}...", &stored_node_identity[..8.min(stored_node_identity.len())]);
-                            eprintln!("   Current:  {}...", &current_node_identity[..8.min(current_node_identity.len())]);
-                            eprintln!("   Updating stored identity for Genesis period");
-                            
-                            // Update stored identity for genesis bootstrap
-                            // Note: In production deployment, this would be more restricted
-                        } else {
-                            eprintln!("🚨 SECURITY WARNING: Node identity mismatch!");
-                            eprintln!("   This activation code was bound to a different node configuration");
-                            return Err(IntegrationError::SecurityError("Node identity mismatch".to_string()));
+                    // AES-256 format: code:node_type:timestamp:device_signature:server_ip
+                    if decrypted_parts.len() >= 5 {
+                        let saved_code = decrypted_parts[0];
+                        let node_type = decrypted_parts[1].parse::<u8>().unwrap_or(1);
+                        let timestamp = decrypted_parts[2].parse::<u64>().unwrap_or(0);
+                        let stored_device_signature = decrypted_parts[3];
+                        let stored_server_ip = decrypted_parts[4];
+                        
+                        // SECURITY: Validate that decrypted code matches activation code used for decryption
+                        if saved_code != activation_code {
+                            return Err(IntegrationError::SecurityError(
+                                "Decryption succeeded but activation code mismatch - wrong code provided".to_string()
+                            ));
                         }
-                    }
-                    
-                    // PRODUCTION: Validate state key consistency with Genesis support
-                    let expected_state_key = Self::derive_state_key(code, &current_node_identity)?;
-                    
-                    if expected_state_key != state_key {
-                        if is_genesis_bootstrap {
-                            // GENESIS: Allow state key update during bootstrap period
-                            eprintln!("⚠️  GENESIS: State key updated during bootstrap period");
-                            eprintln!("   Expected: {}...", &expected_state_key[..8.min(expected_state_key.len())]);
-                            eprintln!("   Stored:   {}...", &state_key[..8.min(state_key.len())]);
-                            eprintln!("   Updating for Genesis bootstrap period");
-                            
-                            // Update state key for Genesis bootstrap (in memory)
-                            // Note: This maintains security while allowing Genesis flexibility
-                        } else {
-                            eprintln!("🚨 SECURITY WARNING: State key mismatch!");
-                            eprintln!("   Activation code integrity compromised");
-                            return Err(IntegrationError::SecurityError("State key mismatch".to_string()));
+                        
+                        // PRODUCTION: Log device migration if detected
+                        let current_device = Self::get_device_signature_for_tracking();
+                        if stored_device_signature != current_device {
+                            println!("[Storage] 🔄 Device signature changed (migration or new hardware):");
+                            println!("   Stored: {}...", &stored_device_signature[..8.min(stored_device_signature.len())]);
+                            println!("   Current: {}...", &current_device[..8.min(current_device.len())]);
                         }
+                        
+                        // Log IP changes (normal for migrations)
+                        let current_server_ip = Self::get_server_ip();
+                        if current_server_ip != stored_server_ip {
+                            println!("[Storage] 📍 Server IP changed: {} → {} (migration/restart)", 
+                                     stored_server_ip, current_server_ip);
+                        }
+                        
+                        println!("[Storage] ✅ Activation code loaded and validated (AES-256-GCM)");
+                        return Ok(Some((saved_code.to_string(), node_type, timestamp)));
                     } else {
-                        println!("[IDENTITY] ✅ State key validation passed for node identity");
+                        return Err(IntegrationError::SecurityError("Invalid AES-256 activation format".to_string()));
                     }
-                    
-                    // Log IP changes (device migration is normal)
-                    let current_server_ip = Self::get_server_ip();
-                    if current_server_ip != stored_server_ip {
-                        println!("📍 INFO: Server IP changed from {} to {} (device migration/restart)", stored_server_ip, current_server_ip);
-                    }
-                    
-                    // Log migration status
-                    if is_migrated {
-                        println!("🔄 INFO: Device was migrated to signature: {}", device_signature.unwrap());
-                    }
-                    
-                    println!("✅ Activation code validated with cryptographic binding");
-                    Ok(Some((code.to_string(), node_type, timestamp)))
                 } else {
-                    Err(IntegrationError::SecurityError("Invalid activation record format".to_string()))
+                    // LEGACY FORMAT: Check for old XOR encryption with state_key
+                    println!("[Storage] 🔄 Detected legacy activation format - attempting migration");
+                    
+                    match self.db.get_cf(&metadata_cf, b"state_key")? {
+                        Some(_) => {
+                            // Legacy XOR format exists - load and re-save with AES-256
+                            return self.load_legacy_activation_code(&encrypted_data);
+                        }
+                        None => {
+                            return Err(IntegrationError::SecurityError(
+                                "Unknown activation code format".to_string()
+                            ));
+                        }
+                    }
                 }
             }
             None => Ok(None),
@@ -533,17 +530,23 @@ impl PersistentStorage {
         // Create new state key for migrated device
         let state_key = Self::derive_state_key(code, &migration_identity)?;
         
-        // Save with migration binding
-        let activation_data = format!("{}:{}:{}:{}:{}:migration:{}", 
-            code, node_type, timestamp, migration_identity, server_ip, new_device_signature);
+        // PRODUCTION: Save with AES-256-GCM (same as save_activation_code)
+        let activation_data = format!("{}:{}:{}:{}:{}", 
+            code, node_type, timestamp, new_device_signature, server_ip);
         
-        // Encrypt entire record with new state key
-        let encrypted_data = Self::encrypt_with_code_key(&activation_data, &state_key)?;
+        // Encrypt with AES-256-GCM (key from activation code, NOT stored!)
+        let (encrypted_data, nonce) = Self::encrypt_with_aes_gcm(&activation_data, code)?;
         
-        self.db.put_cf(&metadata_cf, b"activation_code", encrypted_data.as_bytes())?;
-        self.db.put_cf(&metadata_cf, b"state_key", state_key.as_bytes())?;
+        let storage_record = format!("{}:{}", 
+            hex::encode(&nonce),
+            hex::encode(&encrypted_data)
+        );
         
-        println!("✅ Activation code updated for device migration to signature: {}", new_device_signature);
+        self.db.put_cf(&metadata_cf, b"activation_code", storage_record.as_bytes())?;
+        
+        // CRITICAL: Do NOT save encryption key - it's derived from activation code!
+        
+        println!("[Storage] ✅ Activation migrated to device: {} (AES-256-GCM)", &new_device_signature[..16.min(new_device_signature.len())]);
         Ok(())
     }
     
@@ -670,39 +673,114 @@ impl PersistentStorage {
         Ok(key_hash[..32].to_string())
     }
     
-    /// Encrypt data with code-derived key
-    fn encrypt_with_code_key(data: &str, state_key: &str) -> IntegrationResult<String> {
-        use sha3::{Sha3_256, Digest};
-        
-        // Create encryption key from state key
-        let key_bytes = hex::decode(format!("{:0<32}", state_key))
-            .map_err(|e| IntegrationError::SecurityError(format!("Key generation failed: {}", e)))?;
-        
-        let mut encrypted = Vec::new();
-        for (i, byte) in data.as_bytes().iter().enumerate() {
-            encrypted.push(byte ^ key_bytes[i % key_bytes.len()]);
+    /// PRODUCTION: Get activation code for decryption from environment or generate for Genesis
+    fn get_activation_code_for_decryption() -> IntegrationResult<String> {
+        // Priority 1: Check QNET_ACTIVATION_CODE environment variable
+        if let Ok(code) = std::env::var("QNET_ACTIVATION_CODE") {
+            if !code.is_empty() {
+                return Ok(code);
+            }
         }
         
-        Ok(hex::encode(encrypted))
+        // Priority 2: Generate for Genesis nodes from BOOTSTRAP_ID
+        if let Ok(bootstrap_id) = std::env::var("QNET_BOOTSTRAP_ID") {
+            match bootstrap_id.as_str() {
+                "001" | "002" | "003" | "004" | "005" => {
+                    let genesis_code = format!("QNET-BOOT-{:0>4}-STRAP", bootstrap_id);
+                    return Ok(genesis_code);
+                }
+                _ => {}
+            }
+        }
+        
+        // No activation code available
+        Err(IntegrationError::ValidationError(
+            "No activation code available for decryption. Set QNET_ACTIVATION_CODE env var or QNET_BOOTSTRAP_ID for Genesis nodes".to_string()
+        ))
     }
     
-    /// Decrypt data with code-derived key
-    fn decrypt_with_code_key(encrypted_data: &str, state_key: &str) -> IntegrationResult<String> {
+    /// PRODUCTION: Get device signature for tracking (NOT for encryption!)
+    fn get_device_signature_for_tracking() -> String {
         use sha3::{Sha3_256, Digest};
         
-        let encrypted_bytes = hex::decode(encrypted_data)
-            .map_err(|e| IntegrationError::SecurityError(format!("Decryption failed: {}", e)))?;
+        let mut hasher = Sha3_256::new();
         
-        let key_bytes = hex::decode(format!("{:0<32}", state_key))
-            .map_err(|e| IntegrationError::SecurityError(format!("Key generation failed: {}", e)))?;
-        
-        let mut decrypted = Vec::new();
-        for (i, byte) in encrypted_bytes.iter().enumerate() {
-            decrypted.push(byte ^ key_bytes[i % key_bytes.len()]);
+        // Hardware fingerprint for tracking
+        if let Ok(hostname) = std::env::var("HOSTNAME") {
+            hasher.update(hostname.as_bytes());
+        }
+        if let Ok(user) = std::env::var("USER") {
+            hasher.update(user.as_bytes());
         }
         
+        // Add timestamp component for Docker containers (they have random hostnames)
+        let is_docker = std::env::var("DOCKER_ENV").is_ok();
+        if is_docker {
+            // For Docker: use container ID if available
+            if let Ok(container_id) = std::env::var("HOSTNAME") {
+                if container_id.len() == 12 {
+                    hasher.update(b"docker_container:");
+                    hasher.update(container_id.as_bytes());
+                }
+            }
+        }
+        
+        format!("device_{}", hex::encode(&hasher.finalize()[..16]))
+    }
+    
+    /// PRODUCTION: Derive AES-256 encryption key from activation code (for database security)
+    /// Key is NEVER stored - computed from activation code each time
+    fn derive_encryption_key_from_code(code: &str) -> [u8; 32] {
+        use sha3::{Sha3_256, Digest};
+        
+        let mut hasher = Sha3_256::new();
+        hasher.update(code.as_bytes());
+        hasher.update(b"QNET_DB_ENCRYPTION_V1");  // Salt for database encryption
+        
+        let hash = hasher.finalize();
+        hash.into()
+    }
+    
+    /// PRODUCTION: Encrypt data with AES-256-GCM (quantum-resistant symmetric encryption)
+    /// Uses existing aes-gcm dependency from quantum_crypto module
+    fn encrypt_with_aes_gcm(data: &str, activation_code: &str) -> IntegrationResult<(Vec<u8>, [u8; 12])> {
+        use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+        use aes_gcm::aead::Aead;
+        use rand::Rng;
+        
+        // Derive encryption key from activation code
+        let key_bytes = Self::derive_encryption_key_from_code(activation_code);
+        let cipher = Aes256Gcm::new(&key_bytes.into());
+        
+        // Generate random nonce (12 bytes for GCM)
+        let mut nonce_bytes = [0u8; 12];
+        rand::thread_rng().fill(&mut nonce_bytes);
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        
+        // Encrypt with authenticated encryption (AEAD)
+        let encrypted = cipher.encrypt(nonce, data.as_bytes())
+            .map_err(|e| IntegrationError::SecurityError(format!("AES-GCM encryption failed: {}", e)))?;
+        
+        Ok((encrypted, nonce_bytes))
+    }
+    
+    /// PRODUCTION: Decrypt data with AES-256-GCM
+    fn decrypt_with_aes_gcm(encrypted_data: &[u8], nonce: &[u8; 12], activation_code: &str) -> IntegrationResult<String> {
+        use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+        use aes_gcm::aead::Aead;
+        
+        // Derive encryption key from activation code (same as encryption)
+        let key_bytes = Self::derive_encryption_key_from_code(activation_code);
+        let cipher = Aes256Gcm::new(&key_bytes.into());
+        
+        let nonce_ref = Nonce::from_slice(nonce);
+        
+        // Decrypt and verify authentication tag
+        let decrypted = cipher.decrypt(nonce_ref, encrypted_data)
+            .map_err(|e| IntegrationError::SecurityError(format!("AES-GCM decryption failed: {}", e)))?;
+        
         String::from_utf8(decrypted)
-            .map_err(|e| IntegrationError::SecurityError(format!("Decryption failed: {}", e)))
+            .map_err(|e| IntegrationError::SecurityError(format!("UTF-8 decoding failed: {}", e)))
     }
     
     pub fn load_microblock(&self, height: u64) -> IntegrationResult<Option<Vec<u8>>> {

@@ -2,8 +2,8 @@
 name = "qnet-audit"
 version = "0.1.0"
 edition = "2021"
-authors = ["QNet Security Team"]
-description = "Security and performance audit suite for QNet blockchain"
+authors = ["AI-assisted analysis"]
+description = "Comprehensive security and performance audit suite for QNet blockchain"
 
 [dependencies]
 # Core QNet dependencies
@@ -70,6 +70,10 @@ path = "tests/consensus_scalability_tests.rs"
 [[test]]
 name = "critical_attacks"
 path = "tests/critical_attacks_test.rs"
+
+[[test]]
+name = "activation_security"
+path = "tests/activation_security_test.rs"
 
 [[bench]]
 name = "storage_benchmarks"
