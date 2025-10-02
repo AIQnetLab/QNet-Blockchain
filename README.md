@@ -14,11 +14,21 @@ QNet is a high-performance, post-quantum secure blockchain network with a **two-
 - **Phase 2 (Future)**: ONLY QNC token activation on QNet blockchain
 - **Transition**: 90% 1DEV burned OR 5 years from genesis block (whichever comes first)
 
+### 🛡️ **LATEST UPDATES (v2.13.0)**
+- **Atomic Rotation Rewards**: One +30 reward per full 30-block rotation (not 30x +1)
+- **Activity-Based Recovery**: Reputation only recovers if node had recent ping activity
+- **Self-Penalty Fix**: All failovers now apply -20 penalty, even voluntary ones
+- **95% Decentralization**: Minimal Genesis protection for network stability
+- **Jail System**: Progressive suspension with Genesis safeguard (no permanent ban)
+- **Double-Sign Detection**: Automatic tracking and evidence collection (-50 reputation + jail)
+- **Critical Failure Protection**: Genesis nodes get 30-day jail instead of ban at <10%
+- **Anti-DDoS Protection**: Rate limiting and network flooding detection
+
 ### 🖥️ **DEVICE RESTRICTIONS**
 - **Full/Super Nodes**: ONLY servers, VPS, desktops with interactive setup
 - **Light Nodes**: ONLY mobile devices & tablets through mobile app
 
-### 🚀 **Current Status: Production Testnet Ready (v2.6.0)**
+### 🚀 **Current Status: Production Testnet Ready (v2.12.0)**
 
 **QNet production testnet is ready for deployment with advanced consensus and synchronization.**
 
@@ -174,7 +184,15 @@ QNet implements production-grade failover mechanisms for zero-downtime operation
 - **Emergency Selection**: Deterministic SHA3-256 based selection from qualified backup producers
 - **Enhanced Status Visibility**: Comprehensive failover dashboard with recovery metrics
 - **Network Recovery**: <7 seconds automatic recovery time with full broadcast success tracking
-- **Reputation Impact**: -25.0 penalty for failed producer, +5.0 reward for emergency takeover
+- **Reputation Impact**: -20.0 penalty for failed producer, +5.0 reward for emergency takeover
+
+### **Emergency Mode (Network-Wide Degradation)**
+When all nodes fall below 70% reputation threshold:
+- **Progressive Degradation**: Tries thresholds 50% → 40% → 30% → 20%
+- **Emergency Boost**: +30% reputation to Genesis nodes, +50% to regular nodes
+- **Forced Recovery**: Selects any responding node as emergency producer
+- **Genesis Protection**: Always tries to recover with Genesis nodes first
+- **Network Continuity**: Ensures blockchain never halts completely
 
 ### **Macroblock Leader Failover**
 - **Byzantine Consensus**: Full commit-reveal with 67% honest assumption
@@ -194,29 +212,67 @@ QNet implements production-grade failover mechanisms for zero-downtime operation
 
 QNet implements an economic reputation system that incentivizes network participation:
 
-### **Reputation Rewards**
+### **Reputation Rewards (Atomic System)**
 | Action | Reward | Frequency |
 |--------|--------|-----------|
-| **Produce Microblock** | +1 | Per block (30 blocks/rotation) |
+| **Complete Full Rotation** | +30 | Every 30 blocks (one atomic reward) |
+| **Partial Rotation** | Proportional | Based on blocks created before failover |
 | **Lead Macroblock Consensus** | +10 | Every 90 seconds |
 | **Participate in Consensus** | +5 | Every 90 seconds |
 | **Emergency Producer** | +5 | On failover events |
 | **Successful Ping** | +1 | Every 4 hours |
 
-### **Reputation Penalties**
-| Action | Penalty | Impact |
-|--------|---------|--------|
-| **Failed Microblock** | -20 | Lost producer slot |
-| **Failed Macroblock** | -30 | Consensus failure |
-| **Missed Ping** | -1 | Every 4 hours |
-| **Double-Sign** | -30 | Malicious behavior |
+### **Reputation System (Atomic Rewards)**
+| Action | Penalty/Reward | Impact |
+|--------|----------------|--------|
+| **Full Rotation (30 blocks)** | +30.0 | Complete producer rotation |
+| **Partial Rotation** | Proportional | e.g., 15 blocks = +15.0 |
+| **Failed Microblock** | -20.0 | Lost producer slot (applies to self) |
+| **Successful Macroblock Leader** | +10.0 | Consensus leadership |
+| **Successful Macroblock Participant** | +5.0 | Consensus participation |
+| **Failed Macroblock** | -30.0 | Consensus failure |
+| **Failed Ping** | -2.0 | Connection issue |
+| **Double-Sign** | -50.0 | Byzantine fault |
+| **Emergency Producer** | +5.0 | Network service |
+| **Recovery Rate** | +0.7%/hour | ONLY if active (had ping) |
 
 ### **Reputation Thresholds**
 - **70+ points**: Eligible for consensus participation (70% minimum)
 - **40+ points**: Eligible for rewards from all pools
 - **10-39 points**: Network access only, no rewards
-- **<10 points**: Network ban
+- **<10 points**: Network ban (7-day recovery period)
 - **Maximum**: 100 points (hard cap)
+
+### **Anti-Malicious Protection System**
+
+#### **Jail System (Temporary Suspension)**
+Progressive penalties for repeat offenders:
+
+| Offense Count | Jail Duration | Recovery After Jail |
+|--------------|---------------|---------------------|
+| 1st offense | 1 hour | Restore to 30% |
+| 2nd offense | 24 hours | Restore to 25% |
+| 3rd offense | 7 days | Restore to 20% |
+| 4th offense | 30 days | Restore to 15% |
+| 5th offense | 3 months | Restore to 10% |
+| 6+ offenses | 1 year maximum | Governance review |
+
+**Stability Protection (Minimal):**
+- Genesis nodes: Cannot be permanently banned (network stability)
+- Critical failure (<10%): 30-day jail instead of ban
+- After jail: Restore to 10% (alive but no consensus)
+- Regular nodes: Full ban at <10% (true penalties)
+- Balance: 95% decentralization with 5% stability safeguard
+
+#### **Malicious Behavior Detection**
+
+| Attack Type | Detection Method | Penalty |
+|-------------|-----------------|---------|
+| **Double-Sign** | Multiple signatures at same height | -50.0 points |
+| **Invalid Block** | Failed cryptographic verification | -30.0 points |
+| **Time Manipulation** | Block timestamp >5s in future | -20.0 points |
+| **Network Flooding** | >100 msgs/sec from single node | -10.0 points |
+| **Invalid Consensus** | Malformed commit/reveal | -5.0 points |
 
 ### **Entropy-Based Selection**
 ```rust
@@ -1422,30 +1478,29 @@ Year 10+:   ~300+ GB    🔧 Increase to 500-1000 GB
 
 #### 🚫 **Advanced Reputation & Penalty System:**
 
-**Automatic Penalties for Bad Behavior:**
-| Violation Type | Penalty | Description |
-|----------------|---------|-------------|
-| **Invalid Signature** | -5.0 points | Cryptographic security threat |
-| **Invalid Reveal** | -3.0 points | Consensus protocol violation |
-| **Technical Errors** | -0.5 points | Connection/protocol issues |
-| **Double Signing** | -50.0 points | Major Byzantine fault |
-| **General Failure** | -2.0 points | Generic operational failure |
+**Reputation System Details:**
+| Behavior | Change | Description |
+|----------|--------|-------------|
+| **Double-Sign Detection** | -50.0 points | Major Byzantine fault - immediate ban if < 10% |
+| **Failed Block Production** | -20.0 points | Microblock production failure |
+| **Failed Consensus Lead** | -30.0 points | Macroblock consensus failure |
+| **Successful Operation** | +1.0 points | Regular successful interaction |
+| **Emergency Recovery** | +5.0 to +50.0 | Bonus for saving the network |
+| **Ban Threshold** | < 10% | Node removed from network (7-day recovery for regular nodes) |
+| **Consensus Threshold** | ≥ 70% | Minimum to participate in consensus |
 
 **Reputation Consequences:**
 - **<70% Reputation**: Excluded from consensus participation
 - **<10% Reputation**: Automatically banned from network
 - **Hourly Decay**: -1% automatic reputation decay for inactive nodes
 
-**Genesis Node Security:**
-- **Starting Reputation**: 90% (high trust)
-- **Penalty Floor**: 70% minimum (cannot be banned, critical infrastructure)
-- **Can Be Penalized**: 90% → 85% → 80% → 75% → 70% (floor)
-- **Cannot Go Below**: 70% (ensures network stability)
-
-**Regular Node Security:**
-- **Starting Reputation**: 70% (immediate consensus participation)
-- **Full Penalties**: Can be reduced to 0% and banned
-- **Merit-Based**: Must earn reputation through good behavior
+**Universal Node Security (Full Decentralization):**
+- **Starting Reputation**: 70% for ALL nodes (consensus threshold)
+- **No Special Protection**: Genesis nodes = Regular nodes
+- **Full Penalties Apply**: Any node can be reduced to 0% and banned
+- **Merit-Based System**: ALL nodes must maintain good behavior
+- **Consensus Participation**: ≥70% required for everyone
+- **True Equality**: No privileged nodes in the network
 
 #### 🔧 **Node Migration Support:**
 - **Data Transfer**: Archive responsibilities transfer with node migration

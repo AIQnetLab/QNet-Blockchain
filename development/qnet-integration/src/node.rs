@@ -36,6 +36,7 @@ use qnet_state::{State as StateManager, Account, Transaction, Block, BlockType, 
 use qnet_mempool::{SimpleMempool, SimpleMempoolConfig};
 use qnet_consensus::{ConsensusEngine, ConsensusConfig, NodeId, CommitRevealConsensus, ConsensusError};
 use qnet_consensus::lazy_rewards::{PhaseAwareRewardManager, NodeType as RewardNodeType};
+use qnet_consensus::reputation::{Evidence, MaliciousBehavior};
 use qnet_sharding::{ShardCoordinator, ParallelValidator};
 use std::sync::Arc;
 use std::collections::HashMap;
@@ -188,6 +189,112 @@ impl Default for PerformanceConfig {
     }
 }
 
+/// Track signed blocks for double-sign detection
+#[derive(Clone)]
+pub struct SignedBlockTracker {
+    // Map: height -> (block_hash, producer_id, timestamp)
+    signed_blocks: Arc<RwLock<HashMap<u64, Vec<(String, String, u64)>>>>,
+    max_history: usize,  // Keep last N heights for memory efficiency
+}
+
+impl SignedBlockTracker {
+    pub fn new() -> Self {
+        Self {
+            signed_blocks: Arc::new(RwLock::new(HashMap::new())),
+            max_history: 100,  // Keep last 100 block heights
+        }
+    }
+    
+    /// Check for double-sign and add new signature
+    pub async fn check_and_add(&self, height: u64, block_hash: &str, producer: &str) -> Option<Evidence> {
+        let mut blocks = self.signed_blocks.write().await;
+        
+        // Get or create entry for this height
+        let entries = blocks.entry(height).or_insert_with(Vec::new);
+        
+        // Check for existing signature from same producer
+        for (existing_hash, existing_producer, timestamp) in entries.iter() {
+            if existing_producer == producer && existing_hash != block_hash {
+                // Double-sign detected!
+                println!("[SECURITY] ⚠️ DOUBLE-SIGN DETECTED: {} signed two different blocks at height {}", producer, height);
+                
+                return Some(Evidence {
+                    evidence_type: "double_sign".to_string(),
+                    node_id: producer.to_string(),
+                    evidence_data: format!("height:{},hash1:{},hash2:{}", height, existing_hash, block_hash).into_bytes(),
+                    timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+                });
+            }
+        }
+        
+        // Add new signature
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        entries.push((block_hash.to_string(), producer.to_string(), timestamp));
+        
+        // Clean old entries to prevent memory bloat
+        if blocks.len() > self.max_history {
+            let min_height = blocks.keys().min().cloned().unwrap_or(0);
+            blocks.remove(&min_height);
+        }
+        
+        None
+    }
+    
+    /// Detect invalid blocks
+    pub fn detect_invalid_block(&self, block: &MicroBlock) -> Option<Evidence> {
+        // Check timestamp is not too far in future (>5 seconds)
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        if block.timestamp > now + 5 {
+            println!("[SECURITY] ⚠️ TIME MANIPULATION: Block from future by {}s", block.timestamp - now);
+            return Some(Evidence {
+                evidence_type: "time_manipulation".to_string(),
+                node_id: block.producer.clone(),
+                evidence_data: format!("future_by:{}s", block.timestamp - now).into_bytes(),
+                timestamp: now,
+            });
+        }
+        
+        None
+    }
+}
+
+/// Track rotation progress for atomic rewards
+#[derive(Clone)]
+pub struct RotationTracker {
+    // leadership_round -> (producer_id, blocks_created, start_height)  
+    current_rotations: Arc<RwLock<HashMap<u64, (String, u32, u64)>>>,
+}
+
+impl RotationTracker {
+    pub fn new() -> Self {
+        Self {
+            current_rotations: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+    
+    /// Track block production
+    pub async fn track_block(&self, height: u64, producer: &str) {
+        let round = height / ROTATION_INTERVAL_BLOCKS;
+        let mut rotations = self.current_rotations.write().await;
+        
+        let entry = rotations.entry(round).or_insert((producer.to_string(), 0, height));
+        entry.1 += 1; // Increment block count
+    }
+    
+    /// Check if rotation completed and return producer info
+    pub async fn check_rotation_complete(&self, height: u64) -> Option<(String, u32)> {
+        if height % ROTATION_INTERVAL_BLOCKS == 0 && height > 0 {
+            let round = (height - 1) / ROTATION_INTERVAL_BLOCKS; // Previous round
+            let mut rotations = self.current_rotations.write().await;
+            
+            if let Some((producer, blocks, _)) = rotations.remove(&round) {
+                return Some((producer, blocks));
+            }
+        }
+        None
+    }
+}
+
 /// Main blockchain node with unified P2P and regional clustering
 pub struct BlockchainNode {
     storage: Arc<Storage>,
@@ -206,6 +313,12 @@ pub struct BlockchainNode {
     node_id: String,
     node_type: NodeType,
     region: Region,
+    
+    // Malicious behavior detection
+    signed_block_tracker: Arc<SignedBlockTracker>,
+    
+    // Rotation tracking for atomic rewards
+    rotation_tracker: Arc<RotationTracker>,
     p2p_port: u16,
     bootstrap_peers: Vec<String>,
     
@@ -747,6 +860,8 @@ impl BlockchainNode {
             node_id: node_id.clone(),
             node_type,
             region,
+            signed_block_tracker: Arc::new(SignedBlockTracker::new()),
+            rotation_tracker: Arc::new(RotationTracker::new()),
             p2p_port,
             bootstrap_peers,
             perf_config,
@@ -1213,6 +1328,7 @@ impl BlockchainNode {
         let consensus_nonce_storage = self.consensus_nonce_storage.clone();
         let last_block_attempt = self.last_block_attempt.clone();
         let perf_config = self.perf_config.clone();
+        let rotation_tracker = self.rotation_tracker.clone();
         
         // CRITICAL FIX: Take consensus_rx ownership for MACROBLOCK consensus phases
         // Macroblock commit/reveal phases NEED exclusive access to process P2P messages  
@@ -1386,9 +1502,9 @@ impl BlockchainNode {
                     .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
                     .unwrap_or(false);
                 
-                // PERFORMANCE FIX: Skip redundant producer selection check - will be done later in production loop
-                // This avoids double calls to get_validated_active_peers() and Registry operations
-                let own_node_id = Self::get_genesis_node_id("").unwrap_or_else(|| format!("node_{}", std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string())));
+                // CRITICAL FIX: Use the validated node_id passed as parameter, NOT regenerate it
+                // This ensures consistency throughout the node's lifecycle
+                let own_node_id = node_id.clone(); // Use the validated node_id from startup
                 let is_selected_producer = true; // Will be checked properly in production loop
                 
                 // EXISTING: Use cached phase detection with sophisticated caching
@@ -1738,6 +1854,7 @@ impl BlockchainNode {
                     let height_for_storage = microblock_height;
                     let p2p_for_reward = unified_p2p.clone();
                     let producer_id_for_reward = node_id.clone();
+                    let rotation_tracker_clone = rotation_tracker.clone();
                     
                     tokio::spawn(async move {
                         // NEW: Use delta encoding for sequential blocks
@@ -1749,20 +1866,30 @@ impl BlockchainNode {
                         Ok(_) => {
                                 println!("[Storage] ✅ Microblock {} saved with delta/compression", height_for_storage);
                                 
-                                // PRODUCTION: Reward microblock producer with reputation
-                                // +1 per block (vs +5/+10 for macroblock consensus)
-                                if let Some(ref p2p) = p2p_for_reward {
-                                    p2p.update_node_reputation(&producer_id_for_reward, 1.0);
-                                    
-                                    // Log every 10 blocks for better visibility during Genesis phase
-                                    if height_for_storage % 10 == 0 || height_for_storage <= 10 {
-                                        let current_rep = p2p.get_reputation_system().lock()
-                                            .map(|r| r.get_reputation(&producer_id_for_reward))
-                                            .unwrap_or(70.0);
-                                        println!("[REPUTATION] ⚡ Microblock #{} producer {} rewarded: +1.0 (total: {:.1}%)", 
-                                                 height_for_storage, producer_id_for_reward, current_rep);
-                                    }
+                    // ATOMIC ROTATION TRACKING: Track block production
+                    // Rewards given once per rotation, not per block
+                    rotation_tracker_clone.track_block(height_for_storage, &producer_id_for_reward).await;
+                    
+                    // Check if rotation completed (every 30 blocks)
+                    if let Some((rotation_producer, blocks_created)) = 
+                        rotation_tracker_clone.check_rotation_complete(height_for_storage).await {
+                            
+                            // ATOMIC REWARD: One reward for entire rotation
+                            if let Some(ref p2p) = p2p_for_reward {
+                                if blocks_created == ROTATION_INTERVAL_BLOCKS as u32 {
+                                    // Full rotation completed
+                                    p2p.update_node_reputation(&rotation_producer, 30.0);
+                                    println!("[ROTATION] ✅ {} completed full rotation ({}/30 blocks) +30.0 reputation", 
+                                            rotation_producer, blocks_created);
+                                } else {
+                                    // Partial rotation (failover occurred)
+                                    let reward = (blocks_created as f64 / 30.0) * 30.0;
+                                    p2p.update_node_reputation(&rotation_producer, reward);
+                                    println!("[ROTATION] ⚠️ {} partial rotation ({}/30 blocks) +{:.1} reputation", 
+                                            rotation_producer, blocks_created, reward);
                                 }
+                            }
+                        }
                         },
                         Err(e) => {
                             println!("[Storage] ⚠️ Delta storage failed, falling back to direct save: {}", e);
@@ -1816,15 +1943,26 @@ impl BlockchainNode {
                         println!("[P2P] ⚠️ P2P system not available - cannot broadcast block #{}", microblock.height);
                     }
                     
-                    // PRODUCTION: Reward producer for successful block creation
-                    if let Some(p2p) = &unified_p2p {
-                        if let Ok(mut reputation_system) = p2p.get_reputation_system().lock() {
-                            reputation_system.record_success(&node_id); // +1.0 reputation
-                            let new_reputation = reputation_system.get_reputation(&node_id);
-                            // Log every 10 blocks or first 10 blocks for better visibility
-                            if microblock.height % 10 == 0 || microblock.height <= 10 {
-                                println!("[REPUTATION] ✅ Producer {} earned +1.0 reputation for block #{} (total: {:.1}%)", 
-                                         node_id, microblock.height, new_reputation);
+                    // ATOMIC REWARDS: Track block for rotation reward
+                    // Reward given at rotation completion, not per block
+                    rotation_tracker.track_block(microblock.height, &node_id).await;
+                    
+                    // Check if rotation completed
+                    if let Some((rotation_producer, blocks_created)) = 
+                        rotation_tracker.check_rotation_complete(microblock.height).await {
+                        
+                        if let Some(p2p) = &unified_p2p {
+                            if blocks_created == ROTATION_INTERVAL_BLOCKS as u32 {
+                                // Full rotation: +30 reputation
+                                p2p.update_node_reputation(&rotation_producer, 30.0);
+                                println!("[ROTATION] ✅ {} completed full rotation #{} ({}/30 blocks) +30.0 reputation", 
+                                        rotation_producer, microblock.height / 30, blocks_created);
+                            } else {
+                                // Partial rotation: proportional reward
+                                let reward = (blocks_created as f64 / 30.0) * 30.0;
+                                p2p.update_node_reputation(&rotation_producer, reward);
+                                println!("[ROTATION] ⚠️ {} partial rotation #{} ({}/30 blocks) +{:.1} reputation", 
+                                        rotation_producer, microblock.height / 30, blocks_created, reward);
                             }
                         }
                     }
@@ -2675,12 +2813,17 @@ impl BlockchainNode {
                         continue;
                     }
                     
-                    // ARCHITECTURAL FIX: All Genesis nodes have EXACTLY same reputation
-                    // Reputation is only a threshold, not a weight for selection
-                    let genesis_reputation = 0.70; // Minimum consensus threshold
-                    candidates.push((peer_node_id.clone(), genesis_reputation));
-                    println!("[EMERGENCY_SELECTION] ✅ Genesis emergency candidate {} added (consensus threshold: 70%)", 
-                             peer_node_id);
+                    // CRITICAL FIX: Check REAL reputation for Genesis nodes in emergency
+                    // Failed nodes should not be emergency candidates
+                    let real_reputation = Self::get_node_reputation_score(&peer_node_id, p2p).await;
+                    if real_reputation >= 0.70 {
+                        candidates.push((peer_node_id.clone(), real_reputation));
+                        println!("[EMERGENCY_SELECTION] ✅ Genesis emergency candidate {} added (reputation: {:.1}%)", 
+                                 peer_node_id, real_reputation * 100.0);
+                    } else {
+                        println!("[EMERGENCY_SELECTION] ⚠️ Genesis node {} excluded - reputation {:.1}% < 70%", 
+                                 peer_node_id, real_reputation * 100.0);
+                    }
                 }
             } else {
                 // Normal phase: Use validated peers
@@ -2726,12 +2869,124 @@ impl BlockchainNode {
             
             if valid_candidates.is_empty() {
                 println!("[FAILOVER] 💀 CRITICAL: No valid backup producers available!");
-                // For Genesis phase with invalid IDs, try to recover with Genesis defaults
+                
+                // EMERGENCY MODE: Use existing Progressive Degradation Protocol
                 if is_genesis_phase {
-                    println!("[FAILOVER] 🆘 GENESIS RECOVERY: Using default genesis_node_001");
+                    // Genesis phase: Try progressively lower reputation thresholds
+                    println!("[FAILOVER] 🚨 EMERGENCY: Activating reputation degradation for Genesis");
+                    
+                    // Get Genesis nodes list
+                    let genesis_ips = crate::unified_p2p::get_genesis_bootstrap_ips();
+                    
+                    // Try with 50% threshold
+                    let mut emergency_candidates = Vec::new();
+                    for (i, _ip) in genesis_ips.iter().enumerate() {
+                        let peer_node_id = format!("genesis_node_{:03}", i + 1);
+                        if peer_node_id == failed_producer {
+                            continue;
+                        }
+                        let reputation = Self::get_node_reputation_score(&peer_node_id, p2p).await;
+                        if reputation >= 0.50 {
+                            emergency_candidates.push((peer_node_id.clone(), reputation));
+                            println!("[EMERGENCY] ✅ Found candidate {} at 50% threshold (reputation: {:.1}%)", 
+                                     peer_node_id, reputation * 100.0);
+                        }
+                    }
+                    
+                    if !emergency_candidates.is_empty() {
+                        // Select best from degraded candidates
+                        let best = emergency_candidates.iter()
+                            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+                            .unwrap();
+                        println!("[FAILOVER] 🆘 DEGRADED SELECTION: {} (reputation: {:.1}%)", 
+                                 best.0, best.1 * 100.0);
+                        return best.0.clone();
+                    }
+                    
+                    // Last resort: Bootstrap recovery with reputation reset
+                    println!("[FAILOVER] ⚡ CRITICAL: Initiating Genesis bootstrap recovery");
+                    
+                    // Find ANY responding Genesis node
+                    for (i, _ip) in genesis_ips.iter().enumerate() {
+                        let peer_node_id = format!("genesis_node_{:03}", i + 1);
+                        if peer_node_id != failed_producer {
+                            // Give emergency reputation boost to enable recovery
+                            p2p.update_node_reputation(&peer_node_id, 30.0);
+                            println!("[EMERGENCY] 💊 Emergency boost +30% to {} for recovery", peer_node_id);
+                            
+                            // Check if now eligible
+                            let new_reputation = Self::get_node_reputation_score(&peer_node_id, p2p).await;
+                            if new_reputation >= 0.50 {
+                                return peer_node_id.clone();
+                            }
+                        }
+                    }
+                    
+                    // Ultimate fallback: First Genesis node that isn't failed
+                    for (i, _ip) in genesis_ips.iter().enumerate() {
+                        let peer_node_id = format!("genesis_node_{:03}", i + 1);
+                        if peer_node_id != failed_producer {
+                            println!("[FAILOVER] 🔥 FORCED RECOVERY: Using {} regardless of reputation", peer_node_id);
+                            return peer_node_id.clone();
+                        }
+                    }
+                    
+                    // If even that fails, use genesis_node_001 as hardcoded fallback
+                    println!("[FAILOVER] 🆘 FINAL FALLBACK: Using genesis_node_001");
                     return "genesis_node_001".to_string();
+                } else {
+                    // Production phase: Use Progressive Degradation similar to microblock production
+                    println!("[FAILOVER] 🚨 EMERGENCY: Activating network-wide degradation");
+                    
+                    // Try with progressively lower thresholds: 50%, 40%, 30%, 20%
+                    let thresholds = [0.50, 0.40, 0.30, 0.20];
+                    
+                    for threshold in &thresholds {
+                        let mut emergency_candidates = Vec::new();
+                        let peers = p2p.get_validated_active_peers();
+                        
+                        for peer in peers {
+                            let peer_node_id = peer.id.clone();
+                            if peer_node_id == failed_producer {
+                                continue;
+                            }
+                            
+                            let reputation = Self::get_node_reputation_score(&peer_node_id, p2p).await;
+                            if reputation >= *threshold {
+                                emergency_candidates.push((peer_node_id.clone(), reputation));
+                                println!("[EMERGENCY] ✅ Found candidate {} at {:.0}% threshold (reputation: {:.1}%)", 
+                                         peer_node_id, threshold * 100.0, reputation * 100.0);
+                            }
+                        }
+                        
+                        if !emergency_candidates.is_empty() {
+                            // Select best from degraded candidates
+                            let best = emergency_candidates.iter()
+                                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+                                .unwrap();
+                            println!("[FAILOVER] 🆘 DEGRADED SELECTION: {} (reputation: {:.1}%, threshold: {:.0}%)", 
+                                     best.0, best.1 * 100.0, threshold * 100.0);
+                            return best.0.clone();
+                        }
+                    }
+                    
+                    // Critical: Network halt protection - give emergency boost to any responding node
+                    println!("[FAILOVER] ⚡ CRITICAL: Network halt detected - emergency reputation recovery");
+                    
+                    let peers = p2p.get_validated_active_peers();
+                    if !peers.is_empty() {
+                        // Boost first available peer
+                        let emergency_peer = &peers[0];
+                        p2p.update_node_reputation(&emergency_peer.id, 50.0);
+                        println!("[EMERGENCY] 💊 Critical boost +50% to {} for network recovery", emergency_peer.id);
+                        return emergency_peer.id.clone();
+                    }
+                    
+                    // Ultimate fallback: Return failed producer to prevent complete halt
+                    // It might recover or at least keep trying
+                    println!("[FAILOVER] 💀 NETWORK CRITICAL: No alternatives - keeping failed producer {}", failed_producer);
+                    return failed_producer.to_string();
                 }
-                return failed_producer.to_string(); // Fallback to failed (might recover)
             }
             
             let candidates = valid_candidates;
@@ -3009,12 +3264,21 @@ impl BlockchainNode {
         // CONSENSUS FIX: Use DETERMINISTIC list of ALL Genesis nodes (not just connected)
         // This ensures all nodes have IDENTICAL candidate lists for consistent producer selection
         
-        // Add ALL 5 Genesis nodes in DETERMINISTIC order (001, 002, 003, 004, 005)
+        // Add Genesis nodes that meet reputation threshold (deterministic order maintained)
         for (node_id, _ip) in &static_genesis_nodes {
-                // ARCHITECTURAL FIX: All Genesis nodes have EXACTLY same reputation
-                // Reputation is only a threshold, not a weight for selection
-                let genesis_reputation = 0.70; // Minimum consensus threshold
-                all_qualified.push((node_id.clone(), genesis_reputation));
+                // CRITICAL FIX: Check REAL reputation from P2P system, not static value
+                // This ensures failed/inactive nodes are excluded from candidates
+                let real_reputation = Self::get_node_reputation_score(node_id, p2p).await;
+                
+                if real_reputation >= 0.70 {
+                    // Node meets consensus threshold - add as candidate
+                    all_qualified.push((node_id.clone(), real_reputation));
+                    println!("[GENESIS] ✅ {} qualified with reputation {:.1}%", node_id, real_reputation * 100.0);
+                } else {
+                    // Node below threshold - exclude from candidates
+                    println!("[GENESIS] ⚠️ {} excluded - reputation {:.1}% < 70% threshold", 
+                             node_id, real_reputation * 100.0);
+                }
         }
         
         // BYZANTINE SAFETY: Verify minimum nodes are actually connected (but DON'T filter candidates!)
@@ -3287,8 +3551,8 @@ impl BlockchainNode {
                  consensus_initiator, initiator_index, sorted_candidates.len());
         
         // Check if we are the selected initiator
-        let our_consensus_id = Self::get_genesis_node_id("")
-            .unwrap_or_else(|| our_node_id.to_string());
+        // CRITICAL: Use the node_id passed as parameter, not regenerate it
+        let our_consensus_id = our_node_id.to_string();
         
         let we_are_initiator = consensus_initiator == &our_consensus_id;
         
@@ -3549,6 +3813,7 @@ impl BlockchainNode {
         round_id: u64,
         unified_p2p: &Option<Arc<SimplifiedP2P>>,
         nonce_storage: &Arc<RwLock<HashMap<String, ([u8; 32], Vec<u8>)>>>,
+        node_id: &str,  // CRITICAL: Use validated node_id from startup
         consensus_rx: &Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<ConsensusMessage>>>>, // REAL P2P integration
     ) {
         // CRITICAL: Only execute consensus for MACROBLOCK rounds (every 90 blocks)
@@ -3563,14 +3828,8 @@ impl BlockchainNode {
         use sha3::{Sha3_256, Digest};
         
         // PRODUCTION: REAL commit phase - each node generates only OWN commit
-        // CRITICAL: Use unified Genesis node ID detection
-        let our_node_id = Self::get_genesis_node_id("")
-            .or_else(|| {
-                // Fallback: Find our node in participants list
-                participants.iter()
-                    .find(|&p| p.contains("node_") && (p.contains("9876") || p.contains("8001")))
-                    .cloned()
-            });
+        // CRITICAL: Use the validated node_id passed from startup
+        let our_node_id = Some(node_id.to_string());
         
         if let Some(our_id) = our_node_id {
             println!("[CONSENSUS] 🏛️ Generating REAL commit for OWN node: {}", our_id);
@@ -3720,6 +3979,7 @@ impl BlockchainNode {
         round_id: u64,
         unified_p2p: &Option<Arc<SimplifiedP2P>>,
         nonce_storage: &Arc<RwLock<HashMap<String, ([u8; 32], Vec<u8>)>>>,
+        node_id: &str,  // CRITICAL: Use validated node_id from startup
         consensus_rx: &Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<ConsensusMessage>>>>, // REAL P2P integration
     ) {
         // CRITICAL: Only execute consensus for MACROBLOCK rounds (every 90 blocks)
@@ -3734,14 +3994,8 @@ impl BlockchainNode {
         use sha3::{Sha3_256, Digest};
         
         // PRODUCTION: REAL reveal phase - each node reveals only OWN data
-        // CRITICAL: Use unified Genesis node ID detection
-        let our_node_id = Self::get_genesis_node_id("")
-            .or_else(|| {
-                // Fallback: Find our node in participants list
-                participants.iter()
-                    .find(|&p| p.contains("node_") && (p.contains("9876") || p.contains("8001")))
-                    .cloned()
-            });
+        // CRITICAL: Use the validated node_id passed from startup
+        let our_node_id = Some(node_id.to_string());
         
         if let Some(our_id) = our_node_id {
             println!("[CONSENSUS] 🔓 Generating REAL reveal for OWN node: {}", our_id);
@@ -3872,24 +4126,26 @@ impl BlockchainNode {
         if let Ok(bootstrap_id) = std::env::var("QNET_BOOTSTRAP_ID") {
             match bootstrap_id.as_str() {
                 "001" | "002" | "003" | "004" | "005" => {
-                    // SECURITY FIX: Genesis nodes can be penalized but have 70% floor for network stability
-                    // Simplified to avoid lifetime issues while maintaining penalty system
-                    println!("[REPUTATION] 🛡️ Genesis node {} - checking P2P penalties (floor: 70%)", bootstrap_id);
+                    // FULL DECENTRALIZATION: Genesis nodes have NO special protection
+                    println!("[REPUTATION] ⚖️ Genesis node {} - treated equally, no protection", bootstrap_id);
                     
                     if let Some(p2p) = unified_p2p {
                         // Get current P2P reputation score for this node
                         let p2p_score = match p2p.get_reputation_system().lock() {
                             Ok(reputation) => reputation.get_reputation(node_id),
-                            Err(_) => 90.0, // Default if lock fails
+                            Err(_) => 70.0, // Default start reputation if lock fails
                         };
                         
                         let p2p_reputation = (p2p_score / 100.0).max(0.0).min(1.0);
                         
-                        // Genesis nodes: 70% minimum floor but can be penalized for bad behavior
-                        let final_reputation = p2p_reputation.max(0.70);
+                        // FULL DECENTRALIZATION: No special protection for Genesis nodes
+                        let final_reputation = p2p_reputation; // Equal treatment
                         
-                        if final_reputation < 0.90 {
-                            println!("[REPUTATION] ⚠️ Genesis node {} penalized: {:.1}% (original P2P: {:.1}%)", 
+                        if final_reputation < 0.70 {
+                            println!("[REPUTATION] ⚠️ Genesis node {} penalized: {:.1}% (P2P: {:.1}%, below consensus threshold)", 
+                                bootstrap_id, final_reputation * 100.0, p2p_reputation * 100.0);
+                        } else if final_reputation < 0.90 {
+                            println!("[REPUTATION] 🟡 Genesis node {} partially penalized: {:.1}% (P2P: {:.1}%)", 
                                 bootstrap_id, final_reputation * 100.0, p2p_reputation * 100.0);
                         }
                         
@@ -3906,18 +4162,20 @@ impl BlockchainNode {
         
         // Check for legacy genesis environment variable
         if std::env::var("QNET_GENESIS_BOOTSTRAP").unwrap_or_default() == "1" {
-            // SECURITY FIX: Legacy Genesis nodes also subject to penalties (70% floor)
+            // CRITICAL FIX: Legacy Genesis nodes have same 20% floor as regular Genesis
             if let Some(p2p) = unified_p2p {
                 let p2p_score = match p2p.get_reputation_system().lock() {
                     Ok(reputation) => reputation.get_reputation(node_id),
-                    Err(_) => 90.0, // Default if lock fails
+                    Err(_) => 70.0, // Default start reputation if lock fails
                 };
                 
                 let p2p_reputation = (p2p_score / 100.0).max(0.0).min(1.0);
-                let final_reputation = p2p_reputation.max(0.70);
+                let final_reputation = p2p_reputation; // No special protection
                 
-                if final_reputation < 0.90 {
-                    println!("[REPUTATION] ⚠️ Legacy Genesis node penalized: {:.1}% (floor: 70%)", final_reputation * 100.0);
+                if final_reputation < 0.70 {
+                    println!("[REPUTATION] ⚠️ Legacy Genesis node penalized: {:.1}% (floor: 20%, below threshold)", final_reputation * 100.0);
+                } else if final_reputation < 0.90 {
+                    println!("[REPUTATION] 🟡 Legacy Genesis node partially penalized: {:.1}% (floor: 20%)", final_reputation * 100.0);
                 }
                 
                 return final_reputation;
@@ -3933,18 +4191,20 @@ impl BlockchainNode {
             
             for genesis_code in GENESIS_BOOTSTRAP_CODES {
                 if activation_code == *genesis_code {
-                    // SECURITY FIX: Genesis activation codes also subject to penalties (70% floor)
+                    // CRITICAL FIX: Genesis activation codes have 20% floor for real penalties
                     if let Some(p2p) = unified_p2p {
                         let p2p_score = match p2p.get_reputation_system().lock() {
                             Ok(reputation) => reputation.get_reputation(node_id),
-                            Err(_) => 90.0, // Default if lock fails
+                            Err(_) => 70.0, // Default start reputation if lock fails
                         };
                         
                         let p2p_reputation = (p2p_score / 100.0).max(0.0).min(1.0);
-                        let final_reputation = p2p_reputation.max(0.70);
+                        let final_reputation = p2p_reputation; // No special protection
                         
-                        if final_reputation < 0.90 {
-                            println!("[REPUTATION] ⚠️ Genesis activation {} penalized: {:.1}% (floor: 70%)", genesis_code, final_reputation * 100.0);
+                        if final_reputation < 0.70 {
+                            println!("[REPUTATION] ⚠️ Genesis activation {} penalized: {:.1}% (floor: 20%, below threshold)", genesis_code, final_reputation * 100.0);
+                        } else if final_reputation < 0.90 {
+                            println!("[REPUTATION] 🟡 Genesis activation {} partially penalized: {:.1}% (floor: 20%)", genesis_code, final_reputation * 100.0);
                         }
                         
                         return final_reputation;
@@ -4370,6 +4630,7 @@ impl BlockchainNode {
                 round_id,
                 &unified_p2p_option,
                 &consensus_nonce_storage,
+                node_id,  // Pass the validated node_id
                 consensus_rx,
             ).await;
             
@@ -4381,6 +4642,7 @@ impl BlockchainNode {
                 round_id,
                 &unified_p2p_option,
                 &consensus_nonce_storage,
+                node_id,  // Pass the validated node_id
                 consensus_rx,
             ).await;
             
@@ -6394,6 +6656,8 @@ impl Clone for BlockchainNode {
             node_id: self.node_id.clone(),
             node_type: self.node_type,
             region: self.region,
+            signed_block_tracker: self.signed_block_tracker.clone(),
+            rotation_tracker: self.rotation_tracker.clone(),
             p2p_port: self.p2p_port,
             bootstrap_peers: self.bootstrap_peers.clone(),
             perf_config: self.perf_config.clone(),

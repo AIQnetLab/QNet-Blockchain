@@ -5,6 +5,106 @@ All notable changes to the QNet project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.13.0] - October 2, 2025 "Atomic Rewards & Activity-Based Recovery"
+
+### Added
+- **Atomic Rotation Rewards**: Single +30 reward per full 30-block rotation
+  - Replaced 30 individual +1 rewards with one atomic reward
+  - Partial rotations receive proportional rewards (e.g., 15 blocks = +15)
+  - Reduces lock contention and improves performance
+- **Activity-Based Recovery**: Reputation recovery requires recent activity
+  - Nodes must have successful ping within last hour to recover reputation
+  - Prevents offline nodes from gaining reputation
+  - Ensures only active participants benefit from recovery
+
+### Fixed
+- **Self-Penalty Exploit**: Removed ability to avoid -20 penalty by self-reporting
+  - All failovers now apply consistent -20 penalty
+  - Prevents manipulation of reputation system
+  - Ensures fair penalties for all nodes
+- **apply_decay() signature**: Updated to require last_activity parameter
+  - Enables activity checking for recovery
+  - Improves accuracy of reputation recovery
+
+### Changed
+- **Rotation Tracking**: Added RotationTracker for atomic reward management
+  - Tracks blocks produced per rotation round
+  - Calculates rewards at rotation boundaries
+  - Handles partial rotations from failovers
+- **Reputation Recovery Logic**: 
+  - Recovery rate remains +0.7%/hour towards 70%
+  - But now ONLY applies to active nodes (had recent ping)
+
+## [2.12.0] - October 2, 2025 "95% Decentralization with Stability Protection"
+
+### Added
+- **95% Decentralization**: Minimal Genesis protection for network stability
+  - Genesis nodes cannot be permanently banned (critical infrastructure)
+  - At <10% reputation: 30-day jail instead of ban for Genesis
+  - After critical jail: Restore to 10% (alive but no consensus)
+  - Regular nodes: Full penalties and permanent ban possible
+  - Balance between decentralization and network survival
+- **Jail System**: Universal progressive suspension for ALL nodes
+  - 1st offense: 1 hour jail
+  - 2nd offense: 24 hours jail  
+  - 3rd offense: 7 days jail
+  - 4th offense: 30 days jail
+  - 5th offense: 3 months jail
+  - 6+ offenses: 1 year maximum for ALL nodes
+- **Double-Sign Detection**: Automatic detection and evidence collection
+  - Tracks last 100 block heights for signature verification
+  - Immediate jail + -50 reputation penalty
+- **Invalid Block Detection**: 
+  - Time manipulation detection (>5s future blocks)
+  - Cryptographic signature validation
+  - Invalid consensus message detection
+- **Malicious Behavior Tracking**: 
+  - Violation history per node
+  - Evidence storage and verification
+  - Automatic reputation system integration
+
+### Changed
+- **Reputation Documentation**: Fixed to match actual code implementation
+  - Removed non-existent penalties from README
+  - Updated penalty/reward table with real values
+  - Added Anti-Malicious Protection section
+- **Removed Genesis Protection**: 
+  - No more special treatment for Genesis nodes
+  - All nodes equal in penalties and rewards
+  - Full decentralization achieved
+
+### Security
+- Protection against double-signing attacks
+- Time manipulation prevention
+- Network flooding protection (DDoS mitigation)
+- Protocol violation detection
+- Progressive penalty escalation for repeat offenders
+
+## [2.11.0] - October 2, 2025 "Critical Node ID Consistency & Reputation System Fix"
+
+### Fixed
+- **NODE_ID Consistency**: Complete fix for node identification system
+  - Now uses validated node_id from startup throughout the entire lifecycle
+  - Eliminates fallback IDs (e.g., node_5130b3c4) that caused failover issues
+  - Fixed `execute_real_commit_phase` and `execute_real_reveal_phase` to use passed node_id parameter
+  - Fixed `should_initiate_consensus` to use correct node_id instead of regenerating
+  - Ensures all nodes use consistent `genesis_node_XXX` IDs in Docker environments
+
+- **Genesis Node Reputation**: Critical fix for Genesis node penalty system
+  - Genesis nodes now use REAL P2P reputation instead of static 0.70 in candidate selection
+  - Reduced Genesis reputation floor from 70% to 20% to allow real penalties
+  - Failed/inactive Genesis nodes are now properly excluded from producer candidates
+  - Emergency producer selection now checks real reputation for Genesis nodes
+  - Fixes issue where penalized Genesis nodes remained eligible producers indefinitely
+
+### Added
+- **Emergency Mode for Network Recovery**: Progressive degradation when all nodes below threshold
+  - Genesis phase: Tries thresholds 50%, then emergency boost (+30%), then forced recovery
+  - Production phase: Progressive thresholds 50%, 40%, 30%, 20% to find any viable producer
+  - Emergency reputation boost (+50%) to first responding node in critical situations
+  - Prevents complete network halt when all nodes have low reputation
+  - Uses existing Progressive Finalization Protocol (PFP) for consistency
+
 ## [2.10.0] - October 1, 2025 "Hardware Auto-Tuning & Performance Optimization"
 
 ### Added

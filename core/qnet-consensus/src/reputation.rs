@@ -4,7 +4,7 @@
 use dashmap::DashMap;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 /// Evidence of double signing
@@ -83,6 +83,26 @@ impl Default for ReputationConfig {
     }
 }
 
+/// Jail status for temporary suspension
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JailStatus {
+    pub jailed_until: u64,  // Unix timestamp when jail expires
+    pub jail_count: u32,    // Number of times jailed
+    pub jail_reason: String, // Reason for current jail
+    pub pre_jail_reputation: f64, // Reputation before jailing
+}
+
+/// Malicious behavior types
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum MaliciousBehavior {
+    DoubleSign,           // Signed multiple blocks at same height
+    InvalidBlock,         // Produced cryptographically invalid block
+    TimeManipulation,     // Block timestamp manipulation
+    NetworkFlooding,      // DDoS-like behavior
+    InvalidConsensus,     // Malformed consensus messages
+    ProtocolViolation,    // Other protocol violations
+}
+
 /// Node reputation manager - PRODUCTION: Optimized for millions of nodes
 pub struct NodeReputation {
     config: ReputationConfig,
@@ -90,8 +110,12 @@ pub struct NodeReputation {
     reputations: Arc<DashMap<String, f64>>,
     /// Lock-free tracking of last update times
     last_update: Arc<DashMap<String, Instant>>,
-    /// Lock-free banned nodes tracking
+    /// Lock-free banned nodes tracking (DEPRECATED - use jail system)
     banned_nodes: Arc<DashMap<String, Instant>>,
+    /// Jail system for temporary suspension
+    jailed_nodes: Arc<DashMap<String, JailStatus>>,
+    /// Track malicious behavior history
+    violation_history: Arc<DashMap<String, Vec<(MaliciousBehavior, u64)>>>,
 }
 
 impl NodeReputation {
@@ -102,12 +126,31 @@ impl NodeReputation {
             reputations: Arc::new(DashMap::new()),
             last_update: Arc::new(DashMap::new()),
             banned_nodes: Arc::new(DashMap::new()),
+            jailed_nodes: Arc::new(DashMap::new()),
+            violation_history: Arc::new(DashMap::new()),
         }
     }
     
     /// Get reputation for a node
     pub fn get_reputation(&self, node_id: &str) -> f64 {
-        // Check if node is banned
+        // Check if node is jailed
+        if let Some(jail_status) = self.jailed_nodes.get(node_id) {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            
+            if now < jail_status.jailed_until {
+                // Still jailed - return 0 for complete exclusion
+                return 0.0;
+            } else {
+                // Jail expired - remove from jail and restore reputation
+                drop(jail_status); // Release the read lock
+                self.release_from_jail(node_id);
+            }
+        }
+        
+        // Legacy ban check (will be removed in future)
         if self.banned_nodes.contains_key(node_id) {
             return 0.0;
         }
@@ -128,9 +171,18 @@ impl NodeReputation {
         self.reputations.insert(node_id.to_string(), new_reputation);
         self.last_update.insert(node_id.to_string(), Instant::now());
         
-        // Ban if reputation too low
+        // STABILITY PROTECTION: Genesis nodes get critical jail instead of ban
         if new_reputation < self.config.min_reputation {
-            self.ban_node(node_id);
+            if self.is_genesis_node(node_id) {
+                // Genesis nodes: critical jail (30 days) instead of permanent ban
+                println!("[STABILITY] ⚠️ Genesis {} critical failure - applying 30-day jail instead of ban", node_id);
+                self.jail_node(node_id, MaliciousBehavior::ProtocolViolation);
+                // Set minimum 5% reputation to prevent complete death
+                self.reputations.insert(node_id.to_string(), 5.0);
+            } else {
+                // Regular nodes: normal ban
+                self.ban_node(node_id);
+            }
         }
     }
     
@@ -143,9 +195,16 @@ impl NodeReputation {
         self.reputations.insert(node_id.to_string(), new_reputation);
         self.last_update.insert(node_id.to_string(), Instant::now());
         
-        // Ban if reputation too low
+        // STABILITY PROTECTION: Same logic as update_reputation
         if new_reputation < self.config.min_reputation {
-            self.ban_node(node_id);
+            if self.is_genesis_node(node_id) {
+                // Genesis nodes: critical jail instead of ban
+                println!("[STABILITY] ⚠️ Genesis {} set below threshold - critical jail", node_id);
+                self.jail_node(node_id, MaliciousBehavior::ProtocolViolation);
+                self.reputations.insert(node_id.to_string(), 5.0);
+            } else {
+                self.ban_node(node_id);
+            }
         }
     }
     
@@ -170,9 +229,13 @@ impl NodeReputation {
         self.update_reputation(node_id, -2.0);
     }
     
-    /// Apply reputation decay
-    pub fn apply_decay(&mut self) {
+    /// Apply reputation decay with activity check
+    pub fn apply_decay(&mut self, last_activity: &HashMap<String, u64>) {
         let now = Instant::now();
+        let current_timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         
         // PRODUCTION: Check for ban expiry (7 days for recovery opportunity)
         let expired_bans: Vec<String> = self.banned_nodes
@@ -203,11 +266,24 @@ impl NodeReputation {
         for node_id in nodes_to_decay {
             let current = self.get_reputation(&node_id);
             
-            // PRODUCTION: Progressive recovery for nodes above threshold
+            // CRITICAL: Check if node was active in the last hour (had successful ping)
+            let was_active = last_activity.get(&node_id)
+                .map(|&last_ping| current_timestamp - last_ping < 3600) // Active if pinged within 1 hour
+                .unwrap_or(false);
+            
+            // PRODUCTION: Progressive recovery ONLY for active nodes
             if current < 70.0 {
-                // Below threshold: slow recovery towards 70%
-                let recovery_amount = (70.0 - current) * 0.01; // 1% recovery per hour
-                self.update_reputation(&node_id, recovery_amount);
+                if was_active {
+                    // Active node: allow recovery towards 70%
+                    let recovery_amount = (70.0 - current) * 0.01; // 1% recovery per hour
+                    self.update_reputation(&node_id, recovery_amount);
+                    println!("[REPUTATION] ✅ {} active - recovering +{:.2}% to {:.1}%", 
+                            node_id, recovery_amount, current + recovery_amount);
+                } else {
+                    // Inactive node: no recovery, only decay
+                    println!("[REPUTATION] ⏸️ {} inactive (no ping) - no recovery from {:.1}%", 
+                            node_id, current);
+                }
             } else if current > self.config.initial_reputation {
                 // Above initial: decay towards baseline
                 let decay_amount = (current - self.config.initial_reputation) * self.config.decay_rate;
@@ -293,5 +369,148 @@ impl NodeReputation {
             .iter()
             .map(|entry| entry.key().clone())
             .collect()
+    }
+    
+    /// Jail a node for malicious behavior
+    pub fn jail_node(&mut self, node_id: &str, behavior: MaliciousBehavior) {
+        // Track violation history
+        self.violation_history
+            .entry(node_id.to_string())
+            .or_insert_with(Vec::new)
+            .push((behavior.clone(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()));
+        
+        // Get jail count
+        let jail_count = self.jailed_nodes
+            .get(node_id)
+            .map(|js| js.jail_count + 1)
+            .unwrap_or(1);
+        
+        // Calculate jail duration based on offense count - SAME FOR ALL NODES
+        let jail_hours = match jail_count {
+            1 => 1,           // First offense: 1 hour
+            2 => 24,          // Second: 24 hours
+            3 => 168,         // Third: 7 days
+            4 => 720,         // Fourth: 30 days
+            5 => 2160,        // Fifth: 3 months
+            _ => 8760,        // 6+ offenses: 1 year max for ALL nodes (full equality)
+        };
+        
+        let jailed_until = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() + (jail_hours * 3600);
+        
+        let pre_jail_reputation = self.get_reputation(node_id);
+        
+        // Create jail status
+        let jail_status = JailStatus {
+            jailed_until,
+            jail_count,
+            jail_reason: format!("{:?}", behavior),
+            pre_jail_reputation,
+        };
+        
+        // Apply jail
+        self.jailed_nodes.insert(node_id.to_string(), jail_status);
+        
+        // Apply reputation penalty based on behavior
+        let penalty = match behavior {
+            MaliciousBehavior::DoubleSign => 50.0,
+            MaliciousBehavior::InvalidBlock => 30.0,
+            MaliciousBehavior::TimeManipulation => 20.0,
+            MaliciousBehavior::NetworkFlooding => 10.0,
+            MaliciousBehavior::InvalidConsensus => 5.0,
+            MaliciousBehavior::ProtocolViolation => 15.0,
+        };
+        
+        // Apply penalty equally to ALL nodes - no special protection
+        let new_reputation = (pre_jail_reputation - penalty).max(0.0);
+        
+        self.reputations.insert(node_id.to_string(), new_reputation);
+        
+        println!("[JAIL] ⛓️ Node {} jailed for {} hours (offense #{}) for {:?}", 
+                node_id, jail_hours, jail_count, behavior);
+    }
+    
+    /// Release node from jail
+    fn release_from_jail(&self, node_id: &str) {
+        if let Some((_, jail_status)) = self.jailed_nodes.remove(node_id) {
+            // Calculate restoration reputation based on jail count
+            let restore_reputation: f64 = match jail_status.jail_count {
+                1 => 30.0,
+                2 => 25.0,
+                3 => 20.0,
+                4 => 15.0,
+                5 => 10.0,
+                _ => 5.0,
+            };
+            
+            // STABILITY: Genesis nodes get minimum 10% after critical jail
+            // This keeps them alive but below consensus threshold (70%)
+            let final_reputation = if self.is_genesis_node(node_id) && restore_reputation < 10.0 {
+                10.0  // Minimum for Genesis to stay in network
+            } else {
+                restore_reputation
+            };
+            
+            self.reputations.insert(node_id.to_string(), final_reputation);
+            
+            println!("[JAIL] 🔓 Node {} released from jail - reputation restored to {}%", 
+                    node_id, final_reputation);
+        }
+    }
+    
+    /// Check if node is Genesis (helper method)
+    fn is_genesis_node(&self, node_id: &str) -> bool {
+        // Check various Genesis node patterns
+        node_id.starts_with("genesis_node_") ||
+        node_id == "genesis_node_001" ||
+        node_id == "genesis_node_002" ||
+        node_id == "genesis_node_003" ||
+        node_id == "genesis_node_004" ||
+        node_id == "genesis_node_005" ||
+        // Legacy patterns
+        node_id == "QNET-BOOT-0001-STRAP" ||
+        node_id == "QNET-BOOT-0002-STRAP" ||
+        node_id == "QNET-BOOT-0003-STRAP" ||
+        node_id == "QNET-BOOT-0004-STRAP" ||
+        node_id == "QNET-BOOT-0005-STRAP"
+    }
+    
+    /// Detect and handle malicious behavior
+    pub fn detect_malicious_behavior(&mut self, node_id: &str, evidence: &Evidence) -> bool {
+        // Parse evidence to determine behavior type
+        let behavior = match evidence.evidence_type.as_str() {
+            "double_sign" => MaliciousBehavior::DoubleSign,
+            "invalid_block" => MaliciousBehavior::InvalidBlock,
+            "time_manipulation" => MaliciousBehavior::TimeManipulation,
+            "network_flooding" => MaliciousBehavior::NetworkFlooding,
+            "invalid_consensus" => MaliciousBehavior::InvalidConsensus,
+            _ => MaliciousBehavior::ProtocolViolation,
+        };
+        
+        // Jail the node
+        self.jail_node(node_id, behavior);
+        
+        true // Malicious behavior detected and handled
+    }
+    
+    /// Check if node is currently jailed
+    pub fn is_jailed(&self, node_id: &str) -> bool {
+        if let Some(jail_status) = self.jailed_nodes.get(node_id) {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            
+            now < jail_status.jailed_until
+        } else {
+            false
+        }
+    }
+    
+    /// Get jail status for a node
+    pub fn get_jail_status(&self, node_id: &str) -> Option<JailStatus> {
+        self.jailed_nodes.get(node_id).map(|entry| entry.clone())
     }
 } 

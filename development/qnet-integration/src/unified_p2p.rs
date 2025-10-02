@@ -1552,6 +1552,7 @@ impl SimplifiedP2P {
          let connected_peers = self.connected_peers.clone();
         let connected_peer_addrs = self.connected_peer_addrs.clone(); // CRITICAL: Clone for phantom cleanup
          let reputation_system = self.reputation_system.clone(); // Use shared system
+         let connected_peers_lockfree = self.connected_peers_lockfree.clone(); // For get_last_activity_map
          let genesis_ips = vec!["154.38.160.39".to_string(), "62.171.157.44".to_string(), 
                                "161.97.86.81".to_string(), "173.212.219.226".to_string(), 
                                "164.68.108.218".to_string()]; // Genesis IPs to avoid borrowing self
@@ -1571,9 +1572,24 @@ impl SimplifiedP2P {
                 let check_interval = if is_genesis_phase { 5 } else { 30 };
                 tokio::time::sleep(std::time::Duration::from_secs(check_interval)).await;
                  
-                 // PRODUCTION: Apply reputation decay periodically
+                 // PRODUCTION: Apply reputation decay periodically with activity check
                  if let Ok(mut reputation) = reputation_system.lock() {
-                     reputation.apply_decay();
+                     // Build last activity map from connected peers
+                     let mut last_activity = HashMap::new();
+                     
+                     // Collect from regular connected peers
+                     if let Ok(peers) = connected_peers.read() {
+                         for (_, peer) in peers.iter() {
+                             last_activity.insert(peer.id.clone(), peer.last_seen);
+                         }
+                     }
+                     
+                     // Also check lock-free peers
+                     for entry in connected_peers_lockfree.iter() {
+                         last_activity.insert(entry.value().id.clone(), entry.value().last_seen);
+                     }
+                     
+                     reputation.apply_decay(&last_activity);
                  }
                  
                  // PRODUCTION: Sync reputation with network every 5 minutes
@@ -5436,11 +5452,33 @@ impl SimplifiedP2P {
     
 
     
-    /// PRODUCTION: Apply reputation decay periodically
+    /// Get last activity map for all peers
+    pub fn get_last_activity_map(&self) -> HashMap<String, u64> {
+        let mut activity_map = HashMap::new();
+        
+        // Collect from connected peers
+        if let Ok(peers) = self.connected_peers.read() {
+            for (_, peer) in peers.iter() {
+                activity_map.insert(peer.id.clone(), peer.last_seen);
+            }
+        }
+        
+        // Also check lock-free peers if enabled
+        if self.should_use_lockfree() {
+            for entry in self.connected_peers_lockfree.iter() {
+                activity_map.insert(entry.value().id.clone(), entry.value().last_seen);
+            }
+        }
+        
+        activity_map
+    }
+    
+    /// PRODUCTION: Apply reputation decay periodically with activity check
     pub fn apply_reputation_decay(&self) {
         if let Ok(mut reputation) = self.reputation_system.lock() {
-            reputation.apply_decay();
-            println!("[P2P] ⏰ Applied reputation decay to all nodes");
+            let last_activity = self.get_last_activity_map();
+            reputation.apply_decay(&last_activity);
+            println!("[P2P] ⏰ Applied reputation decay to all nodes (with activity check)");
         }
     }
 
@@ -5733,7 +5771,7 @@ impl SimplifiedP2P {
         println!("[FAILOVER] 💀 Failed producer: {} at block #{}", get_privacy_id_for_addr(&failed_producer), block_height);
         println!("[FAILOVER] 🆘 New producer: {} (emergency activation)", get_privacy_id_for_addr(&new_producer));
         
-        // CRITICAL FIX: Don't penalize invalid or self nodes
+        // CRITICAL FIX: Don't penalize placeholder nodes only
         if failed_producer == "unknown_leader" || 
            failed_producer == "no_leader_selected" || 
            failed_producer == "consensus_lock_failed" {
@@ -5741,16 +5779,15 @@ impl SimplifiedP2P {
             return;
         }
         
-        // CRITICAL FIX: Don't penalize ourselves if we voluntarily stepped down
-        if failed_producer == self.node_id {
-            println!("[REPUTATION] 🛡️ Skipping self-penalty - voluntary producer handover");
-            // We already know we can't produce, no need to penalize ourselves
-            return;
-        }
-        
-        // Update reputation of failed producer (only for actual failures)
+        // PRODUCTION: Apply penalty to ALL failed producers, including self
+        // This prevents exploitation where nodes voluntarily fail without penalty
         self.update_node_reputation(&failed_producer, -20.0);
-        println!("[REPUTATION] ⚔️ Network-wide penalty for {}: -20.0 reputation (emergency change)", failed_producer);
+        
+        if failed_producer == self.node_id {
+            println!("[REPUTATION] ⚔️ Self-penalty applied: -20.0 reputation (failover)");
+        } else {
+            println!("[REPUTATION] ⚔️ Network-wide penalty for {}: -20.0 reputation (emergency change)", failed_producer);
+        }
         
         // Boost reputation of emergency producer for taking over
         if new_producer != "emergency_consensus" && new_producer != self.node_id {
