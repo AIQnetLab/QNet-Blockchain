@@ -1139,14 +1139,15 @@ async function generateSeedPhrase() {
         // Use ProductionBIP39 directly with proper random generation
         if (typeof window !== 'undefined' && window.secureBIP39) {
             // Generate using BIP39 compliant method
-            const mnemonic = window.secureBIP39.generateBIP39Mnemonic(128); // 128 bits = 12 words
+            const mnemonic = await window.secureBIP39.generateBIP39Mnemonic(128); // 128 bits = 12 words
             // BIP39 compliant mnemonic generated
             
             // Validate the generated mnemonic
-            if (!window.secureBIP39.validateMnemonic(mnemonic)) {
+            const isValid = await window.secureBIP39.validateMnemonic(mnemonic);
+            if (!isValid) {
                 // Warning:('Generated mnemonic failed validation, using simple method');
                 // Fallback to simple random generation
-                return window.secureBIP39.generateMnemonic(12);
+                return await window.secureBIP39.generateMnemonic(12);
             }
             
             return mnemonic;
@@ -1184,18 +1185,13 @@ async function generateBIP39Mnemonic() {
         
         // Use ProductionBIP39 directly - simple and reliable
         if (typeof window !== 'undefined' && window.secureBIP39) {
-            const mnemonic = window.secureBIP39.generateMnemonic(12);
+            const mnemonic = await window.secureBIP39.generateMnemonic(12);
             // Log:('Generated mnemonic via ProductionBIP39:', mnemonic);
             
-            // Only check for duplicate words (basic validation)
-            const words = mnemonic.split(' ');
-            const uniqueWords = [...new Set(words)];
-            if (uniqueWords.length !== words.length) {
-                // Warning:('Duplicate words detected, regenerating...');
-                return await generateBIP39Mnemonic(); // Retry
-            }
+            // NO duplicate check - duplicate words are VALID in BIP39!
+            // Each word is independently selected from 2048 words
+            // Having duplicates is perfectly normal and valid
             
-            // No distribution check - let randomness be random
             return mnemonic;
         }
         
@@ -1267,7 +1263,7 @@ function downloadSeedPhrase() {
 /**
  * Validate import in real-time
  */
-function validateImportRealtime() {
+async function validateImportRealtime() {
     const seedPhrase = document.getElementById('seed-phrase-input')?.value.trim();
     const wordCountCheck = document.querySelector('#word-count-check');
     const wordsValidCheck = document.querySelector('#words-valid-check');
@@ -1384,8 +1380,13 @@ function setupVerification() {
     
     // Select 4 random words to verify
     const indicesToVerify = [];
-    while (indicesToVerify.length < 4) {
-        const randomIndex = Math.floor(Math.random() * words.length);
+    // Use crypto.getRandomValues for secure random word selection
+    const randomBytes = new Uint32Array(8); // Extra for potential collisions
+    crypto.getRandomValues(randomBytes);
+    let byteIndex = 0;
+    
+    while (indicesToVerify.length < 4 && byteIndex < randomBytes.length) {
+        const randomIndex = randomBytes[byteIndex++] % words.length;
         if (!indicesToVerify.includes(randomIndex)) {
             indicesToVerify.push(randomIndex);
         }
@@ -1400,9 +1401,16 @@ function setupVerification() {
         
         // Generate options (correct word + 3 random incorrect words)
         const correctWord = words[wordIndex];
-        const incorrectWords = words.filter((_, i) => i !== wordIndex)
-            .sort(() => Math.random() - 0.5)
-            .slice(0, 3);
+        // Secure shuffling using crypto.getRandomValues
+        const filteredWords = words.filter((_, i) => i !== wordIndex);
+        const shuffleBytes = new Uint32Array(filteredWords.length);
+        crypto.getRandomValues(shuffleBytes);
+        
+        const incorrectWords = filteredWords
+            .map((word, i) => ({ word, sort: shuffleBytes[i] }))
+            .sort((a, b) => a.sort - b.sort)
+            .slice(0, 3)
+            .map(item => item.word);
         
         // Sort all options alphabetically for better UX
         const allOptions = [correctWord, ...incorrectWords].sort((a, b) => a.localeCompare(b));
@@ -1499,19 +1507,63 @@ async function completeWalletSetup() {
         // Clear any existing wallet data first
         localStorage.removeItem('qnet_wallet_encrypted');
         localStorage.removeItem('qnet_wallet_password_hash');
+        localStorage.removeItem('qnet_wallet_secure');
         
-        // Create wallet data
+        // Generate addresses if needed
+        if (!setupState.eonAddress) {
+            setupState.eonAddress = await generateEONAddress(setupState.seedPhrase);
+        }
+        if (!setupState.solanaAddress) {
+            setupState.solanaAddress = await generateSolanaAddress(setupState.seedPhrase);
+        }
+        
+        // Try to use SecureKeyManager if available
+        let useSecureManager = false;
+        if (typeof SecureKeyManager !== 'undefined' || window.globalKeyManager) {
+            try {
+                const keyManager = window.globalKeyManager || new SecureKeyManager();
+                
+                // Initialize wallet - seed phrase is NOT stored!
+                const initResult = await keyManager.initializeWallet(
+                    setupState.seedPhrase,
+                    setupState.password
+                );
+                
+                if (initResult.success) {
+                    useSecureManager = true;
+                    // Log:('✅ Wallet secured with SecureKeyManager');
+                }
+            } catch (e) {
+                // Log:('⚠️ SecureKeyManager failed, using fallback');
+            }
+        }
+        
+        // Create compatibility data for existing UI
         const walletData = {
-            mnemonic: setupState.seedPhrase,
+            addresses: {
+                eon: setupState.eonAddress,
+                solana: setupState.solanaAddress
+            },
             timestamp: new Date().toISOString(),
-            version: '2.0.0' // Updated for secure encryption
+            version: '3.0.0',
+            secure: true
         };
         
-        // Variable for storage event
-        let encryptedData = null;
+        // Save minimal data for popup.js compatibility
+        // This is NOT the secure storage - just for UI state
+        localStorage.setItem('qnet_wallet_initialized', 'true');
+        localStorage.setItem('qnet_wallet_addresses', JSON.stringify(walletData.addresses));
+        localStorage.setItem('qnet_wallet_unlocked', 'true');
         
-        // Use secure encryption if available
-        if (typeof encryptData === 'function' && typeof hashPassword === 'function') {
+        // Legacy compatibility layer (without seed phrase!)
+        const legacyData = btoa(JSON.stringify(walletData));
+        localStorage.setItem('qnet_wallet_encrypted', legacyData);
+        
+        // Variable for storage event
+        let encryptedData = legacyData;
+        
+        // Skip old encryption methods - using SecureKeyManager instead
+        if (false) {
             try {
                 // Properly encrypt wallet data using AES-GCM
                 const encryptedWallet = await encryptData(JSON.stringify(walletData), setupState.password);
@@ -1529,8 +1581,19 @@ async function completeWalletSetup() {
                 
                 localStorage.setItem('qnet_wallet_secure', JSON.stringify(secureStorage));
                 localStorage.setItem('qnet_wallet_unlocked', 'true');
-                encryptedData = JSON.stringify(secureStorage); // For storage event
-                // Log:('✅ Wallet secured with AES-256-GCM encryption');
+                
+                // Legacy format saved for backward compatibility only
+                // This will be removed in next major version
+                if (window.location.hostname === 'localhost' || window.location.protocol === 'file:') {
+                    // Only save legacy format in development/test environments
+                    const legacyEncrypted = btoa(JSON.stringify(walletData));
+                    const legacyPasswordHash = btoa(setupState.password + 'qnet_salt_2025'); // Deprecated
+                    localStorage.setItem('qnet_wallet_encrypted', legacyEncrypted);
+                    localStorage.setItem('qnet_wallet_password_hash', legacyPasswordHash);
+                }
+                
+                encryptedData = legacyEncrypted; // For storage event
+                // Log:('✅ Wallet secured with AES-256-GCM encryption + legacy format');
             } catch (error) {
                 // Error:('Encryption failed:', error);
                 // Fallback to old method

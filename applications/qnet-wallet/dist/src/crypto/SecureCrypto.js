@@ -407,9 +407,12 @@ export class SecureCrypto {
         } catch (error) {
             console.error('Error generating EON address:', error);
             // Fallback in case of any crypto failure
-            const fallback_part1 = Math.random().toString(36).substring(2, 10);
-            const fallback_part2 = Math.random().toString(36).substring(2, 10);
-            const fallback_checksum = Math.random().toString(36).substring(2, 6);
+            // Use crypto.getRandomValues for secure fallback
+            const randomBytes = new Uint8Array(32);
+            crypto.getRandomValues(randomBytes);
+            const fallback_part1 = btoa(String.fromCharCode(...randomBytes.slice(0, 8))).replace(/[+/=]/g, '').substring(0, 8);
+            const fallback_part2 = btoa(String.fromCharCode(...randomBytes.slice(8, 16))).replace(/[+/=]/g, '').substring(0, 8);
+            const fallback_checksum = btoa(String.fromCharCode(...randomBytes.slice(16, 20))).replace(/[+/=]/g, '').substring(0, 6);
             return `${fallback_part1}eon${fallback_part2}${fallback_checksum}`;
         }
     }
