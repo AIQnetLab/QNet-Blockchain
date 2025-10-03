@@ -304,45 +304,28 @@ export class DualNetworkManager {
     }
 
     /**
-     * Get secure node information with activation code (for wallet extension)
+     * Get node information for address
      */
     async getNodeInfo(eonAddress) {
         try {
-            // Use secure endpoint to get activation code for this node
-            const qnetEndpoint = this.qnetEndpoints[this.currentNetwork] || 'http://localhost:8001';
-            const response = await fetch(`${qnetEndpoint}/api/v1/node/secure-info`, {
-                method: 'GET',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'User-Agent': 'QNet-Wallet-Extension/2.0.0'
-                },
-                timeout: 15000
+            const response = await this.qnetRpcCall('get_node_info', {
+                owner_address: eonAddress
             });
 
-            if (!response.ok) {
-                console.warn('Secure node info endpoint not available, using fallback');
-                return null;
-            }
-
-            const nodeData = await response.json();
-            
-            if (!nodeData.activation_code) {
+            if (!response.node) {
                 return null; // No active node
             }
 
             return {
-                code: nodeData.activation_code,
-                type: nodeData.node_type,
-                status: nodeData.status,
-                uptime: nodeData.uptime,
-                rewards: nodeData.pending_rewards || 0,
-                activated_at: nodeData.last_seen,
-                node_id: nodeData.node_id,
-                height: nodeData.height,
-                peers: nodeData.peers
+                code: response.node.activation_code,
+                type: response.node.type,
+                status: response.node.status,
+                uptime: response.node.uptime_percentage,
+                rewards: response.node.daily_rewards,
+                activated_at: response.node.activated_at
             };
         } catch (error) {
-            console.error('Failed to get secure node info:', error);
+            console.error('Failed to get node info:', error);
             return null;
         }
     }
