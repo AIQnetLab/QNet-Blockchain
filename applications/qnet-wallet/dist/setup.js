@@ -4,6 +4,11 @@
  * July 2025 - Production Ready
  */
 
+// Initialize SecureKeyManager globally (moved from inline script for CSP compliance)
+if (typeof window !== 'undefined' && typeof SecureKeyManager !== 'undefined') {
+    window.globalKeyManager = new SecureKeyManager();
+}
+
 // Global setup state
 let setupState = {
     currentStep: 'welcome',
