@@ -206,7 +206,7 @@
             
             try {
                 const keyManager = new SecureKeyManager();
-                const result = await keyManager.initializeWallet(TEST_SEED, TEST_PASSWORD, true);
+                const result = await keyManager.initializeWallet(TEST_PASSWORD, TEST_SEED, true);
                 
                 if (result.success) {
                     updateTest(testId, 'passed', `✓ Wallet initialized successfully<br>
@@ -236,13 +236,19 @@
             
             try {
                 const keyManager = new SecureKeyManager();
-                await keyManager.initializeWallet(TEST_SEED, TEST_PASSWORD, true);
+                await keyManager.initializeWallet(TEST_PASSWORD, TEST_SEED, true);
+                
+                // Wait for IndexedDB to complete write operation
+                await new Promise(resolve => setTimeout(resolve, 100));
                 
                 // Lock wallet first
                 keyManager.lockWallet();
                 
+                // Create new instance to test real-world unlock scenario
+                const newKeyManager = new SecureKeyManager();
+                
                 // Try to unlock with correct password
-                const unlockResult = await keyManager.unlockWallet(TEST_PASSWORD, true);
+                const unlockResult = await newKeyManager.unlockWallet(TEST_PASSWORD, true);
                 
                 if (unlockResult.success && unlockResult.mnemonic === TEST_SEED) {
                     updateTest(testId, 'passed', `✓ Wallet unlocked successfully<br>
@@ -269,13 +275,19 @@
             
             try {
                 const keyManager = new SecureKeyManager();
-                await keyManager.initializeWallet(TEST_SEED, TEST_PASSWORD, true);
+                await keyManager.initializeWallet(TEST_PASSWORD, TEST_SEED, true);
+                
+                // Wait for IndexedDB to complete write operation
+                await new Promise(resolve => setTimeout(resolve, 100));
                 
                 // Lock wallet
                 keyManager.lockWallet();
                 
+                // Create new instance to test real-world scenario
+                const newKeyManager = new SecureKeyManager();
+                
                 // Try to unlock with wrong password
-                const unlockResult = await keyManager.unlockWallet(WRONG_PASSWORD, true);
+                const unlockResult = await newKeyManager.unlockWallet(WRONG_PASSWORD, true);
                 
                 if (!unlockResult.success) {
                     updateTest(testId, 'passed', `✓ Wrong password correctly rejected<br>
@@ -303,7 +315,7 @@
             
             try {
                 const keyManager = new SecureKeyManager();
-                await keyManager.initializeWallet(TEST_SEED, TEST_PASSWORD, true);
+                await keyManager.initializeWallet(TEST_PASSWORD, TEST_SEED, true);
                 
                 let foundPlaintext = false;
                 let issues = [];
@@ -360,27 +372,37 @@
             
             try {
                 const keyManager = new SecureKeyManager();
-                await keyManager.initializeWallet(TEST_SEED, TEST_PASSWORD, true);
+                await keyManager.initializeWallet(TEST_PASSWORD, TEST_SEED, true);
                 
-                // Unlock to load keys in memory
-                await keyManager.unlockWallet(TEST_PASSWORD, false);
+                // Wait for IndexedDB to complete write operation
+                await new Promise(resolve => setTimeout(resolve, 100));
                 
-                // Check that session keys exist
-                const hasKeysBeforeLock = keyManager.sessionKeys !== null;
-                
-                // Lock wallet (should clear memory)
+                // Lock wallet first
                 keyManager.lockWallet();
                 
+                // Create new instance and unlock to load keys in memory
+                const testKeyManager = new SecureKeyManager();
+                await testKeyManager.unlockWallet(TEST_PASSWORD, false);
+                
+                // Check that session keys exist after unlock
+                const hasKeysBeforeLock = testKeyManager.sessionKeys !== null;
+                
+                // Lock wallet (should clear memory)
+                testKeyManager.lockWallet();
+                
                 // Check that session keys are cleared
-                const hasKeysAfterLock = keyManager.sessionKeys !== null;
+                const hasKeysAfterLock = testKeyManager.sessionKeys !== null;
                 
                 if (hasKeysBeforeLock && !hasKeysAfterLock) {
                     updateTest(testId, 'passed', `✓ Session keys loaded on unlock<br>
                         ✓ Memory cleared on lock<br>
                         ✓ No sensitive data persists in memory`);
                     testResults.passed++;
+                } else if (!hasKeysBeforeLock) {
+                    updateTest(testId, 'failed', '✗ Session keys not loaded on unlock', 'error');
+                    testResults.failed++;
                 } else {
-                    updateTest(testId, 'failed', '✗ Memory not properly cleared', 'error');
+                    updateTest(testId, 'failed', '✗ Memory not properly cleared on lock', 'error');
                     testResults.failed++;
                 }
             } catch (error) {
@@ -405,7 +427,7 @@
                 
                 // Create first wallet
                 const keyManager1 = new SecureKeyManager();
-                await keyManager1.initializeWallet(TEST_SEED, TEST_PASSWORD, true);
+                await keyManager1.initializeWallet(TEST_PASSWORD, TEST_SEED, true);
                 
                 // Get vault data IMMEDIATELY after creation (before it's overwritten)
                 const vault1 = await keyManager1.loadVault();
@@ -424,7 +446,7 @@
                 
                 // Create second wallet with same seed and password
                 const keyManager2 = new SecureKeyManager();
-                await keyManager2.initializeWallet(TEST_SEED, TEST_PASSWORD, true);
+                await keyManager2.initializeWallet(TEST_PASSWORD, TEST_SEED, true);
                 
                 // Get second vault data
                 const vault2 = await keyManager2.loadVault();

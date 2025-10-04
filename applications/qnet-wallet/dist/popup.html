@@ -147,11 +147,6 @@
                     <div id="account-address" class="address-full" title="Click to copy">
                         Loading...
                     </div>
-                    <button id="copy-address-btn" class="copy-btn" title="Copy Address">
-                        <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor">
-                            <path d="M16 1H4C2.9 1 2 1.9 2 3V17H4V3H16V1ZM19 5H8C6.9 5 6 5.9 6 7V21C6 22.1 6.9 23 8 23H19C20.1 23 21 22.1 21 21V7C21 5.9 20.1 5 19 5ZM19 21H8V7H19V21Z"/>
-                        </svg>
-                    </button>
                 </div>
                 <div class="balance-row">
                     <div class="balance-main">
@@ -175,11 +170,11 @@
 
             <!-- Main Tab Navigation -->
             <nav class="main-tab-nav">
-                <button class="main-tab active" data-tab="assets">Assets</button>
-                <button class="main-tab" data-tab="send">Send</button>
-                <button class="main-tab" data-tab="receive">Receive</button>
-                <button class="main-tab" data-tab="activate">Activate</button>
-                <button class="main-tab" data-tab="history">History</button>
+                <button class="main-tab active" data-tab="assets" type="button">Assets</button>
+                <button class="main-tab" data-tab="send" type="button">Send</button>
+                <button class="main-tab" data-tab="receive" type="button">Receive</button>
+                <button class="main-tab" data-tab="activate" type="button">Activate</button>
+                <button class="main-tab" data-tab="history" type="button">History</button>
             </nav>
 
             <!-- Tab Content Container -->
@@ -486,7 +481,6 @@
                     </div>
                     <div class="address-display">
                         <div class="address-text" id="receive-address">Loading...</div>
-                        <button class="copy-address-btn" id="copy-receive-address-btn">Copy Address</button>
                     </div>
                 </div>
             </div>
@@ -653,6 +647,7 @@
     </div>
 
     <!-- Load production version with working interface -->
+    <script src="src/crypto/Ed25519.js"></script>
     <script src="src/security/SecureKeyManager.js"></script>
     <script src="popup.js"></script>
 </body>

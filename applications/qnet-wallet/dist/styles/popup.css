@@ -260,7 +260,7 @@ body {
 }
 
 .phantom-unlock-btn:active {
-  /* transform removed - button stays static */
+  opacity: 0.95;
 }
 
 .phantom-unlock-btn:disabled {
@@ -476,22 +476,45 @@ body {
 .address-full {
   flex: 1;
   font-family: var(--font-mono);
-  font-size: 0.75rem;
+  font-size: 0.7rem;
   color: var(--text-secondary);
   background: var(--bg-card);
-  padding: 0.4rem 0.6rem;
+  padding: 0.5rem 0.7rem;
   border-radius: var(--radius-sm);
   border: 1px solid var(--border-primary);
   cursor: pointer;
   transition: all 0.2s ease;
   white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  overflow-x: auto;
+  overflow-y: hidden;
+  word-break: keep-all;
+  /* Custom scrollbar */
+  scrollbar-width: thin;
+  scrollbar-color: var(--qnet-primary) var(--bg-card);
+}
+
+.address-full::-webkit-scrollbar {
+  height: 4px;
+}
+
+.address-full::-webkit-scrollbar-track {
+  background: var(--bg-card);
+  border-radius: 2px;
+}
+
+.address-full::-webkit-scrollbar-thumb {
+  background: rgba(0, 210, 190, 0.3);
+  border-radius: 2px;
+}
+
+.address-full::-webkit-scrollbar-thumb:hover {
+  background: rgba(0, 210, 190, 0.5);
 }
 
 .address-full:hover {
-  border-color: var(--qnet-primary);
+  border-color: rgba(0, 210, 190, 0.5);
   color: var(--text-primary);
+  background: rgba(0, 210, 190, 0.05);
 }
 
 .copy-btn {
@@ -574,8 +597,8 @@ body {
   padding: 0.9rem 0.5rem;
   background: transparent;
   border: none;
-  color: var(--text-secondary);
-  font-size: 0.85rem;
+  color: #8a8a8a;
+  font-size: 0.9rem;
   font-weight: 600;
   cursor: pointer;
   border-bottom: 3px solid transparent;
@@ -583,16 +606,18 @@ body {
   position: relative;
   text-transform: capitalize;
   letter-spacing: 0.3px;
+  min-width: 60px;
+  text-align: center;
 }
 
 .main-tab:hover {
-  color: var(--text-primary);
+  color: #ffffff;
   background: linear-gradient(180deg, transparent 0%, rgba(0, 212, 255, 0.05) 100%);
 }
 
 .main-tab.active {
-  color: var(--qnet-primary);
-  border-bottom-color: var(--qnet-primary);
+  color: #00d4ff;
+  border-bottom-color: #00d4ff;
   background: linear-gradient(180deg, transparent 0%, rgba(0, 212, 255, 0.08) 100%);
 }
 
@@ -603,7 +628,7 @@ body {
   left: 0;
   right: 0;
   height: 3px;
-  background: linear-gradient(90deg, transparent, var(--qnet-primary), transparent);
+  background: linear-gradient(90deg, transparent, #00d4ff, transparent);
   animation: slideGlow 2s ease-in-out infinite;
 }
 
@@ -662,10 +687,10 @@ body {
 }
 
 .token-icon {
-  width: 32px;
-  height: 32px;
+  width: 40px;
+  height: 40px;
   border-radius: 50%;
-  background: var(--qnet-gradient);
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -673,6 +698,27 @@ body {
   color: white;
   margin-right: 0.75rem;
   font-size: 0.8rem;
+  overflow: hidden;
+  position: relative;
+}
+
+.token-icon img,
+.token-icon-img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: 50%;
+}
+
+.token-icon svg {
+  width: 24px;
+  height: 24px;
+  z-index: 1;
+}
+
+/* Cost highlight for activation */
+.cost-highlight {
+  color: #00d4ff;
 }
 
 .token-info {

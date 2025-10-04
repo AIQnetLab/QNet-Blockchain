@@ -799,6 +799,28 @@ chrome.runtime.onInstalled.addListener(() => {
     initializeWallet();
 });
 
+// Listen for storage changes to sync state between popup and background
+if (chrome.storage && chrome.storage.onChanged) {
+    chrome.storage.onChanged.addListener((changes, areaName) => {
+        // Listen to both session and local storage
+        if ((areaName === 'local' || areaName === 'session') && changes.isUnlocked) {
+            const newValue = changes.isUnlocked.newValue;
+            const oldValue = changes.isUnlocked.oldValue;
+            
+            console.log('[Background StorageListener] isUnlocked changed from', oldValue, 'to', newValue);
+            
+            // Sync the unlock state
+            if (newValue !== walletState.isUnlocked) {
+                walletState.isUnlocked = newValue;
+                
+                // Don't try to load accounts here - they'll be sent via SET_WALLET_STATE
+                // from popup when it unlocks the wallet
+                console.log('[Background StorageListener] Unlock state synced, waiting for addresses from popup');
+            }
+        }
+    });
+}
+
 /**
  * Initialize wallet state and connections
  */
@@ -806,8 +828,16 @@ async function initializeWallet() {
     try {
         // Initializing production wallet
         
-        // Initialize Solana RPC
-        walletState.solanaRPC = new SolanaRPC('devnet'); // Use devnet for testing
+        // Initialize network setting
+        const networkData = await chrome.storage.local.get(['mainnet']);
+        if (!networkData.hasOwnProperty('mainnet')) {
+            // Default to testnet if not set
+            await chrome.storage.local.set({ mainnet: false });
+        }
+        
+        // Initialize Solana RPC based on network setting
+        const network = networkData.mainnet ? 'mainnet' : 'devnet';
+        walletState.solanaRPC = new SolanaRPC(network);
         
         // Load wallet state from storage
         const result = await chrome.storage.local.get([
@@ -818,23 +848,51 @@ async function initializeWallet() {
             'currentNetwork'
         ]);
         
-        const walletExists = result.walletExists || false;
+        // Check if wallet exists (both markers are valid)
+        const walletExists = (result.walletExists || false) || (result.encryptedWallet !== undefined && result.encryptedWallet !== null);
         walletState.encryptedWallet = result.encryptedWallet;
         walletState.currentNetwork = result.currentNetwork || 'solana';
         
-        // Check if wallet should remain unlocked
-        if (walletExists && result.isUnlocked) {
+        console.log('[Background Init] Storage check - walletExists:', result.walletExists, 'encryptedWallet:', !!result.encryptedWallet, 'final walletExists:', walletExists);
+        
+        // Check for unlock state from storage
+        let shouldUnlock = false;
+        
+        // First check session storage (preferred for browser restart detection)
+        if (chrome.storage.session) {
+            try {
+                const sessionResult = await chrome.storage.session.get(['isUnlocked']);
+                if (sessionResult.hasOwnProperty('isUnlocked') && sessionResult.isUnlocked) {
+                    shouldUnlock = true;
+                    console.log('[Background Init] Found isUnlocked in session storage:', sessionResult.isUnlocked);
+                }
+            } catch (e) {
+                // Session storage not available
+            }
+        }
+        
+        // If not in session, check local storage
+        if (!shouldUnlock && result.isUnlocked) {
+            // For local storage, check if it's within timeout period
             const lastUnlockTime = result.lastUnlockTime || 0;
             const timeSinceUnlock = Date.now() - lastUnlockTime;
             
             if (timeSinceUnlock < walletState.settings.lockTimeout) {
-                // Restore unlocked state
-                walletState.isUnlocked = true;
-                await loadWalletAccounts();
-                startAutoLockTimer();
-                startBalanceUpdates();
-                // Wallet restored to unlocked state
+                shouldUnlock = true;
+                console.log('[Background Init] Found isUnlocked in local storage, within timeout');
             }
+        }
+        
+        // Restore unlocked state if needed
+        if (walletExists && shouldUnlock) {
+            walletState.isUnlocked = true;
+            // Don't try to load accounts here - they'll be loaded when popup sends them
+            // or when wallet is properly unlocked with password
+            startAutoLockTimer();
+            startBalanceUpdates();
+            console.log('[Background Init] Wallet restored to unlocked state, waiting for accounts from popup');
+        } else {
+            console.log('[Background Init] Wallet locked - walletExists:', walletExists, 'shouldUnlock:', shouldUnlock);
         }
         
         // Wallet initialized successfully
@@ -895,11 +953,13 @@ async function handleMessage(request, sender, sendResponse) {
                 break;
                 
             case 'GET_BALANCE':
+                console.log('[Message] GET_BALANCE request:', request.address);
                 const balance = await getBalance(request.address);
                 sendResponse({ balance });
                 break;
                 
             case 'GET_TOKEN_BALANCE':
+                console.log('[Message] GET_TOKEN_BALANCE request:', request.address, request.mintAddress);
                 const tokenBalance = await getBalance(request.address, request.mintAddress);
                 sendResponse({ balance: tokenBalance });
                 break;
@@ -907,6 +967,12 @@ async function handleMessage(request, sender, sendResponse) {
             case 'GET_TRANSACTION_HISTORY':
                 const history = await getTransactionHistory(request.address);
                 sendResponse({ transactions: history });
+                break;
+                
+            case 'CLEAR_CACHE':
+                console.log('[Message] Clearing balance cache');
+                walletState.balanceCache.clear();
+                sendResponse({ success: true });
                 break;
                 
             case 'SEND_TRANSACTION':
@@ -1002,27 +1068,50 @@ async function handleMessage(request, sender, sendResponse) {
                 
             case 'SET_WALLET_STATE':
                 try {
-                    if (request.state.isUnlocked) {
-                        walletState.isUnlocked = true;
+                    if (request.state.isUnlocked !== undefined) {
+                        walletState.isUnlocked = request.state.isUnlocked;
+                        console.log('[Background SET_WALLET_STATE] isUnlocked set to:', request.state.isUnlocked);
                         
-                        // If we don't have accounts loaded yet, try to load them
+                        if (request.state.isUnlocked) {
+                            // Save unlock state and start timers
+                            await chrome.storage.local.set({ 
+                                isUnlocked: true,
+                                lastUnlockTime: Date.now()
+                            });
+                            
+                            if (chrome.storage.session) {
+                                await chrome.storage.session.set({ isUnlocked: true });
+                            }
+                            
+                            startAutoLockTimer();
+                            startBalanceUpdates();
+                        }
+                    }
+                    
+                    // If accounts are provided, save them
+                    if (request.state.accounts) {
+                        walletState.accounts = request.state.accounts;
+                        console.log('[Background SET_WALLET_STATE] Received accounts:', request.state.accounts.length);
+                    }
+                    
+                    // If addresses are provided, create/update accounts
+                    if (request.state.addresses) {
                         if (walletState.accounts.length === 0) {
-                            const result = await chrome.storage.local.get(['encryptedWallet']);
-                            if (result.encryptedWallet) {
-                                // For now, just set that we have accounts
-                                // In a real scenario, we'd need to decrypt, but for setup completion
-                                // we can rely on the fact that the wallet was just created
-                                walletState.accounts = [{ index: 0, solanaAddress: null, qnetAddress: null, balance: {} }];
+                            walletState.accounts = [{
+                                index: 0,
+                                solanaAddress: request.state.addresses.solana || null,
+                                qnetAddress: request.state.addresses.eon || request.state.addresses.qnet || null,
+                                balance: { solana: 0, qnet: 0 }
+                            }];
+                        } else {
+                            if (request.state.addresses.solana) {
+                                walletState.accounts[0].solanaAddress = request.state.addresses.solana;
+                            }
+                            if (request.state.addresses.eon || request.state.addresses.qnet) {
+                                walletState.accounts[0].qnetAddress = request.state.addresses.eon || request.state.addresses.qnet;
                             }
                         }
-                        
-                        // Save unlock state and start timers
-                        await chrome.storage.local.set({ 
-                            isUnlocked: true,
-                            lastUnlockTime: Date.now()
-                        });
-                        startAutoLockTimer();
-                        startBalanceUpdates();
+                        console.log('[Background SET_WALLET_STATE] Updated with addresses:', request.state.addresses);
                     }
                     
                     sendResponse({ success: true });
@@ -1368,6 +1457,16 @@ async function createWallet(password, mnemonic) {
             lastUnlockTime: Date.now()
         });
         
+        // Also save to session storage for sync with popup
+        if (chrome.storage.session) {
+            try {
+                await chrome.storage.session.set({ isUnlocked: true });
+                console.log('[Background CreateWallet] Saved isUnlocked to session storage');
+            } catch (e) {
+                console.log('[Background CreateWallet] Session storage not available');
+            }
+        }
+        
         // Start timers
         startAutoLockTimer();
         startBalanceUpdates();
@@ -1445,6 +1544,16 @@ async function unlockWallet(password) {
             lastUnlockTime: Date.now()
         });
         
+        // Also save to session storage for sync with popup
+        if (chrome.storage.session) {
+            try {
+                await chrome.storage.session.set({ isUnlocked: true });
+                console.log('[Background UnlockWallet] Saved isUnlocked to session storage');
+            } catch (e) {
+                console.log('[Background UnlockWallet] Session storage not available');
+            }
+        }
+        
         // Start timers
         startAutoLockTimer();
         startBalanceUpdates();
@@ -1486,14 +1595,43 @@ async function lockWallet() {
         lastUnlockTime: 0
     });
     
+    // Also clear session storage
+    if (chrome.storage.session) {
+        try {
+            await chrome.storage.session.set({ isUnlocked: false });
+            console.log('[Background LockWallet] Cleared isUnlocked from session storage');
+        } catch (e) {
+            console.log('[Background LockWallet] Session storage not available');
+        }
+    }
+    
     // Log: ( Wallet locked');
 }
 
 /**
  * Load wallet accounts from decrypted data
+ * If walletData is not provided, it will try to load from storage if unlocked
  */
 async function loadWalletAccounts(walletData) {
     try {
+        // If no wallet data provided, try to load from storage
+        if (!walletData) {
+            // Check if we have encrypted wallet in memory or storage
+            if (!walletState.encryptedWallet) {
+                const result = await chrome.storage.local.get(['encryptedWallet']);
+                if (!result.encryptedWallet) {
+                    console.log('[LoadWalletAccounts] No encrypted wallet found');
+                    return false;
+                }
+                walletState.encryptedWallet = result.encryptedWallet;
+            }
+            
+            // For auto-load, we can't decrypt without password
+            // Just return false to indicate accounts couldn't be loaded
+            console.log('[LoadWalletAccounts] Cannot auto-load without decryption password');
+            return false;
+        }
+        
         walletState.accounts = [];
         
         for (const accountData of walletData.accounts) {
@@ -1533,52 +1671,191 @@ async function getBalance(address, tokenMint = null) {
         const cacheKey = `${walletState.currentNetwork}-${address}-${tokenMint || 'native'}`;
         const cached = walletState.balanceCache.get(cacheKey);
         
-        if (cached && (Date.now() - cached.timestamp) < 30000) { // 30 second cache
+        // Cache for 15 seconds to reduce RPC calls
+        if (cached && (Date.now() - cached.timestamp) < 15000) { // 15 second cache
+            console.log(`[GetBalance] Returning cached balance for ${tokenMint || 'SOL'}: ${cached.balance}`);
             return cached.balance;
         }
         
         let balance = 0;
         
+        console.log(`[GetBalance] Current network: ${walletState.currentNetwork}`);
+        
         if (walletState.currentNetwork === 'solana') {
+            // Get the correct RPC endpoint based on network setting
+            const localData = await chrome.storage.local.get(['mainnet']);
+            const isMainnet = localData.mainnet === true;
+            
+            // Multiple RPC endpoints for fallback - ordered by reliability
+            // Start with RPCs that usually don't block browser extensions
+            const mainnetRPCs = [
+                'https://api.mainnet-beta.solana.com',  // Official - try first
+                'https://solana-api.projectserum.com',  // Serum - often works
+                'https://free.rpcpool.com',  // Free RPC pool
+                'https://mainnet.rpcpool.com',  // RPC pool mainnet
+                'https://solana.publicnode.com',  // Public node
+                'https://mainnet.block-engine.jito.wtf/api/v1/rpc',  // Jito with /rpc
+                'https://rpc.ankr.com/solana',  // Ankr
+                'https://solana-mainnet.phantom.app/YBPpkkN4g91xDiAnTE9r0RcMkjg0sKUIWvAfoFVJ',  // Phantom's public RPC
+                'https://solana-mainnet.core.chainstack.com/demo',  // Chainstack demo
+                'https://solana-mainnet.g.alchemy.com/v2/demo'  // Alchemy demo
+            ];
+            
+            const devnetRPCs = [
+                'https://api.devnet.solana.com',  // Official devnet - try first
+                'https://rpc.ankr.com/solana_devnet',  // Ankr devnet
+                'https://devnet.helius-rpc.com/?api-key=demo',  // Helius devnet demo
+                'https://solana-devnet.core.chainstack.com/demo',  // Chainstack devnet
+                'https://solana-devnet.publicnode.com',  // Public node devnet
+                'https://devnet.rpcpool.com'  // RPC pool devnet
+            ];
+            
+            const rpcEndpoints = isMainnet ? mainnetRPCs : devnetRPCs;
+            let rpcEndpoint = rpcEndpoints[0];  // Start with primary
+            
+            console.log(`[GetBalance] Network: ${isMainnet ? 'mainnet' : 'devnet'}, Address: ${address}, Token: ${tokenMint || 'SOL'}`);
+            
             if (!tokenMint) {
-                // SOL balance via direct RPC call
-                const response = await fetch('https://api.devnet.solana.com', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        jsonrpc: '2.0',
-                        id: 1,
-                        method: 'getBalance',
-                        params: [address]
-                    })
-                });
-                const data = await response.json();
-                balance = (data.result?.value || 0) / 1e9; // Convert lamports to SOL
+                // SOL balance via direct RPC call with fallback
+                for (let i = 0; i < rpcEndpoints.length; i++) {
+                    rpcEndpoint = rpcEndpoints[i];
+                    console.log(`[GetBalance] Trying RPC ${i + 1}/${rpcEndpoints.length}: ${rpcEndpoint}`);
+                    
+                    try {
+                        // Add timeout to prevent hanging on slow RPCs
+                        const controller = new AbortController();
+                        const timeoutId = setTimeout(() => controller.abort(), 5000); // 5 second timeout
+                        
+                        const response = await fetch(rpcEndpoint, {
+                            method: 'POST',
+                            headers: { 
+                                'Content-Type': 'application/json',
+                                'Accept': 'application/json'
+                            },
+                            body: JSON.stringify({
+                                jsonrpc: '2.0',
+                                id: 1,
+                                method: 'getBalance',
+                                params: [address]
+                            }),
+                            signal: controller.signal
+                        });
+                        
+                        clearTimeout(timeoutId);
+                        
+                        if (!response.ok) {
+                            let errorText = '';
+                            try {
+                                errorText = await response.text();
+                            } catch (e) {
+                                errorText = 'Could not read error text';
+                            }
+                            console.warn(`[GetBalance] HTTP ${response.status} for SOL on RPC ${i + 1}/${rpcEndpoints.length} (${rpcEndpoint})`);
+                            if (response.status === 403) {
+                                console.log(`[GetBalance] RPC ${i + 1} blocked (403), trying next...`);
+                            }
+                            continue; // Try next RPC
+                        }
+                        
+                        const data = await response.json();
+                        
+                        if (data.error) {
+                            console.warn(`[GetBalance] RPC error for SOL on RPC ${i + 1}:`, data.error);
+                            continue; // Try next RPC
+                        }
+                        
+                        balance = (data.result?.value || 0) / 1e9; // Convert lamports to SOL
+                        console.log(`[GetBalance] SOL balance from RPC ${i + 1}: ${balance}`);
+                        break; // Success, exit loop
+                    } catch (error) {
+                        if (error.name === 'AbortError') {
+                            console.warn(`[GetBalance] RPC ${i + 1} timeout (${rpcEndpoint})`);
+                        } else {
+                            console.warn(`[GetBalance] Failed with RPC ${i + 1} (${rpcEndpoint}):`, error.message);
+                        }
+                        if (i === rpcEndpoints.length - 1) {
+                            console.error(`[GetBalance] All ${rpcEndpoints.length} RPCs failed for SOL balance. Tried: ${rpcEndpoints.join(', ')}`);
+                            return 0;
+                        }
+                    }
+                }
             } else {
-                // Token balance via getTokenAccountsByOwner
-                const response = await fetch('https://api.devnet.solana.com', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        jsonrpc: '2.0',
-                        id: 1,
-                        method: 'getTokenAccountsByOwner',
-                        params: [
-                            address,
-                            { mint: tokenMint },
-                            { encoding: 'jsonParsed' }
-                        ]
-                    })
-                });
-                const data = await response.json();
-                if (data.result?.value?.length > 0) {
-                    const tokenAccount = data.result.value[0];
-                    const amount = tokenAccount.account.data.parsed.info.tokenAmount.amount;
-                    const decimals = tokenAccount.account.data.parsed.info.tokenAmount.decimals;
-                    balance = amount / Math.pow(10, decimals);
+                // Token balance via getTokenAccountsByOwner with fallback
+                for (let i = 0; i < rpcEndpoints.length; i++) {
+                    rpcEndpoint = rpcEndpoints[i];
+                    console.log(`[GetBalance] Trying RPC ${i + 1}/${rpcEndpoints.length} for token: ${rpcEndpoint}`);
+                    
+                    try {
+                        // Add timeout to prevent hanging on slow RPCs
+                        const controller = new AbortController();
+                        const timeoutId = setTimeout(() => controller.abort(), 5000); // 5 second timeout
+                        
+                        const response = await fetch(rpcEndpoint, {
+                            method: 'POST',
+                            headers: { 
+                                'Content-Type': 'application/json',
+                                'Accept': 'application/json'
+                            },
+                            body: JSON.stringify({
+                                jsonrpc: '2.0',
+                                id: 1,
+                                method: 'getTokenAccountsByOwner',
+                                params: [
+                                    address,
+                                    { mint: tokenMint },
+                                    { encoding: 'jsonParsed' }
+                                ]
+                            }),
+                            signal: controller.signal
+                        });
+                        
+                        clearTimeout(timeoutId);
+                        
+                        if (!response.ok) {
+                            let errorText = '';
+                            try {
+                                errorText = await response.text();
+                            } catch (e) {
+                                errorText = 'Could not read error text';
+                            }
+                            console.warn(`[GetBalance] HTTP ${response.status} for token on RPC ${i + 1}/${rpcEndpoints.length} (${rpcEndpoint})`);
+                            if (response.status === 403) {
+                                console.log(`[GetBalance] RPC ${i + 1} blocked (403) for token, trying next...`);
+                            }
+                            continue; // Try next RPC
+                        }
+                        
+                        const data = await response.json();
+                        
+                        if (data.error) {
+                            console.warn(`[GetBalance] RPC error for token on RPC ${i + 1}:`, data.error);
+                            continue; // Try next RPC
+                        }
+                        
+                        if (data.result?.value?.length > 0) {
+                            const tokenAccount = data.result.value[0];
+                            const amount = tokenAccount.account.data.parsed.info.tokenAmount.amount;
+                            const decimals = tokenAccount.account.data.parsed.info.tokenAmount.decimals;
+                            balance = amount / Math.pow(10, decimals);
+                            console.log(`[GetBalance] Token ${tokenMint} balance from RPC ${i + 1}: ${balance}`);
+                        } else {
+                            console.log(`[GetBalance] No token account found for ${tokenMint} on RPC ${i + 1}`);
+                        }
+                        break; // Success, exit loop
+                    } catch (error) {
+                        if (error.name === 'AbortError') {
+                            console.warn(`[GetBalance] RPC ${i + 1} timeout for token (${rpcEndpoint})`);
+                        } else {
+                            console.warn(`[GetBalance] Failed token request with RPC ${i + 1} (${rpcEndpoint}):`, error.message);
+                        }
+                        if (i === rpcEndpoints.length - 1) {
+                            console.error(`[GetBalance] All ${rpcEndpoints.length} RPCs failed for token ${tokenMint}.`);
+                            console.error(`[GetBalance] Tried RPCs: ${rpcEndpoints.join(', ')}`);
+                            return 0;
+                        }
+                    }
                 }
             }
-            // Log:(`Balance for ${address} (${tokenMint || 'SOL'}): ${balance}`);
         } else {
             // QNet balance (mock for now)
             balance = Math.floor(Math.random() * 50000) + 10000;
@@ -1594,7 +1871,7 @@ async function getBalance(address, tokenMint = null) {
         return balance;
         
     } catch (error) {
-        // Error:('Failed to get balance:', error);
+        console.error('[GetBalance] Failed to get balance:', error);
         return 0;
     }
 }
@@ -1897,10 +2174,38 @@ async function recordFeeCollection(feeData) {
 async function getWalletState() {
     try {
         const walletExists = await checkWalletExists();
+        console.log('[GetWalletState] walletExists from checkWalletExists():', walletExists);
+        
+        // Check chrome storage for unlock state (syncs with popup)
+        let isUnlocked = walletState.isUnlocked;
+        
+        // First check session storage (clears on browser restart)
+        if (chrome.storage.session) {
+            try {
+                const sessionResult = await chrome.storage.session.get(['isUnlocked']);
+                if (sessionResult.hasOwnProperty('isUnlocked')) {
+                    isUnlocked = sessionResult.isUnlocked;
+                    // Sync with local state
+                    walletState.isUnlocked = isUnlocked;
+                }
+            } catch (e) {
+                // Session storage not available
+            }
+        }
+        
+        // If not found in session, check local storage
+        if (!isUnlocked) {
+            const localResult = await chrome.storage.local.get(['isUnlocked']);
+            if (localResult.hasOwnProperty('isUnlocked')) {
+                isUnlocked = localResult.isUnlocked;
+                // Sync with local state
+                walletState.isUnlocked = isUnlocked;
+            }
+        }
         
         return {
             success: true,
-            isUnlocked: walletState.isUnlocked,
+            isUnlocked: isUnlocked,
             walletExists: walletExists,
             accounts: walletState.accounts.map(account => ({
                 id: account.index || 0,
@@ -1934,9 +2239,15 @@ async function getWalletState() {
 async function checkWalletExists() {
     try {
         const result = await chrome.storage.local.get(['walletExists', 'encryptedWallet']);
-        return result.walletExists && result.encryptedWallet;
+        
+        // Accept either marker as valid
+        const exists = (result.walletExists === true) || (result.encryptedWallet !== undefined && result.encryptedWallet !== null);
+        
+        console.log('[CheckWalletExists] walletExists:', result.walletExists, 'encryptedWallet:', !!result.encryptedWallet, 'result:', exists);
+        
+        return exists;
     } catch (error) {
-        // Error: ( Failed to check wallet existence:', error);
+        console.error('[CheckWalletExists] Error:', error);
         return false;
     }
 }
