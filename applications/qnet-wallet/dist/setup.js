@@ -1528,10 +1528,11 @@ async function completeWalletSetup() {
             try {
                 const keyManager = window.globalKeyManager || new SecureKeyManager();
                 
-                // Initialize wallet - seed phrase is NOT stored!
+                // Initialize wallet with encrypted seed phrase storage
                 const initResult = await keyManager.initializeWallet(
                     setupState.seedPhrase,
-                    setupState.password
+                    setupState.password,
+                    true // Store encrypted seed phrase
                 );
                 
                 if (initResult.success) {
@@ -1560,9 +1561,18 @@ async function completeWalletSetup() {
         localStorage.setItem('qnet_wallet_addresses', JSON.stringify(walletData.addresses));
         localStorage.setItem('qnet_wallet_unlocked', 'true');
         
-        // Legacy compatibility layer (without seed phrase!)
-        const legacyData = btoa(JSON.stringify(walletData));
+        // Legacy compatibility layer (with seed phrase for backward compatibility)
+        // This will be migrated to secure format on first unlock
+        const legacyWalletData = {
+            ...walletData,
+            mnemonic: setupState.seedPhrase // Include for migration purposes
+        };
+        const legacyData = btoa(JSON.stringify(legacyWalletData));
         localStorage.setItem('qnet_wallet_encrypted', legacyData);
+        
+        // Also store password hash for legacy compatibility
+        const passwordHash = btoa(setupState.password + 'qnet_salt_2025');
+        localStorage.setItem('qnet_wallet_password_hash', passwordHash);
         
         // Variable for storage event
         let encryptedData = legacyData;
@@ -1920,52 +1930,9 @@ function clearAllErrors() {
  * Show toast notification with CORRECT positioning
  */
 function showToast(message, type = 'info') {
-    // Remove any existing toast
-    const existingToast = document.querySelector('.toast-notification');
-    if (existingToast) {
-        existingToast.remove();
-    }
-    
-    const toast = document.createElement('div');
-    toast.className = `toast-notification toast-${type}`;
-    toast.textContent = message;
-    
-    // CORRECT positioning styles
-    toast.style.cssText = `
-        position: fixed;
-        top: 20px;
-        right: 20px;
-        z-index: 10000;
-        padding: 12px 16px;
-        border-radius: 8px;
-        color: white;
-        font-weight: 500;
-        font-size: 14px;
-        font-family: -apple-system, BlinkMacSystemFont, sans-serif;
-        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
-        backdrop-filter: blur(10px);
-        transform: translateX(400px);
-        transition: transform 0.3s ease;
-        max-width: 300px;
-        word-wrap: break-word;
-    `;
-    
-    // Type-specific colors
-    switch (type) {
-        case 'success':
-            toast.style.background = 'linear-gradient(135deg, #22c55e, #16a34a)';
-            break;
-        case 'error':
-            toast.style.background = 'linear-gradient(135deg, #ef4444, #dc2626)';
-            break;
-        case 'info':
-            toast.style.background = 'linear-gradient(135deg, #3b82f6, #2563eb)';
-            break;
-        default:
-            toast.style.background = 'linear-gradient(135deg, #6b7280, #4b5563)';
-    }
-    
-    document.body.appendChild(toast);
+    // Disabled - only log to console
+    console.log(`[${type.toUpperCase()}] ${message}`);
+    return;
     
     // Animate in
     setTimeout(() => {

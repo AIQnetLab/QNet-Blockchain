@@ -1760,14 +1760,16 @@ async function generateMnemonic(entropy = 128) {
 }
 
 /**
- * Execute swap with 0.5% platform fee collection
+ * Execute swap - FREE, no fees
  */
 async function executeSwapWithFee(swapData) {
     try {
-        // Log: ( Executing swap with production fees...');
+        // Log: ( Executing swap - FREE...');
         // Log:('Swap data:', swapData);
         
-        const { fromToken, toToken, amount, platformFee, feeRecipient, network } = swapData;
+        const { fromToken, toToken, amount, network } = swapData;
+        const platformFee = 0; // FREE - no fees
+        const feeRecipient = null; // No fee recipient needed
         
         // Validate input
         if (!fromToken || !toToken || !amount || amount <= 0) {
@@ -1785,27 +1787,23 @@ async function executeSwapWithFee(swapData) {
             return { success: false, error: 'No account found' };
         }
         
-        // Calculate exact amounts
-        const amountAfterFee = amount - platformFee;
+        // No fee calculation needed - FREE wallet
+        const amountAfterFee = amount; // Full amount, no fees
         
-        // Production fee configuration
+        // No fees configuration - FREE wallet
         const PRODUCTION_FEES = {
-            swap: 0.005, // 0.5%
+            swap: 0, // FREE - no fees
             recipient: {
-                solana: "E3qKpwaLAJvx2aVopWikeBBQiYQzyG1McBcobwT4t7g",
+                solana: null, // No fee recipient
                 qnet: null // Will be set when QNet launches
             }
         };
         
-        // Validate fee recipient
-        const productionFeeRecipient = PRODUCTION_FEES.recipient[network];
-        if (!productionFeeRecipient && network === 'solana') {
-            return { success: false, error: 'Fee recipient not configured for Solana' };
-        }
+        // No fee validation needed - FREE wallet
+        const productionFeeRecipient = null;
         
-        // Log: (` Platform fee: ${platformFee} ${fromToken}`);
-        // Log: (` Fee recipient: ${productionFeeRecipient}`);
-        // Log: (` Swap amount after fee: ${amountAfterFee} ${fromToken}`);
+        // Log: (` FREE swap - no fees`);
+        // Log: (` Swap amount: ${amountAfterFee} ${fromToken}`);
         
         // Simulate swap execution (in production, integrate with DEX APIs)
         const swapResult = {
@@ -1823,15 +1821,7 @@ async function executeSwapWithFee(swapData) {
         // Log successful swap with fee collection
         // Log: ( Swap completed with fee collection:', swapResult);
         
-        // Emit analytics event for fee tracking
-        await recordFeeCollection({
-            type: 'swap',
-            amount: platformFee,
-            token: fromToken,
-            recipient: productionFeeRecipient,
-            network,
-            txHash: swapResult.transactionHash
-        });
+        // No fee tracking needed - FREE wallet
         
         return { success: true, result: swapResult };
         
@@ -1894,37 +1884,11 @@ async function getSupportedTokens(network = 'solana') {
 }
 
 /**
- * Record fee collection for analytics and transparency
+ * Fee collection removed - FREE wallet
  */
 async function recordFeeCollection(feeData) {
-    try {
-        // Store fee collection data for analytics
-        const feeRecord = {
-            ...feeData,
-            timestamp: Date.now(),
-            id: 'fee_' + Math.random().toString(16).substr(2, 16)
-        };
-        
-        // Save to chrome storage for local tracking
-        const existingFees = await chrome.storage.local.get(['fee_collections']) || { fee_collections: [] };
-        const feeCollections = existingFees.fee_collections || [];
-        
-        feeCollections.push(feeRecord);
-        
-        // Keep only last 1000 fee records to avoid storage bloat
-        if (feeCollections.length > 1000) {
-            feeCollections.splice(0, feeCollections.length - 1000);
-        }
-        
-        await chrome.storage.local.set({ fee_collections: feeCollections });
-        
-        // Log: ( Fee collection recorded:', feeRecord);
-        return true;
-        
-    } catch (error) {
-        // Error: ( Failed to record fee collection:', error);
-        return false;
-    }
+    // No fee collection - wallet is FREE
+    return true;
 }
 
 /**
@@ -2088,34 +2052,25 @@ async function getBurnPercentage() {
 }
 
 /**
- * Enhanced burn handler with phase check
+ * FREE activation - no burning needed
  */
 async function burnOneDevTokens(request) {
     try {
-        // CRITICAL: Check phase before allowing burn
-        const currentPhase = request.phase || 1;
-        if (currentPhase >= 2) {
-            return {
-                success: false,
-                error: 'PHASE_TRANSITIONED: Network is in Phase 2. 1DEV burns are disabled.',
-                phase: currentPhase
-            };
-        }
-
-        // Proceed with burn operation (demo implementation)
-        const mockSignature = 'burn_' + Math.random().toString(36).substring(2, 15);
+        // FREE wallet - no burning needed, instant activation
+        const mockSignature = 'free_activation_' + Math.random().toString(36).substring(2, 15);
         const mockBlockHeight = Math.floor(Math.random() * 1000000) + 200000000;
 
         return {
             success: true,
             signature: mockSignature,
             blockHeight: mockBlockHeight,
-            phase: currentPhase,
-            amount: request.amount,
-            nodeType: request.nodeType
+            phase: request.phase || 1,
+            amount: 0, // FREE - no cost
+            nodeType: request.nodeType,
+            free: true
         };
     } catch (error) {
-        // Error:('Failed to burn 1DEV tokens:', error);
+        // Error:('Failed to activate:', error);
         return {
             success: false,
             error: error.message
@@ -2124,29 +2079,25 @@ async function burnOneDevTokens(request) {
 }
 
 /**
- * Spend QNC to Pool 3 for node activation (Phase 2 only)
+ * FREE activation - no QNC spending needed
  */
 async function spendQNCToPool3(request) {
     try {
-        // Validate Phase 2 is active
-        if (request.phase < 2) {
-            throw new Error('QNC activations only available in Phase 2');
-        }
-
-        // Demo implementation for production testing
-        const mockSignature = 'pool3_' + Math.random().toString(36).substring(2, 15);
-        const mockPoolTransfer = 'transfer_' + Math.random().toString(36).substring(2, 15);
+        // FREE wallet - instant activation without spending
+        const mockSignature = 'free_pool3_' + Math.random().toString(36).substring(2, 15);
+        const mockPoolTransfer = 'free_transfer_' + Math.random().toString(36).substring(2, 15);
 
         return {
             success: true,
             signature: mockSignature,
             poolTransfer: mockPoolTransfer,
-            amount: request.amount,
+            amount: 0, // FREE - no cost
             nodeType: request.nodeType,
-            networkSize: request.networkSize
+            networkSize: request.networkSize,
+            free: true
         };
     } catch (error) {
-        // Error:('Failed to spend QNC to Pool 3:', error);
+        // Error:('Failed to activate:', error);
         throw error;
     }
 }

@@ -106,38 +106,23 @@ export class UIManager {
             const pricingInfo = dynamicPricing.getPricingInfo();
             
             if (phaseInfo.phase === 'phase1') {
-                // Phase 1: 1DEV burn-to-join
+                // FREE activation
                 const activationCost = dynamicPricing.getActivationCost('light');
-                const hasEnoughTokens = oneDEVBalance >= activationCost.cost;
                 
-                activateButton.disabled = !hasEnoughTokens;
-                activateButton.textContent = hasEnoughTokens ? 
-                    `Activate Node (${activationCost.cost} 1DEV)` : 
-                    `Need ${activationCost.cost} 1DEV`;
-
-                // Show savings if any
-                if (activationCost.cost < 1500) {
-                    const savings = 1500 - activationCost.cost;
-                    const savingsPercent = ((savings / 1500) * 100).toFixed(1);
-                    activateButton.title = `Save ${savings} 1DEV (${savingsPercent}% discount) - ${phaseInfo.burnedPercent}% supply burned`;
-                } else {
-                    activateButton.title = `Burn ${activationCost.cost} 1DEV tokens permanently`;
-                }
+                activateButton.disabled = false; // Always enabled - FREE
+                activateButton.textContent = 'Activate Node (FREE)';
+                activateButton.title = 'Free instant activation - no tokens required!';
             } else {
-                // Phase 2: QNC spend-to-Pool3
-                const lightCost = dynamicPricing.getActivationCost('light');
-                const fullCost = dynamicPricing.getActivationCost('full');
-                const superCost = dynamicPricing.getActivationCost('super');
-                
-                activateButton.textContent = `Phase 2: QNC Spending`;
-                activateButton.disabled = true; // Disable for now in Phase 2
-                activateButton.title = `Phase 2 Active - Light: ${lightCost.cost} QNC, Full: ${fullCost.cost} QNC, Super: ${superCost.cost} QNC (spend to Pool 3)`;
+                // Phase 2: FREE activation
+                activateButton.textContent = 'Activate Node (FREE)';
+                activateButton.disabled = false; // Always enabled - FREE
+                activateButton.title = 'Free instant activation - no tokens required!';
             }
 
         } catch (error) {
-            // Fallback display
-            activateButton.textContent = 'Activate Node (1500 1DEV)';
-            activateButton.title = 'Phase 1: Burn 1DEV tokens to activate node';
+            // Fallback display - FREE
+            activateButton.textContent = 'Activate Node (FREE)';
+            activateButton.title = 'Free instant activation - no tokens required!';
         }
     }
 

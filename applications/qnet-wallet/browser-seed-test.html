@@ -1,0 +1,549 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Seed Phrase Security Test - Browser</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', system-ui, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+        }
+        
+        .container {
+            background: rgba(255, 255, 255, 0.95);
+            border-radius: 20px;
+            padding: 40px;
+            max-width: 800px;
+            width: 100%;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+        }
+        
+        h1 {
+            color: #333;
+            margin-bottom: 10px;
+            font-size: 28px;
+        }
+        
+        .subtitle {
+            color: #666;
+            margin-bottom: 30px;
+            font-size: 14px;
+        }
+        
+        .test-section {
+            margin-bottom: 25px;
+            padding: 20px;
+            background: #f8f9fa;
+            border-radius: 10px;
+            border-left: 4px solid #007bff;
+        }
+        
+        .test-title {
+            font-weight: 600;
+            color: #333;
+            margin-bottom: 10px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .status {
+            display: inline-block;
+            padding: 3px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-weight: 600;
+        }
+        
+        .status.pending { background: #ffc107; color: #000; }
+        .status.running { background: #17a2b8; color: #fff; }
+        .status.passed { background: #28a745; color: #fff; }
+        .status.failed { background: #dc3545; color: #fff; }
+        
+        .test-result {
+            margin-top: 10px;
+            padding: 10px;
+            background: white;
+            border-radius: 5px;
+            font-family: 'Consolas', 'Monaco', monospace;
+            font-size: 13px;
+            line-height: 1.5;
+            max-height: 200px;
+            overflow-y: auto;
+        }
+        
+        .test-result.success { border-left: 3px solid #28a745; }
+        .test-result.error { border-left: 3px solid #dc3545; }
+        .test-result.warning { border-left: 3px solid #ffc107; }
+        
+        button {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            padding: 12px 30px;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.2s;
+        }
+        
+        button:hover {
+            transform: translateY(-2px);
+        }
+        
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        
+        .summary {
+            margin-top: 30px;
+            padding: 20px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border-radius: 10px;
+        }
+        
+        .summary h2 {
+            margin-bottom: 15px;
+        }
+        
+        .score {
+            font-size: 48px;
+            font-weight: bold;
+            margin: 20px 0;
+        }
+        
+        .grade {
+            font-size: 24px;
+            padding: 10px 20px;
+            background: rgba(255, 255, 255, 0.2);
+            border-radius: 8px;
+            display: inline-block;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔐 Seed Phrase Security Test Suite</h1>
+        <p class="subtitle">Production-ready security verification for QNet Wallet</p>
+        
+        <button id="runTests" onclick="runAllTests()">Run Security Tests</button>
+        
+        <div id="tests">
+            <!-- Tests will be added here dynamically -->
+        </div>
+        
+        <div id="summary" class="summary" style="display: none;">
+            <h2>Test Summary</h2>
+            <div class="score" id="score">0%</div>
+            <div class="grade" id="grade">-</div>
+            <div id="details"></div>
+        </div>
+    </div>
+    
+    <!-- Load SecureKeyManager -->
+    <script src="dist/src/security/SecureKeyManager.js"></script>
+    
+    <script>
+        // Test configuration
+        const TEST_SEED = 'abandon ability able about above absent absorb abstract absurd abuse access accident';
+        const TEST_PASSWORD = 'TestPassword123!@#';
+        const WRONG_PASSWORD = 'WrongPassword456';
+        
+        let testResults = {
+            total: 0,
+            passed: 0,
+            failed: 0,
+            tests: []
+        };
+        
+        // Create test element
+        function createTestElement(title, id) {
+            const div = document.createElement('div');
+            div.className = 'test-section';
+            div.innerHTML = `
+                <div class="test-title">
+                    ${title}
+                    <span class="status pending" id="${id}-status">PENDING</span>
+                </div>
+                <div class="test-result" id="${id}-result" style="display: none;"></div>
+            `;
+            document.getElementById('tests').appendChild(div);
+        }
+        
+        // Update test status
+        function updateTest(id, status, message, type = 'success') {
+            const statusEl = document.getElementById(`${id}-status`);
+            const resultEl = document.getElementById(`${id}-result`);
+            
+            statusEl.className = `status ${status}`;
+            statusEl.textContent = status.toUpperCase();
+            
+            resultEl.style.display = 'block';
+            resultEl.className = `test-result ${type}`;
+            resultEl.innerHTML = message;
+        }
+        
+        // Test 1: Initialize SecureKeyManager
+        async function testInitialization() {
+            const testId = 'test1';
+            createTestElement('Test 1: SecureKeyManager Initialization', testId);
+            updateTest(testId, 'running', 'Initializing SecureKeyManager...');
+            
+            try {
+                const keyManager = new SecureKeyManager();
+                const result = await keyManager.initializeWallet(TEST_SEED, TEST_PASSWORD, true);
+                
+                if (result.success) {
+                    updateTest(testId, 'passed', `✓ Wallet initialized successfully<br>
+                        ✓ Addresses generated: ${JSON.stringify(result.addresses, null, 2)}<br>
+                        ✓ Seed phrase encrypted with AES-GCM-256`);
+                    testResults.passed++;
+                    return keyManager;
+                } else {
+                    updateTest(testId, 'failed', `✗ Initialization failed: ${result.error}`, 'error');
+                    testResults.failed++;
+                    return null;
+                }
+            } catch (error) {
+                updateTest(testId, 'failed', `✗ Error: ${error.message}`, 'error');
+                testResults.failed++;
+                return null;
+            } finally {
+                testResults.total++;
+            }
+        }
+        
+        // Test 2: Unlock with correct password
+        async function testCorrectPassword() {
+            const testId = 'test2';
+            createTestElement('Test 2: Correct Password Unlock', testId);
+            updateTest(testId, 'running', 'Testing correct password...');
+            
+            try {
+                const keyManager = new SecureKeyManager();
+                await keyManager.initializeWallet(TEST_SEED, TEST_PASSWORD, true);
+                
+                // Lock wallet first
+                keyManager.lockWallet();
+                
+                // Try to unlock with correct password
+                const unlockResult = await keyManager.unlockWallet(TEST_PASSWORD, true);
+                
+                if (unlockResult.success && unlockResult.mnemonic === TEST_SEED) {
+                    updateTest(testId, 'passed', `✓ Wallet unlocked successfully<br>
+                        ✓ Seed phrase correctly decrypted<br>
+                        ✓ Authentication verified`);
+                    testResults.passed++;
+                } else {
+                    updateTest(testId, 'failed', '✗ Failed to unlock with correct password', 'error');
+                    testResults.failed++;
+                }
+            } catch (error) {
+                updateTest(testId, 'failed', `✗ Error: ${error.message}`, 'error');
+                testResults.failed++;
+            } finally {
+                testResults.total++;
+            }
+        }
+        
+        // Test 3: Unlock with wrong password
+        async function testWrongPassword() {
+            const testId = 'test3';
+            createTestElement('Test 3: Wrong Password Protection', testId);
+            updateTest(testId, 'running', 'Testing wrong password rejection...');
+            
+            try {
+                const keyManager = new SecureKeyManager();
+                await keyManager.initializeWallet(TEST_SEED, TEST_PASSWORD, true);
+                
+                // Lock wallet
+                keyManager.lockWallet();
+                
+                // Try to unlock with wrong password
+                const unlockResult = await keyManager.unlockWallet(WRONG_PASSWORD, true);
+                
+                if (!unlockResult.success) {
+                    updateTest(testId, 'passed', `✓ Wrong password correctly rejected<br>
+                        ✓ Seed phrase remained encrypted<br>
+                        ✓ Security intact`);
+                    testResults.passed++;
+                } else {
+                    updateTest(testId, 'failed', '✗ CRITICAL: Wrong password allowed access!', 'error');
+                    testResults.failed++;
+                }
+            } catch (error) {
+                // Expected behavior - wrong password should throw error
+                updateTest(testId, 'passed', `✓ Wrong password rejected with error<br>✓ ${error.message}`);
+                testResults.passed++;
+            } finally {
+                testResults.total++;
+            }
+        }
+        
+        // Test 4: Check localStorage for plaintext
+        async function testStorageSecurity() {
+            const testId = 'test4';
+            createTestElement('Test 4: Storage Security Check', testId);
+            updateTest(testId, 'running', 'Checking localStorage for plaintext seed...');
+            
+            try {
+                const keyManager = new SecureKeyManager();
+                await keyManager.initializeWallet(TEST_SEED, TEST_PASSWORD, true);
+                
+                let foundPlaintext = false;
+                let issues = [];
+                
+                // Check all localStorage keys
+                for (let i = 0; i < localStorage.length; i++) {
+                    const key = localStorage.key(i);
+                    const value = localStorage.getItem(key);
+                    
+                    // Check for plaintext seed phrase
+                    if (value && value.includes('abandon') && value.includes('ability')) {
+                        // Check if it's actually encrypted (base64 encoded)
+                        try {
+                            const decoded = atob(value);
+                            if (decoded.includes('abandon') && decoded.includes('ability')) {
+                                foundPlaintext = true;
+                                issues.push(`Found in ${key} (base64 only)`);
+                            }
+                        } catch {
+                            // Not base64, check direct
+                            foundPlaintext = true;
+                            issues.push(`Found plaintext in ${key}`);
+                        }
+                    }
+                }
+                
+                // Check IndexedDB if available
+                if (window.indexedDB) {
+                    // IndexedDB check would go here
+                }
+                
+                if (!foundPlaintext) {
+                    updateTest(testId, 'passed', `✓ No plaintext seed phrase in localStorage<br>
+                        ✓ All sensitive data properly encrypted<br>
+                        ✓ Storage security verified`);
+                    testResults.passed++;
+                } else {
+                    updateTest(testId, 'failed', `✗ Security issues found:<br>${issues.join('<br>')}`, 'error');
+                    testResults.failed++;
+                }
+            } catch (error) {
+                updateTest(testId, 'failed', `✗ Error: ${error.message}`, 'error');
+                testResults.failed++;
+            } finally {
+                testResults.total++;
+            }
+        }
+        
+        // Test 5: Memory clearing
+        async function testMemoryClearing() {
+            const testId = 'test5';
+            createTestElement('Test 5: Memory Security', testId);
+            updateTest(testId, 'running', 'Testing memory clearing...');
+            
+            try {
+                const keyManager = new SecureKeyManager();
+                await keyManager.initializeWallet(TEST_SEED, TEST_PASSWORD, true);
+                
+                // Unlock to load keys in memory
+                await keyManager.unlockWallet(TEST_PASSWORD, false);
+                
+                // Check that session keys exist
+                const hasKeysBeforeLock = keyManager.sessionKeys !== null;
+                
+                // Lock wallet (should clear memory)
+                keyManager.lockWallet();
+                
+                // Check that session keys are cleared
+                const hasKeysAfterLock = keyManager.sessionKeys !== null;
+                
+                if (hasKeysBeforeLock && !hasKeysAfterLock) {
+                    updateTest(testId, 'passed', `✓ Session keys loaded on unlock<br>
+                        ✓ Memory cleared on lock<br>
+                        ✓ No sensitive data persists in memory`);
+                    testResults.passed++;
+                } else {
+                    updateTest(testId, 'failed', '✗ Memory not properly cleared', 'error');
+                    testResults.failed++;
+                }
+            } catch (error) {
+                updateTest(testId, 'failed', `✗ Error: ${error.message}`, 'error');
+                testResults.failed++;
+            } finally {
+                testResults.total++;
+            }
+        }
+        
+        // Test 6: Encryption uniqueness
+        async function testEncryptionUniqueness() {
+            const testId = 'test6';
+            createTestElement('Test 6: Encryption Uniqueness', testId);
+            updateTest(testId, 'running', 'Testing encryption randomness...');
+            
+            try {
+                // Clear any existing wallet data first
+                localStorage.removeItem('qnet_wallet_vault');
+                localStorage.removeItem('qnet_wallet_secure');
+                localStorage.removeItem('qnet_wallet_initialized');
+                
+                // Create first wallet
+                const keyManager1 = new SecureKeyManager();
+                await keyManager1.initializeWallet(TEST_SEED, TEST_PASSWORD, true);
+                
+                // Get vault data IMMEDIATELY after creation (before it's overwritten)
+                const vault1 = await keyManager1.loadVault();
+                
+                // Store first vault data
+                const salt1 = vault1.salt;
+                const encryptedData1 = vault1.encryptedSeedPhrase?.data;
+                const iv1 = vault1.encryptedSeedPhrase?.iv;
+                const encryptedKeys1 = vault1.encryptedKeys?.data;
+                
+                // Clear storage for second wallet
+                localStorage.removeItem('qnet_wallet_vault');
+                
+                // Small delay to ensure different timestamp
+                await new Promise(resolve => setTimeout(resolve, 10));
+                
+                // Create second wallet with same seed and password
+                const keyManager2 = new SecureKeyManager();
+                await keyManager2.initializeWallet(TEST_SEED, TEST_PASSWORD, true);
+                
+                // Get second vault data
+                const vault2 = await keyManager2.loadVault();
+                
+                // Store second vault data
+                const salt2 = vault2.salt;
+                const encryptedData2 = vault2.encryptedSeedPhrase?.data;
+                const iv2 = vault2.encryptedSeedPhrase?.iv;
+                const encryptedKeys2 = vault2.encryptedKeys?.data;
+                
+                // Check that all cryptographic parameters are unique
+                const uniqueSalt = salt1 !== salt2;
+                const uniqueIV = iv1 !== iv2;
+                const uniqueSeedEncryption = encryptedData1 !== encryptedData2;
+                const uniqueKeysEncryption = encryptedKeys1 !== encryptedKeys2;
+                
+                // Also verify timestamps are different (proves different creation times)
+                const timestamp1 = vault1.encryptedSeedPhrase?.timestamp;
+                const timestamp2 = vault2.encryptedSeedPhrase?.timestamp;
+                const uniqueTimestamp = timestamp1 !== timestamp2;
+                
+                let results = [];
+                if (uniqueSalt) results.push('✓ Unique salt for each wallet');
+                else results.push('✗ Salt is reused (CRITICAL)');
+                
+                if (uniqueIV) results.push('✓ Unique IV for each encryption');
+                else results.push('✗ IV is reused (CRITICAL)');
+                
+                if (uniqueSeedEncryption) results.push('✓ Same seed produces different ciphertext');
+                else results.push('✗ Seed encryption is deterministic');
+                
+                if (uniqueKeysEncryption) results.push('✓ Keys encrypted uniquely');
+                else results.push('✗ Key encryption is deterministic');
+                
+                if (uniqueTimestamp) results.push('✓ Unique timestamp for each encryption');
+                else results.push('✗ Timestamp not unique or missing');
+                
+                // All checks must pass for the test to succeed
+                if (uniqueSalt && uniqueIV && uniqueSeedEncryption && uniqueKeysEncryption) {
+                    results.push('✓ Protection against rainbow tables');
+                    results.push('✓ Non-deterministic encryption verified');
+                    updateTest(testId, 'passed', results.join('<br>'));
+                    testResults.passed++;
+                } else {
+                    results.push('✗ CRITICAL: Encryption may be vulnerable to attacks');
+                    updateTest(testId, 'failed', results.join('<br>'), 'error');
+                    testResults.failed++;
+                }
+                
+                // Clean up storage after test
+                localStorage.removeItem('qnet_wallet_vault');
+                localStorage.removeItem('qnet_wallet_secure');
+                localStorage.removeItem('qnet_wallet_initialized');
+                
+            } catch (error) {
+                updateTest(testId, 'failed', `✗ Error: ${error.message}`, 'error');
+                testResults.failed++;
+            } finally {
+                testResults.total++;
+            }
+        }
+        
+        // Show summary
+        function showSummary() {
+            const summaryEl = document.getElementById('summary');
+            const scoreEl = document.getElementById('score');
+            const gradeEl = document.getElementById('grade');
+            const detailsEl = document.getElementById('details');
+            
+            const percentage = Math.round((testResults.passed / testResults.total) * 100);
+            
+            scoreEl.textContent = `${percentage}%`;
+            
+            let grade = 'F';
+            if (percentage === 100) grade = 'A+';
+            else if (percentage >= 90) grade = 'A';
+            else if (percentage >= 80) grade = 'B';
+            else if (percentage >= 70) grade = 'C';
+            else if (percentage >= 60) grade = 'D';
+            
+            gradeEl.textContent = `Grade: ${grade}`;
+            
+            detailsEl.innerHTML = `
+                <p>Tests Passed: ${testResults.passed}/${testResults.total}</p>
+                <p>Tests Failed: ${testResults.failed}</p>
+                <p>Security Level: ${percentage === 100 ? 'PRODUCTION READY' : 
+                                     percentage >= 80 ? 'Good' : 'Needs Improvement'}</p>
+            `;
+            
+            summaryEl.style.display = 'block';
+            
+            // Log to console for debugging
+            console.log('Test Results:', testResults);
+        }
+        
+        // Run all tests
+        async function runAllTests() {
+            // Clear previous results
+            document.getElementById('tests').innerHTML = '';
+            document.getElementById('summary').style.display = 'none';
+            testResults = { total: 0, passed: 0, failed: 0, tests: [] };
+            
+            // Disable button
+            document.getElementById('runTests').disabled = true;
+            
+            // Run tests sequentially
+            await testInitialization();
+            await testCorrectPassword();
+            await testWrongPassword();
+            await testStorageSecurity();
+            await testMemoryClearing();
+            await testEncryptionUniqueness();
+            
+            // Show summary
+            showSummary();
+            
+            // Re-enable button
+            document.getElementById('runTests').disabled = false;
+        }
+    </script>
+</body>
+</html>

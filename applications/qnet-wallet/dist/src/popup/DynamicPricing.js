@@ -39,22 +39,17 @@ class DynamicPricing {
     }
     
     /**
-     * Calculate Phase 1 activation cost (1DEV burn)
+     * Calculate Phase 1 activation cost - FREE
      */
     calculatePhase1Cost() {
-        const burnedPercent = this.mockData.totalBurnedPercent;
-        const reductionFactor = Math.min(burnedPercent / 10, 9); // Max 90% reduction
-        const reduction = reductionFactor * this.PRICE_REDUCTION_PER_10_PERCENT;
-        const currentPrice = Math.max(
-            this.PHASE_1_BASE_PRICE - reduction,
-            this.PHASE_1_BASE_PRICE * 0.1 // Minimum 10% of base price (150 1DEV)
-        );
+        // FREE wallet - no cost
+        const currentPrice = 0;
         
         return {
-            cost: Math.round(currentPrice),
-            token: '1DEV',
-            mechanism: 'burn',
-            description: `Burn ${Math.round(currentPrice)} 1DEV tokens (${burnedPercent}% supply burned)`
+            cost: 0, // FREE
+            token: 'FREE',
+            mechanism: 'free',
+            description: 'FREE activation - no tokens required!'
         };
     }
     
@@ -74,21 +69,14 @@ class DynamicPricing {
      * Calculate Phase 2 activation cost (QNC spending to Pool 3)
      */
     calculatePhase2Cost(nodeType) {
-        const baseCost = this.PHASE_2_BASE_COSTS[nodeType];
-        const multiplier = this.getNetworkMultiplier(this.mockData.activeNodes);
-        const finalCost = Math.round(baseCost * multiplier);
-        
-        // Calculate range for display
-        const minCost = Math.round(baseCost * 0.5);  // Minimum at 0.5x
-        const maxCost = Math.round(baseCost * 3.0);  // Maximum at 3.0x
-        
+        // FREE wallet - no cost
         return {
-            cost: finalCost,
-            token: 'QNC',
-            mechanism: 'spend-to-pool3',
-            description: `Spend ${finalCost} QNC to Pool 3 (${this.mockData.activeNodes.toLocaleString()} active nodes)`,
-            range: `${minCost.toLocaleString()}-${maxCost.toLocaleString()} QNC`,
-            multiplier: multiplier,
+            cost: 0, // FREE
+            token: 'FREE',
+            mechanism: 'free',
+            description: 'FREE activation - no tokens required!',
+            range: 'FREE',
+            multiplier: 0,
             networkSize: this.mockData.activeNodes
         };
     }
@@ -112,28 +100,28 @@ class DynamicPricing {
             const cost = this.calculatePhase1Cost();
             return {
                 phase: 1,
-                title: 'Phase 1: 1DEV Burn-to-Join',
-                subtitle: `${this.mockData.totalBurnedPercent}% of supply burned`,
-                cost: cost.cost,
-                token: cost.token,
-                mechanism: 'Burn tokens permanently',
+                title: 'FREE Activation',
+                subtitle: 'No fees or costs!',
+                cost: 0,
+                token: 'FREE',
+                mechanism: 'Instant free activation',
                 details: [
-                    `All node types: ${cost.cost} 1DEV`,
-                    `Price decreases as more tokens burned`,
-                    `Minimum cost: 150 1DEV (at 90% burned)`
+                    'All node types: FREE',
+                    'No tokens required',
+                    'Instant activation'
                 ]
             };
         } else {
             return {
                 phase: 2,
-                title: 'Phase 2: QNC Spend-to-Pool3',
-                subtitle: `${this.mockData.activeNodes.toLocaleString()} active nodes`,
-                mechanism: 'Spend QNC to Pool 3 (redistributed to all nodes)',
+                title: 'FREE Activation',
+                subtitle: 'No fees or costs!',
+                mechanism: 'Instant free activation',
                 details: [
-                    `Light Node: ${this.calculatePhase2Cost('light').range}`,
-                    `Full Node: ${this.calculatePhase2Cost('full').range}`,
-                    `Super Node: ${this.calculatePhase2Cost('super').range}`,
-                    `Current multiplier: ${this.getNetworkMultiplier(this.mockData.activeNodes)}x`
+                    'Light Node: FREE',
+                    'Full Node: FREE', 
+                    'Super Node: FREE',
+                    'All nodes activate instantly for free'
                 ]
             };
         }
