@@ -264,9 +264,34 @@ body {
 }
 
 .phantom-unlock-btn:disabled {
-  opacity: 0.6;
-  cursor: not-allowed;
-  transform: none;
+    opacity: 0.6;
+    cursor: not-allowed;
+    transform: none;
+}
+
+/* Loading state for unlock button */
+.phantom-unlock-btn.loading {
+    position: relative;
+    color: transparent;
+}
+
+.phantom-unlock-btn.loading::after {
+    content: '';
+    position: absolute;
+    width: 20px;
+    height: 20px;
+    top: 50%;
+    left: 50%;
+    margin-left: -10px;
+    margin-top: -10px;
+    border: 2px solid rgba(255, 255, 255, 0.3);
+    border-radius: 50%;
+    border-top-color: var(--qnet-primary);
+    animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+    to { transform: rotate(360deg); }
 }
 
 .phantom-error-message {
@@ -1377,12 +1402,48 @@ body {
     border-radius: 8px;
     color: white;
     font-size: 14px;
+    transition: all 0.3s ease;
 }
 
 .setting-input:focus {
     outline: none;
     border-color: var(--qnet-primary);
     background: rgba(255, 255, 255, 0.08);
+    box-shadow: 0 0 10px rgba(0, 212, 255, 0.2);
+}
+
+.setting-input::placeholder {
+    color: rgba(255, 255, 255, 0.4);
+    transition: color 0.3s ease;
+}
+
+/* Error state */
+.setting-input[style*="border-color: red"] {
+    background: rgba(255, 0, 0, 0.1);
+    animation: errorShake 0.3s ease;
+}
+
+.setting-input[style*="border-color: red"]::placeholder {
+    color: #ff6b6b;
+}
+
+/* Success state */
+.setting-input[style*="border-color: green"],
+.setting-input[style*="border-color: #28a745"] {
+    background: rgba(40, 167, 69, 0.1);
+    animation: successPulse 0.5s ease;
+}
+
+@keyframes errorShake {
+    0%, 100% { transform: translateX(0); }
+    25% { transform: translateX(-5px); }
+    75% { transform: translateX(5px); }
+}
+
+@keyframes successPulse {
+    0% { transform: scale(1); }
+    50% { transform: scale(1.02); }
+    100% { transform: scale(1); }
 }
 
 .setting-textarea {

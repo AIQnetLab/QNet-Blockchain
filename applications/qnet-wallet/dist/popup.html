@@ -409,26 +409,21 @@
                                     Change Password
                                 </button>
                                 <div id="change-password-form" class="setting-form hidden">
-                                    <input type="password" id="old-password" placeholder="Current password" class="setting-input">
-                                    <input type="password" id="new-password" placeholder="New password" class="setting-input">
-                                    <input type="password" id="confirm-password" placeholder="Confirm new password" class="setting-input">
+                                    <input type="password" id="change-old-password" placeholder="Current password" class="setting-input">
+                                    <input type="password" id="change-new-password" placeholder="New password" class="setting-input">
+                                    <input type="password" id="change-confirm-password" placeholder="Confirm new password" class="setting-input">
                                     <button id="confirm-change-password" class="setting-button primary">Update Password</button>
                                 </div>
                                 <button id="show-seed-button" class="setting-button">
-                                    Show Recovery Phrase
+                                    Export Recovery Phrase
                                 </button>
                                 <div id="seed-phrase-form" class="setting-form hidden">
-                                    <input type="password" id="seed-password" placeholder="Enter password" class="setting-input">
-                                    <textarea id="seed-phrase-display" class="setting-textarea" readonly placeholder="Recovery phrase will appear here"></textarea>
-                                    <button id="confirm-show-seed" class="setting-button primary">Show Phrase</button>
-                                </div>
-                                <button id="export-key-button" class="setting-button">
-                                    Export Private Key
-                                </button>
-                                <div id="export-key-form" class="setting-form hidden">
-                                    <input type="password" id="export-password" placeholder="Enter password" class="setting-input">
-                                    <input type="text" id="private-key-display" class="setting-input" readonly placeholder="Private key will appear here">
-                                    <button id="confirm-export-key" class="setting-button primary">Show Key</button>
+                                    <div class="info-box" style="background: rgba(100,200,255,0.1); border: 1px solid rgba(100,200,255,0.3); color: #64c8ff; padding: 10px; border-radius: 8px; margin-bottom: 10px; font-size: 13px;">
+                                        <strong>✓ Universal compatibility:</strong> Use this phrase to import your wallet to Phantom, Solflare, MetaMask, or any other wallet
+                                    </div>
+                                    <input type="password" id="seed-password" placeholder="Enter password to reveal" class="setting-input">
+                                    <textarea id="seed-phrase-display" class="setting-textarea" readonly placeholder="Your 12-word recovery phrase will appear here"></textarea>
+                                    <button id="confirm-show-seed" class="setting-button primary">Show Recovery Phrase</button>
                                 </div>
                             </div>
                         </div>
@@ -563,8 +558,8 @@
                     <!-- Import Wallet -->
                     <div id="import-wallet-content" class="setup-step hidden">
                         <div class="step-header">
-                            <h4>Import Existing Wallet</h4>
-                            <p>Import using 12 or 24-word recovery phrase (BIP39 compatible)</p>
+                            <h4>Import Recovery Phrase</h4>
+                            <p>Enter your 12 or 24-word recovery phrase to restore your wallet.</p>
                         </div>
                         
                         <div class="form-group">

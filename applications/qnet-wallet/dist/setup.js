@@ -208,6 +208,7 @@ function updateStepContent(stepName) {
         const backBtn = document.querySelector('#back-to-password-import');
         const importBtn = document.querySelector('#continue-import');
         const placeholder = document.querySelector('#seed-phrase-input');
+        const seedPhraseLabel = document.querySelector('label[for="seed-phrase-input"]');
         const wordCountCheck = document.querySelector('#word-count-check span:last-child');
         const wordsValidCheck = document.querySelector('#words-valid-check span:last-child');
         
@@ -216,6 +217,7 @@ function updateStepContent(stepName) {
         if (backBtn && t.back) backBtn.textContent = t.back;
         if (importBtn && t.import) importBtn.textContent = t.import;
         if (placeholder && t.enter_recovery_phrase) placeholder.placeholder = t.enter_recovery_phrase;
+        if (seedPhraseLabel && t.recovery_phrase) seedPhraseLabel.textContent = t.recovery_phrase;
         
         // Update validation messages correctly
         if (wordCountCheck && t.valid_word_count) wordCountCheck.textContent = t.valid_word_count;
@@ -253,11 +255,16 @@ const translations = {
         confirm_password: 'Confirm Password',
         at_least_8_chars: 'At least 8 characters',
         passwords_no_match: 'Passwords do not match',
+        password_valid_chars: 'English letters, numbers and symbols only',
         seed_title: 'Your Recovery Phrase',
         seed_desc: 'Write down this 12-word recovery phrase in the exact order shown. Keep it secure and never share it.',
         verify_title: 'Verify Recovery Phrase',
         verify_desc: 'Click the words in the correct order to verify you saved your recovery phrase.',
         import_title: 'Import Recovery Phrase',
+        import_recovery_phrase: 'Import Recovery Phrase',
+        save_recovery_phrase: 'Save Your Recovery Phrase',
+        verify_recovery_phrase: 'Verify Your Recovery Phrase',
+        your_recovery_phrase: 'Your Recovery Phrase',
         import_desc: 'Enter your 12 or 24-word recovery phrase to restore your wallet.',
         back: 'Back',
         continue: 'Continue',
@@ -287,7 +294,7 @@ const translations = {
         must_be_12_or_24: 'Recovery phrase must be 12 or 24 words',
         invalid_bip39_words: 'Some words are not valid BIP39 words'
     },
-    'zh-CN': { // Chinese (2nd largest - massive crypto market)
+    'zh-CN': {
         title: 'QNet 钱包',
         welcome_title: '欢迎使用 QNet',
         welcome_desc: '创建新钱包或导入现有钱包，开始使用 QNet 和 Solana 双网络。',
@@ -304,6 +311,8 @@ const translations = {
         new_password: '密码',
         confirm_password: '确认密码',
         at_least_8_chars: '密码长度至少8个字符',
+        passwords_no_match: '密码不匹配',
+        password_valid_chars: '仅限英文字母、数字和符号',
         back: '← 返回',
         continue: '继续',
         seed_title: '您的恢复短语',
@@ -339,7 +348,7 @@ const translations = {
         must_be_12_or_24: '恢复短语必须是12或24个单词',
         invalid_bip39_words: '某些单词不是有效的BIP39单词'
     },
-    ko: { // Korean (3rd largest - very active crypto community)
+    ko: {
         title: 'QNet 지갑',
         welcome_title: 'QNet에 오신 것을 환영합니다',
         welcome_desc: '새 지갑을 만들거나 기존 지갑을 가져와서 QNet 및 Solana 이중 네트워크를 시작하세요.',
@@ -356,6 +365,8 @@ const translations = {
         new_password: '비밀번호',
         confirm_password: '비밀번호 확인',
         at_least_8_chars: '비밀번호는 최소 8자 이상이어야 합니다',
+        passwords_no_match: '비밀번호가 일치하지 않습니다',
+        password_valid_chars: '영문, 숫자 및 기호만 사용 가능',
         back: '← 뒤로',
         continue: '계속',
         seed_title: '복구 문구',
@@ -390,7 +401,7 @@ const translations = {
         must_be_12_or_24: '복구 문구는 12개 또는 24개 단어여야 합니다',
         invalid_bip39_words: '일부 단어가 유효한 BIP39 단어가 아닙니다'
     },
-    ja: { // Japanese (4th largest - institutional crypto market)
+    ja: {
         title: 'QNet ウォレット',
         welcome_title: 'QNet へようこそ',
         welcome_desc: '新しいウォレットを作成するか、既存のウォレットをインポートして、QNet と Solana のデュアルネットワークを開始してください。',
@@ -407,6 +418,8 @@ const translations = {
         new_password: 'パスワード',
         confirm_password: 'パスワードを確認',
         at_least_8_chars: 'パスワードは8文字以上である必要があります',
+        passwords_no_match: 'パスワードが一致しません',
+        password_valid_chars: '英字、数字、記号のみ',
         back: '← 戻る',
         continue: '続行',
         seed_title: 'リカバリーフレーズ',
@@ -457,6 +470,7 @@ const translations = {
         confirm_password: 'Подтвердить пароль',
         at_least_8_chars: 'Минимум 8 символов',
         passwords_no_match: 'Пароли не совпадают',
+        password_valid_chars: 'Только английские буквы, цифры и символы',
         seed_title: 'Ваша фраза для восстановления',
         seed_desc: 'Запишите эту 12-словную фразу для восстановления в точном порядке. Храните в безопасности и никогда не делитесь.',
         verify_title: 'Проверить фразу для восстановления',
@@ -491,7 +505,7 @@ const translations = {
         must_be_12_or_24: 'Фраза восстановления должна содержать 12 или 24 слова',
         invalid_bip39_words: 'Некоторые слова недействительны для BIP39'
     },
-    es: { // Spanish (6th largest - Latin America growth)
+    es: {
         title: 'QNet Billetera',
         welcome_title: 'Bienvenido a QNet',
         welcome_desc: 'Crea una nueva billetera o importa una existente para comenzar con las redes duales QNet y Solana.',
@@ -508,6 +522,8 @@ const translations = {
         new_password: 'Contraseña',
         confirm_password: 'Confirmar Contraseña',
         at_least_8_chars: 'La contraseña debe tener al menos 8 caracteres',
+        passwords_no_match: 'Las contraseñas no coinciden',
+        password_valid_chars: 'Solo letras inglesas, números y símbolos',
         back: '← Atrás',
         continue: 'Continuar',
         seed_title: 'Tu Frase de Recuperación',
@@ -542,7 +558,7 @@ const translations = {
         must_be_12_or_24: 'La frase de recuperación debe tener 12 o 24 palabras',
         invalid_bip39_words: 'Algunas palabras no son palabras BIP39 válidas'
     },
-    pt: { // Portuguese (7th largest - Brazil crypto boom)
+    pt: {
         title: 'QNet Carteira',
         welcome_title: 'Bem-vindo ao QNet',
         welcome_desc: 'Crie uma nova carteira ou importe uma existente para começar com as redes duplas QNet e Solana.',
@@ -559,6 +575,8 @@ const translations = {
         new_password: 'Senha',
         confirm_password: 'Confirmar Senha',
         at_least_8_chars: 'A senha deve ter pelo menos 8 caracteres',
+        passwords_no_match: 'As senhas não coincidem',
+        password_valid_chars: 'Apenas letras inglesas, números e símbolos',
         back: '← Voltar',
         continue: 'Continuar',
         seed_title: 'Sua Frase de Recuperação',
@@ -593,7 +611,7 @@ const translations = {
         must_be_12_or_24: 'A frase de recuperação deve ter 12 ou 24 palavras',
         invalid_bip39_words: 'Algumas palavras não são palavras BIP39 válidas'
     },
-    fr: { // French (8th largest - France and African markets)
+    fr: {
         title: 'QNet Portefeuille',
         welcome_title: 'Bienvenue dans QNet',
         welcome_desc: 'Créez un nouveau portefeuille ou importez-en un existant pour commencer avec les réseaux doubles QNet et Solana.',
@@ -610,6 +628,8 @@ const translations = {
         new_password: 'Mot de Passe',
         confirm_password: 'Confirmer le Mot de Passe',
         at_least_8_chars: 'Le mot de passe doit contenir au moins 8 caractères',
+        passwords_no_match: 'Les mots de passe ne correspondent pas',
+        password_valid_chars: 'Lettres anglaises, chiffres et symboles uniquement',
         back: '← Retour',
         continue: 'Continuer',
         seed_title: 'Votre Phrase de Récupération',
@@ -644,7 +664,7 @@ const translations = {
         must_be_12_or_24: 'La phrase de récupération doit contenir 12 ou 24 mots',
         invalid_bip39_words: 'Certains mots ne sont pas des mots BIP39 valides'
     },
-    de: { // German (9th largest - Germany and DACH region)
+    de: {
         title: 'QNet Wallet',
         welcome_title: 'Willkommen bei QNet',
         welcome_desc: 'Erstellen Sie eine neue Wallet oder importieren Sie eine bestehende, um mit den QNet- und Solana-Dual-Netzwerken zu beginnen.',
@@ -661,6 +681,8 @@ const translations = {
         new_password: 'Passwort',
         confirm_password: 'Passwort Bestätigen',
         at_least_8_chars: 'Das Passwort muss mindestens 8 Zeichen haben',
+        passwords_no_match: 'Passwörter stimmen nicht überein',
+        password_valid_chars: 'Nur englische Buchstaben, Zahlen und Symbole',
         back: '← Zurück',
         continue: 'Weiter',
         seed_title: 'Ihre Wiederherstellungsphrase',
@@ -695,7 +717,7 @@ const translations = {
         must_be_12_or_24: 'Die Wiederherstellungsphrase muss 12 oder 24 Wörter enthalten',
         invalid_bip39_words: 'Einige Wörter sind keine gültigen BIP39-Wörter'
     },
-    it: { // Italian (10th largest - Italy)
+    it: {
         title: 'QNet Portafoglio',
         welcome_title: 'Benvenuto in QNet',
         welcome_desc: 'Crea un nuovo portafoglio o importa uno esistente per iniziare con le reti doppie QNet e Solana.',
@@ -712,6 +734,8 @@ const translations = {
         new_password: 'Password',
         confirm_password: 'Conferma Password',
         at_least_8_chars: 'La password deve contenere almeno 8 caratteri',
+        passwords_no_match: 'Le password non corrispondono',
+        password_valid_chars: 'Solo lettere inglesi, numeri e simboli',
         back: '← Indietro',
         continue: 'Continua',
         seed_title: 'La Tua Frase di Recupero',
@@ -746,7 +770,7 @@ const translations = {
         must_be_12_or_24: 'La frase di recupero deve essere di 12 o 24 parole',
         invalid_bip39_words: 'Alcune parole non sono parole BIP39 valide'
     },
-    ar: { // Arabic (11th largest - Middle East and North Africa)
+    ar: {
         title: 'محفظة QNet',
         welcome_title: 'مرحباً بك في QNet',
         welcome_desc: 'أنشئ محفظة جديدة أو استورد محفظة موجودة للبدء مع شبكات QNet و Solana المزدوجة.',
@@ -763,6 +787,8 @@ const translations = {
         new_password: 'كلمة المرور',
         confirm_password: 'تأكيد كلمة المرور',
         at_least_8_chars: 'يجب أن تتكون كلمة المرور من 8 أحرف على الأقل',
+        passwords_no_match: 'كلمات المرور غير متطابقة',
+        password_valid_chars: 'الحروف الإنجليزية والأرقام والرموز فقط',
         back: '← رجوع',
         continue: 'متابعة',
         seed_title: 'عبارة الاسترداد الخاصة بك',
@@ -1063,6 +1089,13 @@ function validatePasswordWithErrors() {
         return false;
     }
     
+    // Check for valid characters (English letters, numbers, and keyboard symbols only)
+    const validPasswordRegex = /^[a-zA-Z0-9!@#$%^&*()_+\-=\[\]{};':"\\|,.<>\/?`~\s]*$/;
+    if (!validPasswordRegex.test(newPassword)) {
+        showError('password-error', t('password_valid_chars'));
+        return false;
+    }
+    
     if (newPassword !== confirmPassword) {
         showError('password-error', t('passwords_no_match'));
         return false;
@@ -1333,12 +1366,12 @@ async function handleImportSubmit(e) {
     e.preventDefault();
     setupState.hasSubmittedImport = true;
     
-    const seedPhrase = document.getElementById('seed-phrase-input')?.value.trim();
-    
     clearError('import-error');
     
     const lang = setupState.language;
     const trans = translations[lang] || translations['en'];
+    
+    const seedPhrase = document.getElementById('seed-phrase-input')?.value.trim();
     
     if (!seedPhrase) {
         const errorMsg = trans.please_enter_recovery || 'Please enter your recovery phrase';
@@ -1494,6 +1527,32 @@ function checkVerificationComplete() {
 }
 
 /**
+ * Safe base64 encoding for UTF-8 strings
+ */
+function safeBase64Encode(str) {
+    try {
+        // Handle UTF-8 strings properly
+        return btoa(unescape(encodeURIComponent(str)));
+    } catch (e) {
+        console.error('Encoding error:', e);
+        // Fallback to simple btoa if possible
+        return btoa(str);
+    }
+}
+
+/**
+ * Safe base64 decoding for UTF-8 strings
+ */
+function safeBase64Decode(base64) {
+    try {
+        return decodeURIComponent(escape(atob(base64)));
+    } catch (e) {
+        // Fallback to simple atob
+        return atob(base64);
+    }
+}
+
+/**
  * Complete wallet setup with proper storage
  */
 async function completeWalletSetup() {
@@ -1530,8 +1589,8 @@ async function completeWalletSetup() {
                 
                 // Initialize wallet with encrypted seed phrase storage
                 const initResult = await keyManager.initializeWallet(
-                    setupState.seedPhrase,
                     setupState.password,
+                    setupState.seedPhrase,
                     true // Store encrypted seed phrase
                 );
                 
@@ -1567,11 +1626,11 @@ async function completeWalletSetup() {
             ...walletData,
             mnemonic: setupState.seedPhrase // Include for migration purposes
         };
-        const legacyData = btoa(JSON.stringify(legacyWalletData));
+        const legacyData = safeBase64Encode(JSON.stringify(legacyWalletData));
         localStorage.setItem('qnet_wallet_encrypted', legacyData);
         
         // Also store password hash for legacy compatibility
-        const passwordHash = btoa(setupState.password + 'qnet_salt_2025');
+        const passwordHash = safeBase64Encode(setupState.password + 'qnet_salt_2025');
         localStorage.setItem('qnet_wallet_password_hash', passwordHash);
         
         // Variable for storage event
@@ -1601,8 +1660,8 @@ async function completeWalletSetup() {
                 // This will be removed in next major version
                 if (window.location.hostname === 'localhost' || window.location.protocol === 'file:') {
                     // Only save legacy format in development/test environments
-                    const legacyEncrypted = btoa(JSON.stringify(walletData));
-                    const legacyPasswordHash = btoa(setupState.password + 'qnet_salt_2025'); // Deprecated
+                    const legacyEncrypted = safeBase64Encode(JSON.stringify(walletData));
+                    const legacyPasswordHash = safeBase64Encode(setupState.password + 'qnet_salt_2025'); // Deprecated
                     localStorage.setItem('qnet_wallet_encrypted', legacyEncrypted);
                     localStorage.setItem('qnet_wallet_password_hash', legacyPasswordHash);
                 }
@@ -1612,8 +1671,8 @@ async function completeWalletSetup() {
             } catch (error) {
                 // Error:('Encryption failed:', error);
                 // Fallback to old method
-                encryptedData = btoa(JSON.stringify(walletData));
-                const passwordHash = btoa(setupState.password + 'qnet_salt_2025');
+                encryptedData = safeBase64Encode(JSON.stringify(walletData));
+                const passwordHash = safeBase64Encode(setupState.password + 'qnet_salt_2025');
                 localStorage.setItem('qnet_wallet_encrypted', encryptedData);
                 localStorage.setItem('qnet_wallet_password_hash', passwordHash);
                 localStorage.setItem('qnet_wallet_unlocked', 'true');
@@ -1621,8 +1680,8 @@ async function completeWalletSetup() {
         } else {
             // Fallback to old method (NOT SECURE - for compatibility)
             // Warning:('⚠️ WARNING: Using legacy storage. Crypto library not available.');
-            encryptedData = btoa(JSON.stringify(walletData));
-            const passwordHash = btoa(setupState.password + 'qnet_salt_2025');
+            encryptedData = safeBase64Encode(JSON.stringify(walletData));
+            const passwordHash = safeBase64Encode(setupState.password + 'qnet_salt_2025');
             localStorage.setItem('qnet_wallet_encrypted', encryptedData);
             localStorage.setItem('qnet_wallet_password_hash', passwordHash);
             localStorage.setItem('qnet_wallet_unlocked', 'true');
@@ -1886,10 +1945,11 @@ async function openWalletAfterSetup() {
         // Error:('Failed to open full-screen wallet:', error);
         // Final fallback
         try {
-            window.location.href = 'app.html';
-        } catch (fallbackError) {
+            // Don't redirect to app.html - let user open popup manually
             showToast('Wallet created! Open extension to access your wallet.', 'success');
             setTimeout(() => window.close(), 3000);
+        } catch (fallbackError) {
+            console.error('Window close failed:', fallbackError);
         }
     }
 }
@@ -1930,8 +1990,10 @@ function clearAllErrors() {
  * Show toast notification with CORRECT positioning
  */
 function showToast(message, type = 'info') {
-    // Disabled - only log to console
-    console.log(`[${type.toUpperCase()}] ${message}`);
+    // Disabled - silent mode
+    if (type === 'error') {
+        console.error(message);
+    }
     return;
     
     // Animate in
