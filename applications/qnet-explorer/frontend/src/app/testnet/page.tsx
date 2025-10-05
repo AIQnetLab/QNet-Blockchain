@@ -7,8 +7,11 @@ export default function TestnetPage() {
   const [faucetAddress, setFaucetAddress] = useState('');
   const [showFaucetAlert, setShowFaucetAlert] = useState(false);
   const [showSuccessAlert, setShowSuccessAlert] = useState(false);
+  const [isLoading, setIsLoading] = useState(false);
+  const [errorMessage, setErrorMessage] = useState('');
+  const [txHash, setTxHash] = useState('');
 
-  const handleFaucetClaim = () => {
+  const handleFaucetClaim = async () => {
     if (!faucetAddress.trim()) {
       alert('Please enter a valid testnet address');
       return;
@@ -22,9 +25,41 @@ export default function TestnetPage() {
       return;
     }
 
-    setLastFaucetClaim(now);
-    setShowSuccessAlert(true);
-    setFaucetAddress('');
+    setIsLoading(true);
+    setErrorMessage('');
+
+    try {
+      const requestBody = {
+        walletAddress: faucetAddress.trim(),
+        amount: 1500,
+        tokenType: '1DEV'
+      };
+      
+      const response = await fetch('/api/faucet/claim', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(requestBody),
+      });
+      
+      const data = await response.json();
+
+      if (data.success && data.txHash) {
+        setLastFaucetClaim(now);
+        setTxHash(data.txHash);
+        setShowSuccessAlert(true);
+        setFaucetAddress('');
+      } else {
+        setErrorMessage(data.error || 'Failed to send tokens. Please try again.');
+        alert('Error: ' + (data.error || 'Failed to send tokens'));
+      }
+    } catch (error) {
+      setErrorMessage('Network error. Please check your connection.');
+      alert('Network error: ' + (error as Error).message);
+    } finally {
+      setIsLoading(false);
+    }
   };
 
   return (
@@ -49,20 +84,44 @@ export default function TestnetPage() {
             <div className="faucet-row" style={{ display: 'flex', gap: '1rem', alignItems: 'stretch', width: '100%' }}>
               <input 
                 type="text" 
-                placeholder="Enter your testnet address" 
+                placeholder="Enter your Solana testnet address" 
                 className="qnet-input"
                 value={faucetAddress}
                 onChange={(e) => setFaucetAddress(e.target.value)}
+                disabled={isLoading}
                 style={{ flex: '1', fontSize: '1rem', padding: '1rem', height: '3.5rem', boxSizing: 'border-box' }}
               />
               <button 
                 className="qnet-button" 
                 onClick={handleFaucetClaim}
-                style={{ flex: '1', fontSize: '1rem', padding: '1rem', fontWeight: 'bold', height: '3.5rem', boxSizing: 'border-box' }}
+                disabled={isLoading || !faucetAddress.trim()}
+                style={{ 
+                  flex: '1', 
+                  fontSize: '1rem', 
+                  padding: '1rem', 
+                  fontWeight: 'bold', 
+                  height: '3.5rem', 
+                  boxSizing: 'border-box',
+                  opacity: isLoading || !faucetAddress.trim() ? 0.6 : 1,
+                  cursor: isLoading || !faucetAddress.trim() ? 'not-allowed' : 'pointer'
+                }}
               >
-                GET TEST TOKENS
+                {isLoading ? 'SENDING...' : 'GET TEST TOKENS'}
               </button>
             </div>
+            
+            {errorMessage && (
+              <div style={{
+                marginTop: '1rem',
+                padding: '1rem',
+                background: 'rgba(244, 67, 54, 0.1)',
+                border: '1px solid rgba(244, 67, 54, 0.3)',
+                borderRadius: '8px',
+                color: '#f44336'
+              }}>
+                {errorMessage}
+              </div>
+            )}
           </div>
         </div>
 
@@ -120,16 +179,52 @@ export default function TestnetPage() {
               border: '2px solid #00ffff',
               borderRadius: '12px',
               padding: '2rem',
-              maxWidth: '400px',
+              maxWidth: '500px',
               textAlign: 'center'
             }}>
-              <h3 style={{ color: '#00ffff', marginBottom: '1rem' }}>Success!</h3>
-              <p style={{ color: '#e5e5e5', marginBottom: '2rem' }}>
+              <h3 style={{ color: '#00ffff', marginBottom: '1rem' }}>✅ Success!</h3>
+              <p style={{ color: '#e5e5e5', marginBottom: '1rem' }}>
                 1,500 test 1DEV tokens have been sent to your address successfully!
               </p>
+              {txHash && (
+                <div style={{
+                  background: 'rgba(0, 255, 255, 0.1)',
+                  border: '1px solid rgba(0, 255, 255, 0.3)',
+                  borderRadius: '8px',
+                  padding: '1rem',
+                  marginBottom: '1rem'
+                }}>
+                  <p style={{ color: '#888', fontSize: '0.8rem', marginBottom: '0.5rem' }}>Transaction Hash:</p>
+                  <p style={{ 
+                    color: '#00ffff', 
+                    fontSize: '0.9rem', 
+                    fontFamily: 'monospace',
+                    wordBreak: 'break-all'
+                  }}>
+                    {txHash}
+                  </p>
+                  <a 
+                    href={`https://explorer.solana.com/tx/${txHash}?cluster=devnet`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    style={{
+                      color: '#00ffff',
+                      fontSize: '0.85rem',
+                      textDecoration: 'underline',
+                      marginTop: '0.5rem',
+                      display: 'inline-block'
+                    }}
+                  >
+                    View on Solana Explorer →
+                  </a>
+                </div>
+              )}
               <button 
                 className="qnet-button"
-                onClick={() => setShowSuccessAlert(false)}
+                onClick={() => {
+                  setShowSuccessAlert(false);
+                  setTxHash('');
+                }}
                 style={{ fontSize: '1rem', padding: '0.75rem 1.5rem' }}
               >
                 OK

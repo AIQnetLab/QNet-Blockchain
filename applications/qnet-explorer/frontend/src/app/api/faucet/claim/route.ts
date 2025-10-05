@@ -1,12 +1,14 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { Connection, PublicKey, Transaction, SystemProgram, sendAndConfirmTransaction, Keypair } from '@solana/web3.js';
 import { createTransferInstruction, getOrCreateAssociatedTokenAccount, TOKEN_PROGRAM_ID } from '@solana/spl-token';
+import * as fs from 'fs';
+import * as path from 'path';
 
 // Production faucet configuration
 const FAUCET_CONFIG = {
   // Testnet amounts
   testnet: {
-    '1DEV': 2000,
+    '1DEV': 1500,  // 1500 1DEV tokens for testing
     'SOL': 1.0,
     'QNC': 50000
   },
@@ -18,7 +20,7 @@ const FAUCET_CONFIG = {
   },
   // Cooldown periods (in milliseconds)
   cooldown: {
-    testnet: 1 * 60 * 60 * 1000, // 1 hour for testnet
+    testnet: 24 * 60 * 60 * 1000, // 24 hours for testnet
     mainnet: 24 * 60 * 60 * 1000  // 24 hours for mainnet
   },
   // Rate limiting
@@ -26,9 +28,46 @@ const FAUCET_CONFIG = {
   maxRequestsPerAddress: 5
 };
 
-// In-memory storage for rate limiting (in production, use Redis)
+// In-memory storage for rate limiting
 const rateLimitStore = new Map<string, { count: number; lastReset: number }>();
-const addressCooldowns = new Map<string, number>();
+
+// Persistent cooldown storage path (production ready)
+const COOLDOWN_FILE_PATH = path.join(process.cwd(), 'node_data_local', 'faucet-cooldowns.json');
+
+/**
+ * Load cooldowns from persistent storage
+ */
+function loadCooldowns(): Map<string, number> {
+  try {
+    if (fs.existsSync(COOLDOWN_FILE_PATH)) {
+      const data = fs.readFileSync(COOLDOWN_FILE_PATH, 'utf8');
+      const parsed = JSON.parse(data);
+      return new Map(Object.entries(parsed));
+    }
+  } catch (error) {
+    // If file doesn't exist or is corrupted, start fresh
+  }
+  return new Map();
+}
+
+/**
+ * Save cooldowns to persistent storage
+ */
+function saveCooldowns(cooldowns: Map<string, number>): void {
+  try {
+    const dir = path.dirname(COOLDOWN_FILE_PATH);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    const data = Object.fromEntries(cooldowns);
+    fs.writeFileSync(COOLDOWN_FILE_PATH, JSON.stringify(data, null, 2), 'utf8');
+  } catch (error) {
+    // Silent fail - not critical for operation
+  }
+}
+
+// Load cooldowns on startup
+const addressCooldowns = loadCooldowns();
 
 /**
  * Validate Solana address format
@@ -73,12 +112,18 @@ function checkRateLimit(ip: string): { allowed: boolean; resetTime?: number } {
 }
 
 /**
- * Check cooldown for wallet address
+ * Check cooldown for wallet address (with persistent storage)
  */
 function checkAddressCooldown(address: string, environment: 'testnet' | 'mainnet'): { allowed: boolean; nextClaimTime?: number } {
   const now = Date.now();
   const lastClaim = addressCooldowns.get(address);
   const cooldownMs = FAUCET_CONFIG.cooldown[environment];
+  
+  // Clean up expired entries (older than 48 hours)
+  if (lastClaim && now - lastClaim > cooldownMs * 2) {
+    addressCooldowns.delete(address);
+    saveCooldowns(addressCooldowns);
+  }
   
   if (!lastClaim || now - lastClaim > cooldownMs) {
     return { allowed: true };
@@ -86,6 +131,14 @@ function checkAddressCooldown(address: string, environment: 'testnet' | 'mainnet
   
   const nextClaimTime = lastClaim + cooldownMs;
   return { allowed: false, nextClaimTime };
+}
+
+/**
+ * Record successful claim with persistent storage
+ */
+function recordClaim(address: string): void {
+  addressCooldowns.set(address, Date.now());
+  saveCooldowns(addressCooldowns);
 }
 
 /**
@@ -164,21 +217,136 @@ async function send1DEVTokens(
   };
   
   if (environment === 'testnet') {
-    // Simulate real token transfer for new 1DEV token
-    const mockTxHash = `1DEV_PHASE1_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-    
-    // Log faucet activity
-    console.log(`🚰 Faucet: Sending ${amount} 1DEV tokens to ${address}`);
-    console.log(`📍 Token: ${TOKEN_CONFIG.mintAddress} (Phase 1 Ready)`);
-    console.log(`📊 Phase: ${TOKEN_CONFIG.phase} (Universal pricing 1500 1DEV)`);
-    
-    // Simulate network delay for realistic UX
-    await new Promise(resolve => setTimeout(resolve, 1500));
-    
-    return {
-      success: true,
-      txHash: mockTxHash
-    };
+    try {
+      // Import necessary Solana libraries
+      const { Connection, Keypair, PublicKey, Transaction } = await import('@solana/web3.js');
+      const { createTransferInstruction, getAssociatedTokenAddress, createAssociatedTokenAccountInstruction, getAccount } = await import('@solana/spl-token');
+      
+      // Setup connection with processed commitment for faster transactions
+      const connection = new Connection('https://api.devnet.solana.com', 'processed');
+      
+      // Get faucet private key from environment variable OR testnet config file
+      let faucetPrivateKey: number[] | undefined;
+      const faucetPrivateKeyEnv = process.env.FAUCET_PRIVATE_KEY;
+      
+      if (faucetPrivateKeyEnv) {
+        // Use environment variable if available (production)
+        try {
+          faucetPrivateKey = JSON.parse(faucetPrivateKeyEnv);
+        } catch (e) {
+          throw new Error('Faucet configuration error - invalid private key format');
+        }
+      } else {
+        // Fallback to testnet config file for development/testnet
+        const path = await import('path');
+        const fs = await import('fs');
+        
+        // Try multiple possible paths
+        const possiblePaths = [
+          path.join(process.cwd(), 'infrastructure', 'config', 'faucet-config-testnet.json'),
+          path.join(process.cwd(), '..', '..', '..', 'infrastructure', 'config', 'faucet-config-testnet.json'),
+          'C:\\QNet-Project\\infrastructure\\config\\faucet-config-testnet.json'
+        ];
+        
+        let configFound = false;
+        for (const configPath of possiblePaths) {
+          if (fs.existsSync(configPath)) {
+            const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+            faucetPrivateKey = config.wallet.secretKey;
+            configFound = true;
+            break;
+          }
+        }
+        
+        if (!configFound) {
+          throw new Error('Faucet configuration error - no private key source available');
+        }
+      }
+      
+      if (!faucetPrivateKey) {
+        throw new Error('Faucet configuration error - private key not loaded');
+      }
+      
+      const faucetWallet = Keypair.fromSecretKey(new Uint8Array(faucetPrivateKey));
+      const mintPubkey = new PublicKey(TOKEN_CONFIG.mintAddress);
+      const recipientPubkey = new PublicKey(address);
+      
+      // Get or create recipient's token account
+      const recipientTokenAddress = await getAssociatedTokenAddress(
+        mintPubkey,
+        recipientPubkey
+      );
+      
+      // Get faucet's token account
+      const faucetTokenAddress = await getAssociatedTokenAddress(
+        mintPubkey,
+        faucetWallet.publicKey
+      );
+      
+      // Check faucet balance before sending
+      try {
+        const faucetAccount = await getAccount(connection, faucetTokenAddress);
+        const faucetBalance = Number(faucetAccount.amount) / 1000000;
+        
+        if (faucetBalance < amount) {
+          throw new Error(`Insufficient faucet balance: ${faucetBalance} < ${amount}`);
+        }
+      } catch (balanceError: any) {
+        throw balanceError;
+      }
+      
+      const transaction = new Transaction();
+      
+      // Check if recipient token account exists
+      try {
+        await getAccount(connection, recipientTokenAddress);
+      } catch (error) {
+        // Account doesn't exist, add instruction to create it
+        transaction.add(
+          createAssociatedTokenAccountInstruction(
+            faucetWallet.publicKey,
+            recipientTokenAddress,
+            recipientPubkey,
+            mintPubkey
+          )
+        );
+      }
+      
+      // Add transfer instruction (amount * 10^6 because token has 6 decimals)
+      transaction.add(
+        createTransferInstruction(
+          faucetTokenAddress,
+          recipientTokenAddress,
+          faucetWallet.publicKey,
+          amount * 1000000
+        )
+      );
+      
+      // Send transaction with optimized settings for production speed
+      const signature = await connection.sendTransaction(
+        transaction,
+        [faucetWallet],
+        { 
+          skipPreflight: true, // Skip preflight for faster submission
+          preflightCommitment: 'processed',
+          maxRetries: 3
+        }
+      );
+      
+      // Wait for confirmation with processed commitment (faster)
+      await connection.confirmTransaction(signature, 'processed');
+      
+      return {
+        success: true,
+        txHash: signature
+      };
+      
+    } catch (error: any) {
+      return {
+        success: false,
+        error: error.message || 'Failed to send tokens'
+      };
+    }
   }
   
   // Production would implement real Solana SPL transfer with new token
@@ -263,8 +431,7 @@ async function sendQNCTokens(
           address: address,
           amount: amount,
           token: 'QNC'
-        }),
-        timeout: 30000
+        })
       });
       
       if (response.ok) {
@@ -295,8 +462,7 @@ async function sendQNCTokens(
             address: address,
             amount: amount,
             token: 'QNC'
-          }),
-          timeout: 10000
+          })
         });
         
         if (localResponse.ok) {
@@ -332,8 +498,7 @@ async function sendQNCTokens(
         address: address,
         amount: amount,
         token: 'QNC'
-      }),
-      timeout: 30000
+      })
     });
     
     if (response.ok) {
@@ -394,6 +559,21 @@ export async function POST(request: NextRequest) {
     // Detect environment
     const environment = detectEnvironment(request);
     
+    // Check address cooldown FIRST (before any expensive operations)
+    const cooldownCheck = checkAddressCooldown(walletAddress, environment);
+    
+    if (!cooldownCheck.allowed) {
+      const nextClaimTime = new Date(cooldownCheck.nextClaimTime!).toISOString();
+      return NextResponse.json(
+        { 
+          success: false, 
+          error: 'This address has already claimed tokens. Please wait 24 hours between claims.',
+          nextClaimTime 
+        },
+        { status: 429 }
+      );
+    }
+    
     // Validate amount
     const maxAmount = FAUCET_CONFIG[environment][tokenType as keyof typeof FAUCET_CONFIG.testnet];
     if (!maxAmount || amount > maxAmount) {
@@ -403,7 +583,7 @@ export async function POST(request: NextRequest) {
       );
     }
     
-    // Check rate limiting
+    // Check rate limiting (IP-based protection)
     const clientIP = getClientIP(request);
     const rateLimitCheck = checkRateLimit(clientIP);
     
@@ -412,23 +592,8 @@ export async function POST(request: NextRequest) {
       return NextResponse.json(
         { 
           success: false, 
-          error: 'Rate limit exceeded',
+          error: 'Too many requests from this IP. Please try again later.',
           resetTime 
-        },
-        { status: 429 }
-      );
-    }
-    
-    // Check address cooldown
-    const cooldownCheck = checkAddressCooldown(walletAddress, environment);
-    
-    if (!cooldownCheck.allowed) {
-      const nextClaimTime = new Date(cooldownCheck.nextClaimTime!).toISOString();
-      return NextResponse.json(
-        { 
-          success: false, 
-          error: 'Address is in cooldown period',
-          nextClaimTime 
         },
         { status: 429 }
       );
@@ -438,8 +603,8 @@ export async function POST(request: NextRequest) {
     const result = await sendTokens(tokenType, amount, walletAddress, environment);
     
     if (result.success) {
-      // Update cooldown
-      addressCooldowns.set(walletAddress, Date.now());
+      // Record successful claim with persistent storage
+      recordClaim(walletAddress);
       
       return NextResponse.json({
         success: true,

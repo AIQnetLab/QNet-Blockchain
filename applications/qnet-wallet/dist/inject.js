@@ -62,6 +62,11 @@
             return this.accounts;
         }
 
+        // Get current selected address (Solana address)
+        get selectedAddress() {
+            return this.accounts && this.accounts.length > 0 ? this.accounts[0] : null;
+        }
+
         // Request method - main communication with extension
         async request(args) {
             return new Promise((resolve, reject) => {

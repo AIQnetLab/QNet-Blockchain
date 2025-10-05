@@ -784,6 +784,7 @@ let walletState = {
     encryptedWallet: null,
     solanaRPC: null,
     balanceCache: new Map(),
+    pendingBalanceRequests: new Map(), // Debounce parallel requests
     transactionHistory: new Map()
 };
 
@@ -952,6 +953,7 @@ async function handleMessage(request, sender, sendResponse) {
             case 'GET_TOKEN_BALANCE':
                 console.log('[Message] GET_TOKEN_BALANCE request:', request.address, request.mintAddress);
                 const tokenBalance = await getBalance(request.address, request.mintAddress);
+                console.log('[Message] Token balance result:', tokenBalance);
                 sendResponse({ balance: tokenBalance });
                 break;
                 
@@ -1372,9 +1374,9 @@ async function getAccounts() {
     }
     
     const currentAccount = walletState.accounts[0];
-    const address = walletState.currentNetwork === 'solana' 
-        ? currentAccount.solanaAddress 
-        : currentAccount.qnetAddress;
+    // ALWAYS return Solana address for compatibility with dApps and faucets
+    // (1DEV tokens are on Solana network, even if current network is QNet)
+    const address = currentAccount.solanaAddress || currentAccount.qnetAddress;
     
     return { result: [address] };
 }
@@ -1653,7 +1655,7 @@ async function loadWalletAccounts(walletData) {
 }
 
 /**
- * Get real balance from blockchain
+ * Get real balance from blockchain with request deduplication
  */
 async function getBalance(address, tokenMint = null) {
     try {
@@ -1661,15 +1663,40 @@ async function getBalance(address, tokenMint = null) {
         const cacheKey = `${walletState.currentNetwork}-${address}-${tokenMint || 'native'}`;
         const cached = walletState.balanceCache.get(cacheKey);
         
-        // Cache for 15 seconds to reduce RPC calls
-        if (cached && (Date.now() - cached.timestamp) < 15000) { // 15 second cache
-            console.log(`[GetBalance] Returning cached balance for ${tokenMint || 'SOL'}: ${cached.balance}`);
+        // Faster cache for production (5 seconds for quick UI updates)
+        if (cached && (Date.now() - cached.timestamp) < 5000) { // 5 second cache
             return cached.balance;
         }
         
-        let balance = 0;
+        // Deduplicate concurrent requests for same balance
+        const pendingRequest = walletState.pendingBalanceRequests.get(cacheKey);
+        if (pendingRequest) {
+            return await pendingRequest;
+        }
         
-        console.log(`[GetBalance] Current network: ${walletState.currentNetwork}`);
+        // Create new request promise
+        const balancePromise = fetchBalanceFromBlockchain(address, tokenMint, cacheKey);
+        walletState.pendingBalanceRequests.set(cacheKey, balancePromise);
+        
+        try {
+            const balance = await balancePromise;
+            return balance;
+        } finally {
+            // Clean up pending request
+            walletState.pendingBalanceRequests.delete(cacheKey);
+        }
+        
+    } catch (error) {
+        return 0;
+    }
+}
+
+/**
+ * Internal function to fetch balance from blockchain
+ */
+async function fetchBalanceFromBlockchain(address, tokenMint, cacheKey) {
+    try {
+        let balance = 0;
         
         if (walletState.currentNetwork === 'solana') {
             // Get the correct RPC endpoint based on network setting
@@ -1703,18 +1730,28 @@ async function getBalance(address, tokenMint = null) {
             const rpcEndpoints = isMainnet ? mainnetRPCs : devnetRPCs;
             let rpcEndpoint = rpcEndpoints[0];  // Start with primary
             
-            console.log(`[GetBalance] Network: ${isMainnet ? 'mainnet' : 'devnet'}, Address: ${address}, Token: ${tokenMint || 'SOL'}`);
+            // Validate Solana address format
+            if (!address || typeof address !== 'string' || address.length < 32 || address.length > 44) {
+                return 0;
+            }
             
             if (!tokenMint) {
                 // SOL balance via direct RPC call with fallback
                 for (let i = 0; i < rpcEndpoints.length; i++) {
                     rpcEndpoint = rpcEndpoints[i];
-                    console.log(`[GetBalance] Trying RPC ${i + 1}/${rpcEndpoints.length}: ${rpcEndpoint}`);
                     
                     try {
                         // Add timeout to prevent hanging on slow RPCs
                         const controller = new AbortController();
-                        const timeoutId = setTimeout(() => controller.abort(), 5000); // 5 second timeout
+                        const timeoutId = setTimeout(() => controller.abort(), 3000); // 3 second timeout for faster failover
+                        
+                        // Ensure address is properly formatted
+                        const requestBody = {
+                            jsonrpc: '2.0',
+                            id: 1,
+                            method: 'getBalance',
+                            params: [address.toString()]
+                        };
                         
                         const response = await fetch(rpcEndpoint, {
                             method: 'POST',
@@ -1722,12 +1759,7 @@ async function getBalance(address, tokenMint = null) {
                                 'Content-Type': 'application/json',
                                 'Accept': 'application/json'
                             },
-                            body: JSON.stringify({
-                                jsonrpc: '2.0',
-                                id: 1,
-                                method: 'getBalance',
-                                params: [address]
-                            }),
+                            body: JSON.stringify(requestBody),
                             signal: controller.signal
                         });
                         
@@ -1740,31 +1772,19 @@ async function getBalance(address, tokenMint = null) {
                             } catch (e) {
                                 errorText = 'Could not read error text';
                             }
-                            console.warn(`[GetBalance] HTTP ${response.status} for SOL on RPC ${i + 1}/${rpcEndpoints.length} (${rpcEndpoint})`);
-                            if (response.status === 403) {
-                                console.log(`[GetBalance] RPC ${i + 1} blocked (403), trying next...`);
-                            }
                             continue; // Try next RPC
                         }
                         
                         const data = await response.json();
                         
                         if (data.error) {
-                            console.warn(`[GetBalance] RPC error for SOL on RPC ${i + 1}:`, data.error);
                             continue; // Try next RPC
                         }
                         
                         balance = (data.result?.value || 0) / 1e9; // Convert lamports to SOL
-                        console.log(`[GetBalance] SOL balance from RPC ${i + 1}: ${balance}`);
                         break; // Success, exit loop
                     } catch (error) {
-                        if (error.name === 'AbortError') {
-                            console.warn(`[GetBalance] RPC ${i + 1} timeout (${rpcEndpoint})`);
-                        } else {
-                            console.warn(`[GetBalance] Failed with RPC ${i + 1} (${rpcEndpoint}):`, error.message);
-                        }
                         if (i === rpcEndpoints.length - 1) {
-                            console.error(`[GetBalance] All ${rpcEndpoints.length} RPCs failed for SOL balance. Tried: ${rpcEndpoints.join(', ')}`);
                             return 0;
                         }
                     }
@@ -1773,12 +1793,11 @@ async function getBalance(address, tokenMint = null) {
                 // Token balance via getTokenAccountsByOwner with fallback
                 for (let i = 0; i < rpcEndpoints.length; i++) {
                     rpcEndpoint = rpcEndpoints[i];
-                    console.log(`[GetBalance] Trying RPC ${i + 1}/${rpcEndpoints.length} for token: ${rpcEndpoint}`);
                     
                     try {
                         // Add timeout to prevent hanging on slow RPCs
                         const controller = new AbortController();
-                        const timeoutId = setTimeout(() => controller.abort(), 5000); // 5 second timeout
+                        const timeoutId = setTimeout(() => controller.abort(), 3000); // 3 second timeout for faster failover
                         
                         const response = await fetch(rpcEndpoint, {
                             method: 'POST',
@@ -1808,17 +1827,16 @@ async function getBalance(address, tokenMint = null) {
                             } catch (e) {
                                 errorText = 'Could not read error text';
                             }
-                            console.warn(`[GetBalance] HTTP ${response.status} for token on RPC ${i + 1}/${rpcEndpoints.length} (${rpcEndpoint})`);
-                            if (response.status === 403) {
-                                console.log(`[GetBalance] RPC ${i + 1} blocked (403) for token, trying next...`);
-                            }
                             continue; // Try next RPC
                         }
                         
                         const data = await response.json();
                         
                         if (data.error) {
-                            console.warn(`[GetBalance] RPC error for token on RPC ${i + 1}:`, data.error);
+                            // Ignore "Invalid param: could not find account" - it's normal for new accounts
+                            if (!data.error.message?.includes('could not find account')) {
+                                console.warn(`[GetBalance] RPC error for token on RPC ${i + 1}:`, data.error);
+                            }
                             continue; // Try next RPC
                         }
                         
@@ -1827,20 +1845,13 @@ async function getBalance(address, tokenMint = null) {
                             const amount = tokenAccount.account.data.parsed.info.tokenAmount.amount;
                             const decimals = tokenAccount.account.data.parsed.info.tokenAmount.decimals;
                             balance = amount / Math.pow(10, decimals);
-                            console.log(`[GetBalance] Token ${tokenMint} balance from RPC ${i + 1}: ${balance}`);
-                        } else {
-                            console.log(`[GetBalance] No token account found for ${tokenMint} on RPC ${i + 1}`);
+                            // Found balance, exit both loops and continue to cache it
+                            break;
                         }
-                        break; // Success, exit loop
+                        break; // Success response received, exit loop
                     } catch (error) {
-                        if (error.name === 'AbortError') {
-                            console.warn(`[GetBalance] RPC ${i + 1} timeout for token (${rpcEndpoint})`);
-                        } else {
-                            console.warn(`[GetBalance] Failed token request with RPC ${i + 1} (${rpcEndpoint}):`, error.message);
-                        }
                         if (i === rpcEndpoints.length - 1) {
-                            console.error(`[GetBalance] All ${rpcEndpoints.length} RPCs failed for token ${tokenMint}.`);
-                            console.error(`[GetBalance] Tried RPCs: ${rpcEndpoints.join(', ')}`);
+                            // Not an error - token account might not exist yet
                             return 0;
                         }
                     }
@@ -1861,7 +1872,6 @@ async function getBalance(address, tokenMint = null) {
         return balance;
         
     } catch (error) {
-        console.error('[GetBalance] Failed to get balance:', error);
         return 0;
     }
 }
@@ -2116,8 +2126,8 @@ async function getSupportedTokens(network = 'solana') {
                 "1DEV": {
                     symbol: "1DEV",
                     name: "1DEV Token",
-                    decimals: 9,
-                    mintAddress: "AtkC8fLJgb5XAfutK4C5qqKLXk14TJ6GXZMKyeNWPvtH", // Real testnet 1DEV address
+                    decimals: 6,  // 1DEV has 6 decimals
+                    mintAddress: "62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ", // Real testnet 1DEV address
                     logoURI: "data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTAwIiBoZWlnaHQ9IjEwMCIgdmlld0JveD0iMCAwIDEwMCAxMDAiIGZpbGw9Im5vbmUiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyI+PHJlY3Qgd2lkdGg9IjEwMCIgaGVpZ2h0PSIxMDAiIHJ4PSI1MCIgZmlsbD0iIzk5NDVmZiIvPjx0ZXh0IHg9IjUwIiB5PSI0NSIgZm9udC1mYW1pbHk9IkFyaWFsLCBzYW5zLXNlcmlmIiBmb250LXNpemU9IjE2IiBmb250LXdlaWdodD0iYm9sZCIgZmlsbD0id2hpdGUiIHRleHQtYW5jaG9yPSJtaWRkbGUiPjFERVY8L3RleHQ+PC9zdmc+"
                 },
                 USDC: {

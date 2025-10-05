@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { Card } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -18,9 +18,68 @@ export default function TokenFaucet() {
   const [lastClaim, setLastClaim] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
+  const [isWalletConnected, setIsWalletConnected] = useState(false);
 
   const FAUCET_AMOUNT = 1500; // 1500 1DEV tokens
   const COOLDOWN_HOURS = 24; // 24 hour cooldown
+
+  // Check for QNet Wallet on component mount
+  useEffect(() => {
+    const checkWallet = async () => {
+      // Check if QNet Wallet is installed
+      const qnetWallet = (window as any).qnet || (window as any).qnetWallet;
+      
+      if (qnetWallet && qnetWallet.isConnected) {
+        try {
+          const accounts = await qnetWallet.getAccounts();
+          if (accounts && accounts.length > 0) {
+            setWalletAddress(accounts[0]);
+            setIsWalletConnected(true);
+          }
+        } catch (err) {
+          // Silently handle error
+        }
+      }
+    };
+
+    // Check immediately
+    checkWallet();
+
+    // Also check after a delay (wallet might not be ready immediately)
+    setTimeout(checkWallet, 1000);
+    setTimeout(checkWallet, 2000);
+    
+    // Load last claim time from localStorage
+    const storedLastClaim = localStorage.getItem('qnet_faucet_last_claim');
+    if (storedLastClaim) {
+      setLastClaim(storedLastClaim);
+    }
+  }, []);
+
+  // Connect to wallet
+  const connectWallet = async () => {
+    const qnetWallet = (window as any).qnet || (window as any).qnetWallet;
+    
+    if (!qnetWallet) {
+      setError('QNet Wallet not found. Please install the extension.');
+      return;
+    }
+
+    try {
+      await qnetWallet.connect();
+      const accounts = await qnetWallet.getAccounts();
+      
+      if (accounts && accounts.length > 0) {
+        setWalletAddress(accounts[0]);
+        setIsWalletConnected(true);
+        setError(null);
+      } else {
+        setError('No accounts found in wallet');
+      }
+    } catch (err: any) {
+      setError(err.message || 'Failed to connect wallet');
+    }
+  };
 
   const validateSolanaAddress = (address: string): boolean => {
     // Basic Solana address validation (base58, 32-44 chars)
@@ -63,33 +122,31 @@ export default function TokenFaucet() {
     setIsLoading(true);
 
     try {
-      // Call faucet API
+      const requestBody = {
+        walletAddress: walletAddress.trim(),
+        amount: FAUCET_AMOUNT,
+        tokenType: '1DEV'
+      };
+      
       const response = await fetch('/api/faucet/claim', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({
-          walletAddress: walletAddress.trim(),
-          amount: FAUCET_AMOUNT,
-          tokenType: '1DEV'
-        }),
+        body: JSON.stringify(requestBody),
       });
-
+      
       const data: FaucetResponse = await response.json();
 
       if (data.success && data.txHash) {
         setSuccess(`Successfully sent ${FAUCET_AMOUNT} 1DEV tokens! Transaction: ${data.txHash}`);
         setLastClaim(new Date().toISOString());
         setWalletAddress('');
-        
-        // Store last claim time in localStorage
         localStorage.setItem('qnet_faucet_last_claim', new Date().toISOString());
       } else {
         setError(data.error || 'Failed to send tokens. Please try again.');
       }
     } catch (err) {
-      console.error('Faucet error:', err);
       setError('Network error. Please check your connection and try again.');
     } finally {
       setIsLoading(false);
@@ -161,19 +218,42 @@ export default function TokenFaucet() {
         </div>
 
         <div className="space-y-6">
-          <div>
-            <label className="block text-sm font-medium text-gray-300 mb-2">
-              Solana Wallet Address
-            </label>
-            <Input
-              type="text"
-              placeholder="Enter your Solana wallet address (e.g., 7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU)"
-              value={walletAddress}
-              onChange={(e) => setWalletAddress(e.target.value)}
-              className="quantum-card border-purple-500/30 focus:border-purple-400"
-              disabled={isLoading}
-            />
-          </div>
+          {!isWalletConnected ? (
+            <div className="text-center">
+              <Button
+                onClick={connectWallet}
+                disabled={isLoading}
+                className="quantum-button primary"
+              >
+                🔗 Connect QNet Wallet
+              </Button>
+              <p className="text-sm text-gray-400 mt-4">
+                Or enter address manually:
+              </p>
+            </div>
+          ) : (
+            <div className="p-4 bg-purple-500/10 border border-purple-500/30 rounded-lg">
+              <p className="text-purple-400 text-sm">
+                ✅ Wallet Connected: <span className="font-mono">{walletAddress}</span>
+              </p>
+            </div>
+          )}
+          
+          {!isWalletConnected && (
+            <div>
+              <label className="block text-sm font-medium text-gray-300 mb-2">
+                Solana Wallet Address
+              </label>
+              <Input
+                type="text"
+                placeholder="Enter your Solana wallet address (e.g., 7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU)"
+                value={walletAddress}
+                onChange={(e) => setWalletAddress(e.target.value)}
+                className="quantum-card border-purple-500/30 focus:border-purple-400"
+                disabled={isLoading}
+              />
+            </div>
+          )}
 
           {error && (
             <div className="p-4 bg-red-500/10 border border-red-500/30 rounded-lg">
