@@ -12,6 +12,13 @@ interface QNetProvider {
   disconnect(): void;
   isConnected(): boolean;
   request(args: { method: string; params?: any[] }): Promise<any>;
+  // Optional wallet-specific methods
+  getBalance?(): Promise<number>;
+  getNetwork?(): Promise<string>;
+  switchNetwork?(network: string): Promise<void>;
+  signTransaction?(tx: any): Promise<string>;
+  on?(event: string, callback: Function): void;
+  removeListener?(event: string, callback: Function): void;
 }
 
 interface AppContextType {

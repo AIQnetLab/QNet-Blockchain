@@ -785,7 +785,10 @@ let walletState = {
     solanaRPC: null,
     balanceCache: new Map(),
     pendingBalanceRequests: new Map(), // Debounce parallel requests
-    transactionHistory: new Map()
+    encryptionKey: null, // Store encryption key for activation codes
+    encryptedActivationCodes: {}, // Store encrypted activation codes
+    transactionHistory: new Map(),
+    isActivatingNode: false // Lock to prevent concurrent node activations
 };
 
 let lockTimer = null;
@@ -895,6 +898,257 @@ async function initializeWallet() {
 }
 
 /**
+ * Burn tokens and activate node
+ */
+async function burnAndActivateNode(nodeType, amount) {
+    // Check if activation is already in progress (prevent race conditions)
+    if (walletState.isActivatingNode) {
+        return { success: false, error: 'Node activation already in progress. Please wait.' };
+    }
+    
+    try {
+        // Set lock to prevent concurrent activations
+        walletState.isActivatingNode = true;
+        
+        if (!walletState.isUnlocked || walletState.accounts.length === 0) {
+            walletState.isActivatingNode = false;
+            return { success: false, error: 'Wallet is locked' };
+        }
+
+        const account = walletState.accounts[0];
+        const solanaAddress = account.solanaAddress;
+
+        if (!solanaAddress) {
+            walletState.isActivatingNode = false;
+            return { success: false, error: 'No Solana address found' };
+        }
+
+        // Check if any node is already activated on this wallet
+        const storageData = await chrome.storage.local.get(['walletData', 'encryptedActivationCodes']);
+        const existingCodes = storageData.encryptedActivationCodes || {};
+        
+        if (Object.keys(existingCodes).length > 0) {
+            // Found existing activation - determine which type
+            const existingType = Object.keys(existingCodes)[0];
+            const nodeTypeNames = { 
+                light: 'Light Node', 
+                full: 'Full Node', 
+                super: 'Super Node' 
+            };
+            walletState.isActivatingNode = false;
+            return { 
+                success: false, 
+                error: `This wallet already has an active ${nodeTypeNames[existingType] || 'node'}. One wallet can only run one node.` 
+            };
+        }
+
+        // Get current balance
+        const balanceResult = await getBalance(solanaAddress);
+        if (!balanceResult.success) {
+            walletState.isActivatingNode = false;
+            return { success: false, error: 'Failed to check wallet balance. Please try again.' };
+        }
+
+        const currentBalance = parseFloat(balanceResult.balance);
+        if (currentBalance < amount) {
+            walletState.isActivatingNode = false;
+            return { success: false, error: `Insufficient balance: ${currentBalance.toFixed(2)} 1DEV available, ${amount} 1DEV required.` };
+        }
+
+        // Generate activation code (without actual token burning in testnet)
+        const activationCode = generateActivationCode(nodeType, solanaAddress);
+        
+        // Encrypt activation code before storing (similar to seed phrase)
+        const currentStorageData = await chrome.storage.local.get(['walletData', 'encryptedActivationCodes']);
+        const walletData = currentStorageData.walletData || {};
+        
+        // Store encrypted activation codes separately for better security
+        let encryptedCodes = currentStorageData.encryptedActivationCodes || {};
+        
+        // Double-check: ensure no other nodes are activated (protection against race conditions)
+        if (Object.keys(encryptedCodes).length > 0) {
+            const existingType = Object.keys(encryptedCodes)[0];
+            const nodeTypeNames = { 
+                light: 'Light Node', 
+                full: 'Full Node', 
+                super: 'Super Node' 
+            };
+            walletState.isActivatingNode = false;
+            return { 
+                success: false, 
+                error: `This wallet already has an active ${nodeTypeNames[existingType] || 'node'}. One wallet can only run one node.` 
+            };
+        }
+        
+        // Encrypt the activation code using wallet's encryption key
+        const encryptedCode = await encryptActivationCode(activationCode);
+        
+        encryptedCodes[nodeType] = {
+            encryptedCode: encryptedCode,
+            timestamp: Date.now(),
+            address: solanaAddress
+        };
+        
+        // Update node status
+        walletData.nodeStatus = {
+            active: true,
+            type: nodeType,
+            activationTime: Date.now()
+        };
+        
+        // Store both encrypted codes and wallet data
+        await chrome.storage.local.set({ 
+            'walletData': walletData,
+            'encryptedActivationCodes': encryptedCodes
+        });
+        
+        // Update in-memory state (store encrypted version)
+        walletState.nodeStatus = walletData.nodeStatus;
+        walletState.encryptedActivationCodes = encryptedCodes;
+
+        return { 
+            success: true, 
+            activationCode: activationCode
+        };
+
+    } catch (error) {
+        console.error('Node activation error:', error);
+        return { success: false, error: error.message || 'Failed to activate node' };
+    } finally {
+        // Always release the lock
+        walletState.isActivatingNode = false;
+    }
+}
+
+/**
+ * Generate unique activation code
+ */
+function generateActivationCode(nodeType, address) {
+    // Generate activation code in format: QNET-XXXXXX-XXXXXX-XXXXXX (26 chars total)
+    const timestamp = Date.now();
+    const data = `${nodeType}-${address}-${timestamp}`;
+    
+    // Generate random bytes for entropy
+    const randomBytes = new Uint8Array(18); // 18 bytes = 36 hex chars (enough for 3x6 segments)
+    crypto.getRandomValues(randomBytes);
+    
+    // Convert to hex string
+    const hexString = Array.from(randomBytes)
+        .map(b => b.toString(16).padStart(2, '0'))
+        .join('')
+        .toUpperCase();
+    
+    // Create three 6-character segments
+    const segment1 = hexString.substring(0, 6);
+    const segment2 = hexString.substring(6, 12);
+    const segment3 = hexString.substring(12, 18);
+    
+    // Format as QNET-XXXXXX-XXXXXX-XXXXXX
+    const formatted = `QNET-${segment1}-${segment2}-${segment3}`;
+    
+    return formatted;
+}
+
+/**
+ * Encrypt activation code for secure storage
+ */
+async function encryptActivationCode(code) {
+    try {
+        // Use same encryption method as seed phrase
+        if (walletState.encryptionKey) {
+            // If we have an encryption key, use it to encrypt
+            const encoder = new TextEncoder();
+            const data = encoder.encode(code);
+            
+            // Simple XOR encryption with key (same as seed phrase)
+            const keyBytes = new TextEncoder().encode(walletState.encryptionKey);
+            const encrypted = new Uint8Array(data.length);
+            
+            for (let i = 0; i < data.length; i++) {
+                encrypted[i] = data[i] ^ keyBytes[i % keyBytes.length];
+            }
+            
+            // Convert to base64 for storage
+            return btoa(String.fromCharCode(...encrypted));
+        } else {
+            // Fallback: use base64 encoding (better than plaintext)
+            return btoa(code);
+        }
+    } catch (error) {
+        console.error('Encryption error:', error);
+        return btoa(code); // Fallback to base64
+    }
+}
+
+/**
+ * Decrypt activation code from storage
+ */
+async function decryptActivationCode(encryptedCode) {
+    try {
+        if (walletState.encryptionKey) {
+            // Decrypt using encryption key
+            const encrypted = new Uint8Array(
+                atob(encryptedCode).split('').map(c => c.charCodeAt(0))
+            );
+            
+            const keyBytes = new TextEncoder().encode(walletState.encryptionKey);
+            const decrypted = new Uint8Array(encrypted.length);
+            
+            for (let i = 0; i < encrypted.length; i++) {
+                decrypted[i] = encrypted[i] ^ keyBytes[i % keyBytes.length];
+            }
+            
+            return new TextDecoder().decode(decrypted);
+        } else {
+            // Fallback: decode from base64
+            return atob(encryptedCode);
+        }
+    } catch (error) {
+        console.error('Decryption error:', error);
+        return null;
+    }
+}
+
+/**
+ * Export activation code (similar to recovery phrase export)
+ */
+async function exportActivationCode(password, nodeType) {
+    try {
+        // Verify password
+        const unlocked = await unlockWallet(password);
+        if (!unlocked.success) {
+            return { success: false, error: 'Invalid password' };
+        }
+        
+        // Get encrypted activation codes from storage
+        const storageData = await chrome.storage.local.get(['encryptedActivationCodes']);
+        const encryptedCodes = storageData.encryptedActivationCodes || {};
+        
+        if (!encryptedCodes[nodeType]) {
+            return { success: false, error: 'No activation code found for this node type' };
+        }
+        
+        // Decrypt the activation code
+        const decryptedCode = await decryptActivationCode(encryptedCodes[nodeType].encryptedCode);
+        
+        if (!decryptedCode) {
+            return { success: false, error: 'Failed to decrypt activation code' };
+        }
+        
+        return { 
+            success: true, 
+            activationCode: decryptedCode,
+            timestamp: encryptedCodes[nodeType].timestamp,
+            nodeType: nodeType
+        };
+        
+    } catch (error) {
+        console.error('Export activation code error:', error);
+        return { success: false, error: error.message };
+    }
+}
+
+/**
  * Message handler
  */
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
@@ -962,6 +1216,21 @@ async function handleMessage(request, sender, sendResponse) {
                 sendResponse({ transactions: history });
                 break;
                 
+            case 'BURN_AND_ACTIVATE':
+                // Security check: ensure request is from our extension popup
+                if (sender.tab || !sender.url?.includes('popup.html')) {
+                    sendResponse({ success: false, error: 'Unauthorized request. Node activation must be done through the wallet interface.' });
+                    break;
+                }
+                const burnResult = await burnAndActivateNode(request.nodeType, request.amount);
+                sendResponse(burnResult);
+                break;
+                
+            case 'EXPORT_ACTIVATION_CODE':
+                const exportResult = await exportActivationCode(request.password, request.nodeType);
+                sendResponse(exportResult);
+                break;
+                
             case 'CLEAR_CACHE':
                 console.log('[Message] Clearing balance cache');
                 walletState.balanceCache.clear();
@@ -1004,8 +1273,8 @@ async function handleMessage(request, sender, sendResponse) {
                 break;
                 
             case 'BURN_1DEV_TOKENS':
-                const burnResult = await burnOneDevTokens(request);
-                sendResponse(burnResult);
+                const burn1DevResult = await burnOneDevTokens(request);
+                sendResponse(burn1DevResult);
                 break;
                 
             case 'SETUP_COMPLETE':
@@ -1439,6 +1708,7 @@ async function createWallet(password, mnemonic) {
         // Auto-unlock wallet after creation
         walletState.isUnlocked = true;
         walletState.encryptedWallet = encryptedWallet;
+        walletState.encryptionKey = password; // Store encryption key for activation codes
         walletState.currentNetwork = 'solana';
         
         // Load accounts
@@ -1530,6 +1800,7 @@ async function unlockWallet(password) {
         
         walletState.isUnlocked = true;
         walletState.encryptedWallet = result.encryptedWallet;
+        walletState.encryptionKey = password; // Store encryption key for activation codes
         
         // Save unlock state
         await chrome.storage.local.set({

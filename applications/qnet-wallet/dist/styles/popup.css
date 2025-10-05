@@ -594,19 +594,19 @@ body {
 
 .main-tab {
   flex: 1;
-  padding: 0.9rem 0.5rem;
+  padding: 0.8rem 0.4rem;
   background: transparent;
   border: none;
   color: #8a8a8a;
-  font-size: 0.9rem;
+  font-size: 0.85rem;
   font-weight: 600;
   cursor: pointer;
   border-bottom: 3px solid transparent;
   transition: all 0.3s ease;
   position: relative;
   text-transform: capitalize;
-  letter-spacing: 0.3px;
-  min-width: 60px;
+  letter-spacing: 0.2px;
+  min-width: 0;
   text-align: center;
 }
 
@@ -624,11 +624,11 @@ body {
 .main-tab.active::after {
   content: '';
   position: absolute;
-  bottom: -1px;
+  bottom: -3px;
   left: 0;
   right: 0;
   height: 3px;
-  background: linear-gradient(90deg, transparent, #00d4ff, transparent);
+  background: #00d4ff;
   animation: slideGlow 2s ease-in-out infinite;
 }
 
@@ -1490,6 +1490,31 @@ body {
     0% { transform: scale(1); }
     50% { transform: scale(1.02); }
     100% { transform: scale(1); }
+}
+
+/* Node activation animations */
+@keyframes pulseSuccess {
+    0% {
+        box-shadow: 0 0 0 0 rgba(0, 255, 100, 0.4);
+        transform: scale(1);
+    }
+    50% {
+        box-shadow: 0 0 20px 10px rgba(0, 255, 100, 0.1);
+        transform: scale(1.05);
+    }
+    100% {
+        box-shadow: 0 0 0 0 rgba(0, 255, 100, 0);
+        transform: scale(1);
+    }
+}
+
+@keyframes scanLine {
+    0% {
+        left: -100%;
+    }
+    100% {
+        left: 200%;
+    }
 }
 
 .setting-textarea {

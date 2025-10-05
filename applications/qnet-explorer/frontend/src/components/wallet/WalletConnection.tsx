@@ -7,17 +7,24 @@ interface QNetWallet {
   isQNet?: boolean;
   connect: () => Promise<string[]>;
   disconnect: () => Promise<void>;
-  getBalance: () => Promise<number>;
-  getNetwork: () => Promise<string>;
-  switchNetwork: (network: string) => Promise<void>;
-  signTransaction: (tx: any) => Promise<string>;
-  on: (event: string, callback: Function) => void;
-  removeListener: (event: string, callback: Function) => void;
+  getBalance?: () => Promise<number>;
+  getNetwork?: () => Promise<string>;
+  switchNetwork?: (network: string) => Promise<void>;
+  signTransaction?: (tx: any) => Promise<string>;
+  on?: (event: string, callback: Function) => void;
+  removeListener?: (event: string, callback: Function) => void;
+  request?: (args: { method: string; params?: any[] }) => Promise<any>;
+  isConnected?: () => boolean;
+  connected?: boolean;
+  selectedAddress?: string | null;
+  networkVersion?: string;
+  version?: string;
 }
 
+// Don't redeclare window.qnet since it's already declared in AppContext.tsx
+// Just extend the Window interface for ethereum
 declare global {
   interface Window {
-    qnet?: QNetWallet;
     ethereum?: any;
   }
 }
@@ -74,8 +81,8 @@ export default function WalletConnection() {
         setWalletType('qnet');
         
         // Get additional info
-        const balance = await window.qnet.getBalance();
-        const network = await window.qnet.getNetwork();
+        const balance = window.qnet.getBalance ? await window.qnet.getBalance() : 0;
+        const network = window.qnet.getNetwork ? await window.qnet.getNetwork() : 'qnet';
         
         setBalance(balance);
         setNetwork(network);
@@ -111,7 +118,7 @@ export default function WalletConnection() {
    */
   const setupWalletListeners = () => {
     // QNet Wallet listeners
-    if (window.qnet) {
+    if (window.qnet && window.qnet.on) {
       window.qnet.on('accountsChanged', handleAccountsChanged);
       window.qnet.on('networkChanged', handleNetworkChanged);
       window.qnet.on('disconnect', handleDisconnect);
@@ -119,7 +126,7 @@ export default function WalletConnection() {
 
     // Phantom listeners
     const phantom = (window as any).solana;
-    if (phantom) {
+    if (phantom && phantom.on) {
       phantom.on('accountChanged', handleAccountsChanged);
       phantom.on('disconnect', handleDisconnect);
     }
@@ -129,14 +136,14 @@ export default function WalletConnection() {
    * Cleanup wallet event listeners
    */
   const cleanupWalletListeners = () => {
-    if (window.qnet) {
+    if (window.qnet && window.qnet.removeListener) {
       window.qnet.removeListener('accountsChanged', handleAccountsChanged);
       window.qnet.removeListener('networkChanged', handleNetworkChanged);
       window.qnet.removeListener('disconnect', handleDisconnect);
     }
 
     const phantom = (window as any).solana;
-    if (phantom) {
+    if (phantom && phantom.removeListener) {
       phantom.removeListener('accountChanged', handleAccountsChanged);
       phantom.removeListener('disconnect', handleDisconnect);
     }
@@ -180,8 +187,8 @@ export default function WalletConnection() {
   const updateWalletInfo = async () => {
     try {
       if (walletType === 'qnet' && window.qnet) {
-        const balance = await window.qnet.getBalance();
-        const network = await window.qnet.getNetwork();
+        const balance = window.qnet.getBalance ? await window.qnet.getBalance() : 0;
+        const network = window.qnet.getNetwork ? await window.qnet.getNetwork() : 'qnet';
         setBalance(balance);
         setNetwork(network);
       }
@@ -215,8 +222,8 @@ export default function WalletConnection() {
         setWalletType('qnet');
         
         // Get wallet info
-        const balance = await window.qnet.getBalance();
-        const network = await window.qnet.getNetwork();
+        const balance = window.qnet.getBalance ? await window.qnet.getBalance() : 0;
+        const network = window.qnet.getNetwork ? await window.qnet.getNetwork() : 'qnet';
         
         setBalance(balance);
         setNetwork(network);
@@ -295,7 +302,17 @@ export default function WalletConnection() {
     if (walletType !== 'qnet' || !window.qnet) return;
 
     try {
-      await window.qnet.switchNetwork(targetNetwork);
+      if (window.qnet.switchNetwork) {
+        await window.qnet.switchNetwork(targetNetwork);
+      } else if (window.qnet.request) {
+        // Fallback to request method
+        await window.qnet.request({ 
+          method: 'wallet_switchEthereumChain',
+          params: [{ chainId: targetNetwork }]
+        });
+      } else {
+        throw new Error('Network switching not supported');
+      }
       setNetwork(targetNetwork);
       await updateWalletInfo();
       console.log(`Switched to ${targetNetwork} network`);

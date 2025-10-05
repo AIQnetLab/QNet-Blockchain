@@ -221,7 +221,7 @@
                             <div class="form-group">
                                 <label>Network Fee</label>
                                 <div class="fee-info-free">
-                                    <span style="color: #00d4ff;">✨ Free - No fees!</span>
+                                    <span id="network-fee-display" style="color: #00d4ff;">0.00 SOL</span>
                                 </div>
                             </div>
                             <button id="send-confirm-btn" class="action-btn primary">Send Transaction</button>
@@ -247,37 +247,173 @@
 
                 <!-- Activate Tab -->
                 <div id="activate-tab" class="tab-content hidden">
-                    <div class="content-scroll">
-                        <div class="activate-content">
+                    <div class="content-scroll" style="height: 100%; overflow: hidden;">
+                        <div class="activate-content" style="position: relative; height: 100%;">
+                            <!-- Main Node Selection View -->
+                            <div id="node-selection-view" style="height: 100%; display: flex; flex-direction: column;">
                             <div class="phase-indicator compact">
                                 <div class="phase-info">
                                     <span id="phase-text">Phase 1: 1DEV Burn Activation</span>
-                                    <span id="phase-progress">25% burned</span>
+                                        <span id="phase-progress">Inactive</span>
+                                    </div>
+                                </div>
+                                
+                                <div class="node-management" style="flex: 1; display: flex; flex-direction: column;">
+                                    <h3 style="margin-top: 1.5rem;">Node Management</h3>
+                                    <div class="node-status" id="node-status">
+                                        <span id="node-status-text">Status: Not Active</span>
+                                    </div>
+                                    
+                                    <div class="node-options" id="node-options" style="flex: 1; display: flex; flex-direction: column; justify-content: center; gap: 0.8rem;">
+                                        <div class="node-option" data-type="light" style="display: flex; justify-content: space-between; align-items: center; cursor: pointer;">
+                                            <span class="node-name">Light Node</span>
+                                            <span class="node-price" style="flex-grow: 1; text-align: center;">1500 1DEV</span>
+                                            <span class="node-action">Activate</span>
+                                        </div>
+                                        <div class="node-option" data-type="full" style="display: flex; justify-content: space-between; align-items: center; cursor: pointer;">
+                                            <span class="node-name">Full Node</span>
+                                            <span class="node-price" style="flex-grow: 1; text-align: center;">1500 1DEV</span>
+                                            <span class="node-action">Activate</span>
+                                        </div>
+                                        <div class="node-option" data-type="super" style="display: flex; justify-content: space-between; align-items: center; cursor: pointer;">
+                                            <span class="node-name">Super Node</span>
+                                            <span class="node-price" style="flex-grow: 1; text-align: center;">1500 1DEV</span>
+                                            <span class="node-action">Activate</span>
+                                        </div>
+                                    </div>
                                 </div>
                             </div>
                             
-                            <div class="node-management">
-                                <h3>Node Management</h3>
-                                <div class="node-status" id="node-status">
-                                    <span>Status: Not Active</span>
-                                    <button id="activate-node-btn" class="action-btn secondary">Activate Node</button>
+                            <!-- Node Details View (Hidden by default) -->
+                            <div id="node-details-view" class="hidden" style="position: absolute; top: 0; left: 0; right: 0; bottom: 0;">
+                                <div class="node-management" style="height: 100%; display: flex; flex-direction: column; padding: 0.5rem;">
+                                    <div style="display: flex; align-items: center; margin-bottom: 0.5rem;">
+                                        <button id="back-to-nodes" style="background: none; border: none; color: #00d4ff; cursor: pointer; font-size: 1.2rem; padding: 0; margin-right: 0.5rem;">←</button>
+                                        <h3 id="node-type-title" style="margin: 0; font-size: 0.95rem;">Node Activation</h3>
+                                    </div>
+                                    
+                                    <div class="node-details-content" style="flex: 1; display: flex; flex-direction: column; justify-content: space-between;">
+                                        <div>
+                                            <h4 id="node-type-name" style="color: #00d4ff; margin-bottom: 0.4rem; font-size: 1rem;">Node Type</h4>
+                                            <p id="node-description" style="color: #a0a0a0; margin: 0.4rem 0; line-height: 1.2; font-size: 0.75rem;"></p>
+                                            
+                                            <div class="node-specs" style="background: rgba(0, 212, 255, 0.05); padding: 0.5rem; border-radius: 6px; margin: 0.6rem 0; font-size: 0.7rem;">
+                                                <div id="node-specs-content"></div>
+                                            </div>
+                                        </div>
+                                        
+                                        <div>
+                                            <div class="activation-cost" style="text-align: center; margin: 0.8rem 0;">
+                                                <div style="color: #888; font-size: 0.75rem;">Activation Cost</div>
+                                                <div style="color: #00d4ff; font-size: 1.2rem; font-weight: bold; margin: 0.2rem 0;">1500 1DEV</div>
+                                                <div style="color: #888; font-size: 0.7rem;">Tokens will be burned permanently</div>
                                 </div>
                                 
-                                <div class="node-options" id="node-options">
-                                    <div class="node-option" data-type="light">
-                                        <span class="node-emoji">💡</span>
-                                        <span class="node-name">Light Node</span>
-                                        <span class="node-price">Free</span>
+                                            <button id="activate-node-button" class="qnet-button primary full-width" style="padding: 0.6rem; font-size: 0.85rem;">
+                                                Get Activation Code
+                                            </button>
+                                        </div>
                                     </div>
-                                    <div class="node-option" data-type="full">
-                                        <span class="node-emoji">🔋</span>
-                                        <span class="node-name">Full Node</span>
-                                        <span class="node-price">Free</span>
+                                </div>
+                            </div>
+                            
+                            <!-- Burn Confirmation View (Hidden by default) -->
+                            <div id="burn-confirmation-view" class="hidden" style="position: absolute; top: 0; left: 0; right: 0; bottom: 0; display: flex; align-items: center; justify-content: center; background: rgba(13, 13, 23, 0.95); z-index: 100;">
+                                <div class="node-management" style="width: 100%; height: 100%; display: flex; flex-direction: column; justify-content: center; align-items: center; padding: 0.5rem;">
+                                    <div class="confirmation-modal" style="width: calc(100% - 1rem); background: linear-gradient(135deg, rgba(26, 26, 46, 1) 0%, rgba(13, 13, 23, 1) 100%); border: 1px solid rgba(0, 212, 255, 0.3); border-radius: 16px; padding: 1.5rem 1rem; box-shadow: 0 0 30px rgba(0, 212, 255, 0.3);">
+                                        <div style="text-align: center;">
+                                            <div class="warning-icon" style="width: 60px; height: 60px; margin: 0 auto 1rem; border-radius: 50%; background: linear-gradient(135deg, rgba(0, 212, 255, 0.1) 0%, rgba(0, 150, 200, 0.05) 100%); border: 2px solid rgba(0, 212, 255, 0.5); display: flex; align-items: center; justify-content: center;">
+                                                <span style="font-size: 1.8rem;">🔥</span>
+                                            </div>
+                                            
+                                            <h3 style="color: #fff; font-size: 1.2rem; margin-bottom: 0.6rem;">Activate Node</h3>
+                                            
+                                            <p style="color: #a0a0a0; line-height: 1.4; margin-bottom: 0.8rem; font-size: 0.95rem;">
+                                                Burn <strong style="color: #00d4ff;">1500 1DEV</strong> to activate<br>
+                                                <strong id="confirm-node-type" style="color: #00d4ff; font-size: 1rem;"></strong>
+                                            </p>
+                                            
+                                            <div class="burn-warning" style="background: rgba(0, 212, 255, 0.05); border: 1px solid rgba(0, 212, 255, 0.2); border-radius: 8px; padding: 0.8rem; margin: 1rem 0;">
+                                                <p style="color: #00d4ff; font-size: 0.85rem; margin: 0; opacity: 0.9;">
+                                                    Permanent action - tokens will be burned
+                                                </p>
+                                            </div>
+                                            
+                                            <div style="display: flex; gap: 0.8rem; margin-top: 1.2rem;">
+                                                <button id="cancel-burn" class="qnet-button secondary" style="flex: 1; padding: 0.7rem; font-size: 0.95rem;">
+                                                    Cancel
+                                                </button>
+                                                <button id="confirm-burn" class="qnet-button primary" style="flex: 1; padding: 0.7rem; font-size: 0.95rem; background: linear-gradient(135deg, #00d4ff 0%, #0099cc 100%);">
+                                                    Confirm
+                                                </button>
+                                            </div>
+                                        </div>
                                     </div>
-                                    <div class="node-option" data-type="super">
-                                        <span class="node-emoji">⚡</span>
-                                        <span class="node-name">Super Node</span>
-                                        <span class="node-price">Free</span>
+                                </div>
+                            </div>
+                            
+                            <!-- Activation Error View (Hidden by default) -->
+                            <div id="activation-error-view" class="hidden" style="position: absolute; top: 0; left: 0; right: 0; bottom: 0; display: flex; align-items: center; justify-content: center; background: rgba(13, 13, 23, 0.95); z-index: 100;">
+                                <div class="node-management" style="width: 100%; height: 100%; display: flex; flex-direction: column; justify-content: center; align-items: center; padding: 0.5rem;">
+                                    <div class="error-modal" style="width: calc(100% - 1rem); background: linear-gradient(135deg, rgba(26, 26, 46, 1) 0%, rgba(13, 13, 23, 1) 100%); border: 1px solid rgba(255, 100, 100, 0.3); border-radius: 16px; padding: 1.5rem 1rem; box-shadow: 0 0 30px rgba(255, 100, 100, 0.2);">
+                                        <div style="text-align: center;">
+                                            <div class="error-icon" style="width: 60px; height: 60px; margin: 0 auto 1rem; border-radius: 50%; background: linear-gradient(135deg, rgba(255, 100, 100, 0.1) 0%, rgba(255, 50, 50, 0.05) 100%); border: 2px solid rgba(255, 100, 100, 0.5); display: flex; align-items: center; justify-content: center;">
+                                                <span style="color: #ff6464; font-size: 2rem;">✕</span>
+                                            </div>
+                                            
+                                            <h3 style="color: #ff6464; font-size: 1.2rem; margin-bottom: 0.8rem;">Activation Failed</h3>
+                                            
+                                            <div style="background: rgba(255, 100, 100, 0.05); border: 1px solid rgba(255, 100, 100, 0.2); border-radius: 8px; padding: 1rem; margin-bottom: 1.5rem;">
+                                                <p id="error-message" style="color: #ff9999; line-height: 1.4; font-size: 0.9rem; margin: 0;">
+                                                    Error message will appear here
+                                                </p>
+                                            </div>
+                                            
+                                            <button id="error-back-button" class="qnet-button secondary" style="padding: 0.7rem 1.5rem; font-size: 0.95rem;">
+                                                Back
+                                            </button>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                            
+                            <!-- Activation Success View (Hidden by default) -->
+                            <div id="activation-success-view" class="hidden" style="position: absolute; top: 0; left: 0; right: 0; bottom: 0; display: flex; align-items: center; justify-content: center; background: rgba(13, 13, 23, 0.95); z-index: 100;">
+                                <div class="node-management" style="width: 100%; height: 100%; display: flex; flex-direction: column; justify-content: center; align-items: center; padding: 0.5rem;">
+                                    <div class="success-modal" style="width: calc(100% - 1rem); background: linear-gradient(135deg, rgba(26, 26, 46, 1) 0%, rgba(13, 13, 23, 1) 100%); border: 1px solid rgba(0, 255, 100, 0.3); border-radius: 16px; padding: 1rem; box-shadow: 0 0 30px rgba(0, 255, 100, 0.3);">
+                                        <div style="text-align: center;">
+                                            <div class="success-animation" style="width: 60px; height: 60px; margin: 0 auto 0.8rem; position: relative;">
+                                                <div style="width: 100%; height: 100%; border-radius: 50%; background: linear-gradient(135deg, rgba(0, 255, 100, 0.1) 0%, rgba(0, 212, 255, 0.1) 100%); border: 2px solid rgba(0, 255, 100, 0.5); display: flex; align-items: center; justify-content: center; animation: pulseSuccess 2s ease-in-out infinite;">
+                                                    <span style="color: #00ff64; font-size: 2rem;">✓</span>
+                                                </div>
+                                            </div>
+                                            
+                                            <h3 style="color: #00ff64; font-size: 1.1rem; margin-bottom: 0.4rem;">Node Activated!</h3>
+                                            <p style="color: #a0a0a0; margin-bottom: 0.6rem; font-size: 0.85rem;">Your <span id="activated-node-type" style="color: #00d4ff;"></span> is ready</p>
+                                            
+                                            <div style="background: rgba(0, 212, 255, 0.05); border: 1px solid rgba(0, 212, 255, 0.2); border-radius: 8px; padding: 0.7rem; margin: 0.6rem 0;">
+                                                <p style="color: #00d4ff; font-size: 0.8rem; margin-bottom: 0.5rem; text-transform: uppercase; letter-spacing: 0.5px;">Activation Code</p>
+                                                
+                                                <div class="activation-code-container" style="background: #0a0a14; border: 1px solid rgba(0, 212, 255, 0.3); border-radius: 6px; padding: 0.6rem; position: relative; overflow: hidden;">
+                                                    <div style="position: absolute; top: 0; left: -100%; width: 100%; height: 1px; background: linear-gradient(90deg, transparent 0%, #00d4ff 50%, transparent 100%); animation: scanLine 3s linear infinite;"></div>
+                                                    <code id="activation-code" style="color: #00ff64; font-family: 'Courier New', monospace; font-size: 0.8rem; letter-spacing: 1px; word-break: break-all; display: block;"></code>
+                                                </div>
+                                                
+                                                <button id="copy-activation-code" class="qnet-button secondary full-width" style="margin-top: 0.5rem; padding: 0.5rem; background: rgba(0, 212, 255, 0.1); border: 1px solid rgba(0, 212, 255, 0.3); font-size: 0.8rem;">
+                                                    <span id="copy-button-text">Copy Code</span>
+                                                </button>
+                                            </div>
+                                            
+                                            <div class="info-box" style="background: rgba(0, 212, 255, 0.03); border: 1px solid rgba(0, 212, 255, 0.15); border-radius: 6px; padding: 0.5rem; margin: 0.6rem 0;">
+                                                <p style="color: #00d4ff; font-size: 0.75rem; margin: 0; opacity: 0.9;">
+                                                    💾 Access later: Settings → Export Activation Code
+                                                </p>
+                                            </div>
+                                            
+                                            <button id="done-activation" class="qnet-button primary full-width" style="margin-top: 0.6rem; padding: 0.6rem; background: linear-gradient(135deg, #00d4ff 0%, #0099cc 100%); font-size: 0.9rem;">
+                                                Continue
+                                            </button>
+                                        </div>
                                     </div>
                                 </div>
                             </div>
@@ -412,6 +548,9 @@
                                 <button id="show-seed-button" class="setting-button">
                                     Export Recovery Phrase
                                 </button>
+                                <button id="show-activation-code-button" class="setting-button">
+                                    Export Activation Code
+                                </button>
                                 <div id="seed-phrase-form" class="setting-form hidden">
                                     <div class="info-box" style="background: rgba(100,200,255,0.1); border: 1px solid rgba(100,200,255,0.3); color: #64c8ff; padding: 10px; border-radius: 8px; margin-bottom: 10px; font-size: 13px;">
                                         <strong>✓ <span data-translate="best_compatibility">Universal compatibility: Use this phrase to import your wallet to Phantom, Solflare, MetaMask, or any other wallet</span></strong>
@@ -420,6 +559,15 @@
                                     <textarea id="seed-phrase-display" class="setting-textarea" readonly data-translate-placeholder="recovery_phrase_will_appear" placeholder="Your 12-word recovery phrase will appear here" style="cursor: pointer; user-select: all;" title="Click to copy"></textarea>
                                     <button id="copy-seed-phrase" class="setting-button" style="display: none; margin-top: 10px;" data-translate="copy_recovery_phrase">Copy Recovery Phrase</button>
                                     <button id="confirm-show-seed" class="setting-button primary" data-translate="show_recovery_phrase_button">Show Recovery Phrase</button>
+                                </div>
+                                <div id="activation-code-form" class="setting-form hidden">
+                                    <div class="info-box" style="background: rgba(100,200,255,0.1); border: 1px solid rgba(100,200,255,0.3); color: #64c8ff; padding: 10px; border-radius: 8px; margin-bottom: 10px; font-size: 13px;">
+                                        <strong>🔑 Your activation codes prove node ownership. Keep them secure!</strong>
+                                    </div>
+                                    <input type="password" id="activation-code-password" placeholder="Enter password to reveal" class="setting-input">
+                                    <textarea id="activation-codes-display" class="setting-textarea" readonly placeholder="Your activation codes will appear here" style="cursor: pointer; user-select: all; display: none;" title="Click to copy"></textarea>
+                                    <button id="copy-activation-codes" class="setting-button" style="display: none; margin-top: 10px;">Copy Activation Codes</button>
+                                    <button id="confirm-show-activation-code" class="setting-button primary">Show Activation Codes</button>
                                 </div>
                             </div>
                         </div>
