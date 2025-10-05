@@ -313,10 +313,8 @@ export class SecureCrypto {
             const validation = await secureBIP39.validateImportedSeed(mnemonic);
             
             if (validation.valid) {
-                console.log('✅ BIP39 validation passed:', validation.entropyBits, 'bits entropy');
                 return true;
             } else {
-                console.log('❌ BIP39 validation failed:', validation.error);
                 return false;
             }
         } catch (error) {

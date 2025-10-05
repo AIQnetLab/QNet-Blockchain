@@ -292,7 +292,9 @@ const translations = {
         please_select_correct_words: 'Please select the correct words to verify your seed phrase',
         please_enter_recovery: 'Please enter your recovery phrase',
         must_be_12_or_24: 'Recovery phrase must be 12 or 24 words',
-        invalid_bip39_words: 'Some words are not valid BIP39 words'
+        invalid_bip39_words: 'Some words are not valid BIP39 words',
+        invalid_checksum: 'Invalid recovery phrase - checksum verification failed. This phrase will not work in other wallets.',
+        system_error: 'System error - cannot validate recovery phrase'
     },
     'zh-CN': {
         title: 'QNet 钱包',
@@ -346,7 +348,9 @@ const translations = {
         please_select_correct_words: '请选择正确的单词以验证您的恢复短语',
         please_enter_recovery: '请输入您的恢复短语',
         must_be_12_or_24: '恢复短语必须是12或24个单词',
-        invalid_bip39_words: '某些单词不是有效的BIP39单词'
+        invalid_bip39_words: '某些单词不是有效的BIP39单词',
+        invalid_checksum: '无效的恢复短语 - 校验和验证失败。此短语无法在其他钱包中使用。',
+        system_error: '系统错误 - 无法验证恢复短语'
     },
     ko: {
         title: 'QNet 지갑',
@@ -503,7 +507,9 @@ const translations = {
         please_select_correct_words: 'Выберите правильные слова для проверки вашей фразы восстановления',
         please_enter_recovery: 'Пожалуйста, введите вашу фразу восстановления',
         must_be_12_or_24: 'Фраза восстановления должна содержать 12 или 24 слова',
-        invalid_bip39_words: 'Некоторые слова недействительны для BIP39'
+        invalid_bip39_words: 'Некоторые слова недействительны для BIP39',
+        invalid_checksum: 'Неверная фраза восстановления - проверка контрольной суммы не пройдена. Эта фраза не будет работать в других кошельках.',
+        system_error: 'Системная ошибка - невозможно проверить фразу восстановления'
     },
     es: {
         title: 'QNet Billetera',
@@ -1172,25 +1178,25 @@ async function handlePasswordSubmit(e) {
  */
 async function generateSeedPhrase() {
     try {
-        // Generating secure seed phrase
-        
         // Use ProductionBIP39 directly with proper random generation
         if (typeof window !== 'undefined' && window.secureBIP39) {
             // Generate using BIP39 compliant method
             const mnemonic = await window.secureBIP39.generateBIP39Mnemonic(128); // 128 bits = 12 words
-            // BIP39 compliant mnemonic generated
             
             // Validate the generated mnemonic
             const isValid = await window.secureBIP39.validateMnemonic(mnemonic);
+            
             if (!isValid) {
-                // Warning:('Generated mnemonic failed validation, using simple method');
+                console.warn('[GenerateSeed] Generated mnemonic failed validation, using simple method');
                 // Fallback to simple random generation
-                return await window.secureBIP39.generateMnemonic(12);
+                const fallbackMnemonic = await window.secureBIP39.generateMnemonic(12);
+                return fallbackMnemonic;
             }
             
             return mnemonic;
         }
         
+        console.error('[GenerateSeed] ProductionBIP39 not available!');
         throw new Error('ProductionBIP39 not available');
         
     } catch (error) {
@@ -1334,18 +1340,42 @@ async function validateImportRealtime() {
         if (icon) icon.textContent = isValidCount ? '✓' : '✗';
     }
     
-    // Check if all words are valid BIP39 words
+    // Check if all words are valid BIP39 words and validate checksum
     let allWordsValid = true;
+    let checksumValid = false;
+    
     if (window.secureBIP39 && isValidCount) {
+        // First check if all words are in wordlist
         allWordsValid = words.every(word => window.secureBIP39.isValidWord(word));
+        
+        // Then validate checksum if all words are valid
+        if (allWordsValid) {
+            checksumValid = await window.secureBIP39.validateMnemonic(seedPhrase);
+        }
     }
     
     if (wordsValidCheck) {
         wordsValidCheck.classList.remove('waiting', 'valid', 'invalid');
         if (isValidCount) {
-            wordsValidCheck.classList.add(allWordsValid ? 'valid' : 'invalid');
+            // Show checksum validation result
+            const isFullyValid = allWordsValid && checksumValid;
+            wordsValidCheck.classList.add(isFullyValid ? 'valid' : 'invalid');
             const icon = wordsValidCheck.querySelector('.check-icon');
-            if (icon) icon.textContent = allWordsValid ? '✓' : '✗';
+            if (icon) icon.textContent = isFullyValid ? '✓' : '✗';
+            
+            // Update text to show what's wrong
+            const textSpan = wordsValidCheck.querySelector('span:last-child');
+            if (textSpan) {
+                const lang = setupState.language;
+                const trans = translations[lang] || translations['en'];
+                if (!allWordsValid) {
+                    textSpan.textContent = trans.invalid_bip39_words || 'Invalid BIP39 words';
+                } else if (!checksumValid) {
+                    textSpan.textContent = trans.invalid_checksum || 'Invalid checksum';
+                } else {
+                    textSpan.textContent = trans.all_words_valid || 'All words valid';
+                }
+            }
         } else {
             wordsValidCheck.classList.add('waiting');
             const icon = wordsValidCheck.querySelector('.check-icon');
@@ -1353,9 +1383,9 @@ async function validateImportRealtime() {
         }
     }
     
-    // Enable/disable import button
+    // Enable/disable import button - only enable if checksum is valid
     if (importBtn) {
-        importBtn.disabled = !(isValidCount && allWordsValid);
+        importBtn.disabled = !(isValidCount && allWordsValid && checksumValid);
     }
 }
 
@@ -1387,14 +1417,29 @@ async function handleImportSubmit(e) {
         return;
     }
     
-    // Simple validation - check if all words are in BIP39 wordlist
+    // CRITICAL: Full BIP39 validation with checksum verification
     if (window.secureBIP39) {
-        const validWords = words.filter(word => window.secureBIP39.isValidWord(word));
-        if (validWords.length !== words.length) {
-            const errorMsg = trans.invalid_bip39_words || 'Some words are not valid BIP39 words';
+        // First check if all words are in wordlist
+        const invalidWords = words.filter(word => !window.secureBIP39.isValidWord(word));
+        if (invalidWords.length > 0) {
+            const errorMsg = trans.invalid_bip39_words || `Invalid words: ${invalidWords.join(', ')}`;
             showError('import-error', errorMsg);
             return;
         }
+        
+        // Then validate the complete mnemonic with checksum
+        const isValid = await window.secureBIP39.validateMnemonic(seedPhrase);
+        
+        if (!isValid) {
+            const errorMsg = trans.invalid_checksum || 'Invalid recovery phrase - checksum verification failed. This phrase will not work in other wallets.';
+            showError('import-error', errorMsg);
+            return;
+        }
+    } else {
+        // BIP39 library not loaded - critical error
+        const errorMsg = trans.system_error || 'System error - cannot validate recovery phrase';
+        showError('import-error', errorMsg);
+        return;
     }
     
     setupState.seedPhrase = seedPhrase;
@@ -1620,11 +1665,11 @@ async function completeWalletSetup() {
         localStorage.setItem('qnet_wallet_addresses', JSON.stringify(walletData.addresses));
         localStorage.setItem('qnet_wallet_unlocked', 'true');
         
-        // Legacy compatibility layer (with seed phrase for backward compatibility)
-        // This will be migrated to secure format on first unlock
+        // Legacy compatibility layer (WITHOUT seed phrase for security!)
+        // CRITICAL: Never store seed phrase in localStorage
         const legacyWalletData = {
-            ...walletData,
-            mnemonic: setupState.seedPhrase // Include for migration purposes
+            ...walletData
+            // REMOVED: mnemonic - NEVER store seed phrase in plain text!
         };
         const legacyData = safeBase64Encode(JSON.stringify(legacyWalletData));
         localStorage.setItem('qnet_wallet_encrypted', legacyData);

@@ -45,11 +45,16 @@
   "web_accessible_resources": [
     {
       "resources": [
+        "setup.html",
+        "setup.js",
+        "app.html",
+        "app.js",
         "inject.js",
         "styles/*",
         "scripts/*",
         "src/*",
-        "icons/*"
+        "icons/*",
+        "lib/*"
       ],
       "matches": [
         "<all_urls>"

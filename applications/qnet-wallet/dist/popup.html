@@ -414,11 +414,12 @@
                                 </button>
                                 <div id="seed-phrase-form" class="setting-form hidden">
                                     <div class="info-box" style="background: rgba(100,200,255,0.1); border: 1px solid rgba(100,200,255,0.3); color: #64c8ff; padding: 10px; border-radius: 8px; margin-bottom: 10px; font-size: 13px;">
-                                        <strong>✓ Universal compatibility:</strong> Use this phrase to import your wallet to Phantom, Solflare, MetaMask, or any other wallet
+                                        <strong>✓ <span data-translate="best_compatibility">Universal compatibility: Use this phrase to import your wallet to Phantom, Solflare, MetaMask, or any other wallet</span></strong>
                                     </div>
-                                    <input type="password" id="seed-password" placeholder="Enter password to reveal" class="setting-input">
-                                    <textarea id="seed-phrase-display" class="setting-textarea" readonly placeholder="Your 12-word recovery phrase will appear here"></textarea>
-                                    <button id="confirm-show-seed" class="setting-button primary">Show Recovery Phrase</button>
+                                    <input type="password" id="seed-password" data-translate-placeholder="enter_password_to_reveal" placeholder="Enter password to reveal" class="setting-input">
+                                    <textarea id="seed-phrase-display" class="setting-textarea" readonly data-translate-placeholder="recovery_phrase_will_appear" placeholder="Your 12-word recovery phrase will appear here" style="cursor: pointer; user-select: all;" title="Click to copy"></textarea>
+                                    <button id="copy-seed-phrase" class="setting-button" style="display: none; margin-top: 10px;" data-translate="copy_recovery_phrase">Copy Recovery Phrase</button>
+                                    <button id="confirm-show-seed" class="setting-button primary" data-translate="show_recovery_phrase_button">Show Recovery Phrase</button>
                                 </div>
                             </div>
                         </div>

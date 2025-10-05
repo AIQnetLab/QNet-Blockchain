@@ -839,11 +839,10 @@ async function initializeWallet() {
         const network = networkData.mainnet ? 'mainnet' : 'devnet';
         walletState.solanaRPC = new SolanaRPC(network);
         
-        // Load wallet state from storage
+        // Load wallet state from storage (but NOT isUnlocked - that's only in session)
         const result = await chrome.storage.local.get([
             'walletExists', 
             'encryptedWallet', 
-            'isUnlocked', 
             'lastUnlockTime',
             'currentNetwork'
         ]);
@@ -871,17 +870,9 @@ async function initializeWallet() {
             }
         }
         
-        // If not in session, check local storage
-        if (!shouldUnlock && result.isUnlocked) {
-            // For local storage, check if it's within timeout period
-            const lastUnlockTime = result.lastUnlockTime || 0;
-            const timeSinceUnlock = Date.now() - lastUnlockTime;
-            
-            if (timeSinceUnlock < walletState.settings.lockTimeout) {
-                shouldUnlock = true;
-                console.log('[Background Init] Found isUnlocked in local storage, within timeout');
-            }
-        }
+        // Do NOT check local storage for isUnlocked anymore
+        // Only session storage matters (clears on browser restart)
+        // This ensures wallet is always locked on browser restart
         
         // Restore unlocked state if needed
         if (walletExists && shouldUnlock) {
@@ -1589,17 +1580,16 @@ async function lockWallet() {
         balanceUpdateInterval = null;
     }
     
-    // Save locked state
+    // Clear lock time but do NOT save isUnlocked to local storage
     await chrome.storage.local.set({
-        isUnlocked: false,
         lastUnlockTime: 0
     });
     
-    // Also clear session storage
+    // Remove isUnlocked from session storage
     if (chrome.storage.session) {
         try {
-            await chrome.storage.session.set({ isUnlocked: false });
-            console.log('[Background LockWallet] Cleared isUnlocked from session storage');
+            await chrome.storage.session.remove(['isUnlocked']);
+            console.log('[Background LockWallet] Removed isUnlocked from session storage');
         } catch (e) {
             console.log('[Background LockWallet] Session storage not available');
         }
@@ -2193,15 +2183,9 @@ async function getWalletState() {
             }
         }
         
-        // If not found in session, check local storage
-        if (!isUnlocked) {
-            const localResult = await chrome.storage.local.get(['isUnlocked']);
-            if (localResult.hasOwnProperty('isUnlocked')) {
-                isUnlocked = localResult.isUnlocked;
-                // Sync with local state
-                walletState.isUnlocked = isUnlocked;
-            }
-        }
+        // Do NOT check local storage for isUnlocked
+        // Only session storage determines unlock state
+        // This ensures wallet locks on browser restart
         
         return {
             success: true,
