@@ -259,12 +259,19 @@
                                 </div>
                                 
                                 <div class="node-management" style="flex: 1; display: flex; flex-direction: column;">
-                                    <h3 style="margin-top: 1.5rem;">Node Management</h3>
+                                    <h3 style="margin-top: 1rem;">Node Management</h3>
                                     <div class="node-status" id="node-status">
                                         <span id="node-status-text">Status: Not Active</span>
                                     </div>
                                     
-                                    <div class="node-options" id="node-options" style="flex: 1; display: flex; flex-direction: column; justify-content: center; gap: 0.8rem;">
+                                    <!-- Burn Contract Info -->
+                                    <div style="display: flex; align-items: center; gap: 0.3rem; margin: 0.5rem 0; font-size: 0.65rem; color: #666;">
+                                        <div style="width: 5px; height: 5px; background: #00d4ff; border-radius: 50%; animation: pulse 2s ease-in-out infinite;"></div>
+                                        <span style="color: #888;">Burn Contract:</span>
+                                        <span style="font-family: 'Courier New', monospace; color: #00d4ff; font-size: 0.6rem;">D7g7mkL8o1YEex6ZgETJEQyyHV7uuUMvV3Fy3u83igJ7</span>
+                                    </div>
+                                    
+                                    <div class="node-options" id="node-options" style="flex: 1; display: flex; flex-direction: column; justify-content: center; gap: 0.6rem;">
                                         <div class="node-option" data-type="light" style="display: flex; justify-content: space-between; align-items: center; cursor: pointer;">
                                             <span class="node-name">Light Node</span>
                                             <span class="node-price" style="flex-grow: 1; text-align: center;">1500 1DEV</span>
@@ -318,32 +325,35 @@
                             </div>
                             
                             <!-- Burn Confirmation View (Hidden by default) -->
-                            <div id="burn-confirmation-view" class="hidden" style="position: absolute; top: 0; left: 0; right: 0; bottom: 0; display: flex; align-items: center; justify-content: center; background: rgba(13, 13, 23, 0.95); z-index: 100;">
+                            <div id="burn-confirmation-view" class="hidden" style="position: absolute; top: 0; left: 0; right: 0; bottom: 0; display: flex; align-items: center; justify-content: center; background: rgba(13, 13, 23, 1); z-index: 100;">
                                 <div class="node-management" style="width: 100%; height: 100%; display: flex; flex-direction: column; justify-content: center; align-items: center; padding: 0.5rem;">
                                     <div class="confirmation-modal" style="width: calc(100% - 1rem); background: linear-gradient(135deg, rgba(26, 26, 46, 1) 0%, rgba(13, 13, 23, 1) 100%); border: 1px solid rgba(0, 212, 255, 0.3); border-radius: 16px; padding: 1.5rem 1rem; box-shadow: 0 0 30px rgba(0, 212, 255, 0.3);">
                                         <div style="text-align: center;">
-                                            <div class="warning-icon" style="width: 60px; height: 60px; margin: 0 auto 1rem; border-radius: 50%; background: linear-gradient(135deg, rgba(0, 212, 255, 0.1) 0%, rgba(0, 150, 200, 0.05) 100%); border: 2px solid rgba(0, 212, 255, 0.5); display: flex; align-items: center; justify-content: center;">
-                                                <span style="font-size: 1.8rem;">🔥</span>
+                                            <div class="warning-icon" style="width: 60px; height: 60px; margin: 0 auto 0.8rem; border-radius: 50%; background: linear-gradient(135deg, rgba(0, 212, 255, 0.1) 0%, rgba(0, 150, 200, 0.05) 100%); border: 2px solid rgba(0, 212, 255, 0.5); display: flex; align-items: center; justify-content: center;">
+                                                <span style="font-size: 2rem;">🔥</span>
                                             </div>
                                             
-                                            <h3 style="color: #fff; font-size: 1.2rem; margin-bottom: 0.6rem;">Activate Node</h3>
+                                            <h3 style="color: #fff; font-size: 1.3rem; margin-bottom: 0.6rem;">Activate Node</h3>
                                             
-                                            <p style="color: #a0a0a0; line-height: 1.4; margin-bottom: 0.8rem; font-size: 0.95rem;">
+                                            <p style="color: #a0a0a0; line-height: 1.4; margin-bottom: 0.8rem; font-size: 1rem;">
                                                 Burn <strong style="color: #00d4ff;">1500 1DEV</strong> to activate<br>
-                                                <strong id="confirm-node-type" style="color: #00d4ff; font-size: 1rem;"></strong>
+                                                <strong id="confirm-node-type" style="color: #00d4ff; font-size: 1.1rem;"></strong>
                                             </p>
                                             
-                                            <div class="burn-warning" style="background: rgba(0, 212, 255, 0.05); border: 1px solid rgba(0, 212, 255, 0.2); border-radius: 8px; padding: 0.8rem; margin: 1rem 0;">
-                                                <p style="color: #00d4ff; font-size: 0.85rem; margin: 0; opacity: 0.9;">
+                                            <div class="burn-warning" style="background: rgba(0, 212, 255, 0.05); border: 1px solid rgba(0, 212, 255, 0.2); border-radius: 8px; padding: 0.7rem; margin: 0.8rem 0;">
+                                                <p style="color: #00d4ff; font-size: 0.9rem; margin: 0; opacity: 0.9;">
                                                     Permanent action - tokens will be burned
+                                                </p>
+                                                <p id="testnet-notice" style="color: #ff9900; font-size: 0.8rem; margin: 0.3rem 0 0; display: none;">
+                                                    ⚠️ Testnet: Real burn attempted (needs SOL for gas)
                                                 </p>
                                             </div>
                                             
-                                            <div style="display: flex; gap: 0.8rem; margin-top: 1.2rem;">
-                                                <button id="cancel-burn" class="qnet-button secondary" style="flex: 1; padding: 0.7rem; font-size: 0.95rem;">
+                                            <div style="display: flex; gap: 0.8rem; margin-top: 1rem;">
+                                                <button id="cancel-burn" class="qnet-button secondary" style="flex: 1; padding: 0.7rem; font-size: 1rem;">
                                                     Cancel
                                                 </button>
-                                                <button id="confirm-burn" class="qnet-button primary" style="flex: 1; padding: 0.7rem; font-size: 0.95rem; background: linear-gradient(135deg, #00d4ff 0%, #0099cc 100%);">
+                                                <button id="confirm-burn" class="qnet-button primary" style="flex: 1; padding: 0.7rem; font-size: 1rem; background: linear-gradient(135deg, #00d4ff 0%, #0099cc 100%);">
                                                     Confirm
                                                 </button>
                                             </div>
@@ -380,39 +390,44 @@
                             <!-- Activation Success View (Hidden by default) -->
                             <div id="activation-success-view" class="hidden" style="position: absolute; top: 0; left: 0; right: 0; bottom: 0; display: flex; align-items: center; justify-content: center; background: rgba(13, 13, 23, 0.95); z-index: 100;">
                                 <div class="node-management" style="width: 100%; height: 100%; display: flex; flex-direction: column; justify-content: center; align-items: center; padding: 0.5rem;">
-                                    <div class="success-modal" style="width: calc(100% - 1rem); background: linear-gradient(135deg, rgba(26, 26, 46, 1) 0%, rgba(13, 13, 23, 1) 100%); border: 1px solid rgba(0, 255, 100, 0.3); border-radius: 16px; padding: 1rem; box-shadow: 0 0 30px rgba(0, 255, 100, 0.3);">
+                                    <div class="success-modal" style="width: calc(100% - 1rem); background: linear-gradient(135deg, rgba(26, 26, 46, 1) 0%, rgba(13, 13, 23, 1) 100%); border: 1px solid rgba(0, 212, 255, 0.3); border-radius: 16px; padding: 1rem 0.8rem; box-shadow: 0 0 30px rgba(153, 69, 255, 0.3);">
                                         <div style="text-align: center;">
-                                            <div class="success-animation" style="width: 60px; height: 60px; margin: 0 auto 0.8rem; position: relative;">
-                                                <div style="width: 100%; height: 100%; border-radius: 50%; background: linear-gradient(135deg, rgba(0, 255, 100, 0.1) 0%, rgba(0, 212, 255, 0.1) 100%); border: 2px solid rgba(0, 255, 100, 0.5); display: flex; align-items: center; justify-content: center; animation: pulseSuccess 2s ease-in-out infinite;">
-                                                    <span style="color: #00ff64; font-size: 2rem;">✓</span>
+                                            <div class="success-animation" style="width: 50px; height: 50px; margin: 0 auto 0.6rem; position: relative;">
+                                                <div style="width: 100%; height: 100%; border-radius: 50%; background: linear-gradient(135deg, rgba(153, 69, 255, 0.1) 0%, rgba(0, 212, 255, 0.1) 100%); border: 2px solid rgba(0, 212, 255, 0.5); display: flex; align-items: center; justify-content: center; animation: pulseSuccess 2s ease-in-out infinite;">
+                                                    <span style="color: #00d4ff; font-size: 1.5rem;">✓</span>
                                                 </div>
                                             </div>
                                             
-                                            <h3 style="color: #00ff64; font-size: 1.1rem; margin-bottom: 0.4rem;">Node Activated!</h3>
-                                            <p style="color: #a0a0a0; margin-bottom: 0.6rem; font-size: 0.85rem;">Your <span id="activated-node-type" style="color: #00d4ff;"></span> is ready</p>
+                                            <h3 style="color: #00d4ff; font-size: 1rem; margin-bottom: 0.4rem;">Activation Code Generated!</h3>
+                                            <p style="color: #a0a0a0; margin-bottom: 0.6rem; font-size: 0.8rem;">Your <span id="activated-node-type" style="color: #00d4ff;"></span> activation code</p>
                                             
-                                            <div style="background: rgba(0, 212, 255, 0.05); border: 1px solid rgba(0, 212, 255, 0.2); border-radius: 8px; padding: 0.7rem; margin: 0.6rem 0;">
-                                                <p style="color: #00d4ff; font-size: 0.8rem; margin-bottom: 0.5rem; text-transform: uppercase; letter-spacing: 0.5px;">Activation Code</p>
+                                            <div style="background: rgba(0, 212, 255, 0.05); border: 1px solid rgba(0, 212, 255, 0.2); border-radius: 6px; padding: 0.5rem; margin: 0.6rem 0;">
+                                                <p style="color: #00d4ff; font-size: 0.75rem; margin-bottom: 0.4rem; text-transform: uppercase; letter-spacing: 0.5px;">Activation Code</p>
                                                 
-                                                <div class="activation-code-container" style="background: #0a0a14; border: 1px solid rgba(0, 212, 255, 0.3); border-radius: 6px; padding: 0.6rem; position: relative; overflow: hidden;">
+                                                <div class="activation-code-container" style="background: #0a0a14; border: 1px solid rgba(0, 212, 255, 0.3); border-radius: 4px; padding: 0.5rem; position: relative; overflow: hidden;">
                                                     <div style="position: absolute; top: 0; left: -100%; width: 100%; height: 1px; background: linear-gradient(90deg, transparent 0%, #00d4ff 50%, transparent 100%); animation: scanLine 3s linear infinite;"></div>
-                                                    <code id="activation-code" style="color: #00ff64; font-family: 'Courier New', monospace; font-size: 0.8rem; letter-spacing: 1px; word-break: break-all; display: block;"></code>
+                                                    <code id="activation-code" style="color: #9945ff; font-family: 'Courier New', monospace; font-size: 0.75rem; letter-spacing: 0.5px; word-break: break-all; display: block;"></code>
                                                 </div>
                                                 
-                                                <button id="copy-activation-code" class="qnet-button secondary full-width" style="margin-top: 0.5rem; padding: 0.5rem; background: rgba(0, 212, 255, 0.1); border: 1px solid rgba(0, 212, 255, 0.3); font-size: 0.8rem;">
+                                                <button id="copy-activation-code" class="qnet-button secondary full-width" style="margin-top: 0.4rem; padding: 0.4rem; background: rgba(0, 212, 255, 0.1); border: 1px solid rgba(0, 212, 255, 0.3); font-size: 0.75rem;">
                                                     <span id="copy-button-text">Copy Code</span>
                                                 </button>
                                             </div>
                                             
-                                            <div class="info-box" style="background: rgba(0, 212, 255, 0.03); border: 1px solid rgba(0, 212, 255, 0.15); border-radius: 6px; padding: 0.5rem; margin: 0.6rem 0;">
-                                                <p style="color: #00d4ff; font-size: 0.75rem; margin: 0; opacity: 0.9;">
-                                                    💾 Access later: Settings → Export Activation Code
+                                            <div class="info-box" style="background: rgba(0, 212, 255, 0.03); border: 1px solid rgba(0, 212, 255, 0.15); border-radius: 6px; padding: 0.4rem; margin: 0.5rem 0;">
+                                                <p style="color: #00d4ff; font-size: 0.7rem; margin: 0 0 0.2rem; opacity: 0.9;">
+                                                    Access later: Settings → Export Activation Code
+                                                </p>
+                                                <p style="color: #a0a0a0; font-size: 0.65rem; margin: 0; opacity: 0.8;">
+                                                    Use this code in mobile app or server to activate node
                                                 </p>
                                             </div>
                                             
-                                            <button id="done-activation" class="qnet-button primary full-width" style="margin-top: 0.6rem; padding: 0.6rem; background: linear-gradient(135deg, #00d4ff 0%, #0099cc 100%); font-size: 0.9rem;">
-                                                Continue
-                                            </button>
+                                            <div style="display: flex; gap: 0.6rem; margin-top: 0.8rem;">
+                                                <button id="done-activation" class="qnet-button primary" style="flex: 1; padding: 0.5rem; font-size: 0.85rem; background: linear-gradient(135deg, #00d4ff 0%, #0099cc 100%);">
+                                                    Continue
+                                                </button>
+                                            </div>
                                         </div>
                                     </div>
                                 </div>

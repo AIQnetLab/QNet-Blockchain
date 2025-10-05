@@ -1732,6 +1732,52 @@ async function completeWalletSetup() {
             localStorage.setItem('qnet_wallet_unlocked', 'true');
         }
         
+        // CRITICAL: Create wallet in background service for proper storage
+        if (typeof chrome !== 'undefined' && chrome.runtime) {
+            try {
+                const isImport = setupState.walletType === 'import';
+                console.log(`[Setup] ${isImport ? 'Importing' : 'Creating'} wallet in background service...`);
+                console.log('[Setup] Wallet type:', setupState.walletType);
+                
+                const bgResult = await chrome.runtime.sendMessage({
+                    type: isImport ? 'IMPORT_WALLET' : 'CREATE_WALLET',
+                    password: setupState.password,
+                    mnemonic: setupState.seedPhrase
+                });
+                
+                if (bgResult && bgResult.success) {
+                    const actionText = isImport ? 'imported' : 'created';
+                    console.log(`[Setup] ✅ Wallet ${actionText} successfully in background`);
+                    console.log('[Setup] Addresses:', bgResult.accounts);
+                    console.log('[Setup] Has encrypted wallet:', !!bgResult.encryptedWallet);
+                    
+                    // Verify that we have the encrypted wallet
+                    if (!bgResult.encryptedWallet) {
+                        console.error('[Setup] ⚠️ No encrypted wallet returned from background');
+                        console.error('[Setup] This may cause unlock issues later');
+                    }
+                    
+                    // Only save if we actually got encrypted wallet data
+                    if (bgResult.encryptedWallet) {
+                        await chrome.storage.local.set({
+                            walletExists: true,
+                            encryptedWallet: bgResult.encryptedWallet,
+                            currentNetwork: 'solana'
+                        });
+                        console.log('[Setup] ✅ Encrypted wallet saved to storage');
+                    } else {
+                        console.error('[Setup] ⚠️ No encrypted wallet to save - wallet creation may have failed');
+                    }
+                } else {
+                    console.error('[Setup] Failed to create wallet in background:', bgResult?.error);
+                    // Continue with local storage as fallback
+                }
+            } catch (err) {
+                console.error('[Setup] Error creating wallet in background:', err);
+                // Continue with local storage as fallback
+            }
+        }
+        
         // Trigger storage event to notify popup
         window.dispatchEvent(new StorageEvent('storage', {
             key: 'qnet_wallet_encrypted',
