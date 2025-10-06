@@ -12,9 +12,9 @@ const FAUCET_CONFIG = {
     'SOL': 1.0,
     'QNC': 50000
   },
-  // Production amounts (much smaller)
+  // Production amounts (same as testnet for now)
   mainnet: {
-    '1DEV': 100,
+    '1DEV': 1500,  // Same as testnet for testing
     'SOL': 0.1,
     'QNC': 1000
   },
@@ -216,7 +216,8 @@ async function send1DEVTokens(
     status: 'phase_1_active'
   };
   
-  if (environment === 'testnet') {
+  // Use same code for both testnet and mainnet (production)
+  // if (environment === 'testnet') {
     try {
       // Import necessary Solana libraries
       const { Connection, Keypair, PublicKey, Transaction, ComputeBudgetProgram } = await import('@solana/web3.js');
@@ -251,13 +252,17 @@ async function send1DEVTokens(
         const path = await import('path');
         const fs = await import('fs');
         
-        // Direct path for fastest access
-        const configPath = 'C:\\QNet-Project\\infrastructure\\config\\faucet-config-testnet.json';
+        // Use relative path that works on both Windows and Linux
+        const configPath = path.join(process.cwd(), '..', '..', '..', 'infrastructure', 'config', 'faucet-config-testnet.json');
         
+        console.log('[FAUCET] Looking for config at:', configPath);
         if (fs.existsSync(configPath)) {
+          console.log('[FAUCET] Config file found, reading...');
           const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
           faucetPrivateKey = config.wallet.secretKey;
+          console.log('[FAUCET] Private key loaded successfully');
         } else {
+          console.error('[FAUCET] Config file not found at:', configPath);
           throw new Error('Faucet configuration error - config file not found');
         }
       }
@@ -386,13 +391,13 @@ async function send1DEVTokens(
         error: error.message || 'Failed to send tokens'
       };
     }
-  }
+  // } // Commented out - use same code for mainnet
   
-  // Production would implement real Solana SPL transfer with new token
-  return {
-    success: false,
-    error: 'Production 1DEV faucet ready - token configured but real transfer not implemented'
-  };
+  // Production now uses the same code as testnet
+  // return {
+  //   success: false,
+  //   error: 'Production 1DEV faucet ready - token configured but real transfer not implemented'
+  // };
 }
 
 /**
@@ -569,7 +574,9 @@ async function sendQNCTokens(
  */
 export async function POST(request: NextRequest) {
   try {
+    console.log('[FAUCET] POST request received');
     const body = await request.json();
+    console.log('[FAUCET] Request body:', body);
     const { walletAddress, amount, tokenType = '1DEV' } = body;
     
     // Validate input
@@ -645,7 +652,9 @@ export async function POST(request: NextRequest) {
     }
     
     // Send tokens
+    console.log('[FAUCET] Sending tokens:', { tokenType, amount, walletAddress, environment });
     const result = await sendTokens(tokenType, amount, walletAddress, environment);
+    console.log('[FAUCET] Send result:', result);
     
     if (result.success) {
       // Record successful claim only for mainnet
@@ -669,7 +678,8 @@ export async function POST(request: NextRequest) {
     }
     
   } catch (error) {
-    console.error('Faucet API error:', error);
+    console.error('[FAUCET] API error:', error);
+    console.error('[FAUCET] Error stack:', error instanceof Error ? error.stack : 'No stack trace');
     return NextResponse.json(
       { success: false, error: 'Internal server error' },
       { status: 500 }
