@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "QNet Dual Wallet",
+  "name": "QNet Wallet",
   "version": "2.0.0",
-  "description": "Dual network wallet for QNet blockchain and Solana",
+  "description": "Multi-network wallet for QNet blockchain and Solana",
   "permissions": [
     "storage",
     "activeTab",
@@ -23,7 +23,7 @@
   },
   "action": {
     "default_popup": "popup.html",
-    "default_title": "QNet Dual Wallet",
+    "default_title": "QNet Wallet",
     "default_icon": {
       "16": "icons/icon-16.png",
       "32": "icons/icon-32.png",

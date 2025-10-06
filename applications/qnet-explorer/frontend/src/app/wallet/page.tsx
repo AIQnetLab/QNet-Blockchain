@@ -6,6 +6,8 @@ import { useState } from 'react';
 // For now, keeping it simple within the component.
 
 export default function WalletPage() {
+  const [showPrivacyModal, setShowPrivacyModal] = useState(false);
+
   return (
     <div className="page-wallet">
       <section className="explorer-section" data-section="wallet">
@@ -37,6 +39,21 @@ export default function WalletPage() {
               <div className="stat-trend">Supported</div>
             </div>
           </div>
+        </div>
+
+        {/* Privacy Policy Banner */}
+        <div className="tool-card-large" style={{ 
+          cursor: 'pointer',
+          transition: 'all 0.3s ease',
+          border: '1px solid rgba(0, 212, 255, 0.3)',
+          marginBottom: '3rem'
+        }} onClick={() => setShowPrivacyModal(true)}>
+          <h4>QNet Wallet Browser Extension - Privacy Policy & Data Protection</h4>
+          <p>
+            QNet Wallet browser extension respects your privacy. All wallet data is stored locally on your device 
+            with AES-256 encryption. No personal information is collected or transmitted to external servers. 
+            Click to view our complete privacy policy.
+          </p>
         </div>
         
         <div className="tools-grid-large">
@@ -97,6 +114,73 @@ export default function WalletPage() {
           </div>
         </div>
       </section>
+
+      {/* Privacy Policy Modal */}
+      {showPrivacyModal && (
+        <div style={{
+          position: 'fixed',
+          top: 0,
+          left: 0,
+          right: 0,
+          bottom: 0,
+          backgroundColor: 'rgba(0, 0, 0, 0.8)',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          zIndex: 1000,
+          padding: '20px'
+        }} onClick={() => setShowPrivacyModal(false)}>
+          <div style={{
+            backgroundColor: '#1a1a2e',
+            border: '1px solid #00d4ff',
+            borderRadius: '12px',
+            padding: '30px',
+            maxWidth: '800px',
+            maxHeight: '80vh',
+            overflow: 'auto',
+            position: 'relative'
+          }} onClick={(e) => e.stopPropagation()}>
+            <button 
+              onClick={() => setShowPrivacyModal(false)}
+              style={{
+                position: 'absolute',
+                top: '15px',
+                right: '15px',
+                background: 'none',
+                border: 'none',
+                color: '#00d4ff',
+                fontSize: '24px',
+                cursor: 'pointer'
+              }}
+            >
+              ×
+            </button>
+            
+            <h2 style={{ color: '#00d4ff', marginBottom: '20px' }}>Privacy Policy</h2>
+            
+            <div style={{ color: '#b0b0b0', lineHeight: '1.6' }}>
+              <h3 style={{ color: '#00d4ff', marginTop: '20px' }}>Data Collection</h3>
+              <p>QNet Wallet does not collect, store, or transmit any personal user data. All wallet information, including private keys, seed phrases, and transaction history, is stored locally on your device using AES-256 encryption.</p>
+              
+              <h3 style={{ color: '#00d4ff', marginTop: '20px' }}>Local Storage</h3>
+              <p>The extension uses browser local storage to securely store encrypted wallet data. This data never leaves your device and is not accessible to QNet servers or third parties.</p>
+              
+              <h3 style={{ color: '#00d4ff', marginTop: '20px' }}>Network Interactions</h3>
+              <p>The wallet connects to blockchain networks (QNet and Solana) only to broadcast transactions and retrieve public blockchain data. No personal information is transmitted during these interactions.</p>
+              
+              <h3 style={{ color: '#00d4ff', marginTop: '20px' }}>Third-Party Services</h3>
+              <p>The wallet may connect to decentralized applications (dApps) when explicitly authorized by the user. These connections are direct and do not involve QNet as an intermediary.</p>
+              
+              <h3 style={{ color: '#00d4ff', marginTop: '20px' }}>Security</h3>
+              <p>All sensitive data is encrypted using industry-standard AES-256 encryption. Private keys are generated locally and never transmitted over the internet.</p>
+              
+              <p style={{ marginTop: '30px', fontSize: '12px', color: '#666' }}>
+                Last updated: October 6, 2025
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
