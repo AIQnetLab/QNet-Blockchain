@@ -673,7 +673,7 @@ const translations = {
     de: {
         title: 'QNet Wallet',
         welcome_title: 'Willkommen bei QNet',
-        welcome_desc: 'Erstellen Sie eine neue Wallet oder importieren Sie eine bestehende, um mit den QNet- und Solana-Dual-Netzwerken zu beginnen.',
+        welcome_desc: 'Erstellen Sie eine neue Wallet oder importieren Sie eine bestehende, um mit den QNet- und Solana-Netzwerken zu beginnen.',
         create_wallet: 'Neue Wallet Erstellen',
         import_wallet: 'Bestehende Wallet Importieren',
         security_title: 'Ihre Sicherheit ist unsere Priorität',

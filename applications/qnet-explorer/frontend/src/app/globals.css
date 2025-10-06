@@ -346,7 +346,7 @@ main.qnet-container {
   background: 0 0;
   border: 2px solid #00ffff;
   color: #00ffff;
-  padding: 0.75rem 1.5rem;
+  padding: 0.75rem 2rem;
   font-family: 'Inter', sans-serif;
   cursor: pointer;
   transition: all 0.3s ease;

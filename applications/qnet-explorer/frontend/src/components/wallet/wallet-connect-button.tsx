@@ -136,7 +136,7 @@ const WalletConnectButton = () => {
         onClick={installQNetWallet}
         className="qnet-button install-button"
       >
-        CONNECT WALLET
+        GET WALLET
       </button>
     );
   }
@@ -163,7 +163,7 @@ const WalletConnectButton = () => {
       disabled={isConnecting}
       className="qnet-button"
     >
-      CONNECT WALLET
+      GET WALLET
     </button>
   );
 }

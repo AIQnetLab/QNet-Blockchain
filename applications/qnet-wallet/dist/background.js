@@ -4376,15 +4376,45 @@ async function handleMessage(request, sender, sendResponse) {
                 break;
                 
             case 'GET_BALANCE':
-                console.log('[Message] GET_BALANCE request:', request.address);
                 const balance = await getBalance(request.address);
+                
+                // Store balance for change detection
+                if (!walletState.lastBalances) walletState.lastBalances = {};
+                const prevBalance = walletState.lastBalances[request.address + '_SOL'] || 0;
+                walletState.lastBalances[request.address + '_SOL'] = balance;
+                
+                // Notify if balance increased (tokens received)
+                if (balance > prevBalance && prevBalance > 0) {
+                    chrome.runtime.sendMessage({ 
+                        type: 'BALANCE_CHANGED',
+                        token: 'SOL',
+                        oldBalance: prevBalance,
+                        newBalance: balance
+                    }).catch(() => {});
+                }
+                
                 sendResponse({ balance });
                 break;
                 
             case 'GET_TOKEN_BALANCE':
-                console.log('[Message] GET_TOKEN_BALANCE request:', request.address, request.mintAddress);
                 const tokenBalance = await getBalance(request.address, request.mintAddress);
-                console.log('[Message] Token balance result:', tokenBalance);
+                
+                // Store balance for change detection
+                if (!walletState.lastBalances) walletState.lastBalances = {};
+                const key = request.address + '_' + request.mintAddress;
+                const prevTokenBalance = walletState.lastBalances[key] || 0;
+                walletState.lastBalances[key] = tokenBalance;
+                
+                // Notify if balance increased (tokens received)
+                if (tokenBalance > prevTokenBalance && prevTokenBalance > 0) {
+                    chrome.runtime.sendMessage({ 
+                        type: 'TOKEN_RECEIVED',
+                        mintAddress: request.mintAddress,
+                        oldBalance: prevTokenBalance,
+                        newBalance: tokenBalance
+                    }).catch(() => {});
+                }
+                
                 sendResponse({ balance: tokenBalance });
                 break;
                 

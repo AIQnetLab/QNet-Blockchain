@@ -439,7 +439,7 @@ export default function WalletConnection() {
         >
           <span className="wallet-icon">💎</span>
           <span className="wallet-text">
-            {isConnecting ? 'Connecting...' : 'CONNECT WALLET'}
+            {isConnecting ? 'Connecting...' : 'GET WALLET'}
           </span>
         </Button>
 

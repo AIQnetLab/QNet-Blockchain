@@ -63,7 +63,6 @@ export function AppProvider({ children }: { children: ReactNode }) {
     };
 
     const handleWalletNotFound = () => {
-      console.log('ℹ️ QNet Wallet not found');
     };
 
     window.addEventListener('qnet:walletReady', handleWalletReady as EventListener);

@@ -89,9 +89,9 @@ const HomeSection = React.memo(function HomeSection({ setActiveSection }: { setA
               <div className="stat-trend">24h average</div>
             </div>
             <div className="stat-card">
-              <div className="stat-number">2.5M</div>
+              <div className="stat-number">4.29B</div>
               <div className="stat-label">QNC SUPPLY</div>
-              <div className="stat-trend">Circulating</div>
+              <div className="stat-trend">Max Supply</div>
             </div>
             {/* GitHub Code Verification Section */}
             <div className="code-verification-banner">

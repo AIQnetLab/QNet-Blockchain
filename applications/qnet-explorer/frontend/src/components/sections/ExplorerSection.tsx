@@ -122,7 +122,7 @@ const ExplorerSection = React.memo(function ExplorerSection() {
             <div className="stat-label">Rate Limit</div>
           </div>
           <div className="stat-card">
-            <div className="stat-number">2.5M</div>
+            <div className="stat-number">4.29B</div>
             <div className="stat-label">QNC Supply</div>
           </div>
           <div className="stat-card">

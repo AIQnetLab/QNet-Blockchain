@@ -128,7 +128,7 @@ class MockGovernanceContract implements GovernanceContract {
   }
 
   private getQuorumRequirement(type: string): number {
-    const circulatingSupply = 2500000; // 2.5M QNC
+    const circulatingSupply = 4294967296; // 4.29B QNC
     const percentages: { [key: string]: number } = {
       'emergency': 0.25,  // 25%
       'community': 0.03,  // 3%

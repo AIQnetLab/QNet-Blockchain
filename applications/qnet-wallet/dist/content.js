@@ -159,5 +159,4 @@
         detail: provider
     }));
     
-    console.log('✅ QNet Wallet Ready (Production Mode)');
 })();
