@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>QNet Dual Wallet</title>
+    <title>QNet Wallet</title>
     <link rel="stylesheet" href="styles/popup.css">
     <link rel="stylesheet" href="styles/expanded.css">
     <!-- Google Fonts removed for CSP compliance - using system fonts -->
@@ -14,7 +14,7 @@
         <div id="loading-screen" class="loading-screen">
             <div class="loading-container">
                 <div class="loading-spinner"></div>
-                <h2>QNet Dual Wallet</h2>
+                <h2>QNet Wallet</h2>
                 <p>Initializing dual-network architecture...</p>
             </div>
         </div>
@@ -23,7 +23,7 @@
         <div id="setup-options-screen" class="screen hidden">
             <div class="setup-container">
                 <div class="wallet-logo">QNet</div>
-                <h2>QNet Dual Wallet</h2>
+                <h2>QNet Wallet</h2>
                 <p>Professional dual-network cryptocurrency wallet</p>
                 
                 <div class="setup-options">
@@ -579,10 +579,14 @@
                                     <div class="info-box" style="background: rgba(100,200,255,0.1); border: 1px solid rgba(100,200,255,0.3); color: #64c8ff; padding: 10px; border-radius: 8px; margin-bottom: 10px; font-size: 13px;">
                                         <strong>🔑 Your activation codes prove node ownership. Keep them secure!</strong>
                                     </div>
-                                    <input type="password" id="activation-code-password" placeholder="Enter password to reveal" class="setting-input">
-                                    <textarea id="activation-codes-display" class="setting-textarea" readonly placeholder="Your activation codes will appear here" style="cursor: pointer; user-select: all; display: none;" title="Click to copy"></textarea>
+                                    <div class="password-confirmation-group">
+                                        <input type="password" id="activation-code-password" placeholder="Enter password" class="setting-input" style="margin-bottom: 8px;">
+                                        <input type="password" id="activation-code-password-confirm" placeholder="Confirm password" class="setting-input">
+                                        <div id="activation-password-error" style="color: #ff4444; font-size: 12px; margin-top: 5px; display: none;"></div>
+                                    </div>
+                                    <textarea id="activation-codes-display" class="setting-textarea" readonly placeholder="Your activation codes will appear here" style="cursor: pointer; user-select: all; display: none; margin-top: 10px;" title="Click to copy"></textarea>
                                     <button id="copy-activation-codes" class="setting-button" style="display: none; margin-top: 10px;">Copy Activation Codes</button>
-                                    <button id="confirm-show-activation-code" class="setting-button primary">Show Activation Codes</button>
+                                    <button id="confirm-show-activation-code" class="setting-button primary" style="margin-top: 10px;">Show Activation Codes</button>
                                 </div>
                             </div>
                         </div>
@@ -681,7 +685,7 @@
                     <!-- Create Wallet -->
                     <div id="create-wallet-content" class="setup-step">
                         <div class="step-header">
-                            <h4>Create Your QNet Dual Wallet</h4>
+                            <h4>Create Your QNet Wallet</h4>
                             <p>Secure HD wallet supporting both Solana and QNet networks</p>
                         </div>
                         
@@ -709,7 +713,7 @@
                         </div>
                         
                         <button id="generate-wallet-button" class="qnet-button primary gradient full-width">
-                            Generate Dual Wallet
+                            Generate Wallet
                         </button>
                     </div>
                     
@@ -739,7 +743,7 @@
                         <div id="import-error" class="inline-error hidden"></div>
                         
                         <button id="import-wallet-confirm-button" class="qnet-button primary gradient full-width">
-                            Import Dual Wallet
+                            Import Wallet
                         </button>
                     </div>
                     

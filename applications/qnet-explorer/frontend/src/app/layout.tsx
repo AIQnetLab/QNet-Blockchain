@@ -18,11 +18,13 @@ export const metadata: Metadata = {
   robots: 'index, follow',
   icons: {
     icon: [
-      { url: '/favicon.svg', type: 'image/svg+xml' },
-      { url: '/favicon.ico', sizes: '16x16', type: 'image/x-icon' }
+      { url: '/icon-128.png', sizes: '128x128', type: 'image/png' },
+      { url: '/icon-48.png', sizes: '48x48', type: 'image/png' },
+      { url: '/icon-32.png', sizes: '32x32', type: 'image/png' },
+      { url: '/icon-16.png', sizes: '16x16', type: 'image/png' }
     ],
-    shortcut: '/favicon.svg',
-    apple: '/favicon.svg',
+    shortcut: '/icon-32.png',
+    apple: '/icon-128.png',
   },
   metadataBase: new URL('https://aiqnet.io'),
   openGraph: {
@@ -85,7 +87,6 @@ export default function RootLayout({
                 // Fallback check after delay
                 setTimeout(() => {
                   if (!checkQNetWallet()) {
-                    console.log('ℹ️ QNet Wallet not detected. Install QNet Extension for full functionality.');
                     
                     // Show install prompt
                     window.dispatchEvent(new CustomEvent('qnet:walletNotFound'));
@@ -119,6 +120,7 @@ export default function RootLayout({
             `,
           }}
         />
+        <link rel="manifest" href="/manifest.json" />
       </head>
       <body suppressHydrationWarning className="font-sans antialiased quantum-bg">
         <ThemeProvider
