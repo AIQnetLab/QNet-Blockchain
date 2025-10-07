@@ -245,25 +245,35 @@ async function send1DEVTokens(
         try {
           faucetPrivateKey = JSON.parse(faucetPrivateKeyEnv);
         } catch (e) {
+          console.error('[FAUCET] Failed to parse FAUCET_PRIVATE_KEY:', e);
           throw new Error('Faucet configuration error - invalid private key format');
         }
       } else {
         // Fallback to testnet config file for development/testnet
-        const path = await import('path');
-        const fs = await import('fs');
-        
-        // Use relative path that works on both Windows and Linux
-        const configPath = path.join(process.cwd(), '..', '..', '..', 'infrastructure', 'config', 'faucet-config-testnet.json');
-        
-        console.log('[FAUCET] Looking for config at:', configPath);
-        if (fs.existsSync(configPath)) {
-          console.log('[FAUCET] Config file found, reading...');
-          const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
-          faucetPrivateKey = config.wallet.secretKey;
-          console.log('[FAUCET] Private key loaded successfully');
-        } else {
-          console.error('[FAUCET] Config file not found at:', configPath);
-          throw new Error('Faucet configuration error - config file not found');
+        try {
+          const path = await import('path');
+          const fs = await import('fs');
+          
+          // Use relative path that works on both Windows and Linux
+          const configPath = path.join(process.cwd(), '..', '..', '..', 'infrastructure', 'config', 'faucet-config-testnet.json');
+          
+          if (fs.existsSync(configPath)) {
+            const configContent = fs.readFileSync(configPath, 'utf8');
+            const config = JSON.parse(configContent);
+            faucetPrivateKey = config.wallet.secretKey;
+          } else {
+            // Try absolute path as fallback
+            const absolutePath = '/var/qnet-fresh/infrastructure/config/faucet-config-testnet.json';
+            if (fs.existsSync(absolutePath)) {
+              const config = JSON.parse(fs.readFileSync(absolutePath, 'utf8'));
+              faucetPrivateKey = config.wallet.secretKey;
+            } else {
+              throw new Error('Faucet configuration error - config file not found');
+            }
+          }
+        } catch (error) {
+          console.error('[FAUCET] Error loading config:', error);
+          throw error;
         }
       }
       
@@ -363,7 +373,6 @@ async function send1DEVTokens(
         try {
           // Use processed commitment for fastest confirmation
           await connection.confirmTransaction(signature, 'processed');
-          console.log(`Transaction confirmed: ${signature}`);
         } catch (err) {
           console.error('Background confirmation error:', err);
           // Try alternate RPCs for confirmation
@@ -371,7 +380,6 @@ async function send1DEVTokens(
             try {
               const altConnection = new Connection(endpoint);
               await altConnection.confirmTransaction(signature, 'processed');
-              console.log(`Transaction confirmed via ${endpoint}: ${signature}`);
               break;
             } catch (e) {
               continue;
@@ -386,6 +394,8 @@ async function send1DEVTokens(
       };
       
     } catch (error: any) {
+      console.error('[FAUCET] Error in send1DEVTokens:', error);
+      console.error('[FAUCET] Error stack:', error.stack);
       return {
         success: false,
         error: error.message || 'Failed to send tokens'
@@ -574,9 +584,7 @@ async function sendQNCTokens(
  */
 export async function POST(request: NextRequest) {
   try {
-    console.log('[FAUCET] POST request received');
     const body = await request.json();
-    console.log('[FAUCET] Request body:', body);
     const { walletAddress, amount, tokenType = '1DEV' } = body;
     
     // Validate input
@@ -652,9 +660,7 @@ export async function POST(request: NextRequest) {
     }
     
     // Send tokens
-    console.log('[FAUCET] Sending tokens:', { tokenType, amount, walletAddress, environment });
     const result = await sendTokens(tokenType, amount, walletAddress, environment);
-    console.log('[FAUCET] Send result:', result);
     
     if (result.success) {
       // Record successful claim only for mainnet
