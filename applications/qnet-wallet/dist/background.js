@@ -4474,6 +4474,43 @@ async function handleMessage(request, sender, sendResponse) {
                 sendResponse(burnResult);
                 break;
                 
+            case 'VERIFY_PASSWORD':
+                try {
+                    // Always verify password, even if wallet is unlocked
+                    // Get encrypted wallet
+                    const result = await chrome.storage.local.get(['encryptedWallet']);
+                    if (!result.encryptedWallet) {
+                        sendResponse({ success: false, error: 'No wallet found' });
+                        return;
+                    }
+                    
+                    // Try to decrypt wallet with provided password
+                    try {
+                        // Temporarily disable console errors for password verification
+                        const originalError = console.error;
+                        console.error = () => {}; // Suppress error logs
+                        
+                        await ProductionCrypto.decryptWalletData(result.encryptedWallet, request.password);
+                        
+                        // Restore console.error
+                        console.error = originalError;
+                        
+                        // If decryption succeeds, password is correct
+                        sendResponse({ success: true });
+                    } catch (decryptError) {
+                        // Restore console.error if needed
+                        if (console.error.name === '') {
+                            console.error = console.log;
+                        }
+                        // Decryption failed - wrong password (expected, not an error)
+                        sendResponse({ success: false });
+                    }
+                } catch (error) {
+                    console.error('[VERIFY_PASSWORD] Unexpected error:', error);
+                    sendResponse({ success: false, error: error.message });
+                }
+                break;
+                
             case 'EXPORT_ACTIVATION_CODE':
                 const exportResult = await exportActivationCode(request.password, request.nodeType);
                 sendResponse(exportResult);
