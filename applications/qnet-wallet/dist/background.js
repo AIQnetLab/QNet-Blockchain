@@ -40,15 +40,15 @@ class ProductionCrypto {
     static async generateMnemonic() {
         try {
             // Direct BIP39 generation without external dependency
-            return ProductionCrypto.generateSecureMnemonic();
+            return await ProductionCrypto.generateSecureMnemonic();
         } catch (error) {
             // Error:('Failed to generate mnemonic:', error);
             throw new Error('Failed to generate secure mnemonic');
         }
     }
 
-    // Generate secure BIP39 mnemonic using production wordlist
-    static generateSecureMnemonic() {
+    // Generate secure BIP39 mnemonic using production wordlist with proper checksum
+    static async generateSecureMnemonic() {
         try {
             // Complete BIP39 2048-word list for production use
             const words = [
@@ -2102,14 +2102,41 @@ class ProductionCrypto {
                 "zoo"
             ];
             
-            // Generate 12-word mnemonic with proper entropy
-            const entropy = new Uint8Array(16); // 128 bits
+            // Generate proper BIP39 mnemonic with checksum
+            const entropy = new Uint8Array(16); // 128 bits for 12 words
             crypto.getRandomValues(entropy);
             
+            // Calculate SHA-256 hash for checksum
+            const hashBuffer = await crypto.subtle.digest('SHA-256', entropy);
+            const hash = new Uint8Array(hashBuffer);
+            
+            // Calculate checksum bits (entropy bits / 32 = 128 / 32 = 4 bits)
+            const checksumBits = 4;
+            const checksumByte = hash[0];
+            
+            // Combine entropy and checksum into bit array
+            const bits = [];
+            
+            // Add all entropy bits
+            for (let i = 0; i < entropy.length; i++) {
+                for (let j = 7; j >= 0; j--) {
+                    bits.push((entropy[i] >> j) & 1);
+                }
+            }
+            
+            // Add checksum bits (first 4 bits from hash[0])
+            for (let i = 0; i < checksumBits; i++) {
+                bits.push((checksumByte >> (7 - i)) & 1);
+            }
+            
+            // Convert bits to words (11 bits per word)
             const mnemonic = [];
             for (let i = 0; i < 12; i++) {
-                const wordIndex = entropy[i] % words.length;
-                mnemonic.push(words[wordIndex]);
+                let index = 0;
+                for (let j = 0; j < 11; j++) {
+                    index = (index << 1) | bits[i * 11 + j];
+                }
+                mnemonic.push(words[index]);
             }
             
             return mnemonic.join(' ');

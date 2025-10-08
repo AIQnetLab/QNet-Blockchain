@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>QNet Mobile Wallet - Web Preview</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #1a1a2e;
+            color: #ffffff;
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+
+        .phone-container {
+            width: 375px;
+            height: 667px;
+            background: #1a1a2e;
+            border-radius: 25px;
+            border: 3px solid #333;
+            overflow: hidden;
+            position: relative;
+            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.3);
+        }
+
+        .screen {
+            width: 100%;
+            height: 100%;
+            padding: 20px;
+            overflow-y: auto;
+        }
+
+        .title {
+            font-size: 28px;
+            font-weight: bold;
+            color: #00d4ff;
+            text-align: center;
+            margin-bottom: 10px;
+        }
+
+        .subtitle {
+            font-size: 16px;
+            color: #b0b0b0;
+            text-align: center;
+            margin-bottom: 30px;
+        }
+
+        .input {
+            width: 100%;
+            height: 50px;
+            background: #16213e;
+            border-radius: 10px;
+            padding: 0 15px;
+            color: #ffffff;
+            font-size: 16px;
+            margin-bottom: 20px;
+            border: 1px solid #00d4ff;
+            outline: none;
+        }
+
+        .input::placeholder {
+            color: #888;
+        }
+
+        .button {
+            width: 100%;
+            height: 50px;
+            background: #00d4ff;
+            border-radius: 10px;
+            border: none;
+            color: #1a1a2e;
+            font-size: 18px;
+            font-weight: bold;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+
+        .button:hover {
+            background: #00b8e6;
+            transform: translateY(-2px);
+        }
+
+        .button:disabled {
+            background: #666;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .balance-card {
+            background: #16213e;
+            border-radius: 15px;
+            padding: 20px;
+            margin-bottom: 20px;
+            text-align: center;
+        }
+
+        .balance-label {
+            color: #b0b0b0;
+            font-size: 16px;
+            margin-bottom: 5px;
+        }
+
+        .balance-amount {
+            color: #00d4ff;
+            font-size: 32px;
+            font-weight: bold;
+        }
+
+        .address-card {
+            background: #16213e;
+            border-radius: 15px;
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+
+        .address-label {
+            color: #b0b0b0;
+            font-size: 16px;
+            margin-bottom: 5px;
+        }
+
+        .address-text {
+            color: #ffffff;
+            font-size: 14px;
+            font-family: monospace;
+            word-break: break-all;
+        }
+
+        .action-button {
+            background: #16213e;
+            border-radius: 10px;
+            padding: 15px;
+            margin-bottom: 15px;
+            text-align: center;
+            border: 1px solid #00d4ff;
+            color: #00d4ff;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+
+        .action-button:hover {
+            background: #0f3460;
+            transform: translateY(-1px);
+        }
+
+        .hidden {
+            display: none;
+        }
+
+        .center-content {
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            height: 100%;
+        }
+
+        .loading {
+            opacity: 0.7;
+        }
+    </style>
+</head>
+<body>
+    <div class="phone-container">
+        <div class="screen">
+            <!-- Create Wallet Screen -->
+            <div id="createScreen" class="center-content">
+                <div class="title">QNet Wallet</div>
+                <div class="subtitle">Create your wallet</div>
+                
+                <input type="password" class="input" id="passwordInput" placeholder="Enter password">
+                
+                <button class="button" id="createButton">Create Wallet</button>
+            </div>
+
+            <!-- Unlock Wallet Screen -->
+            <div id="unlockScreen" class="center-content hidden">
+                <div class="title">QNet Wallet</div>
+                <div class="subtitle">Unlock your wallet</div>
+                
+                <input type="password" class="input" id="unlockPasswordInput" placeholder="Enter password">
+                
+                <button class="button" id="unlockButton">Unlock Wallet</button>
+            </div>
+
+            <!-- Main Wallet Screen -->
+            <div id="walletScreen" class="hidden">
+                <div class="title">QNet Wallet</div>
+                
+                <div class="balance-card">
+                    <div class="balance-label">Balance</div>
+                    <div class="balance-amount" id="balanceAmount">0.0000 SOL</div>
+                </div>
+
+                <div class="address-card">
+                    <div class="address-label">Address</div>
+                    <div class="address-text" id="walletAddress">Loading...</div>
+                </div>
+
+                <div class="action-button" id="generateCodeButton">
+                    Generate Activation Code
+                </div>
+
+                <div class="action-button" id="exportSeedButton">
+                    Export Seed Phrase
+                </div>
+
+                <div class="action-button" id="refreshButton">
+                    Refresh Balance
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Simple wallet simulation
+        let wallet = null;
+        let hasWallet = false;
+
+        // DOM elements
+        const createScreen = document.getElementById('createScreen');
+        const unlockScreen = document.getElementById('unlockScreen');
+        const walletScreen = document.getElementById('walletScreen');
+        const passwordInput = document.getElementById('passwordInput');
+        const unlockPasswordInput = document.getElementById('unlockPasswordInput');
+        const createButton = document.getElementById('createButton');
+        const unlockButton = document.getElementById('unlockButton');
+        const balanceAmount = document.getElementById('balanceAmount');
+        const walletAddress = document.getElementById('walletAddress');
+
+        // Generate random wallet address
+        function generateAddress() {
+            const chars = 'ABCDEFGHJKMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz123456789';
+            let result = '';
+            for (let i = 0; i < 44; i++) {
+                result += chars.charAt(Math.floor(Math.random() * chars.length));
+            }
+            return result;
+        }
+
+        // Generate activation code
+        function generateActivationCode() {
+            const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+            let code = 'QNET-';
+            
+            for (let i = 0; i < 3; i++) {
+                for (let j = 0; j < 6; j++) {
+                    code += chars.charAt(Math.floor(Math.random() * chars.length));
+                }
+                if (i < 2) code += '-';
+            }
+            
+            return code;
+        }
+
+        // Create wallet
+        createButton.addEventListener('click', () => {
+            const password = passwordInput.value.trim();
+            if (!password) {
+                alert('Please enter a password');
+                return;
+            }
+
+            createButton.textContent = 'Creating...';
+            createButton.disabled = true;
+
+            setTimeout(() => {
+                wallet = {
+                    address: generateAddress(),
+                    balance: Math.random() * 0.1,
+                    password: password
+                };
+
+                localStorage.setItem('qnet_wallet', JSON.stringify(wallet));
+                hasWallet = true;
+
+                alert(`Wallet Created!\n\nAddress: ${wallet.address.substring(0, 20)}...\n\nSeed Phrase: abandon ability able about above absent absorb abstract absurd abuse access accident`);
+
+                showWalletScreen();
+            }, 1500);
+        });
+
+        // Unlock wallet
+        unlockButton.addEventListener('click', () => {
+            const password = unlockPasswordInput.value.trim();
+            if (!password) {
+                alert('Please enter password');
+                return;
+            }
+
+            unlockButton.textContent = 'Unlocking...';
+            unlockButton.disabled = true;
+
+            setTimeout(() => {
+                const storedWallet = localStorage.getItem('qnet_wallet');
+                if (storedWallet) {
+                    wallet = JSON.parse(storedWallet);
+                    if (wallet.password === password) {
+                        showWalletScreen();
+                    } else {
+                        alert('Wrong password');
+                        unlockButton.textContent = 'Unlock Wallet';
+                        unlockButton.disabled = false;
+                    }
+                } else {
+                    alert('No wallet found');
+                    unlockButton.textContent = 'Unlock Wallet';
+                    unlockButton.disabled = false;
+                }
+            }, 1000);
+        });
+
+        // Show wallet screen
+        function showWalletScreen() {
+            createScreen.classList.add('hidden');
+            unlockScreen.classList.add('hidden');
+            walletScreen.classList.remove('hidden');
+
+            balanceAmount.textContent = `${wallet.balance.toFixed(4)} SOL`;
+            walletAddress.textContent = `${wallet.address.substring(0, 20)}...${wallet.address.substring(-10)}`;
+        }
+
+        // Action buttons
+        document.getElementById('generateCodeButton').addEventListener('click', () => {
+            const code = generateActivationCode();
+            alert(`Node Activation Code:\n\n${code}`);
+        });
+
+        document.getElementById('exportSeedButton').addEventListener('click', () => {
+            alert('Seed Phrase:\n\nabandon ability able about above absent absorb abstract absurd abuse access accident');
+        });
+
+        document.getElementById('refreshButton').addEventListener('click', () => {
+            wallet.balance = Math.random() * 0.1;
+            balanceAmount.textContent = `${wallet.balance.toFixed(4)} SOL`;
+        });
+
+        // Check if wallet exists on load
+        window.addEventListener('load', () => {
+            const storedWallet = localStorage.getItem('qnet_wallet');
+            if (storedWallet) {
+                hasWallet = true;
+                createScreen.classList.add('hidden');
+                unlockScreen.classList.remove('hidden');
+            }
+        });
+    </script>
+</body>
+</html>

@@ -667,6 +667,7 @@ const WalletScreen = () => {
   const [autoLockTimer, setAutoLockTimer] = useState(null);
   const [showAutoLockPicker, setShowAutoLockPicker] = useState(false);
   const [showLanguagePicker, setShowLanguagePicker] = useState(false);
+  const [importStep, setImportStep] = useState(1); // 1 = password, 2 = seed phrase
 
   useEffect(() => {
     checkWalletExists();
@@ -827,26 +828,6 @@ const WalletScreen = () => {
       return;
     }
 
-    if (!password || password.length === 0) {
-      setPasswordError('Password is required');
-      return;
-    }
-
-    if (password.length < 8) {
-      setPasswordError(`Password must be at least 8 characters (${8 - password.length} more needed)`);
-      return;
-    }
-
-    if (!confirmPassword || confirmPassword.length === 0) {
-      setPasswordError('Please confirm your password');
-      return;
-    }
-
-    if (password !== confirmPassword) {
-      setPasswordError('Passwords do not match');
-      return;
-    }
-
     setLoading(true);
     try {
       const imported = await walletManager.importWallet(seedPhrase.trim());
@@ -858,6 +839,7 @@ const WalletScreen = () => {
       setPassword('');
       setConfirmPassword('');
       setSeedPhrase('');
+      setImportStep(1); // Reset to step 1 for next time
       
       Alert.alert('Success', 'Wallet imported successfully!');
       loadBalance(imported.publicKey);
@@ -893,15 +875,41 @@ const WalletScreen = () => {
     }
   };
 
-  const generateActivationCode = () => {
-    const code = walletManager.generateActivationCode();
-    Alert.alert(
-      'Node Activation Code',
-      code,
-      [
-        { text: 'Copy', onPress: () => console.log('Code copied') },
-        { text: 'OK' }
-      ]
+  const generateActivationCode = async () => {
+    // Prompt for password to generate/retrieve activation code
+    Alert.prompt(
+      'Enter Password',
+      'Enter your wallet password to generate activation code:',
+      async (password) => {
+        if (!password) return;
+        
+        try {
+          // Verify password
+          const walletData = await walletManager.loadWallet(password);
+          if (!walletData) {
+            Alert.alert('Error', 'Incorrect password');
+            return;
+          }
+          
+          // Try to load existing or generate new
+          let code = await walletManager.loadActivationCode('full', password);
+          if (!code) {
+            code = walletManager.generateActivationCode('full', walletData.address);
+            await walletManager.storeActivationCode(code, 'full', password);
+          }
+          
+          Alert.alert(
+            'Node Activation Code',
+            code,
+            [
+              { text: 'OK' }
+            ]
+          );
+        } catch (error) {
+          Alert.alert('Error', 'Failed to generate activation code');
+        }
+      },
+      'secure-text'
     );
   };
 
@@ -961,8 +969,15 @@ const WalletScreen = () => {
         return;
       }
 
-      // Password is correct, generate activation code
-      const code = walletManager.generateActivationCode();
+      // Try to load existing activation code first
+      let code = await walletManager.loadActivationCode('full', exportPassword);
+      
+      if (!code) {
+        // Generate new secure activation code if none exists
+        code = walletManager.generateActivationCode('full', walletData.address);
+        // Store it encrypted
+        await walletManager.storeActivationCode(code, 'full', exportPassword);
+      }
       
       setShowExportActivation(false);
       setExportPassword('');
@@ -1168,112 +1183,157 @@ const WalletScreen = () => {
     }
 
     if (showCreateOptions === 'import') {
-      return (
-        <SafeAreaView style={styles.container}>
-          <ScrollView contentContainerStyle={styles.centerContent}>
-            <Text style={styles.title}>Import Wallet</Text>
-            <Text style={styles.subtitle}>Enter your seed phrase and password</Text>
-            
-            <TextInput
-              style={[styles.input, styles.textArea]}
-              placeholder="Enter 12 or 24 word seed phrase"
-              placeholderTextColor="#888"
-              multiline
-              value={seedPhrase}
-              onChangeText={(text) => {
-                setSeedPhrase(text);
-                setPasswordError('');
-              }}
-            />
+      // Step 1: Set password
+      if (importStep === 1) {
+        return (
+          <SafeAreaView style={styles.container}>
+            <ScrollView contentContainerStyle={styles.centerContent}>
+              <Text style={styles.title}>Import Wallet</Text>
+              <Text style={styles.subtitle}>Step 1: Create password</Text>
+              
+              <TextInput
+                style={[styles.input, passwordError && password.length > 0 && password.length < 8 ? styles.inputError : null]}
+                placeholder="Enter password (min 8 characters)"
+                placeholderTextColor="#888"
+                secureTextEntry
+                value={password}
+                onChangeText={(text) => {
+                  setPassword(text);
+                  setPasswordError('');
+                }}
+              />
 
-            {seedPhrase.trim().length > 0 && (
-              <Text style={
-                seedPhrase.trim().split(/\s+/).length === 12 || seedPhrase.trim().split(/\s+/).length === 24
-                  ? styles.passwordSuccess
-                  : styles.passwordHint
-              }>
-                {seedPhrase.trim().split(/\s+/).length} words
-                {(seedPhrase.trim().split(/\s+/).length === 12 || seedPhrase.trim().split(/\s+/).length === 24) && ' ✓'}
-              </Text>
-            )}
+              {password.length > 0 && password.length < 8 && (
+                <Text style={styles.passwordHint}>
+                  {8 - password.length} more character{8 - password.length > 1 ? 's' : ''} needed
+                </Text>
+              )}
 
-            <TextInput
-              style={[styles.input, passwordError && password.length > 0 && password.length < 8 ? styles.inputError : null]}
-              placeholder="Enter password (min 8 characters)"
-              placeholderTextColor="#888"
-              secureTextEntry
-              value={password}
-              onChangeText={(text) => {
-                setPassword(text);
-                setPasswordError('');
-              }}
-            />
+              {password.length >= 8 && (
+                <Text style={styles.passwordSuccess}>
+                  ✓ Password length is good
+                </Text>
+              )}
 
-            {password.length > 0 && password.length < 8 && (
-              <Text style={styles.passwordHint}>
-                {8 - password.length} more character{8 - password.length > 1 ? 's' : ''} needed
-              </Text>
-            )}
+              <TextInput
+                style={[styles.input, passwordError && confirmPassword.length > 0 && password !== confirmPassword ? styles.inputError : null]}
+                placeholder="Confirm password"
+                placeholderTextColor="#888"
+                secureTextEntry
+                value={confirmPassword}
+                onChangeText={(text) => {
+                  setConfirmPassword(text);
+                  setPasswordError('');
+                }}
+              />
 
-            {password.length >= 8 && (
-              <Text style={styles.passwordSuccess}>
-                ✓ Password length is good
-              </Text>
-            )}
+              {confirmPassword.length > 0 && password !== confirmPassword && (
+                <Text style={styles.errorText}>
+                  Passwords do not match
+                </Text>
+              )}
 
-            <TextInput
-              style={[styles.input, passwordError && confirmPassword.length > 0 && password !== confirmPassword ? styles.inputError : null]}
-              placeholder="Confirm password"
-              placeholderTextColor="#888"
-              secureTextEntry
-              value={confirmPassword}
-              onChangeText={(text) => {
-                setConfirmPassword(text);
-                setPasswordError('');
-              }}
-            />
+              {confirmPassword.length > 0 && password === confirmPassword && password.length >= 8 && (
+                <Text style={styles.passwordSuccess}>
+                  ✓ Passwords match
+                </Text>
+              )}
 
-            {confirmPassword.length > 0 && password !== confirmPassword && (
-              <Text style={styles.errorText}>
-                Passwords do not match
-              </Text>
-            )}
+              {passwordError ? (
+                <Text style={styles.errorText}>{passwordError}</Text>
+              ) : null}
+              
+              <TouchableOpacity 
+                style={styles.button}
+                onPress={() => {
+                  if (!validatePassword()) {
+                    return;
+                  }
+                  setImportStep(2);
+                }}
+              >
+                <Text style={styles.buttonText}>
+                  Next
+                </Text>
+              </TouchableOpacity>
 
-            {confirmPassword.length > 0 && password === confirmPassword && password.length >= 8 && (
-              <Text style={styles.passwordSuccess}>
-                ✓ Passwords match
-              </Text>
-            )}
+              <TouchableOpacity 
+                style={[styles.button, styles.secondaryButton]}
+                onPress={() => {
+                  setShowCreateOptions(false);
+                  setPassword('');
+                  setConfirmPassword('');
+                  setSeedPhrase('');
+                  setPasswordError('');
+                  setImportStep(1);
+                }}
+              >
+                <Text style={[styles.buttonText, styles.secondaryButtonText]}>Back</Text>
+              </TouchableOpacity>
+            </ScrollView>
+          </SafeAreaView>
+        );
+      }
 
-            {passwordError ? (
-              <Text style={styles.errorText}>{passwordError}</Text>
-            ) : null}
-            
-            <TouchableOpacity 
-              style={styles.button}
-              onPress={importWallet}
-              disabled={loading}
-            >
-              <Text style={styles.buttonText}>
-                {loading ? 'Importing...' : 'Import Wallet'}
-              </Text>
-            </TouchableOpacity>
+      // Step 2: Enter seed phrase
+      if (importStep === 2) {
+        return (
+          <SafeAreaView style={styles.container}>
+            <ScrollView contentContainerStyle={styles.centerContent}>
+              <Text style={styles.title}>Import Wallet</Text>
+              <Text style={styles.subtitle}>Step 2: Enter your seed phrase</Text>
+              
+              <TextInput
+                style={[styles.input, styles.textArea]}
+                placeholder="Enter 12 or 24 word seed phrase"
+                placeholderTextColor="#888"
+                multiline
+                value={seedPhrase}
+                onChangeText={(text) => {
+                  setSeedPhrase(text);
+                  setPasswordError('');
+                }}
+              />
 
-            <TouchableOpacity 
-              style={[styles.button, styles.secondaryButton]}
-              onPress={() => {
-                setShowCreateOptions(false);
-                setPassword('');
-                setConfirmPassword('');
-                setSeedPhrase('');
-                setPasswordError('');
-              }}
-            >
-              <Text style={[styles.buttonText, styles.secondaryButtonText]}>Back</Text>
-            </TouchableOpacity>
-          </ScrollView>
-        </SafeAreaView>
-      );
+              {seedPhrase.trim().length > 0 && (
+                <Text style={
+                  seedPhrase.trim().split(/\s+/).length === 12 || seedPhrase.trim().split(/\s+/).length === 24
+                    ? styles.passwordSuccess
+                    : styles.passwordHint
+                }>
+                  {seedPhrase.trim().split(/\s+/).length} words
+                  {(seedPhrase.trim().split(/\s+/).length === 12 || seedPhrase.trim().split(/\s+/).length === 24) && ' ✓'}
+                </Text>
+              )}
+
+              {passwordError ? (
+                <Text style={styles.errorText}>{passwordError}</Text>
+              ) : null}
+              
+              <TouchableOpacity 
+                style={styles.button}
+                onPress={importWallet}
+                disabled={loading}
+              >
+                <Text style={styles.buttonText}>
+                  {loading ? 'Importing...' : 'Import Wallet'}
+                </Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity 
+                style={[styles.button, styles.secondaryButton]}
+                onPress={() => {
+                  setImportStep(1);
+                  setSeedPhrase('');
+                  setPasswordError('');
+                }}
+              >
+                <Text style={[styles.buttonText, styles.secondaryButtonText]}>Back</Text>
+              </TouchableOpacity>
+            </ScrollView>
+          </SafeAreaView>
+        );
+      }
     }
   }
 
