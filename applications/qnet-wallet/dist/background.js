@@ -2411,7 +2411,7 @@ class ProductionCrypto {
                 {
                     name: 'PBKDF2',
                     salt: salt,
-                    iterations: 10000,
+                    iterations: 100000, // Industry standard for crypto wallets
                     hash: 'SHA-256'
                 },
                 passwordKey,
@@ -2507,7 +2507,7 @@ class ProductionCrypto {
                 {
                     name: 'PBKDF2',
                     salt: new Uint8Array(salt),
-                    iterations: 10000,
+                    iterations: 100000, // Industry standard for crypto wallets
                     hash: 'SHA-256'
                 },
                 passwordKey,
@@ -4217,18 +4217,18 @@ async function encryptActivationCode(code) {
             ['deriveKey']
         );
         
-        const key = await crypto.subtle.deriveKey(
-            {
-                name: 'PBKDF2',
-                salt: salt,
-                iterations: 10000,
-                hash: 'SHA-256'
-            },
-            passwordKey,
-            { name: 'AES-GCM', length: 256 },
-            false,
-            ['encrypt']
-        );
+            const key = await crypto.subtle.deriveKey(
+                {
+                    name: 'PBKDF2',
+                    salt: salt,
+                    iterations: 100000, // Industry standard for crypto wallets
+                    hash: 'SHA-256'
+                },
+                passwordKey,
+                { name: 'AES-GCM', length: 256 },
+                false,
+                ['encrypt']
+            );
         
         // Encrypt data
         const encrypted = await crypto.subtle.encrypt(
@@ -4285,7 +4285,7 @@ async function decryptActivationCode(encryptedCode) {
             {
                 name: 'PBKDF2',
                 salt: salt,
-                iterations: 10000,
+                iterations: 100000, // Industry standard for crypto wallets
                 hash: 'SHA-256'
             },
             passwordKey,

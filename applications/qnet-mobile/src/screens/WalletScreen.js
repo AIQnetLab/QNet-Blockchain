@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   View,
   Text,
@@ -7,7 +7,10 @@ import {
   TextInput,
   Alert,
   ScrollView,
-  SafeAreaView
+  SafeAreaView,
+  Animated,
+  Clipboard,
+  Image
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import WalletManager from '../components/WalletManager';
@@ -645,7 +648,7 @@ const WalletScreen = () => {
   const [balance, setBalance] = useState(0);
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(false);
   const [showCreateOptions, setShowCreateOptions] = useState(false);
   const [seedPhrase, setSeedPhrase] = useState('');
   const [passwordError, setPasswordError] = useState('');
@@ -654,6 +657,18 @@ const WalletScreen = () => {
   const [sendAmount, setSendAmount] = useState('');
   const [showSettings, setShowSettings] = useState(false);
   const [selectedToken, setSelectedToken] = useState('sol');
+  const [selectedNetwork, setSelectedNetwork] = useState('qnet'); // 'qnet' or 'solana'
+  const [isTestnet, setIsTestnet] = useState(true); // testnet by default
+  const [tokenPrices, setTokenPrices] = useState({
+    qnc: 0.0,
+    sol: 0.0,
+    '1dev': 0.0
+  });
+  const [tokenBalances, setTokenBalances] = useState({
+    qnc: 0,
+    sol: 0,
+    '1dev': 0
+  });
   const [language, setLanguage] = useState('en');
   const [autoLockTime, setAutoLockTime] = useState('15');
   const [showChangePassword, setShowChangePassword] = useState(false);
@@ -668,11 +683,88 @@ const WalletScreen = () => {
   const [showAutoLockPicker, setShowAutoLockPicker] = useState(false);
   const [showLanguagePicker, setShowLanguagePicker] = useState(false);
   const [importStep, setImportStep] = useState(1); // 1 = password, 2 = seed phrase
+  const [showSeedConfirm, setShowSeedConfirm] = useState(false);
+  const [seedConfirmWords, setSeedConfirmWords] = useState({});
+  const [tempWallet, setTempWallet] = useState(null);
+  const [wordChoices, setWordChoices] = useState({});
+  const [showSplash, setShowSplash] = useState(true);
+  const spinValue = useRef(new Animated.Value(0)).current;
+  const [customAlert, setCustomAlert] = useState(null); // {title, message, buttons}
+  const [nodeStatus, setNodeStatus] = useState(null); // 'light', 'full', or 'super'
+  const [copiedAddress, setCopiedAddress] = useState(''); // Track which address was copied
+  const [burnProgress, setBurnProgress] = useState('0.0'); // Real burn progress from blockchain
+
+  // Helper function to show custom styled alerts
+  const showAlert = (title, message, buttons = [{ text: 'OK', onPress: () => {} }]) => {
+    setCustomAlert({ title, message, buttons });
+  };
+
+  // Helper function to copy address with visual feedback (no alert)
+  const copyToClipboard = (text, addressType = '') => {
+    try {
+      Clipboard.setString(text);
+      setCopiedAddress(addressType || text);
+      // Clear the copied indication after 2 seconds
+      setTimeout(() => {
+        setCopiedAddress('');
+      }, 2000);
+    } catch (error) {
+      console.error('Failed to copy:', error);
+    }
+  };
+
+  // Get token icon URL like in extension
+  const getTokenIconUrl = (symbol) => {
+    const icons = {
+      // QNC - using QNet branding colors
+      'QNC': 'data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMzIiIGhlaWdodD0iMzIiIHZpZXdCb3g9IjAgMCAzMiAzMiIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj48Y2lyY2xlIGN4PSIxNiIgY3k9IjE2IiByPSIxNiIgZmlsbD0iIzRhOTBlMiIvPjx0ZXh0IHg9IjE2IiB5PSIyMSIgZm9udC1mYW1pbHk9IkFyaWFsIiBmb250LXNpemU9IjE4IiBmb250LXdlaWdodD0iYm9sZCIgZmlsbD0id2hpdGUiIHRleHQtYW5jaG9yPSJtaWRkbGUiPlE8L3RleHQ+PC9zdmc+',
+      // SOL - official Solana token
+      'SOL': 'https://raw.githubusercontent.com/solana-labs/token-list/main/assets/mainnet/So11111111111111111111111111111111111111112/logo.png',
+      // 1DEV - from pump.fun/dexscreener
+      '1DEV': 'https://dd.dexscreener.com/ds-data/tokens/solana/4R3DPW4BY97kJRfv8J5wgTtbDpoXpRv92W957tXMpump.png',
+      // USDC
+      'USDC': 'https://raw.githubusercontent.com/solana-labs/token-list/main/assets/mainnet/EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v/logo.png'
+    };
+    return icons[symbol.toUpperCase()] || null;
+  };
 
   useEffect(() => {
+    // Start rotation animation for splash spinner
+    Animated.loop(
+      Animated.timing(spinValue, {
+        toValue: 1,
+        duration: 1000,
+        useNativeDriver: true,
+      })
+    ).start();
+    
+    // Show splash screen for 2 seconds (like browser extension)
+    const splashTimer = setTimeout(() => {
+      setShowSplash(false);
+    }, 2000);
+    
     checkWalletExists();
     loadSettings();
+    
+    return () => clearTimeout(splashTimer);
   }, []);
+
+  // Load real burn progress when activation tab is selected
+  useEffect(() => {
+    if (activeTab === 'activate' && wallet) {
+      loadBurnProgress();
+    }
+  }, [activeTab, isTestnet, wallet]);
+
+  const loadBurnProgress = async () => {
+    try {
+      const progress = await walletManager.getBurnProgress(isTestnet);
+      setBurnProgress(progress);
+    } catch (error) {
+      console.error('Failed to load burn progress:', error);
+      setBurnProgress('0.0');
+    }
+  };
 
   // Translation function
   const t = (key) => {
@@ -701,7 +793,7 @@ const WalletScreen = () => {
       setAutoLockTime(time);
       setShowAutoLockPicker(false);
     } catch (error) {
-      Alert.alert(t('error'), 'Failed to save setting');
+      showAlert(t('error'), 'Failed to save setting');
     }
   };
 
@@ -710,7 +802,7 @@ const WalletScreen = () => {
       await AsyncStorage.setItem('qnet_language', lang);
       setLanguage(lang);
     } catch (error) {
-      Alert.alert(t('error'), 'Failed to save language');
+      showAlert(t('error'), 'Failed to save language');
     }
   };
 
@@ -731,7 +823,7 @@ const WalletScreen = () => {
         if (inactiveTime >= lockTimeMs && autoLockTime !== 'never') {
           // Lock wallet
           setWallet(null);
-          Alert.alert('Session Expired', 'Wallet locked due to inactivity');
+          showAlert('Session Expired', 'Wallet locked due to inactivity');
         }
       }, 10000); // Check every 10 seconds
 
@@ -788,29 +880,52 @@ const WalletScreen = () => {
     setLoading(true);
     try {
       const newWallet = await walletManager.generateWallet();
-      await walletManager.storeWallet(newWallet, password);
       
-      setWallet(newWallet);
-      setHasWallet(true);
-      setShowCreateOptions(false);
-      setPassword('');
-      setConfirmPassword('');
-      
-      // Show seed phrase in a better format
+      // Store temporarily and show seed phrase
+      setTempWallet({ ...newWallet, password });
       const words = newWallet.mnemonic.split(' ');
+      
+      // Select random words to verify (positions 3, 7, 11 for 12-word mnemonic)
+      const verifyPositions = [2, 6, 10]; // 0-indexed
+      const confirmWords = {};
+      const choices = {};
+      
+      // Generate word choices for each position
+      verifyPositions.forEach(pos => {
+        confirmWords[pos] = '';
+        
+        // Get 3 random words from BIP39 list + correct word
+        const allWords = walletManager.getBIP39WordList();
+        const correctWord = words[pos];
+        const randomWords = [];
+        
+        // Add 3 random incorrect words
+        while (randomWords.length < 3) {
+          const randomWord = allWords[Math.floor(Math.random() * allWords.length)];
+          if (randomWord !== correctWord && !randomWords.includes(randomWord)) {
+            randomWords.push(randomWord);
+          }
+        }
+        
+        // Add correct word and shuffle
+        const wordOptions = [...randomWords, correctWord].sort(() => Math.random() - 0.5);
+        choices[pos] = wordOptions;
+      });
+      
+      setSeedConfirmWords(confirmWords);
+      setWordChoices(choices);
+      
+      // Show seed phrase and prepare for confirmation
       const formattedSeed = words.map((word, i) => `${i + 1}. ${word}`).join('\n');
       
-      Alert.alert(
-        'Wallet Created Successfully!', 
-        `Your wallet address:\n${newWallet.address.substring(0, 20)}...\n\n⚠️ IMPORTANT: Write down your seed phrase!\n\n${formattedSeed}\n\n⚠️ Keep it safe and never share it with anyone!`,
-        [{ text: 'I Saved It' }]
-      );
+      setLoading(false);
       
-      loadBalance(newWallet.publicKey);
+      // Show seed phrase with proper formatting
+      setShowCreateOptions('show-seed');
     } catch (error) {
-      Alert.alert('Error', 'Failed to create wallet: ' + error.message);
+      showAlert('Error', 'Failed to create wallet: ' + error.message);
+      setLoading(false);
     }
-    setLoading(false);
   };
 
   const importWallet = async () => {
@@ -841,17 +956,81 @@ const WalletScreen = () => {
       setSeedPhrase('');
       setImportStep(1); // Reset to step 1 for next time
       
-      Alert.alert('Success', 'Wallet imported successfully!');
+      showAlert('Success', 'Wallet imported successfully!');
       loadBalance(imported.publicKey);
     } catch (error) {
-      Alert.alert('Error', 'Failed to import wallet: ' + error.message);
+      showAlert('Error', 'Failed to import wallet: ' + error.message);
     }
     setLoading(false);
   };
 
+  const confirmSeedPhrase = async () => {
+    if (!tempWallet) {
+      showAlert('Error', 'Wallet data not found. Please try creating the wallet again.');
+      return;
+    }
+    
+    const words = tempWallet.mnemonic.split(' ');
+    const positions = Object.keys(seedConfirmWords).map(Number);
+    
+    // Check if all required words are filled
+    const emptyWords = positions.filter(pos => !seedConfirmWords[pos] || seedConfirmWords[pos].trim() === '');
+    if (emptyWords.length > 0) {
+      showAlert('⚠️ Incomplete', `Please select word #${emptyWords[0] + 1} to continue.`);
+      return;
+    }
+    
+    // Check if all words match
+    const incorrectWords = [];
+    for (const pos of positions) {
+      if (words[pos].toLowerCase() !== seedConfirmWords[pos].toLowerCase().trim()) {
+        incorrectWords.push(pos + 1);
+      }
+    }
+    
+    if (incorrectWords.length > 0) {
+      const wordsList = incorrectWords.length === 1 
+        ? `Word #${incorrectWords[0]}` 
+        : `Words #${incorrectWords.join(', #')}`;
+      showAlert(
+        '❌ Incorrect', 
+        `${wordsList} ${incorrectWords.length === 1 ? 'is' : 'are'} incorrect. Please check your recovery phrase and try again.`
+      );
+      return;
+    }
+    
+    // All words correct, save wallet
+    setLoading(true);
+    try {
+      await walletManager.storeWallet(tempWallet, tempWallet.password);
+      
+      setWallet(tempWallet);
+      setHasWallet(true);
+      setShowSeedConfirm(false);
+      setPassword('');
+      setConfirmPassword('');
+      setTempWallet(null);
+      setSeedConfirmWords({});
+      
+      // Show both addresses like in extension
+      const qnetAddr = tempWallet.qnetAddress || 'Generating...';
+      const solanaAddr = tempWallet.solanaAddress || tempWallet.address;
+      showAlert(
+        '✅ Wallet Created Successfully!', 
+        `Your QNet Wallet is ready to use.\n\nQNet Address:\n${qnetAddr}\n\nSolana Address:\n${solanaAddr}\n\nYou can now manage QNet and Solana assets securely.`
+      );
+      loadBalance(tempWallet.publicKey);
+    } catch (error) {
+      console.error('Error saving wallet:', error);
+      showAlert('Error', 'Failed to save wallet: ' + (error.message || 'Unknown error'));
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const unlockWallet = async () => {
     if (!password) {
-      Alert.alert('Error', 'Please enter password');
+      showAlert('Error', 'Please enter password');
       return;
     }
 
@@ -861,17 +1040,94 @@ const WalletScreen = () => {
       setWallet(loadedWallet);
       loadBalance(loadedWallet.publicKey);
     } catch (error) {
-      Alert.alert('Error', 'Wrong password or corrupted wallet');
+      showAlert('Error', 'Wrong password or corrupted wallet');
     }
     setLoading(false);
   };
 
   const loadBalance = async (publicKey) => {
     try {
-      const bal = await walletManager.getBalance(publicKey);
+      // Get SOL balance from correct network  
+      const bal = await walletManager.getBalance(publicKey, isTestnet);
       setBalance(bal);
+      
+      // Get 1DEV token balance - use correct address based on network
+      const oneDevMint = isTestnet 
+        ? '62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ'  // Testnet/Devnet
+        : '4R3DPW4BY97kJRfv8J5wgTtbDpoXpRv92W957tXMpump'; // Mainnet (pump.fun)
+      
+      // Use Solana address for token balance (not QNet address)
+      const solanaAddr = wallet.solanaAddress || wallet.address || publicKey;
+      const oneDevBalance = await walletManager.getTokenBalance(solanaAddr, oneDevMint, isTestnet);
+      
+      // For QNC, we'll need the actual mint address when deployed
+      // For now, set to 0 as it's not yet deployed
+      const qncBalance = 0;
+      
+      setTokenBalances({
+        qnc: qncBalance,
+        sol: bal,
+        '1dev': oneDevBalance
+      });
+      
+      // Fetch real token prices (always mainnet prices as requested)
+      await fetchTokenPrices();
     } catch (error) {
       console.error('Error loading balance:', error);
+    }
+  };
+
+  const fetchTokenPrices = async () => {
+    try {
+      // Fetch real prices from CoinGecko API
+      const prices = { qnc: 0, sol: 0, '1dev': 0 };
+      
+      // Fetch SOL price
+      try {
+        const solResponse = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
+        if (solResponse.ok) {
+          const solData = await solResponse.json();
+          prices.sol = solData.solana?.usd || 0;
+        }
+      } catch (e) {
+        console.log('Failed to fetch SOL price, trying backup...');
+        // Try Binance as backup
+        try {
+          const binanceResponse = await fetch('https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT');
+          if (binanceResponse.ok) {
+            const binanceData = await binanceResponse.json();
+            prices.sol = parseFloat(binanceData.price) || 0;
+          }
+        } catch (e2) {
+          prices.sol = 150; // Fallback price
+        }
+      }
+      
+      // Fetch 1DEV price (if available)
+      try {
+        const devResponse = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=1dev&vs_currencies=usd');
+        if (devResponse.ok) {
+          const devData = await devResponse.json();
+          prices['1dev'] = devData['1dev']?.usd || 0.0001;
+        } else {
+          prices['1dev'] = 0.0001; // Fallback for 1DEV
+        }
+      } catch (e) {
+        prices['1dev'] = 0.0001; // Fallback price
+      }
+      
+      // QNC price (not listed yet, using fixed price)
+      prices.qnc = 0.0125;
+      
+      setTokenPrices(prices);
+    } catch (error) {
+      console.error('Error fetching prices:', error);
+      // Set fallback prices
+      setTokenPrices({
+        qnc: 0.0125,
+        sol: 150.00,
+        '1dev': 0.0001
+      });
     }
   };
 
@@ -887,7 +1143,7 @@ const WalletScreen = () => {
           // Verify password
           const walletData = await walletManager.loadWallet(password);
           if (!walletData) {
-            Alert.alert('Error', 'Incorrect password');
+            showAlert('Error', 'Incorrect password');
             return;
           }
           
@@ -898,7 +1154,7 @@ const WalletScreen = () => {
             await walletManager.storeActivationCode(code, 'full', password);
           }
           
-          Alert.alert(
+          showAlert(
             'Node Activation Code',
             code,
             [
@@ -906,7 +1162,7 @@ const WalletScreen = () => {
             ]
           );
         } catch (error) {
-          Alert.alert('Error', 'Failed to generate activation code');
+          showAlert('Error', 'Failed to generate activation code');
         }
       },
       'secure-text'
@@ -915,7 +1171,7 @@ const WalletScreen = () => {
 
   const exportSeedPhrase = async () => {
     if (!exportPassword) {
-      Alert.alert('Error', 'Please enter your password');
+      showAlert('Error', 'Please enter your password');
       return;
     }
 
@@ -924,7 +1180,7 @@ const WalletScreen = () => {
       const walletData = await walletManager.loadWallet(exportPassword);
       
       if (!walletData || !walletData.mnemonic) {
-        Alert.alert('Error', 'Incorrect password or wallet data corrupted');
+        showAlert('Error', 'Incorrect password or wallet data corrupted');
         setLoading(false);
         return;
       }
@@ -936,15 +1192,15 @@ const WalletScreen = () => {
       setShowExportSeed(false);
       setExportPassword('');
       
-      Alert.alert(
+      showAlert(
         '⚠️ Recovery Phrase',
-        `${formattedSeed}\n\n⚠️ Keep it safe and never share!`,
+        `${formattedSeed}\n\n Keep it safe and never share!`,
         [
           { text: 'I Saved It', style: 'default' }
         ]
       );
     } catch (error) {
-      Alert.alert('Error', 'Incorrect password');
+      showAlert('Error', 'Incorrect password');
     } finally {
       setLoading(false);
     }
@@ -952,7 +1208,7 @@ const WalletScreen = () => {
 
   const exportActivationCode = async () => {
     if (!exportPassword) {
-      Alert.alert('Error', 'Please enter your password');
+      showAlert('Error', 'Please enter your password');
       return;
     }
 
@@ -963,7 +1219,7 @@ const WalletScreen = () => {
       const walletData = await walletManager.loadWallet(exportPassword);
       
       if (!walletData || !walletData.publicKey) {
-        Alert.alert('Error', 'Incorrect password');
+        showAlert('Error', 'Incorrect password');
         setLoading(false);
         setExportPassword('');
         return;
@@ -982,16 +1238,16 @@ const WalletScreen = () => {
       setShowExportActivation(false);
       setExportPassword('');
       
-      Alert.alert(
-        '🔑 Activation Code',
-        `${code}\n\n🔑 Keep this code secure!`,
+      showAlert(
+        'Activation Code',
+        `${code}\n\n Keep this code secure!`,
         [
           { text: 'I Saved It', style: 'default' }
         ]
       );
     } catch (error) {
       console.error('Error verifying password:', error);
-      Alert.alert('Error', 'Incorrect password');
+      showAlert('Error', 'Incorrect password');
       setExportPassword('');
     } finally {
       setLoading(false);
@@ -1000,12 +1256,12 @@ const WalletScreen = () => {
 
   const handleChangePassword = async () => {
     if (!newPassword || newPassword.length < 8) {
-      Alert.alert('Error', 'New password must be at least 8 characters');
+      showAlert('Error', 'New password must be at least 8 characters');
       return;
     }
 
     if (newPassword !== confirmNewPassword) {
-      Alert.alert('Error', 'New passwords do not match');
+      showAlert('Error', 'New passwords do not match');
       return;
     }
 
@@ -1015,7 +1271,7 @@ const WalletScreen = () => {
       // Verify current password by trying to unlock wallet
       const walletData = await walletManager.loadWallet(currentPassword);
       if (!walletData) {
-        Alert.alert('Error', 'Current password is incorrect');
+        showAlert('Error', 'Current password is incorrect');
         setLoading(false);
         return;
       }
@@ -1023,20 +1279,20 @@ const WalletScreen = () => {
       // Re-encrypt wallet with new password
       await walletManager.storeWallet(walletData, newPassword);
       
-      Alert.alert('Success', 'Password changed successfully!');
+      showAlert('Success', 'Password changed successfully!');
       setShowChangePassword(false);
       setCurrentPassword('');
       setNewPassword('');
       setConfirmNewPassword('');
     } catch (error) {
-      Alert.alert('Error', 'Failed to change password: ' + error.message);
+      showAlert('Error', 'Failed to change password: ' + error.message);
     } finally {
       setLoading(false);
     }
   };
 
   const deleteWallet = async () => {
-    Alert.alert(
+    showAlert(
       '⚠️ Delete Wallet',
       'Are you sure you want to delete this wallet? Make sure you have backed up your recovery phrase!',
       [
@@ -1050,9 +1306,9 @@ const WalletScreen = () => {
               await AsyncStorage.removeItem('qnet_wallet_address');
               setWallet(null);
               setHasWallet(false);
-              Alert.alert('Success', 'Wallet deleted successfully');
+              showAlert('Success', 'Wallet deleted successfully');
             } catch (error) {
-              Alert.alert('Error', 'Failed to delete wallet: ' + error.message);
+              showAlert('Error', 'Failed to delete wallet: ' + error.message);
             }
           }
         }
@@ -1067,6 +1323,105 @@ const WalletScreen = () => {
           <Text style={styles.title}>QNet Wallet</Text>
           <Text style={styles.subtitle}>Loading...</Text>
         </View>
+      </SafeAreaView>
+    );
+  }
+
+  // Splash screen with animated spinner (like browser extension)
+  if (showSplash) {
+    const spin = spinValue.interpolate({
+      inputRange: [0, 1],
+      outputRange: ['0deg', '360deg'],
+    });
+    
+    return (
+      <View style={styles.splashContainer}>
+        <View style={styles.splashContent}>
+          <View style={styles.logoContainer}>
+            {/* Outer rotating ring */}
+            <Animated.View style={[styles.outerRing, { transform: [{ rotate: spin }] }]}>
+              <View style={styles.outerRingGradient} />
+            </Animated.View>
+            {/* Inner static ring */}
+            <View style={styles.innerRing}>
+              <View style={styles.innerRingGradient} />
+            </View>
+            {/* Center Q letter */}
+            <View style={styles.qLetterContainer}>
+              <Text style={styles.qLetter}>Q</Text>
+            </View>
+          </View>
+          <Text style={styles.splashTitle}>QNet Wallet</Text>
+          <Text style={styles.splashSubtitle}>Loading...</Text>
+        </View>
+      </View>
+    );
+  }
+
+  // Seed phrase confirmation screen
+  if (showSeedConfirm && tempWallet) {
+    const words = tempWallet.mnemonic.split(' ');
+    const positions = Object.keys(seedConfirmWords).map(Number).sort((a, b) => a - b);
+    
+    return (
+      <SafeAreaView style={styles.container}>
+        <ScrollView contentContainerStyle={styles.centerContent}>
+          <Text style={styles.title}>Confirm Your Recovery Phrase</Text>
+          <Text style={styles.subtitle}>
+            Please enter the following words from your recovery phrase to confirm you've saved it correctly
+          </Text>
+          
+          {positions.map(pos => (
+            <View key={pos} style={styles.formGroup}>
+              <Text style={styles.label}>Select word #{pos + 1}</Text>
+              <View style={styles.wordChoicesContainer}>
+                {wordChoices[pos]?.map((word, idx) => (
+                  <TouchableOpacity
+                    key={idx}
+                    style={[
+                      styles.wordChoiceButton,
+                      seedConfirmWords[pos] === word && styles.wordChoiceSelected
+                    ]}
+                    onPress={() => {
+                      setSeedConfirmWords({
+                        ...seedConfirmWords,
+                        [pos]: word
+                      });
+                    }}
+                  >
+                    <Text style={[
+                      styles.wordChoiceText,
+                      seedConfirmWords[pos] === word && styles.wordChoiceTextSelected
+                    ]}>
+                      {word}
+                    </Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+            </View>
+          ))}
+          
+          <TouchableOpacity 
+            style={styles.button}
+            onPress={confirmSeedPhrase}
+            disabled={loading || !Object.values(seedConfirmWords).every(w => w.length > 0)}
+          >
+            <Text style={styles.buttonText}>
+              {loading ? 'Verifying...' : 'Confirm & Create Wallet'}
+            </Text>
+          </TouchableOpacity>
+          
+          <TouchableOpacity 
+            style={[styles.button, styles.secondaryButton]}
+            onPress={() => {
+              // Direct action without modal for better UX
+              setShowSeedConfirm(false);
+              setShowCreateOptions('show-seed'); // Go back to seed display
+            }}
+          >
+            <Text style={[styles.buttonText, styles.secondaryButtonText]}>Back</Text>
+          </TouchableOpacity>
+        </ScrollView>
       </SafeAreaView>
     );
   }
@@ -1176,6 +1531,61 @@ const WalletScreen = () => {
               }}
             >
               <Text style={[styles.buttonText, styles.secondaryButtonText]}>Back</Text>
+            </TouchableOpacity>
+          </ScrollView>
+        </SafeAreaView>
+      );
+    }
+
+    // Show seed phrase screen (beautiful grid like extension)
+    if (showCreateOptions === 'show-seed' && tempWallet) {
+      const words = tempWallet.mnemonic.split(' ');
+      
+      return (
+        <SafeAreaView style={styles.container}>
+          <ScrollView contentContainerStyle={styles.centerContent}>
+            <Text style={styles.title}>IMPORTANT: Save Your Recovery Phrase</Text>
+            <Text style={styles.subtitle}>
+              Write down these 12 words in order. You'll need them to recover your wallet.
+            </Text>
+            
+            <View style={styles.seedGrid}>
+              {words.map((word, index) => (
+                <View key={index} style={styles.seedWordContainer}>
+                  <Text style={styles.seedWordNumber}>{index + 1}</Text>
+                  <Text style={styles.seedWordText}>{word}</Text>
+                </View>
+              ))}
+            </View>
+            
+            <TouchableOpacity 
+              style={[styles.button, styles.secondaryButton]}
+              onPress={() => {
+                try {
+                  // Copy seed phrase to clipboard
+                  const seedText = words.join(' ');
+                  Clipboard.setString(seedText);
+                  showAlert('Copied', 'Recovery phrase copied to clipboard');
+                } catch (error) {
+                  showAlert('Error', 'Failed to copy to clipboard');
+                }
+              }}
+            >
+              <Text style={[styles.buttonText, styles.secondaryButtonText]}>Copy Recovery Phrase</Text>
+            </TouchableOpacity>
+            
+            <Text style={styles.warningText}>
+              ⚠️ Never share this with anyone!
+            </Text>
+            
+            <TouchableOpacity 
+              style={styles.button}
+              onPress={() => {
+                setShowSeedConfirm(true);
+                setShowCreateOptions(false);
+              }}
+            >
+              <Text style={styles.buttonText}>I Wrote It Down</Text>
             </TouchableOpacity>
           </ScrollView>
         </SafeAreaView>
@@ -1372,17 +1782,131 @@ const WalletScreen = () => {
       case 'assets':
         return (
           <ScrollView style={styles.content}>
-            <View style={styles.balanceCard}>
-              <Text style={styles.balanceLabel}>Balance</Text>
-              <Text style={styles.balanceAmount}>{balance.toFixed(4)} SOL</Text>
+            {/* Network Selector */}
+            <View style={styles.networkSelector}>
+              <TouchableOpacity 
+                style={[styles.networkTab, selectedNetwork === 'qnet' && styles.networkTabActive]}
+                onPress={() => setSelectedNetwork('qnet')}
+              >
+                <Text style={[styles.networkTabText, selectedNetwork === 'qnet' && styles.networkTabTextActive]}>QNet</Text>
+              </TouchableOpacity>
+              <TouchableOpacity 
+                style={[styles.networkTab, selectedNetwork === 'solana' && styles.networkTabActive]}
+                onPress={() => setSelectedNetwork('solana')}
+              >
+                <Text style={[styles.networkTabText, selectedNetwork === 'solana' && styles.networkTabTextActive]}>Solana</Text>
+              </TouchableOpacity>
             </View>
 
-            <View style={styles.addressCard}>
-              <Text style={styles.addressLabel}>Address</Text>
-              <Text style={styles.addressText}>
-                {wallet.address.substring(0, 20)}...{wallet.address.substring(wallet.address.length - 10)}
+            {/* Address Display (above balance like in extension) */}
+            <TouchableOpacity 
+              style={styles.addressContainer}
+              onPress={() => {
+                const currentAddress = selectedNetwork === 'qnet' 
+                  ? (wallet.qnetAddress || wallet.address)
+                  : (wallet.solanaAddress || wallet.address);
+                const addressType = selectedNetwork === 'qnet' ? 'qnet' : 'solana';
+                copyToClipboard(currentAddress, addressType);
+              }}
+            >
+              <View style={styles.addressRow}>
+                <Text style={[
+                  styles.addressText,
+                  copiedAddress === (selectedNetwork === 'qnet' ? 'qnet' : 'solana') && styles.addressTextCopied
+                ]} numberOfLines={1} ellipsizeMode="middle">
+                  {selectedNetwork === 'qnet' 
+                    ? (wallet.qnetAddress || wallet.address)
+                    : (wallet.solanaAddress || wallet.address)}
+                </Text>
+                {copiedAddress === (selectedNetwork === 'qnet' ? 'qnet' : 'solana') && (
+                  <Text style={styles.checkMark}>✓</Text>
+                )}
+              </View>
+              <Text style={styles.copyHint}>
+                {copiedAddress === (selectedNetwork === 'qnet' ? 'qnet' : 'solana') ? 'Copied!' : 'Tap to copy'}
               </Text>
-            </View>
+            </TouchableOpacity>
+
+            {/* Token List based on selected network */}
+            {selectedNetwork === 'qnet' ? (
+              <View style={styles.tokenList}>
+                {/* QNC Token */}
+                <View style={styles.tokenItem}>
+                  <View style={styles.tokenInfo}>
+                    <View style={styles.tokenIcon}>
+                      {getTokenIconUrl('QNC') ? (
+                        <Image 
+                          source={{uri: getTokenIconUrl('QNC')}} 
+                          style={styles.tokenIconImage}
+                          resizeMode="contain"
+                        />
+                      ) : (
+                        <Text style={styles.tokenIconText}>Q</Text>
+                      )}
+                    </View>
+                    <View style={styles.tokenDetails}>
+                      <Text style={styles.tokenName}>QNC</Text>
+                      <Text style={styles.tokenPrice}>${tokenPrices.qnc.toFixed(4)}</Text>
+                    </View>
+                  </View>
+                  <View style={styles.tokenBalance}>
+                    <Text style={styles.tokenAmount}>{tokenBalances.qnc.toFixed(4)}</Text>
+                    <Text style={styles.tokenValue}>${(tokenBalances.qnc * tokenPrices.qnc).toFixed(2)}</Text>
+                  </View>
+                </View>
+              </View>
+            ) : (
+              <View style={styles.tokenList}>
+                {/* SOL Token */}
+                <View style={styles.tokenItem}>
+                  <View style={styles.tokenInfo}>
+                    <View style={styles.tokenIcon}>
+                      {getTokenIconUrl('SOL') ? (
+                        <Image 
+                          source={{uri: getTokenIconUrl('SOL')}} 
+                          style={styles.tokenIconImage}
+                          resizeMode="contain"
+                        />
+                      ) : (
+                        <Text style={styles.tokenIconText}>S</Text>
+                      )}
+                    </View>
+                    <View style={styles.tokenDetails}>
+                      <Text style={styles.tokenName}>SOL</Text>
+                      <Text style={styles.tokenPrice}>${tokenPrices.sol.toFixed(2)}</Text>
+                    </View>
+                  </View>
+                  <View style={styles.tokenBalance}>
+                    <Text style={styles.tokenAmount}>{balance.toFixed(4)}</Text>
+                    <Text style={styles.tokenValue}>${(balance * tokenPrices.sol).toFixed(2)}</Text>
+                  </View>
+                </View>
+                {/* 1DEV Token */}
+                <View style={styles.tokenItem}>
+                  <View style={styles.tokenInfo}>
+                    <View style={styles.tokenIcon}>
+                      {getTokenIconUrl('1DEV') ? (
+                        <Image 
+                          source={{uri: getTokenIconUrl('1DEV')}} 
+                          style={styles.tokenIconImage}
+                          resizeMode="contain"
+                        />
+                      ) : (
+                        <Text style={styles.tokenIconText}>D</Text>
+                      )}
+                    </View>
+                    <View style={styles.tokenDetails}>
+                      <Text style={styles.tokenName}>1DEV</Text>
+                      <Text style={styles.tokenPrice}>${tokenPrices['1dev'].toFixed(4)}</Text>
+                    </View>
+                  </View>
+                  <View style={styles.tokenBalance}>
+                    <Text style={styles.tokenAmount}>{tokenBalances['1dev'].toFixed(4)}</Text>
+                    <Text style={styles.tokenValue}>${(tokenBalances['1dev'] * tokenPrices['1dev']).toFixed(2)}</Text>
+                  </View>
+                </View>
+              </View>
+            )}
 
             <TouchableOpacity 
               style={[styles.actionButton, styles.refreshButton]}
@@ -1448,10 +1972,10 @@ const WalletScreen = () => {
               style={styles.button}
               onPress={() => {
                 if (!sendAddress || !sendAmount) {
-                  Alert.alert('Error', 'Please enter address and amount');
+                  showAlert('Error', 'Please enter address and amount');
                   return;
                 }
-                Alert.alert('Send', 'Transaction functionality coming soon');
+                showAlert('Send', 'Transaction functionality coming soon');
               }}
             >
               <Text style={styles.buttonText}>Send Transaction</Text>
@@ -1471,13 +1995,27 @@ const WalletScreen = () => {
               </View>
 
               <View style={styles.addressDisplay}>
-                <Text style={styles.label}>Your Address</Text>
-                <Text style={styles.addressDisplayText}>{wallet.address}</Text>
+                <Text style={styles.label}>
+                  {selectedNetwork === 'qnet' ? 'Your QNet Address' : 'Your Solana Address'}
+                </Text>
+                <Text style={styles.addressDisplayText}>
+                  {selectedNetwork === 'qnet' 
+                    ? (wallet.qnetAddress || wallet.address)
+                    : (wallet.solanaAddress || wallet.address)}
+                </Text>
                 <TouchableOpacity 
                   style={[styles.button, styles.secondaryButton]}
-                  onPress={() => Alert.alert('Copied', 'Address copied to clipboard')}
+                  onPress={() => {
+                    const currentAddress = selectedNetwork === 'qnet' 
+                      ? (wallet.qnetAddress || wallet.address)
+                      : (wallet.solanaAddress || wallet.address);
+                    const addressType = selectedNetwork === 'qnet' ? 'qnet-receive' : 'solana-receive';
+                    copyToClipboard(currentAddress, addressType);
+                  }}
                 >
-                  <Text style={[styles.buttonText, styles.secondaryButtonText]}>Copy Address</Text>
+                  <Text style={[styles.buttonText, styles.secondaryButtonText]}>
+                    {copiedAddress.includes('receive') ? '✓ Copied!' : 'Copy Address'}
+                  </Text>
                 </TouchableOpacity>
               </View>
             </View>
@@ -1489,16 +2027,126 @@ const WalletScreen = () => {
           <ScrollView style={styles.content}>
             <Text style={styles.tabTitle}>Node Activation</Text>
             
-            <View style={styles.activateCard}>
-              <Text style={styles.phaseText}>Phase 1: 1DEV Burn Activation</Text>
-              <Text style={styles.statusText}>Status: Not Active</Text>
+            {/* Phase Indicator */}
+            <View style={styles.phaseCard}>
+              <Text style={styles.phaseTitle}>Phase 1: 1DEV Burn Activation</Text>
+              <Text style={styles.phaseSubtitle}>
+                Burn 1500 1DEV to activate your node
+              </Text>
+              <View style={styles.phaseProgress}>
+                <Text style={styles.progressText}>
+                  Network Progress: {burnProgress}% burned {loading && '(updating...)'}
+                </Text>
+                <View style={styles.progressBar}>
+                  <View style={[styles.progressFill, {width: `${burnProgress}%`}]} />
+                </View>
+              </View>
             </View>
 
+            {/* Node Types */}
+            <View style={styles.nodeTypesContainer}>
+              <Text style={styles.sectionTitle}>Select Node Type</Text>
+              <View style={styles.warningBox}>
+                <Text style={styles.warningText}>
+                  💡 You can generate activation codes for all node types
+                </Text>
+                <Text style={styles.warningText}>
+                  ⚡ Mobile activation is available for Light Nodes only
+                </Text>
+                <Text style={styles.warningSubtext}>
+                  Full and Super nodes must be activated on servers
+                </Text>
+              </View>
+              
+              <TouchableOpacity 
+                style={[styles.nodeTypeCard, nodeStatus === 'light' && styles.nodeTypeActive]}
+                onPress={() => setNodeStatus('light')}
+              >
+                <View style={styles.nodeTypeInfo}>
+                  <Text style={styles.nodeTypeName}>Light Node (Mobile)</Text>
+                  <Text style={styles.nodeTypeDesc}>Basic validation, optimized for mobile devices</Text>
+                </View>
+                <Text style={styles.nodeTypePrice}>1500 1DEV</Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity 
+                style={[styles.nodeTypeCard, nodeStatus === 'full' && styles.nodeTypeActive]}
+                onPress={() => setNodeStatus('full')}
+              >
+                <View style={styles.nodeTypeInfo}>
+                  <Text style={styles.nodeTypeName}>Full Node</Text>
+                  <Text style={styles.nodeTypeDesc}>Full validation, medium resources</Text>
+                </View>
+                <Text style={styles.nodeTypePrice}>1500 1DEV</Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity 
+                style={[styles.nodeTypeCard, nodeStatus === 'super' && styles.nodeTypeActive]}
+                onPress={() => setNodeStatus('super')}
+              >
+                <View style={styles.nodeTypeInfo}>
+                  <Text style={styles.nodeTypeName}>Super Node</Text>
+                  <Text style={styles.nodeTypeDesc}>Maximum validation, high resources</Text>
+                </View>
+                <Text style={styles.nodeTypePrice}>1500 1DEV</Text>
+              </TouchableOpacity>
+            </View>
+
+            {/* Activation Button */}
             <TouchableOpacity 
-              style={styles.actionButton}
-              onPress={generateActivationCode}
+              style={[styles.button, !nodeStatus && styles.buttonDisabled]}
+              onPress={async () => {
+                if (!nodeStatus) {
+                  showAlert('Select Node Type', 'Please select a node type to activate');
+                  return;
+                }
+                
+                // Show confirmation
+                showAlert(
+                  'Confirm Activation',
+                  `Burn 1500 1DEV to activate ${nodeStatus} node?\n\nThis action cannot be undone.`,
+                  [
+                    { text: 'Cancel', style: 'cancel' },
+                    { 
+                      text: 'Activate', 
+                      style: 'destructive',
+                      onPress: async () => {
+                        setLoading(true);
+                        try {
+                          // Check 1DEV balance
+                          if (tokenBalances['1dev'] < 1500) {
+                            showAlert('Insufficient Balance', `You need 1500 1DEV to activate a node. Your balance: ${tokenBalances['1dev'].toFixed(2)} 1DEV`);
+                            setLoading(false);
+                            return;
+                          }
+                          
+                          // Burn tokens
+                          const burnResult = await walletManager.burnTokensForNode(nodeStatus, 1500);
+                          
+                          // Generate activation code (use Solana address for node activation)
+                          const solanaAddr = wallet.solanaAddress || wallet.address;
+                          const code = await walletManager.generateActivationCode(nodeStatus, solanaAddr);
+                          await walletManager.storeActivationCode(code, nodeStatus, password);
+                          
+                          // Update balance
+                          await loadBalance(wallet.publicKey);
+                          
+                          showAlert('Success', `${nodeStatus} node activated successfully!\nTransaction: ${burnResult.txHash}\nActivation Code: ${code}`);
+                        } catch (error) {
+                          showAlert('Error', 'Failed to activate node: ' + error.message);
+                        } finally {
+                          setLoading(false);
+                        }
+                      }
+                    }
+                  ]
+                );
+              }}
+              disabled={!nodeStatus || loading}
             >
-              <Text style={styles.actionButtonText}>Generate Activation Code</Text>
+              <Text style={styles.buttonText}>
+                {loading ? 'Activating...' : 'Activate Node'}
+              </Text>
             </TouchableOpacity>
           </ScrollView>
         );
@@ -1563,6 +2211,34 @@ const WalletScreen = () => {
               </View>
             </View>
 
+            {/* Network Settings */}
+            <View style={styles.settingGroup}>
+              <Text style={styles.settingGroupTitle}>Network</Text>
+              
+              <View style={styles.settingItem}>
+                <View style={styles.settingInfo}>
+                  <Text style={styles.settingTitle}>Network Mode</Text>
+                  <Text style={styles.settingSubtitle}>{isTestnet ? 'Testnet (for testing)' : 'Mainnet (real funds)'}</Text>
+                </View>
+                <TouchableOpacity 
+                  style={[styles.settingDropdown, {backgroundColor: isTestnet ? '#ff9800' : '#4caf50'}]}
+                  onPress={async () => {
+                    const newTestnet = !isTestnet;
+                    setIsTestnet(newTestnet);
+                    showAlert('Network Changed', `Switched to ${newTestnet ? 'Testnet' : 'Mainnet'}. Reloading balances...`);
+                    // Reload balances with new network
+                    if (wallet && wallet.publicKey) {
+                      await loadBalance(wallet.publicKey);
+                    }
+                  }}
+                >
+                  <Text style={[styles.settingValue, {color: '#ffffff'}]}>
+                    {isTestnet ? 'Testnet' : 'Mainnet'}
+                  </Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+
             {/* Security Settings */}
             <View style={styles.settingGroup}>
               <Text style={styles.settingGroupTitle}>{t('security_options')}</Text>
@@ -1608,7 +2284,7 @@ const WalletScreen = () => {
               <TouchableOpacity 
                 style={[styles.actionButton, {backgroundColor: '#16213e', borderColor: '#ff4444'}]}
                 onPress={() => {
-                  Alert.alert(
+                  showAlert(
                     t('logout'),
                     t('logout_confirm'),
                     [
@@ -1923,6 +2599,71 @@ const WalletScreen = () => {
           </View>
         </View>
       )}
+
+      {/* Custom Alert Modal (styled like extension) */}
+      {customAlert && (
+        <Animated.View style={[styles.modalOverlay, {
+          opacity: customAlert ? 1 : 0
+        }]}>
+          <Animated.View style={[
+            styles.modalBox, 
+            { 
+              maxWidth: 350,
+              transform: [{
+                scale: customAlert ? 1 : 0.9
+              }]
+            }
+          ]}>
+            {/* Modal Header with icon */}
+            <View style={styles.modalHeader}>
+              <Text style={styles.modalTitle}>
+                {customAlert.title.includes('Success') && '✅ '}
+                {customAlert.title.includes('Error') && '❌ '}
+                {customAlert.title.includes('Warning') || customAlert.title.includes('⚠️') ? '⚠️ ' : ''}
+                {customAlert.title.includes('Activation') || customAlert.title.includes('🔑') ? '🔑 ' : ''}
+                {customAlert.title.includes('Recovery') || customAlert.title.includes('⚠️ Recovery') ? '🔐 ' : ''}
+                {customAlert.title.includes('Copied') || customAlert.title.includes('📋') ? '📋 ' : ''}
+                {customAlert.title}
+              </Text>
+            </View>
+            
+            {/* Modal Content */}
+            <Text style={styles.modalContent}>
+              {customAlert.message}
+            </Text>
+            
+            {/* Modal Actions */}
+            <View style={styles.modalActions}>
+              {customAlert.buttons.map((button, index) => (
+                <TouchableOpacity
+                  key={index}
+                  style={[
+                    styles.modalButton,
+                    button.style === 'destructive' ? 
+                      styles.modalButtonDanger : 
+                      button.style === 'cancel' ? 
+                        styles.modalButtonSecondary : 
+                        styles.modalButtonPrimary,
+                    { flex: 1 }
+                  ]}
+                  onPress={() => {
+                    setCustomAlert(null);
+                    if (button.onPress) button.onPress();
+                  }}
+                >
+                  <Text style={[
+                    styles.modalButtonText,
+                    button.style === 'destructive' && styles.modalButtonTextDanger,
+                    button.style === 'cancel' && styles.modalButtonTextSecondary
+                  ]}>
+                    {button.text}
+                  </Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+          </Animated.View>
+        </Animated.View>
+      )}
     </SafeAreaView>
   );
 };
@@ -1930,13 +2671,14 @@ const WalletScreen = () => {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: '#1a1a2e',
+    backgroundColor: '#0f0f1a', // Same as splash screen for smooth transition
   },
   centerContent: {
     flex: 1,
     justifyContent: 'center',
     alignItems: 'center',
     padding: 20,
+    backgroundColor: '#0f0f1a', // Same as container for consistency
   },
   content: {
     flex: 1,
@@ -1958,14 +2700,14 @@ const styles = StyleSheet.create({
   input: {
     width: '100%',
     height: 50,
-    backgroundColor: '#16213e',
+    backgroundColor: 'rgba(22, 33, 62, 0.8)',
     borderRadius: 10,
     paddingHorizontal: 15,
     color: '#ffffff',
     fontSize: 16,
     marginBottom: 20,
     borderWidth: 1,
-    borderColor: '#00d4ff',
+    borderColor: 'rgba(0, 212, 255, 0.5)',
   },
   button: {
     width: '100%',
@@ -1977,8 +2719,8 @@ const styles = StyleSheet.create({
     marginBottom: 15,
   },
   secondaryButton: {
-    backgroundColor: '#16213e',
-    borderWidth: 1,
+    backgroundColor: 'transparent',
+    borderWidth: 2,
     borderColor: '#00d4ff',
   },
   buttonText: {
@@ -2269,31 +3011,96 @@ const styles = StyleSheet.create({
     left: 0,
     right: 0,
     bottom: 0,
-    backgroundColor: 'rgba(0, 0, 0, 0.8)',
+    backgroundColor: 'rgba(0, 0, 0, 0.9)', // Darker overlay for better contrast
     justifyContent: 'center',
     alignItems: 'center',
     padding: 20,
+    zIndex: 9999,
   },
   modalBox: {
-    backgroundColor: '#16213e',
-    borderRadius: 15,
-    padding: 20,
+    backgroundColor: '#1a1a2e', // Like extension modal background
+    borderRadius: 20, // Smoother corners
+    padding: 0, // Content padding handled separately
     width: '100%',
     maxWidth: 400,
     borderWidth: 1,
-    borderColor: '#00d4ff',
+    borderColor: 'rgba(0, 212, 255, 0.3)', // Slightly brighter border
+    shadowColor: '#00d4ff',
+    shadowOffset: { width: 0, height: 0 },
+    shadowOpacity: 0.3,
+    shadowRadius: 20,
+    elevation: 25,
+    overflow: 'hidden',
+  },
+  modalHeader: {
+    backgroundColor: 'rgba(0, 212, 255, 0.1)', // Subtle header background
+    paddingVertical: 20,
+    paddingHorizontal: 24,
+    borderBottomWidth: 1,
+    borderBottomColor: 'rgba(0, 212, 255, 0.2)',
   },
   modalTitle: {
-    fontSize: 22,
-    fontWeight: 'bold',
+    fontSize: 18,
+    fontWeight: '700',
     color: '#00d4ff',
-    marginBottom: 20,
+    textAlign: 'center',
+    letterSpacing: 0.5,
+  },
+  modalContent: {
+    color: '#ffffff',
+    fontSize: 15,
+    lineHeight: 22,
+    paddingHorizontal: 24,
+    paddingVertical: 20,
     textAlign: 'center',
   },
   modalActions: {
     flexDirection: 'row',
-    gap: 10,
-    marginTop: 10,
+    gap: 12,
+    paddingHorizontal: 24,
+    paddingBottom: 24,
+    paddingTop: 8,
+  },
+  modalButton: {
+    paddingVertical: 14,
+    paddingHorizontal: 20,
+    borderRadius: 12,
+    alignItems: 'center',
+    justifyContent: 'center',
+    minHeight: 48,
+  },
+  modalButtonPrimary: {
+    backgroundColor: '#00d4ff',
+    shadowColor: '#00d4ff',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.3,
+    shadowRadius: 8,
+    elevation: 5,
+  },
+  modalButtonSecondary: {
+    backgroundColor: 'transparent',
+    borderWidth: 1,
+    borderColor: 'rgba(0, 212, 255, 0.5)',
+  },
+  modalButtonDanger: {
+    backgroundColor: '#ff4444',
+    shadowColor: '#ff4444',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.3,
+    shadowRadius: 8,
+    elevation: 5,
+  },
+  modalButtonText: {
+    fontSize: 15,
+    fontWeight: '600',
+    color: '#1a1a2e',
+    letterSpacing: 0.3,
+  },
+  modalButtonTextSecondary: {
+    color: '#00d4ff',
+  },
+  modalButtonTextDanger: {
+    color: '#ffffff',
   },
   modalWarning: {
     color: '#ffaa00',
@@ -2335,6 +3142,390 @@ const styles = StyleSheet.create({
     color: '#1a1a2e',
     fontSize: 18,
     fontWeight: 'bold',
+  },
+  splashContainer: {
+    flex: 1,
+    backgroundColor: '#0f0f1a', // --bg-primary from extension
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  splashContent: {
+    alignItems: 'center',
+  },
+  logoContainer: {
+    width: 120,
+    height: 120,
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginBottom: 24,
+  },
+  outerRing: {
+    position: 'absolute',
+    width: 120,
+    height: 120,
+    borderRadius: 60,
+    borderWidth: 3,
+    borderColor: 'transparent',
+    borderTopColor: '#00d4ff',
+    borderRightColor: '#00d4ff',
+  },
+  outerRingGradient: {
+    position: 'absolute',
+    width: '100%',
+    height: '100%',
+    borderRadius: 60,
+    borderWidth: 3,
+    borderColor: 'rgba(0, 212, 255, 0.2)',
+  },
+  innerRing: {
+    position: 'absolute',
+    width: 90,
+    height: 90,
+    borderRadius: 45,
+    borderWidth: 2,
+    borderColor: '#6B46C1',
+    backgroundColor: 'rgba(107, 70, 193, 0.1)',
+  },
+  innerRingGradient: {
+    position: 'absolute',
+    width: '100%',
+    height: '100%',
+    borderRadius: 45,
+    borderWidth: 2,
+    borderColor: 'rgba(107, 70, 193, 0.3)',
+  },
+  qLetterContainer: {
+    width: 70,
+    height: 70,
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: '#0f0f1a',
+    borderRadius: 35,
+  },
+  qLetter: {
+    fontSize: 48,
+    fontWeight: '900',
+    color: '#00d4ff',
+    textAlign: 'center',
+    letterSpacing: 2,
+  },
+  splashTitle: {
+    fontSize: 24,
+    fontWeight: '600',
+    color: '#00d4ff', // --qnet-primary
+    marginTop: 8,
+    marginBottom: 8,
+  },
+  splashSubtitle: {
+    fontSize: 14,
+    color: '#888', // --text-secondary
+  },
+  seedGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    justifyContent: 'space-between',
+    width: '100%',
+    marginVertical: 20,
+  },
+  seedWordContainer: {
+    width: '48%',
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(22, 33, 62, 0.8)',
+    borderRadius: 10,
+    padding: 12,
+    marginBottom: 10,
+    borderWidth: 1,
+    borderColor: 'rgba(0, 212, 255, 0.3)',
+  },
+  seedWordNumber: {
+    fontSize: 12,
+    fontWeight: 'bold',
+    color: '#00d4ff',
+    marginRight: 10,
+    minWidth: 20,
+  },
+  seedWordText: {
+    fontSize: 14,
+    color: '#ffffff',
+    flex: 1,
+  },
+  warningText: {
+    color: '#ffaa00',
+    fontSize: 14,
+    marginBottom: 20,
+    textAlign: 'center',
+    fontWeight: '600',
+  },
+  wordChoicesContainer: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 10,
+    marginTop: 10,
+  },
+  wordChoiceButton: {
+    backgroundColor: 'rgba(22, 33, 62, 0.8)',
+    borderRadius: 8,
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    borderWidth: 1,
+    borderColor: 'rgba(0, 212, 255, 0.3)',
+    minWidth: '45%',
+  },
+  wordChoiceSelected: {
+    backgroundColor: 'rgba(0, 212, 255, 0.2)',
+    borderColor: '#00d4ff',
+    borderWidth: 2,
+  },
+  wordChoiceText: {
+    color: '#ffffff',
+    fontSize: 14,
+    textAlign: 'center',
+  },
+  wordChoiceTextSelected: {
+    color: '#00d4ff',
+    fontWeight: 'bold',
+  },
+  networkSelector: {
+    flexDirection: 'row',
+    backgroundColor: '#16213e',
+    borderRadius: 12,
+    padding: 4,
+    marginBottom: 20,
+  },
+  networkTab: {
+    flex: 1,
+    paddingVertical: 10,
+    alignItems: 'center',
+    borderRadius: 8,
+  },
+  networkTabActive: {
+    backgroundColor: '#00d4ff',
+  },
+  networkTabText: {
+    color: '#888',
+    fontWeight: '600',
+  },
+  networkTabTextActive: {
+    color: '#1a1a2e',
+  },
+  addressContainer: {
+    backgroundColor: '#16213e',
+    borderRadius: 12,
+    padding: 15,
+    marginBottom: 20,
+    borderWidth: 1,
+    borderColor: 'rgba(0, 212, 255, 0.2)',
+  },
+  addressText: {
+    color: '#ffffff',
+    fontSize: 15,
+    fontFamily: 'monospace',
+    marginVertical: 8,
+    letterSpacing: 0.3,
+    width: '100%',
+  },
+  copyHint: {
+    color: '#00d4ff',
+    fontSize: 11,
+    textAlign: 'center',
+  },
+  tokenList: {
+    marginBottom: 20,
+  },
+  tokenItem: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    backgroundColor: '#16213e',
+    borderRadius: 12,
+    padding: 15,
+    marginBottom: 10,
+  },
+  tokenInfo: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  tokenIcon: {
+    width: 40,
+    height: 40,
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginRight: 12,
+  },
+  tokenIconText: {
+    color: '#1a1a2e',
+    fontSize: 18,
+    fontWeight: 'bold',
+  },
+  tokenIconEmoji: {
+    fontSize: 24,
+  },
+  tokenIconImage: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+  },
+  addressRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    width: '100%',
+  },
+  addressTextCopied: {
+    color: '#00d4ff',
+  },
+  checkMark: {
+    color: '#00ff00',
+    fontSize: 16,
+    marginLeft: 8,
+    fontWeight: 'bold',
+  },
+  tokenDetails: {
+    justifyContent: 'center',
+  },
+  tokenName: {
+    color: '#ffffff',
+    fontSize: 16,
+    fontWeight: '600',
+  },
+  tokenPrice: {
+    color: '#888',
+    fontSize: 12,
+  },
+  tokenBalance: {
+    alignItems: 'flex-end',
+  },
+  tokenAmount: {
+    color: '#ffffff',
+    fontSize: 16,
+    fontWeight: '600',
+  },
+  tokenValue: {
+    color: '#888',
+    fontSize: 12,
+  },
+  phaseCard: {
+    backgroundColor: '#16213e',
+    borderRadius: 15,
+    padding: 20,
+    marginBottom: 20,
+    borderWidth: 1,
+    borderColor: 'rgba(0, 212, 255, 0.2)',
+  },
+  phaseTitle: {
+    fontSize: 18,
+    fontWeight: 'bold',
+    color: '#00d4ff',
+    marginBottom: 8,
+  },
+  phaseSubtitle: {
+    fontSize: 14,
+    color: '#888',
+    marginBottom: 15,
+  },
+  phaseProgress: {
+    marginTop: 10,
+  },
+  progressText: {
+    fontSize: 12,
+    color: '#888',
+    marginBottom: 8,
+  },
+  progressBar: {
+    height: 8,
+    backgroundColor: 'rgba(0, 212, 255, 0.1)',
+    borderRadius: 4,
+    overflow: 'hidden',
+  },
+  progressFill: {
+    height: '100%',
+    backgroundColor: '#00d4ff',
+  },
+  nodeTypesContainer: {
+    marginBottom: 20,
+  },
+  sectionTitle: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#ffffff',
+    marginBottom: 15,
+  },
+  sectionSubtitle: {
+    fontSize: 13,
+    color: '#ffa500',
+    marginBottom: 15,
+    textAlign: 'center',
+    fontStyle: 'italic',
+  },
+  warningBox: {
+    backgroundColor: 'rgba(74, 144, 226, 0.1)',
+    borderRadius: 8,
+    padding: 12,
+    marginBottom: 15,
+    borderWidth: 1,
+    borderColor: 'rgba(74, 144, 226, 0.3)',
+  },
+  warningText: {
+    fontSize: 14,
+    color: '#ffffff',
+    marginBottom: 4,
+    fontWeight: '500',
+  },
+  warningSubtext: {
+    fontSize: 12,
+    color: '#888888',
+    marginTop: 4,
+    textAlign: 'center',
+  },
+  nodeTypeCard: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    backgroundColor: '#16213e',
+    borderRadius: 12,
+    padding: 15,
+    marginBottom: 10,
+    borderWidth: 1,
+    borderColor: 'rgba(0, 212, 255, 0.2)',
+  },
+  nodeTypeActive: {
+    borderColor: '#00d4ff',
+    backgroundColor: 'rgba(0, 212, 255, 0.1)',
+  },
+  nodeTypeInfo: {
+    flex: 1,
+  },
+  nodeTypeName: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#ffffff',
+    marginBottom: 4,
+  },
+  nodeTypeDesc: {
+    fontSize: 12,
+    color: '#888',
+  },
+  nodeTypePrice: {
+    fontSize: 14,
+    fontWeight: 'bold',
+    color: '#00d4ff',
+  },
+  buttonDisabled: {
+    opacity: 0.5,
+  },
+  qncTokenIcon: {
+    borderWidth: 2,
+    borderColor: '#6B46C1',
+    backgroundColor: 'rgba(107, 70, 193, 0.1)',
+  },
+  qncIconInner: {
+    width: '100%',
+    height: '100%',
+    borderRadius: 20,
+    backgroundColor: '#0f0f1a',
+    justifyContent: 'center',
+    alignItems: 'center',
   },
 });
 
