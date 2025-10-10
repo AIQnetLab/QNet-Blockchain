@@ -2085,6 +2085,62 @@ export class WalletManager {
     }
   }
 
+  // Generate QNet address from Solana address (for simple display)
+  generateQNetAddressFromSolana(solanaAddress) {
+    try {
+      // Generate deterministic QNet address from Solana address
+      const hash = CryptoJS.SHA512(solanaAddress + 'qnet_eon_bridge');
+      const fullHash = hash.toString(CryptoJS.enc.Hex);
+      
+      // New long format: 19 chars + "eon" + 15 chars + 4 char checksum = 41 total
+      const part1 = fullHash.substring(0, 19).toLowerCase();
+      const part2 = fullHash.substring(19, 34).toLowerCase();
+      
+      // Generate checksum
+      const checksumData = `qnet_${part1}_eon_${part2}`;
+      const checksumHash = CryptoJS.SHA256(checksumData);
+      const checksum = checksumHash.toString(CryptoJS.enc.Hex).substring(0, 4);
+      
+      return `qnet_${part1}_eon_${part2}_${checksum}`;
+    } catch (error) {
+      console.error('Error generating QNet address from Solana:', error);
+      return null;
+    }
+  }
+  
+  // Migrate old short QNet address to new long format
+  async migrateQNetAddress(wallet) {
+    try {
+      // Check if wallet has QNet address
+      if (!wallet.qnetAddress) {
+        // Generate new address from Solana address
+        wallet.qnetAddress = this.generateQNetAddressFromSolana(wallet.solanaAddress || wallet.address);
+        return wallet;
+      }
+      
+      // Check if it's old format (short - less than 40 chars)
+      if (wallet.qnetAddress.length < 40) {
+        console.log('Migrating old short QNet address to new long format');
+        
+        // Generate new long format address
+        if (wallet.mnemonic) {
+          // If we have mnemonic, generate from it for consistency
+          wallet.qnetAddress = await this.generateQNetAddressFromMnemonic(wallet.mnemonic, 0);
+        } else {
+          // Otherwise generate from Solana address
+          wallet.qnetAddress = this.generateQNetAddressFromSolana(wallet.solanaAddress || wallet.address);
+        }
+        
+        console.log('Migrated to new QNet address:', wallet.qnetAddress);
+      }
+      
+      return wallet;
+    } catch (error) {
+      console.error('Error migrating QNet address:', error);
+      return wallet;
+    }
+  }
+
   // Generate QNet EON address (compatible with extension wallet)
   async generateQNetAddress(seed, accountIndex = 0) {
     try {
@@ -2353,6 +2409,9 @@ export class WalletManager {
   // Encrypt and store wallet with PBKDF2 + AES (like extension)
   async storeWallet(walletData, password) {
     try {
+      // Clear old activation codes when storing new wallet
+      await AsyncStorage.removeItem('qnet_activation_codes');
+      
       // Generate random salt (32 bytes)
       const salt = CryptoJS.lib.WordArray.random(32);
       
@@ -2423,7 +2482,47 @@ export class WalletManager {
         if (!decrypted) {
           throw new Error('Invalid password');
         }
-        return JSON.parse(decrypted);
+        let wallet = JSON.parse(decrypted);
+        
+        // Migrate old QNet address format to new if needed
+        wallet = await this.migrateQNetAddress(wallet);
+        
+        // Store migrated wallet in new format
+        if (wallet.qnetAddress && wallet.qnetAddress.length >= 40) {
+          // Generate salt and IV for new format
+          const salt = CryptoJS.lib.WordArray.random(256/8);
+          const iv = CryptoJS.lib.WordArray.random(128/8);
+          
+          // Derive key
+          const key = CryptoJS.PBKDF2(password, salt, {
+            keySize: 256/32,
+            iterations: 10000,
+            hasher: CryptoJS.algo.SHA256
+          });
+          
+          // Encrypt with new format
+          const updatedEncrypted = CryptoJS.AES.encrypt(
+            JSON.stringify(wallet),
+            key,
+            {
+              iv: iv,
+              mode: CryptoJS.mode.CBC,
+              padding: CryptoJS.pad.Pkcs7
+            }
+          ).toString();
+          
+          const updatedVaultData = {
+            encrypted: updatedEncrypted,
+            salt: salt.toString(CryptoJS.enc.Hex),
+            iv: iv.toString(CryptoJS.enc.Hex)
+          };
+          await AsyncStorage.setItem('qnet_wallet', JSON.stringify(updatedVaultData));
+          
+          // Also update the stored QNet address
+          await AsyncStorage.setItem('qnet_address', wallet.qnetAddress);
+        }
+        
+        return wallet;
       }
       
       // New format with salt and IV
@@ -2461,7 +2560,36 @@ export class WalletManager {
       }
       
       try {
-        return JSON.parse(decryptedStr);
+        let wallet = JSON.parse(decryptedStr);
+        
+        // Migrate old QNet address format to new if needed
+        wallet = await this.migrateQNetAddress(wallet);
+        
+        // Store migrated wallet if it was updated
+        if (wallet.qnetAddress && wallet.qnetAddress.length >= 40) {
+          // Re-encrypt with migrated data
+          const updatedEncrypted = CryptoJS.AES.encrypt(
+            JSON.stringify(wallet),
+            key,
+            {
+              iv: iv,
+              mode: CryptoJS.mode.CBC,
+              padding: CryptoJS.pad.Pkcs7
+            }
+          ).toString();
+          
+          const updatedVaultData = {
+            encrypted: updatedEncrypted,
+            salt: vaultData.salt,
+            iv: vaultData.iv
+          };
+          await AsyncStorage.setItem('qnet_wallet', JSON.stringify(updatedVaultData));
+          
+          // Also update the stored QNet address
+          await AsyncStorage.setItem('qnet_address', wallet.qnetAddress);
+        }
+        
+        return wallet;
       } catch (parseError) {
         console.error('Failed to parse decrypted data');
         throw new Error('Wrong password or corrupted wallet');
@@ -2570,39 +2698,9 @@ export class WalletManager {
       
       const TOTAL_SUPPLY = 1000000000; // 1 billion total supply
       
-      // Check burn contract tracker address for actual burned amount
-      const BURN_TRACKER = 'D7g7mkL8o1YEex6ZgETJEQyyHV7uuUMvV3Fy3u83igJ7';
+      console.log('[getBurnProgress] Fetching token supply for:', oneDevMint, 'isTestnet:', isTestnet);
       
-      // First try to get burn tracker account info
-      const burnTrackerResponse = await fetch(rpcUrl, {
-        method: 'POST', 
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          jsonrpc: '2.0',
-          id: 1,
-          method: 'getAccountInfo',
-          params: [BURN_TRACKER, { encoding: 'jsonParsed' }]
-        })
-      });
-      
-      if (burnTrackerResponse.ok) {
-        const burnData = await burnTrackerResponse.json();
-        if (burnData.result && burnData.result.value) {
-          // Parse burned amount from contract data
-          // For now use estimated values based on actual burn activity
-          if (isTestnet) {
-            // Testnet has active burning for testing
-            return '2.3'; // 23M burned out of 1B = 2.3%
-          } else {
-            // Mainnet has less burns so far  
-            return '0.8'; // 8M burned out of 1B = 0.8%
-          }
-        }
-      }
-      
-      // Alternative: Try to get current supply and calculate difference
+      // Try to get current supply and calculate burned amount
       const response = await fetch(rpcUrl, {
         method: 'POST',
         headers: {
@@ -2618,46 +2716,147 @@ export class WalletManager {
       
       if (response.ok) {
         const data = await response.json();
+        console.log('[getBurnProgress] Response data:', data);
+        
         if (data.result && data.result.value) {
           const currentSupply = parseFloat(data.result.value.amount) / Math.pow(10, data.result.value.decimals || 6);
           const burnedAmount = TOTAL_SUPPLY - currentSupply;
           
+          console.log('[getBurnProgress] Current supply:', currentSupply, 'Burned:', burnedAmount);
+          
           // Only return if we have a reasonable burned amount
           if (burnedAmount > 0 && burnedAmount < TOTAL_SUPPLY) {
-            const burnPercentage = (burnedAmount / TOTAL_SUPPLY * 100).toFixed(1);
-            return burnPercentage;
+            const burnPercentage = (burnedAmount / TOTAL_SUPPLY * 100);
+            // Show more precision for small percentages
+            if (burnPercentage < 0.01) {
+              const result = burnPercentage.toFixed(4);
+              console.log('[getBurnProgress] Burn percentage:', result + '%');
+              return result;
+            } else if (burnPercentage < 1) {
+              const result = burnPercentage.toFixed(3);
+              console.log('[getBurnProgress] Burn percentage:', result + '%');
+              return result;
+            } else {
+              const result = burnPercentage.toFixed(1);
+              console.log('[getBurnProgress] Burn percentage:', result + '%');
+              return result;
+            }
           }
         }
+      } else {
+        console.error('[getBurnProgress] Failed to fetch:', response.status, response.statusText);
       }
       
-      // Fallback values based on known burns
-      return isTestnet ? '2.3' : '0.8';
+      // Fallback values
+      console.log('[getBurnProgress] Returning default 0.0%');
+      return '0.0';
     } catch (error) {
-      console.error('Error fetching burn progress:', error);
-      // Return conservative estimates
-      return isTestnet ? '2.3' : '0.8';
+      console.error('[getBurnProgress] Error:', error);
+      // Return zero if can't fetch real data
+      return '0.0';
     }
   }
 
   // Burn tokens for node activation (real implementation)
-  async burnTokensForNode(nodeType, amount = 1500) {
+  async burnTokensForNode(nodeType, amount = 1500, isTestnet = false, password) {
     try {
-      // This would connect to the actual burn program on Solana
-      // For production, implement the actual transaction
-      const burnTx = {
+      const web3 = require('@solana/web3.js');
+      const { Transaction, SystemProgram, Connection, Keypair, PublicKey } = web3;
+      const { createBurnInstruction, getAssociatedTokenAddress, TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID } = require('@solana/spl-token');
+      
+      const connection = new Connection(
+        isTestnet ? 'https://api.devnet.solana.com' : 'https://api.mainnet-beta.solana.com',
+        'confirmed'
+      );
+      
+      // Load and decrypt wallet properly
+      if (!password) {
+        throw new Error('Password required for burning tokens');
+      }
+      
+      const wallet = await this.loadWallet(password);
+      
+      if (!wallet.secretKey) {
+        throw new Error('Secret key not found');
+      }
+      
+      // Create keypair from secret key
+      const keypair = Keypair.fromSecretKey(new Uint8Array(wallet.secretKey));
+      
+      // Token mint address for 1DEV
+      const tokenMint = new PublicKey(
+        isTestnet 
+          ? '62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ' // Devnet
+          : '4R3DPW4BY97kJRfv8J5wgTtbDpoXpRv92W957tXMpump' // Mainnet
+      );
+      
+      // Get associated token address
+      const tokenAccount = await getAssociatedTokenAddress(
+        tokenMint,
+        keypair.publicKey,
+        false,
+        TOKEN_PROGRAM_ID,
+        ASSOCIATED_TOKEN_PROGRAM_ID
+      );
+      
+      // Check token balance
+      const tokenAccountInfo = await connection.getTokenAccountBalance(tokenAccount);
+      if (!tokenAccountInfo || !tokenAccountInfo.value) {
+        throw new Error('No 1DEV token account found');
+      }
+      
+      const tokenBalance = tokenAccountInfo.value.uiAmount || 0;
+      if (tokenBalance < amount) {
+        throw new Error(`Insufficient 1DEV balance: ${tokenBalance}, required: ${amount}`);
+      }
+      
+      // Get recent blockhash
+      const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('finalized');
+      
+      // Create burn instruction
+      const burnAmount = amount * Math.pow(10, 6); // Convert to lamports (6 decimals for 1DEV)
+      const burnInstruction = createBurnInstruction(
+        tokenAccount,      // Token account to burn from
+        tokenMint,         // Token mint
+        keypair.publicKey, // Owner
+        burnAmount,        // Amount to burn
+        [],                // Multisingers (empty)
+        TOKEN_PROGRAM_ID   // Token program
+      );
+      
+      // Create and send transaction
+      const transaction = new Transaction().add(burnInstruction);
+      transaction.recentBlockhash = blockhash;
+      transaction.feePayer = keypair.publicKey;
+      
+      // Sign transaction
+      transaction.sign(keypair);
+      
+      // Send transaction
+      const signature = await connection.sendRawTransaction(transaction.serialize(), {
+        skipPreflight: false,
+        preflightCommitment: 'processed'
+      });
+      
+      // Wait for confirmation
+      const confirmation = await connection.confirmTransaction({
+        signature,
+        blockhash,
+        lastValidBlockHeight
+      }, 'confirmed');
+      
+      if (!confirmation.value.err) {
+        console.log('✅ Tokens burned successfully!', signature);
+        return {
         nodeType,
         amount,
         timestamp: Date.now(),
-        txHash: 'burn_' + Math.random().toString(36).substr(2, 9)
-      };
-      
-      // In production, this would:
-      // 1. Create burn transaction
-      // 2. Sign with wallet
-      // 3. Send to Solana network
-      // 4. Wait for confirmation
-      
-      return burnTx;
+          txHash: signature,
+          explorer: `https://explorer.solana.com/tx/${signature}?cluster=${isTestnet ? 'devnet' : 'mainnet-beta'}`
+        };
+      } else {
+        throw new Error('Transaction failed: ' + JSON.stringify(confirmation.value.err));
+      }
     } catch (error) {
       console.error('Error burning tokens:', error);
       throw error;
@@ -2667,33 +2866,21 @@ export class WalletManager {
   // Generate secure activation code (like extension)
   generateActivationCode(nodeType = 'full', address = '') {
     try {
-      // Generate random bytes for entropy (18 bytes = 36 hex chars)
-      const randomBytes = new Uint8Array(18);
-      
-      // Use crypto-secure random values
-      if (typeof crypto !== 'undefined' && crypto.getRandomValues) {
-        crypto.getRandomValues(randomBytes);
-      } else {
-        // Fallback for React Native - use CryptoJS
-        const randomWords = CryptoJS.lib.WordArray.random(18);
-        for (let i = 0; i < 18; i++) {
-          randomBytes[i] = (randomWords.words[Math.floor(i / 4)] >> (24 - (i % 4) * 8)) & 0xff;
-        }
+      if (!address) {
+        throw new Error('Address required for activation code generation');
       }
       
-      // Convert to hex string
-      const hexString = Array.from(randomBytes)
-        .map(b => b.toString(16).padStart(2, '0'))
-        .join('')
-        .toUpperCase();
+      // Generate deterministic code based on address and node type
+      // This ensures same code is generated in mobile and extension
+      const data = `${address}-${nodeType}-activation`;
+      const hash = CryptoJS.SHA256(data);
+      const hashHex = hash.toString(CryptoJS.enc.Hex).toUpperCase();
       
-      // Create three 6-character segments
-      const segment1 = hexString.substring(0, 6);
-      const segment2 = hexString.substring(6, 12);
-      const segment3 = hexString.substring(12, 18);
+      // Format as QNET-NODETYPE-XXXXXXXXXX
+      const nodeTypeCode = nodeType.toUpperCase().substring(0, 5).padEnd(5, 'X');
+      const codeSegment = hashHex.substring(0, 12);
       
-      // Format as QNET-XXXXXX-XXXXXX-XXXXXX
-      const code = `QNET-${segment1}-${segment2}-${segment3}`;
+      const code = `QNET-${nodeTypeCode}-${codeSegment}`;
       
       return code;
     } catch (error) {
@@ -2789,6 +2976,60 @@ export class WalletManager {
     }
   }
 
+  // Get all stored activation codes
+  async getStoredActivationCodes(password) {
+    try {
+      const codesStr = await AsyncStorage.getItem('qnet_activation_codes');
+      if (!codesStr) return {};
+      
+      const encryptedCodes = JSON.parse(codesStr);
+      const decryptedCodes = {};
+      
+      for (const [nodeType, codeData] of Object.entries(encryptedCodes)) {
+        try {
+          // Check if it's the new format with salt and iv
+          if (codeData.salt && codeData.iv) {
+            // Parse encryption parameters
+            const salt = CryptoJS.enc.Hex.parse(codeData.salt);
+            const iv = CryptoJS.enc.Hex.parse(codeData.iv);
+            
+            // Derive key from password
+            const key = CryptoJS.PBKDF2(password, salt, {
+              keySize: 256/32,
+              iterations: 10000,
+              hasher: CryptoJS.algo.SHA256
+            });
+            
+            // Decrypt the activation code
+            const decrypted = CryptoJS.AES.decrypt(codeData.encrypted, key, {
+              iv: iv,
+              mode: CryptoJS.mode.CBC,
+              padding: CryptoJS.pad.Pkcs7
+            });
+            
+            const code = decrypted.toString(CryptoJS.enc.Utf8);
+            if (code) {
+              decryptedCodes[nodeType] = {
+                code,
+                timestamp: codeData.timestamp || Date.now()
+              };
+            }
+          } else {
+            // Old format - try direct decryption (or skip old codes)
+            console.log(`Skipping old format activation code for ${nodeType}`);
+          }
+        } catch (err) {
+          console.error(`Failed to decrypt ${nodeType} code:`, err);
+        }
+      }
+      
+      return decryptedCodes;
+    } catch (error) {
+      console.error('Error getting stored activation codes:', error);
+      return {};
+    }
+  }
+
   // Check if wallet exists and is valid
   async walletExists() {
     try {
@@ -2811,6 +3052,45 @@ export class WalletManager {
     } catch (error) {
       console.error('Error checking wallet existence:', error);
       return false;
+    }
+  }
+  
+  // Get current wallet without password (returns null if not available)
+  async getCurrentWallet() {
+    try {
+      // We can't get decrypted wallet without password, 
+      // but we can return basic structure that loadBalance needs
+      const exists = await this.walletExists();
+      if (!exists) {
+        return null;
+      }
+      
+      // Return a minimal wallet structure with what we know
+      const solanaAddress = await AsyncStorage.getItem('qnet_wallet_address');
+      if (solanaAddress) {
+        // Check for stored QNet address first
+        let qnetAddress = await AsyncStorage.getItem('qnet_address');
+        
+        // If no QNet address or it's old format, generate/migrate
+        if (!qnetAddress || qnetAddress.length < 40) {
+          qnetAddress = this.generateQNetAddressFromSolana(solanaAddress);
+          // Store the new address for future use
+          if (qnetAddress) {
+            await AsyncStorage.setItem('qnet_address', qnetAddress);
+          }
+        }
+        
+        return {
+          address: solanaAddress,
+          solanaAddress: solanaAddress,
+          qnetAddress: qnetAddress,
+          publicKey: solanaAddress // Use Solana address as publicKey
+        };
+      }
+      return null;
+    } catch (error) {
+      console.error('Error getting current wallet:', error);
+      return null;
     }
   }
 }

@@ -11,7 +11,10 @@ import {
   Clipboard,
   Image,
   Platform,
-  RefreshControl
+  RefreshControl,
+  TouchableWithoutFeedback,
+  DeviceEventEmitter,
+  Linking
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -696,7 +699,10 @@ const WalletScreen = () => {
   const [nodeStatus, setNodeStatus] = useState(null); // 'light', 'full', or 'super'
   const [copiedAddress, setCopiedAddress] = useState(''); // Track which address was copied
   const [burnProgress, setBurnProgress] = useState('0.0'); // Real burn progress from blockchain
+  const [activatingNode, setActivatingNode] = useState(false); // For node activation loading state
   const [verificationError, setVerificationError] = useState(''); // Error message for seed verification
+  const [activatedNodeType, setActivatedNodeType] = useState(null); // Track which node type is activated
+  const [activationCode, setActivationCode] = useState(null); // Store the activation code
 
   // Helper function to show custom styled alerts
   const showAlert = (title, message, buttons = [{ text: 'OK', onPress: () => {} }]) => {
@@ -762,8 +768,7 @@ const WalletScreen = () => {
 
   const loadBurnProgress = async () => {
     try {
-      // NOTE: inverted - when isTestnet is true in UI, we pass false to use devnet
-      const progress = await walletManager.getBurnProgress(!isTestnet);
+      const progress = await walletManager.getBurnProgress(isTestnet);
       setBurnProgress(progress);
     } catch (error) {
       console.error('Failed to load burn progress:', error);
@@ -813,19 +818,29 @@ const WalletScreen = () => {
 
   // Auto-lock timer
   useEffect(() => {
-    if (wallet && hasWallet) {
+    if (wallet && hasWallet && autoLockTime !== 'never') {
+      // Use a ref to track last activity time to avoid re-creating the interval
+      const lastActivityRef = { current: Date.now() };
+      
       // Reset timer on any activity
       const resetTimer = () => {
+        lastActivityRef.current = Date.now();
         setLastActivityTime(Date.now());
       };
+
+      // Add global touch listener for activity tracking
+      const touchListener = () => resetTimer();
+      
+      // Subscribe to touch events
+      const subscription = DeviceEventEmitter.addListener('userActivity', touchListener);
 
       // Start auto-lock check
       const checkAutoLock = setInterval(() => {
         const now = Date.now();
-        const inactiveTime = now - lastActivityTime;
+        const inactiveTime = now - lastActivityRef.current;
         const lockTimeMs = parseInt(autoLockTime) * 60 * 1000; // Convert minutes to ms
 
-        if (inactiveTime >= lockTimeMs && autoLockTime !== 'never') {
+        if (inactiveTime >= lockTimeMs) {
           // Lock wallet
           setWallet(null);
           showAlert('Session Expired', 'Wallet locked due to inactivity');
@@ -836,9 +851,54 @@ const WalletScreen = () => {
 
       return () => {
         clearInterval(checkAutoLock);
+        subscription?.remove();
       };
     }
-  }, [wallet, hasWallet, lastActivityTime, autoLockTime]);
+  }, [wallet, hasWallet, autoLockTime]);
+
+  // Auto-refresh balance every 5 seconds when in assets tab
+  useEffect(() => {
+    if (wallet && wallet.publicKey && activeTab === 'assets') {
+      // Load balance immediately
+      console.log('Loading balance for assets tab - network:', selectedNetwork, isTestnet ? 'testnet' : 'mainnet');
+      loadBalance(wallet.publicKey);
+
+      // Set up auto-refresh only for assets tab
+      const balanceInterval = setInterval(() => {
+        if (wallet && wallet.publicKey && activeTab === 'assets') {
+          console.log('Auto-refresh balance (5s) - network:', selectedNetwork, isTestnet ? 'testnet' : 'mainnet');
+          loadBalance(wallet.publicKey);
+        }
+      }, 5000); // Refresh every 5 seconds
+
+      return () => {
+        clearInterval(balanceInterval);
+      };
+    }
+  }, [wallet, isTestnet, selectedNetwork, activeTab]); // Reload on any network or tab change
+
+  // Check for existing activation codes when wallet is loaded
+  useEffect(() => {
+    const checkActivationStatus = async () => {
+      if (wallet && wallet.address) {
+        try {
+          const storedCodes = await walletManager.getStoredActivationCodes();
+          if (storedCodes && Object.keys(storedCodes).length > 0) {
+            // Get the first (and should be only) activation code
+            const nodeType = Object.keys(storedCodes)[0];
+            const code = storedCodes[nodeType];
+            setActivatedNodeType(nodeType);
+            setActivationCode(code);
+            console.log('Found existing activation:', nodeType, code);
+          }
+        } catch (error) {
+          console.error('Error checking activation status:', error);
+        }
+      }
+    };
+    
+    checkActivationStatus();
+  }, [wallet]);
 
   const checkWalletExists = async () => {
     try {
@@ -989,7 +1049,10 @@ const WalletScreen = () => {
       setImportStep(1); // Reset to step 1 for next time
       
       showAlert('Success', 'Wallet imported successfully!');
+      // Force immediate balance load
+      setTimeout(() => {
       loadBalance(imported.publicKey);
+      }, 500);
     } catch (error) {
       showAlert('Error', 'Failed to import wallet: ' + error.message);
     }
@@ -1050,7 +1113,7 @@ const WalletScreen = () => {
       const qnetAddr = tempWallet.qnetAddress || 'Generating...';
       const solanaAddr = tempWallet.solanaAddress || tempWallet.address;
       showAlert(
-        '✅ Wallet Created Successfully!', 
+        'Wallet Created Successfully', 
         `Your QNet Wallet is ready to use.\n\nQNet Address:\n${qnetAddr}\n\nSolana Address:\n${solanaAddr}\n\nYou can now manage QNet and Solana assets securely.`
       );
       loadBalance(tempWallet.publicKey);
@@ -1072,7 +1135,10 @@ const WalletScreen = () => {
     try {
       const loadedWallet = await walletManager.loadWallet(password);
       setWallet(loadedWallet);
+      // Add a small delay to ensure wallet state is set
+      setTimeout(() => {
       loadBalance(loadedWallet.publicKey);
+      }, 100);
     } catch (error) {
       console.error('Wallet unlock error:', error);
       // Check if it's a corrupted wallet issue
@@ -1113,31 +1179,33 @@ const WalletScreen = () => {
 
   const loadBalance = async (publicKey) => {
     try {
-      // Check if wallet exists before accessing properties
-      if (!wallet) {
-        console.warn('Wallet not loaded yet');
-        return;
-      }
+      // Get current wallet reference (might be set after initial call)
+      const currentWallet = wallet || await walletManager.getCurrentWallet();
       
-      // Get SOL balance from correct network  
-      // NOTE: inverted - when isTestnet is true in UI, we pass false to use devnet
-      const bal = await walletManager.getBalance(publicKey, !isTestnet);
+      console.log('Loading balances for:', publicKey, 
+                  'Selected Network:', selectedNetwork,
+                  'Mode:', isTestnet ? 'Testnet' : 'Mainnet');
+      
+      // Always load SOL balance (used in both networks)
+      const bal = await walletManager.getBalance(publicKey, isTestnet);
+      console.log('SOL balance:', bal);
       setBalance(bal);
       
       // Get 1DEV token balance - use correct address based on network
-      // NOTE: inverted logic for UI consistency
-      const oneDevMint = !isTestnet 
+      const oneDevMint = isTestnet 
         ? '62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ'  // Testnet/Devnet
         : '4R3DPW4BY97kJRfv8J5wgTtbDpoXpRv92W957tXMpump'; // Mainnet (pump.fun)
       
       // Use Solana address for token balance (not QNet address)
-      const solanaAddr = wallet.solanaAddress || wallet.address || publicKey;
-      const oneDevBalance = await walletManager.getTokenBalance(solanaAddr, oneDevMint, !isTestnet);
+      const solanaAddr = currentWallet?.solanaAddress || currentWallet?.address || publicKey;
+      const oneDevBalance = await walletManager.getTokenBalance(solanaAddr, oneDevMint, isTestnet);
+      console.log('1DEV balance:', oneDevBalance);
       
       // For QNC, we'll need the actual mint address when deployed
       // For now, set to 0 as it's not yet deployed
       const qncBalance = 0;
       
+      // Update all balances
       setTokenBalances({
         qnc: qncBalance,
         sol: bal,
@@ -1148,6 +1216,15 @@ const WalletScreen = () => {
       await fetchTokenPrices();
     } catch (error) {
       console.error('Error loading balance:', error);
+      // Retry once after a delay if network error
+      if (error.message && (error.message.includes('fetch') || error.message.includes('network'))) {
+        console.log('Network error, retrying balance fetch in 2 seconds...');
+        setTimeout(() => {
+          if (wallet && wallet.publicKey) {
+            loadBalance(wallet.publicKey);
+          }
+        }, 2000);
+      }
     }
   };
 
@@ -1254,11 +1331,21 @@ const WalletScreen = () => {
 
     try {
       setLoading(true);
-      const walletData = await walletManager.loadWallet(exportPassword);
+      
+      let walletData;
+      try {
+        walletData = await walletManager.loadWallet(exportPassword);
+      } catch (error) {
+        setLoading(false);
+        setExportPassword('');
+        showAlert('Error', 'Incorrect password');
+        return;
+      }
       
       if (!walletData || !walletData.mnemonic) {
-        showAlert('Error', 'Incorrect password or wallet data corrupted');
         setLoading(false);
+        setExportPassword('');
+        showAlert('Error', 'Incorrect password');
         return;
       }
 
@@ -1273,13 +1360,19 @@ const WalletScreen = () => {
         '⚠️ Recovery Phrase',
         `${formattedSeed}\n\n Keep it safe and never share!`,
         [
-          { text: 'I Saved It', style: 'default' }
+          { text: 'Copy', onPress: () => {
+            Clipboard.setString(walletData.mnemonic);
+            showAlert('📋 Copied', 'Recovery phrase copied to clipboard');
+          }},
+          { text: 'OK', style: 'default' }
         ]
       );
     } catch (error) {
-      showAlert('Error', 'Incorrect password');
+      console.error('Export seed error:', error);
+      showAlert('Error', 'Failed to export seed phrase');
     } finally {
       setLoading(false);
+      setExportPassword('');
     }
   };
 
@@ -1293,41 +1386,63 @@ const WalletScreen = () => {
       setLoading(true);
       
       // Verify password by trying to decrypt wallet
-      const walletData = await walletManager.loadWallet(exportPassword);
-      
-      if (!walletData || !walletData.publicKey) {
-        showAlert('Error', 'Incorrect password');
+      let walletData;
+      try {
+        walletData = await walletManager.loadWallet(exportPassword);
+      } catch (error) {
         setLoading(false);
         setExportPassword('');
+        showAlert('Error', 'Incorrect password');
+        return;
+      }
+      
+      if (!walletData || !walletData.publicKey) {
+        setLoading(false);
+        setExportPassword('');
+        showAlert('Error', 'Incorrect password');
         return;
       }
 
-      // Try to load existing activation code first
-      let code = await walletManager.loadActivationCode('full', exportPassword);
+      // Get stored activation codes
+      const storedCodes = await walletManager.getStoredActivationCodes(exportPassword);
       
-      if (!code) {
-        // Generate new secure activation code if none exists
-        code = walletManager.generateActivationCode('full', walletData.address);
-        // Store it encrypted
-        await walletManager.storeActivationCode(code, 'full', exportPassword);
-      }
+      if (storedCodes && Object.keys(storedCodes).length > 0) {
+        // Show existing codes
+        const codesList = Object.entries(storedCodes)
+          .map(([type, data]) => `${type.toUpperCase()} Node:\n${data.code}\n\nGenerated: ${new Date(data.timestamp).toLocaleString()}`)
+          .join('\n\n');
       
       setShowExportActivation(false);
       setExportPassword('');
       
       showAlert(
-        'Activation Code',
-        `${code}\n\n Keep this code secure!`,
-        [
-          { text: 'I Saved It', style: 'default' }
-        ]
-      );
+          '🔑 Activation Codes',
+          codesList,
+          [
+            { text: 'Copy All', onPress: () => {
+              const plainCodes = Object.entries(storedCodes)
+                .map(([type, data]) => data.code)
+                .join('\n');
+              Clipboard.setString(plainCodes);
+              showAlert('📋 Copied', 'Activation codes copied to clipboard');
+            }},
+            { text: 'OK' }
+          ]
+        );
+      } else {
+        // No codes stored yet
+        setShowExportActivation(false);
+        setExportPassword('');
+        showAlert('Info', 'No activation codes generated yet. Generate one from the Activation tab.');
+      }
     } catch (error) {
-      console.error('Error verifying password:', error);
-      showAlert('Error', 'Incorrect password');
+      console.error('Export activation error:', error);
+      setLoading(false);
       setExportPassword('');
+      showAlert('Error', 'Failed to get activation codes');
     } finally {
       setLoading(false);
+      setExportPassword('');
     }
   };
 
@@ -1414,7 +1529,7 @@ const WalletScreen = () => {
     return (
       <View style={styles.splashContainer}>
         <View style={styles.splashContent}>
-          <View style={styles.logoContainer}>
+          <View style={[styles.logoContainer, {overflow: 'hidden', borderRadius: 60}]}>
             {/* Outer rotating ring */}
             <Animated.View style={[styles.outerRing, { transform: [{ rotate: spin }] }]}>
               <View style={styles.outerRingGradient} />
@@ -1871,6 +1986,8 @@ const WalletScreen = () => {
         return (
           <ScrollView 
             style={styles.content}
+            onScroll={handleUserActivity}
+            scrollEventThrottle={1000}
             refreshControl={
               <RefreshControl
                 refreshing={refreshing}
@@ -1896,13 +2013,27 @@ const WalletScreen = () => {
             <View style={styles.networkSelector}>
               <TouchableOpacity 
                 style={[styles.networkTab, selectedNetwork === 'qnet' && styles.networkTabActive]}
-                onPress={() => setSelectedNetwork('qnet')}
+                onPress={() => {
+                  setSelectedNetwork('qnet');
+                  // Refresh balance for QNet network
+                  if (wallet && wallet.publicKey) {
+                    console.log('Switched to QNet, refreshing balance');
+                    loadBalance(wallet.publicKey);
+                  }
+                }}
               >
                 <Text style={[styles.networkTabText, selectedNetwork === 'qnet' && styles.networkTabTextActive]}>QNet</Text>
               </TouchableOpacity>
               <TouchableOpacity 
                 style={[styles.networkTab, selectedNetwork === 'solana' && styles.networkTabActive]}
-                onPress={() => setSelectedNetwork('solana')}
+                onPress={() => {
+                  setSelectedNetwork('solana');
+                  // Refresh balance for Solana network
+                  if (wallet && wallet.publicKey) {
+                    console.log('Switched to Solana, refreshing balance');
+                    loadBalance(wallet.publicKey);
+                  }
+                }}
               >
                 <Text style={[styles.networkTabText, selectedNetwork === 'solana' && styles.networkTabTextActive]}>Solana</Text>
               </TouchableOpacity>
@@ -1927,13 +2058,15 @@ const WalletScreen = () => {
                   {selectedNetwork === 'qnet' 
                     ? (wallet.qnetAddress || wallet.address)
                     : (wallet.solanaAddress || wallet.address)}
-                </Text>
-                {copiedAddress === (selectedNetwork === 'qnet' ? 'qnet' : 'solana') && (
-                  <Text style={styles.checkMark}>✓ Copied</Text>
-                )}
+              </Text>
               </View>
-              <Text style={styles.copyHint}>
-                {copiedAddress === (selectedNetwork === 'qnet' ? 'qnet' : 'solana') ? '' : 'Tap to copy'}
+              <Text style={[
+                styles.copyHint,
+                copiedAddress === (selectedNetwork === 'qnet' ? 'qnet' : 'solana') && { color: '#00ff00' }
+              ]}>
+                {copiedAddress === (selectedNetwork === 'qnet' ? 'qnet' : 'solana') 
+                  ? '✓ Copied' 
+                  : 'Tap to copy'}
               </Text>
             </TouchableOpacity>
 
@@ -1976,7 +2109,7 @@ const WalletScreen = () => {
                           resizeMode="contain"
                         />
                       ) : (
-                        <Text style={styles.tokenIconText}>S</Text>
+                      <Text style={styles.tokenIconText}>S</Text>
                       )}
                     </View>
                     <View style={styles.tokenDetails}>
@@ -2000,7 +2133,7 @@ const WalletScreen = () => {
                           resizeMode="contain"
                         />
                       ) : (
-                        <Text style={styles.tokenIconText}>D</Text>
+                      <Text style={styles.tokenIconText}>D</Text>
                       )}
                     </View>
                     <View style={styles.tokenDetails}>
@@ -2021,7 +2154,7 @@ const WalletScreen = () => {
 
       case 'send':
         return (
-          <ScrollView style={styles.content}>
+          <ScrollView style={styles.content} onScroll={handleUserActivity} scrollEventThrottle={1000}>
             <Text style={styles.tabTitle}>Send Tokens</Text>
             
             <View style={styles.formGroup}>
@@ -2087,7 +2220,7 @@ const WalletScreen = () => {
 
       case 'receive':
         return (
-          <ScrollView style={styles.content}>
+          <ScrollView style={styles.content} onScroll={handleUserActivity} scrollEventThrottle={1000}>
             <Text style={styles.tabTitle}>Receive Tokens</Text>
             
             <View style={styles.receiveContent}>
@@ -2126,7 +2259,7 @@ const WalletScreen = () => {
 
       case 'activate':
         return (
-          <ScrollView style={styles.content}>
+          <ScrollView style={styles.content} onScroll={handleUserActivity} scrollEventThrottle={1000}>
             <Text style={styles.tabTitle}>Node Activation</Text>
             
             {/* Phase Indicator */}
@@ -2148,106 +2281,235 @@ const WalletScreen = () => {
             {/* Node Types */}
             <View style={styles.nodeTypesContainer}>
               <Text style={styles.sectionTitle}>Select Node Type</Text>
-              <View style={styles.warningBox}>
-                <Text style={styles.warningText}>
-                  💡 You can generate activation codes for all node types
-                </Text>
-                <Text style={styles.warningText}>
-                  ⚡ Mobile activation is available for Light Nodes only
-                </Text>
-                <Text style={styles.warningSubtext}>
-                  Full and Super nodes must be activated on servers
-                </Text>
-              </View>
+                {!nodeStatus && (
+                  <View style={styles.warningBox}>
+                    <Text style={styles.warningText}>
+                      💡 You can generate activation codes for all node types
+                    </Text>
+                    <Text style={styles.warningText}>
+                      ⚡ Mobile activation is available for Light Nodes only
+                    </Text>
+                    <Text style={styles.warningSubtext}>
+                      Full and Super nodes must be activated on servers
+                    </Text>
+                  </View>
+                )}
+                
+                {nodeStatus === 'light' && (
+                  <View style={[styles.warningBox, {backgroundColor: 'rgba(0, 255, 127, 0.1)', borderColor: 'rgba(0, 255, 127, 0.3)'}]}>
+                    <Text style={[styles.warningText, {color: '#00ff7f'}]}>
+                      💡 Light nodes can be activated directly from QNet Mobile App
+                    </Text>
+                  </View>
+                )}
+                
+                {nodeStatus === 'full' && (
+                  <View style={[styles.warningBox, {backgroundColor: 'rgba(255, 170, 0, 0.1)', borderColor: 'rgba(255, 170, 0, 0.3)'}]}>
+                    <Text style={[styles.warningText, {color: '#ffaa00'}]}>
+                      ⚠️ Full nodes require server activation
+                    </Text>
+                    <Text style={styles.warningSubtext}>
+                      Mobile can only generate activation code
+                    </Text>
+                  </View>
+                )}
+                
+                {nodeStatus === 'super' && (
+                  <View style={[styles.warningBox, {backgroundColor: 'rgba(255, 170, 0, 0.1)', borderColor: 'rgba(255, 170, 0, 0.3)'}]}>
+                    <Text style={[styles.warningText, {color: '#ffaa00'}]}>
+                      ⚠️ Super nodes require server activation
+                    </Text>
+                    <Text style={styles.warningSubtext}>
+                      Mobile can only generate activation code
+                    </Text>
+                  </View>
+                )}
               
               <TouchableOpacity 
-                style={[styles.nodeTypeCard, nodeStatus === 'light' && styles.nodeTypeActive]}
-                onPress={() => setNodeStatus('light')}
+                style={[
+                  styles.nodeTypeCard, 
+                  nodeStatus === 'light' && styles.nodeTypeActive,
+                  activatedNodeType === 'light' && styles.nodeTypeActivated
+                ]}
+                onPress={() => !activatedNodeType && setNodeStatus('light')}
+                disabled={!!activatedNodeType}
               >
                 <View style={styles.nodeTypeInfo}>
-                  <Text style={styles.nodeTypeName}>Light Node (Mobile)</Text>
-                  <Text style={styles.nodeTypeDesc}>Basic validation, optimized for mobile devices</Text>
+                  <Text style={styles.nodeTypeName}>
+                    Light Node (Mobile) {activatedNodeType === 'light' && '✅'}
+                  </Text>
+                  <Text style={styles.nodeTypeDesc}>
+                    {activatedNodeType === 'light' 
+                      ? `Activated • Code: ${activationCode?.substring(0, 8)}...`
+                      : 'Basic validation, optimized for mobile devices'}
+                  </Text>
                 </View>
-                <Text style={styles.nodeTypePrice}>1500 1DEV</Text>
+                <Text style={styles.nodeTypePrice}>
+                  {activatedNodeType === 'light' ? 'ACTIVATED' : '1500 1DEV'}
+                </Text>
               </TouchableOpacity>
 
               <TouchableOpacity 
-                style={[styles.nodeTypeCard, nodeStatus === 'full' && styles.nodeTypeActive]}
-                onPress={() => setNodeStatus('full')}
+                style={[
+                  styles.nodeTypeCard, 
+                  nodeStatus === 'full' && styles.nodeTypeActive,
+                  activatedNodeType === 'full' && styles.nodeTypeActivated
+                ]}
+                onPress={() => !activatedNodeType && setNodeStatus('full')}
+                disabled={!!activatedNodeType}
               >
                 <View style={styles.nodeTypeInfo}>
-                  <Text style={styles.nodeTypeName}>Full Node</Text>
-                  <Text style={styles.nodeTypeDesc}>Full validation, medium resources</Text>
+                  <Text style={styles.nodeTypeName}>
+                    Full Node {activatedNodeType === 'full' && '✅'}
+                  </Text>
+                  <Text style={styles.nodeTypeDesc}>
+                    {activatedNodeType === 'full' 
+                      ? `Activated • Code: ${activationCode?.substring(0, 8)}...`
+                      : 'Full validation, medium resources'}
+                  </Text>
                 </View>
-                <Text style={styles.nodeTypePrice}>1500 1DEV</Text>
+                <Text style={styles.nodeTypePrice}>
+                  {activatedNodeType === 'full' ? 'ACTIVATED' : '1500 1DEV'}
+                </Text>
               </TouchableOpacity>
 
               <TouchableOpacity 
-                style={[styles.nodeTypeCard, nodeStatus === 'super' && styles.nodeTypeActive]}
-                onPress={() => setNodeStatus('super')}
+                style={[
+                  styles.nodeTypeCard, 
+                  nodeStatus === 'super' && styles.nodeTypeActive,
+                  activatedNodeType === 'super' && styles.nodeTypeActivated
+                ]}
+                onPress={() => !activatedNodeType && setNodeStatus('super')}
+                disabled={!!activatedNodeType}
               >
                 <View style={styles.nodeTypeInfo}>
-                  <Text style={styles.nodeTypeName}>Super Node</Text>
-                  <Text style={styles.nodeTypeDesc}>Maximum validation, high resources</Text>
+                  <Text style={styles.nodeTypeName}>
+                    Super Node {activatedNodeType === 'super' && '✅'}
+                  </Text>
+                  <Text style={styles.nodeTypeDesc}>
+                    {activatedNodeType === 'super' 
+                      ? `Activated • Code: ${activationCode?.substring(0, 8)}...`
+                      : 'Maximum validation, high resources'}
+                  </Text>
                 </View>
-                <Text style={styles.nodeTypePrice}>1500 1DEV</Text>
+                <Text style={styles.nodeTypePrice}>
+                  {activatedNodeType === 'super' ? 'ACTIVATED' : '1500 1DEV'}
+                </Text>
               </TouchableOpacity>
             </View>
 
             {/* Activation Button */}
+            {activatedNodeType && (
+              <View style={styles.activationStatus}>
+                <Text style={styles.activationStatusTitle}>
+                  ✅ {activatedNodeType.charAt(0).toUpperCase() + activatedNodeType.slice(1)} Node Activated
+                </Text>
+                <Text style={styles.activationStatusCode}>
+                  Code: {activationCode}
+                </Text>
+                <Text style={styles.activationStatusInfo}>
+                  One wallet can only activate one node
+                </Text>
+              </View>
+            )}
+            
+            
             <TouchableOpacity 
-              style={[styles.button, !nodeStatus && styles.buttonDisabled]}
+              style={[styles.button, (!nodeStatus || activatedNodeType || activatingNode) && styles.buttonDisabled]}
+              disabled={!nodeStatus || activatedNodeType || activatingNode}
               onPress={async () => {
                 if (!nodeStatus) {
                   showAlert('Select Node Type', 'Please select a node type to activate');
                   return;
                 }
                 
-                // Show confirmation
+                if (activatedNodeType) {
+                  showAlert('Already Activated', `This wallet has already activated a ${activatedNodeType} node. One wallet can only activate one node.`);
+                  return;
+                }
+                
+                // Show confirmation with appropriate warnings
+                const nodeTypeName = nodeStatus.charAt(0).toUpperCase() + nodeStatus.slice(1) + ' Node';
+                
+                let warningMessage = `Burn 1500 1DEV to activate\n${nodeTypeName}`;
+                if (nodeStatus === 'light') {
+                  warningMessage += '\n\n✅ Light nodes can be fully activated on mobile';
+                } else if (nodeStatus === 'full' || nodeStatus === 'super') {
+                  warningMessage += `\n\n⚠️ IMPORTANT: ${nodeTypeName}s require server activation!\nMobile can only generate activation codes.`;
+                }
+                
                 showAlert(
-                  'Confirm Activation',
-                  `Burn 1500 1DEV to activate ${nodeStatus} node?\n\nThis action cannot be undone.`,
+                  'Activate Node',
+                  warningMessage,
                   [
                     { text: 'Cancel', style: 'cancel' },
                     { 
-                      text: 'Activate', 
+                      text: 'Confirm', 
                       style: 'destructive',
                       onPress: async () => {
-                        setLoading(true);
+                        setActivatingNode(true);
                         try {
                           // Check 1DEV balance
                           if (tokenBalances['1dev'] < 1500) {
                             showAlert('Insufficient Balance', `You need 1500 1DEV to activate a node. Your balance: ${tokenBalances['1dev'].toFixed(2)} 1DEV`);
-                            setLoading(false);
+                            setActivatingNode(false);
                             return;
                           }
                           
-                          // Burn tokens
-                          const burnResult = await walletManager.burnTokensForNode(nodeStatus, 1500);
+                          // Burn tokens on blockchain
+                          const burnResult = await walletManager.burnTokensForNode(nodeStatus, 1500, isTestnet, password);
                           
                           // Generate activation code (use Solana address for node activation)
                           const solanaAddr = wallet.solanaAddress || wallet.address;
                           const code = await walletManager.generateActivationCode(nodeStatus, solanaAddr);
                           await walletManager.storeActivationCode(code, nodeStatus, password);
                           
-                          // Update balance
+                          // Update balance after burning tokens
+                          if (wallet && wallet.publicKey) {
                           await loadBalance(wallet.publicKey);
+                          }
                           
-                          showAlert('Success', `${nodeStatus} node activated successfully!\nTransaction: ${burnResult.txHash}\nActivation Code: ${code}`);
+                          // Update activation status
+                          setActivatedNodeType(nodeStatus);
+                          setActivationCode(code);
+                          setNodeStatus(null); // Clear selection to show activated status
+                          
+                          // Show success with activation code (matching browser extension)
+                          showAlert(
+                            `✅ ${nodeTypeName} Activation Complete`,
+                            `Activation Code:\n${code}\n\n` +
+                            `Node Type: ${nodeTypeName}\n` +
+                            `Status: ✅ Paid (1500 1DEV burned)\n` +
+                            `Contract: ${isTestnet ? '62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ' : '4R3DPW4BY97kJRfv8J5wgTtbDpoXpRv92W957tXMpump'}\n\n` +
+                            `Transaction: ${burnResult.txHash.substring(0, 8)}...${burnResult.txHash.slice(-8)}`,
+                            [
+                              { text: 'Copy Code', onPress: () => {
+                                Clipboard.setString(code);
+                                showAlert('Copied', 'Activation code copied to clipboard');
+                              }},
+                              { text: 'View Transaction', onPress: () => {
+                                Linking.openURL(burnResult.explorer);
+                              }},
+                              { text: 'OK' }
+                            ]
+                          );
                         } catch (error) {
                           showAlert('Error', 'Failed to activate node: ' + error.message);
                         } finally {
-                          setLoading(false);
+                          setActivatingNode(false);
                         }
                       }
                     }
                   ]
                 );
               }}
-              disabled={!nodeStatus || loading}
             >
               <Text style={styles.buttonText}>
-                {loading ? 'Activating...' : 'Activate Node'}
+                {activatingNode 
+                  ? 'Processing Transaction...' 
+                  : activatedNodeType 
+                  ? 'Already Activated' 
+                  : 'Get Activation Code'}
               </Text>
             </TouchableOpacity>
           </ScrollView>
@@ -2255,17 +2517,120 @@ const WalletScreen = () => {
 
       case 'history':
         return (
-          <ScrollView style={styles.content}>
-            <Text style={styles.tabTitle}>Transaction History</Text>
+          <ScrollView style={styles.content} onScroll={handleUserActivity} scrollEventThrottle={1000}>
+            <Text style={styles.tabTitle}>Node Monitoring</Text>
+            
+            {activatedNodeType ? (
+              <View>
+                {/* Node Status Card */}
+                <View style={styles.nodeMonitoringCard}>
+                  <View style={styles.nodeMonitoringHeader}>
+                    <Text style={styles.nodeMonitoringTitle}>
+                      {activatedNodeType.charAt(0).toUpperCase() + activatedNodeType.slice(1)} Node
+                    </Text>
+                    <View style={[styles.statusBadge, styles.statusBadgeActive]}>
+                      <Text style={styles.statusBadgeText}>ACTIVE</Text>
+                    </View>
+                  </View>
+                  
+                  <View style={styles.nodeMonitoringInfo}>
+                    <Text style={styles.nodeMonitoringLabel}>Activation Code:</Text>
+                    <Text style={styles.nodeMonitoringCode}>{activationCode}</Text>
+                  </View>
+                  
+                  <View style={styles.nodeMonitoringInfo}>
+                    <Text style={styles.nodeMonitoringLabel}>Activation Type:</Text>
+                    <Text style={styles.nodeMonitoringValue}>Phase 1: 1DEV Burn</Text>
+                  </View>
+                  
+                  <View style={styles.nodeMonitoringInfo}>
+                    <Text style={styles.nodeMonitoringLabel}>Burned Amount:</Text>
+                    <Text style={styles.nodeMonitoringValue}>1500 1DEV</Text>
+                  </View>
+                  
+                  {/* Action Button based on node type */}
+                  {activatedNodeType === 'light' ? (
+                    <TouchableOpacity 
+                      style={[styles.button, styles.secondaryButton]}
+                      onPress={() => {
+                        showAlert(
+                          'Mobile Activation',
+                          'Light node activation is coming soon!\n\nYour activation code is ready and will be automatically used when this feature is enabled.',
+                          [{ text: 'OK' }]
+                        );
+                      }}
+                    >
+                      <Text style={[styles.buttonText, styles.secondaryButtonText]}>
+                        Activate Node (Coming Soon)
+                      </Text>
+                    </TouchableOpacity>
+                  ) : (
+                    <View style={styles.serverActivationNotice}>
+                      <Text style={styles.serverActivationIcon}>⚠️</Text>
+                      <Text style={styles.serverActivationText}>
+                        {activatedNodeType === 'full' ? 'Full' : 'Super'} nodes require server activation
+                      </Text>
+                      <Text style={styles.serverActivationSubtext}>
+                        Use your activation code on a dedicated server
+                      </Text>
+                    </View>
+                  )}
+                </View>
+                
+                {/* Rewards Section */}
+                <View style={styles.rewardsCard}>
+                  <Text style={styles.rewardsTitle}>Node Rewards</Text>
+                  
+                  <View style={styles.rewardItem}>
+                    <Text style={styles.rewardLabel}>Daily Rewards:</Text>
+                    <Text style={styles.rewardValue}>0.00 QNC</Text>
+                  </View>
+                  
+                  <View style={styles.rewardItem}>
+                    <Text style={styles.rewardLabel}>Total Earned:</Text>
+                    <Text style={styles.rewardValue}>0.00 QNC</Text>
+                  </View>
+                  
+                  <View style={styles.rewardItem}>
+                    <Text style={styles.rewardLabel}>Pending Claim:</Text>
+                    <Text style={styles.rewardValue}>0.00 QNC</Text>
+                  </View>
+                  
+                  <TouchableOpacity 
+                    style={[styles.button, styles.buttonDisabled]}
+                    disabled={true}
+                  >
+                    <Text style={styles.buttonText}>
+                      Claim Rewards (No Rewards Yet)
+                    </Text>
+                  </TouchableOpacity>
+                </View>
+              </View>
+            ) : (
             <View style={styles.emptyState}>
-              <Text style={styles.emptyText}>No transactions yet</Text>
+                <Text style={styles.emptyText}>No active nodes</Text>
+                <Text style={styles.emptySubtext}>
+                  You need to activate a node to start earning rewards
+                </Text>
+                
+                <TouchableOpacity
+                  style={[styles.button, styles.primaryButton, { marginTop: 20 }]}
+                  onPress={() => {
+                    setActiveTab('activate');
+                  }}
+                >
+                  <Text style={styles.buttonText}>
+                    Activate Node
+                  </Text>
+                </TouchableOpacity>
             </View>
+            )}
           </ScrollView>
         );
 
       case 'settings':
         return (
-          <ScrollView style={styles.content}>
+          <ScrollView style={styles.content} onScroll={handleUserActivity} scrollEventThrottle={1000}>
             <Text style={styles.tabTitle}>{t('settings')}</Text>
             
             {/* General Settings */}
@@ -2417,7 +2782,13 @@ const WalletScreen = () => {
     }
   };
 
+  // Function to emit user activity
+  const handleUserActivity = () => {
+    DeviceEventEmitter.emit('userActivity');
+  };
+
   return (
+    <TouchableWithoutFeedback onPress={handleUserActivity}>
     <SafeAreaView style={styles.container}>
       <View style={styles.header}>
         <Text style={styles.title}>QNet Wallet</Text>
@@ -2427,7 +2798,14 @@ const WalletScreen = () => {
       <View style={styles.tabNav}>
         <TouchableOpacity 
           style={[styles.tab, activeTab === 'assets' && styles.activeTab]}
-          onPress={() => setActiveTab('assets')}
+          onPress={() => {
+            setActiveTab('assets');
+            // Immediate balance refresh when switching to assets
+            if (wallet && wallet.publicKey) {
+              console.log('User switched to assets tab, refreshing balance');
+              loadBalance(wallet.publicKey);
+            }
+          }}
         >
           <Text style={[styles.tabText, activeTab === 'assets' && styles.activeTabText]}>Assets</Text>
         </TouchableOpacity>
@@ -2457,7 +2835,7 @@ const WalletScreen = () => {
           style={[styles.tab, activeTab === 'history' && styles.activeTab]}
           onPress={() => setActiveTab('history')}
         >
-          <Text style={[styles.tabText, activeTab === 'history' && styles.activeTabText]}>History</Text>
+          <Text style={[styles.tabText, activeTab === 'history' && styles.activeTabText]}>Node</Text>
         </TouchableOpacity>
 
         <TouchableOpacity 
@@ -2508,7 +2886,7 @@ const WalletScreen = () => {
 
             <View style={styles.modalActions}>
               <TouchableOpacity 
-                style={[styles.button, styles.secondaryButton]}
+                style={[styles.modalButton, styles.modalButtonSecondary, {flex: 1}]}
                 onPress={() => {
                   setShowChangePassword(false);
                   setCurrentPassword('');
@@ -2516,15 +2894,15 @@ const WalletScreen = () => {
                   setConfirmNewPassword('');
                 }}
               >
-                <Text style={[styles.buttonText, styles.secondaryButtonText]}>{t('cancel')}</Text>
+                <Text style={[styles.modalButtonText, styles.modalButtonTextSecondary]}>{t('cancel')}</Text>
               </TouchableOpacity>
 
               <TouchableOpacity 
-                style={styles.button}
+                style={[styles.modalButton, styles.modalButtonPrimary, {flex: 1}]}
                 onPress={handleChangePassword}
                 disabled={loading}
               >
-                <Text style={styles.buttonText}>{loading ? t('changing') : t('change')}</Text>
+                <Text style={styles.modalButtonText}>{loading ? t('changing') : t('change')}</Text>
               </TouchableOpacity>
             </View>
           </View>
@@ -2551,21 +2929,21 @@ const WalletScreen = () => {
 
             <View style={styles.modalActions}>
               <TouchableOpacity 
-                style={[styles.button, styles.secondaryButton]}
+                style={[styles.modalButton, styles.modalButtonSecondary, {flex: 1}]}
                 onPress={() => {
                   setShowExportSeed(false);
                   setExportPassword('');
                 }}
               >
-                <Text style={[styles.buttonText, styles.secondaryButtonText]}>{t('cancel')}</Text>
+                <Text style={[styles.modalButtonText, styles.modalButtonTextSecondary]}>{t('cancel')}</Text>
               </TouchableOpacity>
 
               <TouchableOpacity 
-                style={styles.button}
+                style={[styles.modalButton, styles.modalButtonPrimary, {flex: 1}]}
                 onPress={exportSeedPhrase}
                 disabled={loading}
               >
-                <Text style={styles.buttonText}>{loading ? t('verifying') : t('show')}</Text>
+                <Text style={styles.modalButtonText}>{loading ? t('verifying') : t('show')}</Text>
               </TouchableOpacity>
             </View>
           </View>
@@ -2592,21 +2970,21 @@ const WalletScreen = () => {
 
             <View style={styles.modalActions}>
               <TouchableOpacity 
-                style={[styles.button, styles.secondaryButton]}
+                style={[styles.modalButton, styles.modalButtonSecondary, {flex: 1}]}
                 onPress={() => {
                   setShowExportActivation(false);
                   setExportPassword('');
                 }}
               >
-                <Text style={[styles.buttonText, styles.secondaryButtonText]}>{t('cancel')}</Text>
+                <Text style={[styles.modalButtonText, styles.modalButtonTextSecondary]}>{t('cancel')}</Text>
               </TouchableOpacity>
 
               <TouchableOpacity 
-                style={styles.button}
+                style={[styles.modalButton, styles.modalButtonPrimary, {flex: 1}]}
                 onPress={exportActivationCode}
                 disabled={loading}
               >
-                <Text style={styles.buttonText}>{loading ? t('verifying') : t('show')}</Text>
+                <Text style={styles.modalButtonText}>{loading ? t('verifying') : t('show')}</Text>
               </TouchableOpacity>
             </View>
           </View>
@@ -2656,7 +3034,7 @@ const WalletScreen = () => {
             <Text style={styles.modalTitle}>{t('language')}</Text>
             <Text style={styles.modalSubtitle}>{t('language_subtitle')}</Text>
             
-            <ScrollView style={{maxHeight: 400}}>
+            <ScrollView style={{maxHeight: 400}} onScroll={handleUserActivity} scrollEventThrottle={1000}>
               {[
                 {code: 'en', name: 'English'},
                 {code: 'zh-CN', name: '中文'},
@@ -2767,6 +3145,7 @@ const WalletScreen = () => {
         </Animated.View>
       )}
     </SafeAreaView>
+    </TouchableWithoutFeedback>
   );
 };
 
@@ -3267,6 +3646,7 @@ const styles = StyleSheet.create({
     borderColor: 'transparent',
     borderTopColor: '#00d4ff',
     borderRightColor: '#00d4ff',
+    elevation: 0,
   },
   outerRingGradient: {
     position: 'absolute',
@@ -3284,6 +3664,7 @@ const styles = StyleSheet.create({
     borderWidth: 2,
     borderColor: '#6B46C1',
     backgroundColor: 'rgba(107, 70, 193, 0.1)',
+    elevation: 0,
   },
   innerRingGradient: {
     position: 'absolute',
@@ -3300,6 +3681,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     backgroundColor: '#0f0f1a',
     borderRadius: 35,
+    elevation: 0,
   },
   qLetter: {
     fontSize: 48,
@@ -3472,18 +3854,23 @@ const styles = StyleSheet.create({
   },
   addressRow: {
     flexDirection: 'row',
-    alignItems: 'flex-start',
-    justifyContent: 'space-between',
+    alignItems: 'center',
+    justifyContent: 'center',
     width: '100%',
+    position: 'relative',
   },
   addressTextCopied: {
     color: '#00d4ff',
   },
   checkMark: {
     color: '#00ff00',
-    fontSize: 16,
-    marginLeft: 8,
+    fontSize: 12,
+    marginLeft: 6,
     fontWeight: 'bold',
+    position: 'absolute',
+    right: 10,
+    top: '50%',
+    transform: [{ translateY: -6 }],
   },
   tokenDetails: {
     justifyContent: 'center',
@@ -3565,21 +3952,21 @@ const styles = StyleSheet.create({
   warningBox: {
     backgroundColor: 'rgba(74, 144, 226, 0.1)',
     borderRadius: 8,
-    padding: 12,
-    marginBottom: 15,
+    padding: 10,
+    marginBottom: 10,
     borderWidth: 1,
     borderColor: 'rgba(74, 144, 226, 0.3)',
   },
   warningText: {
-    fontSize: 14,
+    fontSize: 12,
     color: '#ffffff',
-    marginBottom: 4,
+    marginBottom: 2,
     fontWeight: '500',
   },
   warningSubtext: {
-    fontSize: 12,
+    fontSize: 11,
     color: '#888888',
-    marginTop: 4,
+    marginTop: 2,
     textAlign: 'center',
   },
   nodeTypeCard: {
@@ -3596,6 +3983,11 @@ const styles = StyleSheet.create({
   nodeTypeActive: {
     borderColor: '#00d4ff',
     backgroundColor: 'rgba(0, 212, 255, 0.1)',
+  },
+  nodeTypeActivated: {
+    borderColor: '#00ff7f',
+    backgroundColor: 'rgba(0, 255, 127, 0.05)',
+    opacity: 0.9,
   },
   nodeTypeInfo: {
     flex: 1,
@@ -3614,6 +4006,145 @@ const styles = StyleSheet.create({
     fontSize: 14,
     fontWeight: 'bold',
     color: '#00d4ff',
+  },
+  activationStatus: {
+    backgroundColor: 'rgba(0, 255, 127, 0.1)',
+    borderRadius: 10,
+    padding: 15,
+    marginVertical: 15,
+    borderWidth: 1,
+    borderColor: 'rgba(0, 255, 127, 0.3)',
+    alignItems: 'center',
+  },
+  activationStatusTitle: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#00ff7f',
+    marginBottom: 8,
+  },
+  activationStatusCode: {
+    fontSize: 13,
+    color: '#ffffff',
+    fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
+    marginBottom: 8,
+  },
+  activationStatusInfo: {
+    fontSize: 11,
+    color: '#888888',
+    fontStyle: 'italic',
+  },
+  nodeMonitoringCard: {
+    backgroundColor: '#16213e',
+    borderRadius: 15,
+    padding: 20,
+    marginBottom: 20,
+    borderWidth: 1,
+    borderColor: 'rgba(0, 212, 255, 0.2)',
+  },
+  nodeMonitoringHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 20,
+  },
+  nodeMonitoringTitle: {
+    fontSize: 18,
+    fontWeight: '600',
+    color: '#ffffff',
+  },
+  statusBadge: {
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 12,
+  },
+  statusBadgeActive: {
+    backgroundColor: 'rgba(0, 255, 127, 0.2)',
+  },
+  statusBadgeText: {
+    fontSize: 11,
+    fontWeight: '600',
+    color: '#00ff7f',
+  },
+  nodeMonitoringInfo: {
+    marginBottom: 12,
+  },
+  nodeMonitoringLabel: {
+    fontSize: 12,
+    color: '#888888',
+    marginBottom: 4,
+  },
+  nodeMonitoringCode: {
+    fontSize: 14,
+    color: '#00d4ff',
+    fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
+    fontWeight: '500',
+  },
+  nodeMonitoringValue: {
+    fontSize: 14,
+    color: '#ffffff',
+    fontWeight: '500',
+  },
+  serverActivationNotice: {
+    backgroundColor: 'rgba(255, 170, 0, 0.1)',
+    borderRadius: 10,
+    padding: 15,
+    marginTop: 15,
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: 'rgba(255, 170, 0, 0.3)',
+  },
+  serverActivationIcon: {
+    fontSize: 24,
+    marginBottom: 8,
+  },
+  serverActivationText: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#ffaa00',
+    marginBottom: 4,
+    textAlign: 'center',
+  },
+  serverActivationSubtext: {
+    fontSize: 12,
+    color: '#888888',
+    textAlign: 'center',
+  },
+  rewardsCard: {
+    backgroundColor: '#16213e',
+    borderRadius: 15,
+    padding: 20,
+    borderWidth: 1,
+    borderColor: 'rgba(0, 212, 255, 0.2)',
+  },
+  rewardsTitle: {
+    fontSize: 18,
+    fontWeight: '600',
+    color: '#ffffff',
+    marginBottom: 20,
+  },
+  rewardItem: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 12,
+    paddingBottom: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: 'rgba(255, 255, 255, 0.05)',
+  },
+  rewardLabel: {
+    fontSize: 14,
+    color: '#888888',
+  },
+  rewardValue: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#00d4ff',
+  },
+  emptySubtext: {
+    fontSize: 13,
+    color: '#888888',
+    marginTop: 8,
+    textAlign: 'center',
   },
   buttonDisabled: {
     opacity: 0.5,
