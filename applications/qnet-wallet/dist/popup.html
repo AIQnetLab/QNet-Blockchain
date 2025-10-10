@@ -292,31 +292,31 @@
                             </div>
                             
                             <!-- Node Details View (Hidden by default) -->
-                            <div id="node-details-view" class="hidden" style="position: absolute; top: 0; left: 0; right: 0; bottom: 0;">
-                                <div class="node-management" style="height: 100%; display: flex; flex-direction: column; padding: 0.5rem;">
-                                    <div style="display: flex; align-items: center; margin-bottom: 0.5rem;">
-                                        <button id="back-to-nodes" style="background: none; border: none; color: #00d4ff; cursor: pointer; font-size: 1.2rem; padding: 0; margin-right: 0.5rem;">←</button>
-                                        <h3 id="node-type-title" style="margin: 0; font-size: 0.95rem;">Node Activation</h3>
+                            <div id="node-details-view" class="hidden" style="position: absolute; top: 0; left: 0; right: 0; bottom: 0; overflow-y: auto;">
+                                <div class="node-management" style="display: flex; flex-direction: column; padding: 0.3rem;">
+                                    <div style="display: flex; align-items: center; margin-bottom: 0.3rem;">
+                                        <button id="back-to-nodes" style="background: none; border: none; color: #00d4ff; cursor: pointer; font-size: 1rem; padding: 0; margin-right: 0.3rem;">←</button>
+                                        <h3 id="node-type-title" style="margin: 0; font-size: 0.85rem;">Node Activation</h3>
                                     </div>
                                     
-                                    <div class="node-details-content" style="flex: 1; display: flex; flex-direction: column; justify-content: space-between;">
+                                    <div class="node-details-content" style="display: flex; flex-direction: column;">
                                         <div>
-                                            <h4 id="node-type-name" style="color: #00d4ff; margin-bottom: 0.4rem; font-size: 1rem;">Node Type</h4>
-                                            <p id="node-description" style="color: #a0a0a0; margin: 0.4rem 0; line-height: 1.2; font-size: 0.75rem;"></p>
+                                            <h4 id="node-type-name" style="color: #00d4ff; margin-bottom: 0.2rem; font-size: 0.85rem;">Node Type</h4>
+                                            <p id="node-description" style="color: #a0a0a0; margin: 0.2rem 0; line-height: 1.1; font-size: 0.65rem;"></p>
                                             
-                                            <div class="node-specs" style="background: rgba(0, 212, 255, 0.05); padding: 0.5rem; border-radius: 6px; margin: 0.6rem 0; font-size: 0.7rem;">
+                                            <div class="node-specs" style="background: rgba(0, 212, 255, 0.05); padding: 0.3rem; border-radius: 6px; margin: 0.3rem 0; font-size: 0.6rem; max-height: 120px; overflow-y: auto;">
                                                 <div id="node-specs-content"></div>
                                             </div>
                                         </div>
                                         
                                         <div>
-                                            <div class="activation-cost" style="text-align: center; margin: 0.8rem 0;">
-                                                <div style="color: #888; font-size: 0.75rem;">Activation Cost</div>
-                                                <div style="color: #00d4ff; font-size: 1.2rem; font-weight: bold; margin: 0.2rem 0;">1500 1DEV</div>
-                                                <div style="color: #888; font-size: 0.7rem;">Tokens will be burned permanently</div>
+                                            <div class="activation-cost" style="text-align: center; margin: 0.4rem 0;">
+                                                <div style="color: #888; font-size: 0.65rem;">Activation Cost</div>
+                                                <div style="color: #00d4ff; font-size: 1rem; font-weight: bold; margin: 0.1rem 0;">1500 1DEV</div>
+                                                <div style="color: #888; font-size: 0.6rem;">Tokens will be burned permanently</div>
                                 </div>
-                                
-                                            <button id="activate-node-button" class="qnet-button primary full-width" style="padding: 0.6rem; font-size: 0.85rem;">
+                
+                                            <button id="activate-node-button" class="qnet-button primary full-width" style="padding: 0.5rem; font-size: 0.75rem;">
                                                 Get Activation Code
                                             </button>
                                         </div>
@@ -347,6 +347,10 @@
                                                 <p id="testnet-notice" style="color: #ff9900; font-size: 0.8rem; margin: 0.3rem 0 0; display: none;">
                                                     ⚠️ Testnet: Real burn attempted (needs SOL for gas)
                                                 </p>
+                                            </div>
+                                            
+                                            <div id="activation-warning" style="background: rgba(255, 68, 68, 0.1); border: 1px solid rgba(255, 68, 68, 0.3); border-radius: 8px; padding: 0.7rem; margin: 0.8rem 0; display: none;">
+                                                <p id="activation-warning-text" style="color: #ff4444; font-size: 0.85rem; margin: 0; font-weight: 600;"></p>
                                             </div>
                                             
                                             <div style="display: flex; gap: 0.8rem; margin-top: 1rem;">

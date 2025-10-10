@@ -2363,6 +2363,93 @@ class ProductionCrypto {
         return this.base58Encode(publicKey);
     }
     
+    // Generate QNet address from Solana address (for simple display)
+    static generateQNetAddressFromSolana(solanaAddress) {
+        try {
+            // Generate deterministic QNet address from Solana address
+            const encoder = new TextEncoder();
+            const data = encoder.encode(solanaAddress + 'qnet_eon_bridge');
+            
+            // Use SHA-512 hash
+            return crypto.subtle.digest('SHA-512', data).then(hashBuffer => {
+                const hash = Array.from(new Uint8Array(hashBuffer));
+                const fullHex = hash.map(b => b.toString(16).padStart(2, '0')).join('');
+                
+                // New long format: 19 chars + "eon" + 15 chars + 4 char checksum = 41 total
+                const part1 = fullHex.substring(0, 19).toLowerCase();
+                const part2 = fullHex.substring(19, 34).toLowerCase();
+                
+                // Generate checksum
+                const checksumData = `qnet_${part1}_eon_${part2}`;
+                const checksumEncoder = new TextEncoder();
+                
+                return crypto.subtle.digest('SHA-256', checksumEncoder.encode(checksumData)).then(checksumBuffer => {
+                    const checksumHash = Array.from(new Uint8Array(checksumBuffer));
+                    const checksumHex = checksumHash.map(b => b.toString(16).padStart(2, '0')).join('');
+                    const checksum = checksumHex.substring(0, 4);
+                    
+                    return `qnet_${part1}_eon_${part2}_${checksum}`;
+                });
+            });
+        } catch (error) {
+            console.error('Error generating QNet address from Solana:', error);
+            return null;
+        }
+    }
+    
+    // Migrate old short QNet address to new long format
+    static async migrateQNetAddress(wallet) {
+        try {
+            // Check if wallet has QNet address
+            if (!wallet.qnetAddress || !wallet.networks?.qnet?.address) {
+                // Generate new address from Solana address if available
+                if (wallet.networks?.solana?.address) {
+                    const newAddress = await CryptoService.generateQNetAddressFromSolana(wallet.networks.solana.address);
+                    if (newAddress) {
+                        if (wallet.networks && wallet.networks.qnet) {
+                            wallet.networks.qnet.address = newAddress;
+                        }
+                        wallet.qnetAddress = newAddress;
+                    }
+                }
+                return wallet;
+            }
+            
+            const currentAddress = wallet.qnetAddress || wallet.networks?.qnet?.address;
+            
+            // Check if it's old format (short - less than 40 chars)
+            if (currentAddress && currentAddress.length < 40) {
+                console.log('Migrating old short QNet address to new long format');
+                
+                // Generate new long format address
+                let newAddress = null;
+                
+                if (wallet.mnemonic) {
+                    // If we have mnemonic, generate from it for consistency
+                    const seed = await bip39.mnemonicToSeed(wallet.mnemonic);
+                    newAddress = await CryptoService.generateQNetAddress(seed, 0);
+                } else if (wallet.networks?.solana?.address) {
+                    // Otherwise generate from Solana address
+                    newAddress = await CryptoService.generateQNetAddressFromSolana(wallet.networks.solana.address);
+                }
+                
+                if (newAddress) {
+                    // Update all references to QNet address
+                    if (wallet.networks && wallet.networks.qnet) {
+                        wallet.networks.qnet.address = newAddress;
+                    }
+                    wallet.qnetAddress = newAddress;
+                    console.log('Migrated to new QNet address:', newAddress);
+                }
+            }
+            
+            return wallet;
+        } catch (error) {
+            console.error('Error migrating QNet address:', error);
+            return wallet;
+        }
+    }
+
     // Generate QNet EON address
     static async generateQNetAddress(seed, accountIndex = 0) {
         try {
@@ -2985,6 +3072,63 @@ class SolanaRPC {
         } catch (error) {
             // Error:('Failed to get balance:', error);
             return 0;
+        }
+    }
+    
+    async getBurnProgress(isTestnet = false) {
+        try {
+            const rpcUrl = isTestnet 
+                ? 'https://api.devnet.solana.com'
+                : 'https://api.mainnet-beta.solana.com';
+            
+            const oneDevMint = isTestnet
+                ? '62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ'  // Devnet
+                : '4R3DPW4BY97kJRfv8J5wgTtbDpoXpRv92W957tXMpump'; // Mainnet
+            
+            const TOTAL_SUPPLY = 1000000000; // 1 billion
+            
+            console.log('[SolanaRPC.getBurnProgress] Fetching token supply for:', oneDevMint, 'isTestnet:', isTestnet);
+            
+            // Get current token supply
+            const response = await fetch(rpcUrl, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    jsonrpc: '2.0',
+                    id: 1,
+                    method: 'getTokenSupply',
+                    params: [oneDevMint]
+                })
+            });
+            
+            if (response.ok) {
+                const data = await response.json();
+                console.log('[SolanaRPC.getBurnProgress] Response data:', data);
+                
+                if (data.result && data.result.value) {
+                    const currentSupply = parseFloat(data.result.value.amount) / Math.pow(10, data.result.value.decimals || 6);
+                    const burnedAmount = TOTAL_SUPPLY - currentSupply;
+                    
+                    console.log('[SolanaRPC.getBurnProgress] Current supply:', currentSupply, 'Burned:', burnedAmount);
+                    
+                    if (burnedAmount > 0 && burnedAmount < TOTAL_SUPPLY) {
+                        const burnPercentage = (burnedAmount / TOTAL_SUPPLY * 100).toFixed(1);
+                        console.log('[SolanaRPC.getBurnProgress] Burn percentage:', burnPercentage + '%');
+                        return burnPercentage;
+                    }
+                }
+            } else {
+                console.error('[SolanaRPC.getBurnProgress] Failed to fetch:', response.status, response.statusText);
+            }
+            
+            // Return zero if can't fetch real data
+            console.log('[SolanaRPC.getBurnProgress] Returning default 0.0%');
+            return '0.0';
+        } catch (error) {
+            console.error('[SolanaRPC.getBurnProgress] Error:', error);
+            return '0.0';
         }
     }
     
@@ -5155,7 +5299,19 @@ async function unlockWallet(password) {
         
         // Decrypt wallet data
         console.log('[UnlockWallet] Attempting to decrypt wallet...');
-        const walletData = await ProductionCrypto.decryptWalletData(result.encryptedWallet, password);
+        let walletData = await ProductionCrypto.decryptWalletData(result.encryptedWallet, password);
+        
+        // Migrate old QNet address format to new if needed
+        walletData = await CryptoService.migrateQNetAddress(walletData);
+        
+        // Store migrated wallet if it was updated
+        if (walletData.qnetAddress && walletData.qnetAddress.length >= 40) {
+            // Re-encrypt with migrated data
+            const updatedEncrypted = await ProductionCrypto.encryptWalletData(walletData, password);
+            await chrome.storage.local.set({ encryptedWallet: updatedEncrypted });
+            walletState.encryptedWallet = updatedEncrypted;
+            console.log('[UnlockWallet] Wallet migrated to new QNet address format');
+        }
         
         // Cache decrypted wallet data for future operations (like burning tokens)
         walletState.decryptedWalletData = walletData;
@@ -6032,14 +6188,43 @@ async function checkWalletExists() {
 /**
  * Start auto-lock timer
  */
-function startAutoLockTimer() {
+async function startAutoLockTimer() {
     if (lockTimer) {
         clearTimeout(lockTimer);
+        lockTimer = null;
     }
     
+    // Get timer setting from chrome.storage
+    try {
+        const result = await chrome.storage.local.get(['auto_lock_timer']);
+        const timerSetting = result.auto_lock_timer || '15'; // Default to 15 minutes
+        
+        // Don't setup timer if set to 'never'
+        if (timerSetting === 'never') {
+            console.log('[AutoLock] Timer disabled (set to never)');
+            return;
+        }
+        
+        // Convert to milliseconds
+        const minutes = parseInt(timerSetting);
+        const milliseconds = minutes * 60 * 1000;
+        
+        console.log(`[AutoLock] Setting timer for ${minutes} minute(s)`);
+    
     lockTimer = setTimeout(() => {
+            console.log('[AutoLock] Timer expired, locking wallet');
         lockWallet();
-    }, walletState.settings.lockTimeout);
+        }, milliseconds);
+        
+        // Update settings in state for consistency
+        walletState.settings.lockTimeout = milliseconds;
+    } catch (error) {
+        console.error('[AutoLock] Failed to get timer setting:', error);
+        // Fallback to default 15 minutes
+        lockTimer = setTimeout(() => {
+            lockWallet();
+        }, 15 * 60 * 1000);
+    }
 }
 
 /**
@@ -6191,12 +6376,26 @@ async function getNetworkSize() {
 async function getBurnPercentage() {
     try {
         // Get real burn percentage from blockchain
-        // For production, return null if no real data available
-        // Do not show fake percentages
-        return null; // No real data available yet
+        const state = await chrome.storage.local.get(['network', 'mainnet']);
+        const isTestnet = state.network === 'testnet';
+        
+        // Initialize SolanaRPC if not already
+        if (!walletState.solanaRPC) {
+            const network = state.mainnet ? 'mainnet' : 'devnet';
+            walletState.solanaRPC = new SolanaRPC(network);
+        }
+        
+        // Use the getBurnProgress method from solanaRPC
+        if (walletState.solanaRPC.getBurnProgress) {
+            const burnPercent = await walletState.solanaRPC.getBurnProgress(isTestnet);
+            console.log('[getBurnPercentage] Result:', burnPercent, 'isTestnet:', isTestnet);
+            return parseFloat(burnPercent);
+        }
+        
+        return 0.0; // No method available
     } catch (error) {
-        // Error:('Failed to get burn percentage:', error);
-        return null; // No data available
+        console.error('Failed to get burn percentage:', error);
+        return 0.0; // Return 0 on error
     }
 }
 
