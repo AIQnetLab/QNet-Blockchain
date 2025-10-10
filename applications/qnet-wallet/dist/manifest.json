@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "QNet Wallet",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Multi-network wallet for QNet blockchain and Solana",
   "permissions": [
     "storage",
