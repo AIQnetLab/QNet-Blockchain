@@ -7,11 +7,13 @@ import {
   TextInput,
   Alert,
   ScrollView,
-  SafeAreaView,
   Animated,
   Clipboard,
-  Image
+  Image,
+  Platform,
+  RefreshControl
 } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import WalletManager from '../components/WalletManager';
 
@@ -649,6 +651,7 @@ const WalletScreen = () => {
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
   const [loading, setLoading] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
   const [showCreateOptions, setShowCreateOptions] = useState(false);
   const [seedPhrase, setSeedPhrase] = useState('');
   const [passwordError, setPasswordError] = useState('');
@@ -658,7 +661,7 @@ const WalletScreen = () => {
   const [showSettings, setShowSettings] = useState(false);
   const [selectedToken, setSelectedToken] = useState('sol');
   const [selectedNetwork, setSelectedNetwork] = useState('qnet'); // 'qnet' or 'solana'
-  const [isTestnet, setIsTestnet] = useState(true); // testnet by default
+  const [isTestnet, setIsTestnet] = useState(true); // testnet by default (true = testnet RPC)
   const [tokenPrices, setTokenPrices] = useState({
     qnc: 0.0,
     sol: 0.0,
@@ -693,6 +696,7 @@ const WalletScreen = () => {
   const [nodeStatus, setNodeStatus] = useState(null); // 'light', 'full', or 'super'
   const [copiedAddress, setCopiedAddress] = useState(''); // Track which address was copied
   const [burnProgress, setBurnProgress] = useState('0.0'); // Real burn progress from blockchain
+  const [verificationError, setVerificationError] = useState(''); // Error message for seed verification
 
   // Helper function to show custom styled alerts
   const showAlert = (title, message, buttons = [{ text: 'OK', onPress: () => {} }]) => {
@@ -758,7 +762,8 @@ const WalletScreen = () => {
 
   const loadBurnProgress = async () => {
     try {
-      const progress = await walletManager.getBurnProgress(isTestnet);
+      // NOTE: inverted - when isTestnet is true in UI, we pass false to use devnet
+      const progress = await walletManager.getBurnProgress(!isTestnet);
       setBurnProgress(progress);
     } catch (error) {
       console.error('Failed to load burn progress:', error);
@@ -839,6 +844,20 @@ const WalletScreen = () => {
     try {
       const exists = await walletManager.walletExists();
       setHasWallet(exists);
+      
+      // If wallet exists, try to validate it's not corrupted
+      if (exists) {
+        try {
+          const vaultDataStr = await AsyncStorage.getItem('qnet_wallet');
+          if (vaultDataStr) {
+            JSON.parse(vaultDataStr); // Just check if it's valid JSON
+          }
+        } catch (parseError) {
+          console.error('Wallet data appears corrupted:', parseError);
+          // Don't auto-clear, let user decide when they try to unlock
+        }
+      }
+      
       setLoading(false);
     } catch (error) {
       console.error('Error checking wallet:', error);
@@ -885,8 +904,21 @@ const WalletScreen = () => {
       setTempWallet({ ...newWallet, password });
       const words = newWallet.mnemonic.split(' ');
       
-      // Select random words to verify (positions 3, 7, 11 for 12-word mnemonic)
-      const verifyPositions = [2, 6, 10]; // 0-indexed
+      // Select 3 random positions to verify from the 12-word mnemonic  
+      const allPositions = [...Array(12).keys()]; // [0, 1, 2, ..., 11]
+      const verifyPositions = [];
+      
+      // Randomly select 3 unique positions
+      while (verifyPositions.length < 3) {
+        const randomPos = Math.floor(Math.random() * 12);
+        if (!verifyPositions.includes(randomPos)) {
+          verifyPositions.push(randomPos);
+        }
+      }
+      
+      // Sort positions for display
+      verifyPositions.sort((a, b) => a - b);
+      
       const confirmWords = {};
       const choices = {};
       
@@ -907,7 +939,7 @@ const WalletScreen = () => {
           }
         }
         
-        // Add correct word and shuffle
+        // Mix correct word with random ones - randomize position
         const wordOptions = [...randomWords, correctWord].sort(() => Math.random() - 0.5);
         choices[pos] = wordOptions;
       });
@@ -965,8 +997,11 @@ const WalletScreen = () => {
   };
 
   const confirmSeedPhrase = async () => {
+    // Clear previous error
+    setVerificationError('');
+    
     if (!tempWallet) {
-      showAlert('Error', 'Wallet data not found. Please try creating the wallet again.');
+      setVerificationError('Wallet data not found. Please try creating the wallet again.');
       return;
     }
     
@@ -976,7 +1011,7 @@ const WalletScreen = () => {
     // Check if all required words are filled
     const emptyWords = positions.filter(pos => !seedConfirmWords[pos] || seedConfirmWords[pos].trim() === '');
     if (emptyWords.length > 0) {
-      showAlert('⚠️ Incomplete', `Please select word #${emptyWords[0] + 1} to continue.`);
+      setVerificationError(`⚠️ Please select word #${emptyWords[0] + 1} to continue.`);
       return;
     }
     
@@ -992,9 +1027,8 @@ const WalletScreen = () => {
       const wordsList = incorrectWords.length === 1 
         ? `Word #${incorrectWords[0]}` 
         : `Words #${incorrectWords.join(', #')}`;
-      showAlert(
-        '❌ Incorrect', 
-        `${wordsList} ${incorrectWords.length === 1 ? 'is' : 'are'} incorrect. Please check your recovery phrase and try again.`
+      setVerificationError(
+        `❌ ${wordsList} ${incorrectWords.length === 1 ? 'is' : 'are'} incorrect. Please check your recovery phrase and try again.`
       );
       return;
     }
@@ -1040,25 +1074,65 @@ const WalletScreen = () => {
       setWallet(loadedWallet);
       loadBalance(loadedWallet.publicKey);
     } catch (error) {
-      showAlert('Error', 'Wrong password or corrupted wallet');
+      console.error('Wallet unlock error:', error);
+      // Check if it's a corrupted wallet issue
+      if (error.message && (error.message.includes('Malformed UTF-8') || 
+          error.message.includes('corrupted'))) {
+        Alert.alert(
+          'Wallet Error',
+          'Your wallet data appears to be corrupted. Would you like to clear it and create a new wallet?',
+          [
+            {
+              text: 'Cancel',
+              style: 'cancel'
+            },
+            {
+              text: 'Clear & Start Fresh',
+              style: 'destructive',
+              onPress: async () => {
+                try {
+                  await AsyncStorage.removeItem('qnet_wallet');
+                  await AsyncStorage.removeItem('qnet_wallet_address');
+                  setHasWallet(false);
+                  setPassword('');
+                  showAlert('Success', 'Wallet data cleared. You can now create a new wallet or import an existing one.');
+                } catch (clearError) {
+                  console.error('Error clearing wallet:', clearError);
+                  showAlert('Error', 'Failed to clear wallet data');
+                }
+              }
+            }
+          ]
+        );
+      } else {
+        showAlert('Error', 'Wrong password');
+      }
     }
     setLoading(false);
   };
 
   const loadBalance = async (publicKey) => {
     try {
+      // Check if wallet exists before accessing properties
+      if (!wallet) {
+        console.warn('Wallet not loaded yet');
+        return;
+      }
+      
       // Get SOL balance from correct network  
-      const bal = await walletManager.getBalance(publicKey, isTestnet);
+      // NOTE: inverted - when isTestnet is true in UI, we pass false to use devnet
+      const bal = await walletManager.getBalance(publicKey, !isTestnet);
       setBalance(bal);
       
       // Get 1DEV token balance - use correct address based on network
-      const oneDevMint = isTestnet 
+      // NOTE: inverted logic for UI consistency
+      const oneDevMint = !isTestnet 
         ? '62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ'  // Testnet/Devnet
         : '4R3DPW4BY97kJRfv8J5wgTtbDpoXpRv92W957tXMpump'; // Mainnet (pump.fun)
       
       // Use Solana address for token balance (not QNet address)
       const solanaAddr = wallet.solanaAddress || wallet.address || publicKey;
-      const oneDevBalance = await walletManager.getTokenBalance(solanaAddr, oneDevMint, isTestnet);
+      const oneDevBalance = await walletManager.getTokenBalance(solanaAddr, oneDevMint, !isTestnet);
       
       // For QNC, we'll need the actual mint address when deployed
       // For now, set to 0 as it's not yet deployed
@@ -1079,6 +1153,9 @@ const WalletScreen = () => {
 
   const fetchTokenPrices = async () => {
     try {
+      // Only fetch prices if wallet is loaded
+      if (!wallet) return;
+      
       // Fetch real prices from CoinGecko API
       const prices = { qnc: 0, sol: 0, '1dev': 0 };
       
@@ -1383,6 +1460,8 @@ const WalletScreen = () => {
                       seedConfirmWords[pos] === word && styles.wordChoiceSelected
                     ]}
                     onPress={() => {
+                      // Clear error when user makes a selection
+                      setVerificationError('');
                       setSeedConfirmWords({
                         ...seedConfirmWords,
                         [pos]: word
@@ -1401,6 +1480,13 @@ const WalletScreen = () => {
             </View>
           ))}
           
+          {/* Verification Error Message (like in browser extension) */}
+          {verificationError ? (
+            <View style={styles.verificationErrorBox}>
+              <Text style={styles.verificationErrorText}>{verificationError}</Text>
+            </View>
+          ) : null}
+          
           <TouchableOpacity 
             style={styles.button}
             onPress={confirmSeedPhrase}
@@ -1414,6 +1500,8 @@ const WalletScreen = () => {
           <TouchableOpacity 
             style={[styles.button, styles.secondaryButton]}
             onPress={() => {
+              // Clear error when going back
+              setVerificationError('');
               // Direct action without modal for better UX
               setShowSeedConfirm(false);
               setShowCreateOptions('show-seed'); // Go back to seed display
@@ -1781,7 +1869,29 @@ const WalletScreen = () => {
     switch(activeTab) {
       case 'assets':
         return (
-          <ScrollView style={styles.content}>
+          <ScrollView 
+            style={styles.content}
+            refreshControl={
+              <RefreshControl
+                refreshing={refreshing}
+                onRefresh={async () => {
+                  setRefreshing(true);
+                  try {
+                    await loadBalance(wallet.publicKey);
+                    await fetchTokenPrices();
+                  } catch (error) {
+                    console.error('Error refreshing:', error);
+                  } finally {
+                    setRefreshing(false);
+                  }
+                }}
+                colors={['#00d4ff']}
+                tintColor="#00d4ff"
+                titleColor="#00d4ff"
+                title="Pull to refresh"
+              />
+            }
+          >
             {/* Network Selector */}
             <View style={styles.networkSelector}>
               <TouchableOpacity 
@@ -1813,17 +1923,17 @@ const WalletScreen = () => {
                 <Text style={[
                   styles.addressText,
                   copiedAddress === (selectedNetwork === 'qnet' ? 'qnet' : 'solana') && styles.addressTextCopied
-                ]} numberOfLines={1} ellipsizeMode="middle">
+                ]}>
                   {selectedNetwork === 'qnet' 
                     ? (wallet.qnetAddress || wallet.address)
                     : (wallet.solanaAddress || wallet.address)}
                 </Text>
                 {copiedAddress === (selectedNetwork === 'qnet' ? 'qnet' : 'solana') && (
-                  <Text style={styles.checkMark}>✓</Text>
+                  <Text style={styles.checkMark}>✓ Copied</Text>
                 )}
               </View>
               <Text style={styles.copyHint}>
-                {copiedAddress === (selectedNetwork === 'qnet' ? 'qnet' : 'solana') ? 'Copied!' : 'Tap to copy'}
+                {copiedAddress === (selectedNetwork === 'qnet' ? 'qnet' : 'solana') ? '' : 'Tap to copy'}
               </Text>
             </TouchableOpacity>
 
@@ -1846,12 +1956,10 @@ const WalletScreen = () => {
                     </View>
                     <View style={styles.tokenDetails}>
                       <Text style={styles.tokenName}>QNC</Text>
-                      <Text style={styles.tokenPrice}>${tokenPrices.qnc.toFixed(4)}</Text>
                     </View>
                   </View>
                   <View style={styles.tokenBalance}>
                     <Text style={styles.tokenAmount}>{tokenBalances.qnc.toFixed(4)}</Text>
-                    <Text style={styles.tokenValue}>${(tokenBalances.qnc * tokenPrices.qnc).toFixed(2)}</Text>
                   </View>
                 </View>
               </View>
@@ -1908,12 +2016,6 @@ const WalletScreen = () => {
               </View>
             )}
 
-            <TouchableOpacity 
-              style={[styles.actionButton, styles.refreshButton]}
-              onPress={() => loadBalance(wallet.publicKey)}
-            >
-              <Text style={styles.actionButtonText}>Refresh Balance</Text>
-            </TouchableOpacity>
           </ScrollView>
         );
 
@@ -2272,7 +2374,7 @@ const WalletScreen = () => {
               <View style={styles.settingItem}>
                 <View style={styles.settingInfo}>
                   <Text style={styles.settingTitle}>{t('current_network')}</Text>
-                  <Text style={styles.settingSubtitle}>Solana Mainnet</Text>
+                  <Text style={styles.settingSubtitle}>Solana {isTestnet ? 'Testnet' : 'Mainnet'}</Text>
                 </View>
               </View>
             </View>
@@ -2808,9 +2910,6 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: '600',
   },
-  refreshButton: {
-    backgroundColor: '#0f3460',
-  },
   header: {
     paddingVertical: 15,
     backgroundColor: '#16213e',
@@ -3312,18 +3411,23 @@ const styles = StyleSheet.create({
   addressContainer: {
     backgroundColor: '#16213e',
     borderRadius: 12,
-    padding: 15,
+    padding: 10,
+    paddingHorizontal: 5,
     marginBottom: 20,
     borderWidth: 1,
     borderColor: 'rgba(0, 212, 255, 0.2)',
   },
   addressText: {
     color: '#ffffff',
-    fontSize: 15,
-    fontFamily: 'monospace',
-    marginVertical: 8,
-    letterSpacing: 0.3,
+    fontSize: 12,
+    fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
+    marginVertical: 2,
+    letterSpacing: 0.5,
     width: '100%',
+    textAlign: 'center',
+    lineHeight: 17,
+    paddingHorizontal: 0,
+    transform: [{ scaleX: 0.88 }],
   },
   copyHint: {
     color: '#00d4ff',
@@ -3368,8 +3472,8 @@ const styles = StyleSheet.create({
   },
   addressRow: {
     flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
+    alignItems: 'flex-start',
+    justifyContent: 'space-between',
     width: '100%',
   },
   addressTextCopied: {
@@ -3526,6 +3630,23 @@ const styles = StyleSheet.create({
     backgroundColor: '#0f0f1a',
     justifyContent: 'center',
     alignItems: 'center',
+  },
+  // Verification error styles (like in browser extension)
+  verificationErrorBox: {
+    backgroundColor: 'rgba(255, 59, 48, 0.1)',
+    borderRadius: 8,
+    padding: 15,
+    marginTop: 10,
+    marginBottom: 10,
+    borderWidth: 1,
+    borderColor: 'rgba(255, 59, 48, 0.3)',
+    width: '100%',
+  },
+  verificationErrorText: {
+    color: '#ff3b30',
+    fontSize: 14,
+    textAlign: 'center',
+    fontWeight: '500',
   },
 });
 

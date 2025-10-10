@@ -82,8 +82,8 @@ function validateSolanaAddress(address: string): boolean {
  * Validate QNet EON address format
  */
 function validateQNetAddress(address: string): boolean {
-  // EON address format: 8chars + "eon" + 8chars (symmetric structure)
-  const eonRegex = /^[a-z0-9]{8}eon[a-z0-9]{8}$/;
+  // New EON address format: 19 chars + "eon" + 15 chars + 4 char checksum = 41 total
+  const eonRegex = /^[a-z0-9]{19}eon[a-z0-9]{15}[a-z0-9]{4}$/;
   return eonRegex.test(address);
 }
 

@@ -1826,25 +1826,21 @@ async function generateEONAddress(seedPhrase) {
     const encoder = new TextEncoder();
     const seedData = encoder.encode(seedPhrase + 'qnet_eon_0'); // Add network identifier
     
-    // Use SHA-256 to derive address deterministically
-    const hashBuffer = await crypto.subtle.digest('SHA-256', seedData);
-    const hashArray = new Uint8Array(hashBuffer);
+    // Use SHA-512 for more entropy (like Ed25519 key generation)
+    const hashBuffer = await crypto.subtle.digest('SHA-512', seedData);
+    const hash = Array.from(new Uint8Array(hashBuffer));
+    const fullHex = hash.map(b => b.toString(16).padStart(2, '0')).join('');
     
-    const chars = '0123456789abcdefghijklmnopqrstuvwxyz';
-    let part1 = '';
-    let part2 = '';
+    // New format: 19 chars + "eon" + 15 chars + 4 char checksum = 41 total
+    const part1 = fullHex.substring(0, 19).toLowerCase();
+    const part2 = fullHex.substring(19, 34).toLowerCase();
     
-    // Generate deterministic parts from hash
-    for (let i = 0; i < 8; i++) {
-        part1 += chars[hashArray[i] % chars.length];
-        part2 += chars[hashArray[i + 8] % chars.length];
-    }
-    
-    // Generate checksum
-    let checksum = '';
-    for (let i = 0; i < 4; i++) {
-        checksum += chars[hashArray[i + 16] % chars.length];
-    }
+    // Generate checksum from the address parts
+    const addressWithoutChecksum = part1 + 'eon' + part2;
+    const checksumBuffer = await crypto.subtle.digest('SHA-256', encoder.encode(addressWithoutChecksum));
+    const checksumHash = Array.from(new Uint8Array(checksumBuffer));
+    const checksumHex = checksumHash.map(b => b.toString(16).padStart(2, '0')).join('');
+    const checksum = checksumHex.substring(0, 4).toLowerCase();
     
     return `${part1}eon${part2}${checksum}`;
 }

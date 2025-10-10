@@ -627,8 +627,8 @@ export class QNetIntegration {
             return false;
         }
 
-        // Check EON format: 8chars + "eon" + 8chars + 4chars = 23 total
-        if (address.length === 23 && address.substring(8, 11) === 'eon') {
+        // Check new EON format: 19 chars + "eon" + 15 chars + 4 char checksum = 41 total
+        if (address.length === 41 && address.substring(19, 22) === 'eon') {
             return true;
         }
 

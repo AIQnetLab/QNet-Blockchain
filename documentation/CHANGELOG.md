@@ -40,7 +40,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Enables proper Genesis node restart and migration
 - **Genesis Wallet Format Sync**: Unified wallet format across all modules
   - quantum_crypto, get_wallet_address, and reward_system now use consistent format
-  - Genesis wallets: "genesis_...eon" (placeholder until real wallet system)
+  - Genesis wallets: "genesis_...eon" (41-character format: 19 + "eon" + 15 + 4 checksum)
   - Eliminates "Code ownership failed" errors for Genesis nodes
 - **Database Key Storage**: Removed encryption key from database
   - state_key no longer saved alongside encrypted data

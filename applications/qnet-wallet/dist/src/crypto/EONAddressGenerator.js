@@ -1,7 +1,7 @@
 /**
  * EON Address Generator for QNet Dual-Network Wallet
- * Generates beautiful EON addresses: 7a9bk4f2eon8x3m5z1c7
- * Format: 8chars + "eon" + 8chars + checksum
+ * Generates beautiful EON addresses
+ * New Format: 19 chars + "eon" + 15 chars + 4 char checksum = 41 total
  */
 
 export class EONAddressGenerator {
@@ -70,20 +70,20 @@ export class EONAddressGenerator {
             return false;
         }
 
-        // Check format: 8chars + "eon" + 8chars + 4chars = 23 total
-        if (address.length !== 23) {
+        // Check new format: 19 chars + "eon" + 15 chars + 4 chars = 41 total
+        if (address.length !== 41) {
             return false;
         }
 
         // Check for "eon" in the middle
-        if (address.substring(8, 11) !== 'eon') {
+        if (address.substring(19, 22) !== 'eon') {
             return false;
         }
 
-        // Extract parts
-        const part1 = address.substring(0, 8);
-        const part2 = address.substring(11, 19);
-        const providedChecksum = address.substring(19, 23);
+        // Extract parts for new format
+        const part1 = address.substring(0, 19);
+        const part2 = address.substring(22, 37);
+        const providedChecksum = address.substring(37, 41);
 
         // Validate character set
         const fullContent = part1 + part2 + providedChecksum;
@@ -159,11 +159,11 @@ export class EONAddressGenerator {
 
         return {
             full: eonAddress,
-            short: `${eonAddress.substring(0, 6)}...${eonAddress.substring(-4)}`,
-            part1: eonAddress.substring(0, 8),
-            part2: eonAddress.substring(11, 19),
-            checksum: eonAddress.substring(19, 23),
-            display: `${eonAddress.substring(0, 8)} eon ${eonAddress.substring(11, 19)} ${eonAddress.substring(19, 23)}`
+            short: `${eonAddress.substring(0, 6)}...${eonAddress.substring(37)}`,
+            part1: eonAddress.substring(0, 19),
+            part2: eonAddress.substring(22, 37),
+            checksum: eonAddress.substring(37, 41),
+            display: `${eonAddress.substring(0, 19)} eon ${eonAddress.substring(22, 37)} ${eonAddress.substring(37, 41)}`
         };
     }
 } 

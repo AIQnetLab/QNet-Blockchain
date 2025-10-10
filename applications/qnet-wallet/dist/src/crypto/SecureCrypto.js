@@ -498,21 +498,21 @@ export class SecureCrypto {
      * Validate QNet address format
      */
     validateAddress(address) {
-        // EON address format: 8chars + eon + 8chars + 4chars checksum
+        // New EON address format: 19 chars + eon + 15 chars + 4 chars checksum = 41 total
         if (!address || typeof address !== 'string') {
             return false;
         }
 
-        const eonRegex = /^[a-z0-9]{8}eon[a-z0-9]{8}[a-z0-9]{4}$/;
+        const eonRegex = /^[a-z0-9]{19}eon[a-z0-9]{15}[a-z0-9]{4}$/;
         if (!eonRegex.test(address)) {
             return false;
         }
 
         // Optional: checksum validation
         try {
-            const part1 = address.substring(0, 8);
-            const part2 = address.substring(11, 19);
-            const checksum = address.substring(19);
+            const part1 = address.substring(0, 19);
+            const part2 = address.substring(22, 37);
+            const checksum = address.substring(37);
 
             const checksum_payload = part1 + part2;
             let calculated_checksum = '';

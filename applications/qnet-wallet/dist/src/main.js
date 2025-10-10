@@ -298,8 +298,8 @@ async function loadCurrentNetworkData() {
                 eonAddress = await networkManager.getOrCreateEonAddress();
             }
             
-            // Get QNC balance
-            const qncBalance = await qnetIntegration.getQNCBalance(eonAddress);
+            // Get QNC balance - not shown per user request
+            const qncBalance = 0;
             
             // Get node information
             const nodeInfo = await qnetIntegration.getNodeInfo(eonAddress);
@@ -315,7 +315,7 @@ async function loadCurrentNetworkData() {
             // Update display
             updateAccountDisplay(eonAddress, `${qncBalance} QNC`);
             
-            console.log('✅ QNet data loaded:', { eonAddress, qncBalance, nodeInfo });
+            console.log('✅ QNet data loaded:', { eonAddress, nodeInfo });
             
         } else {
             // Load Solana data
@@ -391,7 +391,7 @@ function updateAccountDisplay(address, balance) {
 function formatEONAddress(address) {
     if (!address?.includes('eon')) return address;
     
-    const match = address.match(/(.{8})eon(.{8})(.{4})/);
+    const match = address.match(/(.{19})eon(.{15})(.{4})/);
     if (match) {
         return `${match[1]} eon ${match[2]} ${match[3]}`;
     }
@@ -488,8 +488,8 @@ async function updateQNetContent() {
         // Update QNet token list
         const tokenList = document.getElementById('qnet-token-list');
         if (tokenList) {
-            const qncBalance = walletState.networks.qnet.balance?.QNC || 0;
-            tokenList.innerHTML = createTokenItemHTML('💎', 'QNet Coin', 'QNC', qncBalance, '$0.00');
+            // No balance or price shown per user request
+            tokenList.innerHTML = createTokenItemHTML('💎', 'QNet Coin', 'QNC', 0, '');
         }
         
         // Update node card

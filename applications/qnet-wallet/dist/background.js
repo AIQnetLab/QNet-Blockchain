@@ -2366,20 +2366,31 @@ class ProductionCrypto {
     // Generate QNet EON address
     static async generateQNetAddress(seed, accountIndex = 0) {
         try {
+            // Use same cryptographic approach as Solana for consistency
+            // Derive from seed + account index using SHA-512 for maximum entropy
             const encoder = new TextEncoder();
             const accountData = encoder.encode(`qnet-eon-${accountIndex}`);
             const combinedData = new Uint8Array(seed.length + accountData.length);
             combinedData.set(seed);
             combinedData.set(accountData, seed.length);
             
-            const hashBuffer = await crypto.subtle.digest('SHA-256', combinedData);
+            // Use SHA-512 for more entropy (like Ed25519 key generation)
+            const hashBuffer = await crypto.subtle.digest('SHA-512', combinedData);
             const hash = Array.from(new Uint8Array(hashBuffer));
-            const hex = hash.map(b => b.toString(16).padStart(2, '0')).join('');
+            const fullHex = hash.map(b => b.toString(16).padStart(2, '0')).join('');
             
-            // Format as EON address: 8chars + "eon" + 8chars + 4char checksum
-            const part1 = hex.substring(0, 8);
-            const part2 = hex.substring(8, 16);
-            const checksum = hex.substring(56, 60);
+            // Create deterministic address from hash
+            // New format: 19 chars + "eon" + 15 chars + 4 char checksum = 41 total
+            const part1 = fullHex.substring(0, 19).toLowerCase();
+            const part2 = fullHex.substring(19, 34).toLowerCase();
+            
+            // Generate checksum from the address parts
+            const addressWithoutChecksum = part1 + 'eon' + part2;
+            const checksumEncoder = new TextEncoder();
+            const checksumBuffer = await crypto.subtle.digest('SHA-256', checksumEncoder.encode(addressWithoutChecksum));
+            const checksumHash = Array.from(new Uint8Array(checksumBuffer));
+            const checksumHex = checksumHash.map(b => b.toString(16).padStart(2, '0')).join('');
+            const checksum = checksumHex.substring(0, 4).toLowerCase();
             
             return `${part1}eon${part2}${checksum}`;
         } catch (error) {
@@ -6260,7 +6271,7 @@ async function getNetworkAgeYears() {
 
 /**
  * Generate EON address using professional crypto approach
- * Format: 8chars + "eon" + 8chars + checksum (e.g., 7a9bk4f2eon8x3m5z1c7)
+ * New Format: 19 chars + "eon" + 15 chars + 4 char checksum = 41 total
  */
 function generateEONAddress() {
     const charset = '123456789abcdefghijkmnopqrstuvwxyz'; // Safe chars without confusion
@@ -6291,9 +6302,9 @@ function generateEONAddress() {
         return checksum;
     };
     
-    // Generate parts
-    const part1 = generateSecureRandom(8);
-    const part2 = generateSecureRandom(8);
+    // Generate parts for new format
+    const part1 = generateSecureRandom(19);  // 19 chars before "eon"
+    const part2 = generateSecureRandom(15);  // 15 chars after "eon"
     
     // For synchronous compatibility, use simple checksum
     const simpleChecksum = (part1 + part2).split('').reduce((acc, char, i) => {

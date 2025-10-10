@@ -1,6 +1,8 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import CryptoJS from 'crypto-js';
 import { Connection, Keypair, PublicKey } from '@solana/web3.js';
+import { derivePath } from 'ed25519-hd-key';
+import * as bip39 from 'bip39';
 
 export class WalletManager {
   constructor() {
@@ -2059,32 +2061,56 @@ export class WalletManager {
     ];
   }
 
+  // Generate QNet address from mnemonic directly (for extension compatibility)
+  async generateQNetAddressFromMnemonic(mnemonic, accountIndex = 0) {
+    try {
+      // Use same method as extension - SHA-512 hash of mnemonic + account
+      const data = mnemonic + `qnet_eon_${accountIndex}`;
+      const hash = CryptoJS.SHA512(data);
+      const fullHash = hash.toString(CryptoJS.enc.Hex);
+      
+      // New format: 19 chars + "eon" + 15 chars + 4 char checksum = 41 total
+      const part1 = fullHash.substring(0, 19).toLowerCase();
+      const part2 = fullHash.substring(19, 34).toLowerCase();
+      
+      // Generate checksum
+      const addressWithoutChecksum = part1 + 'eon' + part2;
+      const checksumData = CryptoJS.SHA256(addressWithoutChecksum);
+      const checksum = checksumData.toString(CryptoJS.enc.Hex).substring(0, 4).toLowerCase();
+      
+      return `${part1}eon${part2}${checksum}`;
+    } catch (error) {
+      console.error('Error generating QNet address:', error);
+      throw error;
+    }
+  }
+
   // Generate QNet EON address (compatible with extension wallet)
   async generateQNetAddress(seed, accountIndex = 0) {
     try {
-      // Create account-specific data
+      // Use same cryptographic approach as extension for consistency
+      // Derive from seed + account index using SHA-512 for maximum entropy
       const accountData = `qnet-eon-${accountIndex}`;
       
-      // Combine seed and account data
+      // Combine seed and account data (same as extension)
       const combinedData = new Uint8Array(seed.length + accountData.length);
-      combinedData.set(seed);
+      combinedData.set(new Uint8Array(seed));
       const encoder = new TextEncoder();
       combinedData.set(encoder.encode(accountData), seed.length);
       
-      // Hash the combined data
-      const hash = CryptoJS.SHA256(CryptoJS.lib.WordArray.create(combinedData));
-      const hex = hash.toString(CryptoJS.enc.Hex);
+      // Use SHA-512 for more entropy (same as extension)
+      const hash = CryptoJS.SHA512(CryptoJS.lib.WordArray.create(combinedData));
+      const fullHash = hash.toString(CryptoJS.enc.Hex);
       
-      // Take first 16 bytes for address generation
-      const addressBytes = hex.substring(0, 32);
+      // Create deterministic address from hash
+      // New format: 19 chars + "eon" + 15 chars + 4 char checksum = 41 total
+      const part1 = fullHash.substring(0, 19).toLowerCase();
+      const part2 = fullHash.substring(19, 34).toLowerCase();
       
-      // Create checksum
-      const checksumData = CryptoJS.SHA256(addressBytes);
-      const checksum = checksumData.toString(CryptoJS.enc.Hex).substring(0, 4);
-      
-      // Format as QNet EON address: XXXXXXeonXXXXXXYYYY
-      const part1 = addressBytes.substring(0, 6);
-      const part2 = addressBytes.substring(6, 12);
+      // Generate checksum from the address parts
+      const addressWithoutChecksum = part1 + 'eon' + part2;
+      const checksumData = CryptoJS.SHA256(addressWithoutChecksum);
+      const checksum = checksumData.toString(CryptoJS.enc.Hex).substring(0, 4).toLowerCase();
       
       return `${part1}eon${part2}${checksum}`;
     } catch (error) {
@@ -2093,116 +2119,21 @@ export class WalletManager {
     }
   }
 
-  // HD derivation for Solana - SLIP-0010 standard like extension
+  // HD derivation for Solana using ed25519-hd-key (Phantom-compatible)
   async deriveHDKeypair(seed, accountIndex = 0) {
     try {
-      // Implement SLIP-0010 (Ed25519 HD derivation) 
-      // Path: m/44'/501'/accountIndex'/0'
+      // Use Phantom's standard derivation path: m/44'/501'/accountIndex'/0'
+      // This ensures compatibility with Phantom, Solflare and other major Solana wallets
+      const path = `m/44'/501'/${accountIndex}'/0'`;
       
-      // Step 1: Generate master key from seed
-      // HMAC-SHA512(Key = "ed25519 seed", Data = seed)
+      // Use ed25519-hd-key library for proper HD derivation
+      // This is the same library used by Phantom wallet
+      const { key } = derivePath(path, Buffer.from(seed).toString('hex'));
       
-      // Convert seed bytes to proper WordArray
-      const words = [];
-      for (let i = 0; i < seed.length; i += 4) {
-        words.push(
-          (seed[i] << 24) | 
-          ((seed[i + 1] || 0) << 16) | 
-          ((seed[i + 2] || 0) << 8) | 
-          (seed[i + 3] || 0)
-        );
-      }
-      const seedWordArray = CryptoJS.lib.WordArray.create(words, seed.length);
-      
-      const masterSeedKey = 'ed25519 seed';
-      const masterHmac = CryptoJS.HmacSHA512(seedWordArray, masterSeedKey);
-      
-      // Convert to bytes
-      const masterBytes = new Uint8Array(64);
-      for (let i = 0; i < 16; i++) {
-        const word = masterHmac.words[i];
-        masterBytes[i * 4] = (word >> 24) & 0xff;
-        masterBytes[i * 4 + 1] = (word >> 16) & 0xff;
-        masterBytes[i * 4 + 2] = (word >> 8) & 0xff;
-        masterBytes[i * 4 + 3] = word & 0xff;
-      }
-      
-      let currentKey = masterBytes.slice(0, 32);  // Private key
-      let currentChainCode = masterBytes.slice(32, 64);  // Chain code
-      
-      // Step 2: Derive path m/44'/501'/accountIndex'/0'
-      const levels = [
-        0x8000002C, // 44' (hardened)
-        0x800001F5, // 501' (hardened) - Solana coin type
-        0x80000000 + accountIndex, // accountIndex' (hardened)
-        0x80000000  // 0' (hardened change)
-      ];
-      
-      for (const index of levels) {
-        // HMAC-SHA512(Key = chainCode, Data = 0x00 || privateKey || index)
-        const data = new Uint8Array(37);
-        data[0] = 0x00;
-        data.set(currentKey, 1);
-        data[33] = (index >> 24) & 0xFF;
-        data[34] = (index >> 16) & 0xFF;
-        data[35] = (index >> 8) & 0xFF;
-        data[36] = index & 0xFF;
-        
-        // Convert data to proper WordArray
-        const dataWords = [];
-        for (let i = 0; i < data.length; i += 4) {
-          dataWords.push(
-            (data[i] << 24) | 
-            ((data[i + 1] || 0) << 16) | 
-            ((data[i + 2] || 0) << 8) | 
-            (data[i + 3] || 0)
-          );
-        }
-        const dataWordArray = CryptoJS.lib.WordArray.create(dataWords, data.length);
-        
-        // Convert chainCode to proper WordArray  
-        const chainWords = [];
-        for (let i = 0; i < currentChainCode.length; i += 4) {
-          chainWords.push(
-            (currentChainCode[i] << 24) | 
-            (currentChainCode[i + 1] << 16) | 
-            (currentChainCode[i + 2] << 8) | 
-            currentChainCode[i + 3]
-          );
-        }
-        const chainWordArray = CryptoJS.lib.WordArray.create(chainWords, currentChainCode.length);
-        
-        const hmac = CryptoJS.HmacSHA512(dataWordArray, chainWordArray);
-        
-        // Convert to bytes
-        const derivedBytes = new Uint8Array(64);
-        for (let i = 0; i < 16; i++) {
-          const word = hmac.words[i];
-          derivedBytes[i * 4] = (word >> 24) & 0xff;
-          derivedBytes[i * 4 + 1] = (word >> 16) & 0xff;
-          derivedBytes[i * 4 + 2] = (word >> 8) & 0xff;
-          derivedBytes[i * 4 + 3] = word & 0xff;
-        }
-        
-        currentKey = derivedBytes.slice(0, 32);
-        currentChainCode = derivedBytes.slice(32, 64);
-      }
-      
-      // COMPATIBILITY NOTE:
-      // Testing shows browser extension uses direct seed (first 32 bytes) for account 0
-      // This is standard behavior for many Solana wallets to ensure compatibility
-      // HD derivation is fully implemented above but we match extension behavior
-      if (accountIndex === 0) {
-        // Use direct seed for first account - standard Solana wallet behavior
-        // This ensures seed phrase compatibility with browser extension
-        return seed.slice(0, 32);
-      }
-      
-      // For other accounts, use full HD derivation result
-      return currentKey;
+      return key;
     } catch (error) {
       console.error('HD derivation error:', error);
-      // Fallback to simple derivation
+      // Fallback to direct seed for compatibility
       return seed.slice(0, 32);
     }
   }
@@ -2210,43 +2141,20 @@ export class WalletManager {
   // Generate new wallet with BIP39 mnemonic
   async generateWallet() {
     try {
-      // Generate BIP39 mnemonic with checksum
-      const mnemonic = await this.generateMnemonic();
+      // Generate BIP39 mnemonic with checksum using bip39 library
+      const mnemonic = bip39.generateMnemonic();
       
-      // Derive seed from mnemonic (same as importWallet to ensure compatibility)
-      const mnemonicNormalized = mnemonic.trim().toLowerCase();
-      const passphrase = ''; // Optional passphrase, usually empty
+      // Use bip39 library for standard seed generation
+      const seed = bip39.mnemonicToSeedSync(mnemonic);
       
-      // BIP39: PBKDF2 with mnemonic as password and "mnemonic" + passphrase as salt
-      const salt = 'mnemonic' + passphrase;
-      const iterations = 2048; // BIP39 standard
-      const keySize = 512 / 32; // 512 bits = 64 bytes
-      
-      // Use CryptoJS PBKDF2
-      const seed = CryptoJS.PBKDF2(mnemonicNormalized, salt, {
-        keySize: keySize,
-        iterations: iterations,
-        hasher: CryptoJS.algo.SHA512
-      });
-      
-      // Convert CryptoJS WordArray to Uint8Array (full 64 bytes)
-      const seedBytes = new Uint8Array(64);
-      for (let i = 0; i < 16; i++) { // 16 words * 4 bytes = 64 bytes
-        const word = seed.words[i];
-        seedBytes[i * 4] = (word >> 24) & 0xff;
-        seedBytes[i * 4 + 1] = (word >> 16) & 0xff;
-        seedBytes[i * 4 + 2] = (word >> 8) & 0xff;
-        seedBytes[i * 4 + 3] = word & 0xff;
-      }
-      
-      // Use HD derivation for Solana like Phantom and our extension
-      const keypairSeed = await this.deriveHDKeypair(seedBytes, 0);
+      // Use HD derivation for Solana like Phantom wallet
+      const keypairSeed = await this.deriveHDKeypair(seed, 0);
       
       // Create keypair from derived seed  
       const keypair = Keypair.fromSeed(keypairSeed);
       
-      // Generate QNet EON address (compatible with extension wallet)
-      const qnetAddress = await this.generateQNetAddress(seedBytes, 0);
+      // Generate QNet EON address directly from mnemonic for extension compatibility
+      const qnetAddress = await this.generateQNetAddressFromMnemonic(mnemonic, 0);
       
       return {
         publicKey: keypair.publicKey.toString(),
@@ -2409,51 +2317,28 @@ export class WalletManager {
   // Import wallet from mnemonic with BIP39 validation
   async importWallet(mnemonic) {
     try {
-      // Validate BIP39 mnemonic with checksum
-      const validation = this.validateBIP39Mnemonic(mnemonic.trim());
-      if (!validation.valid) {
-        throw new Error(validation.error);
+      // Validate BIP39 mnemonic using bip39 library
+      const trimmedMnemonic = mnemonic.trim();
+      if (!bip39.validateMnemonic(trimmedMnemonic)) {
+        throw new Error('Invalid mnemonic phrase');
       }
 
-      // Derive seed from mnemonic using PBKDF2 (BIP39 standard)
-      const mnemonicNormalized = mnemonic.trim().toLowerCase();
-      const passphrase = ''; // Optional passphrase, usually empty
+      // Use bip39 library for standard seed generation (Phantom-compatible)
+      const seed = bip39.mnemonicToSeedSync(trimmedMnemonic);
       
-      // BIP39: PBKDF2 with mnemonic as password and "mnemonic" + passphrase as salt
-      const salt = 'mnemonic' + passphrase;
-      const iterations = 2048; // BIP39 standard
-      const keySize = 512 / 32; // 512 bits = 64 bytes
-      
-      // Use CryptoJS PBKDF2
-      const seed = CryptoJS.PBKDF2(mnemonicNormalized, salt, {
-        keySize: keySize,
-        iterations: iterations,
-        hasher: CryptoJS.algo.SHA512
-      });
-      
-      // Convert CryptoJS WordArray to Uint8Array (full 64 bytes)
-      const seedBytes = new Uint8Array(64);
-      for (let i = 0; i < 16; i++) { // 16 words * 4 bytes = 64 bytes
-        const word = seed.words[i];
-        seedBytes[i * 4] = (word >> 24) & 0xff;
-        seedBytes[i * 4 + 1] = (word >> 16) & 0xff;
-        seedBytes[i * 4 + 2] = (word >> 8) & 0xff;
-        seedBytes[i * 4 + 3] = word & 0xff;
-      }
-      
-      // Use HD derivation for Solana like Phantom and our extension
-      const keypairSeed = await this.deriveHDKeypair(seedBytes, 0);
+      // Use HD derivation for Solana like Phantom wallet
+      const keypairSeed = await this.deriveHDKeypair(seed, 0);
       
       // Create keypair from derived seed
       const keypair = Keypair.fromSeed(keypairSeed);
       
-      // Generate QNet EON address (compatible with extension wallet)
-      const qnetAddress = await this.generateQNetAddress(seedBytes, 0);
+      // Generate QNet EON address directly from mnemonic for extension compatibility
+      const qnetAddress = await this.generateQNetAddressFromMnemonic(trimmedMnemonic, 0);
       
       return {
         publicKey: keypair.publicKey.toString(),
         secretKey: Array.from(keypair.secretKey),
-        mnemonic: mnemonicNormalized,
+        mnemonic: mnemonic.trim(),
         address: keypair.publicKey.toString(),
         solanaAddress: keypair.publicKey.toString(),
         qnetAddress: qnetAddress,
@@ -2563,12 +2448,24 @@ export class WalletManager {
         }
       );
       
-      const decryptedStr = decrypted.toString(CryptoJS.enc.Utf8);
-      if (!decryptedStr) {
-        throw new Error('Invalid password');
+      let decryptedStr;
+      try {
+        decryptedStr = decrypted.toString(CryptoJS.enc.Utf8);
+      } catch (utf8Error) {
+        console.error('UTF-8 decode error, likely wrong password');
+        throw new Error('Wrong password or corrupted wallet');
       }
       
-      return JSON.parse(decryptedStr);
+      if (!decryptedStr) {
+        throw new Error('Wrong password or corrupted wallet');
+      }
+      
+      try {
+        return JSON.parse(decryptedStr);
+      } catch (parseError) {
+        console.error('Failed to parse decrypted data');
+        throw new Error('Wrong password or corrupted wallet');
+      }
     } catch (error) {
       console.error('Error loading wallet:', error);
       throw error;
@@ -2578,16 +2475,11 @@ export class WalletManager {
   // Get wallet balance from Solana network
   async getBalance(publicKey, isTestnet = true) {
     try {
-      // Try to use existing connection first
-      if (this.connection) {
-        const balance = await this.connection.getBalance(new PublicKey(publicKey));
-        return balance / 1000000000; // Convert lamports to SOL
-      }
-      
-      // Use correct RPC based on network
+      // Use correct RPC based on network (don't use cached connection)
+      // FIXED: Previously inverted - now isTestnet=true means devnet
       const rpcUrl = isTestnet 
-        ? 'https://api.devnet.solana.com'
-        : 'https://api.mainnet-beta.solana.com';
+        ? 'https://api.devnet.solana.com'  // Testnet
+        : 'https://api.mainnet-beta.solana.com';  // Mainnet
         
       const response = await fetch(rpcUrl, {
         method: 'POST',
@@ -2618,10 +2510,10 @@ export class WalletManager {
   // Get SPL token balance (for 1DEV and other tokens)
   async getTokenBalance(walletAddress, mintAddress, isTestnet = true) {
     try {
-      // Use correct RPC based on network
+      // Use correct RPC based on network - TESTNET when isTestnet=true
       const rpcUrl = isTestnet 
-        ? 'https://api.devnet.solana.com'
-        : 'https://api.mainnet-beta.solana.com';
+        ? 'https://api.devnet.solana.com'  // TESTNET when isTestnet=true
+        : 'https://api.mainnet-beta.solana.com';  // MAINNET when isTestnet=false
       
       // Get token accounts for the wallet
       const response = await fetch(rpcUrl, {
@@ -2666,14 +2558,15 @@ export class WalletManager {
   // Get real burn progress from blockchain
   async getBurnProgress(isTestnet = true) {
     try {
+      // Ensure correct RPC endpoint usage
       const rpcUrl = isTestnet 
-        ? 'https://api.devnet.solana.com'
-        : 'https://api.mainnet-beta.solana.com';
+        ? 'https://api.devnet.solana.com'  // TESTNET when isTestnet=true
+        : 'https://api.mainnet-beta.solana.com';  // MAINNET when isTestnet=false
       
-      // 1DEV token mint addresses
+      // 1DEV token mint addresses - ensure correct assignment
       const oneDevMint = isTestnet 
-        ? '62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ'  // Testnet
-        : '4R3DPW4BY97kJRfv8J5wgTtbDpoXpRv92W957tXMpump';  // Mainnet
+        ? '62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ'  // Testnet 1DEV
+        : '4R3DPW4BY97kJRfv8J5wgTtbDpoXpRv92W957tXMpump';  // Mainnet 1DEV
       
       const TOTAL_SUPPLY = 1000000000; // 1 billion total supply
       

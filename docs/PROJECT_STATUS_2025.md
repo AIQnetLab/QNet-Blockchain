@@ -144,7 +144,7 @@
 - ✅ **CORS issues resolved** with background service
 
 ### **QNet Native Network - DEVELOPMENT**
-- ✅ **EON address generation** implemented
+- ✅ **EON address generation** implemented (41-character format: 19 + "eon" + 15 + 4 checksum)
 - ✅ **Node management** framework ready
 - ✅ **QNC token mechanics** designed
 - 🔄 **Network nodes** in testing phase
