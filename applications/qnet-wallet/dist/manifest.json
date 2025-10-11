@@ -1,13 +1,16 @@
 {
   "manifest_version": 3,
   "name": "QNet Wallet",
-  "version": "2.1.0",
+  "version": "2.1.4",
   "description": "Multi-network wallet for QNet blockchain and Solana",
   "permissions": [
     "storage",
     "activeTab",
     "scripting",
     "tabs"
+  ],
+  "host_permissions": [
+    "<all_urls>"
   ],
   "content_security_policy": {
     "extension_pages": "script-src 'self'; object-src 'none'; style-src 'self' 'unsafe-inline';"

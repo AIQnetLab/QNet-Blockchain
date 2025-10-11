@@ -303,7 +303,7 @@ export default function HomePage() {
           </div>
           <div className="tech-item">
             <h4 className="tech-title">Dynamic Activation Pricing</h4>
-            <p>Network size multipliers: 0-100K nodes (0.5x discount), 100K-1M (1.0x standard), 1M-10M (2.0x), 10M+ (3.0x premium). ALL fees → Pool #3!</p>
+            <p>Network size multipliers: 0-100K nodes (0.5x discount), 100K-300K (1.0x standard), 300K-1M (2.0x), 1M+ (3.0x premium). ALL fees → Pool #3!</p>
           </div>
           <div className="tech-item">
             <h4 className="tech-title">Three Reward Pools</h4>

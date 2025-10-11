@@ -461,10 +461,51 @@ export class SolanaIntegration {
         try {
             const burnPercent = await this.getBurnPercentage();
             
-            // CORRECT Phase 1 Economic Model: Universal pricing for ALL node types
+            // Check if Phase 2 (90% burned or 5 years passed)
+            if (burnPercent >= 90) {
+                // Phase 2: QNC activation with dynamic network multiplier
+                const phase2BaseCosts = {
+                    light: 5000,  // Base QNC cost
+                    full: 7500,   // Base QNC cost
+                    super: 10000  // Base QNC cost
+                };
+                
+                // Get active nodes count (mock for now)
+                const activeNodesCount = 150000; // TODO: Get real count from blockchain
+                
+                // Calculate network size multiplier
+                let multiplier = 1.0;
+                if (activeNodesCount <= 100000) {
+                    multiplier = 0.5; // Early network discount
+                } else if (activeNodesCount <= 300000) {
+                    multiplier = 1.0; // Standard rate
+                } else if (activeNodesCount <= 1000000) {
+                    multiplier = 2.0; // High demand
+                } else {
+                    multiplier = 3.0; // Mature network (1M+)
+                }
+                
+                const baseCost = phase2BaseCosts[nodeType] || phase2BaseCosts.full;
+                const finalCost = Math.round(baseCost * multiplier);
+                
+                return {
+                    nodeType: nodeType,
+                    cost: finalCost,
+                    baseCost: baseCost,
+                    currency: 'QNC',
+                    phase: 2,
+                    mechanism: 'transfer', // Transfer to Pool 3, not burn
+                    description: `Transfer ${finalCost} QNC to Pool #3`,
+                    networkSize: activeNodesCount,
+                    multiplier: multiplier,
+                    burnPercent: burnPercent
+                };
+            }
+            
+            // Phase 1 Economic Model: Universal pricing for ALL node types
             const PHASE_1_BASE_PRICE = 1500; // 1DEV base cost
             const PRICE_REDUCTION_PER_10_PERCENT = 150; // 150 1DEV reduction per 10% burned
-            const MINIMUM_PRICE = 150; // Minimum price at 90% burned
+            const MINIMUM_PRICE = 300; // Minimum price at 80-90% burned
             
             // Calculate current price: Every 10% burned = -150 1DEV reduction
             const reductionTiers = Math.floor(burnPercent / 10);

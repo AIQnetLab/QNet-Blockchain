@@ -22,10 +22,10 @@ class PricingConfig:
     super_base_price: float = 10_000  # Super node base cost
     
     # Network size multipliers (CORRECT implementation)
-    multiplier_0_100k: float = 0.5    # 0-100k nodes: 0.5x
-    multiplier_100k_1m: float = 1.0   # 100k-1M nodes: 1.0x  
-    multiplier_1m_10m: float = 2.0    # 1M-10M nodes: 2.0x
-    multiplier_10m_plus: float = 3.0  # 10M+ nodes: 3.0x
+    multiplier_0_100k: float = 0.5     # 0-100k nodes: 0.5x
+    multiplier_100k_300k: float = 1.0  # 100k-300k nodes: 1.0x
+    multiplier_300k_1m: float = 2.0    # 300k-1M nodes: 2.0x
+    multiplier_1m_plus: float = 3.0    # 1M+ nodes: 3.0x
     
     # Target equilibrium points
     target_total_nodes: int = 100_000
@@ -103,13 +103,13 @@ class DynamicPricingCalculator:
     def _get_network_multiplier(self, total_nodes: int) -> float:
         """Get network size multiplier for CORRECT Phase 2 pricing"""
         if total_nodes < 100_000:
-            return self.config.multiplier_0_100k      # 0.5x
+            return self.config.multiplier_0_100k       # 0.5x
+        elif total_nodes < 300_000:
+            return self.config.multiplier_100k_300k    # 1.0x
         elif total_nodes < 1_000_000:
-            return self.config.multiplier_100k_1m     # 1.0x
-        elif total_nodes < 10_000_000:
-            return self.config.multiplier_1m_10m      # 2.0x
+            return self.config.multiplier_300k_1m      # 2.0x
         else:
-            return self.config.multiplier_10m_plus    # 3.0x
+            return self.config.multiplier_1m_plus      # 3.0x
     
     def _get_target_count(self, node_type: NodeType, total_target: int) -> int:
         """Get target count for node type"""

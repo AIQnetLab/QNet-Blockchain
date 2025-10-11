@@ -256,9 +256,9 @@ impl QNetQuantumCrypto {
             });
         }
         
-        // Validate code format: QNET-XXXXXX-XXXXXX-XXXXXX (26 chars)
-        if !activation_code.starts_with("QNET-") || activation_code.len() != 26 {
-            return Err(anyhow!("Invalid activation code format - expected QNET-XXXXXX-XXXXXX-XXXXXX (26 chars)"));
+        // Validate code format: QNET-XXXXXX-XXXXXX-XXXXXX (25 chars)
+        if !activation_code.starts_with("QNET-") || activation_code.len() != 25 {
+            return Err(anyhow!("Invalid activation code format - expected QNET-XXXXXX-XXXXXX-XXXXXX (25 chars)"));
         }
 
         // 2. Parse route.ts format: QNET-[TYPE+TIMESTAMP]-[WALLET_PART1]-[WALLET_PART2+ENTROPY]
@@ -595,8 +595,8 @@ impl QNetQuantumCrypto {
             });
         }
         
-        // Validate format: QNET-XXXXXX-XXXXXX-XXXXXX (26 chars) for regular codes (genesis codes 20 chars)
-        if !code.starts_with("QNET-") || (code.len() != 26 && code.len() != 20) {
+        // Validate format: QNET-XXXXXX-XXXXXX-XXXXXX (25 chars) for regular codes (genesis codes 20 chars)
+        if !code.starts_with("QNET-") || (code.len() != 25 && code.len() != 20) {
             return Err(anyhow!("Invalid activation code format"));
         }
 

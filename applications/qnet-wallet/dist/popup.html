@@ -274,17 +274,17 @@
                                     <div class="node-options" id="node-options" style="flex: 1; display: flex; flex-direction: column; justify-content: center; gap: 0.6rem;">
                                         <div class="node-option" data-type="light" style="display: flex; justify-content: space-between; align-items: center; cursor: pointer;">
                                             <span class="node-name">Light Node</span>
-                                            <span class="node-price" style="flex-grow: 1; text-align: center;">1500 1DEV</span>
+                                            <span class="node-price" data-node-type="light" style="flex-grow: 1; text-align: center;">Loading...</span>
                                             <span class="node-action">Activate</span>
                                         </div>
                                         <div class="node-option" data-type="full" style="display: flex; justify-content: space-between; align-items: center; cursor: pointer;">
                                             <span class="node-name">Full Node</span>
-                                            <span class="node-price" style="flex-grow: 1; text-align: center;">1500 1DEV</span>
+                                            <span class="node-price" data-node-type="full" style="flex-grow: 1; text-align: center;">Loading...</span>
                                             <span class="node-action">Activate</span>
                                         </div>
                                         <div class="node-option" data-type="super" style="display: flex; justify-content: space-between; align-items: center; cursor: pointer;">
                                             <span class="node-name">Super Node</span>
-                                            <span class="node-price" style="flex-grow: 1; text-align: center;">1500 1DEV</span>
+                                            <span class="node-price" data-node-type="super" style="flex-grow: 1; text-align: center;">Loading...</span>
                                             <span class="node-action">Activate</span>
                                         </div>
                                     </div>
@@ -312,8 +312,8 @@
                                         <div>
                                             <div class="activation-cost" style="text-align: center; margin: 0.4rem 0;">
                                                 <div style="color: #888; font-size: 0.65rem;">Activation Cost</div>
-                                                <div style="color: #00d4ff; font-size: 1rem; font-weight: bold; margin: 0.1rem 0;">1500 1DEV</div>
-                                                <div style="color: #888; font-size: 0.6rem;">Tokens will be burned permanently</div>
+                                                <div id="node-activation-cost" style="color: #00d4ff; font-size: 1rem; font-weight: bold; margin: 0.1rem 0;">Loading...</div>
+                                                <div id="node-activation-method" style="color: #888; font-size: 0.6rem;">Loading pricing...</div>
                                 </div>
                 
                                             <button id="activate-node-button" class="qnet-button primary full-width" style="padding: 0.5rem; font-size: 0.75rem;">

@@ -43,7 +43,7 @@ QNet uses a two-phase system for node activation that transitions from external 
 
 ### Pricing:
 - Different base prices: Light 5,000 / Full 7,500 / Super 10,000 QNC
-- Network size multipliers: 0.5x (0-100k) / 1.0x (100k-1M) / 2.0x (1M-10M) / 3.0x (10M+)
+- Network size multipliers: 0.5x (0-100k) / 1.0x (100k-300k) / 2.0x (300k-1M) / 3.0x (1M+)
 - All QNC transferred to Pool 3 for equal daily distribution
 
 ## Architecture Diagram

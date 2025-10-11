@@ -2270,12 +2270,12 @@ impl BlockchainActivationRegistry {
         // Network size multipliers (CORRECT implementation from dynamic_pricing.py)
         let multiplier = if total_nodes < 100_000 {
             0.5  // 0-100k nodes: 0.5x (early adopter discount)
+        } else if total_nodes < 300_000 {
+            1.0  // 100k-300k nodes: 1.0x (standard price)
         } else if total_nodes < 1_000_000 {
-            1.0  // 100k-1M nodes: 1.0x (standard price)
-        } else if total_nodes < 10_000_000 {
-            2.0  // 1M-10M nodes: 2.0x (growing network)
+            2.0  // 300k-1M nodes: 2.0x (growing network)
         } else {
-            3.0  // 10M+ nodes: 3.0x (mature network)
+            3.0  // 1M+ nodes: 3.0x (mature network)
         };
         
         // Calculate final price

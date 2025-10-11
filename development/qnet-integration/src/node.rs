@@ -5763,8 +5763,8 @@ impl BlockchainNode {
             println!("✅ Genesis code - skipping ownership verification (IP-based auth)");
         } else {
             // Check basic format for regular codes (26-char format only)
-            if !code.starts_with("QNET-") || code.len() != 26 {
-                return Err(QNetError::ValidationError("Invalid activation code format. Expected: QNET-XXXXXX-XXXXXX-XXXXXX (26 chars)".to_string()));
+            if !code.starts_with("QNET-") || code.len() != 25 {
+                return Err(QNetError::ValidationError("Invalid activation code format. Expected: QNET-XXXXXX-XXXXXX-XXXXXX (25 chars)".to_string()));
             }
             
             let registry = crate::activation_validation::BlockchainActivationRegistry::new(
@@ -5910,9 +5910,9 @@ impl BlockchainNode {
             return Err("Empty activation code is not allowed".to_string());
         }
         
-        // Validate format: QNET-XXXXXX-XXXXXX-XXXXXX (26 chars)
-        if !code.starts_with("QNET-") || code.len() != 26 {
-            return Err("Invalid activation code format. Expected: QNET-XXXXXX-XXXXXX-XXXXXX (26 chars)".to_string());
+        // Validate format: QNET-XXXXXX-XXXXXX-XXXXXX (25 chars)
+        if !code.starts_with("QNET-") || code.len() != 25 {
+            return Err("Invalid activation code format. Expected: QNET-XXXXXX-XXXXXX-XXXXXX (25 chars)".to_string());
         }
         
         // Use centralized ActivationValidator from activation_validation.rs

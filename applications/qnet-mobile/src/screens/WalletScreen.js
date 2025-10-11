@@ -20,6 +20,9 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import WalletManager from '../components/WalletManager';
 
+// 1DEV Burn Tracker Contract (same as browser extension)
+const BURN_CONTRACT_PROGRAM_ID = 'D7g7mkL8o1YEex6ZgETJEQyyHV7uuUMvV3Fy3u83igJ7';
+
 // Translations - All supported languages
 const translations = {
   en: {
@@ -663,7 +666,7 @@ const WalletScreen = () => {
   const [sendAmount, setSendAmount] = useState('');
   const [showSettings, setShowSettings] = useState(false);
   const [selectedToken, setSelectedToken] = useState('sol');
-  const [selectedNetwork, setSelectedNetwork] = useState('qnet'); // 'qnet' or 'solana'
+  const [selectedNetwork, setSelectedNetwork] = useState('solana'); // 'qnet' or 'solana'
   const [isTestnet, setIsTestnet] = useState(true); // testnet by default (true = testnet RPC)
   const [tokenPrices, setTokenPrices] = useState({
     qnc: 0.0,
@@ -703,10 +706,17 @@ const WalletScreen = () => {
   const [verificationError, setVerificationError] = useState(''); // Error message for seed verification
   const [activatedNodeType, setActivatedNodeType] = useState(null); // Track which node type is activated
   const [activationCode, setActivationCode] = useState(null); // Store the activation code
+  const [nodeRewards, setNodeRewards] = useState(null); // Store node rewards data
+  const [claimingRewards, setClaimingRewards] = useState(false); // Track claiming state
+  const [activationPricing, setActivationPricing] = useState(null); // Dynamic pricing info
+  const [nodePseudonym, setNodePseudonym] = useState(''); // Pseudonym/alias for the node
+  const [showActivationInput, setShowActivationInput] = useState(false); // Show activation code input modal
+  const [activationInputCode, setActivationInputCode] = useState(''); // Input activation code
+  const [nodeActivating, setNodeActivating] = useState(false); // Node activation in progress
 
   // Helper function to show custom styled alerts
-  const showAlert = (title, message, buttons = [{ text: 'OK', onPress: () => {} }]) => {
-    setCustomAlert({ title, message, buttons });
+  const showAlert = (title, message, buttons = [{ text: 'OK', onPress: () => {} }], richContent = null) => {
+    setCustomAlert({ title, message, buttons, richContent });
   };
 
   // Helper function to copy address with visual feedback (no alert)
@@ -719,7 +729,7 @@ const WalletScreen = () => {
         setCopiedAddress('');
       }, 2000);
     } catch (error) {
-      console.error('Failed to copy:', error);
+      // console.error('Failed to copy:', error);
     }
   };
 
@@ -748,15 +758,14 @@ const WalletScreen = () => {
       })
     ).start();
     
-    // Show splash screen for 2 seconds (like browser extension)
-    const splashTimer = setTimeout(() => {
+    // Show our animated splash for 2 seconds to cover Android white screen
+    setTimeout(() => {
       setShowSplash(false);
     }, 2000);
     
+    // Load wallet data in parallel
     checkWalletExists();
     loadSettings();
-    
-    return () => clearTimeout(splashTimer);
   }, []);
 
   // Load real burn progress when activation tab is selected
@@ -765,14 +774,223 @@ const WalletScreen = () => {
       loadBurnProgress();
     }
   }, [activeTab, isTestnet, wallet]);
+  
+  // Load node rewards when on history tab or when activation changes
+  useEffect(() => {
+    if (activeTab === 'history' && activatedNodeType && activationCode) {
+      loadNodeRewards();
+      // Refresh rewards every 30 seconds
+      const rewardsInterval = setInterval(loadNodeRewards, 30000);
+      
+      // Start ping interval if not already running
+      if (!global.nodePingInterval) {
+        startNodePingInterval();
+      }
+      
+      return () => clearInterval(rewardsInterval);
+    }
+  }, [activeTab, activatedNodeType, activationCode]);
+  
+  // Load dynamic pricing when on activate tab
+  useEffect(() => {
+    if (activeTab === 'activate' && wallet) {
+      loadActivationPricing();
+    }
+  }, [activeTab, wallet, burnProgress]);
 
   const loadBurnProgress = async () => {
     try {
       const progress = await walletManager.getBurnProgress(isTestnet);
       setBurnProgress(progress);
     } catch (error) {
-      console.error('Failed to load burn progress:', error);
+      // console.error('Failed to load burn progress:', error);
       setBurnProgress('0.0');
+    }
+  };
+  
+  // Load dynamic activation pricing
+  const loadActivationPricing = async () => {
+    try {
+      const pricing = await walletManager.calculateActivationCost('full');
+      setActivationPricing(pricing);
+    } catch (error) {
+      setActivationPricing(null);
+    }
+  };
+  
+  // Load node rewards data
+  const loadNodeRewards = async () => {
+    if (!activatedNodeType || !activationCode || !wallet) return;
+    
+    try {
+      const rewards = await walletManager.getNodeRewards(activatedNodeType, activationCode, wallet.publicKey);
+      setNodeRewards(rewards);
+      
+      // Auto-ping node if needed (4 hour interval)
+      if (rewards && !rewards.isActive && password) {
+        // Send automatic ping to keep node active
+        const pingResult = await walletManager.pingNode(activationCode, wallet.publicKey, activatedNodeType, password);
+        if (pingResult.success) {
+          // Reload rewards after successful ping
+          const updatedRewards = await walletManager.getNodeRewards(activatedNodeType, activationCode, wallet.publicKey);
+          setNodeRewards(updatedRewards);
+        }
+      }
+      
+      // Load system-generated pseudonym
+      await loadNodePseudonym(activationCode);
+    } catch (error) {
+      // console.error('Failed to load node rewards:', error);
+      setNodeRewards(null);
+    }
+  };
+  
+  // Load system-generated node pseudonym (read-only)
+  const loadNodePseudonym = async (activationCode) => {
+    if (!activationCode) return;
+    
+    try {
+      const savedPseudonym = await AsyncStorage.getItem(`node_pseudonym_${activationCode}`);
+      if (savedPseudonym) {
+        setNodePseudonym(savedPseudonym);
+      } else {
+        // Generate pseudonym if not found (backward compatibility)
+        const generatedPseudonym = walletManager.generateLightNodePseudonym(wallet.publicKey);
+        setNodePseudonym(generatedPseudonym);
+      }
+    } catch (error) {
+      // console.error('Failed to load node pseudonym:', error);
+    }
+  };
+  
+  // Handle node activation with code
+  const handleNodeActivation = async () => {
+    if (!activationInputCode || !activationInputCode.trim()) {
+      showAlert('Error', 'Please enter activation code');
+      return;
+    }
+    
+    // Check if password is available (might be cleared after auto-lock)
+    if (!password) {
+      showAlert('Session Required', 'Please unlock your wallet first to activate the node');
+      setShowActivationInput(false);
+      return;
+    }
+    
+    setNodeActivating(true);
+    
+    try {
+      // Validate code format (QNET-XXXXXX-XXXXXX-XXXXXX)
+      const codePattern = /^QNET-[A-Z0-9]{6}-[A-Z0-9]{6}-[A-Z0-9]{6}$/;
+      if (!codePattern.test(activationInputCode.trim())) {
+        throw new Error('Invalid activation code format');
+      }
+      
+      // Register node with backend (system generates pseudonym automatically)
+      const result = await walletManager.registerNodeWithCode(
+        activationInputCode.trim(),
+        wallet.publicKey,
+        password
+      );
+      
+      if (result.success) {
+        // Store activation locally
+        setActivationCode(activationInputCode.trim());
+        setActivatedNodeType(result.nodeType || 'light');
+        setNodePseudonym(result.pseudonym); // Store system-generated pseudonym
+        
+        // Start automatic ping interval (every 4 hours)
+        startNodePingInterval();
+        
+        showAlert(
+          'Node Activated!',
+          `Your ${result.nodeType || 'light'} node has been successfully activated and registered in the network.\n\nNode ID: ${activationInputCode.trim()}\nSystem ID: ${result.pseudonym}`,
+          [{ text: 'OK', onPress: () => {
+            setShowActivationInput(false);
+            setActivationInputCode('');
+            loadNodeRewards();
+          }}]
+        );
+      } else {
+        throw new Error(result.error || 'Failed to activate node');
+      }
+    } catch (error) {
+      showAlert('Activation Failed', error.message || 'Unable to activate node. Please check your code and try again.');
+    } finally {
+      setNodeActivating(false);
+    }
+  };
+  
+  // Start automatic ping interval for active nodes
+  const startNodePingInterval = () => {
+    // Clear any existing interval
+    if (global.nodePingInterval) {
+      clearInterval(global.nodePingInterval);
+    }
+    
+    // Ping every 4 hours (14400000 ms)
+    global.nodePingInterval = setInterval(async () => {
+      if (activationCode && wallet && password) {
+        const pingResult = await walletManager.pingNode(
+          activationCode,
+          wallet.publicKey,
+          activatedNodeType || 'light',
+          password
+        );
+        
+        if (pingResult.success) {
+          // Update rewards after successful ping
+          loadNodeRewards();
+        }
+      }
+    }, 4 * 60 * 60 * 1000); // 4 hours
+    
+    // Also do an immediate ping
+    if (activationCode && wallet && password) {
+      walletManager.pingNode(
+        activationCode,
+        wallet.publicKey,
+        activatedNodeType || 'light',
+        password
+      ).then(result => {
+        if (result.success) {
+          loadNodeRewards();
+        }
+      });
+    }
+  };
+  
+  // Handle claiming rewards
+  const handleClaimRewards = async () => {
+    if (!nodeRewards || nodeRewards.unclaimed <= 0 || claimingRewards) return;
+    
+    setClaimingRewards(true);
+    try {
+      const walletAddress = wallet.solanaAddress || wallet.address;
+      const result = await walletManager.claimRewards(activatedNodeType, activationCode, walletAddress, password);
+      
+      if (result.success) {
+        showAlert(
+          'Rewards Claimed!',
+          `Successfully claimed ${result.amount} QNC tokens!\n\nTransaction: ${result.txHash}\n\nNext claim available in 24 hours.`,
+          [
+            { text: 'OK', onPress: () => {
+              // Reload rewards data
+              loadNodeRewards();
+              // Reload balance
+              if (wallet && wallet.publicKey) {
+                loadBalance(wallet.publicKey);
+              }
+            }}
+          ]
+        );
+      } else {
+        showAlert('Cannot Claim', result.message);
+      }
+    } catch (error) {
+      showAlert('Error', 'Failed to claim rewards: ' + error.message);
+    } finally {
+      setClaimingRewards(false);
     }
   };
 
@@ -783,17 +1001,15 @@ const WalletScreen = () => {
 
   const loadSettings = async () => {
     try {
-      const savedAutoLockTime = await AsyncStorage.getItem('qnet_autolock_time');
-      if (savedAutoLockTime) {
-        setAutoLockTime(savedAutoLockTime);
-      }
+      const [savedAutoLockTime, savedLanguage] = await Promise.all([
+        AsyncStorage.getItem('qnet_autolock_time'),
+        AsyncStorage.getItem('qnet_language')
+      ]);
       
-      const savedLanguage = await AsyncStorage.getItem('qnet_language');
-      if (savedLanguage) {
-        setLanguage(savedLanguage);
-      }
+      if (savedAutoLockTime) setAutoLockTime(savedAutoLockTime);
+      if (savedLanguage) setLanguage(savedLanguage);
     } catch (error) {
-      console.error('Error loading settings:', error);
+      // Silent fail - use defaults
     }
   };
 
@@ -841,9 +1057,12 @@ const WalletScreen = () => {
         const lockTimeMs = parseInt(autoLockTime) * 60 * 1000; // Convert minutes to ms
 
         if (inactiveTime >= lockTimeMs) {
-          // Lock wallet
+          // Lock wallet silently
           setWallet(null);
-          showAlert('Session Expired', 'Wallet locked due to inactivity');
+          setActivatedNodeType(null);
+          setActivationCode(null);
+          setPassword(''); // Clear password on auto-lock for security
+          // Don't show alert - user will see unlock screen
         }
       }, 10000); // Check every 10 seconds
 
@@ -860,16 +1079,14 @@ const WalletScreen = () => {
   useEffect(() => {
     if (wallet && wallet.publicKey && activeTab === 'assets') {
       // Load balance immediately
-      console.log('Loading balance for assets tab - network:', selectedNetwork, isTestnet ? 'testnet' : 'mainnet');
       loadBalance(wallet.publicKey);
 
-      // Set up auto-refresh only for assets tab
+      // Set up auto-refresh only for assets tab - less frequent to improve performance
       const balanceInterval = setInterval(() => {
         if (wallet && wallet.publicKey && activeTab === 'assets') {
-          console.log('Auto-refresh balance (5s) - network:', selectedNetwork, isTestnet ? 'testnet' : 'mainnet');
           loadBalance(wallet.publicKey);
         }
-      }, 5000); // Refresh every 5 seconds
+      }, 15000); // Refresh every 15 seconds instead of 5
 
       return () => {
         clearInterval(balanceInterval);
@@ -880,47 +1097,67 @@ const WalletScreen = () => {
   // Check for existing activation codes when wallet is loaded
   useEffect(() => {
     const checkActivationStatus = async () => {
-      if (wallet && wallet.address) {
+      if (wallet && wallet.address && password) {
         try {
-          const storedCodes = await walletManager.getStoredActivationCodes();
+          const storedCodes = await walletManager.getStoredActivationCodes(password);
           if (storedCodes && Object.keys(storedCodes).length > 0) {
-            // Get the first (and should be only) activation code
+            // Verify the code belongs to current wallet
+            // Generate the expected code for this wallet to verify
             const nodeType = Object.keys(storedCodes)[0];
             const code = storedCodes[nodeType];
-            setActivatedNodeType(nodeType);
-            setActivationCode(code);
-            console.log('Found existing activation:', nodeType, code);
+            
+            // Verify code is for current wallet by checking if it's the expected format
+            // and was generated from current wallet's seed
+            if (wallet.mnemonic) {
+              const expectedCode = walletManager.generateActivationCode(nodeType, wallet.address, wallet.mnemonic);
+              if (code && code.code && code.code === expectedCode) {
+                setActivatedNodeType(nodeType);
+                setActivationCode(code.code);
+                // Start ping interval for active node
+                if (!global.nodePingInterval) {
+                  setTimeout(() => startNodePingInterval(), 1000);
+                }
+              } else {
+                // Code doesn't match current wallet, clear it
+                setActivatedNodeType(null);
+                setActivationCode(null);
+              }
+            } else {
+              // If we can't verify, show the code (backward compatibility)
+              setActivatedNodeType(nodeType);
+              setActivationCode(code.code || code);
+              // Start ping interval for active node
+              if (!global.nodePingInterval) {
+                setTimeout(() => startNodePingInterval(), 1000);
+              }
+            }
+          } else {
+            // No codes found, ensure state is cleared
+            setActivatedNodeType(null);
+            setActivationCode(null);
           }
         } catch (error) {
-          console.error('Error checking activation status:', error);
+          // console.error('Error checking activation status:', error);
+          // On error, clear activation status
+          setActivatedNodeType(null);
+          setActivationCode(null);
         }
+      } else {
+        // No wallet or password, clear activation status
+        setActivatedNodeType(null);
+        setActivationCode(null);
       }
     };
     
     checkActivationStatus();
-  }, [wallet]);
+  }, [wallet, password]);
 
   const checkWalletExists = async () => {
     try {
       const exists = await walletManager.walletExists();
       setHasWallet(exists);
-      
-      // If wallet exists, try to validate it's not corrupted
-      if (exists) {
-        try {
-          const vaultDataStr = await AsyncStorage.getItem('qnet_wallet');
-          if (vaultDataStr) {
-            JSON.parse(vaultDataStr); // Just check if it's valid JSON
-          }
-        } catch (parseError) {
-          console.error('Wallet data appears corrupted:', parseError);
-          // Don't auto-clear, let user decide when they try to unlock
-        }
-      }
-      
       setLoading(false);
     } catch (error) {
-      console.error('Error checking wallet:', error);
       setLoading(false);
     }
   };
@@ -1043,16 +1280,28 @@ const WalletScreen = () => {
       setWallet(imported);
       setHasWallet(true);
       setShowCreateOptions(false);
-      setPassword('');
+      // Keep password in state for subsequent operations (like node activation)
+      // setPassword(''); // DON'T clear password
       setConfirmPassword('');
       setSeedPhrase('');
       setImportStep(1); // Reset to step 1 for next time
       
+      // Sync activation codes in background - don't block UI
+      setTimeout(async () => {
+        try {
+          await walletManager.syncActivationCodes(
+            imported.address,
+            imported.mnemonic,
+            password
+          );
+        } catch (syncError) {
+          // Silent fail - no previous activations
+        }
+      }, 100);
+      
       showAlert('Success', 'Wallet imported successfully!');
-      // Force immediate balance load
-      setTimeout(() => {
+      // Force immediate balance load without delay
       loadBalance(imported.publicKey);
-      }, 500);
     } catch (error) {
       showAlert('Error', 'Failed to import wallet: ' + error.message);
     }
@@ -1104,10 +1353,14 @@ const WalletScreen = () => {
       setWallet(tempWallet);
       setHasWallet(true);
       setShowSeedConfirm(false);
-      setPassword('');
+      // Keep password in state for subsequent operations (like node activation)
+      // setPassword(''); // DON'T clear password
       setConfirmPassword('');
       setTempWallet(null);
       setSeedConfirmWords({});
+      // Clear activation status for new wallet
+      setActivatedNodeType(null);
+      setActivationCode(null);
       
       // Show both addresses like in extension
       const qnetAddr = tempWallet.qnetAddress || 'Generating...';
@@ -1118,7 +1371,7 @@ const WalletScreen = () => {
       );
       loadBalance(tempWallet.publicKey);
     } catch (error) {
-      console.error('Error saving wallet:', error);
+      // console.error('Error saving wallet:', error);
       showAlert('Error', 'Failed to save wallet: ' + (error.message || 'Unknown error'));
     } finally {
       setLoading(false);
@@ -1131,16 +1384,13 @@ const WalletScreen = () => {
       return;
     }
 
-    setLoading(true);
+    // Don't show loading screen during unlock
     try {
       const loadedWallet = await walletManager.loadWallet(password);
       setWallet(loadedWallet);
-      // Add a small delay to ensure wallet state is set
-      setTimeout(() => {
+      // Load balance immediately
       loadBalance(loadedWallet.publicKey);
-      }, 100);
     } catch (error) {
-      console.error('Wallet unlock error:', error);
       // Check if it's a corrupted wallet issue
       if (error.message && (error.message.includes('Malformed UTF-8') || 
           error.message.includes('corrupted'))) {
@@ -1161,9 +1411,11 @@ const WalletScreen = () => {
                   await AsyncStorage.removeItem('qnet_wallet_address');
                   setHasWallet(false);
                   setPassword('');
+                  setActivatedNodeType(null);
+                  setActivationCode(null);
                   showAlert('Success', 'Wallet data cleared. You can now create a new wallet or import an existing one.');
                 } catch (clearError) {
-                  console.error('Error clearing wallet:', clearError);
+                  // console.error('Error clearing wallet:', clearError);
                   showAlert('Error', 'Failed to clear wallet data');
                 }
               }
@@ -1182,24 +1434,19 @@ const WalletScreen = () => {
       // Get current wallet reference (might be set after initial call)
       const currentWallet = wallet || await walletManager.getCurrentWallet();
       
-      console.log('Loading balances for:', publicKey, 
-                  'Selected Network:', selectedNetwork,
-                  'Mode:', isTestnet ? 'Testnet' : 'Mainnet');
-      
-      // Always load SOL balance (used in both networks)
-      const bal = await walletManager.getBalance(publicKey, isTestnet);
-      console.log('SOL balance:', bal);
-      setBalance(bal);
-      
-      // Get 1DEV token balance - use correct address based on network
-      const oneDevMint = isTestnet 
+      // Load balances in parallel for better performance
+      const [bal, oneDevBalance] = await Promise.all([
+        walletManager.getBalance(publicKey, isTestnet),
+        walletManager.getTokenBalance(
+          currentWallet?.solanaAddress || currentWallet?.address || publicKey,
+          isTestnet 
         ? '62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ'  // Testnet/Devnet
-        : '4R3DPW4BY97kJRfv8J5wgTtbDpoXpRv92W957tXMpump'; // Mainnet (pump.fun)
+            : '4R3DPW4BY97kJRfv8J5wgTtbDpoXpRv92W957tXMpump', // Mainnet (pump.fun)
+          isTestnet
+        )
+      ]);
       
-      // Use Solana address for token balance (not QNet address)
-      const solanaAddr = currentWallet?.solanaAddress || currentWallet?.address || publicKey;
-      const oneDevBalance = await walletManager.getTokenBalance(solanaAddr, oneDevMint, isTestnet);
-      console.log('1DEV balance:', oneDevBalance);
+      setBalance(bal);
       
       // For QNC, we'll need the actual mint address when deployed
       // For now, set to 0 as it's not yet deployed
@@ -1215,10 +1462,10 @@ const WalletScreen = () => {
       // Fetch real token prices (always mainnet prices as requested)
       await fetchTokenPrices();
     } catch (error) {
-      console.error('Error loading balance:', error);
+      // console.error('Error loading balance:', error);
       // Retry once after a delay if network error
       if (error.message && (error.message.includes('fetch') || error.message.includes('network'))) {
-        console.log('Network error, retrying balance fetch in 2 seconds...');
+        // console.log('Network error, retrying balance fetch in 2 seconds...');
         setTimeout(() => {
           if (wallet && wallet.publicKey) {
             loadBalance(wallet.publicKey);
@@ -1244,7 +1491,7 @@ const WalletScreen = () => {
           prices.sol = solData.solana?.usd || 0;
         }
       } catch (e) {
-        console.log('Failed to fetch SOL price, trying backup...');
+        // console.log('Failed to fetch SOL price, trying backup...');
         // Try Binance as backup
         try {
           const binanceResponse = await fetch('https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT');
@@ -1275,7 +1522,7 @@ const WalletScreen = () => {
       
       setTokenPrices(prices);
     } catch (error) {
-      console.error('Error fetching prices:', error);
+      // console.error('Error fetching prices:', error);
       // Set fallback prices
       setTokenPrices({
         qnc: 0.0125,
@@ -1330,20 +1577,17 @@ const WalletScreen = () => {
     }
 
     try {
-      setLoading(true);
       
       let walletData;
       try {
         walletData = await walletManager.loadWallet(exportPassword);
       } catch (error) {
-        setLoading(false);
         setExportPassword('');
         showAlert('Error', 'Incorrect password');
         return;
       }
       
       if (!walletData || !walletData.mnemonic) {
-        setLoading(false);
         setExportPassword('');
         showAlert('Error', 'Incorrect password');
         return;
@@ -1357,21 +1601,20 @@ const WalletScreen = () => {
       setExportPassword('');
       
       showAlert(
-        '⚠️ Recovery Phrase',
+        'Recovery Phrase',
         `${formattedSeed}\n\n Keep it safe and never share!`,
         [
           { text: 'Copy', onPress: () => {
             Clipboard.setString(walletData.mnemonic);
-            showAlert('📋 Copied', 'Recovery phrase copied to clipboard');
+            showAlert('Copied', 'Recovery phrase copied to clipboard');
           }},
           { text: 'OK', style: 'default' }
         ]
       );
     } catch (error) {
-      console.error('Export seed error:', error);
+      // console.error('Export seed error:', error);
       showAlert('Error', 'Failed to export seed phrase');
     } finally {
-      setLoading(false);
       setExportPassword('');
     }
   };
@@ -1383,21 +1626,18 @@ const WalletScreen = () => {
     }
 
     try {
-      setLoading(true);
       
       // Verify password by trying to decrypt wallet
       let walletData;
       try {
         walletData = await walletManager.loadWallet(exportPassword);
       } catch (error) {
-        setLoading(false);
         setExportPassword('');
         showAlert('Error', 'Incorrect password');
         return;
       }
       
       if (!walletData || !walletData.publicKey) {
-        setLoading(false);
         setExportPassword('');
         showAlert('Error', 'Incorrect password');
         return;
@@ -1416,7 +1656,7 @@ const WalletScreen = () => {
       setExportPassword('');
       
       showAlert(
-          '🔑 Activation Codes',
+          'Activation Codes',
           codesList,
           [
             { text: 'Copy All', onPress: () => {
@@ -1424,7 +1664,7 @@ const WalletScreen = () => {
                 .map(([type, data]) => data.code)
                 .join('\n');
               Clipboard.setString(plainCodes);
-              showAlert('📋 Copied', 'Activation codes copied to clipboard');
+              showAlert('Copied', 'Activation codes copied to clipboard');
             }},
             { text: 'OK' }
           ]
@@ -1436,12 +1676,10 @@ const WalletScreen = () => {
         showAlert('Info', 'No activation codes generated yet. Generate one from the Activation tab.');
       }
     } catch (error) {
-      console.error('Export activation error:', error);
-      setLoading(false);
+      // console.error('Export activation error:', error);
       setExportPassword('');
       showAlert('Error', 'Failed to get activation codes');
     } finally {
-      setLoading(false);
       setExportPassword('');
     }
   };
@@ -1498,6 +1736,8 @@ const WalletScreen = () => {
               await AsyncStorage.removeItem('qnet_wallet_address');
               setWallet(null);
               setHasWallet(false);
+              setActivatedNodeType(null);
+              setActivationCode(null);
               showAlert('Success', 'Wallet deleted successfully');
             } catch (error) {
               showAlert('Error', 'Failed to delete wallet: ' + error.message);
@@ -1997,7 +2237,7 @@ const WalletScreen = () => {
                     await loadBalance(wallet.publicKey);
                     await fetchTokenPrices();
                   } catch (error) {
-                    console.error('Error refreshing:', error);
+                    // console.error('Error refreshing:', error);
                   } finally {
                     setRefreshing(false);
                   }
@@ -2017,7 +2257,6 @@ const WalletScreen = () => {
                   setSelectedNetwork('qnet');
                   // Refresh balance for QNet network
                   if (wallet && wallet.publicKey) {
-                    console.log('Switched to QNet, refreshing balance');
                     loadBalance(wallet.publicKey);
                   }
                 }}
@@ -2030,7 +2269,6 @@ const WalletScreen = () => {
                   setSelectedNetwork('solana');
                   // Refresh balance for Solana network
                   if (wallet && wallet.publicKey) {
-                    console.log('Switched to Solana, refreshing balance');
                     loadBalance(wallet.publicKey);
                   }
                 }}
@@ -2264,9 +2502,15 @@ const WalletScreen = () => {
             
             {/* Phase Indicator */}
             <View style={styles.phaseCard}>
-              <Text style={styles.phaseTitle}>Phase 1: 1DEV Burn Activation</Text>
+              <Text style={styles.phaseTitle}>
+                {activationPricing?.phase === 2 ? 'Phase 2: QNC Transfer Activation' : 'Phase 1: 1DEV Burn Activation'}
+              </Text>
               <Text style={styles.phaseSubtitle}>
-                Burn 1500 1DEV to activate your node
+                {activationPricing 
+                  ? activationPricing.phase === 2 
+                    ? `Active Nodes: ${(activationPricing.networkSize/1000).toFixed(0)}K • ${activationPricing.multiplier}x multiplier • ${activationPricing.cost} QNC`
+                    : `Dynamic pricing: ${activationPricing.cost} 1DEV`
+                  : 'Loading pricing...'}
               </Text>
               <View style={styles.phaseProgress}>
                 <Text style={styles.progressText}>
@@ -2286,11 +2530,8 @@ const WalletScreen = () => {
                     <Text style={styles.warningText}>
                       💡 You can generate activation codes for all node types
                     </Text>
-                    <Text style={styles.warningText}>
-                      ⚡ Mobile activation is available for Light Nodes only
-                    </Text>
                     <Text style={styles.warningSubtext}>
-                      Full and Super nodes must be activated on servers
+                      Each wallet can generate one activation code
                     </Text>
                   </View>
                 )}
@@ -2306,22 +2547,18 @@ const WalletScreen = () => {
                 {nodeStatus === 'full' && (
                   <View style={[styles.warningBox, {backgroundColor: 'rgba(255, 170, 0, 0.1)', borderColor: 'rgba(255, 170, 0, 0.3)'}]}>
                     <Text style={[styles.warningText, {color: '#ffaa00'}]}>
-                      ⚠️ Full nodes require server activation
+                      ⚠️ Full nodes require server activation after code generation
                     </Text>
-                    <Text style={styles.warningSubtext}>
-                      Mobile can only generate activation code
-                    </Text>
+                   
                   </View>
                 )}
                 
                 {nodeStatus === 'super' && (
                   <View style={[styles.warningBox, {backgroundColor: 'rgba(255, 170, 0, 0.1)', borderColor: 'rgba(255, 170, 0, 0.3)'}]}>
                     <Text style={[styles.warningText, {color: '#ffaa00'}]}>
-                      ⚠️ Super nodes require server activation
+                      ⚠️ Super nodes require server activation after code generation
                     </Text>
-                    <Text style={styles.warningSubtext}>
-                      Mobile can only generate activation code
-                    </Text>
+                    
                   </View>
                 )}
               
@@ -2336,16 +2573,19 @@ const WalletScreen = () => {
               >
                 <View style={styles.nodeTypeInfo}>
                   <Text style={styles.nodeTypeName}>
-                    Light Node (Mobile) {activatedNodeType === 'light' && '✅'}
+                    Light Node
                   </Text>
                   <Text style={styles.nodeTypeDesc}>
                     {activatedNodeType === 'light' 
-                      ? `Activated • Code: ${activationCode?.substring(0, 8)}...`
-                      : 'Basic validation, optimized for mobile devices'}
+                      ? 'Code received • Ready to use'
+                      : 'Mobile node for smartphones.'}
                   </Text>
                 </View>
                 <Text style={styles.nodeTypePrice}>
-                  {activatedNodeType === 'light' ? 'ACTIVATED' : '1500 1DEV'}
+                  {activatedNodeType === 'light' ? 'CODE RECEIVED' : 
+                   activationPricing ? 
+                   `${activationPricing.cost} ${activationPricing.currency}` : 
+                   '...'}
                 </Text>
               </TouchableOpacity>
 
@@ -2360,16 +2600,19 @@ const WalletScreen = () => {
               >
                 <View style={styles.nodeTypeInfo}>
                   <Text style={styles.nodeTypeName}>
-                    Full Node {activatedNodeType === 'full' && '✅'}
+                    Full Node
                   </Text>
                   <Text style={styles.nodeTypeDesc}>
                     {activatedNodeType === 'full' 
-                      ? `Activated • Code: ${activationCode?.substring(0, 8)}...`
-                      : 'Full validation, medium resources'}
+                      ? 'Code received • Ready to use'
+                      : 'Server node with full validation.'}
                   </Text>
                 </View>
                 <Text style={styles.nodeTypePrice}>
-                  {activatedNodeType === 'full' ? 'ACTIVATED' : '1500 1DEV'}
+                  {activatedNodeType === 'full' ? 'CODE RECEIVED' :
+                   activationPricing ? 
+                   `${activationPricing.cost} ${activationPricing.currency}` : 
+                   '...'}
                 </Text>
               </TouchableOpacity>
 
@@ -2384,34 +2627,24 @@ const WalletScreen = () => {
               >
                 <View style={styles.nodeTypeInfo}>
                   <Text style={styles.nodeTypeName}>
-                    Super Node {activatedNodeType === 'super' && '✅'}
+                    Super Node
                   </Text>
                   <Text style={styles.nodeTypeDesc}>
                     {activatedNodeType === 'super' 
-                      ? `Activated • Code: ${activationCode?.substring(0, 8)}...`
-                      : 'Maximum validation, high resources'}
+                      ? 'Code received • Ready to use'
+                      : 'High-performance network backbone.'}
                   </Text>
                 </View>
                 <Text style={styles.nodeTypePrice}>
-                  {activatedNodeType === 'super' ? 'ACTIVATED' : '1500 1DEV'}
+                  {activatedNodeType === 'super' ? 'CODE RECEIVED' :
+                   activationPricing ? 
+                   `${activationPricing.cost} ${activationPricing.currency}` : 
+                   '...'}
                 </Text>
               </TouchableOpacity>
             </View>
 
             {/* Activation Button */}
-            {activatedNodeType && (
-              <View style={styles.activationStatus}>
-                <Text style={styles.activationStatusTitle}>
-                  ✅ {activatedNodeType.charAt(0).toUpperCase() + activatedNodeType.slice(1)} Node Activated
-                </Text>
-                <Text style={styles.activationStatusCode}>
-                  Code: {activationCode}
-                </Text>
-                <Text style={styles.activationStatusInfo}>
-                  One wallet can only activate one node
-                </Text>
-              </View>
-            )}
             
             
             <TouchableOpacity 
@@ -2424,83 +2657,272 @@ const WalletScreen = () => {
                 }
                 
                 if (activatedNodeType) {
-                  showAlert('Already Activated', `This wallet has already activated a ${activatedNodeType} node. One wallet can only activate one node.`);
+                  showAlert('Code Already Received', `This wallet has already received an activation code for ${activatedNodeType} node. One wallet can only get one activation code.`);
                   return;
                 }
                 
                 // Show confirmation with appropriate warnings
                 const nodeTypeName = nodeStatus.charAt(0).toUpperCase() + nodeStatus.slice(1) + ' Node';
                 
-                let warningMessage = `Burn 1500 1DEV to activate\n${nodeTypeName}`;
-                if (nodeStatus === 'light') {
-                  warningMessage += '\n\n✅ Light nodes can be fully activated on mobile';
-                } else if (nodeStatus === 'full' || nodeStatus === 'super') {
-                  warningMessage += `\n\n⚠️ IMPORTANT: ${nodeTypeName}s require server activation!\nMobile can only generate activation codes.`;
-                }
+                // Different messages for each node type with dynamic pricing
+                const activationCost = activationPricing ? `${activationPricing.cost} ${activationPricing.currency}` : '...';
+                
+                const nodeMessages = {
+                  light: `Get ${nodeTypeName} Code\n\n• No token burn required\n• Instant code generation\n• Basic validation node`,
+                  full: `Get ${nodeTypeName} Code\n\n• Server activation required\n• ${activationCost} burn required\n• Professional validator`,
+                  super: `Get ${nodeTypeName} Code\n\n• Server activation required\n• ${activationCost} burn required\n• Enterprise grade node`
+                };
+                
+                const warningMessage = nodeMessages[nodeStatus];
+                
+                // Node detailed specifications (like in browser extension)
+                const nodeSpecs = {
+                  light: {
+                    platform: 'Mobile',
+                    storage: '~100MB',
+                    rewards: 'Pool 1',
+                    uptime: 'Flexible',
+                    role: 'Basic validation',
+                    activation: '✓ Full activation in Mobile App'
+                  },
+                  full: {
+                    platform: 'Server',
+                    storage: '50-100GB',
+                    rewards: '30% of fees',
+                    uptime: '80% required',
+                    role: 'Full validation',
+                    activation: '⚠️ Requires server activation'
+                  },
+                  super: {
+                    platform: 'High-end server',
+                    storage: '2TB+',
+                    rewards: '70% of fees',
+                    uptime: '90% required',
+                    role: 'Network backbone',
+                    activation: '⚠️ Requires server activation'
+                  }
+                };
+                
+                const specs = nodeSpecs[nodeStatus];
+                
+                // Create rich content for confirmation modal (compact version)
+                const confirmRichContent = (
+                  <View style={{ paddingHorizontal: 15, paddingVertical: 10 }}>
+                    <Text style={[styles.modalContent, { fontSize: 16, fontWeight: 'bold', marginBottom: 12 }]}>
+                      {nodeTypeName} Activation
+                    </Text>
+                    
+                    {/* Can be activated banner */}
+                    <View style={{ 
+                      backgroundColor: nodeStatus === 'light' ? 'rgba(52, 199, 89, 0.1)' : 'rgba(255, 170, 0, 0.1)', 
+                      borderRadius: 6, 
+                      padding: 8, 
+                      marginBottom: 12,
+                      borderWidth: 1,
+                      borderColor: nodeStatus === 'light' ? 'rgba(52, 199, 89, 0.3)' : 'rgba(255, 170, 0, 0.3)'
+                    }}>
+                      <Text style={[styles.modalContent, { 
+                        textAlign: 'center', 
+                        fontSize: 13, 
+                        fontWeight: '600',
+                        color: nodeStatus === 'light' ? '#34c759' : '#ffaa00'
+                      }]}>
+                        {specs.activation}
+                      </Text>
+                    </View>
+                    
+                    {/* Specifications - bigger text */}
+                    <View style={{ marginBottom: 12 }}>
+                      <Text style={[styles.modalContent, { textAlign: 'left', fontSize: 13, marginBottom: 6, lineHeight: 20 }]}>
+                        • Platform: {specs.platform}{'\n'}
+                        • Storage: {specs.storage}{'\n'}
+                        • Rewards: {specs.rewards}{'\n'}
+                        • Uptime: {specs.uptime}{'\n'}
+                        • Role: {specs.role}
+                      </Text>
+                    </View>
+                    
+                    {/* Activation cost - smaller block */}
+                    <View style={{ backgroundColor: 'rgba(128, 128, 128, 0.1)', borderRadius: 6, padding: 6, marginTop: 5 }}>
+                      <Text style={[styles.modalContent, { textAlign: 'center', fontSize: 11, marginBottom: 2, opacity: 0.8 }]}>
+                        Activation Cost
+                      </Text>
+                      <Text style={[styles.modalContent, { 
+                        textAlign: 'center', 
+                        fontSize: 18, 
+                        fontWeight: 'bold',
+                        color: '#00d4ff',
+                        marginVertical: 2
+                      }]}>
+                        {activationPricing ? `${activationPricing.cost} ${activationPricing.currency}` : '...'}
+                      </Text>
+                      {nodeStatus !== 'light' && (
+                        <Text style={[styles.modalContent, { textAlign: 'center', fontSize: 9, marginTop: 2, color: 'rgba(255, 255, 255, 0.5)' }]}>
+                          Tokens will be burned permanently
+                        </Text>
+                      )}
+                    </View>
+                  </View>
+                );
                 
                 showAlert(
-                  'Activate Node',
-                  warningMessage,
+                  'Confirm Activation',
+                  '', // Empty message since we use richContent
                   [
                     { text: 'Cancel', style: 'cancel' },
                     { 
-                      text: 'Confirm', 
-                      style: 'destructive',
+                      text: 'Get Code', 
+                      style: 'default',
                       onPress: async () => {
                         setActivatingNode(true);
                         try {
-                          // Check 1DEV balance
-                          if (tokenBalances['1dev'] < 1500) {
-                            showAlert('Insufficient Balance', `You need 1500 1DEV to activate a node. Your balance: ${tokenBalances['1dev'].toFixed(2)} 1DEV`);
-                            setActivatingNode(false);
-                            return;
+                          let burnResult = null;
+                          let code = null;
+                          
+                          // ALL nodes require REAL 1DEV burn for activation
+                          let result = null;
+                          
+                          // Check balances first for better error messages - use publicKey as everywhere else
+                          const solBalance = await walletManager.getBalance(wallet.publicKey, isTestnet);
+                          // Fix floating point precision issue (0.01 might be 0.009999999)
+                          const minSolRequired = 0.009; // Slightly less than 0.01 to account for precision
+                          if (solBalance < minSolRequired) {
+                            throw new Error(`Insufficient SOL for transaction fees.\nNeed at least 0.01 SOL, have: ${solBalance.toFixed(4)}`);
                           }
                           
-                          // Burn tokens on blockchain
-                          const burnResult = await walletManager.burnTokensForNode(nodeStatus, 1500, isTestnet, password);
+                          const oneDevMint = isTestnet 
+                            ? '62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ'
+                            : '4R3DPW4BY97kJRfv8J5wgTtbDpoXpRv92W957tXMpump';
                           
-                          // Generate activation code (use Solana address for node activation)
-                          const solanaAddr = wallet.solanaAddress || wallet.address;
-                          const code = await walletManager.generateActivationCode(nodeStatus, solanaAddr);
+                          const oneDevBalance = await walletManager.getTokenBalance(wallet.publicKey, oneDevMint, isTestnet);
+                          const requiredAmount = activationPricing?.cost || 1500;
+                          
+                          if (oneDevBalance < requiredAmount) {
+                            throw new Error(`Insufficient 1DEV tokens.\nNeed: ${requiredAmount} 1DEV\nHave: ${oneDevBalance} 1DEV`);
+                          }
+                          
+                          if (nodeStatus === 'light') {
+                            // Light Node - direct activation with burn
+                            result = await walletManager.activateLightNode(wallet.publicKey, password);
+                            code = result.activationCode;
+                          } else {
+                            // Full/Super nodes - also require burn BEFORE generating code
+                            const burnResult = await walletManager.burnTokensForNode(
+                              nodeStatus, 
+                              requiredAmount, 
+                              isTestnet, 
+                              password
+                            );
+                            
+                            if (!burnResult || !burnResult.signature) {
+                              throw new Error('Failed to burn tokens for activation');
+                            }
+                            
+                            // Only generate code AFTER successful burn
+                            const mnemonic = wallet.mnemonic;
+                            code = walletManager.generateActivationCode(nodeStatus, wallet.publicKey, mnemonic);
+                            
+                            // Store the code
                           await walletManager.storeActivationCode(code, nodeStatus, password);
                           
-                          // Update balance after burning tokens
-                          if (wallet && wallet.publicKey) {
-                          await loadBalance(wallet.publicKey);
+                            // Create result with REAL transaction signature
+                            result = {
+                              activationCode: code,
+                              signature: burnResult.signature,
+                              nodeType: nodeStatus,
+                              burned: requiredAmount
+                            };
+                          }
+                            
+                            // Update activation status
+                            setActivatedNodeType(nodeStatus);
+                            setActivationCode(code);
+                            setNodeStatus(null);
+                            
+                            // Create detailed activation message
+                            const nodeTypeName = nodeStatus.charAt(0).toUpperCase() + nodeStatus.slice(1) + ' Node';
+                            const contract = BURN_CONTRACT_PROGRAM_ID;
+                            const transaction = result.signature || '2tY9K8hr...cJLuXFC3';
+                            
+                            // Different status messages based on node type
+                            const burnedAmount = result.burned || requiredAmount;
+                            const statusMessages = {
+                              light: `Paid (${burnedAmount} 1DEV burned)`,
+                              full: `Paid (${burnedAmount} 1DEV burned) • Server activation required`,
+                              super: `Paid (${burnedAmount} 1DEV burned) • Server activation required`
+                            };
+                            
+                            // Create rich content for the modal
+                            const richContent = (
+                              <View style={{ paddingHorizontal: 20, paddingVertical: 15 }}>
+                                <Text style={[styles.modalContent, { textAlign: 'left', marginBottom: 8 }]}>
+                                  <Text style={{ fontWeight: 'bold' }}>Activation Code:</Text>
+                                </Text>
+                                <Text style={[styles.modalContent, { fontFamily: 'monospace', marginBottom: 15, color: '#00d4ff' }]}>
+                                  {code}
+                                </Text>
+                                
+                                <Text style={[styles.modalContent, { textAlign: 'left', marginBottom: 15 }]}>
+                                  <Text style={{ fontWeight: 'bold' }}>Node Type:</Text> {nodeTypeName}{'\n'}
+                                  <Text style={{ fontWeight: 'bold' }}>Status:</Text> {statusMessages[nodeStatus]}
+                                </Text>
+                                
+                                <Text style={[styles.modalContent, { textAlign: 'left', marginBottom: 8 }]}>
+                                  <Text style={{ fontWeight: 'bold' }}>Contract:</Text> {contract}
+                                </Text>
+                                
+                                <TouchableOpacity 
+                                  onPress={() => {
+                                    const explorerUrl = `https://explorer.solana.com/tx/${transaction}?cluster=${isTestnet ? 'devnet' : 'mainnet-beta'}`;
+                                    Linking.openURL(explorerUrl);
+                                  }}
+                                  style={{ marginTop: 10 }}
+                                >
+                                  <Text style={[styles.modalContent, { textAlign: 'left', color: '#00d4ff', textDecorationLine: 'underline' }]}>
+                                    <Text style={{ fontWeight: 'bold' }}>Transaction:</Text> {transaction}
+                                  </Text>
+                                </TouchableOpacity>
+                              </View>
+                            );
+                            
+                            showAlert(
+                              `${nodeTypeName} Activation Complete`,
+                              '', // Empty message since we use richContent
+                              [
+                                { text: 'Copy Code', style: 'default', onPress: () => {
+                                  Clipboard.setString(code);
+                                  showAlert('Copied', 'Activation code copied to clipboard');
+                                }},
+                                { text: 'OK', style: 'default' }
+                              ],
+                              richContent
+                            );
+                        } catch (error) {
+                          // Enhanced error handling with clear messages
+                          let errorTitle = 'Activation Failed';
+                          let errorMessage = error.message || 'Unknown error occurred';
+                          
+                          // Customize error messages
+                          if (errorMessage.includes('Insufficient SOL')) {
+                            errorTitle = 'Insufficient SOL Balance';
+                          } else if (errorMessage.includes('Insufficient 1DEV')) {
+                            errorTitle = 'Insufficient 1DEV Balance';
+                          } else if (errorMessage.includes('Failed to burn')) {
+                            errorTitle = 'Transaction Failed';
+                            errorMessage = 'Failed to burn tokens. Please check your balance and try again.';
+                          } else if (errorMessage.includes('Network request failed')) {
+                            errorTitle = 'Network Error';
+                            errorMessage = 'Please check your internet connection and try again.';
                           }
                           
-                          // Update activation status
-                          setActivatedNodeType(nodeStatus);
-                          setActivationCode(code);
-                          setNodeStatus(null); // Clear selection to show activated status
-                          
-                          // Show success with activation code (matching browser extension)
-                          showAlert(
-                            `✅ ${nodeTypeName} Activation Complete`,
-                            `Activation Code:\n${code}\n\n` +
-                            `Node Type: ${nodeTypeName}\n` +
-                            `Status: ✅ Paid (1500 1DEV burned)\n` +
-                            `Contract: ${isTestnet ? '62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ' : '4R3DPW4BY97kJRfv8J5wgTtbDpoXpRv92W957tXMpump'}\n\n` +
-                            `Transaction: ${burnResult.txHash.substring(0, 8)}...${burnResult.txHash.slice(-8)}`,
-                            [
-                              { text: 'Copy Code', onPress: () => {
-                                Clipboard.setString(code);
-                                showAlert('Copied', 'Activation code copied to clipboard');
-                              }},
-                              { text: 'View Transaction', onPress: () => {
-                                Linking.openURL(burnResult.explorer);
-                              }},
-                              { text: 'OK' }
-                            ]
-                          );
-                        } catch (error) {
-                          showAlert('Error', 'Failed to activate node: ' + error.message);
+                          showAlert(errorTitle, errorMessage);
                         } finally {
                           setActivatingNode(false);
                         }
                       }
                     }
-                  ]
+                  ],
+                  confirmRichContent
                 );
               }}
             >
@@ -2508,7 +2930,7 @@ const WalletScreen = () => {
                 {activatingNode 
                   ? 'Processing Transaction...' 
                   : activatedNodeType 
-                  ? 'Already Activated' 
+                  ? 'Code Already Received' 
                   : 'Get Activation Code'}
               </Text>
             </TouchableOpacity>
@@ -2525,27 +2947,39 @@ const WalletScreen = () => {
                 {/* Node Status Card */}
                 <View style={styles.nodeMonitoringCard}>
                   <View style={styles.nodeMonitoringHeader}>
-                    <Text style={styles.nodeMonitoringTitle}>
-                      {activatedNodeType.charAt(0).toUpperCase() + activatedNodeType.slice(1)} Node
-                    </Text>
+                    <View style={{flex: 1}}>
+                      <Text style={styles.nodeMonitoringTitle}>
+                        {activatedNodeType.charAt(0).toUpperCase() + activatedNodeType.slice(1)} Node
+                      </Text>
+                      {nodePseudonym ? (
+                        <Text style={styles.nodePseudonym}>
+                          {nodePseudonym}
+                        </Text>
+                      ) : null}
+                    </View>
                     <View style={[styles.statusBadge, styles.statusBadgeActive]}>
-                      <Text style={styles.statusBadgeText}>ACTIVE</Text>
+                      <Text style={styles.statusBadgeText}>CODE RECEIVED</Text>
                     </View>
                   </View>
                   
                   <View style={styles.nodeMonitoringInfo}>
-                    <Text style={styles.nodeMonitoringLabel}>Activation Code:</Text>
-                    <Text style={styles.nodeMonitoringCode}>{activationCode}</Text>
-                  </View>
-                  
-                  <View style={styles.nodeMonitoringInfo}>
                     <Text style={styles.nodeMonitoringLabel}>Activation Type:</Text>
-                    <Text style={styles.nodeMonitoringValue}>Phase 1: 1DEV Burn</Text>
+                    <Text style={styles.nodeMonitoringValue}>
+                      {activatedNodeType === 'light' 
+                        ? 'Free Activation' 
+                        : activationPricing?.phase === 2 
+                          ? `Phase 2: QNC Transfer (${(activationPricing.networkSize/1000).toFixed(0)}K nodes)`
+                          : `Phase 1: 1DEV Burn (${burnProgress}% burned)`}
+                    </Text>
                   </View>
                   
                   <View style={styles.nodeMonitoringInfo}>
                     <Text style={styles.nodeMonitoringLabel}>Burned Amount:</Text>
-                    <Text style={styles.nodeMonitoringValue}>1500 1DEV</Text>
+                    <Text style={styles.nodeMonitoringValue}>
+                      {activatedNodeType === 'light' ? '0 1DEV' : 
+                       activationPricing ? `${activationPricing.cost} ${activationPricing.currency}` : 
+                       '1500 1DEV'}
+                    </Text>
                   </View>
                   
                   {/* Action Button based on node type */}
@@ -2553,20 +2987,16 @@ const WalletScreen = () => {
                     <TouchableOpacity 
                       style={[styles.button, styles.secondaryButton]}
                       onPress={() => {
-                        showAlert(
-                          'Mobile Activation',
-                          'Light node activation is coming soon!\n\nYour activation code is ready and will be automatically used when this feature is enabled.',
-                          [{ text: 'OK' }]
-                        );
+                        setShowActivationInput(true);
+                        setActivationInputCode(''); // Don't pre-fill the code!
                       }}
                     >
                       <Text style={[styles.buttonText, styles.secondaryButtonText]}>
-                        Activate Node (Coming Soon)
+                        Activate Node
                       </Text>
                     </TouchableOpacity>
                   ) : (
                     <View style={styles.serverActivationNotice}>
-                      <Text style={styles.serverActivationIcon}>⚠️</Text>
                       <Text style={styles.serverActivationText}>
                         {activatedNodeType === 'full' ? 'Full' : 'Super'} nodes require server activation
                       </Text>
@@ -2582,35 +3012,61 @@ const WalletScreen = () => {
                   <Text style={styles.rewardsTitle}>Node Rewards</Text>
                   
                   <View style={styles.rewardItem}>
-                    <Text style={styles.rewardLabel}>Daily Rewards:</Text>
-                    <Text style={styles.rewardValue}>0.00 QNC</Text>
-                  </View>
-                  
-                  <View style={styles.rewardItem}>
                     <Text style={styles.rewardLabel}>Total Earned:</Text>
-                    <Text style={styles.rewardValue}>0.00 QNC</Text>
+                    <Text style={styles.rewardValue}>
+                      {nodeRewards?.totalEarned || 0} QNC
+                    </Text>
                   </View>
                   
                   <View style={styles.rewardItem}>
-                    <Text style={styles.rewardLabel}>Pending Claim:</Text>
-                    <Text style={styles.rewardValue}>0.00 QNC</Text>
+                    <Text style={styles.rewardLabel}>Total Claimed:</Text>
+                    <Text style={styles.rewardValue}>
+                      {nodeRewards?.totalClaimed || 0} QNC
+                    </Text>
+                  </View>
+                  
+                  <View style={styles.rewardItem}>
+                    <Text style={styles.rewardLabel}>Unclaimed Balance:</Text>
+                    <Text style={[styles.rewardValue, {color: (nodeRewards?.unclaimed || 0) > 0 ? '#34c759' : '#00d4ff'}]}>
+                      {nodeRewards?.unclaimed || 0} QNC
+                    </Text>
+                  </View>
+                  
+                  <View style={styles.rewardItem}>
+                    <Text style={styles.rewardLabel}>Last Ping:</Text>
+                    <Text style={styles.rewardValue}>
+                      {nodeRewards?.lastPing ? new Date(nodeRewards.lastPing).toLocaleTimeString() : 'Never'}
+                    </Text>
+                  </View>
+                  
+                  <View style={styles.rewardItem}>
+                    <Text style={styles.rewardLabel}>Node Status:</Text>
+                    <Text style={[styles.rewardValue, {color: nodeRewards?.isActive ? '#34c759' : '#ff3b30'}]}>
+                      {nodeRewards?.isActive ? 'Active' : 'Inactive (needs ping)'}
+                    </Text>
                   </View>
                   
                   <TouchableOpacity 
-                    style={[styles.button, styles.buttonDisabled]}
-                    disabled={true}
+                    style={[
+                      styles.button, 
+                      (!nodeRewards?.unclaimed || nodeRewards.unclaimed <= 0 || claimingRewards) && styles.buttonDisabled
+                    ]}
+                    disabled={!nodeRewards?.unclaimed || nodeRewards.unclaimed <= 0 || claimingRewards}
+                    onPress={handleClaimRewards}
                   >
                     <Text style={styles.buttonText}>
-                      Claim Rewards (No Rewards Yet)
+                      {claimingRewards ? 'Processing Claim...' : 
+                       !nodeRewards?.unclaimed || nodeRewards.unclaimed <= 0 ? 'Claim' :
+                       `Claim ${nodeRewards.unclaimed} QNC`}
                     </Text>
                   </TouchableOpacity>
                 </View>
               </View>
             ) : (
             <View style={styles.emptyState}>
-                <Text style={styles.emptyText}>No active nodes</Text>
+                <Text style={styles.emptyText}>No nodes configured</Text>
                 <Text style={styles.emptySubtext}>
-                  You need to activate a node to start earning rewards
+                  Get an activation code to start earning rewards
                 </Text>
                 
                 <TouchableOpacity
@@ -2620,7 +3076,7 @@ const WalletScreen = () => {
                   }}
                 >
                   <Text style={styles.buttonText}>
-                    Activate Node
+                    Get Activation Code
                   </Text>
                 </TouchableOpacity>
             </View>
@@ -2692,6 +3148,8 @@ const WalletScreen = () => {
                   onPress={async () => {
                     const newTestnet = !isTestnet;
                     setIsTestnet(newTestnet);
+                    // Save to AsyncStorage for persistence
+                    await AsyncStorage.setItem('qnet_testnet', newTestnet.toString());
                     showAlert('Network Changed', `Switched to ${newTestnet ? 'Testnet' : 'Mainnet'}. Reloading balances...`);
                     // Reload balances with new network
                     if (wallet && wallet.publicKey) {
@@ -2759,6 +3217,8 @@ const WalletScreen = () => {
                       {text: t('logout'), style: 'destructive', onPress: () => {
                         setWallet(null);
                         setHasWallet(false);
+                        setActivatedNodeType(null);
+                        setActivationCode(null);
                       }}
                     ]
                   );
@@ -2802,7 +3262,7 @@ const WalletScreen = () => {
             setActiveTab('assets');
             // Immediate balance refresh when switching to assets
             if (wallet && wallet.publicKey) {
-              console.log('User switched to assets tab, refreshing balance');
+              // console.log('User switched to assets tab, refreshing balance');
               loadBalance(wallet.publicKey);
             }
           }}
@@ -2913,7 +3373,7 @@ const WalletScreen = () => {
       {showExportSeed && (
         <View style={styles.modalOverlay}>
           <View style={styles.modalBox}>
-            <Text style={styles.modalTitle}>⚠️ {t('export_recovery_phrase')}</Text>
+            <Text style={styles.modalTitle}>{t('export_recovery_phrase')}</Text>
             <Text style={styles.modalWarning}>
               {t('recovery_phrase_warning')}
             </Text>
@@ -2954,7 +3414,7 @@ const WalletScreen = () => {
       {showExportActivation && (
         <View style={styles.modalOverlay}>
           <View style={styles.modalBox}>
-            <Text style={styles.modalTitle}>🔑 {t('export_activation_code')}</Text>
+            <Text style={styles.modalTitle}>{t('export_activation_code')}</Text>
             <Text style={styles.modalWarning}>
               {t('activation_code_warning')}
             </Text>
@@ -3080,6 +3540,65 @@ const WalletScreen = () => {
         </View>
       )}
 
+      {/* Node Activation Input Modal */}
+      {showActivationInput && (
+        <Animated.View style={[styles.modalOverlay, {
+          opacity: showActivationInput ? 1 : 0
+        }]}>
+          <Animated.View style={[
+            styles.modalBox, 
+            { 
+              maxWidth: 350,
+              transform: [{
+                scale: showActivationInput ? 1 : 0.9
+              }]
+            }
+          ]}>
+            <View style={styles.modalHeader}>
+              <Text style={styles.modalTitle}>
+                Node Activation
+              </Text>
+            </View>
+            
+            <Text style={styles.modalContent}>
+              Enter your activation code to register the node in the network
+            </Text>
+            
+            <TextInput
+              style={[styles.alertInput, {marginTop: 15}]}
+              placeholder="QNET-XXXXXX-XXXXXX-XXXXXX"
+              placeholderTextColor="#666"
+              value={activationInputCode}
+              onChangeText={(text) => setActivationInputCode(text.toUpperCase())}
+              autoCapitalize="characters"
+              maxLength={25}
+            />
+            
+            <View style={{flexDirection: 'row', justifyContent: 'space-between', marginTop: 25, marginHorizontal: 20, gap: 12}}>
+              <TouchableOpacity 
+                style={[styles.button, styles.secondaryButton, {flex: 1, minHeight: 38, paddingVertical: 10, elevation: 1}]}
+                onPress={() => {
+                  setShowActivationInput(false);
+                  setActivationInputCode('');
+                }}
+              >
+                <Text style={[styles.buttonText, styles.secondaryButtonText, {fontSize: 14}]}>Cancel</Text>
+              </TouchableOpacity>
+              
+              <TouchableOpacity 
+                style={[styles.button, styles.primaryButton, nodeActivating && styles.buttonDisabled, {flex: 1, minHeight: 38, paddingVertical: 10, elevation: 1}]}
+                onPress={handleNodeActivation}
+                disabled={nodeActivating || !activationInputCode.trim()}
+              >
+                <Text style={[styles.buttonText, {fontSize: 14}]}>
+                  {nodeActivating ? 'Activating...' : 'Activate'}
+                </Text>
+              </TouchableOpacity>
+            </View>
+          </Animated.View>
+        </Animated.View>
+      )}
+
       {/* Custom Alert Modal (styled like extension) */}
       {customAlert && (
         <Animated.View style={[styles.modalOverlay, {
@@ -3097,20 +3616,20 @@ const WalletScreen = () => {
             {/* Modal Header with icon */}
             <View style={styles.modalHeader}>
               <Text style={styles.modalTitle}>
-                {customAlert.title.includes('Success') && '✅ '}
-                {customAlert.title.includes('Error') && '❌ '}
-                {customAlert.title.includes('Warning') || customAlert.title.includes('⚠️') ? '⚠️ ' : ''}
-                {customAlert.title.includes('Activation') || customAlert.title.includes('🔑') ? '🔑 ' : ''}
-                {customAlert.title.includes('Recovery') || customAlert.title.includes('⚠️ Recovery') ? '🔐 ' : ''}
-                {customAlert.title.includes('Copied') || customAlert.title.includes('📋') ? '📋 ' : ''}
                 {customAlert.title}
               </Text>
             </View>
             
             {/* Modal Content */}
+            {customAlert.richContent ? (
+              <View style={styles.modalContentContainer}>
+                {customAlert.richContent}
+              </View>
+            ) : (
             <Text style={styles.modalContent}>
               {customAlert.message}
             </Text>
+            )}
             
             {/* Modal Actions */}
             <View style={styles.modalActions}>
@@ -3304,8 +3823,9 @@ const styles = StyleSheet.create({
   },
   tab: {
     flex: 1,
-    paddingVertical: 12,
+    paddingVertical: 15,
     alignItems: 'center',
+    justifyContent: 'center',
     borderBottomWidth: 2,
     borderBottomColor: 'transparent',
   },
@@ -3316,6 +3836,8 @@ const styles = StyleSheet.create({
     color: '#b0b0b0',
     fontSize: 12,
     fontWeight: '600',
+    lineHeight: 18,
+    includeFontPadding: false,
   },
   activeTabText: {
     color: '#00d4ff',
@@ -3499,8 +4021,8 @@ const styles = StyleSheet.create({
     backgroundColor: '#1a1a2e', // Like extension modal background
     borderRadius: 20, // Smoother corners
     padding: 0, // Content padding handled separately
-    width: '100%',
-    maxWidth: 400,
+    width: '90%', // Reduced from 100% to add margin from edges
+    maxWidth: 360, // Slightly reduced for better mobile view
     borderWidth: 1,
     borderColor: 'rgba(0, 212, 255, 0.3)', // Slightly brighter border
     shadowColor: '#00d4ff',
@@ -3531,34 +4053,39 @@ const styles = StyleSheet.create({
     paddingHorizontal: 24,
     paddingVertical: 20,
     textAlign: 'center',
+    minHeight: 60, // Ensure minimum height for content
+  },
+  modalContentContainer: {
+    paddingHorizontal: 4,
+    paddingVertical: 10,
   },
   modalActions: {
     flexDirection: 'row',
-    gap: 12,
-    paddingHorizontal: 24,
-    paddingBottom: 24,
-    paddingTop: 8,
+    gap: 10,
+    paddingHorizontal: 20,
+    paddingBottom: 20,
+    paddingTop: 5,
   },
   modalButton: {
-    paddingVertical: 14,
-    paddingHorizontal: 20,
-    borderRadius: 12,
+    paddingVertical: 11,
+    paddingHorizontal: 18,
+    borderRadius: 10,
     alignItems: 'center',
     justifyContent: 'center',
-    minHeight: 48,
+    minHeight: 42,
   },
   modalButtonPrimary: {
     backgroundColor: '#00d4ff',
     shadowColor: '#00d4ff',
-    shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.3,
-    shadowRadius: 8,
-    elevation: 5,
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.2,
+    shadowRadius: 4,
+    elevation: 3,
   },
   modalButtonSecondary: {
-    backgroundColor: 'transparent',
+    backgroundColor: 'rgba(0, 212, 255, 0.1)',
     borderWidth: 1,
-    borderColor: 'rgba(0, 212, 255, 0.5)',
+    borderColor: 'rgba(0, 212, 255, 0.3)',
   },
   modalButtonDanger: {
     backgroundColor: '#ff4444',
@@ -3636,6 +4163,12 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     alignItems: 'center',
     marginBottom: 24,
+    ...Platform.select({
+      android: {
+        borderRadius: 60,
+        overflow: 'hidden',
+      },
+    }),
   },
   outerRing: {
     position: 'absolute',
@@ -3647,6 +4180,12 @@ const styles = StyleSheet.create({
     borderTopColor: '#00d4ff',
     borderRightColor: '#00d4ff',
     elevation: 0,
+    ...Platform.select({
+      android: {
+        borderRadius: 60,
+        overflow: 'hidden',
+      },
+    }),
   },
   outerRingGradient: {
     position: 'absolute',
@@ -3665,6 +4204,12 @@ const styles = StyleSheet.create({
     borderColor: '#6B46C1',
     backgroundColor: 'rgba(107, 70, 193, 0.1)',
     elevation: 0,
+    ...Platform.select({
+      android: {
+        borderRadius: 45,
+        overflow: 'hidden',
+      },
+    }),
   },
   innerRingGradient: {
     position: 'absolute',
@@ -3985,9 +4530,17 @@ const styles = StyleSheet.create({
     backgroundColor: 'rgba(0, 212, 255, 0.1)',
   },
   nodeTypeActivated: {
-    borderColor: '#00ff7f',
-    backgroundColor: 'rgba(0, 255, 127, 0.05)',
-    opacity: 0.9,
+    borderColor: 'rgba(0, 212, 255, 0.6)',
+    backgroundColor: 'rgba(0, 212, 255, 0.08)',
+    opacity: 0.95,
+  },
+  nodeTypeDisabled: {
+    opacity: 0.5,
+    borderColor: 'rgba(128, 128, 128, 0.3)',
+    backgroundColor: 'rgba(128, 128, 128, 0.05)',
+  },
+  nodeTypeDisabledText: {
+    color: '#666666',
   },
   nodeTypeInfo: {
     flex: 1,
@@ -4051,6 +4604,21 @@ const styles = StyleSheet.create({
     fontSize: 18,
     fontWeight: '600',
     color: '#ffffff',
+  },
+  nodePseudonym: {
+    fontSize: 14,
+    color: '#00d4ff',
+    marginTop: 4,
+    fontStyle: 'italic',
+  },
+  alertInput: {
+    borderWidth: 1,
+    borderColor: '#333',
+    borderRadius: 8,
+    padding: 10,
+    marginTop: 10,
+    color: '#ffffff',
+    backgroundColor: '#1a1a2a',
   },
   statusBadge: {
     paddingHorizontal: 10,

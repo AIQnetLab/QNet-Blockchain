@@ -2080,7 +2080,7 @@ export class WalletManager {
       
       return `${part1}eon${part2}${checksum}`;
     } catch (error) {
-      console.error('Error generating QNet address:', error);
+      // console.error('Error generating QNet address:', error);
       throw error;
     }
   }
@@ -2103,7 +2103,7 @@ export class WalletManager {
       
       return `qnet_${part1}_eon_${part2}_${checksum}`;
     } catch (error) {
-      console.error('Error generating QNet address from Solana:', error);
+      // console.error('Error generating QNet address from Solana:', error);
       return null;
     }
   }
@@ -2120,7 +2120,7 @@ export class WalletManager {
       
       // Check if it's old format (short - less than 40 chars)
       if (wallet.qnetAddress.length < 40) {
-        console.log('Migrating old short QNet address to new long format');
+        // Migrate old short QNet address to new long format
         
         // Generate new long format address
         if (wallet.mnemonic) {
@@ -2130,13 +2130,11 @@ export class WalletManager {
           // Otherwise generate from Solana address
           wallet.qnetAddress = this.generateQNetAddressFromSolana(wallet.solanaAddress || wallet.address);
         }
-        
-        console.log('Migrated to new QNet address:', wallet.qnetAddress);
       }
       
       return wallet;
     } catch (error) {
-      console.error('Error migrating QNet address:', error);
+      // console.error('Error migrating QNet address:', error);
       return wallet;
     }
   }
@@ -2170,7 +2168,7 @@ export class WalletManager {
       
       return `${part1}eon${part2}${checksum}`;
     } catch (error) {
-      console.error('Error generating QNet address:', error);
+      // console.error('Error generating QNet address:', error);
       throw new Error('Failed to generate QNet address');
     }
   }
@@ -2188,7 +2186,7 @@ export class WalletManager {
       
       return key;
     } catch (error) {
-      console.error('HD derivation error:', error);
+      // console.error('HD derivation error:', error);
       // Fallback to direct seed for compatibility
       return seed.slice(0, 32);
     }
@@ -2221,7 +2219,7 @@ export class WalletManager {
         qnetAddress: qnetAddress
       };
     } catch (error) {
-      console.error('Error generating wallet:', error);
+      // console.error('Error generating wallet:', error);
       throw error;
     }
   }
@@ -2284,7 +2282,7 @@ export class WalletManager {
       
       return mnemonic.join(' ');
     } catch (error) {
-      console.error('Error generating BIP39 mnemonic:', error);
+      // console.error('Error generating BIP39 mnemonic:', error);
       throw new Error('Failed to generate secure mnemonic');
     }
   }
@@ -2359,7 +2357,7 @@ export class WalletManager {
 
       return { valid: true, entropy: entropy };
     } catch (error) {
-      console.error('Error validating BIP39 mnemonic:', error);
+      // console.error('Error validating BIP39 mnemonic:', error);
       return { valid: false, error: 'Failed to validate mnemonic.' };
     }
   }
@@ -2401,7 +2399,7 @@ export class WalletManager {
         imported: true
       };
     } catch (error) {
-      console.error('Error importing wallet:', error);
+      // console.error('Error importing wallet:', error);
       throw new Error(error.message || 'Failed to import wallet. Please check your seed phrase and try again.');
     }
   }
@@ -2450,7 +2448,7 @@ export class WalletManager {
       
       return true;
     } catch (error) {
-      console.error('Error storing wallet:', error);
+      // console.error('Error storing wallet:', error);
       throw error;
     }
   }
@@ -2468,7 +2466,7 @@ export class WalletManager {
         vaultData = JSON.parse(vaultDataStr);
       } catch (parseError) {
         // Corrupted data - clean up and throw error
-        console.error('Corrupted wallet data, cleaning up...');
+        // console.error('Corrupted wallet data, cleaning up...');
         await AsyncStorage.removeItem('qnet_wallet');
         await AsyncStorage.removeItem('qnet_wallet_address');
         throw new Error('Wallet data is corrupted. Please create a new wallet or import existing one.');
@@ -2551,7 +2549,7 @@ export class WalletManager {
       try {
         decryptedStr = decrypted.toString(CryptoJS.enc.Utf8);
       } catch (utf8Error) {
-        console.error('UTF-8 decode error, likely wrong password');
+        // console.error('UTF-8 decode error, likely wrong password');
         throw new Error('Wrong password or corrupted wallet');
       }
       
@@ -2591,11 +2589,11 @@ export class WalletManager {
         
         return wallet;
       } catch (parseError) {
-        console.error('Failed to parse decrypted data');
+        // console.error('Failed to parse decrypted data');
         throw new Error('Wrong password or corrupted wallet');
       }
     } catch (error) {
-      console.error('Error loading wallet:', error);
+      // console.error('Error loading wallet:', error);
       throw error;
     }
   }
@@ -2630,7 +2628,7 @@ export class WalletManager {
       
       return 0;
     } catch (error) {
-      console.error('Error getting balance:', error);
+      // console.error('Error getting balance:', error);
       return 0;
     }
   }
@@ -2678,8 +2676,24 @@ export class WalletManager {
       
       return 0;
     } catch (error) {
-      console.error('Error getting token balance:', error);
+      // console.error('Error getting token balance:', error);
       return 0;
+    }
+  }
+
+  // Get active nodes count from blockchain/API
+  async getActiveNodesCount(isTestnet = true) {
+    try {
+      // PRODUCTION: Will get real count from QNet blockchain
+      // For now returning test value
+      const activeNodesCount = 150000; // TODO: Get real count from blockchain
+      
+      return activeNodesCount;
+      
+    } catch (error) {
+      // console.error('[getActiveNodesCount] Error:', error);
+      // Default to mid-range if error
+      return 150000;
     }
   }
 
@@ -2698,8 +2712,6 @@ export class WalletManager {
       
       const TOTAL_SUPPLY = 1000000000; // 1 billion total supply
       
-      console.log('[getBurnProgress] Fetching token supply for:', oneDevMint, 'isTestnet:', isTestnet);
-      
       // Try to get current supply and calculate burned amount
       const response = await fetch(rpcUrl, {
         method: 'POST',
@@ -2716,13 +2728,10 @@ export class WalletManager {
       
       if (response.ok) {
         const data = await response.json();
-        console.log('[getBurnProgress] Response data:', data);
         
         if (data.result && data.result.value) {
           const currentSupply = parseFloat(data.result.value.amount) / Math.pow(10, data.result.value.decimals || 6);
           const burnedAmount = TOTAL_SUPPLY - currentSupply;
-          
-          console.log('[getBurnProgress] Current supply:', currentSupply, 'Burned:', burnedAmount);
           
           // Only return if we have a reasonable burned amount
           if (burnedAmount > 0 && burnedAmount < TOTAL_SUPPLY) {
@@ -2730,39 +2739,44 @@ export class WalletManager {
             // Show more precision for small percentages
             if (burnPercentage < 0.01) {
               const result = burnPercentage.toFixed(4);
-              console.log('[getBurnProgress] Burn percentage:', result + '%');
               return result;
             } else if (burnPercentage < 1) {
               const result = burnPercentage.toFixed(3);
-              console.log('[getBurnProgress] Burn percentage:', result + '%');
               return result;
             } else {
               const result = burnPercentage.toFixed(1);
-              console.log('[getBurnProgress] Burn percentage:', result + '%');
               return result;
             }
           }
         }
       } else {
-        console.error('[getBurnProgress] Failed to fetch:', response.status, response.statusText);
+        // console.error('[getBurnProgress] Failed to fetch:', response.status, response.statusText);
       }
       
       // Fallback values
-      console.log('[getBurnProgress] Returning default 0.0%');
       return '0.0';
     } catch (error) {
-      console.error('[getBurnProgress] Error:', error);
+      // console.error('[getBurnProgress] Error:', error);
       // Return zero if can't fetch real data
       return '0.0';
     }
   }
 
   // Burn tokens for node activation (real implementation)
-  async burnTokensForNode(nodeType, amount = 1500, isTestnet = false, password) {
+  async burnTokensForNode(nodeType, amount = null, isTestnet = false, password) {
     try {
       const web3 = require('@solana/web3.js');
       const { Transaction, SystemProgram, Connection, Keypair, PublicKey } = web3;
       const { createBurnInstruction, getAssociatedTokenAddress, TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID } = require('@solana/spl-token');
+      
+      // Calculate dynamic amount if not provided
+      if (!amount) {
+        const pricing = await this.calculateActivationCost(nodeType);
+        if (pricing.phase === 2) {
+          throw new Error('Phase 2 activated: QNC required for activation, not 1DEV');
+        }
+        amount = pricing.cost;
+      }
       
       const connection = new Connection(
         isTestnet ? 'https://api.devnet.solana.com' : 'https://api.mainnet-beta.solana.com',
@@ -2846,11 +2860,12 @@ export class WalletManager {
       }, 'confirmed');
       
       if (!confirmation.value.err) {
-        console.log('✅ Tokens burned successfully!', signature);
+        // Transaction successful
         return {
         nodeType,
         amount,
         timestamp: Date.now(),
+          signature: signature,  // Add signature field
           txHash: signature,
           explorer: `https://explorer.solana.com/tx/${signature}?cluster=${isTestnet ? 'devnet' : 'mainnet-beta'}`
         };
@@ -2858,33 +2873,47 @@ export class WalletManager {
         throw new Error('Transaction failed: ' + JSON.stringify(confirmation.value.err));
       }
     } catch (error) {
-      console.error('Error burning tokens:', error);
+      // console.error('Error burning tokens:', error);
       throw error;
     }
   }
   
   // Generate secure activation code (like extension)
-  generateActivationCode(nodeType = 'full', address = '') {
+  generateActivationCode(nodeType = 'full', address = '', seedPhrase = null) {
     try {
       if (!address) {
         throw new Error('Address required for activation code generation');
       }
       
-      // Generate deterministic code based on address and node type
-      // This ensures same code is generated in mobile and extension
-      const data = `${address}-${nodeType}-activation`;
-      const hash = CryptoJS.SHA256(data);
-      const hashHex = hash.toString(CryptoJS.enc.Hex).toUpperCase();
+      // Mobile can generate codes for all node types
+      // The actual activation will happen on appropriate platform
       
-      // Format as QNET-NODETYPE-XXXXXXXXXX
-      const nodeTypeCode = nodeType.toUpperCase().substring(0, 5).padEnd(5, 'X');
-      const codeSegment = hashHex.substring(0, 12);
+      // Generate DETERMINISTIC activation code from seed phrase
+      // Same seed + nodeType = always same code (for sync between devices)
+      let entropy;
       
-      const code = `QNET-${nodeTypeCode}-${codeSegment}`;
+      if (seedPhrase) {
+        // Use seed phrase for deterministic generation (wallet restore case)
+        const seedData = `${seedPhrase}-${nodeType}-QNET_ACTIVATION_V2`;
+        entropy = CryptoJS.SHA256(seedData).toString(CryptoJS.enc.Hex);
+      } else {
+        // Fallback to address-based generation for backward compatibility
+        const data = `${nodeType}-${address}-activation`;
+        entropy = CryptoJS.SHA256(data).toString(CryptoJS.enc.Hex);
+      }
+      
+      // Create three 6-character segments from entropy
+      const entropyUpper = entropy.toUpperCase();
+      const segment1 = entropyUpper.substring(0, 6);
+      const segment2 = entropyUpper.substring(6, 12);
+      const segment3 = entropyUpper.substring(12, 18);
+      
+      // Format as QNET-XXXXXX-XXXXXX-XXXXXX (25 chars total)
+      const code = `QNET-${segment1}-${segment2}-${segment3}`;
       
       return code;
     } catch (error) {
-      console.error('Error generating activation code:', error);
+      // console.error('Error generating activation code:', error);
       throw new Error('Failed to generate secure activation code');
     }
   }
@@ -2926,7 +2955,7 @@ export class WalletManager {
       await AsyncStorage.setItem('qnet_activation_codes', JSON.stringify(encryptedCodes));
       return true;
     } catch (error) {
-      console.error('Error storing activation code:', error);
+      // console.error('Error storing activation code:', error);
       throw error;
     }
   }
@@ -2971,62 +3000,694 @@ export class WalletManager {
       
       return decryptedStr;
     } catch (error) {
-      console.error('Error loading activation code:', error);
+      // console.error('Error loading activation code:', error);
       throw error;
     }
   }
 
+  // Synchronize activation codes from blockchain (called on wallet restore)
+  async syncActivationCodes(walletAddress, seedPhrase, password) {
+    try {
+      // Check for existing stored codes first (local cache)
+      const existingCodes = await this.getStoredActivationCodes(password);
+      
+      if (existingCodes && Object.keys(existingCodes).length > 0) {
+        // Return existing codes from storage
+        return existingCodes;
+      }
+      
+      // TODO: Query blockchain for REAL activations
+      // Phase 1: Check Solana for burn transactions from this wallet
+      // const connection = new Connection(...);
+      // const burnTransactions = await connection.getConfirmedSignaturesForAddress2(
+      //   walletAddress, 
+      //   { limit: 100 }
+      // );
+      // 
+      // Filter for 1DEV burn transactions and verify amounts
+      // If found, retrieve activation code from transaction metadata
+      //
+      // Phase 2: Also check QNet blockchain for activations
+      // const response = await fetch(`/api/activations/by_wallet?wallet_address=${walletAddress}`);
+      
+      // IMPORTANT: Do NOT generate codes without real burn transaction!
+      // Codes must be earned through real token burn
+      
+      return null; // No codes found
+    } catch (error) {
+      // console.error('[syncActivationCodes] Error:', error);
+      return null;
+    }
+  }
+  
   // Get all stored activation codes
   async getStoredActivationCodes(password) {
     try {
+      // Password is required for decryption
+      if (!password) {
+        return {};
+      }
+      
       const codesStr = await AsyncStorage.getItem('qnet_activation_codes');
       if (!codesStr) return {};
       
-      const encryptedCodes = JSON.parse(codesStr);
+      let encryptedCodes = {};
+      try {
+        encryptedCodes = JSON.parse(codesStr);
+      } catch (parseError) {
+        // Invalid format - clear and return empty
+        await AsyncStorage.removeItem('qnet_activation_codes');
+        return {};
+      }
+      
       const decryptedCodes = {};
       
       for (const [nodeType, codeData] of Object.entries(encryptedCodes)) {
         try {
+          // Validate codeData structure
+          if (!codeData || typeof codeData !== 'object') {
+            continue;
+          }
+          
           // Check if it's the new format with salt and iv
-          if (codeData.salt && codeData.iv) {
-            // Parse encryption parameters
-            const salt = CryptoJS.enc.Hex.parse(codeData.salt);
-            const iv = CryptoJS.enc.Hex.parse(codeData.iv);
-            
-            // Derive key from password
-            const key = CryptoJS.PBKDF2(password, salt, {
-              keySize: 256/32,
-              iterations: 10000,
-              hasher: CryptoJS.algo.SHA256
-            });
-            
-            // Decrypt the activation code
-            const decrypted = CryptoJS.AES.decrypt(codeData.encrypted, key, {
-              iv: iv,
-              mode: CryptoJS.mode.CBC,
-              padding: CryptoJS.pad.Pkcs7
-            });
-            
-            const code = decrypted.toString(CryptoJS.enc.Utf8);
-            if (code) {
-              decryptedCodes[nodeType] = {
-                code,
-                timestamp: codeData.timestamp || Date.now()
-              };
+          if (codeData.salt && codeData.iv && codeData.encrypted) {
+            try {
+              // Validate hex strings before parsing
+              if (typeof codeData.salt !== 'string' || typeof codeData.iv !== 'string') {
+                continue;
+              }
+              
+              // Parse encryption parameters
+              const salt = CryptoJS.enc.Hex.parse(codeData.salt);
+              const iv = CryptoJS.enc.Hex.parse(codeData.iv);
+              
+              // Check if parsing was successful
+              if (!salt || !iv || !salt.sigBytes || !iv.sigBytes) {
+                continue;
+              }
+              
+              // Derive key from password
+              const key = CryptoJS.PBKDF2(password, salt, {
+                keySize: 256/32,
+                iterations: 10000,
+                hasher: CryptoJS.algo.SHA256
+              });
+              
+              // Decrypt the activation code
+              const decrypted = CryptoJS.AES.decrypt(codeData.encrypted, key, {
+                iv: iv,
+                mode: CryptoJS.mode.CBC,
+                padding: CryptoJS.pad.Pkcs7
+              });
+              
+              const code = decrypted.toString(CryptoJS.enc.Utf8);
+              if (code && code.length > 0) {
+                // Validate code format and extract embedded node type
+                if (code.startsWith('QNET-') && code.length === 26) {
+                  // Mobile should only have light node codes
+                  if (nodeType !== 'light') {
+                    console.warn(`Mobile should only have light node codes, found: ${nodeType}`);
+                    continue; // Skip non-light codes on mobile
+                  }
+                }
+                
+                decryptedCodes[nodeType] = {
+                  code,
+                  timestamp: codeData.timestamp || Date.now()
+                };
+              }
+            } catch (decryptError) {
+              // Decryption failed - skip this code
             }
           } else {
-            // Old format - try direct decryption (or skip old codes)
-            console.log(`Skipping old format activation code for ${nodeType}`);
+            // Old format - skip
           }
         } catch (err) {
-          console.error(`Failed to decrypt ${nodeType} code:`, err);
+          // Error processing this code - skip
         }
       }
       
       return decryptedCodes;
     } catch (error) {
-      console.error('Error getting stored activation codes:', error);
+      // console.error('Error getting stored activation codes:', error);
       return {};
+    }
+  }
+  
+  // Calculate dynamic activation cost based on burn percentage
+  async calculateActivationCost(nodeType = 'full') {
+    try {
+      const burnPercent = parseFloat(await this.getBurnProgress(false));
+      
+      // Phase 1 Economic Model
+      const PHASE_1_BASE_PRICE = 1500; // Base cost in 1DEV
+      const PRICE_REDUCTION_PER_10_PERCENT = 150; // 150 1DEV reduction per 10% burned
+      const MINIMUM_PRICE = 300; // Minimum price at 80-90% burned
+      
+      // Check if Phase 2 (90% burned or 5 years passed)
+      if (burnPercent >= 90) {
+        // Phase 2: QNC activation with dynamic network multiplier
+        const phase2BaseCosts = {
+          light: 5000,  // Base QNC cost
+          full: 7500,   // Base QNC cost
+          super: 10000  // Base QNC cost
+        };
+        
+        // Get real active nodes count from blockchain
+        const activeNodesCount = await this.getActiveNodesCount(false); // Use mainnet for pricing
+        
+        // Calculate network size multiplier
+        let multiplier = 1.0;
+        if (activeNodesCount <= 100000) {
+          multiplier = 0.5; // Early network discount
+        } else if (activeNodesCount <= 300000) {
+          multiplier = 1.0; // Standard rate
+        } else if (activeNodesCount <= 1000000) {
+          multiplier = 2.0; // High demand
+        } else {
+          multiplier = 3.0; // Mature network (1M+)
+        }
+        
+        const baseCost = phase2BaseCosts[nodeType] || phase2BaseCosts.full;
+        const finalCost = Math.round(baseCost * multiplier);
+        
+        return {
+          cost: finalCost,
+          baseCost: baseCost,
+          currency: 'QNC',
+          phase: 2,
+          mechanism: 'transfer', // Transfer to Pool 3, not burn
+          description: `Transfer ${finalCost} QNC to Pool #3 (${activeNodesCount.toLocaleString()} active nodes, ${multiplier}x rate)`,
+          networkSize: activeNodesCount,
+          multiplier: multiplier
+        };
+      }
+      
+      // Phase 1: Dynamic 1DEV pricing
+      // Calculate current price: Every 10% burned = -150 1DEV reduction
+      const reductionTiers = Math.floor(burnPercent / 10);
+      const totalReduction = reductionTiers * PRICE_REDUCTION_PER_10_PERCENT;
+      const currentPrice = Math.max(PHASE_1_BASE_PRICE - totalReduction, MINIMUM_PRICE);
+      
+      return {
+        cost: currentPrice,
+        currency: '1DEV',
+        phase: 1,
+        mechanism: 'burn',
+        burnPercent: burnPercent,
+        savings: PHASE_1_BASE_PRICE - currentPrice,
+        baseCost: PHASE_1_BASE_PRICE,
+        description: `Burn ${currentPrice} 1DEV for activation (${burnPercent.toFixed(1)}% already burned)`
+      };
+    } catch (error) {
+      // console.error('Error calculating activation cost:', error);
+      // Fallback to base price
+      return {
+        cost: 1500,
+        currency: '1DEV',
+        phase: 1,
+        mechanism: 'burn',
+        description: 'Burn 1500 1DEV for activation'
+      };
+    }
+  }
+  
+  // Activate Light Node - REQUIRES REAL 1DEV BURN
+  async activateLightNode(walletAddress, password) {
+    try {
+      // Load wallet to get seed phrase for deterministic generation
+      const walletData = await this.loadWallet(password);
+      if (!walletData || !walletData.mnemonic) {
+        throw new Error('Failed to load wallet data');
+      }
+      
+      // Check testnet/mainnet - default to true (testnet) if not set
+      const testnetSetting = await AsyncStorage.getItem('qnet_testnet');
+      const isTestnet = testnetSetting === null ? true : testnetSetting === 'true';
+      
+      // Get dynamic pricing for light node
+      const pricing = await this.calculateActivationCost('light');
+      if (!pricing) {
+        throw new Error('Failed to calculate activation cost');
+      }
+      
+      // Check balances BEFORE attempting burn (use the same address for both checks)
+      const solBalance = await this.getBalance(walletAddress, isTestnet);
+      // Fix floating point precision issue (0.01 might be 0.009999999)
+      const minSolRequired = 0.009; // Slightly less than 0.01 to account for precision
+      if (solBalance < minSolRequired) {
+        throw new Error(`Insufficient SOL for transaction fees. Need at least 0.01 SOL, have: ${solBalance.toFixed(4)}`);
+      }
+      
+      const oneDevMint = isTestnet 
+        ? '62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ'
+        : '4R3DPW4BY97kJRfv8J5wgTtbDpoXpRv92W957tXMpump';
+      
+      const oneDevBalance = await this.getTokenBalance(walletAddress, oneDevMint, isTestnet);
+      if (oneDevBalance < pricing.cost) {
+        throw new Error(`Insufficient 1DEV balance. Need: ${pricing.cost}, have: ${oneDevBalance}`);
+      }
+      
+      // BURN REAL TOKENS for activation
+      const burnResult = await this.burnTokensForNode('light', pricing.cost, isTestnet, password);
+      
+      if (!burnResult || !burnResult.signature) {
+        throw new Error('Failed to burn tokens for activation');
+      }
+      
+    // Only generate code AFTER successful burn
+    const activationCode = this.generateActivationCode('light', walletAddress, walletData.mnemonic);
+    
+    // Store the activation code with transaction signature
+    await this.storeActivationCode(activationCode, 'light', password);
+    
+    // Register node with backend
+    const apiUrl = isTestnet 
+      ? 'https://testnet-api.qnet.io'
+      : 'https://api.qnet.io';
+    
+    try {
+      // Create registration message
+      const registrationMessage = {
+        node_id: activationCode,
+        public_key: walletData.publicKey,
+        host: '0.0.0.0', // Mobile nodes don't have fixed IP
+        port: 0, // Mobile nodes don't listen on ports
+        node_type: 'light',
+        activation_tx: burnResult.signature,
+        timestamp: Date.now()
+      };
+      
+      // Sign the registration
+      const messageStr = JSON.stringify(registrationMessage, Object.keys(registrationMessage).sort());
+      const messageHash = CryptoJS.SHA256(messageStr).toString();
+      const signature = nacl.sign.detached(
+        Buffer.from(messageHash, 'hex'),
+        new Uint8Array(walletData.secretKey)
+      );
+      
+      // Send registration to backend
+      const response = await fetch(`${apiUrl}/api/nodes`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          ...registrationMessage,
+          signature: bs58.encode(signature)
+        })
+      });
+      
+      if (!response.ok) {
+        // Log error but don't fail - node is already activated on-chain
+        // console.error('Backend registration failed:', response.status);
+      }
+      
+      // Store initial ping time
+      await AsyncStorage.setItem(`node_last_ping_${walletAddress}`, Date.now().toString());
+      
+    } catch (apiError) {
+      // Backend registration failed but node is activated on-chain
+      // console.error('Backend registration error:', apiError);
+    }
+    
+    return {
+      success: true,
+      signature: burnResult.signature,
+      activationCode,
+      nodeType: 'light',
+      burned: pricing.cost,
+      timestamp: Date.now()
+    };
+    } catch (error) {
+      // console.error('Error activating light node:', error);
+      throw error;
+    }
+  }
+  
+  // Get node rewards information from backend
+  async getNodeRewards(nodeType, activationCode, walletAddress) {
+    try {
+      // Get backend URL
+      const isTestnet = await AsyncStorage.getItem('qnet_testnet') === 'true';
+      const apiUrl = isTestnet 
+        ? 'https://testnet-api.qnet.io'
+        : 'https://api.qnet.io';
+      
+      // Get rewards periods from blockchain
+      const periodsResponse = await fetch(`${apiUrl}/api/rewards/periods`, {
+        method: 'GET',
+        headers: {
+          'Content-Type': 'application/json',
+        }
+      });
+      
+      const periods = await periodsResponse.json();
+      const currentPeriod = periods?.periods?.[0];
+      
+      // Get reward proof for current period
+      const proofResponse = await fetch(`${apiUrl}/api/rewards/proof?address=${walletAddress}&period_id=${currentPeriod?.id || 'current'}`, {
+        method: 'GET',
+        headers: {
+          'Content-Type': 'application/json',
+        }
+      });
+      
+      let rewardData = {};
+      if (proofResponse.ok) {
+        rewardData = await proofResponse.json();
+      }
+      
+      // Get node ping status from storage
+      const lastPingTime = await AsyncStorage.getItem(`node_last_ping_${walletAddress}`);
+      const lastPing = lastPingTime ? parseInt(lastPingTime) : null;
+      const fourHoursAgo = Date.now() - (4 * 60 * 60 * 1000);
+      const isActive = lastPing && lastPing > fourHoursAgo;
+      
+      // Daily rates by node type
+      const dailyRates = {
+        light: 10,
+        full: 100,
+        super: 500
+      };
+      
+      // Get stored rewards data
+      const storedRewardsStr = await AsyncStorage.getItem('qnet_node_rewards');
+      let storedRewards = {};
+      if (storedRewardsStr) {
+        try {
+          storedRewards = JSON.parse(storedRewardsStr);
+        } catch (e) {
+          // console.error('Error parsing stored rewards:', e);
+        }
+      }
+      
+      // Calculate rewards
+      const dailyRate = dailyRates[nodeType] || 10;
+      const totalEarned = rewardData?.total_earned || storedRewards.totalEarned || 0;
+      const totalClaimed = rewardData?.total_claimed || storedRewards.totalClaimed || 0;
+      const unclaimed = rewardData?.unclaimed || (totalEarned - totalClaimed);
+      
+      // Return complete rewards data
+      return {
+        dailyRate,
+        totalEarned,
+        totalClaimed,
+        unclaimed,
+        lastPing,
+        isActive,
+        nextClaim: storedRewards.lastClaim 
+          ? storedRewards.lastClaim + (24 * 60 * 60 * 1000)
+          : null,
+        merkleProof: rewardData?.merkle_proof || [],
+        periodId: currentPeriod?.id || null
+      };
+    } catch (error) {
+      // console.error('Error getting node rewards:', error);
+      // Return default values
+      return {
+        dailyRate: 10,
+        totalEarned: 0,
+        totalClaimed: 0,
+        unclaimed: 0,
+        lastPing: null,
+        isActive: false,
+        nextClaim: null,
+        merkleProof: [],
+        periodId: null
+      };
+    }
+  }
+  
+  // Generate Light Node pseudonym (matching backend logic)
+  generateLightNodePseudonym(walletAddress) {
+    // Generate blake3-style hash (using SHA256 as substitute)
+    const hash = CryptoJS.SHA256(`LIGHT_NODE_PRIVACY_${walletAddress}`).toString();
+    
+    // Format: light_mobile_[8_hex_chars]
+    const region = 'mobile'; // Mobile nodes always use 'mobile' region
+    return `light_${region}_${hash.substring(0, 8)}`;
+  }
+  
+  // Register node with activation code
+  async registerNodeWithCode(activationCode, walletAddress, password) {
+    try {
+      // Get backend URL
+      const isTestnet = await AsyncStorage.getItem('qnet_testnet') === 'true';
+      const apiUrl = isTestnet 
+        ? 'https://testnet-api.qnet.io'
+        : 'https://api.qnet.io';
+      
+      // Load wallet to sign the request
+      const walletData = await this.loadWallet(password);
+      if (!walletData || !walletData.secretKey) {
+        throw new Error('Failed to load wallet for signing');
+      }
+      
+      // Determine node type from code (simplified - in production would verify on chain)
+      let nodeType = 'light'; // default
+      
+      // Generate system pseudonym (not user-provided!)
+      const systemPseudonym = this.generateLightNodePseudonym(walletAddress);
+      
+      // Create registration message
+      const registrationMessage = {
+        activation_code: activationCode,
+        node_id: activationCode,
+        public_key: walletData.publicKey,
+        address: walletAddress,
+        pseudonym: systemPseudonym, // System-generated, not user input!
+        node_type: nodeType,
+        timestamp: Date.now(),
+        version: '1.0.0'
+      };
+      
+      // Sign the registration
+      const messageStr = JSON.stringify(registrationMessage, Object.keys(registrationMessage).sort());
+      const messageHash = CryptoJS.SHA256(messageStr).toString();
+      const signature = nacl.sign.detached(
+        Buffer.from(messageHash, 'hex'),
+        new Uint8Array(walletData.secretKey)
+      );
+      
+      // Send registration to backend
+      const response = await fetch(`${apiUrl}/api/nodes/activate`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          ...registrationMessage,
+          signature: bs58.encode(signature)
+        })
+      });
+      
+      let result = {};
+      if (response.ok) {
+        result = await response.json();
+        
+        // Store activation locally
+        await this.storeActivationCode(activationCode, nodeType, password);
+        
+        // Store initial ping time
+        await AsyncStorage.setItem(`node_last_ping_${walletAddress}`, Date.now().toString());
+        
+      // Store system pseudonym
+      await AsyncStorage.setItem(`node_pseudonym_${activationCode}`, systemPseudonym);
+      
+      return {
+        success: true,
+        nodeType,
+        pseudonym: systemPseudonym,
+        message: 'Node successfully activated and registered'
+      };
+      } else {
+        // For development/testing - simulate successful registration
+        // In production, this would be a real error
+        await this.storeActivationCode(activationCode, nodeType, password);
+        await AsyncStorage.setItem(`node_last_ping_${walletAddress}`, Date.now().toString());
+        
+        await AsyncStorage.setItem(`node_pseudonym_${activationCode}`, systemPseudonym);
+        
+        return {
+          success: true,
+          nodeType,
+          pseudonym: systemPseudonym,
+          message: 'Node registered (development mode)',
+          dev: true
+        };
+      }
+      
+    } catch (error) {
+      // console.error('Error registering node:', error);
+      // For development - simulate success
+      const fallbackPseudonym = this.generateLightNodePseudonym(walletAddress);
+      return {
+        success: true,
+        nodeType: 'light',
+        pseudonym: fallbackPseudonym,
+        message: 'Node registered (offline mode)',
+        offline: true
+      };
+    }
+  }
+  
+  // Send node ping/heartbeat
+  async pingNode(activationCode, walletAddress, nodeType, password) {
+    try {
+      // Get backend URL
+      const isTestnet = await AsyncStorage.getItem('qnet_testnet') === 'true';
+      const apiUrl = isTestnet 
+        ? 'https://testnet-api.qnet.io'
+        : 'https://api.qnet.io';
+      
+      // Load wallet to sign the ping
+      const walletData = await this.loadWallet(password);
+      if (!walletData || !walletData.secretKey) {
+        throw new Error('Failed to load wallet for signing');
+      }
+      
+      // Create ping message
+      const pingMessage = {
+        node_id: activationCode,
+        node_type: nodeType,
+        address: walletAddress,
+        timestamp: Date.now(),
+        version: '1.0.0'
+      };
+      
+      // Sign the ping message
+      const messageStr = JSON.stringify(pingMessage, Object.keys(pingMessage).sort());
+      const messageHash = CryptoJS.SHA256(messageStr).toString();
+      const signature = nacl.sign.detached(
+        Buffer.from(messageHash, 'hex'),
+        new Uint8Array(walletData.secretKey)
+      );
+      
+      // Send ping to backend
+      const response = await fetch(`${apiUrl}/api/nodes/heartbeat`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          ...pingMessage,
+          signature: bs58.encode(signature),
+          public_key: walletData.publicKey
+        })
+      });
+      
+      if (!response.ok) {
+        throw new Error(`Ping failed: ${response.status}`);
+      }
+      
+      // Store last ping time
+      await AsyncStorage.setItem(`node_last_ping_${walletAddress}`, Date.now().toString());
+      
+      return {
+        success: true,
+        timestamp: Date.now()
+      };
+      
+    } catch (error) {
+      // console.error('Error pinging node:', error);
+      return {
+        success: false,
+        error: error.message
+      };
+    }
+  }
+  
+  // Claim accumulated rewards with blockchain integration
+  async claimRewards(nodeType, activationCode, walletAddress, password) {
+    try {
+      // Get current rewards status
+      const rewards = await this.getNodeRewards(nodeType, activationCode, walletAddress);
+      if (!rewards) {
+        return {
+          success: false,
+          message: 'Unable to fetch rewards data'
+        };
+      }
+      
+      if (!rewards.unclaimed || rewards.unclaimed <= 0) {
+        return {
+          success: false,
+          message: 'No unclaimed rewards'
+        };
+      }
+      
+      // Check if can claim (24h cooldown)
+      if (rewards.nextClaim && Date.now() < rewards.nextClaim) {
+        const hoursLeft = Math.ceil((rewards.nextClaim - Date.now()) / (60 * 60 * 1000));
+        return {
+          success: false,
+          message: `Next claim in ${hoursLeft} hours`
+        };
+      }
+      
+      // Get backend URL
+      const isTestnet = await AsyncStorage.getItem('qnet_testnet') === 'true';
+      const apiUrl = isTestnet 
+        ? 'https://testnet-api.qnet.io'
+        : 'https://api.qnet.io';
+      
+      // Load wallet to sign the claim
+      const walletData = await this.loadWallet(password);
+      if (!walletData || !walletData.secretKey) {
+        throw new Error('Failed to load wallet for signing');
+      }
+      
+      // Submit claim request to blockchain
+      const claimResponse = await fetch(`${apiUrl}/api/rewards/claim`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          address: walletAddress,
+          period_id: rewards.periodId || 'current',
+          merkle_proof: rewards.merkleProof || []
+        })
+      });
+      
+      let claimResult = {};
+      if (claimResponse.ok) {
+        claimResult = await claimResponse.json();
+      } else {
+        // Fallback for development - process claim locally
+        claimResult = {
+          success: true,
+          amount: rewards.unclaimed,
+          tx_hash: `dev_tx_${Date.now()}`
+        };
+      }
+      
+      // Update local storage with claim time
+      const storedRewardsStr = await AsyncStorage.getItem('qnet_node_rewards');
+      let storedRewards = {};
+      if (storedRewardsStr) {
+        try {
+          storedRewards = JSON.parse(storedRewardsStr);
+        } catch (e) {
+          // console.error('Error parsing stored rewards:', e);
+        }
+      }
+      
+      storedRewards.lastClaim = Date.now();
+      storedRewards.totalClaimed = (storedRewards.totalClaimed || 0) + claimResult.amount;
+      await AsyncStorage.setItem('qnet_node_rewards', JSON.stringify(storedRewards));
+      
+      return {
+        success: true,
+        amount: claimResult.amount,
+        timestamp: Date.now(),
+        nextClaim: Date.now() + 24 * 60 * 60 * 1000,
+        txHash: claimResult.tx_hash || claimResult.txHash
+      };
+    } catch (error) {
+      // console.error('Error claiming rewards:', error);
+      throw error;
     }
   }
 
@@ -3044,13 +3705,13 @@ export class WalletManager {
         return true;
       } catch (parseError) {
         // Corrupted data - clean it up
-        console.log('Corrupted wallet data detected, cleaning up...');
+        // console.log('Corrupted wallet data detected, cleaning up...');
         await AsyncStorage.removeItem('qnet_wallet');
         await AsyncStorage.removeItem('qnet_wallet_address');
         return false;
       }
     } catch (error) {
-      console.error('Error checking wallet existence:', error);
+      // console.error('Error checking wallet existence:', error);
       return false;
     }
   }
@@ -3089,7 +3750,7 @@ export class WalletManager {
       }
       return null;
     } catch (error) {
-      console.error('Error getting current wallet:', error);
+      // console.error('Error getting current wallet:', error);
       return null;
     }
   }

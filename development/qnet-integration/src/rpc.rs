@@ -4014,7 +4014,7 @@ async fn generate_quantum_activation_code(
     quantum_crypto.initialize().await
         .map_err(|e| format!("Quantum crypto initialization failed: {}", e))?;
         
-    // Create quantum-secure code with extended format QNET-XXXXXX-XXXXXX-XXXXXX (26 chars total)
+    // Create quantum-secure code with extended format QNET-XXXXXX-XXXXXX-XXXXXX (25 chars total)
     let node_type_prefix = match request.node_type.to_lowercase().as_str() {
         "light" => "L",
         "full" => "F", 
@@ -4030,7 +4030,7 @@ async fn generate_quantum_activation_code(
     let wallet_part = &request.wallet_address[..6.min(request.wallet_address.len())];
     let entropy_part = &hex::encode(&entropy_hash)[..12]; // Extended entropy
     
-    // Create segments for QNET-XXXXXX-XXXXXX-XXXXXX format (26 chars total)
+    // Create segments for QNET-XXXXXX-XXXXXX-XXXXXX format (25 chars total)
     let segment1 = format!("{}{}", node_type_prefix, &timestamp_hex[..5]); // 6 chars
     let segment2 = format!("{:0<6}", wallet_part.to_uppercase()); // 6 chars
     let segment3 = format!("{:0<6}", &entropy_part[..6].to_uppercase()); // 6 chars

@@ -47,9 +47,9 @@ class QNCNodeActivationContract:
         # Network size multipliers
         self.size_multipliers = {
             (0, 100_000): 0.5,              # Early phase discount
-            (100_001, 1_000_000): 1.0,      # Standard rate
-            (1_000_001, 10_000_000): 2.0,   # High demand
-            (10_000_001, float('inf')): 3.0 # Mature network
+            (100_001, 300_000): 1.0,        # Standard rate
+            (300_001, 1_000_000): 2.0,      # High demand
+            (1_000_001, float('inf')): 3.0  # Mature network
         }
         
     def activate_contract(self, transition_timestamp: int) -> Tuple[bool, str]:

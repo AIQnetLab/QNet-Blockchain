@@ -204,9 +204,9 @@ class NodeActivationRouter:
             # Apply network size multiplier
             if total_nodes < 100_000:
                 multiplier = 0.5
-            elif total_nodes < 1_000_000:
+            elif total_nodes < 300_000:
                 multiplier = 1.0
-            elif total_nodes < 10_000_000:
+            elif total_nodes < 1_000_000:
                 multiplier = 2.0
             else:
                 multiplier = 3.0

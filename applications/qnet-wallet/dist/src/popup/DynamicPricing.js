@@ -25,9 +25,9 @@ class DynamicPricing {
         // Network size multipliers for Phase 2
         this.NETWORK_SIZE_MULTIPLIERS = [
             { min: 0, max: 100000, multiplier: 0.5 },        // 0-100K nodes: early discount
-            { min: 100001, max: 1000000, multiplier: 1.0 },  // 100K-1M nodes: standard rate
-            { min: 1000001, max: 10000000, multiplier: 2.0 }, // 1M-10M nodes: high demand
-            { min: 10000001, max: Infinity, multiplier: 3.0 } // 10M+ nodes: mature network
+            { min: 100001, max: 300000, multiplier: 1.0 },   // 100K-300K nodes: standard rate
+            { min: 300001, max: 1000000, multiplier: 2.0 },  // 300K-1M nodes: high demand
+            { min: 1000001, max: Infinity, multiplier: 3.0 } // 1M+ nodes: mature network
         ];
         
         // Mock data for testing
@@ -39,17 +39,23 @@ class DynamicPricing {
     }
     
     /**
-     * Calculate Phase 1 activation cost - FREE
+     * Calculate Phase 1 activation cost - Dynamic pricing
      */
     calculatePhase1Cost() {
-        // FREE wallet - no cost
-        const currentPrice = 0;
+        // Calculate reduction based on burn percentage
+        const burnPercent = this.mockData.totalBurnedPercent;
+        const reductionTiers = Math.floor(burnPercent / 10);
+        const totalReduction = reductionTiers * this.PRICE_REDUCTION_PER_10_PERCENT;
+        const currentPrice = Math.max(this.PHASE_1_BASE_PRICE - totalReduction, 300); // Min price: 300 1DEV
         
         return {
-            cost: 0, // FREE
-            token: 'FREE',
-            mechanism: 'free',
-            description: 'FREE activation - no tokens required!'
+            cost: currentPrice,
+            token: '1DEV',
+            mechanism: 'burn',
+            description: `Burn ${currentPrice} 1DEV for activation (${burnPercent}% already burned)`,
+            burnPercent: burnPercent,
+            savings: this.PHASE_1_BASE_PRICE - currentPrice,
+            baseCost: this.PHASE_1_BASE_PRICE
         };
     }
     
@@ -69,14 +75,17 @@ class DynamicPricing {
      * Calculate Phase 2 activation cost (QNC spending to Pool 3)
      */
     calculatePhase2Cost(nodeType) {
-        // FREE wallet - no cost
+        const baseCost = this.PHASE_2_BASE_COSTS[nodeType] || this.PHASE_2_BASE_COSTS.full;
+        const multiplier = this.getNetworkMultiplier(this.mockData.activeNodes);
+        const finalCost = Math.round(baseCost * multiplier);
+        
         return {
-            cost: 0, // FREE
-            token: 'FREE',
-            mechanism: 'free',
-            description: 'FREE activation - no tokens required!',
-            range: 'FREE',
-            multiplier: 0,
+            cost: finalCost,
+            token: 'QNC',
+            mechanism: 'transfer', // Transfer to Pool 3, not burn
+            description: `Transfer ${finalCost} QNC to Pool #3 for activation`,
+            baseCost: baseCost,
+            multiplier: multiplier,
             networkSize: this.mockData.activeNodes
         };
     }
@@ -100,28 +109,33 @@ class DynamicPricing {
             const cost = this.calculatePhase1Cost();
             return {
                 phase: 1,
-                title: 'FREE Activation',
-                subtitle: 'No fees or costs!',
-                cost: 0,
-                token: 'FREE',
-                mechanism: 'Instant free activation',
+                title: `Phase 1: 1DEV Burn Activation`,
+                subtitle: `${cost.burnPercent}% of supply burned`,
+                cost: cost.cost,
+                token: '1DEV',
+                mechanism: 'Token burn on Solana',
                 details: [
-                    'All node types: FREE',
-                    'No tokens required',
-                    'Instant activation'
+                    `Current price: ${cost.cost} 1DEV (all node types)`,
+                    `Original price: ${cost.baseCost} 1DEV`,
+                    `Your savings: ${cost.savings} 1DEV`,
+                    `Minimum price: 300 1DEV at 80-90% burned`
                 ]
             };
         } else {
+            const lightCost = this.calculatePhase2Cost('light');
+            const fullCost = this.calculatePhase2Cost('full');
+            const superCost = this.calculatePhase2Cost('super');
+            
             return {
                 phase: 2,
-                title: 'FREE Activation',
-                subtitle: 'No fees or costs!',
-                mechanism: 'Instant free activation',
+                title: 'Phase 2: QNC Transfer Activation',
+                subtitle: `Transfer to Pool #3 for redistribution`,
+                mechanism: 'QNC transfer to Pool #3',
                 details: [
-                    'Light Node: FREE',
-                    'Full Node: FREE', 
-                    'Super Node: FREE',
-                    'All nodes activate instantly for free'
+                    `Light Node: ${lightCost.cost} QNC`,
+                    `Full Node: ${fullCost.cost} QNC`, 
+                    `Super Node: ${superCost.cost} QNC`,
+                    `Network multiplier: ${lightCost.multiplier}x (${lightCost.networkSize} nodes)`
                 ]
             };
         }

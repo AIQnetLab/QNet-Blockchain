@@ -92,9 +92,9 @@ Super Node:  5,000-30,000 QNC (base: 10,000 QNC)
 
 # Network size multipliers:
 # 0-100K nodes: 0.5x (early network discount)
-# 100K-1M nodes: 1.0x (standard pricing)  
-# 1M-10M nodes: 2.0x (high demand)
-# 10M+ nodes: 3.0x (mature network premium)
+# 100K-300K nodes: 1.0x (standard pricing)  
+# 300K-1M nodes: 2.0x (high demand)
+# 1M+ nodes: 3.0x (mature network premium)
 
 # ALL activation fees → Pool #3 → Equal distribution to ALL active nodes
 ```  

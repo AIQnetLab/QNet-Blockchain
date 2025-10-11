@@ -106,9 +106,9 @@ export class NetworkConfig {
                         },
                         networkSizeMultipliers: {
                             small: 0.5,     // 0-100K nodes
-                            medium: 1.0,    // 100K-1M nodes
-                            large: 2.0,     // 1M-10M nodes
-                            massive: 3.0    // 10M+ nodes
+                            medium: 1.0,    // 100K-300K nodes
+                            large: 2.0,     // 300K-1M nodes
+                            massive: 3.0    // 1M+ nodes
                         },
                         timeout: 30000,
                         networkId: 'mainnet'
@@ -189,9 +189,9 @@ export class NetworkConfig {
                         },
                         networkSizeMultipliers: {
                             small: 0.5,     // 0-100K nodes
-                            medium: 1.0,    // 100K-1M nodes
-                            large: 2.0,     // 1M-10M nodes
-                            massive: 3.0    // 10M+ nodes
+                            medium: 1.0,    // 100K-300K nodes
+                            large: 2.0,     // 300K-1M nodes
+                            massive: 3.0    // 1M+ nodes
                         },
                         timeout: 30000,
                         networkId: 'mainnet'

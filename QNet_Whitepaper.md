@@ -529,9 +529,9 @@ Base Activation Costs:
 
 Network Size Multipliers:
 ├── 0-100K nodes: 0.5x (early adopter discount)
-├── 100K-1M nodes: 1.0x (standard pricing)
-├── 1M-10M nodes: 2.0x (high demand premium)
-└── 10M+ nodes: 3.0x (mature network premium)
+├── 100K-300K nodes: 1.0x (standard pricing)
+├── 300K-1M nodes: 2.0x (high demand premium)
+└── 1M+ nodes: 3.0x (mature network premium)
 
 Final Price Ranges:
 ├── Light: 2,500-15,000 QNC

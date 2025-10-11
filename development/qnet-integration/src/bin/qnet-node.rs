@@ -467,8 +467,8 @@ async fn validate_activation_code_comprehensive(
     }
     
     // 3. Format validation - QNET-XXXXXX-XXXXXX-XXXXXX for regular production codes (enhanced security)
-    if !code.starts_with("QNET-") || code.len() != 26 {
-        return Err("Invalid activation code format. Expected: QNET-XXXXXX-XXXXXX-XXXXXX (26 chars)".to_string());
+    if !code.starts_with("QNET-") || code.len() != 25 {
+        return Err("Invalid activation code format. Expected: QNET-XXXXXX-XXXXXX-XXXXXX (25 chars)".to_string());
     }
     
             // 4. Phase and pricing validation with quantum decryption

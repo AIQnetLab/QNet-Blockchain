@@ -224,9 +224,9 @@ pub async fn verify_solana_burn(
 
 **Network Size Multipliers:**
 - 0-100K nodes: 0.5x (early network discount)
-- 100K-1M nodes: 1.0x (standard rate)
-- 1M-10M nodes: 2.0x (high demand)
-- 10M+ nodes: 3.0x (mature network)
+- 100K-300K nodes: 1.0x (standard rate)
+- 300K-1M nodes: 2.0x (high demand)
+- 1M+ nodes: 3.0x (mature network)
 
 ## Activation Flow Architecture
 
