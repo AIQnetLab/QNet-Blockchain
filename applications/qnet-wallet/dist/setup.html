@@ -98,6 +98,14 @@
 
                     <div id="password-error" class="error-message"></div>
 
+                    <!-- Terms of Service Checkbox -->
+                    <div class="terms-container">
+                        <label class="checkbox-label">
+                            <input type="checkbox" id="terms-checkbox" class="terms-checkbox">
+                            <span>I accept the <a href="#" id="terms-link" class="terms-link">Terms of Service</a></span>
+                        </label>
+                    </div>
+
                     <div class="form-actions">
                         <button type="button" id="back-to-welcome" class="back-button">← Back</button>
                         <button type="submit" id="continue-password" class="primary-button" disabled>Continue</button>
@@ -171,6 +179,14 @@
 
                     <div id="import-error" class="error-message"></div>
 
+                    <!-- Terms of Service Checkbox -->
+                    <div class="terms-container">
+                        <label class="checkbox-label">
+                            <input type="checkbox" id="terms-checkbox-import" class="terms-checkbox">
+                            <span>I accept the <a href="#" id="terms-link-import" class="terms-link">Terms of Service</a></span>
+                        </label>
+                    </div>
+
                     <div class="form-actions">
                         <button type="button" id="back-to-password-import" class="back-button">← Back</button>
                         <button type="submit" id="continue-import" class="primary-button" disabled>Import Wallet</button>
@@ -223,6 +239,72 @@
                         <button id="open-wallet" class="primary-button large">Open Wallet</button>
                     </div>
                 </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Terms of Service Modal -->
+    <div id="terms-modal" class="modal-overlay hidden">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>Terms of Service & Privacy Policy</h2>
+                <button class="modal-close" id="close-terms-modal">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="terms-text">
+                    <h3>QNET WALLET TERMS OF SERVICE AND USER AGREEMENT</h3>
+                    <p>By using this software, you acknowledge and agree to the following terms:</p>
+                    
+                    <h4>1. NO WARRANTY</h4>
+                    <p>This software is provided "as is" without warranty of any kind, express or implied. The developers make no representations or warranties regarding the software's functionality, security, or fitness for any particular purpose.</p>
+                    
+                    <h4>2. ASSUMPTION OF RISK</h4>
+                    <p>You acknowledge that:</p>
+                    <ul>
+                        <li>Cryptocurrency transactions are irreversible</li>
+                        <li>Private keys and seed phrases are your sole responsibility</li>
+                        <li>Loss of your seed phrase means permanent loss of access to your funds</li>
+                        <li>Software bugs, hacks, or technical failures may result in loss of funds</li>
+                        <li>The value of cryptocurrencies is highly volatile and may decrease to zero</li>
+                    </ul>
+                    
+                    <h4>3. NO LIABILITY</h4>
+                    <p>The developers, contributors, and affiliated parties shall not be liable for any direct, indirect, incidental, special, consequential, or punitive damages, including but not limited to loss of funds, loss of data, or loss of profits.</p>
+                    
+                    <h4>4. YOUR RESPONSIBILITIES</h4>
+                    <p>You are solely responsible for:</p>
+                    <ul>
+                        <li>Securing your seed phrase and private keys</li>
+                        <li>Ensuring the legality of cryptocurrency use in your jurisdiction</li>
+                        <li>Paying any applicable taxes on cryptocurrency transactions</li>
+                        <li>Verifying transaction details before signing</li>
+                        <li>Maintaining the security of your device</li>
+                    </ul>
+                    
+                    <h4>5. PROHIBITED USE</h4>
+                    <p>You agree not to use this wallet for:</p>
+                    <ul>
+                        <li>Any illegal activities</li>
+                        <li>Money laundering or terrorist financing</li>
+                        <li>Violating any applicable laws or regulations</li>
+                        <li>Attempting to hack or disrupt the software</li>
+                    </ul>
+                    
+                    <h4>6. INDEMNIFICATION</h4>
+                    <p>You agree to indemnify and hold harmless the developers from any claims, damages, losses, or expenses arising from your use of this software.</p>
+                    
+                    <h4>7. CHANGES TO TERMS</h4>
+                    <p>These terms may be updated at any time without prior notice. Continued use of the software constitutes acceptance of the updated terms.</p>
+                    
+                    <h4>8. GOVERNING LAW</h4>
+                    <p>These terms shall be governed by the laws of the jurisdiction in which you reside.</p>
+                    
+                    <p><strong>By clicking "Accept", you confirm that you have read, understood, and agree to be bound by these terms.</strong></p>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="secondary-button" id="decline-terms">Decline</button>
+                <button class="primary-button" id="accept-terms">Accept</button>
             </div>
         </div>
     </div>

@@ -327,37 +327,37 @@
                             <!-- Burn Confirmation View (Hidden by default) -->
                             <div id="burn-confirmation-view" class="hidden" style="position: absolute; top: 0; left: 0; right: 0; bottom: 0; display: flex; align-items: center; justify-content: center; background: rgba(13, 13, 23, 1); z-index: 100;">
                                 <div class="node-management" style="width: 100%; height: 100%; display: flex; flex-direction: column; justify-content: center; align-items: center; padding: 0.5rem;">
-                                    <div class="confirmation-modal" style="width: calc(100% - 1rem); background: linear-gradient(135deg, rgba(26, 26, 46, 1) 0%, rgba(13, 13, 23, 1) 100%); border: 1px solid rgba(0, 212, 255, 0.3); border-radius: 16px; padding: 1.5rem 1rem; box-shadow: 0 0 30px rgba(0, 212, 255, 0.3);">
+                                    <div class="confirmation-modal" style="width: calc(100% - 1rem); background: linear-gradient(135deg, rgba(26, 26, 46, 1) 0%, rgba(13, 13, 23, 1) 100%); border: 1px solid rgba(0, 212, 255, 0.3); border-radius: 12px; padding: 0.8rem 0.7rem; box-shadow: 0 0 30px rgba(0, 212, 255, 0.3);">
                                         <div style="text-align: center;">
-                                            <div class="warning-icon" style="width: 60px; height: 60px; margin: 0 auto 0.8rem; border-radius: 50%; background: linear-gradient(135deg, rgba(0, 212, 255, 0.1) 0%, rgba(0, 150, 200, 0.05) 100%); border: 2px solid rgba(0, 212, 255, 0.5); display: flex; align-items: center; justify-content: center;">
-                                                <span style="font-size: 2rem;">🔥</span>
+                                            <div class="warning-icon" style="width: 50px; height: 50px; margin: 0 auto 0.5rem; border-radius: 50%; background: linear-gradient(135deg, rgba(0, 212, 255, 0.1) 0%, rgba(0, 150, 200, 0.05) 100%); border: 2px solid rgba(0, 212, 255, 0.5); display: flex; align-items: center; justify-content: center;">
+                                                <span style="font-size: 1.5rem;">🔥</span>
                                             </div>
                                             
-                                            <h3 style="color: #fff; font-size: 1.3rem; margin-bottom: 0.6rem;">Activate Node</h3>
+                                            <h3 style="color: #fff; font-size: 1.1rem; margin-bottom: 0.4rem;">Activate Node</h3>
                                             
-                                            <p style="color: #a0a0a0; line-height: 1.4; margin-bottom: 0.8rem; font-size: 1rem;">
-                                                Burn <strong style="color: #00d4ff;">1500 1DEV</strong> to activate<br>
-                                                <strong id="confirm-node-type" style="color: #00d4ff; font-size: 1.1rem;"></strong>
+                                            <p style="color: #a0a0a0; line-height: 1.3; margin-bottom: 0.5rem; font-size: 0.85rem;">
+                                                Burn <strong id="confirm-activation-cost" style="color: #00d4ff;">1500 1DEV</strong> to activate<br>
+                                                <strong id="confirm-node-type" style="color: #00d4ff; font-size: 0.9rem;"></strong>
                                             </p>
                                             
-                                            <div class="burn-warning" style="background: rgba(0, 212, 255, 0.05); border: 1px solid rgba(0, 212, 255, 0.2); border-radius: 8px; padding: 0.7rem; margin: 0.8rem 0;">
-                                                <p style="color: #00d4ff; font-size: 0.9rem; margin: 0; opacity: 0.9;">
+                                            <div class="burn-warning" style="background: rgba(0, 212, 255, 0.05); border: 1px solid rgba(0, 212, 255, 0.2); border-radius: 6px; padding: 0.5rem; margin: 0.5rem 0;">
+                                                <p style="color: #00d4ff; font-size: 0.75rem; margin: 0; opacity: 0.9;">
                                                     Permanent action - tokens will be burned
                                                 </p>
-                                                <p id="testnet-notice" style="color: #ff9900; font-size: 0.8rem; margin: 0.3rem 0 0; display: none;">
+                                                <p id="testnet-notice" style="color: #ff9900; font-size: 0.7rem; margin: 0.2rem 0 0; display: none;">
                                                     ⚠️ Testnet: Real burn attempted (needs SOL for gas)
                                                 </p>
                                             </div>
                                             
-                                            <div id="activation-warning" style="background: rgba(255, 68, 68, 0.1); border: 1px solid rgba(255, 68, 68, 0.3); border-radius: 8px; padding: 0.7rem; margin: 0.8rem 0; display: none;">
-                                                <p id="activation-warning-text" style="color: #ff4444; font-size: 0.85rem; margin: 0; font-weight: 600;"></p>
+                                            <div id="activation-warning" style="background: rgba(255, 68, 68, 0.1); border: 1px solid rgba(255, 68, 68, 0.3); border-radius: 6px; padding: 0.5rem; margin: 0.5rem 0; display: none;">
+                                                <p id="activation-warning-text" style="color: #ff4444; font-size: 0.75rem; margin: 0; font-weight: 600;"></p>
                                             </div>
                                             
-                                            <div style="display: flex; gap: 0.8rem; margin-top: 1rem;">
-                                                <button id="cancel-burn" class="qnet-button secondary" style="flex: 1; padding: 0.7rem; font-size: 1rem;">
+                                            <div style="display: flex; gap: 0.6rem; margin-top: 0.7rem;">
+                                                <button id="cancel-burn" class="qnet-button secondary" style="flex: 1; padding: 0.6rem; font-size: 0.85rem;">
                                                     Cancel
                                                 </button>
-                                                <button id="confirm-burn" class="qnet-button primary" style="flex: 1; padding: 0.7rem; font-size: 1rem; background: linear-gradient(135deg, #00d4ff 0%, #0099cc 100%);">
+                                                <button id="confirm-burn" class="qnet-button primary" style="flex: 1; padding: 0.6rem; font-size: 0.85rem; background: linear-gradient(135deg, #00d4ff 0%, #0099cc 100%);">
                                                     Confirm
                                                 </button>
                                             </div>

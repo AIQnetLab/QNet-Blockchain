@@ -14,7 +14,9 @@ import {
   RefreshControl,
   TouchableWithoutFeedback,
   DeviceEventEmitter,
-  Linking
+  Linking,
+  AppState,
+  Modal
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -96,6 +98,57 @@ const translations = {
     logout_confirm: 'Are you sure you want to logout?',
     delete_wallet_confirm: 'Are you sure you want to delete this wallet? Make sure you have backed up your recovery phrase!',
     i_saved_it: 'I Saved It',
+    
+    // Terms of Service
+    terms_of_service: 'Terms of Service',
+    accept_terms: 'I accept the Terms of Service and Privacy Policy',
+    read_terms: 'Read Terms of Service',
+    terms_title: 'Terms of Service & Privacy Policy',
+    terms_text: `QNET WALLET TERMS OF SERVICE AND USER AGREEMENT
+
+By using this software, you acknowledge and agree to the following terms:
+
+1. NO WARRANTY
+This software is provided "as is" without warranty of any kind, express or implied. The developers make no representations or warranties regarding the software's functionality, security, or fitness for any particular purpose.
+
+2. ASSUMPTION OF RISK
+You acknowledge that:
+• Cryptocurrency transactions are irreversible
+• Private keys and seed phrases are your sole responsibility
+• Loss of your seed phrase means permanent loss of access to your funds
+• Software bugs, hacks, or technical failures may result in loss of funds
+• The value of cryptocurrencies is highly volatile and may decrease to zero
+
+3. NO LIABILITY
+The developers, contributors, and affiliated parties shall not be liable for any direct, indirect, incidental, special, consequential, or punitive damages, including but not limited to loss of funds, loss of data, or loss of profits.
+
+4. YOUR RESPONSIBILITIES
+You are solely responsible for:
+• Securing your seed phrase and private keys
+• Ensuring the legality of cryptocurrency use in your jurisdiction
+• Paying any applicable taxes on cryptocurrency transactions
+• Verifying transaction details before signing
+• Maintaining the security of your device
+
+5. PROHIBITED USE
+You agree not to use this wallet for:
+• Any illegal activities
+• Money laundering or terrorist financing
+• Violating any applicable laws or regulations
+• Attempting to hack or disrupt the software
+
+6. INDEMNIFICATION
+You agree to indemnify and hold harmless the developers from any claims, damages, losses, or expenses arising from your use of this software.
+
+7. CHANGES TO TERMS
+These terms may be updated at any time without prior notice. Continued use of the software constitutes acceptance of the updated terms.
+
+8. GOVERNING LAW
+These terms shall be governed by the laws of the jurisdiction in which you reside.
+
+By clicking "Accept", you confirm that you have read, understood, and agree to be bound by these terms.`,
+    accept: 'Accept',
+    decline: 'Decline',
   },
   'zh-CN': {
     qnet_wallet: 'QNet 钱包',
@@ -696,6 +749,8 @@ const WalletScreen = () => {
   const [seedConfirmWords, setSeedConfirmWords] = useState({});
   const [tempWallet, setTempWallet] = useState(null);
   const [wordChoices, setWordChoices] = useState({});
+  const [termsAccepted, setTermsAccepted] = useState(false);
+  const [showTermsModal, setShowTermsModal] = useState(false);
   const [showSplash, setShowSplash] = useState(true);
   const spinValue = useRef(new Animated.Value(0)).current;
   const [customAlert, setCustomAlert] = useState(null); // {title, message, buttons}
@@ -777,19 +832,43 @@ const WalletScreen = () => {
   
   // Load node rewards when on history tab or when activation changes
   useEffect(() => {
-    if (activeTab === 'history' && activatedNodeType && activationCode) {
-      loadNodeRewards();
-      // Refresh rewards every 30 seconds
-      const rewardsInterval = setInterval(loadNodeRewards, 30000);
-      
-      // Start ping interval if not already running
-      if (!global.nodePingInterval) {
-        startNodePingInterval();
+    if (activeTab === 'history') {
+      // Sync activation codes when opening Node tab (battery-friendly)
+      if (wallet && wallet.publicKey && password) {
+        // Get mnemonic securely from encrypted storage
+        walletManager.getEncryptedMnemonic(password).then(mnemonic => {
+          if (!mnemonic) return;
+          return walletManager.syncActivationCodes(
+            wallet.publicKey,
+            mnemonic,
+            password
+          );
+        }).then((syncedCodes) => {
+          if (syncedCodes && Object.keys(syncedCodes).length > 0) {
+            const nodeType = Object.keys(syncedCodes)[0];
+            const code = syncedCodes[nodeType];
+            setActivatedNodeType(nodeType);
+            setActivationCode(code.code || code);
+          }
+        }).catch(() => {
+          // Silent fail
+        });
       }
       
-      return () => clearInterval(rewardsInterval);
+      if (activatedNodeType && activationCode) {
+        loadNodeRewards();
+        // Refresh rewards every 30 seconds
+        const rewardsInterval = setInterval(loadNodeRewards, 30000);
+        
+        // Start ping interval if not already running
+        if (!global.nodePingInterval) {
+          startNodePingInterval();
+        }
+        
+        return () => clearInterval(rewardsInterval);
+      }
     }
-  }, [activeTab, activatedNodeType, activationCode]);
+  }, [activeTab, activatedNodeType, activationCode, wallet, password]);
   
   // Load dynamic pricing when on activate tab
   useEffect(() => {
@@ -1108,20 +1187,25 @@ const WalletScreen = () => {
             
             // Verify code is for current wallet by checking if it's the expected format
             // and was generated from current wallet's seed
-            if (wallet.mnemonic) {
-              const expectedCode = walletManager.generateActivationCode(nodeType, wallet.address, wallet.mnemonic);
-              if (code && code.code && code.code === expectedCode) {
-                setActivatedNodeType(nodeType);
-                setActivationCode(code.code);
-                // Start ping interval for active node
-                if (!global.nodePingInterval) {
-                  setTimeout(() => startNodePingInterval(), 1000);
+            // Verify code asynchronously
+            if (password) {
+              walletManager.getEncryptedMnemonic(password).then(mnemonic => {
+                if (mnemonic) {
+                  const expectedCode = walletManager.generateActivationCode(nodeType, wallet.address, mnemonic);
+                  if (code && code.code && code.code === expectedCode) {
+                    setActivatedNodeType(nodeType);
+                    setActivationCode(code.code);
+                    // Start ping interval for active node
+                    if (!global.nodePingInterval) {
+                      setTimeout(() => startNodePingInterval(), 1000);
+                    }
+                  } else {
+                    // Code doesn't match current wallet, clear it
+                    setActivatedNodeType(null);
+                    setActivationCode(null);
+                  }
                 }
-              } else {
-                // Code doesn't match current wallet, clear it
-                setActivatedNodeType(null);
-                setActivationCode(null);
-              }
+              });
             } else {
               // If we can't verify, show the code (backward compatibility)
               setActivatedNodeType(nodeType);
@@ -1150,6 +1234,42 @@ const WalletScreen = () => {
     };
     
     checkActivationStatus();
+  }, [wallet, password]);
+
+  // Sync activation codes when app comes to foreground (battery-friendly)
+  useEffect(() => {
+    const handleAppStateChange = async (nextAppState) => {
+      // Only sync when coming back to active from background
+      if (nextAppState === 'active' && wallet && wallet.publicKey && password) {
+        try {
+          // Get mnemonic securely from encrypted storage
+          const mnemonic = await walletManager.getEncryptedMnemonic(password);
+          if (!mnemonic) return;
+          
+          // Silent sync in background - no loading indicators
+          const syncedCodes = await walletManager.syncActivationCodes(
+            wallet.publicKey,
+            mnemonic,
+            password
+          );
+          
+          if (syncedCodes && Object.keys(syncedCodes).length > 0) {
+            const nodeType = Object.keys(syncedCodes)[0];
+            const code = syncedCodes[nodeType];
+            setActivatedNodeType(nodeType);
+            setActivationCode(code.code || code);
+          }
+        } catch (error) {
+          // Silent fail - don't interrupt user
+        }
+      }
+    };
+
+    const subscription = AppState.addEventListener('change', handleAppStateChange);
+    
+    return () => {
+      subscription.remove();
+    };
   }, [wallet, password]);
 
   const checkWalletExists = async () => {
@@ -1189,11 +1309,17 @@ const WalletScreen = () => {
   };
 
   const createWallet = async () => {
+    // Check terms acceptance
+    if (!termsAccepted) {
+      setPasswordError('Please accept the Terms of Service');
+      return;
+    }
+    
     if (!validatePassword()) {
       return;
     }
 
-    setLoading(true);
+    // Don't show loading for better UX
     try {
       const newWallet = await walletManager.generateWallet();
       
@@ -1260,6 +1386,12 @@ const WalletScreen = () => {
   const importWallet = async () => {
     setPasswordError('');
 
+    // Check terms acceptance  
+    if (!termsAccepted) {
+      setPasswordError('Please accept the Terms of Service');
+      return;
+    }
+
     if (!seedPhrase || seedPhrase.trim().length === 0) {
       setPasswordError('Please enter your seed phrase');
       return;
@@ -1272,10 +1404,16 @@ const WalletScreen = () => {
       return;
     }
 
-    setLoading(true);
+    // Fast import without loading screen
     try {
-      const imported = await walletManager.importWallet(seedPhrase.trim());
+      // Keep seed for import, clear after success
+      const seedToImport = seedPhrase.trim();
+      
+      const imported = await walletManager.importWallet(seedToImport);
       await walletManager.storeWallet(imported, password);
+      
+      // Clear seed phrase only after successful import
+      setSeedPhrase('');
       
       setWallet(imported);
       setHasWallet(true);
@@ -1283,29 +1421,18 @@ const WalletScreen = () => {
       // Keep password in state for subsequent operations (like node activation)
       // setPassword(''); // DON'T clear password
       setConfirmPassword('');
-      setSeedPhrase('');
       setImportStep(1); // Reset to step 1 for next time
       
-      // Sync activation codes in background - don't block UI
-      setTimeout(async () => {
-        try {
-          await walletManager.syncActivationCodes(
-            imported.address,
-            imported.mnemonic,
-            password
-          );
-        } catch (syncError) {
-          // Silent fail - no previous activations
-        }
-      }, 100);
+      // Don't sync activation codes immediately - let user do it manually
+      // This avoids issues with wallet not being fully saved yet
       
-      showAlert('Success', 'Wallet imported successfully!');
+      // Switch directly to assets tab without alert
+      setActiveTab('assets');
       // Force immediate balance load without delay
       loadBalance(imported.publicKey);
     } catch (error) {
       showAlert('Error', 'Failed to import wallet: ' + error.message);
     }
-    setLoading(false);
   };
 
   const confirmSeedPhrase = async () => {
@@ -1346,7 +1473,7 @@ const WalletScreen = () => {
     }
     
     // All words correct, save wallet
-    setLoading(true);
+    // Fast save without loading screen
     try {
       await walletManager.storeWallet(tempWallet, tempWallet.password);
       
@@ -1362,19 +1489,12 @@ const WalletScreen = () => {
       setActivatedNodeType(null);
       setActivationCode(null);
       
-      // Show both addresses like in extension
-      const qnetAddr = tempWallet.qnetAddress || 'Generating...';
-      const solanaAddr = tempWallet.solanaAddress || tempWallet.address;
-      showAlert(
-        'Wallet Created Successfully', 
-        `Your QNet Wallet is ready to use.\n\nQNet Address:\n${qnetAddr}\n\nSolana Address:\n${solanaAddr}\n\nYou can now manage QNet and Solana assets securely.`
-      );
+      // Directly load balance and switch to assets tab without modal
+      setActiveTab('assets');
       loadBalance(tempWallet.publicKey);
     } catch (error) {
       // console.error('Error saving wallet:', error);
       showAlert('Error', 'Failed to save wallet: ' + (error.message || 'Unknown error'));
-    } finally {
-      setLoading(false);
     }
   };
 
@@ -1388,8 +1508,25 @@ const WalletScreen = () => {
     try {
       const loadedWallet = await walletManager.loadWallet(password);
       setWallet(loadedWallet);
-      // Load balance immediately
+      
+      // Load balance immediately without waiting
       loadBalance(loadedWallet.publicKey);
+      
+      // Sync activation codes without blocking UI
+      walletManager.syncActivationCodes(
+        loadedWallet.publicKey,
+        loadedWallet.mnemonic,
+        password
+      ).then(syncedCodes => {
+        if (syncedCodes && Object.keys(syncedCodes).length > 0) {
+          const nodeType = Object.keys(syncedCodes)[0];
+          const code = syncedCodes[nodeType];
+          setActivatedNodeType(nodeType);
+          setActivationCode(code.code || code);
+        }
+      }).catch(() => {
+        // Silent fail - sync in background
+      });
     } catch (error) {
       // Check if it's a corrupted wallet issue
       if (error.message && (error.message.includes('Malformed UTF-8') || 
@@ -1577,24 +1714,25 @@ const WalletScreen = () => {
     }
 
     try {
-      
-      let walletData;
-      try {
-        walletData = await walletManager.loadWallet(exportPassword);
-      } catch (error) {
+      // Verify password
+      const passwordValid = await walletManager.verifyPassword(exportPassword);
+      if (!passwordValid) {
         setExportPassword('');
         showAlert('Error', 'Incorrect password');
         return;
       }
       
-      if (!walletData || !walletData.mnemonic) {
+      // Get mnemonic from encrypted storage
+      const mnemonic = await walletManager.getEncryptedMnemonic(exportPassword);
+      
+      if (!mnemonic) {
         setExportPassword('');
-        showAlert('Error', 'Incorrect password');
+        showAlert('Error', 'Failed to retrieve seed phrase');
         return;
       }
 
       // Format seed phrase
-      const words = walletData.mnemonic.split(' ');
+      const words = mnemonic.split(' ');
       const formattedSeed = words.map((word, i) => `${i + 1}. ${word}`).join('\n');
 
       setShowExportSeed(false);
@@ -1605,8 +1743,13 @@ const WalletScreen = () => {
         `${formattedSeed}\n\n Keep it safe and never share!`,
         [
           { text: 'Copy', onPress: () => {
-            Clipboard.setString(walletData.mnemonic);
-            showAlert('Copied', 'Recovery phrase copied to clipboard');
+            Clipboard.setString(mnemonic);
+            // Use visual feedback instead of alert
+            copyToClipboard(mnemonic, 'seed');
+            // Clear sensitive data from clipboard after 10 seconds
+            setTimeout(() => {
+              Clipboard.setString('');
+            }, 10000);
           }},
           { text: 'OK', style: 'default' }
         ]
@@ -1626,31 +1769,22 @@ const WalletScreen = () => {
     }
 
     try {
-      
-      // Verify password by trying to decrypt wallet
-      let walletData;
-      try {
-        walletData = await walletManager.loadWallet(exportPassword);
-      } catch (error) {
-        setExportPassword('');
-        showAlert('Error', 'Incorrect password');
-        return;
-      }
-      
-      if (!walletData || !walletData.publicKey) {
+      // Quick password verification
+      const passwordValid = await walletManager.verifyPassword(exportPassword);
+      if (!passwordValid) {
         setExportPassword('');
         showAlert('Error', 'Incorrect password');
         return;
       }
 
-      // Get stored activation codes
+      // Get stored activation codes directly
       const storedCodes = await walletManager.getStoredActivationCodes(exportPassword);
       
       if (storedCodes && Object.keys(storedCodes).length > 0) {
         // Show existing codes
         const codesList = Object.entries(storedCodes)
-          .map(([type, data]) => `${type.toUpperCase()} Node:\n${data.code}\n\nGenerated: ${new Date(data.timestamp).toLocaleString()}`)
-          .join('\n\n');
+          .map(([type, data]) => `${type.toUpperCase()} Node:\n${data.code || data}\n`)
+          .join('\n');
       
       setShowExportActivation(false);
       setExportPassword('');
@@ -1661,10 +1795,14 @@ const WalletScreen = () => {
           [
             { text: 'Copy All', onPress: () => {
               const plainCodes = Object.entries(storedCodes)
-                .map(([type, data]) => data.code)
+                .map(([type, data]) => data.code || data)
                 .join('\n');
               Clipboard.setString(plainCodes);
               showAlert('Copied', 'Activation codes copied to clipboard');
+              // Clear sensitive data from clipboard after 10 seconds
+              setTimeout(() => {
+                Clipboard.setString('');
+              }, 10000);
             }},
             { text: 'OK' }
           ]
@@ -1716,8 +1854,6 @@ const WalletScreen = () => {
       setConfirmNewPassword('');
     } catch (error) {
       showAlert('Error', 'Failed to change password: ' + error.message);
-    } finally {
-      setLoading(false);
     }
   };
 
@@ -1738,13 +1874,71 @@ const WalletScreen = () => {
               setHasWallet(false);
               setActivatedNodeType(null);
               setActivationCode(null);
-              showAlert('Success', 'Wallet deleted successfully');
+              
             } catch (error) {
               showAlert('Error', 'Failed to delete wallet: ' + error.message);
             }
           }
         }
       ]
+    );
+  };
+
+  // Terms of Service Modal
+  const renderTermsModal = () => {
+    if (!showTermsModal) return null;
+    
+    return (
+      <Modal
+        visible={showTermsModal}
+        animationType="fade"
+        transparent={true}
+        onRequestClose={() => setShowTermsModal(false)}
+      >
+        <View style={styles.termsModal}>
+          <View style={styles.termsModalContent}>
+            <View style={styles.termsModalHeader}>
+              <Text style={styles.termsModalTitle}>{t('terms_title')}</Text>
+              <TouchableOpacity 
+                style={styles.termsModalClose}
+                onPress={() => setShowTermsModal(false)}
+              >
+                <Text style={styles.termsModalCloseText}>×</Text>
+              </TouchableOpacity>
+            </View>
+            
+            <ScrollView style={styles.termsModalBody}>
+              <Text style={styles.termsModalText}>{t('terms_text')}</Text>
+            </ScrollView>
+            
+            <View style={styles.termsModalButtons}>
+              <TouchableOpacity 
+                style={[styles.termsModalButton, styles.termsModalDecline]}
+                onPress={() => {
+                  setShowTermsModal(false);
+                  setTermsAccepted(false);
+                }}
+              >
+                <Text style={[styles.termsModalButtonText, styles.termsModalDeclineText]}>
+                  {t('decline')}
+                </Text>
+              </TouchableOpacity>
+              
+              <TouchableOpacity 
+                style={[styles.termsModalButton, styles.termsModalAccept]}
+                onPress={() => {
+                  setShowTermsModal(false);
+                  setTermsAccepted(true);
+                }}
+              >
+                <Text style={[styles.termsModalButtonText, styles.termsModalAcceptText]}>
+                  {t('accept')}
+                </Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
     );
   };
 
@@ -1755,6 +1949,7 @@ const WalletScreen = () => {
           <Text style={styles.title}>QNet Wallet</Text>
           <Text style={styles.subtitle}>Loading...</Text>
         </View>
+        {renderTermsModal()}
       </SafeAreaView>
     );
   }
@@ -1879,14 +2074,30 @@ const WalletScreen = () => {
             
             <TouchableOpacity 
               style={styles.button}
-              onPress={() => setShowCreateOptions('create')}
+              onPress={() => {
+                // Clear all password fields when starting create
+                setPassword('');
+                setConfirmPassword('');
+                setPasswordError('');
+                setTermsAccepted(false); // Reset terms
+                setShowCreateOptions('create');
+              }}
             >
               <Text style={styles.buttonText}>Create New Wallet</Text>
             </TouchableOpacity>
 
             <TouchableOpacity 
               style={[styles.button, styles.secondaryButton]}
-              onPress={() => setShowCreateOptions('import')}
+              onPress={() => {
+                // Clear all password fields when starting import
+                setPassword('');
+                setConfirmPassword('');
+                setSeedPhrase('');
+                setPasswordError('');
+                setTermsAccepted(false); // Reset terms
+                setImportStep(1);
+                setShowCreateOptions('import');
+              }}
             >
               <Text style={[styles.buttonText, styles.secondaryButtonText]}>Import Existing Wallet</Text>
             </TouchableOpacity>
@@ -1953,11 +2164,29 @@ const WalletScreen = () => {
             {passwordError ? (
               <Text style={styles.errorText}>{passwordError}</Text>
             ) : null}
+
+            {/* Terms of Service Checkbox */}
+            <View style={styles.termsContainer}>
+              <TouchableOpacity 
+                style={styles.checkbox}
+                onPress={() => setTermsAccepted(!termsAccepted)}
+              >
+                <View style={[styles.checkboxInner, termsAccepted && styles.checkboxChecked]}>
+                  {termsAccepted && <Text style={styles.checkmark}>✓</Text>}
+                </View>
+              </TouchableOpacity>
+              <View style={styles.termsTextContainer}>
+                <Text style={styles.termsText}>I accept the </Text>
+                <TouchableOpacity onPress={() => setShowTermsModal(true)}>
+                  <Text style={styles.termsLink}>Terms of Service</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
             
             <TouchableOpacity 
-              style={styles.button}
+              style={[styles.button, !termsAccepted && styles.buttonDisabled]}
               onPress={createWallet}
-              disabled={loading}
+              disabled={loading || !termsAccepted}
             >
               <Text style={styles.buttonText}>
                 {loading ? 'Creating...' : 'Create Wallet'}
@@ -1971,11 +2200,13 @@ const WalletScreen = () => {
                 setPassword('');
                 setConfirmPassword('');
                 setPasswordError('');
+                setTermsAccepted(false); // Reset terms
               }}
             >
               <Text style={[styles.buttonText, styles.secondaryButtonText]}>Back</Text>
             </TouchableOpacity>
           </ScrollView>
+          {renderTermsModal()}
         </SafeAreaView>
       );
     }
@@ -2008,7 +2239,12 @@ const WalletScreen = () => {
                   // Copy seed phrase to clipboard
                   const seedText = words.join(' ');
                   Clipboard.setString(seedText);
-                  showAlert('Copied', 'Recovery phrase copied to clipboard');
+                  // Use visual feedback instead of alert
+                  copyToClipboard(seedText, 'seed');
+                  // Clear sensitive data from clipboard after 10 seconds
+                  setTimeout(() => {
+                    Clipboard.setString('');
+                  }, 10000);
                 } catch (error) {
                   showAlert('Error', 'Failed to copy to clipboard');
                 }
@@ -2118,12 +2354,14 @@ const WalletScreen = () => {
                   setConfirmPassword('');
                   setSeedPhrase('');
                   setPasswordError('');
+                  setTermsAccepted(false); // Reset terms
                   setImportStep(1);
                 }}
               >
                 <Text style={[styles.buttonText, styles.secondaryButtonText]}>Back</Text>
               </TouchableOpacity>
             </ScrollView>
+            {renderTermsModal()}
           </SafeAreaView>
         );
       }
@@ -2162,11 +2400,29 @@ const WalletScreen = () => {
               {passwordError ? (
                 <Text style={styles.errorText}>{passwordError}</Text>
               ) : null}
+
+              {/* Terms of Service Checkbox */}
+              <View style={styles.termsContainer}>
+                <TouchableOpacity 
+                  style={styles.checkbox}
+                  onPress={() => setTermsAccepted(!termsAccepted)}
+                >
+                  <View style={[styles.checkboxInner, termsAccepted && styles.checkboxChecked]}>
+                    {termsAccepted && <Text style={styles.checkmark}>✓</Text>}
+                  </View>
+                </TouchableOpacity>
+                <View style={styles.termsTextContainer}>
+                  <Text style={styles.termsText}>I accept the </Text>
+                  <TouchableOpacity onPress={() => setShowTermsModal(true)}>
+                    <Text style={styles.termsLink}>Terms of Service</Text>
+                  </TouchableOpacity>
+                </View>
+              </View>
               
               <TouchableOpacity 
-                style={styles.button}
+                style={[styles.button, !termsAccepted && styles.buttonDisabled]}
                 onPress={importWallet}
-                disabled={loading}
+                disabled={loading || !termsAccepted}
               >
                 <Text style={styles.buttonText}>
                   {loading ? 'Importing...' : 'Import Wallet'}
@@ -2179,11 +2435,13 @@ const WalletScreen = () => {
                   setImportStep(1);
                   setSeedPhrase('');
                   setPasswordError('');
+                  setTermsAccepted(false); // Reset terms
                 }}
               >
                 <Text style={[styles.buttonText, styles.secondaryButtonText]}>Back</Text>
               </TouchableOpacity>
             </ScrollView>
+            {renderTermsModal()}
           </SafeAreaView>
         );
       }
@@ -2776,6 +3034,30 @@ const WalletScreen = () => {
                       onPress: async () => {
                         setActivatingNode(true);
                         try {
+                          // Check if already activated (prevent duplicates)
+                          const existingCodes = await walletManager.getStoredActivationCodes(password);
+                          if (existingCodes && Object.keys(existingCodes).length > 0) {
+                            setActivatingNode(false);
+                            Alert.alert(
+                              'Already Activated',
+                              'This wallet already has an activated node. One wallet can only activate one node.',
+                              [{ text: 'OK' }]
+                            );
+                            return;
+                          }
+                          
+                          // Also check blockchain to prevent concurrent activation attempts
+                          const activatedNodes = await walletManager.checkBlockchainForActivations(wallet.publicKey);
+                          if (activatedNodes && activatedNodes.length > 0) {
+                            setActivatingNode(false);
+                            Alert.alert(
+                              'Already Activated',
+                              'This wallet has a node activation on blockchain. Please wait for sync to complete.',
+                              [{ text: 'OK' }]
+                            );
+                            return;
+                          }
+                          
                           let burnResult = null;
                           let code = null;
                           
@@ -2783,7 +3065,10 @@ const WalletScreen = () => {
                           let result = null;
                           
                           // Check balances first for better error messages - use publicKey as everywhere else
-                          const solBalance = await walletManager.getBalance(wallet.publicKey, isTestnet);
+                          const [solBalance] = await Promise.all([
+                            walletManager.getBalance(wallet.publicKey, isTestnet)
+                          ]);
+                          
                           // Fix floating point precision issue (0.01 might be 0.009999999)
                           const minSolRequired = 0.009; // Slightly less than 0.01 to account for precision
                           if (solBalance < minSolRequired) {
@@ -2819,7 +3104,11 @@ const WalletScreen = () => {
                             }
                             
                             // Only generate code AFTER successful burn
-                            const mnemonic = wallet.mnemonic;
+                            // Get mnemonic securely from encrypted storage
+                            const mnemonic = await walletManager.getEncryptedMnemonic(password);
+                            if (!mnemonic) {
+                              throw new Error('Failed to retrieve seed phrase for code generation');
+                            }
                             code = walletManager.generateActivationCode(nodeStatus, wallet.publicKey, mnemonic);
                             
                             // Store the code
@@ -2834,7 +3123,7 @@ const WalletScreen = () => {
                             };
                           }
                             
-                            // Update activation status
+                            // Update activation status immediately after tx sent
                             setActivatedNodeType(nodeStatus);
                             setActivationCode(code);
                             setNodeStatus(null);
@@ -2892,6 +3181,10 @@ const WalletScreen = () => {
                                 { text: 'Copy Code', style: 'default', onPress: () => {
                                   Clipboard.setString(code);
                                   showAlert('Copied', 'Activation code copied to clipboard');
+                                  // Clear sensitive data from clipboard after 10 seconds
+                                  setTimeout(() => {
+                                    Clipboard.setString('');
+                                  }, 10000);
                                 }},
                                 { text: 'OK', style: 'default' }
                               ],
@@ -3215,10 +3508,10 @@ const WalletScreen = () => {
                     [
                       {text: t('cancel'), style: 'cancel'},
                       {text: t('logout'), style: 'destructive', onPress: () => {
+                        // Just lock the wallet, don't delete it
                         setWallet(null);
-                        setHasWallet(false);
-                        setActivatedNodeType(null);
-                        setActivationCode(null);
+                        setActiveTab('assets');
+                        // Wallet data remains in AsyncStorage, user just needs to unlock again
                       }}
                     ]
                   );
@@ -4746,6 +5039,117 @@ const styles = StyleSheet.create({
     fontSize: 14,
     textAlign: 'center',
     fontWeight: '500',
+  },
+  // Terms of Service styles
+  termsContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginVertical: 15,
+    paddingHorizontal: 20,
+  },
+  checkbox: {
+    width: 24,
+    height: 24,
+    marginRight: 10,
+  },
+  checkboxInner: {
+    width: 24,
+    height: 24,
+    borderWidth: 2,
+    borderColor: '#00d4ff',
+    borderRadius: 4,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: 'transparent',
+  },
+  checkboxChecked: {
+    backgroundColor: '#00d4ff',
+  },
+  checkmark: {
+    color: '#000000',
+    fontSize: 16,
+    fontWeight: 'bold',
+  },
+  termsTextContainer: {
+    flexDirection: 'row',
+    flex: 1,
+    flexWrap: 'wrap',
+  },
+  termsText: {
+    fontSize: 14,
+    color: '#ffffff',
+  },
+  termsLink: {
+    fontSize: 14,
+    color: '#00d4ff',
+    textDecorationLine: 'underline',
+  },
+  buttonDisabled: {
+    opacity: 0.5,
+  },
+  termsModal: {
+    flex: 1,
+    backgroundColor: 'rgba(0, 0, 0, 0.9)',
+  },
+  termsModalContent: {
+    flex: 1,
+    margin: 20,
+    backgroundColor: '#1a1a1a',
+    borderRadius: 12,
+    padding: 20,
+  },
+  termsModalHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 20,
+  },
+  termsModalTitle: {
+    fontSize: 18,
+    fontWeight: 'bold',
+    color: '#ffffff',
+  },
+  termsModalClose: {
+    padding: 5,
+  },
+  termsModalCloseText: {
+    fontSize: 24,
+    color: '#888888',
+  },
+  termsModalBody: {
+    flex: 1,
+  },
+  termsModalText: {
+    fontSize: 14,
+    color: '#cccccc',
+    lineHeight: 20,
+  },
+  termsModalButtons: {
+    flexDirection: 'row',
+    marginTop: 20,
+    gap: 10,
+  },
+  termsModalButton: {
+    flex: 1,
+    paddingVertical: 12,
+    borderRadius: 8,
+    alignItems: 'center',
+  },
+  termsModalAccept: {
+    backgroundColor: '#00d4ff',
+  },
+  termsModalDecline: {
+    backgroundColor: '#333333',
+  },
+  termsModalButtonText: {
+    fontSize: 16,
+    fontWeight: '600',
+  },
+  termsModalAcceptText: {
+    color: '#000000',
+  },
+  termsModalDeclineText: {
+    color: '#ffffff',
   },
 });
 

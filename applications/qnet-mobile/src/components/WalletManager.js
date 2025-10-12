@@ -1,5 +1,7 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import CryptoJS from 'crypto-js';
+// Import native crypto for production - falls back to CryptoJS
+import 'react-native-get-random-values'; // Must be imported first
 import { Connection, Keypair, PublicKey } from '@solana/web3.js';
 import { derivePath } from 'ed25519-hd-key';
 import * as bip39 from 'bip39';
@@ -2210,14 +2212,19 @@ export class WalletManager {
       // Generate QNet EON address directly from mnemonic for extension compatibility
       const qnetAddress = await this.generateQNetAddressFromMnemonic(mnemonic, 0);
       
-      return {
+      // Store mnemonic temporarily for wallet creation flow
+      const wallet = {
         publicKey: keypair.publicKey.toString(),
         secretKey: Array.from(keypair.secretKey),
-        mnemonic: mnemonic,
+        mnemonic: mnemonic, // Needed for creation flow, will be encrypted when stored
         address: keypair.publicKey.toString(),
         solanaAddress: keypair.publicKey.toString(),
         qnetAddress: qnetAddress
       };
+      
+      // Temporarily attach mnemonic for storage only
+      wallet._tempMnemonic = mnemonic;
+      return wallet;
     } catch (error) {
       // console.error('Error generating wallet:', error);
       throw error;
@@ -2232,15 +2239,13 @@ export class WalletManager {
       // Generate proper BIP39 mnemonic with checksum
       const entropy = new Uint8Array(16); // 128 bits for 12 words
       
-      // Use crypto-secure random values
+      // Use native crypto-secure random values (from react-native-get-random-values)
+      // This is much more secure and faster than CryptoJS on mobile
       if (typeof crypto !== 'undefined' && crypto.getRandomValues) {
         crypto.getRandomValues(entropy);
       } else {
-        // Fallback for React Native - use CryptoJS random
-        const randomWords = CryptoJS.lib.WordArray.random(16);
-        for (let i = 0; i < 16; i++) {
-          entropy[i] = (randomWords.words[Math.floor(i / 4)] >> (24 - (i % 4) * 8)) & 0xff;
-        }
+        // This should never happen with react-native-get-random-values imported
+        throw new Error('Secure random number generator not available - critical security issue');
       }
       
       // Calculate SHA-256 hash for checksum using CryptoJS
@@ -2389,18 +2394,113 @@ export class WalletManager {
       // Generate QNet EON address directly from mnemonic for extension compatibility
       const qnetAddress = await this.generateQNetAddressFromMnemonic(trimmedMnemonic, 0);
       
-      return {
+      // Store mnemonic temporarily for import flow
+      const wallet = {
         publicKey: keypair.publicKey.toString(),
         secretKey: Array.from(keypair.secretKey),
-        mnemonic: mnemonic.trim(),
+        mnemonic: trimmedMnemonic, // Needed for import flow, will be encrypted when stored
         address: keypair.publicKey.toString(),
         solanaAddress: keypair.publicKey.toString(),
         qnetAddress: qnetAddress,
         imported: true
       };
+      
+      // Also keep temp reference for storage
+      wallet._tempMnemonic = trimmedMnemonic;
+      return wallet;
     } catch (error) {
       // console.error('Error importing wallet:', error);
       throw new Error(error.message || 'Failed to import wallet. Please check your seed phrase and try again.');
+    }
+  }
+
+  // Get mnemonic securely from encrypted storage
+  async getEncryptedMnemonic(password) {
+    try {
+      const storedWallet = await AsyncStorage.getItem('qnet_wallet');
+      if (!storedWallet) return null;
+      
+      const vaultData = JSON.parse(storedWallet);
+      
+      // Decrypt to get mnemonic
+      const salt = CryptoJS.enc.Hex.parse(vaultData.salt);
+      const iv = CryptoJS.enc.Hex.parse(vaultData.iv);
+      
+      const key = CryptoJS.PBKDF2(password, salt, {
+        keySize: 256/32,
+        iterations: 10000, // Optimized for instant mobile response
+        hasher: CryptoJS.algo.SHA256
+      });
+      
+      const decrypted = CryptoJS.AES.decrypt(
+        vaultData.encrypted,
+        key,
+        {
+          iv: iv,
+          mode: CryptoJS.mode.CBC,
+          padding: CryptoJS.pad.Pkcs7
+        }
+      );
+      
+      const walletData = JSON.parse(decrypted.toString(CryptoJS.enc.Utf8));
+      return walletData.mnemonic || null;
+    } catch (error) {
+      return null;
+    }
+  }
+  
+  // Quick password verification without loading full wallet
+  async verifyPassword(password) {
+    try {
+      const storedWallet = await AsyncStorage.getItem('qnet_wallet');
+      if (!storedWallet) return false;
+      
+      const vaultData = JSON.parse(storedWallet);
+      
+      // Handle old format 
+      if (typeof vaultData === 'string' || !vaultData.salt) {
+        // Legacy format - try direct decryption
+        const encrypted = typeof vaultData === 'string' ? vaultData : vaultData.encrypted;
+        try {
+          const decrypted = CryptoJS.AES.decrypt(encrypted, password).toString(CryptoJS.enc.Utf8);
+          if (!decrypted) return false;
+          const wallet = JSON.parse(decrypted);
+          return wallet && wallet.publicKey ? true : false;
+        } catch (error) {
+          return false;
+        }
+      }
+      
+      // New format with salt and IV
+      const salt = CryptoJS.enc.Hex.parse(vaultData.salt);
+      const iv = CryptoJS.enc.Hex.parse(vaultData.iv);
+      
+      // Derive key using same parameters as storage
+      const key = CryptoJS.PBKDF2(password, salt, {
+        keySize: 256/32,
+        iterations: 10000, // Same as in loadWallet
+        hasher: CryptoJS.algo.SHA256
+      });
+      
+      // Decrypt
+      const decrypted = CryptoJS.AES.decrypt(
+        vaultData.encrypted,
+        key,
+        {
+          iv: iv,
+          mode: CryptoJS.mode.CBC,
+          padding: CryptoJS.pad.Pkcs7
+        }
+      );
+      
+      try {
+        const walletData = JSON.parse(decrypted.toString(CryptoJS.enc.Utf8));
+        return walletData && walletData.publicKey ? true : false;
+      } catch (error) {
+        return false; // Wrong password
+      }
+    } catch (error) {
+      return false;
     }
   }
 
@@ -2410,22 +2510,37 @@ export class WalletManager {
       // Clear old activation codes when storing new wallet
       await AsyncStorage.removeItem('qnet_activation_codes');
       
+      // Extract and use temporary mnemonic if present
+      const mnemonic = walletData._tempMnemonic || walletData.mnemonic;
+      if (walletData._tempMnemonic) {
+        delete walletData._tempMnemonic; // Clear from memory immediately
+      }
+      if (walletData.mnemonic) {
+        delete walletData.mnemonic; // Clear from memory immediately
+      }
+      
+      // Create storage data with mnemonic
+      const storageData = {
+        ...walletData,
+        mnemonic: mnemonic // Will be encrypted below
+      };
+      
       // Generate random salt (32 bytes)
       const salt = CryptoJS.lib.WordArray.random(32);
       
-      // Derive key using PBKDF2 (10,000 iterations - optimized for CryptoJS on mobile)
+      // Derive key using PBKDF2 (10,000 iterations for mobile)
       const key = CryptoJS.PBKDF2(password, salt, {
         keySize: 256/32,
-        iterations: 10000, // CryptoJS is slower than native crypto, optimized for mobile
+        iterations: 10000, // Optimized for mobile
         hasher: CryptoJS.algo.SHA256
       });
       
       // Generate random IV (16 bytes for AES)
       const iv = CryptoJS.lib.WordArray.random(16);
       
-      // Encrypt wallet data
+      // Encrypt wallet data with mnemonic included
       const encrypted = CryptoJS.AES.encrypt(
-        JSON.stringify(walletData), 
+        JSON.stringify(storageData), 
         key,
         { 
           iv: iv,
@@ -2520,6 +2635,10 @@ export class WalletManager {
           await AsyncStorage.setItem('qnet_address', wallet.qnetAddress);
         }
         
+        // Remove mnemonic from memory for security
+        if (wallet.mnemonic) {
+          delete wallet.mnemonic;
+        }
         return wallet;
       }
       
@@ -2587,6 +2706,10 @@ export class WalletManager {
           await AsyncStorage.setItem('qnet_address', wallet.qnetAddress);
         }
         
+        // Remove mnemonic from memory for security
+        if (wallet.mnemonic) {
+          delete wallet.mnemonic;
+        }
         return wallet;
       } catch (parseError) {
         // console.error('Failed to parse decrypted data');
@@ -2838,8 +2961,20 @@ export class WalletManager {
         TOKEN_PROGRAM_ID   // Token program
       );
       
-      // Create and send transaction
-      const transaction = new Transaction().add(burnInstruction);
+      // Create MEMO instruction with node type
+      // This will be permanently stored on blockchain for sync
+      const MEMO_PROGRAM_ID = new PublicKey('MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr');
+      const memoData = `QNET_NODE_TYPE:${nodeType.toUpperCase()}`;
+      const memoInstruction = {
+        keys: [],
+        programId: MEMO_PROGRAM_ID,
+        data: Buffer.from(memoData, 'utf-8')
+      };
+      
+      // Create and send transaction with BOTH instructions
+      const transaction = new Transaction()
+        .add(burnInstruction)
+        .add(memoInstruction);  // Add memo after burn
       transaction.recentBlockhash = blockhash;
       transaction.feePayer = keypair.publicKey;
       
@@ -2953,6 +3088,7 @@ export class WalletManager {
       };
       
       await AsyncStorage.setItem('qnet_activation_codes', JSON.stringify(encryptedCodes));
+      
       return true;
     } catch (error) {
       // console.error('Error storing activation code:', error);
@@ -3012,31 +3148,186 @@ export class WalletManager {
       const existingCodes = await this.getStoredActivationCodes(password);
       
       if (existingCodes && Object.keys(existingCodes).length > 0) {
-        // Return existing codes from storage
+        // Already have codes locally - no need to check blockchain
+        // This saves battery and RPC calls
         return existingCodes;
       }
       
-      // TODO: Query blockchain for REAL activations
-      // Phase 1: Check Solana for burn transactions from this wallet
-      // const connection = new Connection(...);
-      // const burnTransactions = await connection.getConfirmedSignaturesForAddress2(
-      //   walletAddress, 
-      //   { limit: 100 }
-      // );
-      // 
-      // Filter for 1DEV burn transactions and verify amounts
-      // If found, retrieve activation code from transaction metadata
-      //
-      // Phase 2: Also check QNet blockchain for activations
-      // const response = await fetch(`/api/activations/by_wallet?wallet_address=${walletAddress}`);
+      // Generate deterministic codes from seed
+      const codes = {};
+      if (seedPhrase) {
+        codes.light = this.generateActivationCode('light', walletAddress, seedPhrase);
+        codes.full = this.generateActivationCode('full', walletAddress, seedPhrase);  
+        codes.super = this.generateActivationCode('super', walletAddress, seedPhrase);
+      }
       
-      // IMPORTANT: Do NOT generate codes without real burn transaction!
-      // Codes must be earned through real token burn
+      // Check blockchain for burn transactions
+      const activatedNodes = await this.checkBlockchainForActivations(walletAddress);
       
-      return null; // No codes found
+      // Store code for activated node
+      if (activatedNodes && activatedNodes.length > 0) {
+        // First check if we already have a stored code
+        const existingCodes = await this.getStoredActivationCodes(password);
+        if (existingCodes && Object.keys(existingCodes).length > 0) {
+          // Already have a code stored, keep it
+          return existingCodes;
+        }
+        
+        // Check if we have exact node type from MEMO
+        if (activatedNodes.length === 1) {
+          // Exact type determined from MEMO!
+          const nodeType = activatedNodes[0];
+          const code = codes[nodeType];
+          
+          if (code && password) {
+            // console.log('[syncActivationCodes] Storing code for node type (from MEMO):', nodeType);
+            await this.storeActivationCode(code, nodeType, password);
+            return { [nodeType]: code };
+          }
+        } else {
+          // Old activation without MEMO - can't determine exact type
+          // console.log('[syncActivationCodes] ⚠️ Old activation detected without MEMO');
+          // console.log('[syncActivationCodes] Cannot determine exact node type');
+          // console.log('[syncActivationCodes] Please re-activate your node with latest version');
+          
+          // Don't store anything - user needs to re-activate
+          return null;
+        }
+      }
+      
+      // Return stored codes if any were found
+      const storedCodes = await this.getStoredActivationCodes(password);
+      if (storedCodes && Object.keys(storedCodes).length > 0) {
+        return storedCodes;
+      }
+      
+      return null; // No activated nodes found
     } catch (error) {
       // console.error('[syncActivationCodes] Error:', error);
       return null;
+    }
+  }
+  
+  // Check blockchain for burn transactions to find activated nodes
+  async checkBlockchainForActivations(walletAddress) {
+    try {
+      const activatedNodes = [];
+      
+      // Get network setting
+      const testnetSetting = await AsyncStorage.getItem('qnet_testnet');
+      const isTestnet = testnetSetting === null ? true : testnetSetting === 'true';
+      
+      // Burn contract for checking
+      const BURN_CONTRACT_ID = 'D7g7mkL8o1YEex6ZgETJEQyyHV7uuUMvV3Fy3u83igJ7';
+      
+      try {
+        // Import Solana web3
+        const { Connection, PublicKey } = require('@solana/web3.js');
+        
+        // Create connection
+        const connection = new Connection(
+          isTestnet ? 'https://api.devnet.solana.com' : 'https://api.mainnet-beta.solana.com',
+          'confirmed'
+        );
+        
+        // Get transaction signatures for this wallet
+        const signatures = await connection.getSignaturesForAddress(
+          new PublicKey(walletAddress),
+          { limit: 100 }
+        );
+        
+        // Check each transaction
+        for (const sigInfo of signatures) {
+          try {
+            const tx = await connection.getParsedTransaction(sigInfo.signature);
+            
+            if (tx && tx.meta && !tx.meta.err) {
+              // Check if this transaction involves burn contract
+              const instructions = tx.transaction.message.instructions;
+              
+              for (const inst of instructions) {
+                // Check for burn program or token burn
+                if (inst.programId && inst.programId.toString() === BURN_CONTRACT_ID) {
+                  // Found burn transaction but can't determine type in Phase 1
+                  // All nodes have DYNAMIC pricing (1500-300 1DEV based on burn %)
+                  // Return all types and let sync logic determine which one
+                  // console.log('[checkBlockchainForActivations] Found burn transaction');
+                  return ['light', 'full', 'super'];
+                }
+                
+                // Also check for SPL token burns
+                if (inst.program === 'spl-token' && inst.parsed && inst.parsed.type === 'burn') {
+                  // Check if it's 1DEV token
+                  const oneDevMint = isTestnet 
+                    ? '62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ'
+                    : '4R3DPW4BY97kJRfv8J5wgTtbDpoXpRv92W957tXMpump';
+                  
+                  if (inst.parsed.info && inst.parsed.info.mint === oneDevMint) {
+                    // Found 1DEV burn - now check for MEMO to determine type
+                    // console.log('[checkBlockchainForActivations] Found 1DEV burn, checking for memo...');
+                    
+                    // Look for MEMO instruction in the same transaction
+                    let nodeType = null;
+                    for (const memoInst of instructions) {
+                      if (memoInst.program === 'spl-memo' || 
+                          (memoInst.programId && memoInst.programId.toString() === 'MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr')) {
+                        // Found memo instruction - parse the data
+                        let memoData = null;
+                        if (memoInst.parsed) {
+                          memoData = memoInst.parsed;
+                        } else if (memoInst.data) {
+                          // Decode base58 data
+                          try {
+                            const bs58 = require('bs58');
+                            memoData = Buffer.from(bs58.decode(memoInst.data)).toString('utf-8');
+                          } catch (e) {
+                            // Try as base64 if bs58 fails
+                            try {
+                              memoData = Buffer.from(memoInst.data, 'base64').toString('utf-8');
+                            } catch (e2) {
+                              // Failed to decode
+                            }
+                          }
+                        }
+                        
+                        if (memoData && typeof memoData === 'string') {
+                          // Check if it's our node type memo
+                          const match = memoData.match(/QNET_NODE_TYPE:(\w+)/);
+                          if (match && match[1]) {
+                            nodeType = match[1].toLowerCase();
+                            // console.log('[checkBlockchainForActivations] Found node type in memo:', nodeType);
+                            break;
+                          }
+                        }
+                      }
+                    }
+                    
+                    if (nodeType && ['light', 'full', 'super'].includes(nodeType)) {
+                      // Found exact type from memo!
+                      // console.log('[checkBlockchainForActivations] ✅ Exact node type determined:', nodeType);
+                      return [nodeType];
+                    } else {
+                      // Old activation without memo - return all types
+                      // console.log('[checkBlockchainForActivations] No memo found (old activation), returning all types');
+                      return ['light', 'full', 'super'];
+                    }
+                  }
+                }
+              }
+            }
+          } catch (txError) {
+            // Continue checking other transactions
+          }
+        }
+      } catch (rpcError) {
+        // console.log('[checkBlockchainForActivations] RPC check error:', rpcError);
+        // Continue without blockchain check
+      }
+      
+      return activatedNodes;
+    } catch (error) {
+      // console.error('[checkBlockchainForActivations] Error:', error);
+      return [];
     }
   }
   
@@ -3102,14 +3393,8 @@ export class WalletManager {
               
               const code = decrypted.toString(CryptoJS.enc.Utf8);
               if (code && code.length > 0) {
-                // Validate code format and extract embedded node type
-                if (code.startsWith('QNET-') && code.length === 26) {
-                  // Mobile should only have light node codes
-                  if (nodeType !== 'light') {
-                    console.warn(`Mobile should only have light node codes, found: ${nodeType}`);
-                    continue; // Skip non-light codes on mobile
-                  }
-                }
+                // Validate code format
+                // Mobile can have any node type code - light, full, or super
                 
                 decryptedCodes[nodeType] = {
                   code,
@@ -3215,10 +3500,28 @@ export class WalletManager {
   // Activate Light Node - REQUIRES REAL 1DEV BURN
   async activateLightNode(walletAddress, password) {
     try {
-      // Load wallet to get seed phrase for deterministic generation
+      // Check if node already activated on blockchain (prevent duplicates)
+      const existingActivations = await this.checkBlockchainForActivations(walletAddress);
+      if (existingActivations && existingActivations.length > 0) {
+        throw new Error('This wallet already has an activated node on the blockchain. One wallet can only activate one node.');
+      }
+      
+      // Also check local storage for existing codes
+      const existingCodes = await this.getStoredActivationCodes(password);
+      if (existingCodes && Object.keys(existingCodes).length > 0) {
+        throw new Error('This wallet already has an activated node. One wallet can only activate one node.');
+      }
+      
+      // Load wallet and get seed phrase separately for security
       const walletData = await this.loadWallet(password);
-      if (!walletData || !walletData.mnemonic) {
+      if (!walletData) {
         throw new Error('Failed to load wallet data');
+      }
+      
+      // Get mnemonic securely from encrypted storage
+      const mnemonic = await this.getEncryptedMnemonic(password);
+      if (!mnemonic) {
+        throw new Error('Failed to retrieve seed phrase');
       }
       
       // Check testnet/mainnet - default to true (testnet) if not set
@@ -3256,7 +3559,7 @@ export class WalletManager {
       }
       
     // Only generate code AFTER successful burn
-    const activationCode = this.generateActivationCode('light', walletAddress, walletData.mnemonic);
+    const activationCode = this.generateActivationCode('light', walletAddress, mnemonic);
     
     // Store the activation code with transaction signature
     await this.storeActivationCode(activationCode, 'light', password);

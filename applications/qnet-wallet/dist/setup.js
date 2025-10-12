@@ -844,6 +844,26 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 
 /**
+ * Show Terms of Service modal
+ */
+function showTermsModal() {
+    const modal = document.getElementById('terms-modal');
+    if (modal) {
+        modal.classList.remove('hidden');
+    }
+}
+
+/**
+ * Hide Terms of Service modal
+ */
+function hideTermsModal() {
+    const modal = document.getElementById('terms-modal');
+    if (modal) {
+        modal.classList.add('hidden');
+    }
+}
+
+/**
  * Get translated text
  */
 function t(key) {
@@ -916,6 +936,43 @@ function setupEventListeners() {
     // Real-time password validation (no errors shown until submit)
     document.getElementById('new-password')?.addEventListener('input', validatePasswordRealtime);
     document.getElementById('confirm-password')?.addEventListener('input', validatePasswordRealtime);
+    
+    // Terms of Service
+    document.getElementById('terms-checkbox')?.addEventListener('change', validatePasswordRealtime);
+    document.getElementById('terms-link')?.addEventListener('click', (e) => {
+        e.preventDefault();
+        showTermsModal();
+    });
+    document.getElementById('terms-checkbox-import')?.addEventListener('change', validateImportForm);
+    document.getElementById('terms-link-import')?.addEventListener('click', (e) => {
+        e.preventDefault();
+        showTermsModal();
+    });
+    
+    // Terms Modal
+    document.getElementById('close-terms-modal')?.addEventListener('click', hideTermsModal);
+    document.getElementById('decline-terms')?.addEventListener('click', () => {
+        hideTermsModal();
+        // Uncheck the checkbox when declining
+        const checkbox = document.getElementById(setupState.walletType === 'import' ? 'terms-checkbox-import' : 'terms-checkbox');
+        if (checkbox) checkbox.checked = false;
+        if (setupState.walletType === 'import') {
+            validateImportForm();
+        } else {
+            validatePasswordRealtime();
+        }
+    });
+    document.getElementById('accept-terms')?.addEventListener('click', () => {
+        hideTermsModal();
+        // Check the checkbox when accepting
+        const checkbox = document.getElementById(setupState.walletType === 'import' ? 'terms-checkbox-import' : 'terms-checkbox');
+        if (checkbox) checkbox.checked = true;
+        if (setupState.walletType === 'import') {
+            validateImportForm();
+        } else {
+            validatePasswordRealtime();
+        }
+    });
     
     // Seed display step
     document.getElementById('back-to-password')?.addEventListener('click', () => showStep('password'));
@@ -1018,12 +1075,16 @@ function validatePasswordRealtime() {
     const confirmPassword = document.getElementById('confirm-password')?.value || '';
     const continueBtn = document.getElementById('continue-password');
     const passwordInput = document.getElementById('new-password');
+    const termsCheckbox = document.getElementById('terms-checkbox');
     
     // Update password checklist
     updatePasswordChecklist(newPassword);
     
-    // Enable/disable continue button
-    const isValid = newPassword.length >= 8 && newPassword === confirmPassword;
+    // Enable/disable continue button - also check terms acceptance
+    const passwordsValid = newPassword.length >= 8 && newPassword === confirmPassword;
+    const termsAccepted = termsCheckbox ? termsCheckbox.checked : false;
+    const isValid = passwordsValid && termsAccepted;
+    
     if (continueBtn) {
         continueBtn.disabled = !isValid;
     }
@@ -1187,7 +1248,7 @@ async function generateSeedPhrase() {
             const isValid = await window.secureBIP39.validateMnemonic(mnemonic);
             
             if (!isValid) {
-                console.warn('[GenerateSeed] Generated mnemonic failed validation, using simple method');
+                // console.warn('[GenerateSeed] Generated mnemonic failed validation, using simple method');
                 // Fallback to simple random generation
                 const fallbackMnemonic = await window.secureBIP39.generateMnemonic(12);
                 return fallbackMnemonic;
@@ -1196,7 +1257,7 @@ async function generateSeedPhrase() {
             return mnemonic;
         }
         
-        console.error('[GenerateSeed] ProductionBIP39 not available!');
+        // console.error('[GenerateSeed] ProductionBIP39 not available!');
         throw new Error('ProductionBIP39 not available');
         
     } catch (error) {
@@ -1305,6 +1366,13 @@ function downloadSeedPhrase() {
 }
 
 /**
+ * Validate import form
+ */
+function validateImportForm() {
+    validateImportRealtime();
+}
+
+/**
  * Validate import in real-time
  */
 async function validateImportRealtime() {
@@ -1312,6 +1380,7 @@ async function validateImportRealtime() {
     const wordCountCheck = document.querySelector('#word-count-check');
     const wordsValidCheck = document.querySelector('#words-valid-check');
     const importBtn = document.querySelector('#step-seed-import .primary-button');
+    const termsCheckbox = document.getElementById('terms-checkbox-import');
     
     if (!seedPhrase) {
         // Reset validation states
@@ -1383,9 +1452,10 @@ async function validateImportRealtime() {
         }
     }
     
-    // Enable/disable import button - only enable if checksum is valid
+    // Enable/disable import button - only enable if checksum is valid AND terms accepted
+    const termsAccepted = termsCheckbox ? termsCheckbox.checked : false;
     if (importBtn) {
-        importBtn.disabled = !(isValidCount && allWordsValid && checksumValid);
+        importBtn.disabled = !(isValidCount && allWordsValid && checksumValid && termsAccepted);
     }
 }
 
@@ -1579,7 +1649,7 @@ function safeBase64Encode(str) {
         // Handle UTF-8 strings properly
         return btoa(unescape(encodeURIComponent(str)));
     } catch (e) {
-        console.error('Encoding error:', e);
+        // console.error('Encoding error:', e);
         // Fallback to simple btoa if possible
         return btoa(str);
     }
@@ -1736,8 +1806,8 @@ async function completeWalletSetup() {
         if (typeof chrome !== 'undefined' && chrome.runtime) {
             try {
                 const isImport = setupState.walletType === 'import';
-                console.log(`[Setup] ${isImport ? 'Importing' : 'Creating'} wallet in background service...`);
-                console.log('[Setup] Wallet type:', setupState.walletType);
+                // console.log(`[Setup] ${isImport ? 'Importing' : 'Creating'} wallet in background service...`);
+                // console.log('[Setup] Wallet type:', setupState.walletType);
                 
                 const bgResult = await chrome.runtime.sendMessage({
                     type: isImport ? 'IMPORT_WALLET' : 'CREATE_WALLET',
@@ -1747,14 +1817,14 @@ async function completeWalletSetup() {
                 
                 if (bgResult && bgResult.success) {
                     const actionText = isImport ? 'imported' : 'created';
-                    console.log(`[Setup] ✅ Wallet ${actionText} successfully in background`);
-                    console.log('[Setup] Addresses:', bgResult.accounts);
-                    console.log('[Setup] Has encrypted wallet:', !!bgResult.encryptedWallet);
+                    // console.log(`[Setup] ✅ Wallet ${actionText} successfully in background`);
+                    // console.log('[Setup] Addresses:', bgResult.accounts);
+                    // console.log('[Setup] Has encrypted wallet:', !!bgResult.encryptedWallet);
                     
                     // Verify that we have the encrypted wallet
                     if (!bgResult.encryptedWallet) {
-                        console.error('[Setup] ⚠️ No encrypted wallet returned from background');
-                        console.error('[Setup] This may cause unlock issues later');
+                        // console.error('[Setup] ⚠️ No encrypted wallet returned from background');
+                        // console.error('[Setup] This may cause unlock issues later');
                     }
                     
                     // Only save if we actually got encrypted wallet data
@@ -1764,16 +1834,16 @@ async function completeWalletSetup() {
                             encryptedWallet: bgResult.encryptedWallet,
                             currentNetwork: 'solana'
                         });
-                        console.log('[Setup] ✅ Encrypted wallet saved to storage');
+                        // console.log('[Setup] ✅ Encrypted wallet saved to storage');
                     } else {
-                        console.error('[Setup] ⚠️ No encrypted wallet to save - wallet creation may have failed');
+                        // console.error('[Setup] ⚠️ No encrypted wallet to save - wallet creation may have failed');
                     }
                 } else {
-                    console.error('[Setup] Failed to create wallet in background:', bgResult?.error);
+                    // console.error('[Setup] Failed to create wallet in background:', bgResult?.error);
                     // Continue with local storage as fallback
                 }
             } catch (err) {
-                console.error('[Setup] Error creating wallet in background:', err);
+                // console.error('[Setup] Error creating wallet in background:', err);
                 // Continue with local storage as fallback
             }
         }
@@ -2036,7 +2106,7 @@ async function openWalletAfterSetup() {
             showToast('Wallet created! Open extension to access your wallet.', 'success');
             setTimeout(() => window.close(), 3000);
         } catch (fallbackError) {
-            console.error('Window close failed:', fallbackError);
+            // console.error('Window close failed:', fallbackError);
         }
     }
 }
@@ -2079,7 +2149,7 @@ function clearAllErrors() {
 function showToast(message, type = 'info') {
     // Disabled - silent mode
     if (type === 'error') {
-        console.error(message);
+        // console.error(message);
     }
     return;
     
