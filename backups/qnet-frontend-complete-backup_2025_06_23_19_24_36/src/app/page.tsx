@@ -295,7 +295,7 @@ export default function HomePage() {
         <div className="technology-grid expanded">
           <div className="tech-item">
             <h4 className="tech-title">Phase 1: 1DEV Burn (Current)</h4>
-            <p>1DEV tokens are BURNED on Solana for node activation. 1,500 1DEV burn for any node type. Dynamic pricing 1500→150. Transition at 90% burned OR 5 years.</p>
+            <p>1DEV tokens are BURNED on Solana for node activation. 1,500 1DEV burn for any node type. Dynamic pricing 1500→300 minimum. Transition at 90% burned OR 5 years.</p>
           </div>
           <div className="tech-item">
             <h4 className="tech-title">Phase 2: QNC to Pool #3 (Future)</h4>

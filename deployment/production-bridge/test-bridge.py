@@ -62,14 +62,14 @@ def test_phase1_pricing():
         (200_000_000, "20% burned", 1200),     # 20% → 1200 1DEV
         (300_000_000, "30% burned", 1050),     # 30% → 1050 1DEV
         (500_000_000, "50% burned", 750),      # 50% → 750 1DEV
-        (800_000_000, "80% burned", 300),      # 80% → 300 1DEV
-        (900_000_000, "90% burned", 150),      # 90% → 150 1DEV (minimum)
+        (800_000_000, "80% burned", 300),      # 80% → 300 1DEV (minimum Phase 1)
+        (900_000_000, "90% burned", 300),      # 90% → Phase 2 transition (QNC)
     ]
     
     for total_burned, description, expected_cost in test_cases:
         burn_percentage = (total_burned / total_1dev_supply) * 100
         price_reduction = int((burn_percentage // 10) * reduction_per_10_percent)
-        current_cost = max(base_cost - price_reduction, 150)
+        current_cost = max(base_cost - price_reduction, 300)  # Minimum at 80-90%
         
         print(f"  💰 {description}: {current_cost} 1DEV (reduced by {price_reduction})")
         

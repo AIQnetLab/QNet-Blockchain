@@ -97,7 +97,7 @@
 **Real-time Monitoring:**
 - ✅ **Official Solana incinerator** (`1nc1nerator11111111111111111111111111111111`) integration
 - ✅ **Real-time burn percentage** calculation from blockchain data
-- ✅ **Dynamic pricing model** based on burn progress (1500 → 150 1DEV)
+- ✅ **Dynamic pricing model** based on burn progress (1500 → 300 1DEV minimum)
 - ✅ **Transition monitoring** for Phase 2 QNC activation
 - ✅ **Complete burn history** tracking with immutable records
 

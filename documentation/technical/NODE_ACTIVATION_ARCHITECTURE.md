@@ -171,9 +171,10 @@ fn verify_node_ownership(user_key: &Pubkey, node_pubkey: &Pubkey) -> bool {
 7. Interactive activation on servers OR mobile activation for Light nodes
 
 **Universal Pricing (All Node Types):**
-- Base: 1,500 1DEV → 150 1DEV (decreases as tokens burned)
+- Base: 1,500 1DEV → 300 1DEV minimum (decreases as tokens burned, min at 80-90%)
 - Every 10% burned reduces cost by 150 1DEV
 - Same price for Light/Full/Super nodes
+- At 90% burned: Transition to Phase 2 (QNC activation)
 
 **Phase 1 Solana Integration:**
 ```rust

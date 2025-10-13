@@ -76,7 +76,7 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 - **🎲 True Decentralization**: Entropy-based producer selection with unpredictable rotation
 - **💰 Reputation Economics**: Rewards for block production (+1 micro, +10/+5 macro)
 - **🔄 Advanced Synchronization**: State snapshots with parallel downloads & IPFS
-- **🔥 Phase 1 Active**: 1DEV burn-to-join (1,500 → 150 1DEV universal pricing)
+- **🔥 Phase 1 Active**: 1DEV burn-to-join (1,500 → 300 1DEV minimum, universal pricing)
 - **💎 Phase 2 Ready**: QNC Pool 3 system (5k-30k QNC dynamic pricing)
 - **🌐 Scalable Architecture**: 256 shards, microblocks, lock-free operations (10M+ nodes)
 - **🔗 Cross-Chain Compatibility**: Solana integration for Phase 1

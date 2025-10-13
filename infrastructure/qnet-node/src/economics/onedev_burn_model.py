@@ -24,9 +24,9 @@ class OneDEVBurnConfig:
     base_price_super: int = 1500    # 1500 1DEV universal
     
     # Universal minimum prices
-    min_price_light: int = 150      # 150 1DEV minimum
-    min_price_full: int = 150       # 150 1DEV minimum
-    min_price_super: int = 150      # 150 1DEV minimum
+    min_price_light: int = 300      # 300 1DEV minimum at 80-90%
+    min_price_full: int = 300       # 300 1DEV minimum at 80-90%
+    min_price_super: int = 300      # 300 1DEV minimum at 80-90%
     
     # Supply configuration
     total_1dev_supply: float = 1_000_000_000  # 1 billion 1DEV (Pump.fun standard)
@@ -64,7 +64,7 @@ class OneDEVBurnCalculator:
         
         # CORRECTED: Universal pricing for all node types
         base_price = 1500  # Universal base price
-        min_price = 150    # Universal minimum price
+        min_price = 300    # Universal minimum price at 80-90%
         
         # Calculate tier (each 10% = 1 tier)
         tier = int(burn_ratio * 10)  # 0.1 = tier 1, 0.2 = tier 2, etc.
@@ -177,7 +177,7 @@ if __name__ == "__main__":
     print("=" * 80)
     print("Base price: 1500 1DEV (ALL node types)")
     print("Reduction: -150 1DEV per 10% burned tier")
-    print("Minimum: 150 1DEV at 90% burned")
+    print("Minimum: 300 1DEV at 80-90% burned (then Phase 2)")
     print("=" * 80)
     
     # Test burn percentages
@@ -205,4 +205,4 @@ if __name__ == "__main__":
     print("-" * 50)
     print("✅ UNIVERSAL PRICING: All node types cost the same!")
     print("✅ CORRECT FORMULA: -150 1DEV per 10% burned tier")
-    print("✅ MINIMUM FLOOR: 150 1DEV at 90% burned") 
+    print("✅ MINIMUM FLOOR: 300 1DEV at 80-90% burned (Phase 2 at 90%)") 

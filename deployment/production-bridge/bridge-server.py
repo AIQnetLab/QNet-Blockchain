@@ -240,7 +240,7 @@ async def start_phase1_activation(request: Phase1ActivationRequest):
     base_cost = 1500
     reduction_per_10_percent = 150
     price_reduction = int((burn_state['burn_percentage'] // 10) * reduction_per_10_percent)
-    current_cost = max(base_cost - price_reduction, 150)  # Minimum 150 1DEV
+    current_cost = max(base_cost - price_reduction, 300)  # Minimum 300 1DEV at 80-90%
     
     # Verify user burned enough tokens
     required_amount = current_cost * 1_000_000  # Convert to 6 decimals
@@ -501,7 +501,7 @@ async def get_1dev_burn_contract_info():
     base_cost = 1500
     reduction_per_10_percent = 150
     price_reduction = int((burn_percentage // 10) * reduction_per_10_percent)
-    current_price = max(base_cost - price_reduction, 150)
+    current_price = max(base_cost - price_reduction, 300)  # Minimum at 80-90%
     
     return {
         "contract_address": "1DEVBurnContractMainnet...",
@@ -511,7 +511,7 @@ async def get_1dev_burn_contract_info():
         "burn_events": 150000,
         "is_active": True,
         "current_burn_price": current_price,
-        "minimum_burn_amount": 150,  # Minimum possible price
+        "minimum_burn_amount": 300,  # Minimum possible price at 80-90%
         "dynamic_pricing": {
             "enabled": True,
             "model": "Every 10% burned = -150 1DEV cost reduction",

@@ -21,7 +21,8 @@ QNet uses a two-phase system for node activation that transitions from external 
 - Dynamic pricing based on burn progress  
 - Universal pricing: 1,500 1DEV for ALL node types (Light/Full/Super)
 - Every 10% burned reduces cost by 150 1DEV
-- Minimum cost: 150 1DEV at 90% burned
+- Minimum cost: 300 1DEV at 80-90% burned
+- At 90% burned: Transition to Phase 2 (QNC activation)
 
 ## Phase 2: QNC Transfer to Pool 3 on QNet (After transition)
 

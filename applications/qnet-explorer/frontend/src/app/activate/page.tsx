@@ -11,9 +11,9 @@ export default function ActivatePage() {
   const currentPhase: 'phase1' | 'phase2' = 'phase1';
   const [burnedTokensPhase1, setBurnedTokensPhase1] = useState(0); // Real-time from blockchain
   const [currentPricing, setCurrentPricing] = useState<Record<string, [number, number]>>({
-    light: [1500, 150], // [currentPrice, minimumPrice] - updated from API
-    full: [1500, 150],
-    super: [1500, 150]
+    light: [1500, 300], // [currentPrice, minimumPrice] - updated from API
+    full: [1500, 300],
+    super: [1500, 300]
   });
   const activeNodes = 156;
 
@@ -27,9 +27,9 @@ export default function ActivatePage() {
         if (data.dynamicPricing && data.dynamicPricing.enabled) {
           const currentPrice = data.nodeTypes.light.burnAmount;
           setCurrentPricing({
-            light: [currentPrice, 150],
-            full: [currentPrice, 150], 
-            super: [currentPrice, 150]
+            light: [currentPrice, 300],
+            full: [currentPrice, 300], 
+            super: [currentPrice, 300]
           });
           
           // Calculate burned tokens from pricing info
@@ -51,15 +51,15 @@ export default function ActivatePage() {
   const getCostInfo = (type: 'light' | 'full' | 'super') => {
     if (currentPhase === 'phase1') {
       const base: Record<'light' | 'full' | 'super', [number, number]> = {
-        light: [1500, 150],
-        full: [1500, 150],
-        super: [1500, 150]
+        light: [1500, 300],
+        full: [1500, 300],
+        super: [1500, 300]
       };
-      // CORRECT Phase 1 pricing: 1500 base, -150 per each COMPLETE 10% burned, min 150
+      // CORRECT Phase 1 pricing: 1500 base, -150 per each COMPLETE 10% burned, min 300 at 80-90%
       const burnedPercent = Math.min(1, burnedTokensPhase1 / totalPhase1Supply);
       const completedTiers = Math.floor((burnedPercent * 100) / 10); // Each complete 10% = 1 tier
       const reduction = completedTiers * 150; // 150 1DEV per tier
-      const cost = Math.max(1500 - reduction, 150); // Min 150 1DEV
+      const cost = Math.max(1500 - reduction, 300); // Min 300 1DEV at 80-90% burned
       const percentBurned = Math.round(burnedPercent * 100);
       
       return {

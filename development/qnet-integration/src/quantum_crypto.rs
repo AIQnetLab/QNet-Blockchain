@@ -941,7 +941,7 @@ impl QNetQuantumCrypto {
             let burn_percentage = blockchain_state.get_1dev_burn_percentage();
             let base_price = 1500u64; // Base: 1500 1DEV
             let reduction_per_10_percent = 150u64; // Reduce by 150 per 10%
-            let min_price = 150u64; // Minimum: 150 1DEV
+            let min_price = 300u64; // Minimum: 300 1DEV (at 80-90%, then Phase 2)
             
             // Calculate dynamic price: 1500 - (burn_percentage / 10) * 150
             let reduction_steps = (burn_percentage as u64) / 10;

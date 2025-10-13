@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   View,
   Text,
@@ -7,7 +7,6 @@ import {
   TextInput,
   Alert,
   ScrollView,
-  Animated,
   Clipboard,
   Image,
   Platform,
@@ -751,8 +750,6 @@ const WalletScreen = () => {
   const [wordChoices, setWordChoices] = useState({});
   const [termsAccepted, setTermsAccepted] = useState(false);
   const [showTermsModal, setShowTermsModal] = useState(false);
-  const [showSplash, setShowSplash] = useState(true);
-  const spinValue = useRef(new Animated.Value(0)).current;
   const [customAlert, setCustomAlert] = useState(null); // {title, message, buttons}
   const [nodeStatus, setNodeStatus] = useState(null); // 'light', 'full', or 'super'
   const [copiedAddress, setCopiedAddress] = useState(''); // Track which address was copied
@@ -804,20 +801,6 @@ const WalletScreen = () => {
   };
 
   useEffect(() => {
-    // Start rotation animation for splash spinner
-    Animated.loop(
-      Animated.timing(spinValue, {
-        toValue: 1,
-        duration: 1000,
-        useNativeDriver: true,
-      })
-    ).start();
-    
-    // Show our animated splash for 2 seconds to cover Android white screen
-    setTimeout(() => {
-      setShowSplash(false);
-    }, 2000);
-    
     // Load wallet data in parallel
     checkWalletExists();
     loadSettings();
@@ -1954,37 +1937,6 @@ const WalletScreen = () => {
     );
   }
 
-  // Splash screen with animated spinner (like browser extension)
-  if (showSplash) {
-    const spin = spinValue.interpolate({
-      inputRange: [0, 1],
-      outputRange: ['0deg', '360deg'],
-    });
-    
-    return (
-      <View style={styles.splashContainer}>
-        <View style={styles.splashContent}>
-          <View style={[styles.logoContainer, {overflow: 'hidden', borderRadius: 60}]}>
-            {/* Outer rotating ring */}
-            <Animated.View style={[styles.outerRing, { transform: [{ rotate: spin }] }]}>
-              <View style={styles.outerRingGradient} />
-            </Animated.View>
-            {/* Inner static ring */}
-            <View style={styles.innerRing}>
-              <View style={styles.innerRingGradient} />
-            </View>
-            {/* Center Q letter */}
-            <View style={styles.qLetterContainer}>
-              <Text style={styles.qLetter}>Q</Text>
-            </View>
-          </View>
-          <Text style={styles.splashTitle}>QNet Wallet</Text>
-          <Text style={styles.splashSubtitle}>Loading...</Text>
-        </View>
-      </View>
-    );
-  }
-
   // Seed phrase confirmation screen
   if (showSeedConfirm && tempWallet) {
     const words = tempWallet.mnemonic.split(' ');
@@ -2164,10 +2116,10 @@ const WalletScreen = () => {
             {passwordError ? (
               <Text style={styles.errorText}>{passwordError}</Text>
             ) : null}
-
+            
             {/* Terms of Service Checkbox */}
             <View style={styles.termsContainer}>
-              <TouchableOpacity 
+            <TouchableOpacity 
                 style={styles.checkbox}
                 onPress={() => setTermsAccepted(!termsAccepted)}
               >
@@ -2400,10 +2352,10 @@ const WalletScreen = () => {
               {passwordError ? (
                 <Text style={styles.errorText}>{passwordError}</Text>
               ) : null}
-
+              
               {/* Terms of Service Checkbox */}
               <View style={styles.termsContainer}>
-                <TouchableOpacity 
+              <TouchableOpacity 
                   style={styles.checkbox}
                   onPress={() => setTermsAccepted(!termsAccepted)}
                 >
@@ -4440,104 +4392,6 @@ const styles = StyleSheet.create({
     color: '#1a1a2e',
     fontSize: 18,
     fontWeight: 'bold',
-  },
-  splashContainer: {
-    flex: 1,
-    backgroundColor: '#0f0f1a', // --bg-primary from extension
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  splashContent: {
-    alignItems: 'center',
-  },
-  logoContainer: {
-    width: 120,
-    height: 120,
-    justifyContent: 'center',
-    alignItems: 'center',
-    marginBottom: 24,
-    ...Platform.select({
-      android: {
-        borderRadius: 60,
-        overflow: 'hidden',
-      },
-    }),
-  },
-  outerRing: {
-    position: 'absolute',
-    width: 120,
-    height: 120,
-    borderRadius: 60,
-    borderWidth: 3,
-    borderColor: 'transparent',
-    borderTopColor: '#00d4ff',
-    borderRightColor: '#00d4ff',
-    elevation: 0,
-    ...Platform.select({
-      android: {
-        borderRadius: 60,
-        overflow: 'hidden',
-      },
-    }),
-  },
-  outerRingGradient: {
-    position: 'absolute',
-    width: '100%',
-    height: '100%',
-    borderRadius: 60,
-    borderWidth: 3,
-    borderColor: 'rgba(0, 212, 255, 0.2)',
-  },
-  innerRing: {
-    position: 'absolute',
-    width: 90,
-    height: 90,
-    borderRadius: 45,
-    borderWidth: 2,
-    borderColor: '#6B46C1',
-    backgroundColor: 'rgba(107, 70, 193, 0.1)',
-    elevation: 0,
-    ...Platform.select({
-      android: {
-        borderRadius: 45,
-        overflow: 'hidden',
-      },
-    }),
-  },
-  innerRingGradient: {
-    position: 'absolute',
-    width: '100%',
-    height: '100%',
-    borderRadius: 45,
-    borderWidth: 2,
-    borderColor: 'rgba(107, 70, 193, 0.3)',
-  },
-  qLetterContainer: {
-    width: 70,
-    height: 70,
-    justifyContent: 'center',
-    alignItems: 'center',
-    backgroundColor: '#0f0f1a',
-    borderRadius: 35,
-    elevation: 0,
-  },
-  qLetter: {
-    fontSize: 48,
-    fontWeight: '900',
-    color: '#00d4ff',
-    textAlign: 'center',
-    letterSpacing: 2,
-  },
-  splashTitle: {
-    fontSize: 24,
-    fontWeight: '600',
-    color: '#00d4ff', // --qnet-primary
-    marginTop: 8,
-    marginBottom: 8,
-  },
-  splashSubtitle: {
-    fontSize: 14,
-    color: '#888', // --text-secondary
   },
   seedGrid: {
     flexDirection: 'row',

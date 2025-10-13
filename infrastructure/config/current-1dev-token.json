@@ -17,7 +17,7 @@
     "phase1": {
       "baseCost": 1500,
       "currentCost": 1500,
-      "minCost": 150,
+      "minCost": 300,
       "reductionPer10Percent": 150
     },
     "phase2": {

@@ -1,0 +1,42 @@
+warning: in the working copy of 'applications/qnet-mobile/src/screens/WalletScreen.js', LF will be replaced by CRLF the next time Git touches it
+ QNet_Whitepaper.md                                 |   5 [32m+[m[31m-[m
+ README.md                                          |   2 [32m+[m[31m-[m
+ Tokenomics.md                                      |   5 [32m+[m[31m-[m
+ .../frontend/src/app/ClientWrapper.tsx             |   6 [32m+[m[31m-[m
+ .../frontend/src/app/activate/page.tsx             |  22 [32m+[m[31m--[m
+ .../qnet-explorer/frontend/src/app/nodes/page.tsx  |   6 [32m+[m[31m-[m
+ .../src/components/sections/NodesSection.tsx       |  12 [32m+[m[31m-[m
+ .../qnet-mobile/src/screens/WalletScreen.js        | 156 [32m+[m[31m--------------------[m
+ .../src/app/page.tsx                               |   2 [32m+[m[31m-[m
+ .../src/app/src/app/page.tsx                       |   2 [32m+[m[31m-[m
+ .../app/src/components/sections/HomeSection.tsx    |   2 [32m+[m[31m-[m
+ .../src/components/sections/HomeSection.tsx        |   2 [32m+[m[31m-[m
+ .../src/src/app/page.tsx                           |   2 [32m+[m[31m-[m
+ .../src/src/app/src/app/page.tsx                   |   2 [32m+[m[31m-[m
+ .../app/src/components/sections/HomeSection.tsx    |   2 [32m+[m[31m-[m
+ .../src/src/components/sections/HomeSection.tsx    |   2 [32m+[m[31m-[m
+ core/qnet-consensus/src/burn_security.rs           |   4 [32m+[m[31m-[m
+ deployment/deploy_instructions.md                  |   2 [32m+[m[31m-[m
+ deployment/production-bridge/bridge-server.py      |   6 [32m+[m[31m-[m
+ deployment/production-bridge/test-bridge.py        |   6 [32m+[m[31m-[m
+ .../qnet-contracts/1dev-burn-contract/src/state.rs |   4 [32m+[m[31m-[m
+ development/qnet-integration/src/bin/qnet-node.rs  |  10 [32m+[m[31m-[m
+ development/qnet-integration/src/quantum_crypto.rs |   2 [32m+[m[31m-[m
+ docs/PROJECT_STATUS_2025.md                        |   2 [32m+[m[31m-[m
+ docs/QNET_DAO_MASTER_PLAN.md                       |   2 [32m+[m[31m-[m
+ documentation/README.md                            |  18 [32m+[m[31m--[m
+ .../technical/1DEV_TOKEN_CREATION_GUIDE.md         |   5 [32m+[m[31m-[m
+ documentation/technical/ECONOMIC_MODEL.md          | Bin [31m42270[m -> [32m42422[m bytes
+ .../technical/NODE_ACTIVATION_ARCHITECTURE.md      |   3 [32m+[m[31m-[m
+ documentation/technical/QUICK_REFERENCE.md         |   3 [32m+[m[31m-[m
+ documentation/technical/WALLET_DEVELOPMENT_PLAN.md | Bin [31m28332[m -> [32m28406[m bytes
+ infrastructure/config/config.ini                   |  14 [32m+[m[31m-[m
+ infrastructure/config/current-1dev-token.json      |   2 [32m+[m[31m-[m
+ .../qnet-node/src/economics/ARCHITECTURE.md        |   6 [32m+[m[31m-[m
+ .../qnet-node/src/economics/FINAL_BURN_MODEL.md    |  36 [32m++[m[31m---[m
+ infrastructure/qnet-node/src/economics/README.md   |   4 [32m+[m[31m-[m
+ .../src/economics/TWO_PHASE_ARCHITECTURE.md        |   3 [32m+[m[31m-[m
+ .../src/economics/burn_model_visualization.py      |   8 [32m+[m[31m-[m
+ .../qnet-node/src/economics/onedev_burn_model.py   |  12 [32m+[m[31m-[m
+ .../src/economics/onedev_phase_handler.py          |   6 [32m+[m[31m-[m
+ 40 files changed, 119 insertions(+), 269 deletions(-)

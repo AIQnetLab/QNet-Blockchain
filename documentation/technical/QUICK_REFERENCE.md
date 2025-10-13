@@ -190,9 +190,10 @@ python test_rpc.py
 ### Node Activation Costs
 
 #### Phase 1 (1DEV Token Spending)
-- **All Node Types**: 1,500 → 150 1DEV (same price for all, decreases as tokens burned)
+- **All Node Types**: 1,500 → 300 1DEV (same price for all, decreases as tokens burned, min at 80-90%)
 - **Light/Full/Super**: Equal access, price based on burn progress only
 - **Mechanism**: Tokens burned on Solana, permanently removed
+- **At 90% burned**: Transition to Phase 2 (QNC activation)
 
 #### Phase 2 (QNC Token Spending) 
 - **Light**: 2,500-15,000 QNC (base: 5,000, varies by network size)

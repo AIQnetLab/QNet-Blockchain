@@ -133,7 +133,7 @@ curl http://localhost:9877/api/v1/height
 
 **Valid activation codes required:**
 - **Format:** QNET-XXXXXX-XXXXXX-XXXXXX (26 characters)
-- **Phase 1:** 1DEV burn on Solana (1,500 → 150 1DEV pricing)
+- **Phase 1:** 1DEV burn on Solana (1,500 → 300 1DEV minimum pricing)
 - **Phase 2:** QNC transfer to Pool 3 (5k-30k QNC pricing)
 - **Node Types:** Full/Super for servers, Light for mobile only
 

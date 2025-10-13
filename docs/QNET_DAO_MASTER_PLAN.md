@@ -459,7 +459,7 @@ Defense:
 ### **✅ IMMEDIATE (Week 1)**
 - [ ] Deploy DAO contracts with 3-year locks
 - [ ] Set up 1/1 founder multisig (temporary)
-- [ ] Lock Phase 1 economics: 1500-150 $1DEV pricing
+- [ ] Lock Phase 1 economics: 1500-300 $1DEV minimum pricing
 - [ ] Lock Phase 2 economics: QNC pricing & pools
 - [ ] Lock technical core: consensus, reputation, pings
 - [ ] Enable community proposals only

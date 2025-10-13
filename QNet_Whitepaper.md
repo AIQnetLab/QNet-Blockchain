@@ -513,10 +513,9 @@ Dynamic Reduction Formula:
 ├── 50-60% burned: 750 1DEV (-50% discount)
 ├── 60-70% burned: 600 1DEV (-60% discount)
 ├── 70-80% burned: 450 1DEV (-70% discount)
-├── 80-90% burned: 300 1DEV (-80% discount)
-└── 90%+ burned: 150 1DEV (-90% discount)
+└── 80-90% burned: 300 1DEV (-80% discount, minimum Phase 1 price)
 
-Transition Trigger: 90% burned OR 5 years from genesis
+Transition Trigger: 90% burned OR 5 years from genesis → Phase 2 (QNC activation)
 ```
 
 **Phase 2 (QNC Network-Based Pricing):**

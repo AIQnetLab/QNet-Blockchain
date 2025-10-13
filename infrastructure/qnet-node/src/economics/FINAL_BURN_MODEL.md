@@ -7,10 +7,10 @@
 - **Full node**: 1,500 $1DEV  
 - **Super node**: 1,500 $1DEV
 
-### Minimum Prices (at 90% burned)
-- **Light node**: 150 $1DEV
-- **Full node**: 150 $1DEV
-- **Super node**: 150 $1DEV
+### Minimum Prices (at 80-90% burned)
+- **Light node**: 300 $1DEV
+- **Full node**: 300 $1DEV
+- **Super node**: 300 $1DEV
 
 ### QNC Transition Conditions
 - When 90% of $1DEV supply is burned (900 million out of 1 billion)
@@ -21,18 +21,15 @@
 | Burned | % of Supply | Light | Full | Super | Note |
 |--------|-------------|-------|------|-------|------|
 | 0 | 0% | 1,500 | 1,500 | 1,500 | Network launch |
-| 50M | 5% | 1,350 | 1,350 | 1,350 | |
-| 100M | 10% | 1,200 | 1,200 | 1,200 | |
-| 200M | 20% | 950 | 950 | 950 | |
-| 300M | 30% | 750 | 750 | 750 | |
-| 400M | 40% | 600 | 600 | 600 | |
-| 500M | 50% | 500 | 500 | 500 | Halfway point |
-| 600M | 60% | 400 | 400 | 400 | |
-| 700M | 70% | 350 | 350 | 350 | |
-| 800M | 80% | 300 | 300 | 300 | |
-| 850M | 85% | 250 | 250 | 250 | Late stage |
-| 890M | 89% | 200 | 200 | 200 | |
-| 900M | 90% | 150 | 150 | 150 | Transition to QNC |
+| 100M | 10% | 1,350 | 1,350 | 1,350 | |
+| 200M | 20% | 1200 | 1200 | 1200 | |
+| 300M | 30% | 1050 | 1050 | 1050 | |
+| 400M | 40% | 900 | 900 | 900 | |
+| 500M | 50% | 750 | 750 | 750 | Halfway point |
+| 600M | 60% | 600 | 600 | 600 | |
+| 700M | 70% | 450 | 450 | 450 | |
+| 800M | 80% | 300 | 300 | 300 | Minimum Phase 1 price |
+| 900M | 90% | - | - | - | **Transition to Phase 2 (QNC)** |
 
 ## Genesis Whitelist
 
@@ -41,6 +38,7 @@
 2. **Genesis Validator 2** - Secondary (1 free activation)
 3. **Genesis Validator 3** - Backup 1 (1 free activation)
 4. **Genesis Validator 4** - Backup 2 (1 free activation)
+4. **Genesis Validator 5** - Backup 3 (1 free activation)
 
 ### All Other Participants
 - Pay full price according to current burn progress
@@ -53,13 +51,7 @@
 - **No discounts** during transition
 - Simple transition from $1DEV burn to QNC payment when transition occurs
 
-## Economic Incentives
 
-### For Early Participants
-- At 10% burned: save 25-27%
-- At 30% burned: save 55-57%
-- At 50% burned: save 75%
-- At 70% burned: save 80-82%
 
 ### Deflationary Effect
 - Each burn reduces total $1DEV supply

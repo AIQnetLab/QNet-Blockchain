@@ -60,15 +60,15 @@
 
 ```bash
 # Dynamic pricing based on network burn progress (exponential decay curve)
-Light Node:  1,500-150 $1DEV burned (decreases as total network burn % increases)
-Full Node:   1,500-150 $1DEV burned (decreases as total network burn % increases)  
-Super Node:  1,500-150 $1DEV burned (decreases as total network burn % increases)
+Light Node:  1,500-300 $1DEV burned (decreases as total network burn % increases)
+Full Node:   1,500-300 $1DEV burned (decreases as total network burn % increases)  
+Super Node:  1,500-300 $1DEV burned (decreases as total network burn % increases)
 
 # Price reduction mechanism:
 # 0% burned: 1,500 $1DEV per node
 # 50% burned: ~750 $1DEV per node  
-# 90% burned: 150 $1DEV per node (minimum price)
-# Formula: price = 150 + (1350 * (1 - burn_percentage)^2)
+# 80-90% burned: 300 $1DEV per node (minimum Phase 1 price)
+# At 90% burned or 5 years: Transition to Phase 2 (QNC activation)
 ```
 
 #### 2. QNet Blockchain (Native)
@@ -155,9 +155,9 @@ curl http://localhost:8545/api/v1/metrics
 
 | Type | Access Cost | Capabilities | Resources | Performance |
 |------|-------------|--------------|-----------|-------------|
-| **Light** | 1,500-150 $1DEV | Basic validation, mobile-optimized | Minimal | 8,859 TPS mobile |
-| **Full** | 1,500-150 $1DEV | Complete validation, single shard | Moderate | 424,411 TPS blockchain |
-| **Super** | 1,500-150 $1DEV | Priority validation, triple shard | High | 424,411 TPS blockchain |
+| **Light** | 1,500-300 $1DEV | Basic validation, mobile-optimized | Minimal | 8,859 TPS mobile |
+| **Full** | 1,500-300 $1DEV | Complete validation, single shard | Moderate | 424,411 TPS blockchain |
+| **Super** | 1,500-300 $1DEV | Priority validation, triple shard | High | 424,411 TPS blockchain |
 
 ### Performance Metrics
 - ✅ **424,411 TPS** achieved (verified June 2025) ⚡
@@ -229,7 +229,7 @@ Mobile Layer Performance:
 ```javascript
 // Burn $1DEV tokens on Solana for network access
 const burnAmount = calculateBurnAmount(nodeType, totalBurnedPercent);
-// All node types: 1500-150 $1DEV (decreases as network burn progress increases)
+// All node types: 1500-300 $1DEV (decreases as network burn progress increases)
 await burnTokensOnSolana(burnAmount, nodeType);
 ```
 

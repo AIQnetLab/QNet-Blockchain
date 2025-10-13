@@ -17,9 +17,9 @@ const NodeActivation = React.memo(function NodeActivation() {
     // Dynamic pricing data
     const [burnedTokensPhase1, setBurnedTokensPhase1] = useState(0);
     const [currentPricing, setCurrentPricing] = useState({
-        light: [1500, 150],
-        full: [1500, 150],
-        super: [1500, 150]
+        light: [1500, 300],
+        full: [1500, 300],
+        super: [1500, 300]
     });
     
     // Fetch real-time pricing data
@@ -30,9 +30,9 @@ const NodeActivation = React.memo(function NodeActivation() {
                 if (data.dynamicPricing && data.dynamicPricing.enabled) {
                     const currentPrice = data.nodeTypes.light.burnAmount;
                     setCurrentPricing({
-                        light: [currentPrice, 150],
-                        full: [currentPrice, 150],
-                        super: [currentPrice, 150]
+                        light: [currentPrice, 300],
+                        full: [currentPrice, 300],
+                        super: [currentPrice, 300]
                     });
                     
                     if (data.dynamicPricing.burnPercentage !== undefined) {

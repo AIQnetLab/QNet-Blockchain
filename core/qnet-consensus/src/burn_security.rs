@@ -102,14 +102,14 @@ impl NodeType {
     pub fn get_phase1_cost(&self, burn_percentage: f64) -> u64 {
         // REAL QNet economic model: Universal pricing for ALL node types
         let base_cost = 1500u64; // 1500 1DEV for all node types
-        let min_cost = 150u64;   // 150 1DEV minimum at 90% burned
+        let min_cost = 300u64;   // 300 1DEV minimum at 80-90% burned
         
         // Every 10% burned = -150 1DEV reduction
         let reduction_per_10_percent = 150u64;
         let reduction_tiers = (burn_percentage / 10.0).floor() as u64;
         let total_reduction = reduction_tiers * reduction_per_10_percent;
         
-        // Calculate final cost
+        // Calculate final cost (at 90% switches to Phase 2 QNC)
         let final_cost = base_cost.saturating_sub(total_reduction);
         final_cost.max(min_cost)
     }

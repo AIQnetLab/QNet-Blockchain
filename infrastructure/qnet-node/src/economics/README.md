@@ -7,8 +7,8 @@ This module contains the economic models and pricing mechanisms for the QNet blo
 ### 1. 1DEV Burn Model (`1dev_burn_model.py`)
 Implements the dynamic pricing for node activation using 1DEV tokens:
 - Starting prices: 1,500 / 1,500 / 1,500 $1DEV (light/full/super - all same price)
-- Minimum prices: 150 / 150 / 150 $1DEV (all same minimum)
-- Exponential decay curve based on burn progress
+- Minimum prices: 300 / 300 / 300 $1DEV (all same minimum at 80-90%)
+- Linear reduction: -150 1DEV per 10% burned
 - Automatic transition to QNC at 90% burned or 5 years
 
 ### 2. Dynamic Pricing (`dynamic_pricing.py`)

@@ -84,8 +84,9 @@ Activation cost decreases as more supply is burned:
 | 50-60% | 750 1DEV | 50% |
 | 60-70% | 600 1DEV | 60% |
 | 70-80% | 450 1DEV | 70% |
-| 80-90% | 300 1DEV | 80% |
-| 90%+ | 150 1DEV | 90% |
+| 80-90% | 300 1DEV | 80% (min) |
+
+**Note:** At 90% burned or 5 years from genesis, system transitions to Phase 2 (QNC activation)
 
 ## Two-Phase System
 

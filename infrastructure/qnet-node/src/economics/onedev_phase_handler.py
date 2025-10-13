@@ -49,9 +49,9 @@ class OneDEVPhaseHandler:
             "super": 1500
         }
         self.min_prices = {
-            "light": 150,
-            "full": 150,
-            "super": 150
+            "light": 300,
+            "full": 300,
+            "super": 300
         }
         
     def activate_node(

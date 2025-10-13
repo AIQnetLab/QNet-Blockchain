@@ -165,7 +165,7 @@ fn validate_activation_code_node_type(code: &str, expected_type: NodeType, curre
 }
 
 // Note: QNC amounts are now calculated dynamically based on network state
-// Phase 1: 1500 → 150 1DEV (decreases by 150 per 10% burned)
+// Phase 1: 1500 → 300 1DEV min (decreases by 150 per 10% burned, Phase 2 at 90%)
 // Phase 2: Base * multiplier (0.5x to 3.0x based on network size)
 
 // Device type validation functions
@@ -1121,9 +1121,9 @@ fn calculate_node_price(phase: u8, node_type: NodeType, pricing: &PricingInfo) -
             // Phase 1: CORRECT 1DEV pricing mathematics
             // Base price: 1500 1DEV
             // Reduction: 150 1DEV per each COMPLETE 10% burned tokens
-            // Minimum price: 150 1DEV (at 90%+ burned)
+            // Minimum price: 300 1DEV (at 80-90% burned, then Phase 2 transition)
             let base_price = 1500.0;
-            let min_price = 150.0;
+            let min_price = 300.0;
             let reduction_per_tier = 150.0; // 150 1DEV per each 10%
             
             // CORRECT calculation: number of COMPLETE 10% tiers
@@ -3201,13 +3201,13 @@ fn display_node_config(config: &AutoConfig, node_type: &NodeType, region: &Regio
             println!("  ✅ Full node: Suitable for server deployment");
             println!("  🔧 Capability: Full validation + microblock sync");
             println!("  💰 Dynamic pricing: Base 7500 QNC × network multiplier (Phase 2)");
-            println!("  💰 Dynamic pricing: 1500→150 1DEV (Phase 1, universal)");
+            println!("  💰 Dynamic pricing: 1500→300 1DEV min (Phase 1, universal)");
         },
         NodeType::Super => {
             println!("  ✅ Super node: Optimized for server deployment");
             println!("  🔧 Capability: Validation + production + maximum rewards");
             println!("  💰 Dynamic pricing: Base 10000 QNC × network multiplier (Phase 2)");
-            println!("  💰 Dynamic pricing: 1500→150 1DEV (Phase 1, universal)");
+            println!("  💰 Dynamic pricing: 1500→300 1DEV min (Phase 1, universal)");
         },
     }
     

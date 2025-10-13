@@ -167,7 +167,7 @@ def calculate_burn_price(total_burned_percent):
     base_price = 1500
     reduction = total_burned_percent * 0.1  # 10% per 10% burned
     current_price = base_price * (1.0 - reduction)
-    return max(current_price, 150)  # Minimum 150 1DEV
+    return max(current_price, 300)  # Minimum 300 1DEV at 80-90%
 
 # Test different burn percentages
 test_cases = [0, 10, 20, 30, 50, 70, 90]
@@ -184,7 +184,8 @@ Burned: 20% | Price: 1200 1DEV
 Burned: 30% | Price: 1050 1DEV
 Burned: 50% | Price: 750 1DEV
 Burned: 70% | Price: 450 1DEV
-Burned: 90% | Price: 150 1DEV
+Burned: 80% | Price: 300 1DEV (minimum Phase 1)
+Burned: 90% | Transition to Phase 2 (QNC)
 ```
 
 ## 🔐 Security Considerations

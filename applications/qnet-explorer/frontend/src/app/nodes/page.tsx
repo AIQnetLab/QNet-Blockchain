@@ -29,9 +29,9 @@ export default function NodesPage() {
         if (data.dynamicPricing && data.dynamicPricing.enabled) {
           const currentPrice = data.nodeTypes.light.burnAmount;
           setCurrentPricing({
-            light: [currentPrice, 150],
-            full: [currentPrice, 150],
-            super: [currentPrice, 150]
+            light: [currentPrice, 300],
+            full: [currentPrice, 300],
+            super: [currentPrice, 300]
           });
           
           if (data.dynamicPricing.burnPercentage !== undefined) {
