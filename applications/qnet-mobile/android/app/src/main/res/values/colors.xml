@@ -5,4 +5,6 @@
     <!-- QNet brand color -->
     <color name="qnet_blue">#00d4ff</color>
     <color name="primary">#00d4ff</color>
+    <!-- Icon background - Dark background like original icon -->
+    <color name="ic_launcher_background">#1a1a2e</color>
 </resources>
