@@ -943,35 +943,23 @@ function setupEventListeners() {
         e.preventDefault();
         showTermsModal();
     });
-    document.getElementById('terms-checkbox-import')?.addEventListener('change', validateImportForm);
-    document.getElementById('terms-link-import')?.addEventListener('click', (e) => {
-        e.preventDefault();
-        showTermsModal();
-    });
+    // Terms checkbox removed from import screen - user already accepts on password screen
     
     // Terms Modal
     document.getElementById('close-terms-modal')?.addEventListener('click', hideTermsModal);
     document.getElementById('decline-terms')?.addEventListener('click', () => {
         hideTermsModal();
-        // Uncheck the checkbox when declining
-        const checkbox = document.getElementById(setupState.walletType === 'import' ? 'terms-checkbox-import' : 'terms-checkbox');
+        // Uncheck the checkbox when declining - only for create wallet (password screen)
+        const checkbox = document.getElementById('terms-checkbox');
         if (checkbox) checkbox.checked = false;
-        if (setupState.walletType === 'import') {
-            validateImportForm();
-        } else {
-            validatePasswordRealtime();
-        }
+        validatePasswordRealtime();
     });
     document.getElementById('accept-terms')?.addEventListener('click', () => {
         hideTermsModal();
-        // Check the checkbox when accepting
-        const checkbox = document.getElementById(setupState.walletType === 'import' ? 'terms-checkbox-import' : 'terms-checkbox');
+        // Check the checkbox when accepting - only for create wallet (password screen)
+        const checkbox = document.getElementById('terms-checkbox');
         if (checkbox) checkbox.checked = true;
-        if (setupState.walletType === 'import') {
-            validateImportForm();
-        } else {
-            validatePasswordRealtime();
-        }
+        validatePasswordRealtime();
     });
     
     // Seed display step
@@ -1380,7 +1368,6 @@ async function validateImportRealtime() {
     const wordCountCheck = document.querySelector('#word-count-check');
     const wordsValidCheck = document.querySelector('#words-valid-check');
     const importBtn = document.querySelector('#step-seed-import .primary-button');
-    const termsCheckbox = document.getElementById('terms-checkbox-import');
     
     if (!seedPhrase) {
         // Reset validation states
@@ -1452,10 +1439,10 @@ async function validateImportRealtime() {
         }
     }
     
-    // Enable/disable import button - only enable if checksum is valid AND terms accepted
-    const termsAccepted = termsCheckbox ? termsCheckbox.checked : false;
+    // Enable/disable import button - only enable if checksum is valid
+    // Terms are already accepted on the password screen
     if (importBtn) {
-        importBtn.disabled = !(isValidCount && allWordsValid && checksumValid && termsAccepted);
+        importBtn.disabled = !(isValidCount && allWordsValid && checksumValid);
     }
 }
 

@@ -189,8 +189,13 @@
   "settings": {
     "general": "General",
     "language": "Language",
+    "language_subtitle": "Wallet interface language",
     "currency": "Currency",
     "theme": "Theme",
+    "network": "Network Environment",
+    "network_subtitle": "Switch between testnet and mainnet",
+    "autolock": "Auto-Lock Timer",
+    "autolock_subtitle": "Automatically lock wallet after inactivity",
     "notifications": "Notifications",
     "privacy": "Privacy",
     "advanced": "Advanced",

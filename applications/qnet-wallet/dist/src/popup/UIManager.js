@@ -413,8 +413,30 @@ export class UIManager {
      * Update UI texts based on current language
      */
     updateUITexts() {
-        // This would update all UI texts based on current language
-        // Implementation depends on i18n structure
+        // Update all elements with data-i18n attribute
+        document.querySelectorAll('[data-i18n]').forEach(element => {
+            const key = element.getAttribute('data-i18n');
+            const translation = this.getTranslation(key);
+            if (translation) {
+                element.textContent = translation;
+            }
+        });
+    }
+    
+    /**
+     * Get translation for a key
+     */
+    getTranslation(key) {
+        // Simple implementation - should be connected to i18n system
+        const translations = {
+            'settings.network': 'Network Environment',
+            'settings.network_subtitle': 'Switch between testnet and mainnet',
+            'settings.autolock': 'Auto-Lock Timer',
+            'settings.autolock_subtitle': 'Automatically lock wallet after inactivity',
+            'settings.language': 'Language',
+            'settings.language_subtitle': 'Wallet interface language'
+        };
+        return translations[key] || key;
     }
     
     /**

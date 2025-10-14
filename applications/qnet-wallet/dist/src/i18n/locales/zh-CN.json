@@ -173,6 +173,27 @@
     "support": "支持",
     "documentation": "文档"
   },
+  "settings": {
+    "general": "常规",
+    "language": "语言",
+    "language_subtitle": "钱包界面语言",
+    "currency": "货币",
+    "theme": "主题",
+    "network": "网络环境",
+    "network_subtitle": "在测试网和主网之间切换",
+    "autolock": "自动锁定计时器",
+    "autolock_subtitle": "闲置后自动锁定钱包",
+    "notifications": "通知",
+    "privacy": "隐私",
+    "advanced": "高级",
+    "developer": "开发者模式",
+    "resetWallet": "重置钱包",
+    "exportLogs": "导出日志",
+    "about": "关于",
+    "version": "版本",
+    "support": "支持",
+    "documentation": "文档"
+  },
   "errors": {
     "networkError": "网络错误",
     "connectionFailed": "连接失败",
