@@ -114,7 +114,7 @@ const WalletConnectButton = () => {
   };
 
   const installQNetWallet = () => {
-    window.open('https://chrome.google.com/webstore/detail/qnet-wallet', '_blank');
+    window.open('https://chromewebstore.google.com/detail/qnet-wallet/pahnggomgmhhjjncgfnmmofmplfhkncg?hl=en-US&utm_source=ext_sidebar', '_blank');
   };
 
   const formatAddress = (address: string) => {

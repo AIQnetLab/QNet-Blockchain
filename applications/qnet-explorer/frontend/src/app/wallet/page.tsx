@@ -632,7 +632,7 @@ export default function WalletPage() {
                     fontSize: '16px',
                     width: '100%'
                   }}
-                  onClick={() => window.open('https://chromewebstore.google.com/detail/qnet-wallet/pahnggomgmhhjjncgfnmmofmplfhkncg', '_blank')}
+                  onClick={() => window.open('https://chromewebstore.google.com/detail/qnet-wallet/pahnggomgmhhjjncgfnmmofmplfhkncg?hl=en-US&utm_source=ext_sidebar', '_blank')}
                 >
                   Install from Chrome Web Store
                 </button>
