@@ -1,0 +1,129 @@
+QNET WALLET PRIVACY POLICY
+
+Last Updated: October 14, 2025
+
+====================
+1. INTRODUCTION
+====================
+
+QNet Wallet ("we", "our", "the app") is committed to protecting your privacy. This Privacy Policy explains how we collect, use, and safeguard your information when you use our cryptocurrency wallet application.
+
+====================
+2. INFORMATION WE COLLECT
+====================
+
+LOCAL DATA ONLY:
+• Wallet Information: Private keys, seed phrases, and wallet addresses are generated and stored locally on your device only
+• Node Configuration: Activation codes and node settings stored locally
+• User Preferences: Language settings, display preferences stored locally
+
+NETWORK INTERACTION DATA:
+• Node Status: Your node's participation status is recorded on the public blockchain
+• Transaction History: Blockchain transactions are publicly visible by design
+• Network Metrics: Node uptime and performance data for reward calculation
+
+====================
+3. HOW WE USE INFORMATION
+====================
+
+We use information solely for app functionality:
+• Managing your cryptocurrency wallet
+• Activating and monitoring your node
+• Calculating and distributing network rewards
+• Providing app features and improvements
+
+====================
+4. DATA STORAGE & SECURITY
+====================
+
+• All sensitive data (private keys, seed phrases) is stored locally on your device
+• We use industry-standard encryption (AES-256) for local storage
+• We do NOT have servers that store your private information
+• You are responsible for backing up your seed phrase
+
+====================
+5. DATA SHARING
+====================
+
+We DO NOT:
+• Sell your personal information
+• Share your private keys or seed phrases
+• Track your personal usage patterns
+• Collect analytics without consent
+
+Public Blockchain Data:
+• Node addresses and transactions are visible on the public blockchain
+• This is inherent to blockchain technology and ensures transparency
+
+====================
+6. THIRD-PARTY SERVICES
+====================
+
+The app interacts with:
+• QNet Blockchain Network (for node operations)
+• Solana Blockchain (for activation during Phase 1)
+• No analytics or advertising services are used
+
+====================
+7. YOUR RIGHTS
+====================
+
+You have the right to:
+• Export your wallet seed phrase at any time
+• Delete all app data by uninstalling the application
+• Control what information is shared on the blockchain
+• Operate your node pseudonymously
+
+====================
+8. CHILDREN'S PRIVACY
+====================
+
+Our app is not intended for users under 18 years of age. We do not knowingly collect information from children.
+
+====================
+9. DATA BREACH
+====================
+
+Since we don't store your private data on our servers, a breach of our systems cannot compromise your wallet. However, if your device is compromised, your wallet may be at risk. Always keep your seed phrase backed up securely offline.
+
+====================
+10. CHANGES TO THIS POLICY
+====================
+
+We may update this Privacy Policy from time to time. Changes will be posted within the app with the updated date.
+
+====================
+11. CONTACT US
+====================
+
+For privacy-related questions:
+Twitter: https://x.com/AIQnetLab
+Website: https://aiqnet.io
+
+====================
+12. COMPLIANCE
+====================
+
+This privacy policy complies with:
+• GDPR (General Data Protection Regulation)
+• CCPA (California Consumer Privacy Act)
+• Google Play Store requirements
+
+====================
+SIMPLIFIED VERSION FOR PLAY STORE
+====================
+
+QNet Wallet - Privacy Policy
+
+We respect your privacy:
+
+• Your private keys and seed phrases are stored only on your device
+• We don't collect personal information
+• We don't have access to your funds
+• We don't use analytics or tracking
+• We don't share or sell your data
+
+The app interacts with public blockchains where transactions are transparent by design.
+
+For full privacy policy visit: https://aiqnet.io
+Contact: https://x.com/AIQnetLab

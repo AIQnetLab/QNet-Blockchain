@@ -1,0 +1,95 @@
+GOOGLE PLAY STORE LISTING
+
+====================
+APP TITLE (30 chars max)
+====================
+QNet Wallet
+
+====================
+SHORT DESCRIPTION (80 chars max)  
+====================
+Secure quantum-resistant crypto wallet with node activation and staking rewards
+
+====================
+FULL DESCRIPTION (4000 chars max)
+====================
+QNet Wallet - Quantum-Resistant Cryptocurrency Wallet
+
+QNet Wallet is a secure, non-custodial cryptocurrency wallet designed for the quantum-resistant QNet blockchain. Store, send, and receive digital assets with military-grade encryption while earning staking rewards through network participation.
+
+KEY FEATURES:
+
+• Secure Cryptocurrency Wallet
+Non-custodial wallet with full control of your private keys. Generate and restore wallets using industry-standard BIP39 seed phrases. Your keys never leave your device.
+
+• Send & Receive Crypto
+Instantly send and receive QNet tokens and other supported cryptocurrencies. QR code scanning for easy transactions. Full transaction history and balance tracking.
+
+• Network Participation (Staking)
+Participate in network validation through Proof of Participation (PoP) consensus mechanism. Activate a light node to support network security and receive participation rewards. NOT cryptocurrency mining - only lightweight periodic status checks every 4 hours.
+
+• Quantum-Resistant Security
+Built with future-proof cryptography using CRYSTALS-Kyber and CRYSTALS-Dilithium algorithms to protect against quantum computing threats.
+
+• Multi-Language Support
+Available in English, Chinese, Russian, Spanish, French, German, Japanese, Korean, and more.
+
+TECHNICAL HIGHLIGHTS:
+
+• Quantum-Resistant Security
+Implements CRYSTALS-Kyber and CRYSTALS-Dilithium algorithms for future-proof security against quantum computing threats.
+
+• Energy Efficient
+Optimized for mobile devices with minimal battery usage. Optional node activation enables staking without mining or intensive computations.
+
+• Decentralized & Non-Custodial
+You control your private keys. Direct blockchain interaction without intermediaries. Open-source and transparent.
+
+• Cross-Platform Compatibility
+Seamlessly sync with QNet Wallet browser extension. Import and export wallets between devices using seed phrases.
+
+HOW IT WORKS:
+
+1. Create a new wallet or import existing one
+2. Secure your seed phrase backup
+3. Send, receive, and manage your crypto assets
+4. Optional: Activate a node for staking rewards
+
+QNet Wallet provides all the functionality of a modern cryptocurrency wallet with additional features for network participation. Similar to popular wallets like MetaMask or Trust Wallet, but with quantum-resistant security.
+
+IMPORTANT NOTES:
+
+• Your private keys are never shared or stored on our servers
+• Optional node activation for network participation (Proof of Participation consensus)
+• NOT cryptocurrency mining - lightweight network validation only
+• Requires maintaining active node status - device must respond to periodic network checks
+• Compatible with blockchain standards
+
+ABOUT NETWORK PARTICIPATION:
+This app implements Proof of Participation (PoP) - a lightweight consensus mechanism for blockchain validation. Your device must respond to periodic network status checks (every 4 hours) to maintain node eligibility. Minimal battery usage (<0.01% daily). This is NOT mining and does not involve intensive computations. Participation rewards are distributed to active nodes that successfully maintain network connectivity.
+
+Join users securing their digital assets with quantum-resistant technology.
+
+For support and documentation, visit: https://aiqnet.io
+
+====================
+CATEGORY
+====================
+Finance
+
+====================
+CONTENT RATING
+====================
+Everyone
+
+====================
+TAGS (for better discovery)
+====================
+crypto wallet, cryptocurrency wallet, bitcoin wallet, ethereum wallet, blockchain wallet, defi wallet, web3 wallet, non custodial wallet, secure wallet, quantum resistant
+
+EMPHASIZE:
+- Cryptocurrency wallet (primary function)
+- Non-custodial and secure
+- Optional staking features (not mining)
+- Similar to MetaMask, Trust Wallet
+- Quantum-resistant security
