@@ -59,29 +59,35 @@ class GenesisWhitelist:
     
     def _create_default_whitelist(self):
         """Create default whitelist for genesis"""
-        # Genesis validators - 4 nodes for redundancy
+        # Genesis validators - 5 bootstrap nodes with new BIP44/SLIP-0010 addresses
         genesis_validators = [
             {
-                "address": "GENESIS_VALIDATOR_1_ADDRESS",
-                "description": "Genesis Validator Node 1 - Primary",
+                "address": "b07408bdc5688b92d69eonfd060d05f246f659414",
+                "description": "Genesis Bootstrap Node 1 - Primary",
                 "free_activations": 1,
                 "priority_access": True
             },
             {
-                "address": "GENESIS_VALIDATOR_2_ADDRESS", 
-                "description": "Genesis Validator Node 2 - Secondary",
+                "address": "d0da31d839ce7ef8ca8eon3f37c6b1f2150e301fc", 
+                "description": "Genesis Bootstrap Node 2 - Secondary",
                 "free_activations": 1,
                 "priority_access": True
             },
             {
-                "address": "GENESIS_VALIDATOR_3_ADDRESS",
-                "description": "Genesis Validator Node 3 - Backup 1", 
+                "address": "a3d62ef91e60d66d2a2eon2caa0d87cb2a1976f31",
+                "description": "Genesis Bootstrap Node 3 - Tertiary", 
                 "free_activations": 1,
                 "priority_access": True
             },
             {
-                "address": "GENESIS_VALIDATOR_4_ADDRESS",
-                "description": "Genesis Validator Node 4 - Backup 2", 
+                "address": "29e11b0a9cc89296490eoncca66139e40d72bd25d",
+                "description": "Genesis Bootstrap Node 4 - Quaternary", 
+                "free_activations": 1,
+                "priority_access": True
+            },
+            {
+                "address": "f8c4ed54ad92b0a94f1eonad6cc5623af63b79826",
+                "description": "Genesis Bootstrap Node 5 - Quinary",
                 "free_activations": 1,
                 "priority_access": True
             }

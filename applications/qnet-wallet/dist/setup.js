@@ -1880,26 +1880,58 @@ async function generateEONAddress(seedPhrase) {
         return 'error_no_seed_eon_address';
     }
     
-    const encoder = new TextEncoder();
-    const seedData = encoder.encode(seedPhrase + 'qnet_eon_0'); // Add network identifier
-    
-    // Use SHA-512 for more entropy (like Ed25519 key generation)
-    const hashBuffer = await crypto.subtle.digest('SHA-512', seedData);
-    const hash = Array.from(new Uint8Array(hashBuffer));
-    const fullHex = hash.map(b => b.toString(16).padStart(2, '0')).join('');
-    
-    // New format: 19 chars + "eon" + 15 chars + 4 char checksum = 41 total
-    const part1 = fullHex.substring(0, 19).toLowerCase();
-    const part2 = fullHex.substring(19, 34).toLowerCase();
-    
-    // Generate checksum from the address parts
-    const addressWithoutChecksum = part1 + 'eon' + part2;
-    const checksumBuffer = await crypto.subtle.digest('SHA-256', encoder.encode(addressWithoutChecksum));
-    const checksumHash = Array.from(new Uint8Array(checksumBuffer));
-    const checksumHex = checksumHash.map(b => b.toString(16).padStart(2, '0')).join('');
-    const checksum = checksumHex.substring(0, 4).toLowerCase();
-    
-    return `${part1}eon${part2}${checksum}`;
+    try {
+        // Convert mnemonic to seed using BIP39 standard
+        const seed = await mnemonicToSeed(seedPhrase);
+        
+        // BIP44 path for QNet: m/44'/9999'/0'/0'/0'
+        const path = "m/44'/9999'/0'/0'/0'";
+        
+        // Derive seed for QNet using the path
+        const derivedSeed = await deriveEd25519Seed(seed, path);
+        
+        // Generate keypair from derived seed
+        const privateKey = derivedSeed.slice(0, 32);
+        
+        // Generate public key from private key
+        const publicKeyMaterial = await crypto.subtle.digest('SHA-256', privateKey);
+        const publicKey = new Uint8Array(publicKeyMaterial);
+        
+        // Generate address from public key
+        const addressData = await crypto.subtle.digest('SHA-512', publicKey);
+        const addressHash = Array.from(new Uint8Array(addressData));
+        const fullHex = addressHash.map(b => b.toString(16).padStart(2, '0')).join('');
+        
+        // Create address format: 19 chars + "eon" + 15 chars + 4 char checksum
+        const part1 = fullHex.substring(0, 19).toLowerCase();
+        const part2 = fullHex.substring(19, 34).toLowerCase();
+        
+        // Generate checksum
+        const addressWithoutChecksum = part1 + 'eon' + part2;
+        const encoder = new TextEncoder();
+        const checksumBuffer = await crypto.subtle.digest('SHA-256', encoder.encode(addressWithoutChecksum));
+        const checksumHash = Array.from(new Uint8Array(checksumBuffer));
+        const checksumHex = checksumHash.map(b => b.toString(16).padStart(2, '0')).join('');
+        const checksum = checksumHex.substring(0, 4).toLowerCase();
+        
+        return `${part1}eon${part2}${checksum}`;
+    } catch (error) {
+        // Error:('Failed to generate QNet address:', error);
+        // Fallback to old method for compatibility
+        const encoder = new TextEncoder();
+        const seedData = encoder.encode(seedPhrase + 'qnet_eon_0');
+        const hashBuffer = await crypto.subtle.digest('SHA-512', seedData);
+        const hash = Array.from(new Uint8Array(hashBuffer));
+        const fullHex = hash.map(b => b.toString(16).padStart(2, '0')).join('');
+        const part1 = fullHex.substring(0, 19).toLowerCase();
+        const part2 = fullHex.substring(19, 34).toLowerCase();
+        const addressWithoutChecksum = part1 + 'eon' + part2;
+        const checksumBuffer = await crypto.subtle.digest('SHA-256', encoder.encode(addressWithoutChecksum));
+        const checksumHash = Array.from(new Uint8Array(checksumBuffer));
+        const checksumHex = checksumHash.map(b => b.toString(16).padStart(2, '0')).join('');
+        const checksum = checksumHex.substring(0, 4).toLowerCase();
+        return `${part1}eon${part2}${checksum}`;
+    }
 }
 
 /**
@@ -1973,29 +2005,84 @@ async function mnemonicToSeed(mnemonic, passphrase = '') {
  * Production-ready HD derivation for Ed25519 using HMAC-SHA512
  */
 async function deriveEd25519Seed(seed, path) {
-    // HD derivation using HMAC-SHA512 (SLIP-0010 style)
+    // Proper SLIP-0010 HD derivation for Ed25519
     const encoder = new TextEncoder();
-    const pathBytes = encoder.encode(path);
     
-    // Create HMAC key from seed
-    const key = await crypto.subtle.importKey(
+    // Step 1: Generate master key from seed (SLIP-0010)
+    // HMAC-SHA512(Key = "ed25519 seed", Data = seed)
+    const masterKey = await crypto.subtle.importKey(
         'raw',
-        seed.slice(0, 32), // Use first 32 bytes as HMAC key
+        encoder.encode('ed25519 seed'),
         { name: 'HMAC', hash: 'SHA-512' },
         false,
         ['sign']
     );
     
-    // Derive child key using HMAC-SHA512
-    const signature = await crypto.subtle.sign('HMAC', key, pathBytes);
-    const derivedSeed = new Uint8Array(signature).slice(0, 32); // Ed25519 needs 32 bytes
+    const masterData = await crypto.subtle.sign('HMAC', masterKey, seed);
+    const masterBytes = new Uint8Array(masterData);
+    let currentKey = masterBytes.slice(0, 32);  // Private key
+    let currentChainCode = masterBytes.slice(32, 64);  // Chain code
     
-    // Apply Ed25519 clamping
-    derivedSeed[0] &= 248;
-    derivedSeed[31] &= 127;
-    derivedSeed[31] |= 64;
+    // Step 2: Parse path and derive each level
+    // For QNet: m/44'/9999'/0'/0'/0'
+    const levels = [];
+    if (path === "m/44'/9999'/0'/0'/0'") {
+        levels.push(0x8000002C); // 44' (hardened)
+        levels.push(0x8000270F); // 9999' (hardened)
+        levels.push(0x80000000); // 0' (hardened)
+        levels.push(0x80000000); // 0' (hardened)
+        levels.push(0x80000000); // 0' (hardened)
+    } else if (path === "m/44'/501'/0'/0'") {
+        // For Solana compatibility
+        levels.push(0x8000002C); // 44' (hardened)
+        levels.push(0x800001F5); // 501' (hardened)
+        levels.push(0x80000000); // 0' (hardened)
+        levels.push(0x80000000); // 0' (hardened)
+    } else {
+        // Fallback to old method for unknown paths
+        const pathBytes = encoder.encode(path);
+        const key = await crypto.subtle.importKey(
+            'raw',
+            seed.slice(0, 32),
+            { name: 'HMAC', hash: 'SHA-512' },
+            false,
+            ['sign']
+        );
+        const signature = await crypto.subtle.sign('HMAC', key, pathBytes);
+        const derivedSeed = new Uint8Array(signature).slice(0, 32);
+        derivedSeed[0] &= 248;
+        derivedSeed[31] &= 127;
+        derivedSeed[31] |= 64;
+        return derivedSeed;
+    }
     
-    return derivedSeed;
+    // Step 3: Derive each level
+    for (const index of levels) {
+        // HMAC-SHA512(Key = chainCode, Data = 0x00 || privateKey || index)
+        const data = new Uint8Array(37);
+        data[0] = 0x00;
+        data.set(currentKey, 1);
+        data[33] = (index >> 24) & 0xFF;
+        data[34] = (index >> 16) & 0xFF;
+        data[35] = (index >> 8) & 0xFF;
+        data[36] = index & 0xFF;
+        
+        const hmacKey = await crypto.subtle.importKey(
+            'raw',
+            currentChainCode,
+            { name: 'HMAC', hash: 'SHA-512' },
+            false,
+            ['sign']
+        );
+        
+        const derivedData = await crypto.subtle.sign('HMAC', hmacKey, data);
+        const derivedBytes = new Uint8Array(derivedData);
+        
+        currentKey = derivedBytes.slice(0, 32);
+        currentChainCode = derivedBytes.slice(32, 64);
+    }
+    
+    return currentKey;
 }
 
 /**

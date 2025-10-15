@@ -33,12 +33,13 @@ class OneDEVPhaseHandler:
         self.activated_nodes: Dict[str, OneDEVNodeActivation] = {}
         self.used_burn_txs = set()  # Prevent reuse of burn transactions
         
-        # Genesis whitelist
+        # Genesis whitelist - Bootstrap nodes with new BIP44/SLIP-0010 addresses
         self.genesis_whitelist = {
-            "QNetGenesis1xxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
-            "QNetGenesis2xxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
-            "QNetGenesis3xxxxxxxxxxxxxxxxxxxxxxxxxxxxx", 
-            "QNetGenesis4xxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            "b07408bdc5688b92d69eonfd060d05f246f659414",  # Bootstrap Node 1
+            "d0da31d839ce7ef8ca8eon3f37c6b1f2150e301fc",  # Bootstrap Node 2
+            "a3d62ef91e60d66d2a2eon2caa0d87cb2a1976f31",  # Bootstrap Node 3
+            "29e11b0a9cc89296490eoncca66139e40d72bd25d",  # Bootstrap Node 4
+            "f8c4ed54ad92b0a94f1eonad6cc5623af63b79826"   # Bootstrap Node 5
         }
         self.genesis_claimed = set()
         

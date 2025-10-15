@@ -2063,24 +2063,17 @@ export class WalletManager {
     ];
   }
 
-  // Generate QNet address from mnemonic directly (for extension compatibility)
+  // Generate QNet address from mnemonic (extension-compatible)
   async generateQNetAddressFromMnemonic(mnemonic, accountIndex = 0) {
     try {
-      // Use same method as extension - SHA-512 hash of mnemonic + account
-      const data = mnemonic + `qnet_eon_${accountIndex}`;
-      const hash = CryptoJS.SHA512(data);
-      const fullHash = hash.toString(CryptoJS.enc.Hex);
+      // Convert mnemonic to seed using BIP39 standard
+      const seed = bip39.mnemonicToSeedSync(mnemonic);
       
-      // New format: 19 chars + "eon" + 15 chars + 4 char checksum = 41 total
-      const part1 = fullHash.substring(0, 19).toLowerCase();
-      const part2 = fullHash.substring(19, 34).toLowerCase();
+      // Generate QNet address using BIP44 derivation
+      const result = await this.generateQNetAddress(seed, accountIndex);
       
-      // Generate checksum
-      const addressWithoutChecksum = part1 + 'eon' + part2;
-      const checksumData = CryptoJS.SHA256(addressWithoutChecksum);
-      const checksum = checksumData.toString(CryptoJS.enc.Hex).substring(0, 4).toLowerCase();
-      
-      return `${part1}eon${part2}${checksum}`;
+      // Return just the address for backward compatibility
+      return result.address;
     } catch (error) {
       // console.error('Error generating QNet address:', error);
       throw error;
@@ -2091,7 +2084,7 @@ export class WalletManager {
   generateQNetAddressFromSolana(solanaAddress) {
     try {
       // Generate deterministic QNet address from Solana address
-      const hash = CryptoJS.SHA512(solanaAddress + 'qnet_eon_bridge');
+      const hash = CryptoJS.SHA512(solanaAddress + 'qnet-eon-bridge'); // Use hyphen for consistency
       const fullHash = hash.toString(CryptoJS.enc.Hex);
       
       // New long format: 19 chars + "eon" + 15 chars + 4 char checksum = 41 total
@@ -2110,65 +2103,141 @@ export class WalletManager {
     }
   }
   
-  // Migrate old short QNet address to new long format
+  // Migrate old QNet address to new BIP44-based format
   async migrateQNetAddress(wallet) {
     try {
-      // Check if wallet has QNet address
-      if (!wallet.qnetAddress) {
-        // Generate new address from Solana address
-        wallet.qnetAddress = this.generateQNetAddressFromSolana(wallet.solanaAddress || wallet.address);
+      // MIGRATE ALL wallets to proper BIP44 addresses
+      if (wallet.mnemonic) {
+        const seed = bip39.mnemonicToSeedSync(wallet.mnemonic);
+        const result = await this.generateQNetAddress(seed, 0);
+        
+        // Store old address for logging
+        const oldAddress = wallet.qnetAddress;
+        
+        // UPDATE to new BIP44 address (breaking change but necessary)
+        wallet.qnetAddress = result.address;
+        wallet.qnetKeypair = {
+          publicKey: Array.from(result.keypair.publicKey),
+          privateKey: Array.from(result.keypair.privateKey),
+          path: result.keypair.path
+        };
+        
+        //if (oldAddress && oldAddress !== result.address) {
+          //console.log('[MIGRATION] QNet address updated:', oldAddress, '->', result.address);
+       // } else {
+         // console.log('[Migration] Generated BIP44 QNet address:', result.address);
+       // }
+        
         return wallet;
       }
       
-      // Check if it's old format (short - less than 40 chars)
-      if (wallet.qnetAddress.length < 40) {
-        // Migrate old short QNet address to new long format
-        
-        // Generate new long format address
-        if (wallet.mnemonic) {
-          // If we have mnemonic, generate from it for consistency
-          wallet.qnetAddress = await this.generateQNetAddressFromMnemonic(wallet.mnemonic, 0);
-        } else {
-          // Otherwise generate from Solana address
-          wallet.qnetAddress = this.generateQNetAddressFromSolana(wallet.solanaAddress || wallet.address);
-        }
+      // No mnemonic - check if we need to generate address
+      if (!wallet.qnetAddress) {
+        // Generate from Solana as fallback
+        wallet.qnetAddress = this.generateQNetAddressFromSolana(wallet.solanaAddress || wallet.address);
       }
       
       return wallet;
     } catch (error) {
       // console.error('Error migrating QNet address:', error);
+      // Fallback to Solana-based generation
+      if (!wallet.qnetAddress) {
+        wallet.qnetAddress = this.generateQNetAddressFromSolana(wallet.solanaAddress || wallet.address);
+      }
       return wallet;
     }
   }
 
+  // Generate QNet keypair using BIP44 standard with proper SLIP-0010
+  async generateQNetKeypair(seed, accountIndex = 0) {
+    try {
+      // BIP44 path for QNet: m/44'/9999'/accountIndex'/0'/0'
+      // Using SLIP-0010 standard (same as browser extension)
+      
+      // Step 1: Generate master key from seed
+      // HMAC-SHA512(Key = "ed25519 seed", Data = seed)
+      const masterKey = CryptoJS.HmacSHA512(
+        CryptoJS.lib.WordArray.create(seed),
+        "ed25519 seed"
+      );
+      const masterBytes = Buffer.from(masterKey.toString(CryptoJS.enc.Hex), 'hex');
+      let currentKey = masterBytes.slice(0, 32);  // Private key
+      let currentChainCode = masterBytes.slice(32, 64);  // Chain code
+      
+      // Step 2: Derive path m/44'/9999'/accountIndex'/0'/0'
+      const levels = [
+        0x8000002C, // 44' (hardened)
+        0x8000270F, // 9999' (hardened) - 0x270F = 9999
+        0x80000000 + accountIndex, // accountIndex' (hardened)
+        0x80000000, // 0' (hardened change)
+        0x80000000  // 0' (hardened address index)
+      ];
+      
+      // Step 3: Derive each level
+      for (const index of levels) {
+        // HMAC-SHA512(Key = chainCode, Data = 0x00 || privateKey || index)
+        const data = Buffer.allocUnsafe(37);
+        data[0] = 0x00;
+        currentKey.copy(data, 1);
+        data[33] = (index >> 24) & 0xFF;
+        data[34] = (index >> 16) & 0xFF;
+        data[35] = (index >> 8) & 0xFF;
+        data[36] = index & 0xFF;
+        
+        const derivedData = CryptoJS.HmacSHA512(
+          CryptoJS.lib.WordArray.create(data),
+          CryptoJS.lib.WordArray.create(currentChainCode)
+        );
+        const derivedBytes = Buffer.from(derivedData.toString(CryptoJS.enc.Hex), 'hex');
+        
+        currentKey = derivedBytes.slice(0, 32);
+        currentChainCode = derivedBytes.slice(32, 64);
+      }
+      
+      // Step 4: Generate public key from private key
+      // Using SHA-256 as fallback (same as browser extension fallback)
+      const publicKeyHash = CryptoJS.SHA256(CryptoJS.lib.WordArray.create(currentKey));
+      const publicKey = Buffer.from(publicKeyHash.toString(CryptoJS.enc.Hex), 'hex');
+      
+      return {
+        privateKey: currentKey,
+        publicKey: publicKey,
+        path: `m/44'/9999'/${accountIndex}'/0'/0'`,
+        chainCode: currentChainCode
+      };
+    } catch (error) {
+      // console.error('Error generating QNet keypair:', error);
+      throw new Error('Failed to generate QNet keypair');
+    }
+  }
+  
   // Generate QNet EON address (compatible with extension wallet)
   async generateQNetAddress(seed, accountIndex = 0) {
     try {
-      // Use same cryptographic approach as extension for consistency
-      // Derive from seed + account index using SHA-512 for maximum entropy
-      const accountData = `qnet-eon-${accountIndex}`;
+      // Generate keypair first using BIP44
+      const keypair = await this.generateQNetKeypair(seed, accountIndex);
       
-      // Combine seed and account data (same as extension)
-      const combinedData = new Uint8Array(seed.length + accountData.length);
-      combinedData.set(new Uint8Array(seed));
-      const encoder = new TextEncoder();
-      combinedData.set(encoder.encode(accountData), seed.length);
+      // Generate address from public key
+      const publicKeyWordArray = CryptoJS.lib.WordArray.create(keypair.publicKey);
+      const addressHash = CryptoJS.SHA512(publicKeyWordArray);
+      const fullHash = addressHash.toString(CryptoJS.enc.Hex);
       
-      // Use SHA-512 for more entropy (same as extension)
-      const hash = CryptoJS.SHA512(CryptoJS.lib.WordArray.create(combinedData));
-      const fullHash = hash.toString(CryptoJS.enc.Hex);
-      
-      // Create deterministic address from hash
-      // New format: 19 chars + "eon" + 15 chars + 4 char checksum = 41 total
+      // Create address format: 19 chars + "eon" + 15 chars + 4 char checksum
       const part1 = fullHash.substring(0, 19).toLowerCase();
       const part2 = fullHash.substring(19, 34).toLowerCase();
       
-      // Generate checksum from the address parts
+      // Generate checksum
       const addressWithoutChecksum = part1 + 'eon' + part2;
       const checksumData = CryptoJS.SHA256(addressWithoutChecksum);
       const checksum = checksumData.toString(CryptoJS.enc.Hex).substring(0, 4).toLowerCase();
       
-      return `${part1}eon${part2}${checksum}`;
+      const address = `${part1}eon${part2}${checksum}`;
+      
+      // Return both address and keypair for storage
+      return {
+        address: address,
+        keypair: keypair
+      };
     } catch (error) {
       // console.error('Error generating QNet address:', error);
       throw new Error('Failed to generate QNet address');

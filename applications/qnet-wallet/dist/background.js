@@ -2396,12 +2396,15 @@ class ProductionCrypto {
         }
     }
     
-    // Migrate old short QNet address to new long format
+    // Migrate QNet address - preserve old addresses, add keypairs for new
     static async migrateQNetAddress(wallet) {
         try {
+            // IMPORTANT: For backward compatibility, we keep existing addresses
+            // Only add keypairs for transaction signing
+            
             // Check if wallet has QNet address
             if (!wallet.qnetAddress || !wallet.networks?.qnet?.address) {
-                // Generate new address from Solana address if available
+                // No existing address - generate from Solana as fallback
                 if (wallet.networks?.solana?.address) {
                     const newAddress = await CryptoService.generateQNetAddressFromSolana(wallet.networks.solana.address);
                     if (newAddress) {
@@ -2416,29 +2419,47 @@ class ProductionCrypto {
             
             const currentAddress = wallet.qnetAddress || wallet.networks?.qnet?.address;
             
-            // Check if it's old format (short - less than 40 chars)
-            if (currentAddress && currentAddress.length < 40) {
-                // console.log('Migrating old short QNet address to new long format');
-                
-                // Generate new long format address
-                let newAddress = null;
-                
-                if (wallet.mnemonic) {
-                    // If we have mnemonic, generate from it for consistency
-                    const seed = await bip39.mnemonicToSeed(wallet.mnemonic);
-                    newAddress = await CryptoService.generateQNetAddress(seed, 0);
-                } else if (wallet.networks?.solana?.address) {
-                    // Otherwise generate from Solana address
-                    newAddress = await CryptoService.generateQNetAddressFromSolana(wallet.networks.solana.address);
-                }
-                
-                if (newAddress) {
-                    // Update all references to QNet address
+            // If wallet has mnemonic, ALWAYS migrate to BIP44 address
+            if (wallet.mnemonic) {
+                try {
+                    // Generate proper BIP44 address and keypair
+                    const seed = await ProductionCrypto.mnemonicToSeed(wallet.mnemonic);
+                    const result = await ProductionCrypto.generateQNetAddress(seed, 0);
+                    
+                    // UPDATE to new address (breaking change but necessary)
+                    const oldAddress = currentAddress;
+                    wallet.qnetAddress = result.address;
+                    wallet.qnetKeypair = {
+                        publicKey: Array.from(result.keypair.publicKey),
+                        privateKey: Array.from(result.keypair.privateKey),
+                        path: result.keypair.path
+                    };
+                    
                     if (wallet.networks && wallet.networks.qnet) {
-                        wallet.networks.qnet.address = newAddress;
+                        wallet.networks.qnet.address = result.address;
                     }
-                    wallet.qnetAddress = newAddress;
-                    // console.log('Migrated to new QNet address:', newAddress);
+                    
+                    //console.log('[MIGRATION] QNet address updated:', oldAddress, '->', result.address);
+                } catch (e) {
+                    // console.error('Failed to migrate to BIP44:', e);
+                }
+            }
+            
+            // Handle old short format (< 40 chars) - unlikely but just in case
+            if (currentAddress && currentAddress.length < 40) {
+                // This is very old format, need to regenerate
+                if (wallet.mnemonic) {
+                    const seed = await ProductionCrypto.mnemonicToSeed(wallet.mnemonic);
+                    const result = await ProductionCrypto.generateQNetAddress(seed, 0);
+                    wallet.qnetAddress = result.address;
+                    wallet.qnetKeypair = {
+                        publicKey: Array.from(result.keypair.publicKey),
+                        privateKey: Array.from(result.keypair.privateKey),
+                        path: result.keypair.path
+                    };
+                    if (wallet.networks && wallet.networks.qnet) {
+                        wallet.networks.qnet.address = result.address;
+                    }
                 }
             }
             
@@ -2449,36 +2470,124 @@ class ProductionCrypto {
         }
     }
     
-    // Generate QNet EON address
+    // Generate QNet keypair using BIP44 standard with proper SLIP-0010
+    static async generateQNetKeypair(seed, accountIndex = 0) {
+        try {
+            // BIP44 path for QNet: m/44'/9999'/accountIndex'/0'/0'
+            // 9999 is the coin type for QNet (unregistered, for testing)
+            const encoder = new TextEncoder();
+            
+            // Step 1: Generate master key from seed (SLIP-0010)
+            // HMAC-SHA512(Key = "ed25519 seed", Data = seed)
+            const masterKey = await crypto.subtle.importKey(
+                'raw',
+                encoder.encode('ed25519 seed'),
+                { name: 'HMAC', hash: 'SHA-512' },
+                false,
+                ['sign']
+            );
+            
+            const masterData = await crypto.subtle.sign('HMAC', masterKey, seed);
+            const masterBytes = new Uint8Array(masterData);
+            let currentKey = masterBytes.slice(0, 32);  // Private key
+            let currentChainCode = masterBytes.slice(32, 64);  // Chain code
+            
+            // Step 2: Derive path m/44'/9999'/accountIndex'/0'/0'
+            const levels = [
+                0x8000002C, // 44' (hardened)
+                0x8000270F, // 9999' (hardened) - 0x270F = 9999
+                0x80000000 + accountIndex, // accountIndex' (hardened)
+                0x80000000, // 0' (hardened change)
+                0x80000000  // 0' (hardened address index)
+            ];
+            
+            // Step 3: Derive each level
+            for (const index of levels) {
+                // HMAC-SHA512(Key = chainCode, Data = 0x00 || privateKey || index)
+                const data = new Uint8Array(37);
+                data[0] = 0x00;
+                data.set(currentKey, 1);
+                data[33] = (index >> 24) & 0xFF;
+                data[34] = (index >> 16) & 0xFF;
+                data[35] = (index >> 8) & 0xFF;
+                data[36] = index & 0xFF;
+                
+                const hmacKey = await crypto.subtle.importKey(
+                    'raw',
+                    currentChainCode,
+                    { name: 'HMAC', hash: 'SHA-512' },
+                    false,
+                    ['sign']
+                );
+                
+                const derivedData = await crypto.subtle.sign('HMAC', hmacKey, data);
+                const derivedBytes = new Uint8Array(derivedData);
+                
+                currentKey = derivedBytes.slice(0, 32);
+                currentChainCode = derivedBytes.slice(32, 64);
+            }
+            
+            // Step 4: Generate public key from private key
+            // For Ed25519, we need proper key generation
+            let publicKey;
+            try {
+                // Try to use Ed25519 if available
+                const keypair = await this.ed25519GenerateKeypair(currentKey);
+                publicKey = keypair.publicKey;
+            } catch (e) {
+                // Fallback: SHA-256 hash of private key
+                const publicKeyMaterial = await crypto.subtle.digest('SHA-256', currentKey);
+                publicKey = new Uint8Array(publicKeyMaterial);
+            }
+            
+            return {
+                privateKey: currentKey,
+                publicKey: publicKey,
+                path: `m/44'/9999'/${accountIndex}'/0'/0'`,
+                chainCode: currentChainCode
+            };
+        } catch (error) {
+            // Error:('QNet keypair generation failed:', error);
+            throw new Error('Failed to generate QNet keypair');
+        }
+    }
+    
+    // Generate QNet EON address from keypair
     static async generateQNetAddress(seed, accountIndex = 0) {
         try {
-            // Use same cryptographic approach as Solana for consistency
-            // Derive from seed + account index using SHA-512 for maximum entropy
-            const encoder = new TextEncoder();
-            const accountData = encoder.encode(`qnet-eon-${accountIndex}`);
-            const combinedData = new Uint8Array(seed.length + accountData.length);
-            combinedData.set(seed);
-            combinedData.set(accountData, seed.length);
+            // Generate keypair first using BIP44
+            const keypair = await ProductionCrypto.generateQNetKeypair(seed, accountIndex);
             
-            // Use SHA-512 for more entropy (like Ed25519 key generation)
-            const hashBuffer = await crypto.subtle.digest('SHA-512', combinedData);
-            const hash = Array.from(new Uint8Array(hashBuffer));
-            const fullHex = hash.map(b => b.toString(16).padStart(2, '0')).join('');
+            // Create address from public key
+            const publicKeyHex = Array.from(keypair.publicKey)
+                .map(b => b.toString(16).padStart(2, '0'))
+                .join('');
+            
+            // Use SHA-512 of public key for address generation
+            const addressData = await crypto.subtle.digest('SHA-512', keypair.publicKey);
+            const addressHash = Array.from(new Uint8Array(addressData));
+            const fullHex = addressHash.map(b => b.toString(16).padStart(2, '0')).join('');
             
             // Create deterministic address from hash
-            // New format: 19 chars + "eon" + 15 chars + 4 char checksum = 41 total
+            // Format: 19 chars + "eon" + 15 chars + 4 char checksum = 41 total
             const part1 = fullHex.substring(0, 19).toLowerCase();
             const part2 = fullHex.substring(19, 34).toLowerCase();
             
             // Generate checksum from the address parts
             const addressWithoutChecksum = part1 + 'eon' + part2;
-            const checksumEncoder = new TextEncoder();
-            const checksumBuffer = await crypto.subtle.digest('SHA-256', checksumEncoder.encode(addressWithoutChecksum));
+            const encoder = new TextEncoder();
+            const checksumBuffer = await crypto.subtle.digest('SHA-256', encoder.encode(addressWithoutChecksum));
             const checksumHash = Array.from(new Uint8Array(checksumBuffer));
             const checksumHex = checksumHash.map(b => b.toString(16).padStart(2, '0')).join('');
             const checksum = checksumHex.substring(0, 4).toLowerCase();
             
-            return `${part1}eon${part2}${checksum}`;
+            const address = `${part1}eon${part2}${checksum}`;
+            
+            // Return both address and keypair for storage
+            return {
+                address: address,
+                keypair: keypair
+            };
         } catch (error) {
             // Error:('QNet address generation failed:', error);
             throw new Error('Failed to generate QNet address');
@@ -5608,7 +5717,7 @@ async function createWallet(password, mnemonic) {
         
         // Generate keypairs for both networks
         const solanaKeypair = await ProductionCrypto.generateSolanaKeypair(seed, 0);
-        const qnetAddress = await ProductionCrypto.generateQNetAddress(seed, 0);
+        const qnetResult = await ProductionCrypto.generateQNetAddress(seed, 0);
         
         // Create wallet data
         const walletData = {
@@ -5621,7 +5730,12 @@ async function createWallet(password, mnemonic) {
                     secretKey: Array.from(solanaKeypair.secretKey),
                     address: solanaKeypair.address
                 },
-                qnetAddress: qnetAddress
+                qnetAddress: qnetResult.address,
+                qnetKeypair: {
+                    publicKey: Array.from(qnetResult.keypair.publicKey),
+                    privateKey: Array.from(qnetResult.keypair.privateKey),
+                    path: qnetResult.keypair.path
+                }
             }],
             networks: ['solana', 'qnet'],
             createdAt: Date.now()

@@ -218,8 +218,14 @@ impl SecurityValidator {
     
     /// Check if validator is a bootstrap node
     fn is_bootstrap_validator(&self, validator: &str) -> bool {
-        // Bootstrap validators have special prefixes
-        validator.starts_with("QNET-BOOT") || validator.contains("genesis_")
+        // Bootstrap validators - new BIP44/SLIP-0010 addresses
+        matches!(validator,
+            "b07408bdc5688b92d69eonfd060d05f246f659414" |
+            "d0da31d839ce7ef8ca8eon3f37c6b1f2150e301fc" |
+            "a3d62ef91e60d66d2a2eon2caa0d87cb2a1976f31" |
+            "29e11b0a9cc89296490eoncca66139e40d72bd25d" |
+            "f8c4ed54ad92b0a94f1eonad6cc5623af63b79826"
+        )
     }
 }
 
