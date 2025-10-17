@@ -22,6 +22,7 @@ const HeaderComponent = () => {
     { href: '/testnet', label: 'Testnet' },
     { href: '/wallet', label: 'Wallet' },
     { href: '/docs', label: 'Docs' },
+    { href: '/privacy', label: 'Privacy' },
   ];
 
   useEffect(() => {

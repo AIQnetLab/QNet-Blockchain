@@ -34,7 +34,7 @@ main.qnet-container {
 }
 
 /* Page-specific wrappers */
-.page-home, .page-nodes, .page-explorer, .page-dao, .page-testnet, .page-wallet, .page-docs {
+.page-home, .page-nodes, .page-explorer, .page-dao, .page-testnet, .page-wallet, .page-docs, .page-privacy {
   width: 100%;
 }
 
@@ -1955,4 +1955,83 @@ a[href*="play.google.com"] img {
   text-align: center;
   max-width: 800px;
   margin: 0 auto 3rem;
+}
+
+/* Privacy Policy Page */
+.page-privacy .content-card {
+  background: rgba(0, 20, 40, 0.4);
+  border: 1px solid rgba(0, 255, 136, 0.2);
+  border-radius: 12px;
+  padding: 3rem;
+  margin-top: 2rem;
+}
+
+.privacy-section {
+  margin-bottom: 2.5rem;
+}
+
+.privacy-section:last-child {
+  margin-bottom: 0;
+}
+
+.privacy-section h3 {
+  font-size: 1.5rem;
+  color: #00ffff;
+  margin-bottom: 1rem;
+  font-weight: 600;
+}
+
+.privacy-section p {
+  color: #dddddd;
+  line-height: 1.8;
+  margin-bottom: 1rem;
+  font-size: 1rem;
+}
+
+.privacy-section ul {
+  list-style: none;
+  padding-left: 0;
+  margin: 1rem 0;
+}
+
+.privacy-section ul li {
+  color: #dddddd;
+  line-height: 1.8;
+  padding-left: 1.5rem;
+  position: relative;
+  margin-bottom: 0.5rem;
+}
+
+.privacy-section ul li::before {
+  content: "•";
+  color: #dddddd;
+  font-weight: bold;
+  position: absolute;
+  left: 0;
+}
+
+.privacy-section a {
+  color: #00d4ff;
+  text-decoration: none;
+  transition: color 0.3s ease;
+}
+
+.privacy-section a:hover {
+  color: #00ffff;
+  text-decoration: underline;
+}
+
+@media (max-width: 768px) {
+  .page-privacy .content-card {
+    padding: 2rem 1.5rem;
+  }
+  
+  .privacy-section h3 {
+    font-size: 1.3rem;
+  }
+  
+  .privacy-section p,
+  .privacy-section ul li {
+    font-size: 0.95rem;
+  }
 }
