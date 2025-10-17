@@ -81,7 +81,7 @@ export default function WalletPage() {
             }}>
               Ready for Submission
             </div>
-          </div>
+            </div>
 
           {/* Google Play Card */}
           <div className="tool-card-large" style={{ 

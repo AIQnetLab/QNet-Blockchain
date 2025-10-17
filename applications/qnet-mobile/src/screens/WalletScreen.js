@@ -747,6 +747,7 @@ const WalletScreen = () => {
   const [importStep, setImportStep] = useState(1); // 1 = password, 2 = seed phrase
   const [showSeedConfirm, setShowSeedConfirm] = useState(false);
   const [seedConfirmWords, setSeedConfirmWords] = useState({});
+  const [showSplash, setShowSplash] = useState(true); // Show splash initially
   const [tempWallet, setTempWallet] = useState(null);
   const [wordChoices, setWordChoices] = useState({});
   const [termsAccepted, setTermsAccepted] = useState(false);
@@ -810,17 +811,23 @@ const WalletScreen = () => {
   // Load real burn progress when activation tab is selected
   useEffect(() => {
     if (activeTab === 'activate' && wallet) {
-      loadBurnProgress();
+      // Small delay to let UI render first
+      const timer = setTimeout(() => {
+        loadBurnProgress();
+      }, 50);
+      return () => clearTimeout(timer);
     }
   }, [activeTab, isTestnet, wallet]);
   
   // Load node rewards when on history tab or when activation changes
   useEffect(() => {
     if (activeTab === 'history') {
-      // Sync activation codes when opening Node tab (battery-friendly)
-      if (wallet && wallet.publicKey && password) {
-        // Get mnemonic securely from encrypted storage
-        walletManager.getEncryptedMnemonic(password).then(mnemonic => {
+      // Small delay to let UI render first
+      const syncTimer = setTimeout(() => {
+        // Sync activation codes when opening Node tab (battery-friendly)
+        if (wallet && wallet.publicKey && password) {
+          // Get mnemonic securely from encrypted storage
+          walletManager.getEncryptedMnemonic(password).then(mnemonic => {
           if (!mnemonic) return;
           return walletManager.syncActivationCodes(
             wallet.publicKey,
@@ -834,10 +841,14 @@ const WalletScreen = () => {
             setActivatedNodeType(nodeType);
             setActivationCode(code.code || code);
           }
-        }).catch(() => {
-          // Silent fail
-        });
-      }
+          }).catch(() => {
+            // Silent fail
+          });
+        }
+      }, 50); // Small delay
+      
+      // Cleanup timer
+      return () => clearTimeout(syncTimer);
       
       if (activatedNodeType && activationCode) {
         loadNodeRewards();
@@ -857,7 +868,11 @@ const WalletScreen = () => {
   // Load dynamic pricing when on activate tab
   useEffect(() => {
     if (activeTab === 'activate' && wallet) {
-      loadActivationPricing();
+      // Small delay to let UI render first
+      const timer = setTimeout(() => {
+        loadActivationPricing();
+      }, 100);
+      return () => clearTimeout(timer);
     }
   }, [activeTab, wallet, burnProgress]);
 
@@ -1261,8 +1276,13 @@ const WalletScreen = () => {
       const exists = await walletManager.walletExists();
       setHasWallet(exists);
       setLoading(false);
+      // Hide splash if no wallet exists
+      if (!exists) {
+        setShowSplash(false);
+      }
     } catch (error) {
       setLoading(false);
+      setShowSplash(false);
     }
   };
 
@@ -1394,11 +1414,9 @@ const WalletScreen = () => {
       const seedToImport = seedPhrase.trim();
       
       const imported = await walletManager.importWallet(seedToImport);
-      await walletManager.storeWallet(imported, password);
       
-      // Clear seed phrase only after successful import
+      // Set UI state immediately for instant response
       setSeedPhrase('');
-      
       setWallet(imported);
       setHasWallet(true);
       setShowCreateOptions(false);
@@ -1407,13 +1425,16 @@ const WalletScreen = () => {
       setConfirmPassword('');
       setImportStep(1); // Reset to step 1 for next time
       
-      // Don't sync activation codes immediately - let user do it manually
-      // This avoids issues with wallet not being fully saved yet
-      
       // Switch directly to assets tab without alert
       setActiveTab('assets');
       // Force immediate balance load without delay
       loadBalance(imported.publicKey);
+      
+      // Store wallet in background (non-blocking)
+      walletManager.storeWallet(imported, password).catch(error => {
+        // If save fails, show error but keep wallet in memory
+        showAlert('Warning', 'Wallet imported but not saved: ' + error.message);
+      });
     } catch (error) {
       showAlert('Error', 'Failed to import wallet: ' + error.message);
     }
@@ -1457,29 +1478,31 @@ const WalletScreen = () => {
     }
     
     // All words correct, save wallet
-    // Fast save without loading screen
-    try {
-      await walletManager.storeWallet(tempWallet, tempWallet.password);
-      
-      setWallet(tempWallet);
-      setHasWallet(true);
-      setShowSeedConfirm(false);
-      // Keep password in state for subsequent operations (like node activation)
-      // setPassword(''); // DON'T clear password
-      setConfirmPassword('');
+    // Optimized: Set UI state immediately, save in background
+    setWallet(tempWallet);
+    setHasWallet(true);
+    setShowSeedConfirm(false);
+    // Keep password in state for subsequent operations (like node activation)
+    // setPassword(''); // DON'T clear password
+    setConfirmPassword('');
+    setSeedConfirmWords({});
+    // Clear activation status for new wallet
+    setActivatedNodeType(null);
+    setActivationCode(null);
+    
+    // Switch to assets tab immediately
+    setActiveTab('assets');
+    loadBalance(tempWallet.publicKey);
+    
+    // Save wallet in background (non-blocking)
+    walletManager.storeWallet(tempWallet, tempWallet.password).then(() => {
       setTempWallet(null);
-      setSeedConfirmWords({});
-      // Clear activation status for new wallet
-      setActivatedNodeType(null);
-      setActivationCode(null);
-      
-      // Directly load balance and switch to assets tab without modal
-      setActiveTab('assets');
-      loadBalance(tempWallet.publicKey);
-    } catch (error) {
-      // console.error('Error saving wallet:', error);
+    }).catch(error => {
+      // If save fails, revert UI state
       showAlert('Error', 'Failed to save wallet: ' + (error.message || 'Unknown error'));
-    }
+      setWallet(null);
+      setHasWallet(false);
+    });
   };
 
   const unlockWallet = async () => {
@@ -1488,30 +1511,41 @@ const WalletScreen = () => {
       return;
     }
 
-    // Don't show loading screen during unlock
-    try {
-      const loadedWallet = await walletManager.loadWallet(password);
+    // Optimized: Set UI state immediately, decrypt in background
+    setShowSplash(false); // Hide splash immediately
+    
+    // Quick password check first (fast)
+    const isValid = await walletManager.verifyPassword(password);
+    if (!isValid) {
+      showAlert('Error', 'Invalid password');
+      return;
+    }
+    
+    // Load wallet asynchronously
+    walletManager.loadWallet(password).then(loadedWallet => {
       setWallet(loadedWallet);
       
-      // Load balance immediately without waiting
+      // Load balance in parallel
       loadBalance(loadedWallet.publicKey);
       
-      // Sync activation codes without blocking UI
-      walletManager.syncActivationCodes(
-        loadedWallet.publicKey,
-        loadedWallet.mnemonic,
-        password
-      ).then(syncedCodes => {
-        if (syncedCodes && Object.keys(syncedCodes).length > 0) {
-          const nodeType = Object.keys(syncedCodes)[0];
-          const code = syncedCodes[nodeType];
-          setActivatedNodeType(nodeType);
-          setActivationCode(code.code || code);
-        }
-      }).catch(() => {
-        // Silent fail - sync in background
-      });
-    } catch (error) {
+      // Sync activation codes in background (non-blocking)
+      setTimeout(() => {
+        walletManager.syncActivationCodes(
+          loadedWallet.publicKey,
+          loadedWallet.mnemonic,
+          password
+        ).then(syncedCodes => {
+          if (syncedCodes && Object.keys(syncedCodes).length > 0) {
+            const nodeType = Object.keys(syncedCodes)[0];
+            const code = syncedCodes[nodeType];
+            setActivatedNodeType(nodeType);
+            setActivationCode(code.code || code);
+          }
+        }).catch(() => {
+          // Silent fail
+        });
+      }, 100);
+    }).catch(error => {
       // Check if it's a corrupted wallet issue
       if (error.message && (error.message.includes('Malformed UTF-8') || 
           error.message.includes('corrupted'))) {
@@ -1546,8 +1580,7 @@ const WalletScreen = () => {
       } else {
         showAlert('Error', 'Wrong password');
       }
-    }
-    setLoading(false);
+    });
   };
 
   const loadBalance = async (publicKey) => {
@@ -3492,6 +3525,25 @@ const WalletScreen = () => {
   const handleUserActivity = () => {
     DeviceEventEmitter.emit('userActivity');
   };
+
+  // Show splash screen after unlock while loading wallet
+  if (hasWallet && !wallet && showSplash) {
+    return (
+      <SafeAreaView style={styles.container}>
+        <View style={styles.centerContent}>
+          <View style={styles.logoContainer}>
+            <View style={styles.logoOuter}>
+              <View style={styles.logoMiddle}>
+                <View style={styles.logoInner}>
+                  <Text style={styles.logoText}>Q</Text>
+                </View>
+              </View>
+            </View>
+          </View>
+        </View>
+      </SafeAreaView>
+    );
+  }
 
   return (
     <TouchableWithoutFeedback onPress={handleUserActivity}>
