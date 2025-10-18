@@ -2285,14 +2285,25 @@ export class WalletManager {
     }
   }
 
+  // Async wrapper for mnemonic to seed conversion
+  async mnemonicToSeedAsync(mnemonic) {
+    return new Promise((resolve) => {
+      // Use setTimeout to avoid blocking the main thread
+      setTimeout(() => {
+        const seed = bip39.mnemonicToSeedSync(mnemonic);
+        resolve(seed);
+      }, 0);
+    });
+  }
+
   // Generate new wallet with BIP39 mnemonic
   async generateWallet() {
     try {
       // Generate BIP39 mnemonic with checksum using bip39 library
       const mnemonic = bip39.generateMnemonic();
       
-      // Use bip39 library for standard seed generation
-      const seed = bip39.mnemonicToSeedSync(mnemonic);
+      // Use ASYNC seed generation to avoid blocking UI
+      const seed = await this.mnemonicToSeedAsync(mnemonic);
       
       // Use HD derivation for Solana like Phantom wallet
       const keypairSeed = await this.deriveHDKeypair(seed, 0);
@@ -2478,9 +2489,8 @@ export class WalletManager {
         throw new Error('Invalid mnemonic phrase');
       }
 
-      // Use bip39 library for standard seed generation (Phantom-compatible)
-      // This is the ONLY place we call mnemonicToSeedSync during import
-      const seed = bip39.mnemonicToSeedSync(trimmedMnemonic);
+      // Use ASYNC seed generation to avoid blocking UI
+      const seed = await this.mnemonicToSeedAsync(trimmedMnemonic);
       
       // Use HD derivation for Solana like Phantom wallet
       const keypairSeed = await this.deriveHDKeypair(seed, 0);
@@ -2528,11 +2538,7 @@ export class WalletManager {
       const salt = CryptoJS.enc.Hex.parse(vaultData.salt);
       const iv = CryptoJS.enc.Hex.parse(vaultData.iv);
       
-      const key = CryptoJS.PBKDF2(password, salt, {
-        keySize: 256/32,
-        iterations: 10000, // Standard security level
-        hasher: CryptoJS.algo.SHA256
-      });
+      const key = await this.deriveKeyAsync(password, salt, 10000);
       
       const decrypted = CryptoJS.AES.decrypt(
         vaultData.encrypted,
@@ -2582,12 +2588,8 @@ export class WalletManager {
       if (this.keyCachePassword === password && this.keyCache) {
         key = this.keyCache;
       } else {
-        // Derive key using same parameters as storage
-        key = CryptoJS.PBKDF2(password, salt, {
-          keySize: 256/32,
-          iterations: 10000, // Standard security level
-          hasher: CryptoJS.algo.SHA256
-        });
+        // Derive key ASYNCHRONOUSLY using same parameters as storage
+        key = await this.deriveKeyAsync(password, salt, 10000);
         this.keyCache = key;
         this.keyCachePassword = password;
       }
@@ -2614,6 +2616,21 @@ export class WalletManager {
     }
   }
 
+  // Async PBKDF2 wrapper to avoid blocking UI
+  async deriveKeyAsync(password, salt, iterations = 10000) {
+    return new Promise((resolve) => {
+      // Use setTimeout to avoid blocking the main thread
+      setTimeout(() => {
+      const key = CryptoJS.PBKDF2(password, salt, {
+        keySize: 256/32,
+          iterations: iterations,
+        hasher: CryptoJS.algo.SHA256
+      });
+        resolve(key);
+      }, 0);
+    });
+  }
+
   // Encrypt and store wallet with PBKDF2 + AES (like extension)
   async storeWallet(walletData, password) {
     try {
@@ -2638,12 +2655,12 @@ export class WalletManager {
       // Generate random salt (32 bytes)
       const salt = CryptoJS.lib.WordArray.random(32);
       
-      // Derive key using PBKDF2 (10,000 iterations for security)
-      const key = CryptoJS.PBKDF2(password, salt, {
-        keySize: 256/32,
-        iterations: 10000, // Security standard
-        hasher: CryptoJS.algo.SHA256
-      });
+      // Derive key using PBKDF2 ASYNCHRONOUSLY (10,000 iterations for security)
+      const key = await this.deriveKeyAsync(password, salt, 10000);
+      
+      // Cache the key for faster subsequent operations
+      this.keyCache = key;
+      this.keyCachePassword = password;
       
       // Generate random IV (16 bytes for AES)
       const iv = CryptoJS.lib.WordArray.random(16);
@@ -2716,12 +2733,8 @@ export class WalletManager {
           const salt = CryptoJS.lib.WordArray.random(256/8);
           const iv = CryptoJS.lib.WordArray.random(128/8);
           
-          // Derive key
-          const key = CryptoJS.PBKDF2(password, salt, {
-            keySize: 256/32,
-            iterations: 10000,
-            hasher: CryptoJS.algo.SHA256
-          });
+          // Derive key ASYNCHRONOUSLY
+          const key = await this.deriveKeyAsync(password, salt, 10000);
           
           // Encrypt with new format
           const updatedEncrypted = CryptoJS.AES.encrypt(
@@ -2761,12 +2774,8 @@ export class WalletManager {
       if (this.keyCachePassword === password && this.keyCache) {
         key = this.keyCache;
       } else {
-        // Derive key using same parameters as storage
-        key = CryptoJS.PBKDF2(password, salt, {
-          keySize: 256/32,
-          iterations: 10000, // Optimized for CryptoJS on mobile
-          hasher: CryptoJS.algo.SHA256
-        });
+        // Derive key ASYNCHRONOUSLY using same parameters as storage
+        key = await this.deriveKeyAsync(password, salt, 10000);
         this.keyCache = key;
         this.keyCachePassword = password;
       }
@@ -3182,12 +3191,8 @@ export class WalletManager {
       const salt = CryptoJS.lib.WordArray.random(16);
       const iv = CryptoJS.lib.WordArray.random(16);
       
-      // Derive key from password
-      const key = CryptoJS.PBKDF2(password, salt, {
-        keySize: 256/32,
-        iterations: 10000, // Faster for activation codes
-        hasher: CryptoJS.algo.SHA256
-      });
+      // Derive key from password ASYNCHRONOUSLY
+      const key = await this.deriveKeyAsync(password, salt, 10000);
       
       // Encrypt the activation code
       const encrypted = CryptoJS.AES.encrypt(code, key, {
@@ -3233,12 +3238,8 @@ export class WalletManager {
       const salt = CryptoJS.enc.Hex.parse(codeData.salt);
       const iv = CryptoJS.enc.Hex.parse(codeData.iv);
       
-      // Derive key from password
-      const key = CryptoJS.PBKDF2(password, salt, {
-        keySize: 256/32,
-        iterations: 10000,
-        hasher: CryptoJS.algo.SHA256
-      });
+      // Derive key from password ASYNCHRONOUSLY
+      const key = await this.deriveKeyAsync(password, salt, 10000);
       
       // Decrypt the activation code
       const decrypted = CryptoJS.AES.decrypt(codeData.encrypted, key, {
@@ -3495,12 +3496,8 @@ export class WalletManager {
                 continue;
               }
               
-              // Derive key from password
-              const key = CryptoJS.PBKDF2(password, salt, {
-                keySize: 256/32,
-                iterations: 10000,
-                hasher: CryptoJS.algo.SHA256
-              });
+              // Derive key from password ASYNCHRONOUSLY
+              const key = await this.deriveKeyAsync(password, salt, 10000);
               
               // Decrypt the activation code
               const decrypted = CryptoJS.AES.decrypt(codeData.encrypted, key, {
@@ -4151,12 +4148,8 @@ export class WalletManager {
       if (this.keyCachePassword === password && this.keyCache) {
         key = this.keyCache;
       } else {
-        // Derive key and cache it
-        key = CryptoJS.PBKDF2(password, CryptoJS.enc.Hex.parse(vaultData.salt), {
-          keySize: 256/32,
-          iterations: 10000,
-          hasher: CryptoJS.algo.SHA256
-        });
+        // Derive key ASYNCHRONOUSLY and cache it
+        key = await this.deriveKeyAsync(password, CryptoJS.enc.Hex.parse(vaultData.salt), 10000);
         this.keyCache = key;
         this.keyCachePassword = password;
       }

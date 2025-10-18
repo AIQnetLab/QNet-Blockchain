@@ -1,6 +1,6 @@
 {
   "name": "qnet-mobile",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "private": true,
   "scripts": {
     "android": "react-native run-android",
@@ -25,8 +25,9 @@
     "react-native-crypto": "^2.2.0",
     "react-native-get-random-values": "^1.11.0",
     "react-native-keychain": "^8.2.0",
+    "react-native-qrcode-svg": "^6.3.15",
     "react-native-safe-area-context": "^5.5.2",
-    "readable-stream": "^3.6.2",
+    "react-native-svg": "^15.14.0",
     "stream-browserify": "^3.0.0",
     "tweetnacl": "^1.0.3"
   },
@@ -46,6 +47,7 @@
     "@types/react-test-renderer": "^19.1.0",
     "eslint": "^8.19.0",
     "jest": "^29.6.3",
+    "metro-resolver": "^0.83.3",
     "prettier": "2.8.8",
     "react-test-renderer": "19.1.0",
     "typescript": "^5.8.3"

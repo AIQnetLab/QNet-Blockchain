@@ -16,11 +16,13 @@ import {
   Linking,
   AppState,
   Modal,
-  Animated
+  Animated,
+  Share
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import WalletManager from '../components/WalletManager';
+import QRCode from 'react-native-qrcode-svg';
 
 // 1DEV Burn Tracker Contract (same as browser extension)
 const BURN_CONTRACT_PROGRAM_ID = 'D7g7mkL8o1YEex6ZgETJEQyyHV7uuUMvV3Fy3u83igJ7';
@@ -1271,6 +1273,7 @@ const WalletScreen = () => {
     };
   }, [wallet, password]);
 
+
   const checkWalletExists = async () => {
     try {
       const exists = await walletManager.walletExists();
@@ -1323,9 +1326,11 @@ const WalletScreen = () => {
       return;
     }
 
-    // Don't show loading for better UX
+    // Show brief loading state
+    setLoading(true);
     try {
       const newWallet = await walletManager.generateWallet();
+      setLoading(false);
       
       // Store temporarily and show seed phrase
       setTempWallet({ ...newWallet, password });
@@ -1382,8 +1387,8 @@ const WalletScreen = () => {
       // Show seed phrase with proper formatting
       setShowCreateOptions('show-seed');
     } catch (error) {
-      showAlert('Error', 'Failed to create wallet: ' + error.message);
       setLoading(false);
+      showAlert('Error', 'Failed to create wallet: ' + error.message);
     }
   };
 
@@ -1413,6 +1418,9 @@ const WalletScreen = () => {
       // Keep seed for import, clear after success
       const seedToImport = seedPhrase.trim();
       
+      // Show brief loading state
+      setLoading(true);
+      
       const imported = await walletManager.importWallet(seedToImport);
       
       // Set UI state immediately for instant response
@@ -1424,18 +1432,41 @@ const WalletScreen = () => {
       // setPassword(''); // DON'T clear password
       setConfirmPassword('');
       setImportStep(1); // Reset to step 1 for next time
+      setLoading(false);
       
       // Switch directly to assets tab without alert
       setActiveTab('assets');
       // Force immediate balance load without delay
       loadBalance(imported.publicKey);
       
-      // Store wallet in background (non-blocking)
-      walletManager.storeWallet(imported, password).catch(error => {
+      // Store wallet in background (non-blocking) - async PBKDF2 won't block UI
+      walletManager.storeWallet(imported, password).then(async () => {
+        // After wallet is saved, sync activation codes
+        try {
+          const mnemonic = await walletManager.getEncryptedMnemonic(password);
+          if (mnemonic) {
+            const syncedCodes = await walletManager.syncActivationCodes(
+              imported.publicKey,
+              mnemonic,
+              password
+            );
+            if (syncedCodes && Object.keys(syncedCodes).length > 0) {
+              const nodeType = Object.keys(syncedCodes)[0];
+              const code = syncedCodes[nodeType];
+              setActivatedNodeType(nodeType);
+              setActivationCode(code.code || code);
+            }
+          }
+        } catch (error) {
+          // Silent fail - activation sync is not critical
+          console.log('Activation sync failed:', error.message);
+        }
+      }).catch(error => {
         // If save fails, show error but keep wallet in memory
         showAlert('Warning', 'Wallet imported but not saved: ' + error.message);
       });
     } catch (error) {
+      setLoading(false);
       showAlert('Error', 'Failed to import wallet: ' + error.message);
     }
   };
@@ -1494,7 +1525,7 @@ const WalletScreen = () => {
     setActiveTab('assets');
     loadBalance(tempWallet.publicKey);
     
-    // Save wallet in background (non-blocking)
+    // Save wallet in background (non-blocking) - async PBKDF2 won't block UI
     walletManager.storeWallet(tempWallet, tempWallet.password).then(() => {
       setTempWallet(null);
     }).catch(error => {
@@ -2026,7 +2057,7 @@ const WalletScreen = () => {
           <TouchableOpacity 
             style={styles.button}
             onPress={confirmSeedPhrase}
-            disabled={loading || !Object.values(seedConfirmWords).every(w => w.length > 0)}
+            disabled={Boolean(loading || !Object.values(seedConfirmWords).every(w => w && w.length > 0))}
           >
             <Text style={styles.buttonText}>
               {loading ? 'Verifying...' : 'Confirm & Create Wallet'}
@@ -2239,7 +2270,7 @@ const WalletScreen = () => {
               <Text style={[styles.buttonText, styles.secondaryButtonText]}>Copy Recovery Phrase</Text>
             </TouchableOpacity>
             
-            <Text style={styles.warningText}>
+            <Text style={[styles.warningText, {marginTop: 12, marginBottom: 20}]}>
               ⚠️ Never share this with anyone!
             </Text>
             
@@ -2701,37 +2732,52 @@ const WalletScreen = () => {
         );
 
       case 'receive':
+        const currentReceiveAddress = selectedNetwork === 'qnet' 
+          ? (wallet.qnetAddress || wallet.address)
+          : (wallet.solanaAddress || wallet.address);
+        
         return (
           <ScrollView style={styles.content} onScroll={handleUserActivity} scrollEventThrottle={1000}>
             <Text style={styles.tabTitle}>Receive Tokens</Text>
             
             <View style={styles.receiveContent}>
-              <View style={styles.qrPlaceholder}>
-                <Text style={styles.qrText}>QR Code</Text>
-                <Text style={styles.qrSubtext}>(Coming Soon)</Text>
+              {/* REAL QR Code */}
+              <View style={styles.qrContainer}>
+                <View style={styles.qrWrapper}>
+                  <QRCode
+                    value={currentReceiveAddress || 'No Address'}
+                    size={200}
+                    color='black'
+                    backgroundColor='white'
+                  />
+                </View>
+                <Text style={styles.qrLabel}>
+                  Scan to send {selectedNetwork === 'qnet' ? 'QNet' : 'Solana'} tokens
+                </Text>
               </View>
 
+              {/* Clickable Address Display - like Assets tab */}
               <View style={styles.addressDisplay}>
                 <Text style={styles.label}>
                   {selectedNetwork === 'qnet' ? 'Your QNet Address' : 'Your Solana Address'}
                 </Text>
-                <Text style={styles.addressDisplayText}>
-                  {selectedNetwork === 'qnet' 
-                    ? (wallet.qnetAddress || wallet.address)
-                    : (wallet.solanaAddress || wallet.address)}
-                </Text>
+                
                 <TouchableOpacity 
-                  style={[styles.button, styles.secondaryButton]}
+                  style={[
+                    styles.addressItem,
+                    copiedAddress.includes('receive') && styles.addressItemCopied
+                  ]}
                   onPress={() => {
-                    const currentAddress = selectedNetwork === 'qnet' 
-                      ? (wallet.qnetAddress || wallet.address)
-                      : (wallet.solanaAddress || wallet.address);
                     const addressType = selectedNetwork === 'qnet' ? 'qnet-receive' : 'solana-receive';
-                    copyToClipboard(currentAddress, addressType);
+                    copyToClipboard(currentReceiveAddress, addressType);
                   }}
+                  activeOpacity={0.7}
                 >
-                  <Text style={[styles.buttonText, styles.secondaryButtonText]}>
-                    {copiedAddress.includes('receive') ? '✓ Copied!' : 'Copy Address'}
+                  <Text style={styles.addressText} numberOfLines={1} ellipsizeMode="middle">
+                    {currentReceiveAddress}
+                  </Text>
+                  <Text style={styles.tapToCopy}>
+                    {copiedAddress.includes('receive') ? '✓ Copied!' : 'Tap to copy'}
                   </Text>
                 </TouchableOpacity>
               </View>
@@ -2813,7 +2859,7 @@ const WalletScreen = () => {
                   activatedNodeType === 'light' && styles.nodeTypeActivated
                 ]}
                 onPress={() => !activatedNodeType && setNodeStatus('light')}
-                disabled={!!activatedNodeType}
+                disabled={Boolean(activatedNodeType)}
               >
                 <View style={styles.nodeTypeInfo}>
                   <Text style={styles.nodeTypeName}>
@@ -2840,7 +2886,7 @@ const WalletScreen = () => {
                   activatedNodeType === 'full' && styles.nodeTypeActivated
                 ]}
                 onPress={() => !activatedNodeType && setNodeStatus('full')}
-                disabled={!!activatedNodeType}
+                disabled={Boolean(activatedNodeType)}
               >
                 <View style={styles.nodeTypeInfo}>
                   <Text style={styles.nodeTypeName}>
@@ -2867,7 +2913,7 @@ const WalletScreen = () => {
                   activatedNodeType === 'super' && styles.nodeTypeActivated
                 ]}
                 onPress={() => !activatedNodeType && setNodeStatus('super')}
-                disabled={!!activatedNodeType}
+                disabled={Boolean(activatedNodeType)}
               >
                 <View style={styles.nodeTypeInfo}>
                   <Text style={styles.nodeTypeName}>
@@ -2893,7 +2939,7 @@ const WalletScreen = () => {
             
             <TouchableOpacity 
               style={[styles.button, (!nodeStatus || activatedNodeType || activatingNode) && styles.buttonDisabled]}
-              disabled={!nodeStatus || activatedNodeType || activatingNode}
+              disabled={Boolean(!nodeStatus || activatedNodeType || activatingNode)}
               onPress={async () => {
                 if (!nodeStatus) {
                   showAlert('Select Node Type', 'Please select a node type to activate');
@@ -3129,35 +3175,48 @@ const WalletScreen = () => {
                             
                             // Create rich content for the modal
                             const richContent = (
-                              <View style={{ paddingHorizontal: 20, paddingVertical: 15 }}>
-                                <Text style={[styles.modalContent, { textAlign: 'left', marginBottom: 8 }]}>
-                                  <Text style={{ fontWeight: 'bold' }}>Activation Code:</Text>
-                                </Text>
-                                <Text style={[styles.modalContent, { fontFamily: 'monospace', marginBottom: 15, color: '#00d4ff' }]}>
-                                  {code}
-                                </Text>
-                                
-                                <Text style={[styles.modalContent, { textAlign: 'left', marginBottom: 15 }]}>
-                                  <Text style={{ fontWeight: 'bold' }}>Node Type:</Text> {nodeTypeName}{'\n'}
-                                  <Text style={{ fontWeight: 'bold' }}>Status:</Text> {statusMessages[nodeStatus]}
-                                </Text>
-                                
-                                <Text style={[styles.modalContent, { textAlign: 'left', marginBottom: 8 }]}>
-                                  <Text style={{ fontWeight: 'bold' }}>Contract:</Text> {contract}
-                                </Text>
-                                
-                                <TouchableOpacity 
-                                  onPress={() => {
-                                    const explorerUrl = `https://explorer.solana.com/tx/${transaction}?cluster=${isTestnet ? 'devnet' : 'mainnet-beta'}`;
-                                    Linking.openURL(explorerUrl);
-                                  }}
-                                  style={{ marginTop: 10 }}
-                                >
-                                  <Text style={[styles.modalContent, { textAlign: 'left', color: '#00d4ff', textDecorationLine: 'underline' }]}>
-                                    <Text style={{ fontWeight: 'bold' }}>Transaction:</Text> {transaction}
+                              <ScrollView style={{ maxHeight: 400 }} showsVerticalScrollIndicator={true}>
+                                <View style={{ paddingHorizontal: 16, paddingVertical: 12 }}>
+                                  <Text style={[styles.modalContent, { textAlign: 'left', marginBottom: 8, fontSize: 13 }]}>
+                                    <Text style={{ fontWeight: 'bold' }}>Activation Code:</Text>
                                   </Text>
-                                </TouchableOpacity>
-                              </View>
+                                  <TouchableOpacity
+                                    onPress={() => {
+                                      Clipboard.setString(code);
+                                      showAlert('Copied', 'Activation code copied to clipboard');
+                                    }}
+                                    style={{ backgroundColor: 'rgba(0, 212, 255, 0.1)', borderRadius: 8, padding: 8, marginBottom: 12 }}
+                                  >
+                                    <Text style={[styles.modalContent, { fontFamily: 'monospace', color: '#00d4ff', fontSize: 12, textAlign: 'center' }]}>
+                                      {code}
+                                    </Text>
+                                    <Text style={{ color: '#888', fontSize: 10, textAlign: 'center', marginTop: 4 }}>
+                                      Tap to copy
+                                    </Text>
+                                  </TouchableOpacity>
+                                  
+                                  <Text style={[styles.modalContent, { textAlign: 'left', marginBottom: 12, fontSize: 13 }]}>
+                                    <Text style={{ fontWeight: 'bold' }}>Node Type:</Text> {nodeTypeName}{'\n'}
+                                    <Text style={{ fontWeight: 'bold' }}>Status:</Text> {statusMessages[nodeStatus]}
+                                  </Text>
+                                  
+                                  <Text style={[styles.modalContent, { textAlign: 'left', marginBottom: 8, fontSize: 12 }]} numberOfLines={2} ellipsizeMode="middle">
+                                    <Text style={{ fontWeight: 'bold' }}>Contract:</Text> {contract}
+                                  </Text>
+                                  
+                                  <TouchableOpacity 
+                                    onPress={() => {
+                                      const explorerUrl = `https://explorer.solana.com/tx/${transaction}?cluster=${isTestnet ? 'devnet' : 'mainnet-beta'}`;
+                                      Linking.openURL(explorerUrl);
+                                    }}
+                                    style={{ marginTop: 8 }}
+                                  >
+                                    <Text style={[styles.modalContent, { textAlign: 'left', color: '#00d4ff', textDecorationLine: 'underline', fontSize: 12 }]} numberOfLines={3} ellipsizeMode="middle">
+                                      <Text style={{ fontWeight: 'bold' }}>Transaction:</Text> {transaction}
+                                    </Text>
+                                  </TouchableOpacity>
+                                </View>
+                              </ScrollView>
                             );
                             
                             showAlert(
@@ -3330,7 +3389,7 @@ const WalletScreen = () => {
                       styles.button, 
                       (!nodeRewards?.unclaimed || nodeRewards.unclaimed <= 0 || claimingRewards) && styles.buttonDisabled
                     ]}
-                    disabled={!nodeRewards?.unclaimed || nodeRewards.unclaimed <= 0 || claimingRewards}
+                    disabled={Boolean(!nodeRewards?.unclaimed || nodeRewards.unclaimed <= 0 || claimingRewards)}
                     onPress={handleClaimRewards}
                   >
                     <Text style={styles.buttonText}>
@@ -3364,8 +3423,19 @@ const WalletScreen = () => {
         );
 
       case 'settings':
+        // Delay heavy rendering for better initial load
+        setTimeout(() => {
+          setRefreshing(false);
+        }, 100);
+        
         return (
-          <ScrollView style={styles.content} onScroll={handleUserActivity} scrollEventThrottle={1000}>
+          <ScrollView 
+            style={styles.content} 
+            onScroll={handleUserActivity} 
+            scrollEventThrottle={1000}
+            removeClippedSubviews={true}
+            initialNumToRender={10}
+          >
             <Text style={styles.tabTitle}>{t('settings')}</Text>
             
             {/* General Settings */}
@@ -3443,31 +3513,45 @@ const WalletScreen = () => {
               </View>
             </View>
 
-            {/* Security Settings */}
-            <View style={styles.settingGroup}>
-              <Text style={styles.settingGroupTitle}>{t('security_options')}</Text>
-              
-              <TouchableOpacity 
-                style={styles.actionButton}
-                onPress={() => setShowChangePassword(true)}
-              >
-                <Text style={styles.actionButtonText}>{t('change_password')}</Text>
-              </TouchableOpacity>
+            {/* Security Settings - Lazy loaded */}
+            {activeTab === 'settings' && (
+              <View style={styles.settingGroup}>
+                <Text style={styles.settingGroupTitle}>{t('security_options')}</Text>
+                
+                <TouchableOpacity 
+                  style={styles.actionButton}
+                  onPress={() => setShowChangePassword(true)}
+                >
+                  <Text style={styles.actionButtonText}>{t('change_password')}</Text>
+                </TouchableOpacity>
 
-              <TouchableOpacity 
-                style={styles.actionButton}
-                onPress={() => setShowExportSeed(true)}
-              >
-                <Text style={styles.actionButtonText}>{t('export_recovery_phrase')}</Text>
-              </TouchableOpacity>
+                <TouchableOpacity 
+                  style={styles.actionButton}
+                  onPress={() => setShowExportSeed(true)}
+                >
+                  <Text style={styles.actionButtonText}>{t('export_recovery_phrase')}</Text>
+                </TouchableOpacity>
 
-              <TouchableOpacity 
-                style={styles.actionButton}
-                onPress={() => setShowExportActivation(true)}
-              >
-                <Text style={styles.actionButtonText}>{t('export_activation_code')}</Text>
-              </TouchableOpacity>
-            </View>
+                <TouchableOpacity 
+                  style={styles.actionButton}
+                  onPress={() => {
+                    if (activationCode) {
+                      Clipboard.setString(activationCode);
+                      showAlert('Copied', 'Activation code copied to clipboard');
+                      setTimeout(() => {
+                        Clipboard.setString('');
+                      }, 10000);
+                    } else {
+                      setShowExportActivation(true);
+                    }
+                  }}
+                >
+                  <Text style={styles.actionButtonText}>
+                    {activationCode ? 'Copy Activation Code' : t('export_activation_code')}
+                  </Text>
+                </TouchableOpacity>
+              </View>
+            )}
 
             {/* Network Settings */}
             <View style={styles.settingGroup}>
@@ -3886,7 +3970,7 @@ const WalletScreen = () => {
               <TouchableOpacity 
                 style={[styles.button, styles.primaryButton, nodeActivating && styles.buttonDisabled, {flex: 1, minHeight: 38, paddingVertical: 10, elevation: 1}]}
                 onPress={handleNodeActivation}
-                disabled={nodeActivating || !activationInputCode.trim()}
+                disabled={Boolean(nodeActivating || !activationInputCode.trim())}
               >
                 <Text style={[styles.buttonText, {fontSize: 14}]}>
                   {nodeActivating ? 'Activating...' : 'Activate'}
@@ -4177,6 +4261,50 @@ const styles = StyleSheet.create({
     borderWidth: 2,
     borderColor: '#00d4ff',
   },
+  qrContainer: {
+    alignItems: 'center',
+    marginBottom: 30,
+  },
+  qrWrapper: {
+    backgroundColor: '#ffffff',
+    padding: 20,
+    borderRadius: 15,
+    marginBottom: 15,
+    elevation: 5,
+    shadowColor: '#00d4ff',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.3,
+    shadowRadius: 4,
+  },
+  qrLabel: {
+    color: '#aaa',
+    fontSize: 14,
+    textAlign: 'center',
+  },
+  addressBox: {
+    backgroundColor: '#16213e',
+    borderRadius: 10,
+    padding: 15,
+    marginVertical: 15,
+    borderWidth: 1,
+    borderColor: '#00d4ff20',
+  },
+  addressText: {
+    color: '#ffffff',
+    fontSize: 13,
+    fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
+  },
+  receiveButtons: {
+    flexDirection: 'row',
+    marginTop: 10,
+  },
+  tapToCopy: {
+    color: '#00d4ff',
+    fontSize: 12,
+    marginTop: 10,
+    fontStyle: 'italic',
+    textAlign: 'center',
+  },
   qrText: {
     color: '#00d4ff',
     fontSize: 20,
@@ -4321,6 +4449,7 @@ const styles = StyleSheet.create({
     padding: 0, // Content padding handled separately
     width: '90%', // Reduced from 100% to add margin from edges
     maxWidth: 360, // Slightly reduced for better mobile view
+    maxHeight: '80%', // Limit height for small screens
     borderWidth: 1,
     borderColor: 'rgba(0, 212, 255, 0.3)', // Slightly brighter border
     shadowColor: '#00d4ff',
@@ -4346,12 +4475,11 @@ const styles = StyleSheet.create({
   },
   modalContent: {
     color: '#ffffff',
-    fontSize: 15,
-    lineHeight: 22,
-    paddingHorizontal: 24,
-    paddingVertical: 20,
+    fontSize: 14,
+    lineHeight: 20,
+    paddingHorizontal: 16,
+    paddingVertical: 12,
     textAlign: 'center',
-    minHeight: 60, // Ensure minimum height for content
   },
   modalContentContainer: {
     paddingHorizontal: 4,
@@ -4451,7 +4579,8 @@ const styles = StyleSheet.create({
     flexWrap: 'wrap',
     justifyContent: 'space-between',
     width: '100%',
-    marginVertical: 20,
+    marginVertical: 15,
+    paddingHorizontal: 5,
   },
   seedWordContainer: {
     width: '48%',
@@ -4459,8 +4588,8 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     backgroundColor: 'rgba(22, 33, 62, 0.8)',
     borderRadius: 10,
-    padding: 12,
-    marginBottom: 10,
+    padding: 10,
+    marginBottom: 8,
     borderWidth: 1,
     borderColor: 'rgba(0, 212, 255, 0.3)',
   },
@@ -4720,8 +4849,8 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     backgroundColor: '#16213e',
     borderRadius: 12,
-    padding: 15,
-    marginBottom: 10,
+    padding: 12,
+    marginBottom: 8,
     borderWidth: 1,
     borderColor: 'rgba(0, 212, 255, 0.2)',
   },
@@ -4746,13 +4875,13 @@ const styles = StyleSheet.create({
     flex: 1,
   },
   nodeTypeName: {
-    fontSize: 16,
+    fontSize: 15,
     fontWeight: '600',
     color: '#ffffff',
-    marginBottom: 4,
+    marginBottom: 3,
   },
   nodeTypeDesc: {
-    fontSize: 12,
+    fontSize: 11,
     color: '#888',
   },
   nodeTypePrice: {
