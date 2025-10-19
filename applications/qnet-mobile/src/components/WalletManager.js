@@ -2275,9 +2275,17 @@ export class WalletManager {
       
       // Use ed25519-hd-key library for proper HD derivation
       // This is the same library used by Phantom wallet
-      const { key } = derivePath(path, Buffer.from(seed).toString('hex'));
-      
-      return key;
+      try {
+        const seedHex = Array.from(seed)
+          .map(b => b.toString(16).padStart(2, '0'))
+          .join('');
+        const { key } = derivePath(path, seedHex);
+        return key;
+      } catch (error) {
+        console.error('HD derivation error:', error);
+        // Fallback to simple derivation
+        return seed.slice(0, 32);
+      }
     } catch (error) {
       // console.error('HD derivation error:', error);
       // Fallback to direct seed for compatibility
@@ -2708,7 +2716,7 @@ export class WalletManager {
         vaultData = JSON.parse(vaultDataStr);
       } catch (parseError) {
         // Corrupted data - clean up and throw error
-        // console.error('Corrupted wallet data, cleaning up...');
+        console.error('Corrupted wallet data:', parseError.message);
         await AsyncStorage.removeItem('qnet_wallet');
         await AsyncStorage.removeItem('qnet_wallet_address');
         throw new Error('Wallet data is corrupted. Please create a new wallet or import existing one.');
@@ -3181,11 +3189,20 @@ export class WalletManager {
   }
   
   // Encrypt and store activation code securely
-  async storeActivationCode(code, nodeType, password) {
+  async storeActivationCode(code, nodeType, password, metadata = {}) {
     try {
       // Get existing encrypted codes or initialize
       const existingCodesStr = await AsyncStorage.getItem('qnet_activation_codes');
       let encryptedCodes = existingCodesStr ? JSON.parse(existingCodesStr) : {};
+      
+      // Store activation metadata (timestamp, tx signature, etc)
+      if (metadata.timestamp || metadata.signature) {
+        await AsyncStorage.setItem(`qnet_activation_meta_${nodeType}`, JSON.stringify({
+          timestamp: metadata.timestamp || Date.now(),
+          signature: metadata.signature || null,
+          nodeType: nodeType
+        }));
+      }
       
       // Generate random salt and IV for this specific code
       const salt = CryptoJS.lib.WordArray.random(16);
@@ -3272,6 +3289,53 @@ export class WalletManager {
         return existingCodes;
       }
       
+      // First check if we have stored activation metadata
+      // This is the most reliable way to know if node was activated
+      const metaKeys = ['light', 'full', 'super'];
+      for (const nodeType of metaKeys) {
+        const metaData = await AsyncStorage.getItem(`qnet_activation_meta_${nodeType}`);
+        if (metaData) {
+          const meta = JSON.parse(metaData);
+          console.log(`Found activation metadata for ${nodeType} node`);
+          // Generate code for this node type
+          if (seedPhrase) {
+            const code = this.generateActivationCode(nodeType, walletAddress, seedPhrase);
+            if (code && password) {
+              await this.storeActivationCode(code, nodeType, password);
+              return { [nodeType]: code };
+            }
+          }
+        }
+      }
+      
+      // Check cache for recent blockchain check
+      const cacheKey = `blockchain_check_${walletAddress}`;
+      const cachedResult = await AsyncStorage.getItem(cacheKey);
+      if (cachedResult) {
+        const cached = JSON.parse(cachedResult);
+        const cacheAge = Date.now() - cached.timestamp;
+        // Use cache if less than 30 seconds old
+        if (cacheAge < 30 * 1000) {
+          console.log('Using cached blockchain check result');
+          if (cached.activatedNodes && cached.activatedNodes.length > 0) {
+            // Process cached result
+            const codes = {};
+            if (seedPhrase) {
+              codes.light = this.generateActivationCode('light', walletAddress, seedPhrase);
+              codes.full = this.generateActivationCode('full', walletAddress, seedPhrase);  
+              codes.super = this.generateActivationCode('super', walletAddress, seedPhrase);
+            }
+            const nodeType = cached.activatedNodes[0];
+            const code = codes[nodeType];
+            if (code && password) {
+              await this.storeActivationCode(code, nodeType, password, { fromCache: true });
+              return { [nodeType]: code };
+            }
+          }
+          return null;
+        }
+      }
+      
       // Generate deterministic codes from seed
       const codes = {};
       if (seedPhrase) {
@@ -3300,7 +3364,7 @@ export class WalletManager {
           
           if (code && password) {
             // console.log('[syncActivationCodes] Storing code for node type (from MEMO):', nodeType);
-            await this.storeActivationCode(code, nodeType, password);
+            await this.storeActivationCode(code, nodeType, password, { fromBlockchain: true });
             return { [nodeType]: code };
           }
         } else {
@@ -3343,24 +3407,48 @@ export class WalletManager {
         // Import Solana web3
         const { Connection, PublicKey } = require('@solana/web3.js');
         
-        // Create connection
+        // Create connection with timeout
         const connection = new Connection(
           isTestnet ? 'https://api.devnet.solana.com' : 'https://api.mainnet-beta.solana.com',
-          'confirmed'
+          {
+            commitment: 'confirmed',
+            confirmTransactionInitialTimeout: 10000 // 10 second timeout
+          }
         );
         
-        // Get transaction signatures for this wallet
-        const signatures = await connection.getSignaturesForAddress(
+        // Smart transaction fetching strategy
+        // 1. First check recent transactions (fast)
+        let signatures = await connection.getSignaturesForAddress(
           new PublicKey(walletAddress),
-          { limit: 100 }
+          { limit: 10 } // Quick check of recent transactions
         );
         
-        // Check each transaction
-        for (const sigInfo of signatures) {
-          try {
-            const tx = await connection.getParsedTransaction(sigInfo.signature);
+        // Function to check transactions in batches
+        const checkTransactionBatch = async (sigs) => {
+          const txPromises = [];
+          const txSignatures = []; // Store signatures for later use
+          const maxBatchSize = 5;
+          
+          for (let i = 0; i < sigs.length; i++) {
+            const sigInfo = sigs[i];
+            txPromises.push(
+              connection.getParsedTransaction(sigInfo.signature)
+                .then(tx => ({ tx, sigInfo })) // Include sigInfo with transaction
+                .catch(err => {
+                  console.log('Failed to get tx:', err.message);
+                  return null;
+                })
+            );
             
-            if (tx && tx.meta && !tx.meta.err) {
+            // Process in batches
+            if (txPromises.length === maxBatchSize || i === sigs.length - 1) {
+              const txBatch = await Promise.all(txPromises);
+              
+              for (const result of txBatch) {
+                if (!result) continue;
+                const { tx, sigInfo } = result;
+                
+                if (tx && tx.meta && !tx.meta.err) {
               // Check if this transaction involves burn contract
               const instructions = tx.transaction.message.instructions;
               
@@ -3424,6 +3512,12 @@ export class WalletManager {
                     if (nodeType && ['light', 'full', 'super'].includes(nodeType)) {
                       // Found exact type from memo!
                       // console.log('[checkBlockchainForActivations] ✅ Exact node type determined:', nodeType);
+                      // Store activation metadata for future quick lookups
+                      await AsyncStorage.setItem(`qnet_activation_meta_${nodeType}`, JSON.stringify({
+                        timestamp: tx.blockTime ? tx.blockTime * 1000 : Date.now(),
+                        signature: sigInfo.signature,
+                        nodeType: nodeType
+                      }));
                       return [nodeType];
                     } else {
                       // Old activation without memo - return all types
@@ -3433,15 +3527,73 @@ export class WalletManager {
                   }
                 }
               }
+              
+                // Early exit if we found activation
+                if (activatedNodes.length > 0) {
+                  break;
+                }
+                }
+              }
+              
+              // Clear promise array for next batch
+              txPromises.length = 0;
+            
+              // Early exit if we found activation
+              if (activatedNodes.length > 0) {
+                return activatedNodes;
+              }
             }
-          } catch (txError) {
-            // Continue checking other transactions
+          }
+          return activatedNodes;
+        };
+        
+        // First, quick check of recent transactions
+        let result = await checkTransactionBatch(signatures);
+        if (result && result.length > 0) {
+          activatedNodes.push(...result);
+        }
+        
+        // If not found in recent, do targeted search for burn transactions
+        if (activatedNodes.length === 0) {
+          console.log('Not found in recent transactions, searching for burn transactions...');
+          
+          // Search specifically for 1DEV token burns (more targeted)
+          const oneDevMint = isTestnet 
+            ? '62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ'
+            : '4R3DPW4BY97kJRfv8J5wgTtbDpoXpRv92W957tXMpump';
+          
+          // Get more transactions but only check those that involve token program
+          signatures = await connection.getSignaturesForAddress(
+            new PublicKey(walletAddress),
+            { 
+              limit: 50, // Check more transactions
+              before: signatures.length > 0 ? signatures[signatures.length - 1].signature : undefined
+            }
+          );
+          
+          // Filter signatures to only check potential burn transactions
+          // This is a heuristic - transactions with errors are skipped
+          const filteredSigs = signatures.filter(sig => !sig.err);
+          
+          // Check next batch (but limit processing)
+          if (filteredSigs.length > 0) {
+            result = await checkTransactionBatch(filteredSigs.slice(0, 20));
+            if (result && result.length > 0) {
+              activatedNodes.push(...result);
+            }
           }
         }
       } catch (rpcError) {
         // console.log('[checkBlockchainForActivations] RPC check error:', rpcError);
         // Continue without blockchain check
       }
+      
+      // Cache the result
+      const cacheKey = `blockchain_check_${walletAddress}`;
+      await AsyncStorage.setItem(cacheKey, JSON.stringify({
+        timestamp: Date.now(),
+        activatedNodes: activatedNodes
+      }));
       
       return activatedNodes;
     } catch (error) {

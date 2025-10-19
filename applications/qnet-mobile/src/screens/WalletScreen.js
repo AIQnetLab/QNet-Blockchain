@@ -821,51 +821,78 @@ const WalletScreen = () => {
     }
   }, [activeTab, isTestnet, wallet]);
   
-  // Load node rewards when on history tab or when activation changes
+  // Background sync activation codes - check periodically until found
   useEffect(() => {
-    if (activeTab === 'history') {
-      // Small delay to let UI render first
-      const syncTimer = setTimeout(() => {
-        // Sync activation codes when opening Node tab (battery-friendly)
-        if (wallet && wallet.publicKey && password) {
-          // Get mnemonic securely from encrypted storage
-          walletManager.getEncryptedMnemonic(password).then(mnemonic => {
+    if (wallet && wallet.publicKey && password) {
+      let syncInterval;
+      
+      // Sync in background without blocking UI
+      const backgroundSync = async () => {
+        try {
+          const mnemonic = await walletManager.getEncryptedMnemonic(password);
           if (!mnemonic) return;
-          return walletManager.syncActivationCodes(
+          
+          const syncedCodes = await walletManager.syncActivationCodes(
             wallet.publicKey,
             mnemonic,
             password
           );
-        }).then((syncedCodes) => {
+          
           if (syncedCodes && Object.keys(syncedCodes).length > 0) {
             const nodeType = Object.keys(syncedCodes)[0];
             const code = syncedCodes[nodeType];
             setActivatedNodeType(nodeType);
             setActivationCode(code.code || code);
+            
+            // Stop syncing once we found activation
+            if (syncInterval) {
+              clearInterval(syncInterval);
+              syncInterval = null;
+            }
           }
-          }).catch(() => {
-            // Silent fail
-          });
+        } catch (error) {
+          // Silent fail - background operation
         }
-      }, 50); // Small delay
+      };
       
-      // Cleanup timer
-      return () => clearTimeout(syncTimer);
+      // Run sync immediately
+      backgroundSync();
       
-      if (activatedNodeType && activationCode) {
-        loadNodeRewards();
-        // Refresh rewards every 30 seconds
-        const rewardsInterval = setInterval(loadNodeRewards, 30000);
-        
-        // Start ping interval if not already running
-        if (!global.nodePingInterval) {
-          startNodePingInterval();
-        }
-        
-        return () => clearInterval(rewardsInterval);
+      // Only set interval if we don't have activation yet
+      if (!activatedNodeType) {
+        // Then sync every 30 seconds to catch new activations
+        syncInterval = setInterval(backgroundSync, 30000);
       }
+      
+      // Cleanup
+      return () => {
+        if (syncInterval) clearInterval(syncInterval);
+      };
     }
-  }, [activeTab, activatedNodeType, activationCode, wallet, password]);
+  }, [wallet, password]); // Run when wallet loads
+  
+  // Load node rewards when on history tab
+  useEffect(() => {
+    if (activeTab === 'history' && activatedNodeType && activationCode) {
+      let rewardsInterval;
+      
+      // Load rewards immediately
+      loadNodeRewards();
+      
+      // Refresh rewards every 30 seconds
+      rewardsInterval = setInterval(loadNodeRewards, 30000);
+      
+      // Start ping interval if not already running
+      if (!global.nodePingInterval) {
+        startNodePingInterval();
+      }
+      
+      // Cleanup function
+      return () => {
+        if (rewardsInterval) clearInterval(rewardsInterval);
+      };
+    }
+  }, [activeTab, activatedNodeType, activationCode]); // Load when tab opens and we have activation
   
   // Load dynamic pricing when on activate tab
   useEffect(() => {
@@ -1434,6 +1461,25 @@ const WalletScreen = () => {
       setImportStep(1); // Reset to step 1 for next time
       setLoading(false);
       
+      // Clear previous wallet's activation data
+      setActivatedNodeType(null);
+      setActivationCode(null);
+      setNodeRewards(null);
+      setNodePseudonym('');
+      setNodeStatus(null); // Reset node selection
+      
+      // Clear stored activation data from AsyncStorage
+      await AsyncStorage.removeItem('qnet_activation_codes');
+      await AsyncStorage.removeItem('qnet_activation_meta_light');
+      await AsyncStorage.removeItem('qnet_activation_meta_full');
+      await AsyncStorage.removeItem('qnet_activation_meta_super');
+      // Clear cache for any previous wallet
+      const keys = await AsyncStorage.getAllKeys();
+      const blockchainCacheKeys = keys.filter(key => key.startsWith('blockchain_check_'));
+      if (blockchainCacheKeys.length > 0) {
+        await AsyncStorage.multiRemove(blockchainCacheKeys);
+      }
+      
       // Switch directly to assets tab without alert
       setActiveTab('assets');
       // Force immediate balance load without delay
@@ -1520,6 +1566,16 @@ const WalletScreen = () => {
     // Clear activation status for new wallet
     setActivatedNodeType(null);
     setActivationCode(null);
+    setNodeRewards(null);
+    setNodePseudonym('');
+    setNodeStatus(null); // Reset node selection
+    
+    // Clear stored activation data from AsyncStorage
+    AsyncStorage.removeItem('qnet_activation_codes');
+    AsyncStorage.removeItem('qnet_activation_meta_light');
+    AsyncStorage.removeItem('qnet_activation_meta_full');
+    AsyncStorage.removeItem('qnet_activation_meta_super');
+    AsyncStorage.removeItem(`blockchain_check_${tempWallet.publicKey}`);
     
     // Switch to assets tab immediately
     setActiveTab('assets');
@@ -1599,6 +1655,7 @@ const WalletScreen = () => {
                   setPassword('');
                   setActivatedNodeType(null);
                   setActivationCode(null);
+                  setNodeStatus(null); // Reset node selection
                   showAlert('Success', 'Wallet data cleared. You can now create a new wallet or import an existing one.');
                 } catch (clearError) {
                   // console.error('Error clearing wallet:', clearError);
@@ -1922,6 +1979,7 @@ const WalletScreen = () => {
               setHasWallet(false);
               setActivatedNodeType(null);
               setActivationCode(null);
+              setNodeStatus(null); // Reset node selection
               
             } catch (error) {
               showAlert('Error', 'Failed to delete wallet: ' + error.message);
@@ -2505,7 +2563,7 @@ const WalletScreen = () => {
           <ScrollView 
             style={styles.content}
             onScroll={handleUserActivity}
-            scrollEventThrottle={1000}
+            scrollEventThrottle={16}
             refreshControl={
               <RefreshControl
                 refreshing={refreshing}
@@ -2670,7 +2728,7 @@ const WalletScreen = () => {
 
       case 'send':
         return (
-          <ScrollView style={styles.content} onScroll={handleUserActivity} scrollEventThrottle={1000}>
+          <ScrollView style={styles.content} onScroll={handleUserActivity} scrollEventThrottle={16}>
             <Text style={styles.tabTitle}>Send Tokens</Text>
             
             <View style={styles.formGroup}>
@@ -2740,7 +2798,7 @@ const WalletScreen = () => {
           : (wallet.solanaAddress || wallet.address);
         
         return (
-          <ScrollView style={styles.content} onScroll={handleUserActivity} scrollEventThrottle={1000}>
+          <ScrollView style={styles.content} onScroll={handleUserActivity} scrollEventThrottle={16}>
             <Text style={styles.tabTitle}>Receive Tokens</Text>
             
             <View style={styles.receiveContent}>
@@ -2790,7 +2848,7 @@ const WalletScreen = () => {
 
       case 'activate':
         return (
-          <ScrollView style={styles.content} onScroll={handleUserActivity} scrollEventThrottle={1000}>
+          <ScrollView style={styles.content} onScroll={handleUserActivity} scrollEventThrottle={16}>
             <Text style={styles.tabTitle}>Node Activation</Text>
             
             {/* Phase Indicator */}
@@ -2858,7 +2916,7 @@ const WalletScreen = () => {
               <TouchableOpacity 
                 style={[
                   styles.nodeTypeCard, 
-                  nodeStatus === 'light' && styles.nodeTypeActive,
+                  nodeStatus === 'light' && !activatedNodeType && styles.nodeTypeActive,
                   activatedNodeType === 'light' && styles.nodeTypeActivated
                 ]}
                 onPress={() => !activatedNodeType && setNodeStatus('light')}
@@ -2885,7 +2943,7 @@ const WalletScreen = () => {
               <TouchableOpacity 
                 style={[
                   styles.nodeTypeCard, 
-                  nodeStatus === 'full' && styles.nodeTypeActive,
+                  nodeStatus === 'full' && !activatedNodeType && styles.nodeTypeActive,
                   activatedNodeType === 'full' && styles.nodeTypeActivated
                 ]}
                 onPress={() => !activatedNodeType && setNodeStatus('full')}
@@ -2912,7 +2970,7 @@ const WalletScreen = () => {
               <TouchableOpacity 
                 style={[
                   styles.nodeTypeCard, 
-                  nodeStatus === 'super' && styles.nodeTypeActive,
+                  nodeStatus === 'super' && !activatedNodeType && styles.nodeTypeActive,
                   activatedNodeType === 'super' && styles.nodeTypeActivated
                 ]}
                 onPress={() => !activatedNodeType && setNodeStatus('super')}
@@ -3282,7 +3340,12 @@ const WalletScreen = () => {
 
       case 'history':
         return (
-          <ScrollView style={styles.content} onScroll={handleUserActivity} scrollEventThrottle={1000}>
+          <ScrollView 
+            key="history-tab"
+            style={styles.content} 
+            onScroll={handleUserActivity} 
+            scrollEventThrottle={1000}
+          >
             <Text style={styles.tabTitle}>Node Monitoring</Text>
             
             {activatedNodeType ? (
@@ -3428,18 +3491,14 @@ const WalletScreen = () => {
         );
 
       case 'settings':
-        // Delay heavy rendering for better initial load
-        setTimeout(() => {
-          setRefreshing(false);
-        }, 100);
-        
         return (
           <ScrollView 
-            style={styles.content} 
+            style={styles.content}
+            contentContainerStyle={{ paddingBottom: 100 }}
             onScroll={handleUserActivity} 
-            scrollEventThrottle={1000}
-            removeClippedSubviews={true}
-            initialNumToRender={10}
+            scrollEventThrottle={16}
+            showsVerticalScrollIndicator={true}
+            bounces={true}
           >
             <Text style={styles.tabTitle}>{t('settings')}</Text>
             
@@ -3539,20 +3598,10 @@ const WalletScreen = () => {
 
                 <TouchableOpacity 
                   style={styles.actionButton}
-                  onPress={() => {
-                    if (activationCode) {
-                      Clipboard.setString(activationCode);
-                      showAlert('Copied', 'Activation code copied to clipboard');
-                      setTimeout(() => {
-                        Clipboard.setString('');
-                      }, 10000);
-                    } else {
-                      setShowExportActivation(true);
-                    }
-                  }}
+                  onPress={() => setShowExportActivation(true)}
                 >
                   <Text style={styles.actionButtonText}>
-                    {activationCode ? 'Copy Activation Code' : t('export_activation_code')}
+                    {t('export_activation_code')}
                   </Text>
                 </TouchableOpacity>
               </View>
@@ -3647,6 +3696,7 @@ const WalletScreen = () => {
           style={[styles.tab, activeTab === 'assets' && styles.activeTab]}
           onPress={() => {
             setActiveTab('assets');
+            setNodeStatus(null); // Reset node selection when leaving activate tab
             // Immediate balance refresh when switching to assets
             if (wallet && wallet.publicKey) {
               // console.log('User switched to assets tab, refreshing balance');
@@ -3659,35 +3709,50 @@ const WalletScreen = () => {
         
         <TouchableOpacity 
           style={[styles.tab, activeTab === 'send' && styles.activeTab]}
-          onPress={() => setActiveTab('send')}
+          onPress={() => {
+            setActiveTab('send');
+            setNodeStatus(null); // Reset node selection when leaving activate tab
+          }}
         >
           <Text style={[styles.tabText, activeTab === 'send' && styles.activeTabText]}>Send</Text>
         </TouchableOpacity>
         
         <TouchableOpacity 
           style={[styles.tab, activeTab === 'receive' && styles.activeTab]}
-          onPress={() => setActiveTab('receive')}
+          onPress={() => {
+            setActiveTab('receive');
+            setNodeStatus(null); // Reset node selection when leaving activate tab
+          }}
         >
           <Text style={[styles.tabText, activeTab === 'receive' && styles.activeTabText]}>Receive</Text>
         </TouchableOpacity>
         
         <TouchableOpacity 
           style={[styles.tab, activeTab === 'activate' && styles.activeTab]}
-          onPress={() => setActiveTab('activate')}
+          onPress={() => {
+            setActiveTab('activate');
+            setNodeStatus(null); // Reset node selection when switching tabs
+          }}
         >
           <Text style={[styles.tabText, activeTab === 'activate' && styles.activeTabText]}>Activate</Text>
         </TouchableOpacity>
         
         <TouchableOpacity 
           style={[styles.tab, activeTab === 'history' && styles.activeTab]}
-          onPress={() => setActiveTab('history')}
+          onPress={() => {
+            setActiveTab('history');
+            setNodeStatus(null); // Reset node selection when leaving activate tab
+          }}
         >
           <Text style={[styles.tabText, activeTab === 'history' && styles.activeTabText]}>Node</Text>
         </TouchableOpacity>
 
         <TouchableOpacity 
           style={[styles.tab, activeTab === 'settings' && styles.activeTab]}
-          onPress={() => setActiveTab('settings')}
+          onPress={() => {
+            setActiveTab('settings');
+            setNodeStatus(null); // Reset node selection when leaving activate tab
+          }}
         >
           <Text style={[styles.tabText, activeTab === 'settings' && styles.activeTabText]}>⚙️</Text>
         </TouchableOpacity>
@@ -4056,6 +4121,18 @@ const WalletScreen = () => {
 };
 
 const styles = StyleSheet.create({
+  loadingContainer: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    paddingVertical: 100,
+  },
+  loadingText: {
+    color: '#8e8e93',
+    fontSize: 16,
+    marginTop: 10,
+    fontFamily: 'Courier New',
+  },
   container: {
     flex: 1,
     backgroundColor: '#0f0f1a', // Same as splash screen for smooth transition
@@ -4231,6 +4308,7 @@ const styles = StyleSheet.create({
   },
   tabContentContainer: {
     flex: 1,
+    marginBottom: 60, // Space to ensure content is scrollable above tab nav
   },
   tabTitle: {
     fontSize: 24,
