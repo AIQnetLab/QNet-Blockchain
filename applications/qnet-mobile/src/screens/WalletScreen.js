@@ -2234,23 +2234,26 @@ const WalletScreen = () => {
       
       return (
         <SafeAreaView style={styles.container}>
-          <ScrollView contentContainerStyle={styles.centerContent}>
-            <Text style={styles.title}>IMPORTANT: Save Your Recovery Phrase</Text>
-            <Text style={styles.subtitle}>
+          <ScrollView 
+            contentContainerStyle={[styles.centerContent, {paddingBottom: 100}]}
+            showsVerticalScrollIndicator={true}
+          >
+            <Text style={[styles.title, {fontSize: 18}]}>Save Your Recovery Phrase</Text>
+            <Text style={[styles.subtitle, {fontSize: 13, marginBottom: 15}]}>
               Write down these 12 words in order. You'll need them to recover your wallet.
             </Text>
             
-            <View style={styles.seedGrid}>
+            <View style={[styles.seedGrid, {marginVertical: 10}]}>
               {words.map((word, index) => (
-                <View key={index} style={styles.seedWordContainer}>
-                  <Text style={styles.seedWordNumber}>{index + 1}</Text>
-                  <Text style={styles.seedWordText}>{word}</Text>
+                <View key={index} style={[styles.seedWordContainer, {padding: 8, marginBottom: 6}]}>
+                  <Text style={[styles.seedWordNumber, {fontSize: 11}]}>{index + 1}</Text>
+                  <Text style={[styles.seedWordText, {fontSize: 13}]}>{word}</Text>
                 </View>
               ))}
             </View>
             
             <TouchableOpacity 
-              style={[styles.button, styles.secondaryButton]}
+              style={[styles.button, styles.secondaryButton, {marginVertical: 10, minHeight: 44}]}
               onPress={() => {
                 try {
                   // Copy seed phrase to clipboard
@@ -2270,12 +2273,12 @@ const WalletScreen = () => {
               <Text style={[styles.buttonText, styles.secondaryButtonText]}>Copy Recovery Phrase</Text>
             </TouchableOpacity>
             
-            <Text style={[styles.warningText, {marginTop: 12, marginBottom: 20}]}>
+            <Text style={[styles.warningText, {marginTop: 10, marginBottom: 15, fontSize: 13}]}>
               ⚠️ Never share this with anyone!
             </Text>
             
             <TouchableOpacity 
-              style={styles.button}
+              style={[styles.button, {marginBottom: 20, minHeight: 44}]}
               onPress={() => {
                 setShowSeedConfirm(true);
                 setShowCreateOptions(false);
@@ -2997,10 +3000,11 @@ const WalletScreen = () => {
                 
                 // Create rich content for confirmation modal (compact version)
                 const confirmRichContent = (
-                  <View style={{ paddingHorizontal: 15, paddingVertical: 10 }}>
-                    <Text style={[styles.modalContent, { fontSize: 16, fontWeight: 'bold', marginBottom: 12 }]}>
-                      {nodeTypeName} Activation
-                    </Text>
+                  <ScrollView style={{ maxHeight: 350 }} showsVerticalScrollIndicator={true}>
+                    <View style={{ paddingHorizontal: 15, paddingVertical: 10 }}>
+                      <Text style={[styles.modalContent, { fontSize: 15, fontWeight: 'bold', marginBottom: 10 }]}>
+                        {nodeTypeName} Activation
+                      </Text>
                     
                     {/* Can be activated banner */}
                     <View style={{ 
@@ -3052,7 +3056,8 @@ const WalletScreen = () => {
                         </Text>
                       )}
                     </View>
-                  </View>
+                    </View>
+                  </ScrollView>
                 );
                 
                 showAlert(

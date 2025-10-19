@@ -7,6 +7,8 @@
     <link rel="stylesheet" href="styles/popup.css">
     <link rel="stylesheet" href="styles/expanded.css">
     <!-- Google Fonts removed for CSP compliance - using system fonts -->
+    <script src="lib/canvas-polyfill.js"></script>
+    <script src="lib/qrious.min.js"></script>
 </head>
 <body>
     <div id="app-container">
@@ -236,10 +238,8 @@
                             <div class="qr-container">
                                 <canvas id="qr-canvas"></canvas>
                             </div>
-                            <div class="address-display">
-                                <label>Your Address</label>
-                                <div class="address-text" id="receive-address">Loading...</div>
-                                <button id="copy-receive-address" class="copy-btn">Copy Address</button>
+                            <div class="qr-info">
+                                <p class="scan-label">Scan to receive <span id="receive-network-label">QNet</span> tokens</p>
                             </div>
                         </div>
                     </div>
@@ -637,7 +637,7 @@
             </div>
         </div>
 
-        <!-- Receive Modal -->
+        <!-- Receive Modal (deprecated - using tab instead) -->
         <div id="receive-modal" class="modal-overlay hidden">
             <div class="modal-box modern">
                 <div class="modal-header">
@@ -646,11 +646,9 @@
                 </div>
                 <div class="receive-content">
                     <div class="qr-container" id="qr-container">
-                        <canvas id="qr-canvas"></canvas>
+                        <canvas id="qr-modal-canvas"></canvas>
                     </div>
-                    <div class="address-display">
-                        <div class="address-text" id="receive-address">Loading...</div>
-                    </div>
+                    <p class="scan-label">Scan to receive tokens</p>
                 </div>
             </div>
         </div>
