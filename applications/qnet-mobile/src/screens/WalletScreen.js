@@ -770,6 +770,18 @@ const WalletScreen = () => {
   const [activationInputCode, setActivationInputCode] = useState(''); // Input activation code
   const [nodeActivating, setNodeActivating] = useState(false); // Node activation in progress
 
+  // Throttle helper to prevent too frequent updates
+  const lastActivityEmit = React.useRef(0);
+  
+  // Function to emit user activity (throttled to once per 5 seconds)
+  const handleUserActivity = React.useCallback(() => {
+    const now = Date.now();
+    if (now - lastActivityEmit.current > 5000) { // Only emit once per 5 seconds
+      lastActivityEmit.current = now;
+      DeviceEventEmitter.emit('userActivity');
+    }
+  }, []);
+
   // Helper function to show custom styled alerts
   const showAlert = (title, message, buttons = [{ text: 'OK', onPress: () => {} }], richContent = null) => {
     setCustomAlert({ title, message, buttons, richContent });
@@ -2141,7 +2153,10 @@ const WalletScreen = () => {
   if (!hasWallet) {
     if (!showCreateOptions) {
       return (
-        <SafeAreaView style={styles.container}>
+        <SafeAreaView 
+          style={[styles.container, Platform.OS === 'ios' && {paddingTop: 44}]} 
+          edges={Platform.OS === 'ios' ? ['left', 'right'] : ['top', 'left', 'right']}
+        >
           <View style={styles.centerContent}>
             <Text style={styles.title}>QNet Wallet</Text>
             <Text style={styles.subtitle}>Get started with QNet</Text>
@@ -2182,7 +2197,10 @@ const WalletScreen = () => {
 
     if (showCreateOptions === 'create') {
       return (
-        <SafeAreaView style={styles.container}>
+        <SafeAreaView 
+          style={[styles.container, Platform.OS === 'ios' && {paddingTop: 44}]} 
+          edges={Platform.OS === 'ios' ? ['left', 'right'] : ['top', 'left', 'right']}
+        >
           <ScrollView contentContainerStyle={styles.centerContent}>
             <Text style={styles.title}>Create Wallet</Text>
             <Text style={styles.subtitle}>Enter a strong password (min 8 characters)</Text>
@@ -2352,7 +2370,10 @@ const WalletScreen = () => {
       // Step 1: Set password
       if (importStep === 1) {
         return (
-          <SafeAreaView style={styles.container}>
+          <SafeAreaView 
+            style={[styles.container, Platform.OS === 'ios' && {paddingTop: 44}]} 
+            edges={Platform.OS === 'ios' ? ['left', 'right'] : ['top', 'left', 'right']}
+          >
             <ScrollView contentContainerStyle={styles.centerContent}>
               <Text style={styles.title}>Import Wallet</Text>
               <Text style={styles.subtitle}>Step 1: Create password</Text>
@@ -2446,7 +2467,10 @@ const WalletScreen = () => {
       // Step 2: Enter seed phrase
       if (importStep === 2) {
         return (
-          <SafeAreaView style={styles.container}>
+          <SafeAreaView 
+            style={[styles.container, Platform.OS === 'ios' && {paddingTop: 44}]} 
+            edges={Platform.OS === 'ios' ? ['left', 'right'] : ['top', 'left', 'right']}
+          >
             <ScrollView contentContainerStyle={styles.centerContent}>
               <Text style={styles.title}>Import Wallet</Text>
               <Text style={styles.subtitle}>Step 2: Enter your seed phrase</Text>
@@ -2527,7 +2551,10 @@ const WalletScreen = () => {
 
   if (!wallet) {
     return (
-      <SafeAreaView style={styles.container}>
+      <SafeAreaView 
+        style={[styles.container, Platform.OS === 'ios' && {paddingTop: 44}]} 
+        edges={Platform.OS === 'ios' ? ['left', 'right'] : ['top', 'left', 'right']}
+      >
         <View style={styles.centerContent}>
           <Text style={styles.title}>QNet Wallet</Text>
           <Text style={styles.subtitle}>Unlock your wallet</Text>
@@ -3673,22 +3700,13 @@ const WalletScreen = () => {
     }
   };
 
-  // Throttle helper to prevent too frequent updates
-  const lastActivityEmit = React.useRef(0);
-  
-  // Function to emit user activity (throttled to once per 5 seconds)
-  const handleUserActivity = React.useCallback(() => {
-    const now = Date.now();
-    if (now - lastActivityEmit.current > 5000) { // Only emit once per 5 seconds
-      lastActivityEmit.current = now;
-      DeviceEventEmitter.emit('userActivity');
-    }
-  }, []);
-
   // Show splash screen after unlock while loading wallet
   if (hasWallet && !wallet && showSplash) {
     return (
-      <SafeAreaView style={styles.container}>
+      <SafeAreaView 
+        style={[styles.container, Platform.OS === 'ios' && {paddingTop: 44}]} 
+        edges={Platform.OS === 'ios' ? ['left', 'right'] : ['top', 'left', 'right']}
+      >
         <View style={styles.centerContent}>
           <View style={styles.logoContainer}>
             <View style={styles.logoOuter}>
@@ -3706,7 +3724,10 @@ const WalletScreen = () => {
 
   return (
     <TouchableWithoutFeedback onPress={handleUserActivity}>
-    <SafeAreaView style={styles.container} edges={['top', 'left', 'right']}>
+    <SafeAreaView 
+      style={[styles.container, Platform.OS === 'ios' && {paddingTop: 44}]} 
+      edges={Platform.OS === 'ios' ? ['left', 'right'] : ['top', 'left', 'right']}
+    >
       <View style={styles.header}>
         <Text style={styles.title}>QNet Wallet</Text>
       </View>
@@ -4156,7 +4177,7 @@ const styles = StyleSheet.create({
   },
   container: {
     flex: 1,
-    backgroundColor: '#0f0f1a', // Same as splash screen for smooth transition
+    backgroundColor: '#0a0a14', // Same as splash screen for smooth transition
   },
   centerContent: {
     flex: 1,
@@ -4170,7 +4191,7 @@ const styles = StyleSheet.create({
     padding: 20,
   },
   scrollContentContainer: {
-    paddingBottom: Platform.OS === 'ios' ? 100 : 20,
+    paddingBottom: Platform.OS === 'ios' ? 150 : 20,
   },
   title: {
     fontSize: 28,
