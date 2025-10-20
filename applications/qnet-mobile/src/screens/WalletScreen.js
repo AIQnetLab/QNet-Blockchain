@@ -3385,9 +3385,12 @@ const WalletScreen = () => {
           <ScrollView 
             key="history-tab"
             style={styles.content}
-            contentContainerStyle={styles.scrollContentContainer}
-            onScroll={handleUserActivity} 
-            scrollEventThrottle={1000}
+            contentContainerStyle={[
+              styles.scrollContentContainer,
+              Platform.OS === 'ios' && { paddingBottom: 250 }
+            ]}
+            showsVerticalScrollIndicator={true}
+            bounces={true}
           >
             <Text style={styles.tabTitle}>Node Monitoring</Text>
             
@@ -4177,7 +4180,7 @@ const styles = StyleSheet.create({
   },
   container: {
     flex: 1,
-    backgroundColor: '#0a0a14', // Same as splash screen for smooth transition
+    backgroundColor: '#11131f', // Same as splash screen background for smooth transition
   },
   centerContent: {
     flex: 1,

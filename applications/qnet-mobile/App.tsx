@@ -11,7 +11,7 @@ import ErrorBoundary from './src/components/ErrorBoundary';
 function App(): React.JSX.Element {
   return (
     <ErrorBoundary>
-      <StatusBar barStyle="light-content" backgroundColor="#1a1a2e" translucent={false} />
+      <StatusBar barStyle="light-content" backgroundColor="#11131f" translucent={false} />
       <WalletScreen />
     </ErrorBoundary>
   );

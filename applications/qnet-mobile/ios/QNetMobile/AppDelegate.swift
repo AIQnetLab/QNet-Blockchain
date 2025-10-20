@@ -23,8 +23,8 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
 
     window = UIWindow(frame: UIScreen.main.bounds)
     
-    // Set dark background color to match launch screen (#0a0a14) 
-    window?.backgroundColor = UIColor(red: 0.039, green: 0.039, blue: 0.078, alpha: 1.0)
+    // Set dark background color to match launch screen (#11131f = rgb(17, 19, 31))
+    window?.backgroundColor = UIColor(red: 17.0/255.0, green: 19.0/255.0, blue: 31.0/255.0, alpha: 1.0)
 
     factory.startReactNative(
       withModuleName: "QNetMobile",
@@ -34,7 +34,7 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
     
     // Set root view background to match launch screen
     if let rootView = window?.rootViewController?.view {
-      rootView.backgroundColor = UIColor(red: 0.039, green: 0.039, blue: 0.078, alpha: 1.0)
+      rootView.backgroundColor = UIColor(red: 17.0/255.0, green: 19.0/255.0, blue: 31.0/255.0, alpha: 1.0)
     }
 
     return true

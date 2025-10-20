@@ -17,14 +17,14 @@
                         <autoresizingMask key="autoresizingMask" widthSizable="YES" heightSizable="YES"/>
                         <subviews>
                             <imageView clipsSubviews="YES" userInteractionEnabled="NO" contentMode="scaleAspectFit" horizontalHuggingPriority="251" verticalHuggingPriority="251" image="LaunchIcon" translatesAutoresizingMaskIntoConstraints="NO" id="tWc-Dq-wcI">
-                                <rect key="frame" x="127.5" y="273.5" width="120" height="120"/>
+                                <rect key="frame" x="91.5" y="237.5" width="192" height="192"/>
                                 <constraints>
-                                    <constraint firstAttribute="width" constant="120" id="Tcx-6S-aHd"/>
-                                    <constraint firstAttribute="height" constant="120" id="xQt-2g-Uqd"/>
+                                    <constraint firstAttribute="width" constant="192" id="Tcx-6S-aHd"/>
+                                    <constraint firstAttribute="height" constant="192" id="xQt-2g-Uqd"/>
                                 </constraints>
                             </imageView>
                         </subviews>
-                        <color key="backgroundColor" red="0.10196078431" green="0.10196078431" blue="0.18039215686" alpha="1" colorSpace="custom" customColorSpace="sRGB"/>
+                        <color key="backgroundColor" red="0.06666666667" green="0.07450980392" blue="0.12156862745" alpha="1" colorSpace="custom" customColorSpace="sRGB"/>
                         <constraints>
                             <constraint firstItem="tWc-Dq-wcI" firstAttribute="centerX" secondItem="Ze5-6b-2t3" secondAttribute="centerX" id="8RO-hn-QZo"/>
                             <constraint firstItem="tWc-Dq-wcI" firstAttribute="centerY" secondItem="Ze5-6b-2t3" secondAttribute="centerY" id="N7a-6g-aKj"/>
