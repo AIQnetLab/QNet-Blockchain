@@ -769,6 +769,7 @@ const WalletScreen = () => {
   const [showActivationInput, setShowActivationInput] = useState(false); // Show activation code input modal
   const [activationInputCode, setActivationInputCode] = useState(''); // Input activation code
   const [nodeActivating, setNodeActivating] = useState(false); // Node activation in progress
+  const [unlockError, setUnlockError] = useState(''); // Error message for unlock screen
 
   // Throttle helper to prevent too frequent updates
   const lastActivityEmit = React.useRef(0);
@@ -1624,19 +1625,21 @@ const WalletScreen = () => {
 
   const unlockWallet = async () => {
     if (!password) {
-      showAlert('Error', 'Please enter password');
+      setUnlockError(translations[language].incorrect_password);
+      setTimeout(() => setUnlockError(''), 3000);
+      return;
+    }
+
+    // Quick password check first (fast)
+    const isValid = await walletManager.verifyPassword(password);
+    if (!isValid) {
+      setUnlockError(translations[language].incorrect_password);
+      setTimeout(() => setUnlockError(''), 3000);
       return;
     }
 
     // Optimized: Set UI state immediately, decrypt in background
     setShowSplash(false); // Hide splash immediately
-    
-    // Quick password check first (fast)
-    const isValid = await walletManager.verifyPassword(password);
-    if (!isValid) {
-      showAlert('Error', 'Invalid password');
-      return;
-    }
     
     // Load wallet asynchronously
     walletManager.loadWallet(password).then(loadedWallet => {
@@ -2652,6 +2655,13 @@ const WalletScreen = () => {
             </Text>
           </TouchableOpacity>
         </View>
+
+        {/* Error Toast */}
+        {unlockError ? (
+          <View style={styles.errorToast}>
+            <Text style={styles.errorToastText}>{unlockError}</Text>
+          </View>
+        ) : null}
       </SafeAreaView>
     );
   }
@@ -2832,7 +2842,7 @@ const WalletScreen = () => {
             style={styles.content} 
             contentContainerStyle={styles.scrollContentContainer}
             onScroll={handleUserActivity} 
-            scrollEventThrottle={16}
+            scrollEventThrottle={500}
             showsVerticalScrollIndicator={true}
             bounces={true}
             scrollEnabled={true}
@@ -2910,7 +2920,7 @@ const WalletScreen = () => {
             style={styles.content} 
             contentContainerStyle={styles.scrollContentContainer}
             onScroll={handleUserActivity} 
-            scrollEventThrottle={16}
+            scrollEventThrottle={500}
             showsVerticalScrollIndicator={true}
             bounces={true}
             scrollEnabled={true}
@@ -2968,7 +2978,7 @@ const WalletScreen = () => {
             style={styles.content} 
             contentContainerStyle={styles.scrollContentContainer}
             onScroll={handleUserActivity} 
-            scrollEventThrottle={16}
+            scrollEventThrottle={500}
             showsVerticalScrollIndicator={true}
             bounces={true}
             scrollEnabled={true}
@@ -3485,7 +3495,7 @@ const WalletScreen = () => {
             bounces={true}
             scrollEnabled={true}
             onScroll={handleUserActivity}
-            scrollEventThrottle={16}
+            scrollEventThrottle={500}
           >
             <Text style={styles.tabTitle}>Node Monitoring</Text>
             
@@ -3628,8 +3638,6 @@ const WalletScreen = () => {
             showsVerticalScrollIndicator={true}
             bounces={true}
             scrollEnabled={true}
-            onScroll={handleUserActivity}
-            scrollEventThrottle={16}
           >
             <Text style={styles.tabTitle}>{t('settings')}</Text>
             
@@ -3813,7 +3821,6 @@ const WalletScreen = () => {
   }
 
   return (
-    <TouchableWithoutFeedback onPress={handleUserActivity}>
     <SafeAreaView 
       style={[styles.container, Platform.OS === 'ios' && {paddingTop: 44}]} 
       edges={Platform.OS === 'ios' ? ['left', 'right'] : ['top', 'left', 'right']}
@@ -4255,7 +4262,6 @@ const WalletScreen = () => {
         </Animated.View>
       )}
     </SafeAreaView>
-    </TouchableWithoutFeedback>
   );
 };
 
@@ -5411,6 +5417,28 @@ const styles = StyleSheet.create({
   },
   termsModalDeclineText: {
     color: '#ffffff',
+  },
+  errorToast: {
+    position: 'absolute',
+    bottom: 40,
+    left: 20,
+    right: 20,
+    backgroundColor: '#ff4444',
+    paddingVertical: 16,
+    paddingHorizontal: 20,
+    borderRadius: 12,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.3,
+    shadowRadius: 8,
+    elevation: 8,
+    zIndex: 1000,
+  },
+  errorToastText: {
+    color: '#ffffff',
+    fontSize: 16,
+    fontWeight: '600',
+    textAlign: 'center',
   },
 });
 
