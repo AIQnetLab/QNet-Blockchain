@@ -6136,9 +6136,16 @@ async function getBalance(address, tokenMint = null) {
         const cacheKey = `${walletState.currentNetwork}-${address}-${tokenMint || 'native'}`;
         const cached = walletState.balanceCache.get(cacheKey);
         
-        // Ultra-fast cache for production (2 seconds for instant UI updates)
-        if (cached && (Date.now() - cached.timestamp) < 2000) { // 2 second cache for speed
+        // Cache balances for 30 seconds to avoid spamming RPCs
+        // But for 0 balances, use shorter cache (3 seconds) to retry faster
+        const cacheTimeout = cached && cached.balance === 0 ? 3000 : 30000;
+        if (cached && (Date.now() - cached.timestamp) < cacheTimeout) {
+            // console.log(`[RPC] Using cached balance for ${cacheKey}: ${cached.balance} (cache age: ${Date.now() - cached.timestamp}ms)`);
             return cached.balance;
+        }
+        
+        if (cached && cached.balance === 0) {
+            // console.log(`[RPC] Cached 0 balance expired, fetching fresh data for ${cacheKey}`);
         }
         
         // Deduplicate concurrent requests for same balance
@@ -6270,13 +6277,18 @@ async function fetchBalanceFromBlockchain(address, tokenMint, cacheKey) {
             
             if (!tokenMint) {
                 // SOL balance via direct RPC call with fallback
+                // console.log(`[RPC] Starting SOL balance fetch, trying ${rpcEndpoints.length} RPCs`);
                 for (let i = 0; i < rpcEndpoints.length; i++) {
                     rpcEndpoint = rpcEndpoints[i];
+                    // console.log(`[RPC] Trying SOL RPC ${i+1}/${rpcEndpoints.length}: ${rpcEndpoint}`);
                     
                     try {
                         // Add timeout to prevent hanging on slow RPCs
                         const controller = new AbortController();
-                        const timeoutId = setTimeout(() => controller.abort(), 1500); // 1.5 second timeout for instant failover
+                        const timeoutId = setTimeout(() => {
+                            // console.log(`[RPC] Timeout at ${rpcEndpoint}`);
+                            controller.abort();
+                        }, 3000); // Increased to 3 seconds
                         
                         const startTime = performance.now(); // Track RPC performance
                         
@@ -6320,15 +6332,108 @@ async function fetchBalanceFromBlockchain(address, tokenMint, cacheKey) {
                         
                         // Track successful RPC performance
                         const responseTime = performance.now() - startTime;
+                        // console.log(`[RPC] ✅ SOL balance from ${rpcEndpoint}: ${balance} SOL (${data.result?.value || 0} lamports) in ${responseTime}ms`);
                         trackRPCPerformance(rpcEndpoint, true, responseTime);
                         
                         break; // Success, exit loop
                     } catch (error) {
                         // Track failed RPC
                         const responseTime = performance.now() - startTime;
+                        // console.log(`[RPC] SOL balance failed from ${rpcEndpoint} (${i+1}/${rpcEndpoints.length}):`, error.message);
                         trackRPCPerformance(rpcEndpoint, false, responseTime);
                         
                         if (i === rpcEndpoints.length - 1) {
+                            // console.error('[RPC] All standard RPCs failed, trying alternative APIs');
+                            
+                            // Try alternative public APIs that work without VPN
+                            const alternativeAPIs = [
+                                // SolScan API - usually not blocked
+                                async () => {
+                                    try {
+                                        const network = isMainnet ? 'mainnet' : 'devnet';
+                                        const url = `https://public-api.solscan.io/account/${address}`;
+                                        const controller = new AbortController();
+                                        const timeoutId = setTimeout(() => controller.abort(), 3000);
+                                        
+                                        const response = await fetch(url, {
+                                            headers: { 'Accept': 'application/json' },
+                                            signal: controller.signal
+                                        });
+                                        clearTimeout(timeoutId);
+                                        
+                                        if (response.ok) {
+                                            const data = await response.json();
+                                            // console.log('[RPC] SolScan API response:', data);
+                                            return (data.lamports || 0) / 1e9;
+                                        }
+                                        return null;
+                                    } catch (e) {
+                                        // console.log('[RPC] SolScan API failed:', e.message);
+                                        return null;
+                                    }
+                                },
+                                // Helius free API
+                                async () => {
+                                    try {
+                                        const network = isMainnet ? 'mainnet-beta' : 'devnet';
+                                        const url = `https://api.helius.xyz/v0/addresses/${address}/balances?api-key=demo`;
+                                        const controller = new AbortController();
+                                        const timeoutId = setTimeout(() => controller.abort(), 3000);
+                                        
+                                        const response = await fetch(url, {
+                                            signal: controller.signal
+                                        });
+                                        clearTimeout(timeoutId);
+                                        
+                                        if (response.ok) {
+                                            const data = await response.json();
+                                            // console.log('[RPC] Helius API response:', data);
+                                            return (data.nativeBalance || 0) / 1e9;
+                                        }
+                                        return null;
+                                    } catch (e) {
+                                        // console.log('[RPC] Helius API failed:', e.message);
+                                        return null;
+                                    }
+                                },
+                                // Blockchair API
+                                async () => {
+                                    try {
+                                        const url = `https://api.blockchair.com/solana/raw/account/${address}`;
+                                        const controller = new AbortController();
+                                        const timeoutId = setTimeout(() => controller.abort(), 3000);
+                                        
+                                        const response = await fetch(url, {
+                                            signal: controller.signal
+                                        });
+                                        clearTimeout(timeoutId);
+                                        
+                                        if (response.ok) {
+                                            const data = await response.json();
+                                            // console.log('[RPC] Blockchair API response:', data);
+                                            if (data.data && data.data[address]) {
+                                                return (data.data[address].account.lamports || 0) / 1e9;
+                                            }
+                                        }
+                                        return null;
+                                    } catch (e) {
+                                        // console.log('[RPC] Blockchair API failed:', e.message);
+                                        return null;
+                                    }
+                                }
+                            ];
+                            
+                            // Try each alternative API
+                            for (const apiCall of alternativeAPIs) {
+                                const result = await apiCall();
+                                if (result !== null) {
+                                    balance = result;
+                                    // console.log(`[RPC] Got SOL balance from alternative API: ${balance}`);
+                                    return balance;
+                                }
+                            }
+                            
+                            // console.error('[RPC] All APIs failed, returning 0');
                             return 0;
                         }
                     }
@@ -6349,7 +6454,10 @@ async function fetchBalanceFromBlockchain(address, tokenMint, cacheKey) {
                         
                         // Add timeout to prevent hanging on slow RPCs
                         const controller = new AbortController();
-                        const timeoutId = setTimeout(() => controller.abort(), 1500); // 1.5 second timeout for instant failover
+                        const timeoutId = setTimeout(() => {
+                            // console.log(`[RPC] Timeout at ${rpcEndpoint}`);
+                            controller.abort();
+                        }, 3000); // Increased to 3 seconds
                         
                         const response = await fetch(rpcEndpoint, {
                             method: 'POST',
@@ -6403,18 +6511,48 @@ async function fetchBalanceFromBlockchain(address, tokenMint, cacheKey) {
                             const amount = tokenAccount.account.data.parsed.info.tokenAmount.amount;
                             const decimals = tokenAccount.account.data.parsed.info.tokenAmount.decimals;
                             balance = amount / Math.pow(10, decimals);
-                            // console.log(`[GetBalance] Found token balance: ${balance} (raw: ${amount}, decimals: ${decimals})`);
+                            // console.log(`[RPC] ✅ Token balance from ${rpcEndpoint}: ${balance} (raw: ${amount}, decimals: ${decimals})`);
                             // Found balance, exit both loops and continue to cache it
                             break;
                         } else {
-                            // console.log('[GetBalance] No token accounts found for this mint/address combination');
+                            // console.log(`[RPC] ✅ Token account not found (balance is 0) - this is normal for new accounts`);
                         }
                         break; // Success response received, exit loop
                     } catch (error) {
-                        // console.log(`[GetBalance] RPC ${i + 1} error:`, error.message);
+                        // console.log(`[RPC] Token balance RPC ${i + 1} error:`, error.message);
                         if (i === rpcEndpoints.length - 1) {
-                            // console.log('[GetBalance] All RPCs failed - returning 0 balance');
-                            // Not an error - token account might not exist yet
+                            // console.error('[RPC] All token RPCs failed, trying alternative APIs');
+                            
+                            // Try alternative APIs for token balance
+                            try {
+                                // SolScan token account API
+                                const url = `https://public-api.solscan.io/account/tokens?account=${address}`;
+                                const controller = new AbortController();
+                                const timeoutId = setTimeout(() => controller.abort(), 3000);
+                                
+                                const response = await fetch(url, {
+                                    headers: { 'Accept': 'application/json' },
+                                    signal: controller.signal
+                                });
+                                clearTimeout(timeoutId);
+                                
+                                if (response.ok) {
+                                    const tokens = await response.json();
+                                    // console.log('[RPC] SolScan tokens response:', tokens);
+                                    
+                                    // Find our token
+                                    const token = tokens.find(t => t.tokenAddress === tokenMint);
+                                    if (token && token.tokenAmount) {
+                                        balance = token.tokenAmount.uiAmount || 0;
+                                        // console.log(`[RPC] Got token balance from SolScan: ${balance}`);
+                                        return balance;
+                                    }
+                                }
+                            } catch (e) {
+                                // console.log('[RPC] SolScan token API failed:', e.message);
+                            }
+                            
+                            // console.log('[RPC] All token APIs failed - returning 0 (token might not exist)');
                             return 0;
                         }
                     }
@@ -6684,21 +6822,21 @@ async function getSupportedTokens(network = 'solana') {
                     name: "Solana",
                     decimals: 9,
                     mintAddress: null, // Native SOL
-                    logoURI: "data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTAwIiBoZWlnaHQ9IjEwMCIgdmlld0JveD0iMCAwIDEwMCAxMDAiIGZpbGw9Im5vbmUiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyI+PHJlY3Qgd2lkdGg9IjEwMCIgaGVpZ2h0PSIxMDAiIHJ4PSI1MCIgZmlsbD0iIzAwZDRmZiIvPjx0ZXh0IHg9IjUwIiB5PSI1NSIgZm9udC1mYW1pbHk9IkFyaWFsLCBzYW5zLXNlcmlmIiBmb250LXNpemU9IjMwIiBmb250LXdlaWdodD0iYm9sZCIgZmlsbD0id2hpdGUiIHRleHQtYW5jaG9yPSJtaWRkbGUiPlM8L3RleHQ+PC9zdmc+"
+                    logoURI: "/icons/sol-token.png"
                 },
                 "1DEV": {
                     symbol: "1DEV",
                     name: "1DEV Token",
                     decimals: 6,  // 1DEV has 6 decimals
                     mintAddress: "62PPztDN8t6dAeh3FvxXfhkDJirpHZjGvCYdHM54FHHJ", // Real testnet 1DEV address
-                    logoURI: "data:image/webp;base64,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"
+                    logoURI: "/icons/1dev-token.png"
                 },
                 USDC: {
                     symbol: "USDC",
                     name: "USD Coin",
                     decimals: 6,
                     mintAddress: "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU", // Devnet USDC
-                    logoURI: "data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTAwIiBoZWlnaHQ9IjEwMCIgdmlld0JveD0iMCAwIDEwMCAxMDAiIGZpbGw9Im5vbmUiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyI+PHJlY3Qgd2lkdGg9IjEwMCIgaGVpZ2h0PSIxMDAiIHJ4PSI1MCIgZmlsbD0iIzI3NzVjYSIvPjx0ZXh0IHg9IjUwIiB5PSI1NSIgZm9udC1mYW1pbHk9IkFyaWFsLCBzYW5zLXNlcmlmIiBmb250LXNpemU9IjE4IiBmb250LXdlaWdodD0iYm9sZCIgZmlsbD0id2hpdGUiIHRleHQtYW5jaG9yPSJtaWRkbGUiPlVTREM8L3RleHQ+PC9zdmc+"
+                    logoURI: "/icons/usdc-token.png"
                 }
             },
             qnet: {

@@ -804,8 +804,8 @@ const WalletScreen = () => {
   // Get token icon URL like in extension
   const getTokenIconUrl = (symbol) => {
     const icons = {
-      // QNC - using QNet branding colors
-      'QNC': 'data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMzIiIGhlaWdodD0iMzIiIHZpZXdCb3g9IjAgMCAzMiAzMiIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj48Y2lyY2xlIGN4PSIxNiIgY3k9IjE2IiByPSIxNiIgZmlsbD0iIzRhOTBlMiIvPjx0ZXh0IHg9IjE2IiB5PSIyMSIgZm9udC1mYW1pbHk9IkFyaWFsIiBmb250LXNpemU9IjE4IiBmb250LXdlaWdodD0iYm9sZCIgZmlsbD0id2hpdGUiIHRleHQtYW5jaG9yPSJtaWRkbGUiPlE8L3RleHQ+PC9zdmc+',
+      // QNC - QNet app icon
+      'QNC': 'data:image/png;base64,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',
       // SOL - official Solana token
       'SOL': 'https://raw.githubusercontent.com/solana-labs/token-list/main/assets/mainnet/So11111111111111111111111111111111111111112/logo.png',
       '1DEV': 'data:image/webp;base64,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',
@@ -971,11 +971,8 @@ const WalletScreen = () => {
       const savedPseudonym = await AsyncStorage.getItem(`node_pseudonym_${activationCode}`);
       if (savedPseudonym) {
         setNodePseudonym(savedPseudonym);
-      } else {
-        // Generate pseudonym if not found (backward compatibility)
-        const generatedPseudonym = walletManager.generateLightNodePseudonym(wallet.publicKey);
-        setNodePseudonym(generatedPseudonym);
       }
+      // DO NOT auto-generate pseudonym - only set it after actual activation
     } catch (error) {
       // console.error('Failed to load node pseudonym:', error);
     }
@@ -1016,6 +1013,9 @@ const WalletScreen = () => {
         setActivationCode(activationInputCode.trim());
         setActivatedNodeType(result.nodeType || 'light');
         setNodePseudonym(result.pseudonym); // Store system-generated pseudonym
+        
+        // Save pseudonym to AsyncStorage for persistence
+        await AsyncStorage.setItem(`node_pseudonym_${activationInputCode.trim()}`, result.pseudonym);
         
         // Start automatic ping interval (every 4 hours)
         startNodePingInterval();
@@ -1729,60 +1729,64 @@ const WalletScreen = () => {
   };
 
   const fetchTokenPrices = async () => {
-    try {
-      // Only fetch prices if wallet is loaded
-      if (!wallet) return;
-      
-      // Fetch real prices from CoinGecko API
-      const prices = { qnc: 0, sol: 0, '1dev': 0 };
-      
-      // Fetch SOL price
+    // Set fallback prices immediately
+    setTokenPrices({
+      qnc: 0.0125,
+      sol: 150.00,
+      '1dev': 0.0001
+    });
+    
+    // Then try to fetch real prices in background
+    setTimeout(async () => {
       try {
-        const solResponse = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
-        if (solResponse.ok) {
-          const solData = await solResponse.json();
-          prices.sol = solData.solana?.usd || 0;
-        }
-      } catch (e) {
-        // console.log('Failed to fetch SOL price, trying backup...');
-        // Try Binance as backup
-        try {
-          const binanceResponse = await fetch('https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT');
-          if (binanceResponse.ok) {
-            const binanceData = await binanceResponse.json();
-            prices.sol = parseFloat(binanceData.price) || 0;
+        // Only fetch prices if wallet is loaded
+        if (!wallet) return;
+        
+        // Helper function to fetch with timeout (1 second)
+        const fetchWithTimeout = async (url, timeout = 1000) => {
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => controller.abort(), timeout);
+          
+          try {
+            const response = await fetch(url, { signal: controller.signal });
+            clearTimeout(timeoutId);
+            return response;
+          } catch (error) {
+            clearTimeout(timeoutId);
+            throw error;
           }
-        } catch (e2) {
-          prices.sol = 150; // Fallback price
+        };
+        
+        // Fetch real prices from CoinGecko API
+        const prices = { qnc: 0.0125, sol: 150.00, '1dev': 0.0001 };
+        
+        // Fetch SOL price with timeout
+        try {
+          const solResponse = await fetchWithTimeout('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
+          if (solResponse.ok) {
+            const solData = await solResponse.json();
+            prices.sol = solData.solana?.usd || 150.00;
+            setTokenPrices(prev => ({ ...prev, sol: prices.sol }));
+          }
+        } catch (e) {
+          // Silently fail, use fallback
         }
-      }
-      
-      // Fetch 1DEV price (if available)
-      try {
-        const devResponse = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=1dev&vs_currencies=usd');
-        if (devResponse.ok) {
-          const devData = await devResponse.json();
-          prices['1dev'] = devData['1dev']?.usd || 0.0001;
-        } else {
-          prices['1dev'] = 0.0001; // Fallback for 1DEV
+        
+        // Fetch 1DEV price (if available) with timeout
+        try {
+          const devResponse = await fetchWithTimeout('https://api.coingecko.com/api/v3/simple/price?ids=1dev&vs_currencies=usd');
+          if (devResponse.ok) {
+            const devData = await devResponse.json();
+            prices['1dev'] = devData['1dev']?.usd || 0.0001;
+            setTokenPrices(prev => ({ ...prev, '1dev': prices['1dev'] }));
+          }
+        } catch (e) {
+          // Silently fail, use fallback
         }
-      } catch (e) {
-        prices['1dev'] = 0.0001; // Fallback price
+      } catch (error) {
+        // Silently fail, fallback prices already set
       }
-      
-      // QNC price (not listed yet, using fixed price)
-      prices.qnc = 0.0125;
-      
-      setTokenPrices(prices);
-    } catch (error) {
-      // console.error('Error fetching prices:', error);
-      // Set fallback prices
-      setTokenPrices({
-        qnc: 0.0125,
-        sol: 150.00,
-        '1dev': 0.0001
-      });
-    }
+    }, 100); // Small delay to not block UI
   };
 
   const generateActivationCode = async () => {
@@ -2678,15 +2682,11 @@ const WalletScreen = () => {
                 <View style={styles.tokenItem}>
                   <View style={styles.tokenInfo}>
                     <View style={styles.tokenIcon}>
-                      {getTokenIconUrl('QNC') ? (
-                        <Image 
-                          source={{uri: getTokenIconUrl('QNC')}} 
-                          style={styles.tokenIconImage}
-                          resizeMode="contain"
-                        />
-                      ) : (
-                        <Text style={styles.tokenIconText}>Q</Text>
-                      )}
+                      <Image 
+                        source={require('../../assets/qnet_logo.png')}
+                        style={styles.tokenIconImage}
+                        resizeMode="contain"
+                      />
                     </View>
                     <View style={styles.tokenDetails}>
                       <Text style={styles.tokenName}>QNC</Text>
@@ -3400,53 +3400,56 @@ const WalletScreen = () => {
                 <View style={styles.nodeMonitoringCard}>
                   <View style={styles.nodeMonitoringHeader}>
                     <View style={{flex: 1}}>
-                      <Text style={styles.nodeMonitoringTitle}>
-                        {activatedNodeType.charAt(0).toUpperCase() + activatedNodeType.slice(1)} Node
-                      </Text>
                       {nodePseudonym ? (
-                        <Text style={styles.nodePseudonym}>
-                          {nodePseudonym}
+                        <>
+                          <Text style={styles.nodeMonitoringLabel}>Node name:</Text>
+                          <Text style={styles.nodeMonitoringValue}>
+                            {nodePseudonym}
+                          </Text>
+                          <View style={{marginTop: 12}}>
+                            <Text style={styles.nodeMonitoringLabel}>Type of node:</Text>
+                            <Text style={styles.nodeMonitoringValue}>
+                              {activatedNodeType.charAt(0).toUpperCase() + activatedNodeType.slice(1)} Node
+                            </Text>
+                          </View>
+                        </>
+                      ) : (
+                        <Text style={styles.nodeMonitoringTitle}>
+                          {activatedNodeType.charAt(0).toUpperCase() + activatedNodeType.slice(1)} Node
                         </Text>
-                      ) : null}
+                      )}
                     </View>
-                    <View style={[styles.statusBadge, styles.statusBadgeActive]}>
-                      <Text style={styles.statusBadgeText}>CODE RECEIVED</Text>
+                    <View style={[styles.statusBadge, nodePseudonym ? styles.statusBadgeActivated : styles.statusBadgeActive]}>
+                      <Text style={[styles.statusBadgeText, !nodePseudonym && styles.statusBadgeTextActive]}>
+                        {nodePseudonym ? 'ACTIVATED' : 'CODE RECEIVED'}
+                      </Text>
                     </View>
-                  </View>
-                  
-                  <View style={styles.nodeMonitoringInfo}>
-                    <Text style={styles.nodeMonitoringLabel}>Activation Type:</Text>
-                    <Text style={styles.nodeMonitoringValue}>
-                      {activatedNodeType === 'light' 
-                        ? 'Free Activation' 
-                        : activationPricing?.phase === 2 
-                          ? `Phase 2: QNC Transfer (${(activationPricing.networkSize/1000).toFixed(0)}K nodes)`
-                          : `Phase 1: 1DEV Burn (${burnProgress}% burned)`}
-                    </Text>
-                  </View>
-                  
-                  <View style={styles.nodeMonitoringInfo}>
-                    <Text style={styles.nodeMonitoringLabel}>Burned Amount:</Text>
-                    <Text style={styles.nodeMonitoringValue}>
-                      {activatedNodeType === 'light' ? '0 1DEV' : 
-                       activationPricing ? `${activationPricing.cost} ${activationPricing.currency}` : 
-                       '1500 1DEV'}
-                    </Text>
                   </View>
                   
                   {/* Action Button based on node type */}
                   {activatedNodeType === 'light' ? (
-                    <TouchableOpacity 
-                      style={[styles.button, styles.secondaryButton]}
-                      onPress={() => {
-                        setShowActivationInput(true);
-                        setActivationInputCode(''); // Don't pre-fill the code!
-                      }}
-                    >
-                      <Text style={[styles.buttonText, styles.secondaryButtonText]}>
-                        Activate Node
-                      </Text>
-                    </TouchableOpacity>
+                    nodePseudonym ? (
+                      <TouchableOpacity 
+                        style={[styles.button, styles.buttonDisabled]}
+                        disabled={true}
+                      >
+                        <Text style={styles.buttonText}>
+                          Activated
+                        </Text>
+                      </TouchableOpacity>
+                    ) : (
+                      <TouchableOpacity 
+                        style={[styles.button, styles.secondaryButton]}
+                        onPress={() => {
+                          setShowActivationInput(true);
+                          setActivationInputCode(''); // Don't pre-fill the code!
+                        }}
+                      >
+                        <Text style={[styles.buttonText, styles.secondaryButtonText]}>
+                          Activate Node
+                        </Text>
+                      </TouchableOpacity>
+                    )
                   ) : (
                     <View style={styles.serverActivationNotice}>
                       <Text style={styles.serverActivationText}>
@@ -3464,13 +3467,6 @@ const WalletScreen = () => {
                   <Text style={styles.rewardsTitle}>Node Rewards</Text>
                   
                   <View style={styles.rewardItem}>
-                    <Text style={styles.rewardLabel}>Total Earned:</Text>
-                    <Text style={styles.rewardValue}>
-                      {nodeRewards?.totalEarned || 0} QNC
-                    </Text>
-                  </View>
-                  
-                  <View style={styles.rewardItem}>
                     <Text style={styles.rewardLabel}>Total Claimed:</Text>
                     <Text style={styles.rewardValue}>
                       {nodeRewards?.totalClaimed || 0} QNC
@@ -3485,16 +3481,9 @@ const WalletScreen = () => {
                   </View>
                   
                   <View style={styles.rewardItem}>
-                    <Text style={styles.rewardLabel}>Last Ping:</Text>
-                    <Text style={styles.rewardValue}>
-                      {nodeRewards?.lastPing ? new Date(nodeRewards.lastPing).toLocaleTimeString() : 'Never'}
-                    </Text>
-                  </View>
-                  
-                  <View style={styles.rewardItem}>
                     <Text style={styles.rewardLabel}>Node Status:</Text>
-                    <Text style={[styles.rewardValue, {color: nodeRewards?.isActive ? '#34c759' : '#ff3b30'}]}>
-                      {nodeRewards?.isActive ? 'Active' : 'Inactive (needs ping)'}
+                    <Text style={[styles.rewardValue, {color: nodePseudonym ? '#34c759' : '#ff3b30'}]}>
+                      {nodePseudonym ? 'Active' : 'Inactive'}
                     </Text>
                   </View>
                   
@@ -5057,19 +5046,13 @@ const styles = StyleSheet.create({
   nodeMonitoringHeader: {
     flexDirection: 'row',
     justifyContent: 'space-between',
-    alignItems: 'center',
+    alignItems: 'flex-start',
     marginBottom: 20,
   },
   nodeMonitoringTitle: {
     fontSize: 18,
     fontWeight: '600',
     color: '#ffffff',
-  },
-  nodePseudonym: {
-    fontSize: 14,
-    color: '#00d4ff',
-    marginTop: 4,
-    fontStyle: 'italic',
   },
   alertInput: {
     borderWidth: 1,
@@ -5086,12 +5069,18 @@ const styles = StyleSheet.create({
     borderRadius: 12,
   },
   statusBadgeActive: {
-    backgroundColor: 'rgba(0, 255, 127, 0.2)',
+    backgroundColor: 'rgba(255, 170, 0, 0.2)',
+  },
+  statusBadgeActivated: {
+    backgroundColor: 'rgba(52, 199, 89, 0.2)',
   },
   statusBadgeText: {
     fontSize: 11,
     fontWeight: '600',
     color: '#00ff7f',
+  },
+  statusBadgeTextActive: {
+    color: '#ffaa00',
   },
   nodeMonitoringInfo: {
     marginBottom: 12,
@@ -5109,7 +5098,7 @@ const styles = StyleSheet.create({
   },
   nodeMonitoringValue: {
     fontSize: 14,
-    color: '#ffffff',
+    color: '#00d4ff',
     fontWeight: '500',
   },
   serverActivationNotice: {
