@@ -44,7 +44,7 @@ const translations = {
     send: 'Send',
     receive: 'Receive',
     activate: 'Activate',
-    history: 'History',
+    node: 'Node',
     settings: 'Settings',
     
     // Settings sections
@@ -164,7 +164,7 @@ By clicking "Accept", you confirm that you have read, understood, and agree to b
     send: '发送',
     receive: '接收',
     activate: '激活',
-    history: '历史',
+    node: '节点',
     settings: '设置',
     general: '常规',
     security_options: '安全选项',
@@ -219,7 +219,7 @@ By clicking "Accept", you confirm that you have read, understood, and agree to b
     send: 'Отправить',
     receive: 'Получить',
     activate: 'Активация',
-    history: 'История',
+    node: 'Нода',
     settings: 'Настройки',
     general: 'Общие',
     security_options: 'Параметры безопасности',
@@ -274,7 +274,7 @@ By clicking "Accept", you confirm that you have read, understood, and agree to b
     send: 'Enviar',
     receive: 'Recibir',
     activate: 'Activar',
-    history: 'Historial',
+    node: 'Nodo',
     settings: 'Configuración',
     general: 'General',
     security_options: 'Opciones de Seguridad',
@@ -329,7 +329,7 @@ By clicking "Accept", you confirm that you have read, understood, and agree to b
     send: '보내기',
     receive: '받기',
     activate: '활성화',
-    history: '기록',
+    node: '노드',
     settings: '설정',
     general: '일반',
     security_options: '보안 옵션',
@@ -384,7 +384,7 @@ By clicking "Accept", you confirm that you have read, understood, and agree to b
     send: '送信',
     receive: '受信',
     activate: 'アクティベート',
-    history: '履歴',
+    node: 'ノード',
     settings: '設定',
     general: '一般',
     security_options: 'セキュリティオプション',
@@ -439,7 +439,7 @@ By clicking "Accept", you confirm that you have read, understood, and agree to b
     send: 'Enviar',
     receive: 'Receber',
     activate: 'Ativar',
-    history: 'Histórico',
+    node: 'Nó',
     settings: 'Configurações',
     general: 'Geral',
     security_options: 'Opções de Segurança',
@@ -494,7 +494,7 @@ By clicking "Accept", you confirm that you have read, understood, and agree to b
     send: 'Envoyer',
     receive: 'Recevoir',
     activate: 'Activer',
-    history: 'Historique',
+    node: 'Nœud',
     settings: 'Paramètres',
     general: 'Général',
     security_options: 'Options de Sécurité',
@@ -549,7 +549,7 @@ By clicking "Accept", you confirm that you have read, understood, and agree to b
     send: 'Senden',
     receive: 'Empfangen',
     activate: 'Aktivieren',
-    history: 'Verlauf',
+    node: 'Knoten',
     settings: 'Einstellungen',
     general: 'Allgemein',
     security_options: 'Sicherheitsoptionen',
@@ -604,7 +604,7 @@ By clicking "Accept", you confirm that you have read, understood, and agree to b
     send: 'إرسال',
     receive: 'استقبال',
     activate: 'تفعيل',
-    history: 'السجل',
+    node: 'عقدة',
     settings: 'الإعدادات',
     general: 'عام',
     security_options: 'خيارات الأمان',
@@ -659,7 +659,7 @@ By clicking "Accept", you confirm that you have read, understood, and agree to b
     send: 'Invia',
     receive: 'Ricevi',
     activate: 'Attiva',
-    history: 'Cronologia',
+    node: 'Nodo',
     settings: 'Impostazioni',
     general: 'Generale',
     security_options: 'Opzioni di Sicurezza',
@@ -882,9 +882,9 @@ const WalletScreen = () => {
     }
   }, [wallet, password]); // Run when wallet loads
   
-  // Load node rewards when on history tab
+  // Load node rewards when on node tab
   useEffect(() => {
-    if (activeTab === 'history' && activatedNodeType && activationCode) {
+    if (activeTab === 'node' && activatedNodeType && activationCode) {
       let rewardsInterval;
       
       // Load rewards immediately
@@ -1010,12 +1010,22 @@ const WalletScreen = () => {
       
       if (result.success) {
         // Store activation locally
-        setActivationCode(activationInputCode.trim());
-        setActivatedNodeType(result.nodeType || 'light');
+        const nodeType = result.nodeType || 'light';
+        const code = activationInputCode.trim();
+        setActivationCode(code);
+        setActivatedNodeType(nodeType);
         setNodePseudonym(result.pseudonym); // Store system-generated pseudonym
         
         // Save pseudonym to AsyncStorage for persistence
-        await AsyncStorage.setItem(`node_pseudonym_${activationInputCode.trim()}`, result.pseudonym);
+        await AsyncStorage.setItem(`node_pseudonym_${code}`, result.pseudonym);
+        
+        // Save complete activation state for quick restore
+        await AsyncStorage.setItem('qnet_last_activated_node', JSON.stringify({
+          nodeType: nodeType,
+          code: code,
+          pseudonym: result.pseudonym,
+          timestamp: Date.now()
+        }));
         
         // Start automatic ping interval (every 4 hours)
         startNodePingInterval();
@@ -1177,8 +1187,9 @@ const WalletScreen = () => {
         if (inactiveTime >= lockTimeMs) {
           // Lock wallet silently
           setWallet(null);
-          setActivatedNodeType(null);
-          setActivationCode(null);
+          // Don't reset activatedNodeType and activationCode - they should persist
+          // setActivatedNodeType(null);
+          // setActivationCode(null);
           setPassword(''); // Clear password on auto-lock for security
           // Don't show alert - user will see unlock screen
         }
@@ -1234,6 +1245,12 @@ const WalletScreen = () => {
                   if (code && code.code && code.code === expectedCode) {
                     setActivatedNodeType(nodeType);
                     setActivationCode(code.code);
+                    // Save to AsyncStorage for quick restore
+                    AsyncStorage.setItem('qnet_last_activated_node', JSON.stringify({
+                      nodeType: nodeType,
+                      code: code.code,
+                      timestamp: Date.now()
+                    }));
                     // Start ping interval for active node
                     if (!global.nodePingInterval) {
                       setTimeout(() => startNodePingInterval(), 1000);
@@ -1484,6 +1501,7 @@ const WalletScreen = () => {
       await AsyncStorage.removeItem('qnet_activation_meta_light');
       await AsyncStorage.removeItem('qnet_activation_meta_full');
       await AsyncStorage.removeItem('qnet_activation_meta_super');
+      await AsyncStorage.removeItem('qnet_last_activated_node');
       // Clear cache for any previous wallet
       const keys = await AsyncStorage.getAllKeys();
       const blockchainCacheKeys = keys.filter(key => key.startsWith('blockchain_check_'));
@@ -1586,6 +1604,7 @@ const WalletScreen = () => {
     AsyncStorage.removeItem('qnet_activation_meta_light');
     AsyncStorage.removeItem('qnet_activation_meta_full');
     AsyncStorage.removeItem('qnet_activation_meta_super');
+    AsyncStorage.removeItem('qnet_last_activated_node');
     AsyncStorage.removeItem(`blockchain_check_${tempWallet.publicKey}`);
     
     // Switch to assets tab immediately
@@ -1626,6 +1645,24 @@ const WalletScreen = () => {
       // Load balance in parallel
       loadBalance(loadedWallet.publicKey);
       
+      // Restore activation state from AsyncStorage immediately
+      AsyncStorage.getItem('qnet_last_activated_node').then(savedState => {
+        if (savedState) {
+          try {
+            const state = JSON.parse(savedState);
+            if (state.nodeType && state.code) {
+              setActivatedNodeType(state.nodeType);
+              setActivationCode(state.code);
+              if (state.pseudonym) {
+                setNodePseudonym(state.pseudonym);
+              }
+            }
+          } catch (e) {
+            // Silent fail
+          }
+        }
+      });
+      
       // Sync activation codes in background (non-blocking)
       setTimeout(() => {
         walletManager.syncActivationCodes(
@@ -1638,6 +1675,12 @@ const WalletScreen = () => {
             const code = syncedCodes[nodeType];
             setActivatedNodeType(nodeType);
             setActivationCode(code.code || code);
+            // Save to AsyncStorage for quick restore
+            AsyncStorage.setItem('qnet_last_activated_node', JSON.stringify({
+              nodeType: nodeType,
+              code: code.code || code,
+              timestamp: Date.now()
+            }));
           }
         }).catch(() => {
           // Silent fail
@@ -2028,7 +2071,12 @@ const WalletScreen = () => {
               </TouchableOpacity>
             </View>
             
-            <ScrollView style={styles.termsModalBody}>
+            <ScrollView 
+              style={styles.termsModalBody}
+              showsVerticalScrollIndicator={true}
+              bounces={true}
+              scrollEnabled={true}
+            >
               <Text style={styles.termsModalText}>{t('terms_text')}</Text>
             </ScrollView>
             
@@ -2082,7 +2130,12 @@ const WalletScreen = () => {
     
     return (
       <SafeAreaView style={styles.container}>
-        <ScrollView contentContainerStyle={styles.centerContent}>
+        <ScrollView 
+          contentContainerStyle={styles.centerContent}
+          showsVerticalScrollIndicator={true}
+          bounces={true}
+          scrollEnabled={true}
+        >
           <Text style={styles.title}>Confirm Your Recovery Phrase</Text>
           <Text style={styles.subtitle}>
             Please enter the following words from your recovery phrase to confirm you've saved it correctly
@@ -2205,7 +2258,12 @@ const WalletScreen = () => {
           style={[styles.container, Platform.OS === 'ios' && {paddingTop: 44}]} 
           edges={Platform.OS === 'ios' ? ['left', 'right'] : ['top', 'left', 'right']}
         >
-          <ScrollView contentContainerStyle={styles.centerContent}>
+          <ScrollView 
+            contentContainerStyle={styles.centerContent}
+            showsVerticalScrollIndicator={true}
+            bounces={true}
+            scrollEnabled={true}
+          >
             <Text style={styles.title}>Create Wallet</Text>
             <Text style={styles.subtitle}>Enter a strong password (min 8 characters)</Text>
             
@@ -2316,6 +2374,8 @@ const WalletScreen = () => {
           <ScrollView 
             contentContainerStyle={[styles.centerContent, {paddingBottom: 100}]}
             showsVerticalScrollIndicator={true}
+            bounces={true}
+            scrollEnabled={true}
           >
             <Text style={[styles.title, {fontSize: 18}]}>Save Your Recovery Phrase</Text>
             <Text style={[styles.subtitle, {fontSize: 13, marginBottom: 15}]}>
@@ -2378,7 +2438,12 @@ const WalletScreen = () => {
             style={[styles.container, Platform.OS === 'ios' && {paddingTop: 44}]} 
             edges={Platform.OS === 'ios' ? ['left', 'right'] : ['top', 'left', 'right']}
           >
-            <ScrollView contentContainerStyle={styles.centerContent}>
+            <ScrollView 
+              contentContainerStyle={styles.centerContent}
+              showsVerticalScrollIndicator={true}
+              bounces={true}
+              scrollEnabled={true}
+            >
               <Text style={styles.title}>Import Wallet</Text>
               <Text style={styles.subtitle}>Step 1: Create password</Text>
               
@@ -2475,7 +2540,12 @@ const WalletScreen = () => {
             style={[styles.container, Platform.OS === 'ios' && {paddingTop: 44}]} 
             edges={Platform.OS === 'ios' ? ['left', 'right'] : ['top', 'left', 'right']}
           >
-            <ScrollView contentContainerStyle={styles.centerContent}>
+            <ScrollView 
+              contentContainerStyle={styles.centerContent}
+              showsVerticalScrollIndicator={true}
+              bounces={true}
+              scrollEnabled={true}
+            >
               <Text style={styles.title}>Import Wallet</Text>
               <Text style={styles.subtitle}>Step 2: Enter your seed phrase</Text>
               
@@ -2595,6 +2665,9 @@ const WalletScreen = () => {
             contentContainerStyle={styles.scrollContentContainer}
             onScroll={handleUserActivity}
             scrollEventThrottle={500}
+            showsVerticalScrollIndicator={true}
+            bounces={true}
+            scrollEnabled={true}
             refreshControl={
               <RefreshControl
                 refreshing={refreshing}
@@ -2760,6 +2833,9 @@ const WalletScreen = () => {
             contentContainerStyle={styles.scrollContentContainer}
             onScroll={handleUserActivity} 
             scrollEventThrottle={16}
+            showsVerticalScrollIndicator={true}
+            bounces={true}
+            scrollEnabled={true}
           >
             <Text style={styles.tabTitle}>Send Tokens</Text>
             
@@ -2835,6 +2911,9 @@ const WalletScreen = () => {
             contentContainerStyle={styles.scrollContentContainer}
             onScroll={handleUserActivity} 
             scrollEventThrottle={16}
+            showsVerticalScrollIndicator={true}
+            bounces={true}
+            scrollEnabled={true}
           >
             <Text style={styles.tabTitle}>Receive Tokens</Text>
             
@@ -2890,6 +2969,9 @@ const WalletScreen = () => {
             contentContainerStyle={styles.scrollContentContainer}
             onScroll={handleUserActivity} 
             scrollEventThrottle={16}
+            showsVerticalScrollIndicator={true}
+            bounces={true}
+            scrollEnabled={true}
           >
             <Text style={styles.tabTitle}>Node Activation</Text>
             
@@ -3100,7 +3182,12 @@ const WalletScreen = () => {
                 
                 // Create rich content for confirmation modal (compact version)
                 const confirmRichContent = (
-                  <ScrollView style={{ maxHeight: 350 }} showsVerticalScrollIndicator={true}>
+                  <ScrollView 
+                    style={{ maxHeight: 350 }} 
+                    showsVerticalScrollIndicator={true}
+                    bounces={true}
+                    scrollEnabled={true}
+                  >
                     <View style={{ paddingHorizontal: 15, paddingVertical: 10 }}>
                       <Text style={[styles.modalContent, { fontSize: 15, fontWeight: 'bold', marginBottom: 10 }]}>
                         {nodeTypeName} Activation
@@ -3280,7 +3367,12 @@ const WalletScreen = () => {
                             
                             // Create rich content for the modal
                             const richContent = (
-                              <ScrollView style={{ maxHeight: 400 }} showsVerticalScrollIndicator={true}>
+                              <ScrollView 
+                                style={{ maxHeight: 400 }} 
+                                showsVerticalScrollIndicator={true}
+                                bounces={true}
+                                scrollEnabled={true}
+                              >
                                 <View style={{ paddingHorizontal: 16, paddingVertical: 12 }}>
                                   <Text style={[styles.modalContent, { textAlign: 'left', marginBottom: 8, fontSize: 13 }]}>
                                     <Text style={{ fontWeight: 'bold' }}>Activation Code:</Text>
@@ -3380,10 +3472,10 @@ const WalletScreen = () => {
           </ScrollView>
         );
 
-      case 'history':
+      case 'node':
         return (
           <ScrollView 
-            key="history-tab"
+            key="node-tab"
             style={styles.content}
             contentContainerStyle={[
               styles.scrollContentContainer,
@@ -3391,6 +3483,9 @@ const WalletScreen = () => {
             ]}
             showsVerticalScrollIndicator={true}
             bounces={true}
+            scrollEnabled={true}
+            onScroll={handleUserActivity}
+            scrollEventThrottle={16}
           >
             <Text style={styles.tabTitle}>Node Monitoring</Text>
             
@@ -3532,6 +3627,9 @@ const WalletScreen = () => {
             contentContainerStyle={styles.scrollContentContainer}
             showsVerticalScrollIndicator={true}
             bounces={true}
+            scrollEnabled={true}
+            onScroll={handleUserActivity}
+            scrollEventThrottle={16}
           >
             <Text style={styles.tabTitle}>{t('settings')}</Text>
             
@@ -3772,13 +3870,13 @@ const WalletScreen = () => {
         </TouchableOpacity>
         
         <TouchableOpacity 
-          style={[styles.tab, activeTab === 'history' && styles.activeTab]}
+          style={[styles.tab, activeTab === 'node' && styles.activeTab]}
           onPress={() => {
-            setActiveTab('history');
+            setActiveTab('node');
             setNodeStatus(null); // Reset node selection when leaving activate tab
           }}
         >
-          <Text style={[styles.tabText, activeTab === 'history' && styles.activeTabText]}>Node</Text>
+          <Text style={[styles.tabText, activeTab === 'node' && styles.activeTabText]}>Node</Text>
         </TouchableOpacity>
 
         <TouchableOpacity 
@@ -3980,7 +4078,14 @@ const WalletScreen = () => {
             <Text style={styles.modalTitle}>{t('language')}</Text>
             <Text style={styles.modalSubtitle}>{t('language_subtitle')}</Text>
             
-            <ScrollView style={{maxHeight: 400}} onScroll={handleUserActivity} scrollEventThrottle={1000}>
+            <ScrollView 
+              style={{maxHeight: 400}} 
+              onScroll={handleUserActivity} 
+              scrollEventThrottle={1000}
+              showsVerticalScrollIndicator={true}
+              bounces={true}
+              scrollEnabled={true}
+            >
               {[
                 {code: 'en', name: 'English'},
                 {code: 'zh-CN', name: '中文'},
