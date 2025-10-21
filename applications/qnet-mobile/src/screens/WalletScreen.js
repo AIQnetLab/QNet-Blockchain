@@ -1506,8 +1506,10 @@ const WalletScreen = () => {
       // Clear cache for any previous wallet
       const keys = await AsyncStorage.getAllKeys();
       const blockchainCacheKeys = keys.filter(key => key.startsWith('blockchain_check_'));
-      if (blockchainCacheKeys.length > 0) {
-        await AsyncStorage.multiRemove(blockchainCacheKeys);
+      const pseudonymKeys = keys.filter(key => key.startsWith('node_pseudonym_'));
+      const keysToRemove = [...blockchainCacheKeys, ...pseudonymKeys];
+      if (keysToRemove.length > 0) {
+        await AsyncStorage.multiRemove(keysToRemove);
       }
       
       // Switch directly to assets tab without alert
@@ -1531,6 +1533,21 @@ const WalletScreen = () => {
               const code = syncedCodes[nodeType];
               setActivatedNodeType(nodeType);
               setActivationCode(code.code || code);
+              
+              // Regenerate pseudonym for imported wallet (deterministic based on wallet address)
+              const regeneratedPseudonym = await walletManager.generateLightNodePseudonym(imported.address);
+              setNodePseudonym(regeneratedPseudonym);
+              
+              // Save regenerated pseudonym to AsyncStorage
+              await AsyncStorage.setItem(`node_pseudonym_${code.code || code}`, regeneratedPseudonym);
+              
+              // Save to AsyncStorage for persistence across app restarts
+              await AsyncStorage.setItem('qnet_last_activated_node', JSON.stringify({
+                nodeType: nodeType,
+                code: code.code || code,
+                pseudonym: regeneratedPseudonym,
+                timestamp: Date.now()
+              }));
             }
           }
         } catch (error) {
@@ -1649,7 +1666,7 @@ const WalletScreen = () => {
       loadBalance(loadedWallet.publicKey);
       
       // Restore activation state from AsyncStorage immediately
-      AsyncStorage.getItem('qnet_last_activated_node').then(savedState => {
+      AsyncStorage.getItem('qnet_last_activated_node').then(async savedState => {
         if (savedState) {
           try {
             const state = JSON.parse(savedState);
@@ -1658,6 +1675,12 @@ const WalletScreen = () => {
               setActivationCode(state.code);
               if (state.pseudonym) {
                 setNodePseudonym(state.pseudonym);
+              } else {
+                // Try to load pseudonym from separate storage
+                const savedPseudonym = await AsyncStorage.getItem(`node_pseudonym_${state.code}`);
+                if (savedPseudonym) {
+                  setNodePseudonym(savedPseudonym);
+                }
               }
             }
           } catch (e) {
@@ -1672,16 +1695,24 @@ const WalletScreen = () => {
           loadedWallet.publicKey,
           loadedWallet.mnemonic,
           password
-        ).then(syncedCodes => {
+        ).then(async syncedCodes => {
           if (syncedCodes && Object.keys(syncedCodes).length > 0) {
             const nodeType = Object.keys(syncedCodes)[0];
             const code = syncedCodes[nodeType];
             setActivatedNodeType(nodeType);
             setActivationCode(code.code || code);
+            
+            // Try to load pseudonym
+            const savedPseudonym = await AsyncStorage.getItem(`node_pseudonym_${code.code || code}`);
+            if (savedPseudonym) {
+              setNodePseudonym(savedPseudonym);
+            }
+            
             // Save to AsyncStorage for quick restore
-            AsyncStorage.setItem('qnet_last_activated_node', JSON.stringify({
+            await AsyncStorage.setItem('qnet_last_activated_node', JSON.stringify({
               nodeType: nodeType,
               code: code.code || code,
+              pseudonym: savedPseudonym || undefined,
               timestamp: Date.now()
             }));
           }
