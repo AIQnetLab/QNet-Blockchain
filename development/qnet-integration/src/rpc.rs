@@ -3516,6 +3516,16 @@ async fn handle_p2p_message(
             
             // Forward to P2P handler
             if let Some(p2p) = blockchain.get_unified_p2p() {
+                // PRODUCTION DEBUG: Log message type for troubleshooting
+                let msg_type = match &message {
+                    NetworkMessage::Block { height, block_type, .. } => 
+                        format!("{} block #{}", block_type, height),
+                    NetworkMessage::EmergencyProducerChange { block_height, .. } => 
+                        format!("EmergencyProducerChange at block #{}", block_height),
+                    _ => "Other".to_string(),
+                };
+                println!("[P2P-RPC] 📨 Received {} from {}", msg_type, peer_addr);
+                
                 p2p.handle_message(&peer_addr, message);
                 
                 println!("[P2P-RPC] ✅ Processed P2P message from network");

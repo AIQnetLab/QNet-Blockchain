@@ -1758,7 +1758,11 @@ impl SimplifiedP2P {
                     data: block_data.clone(),
                     block_type: "micro".to_string(),
                 };
-                // PRODUCTION: Silent block sending for scalability (no spam logs per peer)
+                // PRODUCTION DEBUG: Log block size and destination
+                if height % 10 == 0 || height <= 5 {
+                    println!("[P2P] → Sending Block #{} to {} ({} bytes)", 
+                             height, peer.addr, block_data.len());
+                }
                 self.send_network_message(&peer.addr, block_msg);
             }
         }
@@ -4480,18 +4484,42 @@ impl SimplifiedP2P {
     }
 }
 
+/// PRODUCTION: Base64 serialization module for efficient binary data in JSON
+mod base64_bytes {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    
+    pub fn serialize<S>(bytes: &Vec<u8>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&STANDARD.encode(bytes))
+    }
+    
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        STANDARD.decode(&s).map_err(serde::de::Error::custom)
+    }
+}
+
 /// Message types for simplified network
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum NetworkMessage {
     /// Block data (microblock or macroblock)
+    /// PRODUCTION: Using base64 encoding for efficient binary data transfer over JSON
     Block {
         height: u64,
+        #[serde(with = "base64_bytes")]
         data: Vec<u8>,
         block_type: String,  // "micro" or "macro"
     },
     
     /// Transaction data
     Transaction {
+        #[serde(with = "base64_bytes")]
         data: Vec<u8>,
     },
     
@@ -4580,6 +4608,7 @@ pub enum NetworkMessage {
     /// Response with consensus state
     ConsensusState {
         round: u64,
+        #[serde(with = "base64_bytes")]
         state_data: Vec<u8>,
         sender_id: String,
     },
@@ -5625,7 +5654,15 @@ impl SimplifiedP2P {
         }
         
         let message_json = match serde_json::to_value(&message) {
-            Ok(json) => json,
+            Ok(json) => {
+                // PRODUCTION DEBUG: Check serialization for blocks
+                if let NetworkMessage::Block { height, data, .. } = &message {
+                    if *height <= 5 {
+                        println!("[P2P] 📦 Serialized block #{} ({} bytes data) to JSON", height, data.len());
+                    }
+                }
+                json
+            },
             Err(e) => {
                 println!("[P2P] ❌ Failed to serialize message: {}", e);
                 return;

@@ -985,9 +985,14 @@ impl BlockchainNode {
                         continue;
                     }
                     
-                    // CRITICAL FIX: Actually SAVE the microblock to storage!
-                    // Storage expects raw bytes, not deserialized struct
-                    storage.save_microblock(received_block.height, &received_block.data)
+                    // CRITICAL FIX: Decompress before saving (validation already checked it's valid)
+                    // Storage will apply its own adaptive compression
+                    let decompressed_data = match zstd::decode_all(&received_block.data[..]) {
+                        Ok(data) => data,
+                        Err(_) => received_block.data.clone(), // Not compressed - use as-is
+                    };
+                    
+                    storage.save_microblock(received_block.height, &decompressed_data)
                         .map_err(|e| format!("Storage error: {:?}", e))
                 },
                 "macro" => {
