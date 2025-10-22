@@ -335,20 +335,26 @@ impl SimplifiedP2P {
             reputation_system: {
                 let mut reputation_sys = NodeReputation::new(ReputationConfig::default());
                 
-                // CRITICAL FIX: Genesis nodes get reputation based on environment variable, not node_id
-                // node_id format is "node_9876_2", but activation code is "QNET-BOOT-0001-STRAP"
-                
-                // PRODUCTION: Genesis reputation will be set by initialize_genesis_reputations()
-                // This prevents self-reputation bias where each node gives itself 100%
+                // PRODUCTION FIX: Initialize ALL Genesis nodes with same reputation
+                // This ensures consistent consensus candidate selection
                 if let Ok(bootstrap_id) = std::env::var("QNET_BOOTSTRAP_ID") {
                     match bootstrap_id.as_str() {
                         "001" | "002" | "003" | "004" | "005" => {
-                            // PRIVACY: Don't show node_id even in local logs
-                            println!("[P2P] 🛡️ Genesis node {} detected - reputation will be initialized by consensus system", bootstrap_id);
+                            // Set reputation for ALL Genesis nodes (not just self)
+                            for i in 1..=5 {
+                                let genesis_id = format!("genesis_node_{:03}", i);
+                                reputation_sys.set_reputation(&genesis_id, 70.0);
+                            }
+                            println!("[P2P] 🛡️ Genesis node {} initialized - all Genesis nodes set to 70% reputation", bootstrap_id);
                         }
                         _ => {}
                     }
                 } else if std::env::var("QNET_GENESIS_BOOTSTRAP").unwrap_or_default() == "1" {
+                    // Legacy Genesis nodes also initialize all peers
+                    for i in 1..=5 {
+                        let genesis_id = format!("genesis_node_{:03}", i);
+                        reputation_sys.set_reputation(&genesis_id, 70.0);
+                    }
                     // PRIVACY: Show pseudonym instead of node_id
                     let display_id = if node_id.starts_with("genesis_node_") || node_id.starts_with("node_") {
                         node_id.clone()
@@ -2780,12 +2786,15 @@ impl SimplifiedP2P {
         if std::env::var("QNET_BOOTSTRAP_ID")
             .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
             .unwrap_or(false) {
-            // Genesis nodes: Return ONLY ACTUALLY CONNECTED Genesis peers
+            // PRODUCTION FIX: Use working Genesis nodes from connectivity check
+            // This ensures all nodes see the same set of active peers for consensus
             let genesis_ips = get_genesis_bootstrap_ips();
-            let mut genesis_peers = Vec::new();
             
-            // Get actually connected peers
-            let connected_addrs = self.connected_peer_addrs.read().unwrap();
+            // Use filter_working_genesis_nodes_static to get actually reachable nodes
+            // This is cached for 30 seconds to avoid repeated TCP checks
+            let working_genesis_ips = Self::filter_working_genesis_nodes_static(genesis_ips.clone());
+            
+            let mut genesis_peers = Vec::new();
             
             for (i, ip) in genesis_ips.iter().enumerate() {
                 let node_id = format!("genesis_node_{:03}", i + 1);
@@ -2793,10 +2802,9 @@ impl SimplifiedP2P {
                 
                 // Skip self to avoid duplication
                 if !self.node_id.contains(&node_id) && !self.node_id.contains(&format!("{:03}", i + 1)) {
-                    // OPTIMIZATION: For Genesis phase, trust connected_addrs which is cleaned every 5s
-                    // TCP check on every block (1s) would cause 8s delay with 4 unreachable peers!
-                    // Byzantine safety is maintained by reputation_validation cleanup (max 5s window)
-                    if connected_addrs.contains(&peer_addr) {
+                    // PRODUCTION: Use working_genesis_ips (from cached connectivity check)
+                    // This ensures consistent peer count across all nodes
+                    if working_genesis_ips.contains(ip) {
                         genesis_peers.push(PeerInfo {
                             id: node_id.clone(),
                             addr: peer_addr,
@@ -2817,12 +2825,12 @@ impl SimplifiedP2P {
                 }
             }
             
-            // PHANTOM PEER FIX: Log the actual count, not potential peers
+            // PRODUCTION: Report actual reachable peers (not phantom)
             let actual_count = genesis_peers.len();
-            if actual_count == 0 && connected_addrs.len() == 0 {
-                println!("[P2P] 🌱 Genesis mode: No peers connected yet (starting up)");
+            if actual_count == 0 && working_genesis_ips.is_empty() {
+                println!("[P2P] 🌱 Genesis mode: No reachable peers found (network issue?)");
         } else {
-                println!("[P2P] 🌱 Genesis mode: returning {} CONNECTED peers (verified, not phantom)", actual_count);
+                println!("[P2P] 🌱 Genesis mode: returning {} REACHABLE peers (from connectivity check)", actual_count);
             }
             return genesis_peers;
         }
@@ -5869,7 +5877,28 @@ impl SimplifiedP2P {
             return;
         }
         
-        // PRODUCTION: Apply penalty to ALL failed producers, including self
+        // PRODUCTION FIX: Don't penalize during Genesis bootstrap (first 100 blocks)
+        // Technical issues are expected during network initialization
+        let is_genesis_bootstrap = std::env::var("QNET_BOOTSTRAP_ID")
+            .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
+            .unwrap_or(false);
+        
+        if is_genesis_bootstrap && block_height < 100 {
+            println!("[REPUTATION] ⚠️ Genesis bootstrap phase (block {}): No penalty for {} (technical issues expected)", 
+                     block_height, failed_display);
+            // Still record the event but without reputation penalty
+            println!("[NETWORK] 📊 Emergency producer change recorded | Type: {} | Height: {} | Time: {}", 
+                     change_type, block_height, timestamp);
+            
+            // Still give small boost to emergency producer for service
+            if new_producer != "emergency_consensus" && new_producer != self.node_id {
+                self.update_node_reputation(&new_producer, 2.0);
+                println!("[REPUTATION] ✅ Emergency producer {} rewarded: +2.0 reputation (bootstrap service)", new_display);
+            }
+            return;
+        }
+        
+        // PRODUCTION: Apply penalty to ALL failed producers after bootstrap
         // This prevents exploitation where nodes voluntarily fail without penalty
         self.update_node_reputation(&failed_producer, -20.0);
         

@@ -957,12 +957,23 @@ impl BlockchainNode {
                 continue; // Skip normal block processing
             }
             
-            // Log only every 10th block or errors
-            let should_log = received_block.height % 10 == 0;
+            // PRODUCTION: Enhanced logging for debugging compression issues
+            // Check if data is compressed (Zstd magic bytes: 0x28, 0xB5, 0x2F, 0xFD)
+            let is_compressed = received_block.data.len() >= 4 && 
+                               received_block.data[0] == 0x28 && 
+                               received_block.data[1] == 0xB5 &&
+                               received_block.data[2] == 0x2F &&
+                               received_block.data[3] == 0xFD;
+            
+            // Log every 10th block or special cases
+            let should_log = received_block.height % 10 == 0 || received_block.height <= 5;
             if should_log {
-            println!("[BLOCKS] Processing {} block #{} from {} ({} bytes)",
-                     received_block.block_type, received_block.height, 
-                     received_block.from_peer, received_block.data.len());
+                println!("[BLOCKS] 📦 Received {} block #{} from {} | Size: {} bytes | Compressed: {}",
+                         received_block.block_type, 
+                         received_block.height, 
+                         received_block.from_peer, 
+                         received_block.data.len(),
+                         if is_compressed { "✓ Zstd" } else { "✗ Raw" });
             }
             
             // PRODUCTION: Validate and store received block
@@ -987,8 +998,14 @@ impl BlockchainNode {
                     }
                     
                     // CRITICAL FIX: Actually SAVE the macroblock to storage!
-                    // First deserialize to get the macroblock struct
-                    match bincode::deserialize::<qnet_state::MacroBlock>(&received_block.data) {
+                    // PRODUCTION: Decompress before deserializing
+                    let decompressed_data = match zstd::decode_all(&received_block.data[..]) {
+                        Ok(data) => data,
+                        Err(_) => received_block.data.clone(),
+                    };
+                    
+                    // Deserialize decompressed macroblock struct
+                    match bincode::deserialize::<qnet_state::MacroBlock>(&decompressed_data) {
                         Ok(macroblock) => {
                             // save_macroblock IS async
                             storage.save_macroblock(macroblock.height, &macroblock).await
@@ -1026,8 +1043,26 @@ impl BlockchainNode {
     ) -> Result<(), String> {
         // CRITICAL: Full validation to prevent chain manipulation attacks
         
-        // 1. Deserialize microblock
-        let microblock: qnet_state::MicroBlock = bincode::deserialize(&block.data)
+        // PRODUCTION FIX: Decompress block data if compressed with Zstd
+        // Blocks are compressed during broadcast to save ~20% bandwidth
+        let decompressed_data = match zstd::decode_all(&block.data[..]) {
+            Ok(data) => {
+                // Successfully decompressed - block was compressed
+                if block.height % 10 == 0 {
+                    println!("[BLOCKS] ✅ Decompressed block #{}: {} -> {} bytes", 
+                             block.height, block.data.len(), data.len());
+                }
+                data
+            },
+            Err(_) => {
+                // Not compressed or different compression - use as-is
+                // This handles legacy blocks or uncompressed small blocks
+                block.data.clone()
+            }
+        };
+        
+        // 1. Deserialize microblock (now from decompressed data)
+        let microblock: qnet_state::MicroBlock = bincode::deserialize(&decompressed_data)
             .map_err(|e| format!("Failed to deserialize microblock: {}", e))?;
         
         // 2. Basic structure validation
@@ -1127,8 +1162,22 @@ impl BlockchainNode {
     ) -> Result<(), String> {
         // CRITICAL: Full validation to prevent consensus manipulation
         
-        // 1. Deserialize macroblock
-        let macroblock: qnet_state::MacroBlock = bincode::deserialize(&block.data)
+        // PRODUCTION FIX: Decompress macroblock data if compressed
+        let decompressed_data = match zstd::decode_all(&block.data[..]) {
+            Ok(data) => {
+                // Successfully decompressed
+                println!("[BLOCKS] ✅ Decompressed macroblock #{}: {} -> {} bytes", 
+                         block.height, block.data.len(), data.len());
+                data
+            },
+            Err(_) => {
+                // Not compressed - use as-is
+                block.data.clone()
+            }
+        };
+        
+        // 1. Deserialize macroblock (from decompressed data)
+        let macroblock: qnet_state::MacroBlock = bincode::deserialize(&decompressed_data)
             .map_err(|e| format!("Failed to deserialize macroblock: {}", e))?;
         
         // 2. Basic structure validation
