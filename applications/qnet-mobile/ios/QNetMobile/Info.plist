@@ -31,8 +31,14 @@
 		<key>NSAllowsLocalNetworking</key>
 		<true/>
 	</dict>
-	<key>NSLocationWhenInUseUsageDescription</key>
-	<string></string>
+	<key>NSCameraUsageDescription</key>
+	<string>QNet Wallet needs camera access to scan QR codes for receiving cryptocurrency and activating nodes</string>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>QNet Wallet needs photo library access to save QR codes for your wallet addresses</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>QNet Wallet needs photo library access to load QR codes</string>
+	<key>NSFaceIDUsageDescription</key>
+	<string>QNet Wallet uses Face ID to securely unlock your wallet and authorize transactions</string>
 	<key>RCTNewArchEnabled</key>
 	<true/>
 	<key>UILaunchStoryboardName</key>

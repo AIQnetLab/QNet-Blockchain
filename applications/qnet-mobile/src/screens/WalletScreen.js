@@ -3520,7 +3520,7 @@ const WalletScreen = () => {
             style={styles.content}
             contentContainerStyle={[
               styles.scrollContentContainer,
-              Platform.OS === 'ios' && { paddingBottom: 250 }
+              Platform.OS === 'ios' && { paddingBottom: 50 }
             ]}
             showsVerticalScrollIndicator={true}
             bounces={true}
@@ -4325,7 +4325,7 @@ const styles = StyleSheet.create({
     padding: 20,
   },
   scrollContentContainer: {
-    paddingBottom: Platform.OS === 'ios' ? 150 : 20,
+    paddingBottom: Platform.OS === 'ios' ? 20 : 20,
   },
   title: {
     fontSize: 28,
@@ -4487,7 +4487,7 @@ const styles = StyleSheet.create({
   },
   tabContentContainer: {
     flex: 1,
-    marginBottom: 60, // Space to ensure content is scrollable above tab nav
+    marginBottom: Platform.OS === 'ios' ? 10 : 60, // Space to ensure content is scrollable above tab nav
   },
   tabTitle: {
     fontSize: 24,
