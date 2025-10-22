@@ -277,6 +277,9 @@ pub struct SimplifiedP2P {
     
     /// Block processing channel
     block_tx: Option<tokio::sync::mpsc::UnboundedSender<ReceivedBlock>>,
+    
+    /// Sync request channel for requesting blocks from storage
+    sync_request_tx: Option<tokio::sync::mpsc::UnboundedSender<(u64, u64, String)>>,
 }
 
 // Kademlia DHT constants
@@ -381,6 +384,7 @@ impl SimplifiedP2P {
             },
             consensus_tx: None,
             block_tx: None,
+            sync_request_tx: None,
         }
     }
 
@@ -394,6 +398,11 @@ impl SimplifiedP2P {
     pub fn set_block_channel(&mut self, block_tx: tokio::sync::mpsc::UnboundedSender<ReceivedBlock>) {
         self.block_tx = Some(block_tx);
         // Block processing channel established
+    }
+    
+    /// Set sync request channel for handling block requests
+    pub fn set_sync_request_channel(&mut self, sync_request_tx: tokio::sync::mpsc::UnboundedSender<(u64, u64, String)>) {
+        self.sync_request_tx = Some(sync_request_tx);
     }
     
     /// Start simplified P2P network with load balancing
@@ -601,6 +610,12 @@ impl SimplifiedP2P {
     }
     
     /// QUANTUM OPTIMIZATION: Lock-free peer lookup by ID (O(1))
+    /// Get peer address by ID with O(1) performance
+    pub fn get_peer_address_by_id(&self, peer_id: &str) -> Option<String> {
+        // Use dual index for O(1) lookup
+        self.peer_id_to_addr.get(peer_id).map(|entry| entry.value().clone())
+    }
+    
     pub fn get_peer_by_id_lockfree(&self, peer_id: &str) -> Option<PeerInfo> {
         // DUAL INDEXING: First get address from ID
         if let Some(addr_entry) = self.peer_id_to_addr.get(peer_id) {
@@ -2688,30 +2703,17 @@ impl SimplifiedP2P {
             // Get Genesis IPs from constants
             use crate::genesis_constants::GENESIS_NODE_IPS;
             
-            // PHANTOM PEER FIX: Check both connected_peer_addrs AND connected_peers
-            // to ensure we only return truly connected peers
-            let connected_addrs = self.connected_peer_addrs.read().unwrap_or_else(|e| {
-                println!("[P2P] ⚠️ Failed to read connected_peer_addrs: {}", e);
-                e.into_inner()
-            });
-            
-            let connected_peers = self.connected_peers.read().unwrap_or_else(|e| {
-                println!("[P2P] ⚠️ Failed to read connected_peers: {}", e);
-                e.into_inner()
-            });
+            // CRITICAL FIX: Use SAME logic as get_validated_active_peers
+            // Don't check connected_peers - use working_genesis_ips directly
+            let working_genesis_ips = Self::filter_working_genesis_nodes_static(get_genesis_bootstrap_ips());
             
             for (ip, id) in GENESIS_NODE_IPS {
                 let addr = format!("{}:8001", ip);
                 let node_id = format!("genesis_node_{}", id);
                 
-                // PHANTOM PEER FIX: Only include if BOTH conditions are met:
-                // 1. Address is in connected_peer_addrs (O(1) HashSet check)
-                // 2. Peer is in connected_peers list (O(n) but small n for Genesis)
-                let is_in_addrs = connected_addrs.contains(&addr);
-                // SCALABILITY: O(1) HashMap lookup for millions of nodes
-                let is_in_peers = connected_peers.contains_key(&addr);
-                
-                if is_in_addrs && is_in_peers {
+                // Skip self and check if working
+                if !self.node_id.contains(&format!("{:03}", id.parse::<usize>().unwrap_or(0) + 1)) {
+                    if working_genesis_ips.contains(&ip.to_string()) {
                     genesis_peers.push(PeerInfo {
                         id: node_id,
                         addr: addr.clone(),
@@ -2728,10 +2730,7 @@ impl SimplifiedP2P {
                         successful_pings: 100,
                         failed_pings: 0,
                     });
-                } else if is_in_addrs != is_in_peers {
-                    // PHANTOM PEER DETECTION: Log inconsistency
-                    println!("[P2P] ⚠️ PHANTOM PEER DETECTED: {} - in_addrs={}, in_peers={}", 
-                            node_id, is_in_addrs, is_in_peers);
+                    }
                 }
             }
             
@@ -4913,8 +4912,37 @@ impl SimplifiedP2P {
         
         println!("[SYNC] 📤 Preparing blocks {}-{} for {}", from_height, actual_to, requester_id);
         
-        // This will be connected to storage when node.rs calls it
-        // For now, just log the request
+        // CRITICAL FIX: Send sync request to node.rs where storage is available
+        if let Some(ref sync_tx) = self.sync_request_tx {
+            if let Err(e) = sync_tx.send((from_height, actual_to, requester_id.clone())) {
+                println!("[SYNC] ❌ Failed to send sync request to node: {}", e);
+            } else {
+                println!("[SYNC] ✅ Sync request forwarded to node for processing");
+            }
+        } else {
+            println!("[SYNC] ⚠️ Sync request channel not available - sending empty response");
+            
+            // Fallback: send empty batch to prevent timeout
+            let response = NetworkMessage::BlocksBatch {
+                blocks: Vec::new(),
+                from_height,
+                to_height: actual_to,
+                sender_id: self.node_id.clone(),
+            };
+            
+            // SCALABILITY FIX: Use O(1) lookup instead of O(n) find
+            if let Some(peer_addr) = self.peer_id_to_addr.get(&requester_id) {
+                self.send_network_message(&peer_addr.clone(), response);
+                println!("[SYNC] 📤 Sent empty response to {}", requester_id);
+            } else {
+                // Fallback for Genesis nodes not in index
+                let peers = self.get_validated_active_peers();
+                if let Some(peer) = peers.iter().find(|p| p.id == requester_id) {
+                    self.send_network_message(&peer.addr, response);
+                    println!("[SYNC] 📤 Sent empty response to {} (Genesis fallback)", requester_id);
+                }
+            }
+        }
     }
     
     /// Handle blocks batch received for sync

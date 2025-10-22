@@ -44,6 +44,12 @@ use tokio::sync::RwLock;
 use hex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::env;
+use std::sync::Mutex;
+
+// CRITICAL: Global flag for emergency producer activation
+lazy_static::lazy_static! {
+    static ref EMERGENCY_PRODUCER_FLAG: Mutex<Option<(u64, String)>> = Mutex::new(None);
+}
 use sha3::{Sha3_256, Digest};
 use serde_json;
 use bincode;
@@ -689,6 +695,9 @@ impl BlockchainNode {
         // PRODUCTION: Create block processing channel
         let (block_tx, block_rx) = tokio::sync::mpsc::unbounded_channel();
         
+        // Create sync request channel for handling block requests
+        let (sync_request_tx, mut sync_request_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, u64, String)>();
+        
         println!("[UnifiedP2P] 🔍 DEBUG: Creating SimplifiedP2P instance...");
         let mut unified_p2p_instance = SimplifiedP2P::new(
             node_id.clone(),
@@ -702,6 +711,7 @@ impl BlockchainNode {
         
         // PRODUCTION: Set block processing channel for received blocks
         unified_p2p_instance.set_block_channel(block_tx);
+        unified_p2p_instance.set_sync_request_channel(sync_request_tx);
         
         // CRITICAL: Initialize all Genesis node reputations deterministically at startup
         // This prevents race conditions where different nodes see different candidate lists
@@ -761,6 +771,7 @@ impl BlockchainNode {
         tokio::spawn(async move {
             Self::process_received_blocks(block_rx, storage_clone).await;
         });
+        
         
         // Start unified P2P
         unified_p2p.start();
@@ -925,6 +936,17 @@ impl BlockchainNode {
                 println!("[REWARDS] 📡 Node ready to receive reward pings from RPC system");
             }
         }
+        
+        // Start sync request handler AFTER blockchain is created
+        let blockchain_clone = blockchain.clone();
+        tokio::spawn(async move {
+            while let Some((from_height, to_height, requester_id)) = sync_request_rx.recv().await {
+                // Use existing handle_sync_request method
+                if let Err(e) = blockchain_clone.handle_sync_request(from_height, to_height, requester_id).await {
+                    println!("[SYNC] ❌ Failed to handle sync request: {}", e);
+                }
+            }
+        });
         
         Ok(blockchain)
     }
@@ -1796,7 +1818,7 @@ impl BlockchainNode {
                 std::env::set_var("CURRENT_BLOCK_HEIGHT", microblock_height.to_string());
                 
                 // Determine current microblock producer using cryptographic selection (with REAL node type)
-                let current_producer = Self::select_microblock_producer(
+                let mut current_producer = Self::select_microblock_producer(
                     microblock_height, 
                     &unified_p2p, 
                     &node_id, 
@@ -2327,16 +2349,48 @@ impl BlockchainNode {
                     }
                     } // End of microblock production block
                 } else {
-                    // PRODUCTION: This node is NOT the selected producer - synchronize with network
-                    // CPU OPTIMIZATION: Only log every 10th block to reduce IO load
-                    if microblock_height % 10 == 0 {
-                    println!("[MICROBLOCK] 👥 Waiting for block #{} from producer: {}", microblock_height + 1, current_producer);
+                    // CRITICAL: Check if we became emergency producer
+                    let should_produce_emergency = if let Ok(emergency_flag) = EMERGENCY_PRODUCER_FLAG.lock() {
+                        if let Some((height, producer)) = &*emergency_flag {
+                            if *height == microblock_height + 1 && *producer == node_id {
+                                println!("[EMERGENCY] 🚨 WE ARE EMERGENCY PRODUCER FOR BLOCK #{}", height);
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    
+                    if should_produce_emergency {
+                        // EMERGENCY PRODUCTION: Create block immediately
+                        println!("[EMERGENCY] 🚀 EMERGENCY BLOCK PRODUCTION ACTIVATED!");
+                        *is_leader.write().await = true;
+                        current_producer = node_id.clone();
+                        
+                        // Clear emergency flag
+                        if let Ok(mut emergency_flag) = EMERGENCY_PRODUCER_FLAG.lock() {
+                            *emergency_flag = None;
+                        }
+                        
+                        // Continue to production code (will produce block)
+                    } else {
+                        // PRODUCTION: This node is NOT the selected producer - synchronize with network
+                        // CPU OPTIMIZATION: Only log every 10th block to reduce IO load
+                        if microblock_height % 10 == 0 {
+                            println!("[MICROBLOCK] 👥 Waiting for block #{} from producer: {}", microblock_height + 1, current_producer);
+                        }
+                        
+                        // Update is_leader for backward compatibility
+                        *is_leader.write().await = false;
                     }
                     
-                    // Update is_leader for backward compatibility
-                    *is_leader.write().await = false;
-                    
-                    // EXISTING: Non-blocking background sync as promised in line 868 comments
+                    // Skip sync if we're about to produce emergency block
+                    if !should_produce_emergency {
+                        // EXISTING: Non-blocking background sync as promised in line 868 comments
                     if let Some(p2p) = &unified_p2p {
                         // SYNC FIX: Prevent multiple parallel syncs using atomic flag
                         static SYNC_IN_PROGRESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -2475,6 +2529,17 @@ impl BlockchainNode {
                                         println!("[FAILOVER] ⚠️ Emergency microblock broadcast failed: {}", e);
                                     } else {
                                         println!("[FAILOVER] ✅ Emergency microblock producer change broadcasted to network");
+                                        
+                                        // CRITICAL FIX: If WE are the emergency producer, start producing immediately!
+                                        if emergency_producer == node_id_timeout {
+                                            println!("[FAILOVER] 🚀 WE ARE THE EMERGENCY PRODUCER - CREATING BLOCK #{} NOW!", expected_height_timeout);
+                                            
+                                            // Signal main loop to produce block immediately
+                                            // Store emergency producer flag in a shared location
+                                            if let Ok(mut emergency_flag) = EMERGENCY_PRODUCER_FLAG.lock() {
+                                                *emergency_flag = Some((expected_height_timeout, emergency_producer.clone()));
+                                            }
+                                        }
                                     }
                                 }
                             });
@@ -2485,6 +2550,7 @@ impl BlockchainNode {
                     }
 
                 }
+                } // End of sync block (for non-emergency producers)
                 
                 // ══════════════════════════════════════════════════════════════════
                 // CRITICAL: MACROBLOCK CONSENSUS FOR ALL NODES (not just producer!)
@@ -5496,11 +5562,20 @@ impl BlockchainNode {
                 sender_id: self.node_id.clone(),
             };
             
-            // Find requester's address from peer list
-            let peers = p2p.get_validated_active_peers();
-            if let Some(peer) = peers.iter().find(|p| p.id == requester_id) {
-                p2p.send_network_message(&peer.addr, response);
+            // SCALABILITY: Try O(1) lookup first, then fallback to O(n) for Genesis
+            let peer_addr = if let Some(addr) = p2p.get_peer_address_by_id(&requester_id) {
+                Some(addr)
+            } else {
+                // Fallback for Genesis nodes
+                let peers = p2p.get_validated_active_peers();
+                peers.iter().find(|p| p.id == requester_id).map(|p| p.addr.clone())
+            };
+            
+            if let Some(addr) = peer_addr {
+                p2p.send_network_message(&addr, response);
                 println!("[SYNC] 📤 Sent {} microblocks to {}", blocks_data.len(), requester_id);
+            } else {
+                println!("[SYNC] ⚠️ Requester {} not found in peers", requester_id);
             }
         }
         
