@@ -5942,6 +5942,13 @@ impl SimplifiedP2P {
             return;
         }
         
+        // CRITICAL FIX: Don't process failover for non-existent blocks
+        // This prevents spam about block #1 when it doesn't exist yet
+        if block_height <= 1 {
+            println!("[FAILOVER] ⚠️ Ignoring failover for block #{} (too early in chain)", block_height);
+            return;
+        }
+        
         // PRODUCTION FIX: Don't penalize during Genesis bootstrap (first 100 blocks)
         // Technical issues are expected during network initialization
         let is_genesis_bootstrap = std::env::var("QNET_BOOTSTRAP_ID")

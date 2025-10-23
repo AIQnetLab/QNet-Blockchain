@@ -586,6 +586,24 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(blockchain_filter.clone())
         .and_then(handle_failover_history);
     
+    // Network failovers endpoint (alias for compatibility)
+    let network_failovers = api_v1
+        .and(warp::path("network"))
+        .and(warp::path("failovers"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::query::<HashMap<String, String>>())
+        .and(blockchain_filter.clone())
+        .and_then(handle_failover_history);
+    
+    // General statistics endpoint
+    let stats_endpoint = api_v1
+        .and(warp::path("stats"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(blockchain_filter.clone())
+        .and_then(handle_stats);
+    
     // Producer status endpoint
     let producer_status = api_v1
         .and(warp::path("producer"))
@@ -726,6 +744,8 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .or(graceful_shutdown);
     
     let monitoring_routes = failover_history
+        .or(network_failovers)
+        .or(stats_endpoint)
         .or(producer_status)
         .or(sync_status)
         .or(network_diagnostics)
@@ -3725,6 +3745,88 @@ async fn verify_burn_transaction_exists(
 }
 
 // ===== MONITORING AND DIAGNOSTIC HANDLERS =====
+
+/// Handle general statistics request
+async fn handle_stats(
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    let height = blockchain.get_height().await;
+    
+    // Get network statistics
+    let (total_peers, active_peers, network_tps) = if let Some(p2p) = blockchain.get_unified_p2p() {
+        let peers = p2p.get_validated_active_peers();
+        let total = peers.len();
+        let active = p2p.get_peer_count() as usize;
+        
+        // Calculate network TPS from recent blocks
+        let tps = if let Ok(storage_dir) = std::env::var("QNET_DATA_DIR") {
+            match crate::storage::Storage::new(&storage_dir) {
+                Ok(storage) => {
+                    // Get last 10 blocks and calculate average TPS
+                    let mut total_txs = 0u64;
+                    let blocks_to_check = 10;
+                    for i in 0..blocks_to_check {
+                        let block_height = height.saturating_sub(i);
+                        if block_height == 0 { break; }
+                        
+                        if let Ok(Some(block)) = storage.load_microblock(block_height) {
+                            if let Ok(microblock) = bincode::deserialize::<qnet_state::MicroBlock>(&block) {
+                                total_txs += microblock.transactions.len() as u64;
+                            }
+                        }
+                    }
+                    // Average TPS over last 10 seconds (10 blocks)
+                    total_txs / blocks_to_check.max(1)
+                }
+                Err(_) => 0,
+            }
+        } else {
+            0
+        };
+        
+        (total, active, tps)
+    } else {
+        (0, 0, 0)
+    };
+    
+    // Get mempool stats
+    let mempool_size = blockchain.get_mempool_size().await.unwrap_or(0);
+    
+    // Get node uptime (use a static start time for now)
+    static NODE_START_TIME: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let uptime_seconds = NODE_START_TIME
+        .get_or_init(|| std::time::Instant::now())
+        .elapsed()
+        .as_secs();
+    
+    let stats = json!({
+        "network": {
+            "height": height,
+            "total_peers": total_peers,
+            "active_peers": active_peers,
+            "tps": network_tps,
+            "phase": if height < 1000 { "genesis" } else { "production" },
+        },
+        "node": {
+            "id": blockchain.get_node_id(),
+            "type": format!("{:?}", blockchain.get_node_type()),
+            "uptime_seconds": uptime_seconds,
+            "is_producer": blockchain.is_leader().await,
+        },
+        "mempool": {
+            "size": mempool_size,
+            "max_size": 500000,
+        },
+        "blockchain": {
+            "microblock_interval": 1,
+            "macroblock_interval": 90,
+            "current_round": height / 30,
+        },
+        "timestamp": chrono::Utc::now().timestamp(),
+    });
+    
+    Ok(warp::reply::json(&stats))
+}
 
 /// Handle failover history request
 async fn handle_failover_history(

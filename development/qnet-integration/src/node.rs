@@ -766,14 +766,7 @@ impl BlockchainNode {
         
         let unified_p2p = Arc::new(unified_p2p_instance);
         
-        // PRODUCTION: Start block processing handler  
-        let storage_clone = storage.clone();
-        tokio::spawn(async move {
-            Self::process_received_blocks(block_rx, storage_clone).await;
-        });
-        
-        
-        // Start unified P2P
+        // Start unified P2P (must start before blockchain creation)
         unified_p2p.start();
         
         // QUANTUM AUTO-SCALING: Automatically enable sharding for large networks
@@ -900,6 +893,13 @@ impl BlockchainNode {
         
         println!("[Node] 🔍 DEBUG: BlockchainNode created successfully for node_id: {}", node_id);
         
+        // PRODUCTION: Start block processing handler with blockchain's height
+        let storage_for_blocks = blockchain.storage.clone();
+        let height_for_blocks = blockchain.height.clone();
+        tokio::spawn(async move {
+            Self::process_received_blocks(block_rx, storage_for_blocks, height_for_blocks).await;
+        });
+        
         // Register Genesis nodes in reward system and start processing
         if std::env::var("QNET_BOOTSTRAP_ID").is_ok() {
             let bootstrap_id = std::env::var("QNET_BOOTSTRAP_ID").unwrap_or_default();
@@ -955,6 +955,7 @@ impl BlockchainNode {
     async fn process_received_blocks(
         mut block_rx: tokio::sync::mpsc::UnboundedReceiver<crate::unified_p2p::ReceivedBlock>,
         storage: Arc<Storage>,
+        height: Arc<RwLock<u64>>,
     ) {
         while let Some(received_block) = block_rx.recv().await {
             // Check for special ping signal
@@ -1054,6 +1055,15 @@ impl BlockchainNode {
                 Ok(_) => {
                     if should_log {
                         println!("[BLOCKS] ✅ Block #{} stored successfully", received_block.height);
+                    }
+                    // Height is automatically updated in storage by save_microblock/save_macroblock
+                    // CRITICAL: Also update global height variable for API and consensus
+                    {
+                        let current_height = *height.read().await;
+                        if received_block.height > current_height {
+                            *height.write().await = received_block.height;
+                            println!("[BLOCKS] 📊 Global height updated to {}", received_block.height);
+                        }
                     }
                 },
                 Err(e) => {
@@ -1560,7 +1570,90 @@ impl BlockchainNode {
             let mut last_macroblock_trigger = 0u64;
             let mut consensus_started = false; // Track early consensus start
             
-
+            // GENESIS BLOCK CREATION: Create Genesis Block if blockchain is empty
+            if microblock_height == 0 {
+                // Check if we're the first Genesis node to start
+                let is_genesis_node = std::env::var("QNET_BOOTSTRAP_ID")
+                    .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
+                    .unwrap_or(false);
+                
+                if is_genesis_node {
+                    println!("[GENESIS] 🌍 Blockchain is empty (height=0), creating Genesis Block...");
+                    
+                    // Create Genesis Block using existing genesis module
+                    use crate::genesis::{GenesisConfig, create_genesis_block};
+                    let genesis_config = GenesisConfig::default();
+                    
+                    match create_genesis_block(genesis_config) {
+                        Ok(genesis_block) => {
+                            // Convert to MicroBlock format for storage
+                            let merkle_root = Self::calculate_merkle_root(&genesis_block.transactions);
+                            let mut genesis_microblock = qnet_state::MicroBlock {
+                                height: 0,
+                                timestamp: genesis_block.timestamp,
+                                previous_hash: [0u8; 32],
+                                transactions: genesis_block.transactions,
+                                producer: "genesis".to_string(),
+                                merkle_root,
+                                signature: Vec::new(), // Will be signed with quantum crypto
+                            };
+                            
+                            // PRODUCTION: Sign Genesis Block with quantum-resistant signature
+                            match Self::sign_microblock_with_dilithium(&genesis_microblock, "genesis").await {
+                                Ok(signature) => {
+                                    genesis_microblock.signature = signature;
+                                    println!("[GENESIS] 🔐 Genesis Block signed with CRYSTALS-Dilithium quantum signature");
+                                }
+                                Err(e) => {
+                                    println!("[GENESIS] ⚠️ Failed to sign with quantum crypto: {}, using deterministic signature", e);
+                                    // Fallback: Use deterministic signature for Genesis Block
+                                    genesis_microblock.signature = "GENESIS_BLOCK_QUANTUM_SIGNATURE".as_bytes().to_vec();
+                                }
+                            }
+                            
+                            // Serialize and save Genesis Block
+                            match bincode::serialize(&genesis_microblock) {
+                                Ok(data) => {
+                                    if let Err(e) = storage.save_microblock(0, &data) {
+                                        println!("[GENESIS] ❌ Failed to save Genesis Block: {}", e);
+                                    } else {
+                                        println!("[GENESIS] ✅ Genesis Block created and saved at height 0");
+                                        microblock_height = 1; // Start production from block 1
+                                        *height.write().await = 1;
+                                    }
+                                }
+                                Err(e) => println!("[GENESIS] ❌ Failed to serialize Genesis Block: {}", e),
+                            }
+                        }
+                        Err(e) => println!("[GENESIS] ❌ Failed to create Genesis Block: {}", e),
+                    }
+                } else {
+                    // Non-Genesis node with height=0: needs to sync from network
+                    println!("[SYNC] 📥 Node at height 0, requesting initial sync...");
+                    if let Some(p2p) = &unified_p2p {
+                        // Request blocks from Genesis nodes
+                        if let Some(network_height) = p2p.get_cached_network_height() {
+                            if network_height > 0 {
+                                println!("[SYNC] 🔄 Network is at height {}, syncing...", network_height);
+                                // CRITICAL: Wait for sync to complete before starting production
+                                match p2p.sync_blocks(0, network_height).await {
+                                    Ok(_) => {
+                                        // Update height after successful sync
+                                        microblock_height = network_height;
+                                        *height.write().await = network_height;
+                                        println!("[SYNC] ✅ Initial sync completed, now at height {}", network_height);
+                                    }
+                                    Err(e) => {
+                                        println!("[SYNC] ⚠️ Initial sync failed: {}", e);
+                                        // Continue anyway - will try to sync again during production
+                                        // This prevents deadlock if all Genesis nodes are down
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             
             // PRECISION TIMING: Track exact 1-second intervals to prevent drift
             let mut next_block_time = std::time::Instant::now() + microblock_interval;
@@ -4807,8 +4900,9 @@ impl BlockchainNode {
     fn validate_microblock_production(microblock: &qnet_state::MicroBlock) -> Result<(), String> {
         // Production validation checks
         
-        if microblock.height == 0 {
-            return Err("Invalid height: cannot be zero".to_string());
+        // Allow height 0 for Genesis Block
+        if microblock.height == 0 && microblock.producer != "genesis" {
+            return Err("Invalid height: only genesis producer can create block 0".to_string());
         }
         
         if microblock.timestamp == 0 {
