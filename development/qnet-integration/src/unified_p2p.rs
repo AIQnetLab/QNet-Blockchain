@@ -5880,6 +5880,13 @@ impl SimplifiedP2P {
         change_type: String,
         timestamp: u64
     ) {
+        // CRITICAL FIX: Filter out early block failovers to prevent spam
+        // Block #1 issue is known and will be fixed by height increment fix
+        if block_height <= 1 {
+            // Don't even log these - they create too much noise
+            return;
+        }
+        
         println!("[FAILOVER] 📨 Processing emergency {} producer change notification", change_type);
         
         // CHECK FOR CRITICAL ATTACKS
@@ -5939,13 +5946,6 @@ impl SimplifiedP2P {
            failed_producer == "no_leader_selected" || 
            failed_producer == "consensus_lock_failed" {
             println!("[REPUTATION] ⚠️ Skipping penalty for placeholder producer: {}", failed_producer);
-            return;
-        }
-        
-        // CRITICAL FIX: Don't process failover for non-existent blocks
-        // This prevents spam about block #1 when it doesn't exist yet
-        if block_height <= 1 {
-            println!("[FAILOVER] ⚠️ Ignoring failover for block #{} (too early in chain)", block_height);
             return;
         }
         

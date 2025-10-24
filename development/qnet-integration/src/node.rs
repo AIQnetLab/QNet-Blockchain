@@ -1363,10 +1363,15 @@ impl BlockchainNode {
             // Continue anyway - consensus will start fresh
         }
         
-        // PRODUCTION FIX: Always enable microblock production for blockchain operation
-        // Microblocks are core to QNet's 1-second block time architecture
-        println!("[Node] ⚡ Starting microblock production (1-second intervals)");
-        self.start_microblock_production().await;
+        // PRODUCTION: Start microblock production ONLY for nodes that can produce blocks
+        // Light nodes should NOT enter the production loop - they only sync
+        if !matches!(self.node_type, NodeType::Light) {
+            println!("[Node] ⚡ Starting microblock production (1-second intervals)");
+            self.start_microblock_production().await;
+        } else {
+            println!("[Node] 📱 Light node: Sync-only mode (no block production)");
+            // Light nodes will sync through P2P received blocks
+        }
         
         // PRODUCTION: Start archive compliance enforcement (mandatory for Full/Super nodes)
         if matches!(self.node_type, NodeType::Full | NodeType::Super) {
@@ -1667,6 +1672,17 @@ impl BlockchainNode {
             
             while *is_running.read().await {
                 cpu_check_counter += 1;
+                
+                // CRITICAL FIX: Sync local microblock_height with global height at loop start
+                // This ensures non-producers stay synchronized with the network
+                {
+                    let global_height = *height.read().await;
+                    if global_height > microblock_height {
+                        println!("[SYNC] 📊 Syncing local height {} to global height {}", 
+                                microblock_height, global_height);
+                        microblock_height = global_height;
+                    }
+                }
                 
                 // CPU OPTIMIZATION: Log CPU stats every 30 seconds
                 if cpu_check_counter % 30 == 0 {
@@ -2044,13 +2060,7 @@ impl BlockchainNode {
                     // Byzantine consensus participation required ONLY for macroblock finalization every 90 blocks
                     
                     // EXISTING: Scalable architecture - microblocks 1s interval, macroblocks 90s consensus
-                    microblock_height += 1;
-                    
-                    // CRITICAL FIX: Update global height for API sync
-                    {
-                        let mut global_height = height.write().await;
-                        *global_height = microblock_height;
-                    }
+                    // CRITICAL FIX: Height increment moved AFTER block creation to fix missing block #1
                     
                     // PRODUCTION: Use validated active peers for accurate count
                     let peer_count = if let Some(p2p) = &unified_p2p {
@@ -2439,6 +2449,16 @@ impl BlockchainNode {
                     // Performance monitoring
                     if microblock_height % 100 == 0 {
                         Self::log_performance_metrics(microblock_height, &mempool).await;
+                    }
+                    
+                    // CRITICAL FIX: Increment height AFTER block is created and saved
+                    // This fixes the missing block #1 issue
+                    microblock_height += 1;
+                    
+                    // Update global height for API sync
+                    {
+                        let mut global_height = height.write().await;
+                        *global_height = microblock_height;
                     }
                     } // End of microblock production block
                 } else {
@@ -5377,8 +5397,29 @@ impl BlockchainNode {
     }
     
     pub async fn get_block(&self, height: u64) -> Result<Option<qnet_state::Block>, QNetError> {
-        match self.storage.load_block_by_height(height).await {
-            Ok(block) => Ok(block),
+        // CRITICAL FIX: We store MicroBlocks, not Blocks
+        // Convert MicroBlock to Block format for API compatibility
+        match self.storage.load_microblock(height) {
+            Ok(Some(data)) => {
+                // Deserialize MicroBlock
+                match bincode::deserialize::<qnet_state::MicroBlock>(&data) {
+                    Ok(microblock) => {
+                        // Convert MicroBlock to Block format
+                        let block = qnet_state::Block {
+                            height: microblock.height,
+                            timestamp: microblock.timestamp,
+                            previous_hash: microblock.previous_hash,
+                            merkle_root: microblock.merkle_root,
+                            transactions: microblock.transactions,
+                            producer: microblock.producer,
+                            signature: microblock.signature,
+                        };
+                        Ok(Some(block))
+                    }
+                    Err(e) => Err(QNetError::StorageError(format!("Failed to deserialize microblock: {}", e))),
+                }
+            }
+            Ok(None) => Ok(None),
             Err(e) => Err(QNetError::StorageError(e.to_string())),
         }
     }

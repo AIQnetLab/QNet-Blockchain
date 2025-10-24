@@ -777,8 +777,15 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
     
     let p2p_routes = p2p_message;
     
+    // Simple health check endpoint (no authentication required)
+    let health = warp::path("health")
+        .and(warp::path::end())
+        .and(warp::get())
+        .map(|| warp::reply::with_status("OK", warp::http::StatusCode::OK));
+    
     // Combine route groups
-    let routes = basic_routes
+    let routes = health
+        .or(basic_routes)
         .or(blockchain_routes)
         .or(account_routes)
         .or(transaction_routes)
