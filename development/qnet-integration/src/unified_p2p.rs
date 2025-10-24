@@ -84,6 +84,11 @@ static CACHED_BLOCKCHAIN_HEIGHT: Lazy<Arc<Mutex<(u64, Instant)>>> =
 pub static LOCAL_BLOCKCHAIN_HEIGHT: Lazy<Arc<AtomicU64>> = 
     Lazy::new(|| Arc::new(AtomicU64::new(0)));
 
+// CRITICAL FIX: Deduplicate failover messages to prevent spam
+// Store processed failover events: (block_height, failed_producer, new_producer)
+static PROCESSED_FAILOVERS: Lazy<Arc<RwLock<HashSet<(u64, String, String)>>>> = 
+    Lazy::new(|| Arc::new(RwLock::new(HashSet::new())));
+
 /// SECURITY: Rate limiting structure for DDoS protection
 #[derive(Debug, Clone)]
 pub struct RateLimit {
@@ -5906,6 +5911,23 @@ impl SimplifiedP2P {
             println!("[FAILOVER] 🔇 Ignoring failover for future block #{} (local: {})", 
                      block_height, local_height);
             return;
+        }
+        
+        // CRITICAL FIX: Deduplicate failover messages to prevent processing same event multiple times
+        let failover_key = (block_height, failed_producer.clone(), new_producer.clone());
+        {
+            let mut processed = PROCESSED_FAILOVERS.write().unwrap();
+            if processed.contains(&failover_key) {
+                // Already processed this exact failover event
+                return;
+            }
+            processed.insert(failover_key);
+            
+            // CLEANUP: Remove old entries to prevent memory leak (keep last 1000 events)
+            if processed.len() > 1000 {
+                let min_height = block_height.saturating_sub(500);
+                processed.retain(|(h, _, _)| *h >= min_height);
+            }
         }
         
         println!("[FAILOVER] 📨 Processing emergency {} producer change notification", change_type);
