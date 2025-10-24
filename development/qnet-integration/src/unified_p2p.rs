@@ -6,7 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
 use std::sync::atomic::{AtomicU64, Ordering};
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use std::time::{Duration, Instant};
 use once_cell::sync::Lazy;
 use std::thread;
@@ -86,8 +86,9 @@ pub static LOCAL_BLOCKCHAIN_HEIGHT: Lazy<Arc<AtomicU64>> =
 
 // CRITICAL FIX: Deduplicate failover messages to prevent spam
 // Store processed failover events: (block_height, failed_producer, new_producer)
-static PROCESSED_FAILOVERS: Lazy<Arc<RwLock<HashSet<(u64, String, String)>>>> = 
-    Lazy::new(|| Arc::new(RwLock::new(HashSet::new())));
+// SCALABILITY: Use DashSet for lock-free concurrent access with millions of nodes
+static PROCESSED_FAILOVERS: Lazy<Arc<DashSet<(u64, String, String)>>> = 
+    Lazy::new(|| Arc::new(DashSet::new()));
 
 /// SECURITY: Rate limiting structure for DDoS protection
 #[derive(Debug, Clone)]
@@ -5915,19 +5916,18 @@ impl SimplifiedP2P {
         
         // CRITICAL FIX: Deduplicate failover messages to prevent processing same event multiple times
         let failover_key = (block_height, failed_producer.clone(), new_producer.clone());
-        {
-            let mut processed = PROCESSED_FAILOVERS.write().unwrap();
-            if processed.contains(&failover_key) {
-                // Already processed this exact failover event
-                return;
-            }
-            processed.insert(failover_key);
-            
-            // CLEANUP: Remove old entries to prevent memory leak (keep last 1000 events)
-            if processed.len() > 1000 {
-                let min_height = block_height.saturating_sub(500);
-                processed.retain(|(h, _, _)| *h >= min_height);
-            }
+        
+        // SCALABILITY: DashSet provides lock-free concurrent access for millions of nodes
+        if !PROCESSED_FAILOVERS.insert(failover_key.clone()) {
+            // Already processed this exact failover event (insert returns false if already exists)
+            return;
+        }
+        
+        // CLEANUP: Remove old entries to prevent memory leak (keep last 1000 events)
+        // Only cleanup periodically to avoid overhead
+        if PROCESSED_FAILOVERS.len() > 1000 {
+            let min_height = block_height.saturating_sub(500);
+            PROCESSED_FAILOVERS.retain(|(h, _, _)| *h >= min_height);
         }
         
         println!("[FAILOVER] 📨 Processing emergency {} producer change notification", change_type);

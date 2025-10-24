@@ -1383,9 +1383,39 @@ impl BlockchainNode {
             // CRITICAL: Add startup delay for network stabilization and peer discovery
             // This prevents block #1 creation failures when nodes start simultaneously
             if self.storage.get_chain_height().unwrap_or(0) == 0 {
-                println!("[Node] ⏳ Genesis phase: Waiting 30s for full peer discovery...");
-                println!("[Node] 📡 This allows all 5 Genesis nodes to find each other");
-                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                println!("[Node] ⏳ Genesis phase: Waiting for all 5 Genesis nodes to connect...");
+                println!("[Node] 📡 Byzantine consensus requires minimum 4 nodes");
+                
+                // CRITICAL FIX: Wait until we have enough nodes for Byzantine consensus
+                if let Some(ref p2p) = self.unified_p2p {
+                    let mut wait_time = 0;
+                    loop {
+                        let validated_peers = p2p.get_validated_active_peers();
+                        let total_nodes = validated_peers.len() + 1; // +1 for self
+                        
+                        if total_nodes >= 4 {
+                            println!("[Node] ✅ Byzantine consensus ready: {} nodes connected", total_nodes);
+                            println!("[Node] 🚀 All Genesis nodes found, starting production!");
+                            break;
+                        }
+                        
+                        println!("[Node] ⏳ Waiting for Genesis nodes: {}/4 connected ({}s elapsed)", 
+                                 total_nodes, wait_time);
+                        
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        wait_time += 5;
+                        
+                        // Maximum wait 60 seconds
+                        if wait_time >= 60 {
+                            println!("[Node] ⚠️ Timeout waiting for Genesis nodes, proceeding with {} nodes", total_nodes);
+                            break;
+                        }
+                    }
+                } else {
+                    // Fallback if no P2P
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                }
+                
                 println!("[Node] ✅ Network stabilization complete, starting production");
             } else {
                 // CRITICAL FIX: Sync with network before starting production
@@ -2654,20 +2684,26 @@ impl BlockchainNode {
                             let node_id_timeout = node_id.clone();
                             let node_type_timeout = node_type;
                             
-                            // EXISTING: Use same async timeout pattern as macroblock failover (line 1205)
-                            tokio::spawn(async move {
-                                tokio::time::sleep(microblock_timeout).await;
-                                
-                                // Check if block was received during timeout period
-                                let block_exists = match storage_timeout.load_microblock(expected_height_timeout) {
-                                    Ok(Some(_)) => true,
-                                    _ => false,
-                                };
-                                
-                                if !block_exists {
-                                    let timeout_duration = if expected_height_timeout == 1 { 15 } else { 5 };
-                                    println!("[FAILOVER] 🚨 Microblock #{} not received after {}s timeout from producer: {}", 
-                                             expected_height_timeout, timeout_duration, current_producer_timeout);
+                            // CRITICAL FIX: Don't trigger failover if we're still syncing with network
+                            // This prevents false failovers during startup when nodes are catching up
+                            let network_height = p2p_timeout.sync_blockchain_height().unwrap_or(0);
+                            
+                            // Only start timeout detection if we're reasonably in sync (within 10 blocks)
+                            if network_height == 0 || expected_height_timeout <= network_height + 10 {
+                                // EXISTING: Use same async timeout pattern as macroblock failover (line 1205)
+                                tokio::spawn(async move {
+                                    tokio::time::sleep(microblock_timeout).await;
+                                    
+                                    // Check if block was received during timeout period
+                                    let block_exists = match storage_timeout.load_microblock(expected_height_timeout) {
+                                        Ok(Some(_)) => true,
+                                        _ => false,
+                                    };
+                                    
+                                    if !block_exists {
+                                        let timeout_duration = if expected_height_timeout == 1 { 15 } else { 5 };
+                                        println!("[FAILOVER] 🚨 Microblock #{} not received after {}s timeout from producer: {}", 
+                                                 expected_height_timeout, timeout_duration, current_producer_timeout);
                                     
                                     // EXISTING: Use same emergency selection as implemented in select_emergency_producer (line 1534)
                                     let emergency_producer = crate::node::BlockchainNode::select_emergency_producer(
@@ -2705,6 +2741,10 @@ impl BlockchainNode {
                                     }
                                 }
                             });
+                            } else {
+                                println!("[FAILOVER] ⏸️ Skipping timeout detection - node is syncing (block {} vs network {})", 
+                                         expected_height_timeout, network_height);
+                            }
                         }
                     } else {
                         // No P2P available - standalone mode
