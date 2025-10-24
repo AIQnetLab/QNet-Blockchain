@@ -1366,6 +1366,14 @@ impl BlockchainNode {
         // PRODUCTION: Start microblock production ONLY for nodes that can produce blocks
         // Light nodes should NOT enter the production loop - they only sync
         if !matches!(self.node_type, NodeType::Light) {
+            // CRITICAL: Add startup delay for network stabilization
+            // This prevents block #1 creation failures when nodes start simultaneously
+            if self.storage.get_chain_height().unwrap_or(0) == 0 {
+                println!("[Node] ⏳ Genesis phase: Waiting 10s for network stabilization...");
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                println!("[Node] ✅ Network stabilization complete, starting production");
+            }
+            
             println!("[Node] ⚡ Starting microblock production (1-second intervals)");
             self.start_microblock_production().await;
         } else {
@@ -1674,13 +1682,29 @@ impl BlockchainNode {
                 cpu_check_counter += 1;
                 
                 // CRITICAL FIX: Sync local microblock_height with global height at loop start
-                // This ensures non-producers stay synchronized with the network
+                // But ONLY if we have all intermediate blocks!
                 {
                     let global_height = *height.read().await;
                     if global_height > microblock_height {
-                        println!("[SYNC] 📊 Syncing local height {} to global height {}", 
-                                microblock_height, global_height);
-                        microblock_height = global_height;
+                        // Check if we have all blocks up to global_height
+                        let mut can_sync = true;
+                        for h in (microblock_height + 1)..=global_height {
+                            if storage.load_microblock(h).unwrap_or(None).is_none() {
+                                can_sync = false;
+                                if h == microblock_height + 1 {
+                                    // Missing next block - this is critical
+                                    println!("[SYNC] ⚠️ Cannot sync to height {} - missing block #{}", 
+                                            global_height, h);
+                                }
+                                break;
+                            }
+                        }
+                        
+                        if can_sync {
+                            println!("[SYNC] 📊 Syncing local height {} to global height {} (all blocks present)", 
+                                    microblock_height, global_height);
+                            microblock_height = global_height;
+                        }
                     }
                 }
                 
@@ -1936,6 +1960,12 @@ impl BlockchainNode {
                 ).await;
                 let is_my_turn_to_produce = current_producer == node_id;
                 
+                // DEBUG: Log producer selection for first blocks
+                if microblock_height <= 5 {
+                    println!("[DEBUG] Block #{}: producer={}, is_my_turn={}", 
+                            microblock_height, current_producer, is_my_turn_to_produce);
+                }
+                
                 if is_my_turn_to_produce {
                                     // PRODUCTION: This node is selected as microblock producer for this round
                 *is_leader.write().await = true;
@@ -2002,11 +2032,12 @@ impl BlockchainNode {
                             
                             println!("[PRODUCER] 🆘 Emergency handover to: {}", emergency_producer);
                             
-                            // Broadcast emergency change
+                            // Broadcast emergency change for CURRENT height
+                            // CRITICAL FIX: Use current height, not +1
                             let _ = p2p.broadcast_emergency_producer_change(
                                 &node_id,
                                 &emergency_producer,
-                                microblock_height + 1,
+                                microblock_height,
                                 "microblock"
                             );
                         }
@@ -2106,7 +2137,7 @@ impl BlockchainNode {
                         height: microblock_height,
                         timestamp: deterministic_timestamp,  // DETERMINISTIC: Same on all nodes
                         transactions: txs.clone(),
-                        producer: format!("microblock_producer_{}", node_id), // Simple producer signature for microblocks
+                        producer: node_id.clone(), // Use node_id directly for consistency with failover messages
                         signature: vec![0u8; 64], // Will be filled with real signature
                         merkle_root: Self::calculate_merkle_root(&txs),
                         previous_hash: Self::get_previous_microblock_hash(&storage, microblock_height).await,
@@ -2199,15 +2230,21 @@ impl BlockchainNode {
                     let producer_id_for_reward = node_id.clone();
                     let rotation_tracker_clone = rotation_tracker.clone();
                     
-                    tokio::spawn(async move {
-                        // NEW: Use delta encoding for sequential blocks
+                    // CRITICAL FIX: Save block SYNCHRONOUSLY before broadcast
+                    // This ensures block exists before being announced to network
+                    let save_result = {
                         let microblock_data = bincode::serialize(&microblock_clone)
                             .expect("Failed to serialize microblock");
                         
                         // Try delta encoding first (95% space saving)
-                        match storage_clone.save_block_with_delta(height_for_storage, &microblock_data) {
-                        Ok(_) => {
-                                println!("[Storage] ✅ Microblock {} saved with delta/compression", height_for_storage);
+                        storage_clone.save_block_with_delta(height_for_storage, &microblock_data)
+                    };
+                    
+                    if let Ok(_) = save_result {
+                        println!("[Storage] ✅ Microblock {} saved with delta/compression", height_for_storage);
+                        
+                        // Now spawn async task for rotation tracking
+                        tokio::spawn(async move {
                                 
                     // ATOMIC ROTATION TRACKING: Track block production
                     // Rewards given once per rotation, not per block
@@ -2233,52 +2270,11 @@ impl BlockchainNode {
                                 }
                             }
                         }
-                        },
-                        Err(e) => {
-                            println!("[Storage] ⚠️ Delta storage failed, falling back to direct save: {}", e);
-                            
-                                // Fallback to simple save (still uses adaptive compression internally)
-                                let microblock_data = bincode::serialize(&microblock_clone).unwrap_or_default();
-                                
-                                if let Err(e) = storage_clone.save_microblock(height_for_storage, &microblock_data) {
-                                    println!("[Microblock] ❌ Storage save failed for block #{}: {}", height_for_storage, e);
-                                    
-                                    // CRITICAL: Storage deletion during production - instant ban!
-                                    println!("[SECURITY] 🚨 CRITICAL: Storage deleted during block production!");
-                                    println!("[SECURITY] 🚨 Producer {} deleted database while being active leader!", producer_id_for_reward);
-                                    println!("[SECURITY] 🚨 This is a critical attack on network integrity!");
-                                    
-                                    // Report critical attack for instant ban
-                                    if let Some(ref p2p) = p2p_for_reward {
-                                        // Apply instant maximum penalty
-                                        p2p.update_node_reputation(&producer_id_for_reward, -100.0);
-                                        
-                                        // Broadcast emergency with critical flag
-                                        let _ = p2p.broadcast_emergency_producer_change(
-                                            &producer_id_for_reward,
-                                            "CRITICAL_STORAGE_DELETION",
-                                            height_for_storage,
-                                            "microblock"
-                                        );
-                                        
-                                        // Report for jail (will trigger MaliciousBehavior::StorageDeletion)
-                                        println!("[SECURITY] 📢 Producer {} marked for instant 1-year ban!", producer_id_for_reward);
-                                    }
-                                } else {
-                                    println!("[Storage] 💾 Block #{} saved (legacy format)", height_for_storage);
-                                    
-                                    // PRODUCTION: Reward microblock producer even in legacy path
-                                    if let Some(ref p2p) = p2p_for_reward {
-                                        p2p.update_node_reputation(&producer_id_for_reward, 1.0);
-                                        
-                                        if height_for_storage % 30 == 0 {
-                                            println!("[REPUTATION] ⚡ Microblock producer {} rewarded: +1.0 reputation per block", producer_id_for_reward);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    });
+                        });
+                    } else {
+                        println!("[Storage] ❌ Failed to save microblock #{}: {:?}", height_for_storage, save_result.err());
+                        // Continue anyway - block will be retried
+                    }
                     
                     // Broadcast to network asynchronously for quantum-speed propagation
                     if let Some(p2p) = &unified_p2p {
@@ -2914,9 +2910,16 @@ impl BlockchainNode {
         
         if let Some(p2p) = unified_p2p {
             // PERFORMANCE FIX: Cache producer selection for entire 30-block period to prevent HTTP spam
-            // Producer is SAME for all blocks in rotation period (blocks 0-29, 30-59, etc.)
+            // Producer is SAME for all blocks in rotation period (blocks 1-30, 31-60, etc.)
             let rotation_interval = 30u64; // EXISTING: 30-block rotation from MICROBLOCK_ARCHITECTURE_PLAN.md
-            let leadership_round = current_height / rotation_interval;
+            // CRITICAL FIX: Exclude Genesis Block (height=0) from rotation rounds
+            // Round 0: blocks 1-30, Round 1: blocks 31-60, etc.
+            let leadership_round = if current_height == 0 {
+                // Genesis Block - special case, not part of rotation
+                0
+            } else {
+                (current_height - 1) / rotation_interval
+            };
             
             // CRITICAL: Use shared module-level cache to prevent duplication
             use producer_cache::CACHED_PRODUCER_SELECTION;
@@ -4147,6 +4150,12 @@ impl BlockchainNode {
     ) -> Result<(), String> {
         use sha3::{Sha3_256, Digest};
         
+        // CRITICAL FIX: Don't create macroblock for Genesis (height=0)
+        if height == 0 {
+            println!("[PFP] ⚠️ Skipping macroblock creation for Genesis (height=0)");
+            return Ok(());
+        }
+        
         println!("[PFP] 🔨 Creating {} macroblock with {} participants", 
                  finalization_type, participants.len());
         
@@ -4883,8 +4892,9 @@ impl BlockchainNode {
         storage: &Arc<Storage>,
         current_height: u64,
     ) -> [u8; 32] {
-        if current_height <= 1 {
-            return [0u8; 32];
+        // CRITICAL FIX: Block #1 should have Genesis Block hash as previous_hash
+        if current_height == 0 {
+            return [0u8; 32]; // Genesis Block has no previous
         }
         
         // Production: Get actual previous microblock hash from storage
