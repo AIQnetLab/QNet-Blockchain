@@ -1366,11 +1366,12 @@ impl BlockchainNode {
         // PRODUCTION: Start microblock production ONLY for nodes that can produce blocks
         // Light nodes should NOT enter the production loop - they only sync
         if !matches!(self.node_type, NodeType::Light) {
-            // CRITICAL: Add startup delay for network stabilization
+            // CRITICAL: Add startup delay for network stabilization and peer discovery
             // This prevents block #1 creation failures when nodes start simultaneously
             if self.storage.get_chain_height().unwrap_or(0) == 0 {
-                println!("[Node] ⏳ Genesis phase: Waiting 10s for network stabilization...");
-                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                println!("[Node] ⏳ Genesis phase: Waiting 30s for full peer discovery...");
+                println!("[Node] 📡 This allows all 5 Genesis nodes to find each other");
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
                 println!("[Node] ✅ Network stabilization complete, starting production");
             }
             
