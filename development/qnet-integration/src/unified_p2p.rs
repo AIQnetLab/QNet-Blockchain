@@ -5,6 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicU64, Ordering};
 use dashmap::DashMap;
 use std::time::{Duration, Instant};
 use once_cell::sync::Lazy;
@@ -77,6 +78,11 @@ static DOWNLOADING_BLOCKS: Lazy<Arc<RwLock<HashSet<u64>>>> =
 // RACE CONDITION FIX: Cache blockchain height to prevent excessive queries
 static CACHED_BLOCKCHAIN_HEIGHT: Lazy<Arc<Mutex<(u64, Instant)>>> = 
     Lazy::new(|| Arc::new(Mutex::new((0, Instant::now() - Duration::from_secs(3600)))));
+
+// CRITICAL FIX: Local blockchain height for P2P message filtering
+// This prevents processing failover messages for blocks we don't have yet
+pub static LOCAL_BLOCKCHAIN_HEIGHT: Lazy<Arc<AtomicU64>> = 
+    Lazy::new(|| Arc::new(AtomicU64::new(0)));
 
 /// SECURITY: Rate limiting structure for DDoS protection
 #[derive(Debug, Clone)]
@@ -2220,7 +2226,7 @@ impl SimplifiedP2P {
             // Create DilithiumSignature struct from hex string
             let dilithium_sig = DilithiumSignature {
                 signature: signature.to_string(),
-                algorithm: "Dilithium5".to_string(),
+                algorithm: "QNet-Dilithium-Compatible".to_string(),
                 timestamp: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
@@ -4427,6 +4433,10 @@ impl SimplifiedP2P {
                                             println!("[SYNC] 📦 Downloaded microblock #{} from {}", height, ip);
                                             fetched = true;
                                             consecutive_failures = 0; // Reset failure counter
+                                            
+                                            // CRITICAL FIX: Update P2P local height when syncing blocks
+                                            LOCAL_BLOCKCHAIN_HEIGHT.store(height, Ordering::Relaxed);
+                                            
                                             // RACE CONDITION FIX: Remove from downloading set after successful save
                                             DOWNLOADING_BLOCKS.write().unwrap().remove(&height);
                                             break;
@@ -5884,6 +5894,17 @@ impl SimplifiedP2P {
         // Block #1 issue is known and will be fixed by height increment fix
         if block_height <= 1 {
             // Don't even log these - they create too much noise
+            return;
+        }
+        
+        // CRITICAL FIX: Filter out failover messages for blocks we don't have yet
+        // This prevents spam when a node starts with empty database
+        let local_height = LOCAL_BLOCKCHAIN_HEIGHT.load(Ordering::Relaxed);
+        if block_height > local_height + 10 {
+            // Ignore failover for blocks too far in the future (>10 blocks ahead)
+            // This prevents spam from nodes that are far ahead
+            println!("[FAILOVER] 🔇 Ignoring failover for future block #{} (local: {})", 
+                     block_height, local_height);
             return;
         }
         

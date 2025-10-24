@@ -578,6 +578,14 @@ impl BlockchainNode {
         let mut height = match storage.get_chain_height() {
             Ok(height) => {
                 println!("[Node] 🔍 DEBUG: Chain height: {}", height);
+                
+                // CRITICAL FIX: Initialize P2P local height for message filtering
+                crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(
+                    height, 
+                    std::sync::atomic::Ordering::Relaxed
+                );
+                println!("[Node] 📊 P2P local height initialized to {}", height);
+                
                 height
             }
             Err(e) => {
@@ -1063,6 +1071,12 @@ impl BlockchainNode {
                         if received_block.height > current_height {
                             *height.write().await = received_block.height;
                             println!("[BLOCKS] 📊 Global height updated to {}", received_block.height);
+                            
+                            // CRITICAL FIX: Update P2P local height for message filtering
+                            crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(
+                                received_block.height, 
+                                std::sync::atomic::Ordering::Relaxed
+                            );
                         }
                     }
                 },
@@ -1373,6 +1387,38 @@ impl BlockchainNode {
                 println!("[Node] 📡 This allows all 5 Genesis nodes to find each other");
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
                 println!("[Node] ✅ Network stabilization complete, starting production");
+            } else {
+                // CRITICAL FIX: Sync with network before starting production
+                // This prevents creating blocks at wrong height when restarting
+                println!("[Node] 🔄 Syncing with network before starting production...");
+                
+                if let Some(ref p2p) = self.unified_p2p {
+                    // Try to get network height
+                    match p2p.sync_blockchain_height() {
+                        Ok(network_height) => {
+                            let local_height = self.storage.get_chain_height().unwrap_or(0);
+                            if network_height > local_height {
+                                println!("[Node] 📊 Network is ahead: {} vs local: {}", network_height, local_height);
+                                println!("[Node] 🔄 Syncing {} blocks before production...", network_height - local_height);
+                                
+                                // Download missing blocks
+                                p2p.download_missing_microblocks(&self.storage, local_height, network_height).await;
+                                
+                                // Wait a bit for sync to complete
+                                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                                println!("[Node] ✅ Sync complete, starting production");
+                            } else {
+                                println!("[Node] ✅ Already in sync with network (height: {})", local_height);
+                            }
+                        }
+                        Err(e) if e == "BOOTSTRAP_MODE" => {
+                            println!("[Node] 🚀 Bootstrap mode - starting production immediately");
+                        }
+                        Err(e) => {
+                            println!("[Node] ⚠️ Failed to get network height: {}, starting anyway", e);
+                        }
+                    }
+                }
             }
             
             println!("[Node] ⚡ Starting microblock production (1-second intervals)");
@@ -2456,6 +2502,12 @@ impl BlockchainNode {
                     {
                         let mut global_height = height.write().await;
                         *global_height = microblock_height;
+                        
+                        // CRITICAL FIX: Update P2P local height for message filtering
+                        crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(
+                            microblock_height, 
+                            std::sync::atomic::Ordering::Relaxed
+                        );
                     }
                     } // End of microblock production block
                 } else {

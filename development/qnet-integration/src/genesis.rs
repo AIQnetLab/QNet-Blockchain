@@ -16,11 +16,12 @@ pub struct GenesisConfig {
 
 impl Default for GenesisConfig {
     fn default() -> Self {
-        // Use mainnet launch timestamp if set, otherwise current time
+        // CRITICAL FIX: Use deterministic timestamp for Genesis Block
+        // This ensures all nodes create identical Genesis Block
         let genesis_timestamp = std::env::var("QNET_MAINNET_LAUNCH_TIMESTAMP")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or_else(|| Utc::now().timestamp() as u64);
+            .unwrap_or(1704067200); // January 1, 2024 00:00:00 UTC - deterministic default
             
         Self {
             accounts: vec![
