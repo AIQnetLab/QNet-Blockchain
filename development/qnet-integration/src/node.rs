@@ -5115,11 +5115,9 @@ impl BlockchainNode {
         
         match crypto.create_consensus_signature(node_id, &microblock_hash).await {
             Ok(signature) => {
-                // CRITICAL FIX: Decode hex signature to bytes (signature.signature is hex string)
-                let sig_bytes = hex::decode(&signature.signature).unwrap_or_else(|_| {
-                    // Fallback if not hex - use as bytes
-                    signature.signature.as_bytes().to_vec()
-                });
+                // CRITICAL FIX: signature.signature is already a formatted string "dilithium_sig_<node>_<base64>"
+                // Store it as UTF-8 bytes directly, no encoding needed
+                let sig_bytes = signature.signature.as_bytes().to_vec();
                 println!("[CRYPTO] ✅ Microblock #{} signed with existing QNetQuantumCrypto (size: {} bytes)", 
                         microblock.height, sig_bytes.len());
                 Ok(sig_bytes)
@@ -5160,10 +5158,12 @@ impl BlockchainNode {
         let _ = crypto.initialize().await;
         
         // Create DilithiumSignature from microblock signature
-        // CRITICAL FIX: Use hex encoding for binary signature data
+        // CRITICAL FIX: signature is stored as UTF-8 bytes of the formatted string
+        // Convert back to string directly, no hex decoding needed
         let signature = DilithiumSignature {
-            signature: hex::encode(&microblock.signature),  // Convert bytes to hex
-            algorithm: "QNet-Dilithium-Compatible".to_string(),  // CRITICAL FIX: Use compatible algorithm name
+            signature: String::from_utf8(microblock.signature.clone())
+                .unwrap_or_else(|_| hex::encode(&microblock.signature)),  // Fallback to hex if not UTF-8
+            algorithm: "QNet-Dilithium-Compatible".to_string(),
             timestamp: microblock.timestamp,
             strength: "quantum-resistant".to_string(),
         };

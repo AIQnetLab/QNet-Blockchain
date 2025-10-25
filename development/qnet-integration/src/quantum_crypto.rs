@@ -508,9 +508,17 @@ impl QNetQuantumCrypto {
             return Err(anyhow!("Unsupported signature algorithm: {}", signature.algorithm));
         }
 
-        // 2. Decode base64 signature
-        let signature_bytes = general_purpose::STANDARD.decode(&signature.signature)
-            .map_err(|e| anyhow!("Invalid base64 signature: {}", e))?;
+        // 2. Parse signature format: "dilithium_sig_<node_id>_<base64>"
+        // CRITICAL FIX: signature.signature is a formatted string, not encoded bytes
+        let parts: Vec<&str> = signature.signature.split('_').collect();
+        if parts.len() < 4 || parts[0] != "dilithium" || parts[1] != "sig" {
+            return Err(anyhow!("Invalid signature format: expected 'dilithium_sig_<node>_<base64>'"));
+        }
+        
+        // Extract base64 part (everything after third underscore)
+        let base64_part = parts[3..].join("_");
+        let signature_bytes = general_purpose::STANDARD.decode(&base64_part)
+            .map_err(|e| anyhow!("Invalid base64 in signature: {}", e))?;
 
         if signature_bytes.len() < 64 {
             return Err(anyhow!("Invalid signature length: {}", signature_bytes.len()));
