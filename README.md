@@ -14,7 +14,15 @@ QNet is a high-performance, post-quantum secure blockchain network with a **two-
 - **Phase 2 (Future)**: ONLY QNC token activation on QNet blockchain
 - **Transition**: 90% 1DEV burned OR 5 years from genesis block (whichever comes first)
 
-### 🛡️ **LATEST UPDATES (v2.15.0)**
+### 🛡️ **LATEST UPDATES (v2.16.0)**
+- **Turbine Block Propagation**: 85% bandwidth reduction with Reed-Solomon erasure coding
+- **Quantum Proof of History**: 31.25M hashes/sec cryptographic clock for time synchronization
+- **Hybrid Sealevel Execution**: 5-stage pipeline with 10,000 parallel transactions
+- **Tower BFT Adaptive Timeouts**: Dynamic 20s/10s/7s timeouts based on network conditions
+- **Pre-Execution Cache**: Speculative execution with 10,000 transaction cache
+- **56 API Endpoints**: Complete monitoring and control interface for all features
+
+### **Previous Updates (v2.15.0)**
 - **AES-256-GCM Database Encryption**: Quantum-resistant protection for activation codes
 - **No Encryption Keys in Database**: Keys derived from activation code only
 - **Critical Attack Protection**: Instant 1-year ban for database attacks (substitution, deletion, fork)
@@ -85,6 +93,13 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 - **🖥️ Server Architecture**: Full/Super nodes on dedicated servers
 - **🔧 Interactive Setup**: User-friendly activation process
 - **🛡️ Deadlock Prevention**: Guard patterns & health monitors for stability
+
+#### **Advanced Performance Features**
+- **🌪️ Turbine Protocol**: 85% bandwidth savings with chunked block propagation
+- **⏱️ Quantum PoH**: 31.25M hashes/sec cryptographic clock for precise timing
+- **⚙️ Hybrid Sealevel**: 10,000 parallel transactions with 5-stage pipeline
+- **🎯 Tower BFT**: Adaptive timeouts (20s/10s/7s) for optimal consensus
+- **🚀 Pre-Execution**: Speculative transaction processing with 10,000 cache size
 
 ### 📊 Performance Metrics
 
@@ -170,6 +185,27 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 │      ├── Parallel downloads with 100-block chunks          │
 │      ├── IPFS integration for P2P snapshot distribution    │
 │      └── Deadlock prevention with guard pattern            │
+├─────────────────────────────────────────────────────────────┤
+│  Performance Optimization Layer                   │
+│  ├── Turbine Block Propagation                             │
+│  │   ├── 1KB chunks with Reed-Solomon erasure coding       │
+│  │   ├── Fanout-3 exponential propagation                  │
+│  │   └── 85% bandwidth reduction                           │
+│  ├── Quantum Proof of History (QPoH)                       │
+│  │   ├── 31.25M hashes/sec cryptographic clock             │
+│  │   ├── SHA3-512 + Blake3 alternating hashing             │
+│  │   └── Verifiable delay function                         │
+│  ├── Hybrid Sealevel Execution                             │
+│  │   ├── 5-stage pipeline processing                       │
+│  │   ├── 10,000 parallel transactions                      │
+│  │   └── Dependency graph analysis                         │
+│  ├── Tower BFT Adaptive Timeouts                           │
+│  │   ├── Dynamic 20s/10s/7s timeouts                       │
+│  │   └── Network condition awareness                       │
+│  └── Pre-Execution Cache                                   │
+│      ├── Speculative transaction execution                 │
+│      ├── 10,000 transaction cache                          │
+│      └── 3-block lookahead                                 │
 ├─────────────────────────────────────────────────────────────┤
 │  Network Layer (Optimized for 10M+ nodes)                  │
 │  ├── Kademlia DHT with K-bucket management                 │

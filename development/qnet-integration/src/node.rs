@@ -361,12 +361,45 @@ pub struct BlockchainNode {
     
     // Reward manager for lazy rewards system
     reward_manager: Arc<RwLock<PhaseAwareRewardManager>>,
+    
+    // Quantum Proof of History for time synchronization
+    quantum_poh: Option<Arc<crate::quantum_poh::QuantumPoH>>,
+    quantum_poh_receiver: Option<Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<crate::quantum_poh::PoHEntry>>>>,
+    
+    // Hybrid Sealevel for parallel transaction execution
+    hybrid_sealevel: Option<Arc<crate::hybrid_sealevel::HybridSealevel>>,
+    
+    // Tower BFT for adaptive timeouts
+    tower_bft: Arc<crate::tower_bft::TowerBft>,
+    
+    // Pre-execution for speculative transaction processing
+    pre_execution: Arc<crate::pre_execution::PreExecutionManager>,
 }
 
 impl BlockchainNode {
     /// Get reward manager for RPC integration
     pub fn get_reward_manager(&self) -> Arc<RwLock<PhaseAwareRewardManager>> {
         self.reward_manager.clone()
+    }
+    
+    /// Get Quantum PoH reference
+    pub fn get_quantum_poh(&self) -> &Option<Arc<crate::quantum_poh::QuantumPoH>> {
+        &self.quantum_poh
+    }
+    
+    /// Get Hybrid Sealevel reference
+    pub fn get_hybrid_sealevel(&self) -> &Option<Arc<crate::hybrid_sealevel::HybridSealevel>> {
+        &self.hybrid_sealevel
+    }
+    
+    /// Get Pre-execution manager
+    pub fn get_pre_execution(&self) -> Arc<crate::pre_execution::PreExecutionManager> {
+        self.pre_execution.clone()
+    }
+    
+    /// Get Tower BFT manager
+    pub fn get_tower_bft(&self) -> Arc<crate::tower_bft::TowerBft> {
+        self.tower_bft.clone()
     }
     
     /// Process reward window (called by RPC system every 4 hours)
@@ -861,6 +894,53 @@ impl BlockchainNode {
         }
         
         println!("[Node] 🔍 DEBUG: Creating BlockchainNode struct...");
+        
+        // Initialize Quantum PoH with genesis hash
+        let genesis_hash = vec![0u8; 32]; // TODO: Use real genesis hash from storage
+        let (quantum_poh, poh_receiver) = crate::quantum_poh::QuantumPoH::new(genesis_hash);
+        let quantum_poh = Arc::new(quantum_poh);
+        let poh_receiver = Arc::new(tokio::sync::Mutex::new(poh_receiver));
+        
+        // Start PoH generator
+        let poh_clone = quantum_poh.clone();
+        tokio::spawn(async move {
+            poh_clone.start().await;
+            println!("[QuantumPoH] 🚀 PoH generator started");
+        });
+        
+        // Initialize Hybrid Sealevel if sharding is enabled
+        let hybrid_sealevel = if let (Some(ref shard_coord), Some(ref parallel_val)) = (&shard_coordinator, &parallel_validator) {
+            let sealevel = Arc::new(crate::hybrid_sealevel::HybridSealevel::new(
+                shard_coord.clone(),
+                parallel_val.clone(),
+            ));
+            println!("[HybridSealevel] 🚀 Initialized parallel transaction processor");
+            Some(sealevel)
+        } else {
+            None
+        };
+        
+        // Initialize Tower BFT for adaptive timeouts
+        let tower_bft_config = crate::tower_bft::TowerBftConfig {
+            base_timeout_ms: 7000,      // From existing code
+            timeout_multiplier: 1.5,    
+            max_timeout_ms: 20000,      // From existing first block timeout
+            min_timeout_ms: 1000,       
+            latency_window_size: 100,   
+        };
+        let tower_bft = Arc::new(crate::tower_bft::TowerBft::new(tower_bft_config));
+        println!("[TowerBFT] 🚀 Initialized adaptive timeout manager");
+        
+        // Initialize Pre-execution manager
+        let pre_execution_config = crate::pre_execution::PreExecutionConfig {
+            lookahead_blocks: 3,      // Pre-execute 3 blocks ahead
+            max_tx_per_block: 1000,   // From existing constants
+            cache_size: 10000,        // Cache 10k pre-executed transactions
+            timeout_ms: 500,          // 500ms timeout
+        };
+        let pre_execution = Arc::new(crate::pre_execution::PreExecutionManager::new(pre_execution_config));
+        println!("[PreExecution] 🚀 Initialized speculative execution manager");
+        
         let blockchain = Self {
             storage,
             state,
@@ -897,6 +977,11 @@ impl BlockchainNode {
             parallel_validator,
             archive_manager: Arc::new(tokio::sync::RwLock::new(archive_manager)),
             reward_manager,
+            quantum_poh: Some(quantum_poh),
+            quantum_poh_receiver: Some(poh_receiver),
+            hybrid_sealevel,
+            tower_bft,
+            pre_execution,
         };
         
         println!("[Node] 🔍 DEBUG: BlockchainNode created successfully for node_id: {}", node_id);
@@ -1648,6 +1733,10 @@ impl BlockchainNode {
         let last_block_attempt = self.last_block_attempt.clone();
         let perf_config = self.perf_config.clone();
         let rotation_tracker = self.rotation_tracker.clone();
+        let quantum_poh_for_spawn = self.quantum_poh.clone();
+        let hybrid_sealevel_for_spawn = self.hybrid_sealevel.clone();
+        let tower_bft_for_spawn = self.tower_bft.clone();
+        let pre_execution_for_spawn = self.pre_execution.clone();
         
         // CRITICAL FIX: Take consensus_rx ownership for MACROBLOCK consensus phases
         // Macroblock commit/reveal phases NEED exclusive access to process P2P messages  
@@ -1754,6 +1843,18 @@ impl BlockchainNode {
             // CPU MONITORING: Track CPU usage periodically
             let mut cpu_check_counter = 0u64;
             let start_time = std::time::Instant::now();
+            
+            // QUANTUM PoH: Get reference for microblock production
+            let quantum_poh = quantum_poh_for_spawn.clone();
+            
+            // HYBRID SEALEVEL: Get reference for parallel processing
+            let hybrid_sealevel = hybrid_sealevel_for_spawn.clone();
+            
+            // TOWER BFT: Get reference for adaptive timeouts
+            let tower_bft = tower_bft_for_spawn.clone();
+            
+            // PRE-EXECUTION: Get reference for speculative execution
+            let pre_execution = pre_execution_for_spawn.clone();
             
             while *is_running.read().await {
                 cpu_check_counter += 1;
@@ -2154,6 +2255,54 @@ impl BlockchainNode {
                         }
                     }
                     
+                    // HYBRID SEALEVEL: Process transactions in parallel if available
+                    if let Some(ref sealevel) = hybrid_sealevel {
+                        if !txs.is_empty() {
+                            match sealevel.process_transactions(txs.clone()).await {
+                                Ok(processed_txs) => {
+                                    println!("[HybridSealevel] ✅ Processed {} transactions in parallel", processed_txs.len());
+                                    txs = processed_txs;
+                                },
+                                Err(e) => {
+                                    println!("[HybridSealevel] ⚠️ Parallel processing failed: {}, using fallback", e);
+                                    // Continue with original transactions
+                                }
+                            }
+                        }
+                    }
+                    
+                    // PRE-EXECUTION: Update leader schedule and pre-execute if we're a future leader
+                    {
+                        // Get current producer list for rotation schedule
+                        let producers = if let Some(p2p) = &unified_p2p {
+                            let peers = p2p.get_validated_active_peers();
+                            let mut producer_list: Vec<String> = peers.iter().map(|p| p.id.clone()).collect();
+                            producer_list.push(node_id.clone());
+                            producer_list.sort();
+                            producer_list
+                        } else {
+                            vec![node_id.clone()]
+                        };
+                        
+                        // Update leader schedule
+                        pre_execution.update_leader_schedule(microblock_height, producers).await;
+                        
+                        // Pre-execute transactions for future blocks if we're a future leader
+                        if !txs.is_empty() {
+                            match pre_execution.pre_execute_batch(txs.clone(), microblock_height, &node_id).await {
+                                Ok(pre_executed) => {
+                                    if !pre_executed.is_empty() {
+                                        println!("[PreExecution] ⚡ Pre-executed {} transactions for future block", pre_executed.len());
+                                    }
+                                },
+                                Err(e) => {
+                                    // Pre-execution is optional, continue normally
+                                    println!("[PreExecution] ⚠️ Pre-execution skipped: {}", e);
+                                }
+                            }
+                        }
+                    }
+                    
                     // PRODUCTION QNet Consensus Integration
                     // QNet uses CommitRevealConsensus + ShardedConsensusManager for Byzantine Fault Tolerance
                     
@@ -2182,6 +2331,9 @@ impl BlockchainNode {
                     } else {
                         0
                     };
+                    
+                    // Update Tower BFT with current peer count
+                    tower_bft.update_peer_count(peer_count).await;
                     
                     // Log only every 10 blocks or when there are transactions
                     if microblock_height % 10 == 0 || !txs.is_empty() {
@@ -2219,6 +2371,20 @@ impl BlockchainNode {
                         merkle_root: Self::calculate_merkle_root(&txs),
                         previous_hash: Self::get_previous_microblock_hash(&storage, microblock_height).await,
                     };
+                    
+                    // QUANTUM PoH: Mix microblock into PoH chain for cryptographic time proof
+                    if let Some(ref poh) = quantum_poh {
+                        let block_data = bincode::serialize(&microblock).unwrap_or_default();
+                        match poh.create_microblock_proof(&block_data).await {
+                            Ok(poh_entry) => {
+                                println!("[QuantumPoH] ✅ Microblock #{} mixed into PoH chain (hash_count: {})", 
+                                        microblock_height, poh_entry.num_hashes);
+                            },
+                            Err(e) => {
+                                println!("[QuantumPoH] ⚠️ Failed to mix microblock #{}: {}", microblock_height, e);
+                            }
+                        }
+                    }
                     
                     // PRODUCTION: Generate CRYSTALS-Dilithium signature for microblock
                     match Self::sign_microblock_with_dilithium(&microblock, &node_id).await {
@@ -2369,7 +2535,14 @@ impl BlockchainNode {
                         let height_for_broadcast = microblock.height;
                         
                         // CRITICAL FIX: Synchronous broadcast to ensure delivery before height increment
-                        let result = p2p.broadcast_block(height_for_broadcast, broadcast_data);
+                        // Use Turbine for blocks > 1KB, regular broadcast for smaller blocks
+                        let result = if broadcast_size > 1024 && peer_count > 10 {
+                            // Use Turbine protocol for larger blocks and many peers
+                            p2p.broadcast_block_turbine(height_for_broadcast, broadcast_data)
+                        } else {
+                            // Use regular broadcast for small blocks or few peers
+                            p2p.broadcast_block(height_for_broadcast, broadcast_data)
+                        };
                         
                         // Log only errors or every 10th block
                         if result.is_err() || height_for_broadcast % 10 == 0 {
@@ -2664,17 +2837,10 @@ impl BlockchainNode {
                             // No local block - background sync will handle it with timeout detection
                             println!("[SYNC] ⏳ Waiting for background sync of block #{}", expected_height);
                             
-                            // PRODUCTION: Add microblock producer timeout detection using EXISTING patterns
-                            // CRITICAL FIX: Adaptive timeout based on network conditions
-                            // Synchronous broadcast helps, but network delays still exist
-                            let microblock_timeout = if expected_height == 1 {
-                                println!("[SYNC] ⏰ First microblock - using 20s grace period for network bootstrap");
-                                std::time::Duration::from_secs(20)  // First block: extra time for network formation
-                            } else if expected_height <= 10 {
-                                std::time::Duration::from_secs(10)  // Early blocks: 10s for initial sync
-                            } else {
-                                std::time::Duration::from_secs(7)   // Normal: 7s (was 5s, too aggressive)
-                            };
+                            // PRODUCTION: Use Tower BFT adaptive timeout
+                            let retry_count = 0; // First attempt
+                            let microblock_timeout = tower_bft.get_timeout(expected_height, retry_count).await;
+                            println!("[TowerBFT] ⏱️ Adaptive timeout for block #{}: {:?}", expected_height, microblock_timeout);
                             let timeout_start = std::time::Instant::now();
                             
                             // Wait with timeout for producer block (same pattern as macroblock timeout in line 1201)
@@ -4949,8 +5115,11 @@ impl BlockchainNode {
         
         match crypto.create_consensus_signature(node_id, &microblock_hash).await {
             Ok(signature) => {
-                // Convert signature to bytes
-                let sig_bytes = signature.signature.as_bytes().to_vec();
+                // CRITICAL FIX: Decode hex signature to bytes (signature.signature is hex string)
+                let sig_bytes = hex::decode(&signature.signature).unwrap_or_else(|_| {
+                    // Fallback if not hex - use as bytes
+                    signature.signature.as_bytes().to_vec()
+                });
                 println!("[CRYPTO] ✅ Microblock #{} signed with existing QNetQuantumCrypto (size: {} bytes)", 
                         microblock.height, sig_bytes.len());
                 Ok(sig_bytes)
@@ -4991,8 +5160,9 @@ impl BlockchainNode {
         let _ = crypto.initialize().await;
         
         // Create DilithiumSignature from microblock signature
+        // CRITICAL FIX: Use hex encoding for binary signature data
         let signature = DilithiumSignature {
-            signature: String::from_utf8(microblock.signature.clone()).unwrap_or_default(),
+            signature: hex::encode(&microblock.signature),  // Convert bytes to hex
             algorithm: "QNet-Dilithium-Compatible".to_string(),  // CRITICAL FIX: Use compatible algorithm name
             timestamp: microblock.timestamp,
             strength: "quantum-resistant".to_string(),
@@ -7306,6 +7476,11 @@ impl Clone for BlockchainNode {
             parallel_validator: self.parallel_validator.clone(),
             archive_manager: self.archive_manager.clone(),
             reward_manager: self.reward_manager.clone(),
+            quantum_poh: self.quantum_poh.clone(),
+            quantum_poh_receiver: None, // Cannot clone receiver - use None for cloned instances
+            hybrid_sealevel: self.hybrid_sealevel.clone(),
+            tower_bft: self.tower_bft.clone(),
+            pre_execution: self.pre_execution.clone(),
         }
     }
 }

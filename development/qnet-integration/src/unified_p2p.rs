@@ -15,6 +15,7 @@ use rand;
 use serde_json;
 use base64::Engine;
 use sha3::{Sha3_256, Digest};
+use reed_solomon_erasure::galois_8::ReedSolomon;
 
 // Import QNet consensus components for proper peer validation
 use qnet_consensus::reputation::{NodeReputation, ReputationConfig, MaliciousBehavior};
@@ -292,12 +293,42 @@ pub struct SimplifiedP2P {
     
     /// Sync request channel for requesting blocks from storage
     sync_request_tx: Option<tokio::sync::mpsc::UnboundedSender<(u64, u64, String)>>,
+    
+    /// Turbine block assembly states
+    turbine_assemblies: Arc<DashMap<u64, TurbineBlockAssembly>>,
 }
 
 // Kademlia DHT constants
 const KADEMLIA_K: usize = 20;        // K-bucket size
 const KADEMLIA_ALPHA: usize = 3;     // Concurrent queries
 const KADEMLIA_BITS: usize = 256;    // Hash size in bits
+
+// Turbine block propagation constants (Solana-inspired)
+const TURBINE_CHUNK_SIZE: usize = 1024;      // 1KB chunks (optimal for Dilithium signatures)
+const TURBINE_FANOUT: usize = 3;             // Each node forwards to 3 peers
+const TURBINE_REDUNDANCY_FACTOR: f32 = 1.5;  // 50% redundancy for Reed-Solomon
+const TURBINE_MAX_CHUNKS: usize = 64;        // Max chunks per block (64KB max block size)
+
+/// Turbine chunk for block propagation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TurbineChunk {
+    pub block_height: u64,
+    pub chunk_index: usize,
+    pub total_chunks: usize,
+    pub data: Vec<u8>,
+    pub is_parity: bool,  // Reed-Solomon parity chunk
+}
+
+/// Turbine block assembly state
+#[derive(Debug)]
+struct TurbineBlockAssembly {
+    height: u64,
+    chunks_received: Vec<Option<Vec<u8>>>,
+    parity_chunks: Vec<Option<Vec<u8>>>,
+    total_chunks: usize,
+    parity_count: usize,
+    started_at: Instant,
+}
 
 impl SimplifiedP2P {
     /// Create new simplified P2P network with load balancing and Kademlia DHT
@@ -397,6 +428,7 @@ impl SimplifiedP2P {
             consensus_tx: None,
             block_tx: None,
             sync_request_tx: None,
+            turbine_assemblies: Arc::new(DashMap::new()),
         }
     }
 
@@ -1859,6 +1891,452 @@ impl SimplifiedP2P {
         } else {
             Ok(()) // No peers to send to
         }
+    }
+    
+    /// Broadcast block using Turbine protocol (Solana-inspired chunking)
+    pub fn broadcast_block_turbine(&self, height: u64, block_data: Vec<u8>) -> Result<(), String> {
+        use std::sync::Arc;
+        use std::thread;
+        
+        // Check if block is too large for Turbine
+        if block_data.len() > TURBINE_MAX_CHUNKS * TURBINE_CHUNK_SIZE {
+            return Err(format!("Block too large for Turbine: {} bytes", block_data.len()));
+        }
+        
+        // Get validated peers using existing method
+        let validated_peers = self.get_validated_active_peers();
+        
+        if validated_peers.is_empty() {
+            if height % 10 == 0 {
+                println!("[TURBINE] ⚠️ No validated peers available - block #{} not broadcasted", height);
+            }
+            return Ok(());
+        }
+        
+        // Split block into chunks
+        let chunks = self.split_into_chunks(&block_data);
+        let total_chunks = chunks.len();
+        let parity_count = ((total_chunks as f32) * (TURBINE_REDUNDANCY_FACTOR - 1.0)).ceil() as usize;
+        
+        // Generate Reed-Solomon parity chunks (simplified for now)
+        let parity_chunks = self.generate_parity_chunks(&chunks, parity_count);
+        
+        if height % 10 == 0 {
+            println!("[TURBINE] 🚀 Broadcasting block #{} as {} chunks + {} parity ({}x reduction in bandwidth)", 
+                     height, total_chunks, parity_count, validated_peers.len() / TURBINE_FANOUT);
+        }
+        
+        // Build Kademlia-based routing tree for each chunk
+        let routing_tree = self.build_turbine_routing_tree(&validated_peers);
+        
+        // Send chunks using Turbine fanout pattern
+        let mut handles = Vec::new();
+        
+        // Send data chunks
+        for (chunk_index, chunk_data) in chunks.into_iter().enumerate() {
+            let turbine_chunk = TurbineChunk {
+                block_height: height,
+                chunk_index,
+                total_chunks,
+                data: chunk_data,
+                is_parity: false,
+            };
+            
+            // Select TURBINE_FANOUT peers for this chunk using Kademlia distance
+            let target_peers = self.select_turbine_targets(&routing_tree, chunk_index, TURBINE_FANOUT);
+            
+            for peer in target_peers {
+                let peer_addr = peer.addr.clone();
+                let chunk_clone = turbine_chunk.clone();
+                
+                let handle = thread::spawn(move || {
+                    Self::send_turbine_chunk(peer_addr, chunk_clone)
+                });
+                
+                handles.push(handle);
+            }
+        }
+        
+        // Send parity chunks
+        for (parity_index, parity_data) in parity_chunks.into_iter().enumerate() {
+            let turbine_chunk = TurbineChunk {
+                block_height: height,
+                chunk_index: total_chunks + parity_index,
+                total_chunks,
+                data: parity_data,
+                is_parity: true,
+            };
+            
+            // Different peers for parity chunks for redundancy
+            let target_peers = self.select_turbine_targets(&routing_tree, total_chunks + parity_index, TURBINE_FANOUT);
+            
+            for peer in target_peers {
+                let peer_addr = peer.addr.clone();
+                let chunk_clone = turbine_chunk.clone();
+                
+                let handle = thread::spawn(move || {
+                    Self::send_turbine_chunk(peer_addr, chunk_clone)
+                });
+                
+                handles.push(handle);
+            }
+        }
+        
+        // Wait for all chunk sends to complete
+        let mut success_count = 0;
+        let total_sends = handles.len();
+        
+        for handle in handles {
+            if let Ok(Ok(())) = handle.join() {
+                success_count += 1;
+            }
+        }
+        
+        if success_count > 0 {
+            if height <= 5 || height % 10 == 0 {
+                println!("[TURBINE] ✅ Block #{} chunks sent: {}/{} successful", height, success_count, total_sends);
+            }
+            Ok(())
+        } else if total_sends > 0 {
+            Err(format!("Failed to send any chunks for block #{}", height))
+        } else {
+            Ok(())
+        }
+    }
+    
+    /// Split block data into chunks for Turbine
+    fn split_into_chunks(&self, data: &[u8]) -> Vec<Vec<u8>> {
+        data.chunks(TURBINE_CHUNK_SIZE)
+            .map(|chunk| chunk.to_vec())
+            .collect()
+    }
+    
+    /// Generate Reed-Solomon parity chunks (PRODUCTION implementation)
+    fn generate_parity_chunks(&self, data_chunks: &[Vec<u8>], parity_count: usize) -> Vec<Vec<u8>> {
+        // PRODUCTION: Real Reed-Solomon erasure coding
+        let data_count = data_chunks.len();
+        
+        // Create Reed-Solomon encoder
+        let rs = match ReedSolomon::new(data_count, parity_count) {
+            Ok(rs) => rs,
+            Err(e) => {
+                println!("[TURBINE] ⚠️ Reed-Solomon initialization failed: {:?}, falling back to replication", e);
+                // Fallback: replicate first chunks as parity
+                return data_chunks.iter()
+                    .take(parity_count)
+                    .cloned()
+                    .collect();
+            }
+        };
+        
+        // Ensure all chunks are same size (pad if needed)
+        let chunk_size = data_chunks.iter().map(|c| c.len()).max().unwrap_or(TURBINE_CHUNK_SIZE);
+        let mut padded_chunks: Vec<Vec<u8>> = data_chunks.iter()
+            .map(|chunk| {
+                let mut padded = chunk.clone();
+                padded.resize(chunk_size, 0);
+                padded
+            })
+            .collect();
+        
+        // Add space for parity shards
+        for _ in 0..parity_count {
+            padded_chunks.push(vec![0u8; chunk_size]);
+        }
+        
+        // Convert to format required by reed-solomon-erasure
+        let mut shards: Vec<Box<[u8]>> = padded_chunks.into_iter()
+            .map(|chunk| chunk.into_boxed_slice())
+            .collect();
+        
+        // Generate parity shards
+        if let Err(e) = rs.encode(&mut shards) {
+            println!("[TURBINE] ⚠️ Reed-Solomon encoding failed: {:?}", e);
+            // Fallback to simple XOR
+            let mut parity = vec![vec![0u8; chunk_size]; parity_count];
+            for chunk in data_chunks {
+                for i in 0..parity_count {
+                    for (j, &byte) in chunk.iter().enumerate() {
+                        if j < parity[i].len() {
+                            parity[i][j] ^= byte;
+                        }
+                    }
+                }
+            }
+            return parity;
+        }
+        
+        // Extract parity shards
+        shards.into_iter()
+            .skip(data_count)
+            .take(parity_count)
+            .map(|shard| shard.into_vec())
+            .collect()
+    }
+    
+    /// Build Turbine routing tree using Kademlia DHT
+    fn build_turbine_routing_tree(&self, peers: &[PeerInfo]) -> Vec<PeerInfo> {
+        // Sort peers by Kademlia distance for optimal routing
+        let mut sorted_peers = peers.to_vec();
+        sorted_peers.sort_by_key(|p| p.bucket_index);
+        sorted_peers
+    }
+    
+    /// Select target peers for a chunk using Kademlia distance
+    fn select_turbine_targets(&self, routing_tree: &[PeerInfo], chunk_index: usize, fanout: usize) -> Vec<PeerInfo> {
+        // Deterministic selection based on chunk index
+        let start_index = (chunk_index * fanout) % routing_tree.len();
+        let mut targets = Vec::new();
+        
+        for i in 0..fanout {
+            let peer_index = (start_index + i) % routing_tree.len();
+            targets.push(routing_tree[peer_index].clone());
+        }
+        
+        targets
+    }
+    
+    /// Handle incoming Turbine chunk
+    fn handle_turbine_chunk(&self, from_peer: &str, chunk: TurbineChunk) {
+        let height = chunk.block_height;
+        
+        // Update or create assembly state
+        let mut assembly = self.turbine_assemblies.entry(height)
+            .or_insert_with(|| TurbineBlockAssembly {
+                height,
+                chunks_received: vec![None; chunk.total_chunks],
+                parity_chunks: vec![None; ((chunk.total_chunks as f32) * (TURBINE_REDUNDANCY_FACTOR - 1.0)).ceil() as usize],
+                total_chunks: chunk.total_chunks,
+                parity_count: ((chunk.total_chunks as f32) * (TURBINE_REDUNDANCY_FACTOR - 1.0)).ceil() as usize,
+                started_at: Instant::now(),
+            });
+        
+        // Store chunk
+        if chunk.is_parity {
+            let parity_index = chunk.chunk_index - chunk.total_chunks;
+            if parity_index < assembly.parity_chunks.len() {
+                assembly.parity_chunks[parity_index] = Some(chunk.data.clone());
+            }
+        } else {
+            if chunk.chunk_index < assembly.chunks_received.len() {
+                assembly.chunks_received[chunk.chunk_index] = Some(chunk.data.clone());
+            }
+        }
+        
+        // Forward chunk to other peers (Turbine propagation)
+        self.forward_turbine_chunk(from_peer, chunk.clone());
+        
+        // Check if we can reconstruct the block
+        let chunks_count = assembly.chunks_received.iter().filter(|c| c.is_some()).count();
+        let parity_count = assembly.parity_chunks.iter().filter(|c| c.is_some()).count();
+        
+        if chunks_count == assembly.total_chunks {
+            // All data chunks received - reconstruct block
+            self.reconstruct_block_from_turbine(height);
+        } else if chunks_count + parity_count >= assembly.total_chunks {
+            // Enough chunks + parity to reconstruct
+            if height % 10 == 0 {
+                println!("[TURBINE] 🔧 Reconstructing block #{} from {} data + {} parity chunks", 
+                         height, chunks_count, parity_count);
+            }
+            self.reconstruct_block_with_parity(height);
+        }
+    }
+    
+    /// Forward Turbine chunk to other peers
+    fn forward_turbine_chunk(&self, original_sender: &str, chunk: TurbineChunk) {
+        // Don't forward if we're the original producer
+        if self.node_id == original_sender {
+            return;
+        }
+        
+        // Select TURBINE_FANOUT peers to forward to (excluding sender)
+        let validated_peers = self.get_validated_active_peers();
+        let routing_tree = self.build_turbine_routing_tree(&validated_peers);
+        
+        let forward_targets: Vec<_> = routing_tree.iter()
+            .filter(|p| p.addr != original_sender)
+            .take(TURBINE_FANOUT)
+            .cloned()
+            .collect();
+        
+        // Forward chunk asynchronously
+        for peer in forward_targets {
+            let peer_addr = peer.addr.clone();
+            let chunk_clone = chunk.clone();
+            
+            std::thread::spawn(move || {
+                let _ = Self::send_turbine_chunk(peer_addr, chunk_clone);
+            });
+        }
+    }
+    
+    /// Reconstruct block from all data chunks
+    fn reconstruct_block_from_turbine(&self, height: u64) {
+        if let Some((_, assembly)) = self.turbine_assemblies.remove(&height) {
+            let mut block_data = Vec::new();
+            
+            for chunk_opt in assembly.chunks_received {
+                if let Some(chunk) = chunk_opt {
+                    block_data.extend(chunk);
+                }
+            }
+            
+            let elapsed = assembly.started_at.elapsed();
+            if height % 10 == 0 {
+                println!("[TURBINE] ✅ Block #{} reconstructed from {} chunks in {:?}", 
+                         height, assembly.total_chunks, elapsed);
+            }
+            
+            // Send reconstructed block through normal block channel
+            if let Some(ref block_tx) = self.block_tx {
+                let received_block = ReceivedBlock {
+                    height,
+                    data: block_data,
+                    block_type: if height % 90 == 0 { "macro".to_string() } else { "micro".to_string() },
+                    from_peer: "turbine".to_string(),
+                    timestamp: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
+                };
+                
+                let _ = block_tx.send(received_block);
+            }
+        }
+    }
+    
+    /// Reconstruct block using Reed-Solomon parity (PRODUCTION)
+    fn reconstruct_block_with_parity(&self, height: u64) {
+        // PRODUCTION: Real Reed-Solomon reconstruction
+        if let Some((_, assembly)) = self.turbine_assemblies.remove(&height) {
+            let data_count = assembly.total_chunks;
+            let parity_count = assembly.parity_count;
+            
+            // Create Reed-Solomon decoder
+            let rs = match ReedSolomon::new(data_count, parity_count) {
+                Ok(rs) => rs,
+                Err(e) => {
+                    println!("[TURBINE] ❌ Reed-Solomon init failed for reconstruction: {:?}", e);
+                    return;
+                }
+            };
+            
+            // Prepare shards (data + parity)
+            let chunk_size = assembly.chunks_received.iter()
+                .chain(assembly.parity_chunks.iter())
+                .filter_map(|opt| opt.as_ref())
+                .map(|chunk| chunk.len())
+                .max()
+                .unwrap_or(TURBINE_CHUNK_SIZE);
+            
+            let mut shards: Vec<Option<Box<[u8]>>> = Vec::new();
+            
+            // Add data chunks (Some for available, None for missing)
+            for chunk_opt in assembly.chunks_received.iter() {
+                if let Some(chunk) = chunk_opt {
+                    let mut padded = chunk.clone();
+                    padded.resize(chunk_size, 0);
+                    shards.push(Some(padded.into_boxed_slice()));
+                } else {
+                    shards.push(None);
+                }
+            }
+            
+            // Add parity chunks
+            for parity_opt in assembly.parity_chunks.iter() {
+                if let Some(parity) = parity_opt {
+                    let mut padded = parity.clone();
+                    padded.resize(chunk_size, 0);
+                    shards.push(Some(padded.into_boxed_slice()));
+                } else {
+                    shards.push(None);
+                }
+            }
+            
+            // Count available shards
+            let available_count = shards.iter().filter(|s| s.is_some()).count();
+            if available_count < data_count {
+                println!("[TURBINE] ❌ Not enough shards for reconstruction: {}/{} needed", 
+                         available_count, data_count);
+                return;
+            }
+            
+            // Convert to proper format for reconstruction
+            let mut rs_shards: Vec<Option<Vec<u8>>> = shards.into_iter()
+                .map(|opt| opt.map(|boxed| boxed.into_vec()))
+                .collect();
+            
+            // Reconstruct missing shards
+            if let Err(e) = rs.reconstruct(&mut rs_shards) {
+                println!("[TURBINE] ❌ Reed-Solomon reconstruction failed: {:?}", e);
+                return;
+            }
+            
+            // Convert back to shards for processing
+            let shards: Vec<Option<Box<[u8]>>> = rs_shards.into_iter()
+                .map(|opt| opt.map(|vec| vec.into_boxed_slice()))
+                .collect();
+            
+            // Assemble reconstructed block from data shards
+            let mut block_data = Vec::new();
+            for shard_opt in shards.iter().take(data_count) {
+                if let Some(shard) = shard_opt {
+                    // Remove padding (find actual data length)
+                    let data = shard.as_ref();
+                    let actual_len = data.iter().rposition(|&b| b != 0).map(|i| i + 1).unwrap_or(0);
+                    block_data.extend_from_slice(&data[..actual_len]);
+                }
+            }
+            
+            let elapsed = assembly.started_at.elapsed();
+            println!("[TURBINE] 🔧 Block #{} reconstructed with Reed-Solomon in {:?}", height, elapsed);
+            
+            // Send reconstructed block through normal block channel
+            if let Some(ref block_tx) = self.block_tx {
+                let received_block = ReceivedBlock {
+                    height,
+                    data: block_data,
+                    block_type: if height % 90 == 0 { "macro".to_string() } else { "micro".to_string() },
+                    from_peer: "turbine-rs".to_string(),
+                    timestamp: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
+                };
+                
+                let _ = block_tx.send(received_block);
+            }
+        }
+    }
+    
+    /// Send a single Turbine chunk to a peer
+    fn send_turbine_chunk(peer_addr: String, chunk: TurbineChunk) -> Result<(), String> {
+        use std::time::Duration;
+        
+        let message = NetworkMessage::TurbineChunk {
+            chunk: chunk.clone(),
+        };
+        
+        let message_json = serde_json::to_value(&message)
+            .map_err(|e| format!("Serialize failed: {}", e))?;
+        
+        let peer_ip = peer_addr.split(':').next().unwrap_or(&peer_addr);
+        let url = format!("http://{}:8001/api/v1/p2p/message", peer_ip);
+        
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(1))  // Fast timeout for chunks
+            .connect_timeout(Duration::from_millis(500))
+            .tcp_nodelay(true)
+            .build()
+            .map_err(|e| format!("Client failed: {}", e))?;
+        
+        client.post(&url)
+            .json(&message_json)
+            .send()
+            .map_err(|e| format!("Send chunk to {} failed: {}", peer_ip, e))?;
+        
+        Ok(())
     }
     
     /// API DEADLOCK FIX: Get cached network height WITHOUT triggering sync
@@ -4647,6 +5125,11 @@ pub enum NetworkMessage {
         timestamp: u64,
     },
     
+    /// Turbine chunk for efficient block propagation
+    TurbineChunk {
+        chunk: TurbineChunk,
+    },
+    
     /// PRODUCTION: Reputation synchronization for consensus
     ReputationSync {
         node_id: String,
@@ -4861,6 +5344,11 @@ impl SimplifiedP2P {
                 }
             }
 
+            NetworkMessage::TurbineChunk { chunk } => {
+                // Handle incoming Turbine chunk
+                self.handle_turbine_chunk(from_peer, chunk);
+            }
+            
             NetworkMessage::EmergencyProducerChange { failed_producer, new_producer, block_height, change_type, timestamp } => {
                 // PRIVACY: Use privacy-preserving IDs for producer changes
                 // CRITICAL FIX: Don't double-convert if already a pseudonym (genesis_node_XXX or node_XXX)

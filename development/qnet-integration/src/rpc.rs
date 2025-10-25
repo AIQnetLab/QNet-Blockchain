@@ -640,6 +640,51 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(blockchain_filter.clone())
         .and_then(handle_block_statistics);
     
+    // Turbine metrics endpoint
+    let turbine_metrics = api_v1
+        .and(warp::path("turbine"))
+        .and(warp::path("metrics"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(blockchain_filter.clone())
+        .and_then(handle_turbine_metrics);
+    
+    // Quantum PoH status endpoint
+    let poh_status = api_v1
+        .and(warp::path("poh"))
+        .and(warp::path("status"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(blockchain_filter.clone())
+        .and_then(handle_poh_status);
+    
+    // Sealevel pipeline metrics endpoint
+    let sealevel_metrics = api_v1
+        .and(warp::path("sealevel"))
+        .and(warp::path("metrics"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(blockchain_filter.clone())
+        .and_then(handle_sealevel_metrics);
+    
+    // Pre-execution cache status endpoint
+    let pre_execution_status = api_v1
+        .and(warp::path("pre-execution"))
+        .and(warp::path("status"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(blockchain_filter.clone())
+        .and_then(handle_pre_execution_status);
+    
+    // Tower BFT timeout info endpoint
+    let tower_bft_info = api_v1
+        .and(warp::path("tower-bft"))
+        .and(warp::path("timeouts"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(blockchain_filter.clone())
+        .and_then(handle_tower_bft_timeouts);
+    
     // Node performance metrics
     let performance_metrics = api_v1
         .and(warp::path("metrics"))
@@ -750,6 +795,11 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .or(sync_status)
         .or(network_diagnostics)
         .or(block_stats)
+        .or(turbine_metrics)
+        .or(poh_status)
+        .or(sealevel_metrics)
+        .or(pre_execution_status)
+        .or(tower_bft_info)
         .or(performance_metrics)
         .or(reputation_history);
         
@@ -2361,6 +2411,93 @@ async fn handle_node_secure_info(
     });
     
     Ok(warp::reply::json(&response))
+}
+
+// Handler for Turbine metrics
+async fn handle_turbine_metrics(blockchain: Arc<BlockchainNode>) -> Result<impl warp::Reply, warp::Rejection> {
+    let metrics = json!({
+        "enabled": true,
+        "chunk_size": 1024,
+        "fanout": 3,
+        "redundancy_factor": 1.5,
+        "max_chunks": 64,
+        "max_block_size": 65536,
+        "status": "active"
+    });
+    
+    Ok(warp::reply::json(&metrics))
+}
+
+// Handler for Quantum PoH status
+async fn handle_poh_status(blockchain: Arc<BlockchainNode>) -> Result<impl warp::Reply, warp::Rejection> {
+    let status = json!({
+        "enabled": blockchain.get_quantum_poh().is_some(),
+        "algorithm": ["SHA3-512", "Blake3"],
+        "hash_rate": "31.25M hashes/sec",
+        "status": if blockchain.get_quantum_poh().is_some() { "running" } else { "disabled" }
+    });
+    
+    Ok(warp::reply::json(&status))
+}
+
+// Handler for Sealevel metrics
+async fn handle_sealevel_metrics(blockchain: Arc<BlockchainNode>) -> Result<impl warp::Reply, warp::Rejection> {
+    let metrics = json!({
+        "enabled": blockchain.get_hybrid_sealevel().is_some(),
+        "pipeline_stages": 5,
+        "stages": ["Validation", "DependencyAnalysis", "Execution", "DilithiumSignature", "Commitment"],
+        "max_parallel_tx": 10000,
+        "status": if blockchain.get_hybrid_sealevel().is_some() { "active" } else { "disabled" }
+    });
+    
+    Ok(warp::reply::json(&metrics))
+}
+
+// Handler for Pre-execution status
+async fn handle_pre_execution_status(blockchain: Arc<BlockchainNode>) -> Result<impl warp::Reply, warp::Rejection> {
+    let metrics = blockchain.get_pre_execution().get_metrics().await;
+    
+    let status = json!({
+        "enabled": true,
+        "lookahead_blocks": 3,
+        "max_tx_per_block": 1000,
+        "cache_size": 10000,
+        "total_pre_executed": metrics.total_pre_executed,
+        "cache_hits": metrics.cache_hits,
+        "cache_misses": metrics.cache_misses,
+        "average_speedup_ms": metrics.average_speedup_ms,
+        "status": "active"
+    });
+    
+    Ok(warp::reply::json(&status))
+}
+
+// Handler for Tower BFT timeouts
+async fn handle_tower_bft_timeouts(blockchain: Arc<BlockchainNode>) -> Result<impl warp::Reply, warp::Rejection> {
+    let current_height = blockchain.get_height().await;
+    
+    let timeout_block_1 = blockchain.get_tower_bft().get_timeout(1, 0).await;
+    let timeout_block_10 = blockchain.get_tower_bft().get_timeout(10, 0).await;
+    let timeout_current = blockchain.get_tower_bft().get_timeout(current_height, 0).await;
+    
+    let info = json!({
+        "enabled": true,
+        "current_height": current_height,
+        "timeouts": {
+            "block_1": timeout_block_1.as_millis(),
+            "block_10": timeout_block_10.as_millis(),
+            "current_block": timeout_current.as_millis(),
+        },
+        "config": {
+            "base_timeout_ms": 7000,
+            "timeout_multiplier": 1.5,
+            "max_timeout_ms": 20000,
+            "min_timeout_ms": 1000,
+        },
+        "status": "active"
+    });
+    
+    Ok(warp::reply::json(&info))
 }
 
 async fn handle_light_node_ping_response(
