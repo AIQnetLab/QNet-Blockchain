@@ -2353,7 +2353,8 @@ impl BlockchainNode {
                         // Continue anyway - block will be retried
                     }
                     
-                    // Broadcast to network asynchronously for quantum-speed propagation
+                    // CRITICAL FIX: Synchronous broadcast BEFORE height increment
+                    // This ensures block is sent to peers before we claim it exists
                     if let Some(p2p) = &unified_p2p {
                         let peer_count = p2p.get_peer_count();
                         let broadcast_data = if compression_enabled {
@@ -2365,20 +2366,33 @@ impl BlockchainNode {
                         };
                         
                         let broadcast_size = broadcast_data.len();
-                        let p2p_clone = p2p.clone();
                         let height_for_broadcast = microblock.height;
                         
-                        // Non-blocking broadcast for real-time performance
-                        tokio::spawn(async move {
-                            let result = p2p_clone.broadcast_block(height_for_broadcast, broadcast_data);
-                            // Log only errors or every 10th block
-                            if result.is_err() || height_for_broadcast % 10 == 0 {
-                                println!("[P2P] 📡 Block #{} broadcast: {:?} | {} peers | {} bytes", 
-                                         height_for_broadcast, result.is_ok(), peer_count, broadcast_size);
-                            }
-                        });
+                        // CRITICAL FIX: Synchronous broadcast to ensure delivery before height increment
+                        let result = p2p.broadcast_block(height_for_broadcast, broadcast_data);
+                        
+                        // Log only errors or every 10th block
+                        if result.is_err() || height_for_broadcast % 10 == 0 {
+                            println!("[P2P] 📡 Block #{} broadcast: {:?} | {} peers | {} bytes", 
+                                     height_for_broadcast, result.is_ok(), peer_count, broadcast_size);
+                        }
                     } else {
                         println!("[P2P] ⚠️ P2P system not available - cannot broadcast block #{}", microblock.height);
+                    }
+                    
+                    // CRITICAL FIX: NOW increment height AFTER broadcast completed
+                    microblock_height += 1;
+                    
+                    // Update global height for API sync
+                    {
+                        let mut global_height = height.write().await;
+                        *global_height = microblock_height;
+                        
+                        // CRITICAL FIX: Update P2P local height for message filtering
+                        crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(
+                            microblock_height, 
+                            std::sync::atomic::Ordering::Relaxed
+                        );
                     }
                     
                     // ATOMIC REWARDS: Track block for rotation reward
@@ -2524,21 +2538,8 @@ impl BlockchainNode {
                         Self::log_performance_metrics(microblock_height, &mempool).await;
                     }
                     
-                    // CRITICAL FIX: Increment height AFTER block is created and saved
-                    // This fixes the missing block #1 issue
-                    microblock_height += 1;
-                    
-                    // Update global height for API sync
-                    {
-                        let mut global_height = height.write().await;
-                        *global_height = microblock_height;
-                        
-                        // CRITICAL FIX: Update P2P local height for message filtering
-                        crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(
-                            microblock_height, 
-                            std::sync::atomic::Ordering::Relaxed
-                        );
-                    }
+                    // CRITICAL FIX: DO NOT increment height yet! Wait until after broadcast
+                    // Height increment moved to after broadcast to prevent phantom blocks
                     } // End of microblock production block
                 } else {
                     // CRITICAL: Check if we became emergency producer
@@ -2664,13 +2665,15 @@ impl BlockchainNode {
                             println!("[SYNC] ⏳ Waiting for background sync of block #{}", expected_height);
                             
                             // PRODUCTION: Add microblock producer timeout detection using EXISTING patterns
-                            // EXISTING timeout values: macroblock=30s, commit=15s, http=5s, interval=1s
-                            // GENESIS FIX: Longer grace period for first microblock (simultaneous startup)
+                            // CRITICAL FIX: Adaptive timeout based on network conditions
+                            // Synchronous broadcast helps, but network delays still exist
                             let microblock_timeout = if expected_height == 1 {
-                                println!("[SYNC] ⏰ First microblock - using 15s grace period for network bootstrap");
-                                std::time::Duration::from_secs(15)  // First block: 15s grace for network bootstrap
+                                println!("[SYNC] ⏰ First microblock - using 20s grace period for network bootstrap");
+                                std::time::Duration::from_secs(20)  // First block: extra time for network formation
+                            } else if expected_height <= 10 {
+                                std::time::Duration::from_secs(10)  // Early blocks: 10s for initial sync
                             } else {
-                                std::time::Duration::from_secs(5)   // Normal blocks: 5s timeout
+                                std::time::Duration::from_secs(7)   // Normal: 7s (was 5s, too aggressive)
                             };
                             let timeout_start = std::time::Instant::now();
                             
@@ -2701,7 +2704,15 @@ impl BlockchainNode {
                                     };
                                     
                                     if !block_exists {
-                                        let timeout_duration = if expected_height_timeout == 1 { 15 } else { 5 };
+                                        // CRITICAL FIX: Adaptive timeout based on network conditions
+                                        // Synchronous broadcast should arrive faster, but network delays still exist
+                                        let timeout_duration = if expected_height_timeout == 1 { 
+                                            20  // First block needs more time for network stabilization
+                                        } else if expected_height_timeout <= 10 {
+                                            10  // Early blocks: 10 seconds for initial sync
+                                        } else {
+                                            7   // Normal operation: 7 seconds (was 5, too aggressive)
+                                        };
                                         println!("[FAILOVER] 🚨 Microblock #{} not received after {}s timeout from producer: {}", 
                                                  expected_height_timeout, timeout_duration, current_producer_timeout);
                                     
@@ -3089,7 +3100,7 @@ impl BlockchainNode {
                 let entropy_height = if round_start_block > 0 { 
                     round_start_block  // This will get hash of block (round_start_block - 1)
                 } else { 
-                    1  // For first round, get hash of genesis block (block 0)
+                    0  // CRITICAL FIX: Use Genesis block (0) for Round 0, not block 1 which doesn't exist yet!
                 };
                 let prev_hash = Self::get_previous_microblock_hash(store, entropy_height).await;
                 println!("[CONSENSUS] 🎲 Using entropy from block #{} hash: {:x}", 
@@ -3127,6 +3138,38 @@ impl BlockchainNode {
             
             println!("[CONSENSUS] 🎲 Hash result: {:x} -> index {} -> producer: {}", 
                      selection_number, selection_index, selected_producer);
+            
+            // CRITICAL FIX: Protection against stuck producer - ensure rotation actually happens
+            // Track last round's producer to prevent same producer being selected repeatedly
+            static LAST_ROUND_PRODUCER: once_cell::sync::Lazy<std::sync::RwLock<Option<(u64, String)>>> = 
+                once_cell::sync::Lazy::new(|| std::sync::RwLock::new(None));
+            
+            // Check if this is a new round and if producer is stuck
+            let mut final_producer = selected_producer.clone();
+            if let Ok(last_producer_guard) = LAST_ROUND_PRODUCER.read() {
+                if let Some((last_round, last_producer)) = &*last_producer_guard {
+                    if *last_round != leadership_round {
+                        // New round - update tracking
+                        drop(last_producer_guard);
+                        if let Ok(mut write_guard) = LAST_ROUND_PRODUCER.write() {
+                            *write_guard = Some((leadership_round, selected_producer.clone()));
+                        }
+                    } else if last_producer == &selected_producer && candidates.len() > 1 {
+                        // PROTECTION: Same producer selected again in same round - force rotation
+                        println!("[CONSENSUS] ⚠️ Stuck producer detected: {} - forcing rotation", selected_producer);
+                        let next_index = (selection_index + 1) % candidates.len();
+                        final_producer = candidates[next_index].0.clone();
+                        println!("[CONSENSUS] 🔄 Forced rotation to next candidate: {}", final_producer);
+                    }
+                }
+            } else {
+                // First time - initialize tracking
+                if let Ok(mut write_guard) = LAST_ROUND_PRODUCER.write() {
+                    *write_guard = Some((leadership_round, selected_producer.clone()));
+                }
+            }
+            
+            let selected_producer = final_producer;  // Use potentially rotated producer
             
             // CRITICAL FIX: Verify selected producer is synchronized (not stuck at height 0)
             // This prevents deadlock when an unsynchronized node is selected as producer
