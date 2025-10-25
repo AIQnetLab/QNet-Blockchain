@@ -4993,7 +4993,7 @@ impl BlockchainNode {
         // Create DilithiumSignature from microblock signature
         let signature = DilithiumSignature {
             signature: String::from_utf8(microblock.signature.clone()).unwrap_or_default(),
-            algorithm: "QNet-Dilithium-Consensus".to_string(),
+            algorithm: "QNet-Dilithium-Compatible".to_string(),  // CRITICAL FIX: Use compatible algorithm name
             timestamp: microblock.timestamp,
             strength: "quantum-resistant".to_string(),
         };

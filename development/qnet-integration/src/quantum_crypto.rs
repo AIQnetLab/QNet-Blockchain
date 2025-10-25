@@ -686,7 +686,7 @@ impl QNetQuantumCrypto {
         
         Ok(DilithiumSignature {
             signature: consensus_signature,
-            algorithm: "QNet-Dilithium-Consensus".to_string(),
+            algorithm: "QNet-Dilithium-Compatible".to_string(),  // CRITICAL FIX: Use compatible algorithm everywhere
             timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
             strength: "quantum-resistant".to_string(),
         })

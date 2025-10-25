@@ -1749,8 +1749,11 @@ impl SimplifiedP2P {
     
     // REMOVED: start_kademlia_peer_discovery was a stub, now using Kademlia fields directly in PeerInfo
     
-    /// Broadcast block data
+    /// Broadcast block data with parallel sending but synchronous completion
     pub fn broadcast_block(&self, height: u64, block_data: Vec<u8>) -> Result<(), String> {
+        use std::sync::Arc;
+        use std::thread;
+        
         // CRITICAL FIX: Use CACHED validated active peers for broadcast performance
         // This ensures we broadcast to all REAL peers, with 30s cache for performance
         let validated_peers = self.get_validated_active_peers();
@@ -1769,7 +1772,11 @@ impl SimplifiedP2P {
         println!("[P2P] 📡 Broadcasting block #{} to {} validated peers", height, validated_peers.len());
         }
         
-        // In production: Actually send block data to peers
+        // CRITICAL FIX: Parallel broadcast with synchronous completion
+        // Like Solana: send to all peers in parallel but wait for completion
+        let block_data = Arc::new(block_data);
+        let mut handles = Vec::new();
+        
         for peer in validated_peers.iter() {
             // Filter by node type for efficiency
             let should_send = match (&self.node_type, &peer.node_type) {
@@ -1779,22 +1786,79 @@ impl SimplifiedP2P {
             };
             
             if should_send {
-                // PRODUCTION: Real network send via HTTP POST
-                let block_msg = NetworkMessage::Block {
-                    height,
-                    data: block_data.clone(),
-                    block_type: "micro".to_string(),
-                };
-                // PRODUCTION DEBUG: Log block size and destination
-                if height % 10 == 0 || height <= 5 {
-                    println!("[P2P] → Sending Block #{} to {} ({} bytes)", 
-                             height, peer.addr, block_data.len());
-                }
-                self.send_network_message(&peer.addr, block_msg);
+                let peer_addr = peer.addr.clone();
+                let block_data_clone = Arc::clone(&block_data);
+                
+                // Spawn thread for parallel sending
+                let handle = thread::spawn(move || {
+                    use std::time::Duration;
+                    
+                    // Create message
+                    let block_msg = NetworkMessage::Block {
+                        height,
+                        data: (*block_data_clone).clone(),
+                        block_type: "micro".to_string(),
+                    };
+                    
+                    // Serialize
+                    let message_json = match serde_json::to_value(&block_msg) {
+                        Ok(json) => json,
+                        Err(e) => {
+                            println!("[P2P] ❌ Serialize failed: {}", e);
+                            return Err(format!("Serialize failed: {}", e));
+                        }
+                    };
+                    
+                    // Send with fast timeout
+                    let peer_ip = peer_addr.split(':').next().unwrap_or(&peer_addr);
+                    let url = format!("http://{}:8001/api/v1/p2p/message", peer_ip);
+                    
+                    let client = reqwest::blocking::Client::builder()
+                        .timeout(Duration::from_secs(3))  // Fast timeout for parallel sending
+                        .connect_timeout(Duration::from_secs(1))
+                        .tcp_nodelay(true)
+                        .build()
+                        .map_err(|e| format!("Client failed: {}", e))?;
+                    
+                    client.post(&url)
+                        .json(&message_json)
+                        .send()
+                        .map_err(|e| format!("Send to {} failed: {}", peer_ip, e))?;
+                    
+                    Ok(())
+                });
+                
+                handles.push((peer.addr.clone(), handle));
             }
         }
         
-        Ok(())
+        // Wait for all sends to complete (but don't fail if some fail)
+        let mut success_count = 0;
+        let total = handles.len();
+        
+        for (peer_addr, handle) in handles {
+            match handle.join() {
+                Ok(Ok(())) => success_count += 1,
+                Ok(Err(e)) => {
+                    if height <= 5 || height % 10 == 0 {
+                        println!("[P2P] ⚠️ Failed to send block #{} to {}: {}", height, peer_addr, e);
+                    }
+                }
+                Err(_) => println!("[P2P] ⚠️ Thread panicked for {}", peer_addr),
+            }
+        }
+        
+        // Success if at least one peer received the block
+        if success_count > 0 {
+            if height <= 5 || height % 10 == 0 {
+                println!("[P2P] ✅ Block #{} sent to {}/{} peers", height, success_count, total);
+            }
+            Ok(())
+        } else if total > 0 {
+            Err(format!("Failed to send block #{} to any peer", height))
+        } else {
+            Ok(()) // No peers to send to
+        }
     }
     
     /// API DEADLOCK FIX: Get cached network height WITHOUT triggering sync
@@ -5676,6 +5740,50 @@ impl SimplifiedP2P {
         Ok(())
     }
 
+    /// Send network message SYNCHRONOUSLY for critical messages (blocks)
+    /// Uses blocking HTTP client to ensure delivery before returning
+    pub fn send_network_message_sync(&self, peer_addr: &str, message: NetworkMessage) -> Result<(), String> {
+        use std::time::Duration;
+        
+        // Only use for critical messages
+        let is_critical = matches!(message, NetworkMessage::Block { .. });
+        if !is_critical {
+            // Non-critical messages use async version
+            self.send_network_message(peer_addr, message);
+            return Ok(());
+        }
+        
+        // Serialize message
+        let message_json = serde_json::to_value(&message)
+            .map_err(|e| format!("Failed to serialize: {}", e))?;
+        
+        // Extract IP (skip pseudonym resolution for sync context)
+        let peer_ip = peer_addr.split(':').next().unwrap_or(peer_addr);
+        let url = format!("http://{}:8001/api/v1/p2p/message", peer_ip);
+        
+        // CRITICAL: Use blocking HTTP client for synchronous delivery
+        // This ensures block is delivered before we continue
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(5))  // Fast timeout for local network
+            .connect_timeout(Duration::from_secs(2))
+            .tcp_nodelay(true)  // Disable Nagle's algorithm for faster delivery
+            .build()
+            .map_err(|e| format!("Client build failed: {}", e))?;
+        
+        // Send synchronously
+        let response = client
+            .post(&url)
+            .json(&message_json)
+            .send()
+            .map_err(|e| format!("Send failed to {}: {}", peer_ip, e))?;
+        
+        if !response.status().is_success() {
+            return Err(format!("HTTP {} from {}", response.status(), peer_ip));
+        }
+        
+        Ok(())
+    }
+    
     /// Send network message via HTTP POST to peer's API (with pseudonym resolution)
     pub fn send_network_message(&self, peer_addr: &str, message: NetworkMessage) {
         let peer_addr = peer_addr.to_string();
@@ -5916,7 +6024,7 @@ impl SimplifiedP2P {
         
         // CRITICAL FIX: Deduplicate failover messages to prevent processing same event multiple times
         let failover_key = (block_height, failed_producer.clone(), new_producer.clone());
-        
+            
         // SCALABILITY: DashSet provides lock-free concurrent access for millions of nodes
         if !PROCESSED_FAILOVERS.insert(failover_key.clone()) {
             // Already processed this exact failover event (insert returns false if already exists)
