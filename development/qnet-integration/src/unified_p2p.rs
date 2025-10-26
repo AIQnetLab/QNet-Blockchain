@@ -235,6 +235,8 @@ pub struct SimplifiedP2P {
     node_type: NodeType,
     region: Region,
     port: u16,
+    /// Our external IP address (to prevent self-connection)
+    external_ip: Arc<RwLock<Option<String>>>,
     
     /// Regional peer management with load balancing
     regional_peers: Arc<Mutex<HashMap<Region, Vec<PeerInfo>>>>,
@@ -346,11 +348,23 @@ impl SimplifiedP2P {
         let hash = hasher.finalize();
         let shard_id = hash[0]; // First byte = shard (0-255)
         
+        // CRITICAL: Determine our external IP immediately for Genesis nodes
+        let external_ip = if node_id.starts_with("genesis_node_") {
+            // Genesis nodes have known IPs
+            let genesis_id = node_id.strip_prefix("genesis_node_").unwrap_or("");
+            crate::genesis_constants::get_genesis_ip_by_id(genesis_id)
+                .map(|ip| Some(ip.to_string()))
+                .unwrap_or(None)
+        } else {
+            None // Will be detected later for non-Genesis nodes
+        };
+        
         Self {
             node_id: node_id.clone(),
             node_type,
             region: region.clone(),
             port,
+            external_ip: Arc::new(RwLock::new(external_ip)),
             regional_peers: Arc::new(Mutex::new(HashMap::new())),
             
             // QUANTUM OPTIMIZATION: Initialize lock-free structures
@@ -726,6 +740,20 @@ impl SimplifiedP2P {
             for (addr, peer) in legacy_peers.iter() {
                 // Only migrate if not already present
                 if !self.connected_peers_lockfree.contains_key(addr) {
+                    // CRITICAL: Check for self-connection before migration
+                    let peer_ip = addr.split(':').next().unwrap_or("");
+                    let is_self_by_ip = if let Some(ref our_ip) = *self.external_ip.read().unwrap() {
+                        peer_ip == our_ip
+                    } else {
+                        false
+                    };
+                    
+                    if peer.id == self.node_id || is_self_by_ip {
+                        println!("[P2P] 🚫 MIGRATION: Skipping self-connection {}", 
+                                 get_privacy_id_for_addr(&addr));
+                        continue;
+                    }
+                    
                     // Calculate shard
                     let mut hasher = Sha3_256::new();
                     hasher.update(peer.id.as_bytes());
@@ -842,6 +870,20 @@ impl SimplifiedP2P {
     /// QUANTUM OPTIMIZATION: Lock-free peer addition for millions of nodes
     /// Uses DashMap for concurrent operations without blocking
     pub fn add_peer_lockfree(&self, mut peer_info: PeerInfo) -> bool {
+        // CRITICAL: Prevent self-connection at the earliest stage
+        let peer_ip = peer_info.addr.split(':').next().unwrap_or("");
+        let is_self_by_ip = if let Some(ref our_ip) = *self.external_ip.read().unwrap() {
+            peer_ip == our_ip
+        } else {
+            false
+        };
+        
+        if peer_info.id == self.node_id || is_self_by_ip {
+            println!("[P2P] 🚫 add_peer_lockfree: Rejecting self-connection {}", 
+                     get_privacy_id_for_addr(&peer_info.addr));
+            return false;
+        }
+        
         // Calculate shard and Kademlia bucket
         let mut hasher = Sha3_256::new();
         hasher.update(peer_info.id.as_bytes());
@@ -1093,12 +1135,17 @@ impl SimplifiedP2P {
         
         let mut new_connections = 0;
         for peer_addr in peer_addresses {
+            // CRITICAL: Filter out private/internal IPs before parsing
+            let ip = peer_addr.split(':').next().unwrap_or("");
+            if ip.starts_with("172.17.") || ip.starts_with("172.18.") 
+                || ip.starts_with("10.") || ip.starts_with("192.168.") 
+                || ip.starts_with("127.") || ip == "localhost" {
+                println!("[P2P] 🚫 Skipping private/internal IP: {}", get_privacy_id_for_addr(peer_addr));
+                continue;
+            }
+            
             if let Ok(peer_info) = self.parse_peer_address(peer_addr) {
-                // CRITICAL: Never add self as a peer!
-                if peer_info.id == self.node_id || peer_info.addr.contains(&self.port.to_string()) {
-                    println!("[P2P] 🚫 Skipping self-connection: {}", peer_info.id);
-                    continue;
-                }
+                // Self-connection check is done in add_peer_lockfree(), no need to duplicate here
                 
                 // BYZANTINE FIX: For Genesis peers, ALWAYS verify connectivity even if "already connected"
                 // This prevents phantom Genesis peers from persisting across restarts
@@ -1304,13 +1351,18 @@ impl SimplifiedP2P {
         let region = self.region.clone();
         let node_type = self.node_type.clone();
         let port = self.port;
+        let external_ip_store = self.external_ip.clone();
         
         tokio::spawn(async move {
             println!("[P2P] 🌐 Announcing node to internet...");
             
             // Get our external IP address
             let external_ip = match Self::get_our_ip_address().await {
-                Ok(ip) => ip,
+                Ok(ip) => {
+                    // Store our external IP to prevent self-connection
+                    *external_ip_store.write().unwrap() = Some(ip.clone());
+                    ip
+                },
                 Err(e) => {
                     println!("[P2P] ⚠️ Could not get external IP: {}", e);
                     return;
@@ -5736,10 +5788,12 @@ pub fn get_privacy_id_for_addr(addr: &str) -> String {
         return format!("genesis_node_{}", genesis_id);
     }
     
-    // Check if it's a Docker internal IP (172.17.x.x or 172.x.x.x)
-    if ip.starts_with("172.") {
-        let ip_hash = blake3::hash(format!("DOCKER_NODE_{}", ip).as_bytes());
-        return format!("docker_node_{}", &ip_hash.to_hex()[..8]);
+    // Check if it's a private/internal IP that shouldn't be in P2P network
+    if ip.starts_with("172.") || ip.starts_with("10.") || ip.starts_with("192.168.") {
+        // These are private IPs that shouldn't be exposed in P2P
+        // This includes Docker networks (172.17.x.x), private LANs, etc.
+        let ip_hash = blake3::hash(format!("PRIVATE_{}", ip).as_bytes());
+        return format!("private_{}", &ip_hash.to_hex()[..8]);
     }
     
     // For all other IPs, generate privacy-preserving hash

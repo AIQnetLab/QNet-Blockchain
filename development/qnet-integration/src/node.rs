@@ -2718,7 +2718,8 @@ impl BlockchainNode {
                     // CRITICAL: Check if we became emergency producer
                     let should_produce_emergency = if let Ok(emergency_flag) = EMERGENCY_PRODUCER_FLAG.lock() {
                         if let Some((height, producer)) = &*emergency_flag {
-                            if *height == microblock_height + 1 && *producer == node_id {
+                            // FIX: Emergency producer should produce CURRENT height, not +1
+                            if *height == microblock_height && *producer == node_id {
                                 println!("[EMERGENCY] 🚨 WE ARE EMERGENCY PRODUCER FOR BLOCK #{}", height);
                                 true
                             } else {
@@ -2747,7 +2748,8 @@ impl BlockchainNode {
                     // PRODUCTION: This node is NOT the selected producer - synchronize with network
                     // CPU OPTIMIZATION: Only log every 10th block to reduce IO load
                     if microblock_height % 10 == 0 {
-                    println!("[MICROBLOCK] 👥 Waiting for block #{} from producer: {}", microblock_height + 1, current_producer);
+                    // CRITICAL FIX: When not producer, wait for CURRENT height, not +1
+                    println!("[MICROBLOCK] 👥 Waiting for block #{} from producer: {}", microblock_height, current_producer);
                     }
                     
                     // Update is_leader for backward compatibility
@@ -2822,9 +2824,11 @@ impl BlockchainNode {
                         }
                         
                         // CRITICAL: Check if we already have the next block locally
-                        let expected_height = microblock_height + 1;
+                        // FIX: For non-producer, expected height is CURRENT height, not +1
+                        let expected_height = microblock_height;
                         if let Ok(Some(_)) = storage.load_microblock(expected_height) {
-                            microblock_height = expected_height;
+                            // Block already exists locally, move to next
+                            microblock_height = expected_height + 1;
                             {
                                 let mut global_height = height.write().await;
                                 *global_height = microblock_height;
@@ -2835,17 +2839,19 @@ impl BlockchainNode {
                             // Timing controlled at end of loop only
                         } else {
                             // No local block - background sync will handle it with timeout detection
-                            println!("[SYNC] ⏳ Waiting for background sync of block #{}", expected_height);
+                            // FIX: Wait for CURRENT height when not producer
+                            println!("[SYNC] ⏳ Waiting for background sync of block #{}", microblock_height);
                             
                             // PRODUCTION: Use Tower BFT adaptive timeout
                             let retry_count = 0; // First attempt
-                            let microblock_timeout = tower_bft.get_timeout(expected_height, retry_count).await;
-                            println!("[TowerBFT] ⏱️ Adaptive timeout for block #{}: {:?}", expected_height, microblock_timeout);
+                            let microblock_timeout = tower_bft.get_timeout(microblock_height, retry_count).await;
+                            println!("[TowerBFT] ⏱️ Adaptive timeout for block #{}: {:?}", microblock_height, microblock_timeout);
                             let timeout_start = std::time::Instant::now();
                             
                             // Wait with timeout for producer block (same pattern as macroblock timeout in line 1201)
                             let mut timeout_triggered = false;
-                            let expected_height_timeout = expected_height;
+                            // FIX: Use correct height for timeout
+                            let expected_height_timeout = microblock_height;
                             let current_producer_timeout = current_producer.clone();
                             let storage_timeout = storage.clone();
                             let p2p_timeout = p2p.clone();

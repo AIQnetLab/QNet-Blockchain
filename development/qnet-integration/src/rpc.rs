@@ -351,13 +351,22 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
             if let Some(addr) = remote_addr {
                 let requester_ip = addr.ip().to_string();
                 
-                // Only register if it's a real external IP (not localhost)
-                if !requester_ip.starts_with("127.") && !requester_ip.starts_with("::1") && requester_ip != "0.0.0.0" {
+                // Only register if it's a real external IP (not localhost or Docker internal)
+                if !requester_ip.starts_with("127.") 
+                    && !requester_ip.starts_with("::1") 
+                    && requester_ip != "0.0.0.0"
+                    && !requester_ip.starts_with("172.17.")  // Docker bridge network
+                    && !requester_ip.starts_with("172.18.")  // Docker custom networks
+                    && !requester_ip.starts_with("10.")       // Private network range
+                    && !requester_ip.starts_with("192.168.")  // Private network range
+                {
                     let requester_addr = format!("{}:8001", requester_ip);
                     
                     // SCALABILITY FIX: Use existing P2P system with built-in rate limiting and peer limits
                     // System already handles max_peers_per_region through load balancing (8 peers per region max)
                     if let Some(p2p) = blockchain.get_unified_p2p() {
+                        // CRITICAL: Don't add if this is our own external IP (self-connection via public IP)
+                        // This check is now done inside add_discovered_peers()
                         // QUANTUM: Unlimited peer scalability with cryptographic validation
                         // Use EXISTING add_discovered_peers() with built-in quantum-resistant verification
                         p2p.add_discovered_peers(&[requester_addr.clone()]);
@@ -2092,9 +2101,14 @@ async fn handle_network_ping(
     let signature = ping_request.get("signature")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let node_type = ping_request.get("node_type")
-        .and_then(|v| v.as_str())
-        .unwrap_or("light");
+    // Determine actual node type - Genesis nodes are always Super
+    let node_type = if node_id.starts_with("genesis_node_") {
+        "super"  // All Genesis nodes are Super nodes
+    } else {
+        ping_request.get("node_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("full")  // Default to Full for regular nodes (Light nodes use different endpoint)
+    };
     
     // Quantum-secure signature verification using CRYSTALS-Dilithium
     let signature_valid = verify_dilithium_signature(node_id, challenge, signature).await;
@@ -2118,6 +2132,55 @@ async fn handle_network_ping(
     
     println!("[PING] 📡 Network ping received from {} ({}): {}ms response", 
              node_id, node_type, response_time);
+    
+    // CRITICAL: Record ping for Full/Super/Genesis nodes in reward system
+    {
+        let mut reward_manager = REWARD_MANAGER.lock().unwrap();
+        
+        // Determine node type for reward system
+        let reward_node_type = match node_type {
+            "super" => RewardNodeType::Super,
+            "full" => RewardNodeType::Full,
+            "light" => RewardNodeType::Light,
+            _ => {
+                // This should never happen - we only have 3 node types
+                println!("[REWARDS] ❌ Unknown node type: {}", node_type);
+                return Ok(warp::reply::json(&json!({
+                    "success": false,
+                    "error": format!("Unknown node type: {}", node_type)
+                })));
+            }
+        };
+        
+        // Get wallet address - for Genesis nodes, use pre-registered wallet
+        let wallet_address = if node_id.starts_with("genesis_node_") {
+            // Genesis nodes already registered with deterministic wallet in node.rs:1009
+            // Format: genesis_wallet_XXX_YYYYYYYY
+            let bootstrap_id = node_id.strip_prefix("genesis_node_").unwrap_or("001");
+            let mut hasher = sha3::Sha3_256::new();
+            use sha3::Digest;
+            hasher.update(format!("genesis_{}_wallet", bootstrap_id).as_bytes());
+            let wallet_hash = hasher.finalize();
+            format!("genesis_wallet_{}_{}", bootstrap_id, hex::encode(&wallet_hash[..8]))
+        } else {
+            // For Full/Super nodes, wallet should be extracted from activation code
+            // For now, use node_id-based placeholder (production would query blockchain registry)
+            format!("wallet_{}eon", &blake3::hash(node_id.as_bytes()).to_hex()[..8])
+        };
+        
+        // Register node if not already registered
+        if let Err(_) = reward_manager.register_node(node_id.to_string(), reward_node_type, wallet_address.clone()) {
+            // Node already registered, that's fine
+        }
+        
+        // Record the successful ping
+        if let Err(e) = reward_manager.record_ping_attempt(node_id, true, response_time) {
+            println!("[REWARDS] ⚠️ Failed to record ping for {}: {}", node_id, e);
+        } else {
+            println!("[REWARDS] ✅ Ping recorded for {} node {} (wallet: {}...)", 
+                     node_type, node_id, &wallet_address[..20.min(wallet_address.len())]);
+        }
+    }
     
     // Generate quantum-secure response with CRYSTALS-Dilithium
     let response_challenge = generate_quantum_challenge();
@@ -2943,9 +3006,34 @@ async fn handle_claim_rewards(
         })));
     }
     
-    // FIXED: Extract wallet address from quantum signature or request
-    // For now: derive wallet from node_id (production would extract from signature)
-    let wallet_address = format!("derived_{}eon", &blake3::hash(claim_request.node_id.as_bytes()).to_hex()[..8]);
+    // FIXED: Get the ACTUAL wallet address that was registered with the node
+    let wallet_address = if claim_request.node_id.starts_with("genesis_node_") {
+        // Genesis nodes use deterministic wallet (same as registration in node.rs:1009)
+        let bootstrap_id = claim_request.node_id.strip_prefix("genesis_node_").unwrap_or("001");
+        let mut hasher = sha3::Sha3_256::new();
+        use sha3::Digest;
+        hasher.update(format!("genesis_{}_wallet", bootstrap_id).as_bytes());
+        let wallet_hash = hasher.finalize();
+        format!("genesis_wallet_{}_{}", bootstrap_id, hex::encode(&wallet_hash[..8]))
+    } else if claim_request.node_id.starts_with("light_") {
+        // Light nodes - check LIGHT_NODE_REGISTRY
+        let registry = LIGHT_NODE_REGISTRY.lock().unwrap();
+        if let Some(light_node) = registry.get(&claim_request.node_id) {
+            if let Some(device) = light_node.devices.first() {
+                device.wallet_address.clone()
+            } else {
+                // Fallback if no devices
+                format!("light_{}eon", &blake3::hash(claim_request.node_id.as_bytes()).to_hex()[..8])
+            }
+        } else {
+            // Not found in registry
+            format!("unknown_{}eon", &blake3::hash(claim_request.node_id.as_bytes()).to_hex()[..8])
+        }
+    } else {
+        // Full/Super nodes - should query blockchain registry
+        // For now use placeholder (in production would query activation registry)
+        format!("wallet_{}eon", &blake3::hash(claim_request.node_id.as_bytes()).to_hex()[..8])
+    };
     
     // Claim rewards from reward manager
     let claim_result = {
