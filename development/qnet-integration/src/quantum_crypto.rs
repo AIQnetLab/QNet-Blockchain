@@ -515,6 +515,8 @@ impl QNetQuantumCrypto {
         if !signature.signature.starts_with("dilithium_sig_") {
             return Err(anyhow!("Invalid signature format: expected 'dilithium_sig_<node>_<base64>'"));
         }
+
+        
         
         // Find the last underscore - everything after it is the base64 signature
         let last_underscore_pos = signature.signature.rfind('_')
@@ -534,35 +536,21 @@ impl QNetQuantumCrypto {
             return Err(anyhow!("Invalid signature length: {}", signature_bytes.len()));
         }
 
-        // 3. Create message hash using quantum-resistant SHA3-512
+        // 3. CRITICAL FIX: Use SAME algorithm as create_consensus_signature
+        // Create message hash exactly as in signing
+        let signature_data = format!("{}:{}", wallet_address, data);
         let mut hasher = sha2::Sha512::new();
-        hasher.update(data.as_bytes());
-        hasher.update(wallet_address.as_bytes()); // Critical: include wallet
-        hasher.update(&signature.timestamp.to_le_bytes()); // Include timestamp
-        hasher.update(b"QNET_DILITHIUM_V5"); // Version tag
-        let message_hash = hasher.finalize();
-
-        // 4. QUANTUM-RESISTANT VERIFICATION using Blake3 (Dilithium-compatible approach)
-        // In production: This would use actual CRYSTALS-Dilithium
-        // For now: Use quantum-resistant Blake3 with proper security properties
-        let mut verification_key_hasher = blake3::Hasher::new();
-        verification_key_hasher.update(&message_hash);
-        verification_key_hasher.update(wallet_address.as_bytes());
-        verification_key_hasher.update(b"QNET_VERIFICATION_KEY_V2");
-        let verification_key = verification_key_hasher.finalize();
-
-        // 5. Generate expected signature using same algorithm as wallet generation
-        let mut signature_hasher = blake3::Hasher::new();
-        signature_hasher.update(verification_key.as_bytes());
-        signature_hasher.update(data.as_bytes());
-        signature_hasher.update(wallet_address.as_bytes());
-        signature_hasher.update(b"QNET_SIGNATURE_VERIFICATION");
-        let expected_signature = signature_hasher.finalize();
-
-        // 6. Constant-time comparison to prevent timing attacks
+        hasher.update(signature_data.as_bytes());
+        hasher.update(b"QNET_CONSENSUS_SIG");
+        let expected_signature_hash = hasher.finalize();
+        
+        // 4. Compare first 64 bytes (same as in create_consensus_signature)
+        let expected_signature_bytes = &expected_signature_hash[..64];
+        
+        // 5. Constant-time comparison to prevent timing attacks
         let signature_valid = Self::constant_time_compare(
-            &signature_bytes[..32], 
-            &expected_signature.as_bytes()[..32]
+            &signature_bytes[..64.min(signature_bytes.len())], 
+            expected_signature_bytes
         );
 
         if signature_valid {
