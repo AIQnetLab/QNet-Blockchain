@@ -1536,8 +1536,8 @@ impl BlockchainNode {
                 }
             }
             
-            println!("[Node] ⚡ Starting microblock production (1-second intervals)");
-            self.start_microblock_production().await;
+        println!("[Node] ⚡ Starting microblock production (1-second intervals)");
+        self.start_microblock_production().await;
         } else {
             println!("[Node] 📱 Light node: Sync-only mode (no block production)");
             // Light nodes will sync through P2P received blocks
@@ -2484,7 +2484,7 @@ impl BlockchainNode {
                     };
                     
                     if let Ok(_) = save_result {
-                        println!("[Storage] ✅ Microblock {} saved with delta/compression", height_for_storage);
+                                println!("[Storage] ✅ Microblock {} saved with delta/compression", height_for_storage);
                         
                         // Now spawn async task for rotation tracking
                         tokio::spawn(async move {
@@ -2514,7 +2514,7 @@ impl BlockchainNode {
                             }
                         }
                         });
-                    } else {
+                                } else {
                         println!("[Storage] ❌ Failed to save microblock #{}: {:?}", height_for_storage, save_result.err());
                         // Continue anyway - block will be retried
                     }
@@ -2544,11 +2544,11 @@ impl BlockchainNode {
                             p2p.broadcast_block(height_for_broadcast, broadcast_data)
                         };
                         
-                        // Log only errors or every 10th block
-                        if result.is_err() || height_for_broadcast % 10 == 0 {
-                            println!("[P2P] 📡 Block #{} broadcast: {:?} | {} peers | {} bytes", 
-                                     height_for_broadcast, result.is_ok(), peer_count, broadcast_size);
-                        }
+                            // Log only errors or every 10th block
+                            if result.is_err() || height_for_broadcast % 10 == 0 {
+                                println!("[P2P] 📡 Block #{} broadcast: {:?} | {} peers | {} bytes", 
+                                         height_for_broadcast, result.is_ok(), peer_count, broadcast_size);
+                            }
                     } else {
                         println!("[P2P] ⚠️ P2P system not available - cannot broadcast block #{}", microblock.height);
                     }
@@ -2743,20 +2743,20 @@ impl BlockchainNode {
                         }
                         
                         // Continue to production code (will produce block)
-                    } else {
-                        // PRODUCTION: This node is NOT the selected producer - synchronize with network
-                        // CPU OPTIMIZATION: Only log every 10th block to reduce IO load
-                        if microblock_height % 10 == 0 {
-                            println!("[MICROBLOCK] 👥 Waiting for block #{} from producer: {}", microblock_height + 1, current_producer);
-                        }
-                        
-                        // Update is_leader for backward compatibility
-                        *is_leader.write().await = false;
+                } else {
+                    // PRODUCTION: This node is NOT the selected producer - synchronize with network
+                    // CPU OPTIMIZATION: Only log every 10th block to reduce IO load
+                    if microblock_height % 10 == 0 {
+                    println!("[MICROBLOCK] 👥 Waiting for block #{} from producer: {}", microblock_height + 1, current_producer);
+                    }
+                    
+                    // Update is_leader for backward compatibility
+                    *is_leader.write().await = false;
                     }
                     
                     // Skip sync if we're about to produce emergency block
                     if !should_produce_emergency {
-                        // EXISTING: Non-blocking background sync as promised in line 868 comments
+                    // EXISTING: Non-blocking background sync as promised in line 868 comments
                     if let Some(p2p) = &unified_p2p {
                         // SYNC FIX: Prevent multiple parallel syncs using atomic flag
                         static SYNC_IN_PROGRESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -2859,17 +2859,17 @@ impl BlockchainNode {
                             
                             // Only start timeout detection if we're reasonably in sync (within 10 blocks)
                             if network_height == 0 || expected_height_timeout <= network_height + 10 {
-                                // EXISTING: Use same async timeout pattern as macroblock failover (line 1205)
-                                tokio::spawn(async move {
-                                    tokio::time::sleep(microblock_timeout).await;
-                                    
-                                    // Check if block was received during timeout period
-                                    let block_exists = match storage_timeout.load_microblock(expected_height_timeout) {
-                                        Ok(Some(_)) => true,
-                                        _ => false,
-                                    };
-                                    
-                                    if !block_exists {
+                            // EXISTING: Use same async timeout pattern as macroblock failover (line 1205)
+                            tokio::spawn(async move {
+                                tokio::time::sleep(microblock_timeout).await;
+                                
+                                // Check if block was received during timeout period
+                                let block_exists = match storage_timeout.load_microblock(expected_height_timeout) {
+                                    Ok(Some(_)) => true,
+                                    _ => false,
+                                };
+                                
+                                if !block_exists {
                                         // CRITICAL FIX: Adaptive timeout based on network conditions
                                         // Synchronous broadcast should arrive faster, but network delays still exist
                                         let timeout_duration = if expected_height_timeout == 1 { 
@@ -2879,8 +2879,8 @@ impl BlockchainNode {
                                         } else {
                                             7   // Normal operation: 7 seconds (was 5, too aggressive)
                                         };
-                                        println!("[FAILOVER] 🚨 Microblock #{} not received after {}s timeout from producer: {}", 
-                                                 expected_height_timeout, timeout_duration, current_producer_timeout);
+                                    println!("[FAILOVER] 🚨 Microblock #{} not received after {}s timeout from producer: {}", 
+                                             expected_height_timeout, timeout_duration, current_producer_timeout);
                                     
                                     // EXISTING: Use same emergency selection as implemented in select_emergency_producer (line 1534)
                                     let emergency_producer = crate::node::BlockchainNode::select_emergency_producer(
@@ -6018,7 +6018,7 @@ impl BlockchainNode {
                 Some(addr)
             } else {
                 // Fallback for Genesis nodes
-                let peers = p2p.get_validated_active_peers();
+            let peers = p2p.get_validated_active_peers();
                 peers.iter().find(|p| p.id == requester_id).map(|p| p.addr.clone())
             };
             

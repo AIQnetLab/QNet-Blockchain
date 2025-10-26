@@ -1826,11 +1826,11 @@ impl SimplifiedP2P {
                     use std::time::Duration;
                     
                     // Create message
-                    let block_msg = NetworkMessage::Block {
-                        height,
+                let block_msg = NetworkMessage::Block {
+                    height,
                         data: (*block_data_clone).clone(),
-                        block_type: "micro".to_string(),
-                    };
+                    block_type: "micro".to_string(),
+                };
                     
                     // Serialize
                     let message_json = match serde_json::to_value(&block_msg) {
@@ -5348,7 +5348,7 @@ impl SimplifiedP2P {
                 // Handle incoming Turbine chunk
                 self.handle_turbine_chunk(from_peer, chunk);
             }
-            
+
             NetworkMessage::EmergencyProducerChange { failed_producer, new_producer, block_height, change_type, timestamp } => {
                 // PRIVACY: Use privacy-preserving IDs for producer changes
                 // CRITICAL FIX: Don't double-convert if already a pseudonym (genesis_node_XXX or node_XXX)
@@ -6271,7 +6271,7 @@ impl SimplifiedP2P {
         
         Ok(())
     }
-    
+
     /// Send network message via HTTP POST to peer's API (with pseudonym resolution)
     pub fn send_network_message(&self, peer_addr: &str, message: NetworkMessage) {
         let peer_addr = peer_addr.to_string();

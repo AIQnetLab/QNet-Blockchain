@@ -835,7 +835,7 @@ const WalletScreen = () => {
   
   // Background sync activation codes - check periodically until found
   useEffect(() => {
-    if (wallet && wallet.publicKey && password) {
+        if (wallet && wallet.publicKey && password) {
       let syncInterval;
       
       // Sync in background without blocking UI
@@ -889,21 +889,21 @@ const WalletScreen = () => {
       let rewardsInterval;
       
       // Load rewards immediately
-      loadNodeRewards();
+        loadNodeRewards();
       
-      // Refresh rewards every 30 seconds
+        // Refresh rewards every 30 seconds
       rewardsInterval = setInterval(loadNodeRewards, 30000);
-      
-      // Start ping interval if not already running
-      if (!global.nodePingInterval) {
-        startNodePingInterval();
-      }
-      
+        
+        // Start ping interval if not already running
+        if (!global.nodePingInterval) {
+          startNodePingInterval();
+        }
+        
       // Cleanup function
       return () => {
         if (rewardsInterval) clearInterval(rewardsInterval);
       };
-    }
+      }
   }, [activeTab, activatedNodeType, activationCode]); // Load when tab opens and we have activation
   
   // Load dynamic pricing when on activate tab
@@ -1646,7 +1646,7 @@ const WalletScreen = () => {
       setTimeout(() => setUnlockError(''), 3000);
       return;
     }
-
+    
     // Quick password check first (fast)
     const isValid = await walletManager.verifyPassword(password);
     if (!isValid) {
@@ -1815,9 +1815,9 @@ const WalletScreen = () => {
     
     // Then try to fetch real prices in background
     setTimeout(async () => {
-      try {
-        // Only fetch prices if wallet is loaded
-        if (!wallet) return;
+    try {
+      // Only fetch prices if wallet is loaded
+      if (!wallet) return;
         
         // Helper function to fetch with timeout (1 second)
         const fetchWithTimeout = async (url, timeout = 1000) => {
@@ -1833,34 +1833,34 @@ const WalletScreen = () => {
             throw error;
           }
         };
-        
-        // Fetch real prices from CoinGecko API
+      
+      // Fetch real prices from CoinGecko API
         const prices = { qnc: 0.0125, sol: 150.00, '1dev': 0.0001 };
-        
+      
         // Fetch SOL price with timeout
-        try {
+      try {
           const solResponse = await fetchWithTimeout('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
-          if (solResponse.ok) {
-            const solData = await solResponse.json();
+        if (solResponse.ok) {
+          const solData = await solResponse.json();
             prices.sol = solData.solana?.usd || 150.00;
             setTokenPrices(prev => ({ ...prev, sol: prices.sol }));
-          }
-        } catch (e) {
+        }
+      } catch (e) {
           // Silently fail, use fallback
         }
         
         // Fetch 1DEV price (if available) with timeout
         try {
           const devResponse = await fetchWithTimeout('https://api.coingecko.com/api/v3/simple/price?ids=1dev&vs_currencies=usd');
-          if (devResponse.ok) {
-            const devData = await devResponse.json();
-            prices['1dev'] = devData['1dev']?.usd || 0.0001;
+        if (devResponse.ok) {
+          const devData = await devResponse.json();
+          prices['1dev'] = devData['1dev']?.usd || 0.0001;
             setTokenPrices(prev => ({ ...prev, '1dev': prices['1dev'] }));
-          }
-        } catch (e) {
-          // Silently fail, use fallback
         }
-      } catch (error) {
+      } catch (e) {
+          // Silently fail, use fallback
+      }
+    } catch (error) {
         // Silently fail, fallback prices already set
       }
     }, 100); // Small delay to not block UI
@@ -2796,11 +2796,11 @@ const WalletScreen = () => {
                 <View style={styles.tokenItem}>
                   <View style={styles.tokenInfo}>
                     <View style={styles.tokenIcon}>
-                      <Image 
+                        <Image 
                         source={require('../../assets/qnet_logo.png')}
-                        style={styles.tokenIconImage}
-                        resizeMode="contain"
-                      />
+                          style={styles.tokenIconImage}
+                          resizeMode="contain"
+                        />
                     </View>
                     <View style={styles.tokenDetails}>
                       <Text style={styles.tokenName}>QNC</Text>
@@ -3540,19 +3540,19 @@ const WalletScreen = () => {
                         <>
                           <Text style={styles.nodeMonitoringLabel}>Node name:</Text>
                           <Text style={styles.nodeMonitoringValue}>
-                            {nodePseudonym}
-                          </Text>
+                          {nodePseudonym}
+                        </Text>
                           <View style={{marginTop: 12}}>
                             <Text style={styles.nodeMonitoringLabel}>Type of node:</Text>
-                            <Text style={styles.nodeMonitoringValue}>
+                    <Text style={styles.nodeMonitoringValue}>
                               {activatedNodeType.charAt(0).toUpperCase() + activatedNodeType.slice(1)} Node
-                            </Text>
-                          </View>
+                    </Text>
+                  </View>
                         </>
                       ) : (
                         <Text style={styles.nodeMonitoringTitle}>
                           {activatedNodeType.charAt(0).toUpperCase() + activatedNodeType.slice(1)} Node
-                        </Text>
+                    </Text>
                       )}
                     </View>
                     <View style={[styles.statusBadge, nodePseudonym ? styles.statusBadgeActivated : styles.statusBadgeActive]}>
@@ -3574,17 +3574,17 @@ const WalletScreen = () => {
                         </Text>
                       </TouchableOpacity>
                     ) : (
-                      <TouchableOpacity 
-                        style={[styles.button, styles.secondaryButton]}
-                        onPress={() => {
-                          setShowActivationInput(true);
-                          setActivationInputCode(''); // Don't pre-fill the code!
-                        }}
-                      >
-                        <Text style={[styles.buttonText, styles.secondaryButtonText]}>
-                          Activate Node
-                        </Text>
-                      </TouchableOpacity>
+                    <TouchableOpacity 
+                      style={[styles.button, styles.secondaryButton]}
+                      onPress={() => {
+                        setShowActivationInput(true);
+                        setActivationInputCode(''); // Don't pre-fill the code!
+                      }}
+                    >
+                      <Text style={[styles.buttonText, styles.secondaryButtonText]}>
+                        Activate Node
+                      </Text>
+                    </TouchableOpacity>
                     )
                   ) : (
                     <View style={styles.serverActivationNotice}>
@@ -3664,7 +3664,7 @@ const WalletScreen = () => {
       case 'settings':
         return (
           <ScrollView 
-            style={styles.content}
+            style={styles.content} 
             contentContainerStyle={styles.scrollContentContainer}
             showsVerticalScrollIndicator={true}
             bounces={true}

@@ -509,15 +509,25 @@ impl QNetQuantumCrypto {
         }
 
         // 2. Parse signature format: "dilithium_sig_<node_id>_<base64>"
-        // CRITICAL FIX: signature.signature is a formatted string, not encoded bytes
-        let parts: Vec<&str> = signature.signature.split('_').collect();
-        if parts.len() < 4 || parts[0] != "dilithium" || parts[1] != "sig" {
+        // CRITICAL FIX: Find the LAST underscore to separate node_id from base64
+        // Format: "dilithium_sig_<node_id>_<base64>" where node_id can contain underscores
+        
+        if !signature.signature.starts_with("dilithium_sig_") {
             return Err(anyhow!("Invalid signature format: expected 'dilithium_sig_<node>_<base64>'"));
         }
         
-        // Extract base64 part (everything after third underscore)
-        let base64_part = parts[3..].join("_");
-        let signature_bytes = general_purpose::STANDARD.decode(&base64_part)
+        // Find the last underscore - everything after it is the base64 signature
+        let last_underscore_pos = signature.signature.rfind('_')
+            .ok_or_else(|| anyhow!("Invalid signature format: no underscore found"))?;
+        
+        // Extract base64 part (everything after the LAST underscore)
+        let base64_part = &signature.signature[last_underscore_pos + 1..];
+        
+        if base64_part.is_empty() {
+            return Err(anyhow!("Invalid signature format: empty base64 part"));
+        }
+        
+        let signature_bytes = general_purpose::STANDARD.decode(base64_part)
             .map_err(|e| anyhow!("Invalid base64 in signature: {}", e))?;
 
         if signature_bytes.len() < 64 {
