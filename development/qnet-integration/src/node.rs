@@ -4216,14 +4216,32 @@ impl BlockchainNode {
         // CRITICAL: Check if we're synchronized before participating in consensus
         // New nodes MUST sync before they can participate in macroblock creation
         let stored_height = storage.get_chain_height().unwrap_or(0);
+        
+        // CRITICAL FIX: Allow participation in EARLY consensus (30 blocks ahead for macroblock)
+        // Consensus for macroblock 90 starts at height 60 (30 blocks early)
+        // So we need to allow nodes that are within 30 blocks of the macroblock height
+        let consensus_lookahead = 30; // Consensus starts 30 blocks early (at block 60 for macroblock 90)
         let max_allowed_lag = if current_height <= 100 { 5 } else { 20 }; // Stricter during genesis
         
-        if stored_height + max_allowed_lag < current_height {
+        // Check if node is TOO FAR BEHIND (not synced)
+        if stored_height + max_allowed_lag + consensus_lookahead < current_height {
             println!("[CONSENSUS] ⚠️ Node not synchronized for consensus participation!");
-            println!("[CONSENSUS] 📊 Current height: {}, Expected: {} (max lag: {})", 
-                     stored_height, current_height, max_allowed_lag);
+            println!("[CONSENSUS] 📊 Current height: {}, Expected: {} (max lag: {} + lookahead: {})", 
+                     stored_height, current_height, max_allowed_lag, consensus_lookahead);
             return false; // Cannot initiate or participate if not synced
         }
+        
+        // Check if node is TOO FAR AHEAD (should not happen, but safety check)
+        if stored_height > current_height + consensus_lookahead {
+            println!("[CONSENSUS] ⚠️ Node is ahead of consensus round!");
+            println!("[CONSENSUS] 📊 Current height: {}, Consensus round: {}", 
+                     stored_height, current_height);
+            return false;
+        }
+        
+        // Node is within acceptable range for early consensus participation
+        println!("[CONSENSUS] ✅ Node synchronized for early consensus (height: {}, round: {})", 
+                 stored_height, current_height);
         
         // Get all qualified candidates using existing validator sampling system
         let mut qualified_candidates = Self::calculate_qualified_candidates(p2p, our_node_id, our_node_type).await;

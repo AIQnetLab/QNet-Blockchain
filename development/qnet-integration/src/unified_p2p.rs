@@ -5960,7 +5960,7 @@ impl SimplifiedP2P {
             // Request peer lists from limited set of connected nodes
             for peer in initial_peers.iter().take(max_exchange_peers) {
                 if let Ok(new_peers) = Self::request_peer_list_from_node(&peer.addr).await {
-                    println!("[P2P] 📡 Received {} new peers from {}", new_peers.len(), peer.addr);
+                    println!("[P2P] 📡 Received {} new peers from {}", new_peers.len(), get_privacy_id_for_addr(&peer.addr));
                     
                     // CRITICAL FIX: Use EXISTING add_peer_safe logic without duplication
                     if !new_peers.is_empty() {
@@ -6032,7 +6032,7 @@ impl SimplifiedP2P {
         let ip = node_addr.split(':').next().unwrap_or(node_addr);
         let endpoint = format!("http://{}:8001/api/v1/peers", ip);
         
-        println!("[P2P] 📞 Requesting peer list from {}", endpoint);
+        println!("[P2P] 📞 Requesting peer list from {}", get_privacy_id_for_addr(&ip));
         
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
@@ -6045,7 +6045,7 @@ impl SimplifiedP2P {
             Ok(response) if response.status().is_success() => {
                 match response.text().await {
                     Ok(text) => {
-                        println!("[P2P] ✅ Received peer data from {}: {} bytes", node_addr, text.len());
+                        println!("[P2P] ✅ Received peer data from {}: {} bytes", get_privacy_id_for_addr(node_addr), text.len());
                         
                         // Parse JSON response from /api/v1/peers endpoint
                         if let Ok(json_value) = serde_json::from_str::<serde_json::Value>(&text) {
@@ -6064,29 +6064,29 @@ impl SimplifiedP2P {
                                     }
                                 }
                                 
-                                println!("[P2P] 📡 Parsed {} peers from {}", peer_list.len(), node_addr);
+                                println!("[P2P] 📡 Parsed {} peers from {}", peer_list.len(), get_privacy_id_for_addr(node_addr));
                                 Ok(peer_list)
                             } else {
-                                println!("[P2P] ⚠️ No 'peers' array in response from {}", node_addr);
+                                println!("[P2P] ⚠️ No 'peers' array in response from {}", get_privacy_id_for_addr(node_addr));
                                 Ok(Vec::new())
                             }
                         } else {
-                            println!("[P2P] ⚠️ Failed to parse JSON response from {}", node_addr);
+                            println!("[P2P] ⚠️ Failed to parse JSON response from {}", get_privacy_id_for_addr(node_addr));
                             Ok(Vec::new())
                         }
                     }
                     Err(e) => {
-                        println!("[P2P] ❌ Failed to read response from {}: {}", node_addr, e);
+                        println!("[P2P] ❌ Failed to read response from {}: {}", get_privacy_id_for_addr(node_addr), e);
                         Err(format!("Response read error: {}", e))
                     }
                 }
             }
             Ok(response) => {
-                println!("[P2P] ❌ HTTP error from {}: {}", node_addr, response.status());
+                println!("[P2P] ❌ HTTP error from {}: {}", get_privacy_id_for_addr(node_addr), response.status());
                 Err(format!("HTTP error: {}", response.status()))
             }
             Err(e) => {
-                println!("[P2P] ❌ Request failed to {}: {}", node_addr, e);
+                println!("[P2P] ❌ Request failed to {}: {}", get_privacy_id_for_addr(node_addr), e);
                 Err(format!("Request failed: {}", e))
             }
         }
