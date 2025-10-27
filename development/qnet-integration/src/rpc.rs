@@ -4146,10 +4146,18 @@ async fn handle_producer_status(
     let is_leader = blockchain.is_leader().await; // REAL METHOD - NO STUB!
     let node_id = blockchain.get_node_id();
     
-    // Calculate next producer rotation
-    let leadership_round = current_height / 30;
-    let next_rotation = (leadership_round + 1) * 30;
-    let blocks_until_rotation = next_rotation - current_height;
+    // Calculate next producer rotation using SAME formula as node.rs
+    let leadership_round = if current_height == 0 {
+        0  // Genesis block special case
+    } else {
+        (current_height + 29) / 30 - 1  // Same formula as select_microblock_producer
+    };
+    let next_rotation = (leadership_round + 1) * 30 + 1;  // Round N ends at N*30+30, next starts at N*30+31
+    let blocks_until_rotation = if current_height == 0 {
+        31 - current_height  // Special case for genesis
+    } else {
+        next_rotation - current_height
+    };
     
     let status = json!({
         "current_height": current_height,

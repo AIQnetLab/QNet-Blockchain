@@ -3329,9 +3329,18 @@ impl BlockchainNode {
             } else {
                 leadership_round * rotation_interval  // Last block of previous round
             };
-                let prev_hash = Self::get_previous_microblock_hash(store, entropy_height).await;
+                // CRITICAL FIX: get_previous_microblock_hash loads block (height-1)
+                // But for entropy we need the EXACT block at entropy_height
+                // So we pass entropy_height + 1 to get the correct block
+                let prev_hash = if entropy_height == 0 {
+                    // Genesis block special case - no previous block
+                    Self::get_previous_microblock_hash(store, 1).await  // Will return hash of block 0
+                } else {
+                    // For entropy_height=30, we need block 30, so pass 31 to get hash of block 30
+                    Self::get_previous_microblock_hash(store, entropy_height + 1).await
+                };
                 println!("[CONSENSUS] 🎲 Using entropy from block #{} hash: {:x}", 
-                         if entropy_height > 0 { entropy_height - 1 } else { 0 }, 
+                         entropy_height,  // Log the actual entropy block number
                          u64::from_le_bytes([prev_hash[0], prev_hash[1], prev_hash[2], prev_hash[3], 
                                             prev_hash[4], prev_hash[5], prev_hash[6], prev_hash[7]]));
                 prev_hash
