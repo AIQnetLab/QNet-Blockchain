@@ -2850,10 +2850,10 @@ impl BlockchainNode {
                             // At rotation boundary, be extra careful
                             if storage.load_microblock(next_height).unwrap_or(None).is_some() {
                                 microblock_height = next_height;
-                                {
-                                    let mut global_height = height.write().await;
-                                    *global_height = microblock_height;
-                                }
+                            {
+                                let mut global_height = height.write().await;
+                                *global_height = microblock_height;
+                            }
                                 println!("[SYNC] ✅ Found local block #{} - advancing to #{}", expected_height, microblock_height);
                             } else if is_rotation_boundary {
                                 println!("[SYNC] ⏸️ At rotation boundary block #{} - waiting for next producer", expected_height);
@@ -2928,8 +2928,8 @@ impl BlockchainNode {
                                         // Invalidate producer cache to force new selection
                                         crate::node::BlockchainNode::invalidate_producer_cache();
                                     } else {
-                                        println!("[FAILOVER] 🚨 Microblock #{} not received after {}s timeout from producer: {}", 
-                                                 expected_height_timeout, timeout_duration, current_producer_timeout);
+                                    println!("[FAILOVER] 🚨 Microblock #{} not received after {}s timeout from producer: {}", 
+                                             expected_height_timeout, timeout_duration, current_producer_timeout);
                                     }
                                     
                                     // EXISTING: Use same emergency selection as implemented in select_emergency_producer (line 1534)
@@ -3232,12 +3232,14 @@ impl BlockchainNode {
             // PERFORMANCE FIX: Cache producer selection for entire 30-block period to prevent HTTP spam
             // Producer is SAME for all blocks in rotation period (blocks 1-30, 31-60, etc.)
             let rotation_interval = 30u64; // EXISTING: 30-block rotation from MICROBLOCK_ARCHITECTURE_PLAN.md
-            // CRITICAL FIX: Genesis block (0) is special, real rotation starts from block 1
+            // CRITICAL FIX: Proper round calculation for blocks 1-30, 31-60, 61-90...
             // Round 0: blocks 1-30, Round 1: blocks 31-60, Round 2: blocks 61-90, etc.
             let leadership_round = if current_height == 0 {
-                0  // Genesis block - special case
+                0  // Genesis block - special case, not part of regular rotation
             } else {
-                (current_height - 1) / rotation_interval  // Blocks 1-30 = round 0, 31-60 = round 1
+                // Formula: (height + 29) / 30 - 1
+                // This ensures: 1-30 → round 0, 31-60 → round 1, 61-90 → round 2
+                (current_height + 29) / rotation_interval - 1
             };
             
             // CRITICAL: Use shared module-level cache to prevent duplication
@@ -3253,10 +3255,13 @@ impl BlockchainNode {
             if let Ok(cache) = producer_cache.lock() {
                 if let Some((cached_producer, cached_candidates)) = cache.get(&leadership_round) {
                     // EXISTING: Log only at rotation boundaries for performance
-                    if current_height % rotation_interval == 0 {
+                    // Rotation happens at blocks 31, 61, 91... (not 30, 60, 90)
+                    if current_height > 0 && ((current_height - 1) % rotation_interval == 0 || current_height == 1) {
                         // Using cached producer selection
+                        // Next rotation: Round 0 → 31, Round 1 → 61, Round 2 → 91...
+                        let next_rotation_block = (leadership_round + 1) * rotation_interval + 1;
                         println!("[MICROBLOCK] 🎯 Producer: {} (round: {}, CACHED SELECTION, next rotation: block {})", 
-                                 cached_producer, leadership_round, (leadership_round + 1) * rotation_interval);
+                                 cached_producer, leadership_round, next_rotation_block);
                     }
                     return cached_producer.clone();
                 }
@@ -3305,18 +3310,25 @@ impl BlockchainNode {
             // CRITICAL FIX: Add entropy from previous block hash for true randomness
             // This prevents deterministic selection when all nodes have same reputation
             let entropy_source = if let Some(store) = storage {
-                // Get hash of last block from PREVIOUS round for consistency
-                // All nodes in the round will use the same previous block hash as entropy
-                let round_start_block = leadership_round * rotation_interval;
-                // Use the last block of previous round as entropy source
-                // For round 0 (blocks 0-29): use genesis block hash
-                // For round 1 (blocks 30-59): use block 29 hash 
-                // For round 2 (blocks 60-89): use block 59 hash, etc.
-                let entropy_height = if round_start_block > 0 { 
-                    round_start_block  // This will get hash of block (round_start_block - 1)
-                } else { 
-                    0  // CRITICAL FIX: Use Genesis block (0) for Round 0, not block 1 which doesn't exist yet!
-                };
+            // Get hash of last block from PREVIOUS round for consistency
+            // All nodes in the round will use the same previous block hash as entropy
+            // CRITICAL FIX: Correct calculation of round boundaries
+            // Round 0 starts at block 1, Round 1 at block 31, Round 2 at block 61...
+            let round_start_block = if leadership_round == 0 {
+                1  // Round 0 starts at block 1 (after genesis)
+            } else {
+                leadership_round * rotation_interval + 1  // Round N starts at N*30 + 1
+            };
+            
+            // Use the last block of previous round as entropy source
+            // For round 0 (blocks 1-30): use genesis block (0) hash
+            // For round 1 (blocks 31-60): use block 30 hash 
+            // For round 2 (blocks 61-90): use block 60 hash, etc.
+            let entropy_height = if leadership_round == 0 {
+                0  // Use Genesis block for Round 0 entropy
+            } else {
+                leadership_round * rotation_interval  // Last block of previous round
+            };
                 let prev_hash = Self::get_previous_microblock_hash(store, entropy_height).await;
                 println!("[CONSENSUS] 🎲 Using entropy from block #{} hash: {:x}", 
                          if entropy_height > 0 { entropy_height - 1 } else { 0 }, 
@@ -3463,11 +3475,14 @@ impl BlockchainNode {
                 cache.retain(|k, _| rounds_to_keep.contains(k));
             }
             
-            // PRODUCTION: Log producer selection info ONLY at rotation boundaries (every 30 blocks) for performance
-            if current_height % rotation_interval == 0 {
+            // PRODUCTION: Log producer selection info ONLY at rotation boundaries for performance
+            // Rotation happens at blocks 31, 61, 91... (not 30, 60, 90)
+            if current_height > 0 && ((current_height - 1) % rotation_interval == 0 || current_height == 1) {
                 // New round - cryptographic producer selection
+                // Next rotation: Round 0 → 31, Round 1 → 61, Round 2 → 91...
+                let next_rotation_block = (leadership_round + 1) * rotation_interval + 1;
                 println!("[MICROBLOCK] 🎯 Producer: {} (round: {}, CRYPTOGRAPHIC SELECTION, next rotation: block {})", 
-                         final_producer, leadership_round, (leadership_round + 1) * rotation_interval);
+                         final_producer, leadership_round, next_rotation_block);
             }
             
             final_producer
