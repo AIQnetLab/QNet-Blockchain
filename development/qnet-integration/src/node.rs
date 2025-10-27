@@ -1921,26 +1921,38 @@ impl BlockchainNode {
                             if !FAST_SYNC_IN_PROGRESS.swap(true, std::sync::atomic::Ordering::SeqCst) {
                                 println!("[SYNC] ⚡ FAST SYNC MODE: {} blocks behind, catching up...", height_difference);
                                 
-                                // Update our height to catch up quickly
-                                microblock_height = network_height;
-                                *height.write().await = microblock_height;
+                                // CRITICAL FIX: Do NOT update height before syncing blocks!
+                                // This prevents chain breaks where node thinks it's at height X without having the blocks
+                                // IMPORTANT: Handle rotation boundaries carefully (every 30 blocks)
+                                let sync_from_height = if microblock_height < network_height {
+                                    // Check if we're at rotation boundary where sync might fail
+                                    let is_rotation_boundary = (microblock_height % 30) == 0 && microblock_height > 0;
+                                    if is_rotation_boundary {
+                                        // At rotation boundary, be conservative - sync current height
+                                        microblock_height
+                                    } else {
+                                        microblock_height + 1  // Normal case: sync next block
+                                    }
+                                } else {
+                                    microblock_height      // We're at same height or ahead
+                                };
+                                let sync_to_height = network_height;
                                 
                                 // Trigger immediate sync download
                                 let p2p_clone = p2p.clone();
                                 let storage_clone = storage.clone();
-                                let current_height = microblock_height.saturating_sub(10); // Sync last 10 blocks
                                 
                                 tokio::spawn(async move {
                                     // PRODUCTION: Guard ensures flag is cleared even on panic/error
                                     let _guard = FastSyncGuard;
                                     
-                                    println!("[SYNC] 🚀 Fast downloading blocks {}-{}", current_height, network_height);
+                                    println!("[SYNC] 🚀 Fast downloading blocks {}-{}", sync_from_height, sync_to_height);
                                     
                                     // TIMEOUT PROTECTION: Add 60-second timeout for entire sync operation
                                     // PRODUCTION: Use parallel download for faster sync
                                     let sync_result = tokio::time::timeout(
                                         Duration::from_secs(60),
-                                        p2p_clone.parallel_download_microblocks(&storage_clone, current_height, network_height)
+                                        p2p_clone.parallel_download_microblocks(&storage_clone, sync_from_height, sync_to_height)
                                     ).await;
                                     
                                     match sync_result {
@@ -2827,13 +2839,22 @@ impl BlockchainNode {
                         // FIX: For non-producer, expected height is CURRENT height, not +1
                         let expected_height = microblock_height;
                         if let Ok(Some(_)) = storage.load_microblock(expected_height) {
-                            // Block already exists locally, move to next
-                            microblock_height = expected_height + 1;
-                            {
-                                let mut global_height = height.write().await;
-                                *global_height = microblock_height;
+                            // Block already exists locally
+                            // IMPORTANT: Only increment if we also have the NEXT block or if we're not at rotation boundary
+                            let next_height = expected_height + 1;
+                            let is_rotation_boundary = (expected_height % 30) == 0 && expected_height > 0;
+                            
+                            // Only move forward if next block exists OR we're not at rotation boundary
+                            if !is_rotation_boundary || storage.load_microblock(next_height).unwrap_or(None).is_some() {
+                                microblock_height = next_height;
+                                {
+                                    let mut global_height = height.write().await;
+                                    *global_height = microblock_height;
+                                }
+                                println!("[SYNC] ✅ Found local block #{} - advancing to #{}", expected_height, microblock_height);
+                            } else {
+                                println!("[SYNC] ⏸️ At rotation boundary block #{} - waiting for next producer", expected_height);
                             }
-                            println!("[SYNC] ✅ Found local block #{} - no network sync needed", expected_height);
                             
                             // CRITICAL FIX: Do NOT reset timing - breaks precision intervals
                             // Timing controlled at end of loop only
