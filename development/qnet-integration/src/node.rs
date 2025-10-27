@@ -1926,7 +1926,8 @@ impl BlockchainNode {
                                 // IMPORTANT: Handle rotation boundaries carefully (every 30 blocks)
                                 let sync_from_height = if microblock_height < network_height {
                                     // Check if we're at rotation boundary where sync might fail
-                                    let is_rotation_boundary = (microblock_height % 30) == 0 && microblock_height > 0;
+                                    // Rotation happens after blocks 30, 60, 90... (not block 0 which is genesis)
+                                    let is_rotation_boundary = microblock_height > 0 && (microblock_height % 30) == 0;
                                     if is_rotation_boundary {
                                         // At rotation boundary, be conservative - sync current height
                                         microblock_height
@@ -2840,20 +2841,24 @@ impl BlockchainNode {
                         let expected_height = microblock_height;
                         if let Ok(Some(_)) = storage.load_microblock(expected_height) {
                             // Block already exists locally
-                            // IMPORTANT: Only increment if we also have the NEXT block or if we're not at rotation boundary
+                            // IMPORTANT: Only increment if we have the NEXT block
                             let next_height = expected_height + 1;
-                            let is_rotation_boundary = (expected_height % 30) == 0 && expected_height > 0;
+                            // Rotation boundary check: blocks 30, 60, 90... (not genesis block 0)
+                            let is_rotation_boundary = expected_height > 0 && (expected_height % 30) == 0;
                             
-                            // Only move forward if next block exists OR we're not at rotation boundary
-                            if !is_rotation_boundary || storage.load_microblock(next_height).unwrap_or(None).is_some() {
+                            // FIX: Proper logic - advance only if next block exists
+                            // At rotation boundary, be extra careful
+                            if storage.load_microblock(next_height).unwrap_or(None).is_some() {
                                 microblock_height = next_height;
                                 {
                                     let mut global_height = height.write().await;
                                     *global_height = microblock_height;
                                 }
                                 println!("[SYNC] ✅ Found local block #{} - advancing to #{}", expected_height, microblock_height);
-                            } else {
+                            } else if is_rotation_boundary {
                                 println!("[SYNC] ⏸️ At rotation boundary block #{} - waiting for next producer", expected_height);
+                            } else {
+                                println!("[SYNC] ⏳ Waiting for block #{} from producer {}", next_height, current_producer);
                             }
                             
                             // CRITICAL FIX: Do NOT reset timing - breaks precision intervals
@@ -2884,11 +2889,21 @@ impl BlockchainNode {
                             // This prevents false failovers during startup when nodes are catching up
                             let network_height = p2p_timeout.sync_blockchain_height().unwrap_or(0);
                             
+                            // ROTATION DEADLOCK DETECTION: Special handling at rotation boundaries
+                            // Rotation happens at blocks 30, 60, 90... (not genesis block 0)
+                            let is_rotation_boundary = expected_height_timeout > 0 && (expected_height_timeout % 30) == 0;
+                            let rotation_timeout = if is_rotation_boundary {
+                                // Double timeout at rotation boundaries to account for producer switch
+                                Duration::from_secs(30)
+                            } else {
+                                microblock_timeout
+                            };
+                            
                             // Only start timeout detection if we're reasonably in sync (within 10 blocks)
                             if network_height == 0 || expected_height_timeout <= network_height + 10 {
                             // EXISTING: Use same async timeout pattern as macroblock failover (line 1205)
                             tokio::spawn(async move {
-                                tokio::time::sleep(microblock_timeout).await;
+                                tokio::time::sleep(rotation_timeout).await;
                                 
                                 // Check if block was received during timeout period
                                 let block_exists = match storage_timeout.load_microblock(expected_height_timeout) {
@@ -2906,8 +2921,16 @@ impl BlockchainNode {
                                         } else {
                                             7   // Normal operation: 7 seconds (was 5, too aggressive)
                                         };
-                                    println!("[FAILOVER] 🚨 Microblock #{} not received after {}s timeout from producer: {}", 
-                                             expected_height_timeout, timeout_duration, current_producer_timeout);
+                                    // Special logging for rotation boundaries
+                                    if is_rotation_boundary {
+                                        println!("[FAILOVER] 🔄 ROTATION DEADLOCK: Block #{} not received after {}s timeout from producer: {}", 
+                                                 expected_height_timeout, timeout_duration, current_producer_timeout);
+                                        // Invalidate producer cache to force new selection
+                                        crate::node::BlockchainNode::invalidate_producer_cache();
+                                    } else {
+                                        println!("[FAILOVER] 🚨 Microblock #{} not received after {}s timeout from producer: {}", 
+                                                 expected_height_timeout, timeout_duration, current_producer_timeout);
+                                    }
                                     
                                     // EXISTING: Use same emergency selection as implemented in select_emergency_producer (line 1534)
                                     let emergency_producer = crate::node::BlockchainNode::select_emergency_producer(
@@ -3209,13 +3232,12 @@ impl BlockchainNode {
             // PERFORMANCE FIX: Cache producer selection for entire 30-block period to prevent HTTP spam
             // Producer is SAME for all blocks in rotation period (blocks 1-30, 31-60, etc.)
             let rotation_interval = 30u64; // EXISTING: 30-block rotation from MICROBLOCK_ARCHITECTURE_PLAN.md
-            // CRITICAL FIX: Exclude Genesis Block (height=0) from rotation rounds
-            // Round 0: blocks 1-30, Round 1: blocks 31-60, etc.
+            // CRITICAL FIX: Genesis block (0) is special, real rotation starts from block 1
+            // Round 0: blocks 1-30, Round 1: blocks 31-60, Round 2: blocks 61-90, etc.
             let leadership_round = if current_height == 0 {
-                // Genesis Block - special case, not part of rotation
-                0
+                0  // Genesis block - special case
             } else {
-                (current_height - 1) / rotation_interval
+                (current_height - 1) / rotation_interval  // Blocks 1-30 = round 0, 31-60 = round 1
             };
             
             // CRITICAL: Use shared module-level cache to prevent duplication
