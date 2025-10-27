@@ -2141,9 +2141,11 @@ impl BlockchainNode {
                 // CRITICAL: Set current block height for deterministic validator sampling
                 std::env::set_var("CURRENT_BLOCK_HEIGHT", microblock_height.to_string());
                 
-                // Determine current microblock producer using cryptographic selection (with REAL node type)
+                // CRITICAL FIX: Select producer for the NEXT block to be created
+                // If we're at height 30, we need producer for block 31 (next block)
+                let next_block_height = microblock_height + 1;
                 let mut current_producer = Self::select_microblock_producer(
-                    microblock_height, 
+                    next_block_height,  // Use NEXT height for producer selection
                     &unified_p2p, 
                     &node_id, 
                     node_type,
@@ -2152,9 +2154,9 @@ impl BlockchainNode {
                 let is_my_turn_to_produce = current_producer == node_id;
                 
                 // DEBUG: Log producer selection for first blocks
-                if microblock_height <= 5 {
-                    println!("[DEBUG] Block #{}: producer={}, is_my_turn={}", 
-                            microblock_height, current_producer, is_my_turn_to_produce);
+                if next_block_height <= 5 {
+                    println!("[DEBUG] For block #{}: producer={}, is_my_turn={}", 
+                            next_block_height, current_producer, is_my_turn_to_produce);
                 }
                 
                 if is_my_turn_to_produce {
@@ -2214,7 +2216,7 @@ impl BlockchainNode {
                         if let Some(p2p) = &unified_p2p {
                         let emergency_producer = Self::select_emergency_producer(
                             &node_id,
-                            microblock_height,
+                            next_block_height,  // Use next block height for emergency selection
                             &Some(p2p.clone()),
                             &node_id,
                             node_type,
@@ -2349,14 +2351,14 @@ impl BlockchainNode {
                     tower_bft.update_peer_count(peer_count).await;
                     
                     // Log only every 10 blocks or when there are transactions
-                    if microblock_height % 10 == 0 || !txs.is_empty() {
+                    if next_block_height % 10 == 0 || !txs.is_empty() {
                         // PRODUCTION: Calculate real TPS with sharding
                         let shard_count = perf_config.shard_count;
                         let base_tps = txs.len() as f64;
                         let total_tps = base_tps * shard_count as f64;
                         
-                        println!("[BLOCK] 📦 Microblock #{} | Producer: {} | Peers: {} | TXs: {} | TPS: {:.0} ({:.0}×{} shards)", 
-                             microblock_height, node_id, peer_count, txs.len(), total_tps, base_tps, shard_count);
+                        println!("[BLOCK] 📦 Creating Microblock #{} | Producer: {} | Peers: {} | TXs: {} | TPS: {:.0} ({:.0}×{} shards)", 
+                             next_block_height, node_id, peer_count, txs.len(), total_tps, base_tps, shard_count);
                     }
                     
                     let consensus_result: Option<u64> = None; // NO consensus for microblocks - Byzantine consensus ONLY for macroblocks
@@ -2372,17 +2374,17 @@ impl BlockchainNode {
                         
                         // Calculate deterministic timestamp: genesis + (height * interval)
                         // This ensures ALL nodes calculate the SAME timestamp for the SAME block
-                        GENESIS_TIMESTAMP + (microblock_height * BLOCK_INTERVAL_SECONDS)
+                        GENESIS_TIMESTAMP + (next_block_height * BLOCK_INTERVAL_SECONDS)
                     };
                     
                     let mut microblock = qnet_state::MicroBlock {
-                        height: microblock_height,
+                        height: next_block_height,  // Use next_block_height instead of microblock_height
                         timestamp: deterministic_timestamp,  // DETERMINISTIC: Same on all nodes
                         transactions: txs.clone(),
                         producer: node_id.clone(), // Use node_id directly for consistency with failover messages
                         signature: vec![0u8; 64], // Will be filled with real signature
                         merkle_root: Self::calculate_merkle_root(&txs),
-                        previous_hash: Self::get_previous_microblock_hash(&storage, microblock_height).await,
+                        previous_hash: Self::get_previous_microblock_hash(&storage, next_block_height).await,  // Get hash for next block
                     };
                     
                     // QUANTUM PoH: Mix microblock into PoH chain for cryptographic time proof
@@ -2566,7 +2568,20 @@ impl BlockchainNode {
                         println!("[P2P] ⚠️ P2P system not available - cannot broadcast block #{}", microblock.height);
                     }
                     
-                    // CRITICAL FIX: NOW increment height AFTER broadcast completed
+                    // CRITICAL FIX: DO NOT increment height immediately after producing!
+                    // Producer should stay at same height until next iteration to maintain consensus
+                    // The height will be incremented in the next loop iteration when checking for blocks
+                    
+                    // Log that we created the block but stay at same height
+                    println!("[PRODUCER] ✅ Created block #{}, staying at height {} for consensus", 
+                             microblock.height, microblock_height);
+                    
+                    // ATOMIC REWARDS: Track block for rotation reward
+                    // Reward given at rotation completion, not per block
+                    rotation_tracker.track_block(microblock.height, &node_id).await;
+                    
+                    // CRITICAL: After creating block, increment height for next iteration
+                    // This ensures producer moves forward AFTER block is stored
                     microblock_height += 1;
                     
                     // Update global height for API sync
@@ -2574,16 +2589,14 @@ impl BlockchainNode {
                         let mut global_height = height.write().await;
                         *global_height = microblock_height;
                         
-                        // CRITICAL FIX: Update P2P local height for message filtering
+                        // Update P2P local height for message filtering
                         crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(
                             microblock_height, 
                             std::sync::atomic::Ordering::Relaxed
                         );
                     }
                     
-                    // ATOMIC REWARDS: Track block for rotation reward
-                    // Reward given at rotation completion, not per block
-                    rotation_tracker.track_block(microblock.height, &node_id).await;
+                    println!("[PRODUCER] 📈 Advanced to height {} for next iteration", microblock_height);
                     
                     // Check if rotation completed
                     if let Some((rotation_producer, blocks_created)) = 
@@ -2760,9 +2773,9 @@ impl BlockchainNode {
                 } else {
                     // PRODUCTION: This node is NOT the selected producer - synchronize with network
                     // CPU OPTIMIZATION: Only log every 10th block to reduce IO load
-                    if microblock_height % 10 == 0 {
-                    // CRITICAL FIX: When not producer, wait for CURRENT height, not +1
-                    println!("[MICROBLOCK] 👥 Waiting for block #{} from producer: {}", microblock_height, current_producer);
+                    if next_block_height % 10 == 0 {
+                    // CRITICAL FIX: When not producer, wait for NEXT block to be created
+                    println!("[MICROBLOCK] 👥 Waiting for block #{} from producer: {}", next_block_height, current_producer);
                     }
                     
                     // Update is_leader for backward compatibility
@@ -2837,47 +2850,40 @@ impl BlockchainNode {
                         }
                         
                         // CRITICAL: Check if we already have the next block locally
-                        // FIX: For non-producer, expected height is CURRENT height, not +1
-                        let expected_height = microblock_height;
+                        // FIX: For non-producer, expected height is NEXT block height
+                        let expected_height = next_block_height;
                         if let Ok(Some(_)) = storage.load_microblock(expected_height) {
-                            // Block already exists locally
-                            // IMPORTANT: Only increment if we have the NEXT block
-                            let next_height = expected_height + 1;
-                            // Rotation boundary check: blocks 30, 60, 90... (not genesis block 0)
-                            let is_rotation_boundary = expected_height > 0 && (expected_height % 30) == 0;
-                            
-                            // FIX: Proper logic - advance only if next block exists
-                            // At rotation boundary, be extra careful
-                            if storage.load_microblock(next_height).unwrap_or(None).is_some() {
-                                microblock_height = next_height;
+                            // Block already exists locally - advance to this height
+                            microblock_height = expected_height;
                             {
                                 let mut global_height = height.write().await;
                                 *global_height = microblock_height;
                             }
-                                println!("[SYNC] ✅ Found local block #{} - advancing to #{}", expected_height, microblock_height);
-                            } else if is_rotation_boundary {
-                                println!("[SYNC] ⏸️ At rotation boundary block #{} - waiting for next producer", expected_height);
-                            } else {
-                                println!("[SYNC] ⏳ Waiting for block #{} from producer {}", next_height, current_producer);
+                            println!("[SYNC] ✅ Found local block #{} - advancing to height {}", expected_height, microblock_height);
+                            
+                            // Rotation boundary check for logging
+                            let is_rotation_boundary = expected_height > 0 && (expected_height % 30) == 0;
+                            if is_rotation_boundary {
+                                println!("[SYNC] 🔄 Rotation boundary reached at block #{}", expected_height);
                             }
                             
                             // CRITICAL FIX: Do NOT reset timing - breaks precision intervals
                             // Timing controlled at end of loop only
                         } else {
                             // No local block - background sync will handle it with timeout detection
-                            // FIX: Wait for CURRENT height when not producer
-                            println!("[SYNC] ⏳ Waiting for background sync of block #{}", microblock_height);
+                            // FIX: Wait for NEXT block height when not producer
+                            println!("[SYNC] ⏳ Waiting for background sync of block #{}", next_block_height);
                             
                             // PRODUCTION: Use Tower BFT adaptive timeout
                             let retry_count = 0; // First attempt
-                            let microblock_timeout = tower_bft.get_timeout(microblock_height, retry_count).await;
-                            println!("[TowerBFT] ⏱️ Adaptive timeout for block #{}: {:?}", microblock_height, microblock_timeout);
+                            let microblock_timeout = tower_bft.get_timeout(next_block_height, retry_count).await;
+                            println!("[TowerBFT] ⏱️ Adaptive timeout for block #{}: {:?}", next_block_height, microblock_timeout);
                             let timeout_start = std::time::Instant::now();
                             
                             // Wait with timeout for producer block (same pattern as macroblock timeout in line 1201)
                             let mut timeout_triggered = false;
-                            // FIX: Use correct height for timeout
-                            let expected_height_timeout = microblock_height;
+                            // FIX: Use correct height for timeout - waiting for next block
+                            let expected_height_timeout = next_block_height;
                             let current_producer_timeout = current_producer.clone();
                             let storage_timeout = storage.clone();
                             let p2p_timeout = p2p.clone();
@@ -2935,7 +2941,7 @@ impl BlockchainNode {
                                     // EXISTING: Use same emergency selection as implemented in select_emergency_producer (line 1534)
                                     let emergency_producer = crate::node::BlockchainNode::select_emergency_producer(
                                         &current_producer_timeout,
-                                        expected_height_timeout - 1, // Current height for selection
+                                        expected_height_timeout, // Use expected height directly (already next block height)
                                         &Some(p2p_timeout.clone()),
                                         &node_id_timeout,
                                         node_type_timeout,
