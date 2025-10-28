@@ -10,6 +10,16 @@ pub const GENESIS_BOOTSTRAP_CODES: &[&str] = &[
     "QNET-BOOT-0005-STRAP",
 ];
 
+/// Genesis node wallet addresses (PRODUCTION)
+/// These are the predefined wallet addresses for Genesis nodes
+pub const GENESIS_WALLETS: &[(&str, &str)] = &[
+    ("001", "b07408bdc5688b92d69eonfd060d05f246f659414"), // Genesis Node #1
+    ("002", "5f7e69d299eb6046af7eonb8e632c67d83a8b96a0"), // Genesis Node #2  
+    ("003", "a3d62ef91e60d66d2a2eon2caa0d87cb2a1976f31"), // Genesis Node #3
+    ("004", "29e11b0a9cc89296490eoncca66139e40d72bd25d"), // Genesis Node #4
+    ("005", "f8c4ed54ad92b0a94f1eonad6cc5623af63b79826"), // Genesis Node #5
+];
+
 /// Genesis node IP addresses (PRODUCTION)
 /// These IPs are authorized to run Genesis nodes
 pub const GENESIS_NODE_IPS: &[(&str, &str)] = &[
@@ -70,5 +80,15 @@ pub fn get_genesis_region_by_ip(ip: &str) -> Option<&'static str> {
         "164.68.108.218" => Some("Europe"),      // Genesis Node #5 - Europe (CORRECTED)
         _ => None,
     }
+}
+
+/// Get Genesis wallet address by bootstrap ID (001-005)
+pub fn get_genesis_wallet_by_id(bootstrap_id: &str) -> Option<&'static str> {
+    for (id, wallet) in GENESIS_WALLETS {
+        if id == &bootstrap_id {
+            return Some(wallet);
+        }
+    }
+    None
 }
 

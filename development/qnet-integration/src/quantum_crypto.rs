@@ -229,14 +229,12 @@ impl QNetQuantumCrypto {
             let bootstrap_id = activation_code
                 .split('-')
                 .nth(2)
-                .unwrap_or("000")
-                .trim_start_matches('0');  // "0003" → "3"
+                .unwrap_or("000");  // Keep as "003" format
             
-            // CRITICAL: Use same wallet format as get_wallet_address() stub
-            // get_wallet_address() returns: format!("{}...eon", &self.node_id[..8])
-            // For genesis_node_003 → "genesis_...eon"
-            let genesis_node_id = format!("genesis_node_{:03}", bootstrap_id.parse::<u32>().unwrap_or(1));
-            let wallet = format!("{}...eon", &genesis_node_id[..8]);  // "genesis_...eon"
+            // Use predefined wallet from genesis_constants
+            let wallet = crate::genesis_constants::get_genesis_wallet_by_id(bootstrap_id)
+                .unwrap_or("b07408bdc5688b92d69eonfd060d05f246f659414") // Default to node 001 wallet
+                .to_string();
             
             // Return a dummy payload for genesis codes
             return Ok(ActivationPayload {

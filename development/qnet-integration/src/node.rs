@@ -56,6 +56,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 static SYNC_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static FAST_SYNC_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static NODE_IS_SYNCHRONIZED: AtomicBool = AtomicBool::new(false);
+
+// CRITICAL: Global storage for entropy responses during consensus verification
+lazy_static::lazy_static! {
+    static ref ENTROPY_RESPONSES: Mutex<std::collections::HashMap<(u64, String), [u8; 32]>> = Mutex::new(std::collections::HashMap::new());
+}
 use sha3::{Sha3_256, Digest};
 use serde_json;
 use bincode;
@@ -901,8 +906,40 @@ impl BlockchainNode {
         
         println!("[Node] 🔍 DEBUG: Creating BlockchainNode struct...");
         
-        // Initialize Quantum PoH with genesis hash
-        let genesis_hash = vec![0u8; 32]; // TODO: Use real genesis hash from storage
+        // Initialize Quantum PoH with real genesis hash
+        let genesis_hash = {
+            // Get actual genesis block (height 0) hash from storage
+            match storage.load_microblock(0) {
+                Ok(Some(genesis_data)) => {
+                    // Calculate SHA3-256 hash of genesis block
+                    use sha3::{Sha3_256, Digest};
+                    let mut hasher = Sha3_256::new();
+                    hasher.update(&genesis_data);
+                    let hash_result = hasher.finalize();
+                    let mut hash_vec = vec![0u8; 32];
+                    hash_vec.copy_from_slice(&hash_result);
+                    println!("[QuantumPoH] 📍 Using real genesis hash: {:x}", 
+                            u64::from_le_bytes([hash_vec[0], hash_vec[1], hash_vec[2], hash_vec[3],
+                                               hash_vec[4], hash_vec[5], hash_vec[6], hash_vec[7]]));
+                    hash_vec
+                },
+                _ => {
+                    // No genesis block yet - use deterministic genesis hash
+                    // This ensures all nodes start with the same PoH seed
+                    let deterministic_seed = "qnet_genesis_block_2024";
+                    use sha3::{Sha3_256, Digest};
+                    let mut hasher = Sha3_256::new();
+                    hasher.update(deterministic_seed.as_bytes());
+                    let hash_result = hasher.finalize();
+                    let mut hash_vec = vec![0u8; 32];
+                    hash_vec.copy_from_slice(&hash_result);
+                    println!("[QuantumPoH] 📍 Using deterministic genesis hash (no block 0 yet): {:x}",
+                            u64::from_le_bytes([hash_vec[0], hash_vec[1], hash_vec[2], hash_vec[3],
+                                               hash_vec[4], hash_vec[5], hash_vec[6], hash_vec[7]]));
+                    hash_vec
+                }
+            }
+        };
         let (quantum_poh, poh_receiver) = crate::quantum_poh::QuantumPoH::new(genesis_hash);
         let quantum_poh = Arc::new(quantum_poh);
         let poh_receiver = Arc::new(tokio::sync::Mutex::new(poh_receiver));
@@ -1008,14 +1045,15 @@ impl BlockchainNode {
                 let mut reward_manager = blockchain.reward_manager.write().await;
                 let genesis_node_id = format!("genesis_node_{}", bootstrap_id);
                 
-                // Generate deterministic wallet for Genesis node (placeholder until real wallets)
-                let mut hasher = Sha3_256::new();
-                hasher.update(format!("genesis_{}_wallet", bootstrap_id).as_bytes());
-                let wallet_hash = hasher.finalize();
-                let genesis_wallet = format!("genesis_wallet_{}_{}", 
-                    bootstrap_id, 
-                    hex::encode(&wallet_hash[..8])
-                );
+                // Use predefined wallet address for Genesis node
+                let genesis_wallet = match crate::genesis_constants::get_genesis_wallet_by_id(&bootstrap_id) {
+                    Some(wallet) => wallet.to_string(),
+                    None => {
+                        println!("❌ CRITICAL: No wallet found for Genesis node {}", bootstrap_id);
+                        // Genesis nodes MUST have predefined wallets
+                        panic!("FATAL: No predefined wallet for Genesis node {} - check GENESIS_WALLETS in genesis_constants.rs", bootstrap_id);
+                    }
+                };
                 
                 if let Err(e) = reward_manager.register_node(
                     genesis_node_id.clone(),
@@ -2202,7 +2240,13 @@ impl BlockchainNode {
                                 u64::from_le_bytes([our_entropy[0], our_entropy[1], our_entropy[2], our_entropy[3],
                                                    our_entropy[4], our_entropy[5], our_entropy[6], our_entropy[7]]));
                         
-                        // PRODUCTION: Query peers for their entropy via P2P messages
+                        // Clear old responses for this height
+                        {
+                            let mut responses = ENTROPY_RESPONSES.lock().unwrap();
+                            responses.retain(|(h, _), _| *h != entropy_height);
+                        }
+                        
+                        // PRODUCTION: Query peers for their entropy via P2P messages (ASYNC, non-blocking)
                         for peer in peers.iter().take(sample_size) {
                             // Send entropy request to peer
                             let entropy_request = crate::unified_p2p::NetworkMessage::EntropyRequest {
@@ -2217,20 +2261,82 @@ impl BlockchainNode {
                                 
                                 // Send request (async, response will come later)
                                 p2p.send_network_message(&peer_addr, entropy_request);
-                                
-                                // For now, assume match (real responses will update this)
-                                entropy_matches += 1;
                             }
                         }
                         
-                        // If majority disagrees with our entropy, we need to resync
-                        if entropy_mismatches > entropy_matches {
-                            println!("[CONSENSUS] ⚠️ Entropy mismatch detected! Majority of peers have different entropy");
-                            println!("[CONSENSUS] 🔄 Triggering resync to restore consensus");
-                            // In production: trigger resync of blocks around rotation boundary
-                        } else if sample_size > 0 {
-                            println!("[CONSENSUS] ✅ Entropy consensus verified with {} peers", sample_size);
-                        }
+                        // CRITICAL: DO NOT WAIT! Responses will be processed asynchronously
+                        // Verification happens in background without blocking block production
+                        println!("[CONSENSUS] 🔄 Sent entropy requests to {} peers - verification in background", sample_size);
+                        
+                        // Spawn async task to verify entropy after responses arrive
+                        let storage_clone = storage.clone();
+                        let p2p_clone = unified_p2p.clone();
+                        let our_entropy_clone = our_entropy.clone();
+                        let sample_size_clone = sample_size;
+                        tokio::spawn(async move {
+                            // Wait for responses in background (does not block block production)
+                            tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+                            
+                            let mut matches = 0;
+                            let mut mismatches = 0;
+                            
+                            // Check received responses
+                            {
+                                let responses = ENTROPY_RESPONSES.lock().unwrap();
+                                for ((height, responder), peer_entropy) in responses.iter() {
+                                    if *height == entropy_height {
+                                        if *peer_entropy == our_entropy_clone {
+                                            matches += 1;
+                                            println!("[CONSENSUS] ✅ Entropy match with {}", responder);
+                                        } else {
+                                            mismatches += 1;
+                                            println!("[CONSENSUS] ❌ Entropy mismatch with {}: expected {:x}, got {:x}",
+                                                    responder,
+                                                    u64::from_le_bytes([our_entropy_clone[0], our_entropy_clone[1], our_entropy_clone[2], our_entropy_clone[3],
+                                                                       our_entropy_clone[4], our_entropy_clone[5], our_entropy_clone[6], our_entropy_clone[7]]),
+                                                    u64::from_le_bytes([peer_entropy[0], peer_entropy[1], peer_entropy[2], peer_entropy[3],
+                                                                       peer_entropy[4], peer_entropy[5], peer_entropy[6], peer_entropy[7]]));
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            // If majority disagrees with our entropy, we need to resync
+                            if mismatches > 0 && mismatches > matches {
+                                println!("[CONSENSUS] ⚠️ Entropy mismatch detected! {} peers disagree vs {} agree", 
+                                        mismatches, matches);
+                                println!("[CONSENSUS] 🔄 Triggering resync to restore consensus");
+                                
+                                // CRITICAL: Trigger immediate resync to restore consensus
+                                if let Some(p2p) = &p2p_clone {
+                                    println!("[CONSENSUS] 🔄 Starting emergency resync from network");
+                                    
+                                    // Get current height to know where to sync from
+                                    let current_height = storage_clone.get_chain_height()
+                                        .unwrap_or(0);
+                                    
+                                    // Find the highest peer to sync from
+                                    let peers = p2p.get_validated_active_peers();
+                                    if !peers.is_empty() {
+                                        // Start fast sync from the beginning of current round
+                                        let sync_from = ((current_height / 30) * 30).saturating_sub(30);
+                                        println!("[CONSENSUS] 🔄 Resyncing from block {} to restore consensus", sync_from);
+                                        
+                                        // Set sync flags
+                                        FAST_SYNC_IN_PROGRESS.store(true, Ordering::Relaxed);
+                                        NODE_IS_SYNCHRONIZED.store(false, Ordering::Relaxed);
+                                        
+                                        // Trigger sync (will be picked up by sync loop)
+                                        println!("[CONSENSUS] 🔄 Emergency resync triggered - node will resync on next cycle");
+                                    }
+                                }
+                            } else if matches > 0 {
+                                println!("[CONSENSUS] ✅ Entropy consensus verified: {} peers agree, {} disagree", 
+                                        matches, mismatches);
+                            } else if sample_size_clone > 0 {
+                                println!("[CONSENSUS] ⏳ No entropy responses received from {} peers", sample_size_clone);
+                            }
+                        });
                     }
                 }
                 
@@ -5821,6 +5927,10 @@ impl BlockchainNode {
         self.node_id.clone()
     }
     
+    pub fn get_storage(&self) -> Arc<Storage> {
+        self.storage.clone()
+    }
+    
     pub async fn is_leader(&self) -> bool {
         *self.is_leader.read().await
     }
@@ -5848,6 +5958,18 @@ impl BlockchainNode {
         SYNC_IN_PROGRESS.load(Ordering::Relaxed) || 
         FAST_SYNC_IN_PROGRESS.load(Ordering::Relaxed) || 
         !NODE_IS_SYNCHRONIZED.load(Ordering::Relaxed)
+    }
+    
+    /// Handle incoming EntropyResponse from peer
+    pub fn handle_entropy_response(&self, block_height: u64, entropy_hash: [u8; 32], responder_id: String) {
+        // Store the response
+        let mut responses = ENTROPY_RESPONSES.lock().unwrap();
+        responses.insert((block_height, responder_id.clone()), entropy_hash);
+        
+        println!("[CONSENSUS] 🎯 Stored entropy response for block {} from {}: {:x}", 
+                block_height, responder_id,
+                u64::from_le_bytes([entropy_hash[0], entropy_hash[1], entropy_hash[2], entropy_hash[3],
+                                   entropy_hash[4], entropy_hash[5], entropy_hash[6], entropy_hash[7]]));
     }
     
     pub fn get_start_time(&self) -> chrono::DateTime<chrono::Utc> {
