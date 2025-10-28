@@ -1209,36 +1209,48 @@ impl BlockchainNode {
         // 3. CRITICAL: Verify chain continuity (previous_hash)
         if microblock.height > 1 {
             // Get actual hash of previous block from storage
-            let prev_block_data = storage.load_microblock(microblock.height - 1)
-                .map_err(|e| format!("Cannot load previous block: {}", e))?;
+            // Don't use map_err(?) - handle missing blocks gracefully
+            let prev_block_result = storage.load_microblock(microblock.height - 1);
             
-            if let Some(prev_data) = prev_block_data {
-                // Calculate hash of previous block
-                use sha3::{Sha3_256, Digest};
-                let mut hasher = Sha3_256::new();
-                hasher.update(&prev_data);
-                let prev_hash_result = hasher.finalize();
-                
-                // Compare with previous_hash in current block
-                if microblock.previous_hash != prev_hash_result.as_slice() {
-                    // CRITICAL: Database substitution attack detected!
-                    // Report malicious behavior for instant ban
-                    println!("[SECURITY] 🚨 CRITICAL: Database substitution attack from producer {}!", microblock.producer);
-                    println!("[SECURITY] 🚨 Block #{} has wrong previous_hash - chain fork attempt!", microblock.height);
+            match prev_block_result {
+                Ok(Some(prev_data)) => {
+                    // We have the previous block - verify with real hash
+                    use sha3::{Sha3_256, Digest};
+                    let mut hasher = Sha3_256::new();
+                    hasher.update(&prev_data);
+                    let prev_hash_result = hasher.finalize();
                     
-                    // Report to P2P for instant ban (will be handled by P2P system)
-                    // The producer will get MaliciousBehavior::DatabaseSubstitution
-                    
-                    return Err(format!(
-                        "CRITICAL: Database substitution attack! Block #{} has invalid previous_hash. Producer {} attempting chain fork!",
-                        microblock.height,
-                        microblock.producer
-                    ));
+                    if microblock.previous_hash != prev_hash_result.as_slice() {
+                        println!("[SECURITY] 🚨 CRITICAL: Database substitution attack from producer {}!", microblock.producer);
+                        println!("[SECURITY] 🚨 Block #{} has wrong previous_hash - chain fork attempt!", microblock.height);
+                        return Err(format!(
+                            "CRITICAL: Database substitution attack! Block #{} has invalid previous_hash. Producer {} attempting chain fork!",
+                            microblock.height,
+                            microblock.producer
+                        ));
+                    }
+                    println!("[VALIDATION] ✅ Chain continuity verified for block #{}", microblock.height);
+                },
+                _ => {
+                    // Previous block not found - check if genesis phase allows fallback
+                    if microblock.height <= 10 {
+                        // Genesis phase: validate with deterministic fallback hash
+                        use sha3::{Sha3_256, Digest};
+                        let mut hasher = Sha3_256::new();
+                        hasher.update(&(microblock.height - 1).to_le_bytes());
+                        hasher.update(b"qnet_microblock_");
+                        let fallback_hash = hasher.finalize();
+                        
+                        if microblock.previous_hash != fallback_hash.as_slice() {
+                            println!("[VALIDATION] ❌ Block #{} has invalid fallback hash", microblock.height);
+                            return Err(format!("Block #{} has invalid genesis fallback hash", microblock.height));
+                        }
+                        println!("[VALIDATION] ✅ Block #{} validated with fallback hash (genesis phase)", microblock.height);
+                    } else {
+                        // After genesis phase, must have previous block
+                        return Err(format!("Previous block #{} not found in storage", microblock.height - 1));
+                    }
                 }
-                println!("[VALIDATION] ✅ Chain continuity verified for block #{}", microblock.height);
-            } else if microblock.height > 10 {
-                // After genesis phase, must have previous block
-                return Err(format!("Previous block #{} not found in storage", microblock.height - 1));
             }
         }
         
@@ -2376,6 +2388,18 @@ impl BlockchainNode {
                         // This ensures ALL nodes calculate the SAME timestamp for the SAME block
                         GENESIS_TIMESTAMP + (next_block_height * BLOCK_INTERVAL_SECONDS)
                     };
+                    
+                    // CRITICAL: Check if we have previous block before creating
+                    // For blocks > 10, require strict sync; for blocks 1-10, allow fallback
+                    if next_block_height > 10 {
+                        // After genesis phase: MUST have previous block
+                        if storage.load_microblock(next_block_height - 1).ok().flatten().is_none() {
+                            println!("[PRODUCER] ⏳ Cannot produce block #{} - waiting for previous block #{}", 
+                                     next_block_height, next_block_height - 1);
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                            continue;
+                        }
+                    }
                     
                     let mut microblock = qnet_state::MicroBlock {
                         height: next_block_height,  // Use next_block_height instead of microblock_height
