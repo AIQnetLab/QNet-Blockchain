@@ -4903,6 +4903,43 @@ impl SimplifiedP2P {
         
         println!("[SYNC] 🎯 Parallel sync complete: {} blocks in {:.2}s ({:.1} blocks/sec)", 
                  blocks_synced, duration.as_secs_f64(), blocks_per_sec);
+        
+        // CRITICAL: Verify chain integrity after parallel download
+        // Check for missing blocks that could cause consensus issues
+        let mut missing_blocks = Vec::new();
+        for height in (current_height + 1)..=target_height {
+            if storage.load_microblock(height).is_err() {
+                missing_blocks.push(height);
+            }
+        }
+        
+        if !missing_blocks.is_empty() {
+            println!("[SYNC] ⚠️ Chain integrity check failed: {} blocks missing", missing_blocks.len());
+            println!("[SYNC] ⚠️ Missing blocks: {:?}", &missing_blocks[..missing_blocks.len().min(10)]);
+            
+            // PRODUCTION: Request missing blocks sequentially to ensure chain continuity
+            for height in missing_blocks {
+                println!("[SYNC] 🔄 Requesting missing block #{}", height);
+                // Use existing download method for single blocks
+                Self::download_block_range_static(&peers, storage, height, height).await;
+            }
+            
+            // Final verification
+            let mut still_missing = 0;
+            for height in (current_height + 1)..=target_height {
+                if storage.load_microblock(height).is_err() {
+                    still_missing += 1;
+                }
+            }
+            
+            if still_missing > 0 {
+                println!("[SYNC] ❌ Chain integrity failed: {} blocks still missing after retry", still_missing);
+            } else {
+                println!("[SYNC] ✅ Chain integrity restored: all blocks present");
+            }
+        } else {
+            println!("[SYNC] ✅ Chain integrity verified: all {} blocks present", blocks_synced);
+        }
     }
     
     /// Download a range of blocks (helper for parallel sync)
@@ -5226,6 +5263,19 @@ pub enum NetworkMessage {
         state_data: Vec<u8>,
         sender_id: String,
     },
+    
+    /// Request entropy hash for rotation boundary verification
+    EntropyRequest {
+        block_height: u64,
+        requester_id: String,
+    },
+    
+    /// Response with entropy hash for consensus verification
+    EntropyResponse {
+        block_height: u64,
+        entropy_hash: [u8; 32],
+        responder_id: String,
+    },
 }
 
 /// Internal consensus messages for node communication
@@ -5465,6 +5515,22 @@ impl SimplifiedP2P {
                 println!("[SNAPSHOT] 📸 Received snapshot announcement for height {} with CID {} from {}", height, ipfs_cid, sender_id);
                 // In production: Store CID for potential snapshot download
                 // For now, just log the announcement
+            }
+            
+            NetworkMessage::EntropyRequest { block_height, requester_id } => {
+                // Handle entropy request for rotation boundary verification
+                println!("[CONSENSUS] 🎲 Entropy request for block {} from {}", block_height, requester_id);
+                // Response will be sent by node.rs which has access to storage
+                // Store request for processing
+            }
+            
+            NetworkMessage::EntropyResponse { block_height, entropy_hash, responder_id } => {
+                // Handle entropy response for consensus verification
+                println!("[CONSENSUS] 🎯 Entropy response for block {} from {}: {:x}", 
+                        block_height, responder_id,
+                        u64::from_le_bytes([entropy_hash[0], entropy_hash[1], entropy_hash[2], entropy_hash[3],
+                                           entropy_hash[4], entropy_hash[5], entropy_hash[6], entropy_hash[7]]));
+                // Store response for verification in node.rs
             }
         }
     }
@@ -7075,6 +7141,3 @@ impl SimplifiedP2P {
         Ok(())
     }
 }
-
-
- 

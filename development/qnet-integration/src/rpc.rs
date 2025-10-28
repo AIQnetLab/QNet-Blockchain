@@ -124,22 +124,22 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
             
             // API DEADLOCK FIX: Use cached network height to avoid circular HTTP calls
             let mut network_height = height;
-            let mut is_syncing = false;
+            
+            // CRITICAL FIX: Use real synchronization status from node
+            let is_syncing = blockchain.is_syncing();
             
             if let Some(p2p) = blockchain.get_unified_p2p() {
                 // API DEADLOCK FIX: Get cached height without network calls
                 if let Some(cached_height) = p2p.get_cached_network_height() {
                     network_height = cached_height;
-                    is_syncing = height < network_height;
                 } else {
                     // No cache available - check if we're bootstrap node
                     if std::env::var("QNET_BOOTSTRAP_ID").is_ok() || 
                        std::env::var("QNET_GENESIS_BOOTSTRAP").unwrap_or_default() == "1" {
                         // Genesis node in bootstrap mode - use local height as network height
                         network_height = height;
-                        is_syncing = false; // Bootstrap nodes are never "syncing"
                     } else {
-                        // Regular node without cache - assume not syncing
+                        // Regular node without cache - use local height
                         println!("[API] ⚠️ No cached network height available, using local height");
                     }
                 }
@@ -4143,14 +4143,17 @@ async fn handle_producer_status(
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
     let current_height = blockchain.get_height().await;
-    let is_leader = blockchain.is_leader().await; // REAL METHOD - NO STUB!
+    // CRITICAL FIX: Check if producer for NEXT block, not current state
+    let is_leader = blockchain.is_next_block_producer().await;
     let node_id = blockchain.get_node_id();
     
     // Calculate next producer rotation using SAME formula as node.rs
     let leadership_round = if current_height == 0 {
         0  // Genesis block special case
+    } else if current_height <= 30 {
+        0  // Blocks 1-30 are round 0 (SAME as node.rs line 3266-3267)
     } else {
-        (current_height + 29) / 30 - 1  // Same formula as select_microblock_producer
+        (current_height - 1) / 30  // Formula from node.rs line 3271
     };
     let next_rotation = (leadership_round + 1) * 30 + 1;  // Round N ends at N*30+30, next starts at N*30+31
     let blocks_until_rotation = if current_height == 0 {
