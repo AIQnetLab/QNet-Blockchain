@@ -2391,6 +2391,17 @@ impl BlockchainNode {
                         GENESIS_TIMESTAMP + (next_block_height * BLOCK_INTERVAL_SECONDS)
                     };
                     
+                    // Get previous block hash
+                    let prev_hash = Self::get_previous_microblock_hash(&storage, next_block_height).await;
+                    
+                    // CRITICAL: Don't create block if we don't have previous block (after genesis)
+                    if next_block_height > 10 && prev_hash == [0u8; 32] {
+                        println!("[PRODUCER] ⏳ Cannot produce block #{} - waiting for previous block #{}", 
+                                 next_block_height, next_block_height - 1);
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        continue;
+                    }
+                    
                     let mut microblock = qnet_state::MicroBlock {
                         height: next_block_height,  // Use next_block_height instead of microblock_height
                         timestamp: deterministic_timestamp,  // DETERMINISTIC: Same on all nodes
@@ -2398,7 +2409,7 @@ impl BlockchainNode {
                         producer: node_id.clone(), // Use node_id directly for consistency with failover messages
                         signature: vec![0u8; 64], // Will be filled with real signature
                         merkle_root: Self::calculate_merkle_root(&txs),
-                        previous_hash: Self::get_previous_microblock_hash(&storage, next_block_height).await,  // For block N, get hash of block N-1
+                        previous_hash: prev_hash,  // Use the hash we validated
                     };
                     
                     // QUANTUM PoH: Mix microblock into PoH chain for cryptographic time proof
@@ -2497,7 +2508,7 @@ impl BlockchainNode {
                     // QUANTUM: Always use async storage for consistent timing
                     let storage_clone = storage.clone();
                     let microblock_clone = microblock.clone();
-                    let height_for_storage = microblock_height;
+                    let height_for_storage = microblock.height;  // CRITICAL FIX: Use block's actual height, not old height!
                     let p2p_for_reward = unified_p2p.clone();
                     let producer_id_for_reward = node_id.clone();
                     let rotation_tracker_clone = rotation_tracker.clone();
@@ -5325,7 +5336,8 @@ impl BlockchainNode {
             return hash;
         }
         
-        // After genesis phase: use real block hash or fallback
+        // After genesis phase: use real block hash ONLY
+        // No fallback after block 10 to maintain chain integrity
         match storage.load_microblock(current_height - 1) {
             Ok(Some(microblock_data)) => {
                 // Calculate hash from stored microblock data
@@ -5338,16 +5350,10 @@ impl BlockchainNode {
                 hash
             },
             _ => {
-                // Fallback: deterministic hash based on height
-                // This allows continued operation when sync is needed
-                use sha3::{Sha3_256, Digest};
-                let mut hasher = Sha3_256::new();
-                hasher.update(&(current_height - 1).to_le_bytes());
-                hasher.update(b"qnet_microblock_");
-                let result = hasher.finalize();
-                let mut hash = [0u8; 32];
-                hash.copy_from_slice(&result);
-                hash
+                // No fallback after genesis - return zero to signal sync needed
+                println!("[PRODUCER] ⚠️ Cannot get hash for block {} - previous block {} not found", 
+                         current_height, current_height - 1);
+                [0u8; 32]
             }
         }
     }
