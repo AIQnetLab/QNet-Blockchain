@@ -2384,7 +2384,7 @@ impl BlockchainNode {
                         producer: node_id.clone(), // Use node_id directly for consistency with failover messages
                         signature: vec![0u8; 64], // Will be filled with real signature
                         merkle_root: Self::calculate_merkle_root(&txs),
-                        previous_hash: Self::get_previous_microblock_hash(&storage, next_block_height).await,  // Get hash for next block
+                        previous_hash: Self::get_previous_microblock_hash(&storage, next_block_height).await,  // For block N, get hash of block N-1
                     };
                     
                     // QUANTUM PoH: Mix microblock into PoH chain for cryptographic time proof
@@ -2568,21 +2568,17 @@ impl BlockchainNode {
                         println!("[P2P] ⚠️ P2P system not available - cannot broadcast block #{}", microblock.height);
                     }
                     
-                    // CRITICAL FIX: DO NOT increment height immediately after producing!
-                    // Producer should stay at same height until next iteration to maintain consensus
-                    // The height will be incremented in the next loop iteration when checking for blocks
-                    
-                    // Log that we created the block but stay at same height
-                    println!("[PRODUCER] ✅ Created block #{}, staying at height {} for consensus", 
-                             microblock.height, microblock_height);
-                    
                     // ATOMIC REWARDS: Track block for rotation reward
                     // Reward given at rotation completion, not per block
                     rotation_tracker.track_block(microblock.height, &node_id).await;
                     
-                    // CRITICAL: After creating block, increment height for next iteration
-                    // This ensures producer moves forward AFTER block is stored
-                    microblock_height += 1;
+                    // CRITICAL FIX: Only increment height AFTER block is confirmed saved and broadcast
+                    // This prevents phantom height where node claims height N without having block N
+                    println!("[PRODUCER] ✅ Created and saved block #{}", microblock.height);
+                    
+                    // CRITICAL: Increment height for next iteration
+                    // We only advance after successfully creating and storing the block
+                    microblock_height = microblock.height;  // Set to the block we just created
                     
                     // Update global height for API sync
                     {
@@ -2596,7 +2592,7 @@ impl BlockchainNode {
                         );
                     }
                     
-                    println!("[PRODUCER] 📈 Advanced to height {} for next iteration", microblock_height);
+                    println!("[PRODUCER] 📈 Advanced to height {} after producing block", microblock_height);
                     
                     // Check if rotation completed
                     if let Some((rotation_producer, blocks_created)) = 
@@ -3242,10 +3238,12 @@ impl BlockchainNode {
             // Round 0: blocks 1-30, Round 1: blocks 31-60, Round 2: blocks 61-90, etc.
             let leadership_round = if current_height == 0 {
                 0  // Genesis block - special case, not part of regular rotation
+            } else if current_height <= 30 {
+                0  // Blocks 1-30 are round 0
             } else {
-                // Formula: (height + 29) / 30 - 1
+                // Formula for blocks > 30: (height - 1) / 30
                 // This ensures: 1-30 → round 0, 31-60 → round 1, 61-90 → round 2
-                (current_height + 29) / rotation_interval - 1
+                (current_height - 1) / rotation_interval
             };
             
             // CRITICAL: Use shared module-level cache to prevent duplication
