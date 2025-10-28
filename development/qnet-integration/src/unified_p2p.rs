@@ -4924,16 +4924,25 @@ impl SimplifiedP2P {
                 Self::download_block_range_static(&peers, storage, height, height).await;
             }
             
-            // Final verification
-            let mut still_missing = 0;
+            // Final verification - check ALL blocks are present
+            let mut still_missing = Vec::new();
             for height in (current_height + 1)..=target_height {
-                if storage.load_microblock(height).is_err() {
-                    still_missing += 1;
+                match storage.load_microblock(height) {
+                    Ok(Some(_)) => {
+                        // Block exists
+                    },
+                    _ => {
+                        still_missing.push(height);
+                    }
                 }
             }
             
-            if still_missing > 0 {
-                println!("[SYNC] ❌ Chain integrity failed: {} blocks still missing after retry", still_missing);
+            if !still_missing.is_empty() {
+                println!("[SYNC] ❌ Chain integrity failed: {} blocks still missing after retry", still_missing.len());
+                println!("[SYNC] ❌ Missing blocks: {:?}", &still_missing[..still_missing.len().min(10)]);
+                // PRODUCTION: Mark node as not synchronized if chain is broken
+                use crate::node::NODE_IS_SYNCHRONIZED;
+                NODE_IS_SYNCHRONIZED.store(false, std::sync::atomic::Ordering::Relaxed);
             } else {
                 println!("[SYNC] ✅ Chain integrity restored: all blocks present");
             }

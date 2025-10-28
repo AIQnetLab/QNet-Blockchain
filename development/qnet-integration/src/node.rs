@@ -55,7 +55,7 @@ lazy_static::lazy_static! {
 use std::sync::atomic::{AtomicBool, Ordering};
 static SYNC_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static FAST_SYNC_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
-static NODE_IS_SYNCHRONIZED: AtomicBool = AtomicBool::new(false);
+pub static NODE_IS_SYNCHRONIZED: AtomicBool = AtomicBool::new(false);
 
 // CRITICAL: Global storage for entropy responses during consensus verification
 lazy_static::lazy_static! {
@@ -1277,21 +1277,20 @@ impl BlockchainNode {
                 },
                 _ => {
                     // Previous block not found
-                    if microblock.height <= 10 {
-                        // Genesis phase: validate with deterministic fallback hash
+                    if microblock.height == 1 {
+                        // SPECIAL CASE: Block #1 can use deterministic Genesis hash
                         use sha3::{Sha3_256, Digest};
                         let mut hasher = Sha3_256::new();
-                        hasher.update(&(microblock.height - 1).to_le_bytes());
-                        hasher.update(b"qnet_microblock_");
-                        let fallback_hash = hasher.finalize();
+                        hasher.update(b"qnet_genesis_block_2024");
+                        let genesis_hash = hasher.finalize();
                         
-                        if microblock.previous_hash != fallback_hash.as_slice() {
-                            println!("[VALIDATION] ❌ Block #{} has invalid genesis fallback hash", microblock.height);
-                            return Err(format!("Block #{} has invalid genesis fallback hash", microblock.height));
+                        if microblock.previous_hash != genesis_hash.as_slice() {
+                            println!("[VALIDATION] ❌ Block #1 has invalid genesis hash");
+                            return Err("Block #1 has invalid genesis hash".to_string());
                         }
-                        println!("[VALIDATION] ✅ Block #{} validated with fallback hash (genesis phase)", microblock.height);
+                        println!("[VALIDATION] ✅ Block #1 validated with genesis seed");
                     } else {
-                        // After genesis phase: MUST have previous block for security
+                        // ALL other blocks: MUST have previous block for security
                         println!("[VALIDATION] ❌ Block #{} cannot be validated - previous block #{} not found", 
                                  microblock.height, microblock.height - 1);
                         return Err(format!("Previous block #{} not found in storage - sync required", microblock.height - 1));
@@ -2561,8 +2560,8 @@ impl BlockchainNode {
                     // Get previous block hash
                     let prev_hash = Self::get_previous_microblock_hash(&storage, next_block_height).await;
                     
-                    // CRITICAL: Don't create block if we don't have previous block (after genesis)
-                    if next_block_height > 10 && prev_hash == [0u8; 32] {
+                    // CRITICAL: Don't create block if we don't have previous block (except block #1)
+                    if next_block_height > 1 && prev_hash == [0u8; 32] {
                         println!("[PRODUCER] ⏳ Cannot produce block #{} - waiting for previous block #{}", 
                                  next_block_height, next_block_height - 1);
                         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -5489,21 +5488,37 @@ impl BlockchainNode {
             return [0u8; 32]; // Genesis Block has no previous
         }
         
-        // CRITICAL: For genesis phase (blocks 1-10), ALWAYS use deterministic hash
-        // This prevents desync when nodes have different sets of blocks
-        if current_height <= 10 {
-            use sha3::{Sha3_256, Digest};
-            let mut hasher = Sha3_256::new();
-            hasher.update(&(current_height - 1).to_le_bytes());
-            hasher.update(b"qnet_microblock_");
-            let result = hasher.finalize();
-            let mut hash = [0u8; 32];
-            hash.copy_from_slice(&result);
-            return hash;
+        // PRODUCTION FIX: For block #1 ONLY, use Genesis block hash or deterministic seed
+        // All other blocks (2+) MUST use real previous block hash
+        if current_height == 1 {
+            // Block #1 special case - use Genesis block hash
+            match storage.load_microblock(0) {
+                Ok(Some(genesis_data)) => {
+                    // Use real Genesis block hash
+                    use sha3::{Sha3_256, Digest};
+                    let mut hasher = Sha3_256::new();
+                    hasher.update(&genesis_data);
+                    let result = hasher.finalize();
+                    let mut hash = [0u8; 32];
+                    hash.copy_from_slice(&result);
+                    return hash;
+                },
+                _ => {
+                    // Genesis block not found - use deterministic seed
+                    // This should only happen during initial network formation
+                    use sha3::{Sha3_256, Digest};
+                    let mut hasher = Sha3_256::new();
+                    hasher.update(b"qnet_genesis_block_2024");
+                    let result = hasher.finalize();
+                    let mut hash = [0u8; 32];
+                    hash.copy_from_slice(&result);
+                    return hash;
+                }
+            }
         }
         
-        // After genesis phase: use real block hash ONLY
-        // No fallback after block 10 to maintain chain integrity
+        // CRITICAL: For ALL blocks >= 2, use REAL block hash ONLY
+        // NO fallback to prevent chain integrity violations
         match storage.load_microblock(current_height - 1) {
             Ok(Some(microblock_data)) => {
                 // Calculate hash from stored microblock data
@@ -5516,7 +5531,7 @@ impl BlockchainNode {
                 hash
             },
             _ => {
-                // No fallback after genesis - return zero to signal sync needed
+                // No fallback - return zero to signal sync needed
                 println!("[PRODUCER] ⚠️ Cannot get hash for block {} - previous block {} not found", 
                          current_height, current_height - 1);
                 [0u8; 32]
@@ -5973,9 +5988,15 @@ impl BlockchainNode {
     }
     
     pub fn get_start_time(&self) -> chrono::DateTime<chrono::Utc> {
-        // For now, use node creation time approximation
-        // In production, this would be stored as a field
-        chrono::Utc::now() - chrono::Duration::hours(1)
+        // PRODUCTION FIX: Use actual node start time from environment
+        if let Ok(start_time_str) = std::env::var("QNET_NODE_START_TIME") {
+            if let Ok(timestamp) = start_time_str.parse::<i64>() {
+                return chrono::DateTime::from_timestamp(timestamp, 0)
+                    .unwrap_or_else(|| chrono::Utc::now());
+            }
+        }
+        // Fallback to current time if not set (should not happen)
+        chrono::Utc::now()
     }
     
     /// PRIVACY: Get public display name for API responses (preserves consensus node_id)
