@@ -1232,7 +1232,7 @@ impl BlockchainNode {
                     println!("[VALIDATION] ✅ Chain continuity verified for block #{}", microblock.height);
                 },
                 _ => {
-                    // Previous block not found - check if genesis phase allows fallback
+                    // Previous block not found
                     if microblock.height <= 10 {
                         // Genesis phase: validate with deterministic fallback hash
                         use sha3::{Sha3_256, Digest};
@@ -1242,13 +1242,15 @@ impl BlockchainNode {
                         let fallback_hash = hasher.finalize();
                         
                         if microblock.previous_hash != fallback_hash.as_slice() {
-                            println!("[VALIDATION] ❌ Block #{} has invalid fallback hash", microblock.height);
+                            println!("[VALIDATION] ❌ Block #{} has invalid genesis fallback hash", microblock.height);
                             return Err(format!("Block #{} has invalid genesis fallback hash", microblock.height));
                         }
                         println!("[VALIDATION] ✅ Block #{} validated with fallback hash (genesis phase)", microblock.height);
                     } else {
-                        // After genesis phase, must have previous block
-                        return Err(format!("Previous block #{} not found in storage", microblock.height - 1));
+                        // After genesis phase: MUST have previous block for security
+                        println!("[VALIDATION] ❌ Block #{} cannot be validated - previous block #{} not found", 
+                                 microblock.height, microblock.height - 1);
+                        return Err(format!("Previous block #{} not found in storage - sync required", microblock.height - 1));
                     }
                 }
             }
@@ -2388,18 +2390,6 @@ impl BlockchainNode {
                         // This ensures ALL nodes calculate the SAME timestamp for the SAME block
                         GENESIS_TIMESTAMP + (next_block_height * BLOCK_INTERVAL_SECONDS)
                     };
-                    
-                    // CRITICAL: Check if we have previous block before creating
-                    // For blocks > 10, require strict sync; for blocks 1-10, allow fallback
-                    if next_block_height > 10 {
-                        // After genesis phase: MUST have previous block
-                        if storage.load_microblock(next_block_height - 1).ok().flatten().is_none() {
-                            println!("[PRODUCER] ⏳ Cannot produce block #{} - waiting for previous block #{}", 
-                                     next_block_height, next_block_height - 1);
-                            tokio::time::sleep(Duration::from_millis(500)).await;
-                            continue;
-                        }
-                    }
                     
                     let mut microblock = qnet_state::MicroBlock {
                         height: next_block_height,  // Use next_block_height instead of microblock_height
@@ -5322,7 +5312,20 @@ impl BlockchainNode {
             return [0u8; 32]; // Genesis Block has no previous
         }
         
-        // Production: Get actual previous microblock hash from storage
+        // CRITICAL: For genesis phase (blocks 1-10), ALWAYS use deterministic hash
+        // This prevents desync when nodes have different sets of blocks
+        if current_height <= 10 {
+            use sha3::{Sha3_256, Digest};
+            let mut hasher = Sha3_256::new();
+            hasher.update(&(current_height - 1).to_le_bytes());
+            hasher.update(b"qnet_microblock_");
+            let result = hasher.finalize();
+            let mut hash = [0u8; 32];
+            hash.copy_from_slice(&result);
+            return hash;
+        }
+        
+        // After genesis phase: use real block hash or fallback
         match storage.load_microblock(current_height - 1) {
             Ok(Some(microblock_data)) => {
                 // Calculate hash from stored microblock data
@@ -5336,10 +5339,7 @@ impl BlockchainNode {
             },
             _ => {
                 // Fallback: deterministic hash based on height
-                // IMPORTANT: This is OK for first round because:
-                // 1. All nodes MUST agree on the same entropy for consensus
-                // 2. First round will be deterministic, but subsequent rounds will have real block hashes
-                // 3. The deterministic entropy will select one of the qualified candidates consistently
+                // This allows continued operation when sync is needed
                 use sha3::{Sha3_256, Digest};
                 let mut hasher = Sha3_256::new();
                 hasher.update(&(current_height - 1).to_le_bytes());
