@@ -61,6 +61,12 @@ pub static NODE_IS_SYNCHRONIZED: AtomicBool = AtomicBool::new(false);
 lazy_static::lazy_static! {
     static ref ENTROPY_RESPONSES: Mutex<std::collections::HashMap<(u64, String), [u8; 32]>> = Mutex::new(std::collections::HashMap::new());
 }
+
+// CRITICAL: Global quantum crypto instance to avoid repeated initialization
+lazy_static::lazy_static! {
+    static ref GLOBAL_QUANTUM_CRYPTO: tokio::sync::Mutex<Option<crate::quantum_crypto::QNetQuantumCrypto>> = 
+        tokio::sync::Mutex::new(None);
+}
 use sha3::{Sha3_256, Digest};
 use serde_json;
 use bincode;
@@ -1971,60 +1977,74 @@ impl BlockchainNode {
                     if let Some(network_height) = p2p.get_cached_network_height() {
                         let height_difference = network_height.saturating_sub(microblock_height);
                         
-                        // If we're more than 50 blocks behind, enter fast sync mode
-                        if height_difference > 50 {
-                            // RACE CONDITION FIX: Only start fast sync if not already running
-                            if !FAST_SYNC_IN_PROGRESS.swap(true, Ordering::SeqCst) {
-                                println!("[SYNC] ⚡ FAST SYNC MODE: {} blocks behind, catching up...", height_difference);
-                                
-                                // CRITICAL FIX: Do NOT update height before syncing blocks!
-                                // This prevents chain breaks where node thinks it's at height X without having the blocks
-                                // IMPORTANT: Handle rotation boundaries carefully (every 30 blocks)
-                                let sync_from_height = if microblock_height < network_height {
-                                    // Check if we're at rotation boundary where sync might fail
-                                    // Rotation happens after blocks 30, 60, 90... (not block 0 which is genesis)
-                                    let is_rotation_boundary = microblock_height > 0 && (microblock_height % 30) == 0;
-                                    if is_rotation_boundary {
-                                        // At rotation boundary, be conservative - sync current height
-                                        microblock_height
-                                    } else {
-                                        microblock_height + 1  // Normal case: sync next block
-                                    }
-                                } else {
-                                    microblock_height      // We're at same height or ahead
-                                };
-                                let sync_to_height = network_height;
-                                
-                                // Trigger immediate sync download
-                                let p2p_clone = p2p.clone();
-                                let storage_clone = storage.clone();
-                                
-                                tokio::spawn(async move {
-                                    // PRODUCTION: Guard ensures flag is cleared even on panic/error
-                                    let _guard = FastSyncGuard;
-                                    
-                                    println!("[SYNC] 🚀 Fast downloading blocks {}-{}", sync_from_height, sync_to_height);
-                                    
-                                    // TIMEOUT PROTECTION: Add 60-second timeout for entire sync operation
-                                    // PRODUCTION: Use parallel download for faster sync
-                                    let sync_result = tokio::time::timeout(
-                                        Duration::from_secs(60),
-                                        p2p_clone.parallel_download_microblocks(&storage_clone, sync_from_height, sync_to_height)
-                                    ).await;
-                                    
-                                    match sync_result {
-                                        Ok(_) => println!("[SYNC] ✅ Fast sync completed successfully"),
-                                        Err(_) => println!("[SYNC] ⚠️ Fast sync timeout after 60s - will retry next cycle"),
-                                    }
-                                    // Flag automatically cleared by guard drop
-                                });
-                            } else {
-                                println!("[SYNC] ⏳ Fast sync already in progress, skipping");
-                            }
+                        // CRITICAL FIX: Auto-sync trigger for lagging nodes
+                        // Different thresholds for different levels of lag
+                        if height_difference > 10 {
+                            // Log the lag situation
+                            println!("[SYNC] ⚠️ Node is {} blocks behind network (local: {}, network: {})", 
+                                     height_difference, microblock_height, network_height);
                             
-                            // Skip this production cycle to focus on syncing
-                            tokio::time::sleep(Duration::from_millis(100)).await;
-                            continue;
+                            // For extreme lag (>50 blocks), use fast sync
+                            if height_difference > 50 {
+                                // RACE CONDITION FIX: Only start fast sync if not already running
+                                if !FAST_SYNC_IN_PROGRESS.swap(true, Ordering::SeqCst) {
+                                    println!("[SYNC] ⚡ FAST SYNC MODE: {} blocks behind, catching up...", height_difference);
+                                    
+                                    // CRITICAL FIX: Do NOT update height before syncing blocks!
+                                    // This prevents chain breaks where node thinks it's at height X without having the blocks
+                                    // IMPORTANT: Handle rotation boundaries carefully (every 30 blocks)
+                                    let sync_from_height = if microblock_height < network_height {
+                                        // Check if we're at rotation boundary where sync might fail
+                                        // Rotation happens after blocks 30, 60, 90... (not block 0 which is genesis)
+                                        let is_rotation_boundary = microblock_height > 0 && (microblock_height % 30) == 0;
+                                        if is_rotation_boundary {
+                                            // At rotation boundary, be conservative - sync current height
+                                            microblock_height
+                                        } else {
+                                            microblock_height + 1  // Normal case: sync next block
+                                        }
+                                    } else {
+                                        microblock_height      // We're at same height or ahead
+                                    };
+                                    let sync_to_height = network_height;
+                                    
+                                    // Trigger immediate sync download
+                                    let p2p_clone = p2p.clone();
+                                    let storage_clone = storage.clone();
+                                    
+                                    tokio::spawn(async move {
+                                        // PRODUCTION: Guard ensures flag is cleared even on panic/error
+                                        let _guard = FastSyncGuard;
+                                        
+                                        println!("[SYNC] 🚀 Fast downloading blocks {}-{}", sync_from_height, sync_to_height);
+                                        
+                                        // TIMEOUT PROTECTION: Add 60-second timeout for entire sync operation
+                                        // PRODUCTION: Use parallel download for faster sync
+                                        let sync_result = tokio::time::timeout(
+                                            Duration::from_secs(60),
+                                            p2p_clone.parallel_download_microblocks(&storage_clone, sync_from_height, sync_to_height)
+                                        ).await;
+                                        
+                                        match sync_result {
+                                            Ok(_) => println!("[SYNC] ✅ Fast sync completed successfully"),
+                                            Err(_) => println!("[SYNC] ⚠️ Fast sync timeout after 60s - will retry next cycle"),
+                                        }
+                                        // Flag automatically cleared by guard drop
+                                    });
+                                } else {
+                                    println!("[SYNC] ⏳ Fast sync already in progress, skipping");
+                                }
+                                
+                                // Skip this production cycle to focus on syncing
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                                continue;
+                            }
+                            // For moderate lag (10-50 blocks), trigger normal background sync
+                            else {
+                                println!("[SYNC] 🔄 Triggering background sync for {} blocks lag", height_difference);
+                                // Background sync will handle it in the next cycle
+                                // Continue normal operation but log the situation
+                            }
                         }
                     }
                     // else: No cached height - continue with local production
@@ -2993,6 +3013,7 @@ impl BlockchainNode {
                         let storage_clone = storage.clone();
                         let height_clone = height.clone();
                         let current_height = microblock_height;
+                        let node_id_for_sync = node_id.clone();
                             
                             // Mark sync as in progress
                             SYNC_IN_PROGRESS.store(true, Ordering::SeqCst);
@@ -3020,6 +3041,17 @@ impl BlockchainNode {
                                     if let Ok(Some(_)) = storage_clone.load_microblock(network_height) {
                                         *height_clone.write().await = network_height;
                                         println!("[SYNC] ✅ Background sync completed to block #{}", network_height);
+                                        
+                                        // REPUTATION RECOVERY: Restore reputation if node caught up
+                                        // Check if we were significantly behind (>50 blocks)
+                                        if network_height > current_height + 50 {
+                                            // Node successfully caught up after being behind
+                                            // Give significant reputation boost for recovery
+                                            // This will help nodes that fell behind to rejoin consensus
+                                            p2p_clone.update_node_reputation(&node_id_for_sync, 40.0);
+                                            println!("[REPUTATION] 🔄 Node {} recovered from {} block lag! +40.0 reputation boost", 
+                                                     node_id_for_sync, network_height - current_height);
+                                        }
                                     }
                                         },
                                         Err(_) => {
@@ -5442,8 +5474,15 @@ impl BlockchainNode {
         use crate::quantum_crypto::{QNetQuantumCrypto, DilithiumSignature};
         
         let microblock_hash = hex::encode(message_hash);
-        let mut crypto = QNetQuantumCrypto::new();
-        let _ = crypto.initialize().await;
+        
+        // Use global crypto instance to avoid repeated initialization
+        let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
+        if crypto_guard.is_none() {
+            let mut crypto = QNetQuantumCrypto::new();
+            let _ = crypto.initialize().await;
+            *crypto_guard = Some(crypto);
+        }
+        let crypto = crypto_guard.as_mut().unwrap();
         
         // Create DilithiumSignature from microblock signature
         // CRITICAL FIX: signature is stored as UTF-8 bytes of the formatted string

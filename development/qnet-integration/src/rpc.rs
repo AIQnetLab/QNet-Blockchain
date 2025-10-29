@@ -145,8 +145,11 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
                 }
             }
             
-            println!("[API] 📊 Height request: local={}, network={}, syncing={}", 
-                     height, network_height, is_syncing);
+            // Log only every 100th request to reduce spam
+            if height % 100 == 0 || height <= 10 {
+                println!("[API] 📊 Height request: local={}, network={}, syncing={}", 
+                         height, network_height, is_syncing);
+            }
             
             Ok::<_, Rejection>(warp::reply::json(&json!({
                 "height": height,

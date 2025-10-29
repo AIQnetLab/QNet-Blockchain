@@ -1643,6 +1643,7 @@ impl SimplifiedP2P {
     /// API DEADLOCK FIX: Background height synchronization to prevent circular dependencies
     fn start_background_height_sync(&self) {
         let node_type = self.node_type.clone();
+        let connected_peers = self.connected_peers.clone();
         
         tokio::spawn(async move {
             println!("[SYNC] 🔄 Starting background height synchronization...");
@@ -1666,13 +1667,59 @@ impl SimplifiedP2P {
                     }
                 };
                 
-                println!("[SYNC] 📊 Background sync interval: {}s (Type: {:?}, Genesis: {})", 
-                        sync_interval, node_type, is_genesis_node);
+                // CRITICAL FIX: Actually update network height cache periodically
+                // Query peers for their current height
+                let peers = connected_peers.read().unwrap().clone();
+                let mut peer_heights = Vec::new();
                 
-                // NOTE: Actual height synchronization happens through regular P2P calls
-                // This background task just ensures periodic refresh
-                // The sync_blockchain_height() method cannot be called from tokio::spawn
-                // due to lifetime constraints with &self
+                for peer in peers.values().take(5) {  // Query up to 5 peers
+                    let peer_ip = peer.addr.split(':').next().unwrap_or("");
+                    let endpoint = format!("http://{}:8001/api/v1/height", peer_ip);
+                    
+                    // Simple HTTP query using reqwest
+                    if let Ok(client) = reqwest::Client::builder()
+                        .timeout(std::time::Duration::from_secs(2))
+                        .build() 
+                    {
+                        if let Ok(response) = client.get(&endpoint).send().await {
+                            if let Ok(text) = response.text().await {
+                                if let Ok(height) = text.trim().parse::<u64>() {
+                                    peer_heights.push(height);
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                // Update cache if we got responses
+                if !peer_heights.is_empty() {
+                    peer_heights.sort();
+                    let consensus_height = if peer_heights.len() >= 3 {
+                        // Use median for byzantine fault tolerance
+                        peer_heights[peer_heights.len() / 2]
+                    } else {
+                        // Use maximum height
+                        *peer_heights.iter().max().unwrap_or(&0)
+                    };
+                    
+                    // Update both cache systems
+                    if consensus_height > 0 {
+                        println!("[SYNC] 📊 Background sync: network height updated to {}", consensus_height);
+                        
+                        // Update new cache actor
+                        let epoch = CACHE_ACTOR.increment_epoch();
+                        *CACHE_ACTOR.height_cache.write().unwrap() = Some(CachedData {
+                            data: consensus_height,
+                            epoch,
+                            timestamp: Instant::now(),
+                            topology_hash: 0,
+                        });
+                        
+                        // Also update old cache for backward compatibility
+                        let mut cache = CACHED_BLOCKCHAIN_HEIGHT.lock().unwrap();
+                        *cache = (consensus_height, Instant::now());
+                    }
+                }
                 
                 tokio::time::sleep(std::time::Duration::from_secs(sync_interval)).await;
             }
@@ -4841,21 +4888,40 @@ impl SimplifiedP2P {
     pub async fn parallel_download_microblocks(&self, storage: &Arc<crate::storage::Storage>, current_height: u64, target_height: u64) {
         if target_height <= current_height { return; }
         
+        // OPTIMIZATION: Check which blocks are actually missing
+        let mut missing_blocks = Vec::new();
+        for height in (current_height + 1)..=target_height {
+            if storage.load_microblock(height).unwrap_or(None).is_none() {
+                missing_blocks.push(height);
+            }
+        }
+        
+        if missing_blocks.is_empty() {
+            println!("[SYNC] ✅ All blocks {}-{} already present, skipping download", 
+                     current_height + 1, target_height);
+            return;
+        }
+        
         // PRODUCTION: Parallel download configuration
         const PARALLEL_WORKERS: usize = 10; // Number of parallel download workers
         const CHUNK_SIZE: u64 = 100; // Blocks per chunk
         
-        println!("[SYNC] ⚡ Starting parallel sync: {} blocks with {} workers", 
-                 target_height - current_height, PARALLEL_WORKERS);
+        println!("[SYNC] ⚡ Starting parallel sync: {} missing blocks (of {} total) with {} workers", 
+                 missing_blocks.len(), target_height - current_height, PARALLEL_WORKERS);
         
-        // Split range into chunks for parallel processing
+        // Split MISSING blocks into chunks for parallel processing
         let mut chunks = Vec::new();
-        let mut start = current_height + 1;
+        let mut i = 0;
         
-        while start <= target_height {
-            let end = std::cmp::min(start + CHUNK_SIZE - 1, target_height);
-            chunks.push((start, end));
-            start = end + 1;
+        while i < missing_blocks.len() {
+            let chunk_end = std::cmp::min(i + CHUNK_SIZE as usize, missing_blocks.len());
+            let chunk_blocks: Vec<u64> = missing_blocks[i..chunk_end].to_vec();
+            if !chunk_blocks.is_empty() {
+                let start = *chunk_blocks.first().unwrap();
+                let end = *chunk_blocks.last().unwrap();
+                chunks.push((start, end));
+            }
+            i = chunk_end;
         }
         
         // Create parallel download tasks
