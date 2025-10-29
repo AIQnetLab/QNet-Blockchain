@@ -1657,13 +1657,14 @@ impl SimplifiedP2P {
                                       std::env::var("QNET_GENESIS_BOOTSTRAP").unwrap_or_default() == "1";
                 
                 // Determine sync interval based on node type AND network phase
+                // CRITICAL FIX: Faster sync for Super/Full nodes to prevent desync after long runs
                 let sync_interval = match &node_type {
-                    NodeType::Light => 30,  // Light nodes: 30s (less frequent, mobile bandwidth)
+                    NodeType::Light => 30,  // Light nodes: 30s (mobile, stores only 1000 blocks)
                     NodeType::Full => {
-                        if is_genesis_node { 5 } else { 15 }  // Full nodes: 5s genesis, 15s normal
+                        if is_genesis_node { 2 } else { 5 }  // Full nodes: 2s genesis, 5s normal (FASTER!)
                     },
                     NodeType::Super => {
-                        if is_genesis_node { 3 } else { 10 }  // Super nodes: 3s genesis, 10s normal (producers need accuracy)
+                        if is_genesis_node { 1 } else { 2 }  // Super nodes: 1s genesis, 2s normal (FASTEST!)
                     }
                 };
                 
@@ -6391,8 +6392,10 @@ impl SimplifiedP2P {
     pub fn broadcast_consensus_reveal(&self, round_id: u64, node_id: String, reveal_data: String, nonce: String, timestamp: u64) -> Result<(), String> {
         // CRITICAL: Only broadcast consensus for MACROBLOCK rounds (every 90 blocks)
         // Microblocks use simple producer signatures, NOT Byzantine consensus
+        // BUGFIX: round_id IS the block height (e.g., 90, 180, 270), which are ALL divisible by 90!
+        // We need to check if it's a macroblock height, not if it's NOT divisible by 90
         if round_id == 0 || (round_id % 90 != 0) {
-            println!("[P2P] ⏭️ BLOCKING broadcast reveal for microblock round {} - no consensus needed", round_id);
+            println!("[P2P] ⏭️ BLOCKING broadcast reveal for non-macroblock round {} - no consensus needed", round_id);
             return Ok(());
         }
         

@@ -181,51 +181,32 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
                 ));
             }
             
-            match blockchain.load_microblock_bytes(height) {
-                Ok(Some(data)) => {
-                    let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
-                    // API FIX: Include metadata about the block
+            // CRITICAL FIX: Use get_block() to return deserialized MicroBlock, not raw bytes!
+            match blockchain.get_block(height).await {
+                Ok(Some(block)) => {
+                    // Return the actual block data as JSON
                     Ok::<_, Rejection>(warp::reply::with_status(
-                        warp::reply::json(&json!({
-                            "height": height,
-                            "data": b64,
-                            "size": data.len(),
-                            "exists": true
-                        })),
+                        warp::reply::json(&block),
                         warp::http::StatusCode::OK
                     ))
                 },
                 Ok(None) => {
-                    // API FIX: Distinguish between not found and not synced
-                    if height == 0 {
-                        // Genesis block doesn't exist yet
-                        Ok::<_, Rejection>(warp::reply::with_status(
-                            warp::reply::json(&json!({
-                                "height": height,
-                                "data": null,
-                                "exists": false,
-                                "reason": "Genesis block"
-                            })),
-                            warp::http::StatusCode::OK
-                        ))
-                    } else {
-                        // Block should exist but not found
-                        Ok::<_, Rejection>(warp::reply::with_status(
-                            warp::reply::json(&json!({
-                                "error": "Block not found",
-                                "height": height,
-                                "exists": false
-                            })),
-                            warp::http::StatusCode::NOT_FOUND
-                        ))
-                    }
+                    // Block not found
+                    Ok::<_, Rejection>(warp::reply::with_status(
+                        warp::reply::json(&json!({
+                            "error": "Block not found",
+                            "height": height,
+                            "exists": false
+                        })),
+                        warp::http::StatusCode::NOT_FOUND
+                    ))
                 },
                 Err(e) => {
-                    // API FIX: Return proper error message
+                    // Storage or deserialization error
                     println!("[API] ❌ Error loading microblock {}: {}", height, e);
                     Ok::<_, Rejection>(warp::reply::with_status(
                         warp::reply::json(&json!({
-                            "error": "Storage error",
+                            "error": "Failed to load block",
                             "height": height,
                             "message": e.to_string()
                         })),

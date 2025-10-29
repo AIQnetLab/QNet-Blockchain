@@ -1271,13 +1271,28 @@ impl BlockchainNode {
                     let prev_hash_result = hasher.finalize();
                     
                     if microblock.previous_hash != prev_hash_result.as_slice() {
-                        println!("[SECURITY] 🚨 CRITICAL: Database substitution attack from producer {}!", microblock.producer);
-                        println!("[SECURITY] 🚨 Block #{} has wrong previous_hash - chain fork attempt!", microblock.height);
-                        return Err(format!(
-                            "CRITICAL: Database substitution attack! Block #{} has invalid previous_hash. Producer {} attempting chain fork!",
-                            microblock.height,
-                            microblock.producer
-                        ));
+                        // CRITICAL FIX: Check if this is a sync issue or real attack
+                        // During heavy load, blocks may arrive out of order
+                        let stored_height = storage.get_chain_height().unwrap_or(0);
+                        let height_diff = microblock.height.saturating_sub(stored_height);
+                        
+                        if height_diff > 10 {
+                            // Block is far ahead - likely a sync issue, not an attack
+                            println!("[VALIDATION] ⚠️ Block #{} has mismatched previous_hash - possible sync delay", microblock.height);
+                            return Err(format!(
+                                "Block #{} previous_hash mismatch - sync may be delayed (current height: {})",
+                                microblock.height, stored_height
+                            ));
+                        } else {
+                            // Block is close to current height - this could be an attack
+                            println!("[SECURITY] 🚨 Block #{} has wrong previous_hash - potential chain fork!", microblock.height);
+                            println!("[SECURITY] 🚨 Producer {} may be attempting chain manipulation", microblock.producer);
+                            return Err(format!(
+                                "Chain integrity violation! Block #{} has invalid previous_hash. Producer {} may be malicious",
+                                microblock.height,
+                                microblock.producer
+                            ));
+                        }
                     }
                     println!("[VALIDATION] ✅ Chain continuity verified for block #{}", microblock.height);
                 },
@@ -2397,8 +2412,8 @@ impl BlockchainNode {
                             }
                         };
                         
-                        // Update global sync status
-                        NODE_IS_SYNCHRONIZED.store(is_synchronized, Ordering::SeqCst);
+                        // NOTE: NODE_IS_SYNCHRONIZED is now updated for ALL nodes below (line ~3222)
+                        // Not just for producers - this was moved to fix the bug
                         
                         if !is_synchronized {
                             println!("[PRODUCER] ⚠️ Selected as producer but not synchronized!");
@@ -3207,6 +3222,20 @@ impl BlockchainNode {
 
                 }
                 } // End of sync block (for non-emergency producers)
+                
+                // Update NODE_IS_SYNCHRONIZED for ALL nodes (not just producers)
+                // This was a BUG: only producers updated this flag!
+                {
+                    let current_stored_height = storage.get_chain_height().unwrap_or(0);
+                    let is_synchronized = if microblock_height > 10 {
+                        // Normal operation: allow max 10 blocks behind
+                        current_stored_height + 10 >= microblock_height
+                    } else {
+                        // Genesis phase: must be within 1 block
+                        current_stored_height + 1 >= microblock_height
+                    };
+                    NODE_IS_SYNCHRONIZED.store(is_synchronized, Ordering::SeqCst);
+                }
                 
                 // ══════════════════════════════════════════════════════════════════
                 // CRITICAL: MACROBLOCK CONSENSUS FOR ALL NODES (not just producer!)
@@ -5035,13 +5064,19 @@ impl BlockchainNode {
             }
         }
         
-        println!("[CONSENSUS] ⏰ Commit phase completed");
-        
         println!("[CONSENSUS] ⏰ Commit phase completed, attempting to advance to reveal phase");
         
         // Advance to reveal phase
-        if let Err(e) = consensus_engine.advance_phase() {
-            println!("[CONSENSUS] ⚠️ Failed to advance to reveal phase: {:?}", e);
+        match consensus_engine.advance_phase() {
+            Ok(_) => {
+                println!("[CONSENSUS] ✅ Successfully advanced to reveal phase");
+            }
+            Err(e) => {
+                println!("[CONSENSUS] ❌ CRITICAL: Failed to advance to reveal phase: {:?}", e);
+                println!("[CONSENSUS] ⚠️ Consensus will fail - engine not in reveal phase!");
+                // This is critical - if we can't advance, reveals won't be processed
+                return;
+            }
         }
     }
     
@@ -5752,6 +5787,26 @@ impl BlockchainNode {
                 node_id,  // Pass the validated node_id
                 consensus_rx,
             ).await;
+            
+            // CRITICAL FIX: Ensure reveal phase is complete before finalizing
+            // Check if we have enough reveals for Byzantine threshold
+            let current_reveals = consensus_engine.get_current_reveal_count();
+            let byzantine_threshold = (all_participants.len() * 2 + 2) / 3;
+            
+            if current_reveals < byzantine_threshold {
+                println!("[CONSENSUS] ⚠️ Insufficient reveals for finalization: {}/{} (need {})", 
+                         current_reveals, all_participants.len(), byzantine_threshold);
+                // Wait a bit more for reveals to arrive
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                
+                // Check again after wait
+                let final_reveals = consensus_engine.get_current_reveal_count();
+                if final_reveals < byzantine_threshold {
+                    println!("[CONSENSUS] ❌ Still insufficient reveals: {}/{}", 
+                             final_reveals, byzantine_threshold);
+                    // Continue anyway to avoid blocking - consensus will fail gracefully
+                }
+            }
             
             // STEP 5: Finalize consensus and get result
             match consensus_engine.finalize_round() {
