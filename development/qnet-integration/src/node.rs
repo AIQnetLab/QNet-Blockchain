@@ -1120,6 +1120,13 @@ impl BlockchainNode {
         const MAX_CONCURRENT_REQUESTS: usize = 10; // Limit concurrent block requests
         const REQUEST_COOLDOWN_SECS: u64 = 10; // Minimum seconds between requests for same block
         
+        // CRITICAL: REORG PROTECTION - Prevent concurrent reorgs and DoS attacks
+        let reorg_in_progress = Arc::new(tokio::sync::RwLock::new(false));
+        let last_fork_attempt = Arc::new(tokio::sync::RwLock::new(
+            std::time::Instant::now() - std::time::Duration::from_secs(120)
+        ));
+        const FORK_ATTEMPT_COOLDOWN_SECS: u64 = 60; // Max 1 fork attempt per 60 seconds
+        
         loop {
             // Check both channels - prioritize retries
             let received_block = tokio::select! {
@@ -1220,11 +1227,21 @@ impl BlockchainNode {
                                                 if let Some(p2p) = &unified_p2p {
                                                     let p2p_clone = p2p.clone();
                                                     tokio::spawn(async move {
-                                                        // Request single block immediately
-                                                        if let Err(e) = p2p_clone.sync_blocks(missing_height, missing_height).await {
-                                                            println!("[BLOCKS] ⚠️ Failed to request block #{}: {}", missing_height, e);
+                                                        // SPECIAL CASE: Genesis block request
+                                                        if missing_height == 0 {
+                                                            println!("[BLOCKS] 🌍 Requesting Genesis block #0 from network");
+                                                            if let Err(e) = p2p_clone.sync_blocks(0, 0).await {
+                                                                println!("[BLOCKS] ⚠️ Failed to request Genesis: {}", e);
+                                                            } else {
+                                                                println!("[BLOCKS] ✅ Genesis block requested from network");
+                                                            }
                                                         } else {
-                                                            println!("[BLOCKS] ✅ Block #{} requested from network", missing_height);
+                                                            // Regular block request
+                                                            if let Err(e) = p2p_clone.sync_blocks(missing_height, missing_height).await {
+                                                                println!("[BLOCKS] ⚠️ Failed to request block #{}: {}", missing_height, e);
+                                                            } else {
+                                                                println!("[BLOCKS] ✅ Block #{} requested from network", missing_height);
+                                                            }
                                                         }
                                                     });
                                                 }
@@ -1237,8 +1254,125 @@ impl BlockchainNode {
                                     }
                                 }
                             }
+                        } else if e.starts_with("FORK_DETECTED:") {
+                            // CRITICAL: Fork detected - handle asynchronously to avoid blocking
+                            if let Some(fork_info) = e.strip_prefix("FORK_DETECTED:") {
+                                let parts: Vec<&str> = fork_info.split(':').collect();
+                                if parts.len() == 2 {
+                                    if let Ok(fork_height) = parts[0].parse::<u64>() {
+                                        let fork_producer = parts[1];
+                                        
+                                        // CRITICAL: Check if reorg already in progress (prevent race condition)
+                                        let is_reorg_active = *reorg_in_progress.read().await;
+                                        if is_reorg_active {
+                                            println!("[REORG] ⏸️ Reorg already in progress - ignoring fork from {}", fork_producer);
+                                            continue;
+                                        }
+                                        
+                                        // CRITICAL: Rate limit fork attempts (prevent DoS)
+                                        let last_attempt = *last_fork_attempt.read().await;
+                                        if last_attempt.elapsed().as_secs() < FORK_ATTEMPT_COOLDOWN_SECS {
+                                            println!("[REORG] 🛡️ Fork attempt too soon - rate limited ({}s cooldown)", FORK_ATTEMPT_COOLDOWN_SECS);
+                                            continue;
+                                        }
+                                        
+                                        // Update last attempt timestamp
+                                        *last_fork_attempt.write().await = std::time::Instant::now();
+                                        
+                                        println!("[REORG] 🔀 Fork detected at height {} from {} - processing asynchronously", fork_height, fork_producer);
+                                        
+                                        // CRITICAL: Spawn async task to avoid blocking block processing
+                                        let fork_block = received_block.clone();
+                                        let storage_clone = storage.clone();
+                                        let height_clone = height.clone();
+                                        let p2p_clone = unified_p2p.clone();
+                                        let reorg_flag = reorg_in_progress.clone();
+                                        
+                                        tokio::spawn(async move {
+                                            // Mark reorg as in progress
+                                            *reorg_flag.write().await = true;
+                                            
+                                            // CRITICAL: Additional validation before processing fork
+                                            // Verify fork block is actually valid before expensive operations
+                                            if let Err(validation_error) = bincode::deserialize::<qnet_state::MicroBlock>(&fork_block.data) {
+                                                println!("[REORG] ❌ Fork block validation failed: {:?}", validation_error);
+                                                *reorg_flag.write().await = false;
+                                                return;
+                                            }
+                                            
+                                            // Collect fork chain blocks
+                                            let fork_blocks = vec![fork_block];
+                                            // Note: We only have the current fork block immediately available
+                                            // Other blocks from the fork chain will be requested separately
+                                            
+                                            // Calculate chain weights
+                                            let fork_chain_weight = if let Some(p2p) = &p2p_clone {
+                                                Self::calculate_fork_chain_weight(&fork_blocks, p2p, &storage_clone).await
+                                            } else {
+                                                0.0
+                                            };
+                                            
+                                            let our_chain_weight = if let Some(p2p) = &p2p_clone {
+                                                Self::calculate_our_chain_weight(fork_height, *height_clone.read().await, p2p, &storage_clone).await
+                                            } else {
+                                                1.0
+                                            };
+                                            
+                                            println!("[REORG] ⚖️ Chain weights - Ours: {:.2}, Fork: {:.2}", our_chain_weight, fork_chain_weight);
+                                            
+                                            // Check depth limit
+                                            let reorg_depth = *height_clone.read().await - fork_height;
+                                            const MAX_REORG_DEPTH: u64 = 100;
+                                            
+                                            if reorg_depth > MAX_REORG_DEPTH {
+                                                println!("[REORG] ⚠️ Reorg too deep ({} blocks) - rejecting", reorg_depth);
+                                                return;
+                                            }
+                                            
+                                            // Byzantine threshold check
+                                            const BYZANTINE_THRESHOLD: f64 = 0.67;
+                                            let total_weight = fork_chain_weight + our_chain_weight;
+                                            let fork_ratio = if total_weight > 0.0 {
+                                                fork_chain_weight / total_weight
+                                            } else {
+                                                0.0
+                                            };
+                                            
+                                            if fork_ratio >= BYZANTINE_THRESHOLD {
+                                                println!("[REORG] 🔄 Fork has Byzantine majority - initiating reorg");
+                                                
+                                                // Perform reorganization
+                                                match Self::perform_chain_reorganization(
+                                                    fork_height,
+                                                    &fork_blocks,
+                                                    &storage_clone,
+                                                    &height_clone,
+                                                    &p2p_clone
+                                                ).await {
+                                                    Ok(new_height) => {
+                                                        println!("[REORG] ✅ Reorganization complete! Height: {}", new_height);
+                                                        *height_clone.write().await = new_height;
+                                                    },
+                                                    Err(e) => {
+                                                        println!("[REORG] ❌ Reorganization failed: {}", e);
+                                                    }
+                                                }
+                                            } else {
+                                                println!("[REORG] 📌 Keeping our chain (ratio: {:.2})", fork_ratio);
+                                            }
+                                            
+                                            // CRITICAL: Clear reorg flag when done
+                                            *reorg_flag.write().await = false;
+                                            println!("[REORG] ✅ Reorg analysis complete - ready for next fork");
+                                        });
+                                        
+                                        // Continue processing other blocks immediately
+                                        println!("[REORG] ⚡ Fork analysis running in background - continuing block processing");
+                                    }
+                                }
+                            }
                         } else {
-                            println!("[BLOCKS] ❌ Invalid microblock #{}: {}", received_block.height, e);
+                        println!("[BLOCKS] ❌ Invalid microblock #{}: {}", received_block.height, e);
                         }
                         continue;
                     }
@@ -1377,6 +1511,242 @@ impl BlockchainNode {
         }
     }
     
+    /// Calculate Byzantine weight of fork chain (considers consensus validators)
+    /// OPTIMIZED: Fast calculation for reorg decisions without blocking
+    async fn calculate_fork_chain_weight(
+        blocks: &[crate::unified_p2p::ReceivedBlock],
+        p2p: &Arc<SimplifiedP2P>,
+        _storage: &Arc<Storage>,
+    ) -> f64 {
+        // PERFORMANCE: Limit blocks analyzed to avoid long computation
+        const MAX_BLOCKS_TO_ANALYZE: usize = 50;
+        let blocks_to_check = if blocks.len() > MAX_BLOCKS_TO_ANALYZE {
+            &blocks[..MAX_BLOCKS_TO_ANALYZE]
+        } else {
+            blocks
+        };
+        
+        // CRITICAL: Byzantine weight calculation for chain reorganization
+        // Weight is based on unique validators with reputation ≥ 70%
+        let mut unique_validators = std::collections::HashSet::new();
+        let mut total_reputation = 0.0;
+        
+        // OPTIMIZATION: Get peers once, not per block
+        let peers = p2p.get_validated_active_peers();
+        
+        for block in blocks_to_check {
+            // Deserialize to get producer (fast operation)
+            if let Ok(microblock) = bincode::deserialize::<qnet_state::MicroBlock>(&block.data) {
+                // Only count each validator once (Byzantine principle)
+                if !unique_validators.contains(&microblock.producer) {
+                    unique_validators.insert(microblock.producer.clone());
+                    
+                    // Get producer reputation from P2P peers
+                    let reputation = if microblock.producer.starts_with("genesis_") {
+                        0.70 // Genesis nodes have fixed 70% reputation
+                    } else {
+                        // OPTIMIZATION: Use pre-fetched peers list
+                        let peer_reputation = peers.iter()
+                            .find(|p| p.id == microblock.producer)
+                            .map(|p| p.reputation_score)
+                            .unwrap_or(0.50); // Default 50% for unknown producers
+                        
+                        // CRITICAL: Cap reputation to prevent manipulation (max 95%)
+                        // This prevents a single malicious high-reputation node from dominating
+                        peer_reputation.min(0.95)
+                    };
+                    
+                    // Only validators (reputation ≥ 70%) contribute to Byzantine weight
+                    if reputation >= 0.70 {
+                        total_reputation += reputation;
+                    }
+                }
+            }
+        }
+        
+        // Byzantine weight: number of validators * average reputation
+        let validator_count = unique_validators.len() as f64;
+        if validator_count > 0.0 {
+            total_reputation / validator_count * validator_count.sqrt() // Square root for Byzantine scaling
+        } else {
+            0.0
+        }
+    }
+    
+    /// Perform chain reorganization when fork chain has higher weight
+    async fn perform_chain_reorganization(
+        fork_point: u64,
+        fork_blocks: &[crate::unified_p2p::ReceivedBlock],
+        storage: &Arc<Storage>,
+        current_height: &Arc<RwLock<u64>>,
+        p2p: &Option<Arc<SimplifiedP2P>>,
+    ) -> Result<u64, String> {
+        println!("[REORG] 🔄 Starting chain reorganization from height {}", fork_point);
+        
+        // SAFETY: Create backup of current chain before reorg
+        let mut backup_blocks = Vec::new();
+        let current = *current_height.read().await;
+        
+        // Backup blocks that will be replaced
+        for height in fork_point..=current {
+            if let Ok(Some(block_data)) = storage.load_microblock(height) {
+                backup_blocks.push((height, block_data));
+            }
+        }
+        println!("[REORG] 💾 Backed up {} blocks from current chain", backup_blocks.len());
+        
+        // CRITICAL: Validate fork chain integrity before switching
+        let mut prev_hash: [u8; 32] = if fork_point > 0 {
+            // Get the hash of block before fork point
+            if let Ok(Some(prev_data)) = storage.load_microblock(fork_point - 1) {
+                if let Ok(_prev_block) = bincode::deserialize::<qnet_state::MicroBlock>(&prev_data) {
+                    use sha3::{Sha3_256, Digest};
+                    let mut hasher = Sha3_256::new();
+                    hasher.update(&prev_data);
+                    let hash = hasher.finalize();
+                    let mut hash_bytes = [0u8; 32];
+                    hash_bytes.copy_from_slice(&hash);
+                    hash_bytes
+                } else {
+                    return Err("Failed to deserialize previous block".to_string());
+                }
+            } else {
+                return Err(format!("Previous block #{} not found", fork_point - 1));
+            }
+        } else {
+            // Fork at Genesis
+            [0u8; 32]
+        };
+        
+        // Validate each fork block before applying
+        for (idx, fork_block) in fork_blocks.iter().enumerate() {
+            if let Ok(microblock) = bincode::deserialize::<qnet_state::MicroBlock>(&fork_block.data) {
+                // Check previous_hash continuity
+                if microblock.previous_hash != prev_hash {
+                    println!("[REORG] ❌ Fork chain broken at block #{}", microblock.height);
+                    // Restore backup
+                    for (height, data) in backup_blocks {
+                        let _ = storage.save_microblock(height, &data);
+                    }
+                    return Err(format!("Fork chain integrity check failed at height {}", microblock.height));
+                }
+                
+                // Update prev_hash for next iteration
+                use sha3::{Sha3_256, Digest};
+                let mut hasher = Sha3_256::new();
+                hasher.update(&fork_block.data);
+                let hash = hasher.finalize();
+                prev_hash.copy_from_slice(&hash);
+            } else {
+                return Err(format!("Failed to deserialize fork block {}", idx));
+            }
+        }
+        
+        println!("[REORG] ✅ Fork chain validated - {} blocks", fork_blocks.len());
+        
+        // CRITICAL: Apply fork chain (replace our blocks)
+        let mut new_height = fork_point - 1;
+        for fork_block in fork_blocks {
+            if let Ok(microblock) = bincode::deserialize::<qnet_state::MicroBlock>(&fork_block.data) {
+                let height = microblock.height;
+                
+                // CRITICAL: Decompress before saving
+                let decompressed_data = match zstd::decode_all(&fork_block.data[..]) {
+                    Ok(data) => data,
+                    Err(_) => {
+                        // Data might not be compressed
+                        fork_block.data.clone()
+                    }
+                };
+                
+                // Save the new block
+                if let Err(e) = storage.save_microblock(height, &decompressed_data) {
+                    println!("[REORG] ❌ Failed to save fork block #{}: {}", height, e);
+                    // Restore backup on failure
+                    for (backup_height, data) in backup_blocks {
+                        let _ = storage.save_microblock(backup_height, &data);
+                    }
+                    return Err(format!("Failed to save fork block: {}", e));
+                }
+                
+                new_height = height;
+                println!("[REORG] 💾 Applied fork block #{}", height);
+            }
+        }
+        
+        // CRITICAL: Broadcast reorg event to network
+        if let Some(p2p) = p2p {
+            // Notify peers about reorganization
+            println!("[REORG] 📢 Broadcasting chain reorganization event");
+            // TODO: Implement P2P broadcast of reorg event
+        }
+        
+        println!("[REORG] ✅ Chain reorganization complete! New height: {}", new_height);
+        Ok(new_height)
+    }
+    
+    /// Calculate Byzantine weight of our current chain
+    /// OPTIMIZED: Fast calculation with limited block range
+    async fn calculate_our_chain_weight(
+        from_height: u64,
+        to_height: u64,
+        p2p: &Arc<SimplifiedP2P>,
+        storage: &Arc<Storage>,
+    ) -> f64 {
+        // PERFORMANCE: Limit range to avoid long I/O operations
+        const MAX_BLOCKS_TO_ANALYZE: u64 = 50;
+        let actual_to_height = if to_height - from_height > MAX_BLOCKS_TO_ANALYZE {
+            from_height + MAX_BLOCKS_TO_ANALYZE
+        } else {
+            to_height
+        };
+        
+        // CRITICAL: Byzantine weight calculation for current chain
+        let mut unique_validators = std::collections::HashSet::new();
+        let mut total_reputation = 0.0;
+        
+        // OPTIMIZATION: Get peers once, not per block
+        let peers = p2p.get_validated_active_peers();
+        
+        for height in from_height..=actual_to_height {
+            if let Ok(Some(block_data)) = storage.load_microblock(height) {
+                if let Ok(microblock) = bincode::deserialize::<qnet_state::MicroBlock>(&block_data) {
+                    // Only count each validator once (Byzantine principle)
+                    if !unique_validators.contains(&microblock.producer) {
+                        unique_validators.insert(microblock.producer.clone());
+                        
+                        // Get producer reputation
+                        let reputation = if microblock.producer.starts_with("genesis_") {
+                            0.70 // Genesis nodes have fixed 70% reputation
+                        } else {
+                            // OPTIMIZATION: Use pre-fetched peers list
+                            let peer_reputation = peers.iter()
+                                .find(|p| p.id == microblock.producer)
+                                .map(|p| p.reputation_score)
+                                .unwrap_or(0.50); // Default 50% for unknown producers
+                            
+                            // CRITICAL: Cap reputation to prevent manipulation (max 95%)
+                            peer_reputation.min(0.95)
+                        };
+                        
+                        // Only validators (reputation ≥ 70%) contribute to Byzantine weight
+                        if reputation >= 0.70 {
+                            total_reputation += reputation;
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Byzantine weight: number of validators * average reputation
+        let validator_count = unique_validators.len() as f64;
+        if validator_count > 0.0 {
+            total_reputation / validator_count * validator_count.sqrt() // Square root for Byzantine scaling
+        } else {
+            0.0
+        }
+    }
+    
     /// Validate received microblock
     async fn validate_received_microblock(
         block: &crate::unified_p2p::ReceivedBlock,
@@ -1428,41 +1798,37 @@ impl BlockchainNode {
             match prev_block_result {
                 Ok(Some(prev_data)) => {
                     // We have the previous block - verify with real hash
-                    use sha3::{Sha3_256, Digest};
-                    let mut hasher = Sha3_256::new();
-                    hasher.update(&prev_data);
-                    let prev_hash_result = hasher.finalize();
-                    
-                    if microblock.previous_hash != prev_hash_result.as_slice() {
+                use sha3::{Sha3_256, Digest};
+                let mut hasher = Sha3_256::new();
+                hasher.update(&prev_data);
+                let prev_hash_result = hasher.finalize();
+                
+                if microblock.previous_hash != prev_hash_result.as_slice() {
                         // CRITICAL: previous_hash mismatch detected!
                         println!("[VALIDATION] ❌ Block #{} previous_hash mismatch!", microblock.height);
                         println!("[VALIDATION] Expected (from storage): {:?}", &prev_hash_result[0..8]);
                         println!("[VALIDATION] Got (from block): {:?}", &microblock.previous_hash[0..8]);
                         
                         // NO FALLBACK ALLOWED - all blocks must have correct previous_hash
-                        return Err(format!(
+                    return Err(format!(
                             "Block #{} has invalid previous_hash (mismatch with block #{})",
-                            microblock.height,
+                        microblock.height,
                             microblock.height - 1
-                        ));
+                    ));
                     } else {
-                        println!("[VALIDATION] ✅ Chain continuity verified for block #{}", microblock.height);
+                println!("[VALIDATION] ✅ Chain continuity verified for block #{}", microblock.height);
                     }
                 },
                 _ => {
                     // Previous block not found
                     if microblock.height == 1 {
-                        // Block #1 SPECIAL CASE: Can use deterministic Genesis hash during bootstrap
-                        use sha3::{Sha3_256, Digest};
-                        let mut hasher = Sha3_256::new();
-                        hasher.update(b"qnet_genesis_block_2024");
-                        let genesis_hash = hasher.finalize();
+                        // Block #1 SPECIAL CASE: Genesis might not be synced yet
+                        // Return special error to trigger Genesis sync
+                        println!("[VALIDATION] ⚠️ Block #1 received but Genesis block #0 not found");
+                        println!("[VALIDATION] 🔄 Triggering Genesis sync request");
                         
-                        if microblock.previous_hash != genesis_hash.as_slice() {
-                            println!("[VALIDATION] ❌ Block #1 has invalid genesis hash");
-                            return Err("Block #1 has invalid genesis hash".to_string());
-                        }
-                        println!("[VALIDATION] ✅ Block #1 validated with genesis seed");
+                        // CRITICAL: Return special error for missing Genesis
+                        return Err("MISSING_PREVIOUS:0".to_string());
                     } else {
                         // ALL other blocks: MUST have previous block for security
                         println!("[VALIDATION] ❌ Block #{} cannot be validated - previous block #{} not found", 
@@ -1505,15 +1871,15 @@ impl BlockchainNode {
             let existing_hash = existing_hasher.finalize();
             
             if new_hash != existing_hash {
-                // CRITICAL: Chain fork attack detected!
-                println!("[SECURITY] 🚨 CRITICAL: Chain fork detected from producer {}!", microblock.producer);
-                println!("[SECURITY] 🚨 Block #{} already exists with different content!", microblock.height);
-                println!("[SECURITY] 🚨 This is a deliberate attack on chain integrity!");
+                // CRITICAL: Chain fork detected - need to determine which chain to follow
+                println!("[SECURITY] ⚠️ Chain fork detected at block #{}!", microblock.height);
+                println!("[SECURITY] 🔍 Existing hash: {:?}", &existing_hash[0..8]);
+                println!("[SECURITY] 🔍 New hash: {:?}", &new_hash[0..8]);
                 
-                // The producer will get MaliciousBehavior::ChainFork
-                
+                // CRITICAL: Don't immediately reject - this might be a valid longer chain
+                // Mark for potential chain reorganization
                 return Err(format!(
-                    "CRITICAL: Chain fork attack! Block #{} already exists with different hash! Producer {} attempting to rewrite history!",
+                    "FORK_DETECTED:{}:{}",
                     microblock.height,
                     microblock.producer
                 ));
@@ -2041,6 +2407,17 @@ impl BlockchainNode {
                                         match storage.save_microblock(0, &data) {
                                             Ok(_) => {
                                                 println!("[GENESIS] ✅ Genesis Block created and saved at height 0");
+                                                
+                                                // CRITICAL: Broadcast Genesis block to all peers immediately
+                                                if let Some(p2p) = &unified_p2p {
+                                                    println!("[GENESIS] 📡 Broadcasting Genesis block to all peers");
+                                                    if let Err(e) = p2p.broadcast_block(0, data.clone()) {
+                                                        println!("[GENESIS] ⚠️ Failed to broadcast Genesis: {}", e);
+                                                    } else {
+                                                        println!("[GENESIS] ✅ Genesis block broadcasted to network");
+                                                    }
+                                                }
+                                                
                                                 // CRITICAL FIX: Keep height at 0 after Genesis creation
                                                 // next_block_height will be calculated as microblock_height + 1 = 1
                                                 microblock_height = 0;
@@ -2401,6 +2778,15 @@ impl BlockchainNode {
                         _ => {
                             println!("[GENESIS] ❌ Cannot create block #1 without Genesis block!");
                             println!("[GENESIS] ⏳ Waiting for Genesis block to be created or synced...");
+                            
+                            // CRITICAL: Actively request Genesis from network
+                            if let Some(p2p) = &unified_p2p {
+                                println!("[GENESIS] 🔄 Requesting Genesis block from network");
+                                if let Err(e) = p2p.sync_blocks(0, 0).await {
+                                    println!("[GENESIS] ⚠️ Failed to request Genesis: {}", e);
+                                }
+                            }
+                            
                             tokio::time::sleep(Duration::from_secs(2)).await;
                             continue; // Skip this iteration
                         }

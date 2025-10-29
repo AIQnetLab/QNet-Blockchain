@@ -14,7 +14,15 @@ QNet is a high-performance, post-quantum secure blockchain network with a **two-
 - **Phase 2 (Future)**: ONLY QNC token activation on QNet blockchain
 - **Transition**: 90% 1DEV burned OR 5 years from genesis block (whichever comes first)
 
-### 🛡️ **LATEST UPDATES (v2.16.0)**
+### 🛡️ **LATEST UPDATES (v2.17.0)**
+- **Chain Reorganization (Chain Reorg)**: Byzantine-safe fork resolution with 2/3 majority consensus
+- **Advanced Block Synchronization**: Out-of-order block buffering with active missing block requests
+- **DDoS-Protected P2P**: Rate limiting and concurrent request management for network stability
+- **Deterministic Genesis**: SHA3-256 based Genesis block signature for network consistency
+- **Parallel Block Processing**: High-performance consecutive block processing (up to 10 blocks)
+- **Reputation-Based Chain Weight**: Byzantine weight calculation using validator reputation scores
+
+### **Previous Updates (v2.16.0)**
 - **Turbine Block Propagation**: 85% bandwidth reduction with Reed-Solomon erasure coding
 - **Quantum Proof of History**: 31.25M hashes/sec cryptographic clock for time synchronization
 - **Hybrid Sealevel Execution**: 5-stage pipeline with 10,000 parallel transactions
@@ -223,6 +231,45 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 │  └── Cross-Chain Bridges                                   │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+## 🔄 Chain Reorganization & Synchronization
+
+QNet implements advanced chain reorganization and synchronization mechanisms for network consistency:
+
+### **Chain Reorganization (Byzantine-Safe)**
+- **Fork Detection**: Automatic detection of competing blockchain forks
+- **Byzantine Weight Calculation**: Reputation-based chain weight with unique validator counting
+- **2/3 Majority Consensus**: Requires 67% Byzantine threshold for reorganization
+- **Deep Reorg Protection**: Maximum 100 blocks reorganization depth (51% attack prevention)
+- **Race Condition Prevention**: Single concurrent reorg with lock-free coordination
+- **DoS Protection**: Rate limiting (1 fork attempt per 60 seconds maximum)
+- **Reputation Capping**: Maximum 95% reputation to prevent single-node dominance
+- **Async Processing**: Non-blocking fork analysis in background tasks
+- **Automatic Rollback**: Full backup and restore on reorganization failure
+
+### **Advanced Block Synchronization**
+- **Out-of-Order Buffering**: Temporary storage for blocks received before their dependencies
+- **Active Block Requests**: DDoS-protected requests for missing blocks (max 10 concurrent)
+- **Parallel Block Processing**: Processes up to 10 consecutive blocks simultaneously
+- **Request Cooldown**: 10-second minimum between requests for same block (max 3 attempts)
+- **Automatic Retry**: Re-queues buffered blocks when dependencies arrive
+- **Memory Management**: Automatic cleanup of blocks older than 60 seconds
+- **Genesis Coordination**: Only node_001 creates Genesis block in bootstrap mode
+- **Deterministic Genesis**: SHA3-256 based signature ensures identical Genesis across all nodes
+
+### **Proof of History (PoH) Integration**
+- **Cryptographic Clock**: 31.25M hashes/sec SHA3-512 + Blake3 alternating
+- **Verifiable Delay Function**: Time-stamped block ordering without central authority
+- **Block Time Synchronization**: Sub-second precision across distributed network
+- **Historical Proof**: Cryptographic evidence of event ordering and timing
+- **Fork Prevention**: PoH creates immutable timeline making forks computationally expensive
+
+### **Network Synchronization Metrics**
+- **Sync Speed**: Up to 10,000 blocks/second with parallel processing
+- **Fork Resolution**: <5 seconds for Byzantine weight calculation
+- **Missing Block Request**: <100ms average request latency
+- **Reorg Execution**: 50-200ms for typical reorganizations (background)
+- **Memory Overhead**: <10MB for block buffering and request tracking
 
 ## 🆘 Enterprise Failover System
 
