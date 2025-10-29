@@ -1416,16 +1416,23 @@ impl Storage {
         // CRITICAL: Save state snapshot for efficient storage
         // This is what allows us to reconstruct state without all microblocks
         if let Ok(state_data) = bincode::serialize(&macroblock) {
-            // SECURITY: Verify state root before saving to prevent corrupted state
+            // SECURITY: Verify state root is correctly calculated from microblocks
+            // state_root MUST be XOR of all microblock hashes in this macroblock
             use sha3::{Sha3_256, Digest};
-            let mut hasher = Sha3_256::new();
-            hasher.update(&state_data);
-            let computed_root: [u8; 32] = hasher.finalize().into();
+            let mut computed_state_root = [0u8; 32];
             
-            if computed_root != macroblock.state_root {
+            // Recalculate state root from the microblock hashes stored in macroblock
+            for microblock_hash in &macroblock.micro_blocks {
+                for (i, &byte) in microblock_hash.iter().enumerate() {
+                    computed_state_root[i] ^= byte;
+                }
+            }
+            
+            // NOW we can verify - comparing XOR with XOR!
+            if computed_state_root != macroblock.state_root {
                 return Err(IntegrationError::StorageError(
-                    format!("State root mismatch at height {}: expected {:?}, got {:?}", 
-                            height, macroblock.state_root, computed_root)
+                    format!("State root verification failed at height {}: expected {:?}, computed {:?}", 
+                            height, macroblock.state_root, computed_state_root)
                 ));
             }
             
