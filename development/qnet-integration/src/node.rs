@@ -3526,8 +3526,8 @@ impl BlockchainNode {
                     // CRITICAL: Check if we became emergency producer
                     let should_produce_emergency = if let Ok(emergency_flag) = EMERGENCY_PRODUCER_FLAG.lock() {
                         if let Some((height, producer)) = &*emergency_flag {
-                            // FIX: Emergency producer should produce CURRENT height, not +1
-                            if *height == microblock_height && *producer == node_id {
+                            // FIX: Check against next_block_height since emergency is set for the block we're waiting for
+                            if *height == next_block_height && *producer == node_id {
                                 println!("[EMERGENCY] 🚨 WE ARE EMERGENCY PRODUCER FOR BLOCK #{}", height);
                                 true
                             } else {
@@ -3693,7 +3693,7 @@ impl BlockchainNode {
                             let is_rotation_boundary = expected_height_timeout > 0 && (expected_height_timeout % 30) == 0;
                             let rotation_timeout = if is_rotation_boundary {
                                 // Double timeout at rotation boundaries to account for producer switch
-                                Duration::from_secs(30)
+                                Duration::from_secs(10)
                             } else {
                                 microblock_timeout
                             };
@@ -4880,19 +4880,34 @@ impl BlockchainNode {
         // Do NOT filter by connectivity - this causes different candidate lists on different nodes
         // Instead, all 5 Genesis nodes are ALWAYS candidates (deterministic consensus)
         
-        // CONSENSUS FIX: Use DETERMINISTIC list of ALL Genesis nodes (not just connected)
-        // This ensures all nodes have IDENTICAL candidate lists for consistent producer selection
+        // CONSENSUS FIX: Use DETERMINISTIC list but ONLY include ACTIVE nodes
+        // This ensures all nodes have IDENTICAL candidate lists while excluding offline nodes
         
-        // Add Genesis nodes that meet reputation threshold (deterministic order maintained)
+        // Get list of actually connected peers for activity check
+        let validated_peers = p2p.get_validated_active_peers();
+        let active_peer_ids: std::collections::HashSet<String> = validated_peers
+            .iter()
+            .map(|p| p.id.clone())
+            .collect();
+        
+        // Add Genesis nodes that meet reputation threshold AND are active (deterministic order maintained)
         for (node_id, _ip) in &static_genesis_nodes {
                 // CRITICAL FIX: Check REAL reputation from P2P system, not static value
                 // This ensures failed/inactive nodes are excluded from candidates
                 let real_reputation = Self::get_node_reputation_score(node_id, p2p).await;
                 
-                if real_reputation >= 0.70 {
-                    // Node meets consensus threshold - add as candidate
+                // Check if node is active (connected to network OR is self)
+                let is_active = active_peer_ids.contains(node_id) || 
+                               (node_id == own_node_id && is_own_genesis);
+                
+                if real_reputation >= 0.70 && is_active {
+                    // Node meets consensus threshold AND is active - add as candidate
                     all_qualified.push((node_id.clone(), real_reputation));
-                    println!("[GENESIS] ✅ {} qualified with reputation {:.1}%", node_id, real_reputation * 100.0);
+                    println!("[GENESIS] ✅ {} qualified with reputation {:.1}% (ACTIVE)", node_id, real_reputation * 100.0);
+                } else if real_reputation >= 0.70 && !is_active {
+                    // Node has reputation but is OFFLINE - exclude
+                    println!("[GENESIS] ❌ {} excluded - OFFLINE (reputation {:.1}%)", 
+                             node_id, real_reputation * 100.0);
                 } else {
                     // Node below threshold - exclude from candidates
                     println!("[GENESIS] ⚠️ {} excluded - reputation {:.1}% < 70% threshold", 
