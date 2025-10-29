@@ -820,6 +820,11 @@ impl SimplifiedP2P {
     
     /// Update peer last_seen timestamp when we receive data from them
     pub fn update_peer_last_seen(&self, peer_id_or_addr: &str) {
+        self.update_peer_last_seen_with_height(peer_id_or_addr, None);
+    }
+    
+    /// CRITICAL FIX: Update peer last_seen AND optionally update their height
+    pub fn update_peer_last_seen_with_height(&self, peer_id_or_addr: &str, height: Option<u64>) {
         let current_time = self.current_timestamp();
         
         // CRITICAL FIX: Handle both peer ID (e.g., "genesis_node_003") and address (e.g., "161.97.86.81:8001")
@@ -5390,8 +5395,8 @@ impl SimplifiedP2P {
     pub fn handle_message(&self, from_peer: &str, message: NetworkMessage) {
         match message {
             NetworkMessage::Block { height, data, block_type } => {
-                // Update last_seen for the peer who sent the block
-                self.update_peer_last_seen(from_peer);
+                // CRITICAL FIX: Update last_seen AND height for the peer who sent the block
+                self.update_peer_last_seen_with_height(from_peer, Some(height));
                 
                 // Log only every 10th block
                 if height % 10 == 0 {
@@ -5712,8 +5717,8 @@ impl SimplifiedP2P {
         println!("[SYNC] ✅ Processing {} blocks from {} (heights {}-{})", 
                  blocks.len(), sender_id, from_height, to_height);
         
-        // Update last_seen for sender
-        self.update_peer_last_seen(&sender_id);
+        // CRITICAL FIX: Update last_seen AND height for sender (use highest block in batch)
+        self.update_peer_last_seen_with_height(&sender_id, Some(to_height));
         
         // CRITICAL: Send blocks to block receiver for processing
         if let Some(ref block_tx) = self.block_tx {

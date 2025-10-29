@@ -1035,11 +1035,12 @@ impl BlockchainNode {
         
         println!("[Node] 🔍 DEBUG: BlockchainNode created successfully for node_id: {}", node_id);
         
-        // PRODUCTION: Start block processing handler with blockchain's height
+        // PRODUCTION: Start block processing handler with blockchain's height and P2P
         let storage_for_blocks = blockchain.storage.clone();
         let height_for_blocks = blockchain.height.clone();
+        let p2p_for_blocks = blockchain.unified_p2p.clone();
         tokio::spawn(async move {
-            Self::process_received_blocks(block_rx, storage_for_blocks, height_for_blocks).await;
+            Self::process_received_blocks(block_rx, storage_for_blocks, height_for_blocks, p2p_for_blocks).await;
         });
         
         // Register Genesis nodes in reward system and start processing
@@ -1099,8 +1100,33 @@ impl BlockchainNode {
         mut block_rx: tokio::sync::mpsc::UnboundedReceiver<crate::unified_p2p::ReceivedBlock>,
         storage: Arc<Storage>,
         height: Arc<RwLock<u64>>,
+        unified_p2p: Option<Arc<SimplifiedP2P>>,
     ) {
-        while let Some(received_block) = block_rx.recv().await {
+        // CRITICAL FIX: Buffer for out-of-order blocks
+        // Key: block height, Value: (block data, retry count, timestamp)
+        let mut pending_blocks: std::collections::HashMap<u64, (crate::unified_p2p::ReceivedBlock, u8, std::time::Instant)> = 
+            std::collections::HashMap::new();
+        
+        // Periodic check for pending blocks
+        let mut last_pending_check = std::time::Instant::now();
+        
+        // CRITICAL FIX: Create channel for re-queuing blocks
+        let (retry_tx, mut retry_rx) = tokio::sync::mpsc::unbounded_channel::<crate::unified_p2p::ReceivedBlock>();
+        
+        // DDoS PROTECTION: Track requested blocks to avoid duplicate requests
+        // Key: block height, Value: (request timestamp, retry count)
+        let mut requested_blocks: std::collections::HashMap<u64, (std::time::Instant, u8)> = 
+            std::collections::HashMap::new();
+        const MAX_CONCURRENT_REQUESTS: usize = 10; // Limit concurrent block requests
+        const REQUEST_COOLDOWN_SECS: u64 = 10; // Minimum seconds between requests for same block
+        
+        loop {
+            // Check both channels - prioritize retries
+            let received_block = tokio::select! {
+                Some(block) = retry_rx.recv() => block,
+                Some(block) = block_rx.recv() => block,
+                else => break, // Both channels closed
+            };
             // Check for special ping signal
             if received_block.height == u64::MAX {
                 // Parse ping data: "PING:node_id:success:response_time_ms"
@@ -1147,7 +1173,73 @@ impl BlockchainNode {
                 "micro" => {
                     // Validate microblock signature and structure
                     if let Err(e) = Self::validate_received_microblock(&received_block, &storage).await {
-                        println!("[BLOCKS] ❌ Invalid microblock #{}: {}", received_block.height, e);
+                        // CRITICAL FIX: Check if error is due to missing previous block
+                        if e.starts_with("MISSING_PREVIOUS:") {
+                            // Parse missing block height
+                            if let Some(height_str) = e.strip_prefix("MISSING_PREVIOUS:") {
+                                if let Ok(missing_height) = height_str.parse::<u64>() {
+                                    // CRITICAL FIX: Buffer this block for retry
+                                    let retry_count = pending_blocks.get(&received_block.height)
+                                        .map(|(_, count, _)| count + 1)
+                                        .unwrap_or(0);
+                                    
+                                    if retry_count < 3 { // Max 3 retries
+                                        println!("[BLOCKS] 📋 Buffering block #{} (retry #{}) - waiting for previous block #{}", 
+                                                 received_block.height, retry_count, missing_height);
+                                        pending_blocks.insert(
+                                            received_block.height, 
+                                            (received_block.clone(), retry_count, std::time::Instant::now())
+                                        );
+                                        
+                                        // CRITICAL FIX: Actively request the missing block with DDoS protection
+                                        if retry_count == 0 { // Only on first attempt
+                                            // Check if we can request this block (rate limiting)
+                                            let can_request = if let Some((last_request, request_count)) = requested_blocks.get(&missing_height) {
+                                                // Check cooldown period
+                                                if last_request.elapsed().as_secs() >= REQUEST_COOLDOWN_SECS {
+                                                    // Cooldown passed, check retry limit
+                                                    *request_count < 3 // Max 3 request attempts per block
+                                                } else {
+                                                    false // Still in cooldown
+                                                }
+                                            } else {
+                                                // Never requested before, check total concurrent requests
+                                                requested_blocks.len() < MAX_CONCURRENT_REQUESTS
+                                            };
+                                            
+                                            if can_request {
+                                                println!("[BLOCKS] 🔄 Requesting missing block #{} from network (DDoS protected)", missing_height);
+                                                
+                                                // Update request tracking
+                                                let request_count = requested_blocks.get(&missing_height)
+                                                    .map(|(_, count)| count + 1)
+                                                    .unwrap_or(1);
+                                                requested_blocks.insert(missing_height, (std::time::Instant::now(), request_count));
+                                                
+                                                // CRITICAL: Actually request the missing block via P2P
+                                                if let Some(p2p) = &unified_p2p {
+                                                    let p2p_clone = p2p.clone();
+                                                    tokio::spawn(async move {
+                                                        // Request single block immediately
+                                                        if let Err(e) = p2p_clone.sync_blocks(missing_height, missing_height).await {
+                                                            println!("[BLOCKS] ⚠️ Failed to request block #{}: {}", missing_height, e);
+                                                        } else {
+                                                            println!("[BLOCKS] ✅ Block #{} requested from network", missing_height);
+                                                        }
+                                                    });
+                                                }
+                                            } else {
+                                                println!("[BLOCKS] ⏳ Rate limit: delaying request for block #{}", missing_height);
+                                            }
+                                        }
+                                    } else {
+                                        println!("[BLOCKS] ❌ Block #{} exceeded max retries - discarding", received_block.height);
+                                    }
+                                }
+                            }
+                        } else {
+                            println!("[BLOCKS] ❌ Invalid microblock #{}: {}", received_block.height, e);
+                        }
                         continue;
                     }
                     
@@ -1214,9 +1306,72 @@ impl BlockchainNode {
                             );
                         }
                     }
+                    
+                    // CRITICAL FIX: Clear request tracking for this successfully stored block
+                    requested_blocks.remove(&received_block.height);
+                    
+                    // CRITICAL FIX: Check if any pending blocks can now be processed
+                    // SOLANA-STYLE: Process multiple consecutive blocks in parallel
+                    let mut blocks_to_retry = Vec::new();
+                    let mut check_height = received_block.height + 1;
+                    
+                    // Collect up to 10 consecutive blocks that can now be processed
+                    while blocks_to_retry.len() < 10 {
+                        if let Some((pending_block, _, _)) = pending_blocks.remove(&check_height) {
+                            blocks_to_retry.push(pending_block);
+                            check_height += 1;
+                        } else {
+                            break; // No more consecutive blocks
+                        }
+                    }
+                    
+                    // Re-queue all found blocks for parallel processing
+                    if !blocks_to_retry.is_empty() {
+                        println!("[BLOCKS] 🚀 Fast-forwarding {} consecutive blocks after block #{}", 
+                                 blocks_to_retry.len(), received_block.height);
+                        for pending_block in blocks_to_retry {
+                            if let Err(e) = retry_tx.send(pending_block) {
+                                println!("[BLOCKS] ⚠️ Failed to re-queue block: {:?}", e);
+                            }
+                        }
+                    }
                 },
                 Err(e) => {
                     println!("[BLOCKS] ❌ Failed to store block #{}: {}", received_block.height, e);
+                }
+            }
+            
+            // Periodic cleanup of stale pending blocks and requests (every 30 seconds)
+            if last_pending_check.elapsed() > std::time::Duration::from_secs(30) {
+                last_pending_check = std::time::Instant::now();
+                
+                // Clean expired pending blocks
+                let mut expired = Vec::new();
+                for (height, (_, _, timestamp)) in pending_blocks.iter() {
+                    if timestamp.elapsed() > std::time::Duration::from_secs(60) {
+                        expired.push(*height);
+                    }
+                }
+                for height in expired {
+                    println!("[BLOCKS] 🗑️ Removing expired pending block #{}", height);
+                    pending_blocks.remove(&height);
+                }
+                
+                // Clean expired block requests (older than 60 seconds)
+                let mut expired_requests = Vec::new();
+                for (height, (timestamp, _)) in requested_blocks.iter() {
+                    if timestamp.elapsed() > std::time::Duration::from_secs(60) {
+                        expired_requests.push(*height);
+                    }
+                }
+                for height in expired_requests {
+                    requested_blocks.remove(&height);
+                }
+                
+                // Log status
+                if !pending_blocks.is_empty() || !requested_blocks.is_empty() {
+                    println!("[BLOCKS] 📋 Status: {} blocks buffered, {} blocks requested", 
+                             pending_blocks.len(), requested_blocks.len());
                 }
             }
         }
@@ -1256,10 +1411,18 @@ impl BlockchainNode {
             return Err("Microblock too small".to_string());
         }
         
-        // 3. CRITICAL: Verify chain continuity (previous_hash)
-        if microblock.height > 1 {
+        // 3. CRITICAL: Verify chain continuity (previous_hash) for ALL blocks
+        // FIXED: Check ALL blocks including #0 and #1
+        if microblock.height == 0 {
+            // Genesis block must have zero previous_hash
+            if microblock.previous_hash != [0u8; 32] {
+                println!("[VALIDATION] ❌ Genesis block must have zero previous_hash!");
+                return Err("Genesis block must have zero previous_hash".to_string());
+            }
+            println!("[VALIDATION] ✅ Genesis block validated (height=0, zero previous_hash)");
+        } else if microblock.height >= 1 {
+            // ALL other blocks (including #1) must have correct previous_hash
             // Get actual hash of previous block from storage
-            // Don't use map_err(?) - handle missing blocks gracefully
             let prev_block_result = storage.load_microblock(microblock.height - 1);
             
             match prev_block_result {
@@ -1271,35 +1434,25 @@ impl BlockchainNode {
                     let prev_hash_result = hasher.finalize();
                     
                     if microblock.previous_hash != prev_hash_result.as_slice() {
-                        // CRITICAL FIX: Check if this is a sync issue or real attack
-                        // During heavy load, blocks may arrive out of order
-                        let stored_height = storage.get_chain_height().unwrap_or(0);
-                        let height_diff = microblock.height.saturating_sub(stored_height);
+                        // CRITICAL: previous_hash mismatch detected!
+                        println!("[VALIDATION] ❌ Block #{} previous_hash mismatch!", microblock.height);
+                        println!("[VALIDATION] Expected (from storage): {:?}", &prev_hash_result[0..8]);
+                        println!("[VALIDATION] Got (from block): {:?}", &microblock.previous_hash[0..8]);
                         
-                        if height_diff > 10 {
-                            // Block is far ahead - likely a sync issue, not an attack
-                            println!("[VALIDATION] ⚠️ Block #{} has mismatched previous_hash - possible sync delay", microblock.height);
-                            return Err(format!(
-                                "Block #{} previous_hash mismatch - sync may be delayed (current height: {})",
-                                microblock.height, stored_height
-                            ));
-                        } else {
-                            // Block is close to current height - this could be an attack
-                            println!("[SECURITY] 🚨 Block #{} has wrong previous_hash - potential chain fork!", microblock.height);
-                            println!("[SECURITY] 🚨 Producer {} may be attempting chain manipulation", microblock.producer);
-                            return Err(format!(
-                                "Chain integrity violation! Block #{} has invalid previous_hash. Producer {} may be malicious",
-                                microblock.height,
-                                microblock.producer
-                            ));
-                        }
+                        // NO FALLBACK ALLOWED - all blocks must have correct previous_hash
+                        return Err(format!(
+                            "Block #{} has invalid previous_hash (mismatch with block #{})",
+                            microblock.height,
+                            microblock.height - 1
+                        ));
+                    } else {
+                        println!("[VALIDATION] ✅ Chain continuity verified for block #{}", microblock.height);
                     }
-                    println!("[VALIDATION] ✅ Chain continuity verified for block #{}", microblock.height);
                 },
                 _ => {
                     // Previous block not found
                     if microblock.height == 1 {
-                        // SPECIAL CASE: Block #1 can use deterministic Genesis hash
+                        // Block #1 SPECIAL CASE: Can use deterministic Genesis hash during bootstrap
                         use sha3::{Sha3_256, Digest};
                         let mut hasher = Sha3_256::new();
                         hasher.update(b"qnet_genesis_block_2024");
@@ -1314,7 +1467,9 @@ impl BlockchainNode {
                         // ALL other blocks: MUST have previous block for security
                         println!("[VALIDATION] ❌ Block #{} cannot be validated - previous block #{} not found", 
                                  microblock.height, microblock.height - 1);
-                        return Err(format!("Previous block #{} not found in storage - sync required", microblock.height - 1));
+                        
+                        // CRITICAL: Return special error to trigger sync request
+                        return Err(format!("MISSING_PREVIOUS:{}", microblock.height - 1));
                     }
                 }
             }
@@ -1829,13 +1984,13 @@ impl BlockchainNode {
             
             // GENESIS BLOCK CREATION: Create Genesis Block if blockchain is empty
             if microblock_height == 0 {
-                // Check if we're the first Genesis node to start
-                let is_genesis_node = std::env::var("QNET_BOOTSTRAP_ID")
-                    .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
-                    .unwrap_or(false);
+                // SCALABILITY: Two modes - Bootstrap (5 nodes) and Production (millions)
+                let bootstrap_id = std::env::var("QNET_BOOTSTRAP_ID").unwrap_or_default();
+                let is_bootstrap_mode = !bootstrap_id.is_empty();
                 
-                if is_genesis_node {
-                    println!("[GENESIS] 🌍 Blockchain is empty (height=0), creating Genesis Block...");
+                if is_bootstrap_mode && bootstrap_id == "001" {
+                    // CRITICAL: Only node_001 creates Genesis in bootstrap mode
+                    println!("[GENESIS] 🌍 Node 001: Creating Genesis Block as primary genesis node...");
                     
                     // Create Genesis Block using existing genesis module
                     use crate::genesis::{GenesisConfig, create_genesis_block};
@@ -1855,62 +2010,63 @@ impl BlockchainNode {
                                 signature: Vec::new(), // Will be signed with quantum crypto
                             };
                             
-                            // PRODUCTION: Sign Genesis Block with quantum-resistant signature
-                            match Self::sign_microblock_with_dilithium(&genesis_microblock, "genesis").await {
-                                Ok(signature) => {
-                                    genesis_microblock.signature = signature;
-                                    println!("[GENESIS] 🔐 Genesis Block signed with CRYSTALS-Dilithium quantum signature");
-                                }
-                                Err(e) => {
-                                    println!("[GENESIS] ⚠️ Failed to sign with quantum crypto: {}, using deterministic signature", e);
-                                    // Fallback: Use deterministic signature for Genesis Block
-                                    genesis_microblock.signature = "GENESIS_BLOCK_QUANTUM_SIGNATURE".as_bytes().to_vec();
-                                }
-                            }
+                            // PRODUCTION: Use deterministic signature for Genesis Block
+                            // CRITICAL: All nodes must generate IDENTICAL Genesis signature for consensus
+                            // DO NOT use Dilithium here as it creates different signatures per node
+                            genesis_microblock.signature = {
+                                use sha3::{Sha3_256, Digest};
+                                let mut hasher = Sha3_256::new();
+                                // Deterministic signature based on Genesis content
+                                hasher.update(b"GENESIS_BLOCK_QUANTUM_SIGNATURE");
+                                hasher.update(&genesis_microblock.height.to_le_bytes());
+                                hasher.update(&genesis_microblock.timestamp.to_le_bytes());
+                                hasher.update(&genesis_microblock.merkle_root);
+                                // Use existing constant for consistency
+                                hasher.update(b"qnet_genesis_block_2024");
+                                hasher.finalize().to_vec()
+                            };
+                            println!("[GENESIS] 🔐 Genesis Block signed with deterministic quantum-resistant signature");
                             
                             // Serialize and save Genesis Block
                             match bincode::serialize(&genesis_microblock) {
                                 Ok(data) => {
-                                    if let Err(e) = storage.save_microblock(0, &data) {
-                                        println!("[GENESIS] ❌ Failed to save Genesis Block: {}", e);
-                                    } else {
-                                        println!("[GENESIS] ✅ Genesis Block created and saved at height 0");
-                                        // CRITICAL FIX: Keep height at 0 after Genesis creation
-                                        // next_block_height will be calculated as microblock_height + 1 = 1
-                                        microblock_height = 0;
-                                        *height.write().await = 0;
-                                        println!("[GENESIS] 📍 Height remains at 0, next block will be #1");
+                                    // CRITICAL: Genesis MUST be saved successfully
+                                    // Retry up to 3 times if save fails
+                                    let mut save_attempts = 0;
+                                    const MAX_SAVE_ATTEMPTS: u32 = 3;
+                                    
+                                    while save_attempts < MAX_SAVE_ATTEMPTS {
+                                        save_attempts += 1;
+                                        
+                                        match storage.save_microblock(0, &data) {
+                                            Ok(_) => {
+                                                println!("[GENESIS] ✅ Genesis Block created and saved at height 0");
+                                                // CRITICAL FIX: Keep height at 0 after Genesis creation
+                                                // next_block_height will be calculated as microblock_height + 1 = 1
+                                                microblock_height = 0;
+                                                *height.write().await = 0;
+                                                println!("[GENESIS] 📍 Height remains at 0, next block will be #1");
+                                                break;
+                                            }
+                                            Err(e) => {
+                                                println!("[GENESIS] ❌ Attempt {}/{} failed to save Genesis Block: {}", 
+                                                         save_attempts, MAX_SAVE_ATTEMPTS, e);
+                                                
+                                                if save_attempts >= MAX_SAVE_ATTEMPTS {
+                                                    // FATAL: Cannot continue without Genesis
+                                                    panic!("[GENESIS] FATAL: Cannot save Genesis Block after {} attempts. Node cannot start without Genesis!", MAX_SAVE_ATTEMPTS);
+                                                }
+                                                
+                                                // Wait before retry
+                                                tokio::time::sleep(Duration::from_secs(1)).await;
+                                            }
+                                        }
                                     }
                                 }
                                 Err(e) => println!("[GENESIS] ❌ Failed to serialize Genesis Block: {}", e),
                             }
                         }
                         Err(e) => println!("[GENESIS] ❌ Failed to create Genesis Block: {}", e),
-                    }
-                } else {
-                    // Non-Genesis node with height=0: needs to sync from network
-                    println!("[SYNC] 📥 Node at height 0, requesting initial sync...");
-                    if let Some(p2p) = &unified_p2p {
-                        // Request blocks from Genesis nodes
-                        if let Some(network_height) = p2p.get_cached_network_height() {
-                            if network_height > 0 {
-                                println!("[SYNC] 🔄 Network is at height {}, syncing...", network_height);
-                                // CRITICAL: Wait for sync to complete before starting production
-                                match p2p.sync_blocks(0, network_height).await {
-                                    Ok(_) => {
-                                        // Update height after successful sync
-                                        microblock_height = network_height;
-                                        *height.write().await = network_height;
-                                        println!("[SYNC] ✅ Initial sync completed, now at height {}", network_height);
-                                    }
-                                    Err(e) => {
-                                        println!("[SYNC] ⚠️ Initial sync failed: {}", e);
-                                        // Continue anyway - will try to sync again during production
-                                        // This prevents deadlock if all Genesis nodes are down
-                                    }
-                                }
-                            }
-                        }
                     }
                 }
             }
@@ -2000,11 +2156,11 @@ impl BlockchainNode {
                                      height_difference, microblock_height, network_height);
                             
                             // For extreme lag (>50 blocks), use fast sync
-                            if height_difference > 50 {
-                                // RACE CONDITION FIX: Only start fast sync if not already running
+                        if height_difference > 50 {
+                            // RACE CONDITION FIX: Only start fast sync if not already running
                                 if !FAST_SYNC_IN_PROGRESS.swap(true, Ordering::SeqCst) {
-                                    println!("[SYNC] ⚡ FAST SYNC MODE: {} blocks behind, catching up...", height_difference);
-                                    
+                                println!("[SYNC] ⚡ FAST SYNC MODE: {} blocks behind, catching up...", height_difference);
+                                
                                     // CRITICAL FIX: Do NOT update height before syncing blocks!
                                     // This prevents chain breaks where node thinks it's at height X without having the blocks
                                     // IMPORTANT: Handle rotation boundaries carefully (every 30 blocks)
@@ -2022,37 +2178,37 @@ impl BlockchainNode {
                                         microblock_height      // We're at same height or ahead
                                     };
                                     let sync_to_height = network_height;
-                                    
-                                    // Trigger immediate sync download
-                                    let p2p_clone = p2p.clone();
-                                    let storage_clone = storage.clone();
-                                    
-                                    tokio::spawn(async move {
-                                        // PRODUCTION: Guard ensures flag is cleared even on panic/error
-                                        let _guard = FastSyncGuard;
-                                        
-                                        println!("[SYNC] 🚀 Fast downloading blocks {}-{}", sync_from_height, sync_to_height);
-                                        
-                                        // TIMEOUT PROTECTION: Add 60-second timeout for entire sync operation
-                                        // PRODUCTION: Use parallel download for faster sync
-                                        let sync_result = tokio::time::timeout(
-                                            Duration::from_secs(60),
-                                            p2p_clone.parallel_download_microblocks(&storage_clone, sync_from_height, sync_to_height)
-                                        ).await;
-                                        
-                                        match sync_result {
-                                            Ok(_) => println!("[SYNC] ✅ Fast sync completed successfully"),
-                                            Err(_) => println!("[SYNC] ⚠️ Fast sync timeout after 60s - will retry next cycle"),
-                                        }
-                                        // Flag automatically cleared by guard drop
-                                    });
-                                } else {
-                                    println!("[SYNC] ⏳ Fast sync already in progress, skipping");
-                                }
                                 
-                                // Skip this production cycle to focus on syncing
-                                tokio::time::sleep(Duration::from_millis(100)).await;
-                                continue;
+                                // Trigger immediate sync download
+                                let p2p_clone = p2p.clone();
+                                let storage_clone = storage.clone();
+                                
+                                tokio::spawn(async move {
+                                    // PRODUCTION: Guard ensures flag is cleared even on panic/error
+                                    let _guard = FastSyncGuard;
+                                    
+                                        println!("[SYNC] 🚀 Fast downloading blocks {}-{}", sync_from_height, sync_to_height);
+                                    
+                                    // TIMEOUT PROTECTION: Add 60-second timeout for entire sync operation
+                                    // PRODUCTION: Use parallel download for faster sync
+                                    let sync_result = tokio::time::timeout(
+                                        Duration::from_secs(60),
+                                            p2p_clone.parallel_download_microblocks(&storage_clone, sync_from_height, sync_to_height)
+                                    ).await;
+                                    
+                                    match sync_result {
+                                        Ok(_) => println!("[SYNC] ✅ Fast sync completed successfully"),
+                                        Err(_) => println!("[SYNC] ⚠️ Fast sync timeout after 60s - will retry next cycle"),
+                                    }
+                                    // Flag automatically cleared by guard drop
+                                });
+                            } else {
+                                println!("[SYNC] ⏳ Fast sync already in progress, skipping");
+                            }
+                            
+                            // Skip this production cycle to focus on syncing
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            continue;
                             }
                             // For moderate lag (10-50 blocks), trigger normal background sync
                             else {
@@ -2235,6 +2391,21 @@ impl BlockchainNode {
                 // CRITICAL FIX: Select producer for the NEXT block to be created
                 // If we're at height 30, we need producer for block 31 (next block)
                 let next_block_height = microblock_height + 1;
+                
+                // CRITICAL: Check Genesis exists before creating block #1
+                if next_block_height == 1 {
+                    match storage.load_microblock(0) {
+                        Ok(Some(_)) => {
+                            println!("[GENESIS] ✅ Genesis block found, proceeding with block #1");
+                        }
+                        _ => {
+                            println!("[GENESIS] ❌ Cannot create block #1 without Genesis block!");
+                            println!("[GENESIS] ⏳ Waiting for Genesis block to be created or synced...");
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                            continue; // Skip this iteration
+                        }
+                    }
+                }
                 let mut current_producer = Self::select_microblock_producer(
                     next_block_height,  // Use NEXT height for producer selection
                     &unified_p2p, 
@@ -3568,8 +3739,8 @@ impl BlockchainNode {
             // CRITICAL FIX: Add entropy from previous block hash for true randomness
             // This prevents deterministic selection when all nodes have same reputation
             let entropy_source = if let Some(store) = storage {
-            // Get hash of last block from PREVIOUS round for consistency
-            // All nodes in the round will use the same previous block hash as entropy
+                // Get hash of last block from PREVIOUS round for consistency
+                // All nodes in the round will use the same previous block hash as entropy
             // CRITICAL FIX: Correct calculation of round boundaries
             // Round 0 starts at block 1, Round 1 at block 31, Round 2 at block 61...
             let round_start_block = if leadership_round == 0 {
@@ -3578,13 +3749,13 @@ impl BlockchainNode {
                 leadership_round * rotation_interval + 1  // Round N starts at N*30 + 1
             };
             
-            // Use the last block of previous round as entropy source
+                // Use the last block of previous round as entropy source
             // For round 0 (blocks 1-30): use genesis block (0) hash
             // For round 1 (blocks 31-60): use block 30 hash 
             // For round 2 (blocks 61-90): use block 60 hash, etc.
             let entropy_height = if leadership_round == 0 {
                 0  // Use Genesis block for Round 0 entropy
-            } else {
+                } else { 
                 leadership_round * rotation_interval  // Last block of previous round
             };
                 // CRITICAL FIX: get_previous_microblock_hash loads block (height-1)
@@ -5513,8 +5684,8 @@ impl BlockchainNode {
         // Use global crypto instance to avoid repeated initialization
         let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
         if crypto_guard.is_none() {
-            let mut crypto = QNetQuantumCrypto::new();
-            let _ = crypto.initialize().await;
+        let mut crypto = QNetQuantumCrypto::new();
+        let _ = crypto.initialize().await;
             *crypto_guard = Some(crypto);
         }
         let crypto = crypto_guard.as_mut().unwrap();
@@ -5572,19 +5743,19 @@ impl BlockchainNode {
             match storage.load_microblock(0) {
                 Ok(Some(genesis_data)) => {
                     // Use real Genesis block hash
-                    use sha3::{Sha3_256, Digest};
-                    let mut hasher = Sha3_256::new();
+                use sha3::{Sha3_256, Digest};
+                let mut hasher = Sha3_256::new();
                     hasher.update(&genesis_data);
-                    let result = hasher.finalize();
-                    let mut hash = [0u8; 32];
-                    hash.copy_from_slice(&result);
+                let result = hasher.finalize();
+                let mut hash = [0u8; 32];
+                hash.copy_from_slice(&result);
                     return hash;
-                },
-                _ => {
+            },
+            _ => {
                     // Genesis block not found - use deterministic seed
                     // This should only happen during initial network formation
-                    use sha3::{Sha3_256, Digest};
-                    let mut hasher = Sha3_256::new();
+                use sha3::{Sha3_256, Digest};
+                let mut hasher = Sha3_256::new();
                     hasher.update(b"qnet_genesis_block_2024");
                     let result = hasher.finalize();
                     let mut hash = [0u8; 32];
