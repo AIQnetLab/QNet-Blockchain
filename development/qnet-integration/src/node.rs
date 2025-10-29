@@ -1854,8 +1854,11 @@ impl BlockchainNode {
                                         println!("[GENESIS] ❌ Failed to save Genesis Block: {}", e);
                                     } else {
                                         println!("[GENESIS] ✅ Genesis Block created and saved at height 0");
-                                        microblock_height = 1; // Start production from block 1
-                                        *height.write().await = 1;
+                                        // CRITICAL FIX: Keep height at 0 after Genesis creation
+                                        // next_block_height will be calculated as microblock_height + 1 = 1
+                                        microblock_height = 0;
+                                        *height.write().await = 0;
+                                        println!("[GENESIS] 📍 Height remains at 0, next block will be #1");
                                     }
                                 }
                                 Err(e) => println!("[GENESIS] ❌ Failed to serialize Genesis Block: {}", e),
