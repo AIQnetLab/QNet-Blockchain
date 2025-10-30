@@ -6419,7 +6419,11 @@ impl SimplifiedP2P {
         println!("[SECURITY] Node: {} attempted to set reputation to {:.1}%", node_id, attempted_reputation);
         
         // Get current legitimate reputation
-        let current_reputation = self.get_node_reputation(node_id);
+        let current_reputation = if let Ok(rep_system) = self.reputation_system.lock() {
+            rep_system.get_reputation(node_id)
+        } else {
+            70.0 // Default if lock fails
+        };
         
         // Calculate severity of tampering
         let severity = if attempted_reputation >= 90.0 && current_reputation < 70.0 {

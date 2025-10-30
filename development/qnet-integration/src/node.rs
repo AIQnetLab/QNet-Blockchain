@@ -6,6 +6,7 @@ use crate::{
     // validator::Validator, // disabled for compilation
     unified_p2p::{SimplifiedP2P, NodeType as UnifiedNodeType, Region as UnifiedRegion, ConsensusMessage, NetworkMessage},
 };
+use once_cell::sync::Lazy;
 
 // PROTOCOL VERSION for compatibility checks
 pub const PROTOCOL_VERSION: u32 = 1;  // Increment when breaking changes are made
@@ -1301,12 +1302,13 @@ impl BlockchainNode {
                                             
                                             // CRITICAL FIX: If we detect our own blocks being rejected as forks,
                                             // we need to sync with the network majority
-                                            if fork_producer == node_id {
-                                                println!("[REORG] ⚠️ Our blocks are being rejected! Forcing sync with network majority");
-                                                
-                                                // Force sync with network to get correct chain
-                                                if let Some(p2p) = &unified_p2p {
-                                                    if let Some(network_height) = p2p.sync_blockchain_height() {
+                                            if let Some(p2p) = &unified_p2p {
+                                                let own_node_id = p2p.get_node_id();
+                                                if fork_producer == own_node_id {
+                                                    println!("[REORG] ⚠️ Our blocks are being rejected! Forcing sync with network majority");
+                                                    
+                                                    // Force sync with network to get correct chain
+                                                    if let Ok(network_height) = p2p.sync_blockchain_height() {
                                                         if network_height > *height.read().await {
                                                             println!("[REORG] 📥 Network is ahead at height {} - syncing...", network_height);
                                                             
@@ -3278,7 +3280,7 @@ impl BlockchainNode {
                     // This prevents creating blocks on a forked/outdated chain
                     if let Some(p2p) = &unified_p2p {
                         // Check if we're behind the network
-                        if let Some(network_height) = p2p.sync_blockchain_height() {
+                        if let Ok(network_height) = p2p.sync_blockchain_height() {
                             if network_height > next_block_height {
                                 println!("[SYNC] ⚠️ We're behind network (local: {} vs network: {})", next_block_height, network_height);
                                 println!("[SYNC] 🔄 Syncing before producing block...");
@@ -6852,6 +6854,7 @@ impl BlockchainNode {
     pub async fn is_next_block_producer(&self) -> bool {
         // CRITICAL FIX: Use network consensus height, not local height
         // This prevents multiple nodes thinking they are producers
+        let local_height = self.get_height().await;
         let network_height = if let Some(p2p) = &self.unified_p2p {
             // Try to get network consensus height
             match p2p.sync_blockchain_height() {
@@ -6859,11 +6862,11 @@ impl BlockchainNode {
                 Err(_) => {
                     // Fallback to cached or local height
                     p2p.get_cached_network_height()
-                        .unwrap_or_else(|| self.get_height().await)
+                        .unwrap_or(local_height)
                 }
             }
         } else {
-            self.get_height().await
+            local_height
         };
         
         let next_height = network_height + 1;
