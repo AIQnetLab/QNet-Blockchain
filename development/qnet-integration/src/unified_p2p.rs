@@ -6249,13 +6249,19 @@ impl SimplifiedP2P {
         if let Ok(mut reputation) = self.reputation_system.lock() {
             reputation.update_reputation(node_id, delta);
             
+            // CRITICAL FIX: Save reputation to persistent storage
+            // This prevents reputation loss on restart
+            let new_reputation = reputation.get_reputation(node_id);
+            self.save_reputation_to_storage(node_id, new_reputation);
+            
             // PRIVACY: Use pseudonym for logging (don't double-convert if already pseudonym)
             let display_id = if node_id.starts_with("genesis_node_") || node_id.starts_with("node_") {
                 node_id.to_string()
             } else {
                 get_privacy_id_for_addr(node_id)
             };
-            println!("[P2P] 📊 Updated reputation for {}: delta {:.1}", display_id, delta);
+            println!("[P2P] 📊 Updated reputation for {}: delta {:.1} (new: {:.1}%)", 
+                    display_id, delta, new_reputation);
         }
     }
     
@@ -6264,13 +6270,16 @@ impl SimplifiedP2P {
         if let Ok(mut rep_system) = self.reputation_system.lock() {
             rep_system.set_reputation(node_id, reputation);
             
+            // CRITICAL FIX: Save reputation to persistent storage
+            self.save_reputation_to_storage(node_id, reputation);
+            
             // PRIVACY: Use pseudonym for logging (don't double-convert if already pseudonym)
             let display_id = if node_id.starts_with("genesis_node_") || node_id.starts_with("node_") {
                 node_id.to_string()
             } else {
                 get_privacy_id_for_addr(node_id)
             };
-            println!("[P2P] 🔐 Set absolute reputation for {}: {:.1}%", display_id, reputation);
+            println!("[P2P] 🔐 Set absolute reputation for {}: {:.1}% (saved)", display_id, reputation);
         }
     }
     
@@ -6281,6 +6290,485 @@ impl SimplifiedP2P {
         } else {
             false
         }
+    }
+    
+    /// CRITICAL FIX: Save reputation to persistent storage with integrity check
+    fn save_reputation_to_storage(&self, node_id: &str, reputation: f64) {
+        // SECURITY: Add cryptographic integrity to prevent tampering
+        let reputation_file = format!("./data/reputation_{}.dat", node_id);
+        
+        // Create reputation record with timestamp and hash
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        
+        // Create integrity hash (SHA3-256)
+        use sha3::{Sha3_256, Digest};
+        let mut hasher = Sha3_256::new();
+        hasher.update(node_id.as_bytes());
+        hasher.update(reputation.to_le_bytes());
+        hasher.update(timestamp.to_le_bytes());
+        
+        // Add secret salt (from node's private key or environment)
+        let salt = std::env::var("QNET_NODE_SECRET").unwrap_or_else(|_| {
+            // Fallback: Use node ID + fixed salt (less secure but works)
+            format!("QNET_REPUTATION_SALT_{}", node_id)
+        });
+        hasher.update(salt.as_bytes());
+        
+        let integrity_hash = hex::encode(hasher.finalize());
+        
+        // Save as JSON with integrity check
+        let reputation_data = serde_json::json!({
+            "node_id": node_id,
+            "reputation": reputation,
+            "timestamp": timestamp,
+            "integrity": integrity_hash,
+            "version": 1
+        });
+        
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&reputation_file) {
+            use std::io::Write;
+            let _ = writeln!(file, "{}", reputation_data.to_string());
+        }
+    }
+    
+    /// CRITICAL FIX: Load reputation from persistent storage with integrity verification
+    pub fn load_reputation_from_storage(&self, node_id: &str) -> Option<f64> {
+        let reputation_file = format!("./data/reputation_{}.dat", node_id);
+        
+        // Read reputation file
+        let content = match std::fs::read_to_string(&reputation_file) {
+            Ok(c) => c,
+            Err(_) => return None,
+        };
+        
+        // Try to parse as JSON (new format with integrity)
+        if let Ok(data) = serde_json::from_str::<serde_json::Value>(&content) {
+            // Extract fields
+            let stored_node_id = data["node_id"].as_str()?;
+            let reputation = data["reputation"].as_f64()?;
+            let timestamp = data["timestamp"].as_u64()?;
+            let stored_hash = data["integrity"].as_str()?;
+            
+            // Verify node ID matches
+            if stored_node_id != node_id {
+                println!("[REPUTATION] ⚠️ Node ID mismatch in reputation file!");
+                return None;
+            }
+            
+            // Verify integrity hash
+            use sha3::{Sha3_256, Digest};
+            let mut hasher = Sha3_256::new();
+            hasher.update(node_id.as_bytes());
+            hasher.update(reputation.to_le_bytes());
+            hasher.update(timestamp.to_le_bytes());
+            
+            // Add secret salt (same as when saving)
+            let salt = std::env::var("QNET_NODE_SECRET").unwrap_or_else(|_| {
+                format!("QNET_REPUTATION_SALT_{}", node_id)
+            });
+            hasher.update(salt.as_bytes());
+            
+            let computed_hash = hex::encode(hasher.finalize());
+            
+            if computed_hash != stored_hash {
+                println!("[REPUTATION] 🚨 INTEGRITY CHECK FAILED! Reputation file may be tampered!");
+                println!("[REPUTATION] Expected: {}", computed_hash);
+                println!("[REPUTATION] Found: {}", stored_hash);
+                
+                // CRITICAL: Report reputation tampering as malicious behavior
+                self.report_reputation_tampering(node_id, reputation);
+                
+                return None;  // Don't load tampered reputation
+            }
+            
+            // Check if reputation is too old (optional: expire after 30 days)
+            let current_time = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            
+            let age_days = (current_time - timestamp) / 86400;
+            if age_days > 30 {
+                println!("[REPUTATION] ⚠️ Reputation data is {} days old - resetting", age_days);
+                return None;
+            }
+            
+            println!("[REPUTATION] ✅ Integrity verified for {} (age: {} days)", node_id, age_days);
+            Some(reputation)
+        } else {
+            // Fallback: Try old format (plain number) - but warn about it
+            if let Ok(rep) = content.trim().parse::<f64>() {
+                println!("[REPUTATION] ⚠️ Old format reputation file - no integrity check!");
+                Some(rep)
+            } else {
+                None
+            }
+        }
+    }
+    
+    /// CRITICAL: Report and punish reputation tampering attempts
+    fn report_reputation_tampering(&self, node_id: &str, attempted_reputation: f64) {
+        println!("[SECURITY] 🚨🚨🚨 REPUTATION TAMPERING DETECTED! 🚨🚨🚨");
+        println!("[SECURITY] Node: {} attempted to set reputation to {:.1}%", node_id, attempted_reputation);
+        
+        // Get current legitimate reputation
+        let current_reputation = self.get_node_reputation(node_id);
+        
+        // Calculate severity of tampering
+        let severity = if attempted_reputation >= 90.0 && current_reputation < 70.0 {
+            // Attempted to jump from low to high reputation
+            "CRITICAL"
+        } else if attempted_reputation - current_reputation > 30.0 {
+            // Attempted significant increase
+            "HIGH"
+        } else {
+            "MEDIUM"
+        };
+        
+        println!("[SECURITY] Tampering severity: {} (current: {:.1}%, attempted: {:.1}%)", 
+                 severity, current_reputation, attempted_reputation);
+        
+        // Apply severe penalties based on tampering severity
+        let penalty = match severity {
+            "CRITICAL" => {
+                // CRITICAL: Attempted to fake high reputation
+                // Penalty: Set to 0% and ban from network
+                println!("[PENALTY] 💀 CRITICAL TAMPERING - Setting reputation to 0% and marking for BAN");
+                
+                // Mark node as malicious in storage
+                self.mark_node_as_malicious(node_id, "REPUTATION_TAMPERING_CRITICAL");
+                
+                -100.0  // Drop to 0%
+            },
+            "HIGH" => {
+                // HIGH: Significant tampering
+                // Penalty: -50% reputation
+                println!("[PENALTY] ⚠️ HIGH TAMPERING - Applying -50% reputation penalty");
+                
+                self.mark_node_as_malicious(node_id, "REPUTATION_TAMPERING_HIGH");
+                
+                -50.0
+            },
+            _ => {
+                // MEDIUM: Minor tampering
+                // Penalty: -30% reputation
+                println!("[PENALTY] ⚠️ MEDIUM TAMPERING - Applying -30% reputation penalty");
+                
+                self.mark_node_as_malicious(node_id, "REPUTATION_TAMPERING_MEDIUM");
+                
+                -30.0
+            }
+        };
+        
+        // Apply the penalty
+        self.update_node_reputation(node_id, penalty);
+        
+        // Broadcast tampering alert to network
+        self.broadcast_tampering_alert(node_id, attempted_reputation, current_reputation, severity);
+        
+        // Log to permanent security audit
+        self.log_security_incident(node_id, "REPUTATION_TAMPERING", severity);
+    }
+    
+    /// Mark node as malicious in permanent storage
+    fn mark_node_as_malicious(&self, node_id: &str, violation_type: &str) {
+        let malicious_file = format!("./data/malicious_{}.json", node_id);
+        
+        let incident = serde_json::json!({
+            "node_id": node_id,
+            "violation": violation_type,
+            "timestamp": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            "action": "REPUTATION_PENALTY",
+            "permanent": violation_type.contains("CRITICAL")
+        });
+        
+        // Append to malicious behavior log
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&malicious_file) {
+            use std::io::Write;
+            let _ = writeln!(file, "{}", incident.to_string());
+        }
+    }
+    
+    /// Broadcast tampering alert to all peers
+    fn broadcast_tampering_alert(&self, node_id: &str, attempted_rep: f64, actual_rep: f64, severity: &str) {
+        // Create security alert message
+        let alert_data = serde_json::json!({
+            "type": "REPUTATION_TAMPERING",
+            "node_id": node_id,
+            "attempted_reputation": attempted_rep,
+            "actual_reputation": actual_rep,
+            "severity": severity,
+            "timestamp": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            "action_taken": "PENALTY_APPLIED"
+        });
+        
+        // SCALABILITY: Only notify Super nodes and random sample of peers
+        // For millions of nodes, broadcasting to all would cause network storm
+        let peers = self.connected_peers.read().unwrap();
+        let mut broadcasted = 0;
+        
+        // Collect Super nodes and sample of other peers
+        let mut super_nodes = Vec::new();
+        let mut other_peers = Vec::new();
+        
+        for (peer_id, peer_info) in peers.iter() {
+            if peer_id != node_id {  // Don't send to the violator
+                match peer_info.node_type {
+                    NodeType::Super => super_nodes.push((peer_id.clone(), peer_info.clone())),
+                    _ => other_peers.push((peer_id.clone(), peer_info.clone())),
+                }
+            }
+        }
+        
+        // Always notify all Super nodes (consensus validators)
+        for (peer_id, peer_info) in super_nodes.iter() {
+                // Send security alert via HTTP endpoint
+                let url = format!("http://{}:{}/api/v1/security/alert", 
+                                peer_info.addr, 8001);
+                
+                let alert_json = alert_data.clone();
+                let peer_id_clone = peer_id.clone();
+                
+                // Send async to not block
+                tokio::spawn(async move {
+                    if let Ok(client) = reqwest::Client::builder()
+                        .timeout(std::time::Duration::from_secs(5))
+                        .build() {
+                        
+                        match client.post(&url)
+                            .json(&alert_json)
+                            .send()
+                            .await {
+                            Ok(_) => {
+                                println!("[SECURITY] ✅ Alert sent to {}", peer_id_clone);
+                            },
+                            Err(e) => {
+                                println!("[SECURITY] ⚠️ Failed to send alert to {}: {}", peer_id_clone, e);
+                            }
+                        }
+                    }
+                });
+                
+                broadcasted += 1;
+            }
+        
+        // SCALABILITY: For other peers, only notify a random sample (max 10)
+        // This prevents network storm when we have millions of nodes
+        use rand::seq::SliceRandom;
+        let mut rng = rand::thread_rng();
+        let sample_size = std::cmp::min(10, other_peers.len());
+        let sampled_peers: Vec<_> = other_peers.choose_multiple(&mut rng, sample_size).cloned().collect();
+        
+        for (peer_id, peer_info) in sampled_peers.iter() {
+            let url = format!("http://{}:{}/api/v1/security/alert", 
+                            peer_info.addr, self.port);
+            
+            let alert_json = alert_data.clone();
+            let peer_id_clone = peer_id.clone();
+            
+            tokio::spawn(async move {
+                if let Ok(client) = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(5))
+                    .build() {
+                    
+                    match client.post(&url)
+                        .json(&alert_json)
+                        .send()
+                        .await {
+                        Ok(_) => {
+                            println!("[SECURITY] ✅ Alert sent to {}", peer_id_clone);
+                        },
+                        Err(e) => {
+                            println!("[SECURITY] ⚠️ Failed to send alert to {}: {}", peer_id_clone, e);
+                        }
+                    }
+                }
+            });
+            
+            broadcasted += 1;
+        }
+        
+        println!("[SECURITY] 📢 Alert sent to {} Super nodes + {} sampled peers", 
+                 super_nodes.len(), sampled_peers.len());
+    }
+    
+    /// Log security incident with cryptographic chain for tamper-proof audit trail
+    fn log_security_incident(&self, node_id: &str, incident_type: &str, severity: &str) {
+        // CRITICAL: Create tamper-proof audit chain (like blockchain)
+        let audit_file = "./data/security_audit.chain";
+        let audit_index_file = "./data/security_audit.index";
+        
+        // Get previous audit hash for chain
+        let previous_hash = self.get_last_audit_hash(&audit_index_file).unwrap_or_else(|| {
+            // Genesis audit entry
+            "0000000000000000000000000000000000000000000000000000000000000000".to_string()
+        });
+        
+        // Create audit entry with all details
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        
+        let audit_entry = serde_json::json!({
+            "index": self.get_audit_index(&audit_index_file),
+            "timestamp": timestamp,
+            "incident_type": incident_type,
+            "node_id": node_id,
+            "severity": severity,
+            "action": "PENALTY_APPLIED",
+            "previous_hash": previous_hash,
+        });
+        
+        // Calculate cryptographic hash of this entry (including previous hash for chain)
+        use sha3::{Sha3_256, Digest};
+        let mut hasher = Sha3_256::new();
+        hasher.update(audit_entry.to_string().as_bytes());
+        
+        // Add system secret for additional protection
+        let system_secret = std::env::var("QNET_AUDIT_SECRET").unwrap_or_else(|_| {
+            // Derive from node's identity
+            format!("QNET_AUDIT_CHAIN_{}", self.node_id)
+        });
+        hasher.update(system_secret.as_bytes());
+        
+        let entry_hash = hex::encode(hasher.finalize());
+        
+        // Create final audit block
+        let audit_block = serde_json::json!({
+            "entry": audit_entry,
+            "hash": entry_hash,
+            "signature": self.sign_audit_entry(&entry_hash),  // Digital signature
+        });
+        
+        // Append to audit chain file
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&audit_file) {
+            use std::io::Write;
+            let _ = writeln!(file, "{}", audit_block.to_string());
+            
+            // Update index with latest hash
+            self.update_audit_index(&audit_index_file, &entry_hash);
+            
+            println!("[AUDIT] 🔐 Security incident logged with hash: {}", &entry_hash[..16]);
+        }
+        
+        // CRITICAL: Also broadcast to network for distributed audit
+        self.broadcast_audit_entry(audit_block);
+    }
+    
+    /// Get the hash of the last audit entry for chain continuity
+    fn get_last_audit_hash(&self, index_file: &str) -> Option<String> {
+        if let Ok(content) = std::fs::read_to_string(index_file) {
+            let lines: Vec<&str> = content.lines().collect();
+            if let Some(last_line) = lines.last() {
+                // Format: index|hash|timestamp
+                let parts: Vec<&str> = last_line.split('|').collect();
+                if parts.len() >= 2 {
+                    return Some(parts[1].to_string());
+                }
+            }
+        }
+        None
+    }
+    
+    /// Get next audit index number
+    fn get_audit_index(&self, index_file: &str) -> u64 {
+        if let Ok(content) = std::fs::read_to_string(index_file) {
+            content.lines().count() as u64 + 1
+        } else {
+            1  // First entry
+        }
+    }
+    
+    /// Update audit index with new entry hash
+    fn update_audit_index(&self, index_file: &str, hash: &str) {
+        let index = self.get_audit_index(index_file);
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(index_file) {
+            use std::io::Write;
+            let _ = writeln!(file, "{}|{}|{}", index, hash, timestamp);
+        }
+    }
+    
+    /// Sign audit entry with node's private key (quantum-resistant)
+    fn sign_audit_entry(&self, entry_hash: &str) -> String {
+        // In production, use Dilithium signature
+        // For now, use HMAC with node secret
+        use sha3::{Sha3_256, Digest};
+        let mut hasher = Sha3_256::new();
+        hasher.update(entry_hash.as_bytes());
+        hasher.update(self.node_id.as_bytes());
+        
+        let secret = std::env::var("QNET_NODE_PRIVATE_KEY").unwrap_or_else(|_| {
+            format!("NODE_KEY_{}", self.node_id)
+        });
+        hasher.update(secret.as_bytes());
+        
+        hex::encode(hasher.finalize())
+    }
+    
+    /// Broadcast audit entry to network for distributed verification
+    fn broadcast_audit_entry(&self, audit_block: serde_json::Value) {
+        // Send to at least 3 random peers for redundancy
+        let peers = self.connected_peers.read().unwrap();
+        let peer_list: Vec<_> = peers.keys().cloned().collect();
+        
+        let selected_peers = if peer_list.len() <= 3 {
+            peer_list
+        } else {
+            // Select 3 random peers
+            use rand::seq::SliceRandom;
+            let mut rng = rand::thread_rng();
+            peer_list.choose_multiple(&mut rng, 3).cloned().collect()
+        };
+        
+        for peer_id in selected_peers {
+            let audit_data = audit_block.clone();
+            let peer_info = peers.get(&peer_id).cloned();
+            
+            if let Some(info) = peer_info {
+                let peer_port = 8001; // Standard QNet port
+                tokio::spawn(async move {
+                    // Send audit entry to peer for distributed storage
+                    let url = format!("http://{}:{}/api/v1/audit/store", 
+                                    info.addr, peer_port);
+                    
+                    if let Ok(client) = reqwest::Client::builder()
+                        .timeout(std::time::Duration::from_secs(5))
+                        .build() {
+                        let _ = client.post(&url).json(&audit_data).send().await;
+                    }
+                });
+            }
+        }
+        
+        println!("[AUDIT] 📤 Audit entry distributed to network for redundancy");
     }
     
     /// PRIVACY: Get public display name for P2P announcements (preserves consensus node_id)

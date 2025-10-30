@@ -1298,6 +1298,31 @@ impl BlockchainNode {
                                         let last_attempt = *last_fork_attempt.read().await;
                                         if last_attempt.elapsed().as_secs() < FORK_ATTEMPT_COOLDOWN_SECS {
                                             println!("[REORG] 🛡️ Fork attempt too soon - rate limited ({}s cooldown)", FORK_ATTEMPT_COOLDOWN_SECS);
+                                            
+                                            // CRITICAL FIX: If we detect our own blocks being rejected as forks,
+                                            // we need to sync with the network majority
+                                            if fork_producer == node_id {
+                                                println!("[REORG] ⚠️ Our blocks are being rejected! Forcing sync with network majority");
+                                                
+                                                // Force sync with network to get correct chain
+                                                if let Some(p2p) = &unified_p2p {
+                                                    if let Some(network_height) = p2p.sync_blockchain_height() {
+                                                        if network_height > *height.read().await {
+                                                            println!("[REORG] 📥 Network is ahead at height {} - syncing...", network_height);
+                                                            
+                                                            // Download missing blocks from network
+                                                            let local_height = *height.read().await;
+                                                            // Sync blocks from network
+                                                            if let Err(e) = p2p.sync_blocks(local_height + 1, network_height).await {
+                                                                println!("[REORG] ⚠️ Failed to sync blocks: {}", e);
+                                                            } else {
+                                                                *height.write().await = network_height;
+                                                                println!("[REORG] ✅ Synced to network height #{}", network_height);
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
                                             continue;
                                         }
                                         
@@ -2566,8 +2591,47 @@ impl BlockchainNode {
                 }
                 
                 if let Some(p2p) = &unified_p2p {
-                    // API DEADLOCK FIX: Use cached height to avoid blocking microblock production
-                    if let Some(network_height) = p2p.get_cached_network_height() {
+                    // CRITICAL FIX: Force network height update if we're stuck at low height
+                    // This prevents Node_005 stuck at block 30 issue
+                    // Also force update every 30 seconds if no new blocks received
+                    static LAST_BLOCK_TIME: Lazy<Arc<Mutex<Instant>>> = Lazy::new(|| Arc::new(Mutex::new(Instant::now())));
+                    static LAST_HEIGHT_CHECK: Lazy<Arc<Mutex<u64>>> = Lazy::new(|| Arc::new(Mutex::new(0)));
+                    
+                    let should_force_update = {
+                        let last_height = *LAST_HEIGHT_CHECK.lock().unwrap();
+                        let time_since_block = LAST_BLOCK_TIME.lock().unwrap().elapsed();
+                        
+                        // Force update if:
+                        // 1. We're at early blocks (<=30)
+                        // 2. No progress for 30 seconds
+                        // 3. Height hasn't changed in last check
+                        microblock_height <= 30 || 
+                        (time_since_block.as_secs() > 30 && last_height == microblock_height)
+                    };
+                    
+                    let network_height = if should_force_update {
+                        // Force fresh query if stuck
+                        match p2p.sync_blockchain_height() {
+                            Ok(h) => {
+                                println!("[SYNC] 🔄 Forced height update: network={}, local={}", h, microblock_height);
+                                // Update tracking
+                                *LAST_HEIGHT_CHECK.lock().unwrap() = microblock_height;
+                                if h > microblock_height {
+                                    *LAST_BLOCK_TIME.lock().unwrap() = Instant::now();
+                                }
+                                h
+                            },
+                            Err(_) => {
+                                // Fallback to cached if query fails
+                                p2p.get_cached_network_height().unwrap_or(microblock_height)
+                            }
+                        }
+                    } else {
+                        // Normal operation: use cached height
+                        p2p.get_cached_network_height().unwrap_or(microblock_height)
+                    };
+                    
+                    if network_height > microblock_height {
                         let height_difference = network_height.saturating_sub(microblock_height);
                         
                         // CRITICAL FIX: Auto-sync trigger for lagging nodes
@@ -2880,33 +2944,59 @@ impl BlockchainNode {
                                 u64::from_le_bytes([our_entropy[0], our_entropy[1], our_entropy[2], our_entropy[3],
                                                    our_entropy[4], our_entropy[5], our_entropy[6], our_entropy[7]]));
                         
-                        // Clear old responses for this height
-                        {
-                            let mut responses = ENTROPY_RESPONSES.lock().unwrap();
-                            responses.retain(|(h, _), _| *h != entropy_height);
-                        }
+                        // CRITICAL FIX: Check if we already have enough responses before sending new requests
+                        let already_have_responses = {
+                            let responses = ENTROPY_RESPONSES.lock().unwrap();
+                            responses.iter()
+                                .filter(|((h, _), _)| *h == entropy_height)
+                                .count()
+                        };
                         
-                        // PRODUCTION: Query peers for their entropy via P2P messages (ASYNC, non-blocking)
-                        for peer in peers.iter().take(sample_size) {
-                            // Send entropy request to peer
-                            let entropy_request = crate::unified_p2p::NetworkMessage::EntropyRequest {
-                                block_height: entropy_height,
-                                requester_id: node_id.clone(),
-                            };
-                            
-                            // Get peer address from peer info
-                            if let Some(peer_addr) = peers.iter()
-                                .find(|p| p.id == peer.id)
-                                .map(|p| p.addr.clone()) {
-                                
-                                // Send request (async, response will come later)
-                                p2p.send_network_message(&peer_addr, entropy_request);
+                        // Only send requests if we don't have enough responses
+                        if already_have_responses < sample_size {
+                            // Clear old responses for this height only if they're stale (>10 seconds)
+                            {
+                                let mut responses = ENTROPY_RESPONSES.lock().unwrap();
+                                // Keep recent responses, only clear if we're starting fresh
+                                if already_have_responses == 0 {
+                                    responses.retain(|(h, _), _| *h != entropy_height);
+                                }
                             }
+                            
+                            // PRODUCTION: Query peers for their entropy via P2P messages (ASYNC, non-blocking)
+                            for peer in peers.iter().take(sample_size - already_have_responses) {
+                                // Check if we already have response from this peer
+                                let peer_already_responded = {
+                                    let responses = ENTROPY_RESPONSES.lock().unwrap();
+                                    responses.contains_key(&(entropy_height, peer.id.clone()))
+                                };
+                                
+                                if !peer_already_responded {
+                                    // Send entropy request to peer
+                                    let entropy_request = crate::unified_p2p::NetworkMessage::EntropyRequest {
+                                        block_height: entropy_height,
+                                        requester_id: node_id.clone(),
+                                    };
+                            
+                                    // Get peer address from peer info
+                                    if let Some(peer_addr) = peers.iter()
+                                        .find(|p| p.id == peer.id)
+                                        .map(|p| p.addr.clone()) {
+                                        
+                                        // Send request (async, response will come later)
+                                        p2p.send_network_message(&peer_addr, entropy_request);
+                                    }
+                                }
+                            }
+                            
+                            // CRITICAL: DO NOT WAIT! Responses will be processed asynchronously
+                            // Verification happens in background without blocking block production
+                            println!("[CONSENSUS] 🔄 Sent entropy requests to {} peers - verification in background", 
+                                    sample_size - already_have_responses);
+                        } else {
+                            println!("[CONSENSUS] ✅ Already have {} entropy responses for block {}", 
+                                    already_have_responses, entropy_height);
                         }
-                        
-                        // CRITICAL: DO NOT WAIT! Responses will be processed asynchronously
-                        // Verification happens in background without blocking block production
-                        println!("[CONSENSUS] 🔄 Sent entropy requests to {} peers - verification in background", sample_size);
                         
                         // Spawn async task to verify entropy after responses arrive
                         let storage_clone = storage.clone();
@@ -3183,6 +3273,29 @@ impl BlockchainNode {
                     }
                     
                     let consensus_result: Option<u64> = None; // NO consensus for microblocks - Byzantine consensus ONLY for macroblocks
+                    
+                    // CRITICAL FIX: Verify we're synchronized before creating a block
+                    // This prevents creating blocks on a forked/outdated chain
+                    if let Some(p2p) = &unified_p2p {
+                        // Check if we're behind the network
+                        if let Some(network_height) = p2p.sync_blockchain_height() {
+                            if network_height > next_block_height {
+                                println!("[SYNC] ⚠️ We're behind network (local: {} vs network: {})", next_block_height, network_height);
+                                println!("[SYNC] 🔄 Syncing before producing block...");
+                                
+                                // Sync missing blocks
+                                if let Err(e) = p2p.sync_blocks(next_block_height, network_height).await {
+                                    println!("[SYNC] ❌ Failed to sync: {}", e);
+                                    tokio::time::sleep(Duration::from_secs(1)).await;
+                                    continue;
+                                }
+                                
+                                *height.write().await = network_height;
+                                microblock_height = network_height;
+                                continue;  // Restart loop after sync
+                            }
+                        }
+                    }
                     
                     // PRODUCTION: Create cryptographically signed microblock
                     // CRITICAL: Deterministic timestamp calculation for consensus integrity
@@ -4070,7 +4183,23 @@ impl BlockchainNode {
     /// PRODUCTION: Initialize only ACTIVE Genesis node reputations discovered via P2P
     /// Prevents phantom candidates for unoperated Genesis nodes
     async fn initialize_genesis_reputations(p2p: &SimplifiedP2P) {
-        println!("[REPUTATION] 🔐 Initializing own Genesis node reputation...");
+        println!("[REPUTATION] 🔐 Initializing Genesis node reputations...");
+        
+        // CRITICAL FIX: Load saved reputations from storage for all Genesis nodes
+        // This ensures reputation persists across restarts
+        for i in 1..=5 {
+            let genesis_id = format!("genesis_node_{:03}", i);
+            
+            // Try to load saved reputation first
+            if let Some(saved_reputation) = p2p.load_reputation_from_storage(&genesis_id) {
+                p2p.set_node_reputation(&genesis_id, saved_reputation);
+                println!("[REPUTATION] 📂 Loaded saved reputation for {}: {:.1}%", genesis_id, saved_reputation);
+            } else {
+                // If no saved reputation, initialize to default 70%
+                p2p.set_node_reputation(&genesis_id, 70.0);
+                println!("[REPUTATION] 🆕 Initialized default reputation for {}: 70.0%", genesis_id);
+            }
+        }
         
         // PRODUCTION: Only initialize reputation for own Genesis node, not all 5 preemptively
         // Other Genesis nodes get reputation dynamically when they actually connect via P2P
@@ -4080,8 +4209,11 @@ impl BlockchainNode {
             match bootstrap_id.as_str() {
                 "001" | "002" | "003" | "004" | "005" => {
                     let own_genesis_id = format!("genesis_node_{}", bootstrap_id);
-                    p2p.set_node_reputation(&own_genesis_id, 70.0);
-                    println!("[REPUTATION] ✅ Own Genesis {} initialized to consensus threshold (70%)", own_genesis_id);
+                    // Check if we need to update own reputation
+                    if p2p.load_reputation_from_storage(&own_genesis_id).is_none() {
+                        p2p.set_node_reputation(&own_genesis_id, 70.0);
+                        println!("[REPUTATION] ✅ Own Genesis {} initialized to consensus threshold (70%)", own_genesis_id);
+                    }
                 }
                 _ => {
                     println!("[REPUTATION] ⚠️ Invalid QNET_BOOTSTRAP_ID: {}", bootstrap_id);
@@ -6718,8 +6850,23 @@ impl BlockchainNode {
     
     /// Check if this node will be the producer for the next block
     pub async fn is_next_block_producer(&self) -> bool {
-        let current_height = self.get_height().await;
-        let next_height = current_height + 1;
+        // CRITICAL FIX: Use network consensus height, not local height
+        // This prevents multiple nodes thinking they are producers
+        let network_height = if let Some(p2p) = &self.unified_p2p {
+            // Try to get network consensus height
+            match p2p.sync_blockchain_height() {
+                Ok(h) => h,
+                Err(_) => {
+                    // Fallback to cached or local height
+                    p2p.get_cached_network_height()
+                        .unwrap_or_else(|| self.get_height().await)
+                }
+            }
+        } else {
+            self.get_height().await
+        };
+        
+        let next_height = network_height + 1;
         
         // Get producer for next block using same logic as microblock production
         let producer = Self::select_microblock_producer(
@@ -6730,7 +6877,11 @@ impl BlockchainNode {
             Some(&self.storage)
         ).await;
         
-        producer == self.node_id
+        // Additional check: only return true if we're synchronized
+        let is_synchronized = !self.is_syncing() && 
+                            self.get_height().await >= network_height.saturating_sub(10);
+        
+        producer == self.node_id && is_synchronized
     }
     
     /// Check if node is currently syncing

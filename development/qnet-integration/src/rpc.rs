@@ -4039,10 +4039,10 @@ async fn handle_stats(
         let active = p2p.get_peer_count() as usize;
         
         // Calculate network TPS from recent blocks
-        let tps = if let Ok(storage_dir) = std::env::var("QNET_DATA_DIR") {
-            match crate::storage::Storage::new(&storage_dir) {
-                Ok(storage) => {
-                    // Get last 10 blocks and calculate average TPS
+        // CRITICAL FIX: Use existing storage from blockchain node to avoid RocksDB lock
+        let tps = {
+            let storage = blockchain.get_storage();
+            // Get last 10 blocks and calculate average TPS
                     let mut total_txs = 0u64;
                     let blocks_to_check = 10;
                     for i in 0..blocks_to_check {
@@ -4057,11 +4057,6 @@ async fn handle_stats(
                     }
                     // Average TPS over last 10 seconds (10 blocks)
                     total_txs / blocks_to_check.max(1)
-                }
-                Err(_) => 0,
-            }
-        } else {
-            0
         };
         
         (total, active, tps)
@@ -4122,10 +4117,10 @@ async fn handle_failover_history(
         .unwrap_or(0);
     
     // Get real failover events from storage
-    let failover_events = if let Ok(storage_dir) = std::env::var("QNET_DATA_DIR") {
-        match crate::storage::Storage::new(&storage_dir) {
-            Ok(storage) => {
-                match storage.get_failover_history(from_height, limit) {
+    // CRITICAL FIX: Use existing storage from blockchain node to avoid RocksDB lock
+    let failover_events = {
+        let storage = blockchain.get_storage();
+        match storage.get_failover_history(from_height, limit) {
                     Ok(events) => {
                         // Convert to JSON format
                         events.into_iter().map(|event| {
@@ -4144,27 +4139,13 @@ async fn handle_failover_history(
                         Vec::new()
                     }
                 }
-            }
-            Err(e) => {
-                println!("[RPC] Failed to open storage: {}", e);
-                Vec::new()
-            }
-        }
-    } else {
-        Vec::new()
     };
     
     // Get failover statistics if we have events
+    // CRITICAL FIX: Use existing storage from blockchain node to avoid RocksDB lock
     let stats = if !failover_events.is_empty() {
-        if let Ok(storage_dir) = std::env::var("QNET_DATA_DIR") {
-            if let Ok(storage) = crate::storage::Storage::new(&storage_dir) {
-                storage.get_failover_stats().unwrap_or_else(|_| json!({}))
-            } else {
-                json!({})
-            }
-        } else {
-            json!({})
-        }
+        let storage = blockchain.get_storage();
+        storage.get_failover_stats().unwrap_or_else(|_| json!({}))
     } else {
         json!({})
     };
