@@ -3316,12 +3316,55 @@ impl BlockchainNode {
                     // Get previous block hash
                     let prev_hash = Self::get_previous_microblock_hash(&storage, next_block_height).await;
                     
+                    // Static counter for retry tracking (defined once for the entire function)
+                    use std::sync::atomic::{AtomicU32, Ordering};
+                    static PREV_HASH_RETRY_COUNTER: AtomicU32 = AtomicU32::new(0);
+                    
                     // CRITICAL: Don't create block if we don't have previous block (except block #1)
+                    // ARCHITECTURE FIX: Add retry limit to prevent infinite loop
                     if next_block_height > 1 && prev_hash == [0u8; 32] {
-                        println!("[PRODUCER] ⏳ Cannot produce block #{} - waiting for previous block #{}", 
-                                 next_block_height, next_block_height - 1);
+                        // Use atomic counter for thread safety
+                        let retry_count = PREV_HASH_RETRY_COUNTER.fetch_add(1, Ordering::SeqCst) + 1;
+                        
+                        if retry_count >= 10 {  // Max 5 seconds wait (10 * 500ms)
+                            println!("[PRODUCER] ❌ TIMEOUT: Cannot get prev_hash for block #{} after {} retries", 
+                                     next_block_height, retry_count);
+                            println!("[PRODUCER] 🆘 Triggering emergency producer selection");
+                            PREV_HASH_RETRY_COUNTER.store(0, Ordering::SeqCst);  // Reset counter
+                            
+                            // Trigger emergency producer selection
+                            if let Some(p2p) = &unified_p2p {
+                                let emergency_producer = Self::select_emergency_producer(
+                                    &node_id,
+                                    next_block_height,
+                                    &Some(p2p.clone()),
+                                    &node_id,
+                                    node_type,
+                                    Some(storage.clone())
+                                ).await;
+                                
+                                // Broadcast emergency change
+                                let _ = p2p.broadcast_emergency_producer_change(
+                                    &node_id,
+                                    &emergency_producer,
+                                    next_block_height,
+                                    "microblock"
+                                );
+                            }
+                            // Skip this production round
+                            tokio::time::sleep(microblock_interval).await;
+                            continue;
+                        }
+                        
+                        println!("[PRODUCER] ⏳ Cannot produce block #{} - waiting for previous block #{} (retry {}/10)", 
+                                 next_block_height, next_block_height - 1, retry_count);
+                        
                         tokio::time::sleep(Duration::from_millis(500)).await;
                         continue;
+                    } else if next_block_height > 1 {
+                        // Reset retry counter on success (only if not block #1)
+                        // Note: PREV_HASH_RETRY_COUNTER already defined above
+                        PREV_HASH_RETRY_COUNTER.store(0, Ordering::SeqCst);
                     }
                     
                     let mut microblock = qnet_state::MicroBlock {
@@ -3713,16 +3756,16 @@ impl BlockchainNode {
                         }
                         
                         // Continue to production code (will produce block)
-                } else {
-                    // PRODUCTION: This node is NOT the selected producer - synchronize with network
-                    // CPU OPTIMIZATION: Only log every 10th block to reduce IO load
-                    if next_block_height % 10 == 0 {
-                    // CRITICAL FIX: When not producer, wait for NEXT block to be created
-                    println!("[MICROBLOCK] 👥 Waiting for block #{} from producer: {}", next_block_height, current_producer);
-                    }
-                    
-                    // Update is_leader for backward compatibility
-                    *is_leader.write().await = false;
+                    } else {
+                        // PRODUCTION: This node is NOT the selected producer - synchronize with network
+                        // CPU OPTIMIZATION: Only log every 10th block to reduce IO load
+                        if next_block_height % 10 == 0 {
+                            // CRITICAL FIX: When not producer, wait for NEXT block to be created
+                            println!("[MICROBLOCK] 👥 Waiting for block #{} from producer: {}", next_block_height, current_producer);
+                        }
+                        
+                        // Update is_leader for backward compatibility
+                        *is_leader.write().await = false;
                     }
                     
                     // Skip sync if we're about to produce emergency block
@@ -3836,12 +3879,9 @@ impl BlockchainNode {
                             let retry_count = 0; // First attempt
                             let base_timeout = tower_bft.get_timeout(next_block_height, retry_count).await;
                             
-                            // Non-producers use 2x timeout to give producer a chance
-                            let microblock_timeout = if current_producer == node_id {
-                                base_timeout
-                            } else {
-                                base_timeout * 2
-                            };
+                            // ARCHITECTURE FIX: All nodes use same timeout for proper failover
+                            // Non-producers should NOT wait 2x longer - this breaks 1 block/sec target!
+                            let microblock_timeout = base_timeout;  // Same for all nodes (7 seconds)
                             
                             println!("[TowerBFT] ⏱️ Timeout for block #{}: {:?} (producer: {})", 
                                     next_block_height, microblock_timeout, current_producer == node_id);
