@@ -877,10 +877,35 @@ impl BlockchainNode {
         
         // Initialize reward manager with current timestamp as genesis
         println!("[Node] 💰 Initializing lazy rewards system...");
-        let genesis_timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        // CRITICAL: Use real Genesis timestamp from actual Genesis block if available
+        let genesis_timestamp = match storage.load_microblock(0) {
+            Ok(Some(genesis_data)) => {
+                match bincode::deserialize::<qnet_state::MicroBlock>(&genesis_data) {
+                    Ok(genesis_block) => {
+                        println!("[REWARDS] 📅 Using Genesis timestamp from block: {}", genesis_block.timestamp);
+                        genesis_block.timestamp
+                    }
+                    Err(_) => {
+                        // Fallback to current time if can't parse
+                        let now = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        println!("[REWARDS] ⚠️ Can't parse Genesis block, using current time: {}", now);
+                        now
+                    }
+                }
+            }
+            _ => {
+                // No Genesis block yet - use current time (will be updated when Genesis is created)
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                println!("[REWARDS] 📅 No Genesis block yet, using current time: {}", now);
+                now
+            }
+        };
         let reward_manager = Arc::new(RwLock::new(
             PhaseAwareRewardManager::new(genesis_timestamp)
         ));
@@ -2458,6 +2483,10 @@ impl BlockchainNode {
             let mut cpu_check_counter = 0u64;
             let start_time = std::time::Instant::now();
             
+            // DEADLOCK PROTECTION: Track last successful block production
+            let mut last_production_time = std::time::Instant::now();
+            let mut last_production_height = 0u64;
+            
             // QUANTUM PoH: Get reference for microblock production
             let quantum_poh = quantum_poh_for_spawn.clone();
             
@@ -2508,6 +2537,22 @@ impl BlockchainNode {
                         .unwrap_or(1);
                     println!("[CPU] 📊 Node uptime: {}s | Threads: {} | Block: #{}", 
                             elapsed, thread_count, microblock_height);
+                    
+                    // DEADLOCK DETECTION: Check if we're stuck on same height for too long
+                    if microblock_height == last_production_height {
+                        let stuck_duration = last_production_time.elapsed();
+                        // CRITICAL: Use 15 seconds - more than rotation_timeout (10s) but less than first block (20s)
+                        if stuck_duration.as_secs() > 15 {
+                            println!("[DEADLOCK] ⚠️ Stuck on height {} for {}s - potential deadlock detected", 
+                                    microblock_height, stuck_duration.as_secs());
+                            // Reset timers to prevent spam
+                            last_production_time = std::time::Instant::now();
+                        }
+                    } else {
+                        // Update tracking
+                        last_production_height = microblock_height;
+                        last_production_time = std::time::Instant::now();
+                    }
                 }
                 // SYNC FIX: Fast catch-up mode for nodes that are far behind
                 // Using global flags defined at module level
@@ -2623,13 +2668,14 @@ impl BlockchainNode {
                     cached_count as u64
                 } else if let Some(p2p) = &unified_p2p {   
                     // EXISTING: Use cached phase detection - sophisticated caching already implemented  
-                    // PERFORMANCE: is_genesis_bootstrap_phase() uses CACHED_PHASE_DETECTION internally (30s cache)
-                    let current_phase = Self::is_genesis_bootstrap_phase(p2p).await; // EXISTING: Uses sophisticated caching
+                    // CRITICAL FIX: Skip phase detection here - will be done ONCE below to prevent double call
                     let is_genesis_node = std::env::var("QNET_BOOTSTRAP_ID")
                         .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
                         .unwrap_or(false);
                     
-                    let count = if current_phase || is_genesis_node {
+                    // CRITICAL FIX: Always use Genesis mode for node count if we're a Genesis node
+                    // This prevents deadlock from recursive phase detection
+                    let count = if is_genesis_node {
                         // EXISTING: Use validated peers for Byzantine safety - has 30s cache for Genesis
                         let validated_peers = p2p.get_validated_active_peers();
                         let total_network_nodes = std::cmp::min(validated_peers.len() + 1, 5); // EXISTING: Add self to peer count, max 5 Genesis nodes
@@ -3142,14 +3188,32 @@ impl BlockchainNode {
                     // CRITICAL: Deterministic timestamp calculation for consensus integrity
                     // Producer sets timestamp based on block height to ensure all nodes agree
                     let deterministic_timestamp = {
-                        // Genesis timestamp: January 1, 2024 00:00:00 UTC
-                        const GENESIS_TIMESTAMP: u64 = 1704067200;
+                        // Get Genesis timestamp from actual Genesis block (height 0)
+                        let genesis_timestamp = match storage.load_microblock(0) {
+                            Ok(Some(genesis_data)) => {
+                                // Parse Genesis block to get its timestamp
+                                match bincode::deserialize::<qnet_state::MicroBlock>(&genesis_data) {
+                                    Ok(genesis_block) => genesis_block.timestamp,
+                                    Err(_) => {
+                                        // Fallback to default if can't parse
+                                        println!("[TIMESTAMP] ⚠️ Can't parse Genesis block, using default timestamp");
+                                        1704067200  // January 1, 2024 00:00:00 UTC
+                                    }
+                                }
+                            }
+                            _ => {
+                                // No Genesis block yet - use default
+                                println!("[TIMESTAMP] ⚠️ No Genesis block found, using default timestamp");
+                                1704067200  // January 1, 2024 00:00:00 UTC
+                            }
+                        };
+                        
                         // 1 second per microblock (deterministic interval)
                         const BLOCK_INTERVAL_SECONDS: u64 = 1;
                         
                         // Calculate deterministic timestamp: genesis + (height * interval)
                         // This ensures ALL nodes calculate the SAME timestamp for the SAME block
-                        GENESIS_TIMESTAMP + (next_block_height * BLOCK_INTERVAL_SECONDS)
+                        genesis_timestamp + (next_block_height * BLOCK_INTERVAL_SECONDS)
                     };
                     
                     // Get previous block hash
@@ -4795,8 +4859,19 @@ impl BlockchainNode {
         }
         
         // API DEADLOCK FIX: Use cached height to avoid blocking during consensus
-        // Try to get cached height first
-        if let Some(network_height) = p2p.get_cached_network_height() {
+        // CRITICAL FIX: Add timeout to prevent deadlock on get_cached_network_height
+        // Try to get cached height first with timeout protection
+        let height_future = async {
+            p2p.get_cached_network_height()
+        };
+        
+        // Use timeout to prevent deadlock - 100ms should be enough for cache read
+        let height_result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            height_future
+        ).await;
+        
+        if let Ok(Some(network_height)) = height_result {
                 let is_genesis = network_height < 1000; // EXISTING: First 1000 blocks = Genesis phase
                 
                 // Update cache
@@ -4807,6 +4882,8 @@ impl BlockchainNode {
             println!("[PHASE] Network height: {} → {} phase (from cache)", network_height, 
                          if is_genesis { "Genesis" } else { "Normal" });
             return is_genesis;
+        } else if height_result.is_err() {
+            println!("[PHASE] ⚠️ Timeout getting cached height - using fallback");
         }
         
         // Check if we're a bootstrap node
@@ -5422,12 +5499,22 @@ impl BlockchainNode {
         // Create emergency macroblock
         // CRITICAL: Deterministic timestamp for macroblock consensus
         let deterministic_timestamp = {
-            const GENESIS_TIMESTAMP: u64 = 1704067200;  // January 1, 2024 00:00:00 UTC
+            // Get Genesis timestamp from actual Genesis block
+            let genesis_timestamp = match storage.load_microblock(0) {
+                Ok(Some(genesis_data)) => {
+                    match bincode::deserialize::<qnet_state::MicroBlock>(&genesis_data) {
+                        Ok(genesis_block) => genesis_block.timestamp,
+                        Err(_) => 1704067200  // Fallback
+                    }
+                }
+                _ => 1704067200  // Fallback: January 1, 2024 00:00:00 UTC
+            };
+            
             const MACROBLOCK_INTERVAL_SECONDS: u64 = 90;  // 90 seconds per macroblock (90 microblocks)
             
             // Macroblock timestamp = genesis + (macroblock_height * 90 seconds)
             let macroblock_height = height / 90;
-            GENESIS_TIMESTAMP + (macroblock_height * MACROBLOCK_INTERVAL_SECONDS)
+            genesis_timestamp + (macroblock_height * MACROBLOCK_INTERVAL_SECONDS)
         };
         
         let macroblock = qnet_state::MacroBlock {
@@ -6465,11 +6552,21 @@ impl BlockchainNode {
         // Create production macroblock with REAL consensus data
         // CRITICAL: Deterministic timestamp for macroblock consensus
         let deterministic_timestamp = {
-            const GENESIS_TIMESTAMP: u64 = 1704067200;  // January 1, 2024 00:00:00 UTC
+            // Get Genesis timestamp from actual Genesis block
+            let genesis_timestamp = match storage.load_microblock(0) {
+                Ok(Some(genesis_data)) => {
+                    match bincode::deserialize::<qnet_state::MicroBlock>(&genesis_data) {
+                        Ok(genesis_block) => genesis_block.timestamp,
+                        Err(_) => 1704067200  // Fallback
+                    }
+                }
+                _ => 1704067200  // Fallback: January 1, 2024 00:00:00 UTC
+            };
+            
             const MACROBLOCK_INTERVAL_SECONDS: u64 = 90;  // 90 seconds per macroblock
             
             // Use consensus round number as macroblock height
-            GENESIS_TIMESTAMP + (consensus_data.round_number * MACROBLOCK_INTERVAL_SECONDS)
+            genesis_timestamp + (consensus_data.round_number * MACROBLOCK_INTERVAL_SECONDS)
         };
         
         let macroblock = qnet_state::MacroBlock {

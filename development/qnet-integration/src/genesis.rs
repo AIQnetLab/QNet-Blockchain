@@ -16,12 +16,21 @@ pub struct GenesisConfig {
 
 impl Default for GenesisConfig {
     fn default() -> Self {
-        // CRITICAL FIX: Use deterministic timestamp for Genesis Block
-        // This ensures all nodes create identical Genesis Block
+        // CRITICAL: Use real time for Genesis Block creation
+        // Only node_001 creates Genesis, others receive it with this timestamp
         let genesis_timestamp = std::env::var("QNET_MAINNET_LAUNCH_TIMESTAMP")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(1704067200); // January 1, 2024 00:00:00 UTC - deterministic default
+            .unwrap_or_else(|| {
+                // Use REAL current time when Genesis is created by node_001
+                // Other nodes will receive this timestamp via P2P
+                let real_time = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                println!("[GENESIS] ⏰ Using real-time timestamp for Genesis: {}", real_time);
+                real_time
+            });
             
         Self {
             accounts: vec![

@@ -986,7 +986,7 @@ impl QNetQuantumCrypto {
             is_phase_1: true,
             burn_percentage: 45.0, // 45% of 1DEV burned (price should be ~825 1DEV)
             total_active_nodes: 50000,
-            genesis_timestamp: 1704067200, // Jan 1, 2024
+            genesis_timestamp: 1704067200, // Default fallback - will be overridden from actual Genesis block
             current_timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
