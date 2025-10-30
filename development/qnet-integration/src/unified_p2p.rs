@@ -6294,15 +6294,61 @@ impl SimplifiedP2P {
     
     /// CRITICAL FIX: Save reputation to persistent storage with integrity check
     fn save_reputation_to_storage(&self, node_id: &str, reputation: f64) {
+        // ARCHITECTURE: Node-type aware storage - only Light nodes don't store
+        match self.node_type {
+            NodeType::Light => {
+                // Light nodes don't store any reputation (mobile/IoT devices)
+                // They request it from Super/Full nodes when needed
+                // This saves ~300MB-3GB of storage on constrained devices
+                return;
+            },
+            NodeType::Full | NodeType::Super => {
+                // Both Full and Super nodes store ALL reputation
+                // Full nodes: Can participate in consensus, need full data
+                // Super nodes: Produce blocks, need full data for leader selection
+                // Storage overhead is minimal (~300MB) compared to blockchain size
+            }
+        }
+        
         // SECURITY: Add cryptographic integrity to prevent tampering
         
-        // Ensure data directory exists
-        if let Err(e) = std::fs::create_dir_all("./data") {
-            println!("[REPUTATION] ⚠️ Failed to create data directory: {}", e);
+        // SCALABILITY: Use batched storage to avoid millions of files
+        // Ensure data directory exists with reputation subdirectory
+        let reputation_dir = "./data/reputation";
+        if let Err(e) = std::fs::create_dir_all(reputation_dir) {
+            println!("[REPUTATION] ⚠️ Failed to create reputation directory: {}", e);
             return; // Don't block on file system errors
         }
         
-        let reputation_file = format!("./data/reputation_{}.dat", node_id);
+        // PRODUCTION: Hash node_id to determine batch (1000 nodes per file)
+        // This reduces file count from millions to thousands
+        use sha3::{Sha3_256, Digest as Sha3Digest};
+        let mut id_hasher = Sha3_256::new();
+        id_hasher.update(node_id.as_bytes());
+        let hash_result = id_hasher.finalize();
+        let batch_num = ((hash_result[0] as u32) << 8 | hash_result[1] as u32) % 1000;
+        let batch_file = format!("{}/batch_{:03}.dat.zst", reputation_dir, batch_num);
+        
+        // PRODUCTION: Load existing batch or create new one
+        let mut batch_data: HashMap<String, serde_json::Value> = if std::path::Path::new(&batch_file).exists() {
+            // Decompress and load existing batch
+            match std::fs::read(&batch_file) {
+                Ok(compressed_data) => {
+                    match zstd::decode_all(&compressed_data[..]) {
+                        Ok(decompressed) => {
+                            match serde_json::from_slice(&decompressed) {
+                                Ok(data) => data,
+                                Err(_) => HashMap::new()
+                            }
+                        },
+                        Err(_) => HashMap::new()
+                    }
+                },
+                Err(_) => HashMap::new()
+            }
+        } else {
+            HashMap::new()
+        };
         
         // Create reputation record with timestamp and hash
         let timestamp = std::time::SystemTime::now()
@@ -6311,7 +6357,6 @@ impl SimplifiedP2P {
             .as_secs();
         
         // Create integrity hash (SHA3-256)
-        use sha3::{Sha3_256, Digest};
         let mut hasher = Sha3_256::new();
         hasher.update(node_id.as_bytes());
         hasher.update(reputation.to_le_bytes());
@@ -6326,59 +6371,115 @@ impl SimplifiedP2P {
         
         let integrity_hash = hex::encode(hasher.finalize());
         
-        // Save as JSON with integrity check
-        let reputation_data = serde_json::json!({
-            "node_id": node_id,
+        // Create JSON entry for this node
+        let reputation_entry = serde_json::json!({
             "reputation": reputation,
             "timestamp": timestamp,
             "integrity": integrity_hash,
             "version": 1
         });
         
-        match std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&reputation_file) {
-            Ok(mut file) => {
-                use std::io::Write;
-                if let Err(e) = writeln!(file, "{}", reputation_data.to_string()) {
-                    println!("[REPUTATION] ⚠️ Failed to write reputation for {}: {}", node_id, e);
+        // Update batch with this node's reputation
+        batch_data.insert(node_id.to_string(), reputation_entry);
+        
+        // COMPRESSION: Serialize and compress batch with Zstd level 10
+        // Higher compression for reputation data that changes rarely
+        match serde_json::to_vec(&batch_data) {
+            Ok(serialized) => {
+                match zstd::encode_all(&serialized[..], 10) { // Level 10 for reputation
+                    Ok(compressed) => {
+                        // Write compressed batch to file
+                        match std::fs::write(&batch_file, compressed) {
+                            Ok(_) => {
+                                if batch_data.len() % 100 == 0 { // Log every 100 nodes
+                                    println!("[REPUTATION] 📦 Batch {} updated: {} nodes (compressed)", 
+                                            batch_num, batch_data.len());
+                                }
+                            },
+                            Err(e) => {
+                                println!("[REPUTATION] ⚠️ Failed to write batch file: {}", e);
+                            }
+                        }
+                    },
+                    Err(e) => {
+                        println!("[REPUTATION] ⚠️ Failed to compress reputation batch: {}", e);
+                    }
                 }
             },
             Err(e) => {
-                println!("[REPUTATION] ⚠️ Failed to open reputation file for {}: {}", node_id, e);
-                // Don't block on file system errors
+                println!("[REPUTATION] ⚠️ Failed to serialize reputation batch: {}", e);
             }
         }
     }
     
     /// CRITICAL FIX: Load reputation from persistent storage with integrity verification
     pub fn load_reputation_from_storage(&self, node_id: &str) -> Option<f64> {
-        let reputation_file = format!("./data/reputation_{}.dat", node_id);
+        // ARCHITECTURE: Node-type aware loading
+        match self.node_type {
+            NodeType::Light => {
+                // Light nodes don't store reputation files
+                // They request from Super/Full nodes via API when needed
+                return None;
+            },
+            NodeType::Full | NodeType::Super => {
+                // Both Full and Super nodes have complete reputation storage
+                // Continue with loading from local files
+            }
+        }
         
-        // Read reputation file
-        let content = match std::fs::read_to_string(&reputation_file) {
-            Ok(c) => c,
-            Err(_) => return None,
+        // SCALABILITY: Calculate batch file for this node_id
+        use sha3::{Sha3_256, Digest as Sha3Digest};
+        let mut id_hasher = Sha3_256::new();
+        id_hasher.update(node_id.as_bytes());
+        let hash_result = id_hasher.finalize();
+        let batch_num = ((hash_result[0] as u32) << 8 | hash_result[1] as u32) % 1000;
+        let batch_file = format!("./data/reputation/batch_{:03}.dat.zst", batch_num);
+        
+        // PRODUCTION: Load and decompress batch file
+        if !std::path::Path::new(&batch_file).exists() {
+            // Try legacy single-file format for backwards compatibility
+            let legacy_file = format!("./data/reputation_{}.dat", node_id);
+            if std::path::Path::new(&legacy_file).exists() {
+                // Migrate from old format
+                if let Ok(content) = std::fs::read_to_string(&legacy_file) {
+                    if let Ok(data) = serde_json::from_str::<serde_json::Value>(&content) {
+                        if let Some(rep) = data["reputation"].as_f64() {
+                            println!("[REPUTATION] 📂 Migrating legacy reputation for {}: {:.1}", node_id, rep);
+                            // Save in new format
+                            self.save_reputation_to_storage(node_id, rep);
+                            // Delete old file
+                            let _ = std::fs::remove_file(&legacy_file);
+                            return Some(rep);
+                        }
+                    }
+                }
+            }
+            return None;
+        }
+        
+        // Decompress and load batch
+        let batch_data: HashMap<String, serde_json::Value> = match std::fs::read(&batch_file) {
+            Ok(compressed_data) => {
+                match zstd::decode_all(&compressed_data[..]) {
+                    Ok(decompressed) => {
+                        match serde_json::from_slice(&decompressed) {
+                            Ok(data) => data,
+                            Err(_) => return None
+                        }
+                    },
+                    Err(_) => return None
+                }
+            },
+            Err(_) => return None
         };
         
-        // Try to parse as JSON (new format with integrity)
-        if let Ok(data) = serde_json::from_str::<serde_json::Value>(&content) {
-            // Extract fields
-            let stored_node_id = data["node_id"].as_str()?;
-            let reputation = data["reputation"].as_f64()?;
-            let timestamp = data["timestamp"].as_u64()?;
-            let stored_hash = data["integrity"].as_str()?;
-            
-            // Verify node ID matches
-            if stored_node_id != node_id {
-                println!("[REPUTATION] ⚠️ Node ID mismatch in reputation file!");
-                return None;
-            }
+        // Find this node's entry in the batch
+        if let Some(entry) = batch_data.get(node_id) {
+            let reputation = entry["reputation"].as_f64()?;
+            let timestamp = entry["timestamp"].as_u64()?;
+            let stored_hash = entry["integrity"].as_str()?;
             
             // Verify integrity hash
-            use sha3::{Sha3_256, Digest};
             let mut hasher = Sha3_256::new();
             hasher.update(node_id.as_bytes());
             hasher.update(reputation.to_le_bytes());
@@ -6393,9 +6494,7 @@ impl SimplifiedP2P {
             let computed_hash = hex::encode(hasher.finalize());
             
             if computed_hash != stored_hash {
-                println!("[REPUTATION] 🚨 INTEGRITY CHECK FAILED! Reputation file may be tampered!");
-                println!("[REPUTATION] Expected: {}", computed_hash);
-                println!("[REPUTATION] Found: {}", stored_hash);
+                println!("[REPUTATION] 🚨 INTEGRITY CHECK FAILED! Reputation may be tampered!");
                 
                 // CRITICAL: Report reputation tampering as malicious behavior
                 self.report_reputation_tampering(node_id, reputation);
@@ -6415,16 +6514,9 @@ impl SimplifiedP2P {
                 return None;
             }
             
-            println!("[REPUTATION] ✅ Integrity verified for {} (age: {} days)", node_id, age_days);
             Some(reputation)
         } else {
-            // Fallback: Try old format (plain number) - but warn about it
-            if let Ok(rep) = content.trim().parse::<f64>() {
-                println!("[REPUTATION] ⚠️ Old format reputation file - no integrity check!");
-                Some(rep)
-            } else {
-                None
-            }
+            None
         }
     }
     

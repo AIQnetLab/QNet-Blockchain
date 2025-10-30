@@ -3276,28 +3276,10 @@ impl BlockchainNode {
                     
                     let consensus_result: Option<u64> = None; // NO consensus for microblocks - Byzantine consensus ONLY for macroblocks
                     
-                    // CRITICAL FIX: Verify we're synchronized before creating a block
-                    // This prevents creating blocks on a forked/outdated chain
-                    if let Some(p2p) = &unified_p2p {
-                        // Check if we're behind the network
-                        if let Ok(network_height) = p2p.sync_blockchain_height() {
-                            if network_height > next_block_height {
-                                println!("[SYNC] ⚠️ We're behind network (local: {} vs network: {})", next_block_height, network_height);
-                                println!("[SYNC] 🔄 Syncing before producing block...");
-                                
-                                // Sync missing blocks
-                                if let Err(e) = p2p.sync_blocks(next_block_height, network_height).await {
-                                    println!("[SYNC] ❌ Failed to sync: {}", e);
-                                    tokio::time::sleep(Duration::from_secs(1)).await;
-                                    continue;
-                                }
-                                
-                                *height.write().await = network_height;
-                                microblock_height = network_height;
-                                continue;  // Restart loop after sync
-                            }
-                        }
-                    }
+                    // CRITICAL: Producer NEVER waits for network!
+                    // The producer's job is to CREATE blocks based on LOCAL state
+                    // Other nodes validate and accept/reject - this is the blockchain way!
+                    // NO SYNC CHECKS, NO NETWORK QUERIES, NO WAITING!
                     
                     // PRODUCTION: Create cryptographically signed microblock
                     // CRITICAL: Deterministic timestamp calculation for consensus integrity
@@ -3846,18 +3828,23 @@ impl BlockchainNode {
                             // FIX: Wait for NEXT block height when not producer
                             println!("[SYNC] ⏳ Waiting for background sync of block #{}", next_block_height);
                             
-                            // CRITICAL FIX: Don't wait full timeout if we're not the producer!
-                            // Only the actual producer should wait for failover timeout
-                            if current_producer != node_id {
-                                // We're not the producer - just wait a short time for block to arrive
-                                tokio::time::sleep(Duration::from_millis(100)).await;
-                                continue; // Go to next iteration quickly
-                            }
+                            // ARCHITECTURE FIX: ALL nodes must track timeout for failover!
+                            // Not just the producer - otherwise network stalls if producer fails
+                            // Non-producers wait shorter time but still trigger failover if needed
                             
-                            // PRODUCTION: Use Tower BFT adaptive timeout (only for actual producer)
+                            // PRODUCTION: Use Tower BFT adaptive timeout
                             let retry_count = 0; // First attempt
-                            let microblock_timeout = tower_bft.get_timeout(next_block_height, retry_count).await;
-                            println!("[TowerBFT] ⏱️ Adaptive timeout for block #{}: {:?}", next_block_height, microblock_timeout);
+                            let base_timeout = tower_bft.get_timeout(next_block_height, retry_count).await;
+                            
+                            // Non-producers use 2x timeout to give producer a chance
+                            let microblock_timeout = if current_producer == node_id {
+                                base_timeout
+                            } else {
+                                base_timeout * 2
+                            };
+                            
+                            println!("[TowerBFT] ⏱️ Timeout for block #{}: {:?} (producer: {})", 
+                                    next_block_height, microblock_timeout, current_producer == node_id);
                             let timeout_start = std::time::Instant::now();
                             
                             // Wait with timeout for producer block (same pattern as macroblock timeout in line 1201)
@@ -3876,8 +3863,8 @@ impl BlockchainNode {
                             let network_height = p2p_timeout.sync_blockchain_height().unwrap_or(0);
                             
                             // ROTATION DEADLOCK DETECTION: Special handling at rotation boundaries
-                            // Rotation happens at blocks 30, 60, 90... (not genesis block 0)
-                            let is_rotation_boundary = expected_height_timeout > 0 && (expected_height_timeout % 30) == 0;
+                            // Rotation happens at blocks 31, 61, 91... (first block of new round)
+                            let is_rotation_boundary = expected_height_timeout > 1 && ((expected_height_timeout - 1) % 30) == 0;
                             let rotation_timeout = if is_rotation_boundary {
                                 // Double timeout at rotation boundaries to account for producer switch
                                 Duration::from_secs(10)
