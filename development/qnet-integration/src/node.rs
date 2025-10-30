@@ -4015,7 +4015,10 @@ impl BlockchainNode {
                 // PRODUCTION: Start consensus SUPER EARLY at block 60 for ZERO downtime
                 // Consensus takes 30s (commit 15s + reveal 15s), so starting at 60 means it completes by block 90
                 // This ensures macroblock is ready EXACTLY when needed - Swiss watch precision!
-                if microblock_height - last_macroblock_trigger == 60 && !consensus_started {
+                // ARCHITECTURE FIX: Allow consensus to start in range 60-65 blocks after trigger
+                // This prevents missing consensus if exact block 60 was skipped
+                let blocks_since_trigger = microblock_height.saturating_sub(last_macroblock_trigger);
+                if blocks_since_trigger >= 60 && blocks_since_trigger <= 65 && !consensus_started {
                     println!("[MACROBLOCK] 🚀 ULTRA-EARLY CONSENSUS START at block {} for ZERO downtime", microblock_height);
                     println!("[MACROBLOCK] 📍 Node: {} | Type: {:?} | ALL NODES PARTICIPATE", node_id, node_type);
                     consensus_started = true;
@@ -4173,13 +4176,30 @@ impl BlockchainNode {
                 let now = std::time::Instant::now();
                 if now < next_block_time {
                     let precise_sleep_duration = next_block_time - now;
-                    tokio::time::sleep(precise_sleep_duration).await;
+                    
+                    // ARCHITECTURE FIX: Compensate for tokio sleep inaccuracy
+                    // Sleep slightly less to account for wakeup delay (typically 5-20ms on Linux)
+                    const SLEEP_COMPENSATION_MS: u64 = 10; // Compensate for tokio wakeup delay
+                    let compensated_duration = if precise_sleep_duration.as_millis() > SLEEP_COMPENSATION_MS as u128 {
+                        precise_sleep_duration - Duration::from_millis(SLEEP_COMPENSATION_MS)
+                    } else {
+                        precise_sleep_duration
+                    };
+                    
+                    tokio::time::sleep(compensated_duration).await;
+                    
+                    // Busy-wait for remaining time for precise timing
+                    while std::time::Instant::now() < next_block_time {
+                        tokio::task::yield_now().await; // Yield to other tasks but stay ready
+                    }
                     
                     // Update next block time for precise 1-second intervals
                     next_block_time += microblock_interval;
                 } else {
                     // We're running behind - set next target time immediately
-                    println!("[MICROBLOCK] ⚠️ Running {}ms behind schedule - adjusting timing", (now - next_block_time).as_millis());
+                    if (now - next_block_time).as_millis() > 50 { // Only log if significantly behind
+                        println!("[MICROBLOCK] ⚠️ Running {}ms behind schedule - adjusting timing", (now - next_block_time).as_millis());
+                    }
                     next_block_time = now + microblock_interval;
                 }
             }

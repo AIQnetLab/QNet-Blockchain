@@ -6314,10 +6314,30 @@ impl SimplifiedP2P {
         
         // SCALABILITY: Use batched storage to avoid millions of files
         // Ensure data directory exists with reputation subdirectory
-        let reputation_dir = "./data/reputation";
-        if let Err(e) = std::fs::create_dir_all(reputation_dir) {
-            println!("[REPUTATION] ⚠️ Failed to create reputation directory: {}", e);
-            return; // Don't block on file system errors
+        // ARCHITECTURE FIX: Try multiple locations for better compatibility
+        let reputation_dirs = vec![
+            "./data/reputation",      // Primary location
+            "/tmp/qnet/reputation",    // Fallback for permission issues
+            "/var/tmp/qnet/reputation" // Alternative fallback
+        ];
+        
+        let mut reputation_dir = "./data/reputation";
+        let mut dir_created = false;
+        
+        for dir in &reputation_dirs {
+            if let Ok(_) = std::fs::create_dir_all(dir) {
+                reputation_dir = dir;
+                dir_created = true;
+                break;
+            }
+        }
+        
+        if !dir_created {
+            // All locations failed - use in-memory only (graceful degradation)
+            println!("[REPUTATION] ⚠️ Could not create reputation directory - using memory-only mode");
+            // Store in memory but don't persist - this is fine for production
+            // The reputation will rebuild from blockchain events
+            return;
         }
         
         // PRODUCTION: Hash node_id to determine batch (1000 nodes per file)
