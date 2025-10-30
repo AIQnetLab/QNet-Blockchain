@@ -3846,7 +3846,15 @@ impl BlockchainNode {
                             // FIX: Wait for NEXT block height when not producer
                             println!("[SYNC] ⏳ Waiting for background sync of block #{}", next_block_height);
                             
-                            // PRODUCTION: Use Tower BFT adaptive timeout
+                            // CRITICAL FIX: Don't wait full timeout if we're not the producer!
+                            // Only the actual producer should wait for failover timeout
+                            if current_producer != node_id {
+                                // We're not the producer - just wait a short time for block to arrive
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                                continue; // Go to next iteration quickly
+                            }
+                            
+                            // PRODUCTION: Use Tower BFT adaptive timeout (only for actual producer)
                             let retry_count = 0; // First attempt
                             let microblock_timeout = tower_bft.get_timeout(next_block_height, retry_count).await;
                             println!("[TowerBFT] ⏱️ Adaptive timeout for block #{}: {:?}", next_block_height, microblock_timeout);
@@ -6287,6 +6295,26 @@ impl BlockchainNode {
     /// PRODUCTION: Verify CRYSTALS-Dilithium signature for received microblock
     async fn verify_microblock_signature(microblock: &qnet_state::MicroBlock, producer_pubkey: &str) -> Result<bool, String> {
         use sha3::{Sha3_256, Digest};
+        
+        // CRITICAL FIX: Genesis block uses deterministic hash, not Dilithium format
+        if microblock.height == 0 && microblock.producer == "genesis" {
+            // Verify Genesis block signature deterministically
+            let mut hasher = Sha3_256::new();
+            hasher.update(b"GENESIS_BLOCK_QUANTUM_SIGNATURE");
+            hasher.update(&microblock.height.to_le_bytes());
+            hasher.update(&microblock.timestamp.to_le_bytes());
+            hasher.update(&microblock.merkle_root);
+            hasher.update(b"qnet_genesis_block_2024");
+            let expected_signature = hasher.finalize().to_vec();
+            
+            let is_valid = microblock.signature == expected_signature;
+            if is_valid {
+                println!("[CRYPTO] ✅ Genesis block signature verified (deterministic)");
+            } else {
+                println!("[CRYPTO] ❌ Genesis block signature mismatch!");
+            }
+            return Ok(is_valid);
+        }
         
         // Recreate message hash (same as signing)
         let mut hasher = Sha3_256::new();

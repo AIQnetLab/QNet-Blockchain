@@ -6295,6 +6295,13 @@ impl SimplifiedP2P {
     /// CRITICAL FIX: Save reputation to persistent storage with integrity check
     fn save_reputation_to_storage(&self, node_id: &str, reputation: f64) {
         // SECURITY: Add cryptographic integrity to prevent tampering
+        
+        // Ensure data directory exists
+        if let Err(e) = std::fs::create_dir_all("./data") {
+            println!("[REPUTATION] ⚠️ Failed to create data directory: {}", e);
+            return; // Don't block on file system errors
+        }
+        
         let reputation_file = format!("./data/reputation_{}.dat", node_id);
         
         // Create reputation record with timestamp and hash
@@ -6328,13 +6335,21 @@ impl SimplifiedP2P {
             "version": 1
         });
         
-        if let Ok(mut file) = std::fs::OpenOptions::new()
+        match std::fs::OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
             .open(&reputation_file) {
-            use std::io::Write;
-            let _ = writeln!(file, "{}", reputation_data.to_string());
+            Ok(mut file) => {
+                use std::io::Write;
+                if let Err(e) = writeln!(file, "{}", reputation_data.to_string()) {
+                    println!("[REPUTATION] ⚠️ Failed to write reputation for {}: {}", node_id, e);
+                }
+            },
+            Err(e) => {
+                println!("[REPUTATION] ⚠️ Failed to open reputation file for {}: {}", node_id, e);
+                // Don't block on file system errors
+            }
         }
     }
     
@@ -6614,6 +6629,12 @@ impl SimplifiedP2P {
     
     /// Log security incident with cryptographic chain for tamper-proof audit trail
     fn log_security_incident(&self, node_id: &str, incident_type: &str, severity: &str) {
+        // Ensure data directory exists
+        if let Err(e) = std::fs::create_dir_all("./data") {
+            println!("[AUDIT] ⚠️ Failed to create data directory: {}", e);
+            return; // Don't block on file system errors
+        }
+        
         // CRITICAL: Create tamper-proof audit chain (like blockchain)
         let audit_file = "./data/security_audit.chain";
         let audit_index_file = "./data/security_audit.index";
