@@ -48,6 +48,26 @@ impl Default for GenesisConfig {
 pub fn create_genesis_block(config: GenesisConfig) -> IntegrationResult<Block> {
     let mut transactions = Vec::new();
     
+    // CRITICAL: Create system_rewards_pool account for reward distribution
+    // This account is used as "from" address for RewardDistribution transactions
+    let rewards_pool_tx = Transaction {
+        hash: String::new(), // will be calculated
+        from: "genesis".to_string(),
+        to: Some("system_rewards_pool".to_string()),
+        amount: 0, // Pool starts empty - rewards are emitted dynamically
+        nonce: 0,
+        gas_price: 0,
+        gas_limit: 0,
+        timestamp: config.timestamp,
+        signature: Some("genesis".to_string()),
+        tx_type: TransactionType::CreateAccount {
+            address: "system_rewards_pool".to_string(),
+            initial_balance: 0, // Starts empty - Pool 1 emission happens every 4 hours
+        },
+        data: Some("System rewards pool for lazy rewards distribution".to_string()),
+    };
+    transactions.push(rewards_pool_tx);
+    
     // Create initial distribution transactions
     for (address, amount) in config.accounts {
         let tx = Transaction {

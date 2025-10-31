@@ -539,6 +539,25 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::body::json())
         .and(blockchain_filter.clone())
         .and_then(handle_claim_rewards);
+    
+    // Get pending rewards endpoint
+    let pending_rewards = api_v1
+        .and(warp::path("rewards"))
+        .and(warp::path("pending"))
+        .and(warp::path::param::<String>()) // node_id
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(blockchain_filter.clone())
+        .and_then(handle_get_pending_rewards);
+    
+    // Node registration endpoint
+    let register_node = api_v1
+        .and(warp::path("nodes"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::body::json())
+        .and(blockchain_filter.clone())
+        .and_then(handle_register_node);
 
     // Activation codes by wallet endpoint for bridge-server queries
     let activations_by_wallet = api_v1
@@ -809,6 +828,8 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
     let light_node_routes = light_node_register
         .or(light_node_ping_response)
         .or(claim_rewards)
+        .or(pending_rewards)
+        .or(register_node)
         .or(activations_by_wallet)
         .or(generate_activation_code)
         .or(node_secure_info);
@@ -3056,6 +3077,164 @@ async fn handle_claim_rewards(
             "next_claim_time": claim_result.next_claim_time
         })))
     }
+}
+
+// GET /api/v1/rewards/pending/{node_id} - Get pending rewards for a node
+async fn handle_get_pending_rewards(
+    node_id: String,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    use qnet_consensus::lazy_rewards::NodeType;
+    
+    // Get pending rewards from reward manager
+    let reward_info = {
+        let reward_manager = REWARD_MANAGER.lock().unwrap();
+        
+        // Get pending reward amount
+        let pending_amount = reward_manager.get_pending_reward(&node_id)
+            .map(|r| r.total_reward)
+            .unwrap_or(0);
+        
+        // Get ping history for performance stats
+        let ping_history = reward_manager.get_ping_history(&node_id);
+        
+        // Calculate stats
+        let (successful_pings, total_pings, last_ping, uptime_percentage) = if let Some(history) = ping_history {
+            let total = history.attempts.len();
+            let successful = history.attempts.iter()
+                .filter(|p| p.success)
+                .count();
+            let last = history.attempts.last()
+                .map(|p| p.timestamp)
+                .unwrap_or(0);
+            let uptime = if total > 0 {
+                (successful as f64 / total as f64) * 100.0
+            } else {
+                0.0
+            };
+            (successful, total, last, uptime)
+        } else {
+            (0, 0, 0, 0.0)
+        };
+        
+        // Get last claim time (not implemented yet, using 0)
+        let last_claim = 0u64;
+        
+        // Determine node type from ID
+        let node_type = if node_id.starts_with("light_") {
+            "Light"
+        } else if node_id.starts_with("full_") {
+            "Full"
+        } else if node_id.starts_with("super_") || node_id.starts_with("genesis_") {
+            "Super"
+        } else {
+            "Unknown"
+        };
+        
+        // Check if node is active (had ping in last 4 hours)
+        let current_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let is_active = last_ping > 0 && (current_time - last_ping) < 14400; // 4 hours
+        
+        json!({
+            "node_id": node_id,
+            "node_type": node_type,
+            "pending_rewards": pending_amount as f64 / 1_000_000_000.0,
+            "pool1_rewards": pending_amount as f64 / 1_000_000_000.0 * 0.7, // 70% from base
+            "pool2_rewards": pending_amount as f64 / 1_000_000_000.0 * 0.3, // 30% from fees
+            "last_claim": last_claim,
+            "last_ping": last_ping,
+            "successful_pings": successful_pings,
+            "total_pings": total_pings,
+            "uptime_percentage": uptime_percentage,
+            "is_active": is_active
+        })
+    };
+    
+    Ok(warp::reply::json(&reward_info))
+}
+
+// POST /api/v1/nodes - Register a new node
+async fn handle_register_node(
+    body: serde_json::Value,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    let node_type = body["node_type"].as_str().unwrap_or("light");
+    let wallet_address = body["wallet_address"].as_str().unwrap_or("");
+    let activation_code = body["activation_code"].as_str().unwrap_or("");
+    let device_id = body["device_id"].as_str().unwrap_or("");
+    let quantum_pubkey = body["quantum_pubkey"].as_str().unwrap_or("default_quantum_key");
+    
+    if wallet_address.is_empty() || activation_code.is_empty() {
+        return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": "Missing required fields"
+        })));
+    }
+    
+    // Generate node ID
+    let node_id = format!("{}_{}", node_type, activation_code);
+    
+    // Register with reward manager
+    {
+        let mut reward_manager = REWARD_MANAGER.lock().unwrap();
+        
+        // Register node with reward manager
+        use qnet_consensus::lazy_rewards::NodeType;
+        let node_type_enum = match node_type {
+            "light" => NodeType::Light,
+            "full" => NodeType::Full,
+            "super" => NodeType::Super,
+            _ => NodeType::Light,
+        };
+        
+        // Register node with all required info
+        if let Err(e) = reward_manager.register_node(
+            node_id.clone(),
+            node_type_enum,
+            wallet_address.to_string()
+        ) {
+            println!("[NODE] Warning: Failed to register node with reward manager: {:?}", e);
+        }
+    }
+    
+    // Store in appropriate registry based on type
+    if node_type == "light" {
+        let mut registry = LIGHT_NODE_REGISTRY.lock().unwrap();
+        let light_node = LightNodeInfo {
+            node_id: node_id.clone(),
+            devices: vec![LightNodeDevice {
+                device_id: device_id.to_string(),
+                wallet_address: wallet_address.to_string(),
+                device_token_hash: format!("hash_{}", device_id),
+                last_active: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                is_active: true,
+            }],
+            quantum_pubkey: quantum_pubkey.to_string(),
+            registered_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            last_ping: 0,
+            ping_count: 0,
+            reward_eligible: true,
+        };
+        registry.insert(node_id.clone(), light_node);
+    }
+    
+    println!("[NODE] ✅ Registered {} node: {} for wallet: {}", 
+             node_type, node_id, wallet_address);
+    
+    Ok(warp::reply::json(&json!({
+        "success": true,
+        "node_id": node_id,
+        "message": format!("{} node registered successfully", node_type)
+    })))
 }
 
 #[derive(Debug, serde::Deserialize)]

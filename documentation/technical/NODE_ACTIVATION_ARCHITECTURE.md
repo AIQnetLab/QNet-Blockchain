@@ -35,6 +35,19 @@ QNet uses a two-phase activation system transitioning from 1DEV burn on Solana t
 - **Parallel Validation**: Concurrent processing of multiple activation requests
 - **Memory Efficiency**: Optimized data structures for high-throughput scenarios
 
+**Proof of History (PoH) Integration:**
+- **Hybrid Hashing**: SHA3-512/Blake3 (25%/75%) for optimal security/performance
+- **Performance**: 2.39M hashes/sec verified on Intel Xeon E5-2680v4 @ 2.4GHz
+- **Test Results**: 7.2M hashes in 3.01 seconds, 187 entries generated (October 31, 2025)
+- **Configuration**: 25,000 hashes per tick, 10ms tick duration, 100 ticks per slot
+- **Entropy Source**: 100 updates/sec for producer selection randomness
+- **VDF Properties**: SHA3-512 every 4th hash prevents parallelization attacks
+- **Persistence**: Checkpoints saved every 1M hashes with zstd compression
+- **Recovery**: Automatic checkpoint loading on node restart
+- **Clock Drift**: 5-7% measured (excellent for production deployment)
+- **Overhead**: 72 bytes per block (poh_hash: 64B + poh_count: 8B) = ~2-3%
+- **Monitoring**: Prometheus metrics for hash rate, drift detection, and checkpoint count
+
 ## **QUANTUM-SECURE ACTIVATION ARCHITECTURE**
 
 ### **Post-Quantum Cryptography Integration**
@@ -321,6 +334,9 @@ const activationResult = await QNetMobile.activateNode({
 - ✅ Basic blockchain sync
 - ✅ Wallet functionality
 - ✅ Transaction submission
+- ✅ Direct node connections via getRandomBootstrapNode()
+- ✅ PhaseAwareRewardManager integration for rewards
+- ✅ LightNodeDevice registration with quantum_pubkey
 - ❌ NO API server
 - ❌ NO public endpoints  
 - ❌ NO metrics endpoints

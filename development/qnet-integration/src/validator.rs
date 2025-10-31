@@ -60,7 +60,11 @@ impl BlockValidator {
             return Err(IntegrationError::ValidationError("Transaction sender cannot be empty".to_string()));
         }
         
-        if tx.amount == 0 {
+        // CRITICAL: NodeActivation has special amount rules based on phase
+        // Skip general amount check for NodeActivation (validated in validate_transaction_type)
+        let is_node_activation = matches!(tx.tx_type, TransactionType::NodeActivation { .. });
+        
+        if tx.amount == 0 && !is_node_activation {
             return Err(IntegrationError::ValidationError("Transaction amount cannot be zero".to_string()));
         }
         

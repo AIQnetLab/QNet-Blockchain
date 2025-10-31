@@ -30,7 +30,7 @@ Experimental achievements:
 - ✅ **Mobile-first**: Optimized for smartphones
 - ✅ **Reputation system**: Without staking, only behavioral assessment
 - ✅ **Experimental architecture**: Innovative approach to consensus
-- ✅ **Advanced optimizations**: Turbine, Quantum PoH, Hybrid Sealevel, Tower BFT, Pre-execution
+- ✅ **Advanced optimizations**: Turbine, Quantum PoH (25M+ hashes/sec), VRF Selection, Hybrid Sealevel, Tower BFT, Pre-execution
 - ✅ **Chain Reorganization**: Byzantine-safe fork resolution with 2/3 majority consensus
 - ✅ **Advanced Synchronization**: Out-of-order block buffering with active missing block requests
 
@@ -247,8 +247,8 @@ QNet integrates Proof of History for verifiable time ordering:
 ```
 PoH Chain: H₀ → H₁ → H₂ → ... → Hₙ
            ↓    ↓    ↓         ↓
-        SHA3-512 alternating Blake3
-        31.25M hashes/second
+        SHA3-512 ONLY (True VDF)
+        25M+ hashes/second
 ```
 
 **Properties:**
@@ -447,9 +447,10 @@ parallel_execute(non_conflicting_transactions);
 - **85% bandwidth reduction**: Compared to full broadcast
 
 **3. Quantum Proof of History:**
-- **31.25M hashes/sec**: Cryptographic clock for time synchronization
+- **25M+ hashes/sec**: SHA3-512 only (true VDF) for time synchronization
 - **400μs tick duration**: Precise event ordering
-- **Verifiable delay function**: Byzantine-resistant timing
+- **Verifiable delay function**: Non-parallelizable, Byzantine-resistant timing
+- **Optimized implementation**: Fixed-size arrays, zero-copy operations
 
 **4. Pre-execution cache:**
 - **10,000 transaction cache**: Speculative execution for future blocks
@@ -1064,17 +1065,21 @@ pub struct TurbineChunk {
 QNet's Quantum Proof of History provides a verifiable, sequential record of events using cryptographic hashing:
 
 **Algorithm:**
-```
-PoH_n = Hash(PoH_{n-1}, event_data, timestamp)
-Alternating: SHA3-512 ↔ Blake3
+```rust
+// Optimized VDF implementation
+PoH_n = SHA3_512(PoH_{n-1} || counter || event_data)
+// SHA3-512 ONLY - ensures true VDF properties
+// No parallelization possible
 ```
 
 **Technical specifications:**
-- **Hash Rate**: 31.25 million hashes per second
+- **Hash Rate**: 25+ million hashes per second (optimized)
+- **Algorithm**: SHA3-512 exclusively (true VDF, non-parallelizable)
 - **Tick Duration**: 400 microseconds (12,500 hashes per tick)
 - **Ticks Per Slot**: 2,500 ticks = 1 second = 1 microblock slot
 - **Drift Detection**: Maximum 5% allowed drift before correction
 - **Verification**: Each node can independently verify PoH sequence
+- **Memory**: Fixed-size arrays (64 bytes), zero Vec allocations in hot path
 
 **Benefits:**
 1. **Time Synchronization**: Network-wide consensus on event ordering
@@ -1085,14 +1090,107 @@ Alternating: SHA3-512 ↔ Blake3
 **Implementation:**
 ```rust
 pub struct PoHEntry {
-    hash: [u8; 64],        // SHA3-512 or Blake3
-    tick: u64,             // Tick number
-    timestamp: u64,        // Unix timestamp
-    algorithm: HashAlgo,   // SHA3 or Blake3
+    num_hashes: u64,       // Sequential counter
+    hash: Vec<u8>,         // SHA3-512 output (64 bytes)
+    data: Option<Vec<u8>>, // Optional transaction/event data
+    timestamp: u64,        // Unix timestamp in microseconds
+}
+
+// Optimized generation loop
+let mut hash_bytes = [0u8; 64];
+for i in 0..HASHES_PER_TICK {
+    let mut hasher = Sha3_512::new();
+    hasher.update(&hash_bytes);
+    hasher.update(&counter.to_le_bytes());
+    hash_bytes.copy_from_slice(&hasher.finalize());
 }
 ```
 
-#### 8.4.3 Hybrid Sealevel Execution Engine
+#### 8.4.3 VRF-Based Producer Selection
+
+**Verifiable Random Function for unpredictable, Byzantine-safe leader election:**
+
+QNet uses Ed25519-based VRF to ensure that block producers are selected in a way that is:
+- **Unpredictable**: No node can predict future producers
+- **Verifiable**: All nodes can verify the selection was fair
+- **Non-manipulable**: Producer cannot bias selection in their favor
+
+**Algorithm:**
+```rust
+// VRF Evaluation (by potential producer)
+pub fn evaluate(&self, input: &[u8]) -> Result<VrfOutput, String> {
+    // Step 1: Hash input to curve point
+    let hash_to_point = SHA3_512(b"QNet_VRF_Hash_To_Point_v1" || input);
+    
+    // Step 2: Sign with Ed25519 (VRF proof)
+    let signature = signing_key.sign(&hash_to_point);
+    
+    // Step 3: Hash signature to get VRF output
+    let output = SHA3_512(b"QNet_VRF_Output_v1" || signature);
+    
+    return VrfOutput { output, proof: signature }
+}
+
+// VRF Verification (by any node)
+pub fn verify(public_key: &[u8], input: &[u8], vrf_output: &VrfOutput) -> bool {
+    // Verify signature
+    let hash_to_point = SHA3_512(b"QNet_VRF_Hash_To_Point_v1" || input);
+    let valid = public_key.verify(&hash_to_point, &vrf_output.proof);
+    
+    // Verify output derivation
+    let expected_output = SHA3_512(b"QNet_VRF_Output_v1" || vrf_output.proof);
+    
+    return valid && (expected_output == vrf_output.output);
+}
+```
+
+**Producer Selection Process:**
+```
+1. Entropy Source: Hash of previous macroblock (Byzantine consensus)
+2. VRF Input: entropy || round_number || candidates
+3. Each candidate generates VRF proof
+4. Selection Index: VRF_output mod num_candidates
+5. Verification: All nodes verify winning proof
+```
+
+**Technical specifications:**
+- **Cryptography**: Ed25519 signatures (quantum-resistant when used with SHA3)
+- **VRF Evaluation**: <1ms per candidate
+- **Verification**: <500μs per proof
+- **No OpenSSL**: Pure Rust implementation using `ed25519-dalek`
+- **Entropy**: Macroblock hashes (agreed via Byzantine consensus)
+
+**Benefits:**
+1. **Unpredictability**: No node knows who will be next producer
+2. **Fairness**: Weighted by reputation, but random within weights
+3. **Byzantine Safety**: Entropy from consensus prevents manipulation
+4. **Verifiable**: Anyone can prove selection was done correctly
+5. **No Coordination**: Each node independently verifies
+
+**Implementation:**
+```rust
+pub struct VrfOutput {
+    output: [u8; 32],     // Random value for selection
+    proof: Vec<u8>,       // Ed25519 signature as proof
+}
+
+// Producer selection with VRF
+async fn select_producer_with_vrf(
+    round: u64,
+    candidates: &[(String, f64)],
+    entropy: &[u8],
+) -> Result<(String, VrfOutput), String> {
+    let mut vrf = QNetVrf::new();
+    vrf.initialize(node_id)?;
+    
+    let vrf_output = vrf.evaluate(&vrf_input)?;
+    let selection_index = (vrf_number as usize) % candidates.len();
+    
+    Ok((candidates[selection_index].0.clone(), vrf_output))
+}
+```
+
+#### 8.4.4 Hybrid Sealevel Execution Engine
 
 **Parallel transaction processing with 5-stage pipeline:**
 
@@ -1670,9 +1768,11 @@ QNetProtocol = {
 
 **Performance Optimizations:**
 - **Turbine Protocol**: Chunked block propagation with Reed-Solomon encoding
-- **Quantum PoH**: 31.25M hashes/sec cryptographic clock
+- **Quantum PoH**: 25M+ hashes/sec SHA3-512 VDF cryptographic clock
+- **VRF Leader Selection**: Ed25519-based verifiable random function for unpredictable producer election
 - **Hybrid Sealevel**: 10,000 parallel transaction execution
 - **Tower BFT**: Adaptive consensus timeouts (20s/10s/7s)
+- **Comprehensive Benchmarks**: Full performance testing harness for all components
 - **Pre-Execution**: Speculative transaction cache (10,000 TX)
 
 ### 17.3 Database

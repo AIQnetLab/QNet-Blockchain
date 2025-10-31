@@ -10,6 +10,14 @@ license = "MIT"
 name = "qnet_integration"
 crate-type = ["cdylib", "rlib"]
 
+[[bench]]
+name = "poh_benchmark"
+harness = false
+
+[[bench]]
+name = "full_benchmark"
+harness = false
+
 [dependencies]
 # QNet core modules - NOW EXIST!
 qnet-core = { path = "../../core/qnet-core" }
@@ -32,7 +40,7 @@ bincode = "1.3.3"
 
 # Cryptography - modern production versions with edition constraints
 blake3 = "1.5.0"
-ed25519-dalek = { version = "2.0.0", features = ["std"] }
+ed25519-dalek = { version = "2.0.0", features = ["std", "rand_core"] }
 curve25519-dalek = "4.1.3"
 sha2 = "0.10.8"
 sha3 = "0.10.8"
@@ -111,7 +119,7 @@ atty = "0.2"
 once_cell = "1.21.3"
 
 [dev-dependencies]
-criterion = "0.5"
+criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 tempfile = "3.8.1"
 
 # Production build profiles are defined in workspace Cargo.toml

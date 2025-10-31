@@ -39,11 +39,20 @@ use qnet_consensus::{ConsensusEngine, ConsensusConfig, NodeId, CommitRevealConse
 use qnet_consensus::lazy_rewards::{PhaseAwareRewardManager, NodeType as RewardNodeType};
 use qnet_consensus::reputation::{Evidence, MaliciousBehavior};
 use qnet_sharding::{ShardCoordinator, ParallelValidator};
+use crate::quantum_poh::QuantumPoH;
 use std::sync::Arc;
 use std::collections::HashMap;
 use tokio::sync::RwLock;
 use hex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// Safe timestamp getter with fallback
+fn get_timestamp_safe() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| Duration::from_secs(0))
+        .as_secs()
+}
 use std::env;
 use std::sync::Mutex;
 
@@ -246,13 +255,13 @@ impl SignedBlockTracker {
                     evidence_type: "double_sign".to_string(),
                     node_id: producer.to_string(),
                     evidence_data: format!("height:{},hash1:{},hash2:{}", height, existing_hash, block_hash).into_bytes(),
-                    timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+                    timestamp: get_timestamp_safe(),
                 });
             }
         }
         
         // Add new signature
-        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let timestamp = get_timestamp_safe();
         entries.push((block_hash.to_string(), producer.to_string(), timestamp));
         
         // Clean old entries to prevent memory bloat
@@ -972,7 +981,18 @@ impl BlockchainNode {
                 }
             }
         };
-        let (quantum_poh, poh_receiver) = crate::quantum_poh::QuantumPoH::new(genesis_hash);
+        // Try to load last PoH checkpoint from storage
+        let initial_poh_state = Self::load_last_poh_checkpoint(&storage).await;
+        
+        let (quantum_poh, poh_receiver) = if let Some((hash, count)) = initial_poh_state {
+            println!("[QuantumPoH] 🔄 Recovering from checkpoint: count={}, hash={}", 
+                    count, hex::encode(&hash[..16]));
+            crate::quantum_poh::QuantumPoH::new_from_checkpoint(hash, count)
+        } else {
+            println!("[QuantumPoH] 🆕 Starting fresh from genesis hash");
+            crate::quantum_poh::QuantumPoH::new(genesis_hash)
+        };
+        
         let quantum_poh = Arc::new(quantum_poh);
         let poh_receiver = Arc::new(tokio::sync::Mutex::new(poh_receiver));
         
@@ -981,6 +1001,46 @@ impl BlockchainNode {
         tokio::spawn(async move {
             poh_clone.start().await;
             println!("[QuantumPoH] 🚀 PoH generator started");
+        });
+        
+        // Start PoH checkpoint processor
+        let poh_receiver_clone = poh_receiver.clone();
+        let storage_clone = storage.clone();
+        tokio::spawn(async move {
+            println!("[QuantumPoH] 📝 Starting PoH checkpoint processor");
+            let mut receiver = poh_receiver_clone.lock().await;
+            let mut last_checkpoint = 0u64;
+            
+            while let Some(entry) = receiver.recv().await {
+                // Save checkpoint every 1 million hashes (about every 40 seconds at 25M/s)
+                if entry.num_hashes >= last_checkpoint + 1_000_000 {
+                    // Serialize and compress the checkpoint
+                    if let Ok(serialized) = bincode::serialize(&entry) {
+                        // Use zstd compression for efficient storage
+                        if let Ok(compressed) = zstd::encode_all(&serialized[..], 3) {
+                            let key = format!("poh_checkpoint_{}", entry.num_hashes);
+                            
+                            // Store in RocksDB
+                            if let Err(e) = storage_clone.save_raw(&key, &compressed) {
+                                println!("[QuantumPoH] ⚠️ Failed to save checkpoint at {}: {}", 
+                                        entry.num_hashes, e);
+                            } else {
+                                println!("[QuantumPoH] 💾 Saved checkpoint at hash count: {} (compressed: {} -> {} bytes)", 
+                                        entry.num_hashes, serialized.len(), compressed.len());
+                                last_checkpoint = entry.num_hashes;
+                            }
+                        }
+                    }
+                }
+                
+                // Also log progress every 10M hashes
+                if entry.num_hashes % 10_000_000 == 0 {
+                    println!("[QuantumPoH] 📊 Progress: {} million hashes computed", 
+                            entry.num_hashes / 1_000_000);
+                }
+            }
+            
+            println!("[QuantumPoH] 🛑 Checkpoint processor stopped");
         });
         
         // Initialize Hybrid Sealevel if sharding is enabled
@@ -1114,6 +1174,53 @@ impl BlockchainNode {
                 // Use existing handle_sync_request method
                 if let Err(e) = blockchain_clone.handle_sync_request(from_height, to_height, requester_id).await {
                     println!("[SYNC] ❌ Failed to handle sync request: {}", e);
+                }
+            }
+        });
+        
+        // CRITICAL FIX: Perform initial sync with network on startup
+        // This prevents nodes from getting stuck on old blocks
+        println!("[SYNC] 🔄 Performing initial network sync...");
+        let blockchain_for_sync = blockchain.clone();
+        tokio::spawn(async move {
+            // Wait a bit for P2P connections to establish
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            
+            if let Some(p2p) = &blockchain_for_sync.unified_p2p {
+                // Get network consensus height
+                match p2p.sync_blockchain_height() {
+                    Ok(network_height) => {
+                        let local_height = *blockchain_for_sync.height.read().await;
+                        
+                        if network_height > local_height + 10 {
+                            println!("[SYNC] 📊 Network is at height {}, local at {} - syncing...", 
+                                     network_height, local_height);
+                            
+                            // Sync in chunks to avoid overwhelming the network
+                            let mut current = local_height + 1;
+                            while current <= network_height {
+                                let chunk_end = std::cmp::min(current + 100, network_height);
+                                
+                                println!("[SYNC] 📦 Requesting blocks {}-{}...", current, chunk_end);
+                                if let Err(e) = p2p.sync_blocks(current, chunk_end).await {
+                                    println!("[SYNC] ⚠️ Sync failed at block {}: {}", current, e);
+                                    break;
+                                }
+                                
+                                current = chunk_end + 1;
+                                
+                                // Small delay between chunks
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                            }
+                            
+                            println!("[SYNC] ✅ Initial sync complete");
+                        } else {
+                            println!("[SYNC] ✅ Node is synchronized (height: {})", local_height);
+                        }
+                    },
+                    Err(e) => {
+                        println!("[SYNC] ⚠️ Could not determine network height: {}", e);
+                    }
                 }
             }
         });
@@ -1331,10 +1438,10 @@ impl BlockchainNode {
                                         // Update last attempt timestamp
                                         *last_fork_attempt.write().await = std::time::Instant::now();
                                         
-                                        println!("[REORG] 🔀 Fork detected at height {} from {} - processing asynchronously", fork_height, fork_producer);
+                                        println!("[REORG] 🔀 Fork detected at height {} from {} - syncing with majority", fork_height, fork_producer);
                                         
-                                        // CRITICAL: Spawn async task to avoid blocking block processing
-                                        let fork_block = received_block.clone();
+                                        // CRITICAL FIX: Instead of complex reorg, sync with network majority
+                                        // This is simpler and more reliable for Byzantine consensus
                                         let storage_clone = storage.clone();
                                         let height_clone = height.clone();
                                         let p2p_clone = unified_p2p.clone();
@@ -1344,78 +1451,60 @@ impl BlockchainNode {
                                             // Mark reorg as in progress
                                             *reorg_flag.write().await = true;
                                             
-                                            // CRITICAL: Additional validation before processing fork
-                                            // Verify fork block is actually valid before expensive operations
-                                            if let Err(validation_error) = bincode::deserialize::<qnet_state::MicroBlock>(&fork_block.data) {
-                                                println!("[REORG] ❌ Fork block validation failed: {:?}", validation_error);
-                                                *reorg_flag.write().await = false;
-                                                return;
-                                            }
-                                            
-                                            // Collect fork chain blocks
-                                            let fork_blocks = vec![fork_block];
-                                            // Note: We only have the current fork block immediately available
-                                            // Other blocks from the fork chain will be requested separately
-                                            
-                                            // Calculate chain weights
-                                            let fork_chain_weight = if let Some(p2p) = &p2p_clone {
-                                                Self::calculate_fork_chain_weight(&fork_blocks, p2p, &storage_clone).await
-                                            } else {
-                                                0.0
-                                            };
-                                            
-                                            let our_chain_weight = if let Some(p2p) = &p2p_clone {
-                                                Self::calculate_our_chain_weight(fork_height, *height_clone.read().await, p2p, &storage_clone).await
-                                            } else {
-                                                1.0
-                                            };
-                                            
-                                            println!("[REORG] ⚖️ Chain weights - Ours: {:.2}, Fork: {:.2}", our_chain_weight, fork_chain_weight);
-                                            
-                                            // Check depth limit
-                                            let reorg_depth = *height_clone.read().await - fork_height;
-                                            const MAX_REORG_DEPTH: u64 = 100;
-                                            
-                                            if reorg_depth > MAX_REORG_DEPTH {
-                                                println!("[REORG] ⚠️ Reorg too deep ({} blocks) - rejecting", reorg_depth);
-                                                return;
-                                            }
-                                            
-                                            // Byzantine threshold check
-                                            const BYZANTINE_THRESHOLD: f64 = 0.67;
-                                            let total_weight = fork_chain_weight + our_chain_weight;
-                                            let fork_ratio = if total_weight > 0.0 {
-                                                fork_chain_weight / total_weight
-                                            } else {
-                                                0.0
-                                            };
-                                            
-                                            if fork_ratio >= BYZANTINE_THRESHOLD {
-                                                println!("[REORG] 🔄 Fork has Byzantine majority - initiating reorg");
+                                            // CRITICAL: Query network for consensus on this height
+                                            if let Some(p2p) = &p2p_clone {
+                                                // Get all peers' blocks at this height
+                                                let peers = p2p.get_validated_active_peers();
+                                                let mut block_versions: std::collections::HashMap<Vec<u8>, usize> = std::collections::HashMap::new();
                                                 
-                                                // Perform reorganization
-                                                match Self::perform_chain_reorganization(
-                                                    fork_height,
-                                                    &fork_blocks,
-                                                    &storage_clone,
-                                                    &height_clone,
-                                                    &p2p_clone
-                                                ).await {
-                                                    Ok(new_height) => {
-                                                        println!("[REORG] ✅ Reorganization complete! Height: {}", new_height);
-                                                        *height_clone.write().await = new_height;
-                                                    },
-                                                    Err(e) => {
-                                                        println!("[REORG] ❌ Reorganization failed: {}", e);
+                                                for peer in peers.iter().take(10) {  // Sample up to 10 peers
+                                                    // Query peer for their block at fork_height
+                                                    // (This would need a new P2P method to query specific block)
+                                                    // For now, we'll use network height consensus
+                                                }
+                                                
+                                                // Get network consensus height
+                                                if let Ok(network_height) = p2p.sync_blockchain_height() {
+                                                    let local_height = *height_clone.read().await;
+                                                    
+                                                    // If network is ahead, sync to catch up
+                                                    if network_height > local_height {
+                                                        println!("[REORG] 📥 Network consensus at height {} - syncing from {}", 
+                                                                 network_height, local_height);
+                                                        
+                                                        // Clear our chain from fork point and resync
+                                                        if fork_height < local_height {
+                                                            // Rollback to before fork
+                                                            println!("[REORG] 🔄 Rolling back from {} to {}", local_height, fork_height - 1);
+                                                            
+                                                            // Delete blocks from fork_height onwards
+                                                            for h in fork_height..=local_height {
+                                                                if let Err(e) = storage_clone.delete_microblock(h) {
+                                                                    println!("[REORG] ⚠️ Failed to delete block {}: {}", h, e);
+                                                                }
+                                                            }
+                                                            
+                                                            // Update height
+                                                            *height_clone.write().await = fork_height - 1;
+                                                            storage_clone.set_chain_height(fork_height - 1).ok();
+                                                        }
+                                                        
+                                                        // Sync missing blocks from network
+                                                        let sync_from = fork_height;
+                                                        let sync_to = std::cmp::min(network_height, fork_height + 100); // Sync in chunks
+                                                        
+                                                        println!("[REORG] 📦 Requesting blocks {}-{} from network", sync_from, sync_to);
+                                                        if let Err(e) = p2p.sync_blocks(sync_from, sync_to).await {
+                                                            println!("[REORG] ❌ Failed to sync blocks: {}", e);
+                                                        } else {
+                                                            println!("[REORG] ✅ Fork resolved by syncing with network majority");
+                                                        }
                                                     }
                                                 }
-                                            } else {
-                                                println!("[REORG] 📌 Keeping our chain (ratio: {:.2})", fork_ratio);
                                             }
                                             
-                                            // CRITICAL: Clear reorg flag when done
+                                            // Clear reorg flag
                                             *reorg_flag.write().await = false;
-                                            println!("[REORG] ✅ Reorg analysis complete - ready for next fork");
                                         });
                                         
                                         // Continue processing other blocks immediately
@@ -1908,6 +1997,32 @@ impl BlockchainNode {
                 "Invalid signature on block #{} from producer {}",
                 microblock.height, microblock.producer
             ));
+        }
+        
+        // 5.5. Verify PoH sequence (if PoH is available and block has PoH data)
+        // Only verify for blocks that have valid PoH data (not genesis or pre-PoH blocks)
+        if microblock.height > 0 && !microblock.poh_hash.is_empty() && microblock.poh_count > 0 {
+            // Get previous block's PoH state for verification
+            if let Ok(Some(prev_data)) = storage.load_microblock(microblock.height - 1) {
+                let prev_block: qnet_state::MicroBlock = bincode::deserialize(&prev_data)
+                    .map_err(|e| format!("Failed to deserialize previous block for PoH check: {}", e))?;
+                
+                // Verify PoH continuity: current count must be greater than previous
+                if microblock.poh_count <= prev_block.poh_count && prev_block.poh_count > 0 {
+                    println!("[PoH] ❌ PoH counter regression detected! Block #{}: {} <= prev: {}", 
+                            microblock.height, microblock.poh_count, prev_block.poh_count);
+                    return Err(format!(
+                        "PoH counter must increase: block #{} has {} but previous has {}",
+                        microblock.height, microblock.poh_count, prev_block.poh_count
+                    ));
+                }
+                
+                // Log PoH progression
+                if microblock.height % 10 == 0 {
+                    println!("[PoH] ✅ PoH verified for block #{}: count={} (prev={})", 
+                            microblock.height, microblock.poh_count, prev_block.poh_count);
+                }
+            }
         }
         
         // 6. CRITICAL: Detect database substitution attack
@@ -2426,6 +2541,8 @@ impl BlockchainNode {
                                 producer: "genesis".to_string(),
                                 merkle_root,
                                 signature: Vec::new(), // Will be signed with quantum crypto
+                                poh_hash: vec![0u8; 64], // Genesis has no PoH yet
+                                poh_count: 0, // Genesis starts at 0
                             };
                             
                             // PRODUCTION: Use deterministic signature for Genesis Block
@@ -2909,7 +3026,8 @@ impl BlockchainNode {
                     &unified_p2p, 
                     &node_id, 
                     node_type,
-                    Some(&storage)  // Pass storage for entropy
+                    Some(&storage),  // Pass storage for entropy
+                    &quantum_poh  // Pass PoH for quantum entropy
                 ).await;
                 let is_my_turn_to_produce = current_producer == node_id;
                 
@@ -3133,7 +3251,8 @@ impl BlockchainNode {
                             &Some(p2p.clone()),
                             &node_id,
                             node_type,
-                            Some(storage.clone())  // Pass storage for entropy
+                            Some(storage.clone()),  // Pass storage for entropy
+                            &quantum_poh  // Pass PoH for quantum entropy
                             ).await;
                             
                             println!("[PRODUCER] 🆘 Emergency handover to: {}", emergency_producer);
@@ -3340,7 +3459,8 @@ impl BlockchainNode {
                                     &Some(p2p.clone()),
                                     &node_id,
                                     node_type,
-                                    Some(storage.clone())
+                                    Some(storage.clone()),
+                                    &quantum_poh  // Pass PoH for quantum entropy
                                 ).await;
                                 
                                 // Broadcast emergency change
@@ -3367,6 +3487,14 @@ impl BlockchainNode {
                         PREV_HASH_RETRY_COUNTER.store(0, Ordering::SeqCst);
                     }
                     
+                    // Get PoH state BEFORE creating block
+                    let (poh_hash, poh_count) = if let Some(ref poh) = quantum_poh {
+                        let (hash, count, _slot) = poh.get_state().await;
+                        (hash, count)
+                    } else {
+                        (vec![0u8; 64], 0u64) // No PoH available
+                    };
+                    
                     let mut microblock = qnet_state::MicroBlock {
                         height: next_block_height,  // Use next_block_height instead of microblock_height
                         timestamp: deterministic_timestamp,  // DETERMINISTIC: Same on all nodes
@@ -3375,6 +3503,8 @@ impl BlockchainNode {
                         signature: vec![0u8; 64], // Will be filled with real signature
                         merkle_root: Self::calculate_merkle_root(&txs),
                         previous_hash: prev_hash,  // Use the hash we validated
+                        poh_hash: poh_hash.clone(), // Add PoH hash to block
+                        poh_count, // Add PoH counter to block
                     };
                     
                     // QUANTUM PoH: Mix microblock into PoH chain for cryptographic time proof
@@ -3384,6 +3514,9 @@ impl BlockchainNode {
                             Ok(poh_entry) => {
                                 println!("[QuantumPoH] ✅ Microblock #{} mixed into PoH chain (hash_count: {})", 
                                         microblock_height, poh_entry.num_hashes);
+                                // Update block with new PoH state after mixing
+                                microblock.poh_hash = poh_entry.hash;
+                                microblock.poh_count = poh_entry.num_hashes;
                             },
                             Err(e) => {
                                 println!("[QuantumPoH] ⚠️ Failed to mix microblock #{}: {}", microblock_height, e);
@@ -3897,6 +4030,7 @@ impl BlockchainNode {
                             let height_timeout = height.clone();
                             let node_id_timeout = node_id.clone();
                             let node_type_timeout = node_type;
+                            let quantum_poh_timeout = quantum_poh.clone();
                             
                             // CRITICAL FIX: Don't trigger failover if we're still syncing with network
                             // This prevents false failovers during startup when nodes are catching up
@@ -3952,7 +4086,8 @@ impl BlockchainNode {
                                         &Some(p2p_timeout.clone()),
                                         &node_id_timeout,
                                         node_type_timeout,
-                                        Some(storage_timeout.clone())  // Pass storage for entropy
+                                        Some(storage_timeout.clone()),  // Pass storage for entropy
+                                        &quantum_poh_timeout  // Pass PoH for quantum entropy
                                     ).await;
                                     
                                     println!("[FAILOVER] 🆘 Emergency microblock producer selected: {}", emergency_producer);
@@ -4031,6 +4166,7 @@ impl BlockchainNode {
                     let unified_p2p_clone = unified_p2p.clone();
                     let consensus_rx_clone = consensus_rx.clone();
                     let macroblock_trigger = last_macroblock_trigger;
+                    let quantum_poh_clone = quantum_poh.clone();
                     
                     tokio::spawn(async move {
                         println!("[MACROBLOCK] 🏛️ Background consensus starting for blocks {}-{}", macroblock_trigger + 1, macroblock_trigger + 90);
@@ -4054,18 +4190,23 @@ impl BlockchainNode {
                             }
                             
                             // ALL nodes run consensus (initiator starts, others participate)
-                            match Self::trigger_macroblock_consensus(
-                                storage_clone,
-                                consensus_clone,
-                                    macroblock_trigger + 1,
-                                    macroblock_trigger + 90, // Will be block 90
-                                    p2p,
-                                &node_id_clone,
-                                node_type_clone,
-                                    &consensus_rx_clone,
-                            ).await {
-                                    Ok(_) => println!("[MACROBLOCK] ✅ Background consensus completed"),
-                                    Err(e) => println!("[MACROBLOCK] ❌ Background consensus failed: {}", e),
+                            if let Some(ref poh) = quantum_poh_clone {
+                                match Self::trigger_macroblock_consensus(
+                                    storage_clone,
+                                    consensus_clone,
+                                        macroblock_trigger + 1,
+                                        macroblock_trigger + 90, // Will be block 90
+                                        p2p,
+                                    &node_id_clone,
+                                    node_type_clone,
+                                        &consensus_rx_clone,
+                                    poh,
+                                ).await {
+                                        Ok(_) => println!("[MACROBLOCK] ✅ Background consensus completed"),
+                                        Err(e) => println!("[MACROBLOCK] ❌ Background consensus failed: {}", e),
+                                    }
+                            } else {
+                                println!("[MACROBLOCK] ❌ PoH not available for consensus");
                             }
                         }
                     });
@@ -4290,6 +4431,7 @@ impl BlockchainNode {
         own_node_id: &str,
         own_node_type: NodeType, // CRITICAL: Use real node type instead of string guessing
         storage: Option<&Arc<Storage>>, // ADDED: For getting previous block hash
+        quantum_poh: &Option<Arc<crate::quantum_poh::QuantumPoH>>, // ADDED: For PoH entropy
     ) -> String {
         // PRODUCTION: QNet microblock producer SELECTION for decentralization (per MICROBLOCK_ARCHITECTURE_PLAN.md)  
         // Each 30-block period uses cryptographic hash to select producer from qualified candidates
@@ -4388,47 +4530,82 @@ impl BlockchainNode {
                 leadership_round * rotation_interval + 1  // Round N starts at N*30 + 1
             };
             
-                // Use the last block of previous round as entropy source
-            // For round 0 (blocks 1-30): use genesis block (0) hash
-            // For round 1 (blocks 31-60): use block 30 hash 
-            // For round 2 (blocks 61-90): use block 60 hash, etc.
-            let entropy_height = if leadership_round == 0 {
-                0  // Use Genesis block for Round 0 entropy
-                } else { 
-                leadership_round * rotation_interval  // Last block of previous round
-            };
-                // CRITICAL FIX: get_previous_microblock_hash loads block (height-1)
-                // But for entropy we need the EXACT block at entropy_height
-                // So we pass entropy_height + 1 to get the correct block
-                let prev_hash = if entropy_height == 0 {
-                    // Genesis block special case - no previous block
-                    Self::get_previous_microblock_hash(store, 1).await  // Will return hash of block 0
+                // CRITICAL FIX: Use proper entropy source to prevent predictable selection
+                // For rounds before first macroblock, use last block of previous round
+                // This ensures different producers for each round even without macroblocks
+                let prev_hash = if leadership_round == 0 {
+                    // Round 0 (blocks 1-30): Use Genesis block as entropy
+                    println!("[CONSENSUS] 🎲 Round 0: Using Genesis block as entropy");
+                    Self::get_previous_microblock_hash(store, 1).await
+                } else if leadership_round == 1 {
+                    // Round 1 (blocks 31-60): Use block 30 as entropy
+                    println!("[CONSENSUS] 🎲 Round 1: Using block 30 as entropy (no macroblock yet)");
+                    Self::get_previous_microblock_hash(store, 31).await  // Gets hash of block 30
+                } else if leadership_round == 2 {
+                    // Round 2 (blocks 61-90): Use block 60 as entropy
+                    println!("[CONSENSUS] 🎲 Round 2: Using block 60 as entropy (no macroblock yet)");
+                    Self::get_previous_microblock_hash(store, 61).await  // Gets hash of block 60
                 } else {
-                    // For entropy_height=30, we need block 30, so pass 31 to get hash of block 30
-                    Self::get_previous_microblock_hash(store, entropy_height + 1).await
+                    // Round 3+ (blocks 91+): Use last macroblock as entropy (Byzantine consensus)
+                    let round_start_block = leadership_round * rotation_interval + 1;
+                    let last_macroblock_height = ((round_start_block - 1) / 90) * 90;
+                    
+                    // We should always have a macroblock by round 3
+                    let macroblock_index = last_macroblock_height / 90;
+                    match store.get_macroblock_by_height(macroblock_index) {
+                        Ok(Some(macroblock_data)) => {
+                            use sha3::{Sha3_256, Digest};
+                            let mut hasher = Sha3_256::new();
+                            hasher.update(&macroblock_data);
+                            let result = hasher.finalize();
+                            let mut hash = [0u8; 32];
+                            hash.copy_from_slice(&result);
+                            println!("[CONSENSUS] 🎲 Using MACROBLOCK #{} (height {}) hash as entropy (Byzantine safe): {:x}", 
+                                     macroblock_index, last_macroblock_height,
+                                     u64::from_le_bytes([hash[0], hash[1], hash[2], hash[3], 
+                                                        hash[4], hash[5], hash[6], hash[7]]));
+                            hash
+                        },
+                        _ => {
+                            // Emergency fallback: use last block of previous round
+                            println!("[CONSENSUS] ⚠️ Macroblock #{} not found, using block {} as entropy", 
+                                     macroblock_index, round_start_block - 1);
+                            Self::get_previous_microblock_hash(store, round_start_block).await
+                        }
+                    }
                 };
-                println!("[CONSENSUS] 🎲 Using entropy from block #{} hash: {:x}", 
-                         entropy_height,  // Log the actual entropy block number
-                         u64::from_le_bytes([prev_hash[0], prev_hash[1], prev_hash[2], prev_hash[3], 
-                                            prev_hash[4], prev_hash[5], prev_hash[6], prev_hash[7]]));
                 prev_hash
             } else {
                 println!("[CONSENSUS] ⚠️ No storage available for entropy - using deterministic selection");
                 [0u8; 32]
             };
             
-            // Deterministic seed using block height, round AND previous block hash for entropy
+            // ENHANCED: Multi-source entropy for better unpredictability
+            // Still not VRF (needs private keys) but much harder to manipulate
             selection_hasher.update(format!("microblock_producer_selection_{}_{}", leadership_round, candidates.len()).as_bytes());
-            selection_hasher.update(&entropy_source); // ADD ENTROPY HERE!
+            selection_hasher.update(&entropy_source); // Previous block hash
             
-            // Include ALL candidate data for Byzantine consensus consistency
-            // ARCHITECTURAL FIX: Reputation is ONLY a threshold (>=70%), not a weight!
-            // All qualified nodes have EQUAL chance of selection
+            // ADD: Network-wide entropy from all candidates
+            // This makes it harder for single node to manipulate selection
             println!("[CONSENSUS] 📊 Producer selection candidates for round {}:", leadership_round);
             for (i, (candidate_id, _reputation)) in candidates.iter().enumerate() {
                 println!("[CONSENSUS]   #{}: {} (qualified ≥70%)", i, candidate_id);
                 selection_hasher.update(candidate_id.as_bytes());
-                // DO NOT include reputation in hash - all qualified nodes are equal!
+                // Include candidate order as entropy (changes as nodes join/leave)
+                selection_hasher.update(&(i as u64).to_le_bytes());
+            }
+            
+            // ADD: Additional entropy from candidate count (network size changes)
+            selection_hasher.update(&(candidates.len() as u64).to_le_bytes());
+            
+            // QUANTUM PoH: Add PoH state as entropy source for unpredictable producer selection
+            // This prevents manipulation as PoH state cannot be predicted or controlled
+            if let Some(poh) = quantum_poh {
+                // Get current PoH state (hash, count, slot)
+                let (poh_hash, poh_count, _poh_slot) = poh.get_state().await;
+                selection_hasher.update(&poh_hash);
+                selection_hasher.update(&poh_count.to_le_bytes());
+                println!("[CONSENSUS] 🔐 PoH entropy added: count={} (prevents manipulation)", poh_count);
             }
             
             let selection_hash = selection_hasher.finalize();
@@ -4631,6 +4808,7 @@ impl BlockchainNode {
         own_node_id: &str, // CRITICAL: Include own node as emergency candidate
         own_node_type: NodeType, // CRITICAL: Use real node type for accurate filtering
         storage: Option<Arc<Storage>>, // Pass storage for failover tracking
+        quantum_poh: &Option<Arc<crate::quantum_poh::QuantumPoH>>, // ADDED: For PoH entropy in emergency
     ) -> String {
         if let Some(p2p) = unified_p2p {
             // CRITICAL FIX: For Genesis phase, use SAME candidate source as normal producer selection
@@ -4879,6 +5057,15 @@ impl BlockchainNode {
             
             emergency_hasher.update(format!("emergency_producer_{}_{}", failed_producer, current_height).as_bytes());
             emergency_hasher.update(&entropy_source); // Add entropy from previous block
+            
+            // QUANTUM PoH: Add PoH entropy for emergency selection
+            if let Some(poh) = quantum_poh {
+                let (poh_hash, poh_count, _) = poh.get_state().await;
+                emergency_hasher.update(&poh_hash);
+                emergency_hasher.update(&poh_count.to_le_bytes());
+                println!("[EMERGENCY] 🔐 PoH entropy added for emergency selection: count={}", poh_count);
+            }
+            
             for (node_id, _) in &candidates {
                 emergency_hasher.update(node_id.as_bytes());
             }
@@ -5714,6 +5901,9 @@ impl BlockchainNode {
             consensus_data,
             previous_hash: storage.get_latest_macroblock_hash()
                 .unwrap_or([0u8; 32]),
+            // Emergency macroblock: PoH state not available in static context
+            poh_hash: vec![0u8; 64], // SHA3-512 produces 64 bytes
+            poh_count: 0, // Will be filled from last microblock's PoH
         };
         
         // Save macroblock
@@ -6543,6 +6733,7 @@ impl BlockchainNode {
         node_id: &str,
         node_type: NodeType,
         consensus_rx: &Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<ConsensusMessage>>>>, // CRITICAL: REAL channel
+        quantum_poh: &Arc<QuantumPoH>,
     ) -> Result<(), String> {
         // ENHANCED MACROBLOCK CONSENSUS DASHBOARD
         println!("[MACROBLOCK] 🏛️ BYZANTINE CONSENSUS INITIATED:");
@@ -6778,6 +6969,9 @@ impl BlockchainNode {
             genesis_timestamp + (consensus_data.round_number * MACROBLOCK_INTERVAL_SECONDS)
         };
         
+        // Capture current PoH state for macroblock
+        let (poh_hash, poh_count, _slot) = quantum_poh.get_state().await;
+        
         let macroblock = qnet_state::MacroBlock {
             height: consensus_data.round_number,
             timestamp: deterministic_timestamp,  // DETERMINISTIC: Same on all nodes
@@ -6789,6 +6983,8 @@ impl BlockchainNode {
                 next_leader: consensus_data.leader_id.clone(),
             },
             previous_hash: previous_macroblock_hash,
+            poh_hash: poh_hash.to_vec(),
+            poh_count,
         };
         
         // PRODUCTION: Save macroblock to storage only after REAL consensus
@@ -6952,7 +7148,8 @@ impl BlockchainNode {
             &self.unified_p2p,
             &self.node_id,
             self.node_type,
-            Some(&self.storage)
+            Some(&self.storage),
+            &self.quantum_poh  // Pass PoH for quantum entropy
         ).await;
         
         // Additional check: only return true if we're synchronized
@@ -8789,6 +8986,41 @@ fn verify_genesis_node_certificate(node_id: &str) -> bool {
     // SECURITY: Certificate must contain valid cryptographic proof
     let expected_hash = format!("{:x}", &verification_hash[..8].iter().fold(0u64, |acc, &b| acc << 8 | b as u64));
     genesis_certificate.contains(&expected_hash)
+}
+
+impl BlockchainNode {
+    /// Load the last PoH checkpoint from storage
+    async fn load_last_poh_checkpoint(storage: &Arc<Storage>) -> Option<(Vec<u8>, u64)> {
+        // Try to find the latest checkpoint by scanning keys
+        // In production, we'd maintain an index of checkpoint heights
+        let mut latest_checkpoint: Option<(Vec<u8>, u64)> = None;
+        let mut max_count = 0u64;
+        
+        // Scan for checkpoint keys (in production, use an index)
+        // For now, check common checkpoint intervals
+        for millions in (1..=1000).rev() {
+            let key = format!("poh_checkpoint_{}", millions * 1_000_000);
+            
+            match storage.load_raw(&key) {
+                Ok(Some(compressed_data)) => {
+                    // Decompress the checkpoint
+                    if let Ok(decompressed) = zstd::decode_all(&compressed_data[..]) {
+                        // Deserialize the PoH entry
+                        if let Ok(entry) = bincode::deserialize::<crate::quantum_poh::PoHEntry>(&decompressed) {
+                            if entry.num_hashes > max_count {
+                                max_count = entry.num_hashes;
+                                latest_checkpoint = Some((entry.hash, entry.num_hashes));
+                                println!("[QuantumPoH] 📂 Found checkpoint at count: {}", entry.num_hashes);
+                            }
+                        }
+                    }
+                }
+                _ => continue,
+            }
+        }
+        
+        latest_checkpoint
+    }
 }
 
 impl Clone for BlockchainNode {

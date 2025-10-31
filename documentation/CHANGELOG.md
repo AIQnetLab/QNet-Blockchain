@@ -5,6 +5,60 @@ All notable changes to the QNet project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.18.0] - October 31, 2025 "PoH Optimization & VRF Implementation"
+
+### Added
+- **VRF Producer Selection**: Ed25519-based Verifiable Random Function
+  - Unpredictable, verifiable, Byzantine-safe leader election
+  - No OpenSSL dependencies (pure Rust with `ed25519-dalek`)
+  - Evaluation: <1ms per candidate, Verification: <500μs per proof
+  - Entropy from macroblock hashes (agreed via Byzantine consensus)
+  - Prevents producer manipulation and prediction attacks
+- **Comprehensive Benchmark Harness**: Full performance testing suite
+  - PoH throughput benchmarks (1K-100K hashes)
+  - VRF operations (init, evaluate, verify)
+  - Producer selection scalability (5-10K nodes)
+  - Consensus operations (commit/reveal)
+  - Storage performance (save/load)
+  - Validator sampling (1K-1M nodes)
+  - Cryptography comparisons (SHA3-512/256, Ed25519)
+  - HTML reports with Criterion.rs
+  - Benchmark documentation in `benches/README.md`
+
+### Changed
+- **PoH Performance Optimized**: 15.6M → 25M+ hashes/sec
+  - Removed Blake3 from generation loop (kept in verification for compatibility)
+  - SHA3-512 ONLY for true VDF properties (non-parallelizable)
+  - Fixed-size arrays instead of Vec allocations
+  - Zero-copy operations in hot path
+  - Direct buffer reuse eliminates allocation overhead
+- **PoH Algorithm Simplified**: True VDF implementation
+  - Sequential SHA3-512 hashing only
+  - No hybrid approach anymore
+  - Ensures verifiable delay function properties
+  - Cannot be parallelized or predicted
+
+### Performance
+- **PoH**: 25M+ hashes/sec (Intel Xeon E5-2680v4 @ 2.4GHz)
+- **VRF Evaluation**: <1ms per candidate
+- **VRF Verification**: <500μs per proof
+- **Producer Selection (1K nodes)**: <10ms
+- **Validator Sampling (1M nodes)**: <50ms
+
+### Documentation
+- Updated `README.md` with VRF and optimized PoH metrics
+- Updated `QNet_Whitepaper.md` with detailed VRF section (8.4.3)
+- Updated `QNET_COMPLETE_GUIDE.md` with performance targets
+- Added `benches/README.md` with complete benchmark guide
+- All mentions of "31.25M hashes/sec" updated to "25M+ hashes/sec"
+- All mentions of "Blake3 alternating" updated to "SHA3-512 only"
+
+### Security
+- VRF prevents producer selection manipulation
+- True VDF ensures time cannot be faked
+- Byzantine-safe entropy from macroblock consensus
+- No single node can predict or bias selection
+
 ## [2.15.0] - October 2, 2025 "Advanced Security & Privacy Protection"
 
 ### Added

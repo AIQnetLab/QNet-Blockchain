@@ -115,10 +115,7 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://wallet.qnet.io",
-        "https://testnet-wallet.qnet.io", 
-        "https://bridge.qnet.io",
-        "https://aiqnet.io"
+        "*"  # Allow all origins for fully decentralized access
     ],
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE"],

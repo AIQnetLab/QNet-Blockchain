@@ -150,6 +150,20 @@ impl TransactionPool {
 }
 
 impl PersistentStorage {
+    /// Save raw data with a custom key
+    pub fn save_raw(&self, key: &str, data: &[u8]) -> IntegrationResult<()> {
+        self.db.put(key.as_bytes(), data)?;
+        Ok(())
+    }
+    
+    /// Load raw data with a custom key
+    pub fn load_raw(&self, key: &str) -> IntegrationResult<Option<Vec<u8>>> {
+        match self.db.get(key.as_bytes())? {
+            Some(data) => Ok(Some(data)),
+            None => Ok(None),
+        }
+    }
+    
     pub fn new(data_dir: &str) -> IntegrationResult<Self> {
         let path = Path::new(data_dir);
         std::fs::create_dir_all(path)?;
@@ -262,6 +276,15 @@ impl PersistentStorage {
             }
             None => Ok(0),
         }
+    }
+    
+    /// Set chain height to a specific value (for fork resolution)
+    pub fn set_chain_height(&self, height: u64) -> IntegrationResult<()> {
+        let metadata_cf = self.db.cf_handle("metadata")
+            .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
+        
+        self.db.put_cf(&metadata_cf, b"chain_height", &height.to_be_bytes())?;
+        Ok(())
     }
     
     /// DATA CONSISTENCY: Reset chain height to 0 (DANGEROUS - requires explicit confirmation)
@@ -794,6 +817,17 @@ impl PersistentStorage {
         }
     }
     
+    /// Delete a microblock at the specified height (for fork resolution)
+    pub fn delete_microblock(&self, height: u64) -> IntegrationResult<()> {
+        let microblocks_cf = self.db.cf_handle("microblocks")
+            .ok_or_else(|| IntegrationError::StorageError("microblocks column family not found".to_string()))?;
+        
+        let key = format!("microblock_{}", height);
+        self.db.delete_cf(&microblocks_cf, key.as_bytes())?;
+        
+        Ok(())
+    }
+    
     pub fn get_latest_macroblock_hash(&self) -> Result<[u8; 32], IntegrationError> {
         let metadata_cf = self.db.cf_handle("metadata")
             .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
@@ -827,6 +861,22 @@ impl PersistentStorage {
         
         self.db.write(batch)?;
         Ok(())
+    }
+    
+    /// Get macroblock by its index (height / 90)
+    pub fn get_macroblock_by_height(&self, macroblock_index: u64) -> IntegrationResult<Option<Vec<u8>>> {
+        let microblocks_cf = self.db.cf_handle("microblocks")
+            .ok_or_else(|| IntegrationError::StorageError("microblocks column family not found".to_string()))?;
+        
+        // Macroblocks are stored with key "macroblock_{height}"
+        // where height is the actual macroblock height (90, 180, 270, etc)
+        let macroblock_height = macroblock_index * 90;
+        let key = format!("macroblock_{}", macroblock_height);
+        
+        match self.db.get_cf(&microblocks_cf, key.as_bytes())? {
+            Some(data) => Ok(Some(data)),
+            None => Ok(None),
+        }
     }
     
     pub fn get_stats(&self) -> IntegrationResult<StorageStats> {
@@ -1161,6 +1211,16 @@ pub struct Storage {
 }
 
 impl Storage {
+    /// Save raw data with a custom key (for PoH checkpoints, etc.)
+    pub fn save_raw(&self, key: &str, data: &[u8]) -> IntegrationResult<()> {
+        self.persistent.save_raw(key, data)
+    }
+    
+    /// Load raw data with a custom key (for PoH checkpoints, etc.)
+    pub fn load_raw(&self, key: &str) -> IntegrationResult<Option<Vec<u8>>> {
+        self.persistent.load_raw(key)
+    }
+    
     pub fn new(data_dir: &str) -> IntegrationResult<Self> {
         let persistent = PersistentStorage::new(data_dir)?;
         let transaction_pool = TransactionPool::new();
@@ -1277,6 +1337,11 @@ impl Storage {
         self.persistent.get_chain_height()
     }
     
+    /// Set chain height to a specific value (for fork resolution)
+    pub fn set_chain_height(&self, height: u64) -> IntegrationResult<()> {
+        self.persistent.set_chain_height(height)
+    }
+    
     /// DATA CONSISTENCY: Reset chain height to 0 (wrapper for persistent storage)
     pub fn reset_chain_height(&self) -> IntegrationResult<()> {
         self.persistent.reset_chain_height()
@@ -1338,8 +1403,19 @@ impl Storage {
         self.persistent.load_microblock(height)
     }
     
+    /// Delete a microblock at the specified height (for fork resolution)
+    pub fn delete_microblock(&self, height: u64) -> IntegrationResult<()> {
+        println!("[Storage] 🗑️ Deleting microblock at height {}", height);
+        self.persistent.delete_microblock(height)
+    }
+    
     pub fn get_latest_macroblock_hash(&self) -> Result<[u8; 32], IntegrationError> {
         self.persistent.get_latest_macroblock_hash()
+    }
+    
+    /// Get macroblock by its index (height / 90)
+    pub fn get_macroblock_by_height(&self, macroblock_index: u64) -> IntegrationResult<Option<Vec<u8>>> {
+        self.persistent.get_macroblock_by_height(macroblock_index)
     }
     
     /// Save state snapshot for efficient storage

@@ -88,7 +88,7 @@ impl QNetNetworkConfig {
             chain_id: 1337,
             endpoints: NetworkEndpoints {
                 qnet_rpc: "https://testnet-rpc.qnet.io".to_string(),
-                qnet_api: "https://testnet-api.qnet.io".to_string(),
+                qnet_api: "".to_string(), // Direct node connections - no central API
                 bridge_api: "https://testnet-bridge.qnet.io".to_string(),
                 wallet_url: "https://testnet-wallet.qnet.io".to_string(),
                 explorer_url: "https://testnet-explorer.qnet.io".to_string(),
@@ -113,7 +113,7 @@ impl QNetNetworkConfig {
             chain_id: 1,
             endpoints: NetworkEndpoints {
                 qnet_rpc: "https://rpc.qnet.io".to_string(),
-                qnet_api: "https://api.qnet.io".to_string(),
+                qnet_api: "".to_string(), // Direct node connections - no central API
                 bridge_api: "https://bridge.qnet.io".to_string(),
                 wallet_url: "https://wallet.qnet.io".to_string(),
                 explorer_url: "https://explorer.qnet.io".to_string(),

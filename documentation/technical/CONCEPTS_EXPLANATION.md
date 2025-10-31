@@ -146,7 +146,7 @@ import { QNetSDK } from '@qnet/sdk';
 // Initialize
 const qnet = new QNetSDK({
   network: 'mainnet',
-  apiUrl: 'https://api.qnet.io'
+  nodeUrl: 'http://NODE_IP:8001' // Direct node connection
 });
 
 // Create wallet

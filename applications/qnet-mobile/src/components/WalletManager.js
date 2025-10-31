@@ -2703,6 +2703,111 @@ export class WalletManager {
     }
   }
 
+  // Get available node for direct connection - fully decentralized
+  async getAvailableNode() {
+    try {
+      // First try to get cached discovered nodes
+      const cachedNodes = await AsyncStorage.getItem('qnet_discovered_nodes');
+      if (cachedNodes) {
+        const nodes = JSON.parse(cachedNodes);
+        const validNodes = nodes.filter(node => {
+          // Check if node was seen in last 24 hours
+          return (Date.now() - node.lastSeen) < 86400000;
+        });
+        
+        if (validNodes.length > 0) {
+          // Use discovered node
+          const node = validNodes[Math.floor(Math.random() * validNodes.length)];
+          return node.url;
+        }
+      }
+    } catch (e) {
+      // Ignore cache errors
+    }
+    
+    // Fallback to Genesis bootstrap nodes if no discovered nodes
+    // These are the official Genesis nodes from genesis_constants.rs
+    const genesisNodes = [
+      { url: 'http://154.38.160.39:8001', region: 'North America' },
+      { url: 'http://62.171.157.44:8001', region: 'Europe' },
+      { url: 'http://161.97.86.81:8001', region: 'Europe' },
+      { url: 'http://173.212.219.226:8001', region: 'Europe' },
+      { url: 'http://164.68.108.218:8001', region: 'Europe' }
+    ];
+    
+    // Try to discover new nodes from Genesis nodes
+    this.discoverNodes(genesisNodes);
+    
+    // Return random Genesis node for now
+    const node = genesisNodes[Math.floor(Math.random() * genesisNodes.length)];
+    return node.url;
+  }
+  
+  // Discover active nodes from network
+  async discoverNodes(seedNodes) {
+    try {
+      // Query each seed node for their peer list
+      for (const seed of seedNodes) {
+        try {
+          const response = await fetch(`${seed.url}/api/v1/peers`, {
+            method: 'GET',
+            timeout: 5000
+          });
+          
+          if (response.ok) {
+            const data = await response.json();
+            if (data.peers && Array.isArray(data.peers)) {
+              // Store discovered nodes
+              const discoveredNodes = data.peers.map(peer => ({
+                url: `http://${peer.address}`,
+                nodeType: peer.node_type,
+                lastSeen: Date.now()
+              }));
+              
+              // Merge with existing cache
+              const cachedNodes = await AsyncStorage.getItem('qnet_discovered_nodes');
+              let allNodes = discoveredNodes;
+              if (cachedNodes) {
+                const existing = JSON.parse(cachedNodes);
+                allNodes = [...existing, ...discoveredNodes];
+                
+                // Remove duplicates
+                const unique = {};
+                allNodes.forEach(node => {
+                  unique[node.url] = node;
+                });
+                allNodes = Object.values(unique);
+              }
+              
+              // Save to cache
+              await AsyncStorage.setItem('qnet_discovered_nodes', JSON.stringify(allNodes));
+              break; // Success, no need to query more seeds
+            }
+          }
+        } catch (e) {
+          // Try next seed node
+          continue;
+        }
+      }
+    } catch (e) {
+      // Discovery failed, will use Genesis nodes
+    }
+  }
+  
+  // Helper for backward compatibility
+  getRandomBootstrapNode() {
+    // Synchronous wrapper for compatibility
+    // Returns Genesis node immediately, discovery happens in background
+    const genesisNodes = [
+      'http://154.38.160.39:8001',
+      'http://62.171.157.44:8001',
+      'http://161.97.86.81:8001',
+      'http://173.212.219.226:8001',
+      'http://164.68.108.218:8001'
+    ];
+    return genesisNodes[Math.floor(Math.random() * genesisNodes.length)];
+  }
+
   // Load and decrypt wallet with PBKDF2 + AES
   async loadWallet(password) {
     try {
@@ -3831,10 +3936,8 @@ export class WalletManager {
     // Store the activation code with transaction signature
     await this.storeActivationCode(activationCode, 'light', password);
     
-    // Register node with backend
-    const apiUrl = isTestnet 
-      ? 'https://testnet-api.qnet.io'
-      : 'https://api.qnet.io';
+    // Direct connection to bootstrap node - fully decentralized
+    const apiUrl = this.getRandomBootstrapNode();
     
     try {
       // Create registration message
@@ -3899,10 +4002,8 @@ export class WalletManager {
   async getNodeRewards(nodeType, activationCode, walletAddress) {
     try {
       // Get backend URL
-      const isTestnet = await AsyncStorage.getItem('qnet_testnet') === 'true';
-      const apiUrl = isTestnet 
-        ? 'https://testnet-api.qnet.io'
-        : 'https://api.qnet.io';
+      // Direct connection to bootstrap node - fully decentralized
+      const apiUrl = this.getRandomBootstrapNode();
       
       // Get rewards periods from blockchain
       const periodsResponse = await fetch(`${apiUrl}/api/rewards/periods`, {
@@ -4003,10 +4104,8 @@ export class WalletManager {
   async registerNodeWithCode(activationCode, walletAddress, password) {
     try {
       // Get backend URL
-      const isTestnet = await AsyncStorage.getItem('qnet_testnet') === 'true';
-      const apiUrl = isTestnet 
-        ? 'https://testnet-api.qnet.io'
-        : 'https://api.qnet.io';
+      // Direct connection to bootstrap node - fully decentralized
+      const apiUrl = this.getRandomBootstrapNode();
       
       // Load wallet to sign the request
       const walletData = await this.loadWallet(password);
@@ -4106,10 +4205,8 @@ export class WalletManager {
   async pingNode(activationCode, walletAddress, nodeType, password) {
     try {
       // Get backend URL
-      const isTestnet = await AsyncStorage.getItem('qnet_testnet') === 'true';
-      const apiUrl = isTestnet 
-        ? 'https://testnet-api.qnet.io'
-        : 'https://api.qnet.io';
+      // Direct connection to bootstrap node - fully decentralized
+      const apiUrl = this.getRandomBootstrapNode();
       
       // Load wallet to sign the ping
       const walletData = await this.loadWallet(password);
@@ -4187,51 +4284,72 @@ export class WalletManager {
         };
       }
       
-      // Check if can claim (24h cooldown)
+      // Check if can claim (1h cooldown for lazy rewards)
       if (rewards.nextClaim && Date.now() < rewards.nextClaim) {
-        const hoursLeft = Math.ceil((rewards.nextClaim - Date.now()) / (60 * 60 * 1000));
+        const minutesLeft = Math.ceil((rewards.nextClaim - Date.now()) / (60 * 1000));
+        if (minutesLeft > 60) {
+          const hoursLeft = Math.ceil(minutesLeft / 60);
+          return {
+            success: false,
+            message: `Next claim in ${hoursLeft} hours`
+          };
+        } else {
+          return {
+            success: false,
+            message: `Next claim in ${minutesLeft} minutes`
+          };
+        }
+      }
+      
+      // Check minimum claim amount (1 QNC)
+      const MIN_CLAIM_QNC = 1.0;
+      if (rewards.unclaimed < MIN_CLAIM_QNC) {
         return {
           success: false,
-          message: `Next claim in ${hoursLeft} hours`
+          message: `Minimum claim amount is ${MIN_CLAIM_QNC} QNC`
         };
       }
       
-      // Get backend URL
-      const isTestnet = await AsyncStorage.getItem('qnet_testnet') === 'true';
-      const apiUrl = isTestnet 
-        ? 'https://testnet-api.qnet.io'
-        : 'https://api.qnet.io';
+      // Get backend URL - use official API endpoints
+      // Direct connection to bootstrap node - fully decentralized
+      const apiUrl = this.getRandomBootstrapNode();
       
-      // Load wallet to sign the claim
+      // Generate node ID from activation code
+      const nodeId = `${nodeType}_${activationCode}`;
+      
+      // Load wallet for signing
       const walletData = await this.loadWallet(password);
       if (!walletData || !walletData.secretKey) {
         throw new Error('Failed to load wallet for signing');
       }
       
-      // Submit claim request to blockchain
-      const claimResponse = await fetch(`${apiUrl}/api/rewards/claim`, {
+      // Create signature using wallet's secret key
+      // In production, this will be replaced with Dilithium signature
+      const message = `claim_rewards:${nodeId}:${walletAddress}:${Date.now()}`;
+      const messageBytes = new TextEncoder().encode(message);
+      const signature = nacl.sign.detached(messageBytes, walletData.secretKey);
+      const quantumSignature = Buffer.from(signature).toString('base64');
+      
+      // Submit claim request to official API
+      const claimResponse = await fetch(`${apiUrl}/api/v1/rewards/claim`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          address: walletAddress,
-          period_id: rewards.periodId || 'current',
-          merkle_proof: rewards.merkleProof || []
+          node_id: nodeId,
+          quantum_signature: quantumSignature
         })
       });
       
-      let claimResult = {};
-      if (claimResponse.ok) {
-        claimResult = await claimResponse.json();
-      } else {
-        // Fallback for development - process claim locally
-        claimResult = {
-          success: true,
-          amount: rewards.unclaimed,
-          tx_hash: `dev_tx_${Date.now()}`
-        };
+      if (!claimResponse.ok) {
+        const errorData = await claimResponse.json().catch(() => ({}));
+        throw new Error(errorData.error || errorData.message || 'Failed to claim rewards');
       }
+      
+      const claimResult = await claimResponse.json().catch(() => {
+        throw new Error('Invalid JSON response from server');
+      });
       
       // Update local storage with claim time
       const storedRewardsStr = await AsyncStorage.getItem('qnet_node_rewards');

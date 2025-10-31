@@ -134,9 +134,9 @@ NEXT_PUBLIC_GA_ID=your-google-analytics-id
 ### Production Environment
 
 ```bash
-# Production API endpoints
-NEXT_PUBLIC_API_URL=https://api.qnet.io
-NEXT_PUBLIC_WS_URL=wss://api.qnet.io/ws
+# Direct node connection - fully decentralized
+NEXT_PUBLIC_NODE_URL=http://NODE_IP:8001
+NEXT_PUBLIC_WS_URL=ws://NODE_IP:8001/ws
 NEXT_PUBLIC_NETWORK=mainnet
 
 # Security

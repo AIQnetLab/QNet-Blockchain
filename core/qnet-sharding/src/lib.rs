@@ -7,17 +7,35 @@
 //! Target: Support 1 Million TPS through intelligent sharding
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use dashmap::DashMap;
 use tokio::sync::RwLock;
 use blake3;
 use rayon::prelude::*;
 
-pub const TOTAL_SHARDS: u32 = 10_000;
+// OPTIMIZED: Dynamic shard configuration based on network size
+pub const DEFAULT_SHARDS: u32 = 10_000;
+pub const MIN_SHARDS: u32 = 100;
+pub const MAX_SHARDS: u32 = 1_000_000; // Support up to 1M shards
 pub const MAX_CROSS_SHARD_TXS: usize = 1000;
 pub const REBALANCE_THRESHOLD: f64 = 1.5; // 50% load difference triggers rebalance
 
+/// Get optimal shard count based on network size
+pub fn get_optimal_shard_count(network_size: usize) -> u32 {
+    match network_size {
+        0..=1000 => MIN_SHARDS,
+        1001..=10_000 => 1_000,
+        10_001..=100_000 => 10_000,
+        100_001..=1_000_000 => 100_000,
+        _ => MAX_SHARDS,
+    }
+}
+
 /// Shard coordinator for managing cross-shard transactions
 pub struct ShardCoordinator {
+    /// Dynamic shard count (using atomic for lock-free reads)
+    total_shards: Arc<std::sync::atomic::AtomicU32>,
+    
     /// Shard assignments
     shard_map: Arc<DashMap<String, u32>>,
     
@@ -60,7 +78,14 @@ pub struct HotAccountStats {
 
 impl ShardCoordinator {
     pub fn new() -> Self {
+        Self::with_shard_count(DEFAULT_SHARDS)
+    }
+    
+    /// Create coordinator with specific shard count
+    pub fn with_shard_count(shard_count: u32) -> Self {
+        let shard_count = shard_count.clamp(MIN_SHARDS, MAX_SHARDS);
         Self {
+            total_shards: Arc::new(AtomicU32::new(shard_count)),
             shard_map: Arc::new(DashMap::new()),
             cross_shard_queue: Arc::new(RwLock::new(Vec::new())),
             shard_loads: Arc::new(DashMap::new()),
@@ -68,17 +93,29 @@ impl ShardCoordinator {
         }
     }
     
-    /// Get shard for an address
+    /// Dynamically adjust shard count based on network growth
+    pub fn adjust_shard_count(&self, network_size: usize) {
+        let optimal = get_optimal_shard_count(network_size);
+        let current = self.total_shards.load(Ordering::Relaxed);
+        if current != optimal {
+            println!("[SHARDING] Adjusting shards: {} -> {} for {} nodes", current, optimal, network_size);
+            self.total_shards.store(optimal, Ordering::Relaxed);
+            // Note: In production, this would trigger shard rebalancing
+        }
+    }
+    
+    /// Get shard for an address (synchronous for compatibility)
     pub fn get_shard(&self, address: &str) -> u32 {
         // Check if account has been reassigned
         if let Some(entry) = self.shard_map.get(address) {
             return *entry;
         }
         
-        // Calculate default shard
+        // Calculate default shard with dynamic total (lock-free read)
+        let total = self.total_shards.load(Ordering::Relaxed);
         let hash = blake3::hash(address.as_bytes());
         let shard = u32::from_le_bytes(hash.as_bytes()[0..4].try_into().unwrap());
-        shard % TOTAL_SHARDS
+        shard % total
     }
     
     /// Process cross-shard transaction
@@ -240,7 +277,7 @@ impl ShardCoordinator {
         let avg_memory = loads.iter().map(|load| load.memory_usage).sum::<f64>() / loads.len() as f64;
         
         ShardStatistics {
-            total_shards: TOTAL_SHARDS,
+            total_shards: self.total_shards.load(Ordering::Relaxed),
             active_shards: loads.len() as u32,
             total_tps,
             average_latency_ms: avg_latency,

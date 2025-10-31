@@ -6,15 +6,46 @@ use tokio::sync::{RwLock, mpsc};
 use sha3::{Sha3_512, Digest};
 use blake3;
 use serde::{Serialize, Deserialize};
+use prometheus::{register_counter, register_gauge, Counter, Gauge};
+use lazy_static::lazy_static;
+
+lazy_static! {
+    /// Total PoH hashes computed
+    static ref POH_HASH_COUNT: Counter = register_counter!(
+        "qnet_poh_hash_count_total",
+        "Total number of PoH hashes computed"
+    ).unwrap();
+    
+    /// PoH hashes per second
+    static ref POH_HASH_RATE: Gauge = register_gauge!(
+        "qnet_poh_hash_rate",
+        "Current PoH hash rate per second"
+    ).unwrap();
+    
+    /// Current PoH slot
+    static ref POH_CURRENT_SLOT: Gauge = register_gauge!(
+        "qnet_poh_current_slot",
+        "Current PoH slot number"
+    ).unwrap();
+    
+    /// PoH checkpoint count
+    static ref POH_CHECKPOINT_COUNT: Counter = register_counter!(
+        "qnet_poh_checkpoint_count_total",
+        "Total number of PoH checkpoints saved"
+    ).unwrap();
+}
 
 /// Number of hashes to perform between entries
-const HASHES_PER_TICK: u64 = 12500; // ~400μs at 31.25M hashes/sec
+/// Optimized for QNet: 1-second microblocks need frequent PoH updates
+const HASHES_PER_TICK: u64 = 25_000; // ~10-15ms per tick with hybrid hashing
 
-/// Target tick duration in microseconds
-const TICK_DURATION_US: u64 = 400;
+/// Target tick duration in milliseconds
+/// 10ms provides good balance: 100 updates/sec for smooth entropy
+const TICK_DURATION_US: u64 = 10_000; // 10ms ticks
 
-/// Number of ticks per slot (1 second = 2500 ticks)
-const TICKS_PER_SLOT: u64 = 2500;
+/// Number of ticks per slot (1 second = 100 ticks)
+/// Aligned with QNet's 1-second microblock interval
+const TICKS_PER_SLOT: u64 = 100;
 
 /// Maximum drift allowed between PoH time and wall clock (5%)
 const MAX_DRIFT_PERCENT: f64 = 0.05;
@@ -69,6 +100,28 @@ impl QuantumPoH {
         (poh, entry_receiver)
     }
     
+    /// Create new Quantum PoH instance from a checkpoint
+    pub fn new_from_checkpoint(hash: Vec<u8>, count: u64) -> (Self, mpsc::UnboundedReceiver<PoHEntry>) {
+        let (entry_sender, entry_receiver) = mpsc::unbounded_channel();
+        
+        // Calculate slot from count (1 slot = ~1M hashes)
+        let slot = count / 1_000_000;
+        
+        let poh = Self {
+            current_hash: Arc::new(RwLock::new(hash)),
+            hash_count: Arc::new(RwLock::new(count)),
+            current_slot: Arc::new(RwLock::new(slot)),
+            start_time: Instant::now(),
+            entry_sender,
+            is_running: Arc::new(RwLock::new(false)),
+            hashes_per_second: Arc::new(RwLock::new(0.0)),
+        };
+        
+        println!("[QuantumPoH] 🔄 Initialized from checkpoint: count={}, slot={}", count, slot);
+        
+        (poh, entry_receiver)
+    }
+    
     /// Start PoH generator
     pub async fn start(&self) {
         let mut is_running = self.is_running.write().await;
@@ -95,6 +148,7 @@ impl QuantumPoH {
             let mut tick_timer = tokio::time::interval(Duration::from_micros(TICK_DURATION_US));
             let mut last_hash_count = 0u64;
             let mut last_perf_check = Instant::now();
+            let mut last_count = 0u64; // For metrics update
             
             while *is_running.read().await {
                 tick_timer.tick().await;
@@ -103,22 +157,39 @@ impl QuantumPoH {
                 let mut hash = current_hash.write().await;
                 let mut count = hash_count.write().await;
                 
-                // Quantum-enhanced hashing: alternate between SHA3-512 and Blake3
+                // OPTIMIZED VDF: SHA3-512 with performance improvements
+                // Using fixed-size arrays and pre-allocated buffers
+                let mut hash_bytes = [0u8; 64];
+                hash_bytes[..hash.len().min(64)].copy_from_slice(&hash[..hash.len().min(64)]);
+                
+                // Hybrid SHA3-512 / Blake3 approach for optimal security/performance
+                // Every 4th hash uses SHA3-512 for VDF property, others use Blake3 for speed
                 for i in 0..HASHES_PER_TICK {
-                    if (*count + i) % 2 == 0 {
-                        // SHA3-512 for even counts (quantum-resistant)
+                    if i % 4 == 0 {
+                        // Every 4th iteration: SHA3-512 for VDF property (prevents parallelization)
                         let mut hasher = Sha3_512::new();
-                        hasher.update(&*hash);
-                        hasher.update((*count + i).to_le_bytes());
-                        *hash = hasher.finalize().to_vec();
+                        hasher.update(&hash_bytes);
+                        let counter = (*count + i).to_le_bytes();
+                        hasher.update(&counter);
+                        let result = hasher.finalize();
+                        hash_bytes.copy_from_slice(&result);
                     } else {
-                        // Blake3 for odd counts (high performance)
+                        // Other iterations: Blake3 for speed (3x faster than SHA3)
                         let mut hasher = blake3::Hasher::new();
-                        hasher.update(&*hash);
-                        hasher.update(&(*count + i).to_le_bytes());
-                        *hash = hasher.finalize().as_bytes().to_vec();
+                        hasher.update(&hash_bytes);
+                        let counter = (*count + i).to_le_bytes();
+                        hasher.update(&counter);
+                        let result = hasher.finalize();
+                        // Blake3 gives 32 bytes, extend to 64 for consistency
+                        hash_bytes[..32].copy_from_slice(result.as_bytes());
+                        let mut hasher2 = blake3::Hasher::new();
+                        hasher2.update(result.as_bytes());
+                        let result2 = hasher2.finalize();
+                        hash_bytes[32..].copy_from_slice(result2.as_bytes());
                     }
                 }
+                
+                *hash = hash_bytes.to_vec();
                 
                 *count += HASHES_PER_TICK;
                 
@@ -139,10 +210,15 @@ impl QuantumPoH {
                     break;
                 }
                 
+                // Update Prometheus metrics
+                POH_HASH_COUNT.inc_by((*count - last_count) as f64);
+                last_count = *count;
+                
                 // Update slot every TICKS_PER_SLOT ticks
                 if *count % (HASHES_PER_TICK * TICKS_PER_SLOT) == 0 {
                     let mut slot = current_slot.write().await;
                     *slot += 1;
+                    POH_CURRENT_SLOT.set(*slot as f64);
                     
                     // Check drift every slot
                     let elapsed = start_time.elapsed();
@@ -166,6 +242,7 @@ impl QuantumPoH {
                     let hps = hashes_done as f64 / elapsed_secs;
                     
                     *hashes_per_second.write().await = hps;
+                    POH_HASH_RATE.set(hps);
                     
                     // Log performance every 10 seconds
                     if *count % (HASHES_PER_TICK * TICKS_PER_SLOT * 10) == 0 {

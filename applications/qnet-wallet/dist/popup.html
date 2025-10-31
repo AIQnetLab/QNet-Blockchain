@@ -176,7 +176,7 @@
                 <button class="main-tab" data-tab="send" type="button">Send</button>
                 <button class="main-tab" data-tab="receive" type="button">Receive</button>
                 <button class="main-tab" data-tab="activate" type="button">Activate</button>
-                <button class="main-tab" data-tab="history" type="button">History</button>
+                <button class="main-tab" data-tab="node" type="button">Node</button>
             </nav>
 
             <!-- Tab Content Container -->
@@ -440,20 +440,74 @@
                     </div>
                 </div>
 
-                <!-- History Tab -->
-                <div id="history-tab" class="tab-content hidden">
+                <!-- Node Tab -->
+                <div id="node-tab" class="tab-content hidden">
                     <div class="content-scroll">
-                        <div class="history-content">
-                            <div class="history-filters">
-                                <select id="history-filter">
-                                    <option value="all">All Transactions</option>
-                                    <option value="sent">Sent</option>
-                                    <option value="received">Received</option>
-                                    <option value="swap">Swapped</option>
-                                </select>
+                        <div class="node-content">
+                            <!-- Node Status -->
+                            <div class="node-status-card">
+                                <h3>Node Status</h3>
+                                <div class="node-info">
+                                    <div class="info-row">
+                                        <span class="label">Type:</span>
+                                        <span id="node-type-display">Not Activated</span>
+                                    </div>
+                                    <div class="info-row">
+                                        <span class="label">Status:</span>
+                                        <span id="node-status-display" class="status-inactive">Inactive</span>
+                                    </div>
+                                    <div class="info-row">
+                                        <span class="label">Activation Code:</span>
+                                        <span id="node-code-display" class="code-text">-</span>
+                                    </div>
+                                </div>
                             </div>
-                            <div id="transaction-list" class="transaction-list">
-                                <!-- Transaction history will be populated here -->
+                            
+                            <!-- Rewards Section -->
+                            <div class="rewards-card">
+                                <h3>Rewards</h3>
+                                <div class="rewards-info">
+                                    <div class="reward-amount">
+                                        <span class="label">Pending:</span>
+                                        <span id="pending-rewards" class="amount">0.000000000 QNC</span>
+                                    </div>
+                                    <div class="reward-details">
+                                        <div class="detail-row">
+                                            <span>Pool 1 (Base):</span>
+                                            <span id="pool1-rewards">0.000 QNC</span>
+                                        </div>
+                                        <div class="detail-row">
+                                            <span>Pool 2 (Fees):</span>
+                                            <span id="pool2-rewards">0.000 QNC</span>
+                                        </div>
+                                        <div class="detail-row">
+                                            <span>Next Claim:</span>
+                                            <span id="next-claim-time">-</span>
+                                        </div>
+                                    </div>
+                                    <button id="claim-rewards-btn" class="action-btn primary" disabled>
+                                        Claim Rewards
+                                    </button>
+                                </div>
+                            </div>
+                            
+                            <!-- Node Monitoring -->
+                            <div class="monitoring-card">
+                                <h3>Performance</h3>
+                                <div class="performance-stats">
+                                    <div class="stat-item">
+                                        <span class="stat-label">Uptime:</span>
+                                        <span id="node-uptime">0%</span>
+                                    </div>
+                                    <div class="stat-item">
+                                        <span class="stat-label">Ping Success:</span>
+                                        <span id="ping-success">0/0</span>
+                                    </div>
+                                    <div class="stat-item">
+                                        <span class="stat-label">Last Active:</span>
+                                        <span id="last-active">Never</span>
+                                    </div>
+                                </div>
                             </div>
                         </div>
                     </div>

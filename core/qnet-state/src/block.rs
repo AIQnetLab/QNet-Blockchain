@@ -40,6 +40,10 @@ pub struct MicroBlock {
     pub previous_hash: [u8; 32],
     /// Merkle root of transactions
     pub merkle_root: [u8; 32],
+    /// Proof of History hash at block creation
+    pub poh_hash: Vec<u8>,  // SHA3-512 produces 64 bytes
+    /// Proof of History counter at block creation
+    pub poh_count: u64,
 }
 
 /// Macroblock structure - consensus blocks that finalize microblocks
@@ -57,6 +61,10 @@ pub struct MacroBlock {
     pub consensus_data: ConsensusData,
     /// Previous macroblock hash
     pub previous_hash: [u8; 32],
+    /// Proof of History hash at macroblock finalization
+    pub poh_hash: Vec<u8>,  // SHA3-512 produces 64 bytes
+    /// Proof of History counter at macroblock finalization
+    pub poh_count: u64,
 }
 
 /// Consensus data for macroblocks
@@ -265,6 +273,9 @@ impl MicroBlock {
             signature: vec![],
             previous_hash,
             merkle_root,
+            // Default PoH values for backward compatibility
+            poh_hash: vec![0u8; 64], // SHA3-512 produces 64 bytes
+            poh_count: 0,
         }
     }
     
@@ -493,6 +504,9 @@ impl MacroBlock {
             state_root,
             consensus_data,
             previous_hash,
+            // Default PoH values for backward compatibility
+            poh_hash: vec![0u8; 64], // SHA3-512 produces 64 bytes
+            poh_count: 0,
         }
     }
     

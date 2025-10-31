@@ -472,8 +472,15 @@ async function sendQNCTokens(
   
   if (environment === 'testnet') {
     try {
-      // Real QNet testnet faucet integration
-      const qnetApiUrl = process.env.QNET_TESTNET_API || 'https://testnet-api.qnet.io';
+      // Direct connection to bootstrap nodes - fully decentralized
+      const bootstrapNodes = [
+        'http://154.38.160.39:8001',
+        'http://62.171.157.44:8001',
+        'http://161.97.86.81:8001',
+        'http://173.212.219.226:8001',
+        'http://164.68.108.218:8001'
+      ];
+      const qnetApiUrl = process.env.QNET_NODE_URL || bootstrapNodes[Math.floor(Math.random() * bootstrapNodes.length)];
       
       const response = await fetch(`${qnetApiUrl}/v1/faucet/claim`, {
         method: 'POST',
@@ -537,9 +544,17 @@ async function sendQNCTokens(
     }
   }
   
-  // Production QNet faucet
+  // Production QNet faucet - direct node connection
   try {
-    const qnetApiUrl = process.env.QNET_MAINNET_API || 'https://api.qnet.io';
+    // Direct connection to bootstrap nodes - fully decentralized
+    const bootstrapNodes = [
+      'http://154.38.160.39:8001',
+      'http://62.171.157.44:8001',
+      'http://161.97.86.81:8001',
+      'http://173.212.219.226:8001',
+      'http://164.68.108.218:8001'
+    ];
+    const qnetApiUrl = process.env.QNET_NODE_URL || bootstrapNodes[Math.floor(Math.random() * bootstrapNodes.length)];
     
     const response = await fetch(`${qnetApiUrl}/v1/faucet/claim`, {
       method: 'POST',
