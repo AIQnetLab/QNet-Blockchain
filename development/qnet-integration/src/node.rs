@@ -1253,7 +1253,10 @@ impl BlockchainNode {
         let mut requested_blocks: std::collections::HashMap<u64, (std::time::Instant, u8)> = 
             std::collections::HashMap::new();
         const MAX_CONCURRENT_REQUESTS: usize = 10; // Limit concurrent block requests
-        const REQUEST_COOLDOWN_SECS: u64 = 10; // Minimum seconds between requests for same block
+        // ADAPTIVE SYNC: Fast mode for catching up, normal mode for steady state
+        const REQUEST_COOLDOWN_NORMAL: u64 = 10; // Normal: 10 seconds between requests
+        const REQUEST_COOLDOWN_FAST: u64 = 1;    // Fast sync: 1 second for catching up
+        const FAST_SYNC_THRESHOLD: u64 = 10;     // Switch to fast sync if >10 blocks behind
         
         // CRITICAL: REORG PROTECTION - Prevent concurrent reorgs and DoS attacks
         let reorg_in_progress = Arc::new(tokio::sync::RwLock::new(false));
@@ -1337,8 +1340,16 @@ impl BlockchainNode {
                                         if retry_count == 0 { // Only on first attempt
                                             // Check if we can request this block (rate limiting)
                                             let can_request = if let Some((last_request, request_count)) = requested_blocks.get(&missing_height) {
+                                                // ADAPTIVE: Use fast sync if far behind
+                                                let blocks_behind = pending_blocks.len() as u64;
+                                                let cooldown = if blocks_behind > FAST_SYNC_THRESHOLD {
+                                                    REQUEST_COOLDOWN_FAST  // Fast sync mode
+                                                } else {
+                                                    REQUEST_COOLDOWN_NORMAL // Normal mode
+                                                };
+                                                
                                                 // Check cooldown period
-                                                if last_request.elapsed().as_secs() >= REQUEST_COOLDOWN_SECS {
+                                                if last_request.elapsed().as_secs() >= cooldown {
                                                     // Cooldown passed, check retry limit
                                                     *request_count < 3 // Max 3 request attempts per block
                                                 } else {
@@ -3006,7 +3017,55 @@ impl BlockchainNode {
                     }
                 }
                 
+                // CRITICAL: Synchronization check before participating in consensus
+                let local_stored_height = storage.get_chain_height().unwrap_or(0);
+                let expected_height = microblock_height;
+                
+                // Determine maximum allowed lag based on round
+                let current_round = if expected_height == 0 {
+                    0
+                } else {
+                    (expected_height - 1) / ROTATION_INTERVAL_BLOCKS
+                };
+                
+                let max_allowed_lag = match current_round {
+                    0 => 2,  // Round 0: Very strict (2 block tolerance)
+                    1 => 3,  // Round 1: Slightly relaxed (3 block tolerance)  
+                    _ => 5,  // Round 2+: Normal tolerance (5 blocks)
+                };
+                
+                // Check if we're too far behind to participate safely
+                if local_stored_height + max_allowed_lag < expected_height {
+                    println!("[CONSENSUS] ⛔ Cannot participate in consensus: node not synchronized");
+                    println!("[CONSENSUS] 📊 Local height: {}, Expected: {}, Max lag: {}", 
+                            local_stored_height, expected_height, max_allowed_lag);
+                    println!("[CONSENSUS] 📊 Round: {}, Required sync level: {}%", 
+                            current_round, 
+                            ((local_stored_height as f64 / expected_height as f64) * 100.0) as u32);
+                    
+                    // Trigger emergency sync
+                    if let Some(ref p2p) = unified_p2p {
+                        println!("[CONSENSUS] 🚨 Starting emergency sync from {} to {}", 
+                                local_stored_height + 1, expected_height);
+                        
+                        // Use fast sync for emergency
+                        let sync_start = std::time::Instant::now();
+                        if let Err(e) = p2p.sync_blocks(local_stored_height + 1, expected_height).await {
+                            println!("[CONSENSUS] ⚠️ Emergency sync failed: {}", e);
+                        } else {
+                            println!("[CONSENSUS] ✅ Emergency sync completed in {:?}", sync_start.elapsed());
+                        }
+                    }
+                    
+                    // Skip this consensus round
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+                
                 println!("[MICROBLOCK] 🚀 Starting microblock production with {} nodes (Byzantine safe)", active_node_count);
+                println!("[MICROBLOCK] ✅ Node synchronized: local={}, expected={}, lag={}", 
+                        local_stored_height, expected_height, expected_height - local_stored_height);
+                
                 // PRODUCTION: QNet microblock producer SELECTION for decentralization (per MICROBLOCK_ARCHITECTURE_PLAN.md)
                 // Each 30-block period selects ONE producer using cryptographic hash from qualified candidates
                 // Producer selection is cryptographically random but deterministic for consensus (Byzantine safety)
@@ -4481,19 +4540,46 @@ impl BlockchainNode {
                 Mutex::new(HashMap::new())
             });
             
+            // CRITICAL FIX: Don't use cache if synchronization state might affect PoH usage
+            // Cache is only valid if all nodes have the same PoH availability
+            let can_use_cache = if leadership_round == 0 {
+                true  // Round 0 is always deterministic, cache is safe
+            } else if let Some(store) = storage {
+                // For PoH rounds, check if we're fully synchronized
+                let required_block = match leadership_round {
+                    1 => 30,
+                    2 => 60,
+                    _ => leadership_round * 30
+                };
+                let local_height = store.get_chain_height().unwrap_or(0);
+                local_height >= required_block  // Only use cache if we have all required blocks
+            } else {
+                false  // No storage, can't verify - recalculate
+            };
+            
             // Check if we have cached result for this round
-            if let Ok(cache) = producer_cache.lock() {
-                if let Some((cached_producer, cached_candidates)) = cache.get(&leadership_round) {
-                    // EXISTING: Log only at rotation boundaries for performance
-                    // Rotation happens at blocks 31, 61, 91... (not 30, 60, 90)
-                    if current_height > 0 && ((current_height - 1) % rotation_interval == 0 || current_height == 1) {
-                        // Using cached producer selection
-                        // Next rotation: Round 0 → 31, Round 1 → 61, Round 2 → 91...
-                        let next_rotation_block = (leadership_round + 1) * rotation_interval + 1;
-                        println!("[MICROBLOCK] 🎯 Producer: {} (round: {}, CACHED SELECTION, next rotation: block {})", 
-                                 cached_producer, leadership_round, next_rotation_block);
+            if can_use_cache {
+                if let Ok(cache) = producer_cache.lock() {
+                    if let Some((cached_producer, cached_candidates)) = cache.get(&leadership_round) {
+                        // EXISTING: Log only at rotation boundaries for performance
+                        // Rotation happens at blocks 31, 61, 91... (not 30, 60, 90)
+                        if current_height > 0 && ((current_height - 1) % rotation_interval == 0 || current_height == 1) {
+                            // Using cached producer selection
+                            // Next rotation: Round 0 → 31, Round 1 → 61, Round 2 → 91...
+                            let next_rotation_block = (leadership_round + 1) * rotation_interval + 1;
+                            println!("[MICROBLOCK] 🎯 Producer: {} (round: {}, CACHED SELECTION, next rotation: block {})", 
+                                     cached_producer, leadership_round, next_rotation_block);
+                        }
+                        return cached_producer.clone();
                     }
-                    return cached_producer.clone();
+                }
+            } else {
+                // CRITICAL: Clear cache for this round if we can't use it
+                // This ensures recalculation when synchronization state changes
+                if let Ok(mut cache) = producer_cache.lock() {
+                    if cache.remove(&leadership_round).is_some() {
+                        println!("[MICROBLOCK] 🔄 Cache invalidated for round {} due to sync state change", leadership_round);
+                    }
                 }
             }
             
@@ -4622,6 +4708,7 @@ impl BlockchainNode {
             // CRITICAL: Use PoH state from the last block, not local generation
             // This ensures all nodes use the same PoH state for producer selection
             
+            // CRITICAL: Safe PoH integration with synchronization checks
             // Get PoH state from the blockchain (synchronized across all nodes)
             let blockchain_poh_used = if let Some(store) = storage {
                 // For round 0, no PoH yet (Genesis doesn't have PoH)
@@ -4629,50 +4716,75 @@ impl BlockchainNode {
                     println!("[CONSENSUS] 🎯 Round 0: No PoH in Genesis, using deterministic entropy");
                     false
                 } else {
-                    // Get PoH from the last block (current_height - 1)
-                    // This is the most recent PoH state that all nodes agree on
-                    let poh_source_block = if current_height > 0 {
-                        current_height - 1
-                    } else {
-                        0
+                    // CRITICAL FIX: Determine which block we need for PoH based on round
+                    // Round 1 needs block 30, Round 2 needs block 60, etc.
+                    let required_poh_block = match leadership_round {
+                        1 => 30,  // Round 1 (blocks 31-60) uses PoH from block 30
+                        2 => 60,  // Round 2 (blocks 61-90) uses PoH from block 60  
+                        _ => leadership_round * 30  // Round N uses block N*30
                     };
                     
-                    // Load the previous block to get its PoH state
-                    match store.load_microblock(poh_source_block) {
-                        Ok(Some(block_data)) => {
-                            match bincode::deserialize::<qnet_state::MicroBlock>(&block_data) {
-                                Ok(block) => {
-                                    if !block.poh_hash.is_empty() && block.poh_count > 0 {
-                                        // Use PoH from blockchain (synchronized across all nodes)
-                                        selection_hasher.update(&block.poh_hash);
-                                        selection_hasher.update(&block.poh_count.to_le_bytes());
-                                        println!("[CONSENSUS] 🔐 Blockchain PoH added: count={} from block #{}", 
-                                                block.poh_count, poh_source_block);
-                                        true
-                                    } else {
-                                        println!("[CONSENSUS] ⚠️ Block #{} has no PoH data", poh_source_block);
+                    // CRITICAL: Check if we're synchronized enough to use PoH
+                    let local_height = store.get_chain_height().unwrap_or(0);
+                    
+                    // Can't use PoH if we don't have the required block
+                    if local_height < required_poh_block {
+                        println!("[CONSENSUS] ❌ Node not synchronized for PoH consensus");
+                        println!("[CONSENSUS] 📊 Need block #{}, have up to #{}", 
+                                required_poh_block, local_height);
+                        println!("[CONSENSUS] 🔄 Falling back to deterministic consensus");
+                        
+                        // CRITICAL: Fallback must be IDENTICAL across all unsynchronized nodes
+                        // Use only deterministic data that all nodes agree on
+                        selection_hasher.update(b"DETERMINISTIC_FALLBACK_UNSYNC");
+                        selection_hasher.update(&leadership_round.to_le_bytes());
+                        // DO NOT add local_height - it's different for each node!
+                        false
+                    } else {
+                        // Load the required block to get its PoH state
+                        match store.load_microblock(required_poh_block) {
+                            Ok(Some(block_data)) => {
+                                match bincode::deserialize::<qnet_state::MicroBlock>(&block_data) {
+                                    Ok(block) => {
+                                        if !block.poh_hash.is_empty() && block.poh_count > 0 {
+                                            // Use PoH from blockchain (synchronized across all nodes)
+                                            selection_hasher.update(&block.poh_hash);
+                                            selection_hasher.update(&block.poh_count.to_le_bytes());
+                                            println!("[CONSENSUS] 🔐 Blockchain PoH added: count={} from block #{}", 
+                                                    block.poh_count, required_poh_block);
+                                            true
+                                        } else {
+                                            println!("[CONSENSUS] ⚠️ Block #{} has no PoH data", required_poh_block);
+                                            // Add fallback entropy
+                                            selection_hasher.update(b"DETERMINISTIC_FALLBACK_NO_POH");
+                                            false
+                                        }
+                                    }
+                                    Err(e) => {
+                                        println!("[CONSENSUS] ⚠️ Failed to deserialize block #{}: {}", required_poh_block, e);
+                                        // Add fallback entropy
+                                        selection_hasher.update(b"DETERMINISTIC_FALLBACK_DESERIALIZE");
                                         false
                                     }
                                 }
-                                Err(e) => {
-                                    println!("[CONSENSUS] ⚠️ Failed to deserialize block #{}: {}", poh_source_block, e);
-                                    false
-                                }
                             }
-                        }
-                        _ => {
-                            println!("[CONSENSUS] ⚠️ Block #{} not found for PoH", poh_source_block);
-                            false
+                            _ => {
+                                println!("[CONSENSUS] ⚠️ Block #{} not found for PoH", required_poh_block);
+                                // Add fallback entropy
+                                selection_hasher.update(b"DETERMINISTIC_FALLBACK_NOT_FOUND");
+                                false
+                            }
                         }
                     }
                 }
             } else {
                 println!("[CONSENSUS] ⚠️ No storage available for blockchain PoH");
+                selection_hasher.update(b"DETERMINISTIC_FALLBACK_NO_STORAGE");
                 false
             };
             
             if !blockchain_poh_used && leadership_round > 0 {
-                println!("[CONSENSUS] ⚡ Warning: PoH not available, using deterministic entropy only");
+                println!("[CONSENSUS] ⚡ Using deterministic fallback for round {} (PoH unavailable)", leadership_round);
             }
             
             let selection_hash = selection_hasher.finalize();
@@ -5125,31 +5237,49 @@ impl BlockchainNode {
             emergency_hasher.update(format!("emergency_producer_{}_{}", failed_producer, current_height).as_bytes());
             emergency_hasher.update(&entropy_source); // Add entropy from previous block
             
-            // QUANTUM PoH: Use SYNCHRONIZED PoH from blockchain for emergency selection
+            // CRITICAL: Safe PoH for emergency selection with synchronization check
             // Same approach as regular selection - use PoH from last block, not local state
             if let Some(ref store) = storage {
                 if current_height > 0 {
-                    // Get PoH from the last confirmed block
+                    // CRITICAL: Check if we're synchronized before using PoH
+                    let local_height = store.get_chain_height().unwrap_or(0);
                     let poh_source_block = current_height - 1;
                     
-                    match store.load_microblock(poh_source_block) {
-                        Ok(Some(block_data)) => {
-                            if let Ok(block) = bincode::deserialize::<qnet_state::MicroBlock>(&block_data) {
-                                if !block.poh_hash.is_empty() && block.poh_count > 0 {
-                                    emergency_hasher.update(&block.poh_hash);
-                                    emergency_hasher.update(&block.poh_count.to_le_bytes());
-                                    println!("[EMERGENCY] 🔐 Blockchain PoH added: count={} from block #{}", 
-                                            block.poh_count, poh_source_block);
+                    // Can only use PoH if we have the required block
+                    if local_height >= poh_source_block {
+                        match store.load_microblock(poh_source_block) {
+                            Ok(Some(block_data)) => {
+                                if let Ok(block) = bincode::deserialize::<qnet_state::MicroBlock>(&block_data) {
+                                    if !block.poh_hash.is_empty() && block.poh_count > 0 {
+                                        emergency_hasher.update(&block.poh_hash);
+                                        emergency_hasher.update(&block.poh_count.to_le_bytes());
+                                        println!("[EMERGENCY] 🔐 Blockchain PoH added: count={} from block #{}", 
+                                                block.poh_count, poh_source_block);
+                                    } else {
+                                        println!("[EMERGENCY] ⚠️ Block #{} has no PoH, using fallback", poh_source_block);
+                                        emergency_hasher.update(b"EMERGENCY_FALLBACK_NO_POH");
+                                    }
                                 }
                             }
+                            _ => {
+                                println!("[EMERGENCY] ⚠️ Block #{} not found for PoH", poh_source_block);
+                                emergency_hasher.update(b"EMERGENCY_FALLBACK_NOT_FOUND");
+                            }
                         }
-                        _ => {
-                            println!("[EMERGENCY] ⚠️ No PoH available from block #{}", poh_source_block);
-                        }
+                    } else {
+                        println!("[EMERGENCY] ❌ Not synchronized for PoH (have {}, need {})", 
+                                local_height, poh_source_block);
+                        println!("[EMERGENCY] 🔄 Using deterministic fallback");
+                        emergency_hasher.update(b"EMERGENCY_FALLBACK_UNSYNC");
+                        emergency_hasher.update(&local_height.to_le_bytes());
                     }
                 } else {
                     println!("[EMERGENCY] 🎯 Height 0: Using deterministic entropy (no blocks yet)");
+                    emergency_hasher.update(b"EMERGENCY_GENESIS");
                 }
+            } else {
+                println!("[EMERGENCY] ⚠️ No storage for PoH check");
+                emergency_hasher.update(b"EMERGENCY_NO_STORAGE");
             }
             
             for (node_id, _) in &candidates {
@@ -8397,6 +8527,11 @@ impl BlockchainNode {
                             timestamp: tx.timestamp,
                             block_height: None,
                             status: "pending".to_string(),
+                            // Fast Finality Indicators for pending tx
+                            confirmation_level: Some(ConfirmationLevel::Pending),
+                            safety_percentage: Some(0.0),
+                            confirmations: Some(0),
+                            time_to_finality: Some(90), // Max time to macroblock
                         }));
                     }
                 }
@@ -8407,6 +8542,48 @@ impl BlockchainNode {
         match self.storage.find_transaction_by_hash(tx_hash).await {
             Ok(Some(tx)) => {
                 let block_height = self.storage.get_transaction_block_height(tx_hash).await.ok();
+                
+                // Calculate Fast Finality Indicators
+                let current_height = *self.height.read().await;
+                let confirmations = if let Some(tx_height) = block_height {
+                    (current_height.saturating_sub(tx_height) + 1) as u32
+                } else {
+                    1
+                };
+                
+                // Determine confirmation level based on confirmations
+                let confirmation_level = match confirmations {
+                    0 => ConfirmationLevel::Pending,
+                    1..=4 => ConfirmationLevel::InBlock,
+                    5..=29 => ConfirmationLevel::QuickConfirmed,
+                    30..=89 => ConfirmationLevel::NearFinal,
+                    _ => ConfirmationLevel::FullyFinalized,
+                };
+                
+                // Calculate safety percentage based on confirmations
+                // Formula: min(99.999, confirmations * 10) for first 10 blocks
+                // Then asymptotically approach 100%
+                let safety_percentage = if confirmations == 0 {
+                    0.0
+                } else if confirmations <= 5 {
+                    90.0 + (confirmations as f64 * 2.0) // 92%, 94%, 96%, 98%, 100% at 5
+                } else if confirmations <= 30 {
+                    99.0 + (confirmations as f64 * 0.03) // Slowly approach 99.9%
+                } else if confirmations <= 90 {
+                    99.9 + (confirmations as f64 * 0.001) // Approach 99.99%
+                } else {
+                    100.0 // Fully finalized in macroblock
+                };
+                
+                // Calculate time to finality (macroblock at 90 blocks)
+                let blocks_to_macroblock = if let Some(tx_height) = block_height {
+                    let next_macroblock = ((tx_height / 90) + 1) * 90;
+                    next_macroblock.saturating_sub(current_height)
+                } else {
+                    90
+                };
+                let time_to_finality = blocks_to_macroblock; // 1 block = 1 second
+                
                 Ok(Some(TransactionInfo {
                     hash: tx.hash,
                     from: tx.from,
@@ -8418,6 +8595,11 @@ impl BlockchainNode {
                     timestamp: tx.timestamp,
                     block_height,
                     status: "confirmed".to_string(),
+                    // Fast Finality Indicators
+                    confirmation_level: Some(confirmation_level),
+                    safety_percentage: Some(safety_percentage),
+                    confirmations: Some(confirmations),
+                    time_to_finality: Some(time_to_finality),
                 }))
             }
             Ok(None) => Ok(None),
@@ -9041,6 +9223,21 @@ pub struct TransactionInfo {
     pub timestamp: u64,
     pub block_height: Option<u64>,
     pub status: String,
+    // Fast Finality Indicators (optional for backward compatibility)
+    pub confirmation_level: Option<ConfirmationLevel>,
+    pub safety_percentage: Option<f64>,
+    pub confirmations: Option<u32>,
+    pub time_to_finality: Option<u64>,
+}
+
+/// Fast Finality Indicators - confirmation levels for better UX
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub enum ConfirmationLevel {
+    Pending,           // In mempool (0s)
+    InBlock,           // 1 confirmation in microblock (1-2s)
+    QuickConfirmed,    // 5+ confirmations (5-10s)  
+    NearFinal,         // 30+ confirmations (30s)
+    FullyFinalized,    // In macroblock (90s)
 }
 
 /// PRODUCTION: Cryptographic verification of genesis node certificates
