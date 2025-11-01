@@ -122,6 +122,17 @@ impl QuantumPoH {
         (poh, entry_receiver)
     }
     
+    /// Synchronize existing PoH instance with a checkpoint
+    /// This is used when receiving blocks from other nodes to maintain consistent PoH state
+    pub async fn sync_from_checkpoint(&self, hash: &[u8], count: u64) {
+        *self.current_hash.write().await = hash.to_vec();
+        *self.hash_count.write().await = count;
+        *self.current_slot.write().await = count / 1_000_000;
+        
+        println!("[QuantumPoH] 🔄 Synchronized to checkpoint: count={}, slot={}", 
+                count, count / 1_000_000);
+    }
+    
     /// Start PoH generator
     pub async fn start(&self) {
         let mut is_running = self.is_running.write().await;

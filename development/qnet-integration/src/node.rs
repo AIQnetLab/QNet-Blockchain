@@ -1125,8 +1125,9 @@ impl BlockchainNode {
         let storage_for_blocks = blockchain.storage.clone();
         let height_for_blocks = blockchain.height.clone();
         let p2p_for_blocks = blockchain.unified_p2p.clone();
+        let poh_for_blocks = blockchain.quantum_poh.clone();
         tokio::spawn(async move {
-            Self::process_received_blocks(block_rx, storage_for_blocks, height_for_blocks, p2p_for_blocks).await;
+            Self::process_received_blocks(block_rx, storage_for_blocks, height_for_blocks, p2p_for_blocks, poh_for_blocks).await;
         });
         
         // Register Genesis nodes in reward system and start processing
@@ -1234,6 +1235,7 @@ impl BlockchainNode {
         storage: Arc<Storage>,
         height: Arc<RwLock<u64>>,
         unified_p2p: Option<Arc<SimplifiedP2P>>,
+        quantum_poh: Option<Arc<crate::quantum_poh::QuantumPoH>>,
     ) {
         // CRITICAL FIX: Buffer for out-of-order blocks
         // Key: block height, Value: (block data, retry count, timestamp)
@@ -1566,6 +1568,24 @@ impl BlockchainNode {
                     if should_log {
                         println!("[BLOCKS] ✅ Block #{} stored successfully", received_block.height);
                     }
+                    
+                    // CRITICAL: Synchronize local PoH generator with received block's PoH
+                    // This ensures all nodes maintain consistent PoH state for producer selection
+                    if let Some(ref poh) = quantum_poh {
+                        if received_block.height > 0 {
+                            // Extract PoH from the received microblock
+                            if let Ok(Some(block_data)) = storage.load_microblock(received_block.height) {
+                                if let Ok(microblock) = bincode::deserialize::<qnet_state::MicroBlock>(&block_data) {
+                                    if !microblock.poh_hash.is_empty() && microblock.poh_count > 0 {
+                                        poh.sync_from_checkpoint(&microblock.poh_hash, microblock.poh_count).await;
+                                        println!("[QuantumPoH] ✅ Local PoH synchronized to block #{} (count: {})", 
+                                                microblock.height, microblock.poh_count);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    
                     // Height is automatically updated in storage by save_microblock/save_macroblock
                     // CRITICAL: Also update global height variable for API and consensus
                     {
