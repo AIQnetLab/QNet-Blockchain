@@ -7035,8 +7035,25 @@ impl BlockchainNode {
             genesis_timestamp + (consensus_data.round_number * MACROBLOCK_INTERVAL_SECONDS)
         };
         
-        // Capture current PoH state for macroblock
-        let (poh_hash, poh_count, _slot) = quantum_poh.get_state().await;
+        // Capture PoH state from the LAST MICROBLOCK for deterministic consensus
+        // CRITICAL: Use blockchain PoH, not local generator (same as microblock producer selection)
+        // All nodes must agree on the same PoH state for Byzantine consensus
+        let (poh_hash, poh_count) = if let Ok(Some(last_micro_data)) = storage.load_microblock(end_height) {
+            match bincode::deserialize::<qnet_state::MicroBlock>(&last_micro_data) {
+                Ok(last_micro) => {
+                    println!("[MACROBLOCK] 🔐 Using PoH from last microblock #{}: count={}", 
+                            end_height, last_micro.poh_count);
+                    (last_micro.poh_hash, last_micro.poh_count)
+                }
+                Err(e) => {
+                    println!("[MACROBLOCK] ⚠️ Failed to deserialize last microblock: {}", e);
+                    (vec![0u8; 64], 0u64)
+                }
+            }
+        } else {
+            println!("[MACROBLOCK] ⚠️ Last microblock #{} not found, using zero PoH", end_height);
+            (vec![0u8; 64], 0u64)
+        };
         
         let macroblock = qnet_state::MacroBlock {
             height: consensus_data.round_number,
