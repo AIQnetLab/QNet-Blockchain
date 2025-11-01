@@ -4598,22 +4598,61 @@ impl BlockchainNode {
             // ADD: Additional entropy from candidate count (network size changes)
             selection_hasher.update(&(candidates.len() as u64).to_le_bytes());
             
-            // QUANTUM PoH: Add PoH state as entropy source for unpredictable producer selection
-            // This prevents manipulation as PoH state cannot be predicted or controlled
-            // CRITICAL FIX: For round 0 (blocks 1-30), use deterministic entropy to ensure consensus
-            // PoH states may diverge during initial sync, causing different producer selection
-            if leadership_round > 0 {
-                // Only use PoH entropy after first rotation when nodes are synchronized
-                if let Some(poh) = quantum_poh {
-                    // Get current PoH state (hash, count, slot)
-                    let (poh_hash, poh_count, _poh_slot) = poh.get_state().await;
-                    selection_hasher.update(&poh_hash);
-                    selection_hasher.update(&poh_count.to_le_bytes());
-                    println!("[CONSENSUS] 🔐 PoH entropy added: count={} (prevents manipulation)", poh_count);
+            // QUANTUM PoH: Use SYNCHRONIZED PoH from blockchain for consensus
+            // CRITICAL: Use PoH state from the last block, not local generation
+            // This ensures all nodes use the same PoH state for producer selection
+            
+            // Get PoH state from the blockchain (synchronized across all nodes)
+            let blockchain_poh_used = if let Some(store) = storage {
+                // For round 0, no PoH yet (Genesis doesn't have PoH)
+                if leadership_round == 0 {
+                    println!("[CONSENSUS] 🎯 Round 0: No PoH in Genesis, using deterministic entropy");
+                    false
+                } else {
+                    // Get PoH from the last block (current_height - 1)
+                    // This is the most recent PoH state that all nodes agree on
+                    let poh_source_block = if current_height > 0 {
+                        current_height - 1
+                    } else {
+                        0
+                    };
+                    
+                    // Load the previous block to get its PoH state
+                    match store.load_microblock(poh_source_block) {
+                        Ok(Some(block_data)) => {
+                            match bincode::deserialize::<qnet_state::MicroBlock>(&block_data) {
+                                Ok(block) => {
+                                    if !block.poh_hash.is_empty() && block.poh_count > 0 {
+                                        // Use PoH from blockchain (synchronized across all nodes)
+                                        selection_hasher.update(&block.poh_hash);
+                                        selection_hasher.update(&block.poh_count.to_le_bytes());
+                                        println!("[CONSENSUS] 🔐 Blockchain PoH added: count={} from block #{}", 
+                                                block.poh_count, poh_source_block);
+                                        true
+                                    } else {
+                                        println!("[CONSENSUS] ⚠️ Block #{} has no PoH data", poh_source_block);
+                                        false
+                                    }
+                                }
+                                Err(e) => {
+                                    println!("[CONSENSUS] ⚠️ Failed to deserialize block #{}: {}", poh_source_block, e);
+                                    false
+                                }
+                            }
+                        }
+                        _ => {
+                            println!("[CONSENSUS] ⚠️ Block #{} not found for PoH", poh_source_block);
+                            false
+                        }
+                    }
                 }
             } else {
-                // Round 0: Use deterministic entropy (Genesis hash + candidates)
-                println!("[CONSENSUS] 🎯 Round 0: Using deterministic entropy (no PoH) for initial consensus");
+                println!("[CONSENSUS] ⚠️ No storage available for blockchain PoH");
+                false
+            };
+            
+            if !blockchain_poh_used && leadership_round > 0 {
+                println!("[CONSENSUS] ⚡ Warning: PoH not available, using deterministic entropy only");
             }
             
             let selection_hash = selection_hasher.finalize();
@@ -5066,18 +5105,31 @@ impl BlockchainNode {
             emergency_hasher.update(format!("emergency_producer_{}_{}", failed_producer, current_height).as_bytes());
             emergency_hasher.update(&entropy_source); // Add entropy from previous block
             
-            // QUANTUM PoH: Add PoH entropy for emergency selection
-            // CRITICAL FIX: Skip PoH for first 30 blocks to ensure consensus during initial sync
-            let leadership_round = if current_height <= 30 { 0 } else { (current_height - 1) / 30 };
-            if leadership_round > 0 {
-                if let Some(poh) = quantum_poh {
-                    let (poh_hash, poh_count, _) = poh.get_state().await;
-                    emergency_hasher.update(&poh_hash);
-                    emergency_hasher.update(&poh_count.to_le_bytes());
-                    println!("[EMERGENCY] 🔐 PoH entropy added for emergency selection: count={}", poh_count);
+            // QUANTUM PoH: Use SYNCHRONIZED PoH from blockchain for emergency selection
+            // Same approach as regular selection - use PoH from last block, not local state
+            if let Some(ref store) = storage {
+                if current_height > 0 {
+                    // Get PoH from the last confirmed block
+                    let poh_source_block = current_height - 1;
+                    
+                    match store.load_microblock(poh_source_block) {
+                        Ok(Some(block_data)) => {
+                            if let Ok(block) = bincode::deserialize::<qnet_state::MicroBlock>(&block_data) {
+                                if !block.poh_hash.is_empty() && block.poh_count > 0 {
+                                    emergency_hasher.update(&block.poh_hash);
+                                    emergency_hasher.update(&block.poh_count.to_le_bytes());
+                                    println!("[EMERGENCY] 🔐 Blockchain PoH added: count={} from block #{}", 
+                                            block.poh_count, poh_source_block);
+                                }
+                            }
+                        }
+                        _ => {
+                            println!("[EMERGENCY] ⚠️ No PoH available from block #{}", poh_source_block);
+                        }
+                    }
+                } else {
+                    println!("[EMERGENCY] 🎯 Height 0: Using deterministic entropy (no blocks yet)");
                 }
-            } else {
-                println!("[EMERGENCY] 🎯 Round 0: Using deterministic entropy (no PoH) for emergency consensus");
             }
             
             for (node_id, _) in &candidates {
