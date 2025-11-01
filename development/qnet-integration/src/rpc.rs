@@ -1136,18 +1136,40 @@ async fn tx_get(
     
     // Get transaction from blockchain
     match blockchain.get_transaction(tx_hash).await {
-        Ok(Some(tx)) => Ok(json!({
-            "hash": tx.hash,
-            "from": tx.from,
-            "to": tx.to,
-            "amount": tx.amount,
-            "nonce": tx.nonce,
-            "gas_price": tx.gas_price,
-            "gas_limit": tx.gas_limit,
-            "timestamp": tx.timestamp,
-            "status": "confirmed",
-            "block_height": tx.block_height.unwrap_or(0)
-        })),
+        Ok(Some(tx)) => {
+            let mut response = json!({
+                "hash": tx.hash,
+                "from": tx.from,
+                "to": tx.to,
+                "amount": tx.amount,
+                "nonce": tx.nonce,
+                "gas_price": tx.gas_price,
+                "gas_limit": tx.gas_limit,
+                "timestamp": tx.timestamp,
+                "status": tx.status,
+                "block_height": tx.block_height.unwrap_or(0)
+            });
+            
+            // Add Fast Finality Indicators if available
+            if let Some(ref confirmation_level) = tx.confirmation_level {
+                response["finality_indicators"] = json!({
+                    "level": format!("{:?}", confirmation_level),
+                    "safety_percentage": tx.safety_percentage.unwrap_or(0.0),
+                    "confirmations": tx.confirmations.unwrap_or(0),
+                    "time_to_finality": tx.time_to_finality.unwrap_or(90),
+                    "risk_assessment": match tx.safety_percentage.unwrap_or(0.0) {
+                        s if s >= 99.99 => "safe_for_any_amount",
+                        s if s >= 99.9 => "safe_for_amounts_under_10000000_qnc",  // 10M QNC (~0.25% of supply)
+                        s if s >= 99.0 => "safe_for_amounts_under_1000000_qnc",   // 1M QNC (~0.025% of supply)
+                        s if s >= 95.0 => "safe_for_amounts_under_100000_qnc",    // 100K QNC (~0.0025% of supply)
+                        s if s >= 90.0 => "safe_for_amounts_under_10000_qnc",     // 10K QNC (~0.00025% of supply)
+                        _ => "wait_for_more_confirmations"
+                    }
+                });
+            }
+            
+            Ok(response)
+        },
         Ok(None) => Err(RpcError {
             code: -32000,
             message: format!("Transaction {} not found", tx_hash),
@@ -1663,20 +1685,40 @@ async fn handle_transaction_get(
     // PRODUCTION: Fetch real transaction from blockchain storage
     match blockchain.get_transaction(&tx_hash).await {
         Ok(Some(tx)) => {
+            let mut transaction_data = json!({
+                "hash": tx.hash,
+                "from": tx.from,
+                "to": tx.to,
+                "amount": tx.amount,
+                "nonce": tx.nonce,
+                "gas_price": tx.gas_price,
+                "gas_limit": tx.gas_limit,
+                "timestamp": tx.timestamp,
+                "block_height": tx.block_height,
+                "status": tx.status
+            });
+            
+            // Add Fast Finality Indicators if available
+            if let Some(ref confirmation_level) = tx.confirmation_level {
+                transaction_data["finality_indicators"] = json!({
+                    "level": format!("{:?}", confirmation_level),
+                    "safety_percentage": tx.safety_percentage.unwrap_or(0.0),
+                    "confirmations": tx.confirmations.unwrap_or(0),
+                    "time_to_finality": tx.time_to_finality.unwrap_or(90),
+                    "risk_assessment": match tx.safety_percentage.unwrap_or(0.0) {
+                        s if s >= 99.99 => "safe_for_any_amount",
+                        s if s >= 99.9 => "safe_for_amounts_under_10000000_qnc",  // 10M QNC (~0.25% of supply)
+                        s if s >= 99.0 => "safe_for_amounts_under_1000000_qnc",   // 1M QNC (~0.025% of supply)
+                        s if s >= 95.0 => "safe_for_amounts_under_100000_qnc",    // 100K QNC (~0.0025% of supply)
+                        s if s >= 90.0 => "safe_for_amounts_under_10000_qnc",     // 10K QNC (~0.00025% of supply)
+                        _ => "wait_for_more_confirmations"
+                    }
+                });
+            }
+            
             let response = json!({
                 "tx_hash": tx_hash,
-                "transaction": {
-                    "hash": tx.hash,
-                    "from": tx.from,
-                    "to": tx.to,
-                    "amount": tx.amount,
-                    "nonce": tx.nonce,
-                    "gas_price": tx.gas_price,
-                    "gas_limit": tx.gas_limit,
-                    "timestamp": tx.timestamp,
-                    "block_height": tx.block_height,
-                    "status": tx.status
-                },
+                "transaction": transaction_data,
                 "status": "found"
             });
             Ok(warp::reply::json(&response))

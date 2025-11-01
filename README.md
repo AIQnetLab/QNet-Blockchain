@@ -14,7 +14,22 @@ QNet is a high-performance, post-quantum secure blockchain network with a **two-
 - **Phase 2 (Future)**: ONLY QNC token activation on QNet blockchain
 - **Transition**: 90% 1DEV burned OR 5 years from genesis block (whichever comes first)
 
-### 🛡️ **LATEST UPDATES (v2.17.0)**
+### 🛡️ **LATEST UPDATES (v2.18.0 - November 1, 2025)**
+- **Fast Finality Indicators**: 5-level transaction confirmation system (Pending → InBlock → QuickConfirmed → NearFinal → FullyFinalized)
+  - Real-time safety percentage calculation (0% - 100%)
+  - Time to finality countdown (seconds until macroblock)
+  - Risk assessment for exchanges and bridges (safe_for_amounts_under_X_qnc)
+  - Optimized for 4.29B QNC supply with conservative thresholds
+  - Zero storage overhead (calculated on-the-fly)
+  - Backward compatible (optional fields)
+- **PoH Synchronization**: Synchronized Proof of History for deterministic producer selection
+  - PoH state from last confirmed block (all nodes agree)
+  - Local PoH generator syncs with received blocks
+  - Prevents consensus failures from diverging PoH states
+  - Macroblock PoH sourced from last microblock in range
+- **Fork Detection & Resolution**: PoH counter regression checks prevent malicious forks
+
+### **Previous Updates (v2.17.0)**
 - **Chain Reorganization (Chain Reorg)**: Byzantine-safe fork resolution with 2/3 majority consensus
 - **Advanced Block Synchronization**: Out-of-order block buffering with active missing block requests
 - **DDoS-Protected P2P**: Rate limiting and concurrent request management for network stability
@@ -1304,7 +1319,8 @@ curl http://localhost:8003/api/v1/transactions/{hash}
 
 **Transactions:**
 - `POST /api/v1/transaction` - Submit transaction
-- `GET /api/v1/transaction/{hash}` - Get transaction details
+- `GET /api/v1/transaction/{hash}` - Get transaction details with Fast Finality Indicators
+  - Returns: `finality_indicators` with level, safety_percentage, confirmations, time_to_finality, risk_assessment
 
 **Network Status:**
 - `GET /api/v1/mempool/status` - Get mempool status
