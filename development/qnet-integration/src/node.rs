@@ -4600,12 +4600,20 @@ impl BlockchainNode {
             
             // QUANTUM PoH: Add PoH state as entropy source for unpredictable producer selection
             // This prevents manipulation as PoH state cannot be predicted or controlled
-            if let Some(poh) = quantum_poh {
-                // Get current PoH state (hash, count, slot)
-                let (poh_hash, poh_count, _poh_slot) = poh.get_state().await;
-                selection_hasher.update(&poh_hash);
-                selection_hasher.update(&poh_count.to_le_bytes());
-                println!("[CONSENSUS] 🔐 PoH entropy added: count={} (prevents manipulation)", poh_count);
+            // CRITICAL FIX: For round 0 (blocks 1-30), use deterministic entropy to ensure consensus
+            // PoH states may diverge during initial sync, causing different producer selection
+            if leadership_round > 0 {
+                // Only use PoH entropy after first rotation when nodes are synchronized
+                if let Some(poh) = quantum_poh {
+                    // Get current PoH state (hash, count, slot)
+                    let (poh_hash, poh_count, _poh_slot) = poh.get_state().await;
+                    selection_hasher.update(&poh_hash);
+                    selection_hasher.update(&poh_count.to_le_bytes());
+                    println!("[CONSENSUS] 🔐 PoH entropy added: count={} (prevents manipulation)", poh_count);
+                }
+            } else {
+                // Round 0: Use deterministic entropy (Genesis hash + candidates)
+                println!("[CONSENSUS] 🎯 Round 0: Using deterministic entropy (no PoH) for initial consensus");
             }
             
             let selection_hash = selection_hasher.finalize();
@@ -5059,11 +5067,17 @@ impl BlockchainNode {
             emergency_hasher.update(&entropy_source); // Add entropy from previous block
             
             // QUANTUM PoH: Add PoH entropy for emergency selection
-            if let Some(poh) = quantum_poh {
-                let (poh_hash, poh_count, _) = poh.get_state().await;
-                emergency_hasher.update(&poh_hash);
-                emergency_hasher.update(&poh_count.to_le_bytes());
-                println!("[EMERGENCY] 🔐 PoH entropy added for emergency selection: count={}", poh_count);
+            // CRITICAL FIX: Skip PoH for first 30 blocks to ensure consensus during initial sync
+            let leadership_round = if current_height <= 30 { 0 } else { (current_height - 1) / 30 };
+            if leadership_round > 0 {
+                if let Some(poh) = quantum_poh {
+                    let (poh_hash, poh_count, _) = poh.get_state().await;
+                    emergency_hasher.update(&poh_hash);
+                    emergency_hasher.update(&poh_count.to_le_bytes());
+                    println!("[EMERGENCY] 🔐 PoH entropy added for emergency selection: count={}", poh_count);
+                }
+            } else {
+                println!("[EMERGENCY] 🎯 Round 0: Using deterministic entropy (no PoH) for emergency consensus");
             }
             
             for (node_id, _) in &candidates {
