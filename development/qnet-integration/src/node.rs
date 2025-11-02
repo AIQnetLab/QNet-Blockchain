@@ -1580,20 +1580,28 @@ impl BlockchainNode {
                         println!("[BLOCKS] ✅ Block #{} stored successfully", received_block.height);
                     }
                     
-                    // CRITICAL: Synchronize local PoH generator with received block's PoH
-                    // This ensures all nodes maintain consistent PoH state for producer selection
+                    // CRITICAL FIX: Asynchronous PoH synchronization to prevent blocking
+                    // This ensures all nodes maintain consistent PoH state without blocking block processing
                     if let Some(ref poh) = quantum_poh {
                         if received_block.height > 0 {
-                            // Extract PoH from the received microblock
-                            if let Ok(Some(block_data)) = storage.load_microblock(received_block.height) {
-                                if let Ok(microblock) = bincode::deserialize::<qnet_state::MicroBlock>(&block_data) {
-                                    if !microblock.poh_hash.is_empty() && microblock.poh_count > 0 {
-                                        poh.sync_from_checkpoint(&microblock.poh_hash, microblock.poh_count).await;
-                                        println!("[QuantumPoH] ✅ Local PoH synchronized to block #{} (count: {})", 
-                                                microblock.height, microblock.poh_count);
+                            // Clone necessary data for async operation
+                            let poh_clone = poh.clone();
+                            let storage_clone = storage.clone();
+                            let block_height = received_block.height;
+                            
+                            // Spawn async task for PoH sync to avoid blocking
+                            tokio::spawn(async move {
+                                // Extract PoH from the received microblock
+                                if let Ok(Some(block_data)) = storage_clone.load_microblock(block_height) {
+                                    if let Ok(microblock) = bincode::deserialize::<qnet_state::MicroBlock>(&block_data) {
+                                        if !microblock.poh_hash.is_empty() && microblock.poh_count > 0 {
+                                            poh_clone.sync_from_checkpoint(&microblock.poh_hash, microblock.poh_count).await;
+                                            println!("[QuantumPoH] ✅ Local PoH synchronized to block #{} (count: {}) [ASYNC]", 
+                                                    microblock.height, microblock.poh_count);
+                                        }
                                     }
                                 }
-                            }
+                            });
                         }
                     }
                     
@@ -5167,8 +5175,9 @@ impl BlockchainNode {
                     // Production phase: Use Progressive Degradation similar to microblock production
                     println!("[FAILOVER] 🚨 EMERGENCY: Activating network-wide degradation");
                     
-                    // Try with progressively lower thresholds: 50%, 40%, 30%, 20%
-                    let thresholds = [0.50, 0.40, 0.30, 0.20];
+                    // CRITICAL FIX: Maintain 70% minimum for emergency producers to prevent forks
+                    // Only degrade if absolutely necessary for network survival
+                    let thresholds = [0.70, 0.60, 0.50];  // Never go below 50% to prevent chaos
                     
                     for threshold in &thresholds {
                         let mut emergency_candidates = Vec::new();
@@ -5189,13 +5198,17 @@ impl BlockchainNode {
                         }
                         
                         if !emergency_candidates.is_empty() {
-                            // Select best from degraded candidates
+                            // CRITICAL: Only use emergency producer if reputation >= 50%
+                            // This prevents fork creation from low-reputation nodes
                             let best = emergency_candidates.iter()
-                                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
-                                .unwrap();
-                            println!("[FAILOVER] 🆘 DEGRADED SELECTION: {} (reputation: {:.1}%, threshold: {:.0}%)", 
-                                     best.0, best.1 * 100.0, threshold * 100.0);
-                            return best.0.clone();
+                                .filter(|(_, rep)| *rep >= 0.50)  // Hard minimum 50%
+                                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+                            
+                            if let Some(selected) = best {
+                                println!("[FAILOVER] 🆘 EMERGENCY SELECTION: {} (reputation: {:.1}%, threshold: {:.0}%)", 
+                                         selected.0, selected.1 * 100.0, threshold * 100.0);
+                                return selected.0.clone();
+                            }
                         }
                     }
                     

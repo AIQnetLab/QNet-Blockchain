@@ -5630,38 +5630,55 @@ impl SimplifiedP2P {
             .unwrap_or_default()
             .as_secs();
         
-        // Check rate limit (max 10 sync requests per minute per peer)
+        // CRITICAL FIX: Adaptive rate limiting based on sync state
+        // If peer is far behind, allow unlimited sync requests for recovery
+        // Check if this peer is requesting blocks they don't have
+        let blocks_behind = if to_height > from_height {
+            to_height - from_height
+        } else {
+            0
+        };
+        
+        // Check rate limit (adaptive based on sync state)
         let rate_limited = {
-            let mut rate_limiter = self.rate_limiter.lock().unwrap();
-            let rate_key = format!("sync_{}", from_peer);
-            
-            let rate_limit = rate_limiter.entry(rate_key).or_insert_with(|| RateLimit {
-                requests: Vec::new(),
-                max_requests: 10,  // 10 sync requests per minute
-                window_seconds: 60,
-                blocked_until: 0,
-            });
-            
-            // Check if currently blocked
-            if rate_limit.blocked_until > current_time {
-                println!("[SYNC] ⛔ Rate limit: {} blocked for {} more seconds", 
-                         from_peer, rate_limit.blocked_until - current_time);
-                return;
-            }
-            
-            // Clean old requests outside window
-            rate_limit.requests.retain(|&req_time| req_time > current_time - rate_limit.window_seconds);
-            
-            // Check if limit exceeded
-            if rate_limit.requests.len() >= rate_limit.max_requests {
-                rate_limit.blocked_until = current_time + 60; // Block for 1 minute
-                println!("[SYNC] ⛔ Rate limit exceeded for {} ({}+ requests/minute)", 
-                         from_peer, rate_limit.max_requests);
-                true
+            // CRITICAL: No rate limit for nodes catching up (>5 blocks behind)
+            if blocks_behind > 5 {
+                println!("[SYNC] 🚀 PRIORITY SYNC: {} is {} blocks behind - no rate limit", 
+                         from_peer, blocks_behind);
+                false // No rate limit for catching up
             } else {
-                // Add this request
-                rate_limit.requests.push(current_time);
-                false
+                // Normal rate limiting for synchronized nodes
+                let mut rate_limiter = self.rate_limiter.lock().unwrap();
+                let rate_key = format!("sync_{}", from_peer);
+                
+                let rate_limit = rate_limiter.entry(rate_key).or_insert_with(|| RateLimit {
+                    requests: Vec::new(),
+                    max_requests: 10,  // 10 sync requests per minute for normal operation
+                    window_seconds: 60,
+                    blocked_until: 0,
+                });
+                
+                // Check if currently blocked
+                if rate_limit.blocked_until > current_time {
+                    println!("[SYNC] ⛔ Rate limit: {} blocked for {} more seconds", 
+                             from_peer, rate_limit.blocked_until - current_time);
+                    return;
+                }
+                
+                // Clean old requests outside window
+                rate_limit.requests.retain(|&req_time| req_time > current_time - rate_limit.window_seconds);
+                
+                // Check if limit exceeded
+                if rate_limit.requests.len() >= rate_limit.max_requests {
+                    rate_limit.blocked_until = current_time + 60; // Block for 1 minute
+                    println!("[SYNC] ⛔ Rate limit exceeded for {} ({}+ requests/minute)", 
+                             from_peer, rate_limit.max_requests);
+                    true
+                } else {
+                    // Add this request
+                    rate_limit.requests.push(current_time);
+                    false
+                }
             }
         };
         
