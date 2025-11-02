@@ -4253,7 +4253,6 @@ impl BlockchainNode {
                     let unified_p2p_clone = unified_p2p.clone();
                     let consensus_rx_clone = consensus_rx.clone();
                     let macroblock_trigger = last_macroblock_trigger;
-                    let quantum_poh_clone = quantum_poh.clone();
                     
                     tokio::spawn(async move {
                         println!("[MACROBLOCK] 🏛️ Background consensus starting for blocks {}-{}", macroblock_trigger + 1, macroblock_trigger + 90);
@@ -4277,23 +4276,21 @@ impl BlockchainNode {
                             }
                             
                             // ALL nodes run consensus (initiator starts, others participate)
-                            if let Some(ref poh) = quantum_poh_clone {
-                                match Self::trigger_macroblock_consensus(
-                                    storage_clone,
-                                    consensus_clone,
-                                        macroblock_trigger + 1,
-                                        macroblock_trigger + 90, // Will be block 90
-                                        p2p,
-                                    &node_id_clone,
-                                    node_type_clone,
-                                        &consensus_rx_clone,
-                                    poh,
-                                ).await {
-                                        Ok(_) => println!("[MACROBLOCK] ✅ Background consensus completed"),
-                                        Err(e) => println!("[MACROBLOCK] ❌ Background consensus failed: {}", e),
-                                    }
-                            } else {
-                                println!("[MACROBLOCK] ❌ PoH not available for consensus");
+                            // CRITICAL FIX: Macroblock consensus should NOT depend on local PoH generator
+                            // PoH data is taken from blocks, not from the generator
+                            // This ensures consensus can proceed even if PoH is temporarily unavailable
+                            match Self::trigger_macroblock_consensus(
+                                storage_clone,
+                                consensus_clone,
+                                    macroblock_trigger + 1,
+                                    macroblock_trigger + 90, // Will be block 90
+                                    p2p,
+                                &node_id_clone,
+                                node_type_clone,
+                                    &consensus_rx_clone,
+                            ).await {
+                                    Ok(_) => println!("[MACROBLOCK] ✅ Background consensus completed"),
+                                    Err(e) => println!("[MACROBLOCK] ❌ Background consensus failed: {}", e),
                             }
                         }
                     });
@@ -6972,7 +6969,6 @@ impl BlockchainNode {
         node_id: &str,
         node_type: NodeType,
         consensus_rx: &Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<ConsensusMessage>>>>, // CRITICAL: REAL channel
-        quantum_poh: &Arc<QuantumPoH>,
     ) -> Result<(), String> {
         // ENHANCED MACROBLOCK CONSENSUS DASHBOARD
         println!("[MACROBLOCK] 🏛️ BYZANTINE CONSENSUS INITIATED:");
