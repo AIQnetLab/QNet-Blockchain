@@ -5800,13 +5800,23 @@ impl BlockchainNode {
         // Consensus for macroblock 90 starts at height 60 (30 blocks early)
         // So we need to allow nodes that are within 30 blocks of the macroblock height
         let consensus_lookahead = 30; // Consensus starts 30 blocks early (at block 60 for macroblock 90)
-        let max_allowed_lag = if current_height <= 100 { 5 } else { 20 }; // Stricter during genesis
+        
+        // CRITICAL FIX: More lenient lag tolerance for early consensus participation
+        // During genesis phase (blocks 1-100), nodes may still be syncing
+        // We need to allow consensus to start even if nodes are slightly behind
+        let max_allowed_lag = if current_height <= 100 { 
+            10  // Increased from 5 to allow nodes to participate during initial sync
+        } else { 
+            20  // Normal operation tolerance
+        };
         
         // Check if node is TOO FAR BEHIND (not synced)
-        if stored_height + max_allowed_lag + consensus_lookahead < current_height {
+        // CRITICAL: For consensus that starts EARLY (block 60 for macroblock 90),
+        // we need to be more lenient because consensus_lookahead adds 30 blocks
+        if stored_height + max_allowed_lag < current_height - consensus_lookahead {
             println!("[CONSENSUS] ⚠️ Node not synchronized for consensus participation!");
-            println!("[CONSENSUS] 📊 Current height: {}, Expected: {} (max lag: {} + lookahead: {})", 
-                     stored_height, current_height, max_allowed_lag, consensus_lookahead);
+            println!("[CONSENSUS] 📊 Stored height: {}, Consensus height: {}, Max lag: {}", 
+                     stored_height, current_height, max_allowed_lag);
             return false; // Cannot initiate or participate if not synced
         }
         

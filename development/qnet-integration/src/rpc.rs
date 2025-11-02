@@ -2540,11 +2540,26 @@ async fn handle_turbine_metrics(blockchain: Arc<BlockchainNode>) -> Result<impl 
 
 // Handler for Quantum PoH status
 async fn handle_poh_status(blockchain: Arc<BlockchainNode>) -> Result<impl warp::Reply, warp::Rejection> {
+    // CRITICAL FIX: Get real hash rate from PoH instance
+    let (enabled, hash_rate_str, status) = if let Some(poh) = blockchain.get_quantum_poh() {
+        let hash_rate = poh.get_performance().await;
+        let hash_rate_formatted = if hash_rate >= 1_000_000.0 {
+            format!("{:.2}M hashes/sec", hash_rate / 1_000_000.0)
+        } else if hash_rate >= 1_000.0 {
+            format!("{:.2}K hashes/sec", hash_rate / 1_000.0)
+        } else {
+            format!("{:.0} hashes/sec", hash_rate)
+        };
+        (true, hash_rate_formatted, "running")
+    } else {
+        (false, "0 hashes/sec".to_string(), "disabled")
+    };
+    
     let status = json!({
-        "enabled": blockchain.get_quantum_poh().is_some(),
+        "enabled": enabled,
         "algorithm": ["SHA3-512", "Blake3"],
-        "hash_rate": "31.25M hashes/sec",
-        "status": if blockchain.get_quantum_poh().is_some() { "running" } else { "disabled" }
+        "hash_rate": hash_rate_str,
+        "status": status
     });
     
     Ok(warp::reply::json(&status))
@@ -2844,6 +2859,10 @@ fn calculate_full_super_ping_times(node_id: &str) -> Vec<u64> {
 
 // Background service for randomized ping system (PRODUCTION: All node types)
 pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
+    // Clone blockchain for different async tasks
+    let blockchain_for_pings = blockchain.clone();
+    let blockchain_for_rewards = blockchain.clone();
+    
     tokio::spawn(async move {
         let fcm_service = FCMPushService::new();
         let mut check_interval = tokio::time::interval(tokio::time::Duration::from_secs(60)); // Check every minute
@@ -2904,7 +2923,27 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
             
             // CRITICAL: Process Full/Super nodes using blockchain registry
             let registry = crate::activation_validation::BlockchainActivationRegistry::new(None);
-            let eligible_nodes = registry.get_eligible_nodes().await;
+            let mut eligible_nodes = registry.get_eligible_nodes().await;
+            
+            // CRITICAL FIX: Add Genesis nodes if not in registry (bootstrap phase ONLY)
+            // Genesis nodes are Super nodes that must be pinged for rewards
+            // SCALABILITY: Only add Genesis nodes during initial bootstrap (first 10000 blocks)
+            let current_height = blockchain_for_pings.get_height().await;
+            let is_bootstrap_phase = current_height < 10000;
+            
+            if is_bootstrap_phase && eligible_nodes.len() < 5 {
+                // Add Genesis nodes with default reputation
+                for i in 1..=5 {
+                    let genesis_id = format!("genesis_node_{:03}", i);
+                    // Check if already in list
+                    if !eligible_nodes.iter().any(|(id, _, _)| id == &genesis_id) {
+                        eligible_nodes.push((genesis_id, 70.0, "super".to_string()));
+                    }
+                }
+                println!("[PING] 🌱 Bootstrap phase (height {}): Added {} Genesis nodes to ping list", 
+                         current_height,
+                         eligible_nodes.iter().filter(|(id, _, _)| id.starts_with("genesis_node_")).count());
+            }
             
             for (node_id, _reputation, node_type) in eligible_nodes {
                 if node_type != "full" && node_type != "super" {
@@ -2928,8 +2967,70 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
                         let challenge = generate_quantum_challenge();
                         
                         // Send HTTP ping to Full/Super node API endpoint
-                        // Note: Full/Super nodes should respond via handle_network_ping endpoint
-                        // This is a trigger - actual ping response handled by node's API
+                        // CRITICAL FIX: Actually send the ping request!
+                        // Clone for async context
+                        let blockchain_clone = blockchain_for_pings.clone();
+                        let node_id_clone = node_id.clone();
+                        let node_type_clone = node_type.clone();
+                        
+                        tokio::spawn(async move {
+                            // Get real node IP from P2P network
+                            let endpoint = if node_id_clone.starts_with("genesis_node_") {
+                                // Genesis nodes use known IPs from environment
+                                use crate::genesis_constants::GENESIS_NODE_IPS;
+                                let node_index = node_id_clone.strip_prefix("genesis_node_")
+                                    .and_then(|s| s.parse::<usize>().ok())
+                                    .unwrap_or(1) - 1;
+                                if node_index < GENESIS_NODE_IPS.len() {
+                                    let (ip, _id) = GENESIS_NODE_IPS[node_index];
+                                    format!("http://{}:8001/api/v1/network/ping", ip)
+                                } else {
+                                    // Fallback to localhost for testing
+                                    "http://127.0.0.1:8001/api/v1/network/ping".to_string()
+                                }
+                            } else {
+                                // For regular nodes, try to get IP from P2P
+                                if let Some(p2p) = blockchain_clone.get_unified_p2p() {
+                                    if let Some(addr) = p2p.get_peer_address_by_id(&node_id_clone) {
+                                        format!("http://{}:8001/api/v1/network/ping", addr)
+                                    } else {
+                                        // Node not in P2P, skip ping
+                                        println!("[PING] ⚠️ Node {} not found in P2P network", node_id_clone);
+                                        return;
+                                    }
+                                } else {
+                                    // No P2P available
+                                    return;
+                                }
+                            };
+                            
+                            println!("[PING] 🎯 Pinging {} at {}", node_id_clone, endpoint);
+                            
+                            // Create ping request
+                            let client = reqwest::Client::new();
+                            let ping_request = json!({
+                                "node_id": node_id_clone,
+                                "challenge": challenge,
+                                "timestamp": now
+                            });
+                            
+                            // Send ping and log result
+                            match client.post(&endpoint)
+                                .json(&ping_request)
+                                .timeout(std::time::Duration::from_secs(5))
+                                .send()
+                                .await {
+                                Ok(response) if response.status().is_success() => {
+                                    println!("[PING] ✅ Successfully pinged {} node {}", node_type.to_uppercase(), node_id);
+                                },
+                                Ok(response) => {
+                                    println!("[PING] ⚠️ Ping failed for {} with status: {}", node_id, response.status());
+                                },
+                                Err(e) => {
+                                    println!("[PING] ❌ Failed to ping {}: {}", node_id, e);
+                                }
+                            }
+                        });
                         
                         break; // Only one ping per check cycle
                     }
@@ -2939,7 +3040,6 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
     });
     
     // Separate task for reward distribution (end of each 4-hour window)
-    let blockchain_for_rewards = blockchain.clone();
     tokio::spawn(async move {
         // Wait for network initialization
         tokio::time::sleep(tokio::time::Duration::from_secs(5 * 60)).await;
