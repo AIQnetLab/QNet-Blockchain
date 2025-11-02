@@ -5279,9 +5279,10 @@ impl BlockchainNode {
                     } else {
                         println!("[EMERGENCY] ❌ Not synchronized for PoH (have {}, need {})", 
                                 local_height, poh_source_block);
-                        println!("[EMERGENCY] 🔄 Using deterministic fallback");
+                        println!("[EMERGENCY] 🔄 Using deterministic fallback (all nodes will agree)");
                         emergency_hasher.update(b"EMERGENCY_FALLBACK_UNSYNC");
-                        emergency_hasher.update(&local_height.to_le_bytes());
+                        // CRITICAL: DO NOT add local_height - it's different for each node!
+                        // All unsynchronized nodes must select the SAME emergency producer
                     }
                 } else {
                     println!("[EMERGENCY] 🎯 Height 0: Using deterministic entropy (no blocks yet)");
