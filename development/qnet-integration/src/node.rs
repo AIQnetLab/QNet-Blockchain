@@ -4551,10 +4551,12 @@ impl BlockchainNode {
                 true  // Round 0 is always deterministic, cache is safe
             } else if let Some(store) = storage {
                 // For PoH rounds, check if we're fully synchronized
+                // CONSERVATIVE: Wait for FULL round completion before using cache
+                // This ensures all nodes have processed the entire previous round
                 let required_block = match leadership_round {
-                    1 => 30,
-                    2 => 60,
-                    _ => leadership_round * 30
+                    1 => 30,  // Round 1: wait for block 30
+                    2 => 60,  // Round 2: wait for block 60 (full Round 1 completion)
+                    _ => leadership_round * 30  // Round N: wait for N*30 (full previous round)
                 };
                 let local_height = store.get_chain_height().unwrap_or(0);
                 local_height >= required_block  // Only use cache if we have all required blocks
@@ -4722,12 +4724,16 @@ impl BlockchainNode {
                     false
                 } else {
                     // CRITICAL FIX: Determine which block we need for PoH based on round
-                    // Round 1 needs block 30, Round 2 needs block 60, etc.
+                    // IMPORTANT: Use last block of PREVIOUS round to ensure all nodes have it
+                    // This prevents desync when the boundary block was JUST created
+                    // Formula: Round N uses block (N*30 - 1) from previous round
                     let required_poh_block = match leadership_round {
-                        1 => 30,  // Round 1 (blocks 31-60) uses PoH from block 30
-                        2 => 60,  // Round 2 (blocks 61-90) uses PoH from block 60  
-                        _ => leadership_round * 30  // Round N uses block N*30
+                        1 => 30,  // Round 1 (blocks 31-60) uses block 30 (last of Round 0)
+                        _ => leadership_round * 30 - 1  // Round N uses block N*30-1 (last of Round N-1)
                     };
+                    // Examples:
+                    // Round 2 (blocks 61-90):  uses block 59 (2*30-1 = 59, last of Round 1)
+                    // Round 3 (blocks 91-120): uses block 89 (3*30-1 = 89, last of Round 2)
                     
                     // CRITICAL: Check if we're synchronized enough to use PoH
                     let local_height = store.get_chain_height().unwrap_or(0);
@@ -5293,7 +5299,12 @@ impl BlockchainNode {
                 emergency_hasher.update(b"EMERGENCY_NO_STORAGE");
             }
             
-            for (node_id, _) in &candidates {
+            // CRITICAL: Sort candidates to ensure deterministic ordering across all nodes
+            // Different nodes may receive peers in different order from p2p.get_validated_active_peers()
+            let mut sorted_candidates = candidates.clone();
+            sorted_candidates.sort_by(|a, b| a.0.cmp(&b.0));  // Sort by node_id alphabetically
+            
+            for (node_id, _) in &sorted_candidates {
                 emergency_hasher.update(node_id.as_bytes());
             }
             
@@ -5304,11 +5315,11 @@ impl BlockchainNode {
             ]);
             
             // Deterministic selection - all nodes will calculate same result
-            let selection_index = (emergency_number as usize) % candidates.len();
-            let emergency_producer = candidates[selection_index].0.clone();
+            let selection_index = (emergency_number as usize) % sorted_candidates.len();
+            let emergency_producer = sorted_candidates[selection_index].0.clone();
             
             println!("[FAILOVER] 🆘 Deterministic emergency producer: {} (reputation: {:.1}%, index: {}/{})", 
-                     emergency_producer, candidates[selection_index].1 * 100.0, selection_index, candidates.len());
+                     emergency_producer, sorted_candidates[selection_index].1 * 100.0, selection_index, sorted_candidates.len());
             
             // Save failover event to storage for monitoring
             if let Some(ref storage) = storage {
@@ -5868,18 +5879,42 @@ impl BlockchainNode {
         // Add entropy from the blockchain
         // For first macroblock, use genesis hash; otherwise use real macroblock hash
         let entropy_source: Vec<u8> = if macroblock_round == 0 {
-            // First macroblock - use genesis block hash as entropy
-            vec![0x42; 32] // Deterministic but unique genesis entropy
+            // First macroblock (block 90) - use Genesis block (block 0) hash as entropy
+            // This ensures all nodes agree on the initiator selection
+            match storage.load_microblock(0) {
+                Ok(Some(genesis_data)) => {
+                    // Calculate hash of Genesis block
+                    use sha3::{Sha3_256, Digest};
+                    let mut hasher = Sha3_256::new();
+                    hasher.update(&genesis_data);
+                    let hash_result = hasher.finalize();
+                    println!("[CONSENSUS] 🎲 Using Genesis block hash for first macroblock initiator selection");
+                    hash_result.to_vec()
+                }
+                _ => {
+                    // CRITICAL: If Genesis not found at block 60+, node CANNOT participate
+                    // This prevents different nodes from using different entropy sources
+                    println!("[CONSENSUS] ❌ Genesis block not found - node not synchronized!");
+                    println!("[CONSENSUS] ⚠️ Cannot participate in consensus without Genesis block");
+                    return false; // Cannot initiate consensus without Genesis
+                }
+            }
         } else {
             // Use actual hash of previous macroblock as entropy source
             // This makes initiator selection truly unpredictable
-            let hash = storage.get_latest_macroblock_hash()
-                .unwrap_or_else(|_| {
-                    // Fallback if macroblock not found (shouldn't happen)
-                    println!("[CONSENSUS] ⚠️ Previous macroblock hash not found, using fallback entropy");
-                    [0x43; 32]
-                });
-            hash.to_vec()
+            match storage.get_latest_macroblock_hash() {
+                Ok(hash) => {
+                    println!("[CONSENSUS] 🎲 Using previous macroblock hash for initiator selection");
+                    hash.to_vec()
+                }
+                Err(_) => {
+                    // CRITICAL: If previous macroblock not found, node CANNOT participate
+                    // This prevents different nodes from using different entropy sources
+                    println!("[CONSENSUS] ❌ Previous macroblock not found - node not synchronized!");
+                    println!("[CONSENSUS] ⚠️ Cannot participate in consensus without previous macroblock");
+                    return false; // Cannot initiate consensus without previous macroblock
+                }
+            }
         };
         
         selection_hasher.update(&entropy_source);
