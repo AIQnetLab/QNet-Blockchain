@@ -535,10 +535,23 @@ impl QNetQuantumCrypto {
             return Err(anyhow!("Invalid signature length: {}", signature_bytes.len()));
         }
 
-        // 3. CRITICAL: Use REAL CRYSTALS-Dilithium verification
-        // Using crystals_dilithium imported at top
+        // 3. CRITICAL: Try consensus_crypto first for REAL verification
+        // Build expected message
+        let expected_message = format!("{}:{}", wallet_address, data);
         
-        // Parse our combined format
+        // Try real Dilithium verification through consensus_crypto
+        let is_valid = qnet_consensus::consensus_crypto::verify_consensus_signature(
+            wallet_address,
+            &expected_message,
+            &signature.signature
+        ).await;
+        
+        if is_valid {
+            println!("✅ REAL Dilithium signature verified via consensus_crypto");
+            return Ok(true);
+        }
+        
+        // Fallback: Parse our combined format for backward compatibility
         if signature_bytes.len() < 8 {
             return Err(anyhow!("Signature too short: {} bytes", signature_bytes.len()));
         }
