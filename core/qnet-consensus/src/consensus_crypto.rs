@@ -4,9 +4,6 @@
 
 use base64::{Engine as _, engine::general_purpose};
 
-// MANDATORY: CRYSTALS-Dilithium for quantum resistance
-use pqcrypto_dilithium::dilithium3 as _dilithium3;
-
 /// Verify consensus signature using hybrid cryptography
 pub async fn verify_consensus_signature(
     node_id: &str,

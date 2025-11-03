@@ -6923,9 +6923,10 @@ impl BlockchainNode {
                 is_valid
             }
             Err(e) => {
-                println!("[CRYPTO] ❌ Quantum crypto verification error: {:?}, using fallback", e);
-                // Simple fallback verification
-                microblock.signature.len() >= 32
+                // NO FALLBACK - quantum crypto is mandatory for production
+                println!("[CRYPTO] ❌ Quantum crypto verification error: {:?}", e);
+                println!("[CRYPTO] ❌ Block rejected - invalid quantum signature");
+                false  // ALWAYS reject if quantum verification fails
             }
         };
         
