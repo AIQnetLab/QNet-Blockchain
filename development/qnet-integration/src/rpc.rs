@@ -3788,7 +3788,7 @@ async fn handle_consensus_commit(
         };
 
         // Process commit through consensus engine
-        match consensus_engine.process_commit(commit) {
+        match consensus_engine.process_commit(commit).await {
             Ok(_) => {
                 println!("[CONSENSUS] ✅ Commit processed by engine for round {}", commit_request.round);
                 true
@@ -4228,14 +4228,9 @@ async fn generate_quantum_signature(node_id: &str, data: &str) -> String {
             signature.signature
         }
         Err(e) => {
+            // NO FALLBACK - quantum crypto is mandatory
             println!("[CRYPTO] ❌ RPC quantum crypto signature failed: {:?}", e);
-            // Simple fallback for stability
-            use sha3::{Sha3_256, Digest};
-            let mut hasher = Sha3_256::new();
-            hasher.update(node_id.as_bytes());
-            hasher.update(data.as_bytes());
-            hasher.update(b"QNET_RPC_FALLBACK");
-            format!("FALLBACK_{}", hex::encode(&hasher.finalize()[..32]))
+            panic!("[FATAL] Cannot operate without quantum-resistant signatures!");
         }
     }
 }

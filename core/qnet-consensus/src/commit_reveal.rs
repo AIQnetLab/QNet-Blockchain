@@ -160,9 +160,9 @@ impl CommitRevealConsensus {
     }
     
     /// Process commit from validator (simplified version)
-    pub fn process_commit(&mut self, commit: Commit) -> Result<(), ConsensusError> {
+    pub async fn process_commit(&mut self, commit: Commit) -> Result<(), ConsensusError> {
         // Validate signature (simplified) - do this before any borrows
-        let signature_valid = self.verify_signature(&commit.node_id, &commit.commit_hash, &commit.signature);
+        let signature_valid = self.verify_signature(&commit.node_id, &commit.commit_hash, &commit.signature).await;
         if !signature_valid {
             return Err(ConsensusError::InvalidSignature(format!("Invalid signature for validator {}", commit.node_id)));
         }
@@ -193,95 +193,27 @@ impl CommitRevealConsensus {
     }
     
     /// PRODUCTION: Verify CRYSTALS-Dilithium post-quantum signature
-    fn verify_signature(&self, node_id: &str, message: &str, signature: &str) -> bool {
-        // PRODUCTION: Real CRYSTALS-Dilithium signature verification using quantum_crypto
-        use sha2::{Sha512, Digest};
-        use base64::{Engine as _, engine::general_purpose};
+    async fn verify_signature(&self, node_id: &str, message: &str, signature: &str) -> bool {
+        // CRITICAL: Use consensus_crypto module for REAL Dilithium verification
+        // This module handles:
+        // - Real CRYSTALS-Dilithium with pqcrypto (if feature enabled)
+        // - Hybrid signatures (Dilithium + Ed25519)
+        // - Proper signature format parsing
+        use crate::consensus_crypto;
         
-        // SECURITY: Strict validation requirements
-        if signature.is_empty() || signature.len() < 100 || signature.len() > 10000 {
-            println!("[CONSENSUS] ❌ Invalid signature length: {}", signature.len());
-            return false;
-        }
+        let valid = consensus_crypto::verify_consensus_signature(node_id, message, signature).await;
         
-        // PRODUCTION: Parse Dilithium signature format: "dilithium_sig_<node_id>_<base64_signature>"
-        if !signature.starts_with("dilithium_sig_") {
-            println!("[CONSENSUS] ❌ Invalid signature format: expected 'dilithium_sig_' prefix");
-            return false;
-        }
-        
-        // PRODUCTION: Extract node_id and signature from format
-        let prefix = "dilithium_sig_";
-        let signature_part = &signature[prefix.len()..];
-        
-        // Find the LAST '_' to separate node_id from base64 signature
-        let last_underscore_pos = signature_part.rfind('_');
-        if last_underscore_pos.is_none() {
-            println!("[CONSENSUS] ❌ Signature format invalid: missing separator in '{}'", signature);
-            return false;
-        }
-        
-        let separator_pos = last_underscore_pos.unwrap();
-        let extracted_node_id = &signature_part[..separator_pos];
-        let signature_base64 = &signature_part[separator_pos + 1..];
-        
-        // PRODUCTION: Validate extracted node_id matches expected
-        if extracted_node_id != node_id {
-            println!("[CONSENSUS] ❌ Node ID mismatch: expected '{}', got '{}' in signature", 
-                     node_id, extracted_node_id);
-            return false;
-        }
-        
-        println!("[CONSENSUS] 🔐 Verifying Dilithium signature: node_id='{}', signature_len={} chars", 
-                 extracted_node_id, signature_base64.len());
-        
-        // PRODUCTION: Decode base64 signature (consistent with quantum_crypto.rs)
-        let signature_bytes = match general_purpose::STANDARD.decode(signature_base64) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                println!("[CONSENSUS] ❌ Failed to decode base64 signature: {}", e);
-                return false;
-            }
-        };
-        
-        // SECURITY: Validate signature length (64 bytes as per quantum_crypto.rs)
-        if signature_bytes.len() != 64 {
-            println!("[CONSENSUS] ❌ Invalid signature length: expected 64 bytes, got {}", signature_bytes.len());
-            return false;
-        }
-        
-        // CRITICAL: Use SAME algorithm as quantum_crypto.rs create_consensus_signature
-        // Create signature data exactly as in signing (node_id:message)
-        let signature_data = format!("{}:{}", node_id, message);
-        
-        // Use SHA512 with QNET_CONSENSUS_SIG salt (EXACT match with quantum_crypto.rs)
-        let mut hasher = Sha512::new();
-        hasher.update(signature_data.as_bytes());
-        hasher.update(b"QNET_CONSENSUS_SIG");
-        let expected_signature_hash = hasher.finalize();
-        
-        // Compare first 64 bytes (same as create_consensus_signature)
-        let expected_signature_bytes = &expected_signature_hash[..64];
-        
-        // SECURITY: Constant-time comparison to prevent timing attacks
-        let mut result = 0u8;
-        for i in 0..64 {
-            result |= signature_bytes[i] ^ expected_signature_bytes[i];
-        }
-        let signature_valid = result == 0;
-        
-        if signature_valid {
-            println!("[CONSENSUS] ✅ Dilithium signature verified successfully");
-            println!("   Algorithm: QNet-Dilithium-Compatible");
-            println!("   Strength: Quantum-resistant");
+        if valid {
+            println!("[CONSENSUS] ✅ Signature verified using consensus_crypto module");
+            println!("   Algorithm: CRYSTALS-Dilithium (quantum-resistant)");
             println!("   Node: {}", node_id);
         } else {
-            println!("[CONSENSUS] ❌ Dilithium signature verification failed");
+            println!("[CONSENSUS] ❌ Signature verification failed");
             println!("   Node: {}", node_id);
             println!("   Possible attack: Forged or manipulated signature");
         }
         
-        signature_valid
+        valid
     }
     
     /// Submit reveal for current round
@@ -519,7 +451,7 @@ impl CommitRevealConsensus {
     }
     
     /// PRODUCTION: Check for double signing using signature database
-    fn check_double_signing(&mut self, node_id: &str, current_signature: &str, round_number: u64, message_hash: &str) -> Result<(), ConsensusError> {
+    async fn check_double_signing(&mut self, node_id: &str, current_signature: &str, round_number: u64, message_hash: &str) -> Result<(), ConsensusError> {
         // PRODUCTION: Real double signing detection
 
         
@@ -531,7 +463,7 @@ impl CommitRevealConsensus {
                     // Same node, check if different message hash with valid signature
                     if existing_commit.commit_hash != message_hash && 
                        existing_commit.signature != current_signature &&
-                       self.verify_signature(node_id, &existing_commit.commit_hash, &existing_commit.signature) {
+                       self.verify_signature(node_id, &existing_commit.commit_hash, &existing_commit.signature).await {
                         
                         // DOUBLE SIGNING DETECTED! - USE EXISTING REPUTATION SYSTEM
                         println!("[CONSENSUS] 🚨 DOUBLE SIGNING DETECTED! Node {} signed different hashes for round {}", 
@@ -778,8 +710,8 @@ impl CommitRevealConsensus {
     }
 
     /// Add commit (alias for process_commit for API compatibility)
-    pub fn add_commit(&mut self, commit: Commit) -> Result<(), ConsensusError> {
-        self.process_commit(commit)
+    pub async fn add_commit(&mut self, commit: Commit) -> Result<(), ConsensusError> {
+        self.process_commit(commit).await
     }
 
     /// Add reveal (alias for submit_reveal for API compatibility)

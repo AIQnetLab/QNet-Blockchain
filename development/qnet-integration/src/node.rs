@@ -2462,7 +2462,7 @@ impl BlockchainNode {
                 };
                 
                 // Submit remote commit to consensus engine
-                match consensus_engine.process_commit(remote_commit) {
+                match consensus_engine.process_commit(remote_commit).await {
                     Ok(_) => {
                         println!("[CONSENSUS] ✅ Remote commit accepted from: {}", node_id);
                     }
@@ -6286,7 +6286,7 @@ impl BlockchainNode {
             println!("[CONSENSUS] 🔍 DEBUG: Commit hash: '{}'", commit.commit_hash);
             
             // Submit OWN commit to consensus engine FIRST
-            match consensus_engine.process_commit(commit.clone()) {
+            match consensus_engine.process_commit(commit.clone()).await {
                 Ok(_) => {
                     println!("[CONSENSUS] ✅ OWN commit processed and stored: {}", our_id);
                     
@@ -6771,20 +6771,17 @@ impl BlockchainNode {
                 }
             }
             
-            // Sign with hybrid signature
-            match hybrid.sign_message(commit_hash.as_bytes()) {
+            // Sign with hybrid signature (BOTH Ed25519 and Dilithium)
+            match hybrid.sign_message(commit_hash.as_bytes()).await {
                 Ok(hybrid_sig) => {
                     println!("[CONSENSUS] ✅ Generated hybrid signature (Ed25519 + Dilithium certificate)");
                     println!("[CONSENSUS]    Certificate: {}", hybrid_sig.certificate.serial_number);
                     println!("[CONSENSUS]    Performance: O(1) with certificate caching");
                     
-                    // Convert to consensus-compatible format
-                    // For backward compatibility, still use dilithium_sig format
-                    use base64::{Engine as _, engine::general_purpose};
-                    format!("dilithium_sig_{}_{}", 
-                        normalized_node_id,
-                        general_purpose::STANDARD.encode(&hybrid_sig.message_signature)
-                    )
+                    // CRITICAL: Send DILITHIUM signature for quantum resistance
+                    // The hybrid_sig contains BOTH Ed25519 and Dilithium signatures
+                    // We send the Dilithium one for consensus verification
+                    hybrid_sig.dilithium_message_signature.clone()
                 }
                 Err(e) => {
                     println!("[CONSENSUS] ⚠️ Failed to generate hybrid signature: {}", e);
@@ -6809,15 +6806,10 @@ impl BlockchainNode {
                 signature.signature
             }
             Err(e) => {
+                // NO FALLBACK - quantum crypto is mandatory for production
                 println!("[CRYPTO] ❌ Quantum crypto signature failed: {:?}", e);
-                // PRODUCTION: Fallback signature in correct format
-                use sha3::{Sha3_256, Digest};
-                let mut hasher = Sha3_256::new();
-                hasher.update(node_id.as_bytes());
-                hasher.update(commit_hash.as_bytes());
-                hasher.update(b"qnet-consensus-fallback");
-                let hash_result = hasher.finalize();
-                format!("dilithium_sig_{}_fallback_{}", node_id, hex::encode(&hash_result[..16]))
+                println!("[CONSENSUS] ❌ Failed to generate quantum signature for consensus");
+                panic!("CRITICAL: Cannot operate without quantum-resistant signatures: {:?}", e);
             }
         }
     }
@@ -6853,15 +6845,10 @@ impl BlockchainNode {
                 Ok(sig_bytes)
             }
             Err(e) => {
-                println!("[CRYPTO] ❌ Quantum crypto microblock signing failed: {:?}, using fallback", e);
-                // Simple fallback for stability
-                let mut fallback_sig = Vec::with_capacity(2420);
-        for i in 0..2420 {
-                    fallback_sig.push(message_hash[i % 32]);
-                }
-                println!("[CRYPTO] ⚠️ Microblock #{} signed with fallback (size: {} bytes)", 
-                        microblock.height, fallback_sig.len());
-                Ok(fallback_sig)
+                // NO FALLBACK - quantum crypto is mandatory for production
+                println!("[CRYPTO] ❌ Quantum crypto microblock signing failed: {:?}", e);
+                println!("[CRYPTO] ❌ Cannot produce block without quantum-resistant signature");
+                Err(format!("Failed to sign microblock with Dilithium: {:?}", e))
             }
         }
     }

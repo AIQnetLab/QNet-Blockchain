@@ -6899,26 +6899,18 @@ impl SimplifiedP2P {
                         }
                     }
                     Err(e) => {
-                        println!("[AUDIT] ⚠️ Failed to generate Dilithium signature: {}", e);
-                        // Fallback to SHA512 (not SHA3)
-                        use sha2::{Sha512, Digest};
-                        let mut hasher = Sha512::new();
-                        hasher.update(entry_hash.as_bytes());
-                        hasher.update(self.node_id.as_bytes());
-                        hasher.update(b"QNET_AUDIT_FALLBACK");
-                        hex::encode(&hasher.finalize()[..32])
+                        println!("[AUDIT] ❌ Failed to generate Dilithium signature: {}", e);
+                        println!("[AUDIT] ⚠️ Audit entry unsigned - quantum-resistant signatures required!");
+                        // NO SHA512 FALLBACK - must be quantum-resistant or nothing
+                        String::from("UNSIGNED_NO_QUANTUM_SIG")
                     }
                 }
             }
             Err(_) => {
-                println!("[AUDIT] ⚠️ No async runtime for audit signature");
-                // Fallback to SHA512 (not SHA3)
-                use sha2::{Sha512, Digest};
-                let mut hasher = Sha512::new();
-                hasher.update(entry_hash.as_bytes());
-                hasher.update(self.node_id.as_bytes());
-                hasher.update(b"QNET_AUDIT_FALLBACK");
-                hex::encode(&hasher.finalize()[..32])
+                println!("[AUDIT] ❌ No async runtime for quantum signature generation");
+                println!("[AUDIT] ⚠️ Cannot create audit signature without quantum resistance");
+                // NO SHA512 FALLBACK - production requires quantum-resistant signatures
+                String::from("NO_RUNTIME_FOR_QUANTUM_SIG")
             }
         }
     }
@@ -7689,23 +7681,35 @@ impl SimplifiedP2P {
                             println!("[P2P] ✅ Generated Dilithium signature for reputation sync");
                             // Extract base64 part from "dilithium_sig_<node>_<base64>"
                             if let Some(b64_part) = sig.signature.rfind('_').map(|i| &sig.signature[i+1..]) {
-                                general_purpose::STANDARD.decode(b64_part).unwrap_or_else(|_| vec![0u8; 64])
+                                general_purpose::STANDARD.decode(b64_part).unwrap_or_else(|e| {
+                                    println!("[P2P] ❌ Failed to decode signature: {}", e);
+                                    return Vec::new(); // Return early with empty signature
+                                })
                             } else {
-                                vec![0u8; 64]
+                                println!("[P2P] ❌ Invalid signature format - cannot broadcast without valid signature");
+                                Vec::new() // Return empty vector if format is wrong
                             }
                         }
                         Err(e) => {
-                            println!("[P2P] ⚠️ Failed to generate Dilithium signature: {}", e);
-                            vec![0u8; 64] // Fallback
+                            println!("[P2P] ❌ Failed to generate Dilithium signature: {} - cannot broadcast", e);
+                            // NO FALLBACK - return empty vector, broadcast will be skipped
+                            Vec::new()
                         }
                     }
                 }
                 Err(_) => {
-                    println!("[P2P] ⚠️ No async runtime for signature generation");
-                    vec![0u8; 64] // Fallback
+                    println!("[P2P] ❌ No async runtime for signature generation - cannot broadcast");
+                    // NO FALLBACK - return empty vector, broadcast will be skipped
+                    Vec::new()
                 }
             }
         };
+        
+        // Check if signature is valid before sending
+        if signature.is_empty() {
+            println!("[P2P] ⚠️ Cannot broadcast reputation sync without valid signature - skipping");
+            return Err("Cannot broadcast without valid quantum-resistant signature".to_string());
+        }
         
         let sync_msg = NetworkMessage::ReputationSync {
             node_id: self.node_id.clone(),

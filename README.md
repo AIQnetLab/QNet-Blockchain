@@ -33,7 +33,7 @@ QNet is a high-performance, post-quantum secure blockchain network with a **two-
 - **Chain Reorganization (Chain Reorg)**: Byzantine-safe fork resolution with 2/3 majority consensus
 - **Advanced Block Synchronization**: Out-of-order block buffering with active missing block requests
 - **DDoS-Protected P2P**: Rate limiting and concurrent request management for network stability
-- **Deterministic Genesis**: SHA3-256 based Genesis block signature for network consistency
+- **Quantum-Resistant Genesis**: CRYSTALS-Dilithium3 Genesis block with encapsulated keys
 - **Parallel Block Processing**: High-performance consecutive block processing (up to 10 blocks)
 - **Reputation-Based Chain Weight**: Byzantine weight calculation using validator reputation scores
 
@@ -49,7 +49,7 @@ QNet is a high-performance, post-quantum secure blockchain network with a **two-
   - Clock drift: 5-7% (excellent for production)
   - 72 bytes overhead per block (poh_hash: 64B + poh_count: 8B) = ~2-3%
   - Hardware: Intel Xeon E5-2680v4 @ 2.4GHz
-- **VRF Producer Selection**: Ed25519-based Verifiable Random Function for unpredictable, Byzantine-safe leader election
+- **Quantum-Resistant Producer Selection**: Deterministic entropy-based selection with Byzantine safety (VRF with quantum-resistant hybrid crypto available)
 - **Hybrid Sealevel Execution**: 5-stage pipeline with 10,000 parallel transactions
 - **Tower BFT Adaptive Timeouts**: Dynamic 20s/10s/7s timeouts based on network conditions
 - **Pre-Execution Cache**: Speculative execution with 10,000 transaction cache
@@ -102,7 +102,7 @@ QNet is a high-performance, post-quantum secure blockchain network with a **two-
 
 **QNet production testnet is ready for deployment with advanced consensus and synchronization.**
 
-- ✅ **Post-Quantum Cryptography**: CRYSTALS-Dilithium integration complete
+- ✅ **Post-Quantum Cryptography**: CRYSTALS-Dilithium3 with NIST/Cisco encapsulated keys
 - ✅ **Entropy-Based Consensus**: True decentralization with unpredictable producer rotation
 - ✅ **Reputation System**: Economic incentives for network participation
 - ✅ **State Snapshots**: Full & incremental snapshots with LZ4 compression
@@ -125,7 +125,7 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 
 ### 🎯 Key Features
 
-- **🔐 Post-Quantum Security**: Quantum-resistant cryptographic algorithms
+- **🔐 Post-Quantum Security**: NIST/Cisco encapsulated keys with Dilithium3 + ephemeral Ed25519
 - **⚡ Ultra-High Performance**: 424,411 TPS with zero-downtime consensus
 - **🎲 True Decentralization**: Entropy-based producer selection with unpredictable rotation
 - **💰 Reputation Economics**: Rewards for block production (+1 micro, +10/+5 macro)
@@ -293,7 +293,7 @@ QNet implements advanced chain reorganization and synchronization mechanisms for
 - **Automatic Retry**: Re-queues buffered blocks when dependencies arrive
 - **Memory Management**: Automatic cleanup of blocks older than 60 seconds
 - **Genesis Coordination**: Only node_001 creates Genesis block in bootstrap mode
-- **Deterministic Genesis**: SHA3-256 based signature ensures identical Genesis across all nodes
+- **Quantum-Resistant Genesis**: CRYSTALS-Dilithium signature ensures identical Genesis across all nodes
 
 ### **Proof of History (PoH) Integration**
 - **Cryptographic Clock**: 31.25M hashes/sec SHA3-512 + Blake3 alternating

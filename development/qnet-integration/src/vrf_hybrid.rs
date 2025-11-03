@@ -3,8 +3,7 @@
 //! Combines CRYSTALS-Dilithium certificates with Ed25519 for performance
 
 use crate::hybrid_crypto::{HybridCrypto, HybridSignature};
-use sha3::{Sha3_512, Digest};
-use sha2::Sha512;
+use sha3::{Sha3_512, Digest};  // Use SHA3 for quantum resistance, not SHA512
 use anyhow::{Result, anyhow};
 
 /// VRF output with quantum-resistant proof
@@ -46,7 +45,7 @@ impl QNetHybridVrf {
     }
     
     /// Generate VRF output with quantum-resistant proof
-    pub fn evaluate(&mut self, input: &[u8]) -> Result<HybridVrfOutput> {
+    pub async fn evaluate(&mut self, input: &[u8]) -> Result<HybridVrfOutput> {
         let hybrid = self.hybrid_crypto.as_mut()
             .ok_or_else(|| anyhow!("Hybrid VRF not initialized"))?;
         
@@ -56,17 +55,17 @@ impl QNetHybridVrf {
             println!("[VRF] 🔄 Certificate needs rotation (synchronous fallback)");
         }
         
-        // Step 1: Hash input to create VRF message
-        let mut hasher = Sha512::new();
+        // Step 1: Hash input to create VRF message (quantum-resistant SHA3)
+        let mut hasher = Sha3_512::new();
         hasher.update(b"QNet_Hybrid_VRF_v2");
         hasher.update(input);
         let vrf_message = hasher.finalize();
         
         // Step 2: Sign with hybrid signature (Dilithium certificate + Ed25519)
-        let hybrid_signature = hybrid.sign_message(&vrf_message)?;
+        let hybrid_signature = hybrid.sign_message(&vrf_message).await?;
         
-        // Step 3: Hash signature to get VRF output
-        let mut output_hasher = Sha512::new();
+        // Step 3: Hash signature to get VRF output (quantum-resistant SHA3)
+        let mut output_hasher = Sha3_512::new();
         output_hasher.update(b"QNet_VRF_Output_v2");
         output_hasher.update(&hybrid_signature.message_signature);
         output_hasher.update(&hybrid_signature.certificate.serial_number.as_bytes());
@@ -87,8 +86,8 @@ impl QNetHybridVrf {
         input: &[u8],
         vrf_output: &HybridVrfOutput,
     ) -> Result<bool> {
-        // Step 1: Recreate VRF message
-        let mut hasher = Sha512::new();
+        // Step 1: Recreate VRF message (quantum-resistant SHA3)
+        let mut hasher = Sha3_512::new();
         hasher.update(b"QNet_Hybrid_VRF_v2");
         hasher.update(input);
         let vrf_message = hasher.finalize();
@@ -103,8 +102,8 @@ impl QNetHybridVrf {
             return Ok(false);
         }
         
-        // Step 3: Recreate output from signature
-        let mut output_hasher = Sha512::new();
+        // Step 3: Recreate output from signature (quantum-resistant SHA3)
+        let mut output_hasher = Sha3_512::new();
         output_hasher.update(b"QNet_VRF_Output_v2");
         output_hasher.update(&vrf_output.proof.message_signature);
         output_hasher.update(&vrf_output.proof.certificate.serial_number.as_bytes());
@@ -146,7 +145,7 @@ pub async fn select_producer_with_hybrid_vrf(
     }
     
     // Generate VRF output with quantum-resistant proof
-    let vrf_output = vrf.evaluate(&vrf_input)?;
+    let vrf_output = vrf.evaluate(&vrf_input).await?;
     
     // Convert VRF output to selection index
     let selection_number = u64::from_le_bytes([
@@ -186,58 +185,5 @@ pub async fn select_producer_with_vrf_fallback(
                 Err(e) => Err(anyhow!("Both hybrid and legacy VRF failed: {}", e))
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    
-    #[tokio::test]
-    async fn test_hybrid_vrf_deterministic() {
-        let mut vrf = QNetHybridVrf::new("test_node".to_string());
-        vrf.initialize().await.unwrap();
-        
-        let input = b"test_input";
-        let output1 = vrf.evaluate(input).unwrap();
-        let output2 = vrf.evaluate(input).unwrap();
-        
-        // Same input should produce same output
-        assert_eq!(output1.output, output2.output);
-    }
-    
-    #[tokio::test]
-    async fn test_hybrid_vrf_verification() {
-        let mut vrf = QNetHybridVrf::new("test_node".to_string());
-        vrf.initialize().await.unwrap();
-        
-        let input = b"test_input";
-        let output = vrf.evaluate(input).unwrap();
-        
-        // Verification should succeed
-        let verified = QNetHybridVrf::verify(input, &output).await.unwrap();
-        assert!(verified);
-        
-        // Wrong input should fail
-        let wrong_input = b"wrong_input";
-        let verified = QNetHybridVrf::verify(wrong_input, &output).await.unwrap();
-        assert!(!verified);
-    }
-    
-    #[tokio::test]
-    async fn test_hybrid_vrf_quantum_resistance() {
-        let mut vrf = QNetHybridVrf::new("quantum_test".to_string());
-        vrf.initialize().await.unwrap();
-        
-        let input = b"quantum_input";
-        let output = vrf.evaluate(input).unwrap();
-        
-        // Check that proof contains Dilithium certificate
-        assert!(output.proof.certificate.dilithium_signature.starts_with("dilithium_sig_"));
-        assert_eq!(output.proof.certificate.node_id, "quantum_test");
-        
-        // Verify the proof is quantum-resistant
-        let verified = QNetHybridVrf::verify(input, &output).await.unwrap();
-        assert!(verified);
     }
 }

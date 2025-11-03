@@ -29,6 +29,7 @@ pub mod reward_sharding;
 pub mod p2p_extensions;
 pub mod vrf;
 pub mod vrf_hybrid;
+pub mod key_manager;
 
 use std::sync::Arc;
 use tokio::sync::RwLock;
