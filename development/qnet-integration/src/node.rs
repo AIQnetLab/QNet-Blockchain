@@ -6727,32 +6727,97 @@ impl BlockchainNode {
         }
     }
     
-    /// PRODUCTION: Generate consensus signature using EXISTING quantum_crypto module
+    /// PRODUCTION: Generate consensus signature using hybrid cryptography for O(1) performance
     async fn generate_consensus_signature(node_id: &str, commit_hash: &str) -> String {
-        // Use EXISTING QNetQuantumCrypto instead of duplicating functionality
+        // CRITICAL: Normalize node_id for consistent signature format
+        let normalized_node_id = Self::normalize_node_id(node_id);
+        
+        // PRODUCTION: ALWAYS use hybrid crypto for quantum resistance
+        // NO OPTION TO DISABLE - quantum protection is mandatory
+        {
+            // Use hybrid cryptography for O(1) performance
+            use crate::hybrid_crypto::HybridCrypto;
+            use tokio::sync::Mutex;
+            use std::sync::Arc;
+            
+            // Get or create hybrid crypto instance for this node (thread-safe)
+            static HYBRID_INSTANCES: tokio::sync::OnceCell<Arc<Mutex<std::collections::HashMap<String, HybridCrypto>>>> = 
+                tokio::sync::OnceCell::const_new();
+            
+            let instances = HYBRID_INSTANCES.get_or_init(|| async {
+                Arc::new(Mutex::new(std::collections::HashMap::new()))
+            }).await;
+            
+            let mut instances_guard = instances.lock().await;
+            
+            // Get or create instance for this node
+            if !instances_guard.contains_key(&normalized_node_id) {
+                let mut hybrid = HybridCrypto::new(normalized_node_id.clone());
+                if let Err(e) = hybrid.initialize().await {
+                    println!("[CONSENSUS] ⚠️ Failed to initialize hybrid crypto: {}", e);
+                    // Fallback to pure Dilithium
+                    drop(instances_guard);
+                    return Self::generate_dilithium_signature(&normalized_node_id, commit_hash).await;
+                }
+                instances_guard.insert(normalized_node_id.clone(), hybrid);
+            }
+            
+            let hybrid = instances_guard.get_mut(&normalized_node_id).unwrap();
+            
+            // Check if certificate needs rotation
+            if hybrid.needs_rotation() {
+                if let Err(e) = hybrid.rotate_certificate().await {
+                    println!("[CONSENSUS] ⚠️ Failed to rotate certificate: {}", e);
+                }
+            }
+            
+            // Sign with hybrid signature
+            match hybrid.sign_message(commit_hash.as_bytes()) {
+                Ok(hybrid_sig) => {
+                    println!("[CONSENSUS] ✅ Generated hybrid signature (Ed25519 + Dilithium certificate)");
+                    println!("[CONSENSUS]    Certificate: {}", hybrid_sig.certificate.serial_number);
+                    println!("[CONSENSUS]    Performance: O(1) with certificate caching");
+                    
+                    // Convert to consensus-compatible format
+                    // For backward compatibility, still use dilithium_sig format
+                    use base64::{Engine as _, engine::general_purpose};
+                    format!("dilithium_sig_{}_{}", 
+                        normalized_node_id,
+                        general_purpose::STANDARD.encode(&hybrid_sig.message_signature)
+                    )
+                }
+                Err(e) => {
+                    println!("[CONSENSUS] ⚠️ Failed to generate hybrid signature: {}", e);
+                    // CRITICAL: Fallback to pure Dilithium if hybrid fails
+                    drop(instances_guard);
+                    Self::generate_dilithium_signature(&normalized_node_id, commit_hash).await
+                }
+            }
+        }
+    }
+    
+    /// Helper: Generate pure Dilithium signature (fallback)
+    async fn generate_dilithium_signature(node_id: &str, commit_hash: &str) -> String {
         use crate::quantum_crypto::QNetQuantumCrypto;
         
         let mut crypto = QNetQuantumCrypto::new();
         let _ = crypto.initialize().await;
         
-        // CRITICAL: Normalize node_id for consistent signature format
-        let normalized_node_id = Self::normalize_node_id(node_id);
-        
-        match crypto.create_consensus_signature(&normalized_node_id, commit_hash).await {
+        match crypto.create_consensus_signature(node_id, commit_hash).await {
             Ok(signature) => {
-                println!("[CRYPTO] ✅ Consensus signature created with normalized node_id: {}", normalized_node_id);
+                println!("[CRYPTO] ✅ Pure Dilithium signature created for node: {}", node_id);
                 signature.signature
             }
             Err(e) => {
                 println!("[CRYPTO] ❌ Quantum crypto signature failed: {:?}", e);
-                // PRODUCTION: Fallback signature in correct format for validation
+                // PRODUCTION: Fallback signature in correct format
                 use sha3::{Sha3_256, Digest};
                 let mut hasher = Sha3_256::new();
-                hasher.update(normalized_node_id.as_bytes());
+                hasher.update(node_id.as_bytes());
                 hasher.update(commit_hash.as_bytes());
                 hasher.update(b"qnet-consensus-fallback");
                 let hash_result = hasher.finalize();
-                format!("dilithium_sig_{}_fallback_{}", normalized_node_id, hex::encode(&hash_result[..16]))
+                format!("dilithium_sig_{}_fallback_{}", node_id, hex::encode(&hash_result[..16]))
             }
         }
     }

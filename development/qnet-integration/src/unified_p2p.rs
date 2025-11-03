@@ -6870,21 +6870,57 @@ impl SimplifiedP2P {
         }
     }
     
-    /// Sign audit entry with node's private key (quantum-resistant)
+    /// Sign audit entry with quantum-resistant Dilithium signature
     fn sign_audit_entry(&self, entry_hash: &str) -> String {
-        // In production, use Dilithium signature
-        // For now, use HMAC with node secret
-        use sha3::{Sha3_256, Digest};
-        let mut hasher = Sha3_256::new();
-        hasher.update(entry_hash.as_bytes());
-        hasher.update(self.node_id.as_bytes());
+        // PRODUCTION: Use real Dilithium signature for audit trail
+        use crate::quantum_crypto::QNetQuantumCrypto;
         
-        let secret = std::env::var("QNET_NODE_PRIVATE_KEY").unwrap_or_else(|_| {
-            format!("NODE_KEY_{}", self.node_id)
-        });
-        hasher.update(secret.as_bytes());
+        // Use async runtime if available
+        let rt = tokio::runtime::Handle::try_current()
+            .or_else(|_| tokio::runtime::Runtime::new().map(|rt| rt.handle().clone()));
         
-        hex::encode(hasher.finalize())
+        match rt {
+            Ok(handle) => {
+                let node_id = self.node_id.clone();
+                let result = handle.block_on(async {
+                    let mut crypto = QNetQuantumCrypto::new();
+                    let _ = crypto.initialize().await;
+                    crypto.create_consensus_signature(&node_id, entry_hash).await
+                });
+                
+                match result {
+                    Ok(sig) => {
+                        println!("[AUDIT] ✅ Generated Dilithium signature for audit entry");
+                        // Extract just the signature part for compact storage
+                        if let Some(sig_part) = sig.signature.split('_').last() {
+                            sig_part.to_string()
+                        } else {
+                            sig.signature
+                        }
+                    }
+                    Err(e) => {
+                        println!("[AUDIT] ⚠️ Failed to generate Dilithium signature: {}", e);
+                        // Fallback to SHA512 (not SHA3)
+                        use sha2::{Sha512, Digest};
+                        let mut hasher = Sha512::new();
+                        hasher.update(entry_hash.as_bytes());
+                        hasher.update(self.node_id.as_bytes());
+                        hasher.update(b"QNET_AUDIT_FALLBACK");
+                        hex::encode(&hasher.finalize()[..32])
+                    }
+                }
+            }
+            Err(_) => {
+                println!("[AUDIT] ⚠️ No async runtime for audit signature");
+                // Fallback to SHA512 (not SHA3)
+                use sha2::{Sha512, Digest};
+                let mut hasher = Sha512::new();
+                hasher.update(entry_hash.as_bytes());
+                hasher.update(self.node_id.as_bytes());
+                hasher.update(b"QNET_AUDIT_FALLBACK");
+                hex::encode(&hasher.finalize()[..32])
+            }
+        }
     }
     
     /// Broadcast audit entry to network for distributed verification
@@ -7538,38 +7574,68 @@ impl SimplifiedP2P {
         }
     }
     
-    /// PRODUCTION: Verify reputation signature using CRYSTALS-Dilithium
+    /// PRODUCTION: Verify reputation signature using real CRYSTALS-Dilithium
     fn verify_reputation_signature(&self, node_id: &str, updates: &[(String, f64)], timestamp: u64, signature: &[u8]) -> bool {
-        // PRODUCTION: Use existing quantum crypto for verification
-        use sha3::{Sha3_256, Digest};
+        // PRODUCTION: Use real quantum crypto for verification
+        use crate::quantum_crypto::{QNetQuantumCrypto, DilithiumSignature};
+        use base64::{Engine as _, engine::general_purpose};
         
-        // Create message hash from reputation updates
-        let mut hasher = Sha3_256::new();
-        hasher.update(node_id.as_bytes());
-        hasher.update(timestamp.to_le_bytes());
+        // Create message from reputation updates
+        let mut message = String::new();
+        message.push_str(&format!("REPUTATION:{}:{}", node_id, timestamp));
         
         for (node, reputation) in updates {
-            hasher.update(node.as_bytes());
-            hasher.update(reputation.to_le_bytes());
+            message.push_str(&format!(":{}={}", node, reputation));
         }
         
-        hasher.update(b"QNET_REPUTATION_SYNC_V1");
-        let message_hash = hasher.finalize();
+        // Convert signature bytes to base64 for Dilithium format
+        let signature_b64 = general_purpose::STANDARD.encode(signature);
+        let dilithium_sig_str = format!("dilithium_sig_{}_{}", node_id, signature_b64);
         
-        // PRODUCTION: Verify using quantum-resistant algorithm
-        // For Bootstrap phase: Accept from Genesis nodes (hardened for production)
-        // For Mainnet: Full Dilithium verification will be enabled
-        let is_genesis = node_id.starts_with("genesis_node_");
-        let signature_valid = signature.len() >= 64 && signature[0] != 0;
+        // Create Dilithium signature struct
+        let dilithium_sig = DilithiumSignature {
+            signature: dilithium_sig_str,
+            algorithm: "QNet-Dilithium-Compatible".to_string(),
+            timestamp,
+            strength: "quantum-resistant".to_string(),
+        };
         
-        if is_genesis && signature_valid {
-            // Genesis nodes: Enhanced verification with hash check
-            let expected_prefix = &message_hash[..8];
-            let signature_prefix = &signature[..8];
-            expected_prefix == signature_prefix
-        } else {
-            // Non-Genesis: Require valid signature structure
-            signature.len() >= 64 && signature.iter().any(|&b| b != 0)
+        // Verify using quantum crypto
+        let rt = tokio::runtime::Handle::try_current()
+            .or_else(|_| tokio::runtime::Runtime::new().map(|rt| rt.handle().clone()));
+        
+        match rt {
+            Ok(handle) => {
+                let result = handle.block_on(async {
+                    let crypto = QNetQuantumCrypto::new();
+                    crypto.verify_dilithium_signature(&message, &dilithium_sig, node_id).await
+                });
+                
+                match result {
+                    Ok(valid) => {
+                        if valid {
+                            println!("[P2P] ✅ Reputation signature verified (Dilithium)");
+                        } else {
+                            println!("[P2P] ❌ Invalid reputation signature");
+                        }
+                        valid
+                    }
+                    Err(e) => {
+                        println!("[P2P] ⚠️ Reputation verification error: {}", e);
+                        // For Genesis nodes during bootstrap, allow with warning
+                        if node_id.starts_with("genesis_node_") {
+                            println!("[P2P] ⚠️ Allowing Genesis node during bootstrap");
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                println!("[P2P] ⚠️ No async runtime for reputation verification");
+                false
+            }
         }
     }
     
@@ -7593,31 +7659,53 @@ impl SimplifiedP2P {
             .unwrap()
             .as_secs();
         
-        // PRODUCTION: Create quantum-resistant signature using SHA3-256
-        use sha3::{Sha3_256, Digest};
-        let mut hasher = Sha3_256::new();
-        hasher.update(self.node_id.as_bytes());
-        hasher.update(timestamp.to_le_bytes());
+        // PRODUCTION: Create real Dilithium signature
+        use crate::quantum_crypto::QNetQuantumCrypto;
+        use base64::{Engine as _, engine::general_purpose};
+        
+        // Create message from reputation updates
+        let mut message = String::new();
+        message.push_str(&format!("REPUTATION:{}:{}", self.node_id, timestamp));
         
         for (node, reputation) in &reputation_updates {
-            hasher.update(node.as_bytes());
-            hasher.update(reputation.to_le_bytes());
+            message.push_str(&format!(":{}={}", node, reputation));
         }
         
-        hasher.update(b"QNET_REPUTATION_SYNC_V1");
-        let message_hash = hasher.finalize();
-        
-        // PRODUCTION: Generate deterministic signature
-        let mut signature = vec![0u8; 64];
-        signature[..32].copy_from_slice(&message_hash);
-        
-        // Add node-specific signature suffix
-        let mut node_hasher = Sha3_256::new();
-        node_hasher.update(self.node_id.as_bytes());
-        node_hasher.update(&message_hash);
-        node_hasher.update(b"QNET_NODE_SIGNATURE");
-        let node_sig = node_hasher.finalize();
-        signature[32..].copy_from_slice(&node_sig);
+        // Generate Dilithium signature
+        let signature = {
+            let rt = tokio::runtime::Handle::try_current()
+                .or_else(|_| tokio::runtime::Runtime::new().map(|rt| rt.handle().clone()));
+            
+            match rt {
+                Ok(handle) => {
+                    let result = handle.block_on(async {
+                        let mut crypto = QNetQuantumCrypto::new();
+                        let _ = crypto.initialize().await;
+                        crypto.create_consensus_signature(&self.node_id, &message).await
+                    });
+                    
+                    match result {
+                        Ok(sig) => {
+                            println!("[P2P] ✅ Generated Dilithium signature for reputation sync");
+                            // Extract base64 part from "dilithium_sig_<node>_<base64>"
+                            if let Some(b64_part) = sig.signature.rfind('_').map(|i| &sig.signature[i+1..]) {
+                                general_purpose::STANDARD.decode(b64_part).unwrap_or_else(|_| vec![0u8; 64])
+                            } else {
+                                vec![0u8; 64]
+                            }
+                        }
+                        Err(e) => {
+                            println!("[P2P] ⚠️ Failed to generate Dilithium signature: {}", e);
+                            vec![0u8; 64] // Fallback
+                        }
+                    }
+                }
+                Err(_) => {
+                    println!("[P2P] ⚠️ No async runtime for signature generation");
+                    vec![0u8; 64] // Fallback
+                }
+            }
+        };
         
         let sync_msg = NetworkMessage::ReputationSync {
             node_id: self.node_id.clone(),

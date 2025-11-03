@@ -10,6 +10,10 @@ members = [
 ]
 resolver = "2"
 
+# Default features for production builds
+[workspace.metadata]
+default-features = ["production"]
+
 [workspace.dependencies]
 # Core blockchain dependencies - production ready versions
 tokio = { version = "1.35", features = ["full"] }

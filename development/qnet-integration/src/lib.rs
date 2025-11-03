@@ -17,6 +17,7 @@ pub mod genesis;
 pub mod blockchain;
 pub mod activation_validation;
 pub mod quantum_crypto;
+pub mod hybrid_crypto;
 pub mod quantum_poh;
 pub mod hybrid_sealevel;
 pub mod tower_bft;
@@ -27,6 +28,7 @@ pub mod genesis_constants;
 pub mod reward_sharding;
 pub mod p2p_extensions;
 pub mod vrf;
+pub mod vrf_hybrid;
 
 use std::sync::Arc;
 use tokio::sync::RwLock;

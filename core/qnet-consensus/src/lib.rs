@@ -12,6 +12,7 @@ pub mod lazy_rewards;
 pub mod reward_integration;
 pub mod batch_operations;
 pub mod commit_reveal;
+pub mod consensus_crypto;
 pub mod dynamic_timing;
 pub mod errors;
 pub mod reputation;

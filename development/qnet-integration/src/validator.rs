@@ -1,7 +1,6 @@
 //! Block and transaction validation for QNet blockchain
 
 use std::sync::Arc;
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use crate::errors::{IntegrationError, IntegrationResult};
 use crate::storage::PersistentStorage;
 use qnet_state::{Block, Transaction, TransactionType};
@@ -104,33 +103,107 @@ impl BlockValidator {
         }
     }
     
-    /// Verify ed25519 signature for testnet
+    /// Verify signature using quantum-resistant cryptography ONLY
     fn verify_ed25519_signature(&self, tx: &Transaction, signature_hex: &str) -> IntegrationResult<bool> {
-        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-        use hex;
-        
-        // Convert signature bytes to ed25519 signature
-        let signature_bytes = hex::decode(signature_hex)
-            .map_err(|_| IntegrationError::ValidationError("Invalid signature hex".to_string()))?;
-        
-        if signature_bytes.len() != 64 {
-            return Err(IntegrationError::ValidationError("Invalid signature length".to_string()));
-        }
-        
-        let signature = Signature::from_bytes(&signature_bytes.try_into().unwrap());
-        
-        // Create message to verify (transaction hash)
-        let message = self.create_signing_message(tx)?;
-        
-        // Extract public key from transaction sender address
-        let public_key = self.extract_public_key_from_address(&tx.from)?;
-        
-        // Verify signature
-        match public_key.verify(&message, &signature) {
-            Ok(_) => Ok(true),
-            Err(_) => Ok(false),
+        // PRODUCTION: Only accept quantum-resistant signatures
+        if signature_hex.starts_with("hybrid:") {
+            // Hybrid signature (Dilithium + Ed25519)
+            self.verify_hybrid_signature(tx, signature_hex)
+        } else if signature_hex.starts_with("dilithium_sig_") {
+            // Pure Dilithium signature
+            self.verify_dilithium_signature(tx, signature_hex)
+        } else {
+            // REJECT legacy Ed25519 - NOT quantum-resistant
+            println!("[VALIDATOR] ❌ REJECTED: Legacy Ed25519 signature detected - not quantum-resistant!");
+            println!("[VALIDATOR] ⚠️  Transaction from {} rejected for security", tx.from);
+            Err(IntegrationError::ValidationError(
+                "Legacy Ed25519 signatures are not accepted. Please use quantum-resistant signatures.".to_string()
+            ))
         }
     }
+    
+    /// Verify hybrid signature (O(1) performance with caching)
+    fn verify_hybrid_signature(&self, tx: &Transaction, signature_hex: &str) -> IntegrationResult<bool> {
+        use crate::hybrid_crypto::{HybridSignature, HybridCrypto};
+        use serde_json;
+        
+        // Parse hybrid signature JSON
+        let signature_json = &signature_hex[7..]; // Skip "hybrid:" prefix
+        let hybrid_sig: HybridSignature = serde_json::from_str(signature_json)
+            .map_err(|e| IntegrationError::ValidationError(format!("Invalid hybrid signature: {}", e)))?;
+        
+        // Create message to verify
+        let message = self.create_signing_message(tx)?;
+        
+        // Verify using hybrid crypto (with certificate caching)
+        let rt = tokio::runtime::Handle::try_current()
+            .or_else(|_| tokio::runtime::Runtime::new().map(|rt| rt.handle().clone()))
+            .map_err(|e| IntegrationError::ValidationError(format!("Runtime error: {}", e)))?;
+        
+        let result = rt.block_on(async {
+            HybridCrypto::verify_signature(&message, &hybrid_sig).await
+        });
+        
+        match result {
+            Ok(valid) => {
+                if valid {
+                    println!("[VALIDATOR] ✅ Hybrid signature verified (O(1) with caching)");
+                } else {
+                    println!("[VALIDATOR] ❌ Invalid hybrid signature");
+                }
+                Ok(valid)
+            }
+            Err(e) => {
+                println!("[VALIDATOR] ⚠️ Hybrid verification error: {}", e);
+                Ok(false)
+            }
+        }
+    }
+    
+    /// Verify pure Dilithium signature
+    fn verify_dilithium_signature(&self, tx: &Transaction, signature_hex: &str) -> IntegrationResult<bool> {
+        use crate::quantum_crypto::{QNetQuantumCrypto, DilithiumSignature};
+        
+        // Create message to verify
+        let message = self.create_signing_message(tx)?;
+        let message_str = hex::encode(&message);
+        
+        // Create Dilithium signature struct
+        let dilithium_sig = DilithiumSignature {
+            signature: signature_hex.to_string(),
+            algorithm: "QNet-Dilithium-Compatible".to_string(),
+            timestamp: tx.timestamp,
+            strength: "quantum-resistant".to_string(),
+        };
+        
+        // Verify using quantum_crypto
+        let rt = tokio::runtime::Handle::try_current()
+            .or_else(|_| tokio::runtime::Runtime::new().map(|rt| rt.handle().clone()))
+            .map_err(|e| IntegrationError::ValidationError(format!("Runtime error: {}", e)))?;
+        
+        let result = rt.block_on(async {
+            let crypto = QNetQuantumCrypto::new();
+            crypto.verify_dilithium_signature(&message_str, &dilithium_sig, &tx.from).await
+        });
+        
+        match result {
+            Ok(valid) => {
+                if valid {
+                    println!("[VALIDATOR] ✅ Dilithium signature verified");
+                } else {
+                    println!("[VALIDATOR] ❌ Invalid Dilithium signature");
+                }
+                Ok(valid)
+            }
+            Err(e) => {
+                println!("[VALIDATOR] ⚠️ Dilithium verification error: {}", e);
+                Ok(false)
+            }
+        }
+    }
+    
+    // REMOVED: Legacy Ed25519 signature verification
+    // All transactions MUST use quantum-resistant signatures
     
     /// Create signing message from transaction
     fn create_signing_message(&self, tx: &Transaction) -> IntegrationResult<Vec<u8>> {
@@ -171,25 +244,8 @@ impl BlockValidator {
         Ok(hash.to_vec())
     }
     
-    /// Extract public key from address (for testnet)
-    fn extract_public_key_from_address(&self, address: &str) -> IntegrationResult<VerifyingKey> {
-        // For testnet, addresses are derived from public keys
-        // In real implementation, this would query the blockchain state
-        
-        // Try to parse address as hex-encoded public key
-        if let Ok(pub_key_bytes) = hex::decode(address) {
-            if pub_key_bytes.len() == 32 {
-                return VerifyingKey::from_bytes(&pub_key_bytes.try_into().unwrap())
-                    .map_err(|_| IntegrationError::ValidationError("Invalid public key in address".to_string()));
-            }
-        }
-        
-        // For testnet compatibility, create a dummy public key if address format is different
-        // This allows testnet to work with different address formats
-        let dummy_key = [0u8; 32];
-        VerifyingKey::from_bytes(&dummy_key)
-            .map_err(|_| IntegrationError::ValidationError("Could not extract public key from address".to_string()))
-    }
+    // REMOVED: extract_public_key_from_address - no longer needed
+    // All signatures must be quantum-resistant (Dilithium or hybrid)
     
     /// Validate transaction type with enhanced checks
     fn validate_transaction_type(&self, tx_type: &TransactionType) -> IntegrationResult<()> {

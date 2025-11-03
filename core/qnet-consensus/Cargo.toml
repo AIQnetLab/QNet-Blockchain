@@ -31,6 +31,10 @@ sha3 = "0.10.8"
 hex = "0.4.3"
 base64 = "0.22"
 
+# CRYSTALS-Dilithium for quantum-resistant signatures
+pqcrypto-dilithium = { version = "0.5", optional = true }
+pqcrypto-traits = { version = "0.3", optional = true }
+
 # Random number generation
 rand = "0.8.5"
 
@@ -64,8 +68,10 @@ criterion = "0.5"
 proptest = "1.4"
 
 [features]
-default = []
+default = ["production"]  # PRODUCTION: Enable quantum-resistant crypto by default
 python = ["pyo3", "pyo3-asyncio"]
+real-dilithium = ["pqcrypto-dilithium", "pqcrypto-traits"]
+production = ["real-dilithium"]
 
 [[bench]]
 name = "consensus_bench"
