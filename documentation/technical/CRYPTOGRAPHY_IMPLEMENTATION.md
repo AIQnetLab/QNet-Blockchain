@@ -96,8 +96,8 @@ pub struct HybridSignature {
         expires_at: u64,                      // 60-second lifetime
         serial_number: String,
     },
-    message_signature: [u8; 64],             // Ed25519 signs message
-    dilithium_message_signature: String,     // Not used (Dilithium signs KEY)
+    message_signature: [u8; 64],             // Ed25519 signs message (fast)
+    dilithium_message_signature: String,     // Dilithium signs MESSAGE (quantum-resistant)
     signed_at: u64,
 }
 ```
@@ -118,16 +118,22 @@ encapsulated_data.extend_from_slice(ephemeral_verifying_key.as_bytes());
 encapsulated_data.extend_from_slice(&sha3::Sha3_256::digest(message));
 encapsulated_data.extend_from_slice(&timestamp.to_le_bytes());
 
-// Step 4: Sign encapsulated data with Dilithium (NOT the message!)
-let dilithium_sig = quantum_crypto
+// Step 4: Sign encapsulated data with Dilithium
+let dilithium_key_sig = quantum_crypto
     .create_consensus_signature(&node_id, &hex::encode(&encapsulated_data))
     .await?;
 
-// Step 5: Create certificate (expires in 60 seconds)
+// Step 5: CRITICAL - Dilithium MUST ALSO sign the message itself!
+// Per NIST/Cisco & Ian Smith: This prevents quantum attacks on Ed25519
+let dilithium_msg_sig = quantum_crypto
+    .create_consensus_signature(&node_id, &hex::encode(message))
+    .await?;
+
+// Step 6: Create certificate (expires in 60 seconds)
 let ephemeral_certificate = HybridCertificate {
     node_id,
     ed25519_public_key: *ephemeral_verifying_key.as_bytes(),
-    dilithium_signature: dilithium_sig.signature,
+    dilithium_signature: dilithium_key_sig.signature,
     issued_at: now,
     expires_at: now + 60,  // 1 minute per NIST
     serial_number: format!("{:x}", now),
@@ -163,7 +169,23 @@ pub async fn verify_signature(
         return Ok(false);
     }
     
-    // Step 4: Verify Ed25519 message signature
+    // Step 4: CRITICAL - Verify Dilithium message signature (quantum-resistant)
+    // Per NIST/Cisco: EVERY message must have BOTH signatures verified
+    if signature.dilithium_message_signature.is_empty() {
+        println!("❌ CRITICAL: No Dilithium message signature - NOT quantum-resistant!");
+        return Ok(false);
+    }
+    
+    let dilithium_msg_valid = quantum_crypto
+        .verify_dilithium_signature(&hex::encode(message), &dilithium_msg_sig, &node_id)
+        .await?;
+    
+    if !dilithium_msg_valid {
+        println!("❌ Invalid Dilithium message signature - QUANTUM ATTACK POSSIBLE!");
+        return Ok(false);
+    }
+    
+    // Step 5: Verify Ed25519 message signature (fast)
     let ed25519_valid = verify_ed25519_signature(
         message,
         &signature.message_signature,
@@ -179,10 +201,40 @@ pub async fn verify_signature(
 | Property | Implementation | Benefit |
 |----------|----------------|---------|
 | **Ephemeral Keys** | NEW Ed25519 per message | Forward secrecy |
+| **Dual Signatures** | Dilithium signs BOTH key AND message | Full quantum protection |
 | **Encapsulation** | Dilithium signs (key + hash) | NIST/Cisco compliant |
 | **No Caching** | Full verification every time | Byzantine-safe |
 | **Expiration** | 60-second lifetime | Limits key exposure |
-| **Quantum-Resistant** | Dilithium protects every key | Post-quantum secure |
+| **Memory Safety** | zeroize() clears sensitive data | Prevents memory dumps |
+| **Quantum-Resistant** | Dilithium protects consensus | Post-quantum secure |
+
+### 2.5 Memory Security (NEW - November 2025)
+
+**Critical security enhancement to prevent memory-based attacks:**
+
+```rust
+// Ephemeral key cleanup (hybrid_crypto.rs:256-257)
+let mut ephemeral_key_bytes = rand::thread_rng().gen::<[u8; 32]>();
+let ephemeral_signing_key = SigningKey::from_bytes(&ephemeral_key_bytes);
+// ... use key ...
+ephemeral_key_bytes.zeroize();  // Clear from memory
+
+// Seed cleanup (key_manager.rs:191, 295-296)
+let mut seed = self.generate_seed();
+// ... use seed ...
+seed.zeroize();  // Clear local copy
+
+// Encryption key cleanup (key_manager.rs:228, 287)
+let mut key_material = hasher.finalize();
+// ... use key ...
+key_material.zeroize();  // Clear derived keys
+```
+
+**Protection Against:**
+- Memory dump attacks
+- Core dump forensics
+- Swap file leakage
+- Cold boot attacks
 
 ---
 

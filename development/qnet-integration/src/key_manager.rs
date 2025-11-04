@@ -177,7 +177,7 @@ impl DilithiumKeyManager {
     /// Generate new seed and store
     async fn generate_and_store_seed(&self) -> Result<()> {
         // Generate deterministic seed from node_id
-        let seed = self.generate_seed();
+        let mut seed = self.generate_seed();
         
         // Store encrypted seed on disk
         self.store_seed(&seed).await?;
@@ -185,6 +185,10 @@ impl DilithiumKeyManager {
         // Cache seed in memory
         let mut seed_guard = self.seed.write().unwrap();
         *seed_guard = Some(seed);
+        
+        // SECURITY: Clear local seed variable from stack memory
+        // The cached version in Arc<RwLock> remains for use
+        seed.zeroize();
         
         Ok(())
     }
@@ -214,11 +218,14 @@ impl DilithiumKeyManager {
         let mut hasher = Sha3_256::new();
         hasher.update(self.node_id.as_bytes());
         hasher.update(b"QNET_KEY_ENCRYPTION_V1");
-        let key_material = hasher.finalize();
+        let mut key_material = hasher.finalize();
         
         // Create AES-256-GCM cipher
         let key = Key::<Aes256Gcm>::from_slice(&key_material);
         let cipher = Aes256Gcm::new(key);
+        
+        // SECURITY: Clear key material after use
+        key_material.zeroize();
         
         // Generate random nonce (96 bits for GCM)
         let nonce_bytes = rand::random::<[u8; 12]>();
@@ -269,15 +276,18 @@ impl DilithiumKeyManager {
         let mut hasher = Sha3_256::new();
         hasher.update(self.node_id.as_bytes());
         hasher.update(b"QNET_KEY_ENCRYPTION_V1");
-        let key_material = hasher.finalize();
+        let mut key_material = hasher.finalize();
         
         // Decrypt
         use aes_gcm::{aead::{Aead, KeyInit}, Aes256Gcm, Nonce, Key};
         let key = Key::<Aes256Gcm>::from_slice(&key_material);
         let cipher = Aes256Gcm::new(key);
+        
+        // SECURITY: Clear key material after use
+        key_material.zeroize();
         let nonce = Nonce::from_slice(nonce_bytes);
         
-        let seed_bytes = cipher.decrypt(nonce, encrypted)
+        let mut seed_bytes = cipher.decrypt(nonce, encrypted)
             .map_err(|e| anyhow!("Decryption failed: {}", e))?;
         
         let mut seed = [0u8; 32];
@@ -286,6 +296,10 @@ impl DilithiumKeyManager {
         // Cache seed in memory
         let mut seed_guard = self.seed.write().unwrap();
         *seed_guard = Some(seed);
+        
+        // SECURITY: Clear decrypted seed bytes from memory
+        seed_bytes.zeroize();
+        seed.zeroize(); // Clear local copy after caching
         
         Ok(())
     }

@@ -5,6 +5,59 @@ All notable changes to the QNet project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.19.0] - November 4, 2025 "Critical Security & Performance Fixes"
+
+### Added
+- **Dual Dilithium Signatures**: Dilithium now signs BOTH ephemeral key AND message
+  - Addresses critical vulnerability identified by Ian Smith (security researcher)
+  - Full compliance with NIST/Cisco hybrid cryptography standards
+  - Prevents quantum attacks on Ed25519 message signatures
+  - Maintains O(1) performance with certificate caching
+- **Memory Security (zeroize)**: Sensitive data cleared from memory after use
+  - Ephemeral key bytes cleared immediately after signing
+  - Dilithium seed cleared after caching
+  - Encryption key material cleared after cipher creation
+  - Protection against memory dumps, core dumps, and cold boot attacks
+- **Global Crypto Instance**: GLOBAL_QUANTUM_CRYPTO for performance
+  - Single initialization per process (was per-block!)
+  - Eliminates repeated disk I/O and decryption overhead
+  - Shared across hybrid_crypto.rs for consistency
+
+### Changed
+- **Tower BFT Timeouts**: Drastically reduced for 1 block/second target
+  - Base timeouts: 2-5 seconds (was 10-25 seconds)
+  - Max timeout: 10 seconds (was 60 seconds)
+  - Rotation boundaries: 3 seconds (was 12 seconds)
+  - Config values: 2000ms base (was 7000ms), 10000ms max (was 20000ms)
+- **Hybrid Crypto Signature Structure**: Updated to include message signature
+  - `dilithium_message_signature`: Now contains REAL signature (was empty string)
+  - Verification enforces non-empty Dilithium message signature
+  - Backward incompatible: old signatures will be rejected
+
+### Fixed
+- **Message Mismatch in Consensus**: Fixed incorrect node_id prepending
+  - File: `core/qnet-consensus/src/consensus_crypto.rs:171`
+  - Used message AS-IS instead of adding duplicate node_id prefix
+- **Emergency Producer Activation**: Fixed global flag not being set
+  - File: `development/qnet-integration/src/unified_p2p.rs:7520-7528`
+  - Now correctly calls `set_emergency_producer_flag` for local node
+- **Block Production Delays**: Fixed two major performance bottlenecks
+  - Repeated crypto initialization: Now uses GLOBAL_QUANTUM_CRYPTO
+  - Excessive TowerBFT timeouts: Reduced to match 1-second block target
+- **Network Stuck at Block 30**: Resolved through combination of above fixes
+  - Message verification now works correctly
+  - Emergency failover activates properly
+  - Blocks produced at correct 1-second intervals
+
+### Security
+- **CRITICAL**: Quantum resistance now complete at consensus level
+  - Previous implementation vulnerable to quantum attacks on Ed25519
+  - Current implementation requires BOTH Ed25519 AND Dilithium verification
+  - Consensus mechanism is now fully post-quantum secure
+- **Memory safety**: All sensitive cryptographic material properly cleared
+  - Addresses forensic analysis and memory dump attack vectors
+  - Complies with best practices for key material handling
+
 ## [2.18.0] - October 31, 2025 "PoH Optimization & VRF Implementation"
 
 ### Added

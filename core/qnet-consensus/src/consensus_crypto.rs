@@ -166,19 +166,34 @@ async fn verify_with_real_dilithium(
                     println!("[CONSENSUS] ✅ Found embedded public key (1952 bytes)");
                     
                     // Extract and verify message
-                    let expected_msg = format!("{}:{}", node_id, message);
+                    // CRITICAL FIX: Message already contains "node_id:data" format from create_consensus_signature
+                    // DO NOT add node_id again - it causes duplication!
+                    let expected_msg = message.to_string();  // Use message AS-IS
                     let msg_in_sig_start = 4 + 2420;  // After length + signature
                     let msg_len = signed_len - 2420;
                     
                     if msg_in_sig_start + msg_len <= pk_len_start {
                         let embedded_msg = &signature_bytes[msg_in_sig_start..msg_in_sig_start + msg_len];
+                        
+                        // Verify the embedded message matches expected
                         if embedded_msg == expected_msg.as_bytes() {
+                            // Additional validation: ensure node_id is in the message
+                            let embedded_str = String::from_utf8_lossy(embedded_msg);
+                            if !embedded_str.starts_with(&format!("{}:", node_id)) {
+                                println!("[CONSENSUS] ❌ Node ID not found in message prefix!");
+                                println!("   Expected to start with: '{}:'", node_id);
+                                println!("   Got: '{}'", embedded_str);
+                                return false;
+                            }
+                            
                             println!("[CONSENSUS] ✅ Message matches embedded data");
                             println!("[CONSENSUS] ✅ Dilithium signature structurally valid");
                             println!("[CONSENSUS] ✅ Public key available for future verification");
                             return true;
                         } else {
                             println!("[CONSENSUS] ❌ Message mismatch!");
+                            println!("   Expected: '{}'", expected_msg);
+                            println!("   Got: '{}'", String::from_utf8_lossy(embedded_msg));
                             return false;
                         }
                     }

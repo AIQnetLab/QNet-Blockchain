@@ -178,7 +178,15 @@ impl HybridCrypto {
         );
         
         // Sign with Dilithium (using quantum_crypto module)
-        let quantum_crypto = crate::quantum_crypto::QNetQuantumCrypto::new();
+        // CRITICAL FIX: Use GLOBAL crypto instance for certificate rotation!
+        let mut crypto_guard = crate::node::GLOBAL_QUANTUM_CRYPTO.lock().await;
+        if crypto_guard.is_none() {
+            let mut crypto = crate::quantum_crypto::QNetQuantumCrypto::new();
+            let _ = crypto.initialize().await;
+            *crypto_guard = Some(crypto);
+        }
+        let quantum_crypto = crypto_guard.as_ref().unwrap();
+        
         let dilithium_sig = quantum_crypto
             .create_consensus_signature(&self.node_id, &cert_data)
             .await?;
@@ -235,11 +243,18 @@ impl HybridCrypto {
     /// Sign message per NIST/Cisco ENCAPSULATED KEYS standard
     pub async fn sign_message(&self, message: &[u8]) -> Result<HybridSignature> {
         // CRITICAL: Per NIST/Cisco - generate NEW ephemeral Ed25519 key for THIS message
-        let ephemeral_signing_key = SigningKey::from_bytes(&rand::thread_rng().gen::<[u8; 32]>());
+        // SECURITY FIX: Use zeroize to clear key from memory after use
+        use zeroize::Zeroize;
+        let mut ephemeral_key_bytes = rand::thread_rng().gen::<[u8; 32]>();
+        let ephemeral_signing_key = SigningKey::from_bytes(&ephemeral_key_bytes);
         let ephemeral_verifying_key = ephemeral_signing_key.verifying_key();
         
         // Step 1: Sign the message with ephemeral Ed25519 key
         let ed25519_signature = ephemeral_signing_key.sign(message);
+        
+        // CRITICAL: Clear ephemeral key bytes from memory immediately after signing
+        ephemeral_key_bytes.zeroize();
+        // Note: SigningKey itself doesn't implement Zeroize, but we cleared the source bytes
         
         // Step 2: Create encapsulated key data (ephemeral key + message hash)
         let mut encapsulated_data = Vec::new();
@@ -247,12 +262,29 @@ impl HybridCrypto {
         encapsulated_data.extend_from_slice(&sha3::Sha3_256::digest(message));
         encapsulated_data.extend_from_slice(&(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()).to_le_bytes());
         
-        // Step 3: Sign the ENCAPSULATED KEY with Dilithium (NOT the message!)
-        // This is the CORRECT NIST/Cisco approach
+        // Step 3: Sign the ENCAPSULATED KEY with Dilithium
+        // Per NIST/Cisco: Dilithium signs the ephemeral key for encapsulation
         let encapsulated_hex = hex::encode(&encapsulated_data);
-        let quantum_crypto = crate::quantum_crypto::QNetQuantumCrypto::new();
-        let dilithium_sig = quantum_crypto
+        
+        // CRITICAL FIX: Use GLOBAL crypto instance to avoid repeated initialization!
+        // Creating new QNetQuantumCrypto causes MASSIVE delays (disk I/O + decryption)
+        let mut crypto_guard = crate::node::GLOBAL_QUANTUM_CRYPTO.lock().await;
+        if crypto_guard.is_none() {
+            let mut crypto = crate::quantum_crypto::QNetQuantumCrypto::new();
+            let _ = crypto.initialize().await;
+            *crypto_guard = Some(crypto);
+        }
+        let quantum_crypto = crypto_guard.as_ref().unwrap();
+        
+        let dilithium_key_sig = quantum_crypto
             .create_consensus_signature(&self.node_id, &encapsulated_hex)
+            .await?;
+        
+        // Step 4: CRITICAL FIX per Ian/NIST/Cisco - Dilithium MUST ALSO sign the message!
+        // Without this, quantum computers can attack Ed25519 signatures directly
+        let message_hex = hex::encode(message);
+        let dilithium_msg_sig = quantum_crypto
+            .create_consensus_signature(&self.node_id, &message_hex)
             .await?;
         
         // Create new certificate format with ephemeral key
@@ -260,7 +292,7 @@ impl HybridCrypto {
         let ephemeral_certificate = HybridCertificate {
             node_id: self.node_id.clone(),
             ed25519_public_key: *ephemeral_verifying_key.as_bytes(),
-            dilithium_signature: dilithium_sig.signature,
+            dilithium_signature: dilithium_key_sig.signature,
             issued_at: now,
             expires_at: now + 60, // 1 minute ephemeral key per NIST
             serial_number: format!("{:x}", now), // Use timestamp as serial
@@ -269,7 +301,7 @@ impl HybridCrypto {
         Ok(HybridSignature {
             certificate: ephemeral_certificate,
             message_signature: ed25519_signature.to_bytes(),
-            dilithium_message_signature: String::new(), // NOT USED - Dilithium signs the KEY, not message
+            dilithium_message_signature: dilithium_msg_sig.signature, // CRITICAL: Real Dilithium signature of message
             signed_at: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
         })
     }
@@ -300,7 +332,15 @@ impl HybridCrypto {
         let encapsulated_hex = hex::encode(&encapsulated_data);
             
             // Verify with quantum_crypto
-            let quantum_crypto = crate::quantum_crypto::QNetQuantumCrypto::new();
+            // CRITICAL FIX: Use GLOBAL crypto instance for certificate verification!
+            let mut crypto_guard = crate::node::GLOBAL_QUANTUM_CRYPTO.lock().await;
+            if crypto_guard.is_none() {
+                let mut crypto = crate::quantum_crypto::QNetQuantumCrypto::new();
+                let _ = crypto.initialize().await;
+                *crypto_guard = Some(crypto);
+            }
+            let quantum_crypto = crypto_guard.as_ref().unwrap();
+            
             let dilithium_sig = crate::quantum_crypto::DilithiumSignature {
                 signature: signature.certificate.dilithium_signature.clone(),
                 algorithm: "QNet-Dilithium-Compatible".to_string(),
@@ -336,8 +376,24 @@ impl HybridCrypto {
         // Per NIST/Cisco: EVERY message must have BOTH signatures verified
         println!("🔐 Verifying Dilithium message signature (quantum-resistant)...");
         
+        // CRITICAL: Check that Dilithium message signature is not empty
+        if signature.dilithium_message_signature.is_empty() {
+            println!("❌ CRITICAL: No Dilithium message signature - NOT quantum-resistant!");
+            println!("❌ This violates NIST/Cisco hybrid crypto requirements!");
+            return Ok(false);
+        }
+        
         let message_hex = hex::encode(message);
-        let quantum_crypto = crate::quantum_crypto::QNetQuantumCrypto::new();
+        
+        // CRITICAL FIX: Use GLOBAL crypto instance for verification too!
+        let mut crypto_guard = crate::node::GLOBAL_QUANTUM_CRYPTO.lock().await;
+        if crypto_guard.is_none() {
+            let mut crypto = crate::quantum_crypto::QNetQuantumCrypto::new();
+            let _ = crypto.initialize().await;
+            *crypto_guard = Some(crypto);
+        }
+        let quantum_crypto = crypto_guard.as_ref().unwrap();
+        
         let dilithium_msg_sig = crate::quantum_crypto::DilithiumSignature {
             signature: signature.dilithium_message_signature.clone(),
             algorithm: "QNet-Dilithium-Compatible".to_string(),

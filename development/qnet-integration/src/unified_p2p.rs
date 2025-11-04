@@ -7515,6 +7515,19 @@ impl SimplifiedP2P {
         println!("[NETWORK] 📊 Emergency producer change recorded | Type: {} | Height: {} | Time: {}", 
                  change_type, block_height, timestamp);
         
+        // CRITICAL FIX: Set EMERGENCY_PRODUCER_FLAG if WE are the new emergency producer
+        // This allows the main production loop to activate immediately
+        if new_producer == self.node_id {
+            println!("[FAILOVER] 🚀 WE ARE THE EMERGENCY PRODUCER - Setting flag for block #{}", block_height);
+            
+            // Use the global EMERGENCY_PRODUCER_FLAG from node.rs
+            // This is exposed as a public static in node.rs
+            use crate::node::set_emergency_producer_flag;
+            
+            set_emergency_producer_flag(block_height, new_producer.clone());
+            println!("[FAILOVER] ✅ Emergency producer flag set successfully");
+        }
+        
         // CRITICAL FIX: Invalidate producer cache to prevent selecting failed producer again
         // This ensures the network will select a new producer in the next round
         crate::node::BlockchainNode::invalidate_producer_cache();

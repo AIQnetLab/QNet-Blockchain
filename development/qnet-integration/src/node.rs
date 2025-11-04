@@ -61,6 +61,13 @@ lazy_static::lazy_static! {
     static ref EMERGENCY_PRODUCER_FLAG: Mutex<Option<(u64, String)>> = Mutex::new(None);
 }
 
+// CRITICAL: Public function to set emergency producer flag from other modules
+pub fn set_emergency_producer_flag(block_height: u64, producer: String) {
+    if let Ok(mut flag) = EMERGENCY_PRODUCER_FLAG.lock() {
+        *flag = Some((block_height, producer));
+    }
+}
+
 // CRITICAL: Global synchronization flags for API access
 use std::sync::atomic::{AtomicBool, Ordering};
 static SYNC_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
@@ -74,7 +81,7 @@ lazy_static::lazy_static! {
 
 // CRITICAL: Global quantum crypto instance to avoid repeated initialization
 lazy_static::lazy_static! {
-    static ref GLOBAL_QUANTUM_CRYPTO: tokio::sync::Mutex<Option<crate::quantum_crypto::QNetQuantumCrypto>> = 
+    pub static ref GLOBAL_QUANTUM_CRYPTO: tokio::sync::Mutex<Option<crate::quantum_crypto::QNetQuantumCrypto>> = 
         tokio::sync::Mutex::new(None);
 }
 use sha3::{Sha3_256, Digest};
@@ -1056,10 +1063,11 @@ impl BlockchainNode {
         };
         
         // Initialize Tower BFT for adaptive timeouts
+        // CRITICAL: Use small timeouts for 1 block/second target!
         let tower_bft_config = crate::tower_bft::TowerBftConfig {
-            base_timeout_ms: 7000,      // From existing code
+            base_timeout_ms: 2000,      // 2 seconds base (was 7000!)
             timeout_multiplier: 1.5,    
-            max_timeout_ms: 20000,      // From existing first block timeout
+            max_timeout_ms: 10000,      // 10 seconds max (was 20000!)
             min_timeout_ms: 1000,       
             latency_window_size: 100,   
         };
@@ -6787,8 +6795,14 @@ impl BlockchainNode {
     async fn generate_dilithium_signature(node_id: &str, commit_hash: &str) -> String {
         use crate::quantum_crypto::QNetQuantumCrypto;
         
-        let mut crypto = QNetQuantumCrypto::new();
-        let _ = crypto.initialize().await;
+        // CRITICAL FIX: Use GLOBAL crypto instance to avoid repeated initialization!
+        let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
+        if crypto_guard.is_none() {
+            let mut crypto = QNetQuantumCrypto::new();
+            let _ = crypto.initialize().await;
+            *crypto_guard = Some(crypto);
+        }
+        let crypto = crypto_guard.as_mut().unwrap();
         
         match crypto.create_consensus_signature(node_id, commit_hash).await {
             Ok(signature) => {
@@ -6822,8 +6836,16 @@ impl BlockchainNode {
         use crate::quantum_crypto::QNetQuantumCrypto;
         
         let microblock_hash = hex::encode(message_hash);
-        let mut crypto = QNetQuantumCrypto::new();
-        let _ = crypto.initialize().await;
+        
+        // CRITICAL FIX: Use GLOBAL crypto instance to avoid repeated initialization!
+        // Creating new QNetQuantumCrypto + initialize() causes MASSIVE delays (disk I/O + decryption)
+        let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
+        if crypto_guard.is_none() {
+            let mut crypto = QNetQuantumCrypto::new();
+            let _ = crypto.initialize().await;
+            *crypto_guard = Some(crypto);
+        }
+        let crypto = crypto_guard.as_mut().unwrap();
         
         match crypto.create_consensus_signature(node_id, &microblock_hash).await {
             Ok(signature) => {
