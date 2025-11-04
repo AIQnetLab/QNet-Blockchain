@@ -3116,7 +3116,20 @@ impl BlockchainNode {
                     Some(&storage),  // Pass storage for entropy
                     &quantum_poh  // Pass PoH for quantum entropy
                 ).await;
-                let is_my_turn_to_produce = current_producer == node_id;
+                let mut is_my_turn_to_produce = current_producer == node_id;
+                
+                // CRITICAL FIX: Check if we're emergency producer for this block
+                if !is_my_turn_to_produce {
+                    if let Ok(emergency_flag) = EMERGENCY_PRODUCER_FLAG.lock() {
+                        if let Some((height, producer)) = &*emergency_flag {
+                            if *height == next_block_height && *producer == node_id {
+                                println!("[EMERGENCY] 🚨 OVERRIDING: WE ARE EMERGENCY PRODUCER FOR BLOCK #{}", height);
+                                current_producer = node_id.clone();
+                                is_my_turn_to_produce = true;
+                            }
+                        }
+                    }
+                }
                 
                 // DEBUG: Log producer selection for first blocks
                 if next_block_height <= 5 {
@@ -3947,49 +3960,28 @@ impl BlockchainNode {
                     // Height increment moved to after broadcast to prevent phantom blocks
                     } // End of microblock production block
                 } else {
-                    // CRITICAL: Check if we became emergency producer
-                    let should_produce_emergency = if let Ok(emergency_flag) = EMERGENCY_PRODUCER_FLAG.lock() {
-                        if let Some((height, producer)) = &*emergency_flag {
-                            // FIX: Check against next_block_height since emergency is set for the block we're waiting for
-                            if *height == next_block_height && *producer == node_id {
-                                println!("[EMERGENCY] 🚨 WE ARE EMERGENCY PRODUCER FOR BLOCK #{}", height);
-                                true
-                            } else {
-                                false
-                            }
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    };
+                    // NOT producer for this block - wait for block from network
+                    // Emergency producer logic already handled above at line 3122
                     
-                    if should_produce_emergency {
-                        // EMERGENCY PRODUCTION: Create block immediately
-                        println!("[EMERGENCY] 🚀 EMERGENCY BLOCK PRODUCTION ACTIVATED!");
-                        *is_leader.write().await = true;
-                        current_producer = node_id.clone();
-                        
-                        // Clear emergency flag
-                        if let Ok(mut emergency_flag) = EMERGENCY_PRODUCER_FLAG.lock() {
-                            *emergency_flag = None;
-                        }
-                        
-                        // Continue to production code (will produce block)
-                    } else {
-                        // PRODUCTION: This node is NOT the selected producer - synchronize with network
-                        // CPU OPTIMIZATION: Only log every 10th block to reduce IO load
-                        if next_block_height % 10 == 0 {
-                            // CRITICAL FIX: When not producer, wait for NEXT block to be created
-                            println!("[MICROBLOCK] 👥 Waiting for block #{} from producer: {}", next_block_height, current_producer);
-                        }
-                        
-                        // Update is_leader for backward compatibility
-                        *is_leader.write().await = false;
+                    // CPU OPTIMIZATION: Only log every 10th block to reduce IO load
+                    if next_block_height % 10 == 0 {
+                        // CRITICAL FIX: When not producer, wait for NEXT block to be created
+                        println!("[MICROBLOCK] 👥 Waiting for block #{} from producer: {}", next_block_height, current_producer);
                     }
                     
-                    // Skip sync if we're about to produce emergency block
-                    if !should_produce_emergency {
+                    // Update is_leader for backward compatibility
+                    *is_leader.write().await = false;
+                    
+                    // Clear emergency flag if it was for us (already processed above)
+                    if let Ok(mut emergency_flag) = EMERGENCY_PRODUCER_FLAG.lock() {
+                        if let Some((height, producer)) = &*emergency_flag {
+                            if *height == next_block_height && *producer == node_id {
+                                // Already processed at line 3122, clear it
+                                *emergency_flag = None;
+                            }
+                        }
+                    }
+                    
                     // EXISTING: Non-blocking background sync as promised in line 868 comments
                     if let Some(p2p) = &unified_p2p {
                         // SYNC FIX: Using global SYNC_IN_PROGRESS flag
@@ -4212,9 +4204,7 @@ impl BlockchainNode {
                         // No P2P available - standalone mode
                         println!("[SYNC] ⚠️ No P2P connection - running in standalone mode");
                     }
-
                 }
-                } // End of sync block (for non-emergency producers)
                 
                 // Update NODE_IS_SYNCHRONIZED for ALL nodes (not just producers)
                 // This was a BUG: only producers updated this flag!

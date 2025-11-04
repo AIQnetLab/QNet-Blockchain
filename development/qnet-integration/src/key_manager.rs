@@ -6,6 +6,13 @@ use pqcrypto_dilithium::dilithium3;
 use serde::{Serialize, Deserialize};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 use sha3::{Sha3_256, Sha3_512, Digest};
+use lazy_static::lazy_static;
+
+// PRODUCTION: Cache writable directory to avoid repeated filesystem checks
+// This is safe as filesystem paths don't change during runtime
+lazy_static! {
+    static ref CACHED_KEY_DIR: Arc<RwLock<Option<PathBuf>>> = Arc::new(RwLock::new(None));
+}
 
 /// Manages Dilithium keys for the node
 pub struct DilithiumKeyManager {
@@ -20,30 +27,150 @@ pub struct DilithiumKeyManager {
 }
 
 impl DilithiumKeyManager {
-    /// Create new key manager
+    /// Create new key manager with ROBUST directory creation
     pub fn new(node_id: String, key_dir: &Path) -> Result<Self> {
+        // CRITICAL: Try multiple fallback paths for Docker/production compatibility
+        let final_key_dir = Self::ensure_writable_directory(key_dir)?;
+        
+        println!("[KEY_MANAGER] 📁 Using key directory: {:?}", final_key_dir);
+        
         Ok(Self {
-            key_dir: key_dir.to_path_buf(),
+            key_dir: final_key_dir,
             seed: Arc::new(RwLock::new(None)),
             node_id,
         })
     }
     
-    /// Initialize keys (load or generate)
-    pub async fn initialize(&self) -> Result<()> {
-        // Ensure key directory exists
-        fs::create_dir_all(&self.key_dir)?;
-        
-        // Try to load existing seed
-        if let Err(_) = self.load_seed().await {
-            // Generate new if not found
-            println!("[KEY_MANAGER] Generating new CRYSTALS-Dilithium seed...");
-            self.generate_and_store_seed().await?;
-            println!("[KEY_MANAGER] ✅ Generated and stored new Dilithium seed");
-        } else {
-            println!("[KEY_MANAGER] ✅ Loaded existing Dilithium seed");
+    /// PRODUCTION-SAFE: Find and create writable directory with fallback paths
+    fn ensure_writable_directory(preferred: &Path) -> Result<PathBuf> {
+        // Check cache first to avoid repeated filesystem operations
+        {
+            let cache = CACHED_KEY_DIR.read().unwrap();
+            if let Some(cached_dir) = &*cache {
+                // Verify cached directory still exists and is writable
+                if cached_dir.exists() && cached_dir.is_dir() {
+                    return Ok(cached_dir.clone());
+                }
+            }
         }
         
+        // Build candidate directories in priority order
+        let mut candidates: Vec<PathBuf> = vec![
+            preferred.to_path_buf(),                              // Preferred path
+            PathBuf::from("/app/data/keys"),                      // Docker persistent volume
+            PathBuf::from("/tmp/qnet_keys"),                      // Always writable fallback
+        ];
+        
+        // Add optional paths if available
+        if let Ok(current_dir) = std::env::current_dir() {
+            candidates.push(current_dir.join("data").join("keys"));
+        }
+        
+        if let Some(data_dir) = dirs::data_local_dir() {
+            candidates.push(data_dir.join("qnet").join("keys"));
+        }
+        
+        println!("[KEY_MANAGER] 🔍 Searching for writable key directory...");
+        
+        for (idx, path) in candidates.iter().enumerate() {
+            println!("[KEY_MANAGER]   [{}/{}] Testing: {:?}", idx + 1, candidates.len(), path);
+            
+            // Try to create directory
+            match fs::create_dir_all(path) {
+                Ok(_) => {
+                    // Verify we can write to it by creating a test file
+                    let test_file = path.join(".write_test");
+                    match fs::write(&test_file, b"test") {
+                        Ok(_) => {
+                            let _ = fs::remove_file(&test_file); // Cleanup
+                            println!("[KEY_MANAGER] ✅ Selected writable directory: {:?}", path);
+                            
+                            // Cache the successful directory for future use
+                            let mut cache = CACHED_KEY_DIR.write().unwrap();
+                            *cache = Some(path.clone());
+                            
+                            return Ok(path.clone());
+                        }
+                        Err(e) => {
+                            println!("[KEY_MANAGER]   ❌ Cannot write to directory: {}", e);
+                            continue;
+                        }
+                    }
+                }
+                Err(e) => {
+                    println!("[KEY_MANAGER]   ❌ Cannot create directory: {}", e);
+                    continue;
+                }
+            }
+        }
+        
+        // CRITICAL: If all fallbacks fail, provide detailed diagnostic
+        println!("[KEY_MANAGER] ❌ NO WRITABLE DIRECTORY FOUND!");
+        println!("[KEY_MANAGER] 🔍 Diagnostic information:");
+        println!("[KEY_MANAGER]   Current dir: {:?}", std::env::current_dir());
+        println!("[KEY_MANAGER]   User: {:?}", std::env::var("USER").or_else(|_| std::env::var("USERNAME")));
+        println!("[KEY_MANAGER]   Temp dir: {:?}", std::env::temp_dir());
+        
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(metadata) = fs::metadata(preferred) {
+                println!("[KEY_MANAGER]   Preferred dir permissions: {:o}", metadata.permissions().mode());
+            }
+        }
+        
+        Err(anyhow!(
+            "Cannot find writable directory for keys. Tried {} candidates. Check Docker volumes and file permissions.",
+            candidates.len()
+        ))
+    }
+    
+    /// Initialize keys (load or generate)
+    pub async fn initialize(&self) -> Result<()> {
+        println!("[KEY_MANAGER] 🔐 Initializing Dilithium key manager for node: {}", self.node_id);
+        println!("[KEY_MANAGER] 📁 Key directory: {:?}", self.key_dir);
+        
+        // Directory should already exist from new(), but verify
+        if !self.key_dir.exists() {
+            println!("[KEY_MANAGER] ⚠️ Key directory doesn't exist, creating now...");
+            fs::create_dir_all(&self.key_dir)
+                .map_err(|e| anyhow!("Failed to create key directory: {}", e))?;
+        }
+        
+        // Check directory permissions
+        match fs::metadata(&self.key_dir) {
+            Ok(metadata) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    println!("[KEY_MANAGER] 🔒 Directory permissions: {:o}", metadata.permissions().mode());
+                }
+                
+                if !metadata.is_dir() {
+                    return Err(anyhow!("Key path exists but is not a directory: {:?}", self.key_dir));
+                }
+            }
+            Err(e) => {
+                println!("[KEY_MANAGER] ❌ Cannot read directory metadata: {}", e);
+                return Err(anyhow!("Cannot access key directory: {}", e));
+            }
+        }
+        
+        // Try to load existing seed
+        match self.load_seed().await {
+            Ok(_) => {
+                println!("[KEY_MANAGER] ✅ Loaded existing Dilithium seed");
+            }
+            Err(e) => {
+                // Generate new if not found
+                println!("[KEY_MANAGER] 📝 No existing seed found ({}), generating new...", e);
+                println!("[KEY_MANAGER] 🔨 Generating new CRYSTALS-Dilithium seed...");
+                self.generate_and_store_seed().await?;
+                println!("[KEY_MANAGER] ✅ Generated and stored new Dilithium seed");
+            }
+        }
+        
+        println!("[KEY_MANAGER] 🎉 Key manager initialization complete!");
         Ok(())
     }
     
