@@ -4234,13 +4234,13 @@ impl BlockchainNode {
                 // CRITICAL: MACROBLOCK CONSENSUS FOR ALL NODES (not just producer!)
                 // ══════════════════════════════════════════════════════════════════
                 
-                // PRODUCTION: Start consensus SUPER EARLY at block 60 for ZERO downtime
-                // Consensus takes 30s (commit 15s + reveal 15s), so starting at 60 means it completes by block 90
+                // PRODUCTION: Start consensus SUPER EARLY after block 60 for ZERO downtime
+                // Consensus takes 30s (commit 15s + reveal 15s), so starting at 61 means it completes by block 90
                 // This ensures macroblock is ready EXACTLY when needed - Swiss watch precision!
-                // ARCHITECTURE FIX: Allow consensus to start in range 60-65 blocks after trigger
-                // This prevents missing consensus if exact block 60 was skipped
+                // CRITICAL FIX: Start AFTER block 60 to prevent deadlock
+                // Block 60 must be created first, then consensus can use block 59 for PoH
                 let blocks_since_trigger = microblock_height.saturating_sub(last_macroblock_trigger);
-                if blocks_since_trigger >= 60 && blocks_since_trigger <= 65 && !consensus_started {
+                if blocks_since_trigger > 60 && blocks_since_trigger <= 65 && !consensus_started {
                     println!("[MACROBLOCK] 🚀 ULTRA-EARLY CONSENSUS START at block {} for ZERO downtime", microblock_height);
                     println!("[MACROBLOCK] 📍 Node: {} | Type: {:?} | ALL NODES PARTICIPATE", node_id, node_type);
                     consensus_started = true;
@@ -4324,7 +4324,7 @@ impl BlockchainNode {
                     let current_trigger = last_macroblock_trigger;
                     
                     tokio::spawn(async move {
-                        // Give consensus 5 more seconds to complete (total 35s from block 60)
+                        // Give consensus 5 more seconds to complete (total 35s from block 61)
                         tokio::time::sleep(Duration::from_secs(5)).await;
                         
                         // Check if macroblock was created
@@ -5805,10 +5805,10 @@ impl BlockchainNode {
         // New nodes MUST sync before they can participate in macroblock creation
         let stored_height = storage.get_chain_height().unwrap_or(0);
         
-        // CRITICAL FIX: Allow participation in EARLY consensus (30 blocks ahead for macroblock)
-        // Consensus for macroblock 90 starts at height 60 (30 blocks early)
-        // So we need to allow nodes that are within 30 blocks of the macroblock height
-        let consensus_lookahead = 30; // Consensus starts 30 blocks early (at block 60 for macroblock 90)
+        // CRITICAL FIX: Allow participation in EARLY consensus (29 blocks ahead for macroblock)
+        // Consensus for macroblock 90 starts at height 61 (29 blocks early)
+        // So we need to allow nodes that are within 29 blocks of the macroblock height
+        let consensus_lookahead = 29; // Consensus starts 29 blocks early (at block 61 for macroblock 90)
         
         // CRITICAL FIX: More lenient lag tolerance for early consensus participation
         // During genesis phase (blocks 1-100), nodes may still be syncing
@@ -5820,8 +5820,8 @@ impl BlockchainNode {
         };
         
         // Check if node is TOO FAR BEHIND (not synced)
-        // CRITICAL: For consensus that starts EARLY (block 60 for macroblock 90),
-        // we need to be more lenient because consensus_lookahead adds 30 blocks
+        // CRITICAL: For consensus that starts EARLY (block 61 for macroblock 90),
+        // we need to be more lenient because consensus_lookahead adds 29 blocks
         if stored_height + max_allowed_lag < current_height - consensus_lookahead {
             println!("[CONSENSUS] ⚠️ Node not synchronized for consensus participation!");
             println!("[CONSENSUS] 📊 Stored height: {}, Consensus height: {}, Max lag: {}", 
