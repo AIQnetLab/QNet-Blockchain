@@ -3791,10 +3791,12 @@ impl BlockchainNode {
                     // Calculate TPS for this microblock
                     let tps = (txs.len() as f64) / current_interval.as_secs_f64();
                     
-                    // CRITICAL: Check if block already exists to prevent forks
-                    if storage.load_microblock(microblock.height).is_ok() {
-                        println!("[PRODUCER] ⚠️ Block #{} already exists, skipping creation to prevent fork", microblock.height);
-                        continue;
+                    // CRITICAL: Check if block already exists to prevent forks (skip for genesis)
+                    if microblock.height > 0 {
+                        if let Ok(Some(_)) = storage.load_microblock(microblock.height) {
+                            println!("[PRODUCER] ⚠️ Block #{} already exists, skipping creation to prevent fork", microblock.height);
+                            continue;
+                        }
                     }
                     
                     // PRODUCTION: Use ultra-modern storage with delta encoding and compression
