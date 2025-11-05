@@ -3839,27 +3839,24 @@ impl BlockchainNode {
                             bincode::serialize(&microblock).unwrap_or_default()
                         };
                         
-                        let broadcast_size = broadcast_data.len();
-                        let height_for_broadcast = microblock.height;
-                        
-                        // PERFORMANCE FIX: Fire-and-forget broadcast to avoid blocking block production
-                        // Spawn background task for broadcast - don't wait for completion
-                        let p2p_clone = p2p.clone();
-                        tokio::spawn(async move {
-                            let result = if broadcast_size > 1024 && peer_count > 10 {
-                                // Use Turbine protocol for larger blocks and many peers
-                                p2p_clone.broadcast_block_turbine(height_for_broadcast, broadcast_data)
-                            } else {
-                                // Use regular broadcast for small blocks or few peers
-                                p2p_clone.broadcast_block(height_for_broadcast, broadcast_data)
-                            };
-                            
-                            // Log only errors or every 10th block
-                            if result.is_err() || height_for_broadcast % 10 == 0 {
-                                println!("[P2P] 📡 Block #{} broadcast: {:?} | {} peers | {} bytes", 
-                                         height_for_broadcast, result.is_ok(), peer_count, broadcast_size);
-                            }
-                        });
+                    let broadcast_size = broadcast_data.len();
+                    let height_for_broadcast = microblock.height;
+                    
+                    // CRITICAL FIX: Synchronous broadcast to ensure delivery before height increment
+                    // Use Turbine for blocks > 1KB, regular broadcast for smaller blocks
+                    let result = if broadcast_size > 1024 && peer_count > 10 {
+                        // Use Turbine protocol for larger blocks and many peers
+                        p2p.broadcast_block_turbine(height_for_broadcast, broadcast_data)
+                    } else {
+                        // Use regular broadcast for small blocks or few peers
+                        p2p.broadcast_block(height_for_broadcast, broadcast_data)
+                    };
+                    
+                    // Log only errors or every 10th block
+                    if result.is_err() || height_for_broadcast % 10 == 0 {
+                        println!("[P2P] 📡 Block #{} broadcast: {:?} | {} peers | {} bytes",
+                                height_for_broadcast, result.is_ok(), peer_count, broadcast_size);
+                    }
                     } else {
                         println!("[P2P] ⚠️ P2P system not available - cannot broadcast block #{}", microblock.height);
                     }
