@@ -5,6 +5,17 @@ All notable changes to the QNet project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.20.0] - November 5, 2025 "Producer Rotation Cache Fix"
+
+### Fixed
+- **Producer Cache at Rotation Boundaries**: Fixed stale cache preventing rotation
+  - Cache now cleared when entering new round (blocks 31, 61, 91...)
+  - First block of new round always recalculates producer
+  - Ensures different producer selected for each round
+- **Key Manager Persistence**: Identified Docker volume requirement
+  - Keys were regenerated on restart due to non-persistent /app/data/keys
+  - Requires Docker volume mount for persistent key storage
+
 ## [2.19.0] - November 4, 2025 "Critical Security & Performance Fixes"
 
 ### Added

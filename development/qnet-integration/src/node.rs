@@ -4641,7 +4641,7 @@ impl BlockchainNode {
             
             // CRITICAL FIX: Don't use cache if synchronization state might affect PoH usage
             // Cache is only valid if all nodes have the same PoH availability
-            let can_use_cache = if leadership_round == 0 {
+            let mut can_use_cache = if leadership_round == 0 {
                 true  // Round 0 is always deterministic, cache is safe
             } else if let Some(store) = storage {
                 // For PoH rounds, check if we're fully synchronized
@@ -4657,6 +4657,21 @@ impl BlockchainNode {
             } else {
                 false  // No storage, can't verify - recalculate
             };
+            
+            // CRITICAL FIX: Clear cache at rotation boundaries to ensure new producer selection
+            // This prevents using stale cached producer when entering new round
+            if current_height > 0 && (current_height - 1) % rotation_interval == 0 {
+                // We're at a rotation boundary (blocks 31, 61, 91...)
+                // Clear cache for the NEW round we're entering
+                if let Ok(mut cache) = producer_cache.lock() {
+                    if cache.remove(&leadership_round).is_some() {
+                        println!("[MICROBLOCK] 🔄 Cache cleared for new round {} at rotation boundary (block {})", 
+                                 leadership_round, current_height);
+                    }
+                }
+                // Don't use cache for first block of new round
+                can_use_cache = false;
+            }
             
             // Check if we have cached result for this round
             if can_use_cache {
@@ -4674,11 +4689,12 @@ impl BlockchainNode {
                         return cached_producer.clone();
                     }
                 }
-            } else {
+            } else if !can_use_cache {
                 // CRITICAL: Clear cache for this round if we can't use it
                 // This ensures recalculation when synchronization state changes
                 if let Ok(mut cache) = producer_cache.lock() {
-                    if cache.remove(&leadership_round).is_some() {
+                    if cache.remove(&leadership_round).is_some() && current_height > 31 {
+                        // Only log after initial rounds to reduce noise
                         println!("[MICROBLOCK] 🔄 Cache invalidated for round {} due to sync state change", leadership_round);
                     }
                 }
