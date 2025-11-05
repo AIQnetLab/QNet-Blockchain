@@ -4507,9 +4507,26 @@ async fn handle_producer_status(
         next_rotation - current_height
     };
     
+    // CRITICAL FIX: Get current producer for next block
+    let next_height = current_height + 1;
+    let current_producer = if let Some(p2p) = blockchain.get_unified_p2p() {
+        // Use the same logic as in node.rs to determine current producer
+        crate::node::BlockchainNode::select_microblock_producer(
+            next_height,
+            &Some(p2p.clone()),
+            &node_id,
+            blockchain.get_node_type(),
+            Some(&blockchain.get_storage()),
+            &blockchain.get_quantum_poh()
+        ).await
+    } else {
+        node_id.clone()  // Solo mode
+    };
+    
     let status = json!({
         "current_height": current_height,
-        "is_current_producer": is_leader,
+        "is_producer": is_leader,  // Fixed: renamed for consistency
+        "current_producer": current_producer,  // ADDED: Show who should produce next block
         "node_id": node_id,
         "leadership_round": leadership_round,
         "next_rotation_height": next_rotation,

@@ -1588,6 +1588,22 @@ impl BlockchainNode {
                         println!("[BLOCKS] ✅ Block #{} stored successfully", received_block.height);
                     }
                     
+                    // CRITICAL FIX: Check if we're the producer for next block after rotation boundary
+                    // This ensures nodes immediately know they're selected after receiving rotation block
+                    if received_block.height > 0 && received_block.height % 30 == 0 {
+                        // Just received last block of a round (30, 60, 90...)
+                        println!("[ROTATION] 🔄 Received rotation boundary block #{} - checking producer for next round", received_block.height);
+                        
+                        // Update global height immediately to ensure proper producer calculation
+                        {
+                            let mut global_height = height.write().await;
+                            if received_block.height > *global_height {
+                                *global_height = received_block.height;
+                                println!("[ROTATION] 📊 Global height updated to {}", received_block.height);
+                            }
+                        }
+                    }
+                    
                     // CRITICAL FIX: Asynchronous PoH synchronization to prevent blocking
                     // This ensures all nodes maintain consistent PoH state without blocking block processing
                     if let Some(ref poh) = quantum_poh {
@@ -3299,8 +3315,18 @@ impl BlockchainNode {
                 }
                 
                 if is_my_turn_to_produce {
-                                    // PRODUCTION: This node is selected as microblock producer for this round
-                *is_leader.write().await = true;
+                    // PRODUCTION: This node is selected as microblock producer for this round
+                    *is_leader.write().await = true;
+                    
+                    // Clear emergency flag if we were emergency producer
+                    if let Ok(mut emergency_flag) = EMERGENCY_PRODUCER_FLAG.lock() {
+                        if let Some((height, _)) = &*emergency_flag {
+                            if *height == next_block_height {
+                                println!("[EMERGENCY] ✅ Clearing emergency flag after entering production");
+                                *emergency_flag = None;
+                            }
+                        }
+                    }
                     
                     // CRITICAL FIX: Self-check for producer readiness
                     // Prevent deadlock when selected producer cannot actually produce blocks
@@ -3587,7 +3613,8 @@ impl BlockchainNode {
                         println!("[PRODUCER] ⏳ Cannot produce block #{} - waiting for previous block #{} (retry {}/10)", 
                                  next_block_height, next_block_height - 1, retry_count);
                         
-                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        // PERFORMANCE FIX: Reduce retry delay from 500ms to 100ms for faster recovery
+                        tokio::time::sleep(Duration::from_millis(100)).await;
                         continue;
                     } else if next_block_height > 1 {
                         // Reset retry counter on success (only if not block #1)
@@ -3780,21 +3807,24 @@ impl BlockchainNode {
                         let broadcast_size = broadcast_data.len();
                         let height_for_broadcast = microblock.height;
                         
-                        // CRITICAL FIX: Synchronous broadcast to ensure delivery before height increment
-                        // Use Turbine for blocks > 1KB, regular broadcast for smaller blocks
-                        let result = if broadcast_size > 1024 && peer_count > 10 {
-                            // Use Turbine protocol for larger blocks and many peers
-                            p2p.broadcast_block_turbine(height_for_broadcast, broadcast_data)
-                        } else {
-                            // Use regular broadcast for small blocks or few peers
-                            p2p.broadcast_block(height_for_broadcast, broadcast_data)
-                        };
-                        
+                        // PERFORMANCE FIX: Fire-and-forget broadcast to avoid blocking block production
+                        // Spawn background task for broadcast - don't wait for completion
+                        let p2p_clone = p2p.clone();
+                        tokio::spawn(async move {
+                            let result = if broadcast_size > 1024 && peer_count > 10 {
+                                // Use Turbine protocol for larger blocks and many peers
+                                p2p_clone.broadcast_block_turbine(height_for_broadcast, broadcast_data)
+                            } else {
+                                // Use regular broadcast for small blocks or few peers
+                                p2p_clone.broadcast_block(height_for_broadcast, broadcast_data)
+                            };
+                            
                             // Log only errors or every 10th block
                             if result.is_err() || height_for_broadcast % 10 == 0 {
                                 println!("[P2P] 📡 Block #{} broadcast: {:?} | {} peers | {} bytes", 
                                          height_for_broadcast, result.is_ok(), peer_count, broadcast_size);
                             }
+                        });
                     } else {
                         println!("[P2P] ⚠️ P2P system not available - cannot broadcast block #{}", microblock.height);
                     }
@@ -3979,16 +4009,6 @@ impl BlockchainNode {
                     
                     // Update is_leader for backward compatibility
                     *is_leader.write().await = false;
-                    
-                    // Clear emergency flag if it was for us (already processed above)
-                    if let Ok(mut emergency_flag) = EMERGENCY_PRODUCER_FLAG.lock() {
-                        if let Some((height, producer)) = &*emergency_flag {
-                            if *height == next_block_height && *producer == node_id {
-                                // Already processed at line 3122, clear it
-                                *emergency_flag = None;
-                            }
-                        }
-                    }
                     
                     // EXISTING: Non-blocking background sync as promised in line 868 comments
                     if let Some(p2p) = &unified_p2p {
@@ -4419,11 +4439,23 @@ impl BlockchainNode {
                     // Update next block time for precise 1-second intervals
                     next_block_time += microblock_interval;
                 } else {
-                    // We're running behind - set next target time immediately
-                    if (now - next_block_time).as_millis() > 50 { // Only log if significantly behind
-                        println!("[MICROBLOCK] ⚠️ Running {}ms behind schedule - adjusting timing", (now - next_block_time).as_millis());
+                    // We're running behind - catch up without accumulating delay
+                    let behind_ms = (now - next_block_time).as_millis();
+                    if behind_ms > 50 { // Only log if significantly behind
+                        println!("[MICROBLOCK] ⚠️ Running {}ms behind schedule - catching up", behind_ms);
                     }
-                    next_block_time = now + microblock_interval;
+                    
+                    // CRITICAL FIX: Don't reset timing, just skip missed intervals
+                    // This prevents accumulating delay over time
+                    while next_block_time < now {
+                        next_block_time += microblock_interval;
+                    }
+                    
+                    // If we're too far behind (>5 seconds), reset to avoid infinite catch-up
+                    if behind_ms > 5000 {
+                        println!("[MICROBLOCK] 🔄 Too far behind ({}ms) - resetting schedule", behind_ms);
+                        next_block_time = now + microblock_interval;
+                    }
                 }
             }
         });
@@ -4507,7 +4539,7 @@ impl BlockchainNode {
     }
     
     /// PRODUCTION: Select microblock producer using cryptographic hash every 30 blocks (QNet specification)
-    async fn select_microblock_producer(
+    pub async fn select_microblock_producer(
         current_height: u64,
         unified_p2p: &Option<Arc<SimplifiedP2P>>,
         own_node_id: &str,
@@ -8472,10 +8504,14 @@ impl BlockchainNode {
     
     /// Extract wallet address from activation code using quantum decryption
     pub async fn extract_wallet_from_activation_code(&self, code: &str) -> Result<String, QNetError> {
-        // Use quantum crypto to decrypt activation code and get wallet address
-        let mut quantum_crypto = crate::quantum_crypto::QNetQuantumCrypto::new();
-        quantum_crypto.initialize().await
-            .map_err(|e| QNetError::ValidationError(format!("Quantum crypto init failed: {}", e)))?;
+        // CRITICAL FIX: Use GLOBAL crypto instance to avoid repeated initialization!
+        let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
+        if crypto_guard.is_none() {
+            let mut crypto = crate::quantum_crypto::QNetQuantumCrypto::new();
+            let _ = crypto.initialize().await;
+            *crypto_guard = Some(crypto);
+        }
+        let quantum_crypto = crypto_guard.as_ref().unwrap();
             
         // SECURITY: NO FALLBACK ALLOWED - quantum decryption MUST work
         match quantum_crypto.decrypt_activation_code(code).await {

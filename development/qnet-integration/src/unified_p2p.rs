@@ -1951,8 +1951,8 @@ impl SimplifiedP2P {
                     let url = format!("http://{}:8001/api/v1/p2p/message", peer_ip);
                     
                     let client = reqwest::blocking::Client::builder()
-                        .timeout(Duration::from_secs(3))  // Fast timeout for parallel sending
-                        .connect_timeout(Duration::from_secs(1))
+                        .timeout(Duration::from_millis(800))  // PERFORMANCE: 800ms timeout for 1s block interval
+                        .connect_timeout(Duration::from_millis(300))  // Fast connect timeout
                         .tcp_nodelay(true)
                         .build()
                         .map_err(|e| format!("Client failed: {}", e))?;
@@ -2430,8 +2430,8 @@ impl SimplifiedP2P {
         let url = format!("http://{}:8001/api/v1/p2p/message", peer_ip);
         
         let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(1))  // Fast timeout for chunks
-            .connect_timeout(Duration::from_millis(500))
+            .timeout(Duration::from_millis(600))  // PERFORMANCE: 600ms timeout for chunks
+            .connect_timeout(Duration::from_millis(200))  // Fast connect for chunks
             .tcp_nodelay(true)
             .build()
             .map_err(|e| format!("Client failed: {}", e))?;
