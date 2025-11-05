@@ -74,9 +74,11 @@ static SYNC_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static FAST_SYNC_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 pub static NODE_IS_SYNCHRONIZED: AtomicBool = AtomicBool::new(false);
 
-// CRITICAL: Flag for immediate production after rotation boundary
-// When set, producer node skips sleep and produces block immediately
-static IMMEDIATE_PRODUCTION_FLAG: AtomicBool = AtomicBool::new(false);
+// CRITICAL: Notify for rotation boundary - interrupts block waiting
+// When rotation block is received, this wakes up the main loop immediately
+lazy_static::lazy_static! {
+    static ref ROTATION_NOTIFY: tokio::sync::Notify = tokio::sync::Notify::new();
+}
 
 // CRITICAL: Global storage for entropy responses during consensus verification
 lazy_static::lazy_static! {
@@ -1632,11 +1634,14 @@ impl BlockchainNode {
                         ).await;
                         
                         if next_producer == node_id {
-                            println!("[ROTATION] 🚀 WE are producer for block #{} - setting immediate production flag", next_height);
-                            IMMEDIATE_PRODUCTION_FLAG.store(true, Ordering::SeqCst);
+                            println!("[ROTATION] 🚀 WE are producer for block #{} - notifying main loop", next_height);
                         } else {
                             println!("[ROTATION] 👥 Producer for block #{}: {}", next_height, next_producer);
                         }
+                        
+                        // CRITICAL: Notify main loop to re-check producer status immediately
+                        // This interrupts any waiting and forces immediate producer selection
+                        ROTATION_NOTIFY.notify_one();
                     }
                     
                     // CRITICAL FIX: Asynchronous PoH synchronization to prevent blocking
@@ -2745,28 +2750,33 @@ impl BlockchainNode {
                 cpu_check_counter += 1;
                 
                 // CRITICAL FIX: Sync local microblock_height with global height at loop start
-                // But ONLY if we have all intermediate blocks!
+                // This ensures producer selection uses latest height after rotation
                 {
                     let global_height = *height.read().await;
                     if global_height > microblock_height {
-                        // Check if we have all blocks up to global_height
-                        let mut can_sync = true;
-                        for h in (microblock_height + 1)..=global_height {
-                            if storage.load_microblock(h).unwrap_or(None).is_none() {
-                                can_sync = false;
-                                if h == microblock_height + 1 {
-                                    // Missing next block - this is critical
+                        // CRITICAL: For rotation boundaries, sync immediately without checking storage
+                        // process_received_blocks updates global_height before storage is fully written
+                        if global_height == microblock_height + 1 {
+                            // Next block - sync immediately for fast rotation
+                            println!("[SYNC] ⚡ Fast sync to height {} (rotation boundary)", global_height);
+                            microblock_height = global_height;
+                        } else {
+                            // Multiple blocks behind - check if we have all intermediate blocks
+                            let mut can_sync = true;
+                            for h in (microblock_height + 1)..=global_height {
+                                if storage.load_microblock(h).unwrap_or(None).is_none() {
+                                    can_sync = false;
                                     println!("[SYNC] ⚠️ Cannot sync to height {} - missing block #{}", 
                                             global_height, h);
+                                    break;
                                 }
-                                break;
                             }
-                        }
-                        
-                        if can_sync {
-                            println!("[SYNC] 📊 Syncing local height {} to global height {} (all blocks present)", 
-                                    microblock_height, global_height);
-                            microblock_height = global_height;
+                            
+                            if can_sync {
+                                println!("[SYNC] 📊 Syncing local height {} to global height {} (all blocks present)", 
+                                        microblock_height, global_height);
+                                microblock_height = global_height;
+                            }
                         }
                     }
                 }
@@ -4447,15 +4457,6 @@ impl BlockchainNode {
                     }
                 }
                 
-                // CRITICAL: Check immediate production flag (set after rotation boundary)
-                // If set, skip sleep and produce block immediately for seamless rotation
-                if IMMEDIATE_PRODUCTION_FLAG.load(Ordering::SeqCst) {
-                    println!("[ROTATION] ⚡ Immediate production flag set - skipping sleep for seamless rotation");
-                    IMMEDIATE_PRODUCTION_FLAG.store(false, Ordering::SeqCst);
-                    // Update next_block_time to maintain timing
-                    next_block_time = std::time::Instant::now() + microblock_interval;
-                    continue; // Go to next iteration immediately
-                }
                 
                 // PRECISION TIMING: Sleep until exact next block time (no drift accumulation)
                 let now = std::time::Instant::now();
