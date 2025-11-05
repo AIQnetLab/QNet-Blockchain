@@ -4750,34 +4750,55 @@ impl BlockchainNode {
                     Self::get_previous_microblock_hash(store, 31).await  // Gets hash of block 30
                 } else if leadership_round == 2 {
                     // Round 2 (blocks 61-90): Use block 60 as entropy
-                    println!("[CONSENSUS] 🎲 Round 2: Using block 60 as entropy (no macroblock yet)");
+                    // Macroblock #0 not ready yet (created at block 90)
+                    println!("[CONSENSUS] 🎲 Round 2: Using block 60 as entropy (macroblock not ready yet)");
                     Self::get_previous_microblock_hash(store, 61).await  // Gets hash of block 60
                 } else {
-                    // Round 3+ (blocks 91+): Use last macroblock as entropy (Byzantine consensus)
+                    // Round 3+ (blocks 91+): Try to use macroblock first, fallback to microblock
+                    // QUANTUM SECURITY: Macroblocks provide Byzantine consensus-verified entropy
                     let round_start_block = leadership_round * rotation_interval + 1;
-                    let last_macroblock_height = ((round_start_block - 1) / 90) * 90;
+                    let last_block_of_prev_round = round_start_block - 1;
                     
-                    // We should always have a macroblock by round 3
-                    let macroblock_index = last_macroblock_height / 90;
-                    match store.get_macroblock_by_height(macroblock_index) {
+                    // Calculate which macroblock we need
+                    // Round 3 (91-120) needs macroblock #0 (blocks 1-90)
+                    // Round 4 (121-150) needs macroblock #0 (blocks 1-90)
+                    // Round 5 (151-180) needs macroblock #0 (blocks 1-90)
+                    // Round 6 (181-210) needs macroblock #1 (blocks 91-180)
+                    let required_macroblock = (last_block_of_prev_round - 1) / 90;
+                    
+                    match store.get_macroblock_by_height(required_macroblock) {
                         Ok(Some(macroblock_data)) => {
+                            // Use macroblock hash as entropy (Byzantine consensus verified)
                             use sha3::{Sha3_256, Digest};
                             let mut hasher = Sha3_256::new();
                             hasher.update(&macroblock_data);
                             let result = hasher.finalize();
                             let mut hash = [0u8; 32];
                             hash.copy_from_slice(&result);
-                            println!("[CONSENSUS] 🎲 Using MACROBLOCK #{} (height {}) hash as entropy (Byzantine safe): {:x}", 
-                                     macroblock_index, last_macroblock_height,
-                                     u64::from_le_bytes([hash[0], hash[1], hash[2], hash[3], 
-                                                        hash[4], hash[5], hash[6], hash[7]]));
+                            println!("[CONSENSUS] 🎲 Round {}: Using MACROBLOCK #{} as entropy (Byzantine consensus)", 
+                                     leadership_round, required_macroblock);
                             hash
                         },
                         _ => {
-                            // Emergency fallback: use last block of previous round
+                            // Fallback: use last microblock of previous round
                             println!("[CONSENSUS] ⚠️ Macroblock #{} not found, using block {} as entropy", 
-                                     macroblock_index, round_start_block - 1);
-                            Self::get_previous_microblock_hash(store, round_start_block).await
+                                     required_macroblock, last_block_of_prev_round);
+                            
+                            // Wait for block to be available
+                            let mut retries = 0;
+                            while retries < 10 {
+                                if let Ok(Some(_)) = store.load_microblock(last_block_of_prev_round) {
+                                    break;
+                                }
+                                if retries == 0 {
+                                    println!("[CONSENSUS] ⏳ Waiting for block {} for fallback entropy", 
+                                             last_block_of_prev_round);
+                                }
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                                retries += 1;
+                            }
+                            
+                            Self::get_previous_microblock_hash(store, last_block_of_prev_round + 1).await
                         }
                     }
                 };
@@ -4821,13 +4842,12 @@ impl BlockchainNode {
                     // IMPORTANT: Use last block of PREVIOUS round to ensure all nodes have it
                     // This prevents desync when the boundary block was JUST created
                     // Formula: Round N uses block (N*30 - 1) from previous round
-                    let required_poh_block = match leadership_round {
-                        1 => 30,  // Round 1 (blocks 31-60) uses block 30 (last of Round 0)
-                        _ => leadership_round * 30 - 1  // Round N uses block N*30-1 (last of Round N-1)
-                    };
+                    // QUANTUM CONSENSUS: Use full round entropy (last block of previous round)
+                    let required_poh_block = leadership_round * 30;
                     // Examples:
-                    // Round 2 (blocks 61-90):  uses block 59 (2*30-1 = 59, last of Round 1)
-                    // Round 3 (blocks 91-120): uses block 89 (3*30-1 = 89, last of Round 2)
+                    // Round 1 (blocks 31-60):  uses block 30 (1*30 = 30, last of Round 0)
+                    // Round 2 (blocks 61-90):  uses block 60 (2*30 = 60, last of Round 1)
+                    // Round 3 (blocks 91-120): uses block 90 (3*30 = 90, last of Round 2)
                     
                     // CRITICAL: Check if we're synchronized enough to use PoH
                     let local_height = store.get_chain_height().unwrap_or(0);
@@ -6202,8 +6222,11 @@ impl BlockchainNode {
                  finalization_type, participants.len());
         
         // Calculate state root from microblocks
-        let start_height = (height / 90) * 90 + 1;
-        let end_height = ((height / 90) + 1) * 90;
+        // CRITICAL FIX: Correct calculation for macroblock boundaries
+        // For height 90: blocks 1-90, for height 180: blocks 91-180
+        let macroblock_index = (height - 1) / 90;  // 0-based index
+        let start_height = macroblock_index * 90 + 1;
+        let end_height = (macroblock_index + 1) * 90;
         
         let mut microblock_hashes = Vec::new();
         let mut state_accumulator = [0u8; 32];
@@ -6255,12 +6278,12 @@ impl BlockchainNode {
             const MACROBLOCK_INTERVAL_SECONDS: u64 = 90;  // 90 seconds per macroblock (90 microblocks)
             
             // Macroblock timestamp = genesis + (macroblock_height * 90 seconds)
-            let macroblock_height = height / 90;
+            let macroblock_height = (height - 1) / 90;
             genesis_timestamp + (macroblock_height * MACROBLOCK_INTERVAL_SECONDS)
         };
         
         let macroblock = qnet_state::MacroBlock {
-            height: height / 90,
+            height: macroblock_index,
             timestamp: deterministic_timestamp,  // DETERMINISTIC: Same on all nodes
             micro_blocks: microblock_hashes,
             state_root: state_accumulator,
