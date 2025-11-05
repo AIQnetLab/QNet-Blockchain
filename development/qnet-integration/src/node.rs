@@ -320,7 +320,12 @@ impl RotationTracker {
     
     /// Track block production
     pub async fn track_block(&self, height: u64, producer: &str) {
-        let round = height / ROTATION_INTERVAL_BLOCKS;
+        // CRITICAL FIX: Blocks 1-30 are round 0, 31-60 are round 1, etc.
+        let round = if height == 0 {
+            0  // Genesis block
+        } else {
+            (height - 1) / ROTATION_INTERVAL_BLOCKS
+        };
         let mut rotations = self.current_rotations.write().await;
         
         let entry = rotations.entry(round).or_insert((producer.to_string(), 0, height));
@@ -1620,6 +1625,10 @@ impl BlockchainNode {
                                 println!("[ROTATION] 📊 Global height updated to {}", received_block.height);
                             }
                         }
+                        
+                        // CRITICAL: Wait for block to be fully saved before calculating next producer
+                        // This ensures all nodes use the same entropy source
+                        tokio::time::sleep(Duration::from_millis(50)).await;
                         
                         // CRITICAL: Check if WE are producer for next block
                         // If yes, set flag for immediate production (skip sleep in main loop)
@@ -3782,6 +3791,12 @@ impl BlockchainNode {
                     // Calculate TPS for this microblock
                     let tps = (txs.len() as f64) / current_interval.as_secs_f64();
                     
+                    // CRITICAL: Check if block already exists to prevent forks
+                    if storage.load_microblock(microblock.height).is_ok() {
+                        println!("[PRODUCER] ⚠️ Block #{} already exists, skipping creation to prevent fork", microblock.height);
+                        continue;
+                    }
+                    
                     // PRODUCTION: Use ultra-modern storage with delta encoding and compression
                     // QUANTUM: Always use async storage for consistent timing
                     let storage_clone = storage.clone();
@@ -4260,7 +4275,11 @@ impl BlockchainNode {
                                             // Store emergency producer flag in a shared location
                                             if let Ok(mut emergency_flag) = EMERGENCY_PRODUCER_FLAG.lock() {
                                                 *emergency_flag = Some((expected_height_timeout, emergency_producer.clone()));
+                                                println!("[FAILOVER] 🔥 Emergency flag set for block #{}", expected_height_timeout);
                                             }
+                                            
+                                            // CRITICAL: Also notify main loop immediately
+                                            ROTATION_NOTIFY.notify_one();
                                         }
                                     }
                                 }
