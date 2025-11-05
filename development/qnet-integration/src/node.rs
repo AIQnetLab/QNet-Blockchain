@@ -58,7 +58,7 @@ use std::sync::Mutex;
 
 // CRITICAL: Global flag for emergency producer activation
 lazy_static::lazy_static! {
-    static ref EMERGENCY_PRODUCER_FLAG: Mutex<Option<(u64, String)>> = Mutex::new(None);
+    pub static ref EMERGENCY_PRODUCER_FLAG: Mutex<Option<(u64, String)>> = Mutex::new(None);
 }
 
 // CRITICAL: Public function to set emergency producer flag from other modules
@@ -73,6 +73,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 static SYNC_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static FAST_SYNC_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 pub static NODE_IS_SYNCHRONIZED: AtomicBool = AtomicBool::new(false);
+
+// CRITICAL: Flag for immediate production after rotation boundary
+// When set, producer node skips sleep and produces block immediately
+static IMMEDIATE_PRODUCTION_FLAG: AtomicBool = AtomicBool::new(false);
 
 // CRITICAL: Global storage for entropy responses during consensus verification
 lazy_static::lazy_static! {
@@ -1134,8 +1138,18 @@ impl BlockchainNode {
         let height_for_blocks = blockchain.height.clone();
         let p2p_for_blocks = blockchain.unified_p2p.clone();
         let poh_for_blocks = blockchain.quantum_poh.clone();
+        let node_id_for_blocks = blockchain.node_id.clone();
+        let node_type_for_blocks = blockchain.node_type;
         tokio::spawn(async move {
-            Self::process_received_blocks(block_rx, storage_for_blocks, height_for_blocks, p2p_for_blocks, poh_for_blocks).await;
+            Self::process_received_blocks(
+                block_rx, 
+                storage_for_blocks, 
+                height_for_blocks, 
+                p2p_for_blocks, 
+                poh_for_blocks,
+                node_id_for_blocks,
+                node_type_for_blocks
+            ).await;
         });
         
         // Register Genesis nodes in reward system and start processing
@@ -1244,6 +1258,8 @@ impl BlockchainNode {
         height: Arc<RwLock<u64>>,
         unified_p2p: Option<Arc<SimplifiedP2P>>,
         quantum_poh: Option<Arc<crate::quantum_poh::QuantumPoH>>,
+        node_id: String,
+        node_type: NodeType,
     ) {
         // CRITICAL FIX: Buffer for out-of-order blocks
         // Key: block height, Value: (block data, retry count, timestamp)
@@ -1601,6 +1617,25 @@ impl BlockchainNode {
                                 *global_height = received_block.height;
                                 println!("[ROTATION] 📊 Global height updated to {}", received_block.height);
                             }
+                        }
+                        
+                        // CRITICAL: Check if WE are producer for next block
+                        // If yes, set flag for immediate production (skip sleep in main loop)
+                        let next_height = received_block.height + 1;
+                        let next_producer = Self::select_microblock_producer(
+                            next_height,
+                            &unified_p2p,
+                            &node_id,
+                            node_type,
+                            Some(&storage),
+                            &quantum_poh
+                        ).await;
+                        
+                        if next_producer == node_id {
+                            println!("[ROTATION] 🚀 WE are producer for block #{} - setting immediate production flag", next_height);
+                            IMMEDIATE_PRODUCTION_FLAG.store(true, Ordering::SeqCst);
+                        } else {
+                            println!("[ROTATION] 👥 Producer for block #{}: {}", next_height, next_producer);
                         }
                     }
                     
@@ -4413,6 +4448,16 @@ impl BlockchainNode {
                     } else {
                         println!("[PFP] ✅ Macroblock #{} found - no recovery needed", expected_macroblock);
                     }
+                }
+                
+                // CRITICAL: Check immediate production flag (set after rotation boundary)
+                // If set, skip sleep and produce block immediately for seamless rotation
+                if IMMEDIATE_PRODUCTION_FLAG.load(Ordering::SeqCst) {
+                    println!("[ROTATION] ⚡ Immediate production flag set - skipping sleep for seamless rotation");
+                    IMMEDIATE_PRODUCTION_FLAG.store(false, Ordering::SeqCst);
+                    // Update next_block_time to maintain timing
+                    next_block_time = std::time::Instant::now() + microblock_interval;
+                    continue; // Go to next iteration immediately
                 }
                 
                 // PRECISION TIMING: Sleep until exact next block time (no drift accumulation)

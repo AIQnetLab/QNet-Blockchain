@@ -4509,7 +4509,7 @@ async fn handle_producer_status(
     
     // CRITICAL FIX: Get current producer for next block
     let next_height = current_height + 1;
-    let current_producer = if let Some(p2p) = blockchain.get_unified_p2p() {
+    let mut current_producer = if let Some(p2p) = blockchain.get_unified_p2p() {
         // Use the same logic as in node.rs to determine current producer
         crate::node::BlockchainNode::select_microblock_producer(
             next_height,
@@ -4522,6 +4522,17 @@ async fn handle_producer_status(
     } else {
         node_id.clone()  // Solo mode
     };
+    
+    // CRITICAL FIX: Check emergency producer flag (same as node.rs line 3147-3155)
+    // If emergency producer is set for this height, use it instead
+    use crate::node::EMERGENCY_PRODUCER_FLAG;
+    if let Ok(emergency_flag) = EMERGENCY_PRODUCER_FLAG.lock() {
+        if let Some((height, producer)) = &*emergency_flag {
+            if *height == next_height {
+                current_producer = producer.clone();
+            }
+        }
+    }
     
     let status = json!({
         "current_height": current_height,
