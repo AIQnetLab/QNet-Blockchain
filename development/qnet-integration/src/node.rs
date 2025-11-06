@@ -3368,6 +3368,21 @@ impl BlockchainNode {
                     }
                 }
                 
+                // CRITICAL FIX: Update NODE_IS_SYNCHRONIZED for ALL nodes BEFORE producer check
+                // This was a BUG: flag was only updated in else branch (non-producers)
+                // Producer nodes need this flag set to pass is_next_block_producer() check
+                {
+                    let current_stored_height = storage.get_chain_height().unwrap_or(0);
+                    let is_synchronized = if microblock_height > 10 {
+                        // Normal operation: allow max 10 blocks behind
+                        current_stored_height + 10 >= microblock_height
+                    } else {
+                        // Genesis phase: must be within 1 block
+                        current_stored_height + 1 >= microblock_height
+                    };
+                    NODE_IS_SYNCHRONIZED.store(is_synchronized, Ordering::SeqCst);
+                }
+                
                 if is_my_turn_to_produce {
                     // PRODUCTION: This node is selected as microblock producer for this round
                     *is_leader.write().await = true;
@@ -4297,19 +4312,8 @@ impl BlockchainNode {
                     }
                 }
                 
-                // Update NODE_IS_SYNCHRONIZED for ALL nodes (not just producers)
-                // This was a BUG: only producers updated this flag!
-                {
-                    let current_stored_height = storage.get_chain_height().unwrap_or(0);
-                    let is_synchronized = if microblock_height > 10 {
-                        // Normal operation: allow max 10 blocks behind
-                        current_stored_height + 10 >= microblock_height
-                    } else {
-                        // Genesis phase: must be within 1 block
-                        current_stored_height + 1 >= microblock_height
-                    };
-                    NODE_IS_SYNCHRONIZED.store(is_synchronized, Ordering::SeqCst);
-                }
+                // NOTE: NODE_IS_SYNCHRONIZED is now updated BEFORE producer check (line ~3371)
+                // This ensures ALL nodes (including producers) have correct sync status
                 
                 // ══════════════════════════════════════════════════════════════════
                 // CRITICAL: MACROBLOCK CONSENSUS FOR ALL NODES (not just producer!)

@@ -12,6 +12,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Cache now cleared when entering new round (blocks 31, 61, 91...)
   - First block of new round always recalculates producer
   - Ensures different producer selected for each round
+- **NODE_IS_SYNCHRONIZED Flag for Producers**: Critical fix for block production
+  - Flag was only updated for non-producer nodes (in else branch)
+  - Producer nodes had stale sync status, failing is_next_block_producer() check
+  - Moved flag update before producer check (line 3371) to ensure ALL nodes update
+  - Fixes: Selected producer unable to create blocks due to false "not synchronized" status
 - **Key Manager Persistence**: Identified Docker volume requirement
   - Keys were regenerated on restart due to non-persistent /app/data/keys
   - Requires Docker volume mount for persistent key storage
