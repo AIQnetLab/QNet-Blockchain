@@ -74,11 +74,8 @@ static SYNC_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static FAST_SYNC_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 pub static NODE_IS_SYNCHRONIZED: AtomicBool = AtomicBool::new(false);
 
-// CRITICAL: Notify for rotation boundary - interrupts block waiting
-// When rotation block is received, this wakes up the main loop immediately
-lazy_static::lazy_static! {
-    static ref ROTATION_NOTIFY: tokio::sync::Notify = tokio::sync::Notify::new();
-}
+// NOTE: Removed ROTATION_NOTIFY - simple 1-second timing is more reliable
+// Testing showed that natural timing without interrupts prevents race conditions
 
 // CRITICAL: Global storage for entropy responses during consensus verification
 lazy_static::lazy_static! {
@@ -1648,9 +1645,8 @@ impl BlockchainNode {
                             println!("[ROTATION] 👥 Producer for block #{}: {}", next_height, next_producer);
                         }
                         
-                        // CRITICAL: Notify main loop to re-check producer status immediately
-                        // This interrupts any waiting and forces immediate producer selection
-                        ROTATION_NOTIFY.notify_one();
+                        // NOTE: Main loop will naturally check on next iteration (max 1 second delay)
+                        // This is more reliable than interrupt-based notifications
                     }
                     
                     // CRITICAL FIX: Asynchronous PoH synchronization to prevent blocking
@@ -4295,8 +4291,7 @@ impl BlockchainNode {
                                                 println!("[FAILOVER] 🔥 Emergency flag set for block #{}", expected_height_timeout);
                                             }
                                             
-                                            // CRITICAL: Also notify main loop immediately
-                                            ROTATION_NOTIFY.notify_one();
+                                            // NOTE: Emergency producer will be checked on next iteration
                                         }
                                     }
                                 }
@@ -4497,9 +4492,12 @@ impl BlockchainNode {
                         precise_sleep_duration
                     };
                     
+                    // ARCHITECTURE: Simple and reliable timing without race conditions
+                    // Each node sleeps for exactly 1 second, then checks if it's producer
+                    // This worked perfectly in commit 669ca77 - don't overcomplicate!
                     tokio::time::sleep(compensated_duration).await;
                     
-                    // Busy-wait for remaining time for precise timing
+                    // Busy-wait for remaining time for precise timing (only if not interrupted)
                     while std::time::Instant::now() < next_block_time {
                         tokio::task::yield_now().await; // Yield to other tasks but stay ready
                     }

@@ -4492,13 +4492,15 @@ async fn handle_producer_status(
     let is_leader = blockchain.is_next_block_producer().await;
     let node_id = blockchain.get_node_id();
     
-    // Calculate next producer rotation using SAME formula as node.rs
-    let leadership_round = if current_height == 0 {
+    // CRITICAL FIX: Calculate round for NEXT block (current_height + 1)
+    // API shows producer status for the NEXT block to be produced
+    let next_height = current_height + 1;
+    let leadership_round = if next_height == 0 {
         0  // Genesis block special case
-    } else if current_height <= 30 {
-        0  // Blocks 1-30 are round 0 (SAME as node.rs line 3266-3267)
+    } else if next_height <= 30 {
+        0  // Blocks 1-30 are round 0
     } else {
-        (current_height - 1) / 30  // Formula from node.rs line 3271
+        (next_height - 1) / 30  // Blocks 31-60 = round 1, 61-90 = round 2, etc.
     };
     let next_rotation = (leadership_round + 1) * 30 + 1;  // Round N ends at N*30+30, next starts at N*30+31
     let blocks_until_rotation = if current_height == 0 {
@@ -4507,8 +4509,7 @@ async fn handle_producer_status(
         next_rotation - current_height
     };
     
-    // CRITICAL FIX: Get current producer for next block
-    let next_height = current_height + 1;
+    // CRITICAL FIX: Get current producer for next block (already calculated above)
     let mut current_producer = if let Some(p2p) = blockchain.get_unified_p2p() {
         // Use the same logic as in node.rs to determine current producer
         crate::node::BlockchainNode::select_microblock_producer(

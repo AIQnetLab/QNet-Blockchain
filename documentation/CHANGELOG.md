@@ -17,6 +17,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Producer nodes had stale sync status, failing is_next_block_producer() check
   - Moved flag update before producer check (line 3371) to ensure ALL nodes update
   - Fixes: Selected producer unable to create blocks due to false "not synchronized" status
+- **Leadership Round Calculation in API**: Fixed incorrect round display
+  - API endpoint calculated round for current block instead of next block
+  - At block 30, showed round 0 instead of round 1 (for block 31)
+  - Now correctly calculates round for next_height (current_height + 1)
+  - Fixes: API showing wrong leadership_round and blocks_until_rotation
+- **Removed ROTATION_NOTIFY Mechanism**: Simplified rotation handling
+  - Removed complex interrupt-based rotation notifications (caused race conditions)
+  - Returned to simple 1-second timing that worked reliably in commits 669ca77 and 356e2bb
+  - Natural timing ensures all nodes check producer status within 1 second
+  - Fixes: Race conditions where notification arrived before rotation block
 - **Key Manager Persistence**: Identified Docker volume requirement
   - Keys were regenerated on restart due to non-persistent /app/data/keys
   - Requires Docker volume mount for persistent key storage
