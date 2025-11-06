@@ -2759,29 +2759,22 @@ impl BlockchainNode {
                 {
                     let global_height = *height.read().await;
                     if global_height > microblock_height {
-                        // CRITICAL: For rotation boundaries, sync immediately without checking storage
-                        // process_received_blocks updates global_height before storage is fully written
-                        if global_height == microblock_height + 1 {
-                            // Next block - sync immediately for fast rotation
-                            println!("[SYNC] ⚡ Fast sync to height {} (rotation boundary)", global_height);
+                        // CRITICAL: Always sync to global height if we're behind
+                        // Check if we have all intermediate blocks
+                        let mut can_sync = true;
+                        for h in (microblock_height + 1)..=global_height {
+                            if storage.load_microblock(h).unwrap_or(None).is_none() {
+                                can_sync = false;
+                                println!("[SYNC] ⚠️ Cannot sync to height {} - missing block #{}", 
+                                        global_height, h);
+                                break;
+                            }
+                        }
+                        
+                        if can_sync {
+                            println!("[SYNC] ⚡ Syncing local height {} → {} (all blocks present)", 
+                                    microblock_height, global_height);
                             microblock_height = global_height;
-                        } else {
-                            // Multiple blocks behind - check if we have all intermediate blocks
-                            let mut can_sync = true;
-                            for h in (microblock_height + 1)..=global_height {
-                                if storage.load_microblock(h).unwrap_or(None).is_none() {
-                                    can_sync = false;
-                                    println!("[SYNC] ⚠️ Cannot sync to height {} - missing block #{}", 
-                                            global_height, h);
-                                    break;
-                                }
-                            }
-                            
-                            if can_sync {
-                                println!("[SYNC] 📊 Syncing local height {} to global height {} (all blocks present)", 
-                                        microblock_height, global_height);
-                                microblock_height = global_height;
-                            }
                         }
                     }
                 }
@@ -2833,12 +2826,10 @@ impl BlockchainNode {
                         let last_height = *LAST_HEIGHT_CHECK.lock().unwrap();
                         let time_since_block = LAST_BLOCK_TIME.lock().unwrap().elapsed();
                         
-                        // Force update if:
-                        // 1. We're at early blocks (<=30)
-                        // 2. No progress for 30 seconds
-                        // 3. Height hasn't changed in last check
-                        microblock_height <= 30 || 
-                        (time_since_block.as_secs() > 30 && last_height == microblock_height)
+                        // Force update ONLY if stuck (no progress for 30 seconds)
+                        // Don't force update during normal operation (blocks <=30)
+                        // This was causing 800-1200ms delay every iteration!
+                        time_since_block.as_secs() > 30 && last_height == microblock_height
                     };
                     
                     let network_height = if should_force_update {
