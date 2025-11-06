@@ -3857,39 +3857,45 @@ impl BlockchainNode {
                         // Continue anyway - block will be retried
                     }
                     
-                    // CRITICAL FIX: ASYNCHRONOUS broadcast for performance (1 block/sec target)
-                    // Block is already saved, broadcast can happen in background
+                    // CRITICAL FIX: SYNCHRONOUS broadcast but AFTER storage save
+                    // This ensures block is delivered to peers before we move to next block
+                    // Storage is already saved, so block won't be lost
                     if let Some(p2p) = &unified_p2p {
-                        let p2p_broadcast = p2p.clone();
-                        let microblock_broadcast = microblock.clone();
-                        let compression_enabled_broadcast = compression_enabled;
+                        let peer_count = p2p.get_peer_count();
+                        let broadcast_data = if compression_enabled {
+                            Self::compress_microblock_data(&microblock).unwrap_or_else(|_| {
+                                bincode::serialize(&microblock).unwrap_or_default()
+                            })
+                        } else {
+                            bincode::serialize(&microblock).unwrap_or_default()
+                        };
                         
-                        tokio::spawn(async move {
-                            let peer_count = p2p_broadcast.get_peer_count();
-                            let broadcast_data = if compression_enabled_broadcast {
-                                Self::compress_microblock_data(&microblock_broadcast).unwrap_or_else(|_| {
-                                    bincode::serialize(&microblock_broadcast).unwrap_or_default()
-                                })
-                            } else {
-                                bincode::serialize(&microblock_broadcast).unwrap_or_default()
-                            };
-                            
-                            let broadcast_size = broadcast_data.len();
-                            let height_for_broadcast = microblock_broadcast.height;
-                            
-                            // Use Turbine for blocks > 1KB, regular broadcast for smaller blocks
-                            let result = if broadcast_size > 1024 && peer_count > 10 {
-                                p2p_broadcast.broadcast_block_turbine(height_for_broadcast, broadcast_data)
-                            } else {
-                                p2p_broadcast.broadcast_block(height_for_broadcast, broadcast_data)
-                            };
-                            
-                            // Log only errors or every 10th block
-                            if result.is_err() || height_for_broadcast % 10 == 0 {
-                                println!("[P2P] 📡 Block #{} broadcast: {:?} | {} peers | {} bytes",
-                                        height_for_broadcast, result.is_ok(), peer_count, broadcast_size);
-                            }
-                        });
+                        let broadcast_size = broadcast_data.len();
+                        let height_for_broadcast = microblock.height;
+                        
+                        // TIMING: Measure broadcast time
+                        let broadcast_start = std::time::Instant::now();
+                        
+                        // Use Turbine for blocks > 1KB, regular broadcast for smaller blocks
+                        let result = if broadcast_size > 1024 && peer_count > 10 {
+                            p2p.broadcast_block_turbine(height_for_broadcast, broadcast_data)
+                        } else {
+                            p2p.broadcast_block(height_for_broadcast, broadcast_data)
+                        };
+                        
+                        let broadcast_time = broadcast_start.elapsed();
+                        
+                        // Log timing and result
+                        if result.is_err() || height_for_broadcast % 10 == 0 || broadcast_time.as_millis() > 500 {
+                            println!("[P2P] 📡 Block #{} broadcast: {:?} | {} peers | {} bytes | {:?}ms",
+                                    height_for_broadcast, result.is_ok(), peer_count, broadcast_size, broadcast_time.as_millis());
+                        }
+                        
+                        // CRITICAL: If broadcast is too slow, log warning
+                        if broadcast_time.as_millis() > 1000 {
+                            println!("[P2P] ⚠️ SLOW BROADCAST: Block #{} took {:?}ms (target: <500ms)", 
+                                    height_for_broadcast, broadcast_time.as_millis());
+                        }
                     } else {
                         println!("[P2P] ⚠️ P2P system not available - cannot broadcast block #{}", microblock.height);
                     }
