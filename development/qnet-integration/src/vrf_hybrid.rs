@@ -93,7 +93,8 @@ impl QNetHybridVrf {
         let vrf_message = hasher.finalize();
         
         // Step 2: Verify hybrid signature (this checks Dilithium certificate)
-        let signature_valid = HybridCrypto::verify_signature(
+        let verifier = HybridCrypto::new(vrf_output.proof.certificate.node_id.clone());
+        let signature_valid = verifier.verify_signature(
             &vrf_message,
             &vrf_output.proof
         ).await?;

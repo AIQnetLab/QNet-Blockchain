@@ -141,7 +141,8 @@ impl BlockValidator {
             .map_err(|e| IntegrationError::ValidationError(format!("Runtime error: {}", e)))?;
         
         let result = rt.block_on(async {
-            HybridCrypto::verify_signature(&message, &hybrid_sig).await
+            let verifier = HybridCrypto::new(hybrid_sig.certificate.node_id.clone());
+            verifier.verify_signature(&message, &hybrid_sig).await
         });
         
         match result {

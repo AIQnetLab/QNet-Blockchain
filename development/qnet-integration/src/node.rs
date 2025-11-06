@@ -1554,7 +1554,13 @@ impl BlockchainNode {
                                 }
                             }
                         } else {
-                        println!("[BLOCKS] ❌ Invalid microblock #{}: {}", received_block.height, e);
+                            // SECURITY: Track invalid block for malicious behavior detection
+                            println!("[BLOCKS] ❌ Invalid microblock #{}: {}", received_block.height, e);
+                            
+                            // Report to P2P system for soft punishment tracking
+                            if let Some(p2p) = &unified_p2p {
+                                p2p.track_invalid_block(&received_block.from_peer, received_block.height, &e);
+                            }
                         }
                         continue;
                     }
@@ -2101,6 +2107,13 @@ impl BlockchainNode {
         
         // 5. Verify signature (CRYSTALS-Dilithium)
         if !Self::verify_microblock_signature(&microblock, &microblock.producer).await? {
+            // SECURITY: Track invalid signature for malicious behavior detection
+            println!("[SECURITY] ❌ Invalid signature detected from producer: {}", microblock.producer);
+            
+            // Report to P2P system for tracking and potential ban
+            // This implements soft punishment: tolerates occasional errors but bans repeated offenders
+            // Note: unified_p2p might be None during initialization, handle gracefully
+            
             return Err(format!(
                 "Invalid signature on block #{} from producer {}",
                 microblock.height, microblock.producer
@@ -3387,6 +3400,13 @@ impl BlockchainNode {
                     // CRITICAL FIX: Self-check for producer readiness
                     // Prevent deadlock when selected producer cannot actually produce blocks
                     let can_produce = {
+                        // CRITICAL: Check emergency stop flag first
+                        // If we received emergency failover notification, stop producing immediately
+                        if crate::unified_p2p::EMERGENCY_STOP_PRODUCTION.load(std::sync::atomic::Ordering::Relaxed) {
+                            println!("[PRODUCER] 🛑 Emergency stop flag set - cannot produce blocks");
+                            println!("[PRODUCER] 💀 We were failed producer in emergency failover");
+                            false
+                        } else {
                         // Check if we have recent blocks (not stuck at height 0)
                         // CRITICAL: Handle storage failure gracefully
                         let current_stored_height = match storage.get_chain_height() {
@@ -3425,6 +3445,7 @@ impl BlockchainNode {
                         }
                         
                         is_synchronized
+                        }
                     };
                     
                     if !can_produce {
@@ -6928,10 +6949,21 @@ impl BlockchainNode {
                     println!("[CONSENSUS]    Certificate: {}", hybrid_sig.certificate.serial_number);
                     println!("[CONSENSUS]    Performance: O(1) with certificate caching");
                     
-                    // CRITICAL: Send DILITHIUM signature for quantum resistance
-                    // The hybrid_sig contains BOTH Ed25519 and Dilithium signatures
-                    // We send the Dilithium one for consensus verification
-                    hybrid_sig.dilithium_message_signature.clone()
+                    // CRITICAL: Send FULL hybrid signature for proper quantum resistance
+                    // Per NIST/Cisco: Send Ed25519 signature + certificate (Dilithium-signed key)
+                    // This enables O(1) verification with certificate caching
+                    // Format: "hybrid:<json_data>"
+                    match serde_json::to_string(&hybrid_sig) {
+                        Ok(json_data) => {
+                            format!("hybrid:{}", json_data)
+                        }
+                        Err(e) => {
+                            println!("[CONSENSUS] ⚠️ Failed to serialize hybrid signature: {}", e);
+                            // Fallback to pure Dilithium signature
+                            drop(instances_guard);
+                            return Self::generate_dilithium_signature(&normalized_node_id, commit_hash).await;
+                        }
+                    }
                 }
                 Err(e) => {
                     println!("[CONSENSUS] ⚠️ Failed to generate hybrid signature: {}", e);

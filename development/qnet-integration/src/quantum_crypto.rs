@@ -758,7 +758,10 @@ impl QNetQuantumCrypto {
             return Err(anyhow!("Quantum crypto not initialized"));
         }
 
-        let signature_data = format!("{}:{}", node_id, data);
+        // CRITICAL FIX: Do NOT add node_id prefix here
+        // The verification in consensus_crypto.rs expects data WITHOUT prefix
+        // Adding prefix causes "Message mismatch" error in consensus
+        let signature_data = data.to_string();
         
         // CRITICAL: Use cached DilithiumKeyManager to avoid repeated disk I/O
         // This caches LONG-TERM keys only, NOT ephemeral keys (per NIST/Cisco)

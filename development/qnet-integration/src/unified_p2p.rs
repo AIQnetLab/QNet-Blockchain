@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 use dashmap::{DashMap, DashSet};
 use std::time::{Duration, Instant};
 use once_cell::sync::Lazy;
@@ -90,6 +90,17 @@ pub static LOCAL_BLOCKCHAIN_HEIGHT: Lazy<Arc<AtomicU64>> =
 // SCALABILITY: Use DashSet for lock-free concurrent access with millions of nodes
 static PROCESSED_FAILOVERS: Lazy<Arc<DashSet<(u64, String, String)>>> = 
     Lazy::new(|| Arc::new(DashSet::new()));
+
+// CRITICAL: Emergency stop flag for failed producers
+// When set, prevents the node from producing blocks after emergency failover
+pub static EMERGENCY_STOP_PRODUCTION: Lazy<Arc<AtomicBool>> = 
+    Lazy::new(|| Arc::new(AtomicBool::new(false)));
+
+// SECURITY: Track invalid blocks from each node for malicious behavior detection
+// Format: node_id -> (invalid_count, first_invalid_time)
+// SCALABILITY: DashMap for lock-free concurrent access with millions of nodes
+static INVALID_BLOCKS_TRACKER: Lazy<Arc<DashMap<String, (AtomicU64, Instant)>>> = 
+    Lazy::new(|| Arc::new(DashMap::new()));
 
 /// SECURITY: Rate limiting structure for DDoS protection
 #[derive(Debug, Clone)]
@@ -7453,6 +7464,14 @@ impl SimplifiedP2P {
         println!("[FAILOVER] 💀 Failed producer: {} at block #{}", failed_display, block_height);
         println!("[FAILOVER] 🆘 New producer: {} (emergency activation)", new_display);
         
+        // CRITICAL: If WE are the failed producer, stop producing blocks immediately
+        if failed_producer == self.node_id {
+            println!("[FAILOVER] 🛑 WE are the failed producer - STOPPING block production");
+            EMERGENCY_STOP_PRODUCTION.store(true, Ordering::Relaxed);
+            // Main loop will check this flag and stop producing blocks
+            // This prevents fork creation when emergency failover happens
+        }
+        
         // CRITICAL FIX: Don't penalize placeholder nodes only
         if failed_producer == "unknown_leader" || 
            failed_producer == "no_leader_selected" || 
@@ -7862,6 +7881,69 @@ impl SimplifiedP2P {
                 }
             }
         });
+    }
+    
+    /// Track invalid block from a producer for malicious behavior detection
+    /// SECURITY: Soft punishment approach - tolerates occasional errors but bans repeated offenders
+    pub fn track_invalid_block(&self, producer: &str, block_height: u64, reason: &str) {
+        // SCALABILITY: Lock-free tracking for millions of nodes
+        let entry = INVALID_BLOCKS_TRACKER
+            .entry(producer.to_string())
+            .or_insert((AtomicU64::new(0), Instant::now()));
+        
+        let count = entry.0.fetch_add(1, Ordering::Relaxed) + 1;
+        let first_seen = entry.1;
+        let elapsed = first_seen.elapsed();
+        
+        println!("[SECURITY] ⚠️ Invalid block from {}: {} (count: {}, window: {}s)", 
+                 producer, reason, count, elapsed.as_secs());
+        
+        // CRITICAL: Soft punishment with escalation
+        // 3 invalid blocks → warning + small penalty
+        // 10 invalid blocks in 5 minutes → critical attack (1 year ban)
+        
+        if count >= 10 && elapsed < Duration::from_secs(300) {
+            // CRITICAL ATTACK: 10+ invalid blocks in 5 minutes = malicious node
+            println!("[SECURITY] 🚨🚨🚨 MALICIOUS NODE DETECTED! 🚨🚨🚨");
+            println!("[SECURITY] 🚨 Producer: {} sent {} invalid blocks in {} seconds", 
+                     producer, count, elapsed.as_secs());
+            println!("[SECURITY] 🚨 APPLYING INSTANT BAN (1 YEAR)!");
+            
+            // Report as critical attack
+            let _ = self.report_critical_attack(
+                producer,
+                MaliciousBehavior::ProtocolViolation,
+                block_height,
+                &format!("Repeated invalid signatures: {} blocks in {}s", count, elapsed.as_secs())
+            );
+            
+            // Clear tracker after ban
+            INVALID_BLOCKS_TRACKER.remove(producer);
+            
+        } else if count == 3 {
+            // WARNING: 3 invalid blocks = possible bug or sync issue
+            println!("[SECURITY] ⚠️ WARNING: {} sent 3 invalid blocks - applying small penalty", producer);
+            self.update_node_reputation(producer, -5.0);
+            
+        } else if count == 5 {
+            // ESCALATION: 5 invalid blocks = suspicious behavior
+            println!("[SECURITY] ⚠️ ESCALATION: {} sent 5 invalid blocks - applying medium penalty", producer);
+            self.update_node_reputation(producer, -10.0);
+        }
+        
+        // CLEANUP: Remove old entries after 5 minutes (prevent memory leak)
+        // SCALABILITY: Periodic cleanup for millions of nodes
+        if elapsed > Duration::from_secs(300) {
+            INVALID_BLOCKS_TRACKER.remove(producer);
+        }
+        
+        // SCALABILITY: Global cleanup every 1000 tracked nodes
+        if INVALID_BLOCKS_TRACKER.len() > 1000 {
+            let now = Instant::now();
+            INVALID_BLOCKS_TRACKER.retain(|_, (_, first_seen)| {
+                now.duration_since(*first_seen) < Duration::from_secs(300)
+            });
+        }
     }
     
     /// Report critical attack to network for instant ban
