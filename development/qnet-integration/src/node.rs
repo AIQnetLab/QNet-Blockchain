@@ -4204,9 +4204,9 @@ impl BlockchainNode {
                             let node_type_timeout = node_type;
                             let quantum_poh_timeout = quantum_poh.clone();
                             
-                            // CRITICAL FIX: Don't trigger failover if we're still syncing with network
-                            // This prevents false failovers during startup when nodes are catching up
-                            let network_height = p2p_timeout.sync_blockchain_height().unwrap_or(0);
+                            // CRITICAL FIX: Use global height instead of sync_blockchain_height()
+                            // sync_blockchain_height() causes 800-1200ms delay!
+                            let network_height = *height.read().await;
                             
                             // ROTATION DEADLOCK DETECTION: Special handling at rotation boundaries
                             // Rotation happens at blocks 31, 61, 91... (first block of new round)
@@ -5157,9 +5157,27 @@ impl BlockchainNode {
             
             if own_node_id != failed_producer && can_participate_emergency {
                 let own_reputation = Self::get_node_reputation_score(own_node_id, p2p).await;
+                
+                // CRITICAL: Check if own node is synchronized for emergency production
+                // Log sync status but don't change selection probability
+                let is_synchronized = if let Some(ref store) = storage {
+                    let stored_height = store.get_chain_height().unwrap_or(0);
+                    // Allow max 10 blocks behind for emergency producer
+                    stored_height + 10 >= current_height
+                } else {
+                    true // If no storage, assume synced (shouldn't happen)
+                };
+                
+                // Add as candidate with ORIGINAL reputation (no boost)
                 candidates.push((own_node_id.to_string(), own_reputation));
-                println!("[EMERGENCY_SELECTION] ✅ Own node {} eligible for emergency production (type: {:?}, reputation: {:.1}%)", 
-                         own_node_id, own_node_type, own_reputation * 100.0);
+                
+                if is_synchronized {
+                    println!("[EMERGENCY_SELECTION] ✅ Own node {} eligible and SYNCHRONIZED (reputation: {:.1}%)", 
+                             own_node_id, own_reputation * 100.0);
+                } else {
+                    println!("[EMERGENCY_SELECTION] ⚠️ Own node {} eligible but NOT SYNCHRONIZED (height behind: {})", 
+                             own_node_id, current_height - storage.as_ref().unwrap().get_chain_height().unwrap_or(0));
+                }
             } else if own_node_id == failed_producer {
                 println!("[EMERGENCY_SELECTION] 💀 Own node {} is the failed producer - excluding", own_node_id);
             } else {
@@ -5720,6 +5738,8 @@ impl BlockchainNode {
                 
                 if real_reputation >= 0.70 && is_active {
                     // Node meets consensus threshold AND is active - add as candidate
+                    // NOTE: Synchronization will be checked AFTER selection in can_produce
+                    // This ensures deterministic candidate list across all nodes
                     all_qualified.push((node_id.clone(), real_reputation));
                     println!("[GENESIS] ✅ {} qualified with reputation {:.1}% (ACTIVE)", node_id, real_reputation * 100.0);
                 } else if real_reputation >= 0.70 && !is_active {
