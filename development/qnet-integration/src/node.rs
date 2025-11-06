@@ -3876,10 +3876,13 @@ impl BlockchainNode {
                         // TIMING: Measure broadcast time
                         let broadcast_start = std::time::Instant::now();
                         
-                        // Use Turbine for blocks > 1KB, regular broadcast for smaller blocks
-                        let result = if broadcast_size > 1024 && peer_count > 10 {
+                        // CRITICAL: Use Turbine for scalability when many peers
+                        // Direct broadcast only for small networks (<10 peers)
+                        let result = if peer_count > 10 {
+                            // Turbine protocol: O(log n) complexity, fanout=3
                             p2p.broadcast_block_turbine(height_for_broadcast, broadcast_data)
                         } else {
+                            // Direct broadcast: O(n) complexity, ok for small networks
                             p2p.broadcast_block(height_for_broadcast, broadcast_data)
                         };
                         
