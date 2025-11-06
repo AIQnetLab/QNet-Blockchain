@@ -3835,9 +3835,8 @@ impl BlockchainNode {
                         // Now spawn async task for rotation tracking
                         tokio::spawn(async move {
                                 
-                    // ATOMIC ROTATION TRACKING: Track block production
-                    // Rewards given once per rotation, not per block
-                    rotation_tracker_clone.track_block(height_for_storage, &producer_id_for_reward).await;
+                    // NOTE: Removed track_block here - it's called after block creation
+                    // This prevents double counting (was causing 59/30 blocks issue)
                     
                     // Check if rotation completed (every 30 blocks)
                     if let Some((rotation_producer, blocks_created)) = 
@@ -7630,7 +7629,9 @@ impl BlockchainNode {
             local_height
         };
         
-        let next_height = network_height + 1;
+        // CRITICAL FIX: Use local height for next block, not network height
+        // We need to check if THIS node is producer for ITS next block
+        let next_height = local_height + 1;
         
         // Get producer for next block using same logic as microblock production
         let producer = Self::select_microblock_producer(

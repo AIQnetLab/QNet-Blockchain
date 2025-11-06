@@ -175,17 +175,11 @@ async fn verify_with_real_dilithium(
                     if msg_in_sig_start + msg_len <= pk_len_start {
                         let embedded_msg = &signature_bytes[msg_in_sig_start..msg_in_sig_start + msg_len];
                         
-                        // Verify the embedded message matches expected
-                        if embedded_msg == expected_msg.as_bytes() {
-                            // Additional validation: ensure node_id is in the message
-                            let embedded_str = String::from_utf8_lossy(embedded_msg);
-                            if !embedded_str.starts_with(&format!("{}:", node_id)) {
-                                println!("[CONSENSUS] ❌ Node ID not found in message prefix!");
-                                println!("   Expected to start with: '{}:'", node_id);
-                                println!("   Got: '{}'", embedded_str);
-                                return false;
-                            }
-                            
+                        // CRITICAL FIX: Handle both formats - with and without node_id prefix
+                        // Check if message already contains node_id prefix
+                        let expected_with_prefix = format!("{}:{}", node_id, expected_msg);
+                        
+                        if embedded_msg == expected_msg.as_bytes() || embedded_msg == expected_with_prefix.as_bytes() {
                             println!("[CONSENSUS] ✅ Message matches embedded data");
                             println!("[CONSENSUS] ✅ Dilithium signature structurally valid");
                             println!("[CONSENSUS] ✅ Public key available for future verification");

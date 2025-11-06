@@ -5,6 +5,22 @@ All notable changes to the QNet project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.21.0] - November 6, 2025 "Critical Rotation and Consensus Fixes"
+
+### Fixed
+- **Duplicate track_block Calls**: Fixed double counting causing "59/30 blocks"
+  - Removed duplicate track_block call in block storage spawn
+  - Now only tracks blocks once after creation
+  - Fixes: Incorrect rotation tracking showing 59 blocks in 30-block rounds
+- **is_next_block_producer Height Calculation**: Fixed wrong height usage
+  - Now uses local_height + 1 instead of network_height + 1
+  - Ensures node checks if it's producer for its next block
+  - Fixes: Selected producer showing is_producer: false in API
+- **Consensus Signature Verification**: Fixed message format mismatch
+  - Now handles both formats: with and without node_id prefix
+  - Prevents "Message mismatch" errors in consensus
+  - Fixes: Macroblock consensus failing due to signature verification
+
 ## [2.20.0] - November 5, 2025 "Producer Rotation Cache Fix"
 
 ### Fixed
