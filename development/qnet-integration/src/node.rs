@@ -3812,88 +3812,84 @@ impl BlockchainNode {
                     
                     // PRODUCTION: Use ultra-modern storage with delta encoding and compression
                     // QUANTUM: Always use async storage for consistent timing
+                    // CRITICAL FIX: Save block with minimal blocking (serialize in main thread, save async)
+                    // This ensures block exists before height increment, but doesn't block on I/O
+                    let microblock_data = bincode::serialize(&microblock)
+                        .expect("Failed to serialize microblock");
+                    
                     let storage_clone = storage.clone();
-                    let microblock_clone = microblock.clone();
-                    let height_for_storage = microblock.height;  // CRITICAL FIX: Use block's actual height, not old height!
+                    let height_for_storage = microblock.height;
                     let p2p_for_reward = unified_p2p.clone();
-                    let producer_id_for_reward = node_id.clone();
                     let rotation_tracker_clone = rotation_tracker.clone();
                     
-                    // CRITICAL FIX: Save block SYNCHRONOUSLY before broadcast
-                    // This ensures block exists before being announced to network
-                    let save_result = {
-                        let microblock_data = bincode::serialize(&microblock_clone)
-                            .expect("Failed to serialize microblock");
-                        
-                        // Try delta encoding first (95% space saving)
-                        storage_clone.save_block_with_delta(height_for_storage, &microblock_data)
-                    };
+                    // Save synchronously to ensure block exists before height increment
+                    // This is FAST (just RocksDB write, ~10-50ms) and prevents race conditions
+                    let save_result = storage_clone.save_block_with_delta(height_for_storage, &microblock_data);
                     
                     if let Ok(_) = save_result {
-                                println!("[Storage] ✅ Microblock {} saved with delta/compression", height_for_storage);
+                        println!("[Storage] ✅ Microblock {} saved with delta/compression", height_for_storage);
                         
-                        // Now spawn async task for rotation tracking
+                        // Spawn async task for rotation tracking (can be in background)
                         tokio::spawn(async move {
+                            // Check if rotation completed (every 30 blocks)
+                            if let Some((rotation_producer, blocks_created)) = 
+                                rotation_tracker_clone.check_rotation_complete(height_for_storage).await {
                                 
-                    // NOTE: Removed track_block here - it's called after block creation
-                    // This prevents double counting (was causing 59/30 blocks issue)
-                    
-                    // Check if rotation completed (every 30 blocks)
-                    if let Some((rotation_producer, blocks_created)) = 
-                        rotation_tracker_clone.check_rotation_complete(height_for_storage).await {
-                            
-                            // ATOMIC REWARD: One reward for entire rotation
-                            if let Some(ref p2p) = p2p_for_reward {
-                                if blocks_created == ROTATION_INTERVAL_BLOCKS as u32 {
-                                    // Full rotation completed
-                                    p2p.update_node_reputation(&rotation_producer, 30.0);
-                                    println!("[ROTATION] ✅ {} completed full rotation ({}/30 blocks) +30.0 reputation", 
-                                            rotation_producer, blocks_created);
-                                } else {
-                                    // Partial rotation (failover occurred)
-                                    let reward = (blocks_created as f64 / 30.0) * 30.0;
-                                    p2p.update_node_reputation(&rotation_producer, reward);
-                                    println!("[ROTATION] ⚠️ {} partial rotation ({}/30 blocks) +{:.1} reputation", 
-                                            rotation_producer, blocks_created, reward);
+                                // ATOMIC REWARD: One reward for entire rotation
+                                if let Some(ref p2p) = p2p_for_reward {
+                                    if blocks_created == ROTATION_INTERVAL_BLOCKS as u32 {
+                                        // Full rotation completed
+                                        p2p.update_node_reputation(&rotation_producer, 30.0);
+                                        println!("[ROTATION] ✅ {} completed full rotation ({}/30 blocks) +30.0 reputation", 
+                                                rotation_producer, blocks_created);
+                                    } else {
+                                        // Partial rotation (failover occurred)
+                                        let reward = (blocks_created as f64 / 30.0) * 30.0;
+                                        p2p.update_node_reputation(&rotation_producer, reward);
+                                        println!("[ROTATION] ⚠️ {} partial rotation ({}/30 blocks) +{:.1} reputation", 
+                                                rotation_producer, blocks_created, reward);
+                                    }
                                 }
                             }
-                        }
                         });
-                                } else {
-                        println!("[Storage] ❌ Failed to save microblock #{}: {:?}", height_for_storage, save_result.err());
+                    } else {
+                        println!("[Storage] ❌ Failed to save microblock #{}", height_for_storage);
                         // Continue anyway - block will be retried
                     }
                     
-                    // CRITICAL FIX: Synchronous broadcast BEFORE height increment
-                    // This ensures block is sent to peers before we claim it exists
+                    // CRITICAL FIX: ASYNCHRONOUS broadcast for performance (1 block/sec target)
+                    // Block is already saved, broadcast can happen in background
                     if let Some(p2p) = &unified_p2p {
-                        let peer_count = p2p.get_peer_count();
-                        let broadcast_data = if compression_enabled {
-                            Self::compress_microblock_data(&microblock).unwrap_or_else(|_| {
-                                bincode::serialize(&microblock).unwrap_or_default()
-                            })
-                        } else {
-                            bincode::serialize(&microblock).unwrap_or_default()
-                        };
+                        let p2p_broadcast = p2p.clone();
+                        let microblock_broadcast = microblock.clone();
+                        let compression_enabled_broadcast = compression_enabled;
                         
-                    let broadcast_size = broadcast_data.len();
-                    let height_for_broadcast = microblock.height;
-                    
-                    // CRITICAL FIX: Synchronous broadcast to ensure delivery before height increment
-                    // Use Turbine for blocks > 1KB, regular broadcast for smaller blocks
-                    let result = if broadcast_size > 1024 && peer_count > 10 {
-                        // Use Turbine protocol for larger blocks and many peers
-                        p2p.broadcast_block_turbine(height_for_broadcast, broadcast_data)
-                    } else {
-                        // Use regular broadcast for small blocks or few peers
-                        p2p.broadcast_block(height_for_broadcast, broadcast_data)
-                    };
-                    
-                    // Log only errors or every 10th block
-                    if result.is_err() || height_for_broadcast % 10 == 0 {
-                        println!("[P2P] 📡 Block #{} broadcast: {:?} | {} peers | {} bytes",
-                                height_for_broadcast, result.is_ok(), peer_count, broadcast_size);
-                    }
+                        tokio::spawn(async move {
+                            let peer_count = p2p_broadcast.get_peer_count();
+                            let broadcast_data = if compression_enabled_broadcast {
+                                Self::compress_microblock_data(&microblock_broadcast).unwrap_or_else(|_| {
+                                    bincode::serialize(&microblock_broadcast).unwrap_or_default()
+                                })
+                            } else {
+                                bincode::serialize(&microblock_broadcast).unwrap_or_default()
+                            };
+                            
+                            let broadcast_size = broadcast_data.len();
+                            let height_for_broadcast = microblock_broadcast.height;
+                            
+                            // Use Turbine for blocks > 1KB, regular broadcast for smaller blocks
+                            let result = if broadcast_size > 1024 && peer_count > 10 {
+                                p2p_broadcast.broadcast_block_turbine(height_for_broadcast, broadcast_data)
+                            } else {
+                                p2p_broadcast.broadcast_block(height_for_broadcast, broadcast_data)
+                            };
+                            
+                            // Log only errors or every 10th block
+                            if result.is_err() || height_for_broadcast % 10 == 0 {
+                                println!("[P2P] 📡 Block #{} broadcast: {:?} | {} peers | {} bytes",
+                                        height_for_broadcast, result.is_ok(), peer_count, broadcast_size);
+                            }
+                        });
                     } else {
                         println!("[P2P] ⚠️ P2P system not available - cannot broadcast block #{}", microblock.height);
                     }
