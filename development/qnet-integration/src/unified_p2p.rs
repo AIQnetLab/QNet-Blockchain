@@ -2037,6 +2037,113 @@ impl SimplifiedP2P {
         }
     }
     
+    /// Broadcast Genesis block with extended timeout (3 seconds)
+    /// Genesis is critical and must be delivered reliably to all peers
+    pub fn broadcast_genesis_block(&self, block_data: Vec<u8>) -> Result<(), String> {
+        use std::sync::Arc;
+        use std::thread;
+        
+        let validated_peers = self.get_validated_active_peers();
+        
+        if validated_peers.is_empty() {
+            println!("[P2P] ⚠️ No validated peers available - Genesis block not broadcasted");
+            return Ok(());
+        }
+        
+        println!("[P2P] 📡 Broadcasting Genesis block to {} validated peers (extended timeout)", validated_peers.len());
+        
+        let block_data = Arc::new(block_data);
+        let mut handles = Vec::new();
+        
+        for peer in validated_peers.iter() {
+            let should_send = match (&self.node_type, &peer.node_type) {
+                (NodeType::Light, _) => false,
+                _ => true,
+            };
+            
+            if !should_send {
+                continue;
+            }
+            
+            let peer_addr = peer.addr.clone();
+            let block_data = Arc::clone(&block_data);
+            let node_id = self.node_id.clone();
+            
+            let handle = thread::spawn(move || -> Result<(), String> {
+                let message = NetworkMessage::Block {
+                    height: 0,
+                    data: (*block_data).clone(),
+                    block_type: "micro".to_string(),
+                };
+                
+                let message_json = match serde_json::to_value(&message) {
+                    Ok(json) => json,
+                    Err(e) => {
+                        println!("[P2P] ❌ Serialize failed: {}", e);
+                        return Err(format!("Serialize failed: {}", e));
+                    }
+                };
+                
+                let peer_ip = peer_addr.split(':').next().unwrap_or(&peer_addr);
+                let url = format!("http://{}:8001/api/v1/p2p/message", peer_ip);
+                
+                // CRITICAL: Extended timeout for Genesis (3 seconds)
+                let client = reqwest::blocking::Client::builder()
+                    .timeout(Duration::from_millis(3000))  // 3 seconds for Genesis
+                    .connect_timeout(Duration::from_millis(1000))  // 1 second connect
+                    .tcp_nodelay(true)
+                    .pool_max_idle_per_host(10)
+                    .build()
+                    .map_err(|e| format!("Client failed: {}", e))?;
+                
+                client.post(&url)
+                    .json(&message_json)
+                    .send()
+                    .map_err(|e| format!("Send to {} failed: {}", peer_ip, e))?;
+                
+                Ok(())
+            });
+            
+            handles.push((peer.addr.clone(), handle));
+        }
+        
+        // For Genesis, wait for ALL peers (no fire-and-forget)
+        let mut success_count = 0;
+        let total = handles.len();
+        
+        // Extended wait time for Genesis: 5 seconds
+        let wait_start = std::time::Instant::now();
+        let max_wait = std::time::Duration::from_secs(5);
+        
+        for (peer_addr, handle) in handles {
+            // Check timeout
+            if wait_start.elapsed() > max_wait {
+                println!("[P2P] ⏱️ Genesis broadcast timeout after 5s - continuing with {} successes", success_count);
+                break;
+            }
+            
+            match handle.join() {
+                Ok(Ok(())) => {
+                    success_count += 1;
+                    println!("[P2P] ✅ Genesis sent to {} ({}/{})", peer_addr, success_count, total);
+                }
+                Ok(Err(e)) => {
+                    println!("[P2P] ⚠️ Failed to send Genesis to {}: {}", peer_addr, e);
+                }
+                Err(_) => println!("[P2P] ⚠️ Thread panicked for {}", peer_addr),
+            }
+        }
+        
+        if success_count > 0 {
+            println!("[P2P] ✅ Genesis block sent to {}/{} peers", success_count, total);
+            Ok(())
+        } else if total > 0 {
+            Err(format!("Failed to send Genesis block to any peer"))
+        } else {
+            Ok(())
+        }
+    }
+    
     /// Broadcast block using Turbine protocol (Solana-inspired chunking)
     pub fn broadcast_block_turbine(&self, height: u64, block_data: Vec<u8>) -> Result<(), String> {
         use std::sync::Arc;

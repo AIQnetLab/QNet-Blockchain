@@ -2737,14 +2737,20 @@ impl BlockchainNode {
                                             Ok(_) => {
                                                 println!("[GENESIS] ✅ Genesis Block created and saved at height 0");
                                                 
-                                                // CRITICAL: Try to broadcast Genesis block to all peers
-                                                // NOTE: It's OK if broadcast fails - other nodes will sync Genesis via P2P
+                                                // CRITICAL: Broadcast Genesis block with extended timeout
+                                                // Genesis is critical - use special method with 3s timeout (vs 200ms for normal blocks)
                                                 if let Some(p2p) = &unified_p2p {
-                                                    println!("[GENESIS] 📡 Broadcasting Genesis block to all peers (best-effort)");
-                                                    // Use fire-and-forget - don't wait for all peers
-                                                    // Other nodes will request Genesis block if they don't receive it
-                                                    let _ = p2p.broadcast_block(0, data.clone());
-                                                    println!("[GENESIS] ✅ Genesis block broadcast initiated (peers will sync if needed)");
+                                                    println!("[GENESIS] 📡 Broadcasting Genesis block to all peers (3s timeout)");
+                                                    
+                                                    // Use dedicated Genesis broadcast with extended timeout
+                                                    match p2p.broadcast_genesis_block(data.clone()) {
+                                                        Ok(_) => {
+                                                            println!("[GENESIS] ✅ Genesis block broadcast successful");
+                                                        }
+                                                        Err(e) => {
+                                                            println!("[GENESIS] ⚠️ Genesis broadcast failed: {} - peers will sync via P2P", e);
+                                                        }
+                                                    }
                                                 }
                                                 
                                                 // CRITICAL FIX: Set height to 0 after Genesis creation
