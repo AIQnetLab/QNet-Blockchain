@@ -4292,22 +4292,6 @@ impl BlockchainNode {
                                             7   // Normal operation: 7 seconds (was 5, too aggressive)
                                         };
                                     
-                                    // CRITICAL FIX: Check if emergency failover already in progress for this block
-                                    // This prevents race condition where multiple nodes trigger failover simultaneously
-                                    let failover_key = format!("emergency_failover_{}", expected_height_timeout);
-                                    if p2p_timeout.check_emergency_in_progress(&failover_key) {
-                                        println!("[FAILOVER] ⏸️ Emergency failover already in progress for block #{} - waiting for network decision", 
-                                                 expected_height_timeout);
-                                        return;
-                                    }
-                                    
-                                    // Mark this failover as in progress (lock-free atomic operation)
-                                    if !p2p_timeout.mark_emergency_in_progress(&failover_key) {
-                                        println!("[FAILOVER] ⏸️ Another node already initiated emergency failover for block #{}", 
-                                                 expected_height_timeout);
-                                        return;
-                                    }
-                                    
                                     // Special logging for rotation boundaries
                                     if is_rotation_boundary {
                                         println!("[FAILOVER] 🔄 ROTATION DEADLOCK: Block #{} not received after {}s timeout from producer: {}", 
@@ -4340,8 +4324,6 @@ impl BlockchainNode {
                                         "microblock"
                                     ) {
                                         println!("[FAILOVER] ⚠️ Emergency microblock broadcast failed: {}", e);
-                                        // Remove lock on failure so another node can try
-                                        p2p_timeout.clear_emergency_in_progress(&failover_key);
                                     } else {
                                         println!("[FAILOVER] ✅ Emergency microblock producer change broadcasted to network");
                                         
