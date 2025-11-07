@@ -2638,10 +2638,18 @@ impl BlockchainNode {
             let mut consensus_started = false; // Track early consensus start
             
             // GENESIS BLOCK CREATION: Create Genesis Block if blockchain is empty
-            if microblock_height == 0 {
+            // CRITICAL FIX: Check if Genesis block EXISTS, not just height == 0
+            // This handles cases where storage reports wrong height but Genesis is missing
+            let genesis_exists = storage.load_microblock(0).unwrap_or(None).is_some();
+            
+            if !genesis_exists {
+                println!("[GENESIS] 🔍 Genesis block not found in storage, checking if we should create it...");
+                
                 // SCALABILITY: Two modes - Bootstrap (5 nodes) and Production (millions)
                 let bootstrap_id = std::env::var("QNET_BOOTSTRAP_ID").unwrap_or_default();
                 let is_bootstrap_mode = !bootstrap_id.is_empty();
+                
+                println!("[GENESIS] 📊 Bootstrap mode: {}, Bootstrap ID: '{}'", is_bootstrap_mode, bootstrap_id);
                 
                 if is_bootstrap_mode && bootstrap_id == "001" {
                     // CRITICAL: Only node_001 creates Genesis in bootstrap mode
@@ -2709,11 +2717,17 @@ impl BlockchainNode {
                                                     println!("[GENESIS] ✅ Genesis block broadcast initiated (peers will sync if needed)");
                                                 }
                                                 
-                                                // CRITICAL FIX: Keep height at 0 after Genesis creation
-                                                // next_block_height will be calculated as microblock_height + 1 = 1
+                                                // CRITICAL FIX: Set height to 0 after Genesis creation
+                                                // This ensures next block will be #1
                                                 microblock_height = 0;
                                                 *height.write().await = 0;
-                                                println!("[GENESIS] 📍 Height remains at 0, next block will be #1");
+                                                
+                                                // Update storage height to 0 to fix any inconsistencies
+                                                if let Err(e) = storage.set_chain_height(0) {
+                                                    println!("[GENESIS] ⚠️ Warning: Could not update storage height: {}", e);
+                                                }
+                                                
+                                                println!("[GENESIS] 📍 Height set to 0, next block will be #1");
                                                 break;
                                             }
                                             Err(e) => {
@@ -2736,7 +2750,15 @@ impl BlockchainNode {
                         }
                         Err(e) => println!("[GENESIS] ❌ Failed to create Genesis Block: {}", e),
                     }
+                } else if is_bootstrap_mode {
+                    // Other bootstrap nodes (002-005) wait for Genesis from node_001
+                    println!("[GENESIS] ⏳ Node {}: Waiting for Genesis block from primary node...", bootstrap_id);
+                } else {
+                    // Non-bootstrap nodes will sync Genesis from network
+                    println!("[GENESIS] ⏳ Non-bootstrap node: Genesis will be synced from network");
                 }
+            } else {
+                println!("[GENESIS] ✅ Genesis block found at height 0, proceeding with normal operation");
             }
             
             // PRECISION TIMING: Track exact 1-second intervals to prevent drift
