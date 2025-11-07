@@ -3928,9 +3928,9 @@ impl BlockchainNode {
                         // Continue anyway - block will be retried
                     }
                     
-                    // CRITICAL FIX: SYNCHRONOUS broadcast but AFTER storage save
-                    // This ensures block is delivered to peers before we move to next block
-                    // Storage is already saved, so block won't be lost
+                    // OPTIMIZATION: ASYNC broadcast after storage save
+                    // Block is already saved in storage, so we can broadcast async
+                    // This allows 1 block/second production without waiting for broadcast
                     if let Some(p2p) = &unified_p2p {
                         let peer_count = p2p.get_peer_count();
                         let broadcast_data = if compression_enabled {
@@ -3944,33 +3944,43 @@ impl BlockchainNode {
                         let broadcast_size = broadcast_data.len();
                         let height_for_broadcast = microblock.height;
                         
-                        // TIMING: Measure broadcast time
-                        let broadcast_start = std::time::Instant::now();
+                        // Clone P2P for async task
+                        let p2p_clone = p2p.clone();
                         
-                        // CRITICAL: Always use Turbine for consistent performance
-                        // Turbine provides stable 200-300ms broadcast regardless of network size
-                        // Direct broadcast can take 800-900ms even with 4-5 peers
-                        let result = if peer_count > 1 {
-                            // Turbine protocol: O(log n) complexity, fanout=3
-                            // STABLE: 200-300ms for any network size
-                            p2p.broadcast_block_turbine(height_for_broadcast, broadcast_data)
-                        } else {
-                            // Single peer or standalone - use direct
-                            p2p.broadcast_block(height_for_broadcast, broadcast_data)
-                        };
+                        // ASYNC: Spawn broadcast in background
+                        tokio::spawn(async move {
+                            // TIMING: Measure broadcast time
+                            let broadcast_start = std::time::Instant::now();
+                            
+                            // WORKING: From 669ca77 - use Turbine only for networks >10 peers
+                            // For small networks (≤10 peers) use direct broadcast - simpler and more reliable
+                            let result = if peer_count > 10 {
+                                // Turbine protocol: O(log n) complexity, fanout=3
+                                // Scales to millions of nodes
+                                p2p_clone.broadcast_block_turbine(height_for_broadcast, broadcast_data)
+                            } else {
+                                // Direct broadcast: O(n) complexity, works well for ≤10 peers
+                                p2p_clone.broadcast_block(height_for_broadcast, broadcast_data)
+                            };
+                            
+                            let broadcast_time = broadcast_start.elapsed();
+                            
+                            // Log timing and result
+                            if result.is_err() || height_for_broadcast % 10 == 0 || broadcast_time.as_millis() > 500 {
+                                println!("[P2P] 📡 Block #{} broadcast: {:?} | {} peers | {} bytes | {:?}ms",
+                                        height_for_broadcast, result.is_ok(), peer_count, broadcast_size, broadcast_time.as_millis());
+                            }
+                            
+                            // CRITICAL: If broadcast is too slow, log warning
+                            if broadcast_time.as_millis() > 1000 {
+                                println!("[P2P] ⚠️ SLOW BROADCAST: Block #{} took {:?}ms (target: <500ms)", 
+                                        height_for_broadcast, broadcast_time.as_millis());
+                            }
+                        });
                         
-                        let broadcast_time = broadcast_start.elapsed();
-                        
-                        // Log timing and result
-                        if result.is_err() || height_for_broadcast % 10 == 0 || broadcast_time.as_millis() > 500 {
-                            println!("[P2P] 📡 Block #{} broadcast: {:?} | {} peers | {} bytes | {:?}ms",
-                                    height_for_broadcast, result.is_ok(), peer_count, broadcast_size, broadcast_time.as_millis());
-                        }
-                        
-                        // CRITICAL: If broadcast is too slow, log warning
-                        if broadcast_time.as_millis() > 1000 {
-                            println!("[P2P] ⚠️ SLOW BROADCAST: Block #{} took {:?}ms (target: <500ms)", 
-                                    height_for_broadcast, broadcast_time.as_millis());
+                        // Log that async broadcast started
+                        if height_for_broadcast <= 5 || height_for_broadcast % 10 == 0 {
+                            println!("[P2P] 🚀 Async broadcast started for block #{}", height_for_broadcast);
                         }
                     } else {
                         println!("[P2P] ⚠️ P2P system not available - cannot broadcast block #{}", microblock.height);

@@ -1968,10 +1968,9 @@ impl SimplifiedP2P {
                     let url = format!("http://{}:8001/api/v1/p2p/message", peer_ip);
                     
                     let client = reqwest::blocking::Client::builder()
-                        .timeout(Duration::from_millis(200))  // CRITICAL: 200ms max to ensure 1s block time
-                        .connect_timeout(Duration::from_millis(100))  // FAST: 100ms connect for local network
-                        .tcp_nodelay(true)  // Disable Nagle's algorithm for low latency
-                        .pool_max_idle_per_host(10)  // Reuse connections
+                        .timeout(Duration::from_secs(3))  // WORKING: 3s timeout (from 669ca77)
+                        .connect_timeout(Duration::from_secs(1))  // WORKING: 1s connect (from 669ca77)
+                        .tcp_nodelay(true)
                         .build()
                         .map_err(|e| format!("Client failed: {}", e))?;
                     
@@ -1987,32 +1986,12 @@ impl SimplifiedP2P {
             }
         }
         
-        // OPTIMIZATION: Fire-and-forget - wait for minimum successful sends
-        // Don't wait for slow peers - they'll get block via gossip/turbine
+        // Wait for all sends to complete (but don't fail if some fail)
+        // WORKING: From 669ca77 - simple and reliable
         let mut success_count = 0;
         let total = handles.len();
-        let min_required = std::cmp::max(1, total / 2); // Need at least half or 1
-        
-        // CRITICAL: Use timeout to avoid waiting for slow peers
-        let wait_start = std::time::Instant::now();
-        let max_wait = std::time::Duration::from_millis(300); // Max 300ms wait
         
         for (peer_addr, handle) in handles {
-            // Check if we already have enough successes
-            if success_count >= min_required {
-                // Detach remaining threads - let them finish in background
-                std::mem::drop(handle);
-                continue;
-            }
-            
-            // Check timeout
-            if wait_start.elapsed() > max_wait {
-                if height <= 5 || height % 10 == 0 {
-                    println!("[P2P] ⏱️ Broadcast timeout - continuing with {} successes", success_count);
-                }
-                break;
-            }
-            
             match handle.join() {
                 Ok(Ok(())) => success_count += 1,
                 Ok(Err(e)) => {
