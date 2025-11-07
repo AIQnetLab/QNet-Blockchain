@@ -2640,7 +2640,37 @@ impl BlockchainNode {
             // GENESIS BLOCK CREATION: Create Genesis Block if blockchain is empty
             // CRITICAL FIX: Check if Genesis block EXISTS, not just height == 0
             // This handles cases where storage reports wrong height but Genesis is missing
-            let genesis_exists = storage.load_microblock(0).unwrap_or(None).is_some();
+            let genesis_check = storage.load_microblock(0);
+            println!("[GENESIS] 🔍 DEBUG: load_microblock(0) result: {:?}", 
+                     genesis_check.as_ref().map(|opt| opt.as_ref().map(|data| data.len())));
+            
+            let genesis_exists = match genesis_check {
+                Ok(Some(ref data)) => {
+                    println!("[GENESIS] 🔍 DEBUG: Genesis block EXISTS in storage ({} bytes)", data.len());
+                    // Try to deserialize to verify it's valid
+                    match bincode::deserialize::<qnet_state::MicroBlock>(data) {
+                        Ok(block) => {
+                            println!("[GENESIS] 🔍 DEBUG: Genesis block is VALID (height={}, producer={})", 
+                                     block.height, block.producer);
+                            true
+                        }
+                        Err(e) => {
+                            println!("[GENESIS] ⚠️ DEBUG: Genesis block is CORRUPTED: {}", e);
+                            println!("[GENESIS] 🗑️ Deleting corrupted Genesis block...");
+                            let _ = storage.delete_microblock(0);
+                            false
+                        }
+                    }
+                }
+                Ok(None) => {
+                    println!("[GENESIS] 🔍 DEBUG: Genesis block does NOT exist in storage");
+                    false
+                }
+                Err(e) => {
+                    println!("[GENESIS] ❌ DEBUG: Error loading Genesis block: {}", e);
+                    false
+                }
+            };
             
             if !genesis_exists {
                 println!("[GENESIS] 🔍 Genesis block not found in storage, checking if we should create it...");
@@ -8116,8 +8146,18 @@ impl BlockchainNode {
         println!("[SYNC] 📥 Processing sync request from {} for microblocks {}-{}", 
                  requester_id, from_height, to_height);
         
+        // CRITICAL DEBUG: Check if Genesis exists before sending
+        if from_height == 0 {
+            let genesis_check = self.storage.load_microblock(0);
+            println!("[SYNC] 🔍 DEBUG: Genesis block check for sync: {:?}", 
+                     genesis_check.as_ref().map(|opt| opt.as_ref().map(|data| data.len())));
+        }
+        
         // Get microblocks from storage (already in network format)
         let blocks_data = self.storage.get_microblocks_range(from_height, to_height).await?;
+        
+        println!("[SYNC] 📊 DEBUG: get_microblocks_range({}, {}) returned {} blocks", 
+                 from_height, to_height, blocks_data.len());
         
         if let Some(ref p2p) = self.unified_p2p {
             // Send blocks batch to requester
