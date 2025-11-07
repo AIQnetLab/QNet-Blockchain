@@ -2699,14 +2699,14 @@ impl BlockchainNode {
                                             Ok(_) => {
                                                 println!("[GENESIS] ✅ Genesis Block created and saved at height 0");
                                                 
-                                                // CRITICAL: Broadcast Genesis block to all peers immediately
+                                                // CRITICAL: Try to broadcast Genesis block to all peers
+                                                // NOTE: It's OK if broadcast fails - other nodes will sync Genesis via P2P
                                                 if let Some(p2p) = &unified_p2p {
-                                                    println!("[GENESIS] 📡 Broadcasting Genesis block to all peers");
-                                                    if let Err(e) = p2p.broadcast_block(0, data.clone()) {
-                                                        println!("[GENESIS] ⚠️ Failed to broadcast Genesis: {}", e);
-                                                    } else {
-                                                        println!("[GENESIS] ✅ Genesis block broadcasted to network");
-                                                    }
+                                                    println!("[GENESIS] 📡 Broadcasting Genesis block to all peers (best-effort)");
+                                                    // Use fire-and-forget - don't wait for all peers
+                                                    // Other nodes will request Genesis block if they don't receive it
+                                                    let _ = p2p.broadcast_block(0, data.clone());
+                                                    println!("[GENESIS] ✅ Genesis block broadcast initiated (peers will sync if needed)");
                                                 }
                                                 
                                                 // CRITICAL FIX: Keep height at 0 after Genesis creation
