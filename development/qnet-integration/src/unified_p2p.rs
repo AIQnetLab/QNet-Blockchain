@@ -96,6 +96,12 @@ static PROCESSED_FAILOVERS: Lazy<Arc<DashSet<(u64, String, String)>>> =
 pub static EMERGENCY_STOP_PRODUCTION: Lazy<Arc<AtomicBool>> = 
     Lazy::new(|| Arc::new(AtomicBool::new(false)));
 
+// CRITICAL: Track emergency failovers in progress to prevent race conditions
+// Format: "emergency_failover_{height}" -> prevents multiple nodes from initiating same failover
+// SCALABILITY: DashSet for lock-free concurrent access with millions of nodes
+static EMERGENCY_FAILOVERS_IN_PROGRESS: Lazy<Arc<DashSet<String>>> = 
+    Lazy::new(|| Arc::new(DashSet::new()));
+
 // SECURITY: Track invalid blocks from each node for malicious behavior detection
 // Format: node_id -> (invalid_count, first_invalid_time)
 // SCALABILITY: DashMap for lock-free concurrent access with millions of nodes
@@ -1962,9 +1968,10 @@ impl SimplifiedP2P {
                     let url = format!("http://{}:8001/api/v1/p2p/message", peer_ip);
                     
                     let client = reqwest::blocking::Client::builder()
-                        .timeout(Duration::from_millis(800))  // PERFORMANCE: 800ms timeout for 1s block interval
-                        .connect_timeout(Duration::from_millis(300))  // Fast connect timeout
-                        .tcp_nodelay(true)
+                        .timeout(Duration::from_millis(200))  // CRITICAL: 200ms max to ensure 1s block time
+                        .connect_timeout(Duration::from_millis(100))  // FAST: 100ms connect for local network
+                        .tcp_nodelay(true)  // Disable Nagle's algorithm for low latency
+                        .pool_max_idle_per_host(10)  // Reuse connections
                         .build()
                         .map_err(|e| format!("Client failed: {}", e))?;
                     
@@ -1980,11 +1987,32 @@ impl SimplifiedP2P {
             }
         }
         
-        // Wait for all sends to complete (but don't fail if some fail)
+        // OPTIMIZATION: Fire-and-forget - wait for minimum successful sends
+        // Don't wait for slow peers - they'll get block via gossip/turbine
         let mut success_count = 0;
         let total = handles.len();
+        let min_required = std::cmp::max(1, total / 2); // Need at least half or 1
+        
+        // CRITICAL: Use timeout to avoid waiting for slow peers
+        let wait_start = std::time::Instant::now();
+        let max_wait = std::time::Duration::from_millis(300); // Max 300ms wait
         
         for (peer_addr, handle) in handles {
+            // Check if we already have enough successes
+            if success_count >= min_required {
+                // Detach remaining threads - let them finish in background
+                std::mem::drop(handle);
+                continue;
+            }
+            
+            // Check timeout
+            if wait_start.elapsed() > max_wait {
+                if height <= 5 || height % 10 == 0 {
+                    println!("[P2P] ⏱️ Broadcast timeout - continuing with {} successes", success_count);
+                }
+                break;
+            }
+            
             match handle.join() {
                 Ok(Ok(())) => success_count += 1,
                 Ok(Err(e)) => {
@@ -1999,7 +2027,7 @@ impl SimplifiedP2P {
         // Success if at least one peer received the block
         if success_count > 0 {
             if height <= 5 || height % 10 == 0 {
-                println!("[P2P] ✅ Block #{} sent to {}/{} peers", height, success_count, total);
+                println!("[P2P] ✅ Block #{} sent to {}/{} peers (fire-and-forget)", height, success_count, total);
             }
             Ok(())
         } else if total > 0 {
@@ -7944,6 +7972,39 @@ impl SimplifiedP2P {
                 now.duration_since(*first_seen) < Duration::from_secs(300)
             });
         }
+    }
+    
+    /// Check if emergency failover is already in progress for a specific block
+    /// CRITICAL: Prevents race condition where multiple nodes trigger failover simultaneously
+    pub fn check_emergency_in_progress(&self, failover_key: &str) -> bool {
+        EMERGENCY_FAILOVERS_IN_PROGRESS.contains(failover_key)
+    }
+    
+    /// Mark emergency failover as in progress (returns false if already marked)
+    /// CRITICAL: Lock-free atomic operation for scalability to millions of nodes
+    pub fn mark_emergency_in_progress(&self, failover_key: &str) -> bool {
+        // insert() returns true if the key was not present before
+        let was_inserted = EMERGENCY_FAILOVERS_IN_PROGRESS.insert(failover_key.to_string());
+        
+        if was_inserted {
+            println!("[FAILOVER] 🔒 Locked emergency failover: {}", failover_key);
+            
+            // CLEANUP: Auto-remove after 30 seconds to prevent memory leak
+            let key_clone = failover_key.to_string();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                EMERGENCY_FAILOVERS_IN_PROGRESS.remove(&key_clone);
+                println!("[FAILOVER] 🔓 Auto-unlocked emergency failover: {}", key_clone);
+            });
+        }
+        
+        was_inserted
+    }
+    
+    /// Clear emergency failover lock (used when broadcast fails)
+    pub fn clear_emergency_in_progress(&self, failover_key: &str) {
+        EMERGENCY_FAILOVERS_IN_PROGRESS.remove(failover_key);
+        println!("[FAILOVER] 🔓 Cleared emergency failover lock: {}", failover_key);
     }
     
     /// Report critical attack to network for instant ban

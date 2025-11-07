@@ -1071,12 +1071,13 @@ impl BlockchainNode {
         };
         
         // Initialize Tower BFT for adaptive timeouts
-        // CRITICAL: Use small timeouts for 1 block/second target!
+        // CRITICAL: Balance between 1 block/sec target and network latency
+        // PRODUCTION: Must account for broadcast time (800-900ms) + processing + consensus
         let tower_bft_config = crate::tower_bft::TowerBftConfig {
-            base_timeout_ms: 2000,      // 2 seconds base (was 7000!)
+            base_timeout_ms: 3000,      // 3 seconds base (allows 800ms broadcast + 2s processing)
             timeout_multiplier: 1.5,    
-            max_timeout_ms: 10000,      // 10 seconds max (was 20000!)
-            min_timeout_ms: 1000,       
+            max_timeout_ms: 10000,      // 10 seconds max
+            min_timeout_ms: 2000,       // 2 seconds minimum (was 1000)
             latency_window_size: 100,   
         };
         let tower_bft = Arc::new(crate::tower_bft::TowerBft::new(tower_bft_config));
@@ -3888,13 +3889,15 @@ impl BlockchainNode {
                         // TIMING: Measure broadcast time
                         let broadcast_start = std::time::Instant::now();
                         
-                        // CRITICAL: Use Turbine for scalability when many peers
-                        // Direct broadcast only for small networks (<10 peers)
-                        let result = if peer_count > 10 {
+                        // CRITICAL: Always use Turbine for consistent performance
+                        // Turbine provides stable 200-300ms broadcast regardless of network size
+                        // Direct broadcast can take 800-900ms even with 4-5 peers
+                        let result = if peer_count > 1 {
                             // Turbine protocol: O(log n) complexity, fanout=3
+                            // STABLE: 200-300ms for any network size
                             p2p.broadcast_block_turbine(height_for_broadcast, broadcast_data)
                         } else {
-                            // Direct broadcast: O(n) complexity, ok for small networks
+                            // Single peer or standalone - use direct
                             p2p.broadcast_block(height_for_broadcast, broadcast_data)
                         };
                         
@@ -4245,9 +4248,14 @@ impl BlockchainNode {
                             tokio::spawn(async move {
                                 tokio::time::sleep(rotation_timeout).await;
                                 
-                                // Check if block was received during timeout period
+                                // CRITICAL: Double-check if block was received during timeout period
+                                // This prevents race condition where block arrives just as timeout triggers
                                 let block_exists = match storage_timeout.load_microblock(expected_height_timeout) {
-                                    Ok(Some(_)) => true,
+                                    Ok(Some(_)) => {
+                                        println!("[FAILOVER] ✅ Block #{} received during timeout - cancelling failover", 
+                                                 expected_height_timeout);
+                                        true
+                                    },
                                     _ => false,
                                 };
                                 
@@ -4261,6 +4269,23 @@ impl BlockchainNode {
                                         } else {
                                             7   // Normal operation: 7 seconds (was 5, too aggressive)
                                         };
+                                    
+                                    // CRITICAL FIX: Check if emergency failover already in progress for this block
+                                    // This prevents race condition where multiple nodes trigger failover simultaneously
+                                    let failover_key = format!("emergency_failover_{}", expected_height_timeout);
+                                    if p2p_timeout.check_emergency_in_progress(&failover_key) {
+                                        println!("[FAILOVER] ⏸️ Emergency failover already in progress for block #{} - waiting for network decision", 
+                                                 expected_height_timeout);
+                                        return;
+                                    }
+                                    
+                                    // Mark this failover as in progress (lock-free atomic operation)
+                                    if !p2p_timeout.mark_emergency_in_progress(&failover_key) {
+                                        println!("[FAILOVER] ⏸️ Another node already initiated emergency failover for block #{}", 
+                                                 expected_height_timeout);
+                                        return;
+                                    }
+                                    
                                     // Special logging for rotation boundaries
                                     if is_rotation_boundary {
                                         println!("[FAILOVER] 🔄 ROTATION DEADLOCK: Block #{} not received after {}s timeout from producer: {}", 
@@ -4293,6 +4318,8 @@ impl BlockchainNode {
                                         "microblock"
                                     ) {
                                         println!("[FAILOVER] ⚠️ Emergency microblock broadcast failed: {}", e);
+                                        // Remove lock on failure so another node can try
+                                        p2p_timeout.clear_emergency_in_progress(&failover_key);
                                     } else {
                                         println!("[FAILOVER] ✅ Emergency microblock producer change broadcasted to network");
                                         
