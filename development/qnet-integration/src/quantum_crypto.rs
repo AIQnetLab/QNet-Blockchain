@@ -549,19 +549,31 @@ impl QNetQuantumCrypto {
             return Err(anyhow!("Invalid signature length: {}", signature_bytes.len()));
         }
 
-        // 3. CRITICAL: Try consensus_crypto first for REAL verification
-        // Build expected message
-        let expected_message = format!("{}:{}", wallet_address, data);
+        // 3. CRITICAL FIX: Try BOTH message formats for compatibility
+        // Some systems expect "node_id:hash", others just "hash"
         
-        // Try real Dilithium verification through consensus_crypto
-        let is_valid = qnet_consensus::consensus_crypto::verify_consensus_signature(
+        // First try with just the data (new format)
+        let is_valid_new = qnet_consensus::consensus_crypto::verify_consensus_signature(
+            wallet_address,
+            data,  // Just the hash, no prefix
+            &signature.signature
+        ).await;
+        
+        if is_valid_new {
+            println!("✅ Dilithium signature verified successfully");
+            return Ok(true);
+        }
+        
+        // Then try with node_id:hash format (old format)
+        let expected_message = format!("{}:{}", wallet_address, data);
+        let is_valid_old = qnet_consensus::consensus_crypto::verify_consensus_signature(
             wallet_address,
             &expected_message,
             &signature.signature
         ).await;
         
-        if is_valid {
-            println!("✅ REAL Dilithium signature verified via consensus_crypto");
+        if is_valid_old {
+            println!("✅ Dilithium signature verified successfully");
             return Ok(true);
         }
         

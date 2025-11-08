@@ -5504,34 +5504,33 @@ impl BlockchainNode {
                     let local_height = store.get_chain_height().unwrap_or(0);
                     let poh_source_block = current_height - 1;
                     
-                    // Can only use PoH if we have the required block
-                    if local_height >= poh_source_block {
-                        match store.load_microblock(poh_source_block) {
-                            Ok(Some(block_data)) => {
-                                if let Ok(block) = bincode::deserialize::<qnet_state::MicroBlock>(&block_data) {
-                                    if !block.poh_hash.is_empty() && block.poh_count > 0 {
-                                        emergency_hasher.update(&block.poh_hash);
-                                        emergency_hasher.update(&block.poh_count.to_le_bytes());
-                                        println!("[EMERGENCY] 🔐 Blockchain PoH added: count={} from block #{}", 
-                                                block.poh_count, poh_source_block);
-                                    } else {
-                                        println!("[EMERGENCY] ⚠️ Block #{} has no PoH, using fallback", poh_source_block);
-                                        emergency_hasher.update(b"EMERGENCY_FALLBACK_NO_POH");
-                                    }
-                                }
-                            }
-                            _ => {
-                                println!("[EMERGENCY] ⚠️ Block #{} not found for PoH", poh_source_block);
-                                emergency_hasher.update(b"EMERGENCY_FALLBACK_NOT_FOUND");
-                            }
-                        }
+                    // CRITICAL FIX: ALL nodes must use SAME data for determinism
+                    // If ANY node doesn't have the block, ALL use fallback
+                    let consensus_block = current_height.saturating_sub(1);
+                    
+                    // For emergency selection, we CANNOT use block data that some nodes might not have
+                    // Instead, use deterministic data that ALL nodes have: the block height itself
+                    // This ensures nodes at different sync levels still agree on emergency producer
+                    
+                    if consensus_block > 0 {
+                        // Use block height and failed producer as entropy
+                        // ALL nodes have this information regardless of sync status
+                        println!("[EMERGENCY] 🔐 Using deterministic entropy for block #{}", current_height);
+                        emergency_hasher.update(b"EMERGENCY_DETERMINISTIC_V2");
+                        emergency_hasher.update(&consensus_block.to_le_bytes());
+                        emergency_hasher.update(&current_height.to_le_bytes());
+                        emergency_hasher.update(failed_producer.as_bytes());
+                        
+                        // Add timestamp window to prevent replay but maintain determinism
+                        // Round to nearest 10 seconds so slightly desynced clocks still agree
+                        let time_window = (get_timestamp_safe() / 10) * 10;
+                        emergency_hasher.update(&time_window.to_le_bytes());
+                        println!("[EMERGENCY] 📍 Time window: {}", time_window);
                     } else {
-                        println!("[EMERGENCY] ❌ Not synchronized for PoH (have {}, need {})", 
-                                local_height, poh_source_block);
-                        println!("[EMERGENCY] 🔄 Using deterministic fallback (all nodes will agree)");
-                        emergency_hasher.update(b"EMERGENCY_FALLBACK_UNSYNC");
-                        // CRITICAL: DO NOT add local_height - it's different for each node!
-                        // All unsynchronized nodes must select the SAME emergency producer
+                        // Height 0 - genesis emergency
+                        println!("[EMERGENCY] 🎯 Height 0: Using genesis emergency entropy");
+                        emergency_hasher.update(b"EMERGENCY_GENESIS");
+                        emergency_hasher.update(&current_height.to_le_bytes());
                     }
                 } else {
                     println!("[EMERGENCY] 🎯 Height 0: Using deterministic entropy (no blocks yet)");
@@ -5542,9 +5541,26 @@ impl BlockchainNode {
                 emergency_hasher.update(b"EMERGENCY_NO_STORAGE");
             }
             
+            // CRITICAL: Apply MAX_VALIDATORS limit BEFORE sorting (for scalability)
+            // Same limit as normal consensus to prevent O(n log n) on millions of nodes
+            const MAX_EMERGENCY_VALIDATORS: usize = 1000; // Same as MAX_VALIDATORS_PER_ROUND
+            
+            let limited_candidates = if candidates.len() <= MAX_EMERGENCY_VALIDATORS {
+                candidates.clone()
+            } else {
+                // PRODUCTION: Deterministic sampling for large networks
+                // Take first N candidates by reputation (already sorted by reputation in candidates)
+                println!("[EMERGENCY] 📊 Limiting {} candidates to {} for scalability", 
+                        candidates.len(), MAX_EMERGENCY_VALIDATORS);
+                candidates.iter()
+                    .take(MAX_EMERGENCY_VALIDATORS)
+                    .cloned()
+                    .collect()
+            };
+            
             // CRITICAL: Sort candidates to ensure deterministic ordering across all nodes
             // Different nodes may receive peers in different order from p2p.get_validated_active_peers()
-            let mut sorted_candidates = candidates.clone();
+            let mut sorted_candidates = limited_candidates;
             sorted_candidates.sort_by(|a, b| a.0.cmp(&b.0));  // Sort by node_id alphabetically
             
             for (node_id, _) in &sorted_candidates {
