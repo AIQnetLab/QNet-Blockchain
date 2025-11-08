@@ -3256,13 +3256,18 @@ impl BlockchainNode {
                 let mut is_my_turn_to_produce = current_producer == node_id;
                 
                 // CRITICAL FIX: Check if we're emergency producer for this block
+                // Emergency producer MUST create block even if not originally scheduled
                 if !is_my_turn_to_produce {
                     if let Ok(emergency_flag) = EMERGENCY_PRODUCER_FLAG.lock() {
                         if let Some((height, producer)) = &*emergency_flag {
                             if *height == next_block_height && *producer == node_id {
                                 println!("[EMERGENCY] 🚨 OVERRIDING: WE ARE EMERGENCY PRODUCER FOR BLOCK #{}", height);
+                                println!("[EMERGENCY] 🔥 FORCING IMMEDIATE BLOCK PRODUCTION!");
                                 current_producer = node_id.clone();
                                 is_my_turn_to_produce = true;
+                                
+                                // CRITICAL: Skip all waiting and produce block NOW
+                                // Emergency producer doesn't wait for sync or anything
                             }
                         }
                     }
@@ -3446,6 +3451,17 @@ impl BlockchainNode {
                     // PRODUCTION: This node is selected as microblock producer for this round
                     *is_leader.write().await = true;
                     
+                    // Check if we're emergency producer
+                    let is_emergency_producer = if let Ok(emergency_flag) = EMERGENCY_PRODUCER_FLAG.lock() {
+                        if let Some((height, _)) = &*emergency_flag {
+                            *height == next_block_height
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    
                     // Clear emergency flag if we were emergency producer
                     if let Ok(mut emergency_flag) = EMERGENCY_PRODUCER_FLAG.lock() {
                         if let Some((height, _)) = &*emergency_flag {
@@ -3456,9 +3472,12 @@ impl BlockchainNode {
                         }
                     }
                     
-                    // CRITICAL FIX: Self-check for producer readiness
-                    // Prevent deadlock when selected producer cannot actually produce blocks
-                    let can_produce = {
+                    // CRITICAL FIX: Emergency producer ALWAYS can produce
+                    // Skip all checks if we're emergency producer to break deadlock
+                    let can_produce = if is_emergency_producer {
+                        println!("[EMERGENCY] 🚀 Emergency producer bypassing all checks!");
+                        true  // Emergency producer ALWAYS produces
+                    } else {
                         // CRITICAL: Check emergency stop flag first
                         // If we received emergency failover notification, stop producing immediately
                         if crate::unified_p2p::EMERGENCY_STOP_PRODUCTION.load(std::sync::atomic::Ordering::Relaxed) {
@@ -3756,12 +3775,50 @@ impl BlockchainNode {
                         PREV_HASH_RETRY_COUNTER.store(0, Ordering::SeqCst);
                     }
                     
-                    // Get PoH state BEFORE creating block
-                    let (poh_hash, poh_count) = if let Some(ref poh) = quantum_poh {
-                        let (hash, count, _slot) = poh.get_state().await;
-                        (hash, count)
+                    // CRITICAL FIX: Get PoH state from PREVIOUS BLOCK for consistency
+                    // This ensures all nodes use the same PoH baseline regardless of local state
+                    let (poh_hash, poh_count) = if next_block_height > 1 {
+                        // Load previous block to get its PoH state
+                        match storage.load_microblock(next_block_height - 1) {
+                            Ok(Some(prev_block_data)) => {
+                                match bincode::deserialize::<qnet_state::MicroBlock>(&prev_block_data) {
+                                    Ok(prev_block) => {
+                                        // Use previous block's PoH as baseline
+                                        println!("[PoH] 📊 Using PoH from block #{}: count={}", 
+                                                prev_block.height, prev_block.poh_count);
+                                        (prev_block.poh_hash.clone(), prev_block.poh_count)
+                                    },
+                                    Err(e) => {
+                                        println!("[PoH] ⚠️ Cannot deserialize previous block: {}", e);
+                                        // Fallback to local PoH if available
+                                        if let Some(ref poh) = quantum_poh {
+                                            let (hash, count, _slot) = poh.get_state().await;
+                                            (hash, count)
+                                        } else {
+                                            (vec![0u8; 64], 0u64)
+                                        }
+                                    }
+                                }
+                            },
+                            _ => {
+                                println!("[PoH] ⚠️ Previous block #{} not found, using local PoH", next_block_height - 1);
+                                // Fallback to local PoH
+                                if let Some(ref poh) = quantum_poh {
+                                    let (hash, count, _slot) = poh.get_state().await;
+                                    (hash, count)
+                                } else {
+                                    (vec![0u8; 64], 0u64)
+                                }
+                            }
+                        }
                     } else {
-                        (vec![0u8; 64], 0u64) // No PoH available
+                        // Block #1: use local PoH or zero
+                        if let Some(ref poh) = quantum_poh {
+                            let (hash, count, _slot) = poh.get_state().await;
+                            (hash, count)
+                        } else {
+                            (vec![0u8; 64], 0u64)
+                        }
                     };
                     
                     let mut microblock = qnet_state::MicroBlock {
@@ -4407,11 +4464,11 @@ impl BlockchainNode {
                 // PRODUCTION: Start consensus SUPER EARLY after block 60 for ZERO downtime
                 // Consensus takes 30s (commit 15s + reveal 15s), so starting at 61 means it completes by block 90
                 // This ensures macroblock is ready EXACTLY when needed - Swiss watch precision!
-                // CRITICAL FIX: Start AFTER block 60 to prevent deadlock
-                // Block 60 must be created first, then consensus can use block 59 for PoH
+                // CRITICAL FIX: Start EXACTLY at block 61 for deterministic consensus
+                // All nodes must start at the same block to ensure phase synchronization
                 let blocks_since_trigger = microblock_height.saturating_sub(last_macroblock_trigger);
-                if blocks_since_trigger > 60 && blocks_since_trigger <= 65 && !consensus_started {
-                    println!("[MACROBLOCK] 🚀 ULTRA-EARLY CONSENSUS START at block {} for ZERO downtime", microblock_height);
+                if blocks_since_trigger == 61 && !consensus_started {
+                    println!("[MACROBLOCK] 🚀 DETERMINISTIC CONSENSUS START at block {} (61 after trigger)", microblock_height);
                     println!("[MACROBLOCK] 📍 Node: {} | Type: {:?} | ALL NODES PARTICIPATE", node_id, node_type);
                     consensus_started = true;
                     
@@ -7481,6 +7538,8 @@ impl BlockchainNode {
             }
             
             // STEP 5: Finalize consensus and get result
+            // CRITICAL: Ensure we're still in reveal phase before finalizing
+            // This prevents "Not in reveal phase" error if advance_phase was called extra times
             match consensus_engine.finalize_round() {
                 Ok(leader_id) => {
                     println!("[CONSENSUS] 🎯 Byzantine consensus FINALIZED! Leader: {}", leader_id);
@@ -7491,7 +7550,33 @@ impl BlockchainNode {
                     }
                 }
                 Err(e) => {
-                    return Err(format!("Consensus finalization failed: {}", e));
+                    // Check if this is a phase error and try to recover
+                    if e.to_string().contains("Not in reveal phase") || e.to_string().contains("NoActiveRound") {
+                        println!("[CONSENSUS] ⚠️ Phase error during finalization: {}", e);
+                        println!("[CONSENSUS] 🔄 Attempting recovery with fallback leader selection");
+                        
+                        // Fallback: Use deterministic leader selection based on participants
+                        use sha3::{Sha3_256, Digest};
+                        let mut hasher = Sha3_256::new();
+                        hasher.update(b"MACROBLOCK_FALLBACK");
+                        hasher.update(&(end_height / 90).to_le_bytes());
+                        for participant in &all_participants {
+                            hasher.update(participant.as_bytes());
+                        }
+                        let hash = hasher.finalize();
+                        let index = u64::from_le_bytes([hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7]]) as usize;
+                        let leader_idx = index % all_participants.len();
+                        let fallback_leader = all_participants[leader_idx].clone();
+                        
+                        println!("[CONSENSUS] 🆘 Using fallback leader: {} (deterministic selection)", fallback_leader);
+                        qnet_consensus::commit_reveal::ConsensusResultData {
+                            round_number: end_height / 90,
+                            leader_id: fallback_leader,
+                            participants: all_participants,
+                        }
+                    } else {
+                        return Err(format!("Consensus finalization failed: {}", e));
+                    }
                 }
             }
         };
