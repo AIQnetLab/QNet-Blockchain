@@ -1027,8 +1027,8 @@ impl BlockchainNode {
             let mut last_checkpoint = 0u64;
             
             while let Some(entry) = receiver.recv().await {
-                // Save checkpoint every 1 million hashes (about every 40 seconds at 25M/s)
-                if entry.num_hashes >= last_checkpoint + 1_000_000 {
+                // Save checkpoint every 10 million hashes (about every 20 seconds at 500K/s)
+                if entry.num_hashes >= last_checkpoint + 10_000_000 {
                     // Serialize and compress the checkpoint
                     if let Ok(serialized) = bincode::serialize(&entry) {
                         // Use zstd compression for efficient storage
@@ -5280,12 +5280,18 @@ impl BlockchainNode {
                          own_node_id, own_node_type);
             };
             
-            // CONSENSUS FIX: For Genesis phase, use DETERMINISTIC list (not connected peers)
+            // CONSENSUS FIX: For Genesis phase, use DETERMINISTIC list
             if is_genesis_phase || is_genesis_node {
-                // Use static Genesis list for emergency selection (same as normal selection)
-                let genesis_ips = crate::unified_p2p::get_genesis_bootstrap_ips();
-                for (i, _ip) in genesis_ips.iter().enumerate() {
-                    let peer_node_id = format!("genesis_node_{:03}", i + 1);
+                // CRITICAL: Use STATIC Genesis list with EQUAL weights for 100% determinism
+                println!("[EMERGENCY_SELECTION] 🌱 Genesis phase: using STATIC list with EQUAL weights");
+                
+                // CRITICAL: Clear any previously added candidates (e.g. own_node)
+                // We need ONLY the deterministic Genesis list
+                candidates.clear();
+                
+                // DETERMINISTIC: Always same 5 Genesis nodes
+                for i in 1..=5 {
+                    let peer_node_id = format!("genesis_node_{:03}", i);
                     
                     // Exclude failed producer
                     if peer_node_id == failed_producer {
@@ -5293,39 +5299,75 @@ impl BlockchainNode {
                         continue;
                     }
                     
-                    // CRITICAL FIX: Check REAL reputation for Genesis nodes in emergency
-                    // Failed nodes should not be emergency candidates
-                    let real_reputation = Self::get_node_reputation_score(&peer_node_id, p2p).await;
-                    if real_reputation >= 0.70 {
-                        candidates.push((peer_node_id.clone(), real_reputation));
-                        println!("[EMERGENCY_SELECTION] ✅ Genesis emergency candidate {} added (reputation: {:.1}%)", 
-                                 peer_node_id, real_reputation * 100.0);
-                    } else {
-                        println!("[EMERGENCY_SELECTION] ⚠️ Genesis node {} excluded - reputation {:.1}% < 70%", 
-                                 peer_node_id, real_reputation * 100.0);
-                    }
+                    // CRITICAL: Use EQUAL weight for ALL to ensure 100% determinism
+                    // Reputation differences can cause slight variations in floating point math
+                    let deterministic_weight = 1.0;
+                    
+                    candidates.push((peer_node_id.clone(), deterministic_weight));
+                    println!("[EMERGENCY_SELECTION] ✅ Genesis emergency candidate {} added (weight: {:.1})", 
+                             peer_node_id, deterministic_weight);
                 }
             } else {
-                // Normal phase: Use validated peers
-            let peers = p2p.get_validated_active_peers();
-            for peer in peers {
-                let peer_ip = peer.addr.split(':').next().unwrap_or(&peer.addr);
-                    let peer_node_id = peer.id.clone(); // Use actual peer ID, not generated one
-                    
-                    // Exclude failed producer
-                if peer_node_id == failed_producer {
-                    println!("[EMERGENCY_SELECTION] 💀 Excluding failed producer {} from emergency candidates", peer_node_id);
-                    continue;
+                // Normal phase: Try to use cached candidates from current round
+                println!("[EMERGENCY_SELECTION] 📦 Attempting to use cached candidates from current round");
+                
+                // Calculate current round
+                let rotation_interval = 30u64;
+                let leadership_round = if current_height <= 30 {
+                    0
+                } else {
+                    (current_height - 1) / rotation_interval
+                };
+                
+                // Try to get candidates from cache
+                use producer_cache::CACHED_PRODUCER_SELECTION;
+                let mut used_cache = false;
+                
+                if let Some(producer_cache) = CACHED_PRODUCER_SELECTION.get() {
+                    if let Ok(cache) = producer_cache.lock() {
+                        if let Some((_, round_candidates)) = cache.get(&leadership_round) {
+                            // Use cached candidates from current round
+                            println!("[EMERGENCY_SELECTION] 📋 Found {} candidates in round {} cache", 
+                                     round_candidates.len(), leadership_round);
+                            
+                            for (node_id, reputation) in round_candidates {
+                                if node_id == failed_producer {
+                                    println!("[EMERGENCY_SELECTION] 💀 Excluding failed producer {} from cached candidates", node_id);
+                                    continue;
+                                }
+                                candidates.push((node_id.clone(), *reputation));
+                            }
+                            used_cache = true;
+                        }
+                    }
                 }
                 
-                let reputation = Self::get_node_reputation_score(&peer_node_id, p2p).await;
-                if reputation >= 0.70 {
-                    candidates.push((peer_node_id.clone(), reputation));
-                        println!("[EMERGENCY_SELECTION] ✅ Emergency candidate {} added (reputation: {:.1}%)", 
-                             peer_node_id, reputation * 100.0);
-                } else {
-                    println!("[EMERGENCY_SELECTION] ⚠️ Peer {} excluded - low reputation: {:.1}%", 
-                             peer_node_id, reputation * 100.0);
+                // Fallback if no cache: Use validated peers
+                if !used_cache {
+                    println!("[EMERGENCY_SELECTION] ⚠️ No cached candidates - using validated peers");
+                    let peers = p2p.get_validated_active_peers();
+                    for peer in peers {
+                        let peer_node_id = peer.id.clone();
+                        
+                        // Exclude failed producer
+                        if peer_node_id == failed_producer {
+                            println!("[EMERGENCY_SELECTION] 💀 Excluding failed producer {} from emergency candidates", peer_node_id);
+                            continue;
+                        }
+                        
+                        // CRITICAL: Do NOT filter by reputation to ensure deterministic list
+                        let reputation = Self::get_node_reputation_score(&peer_node_id, p2p).await;
+                        
+                        // Use minimum weight if below threshold (ensures deterministic list)
+                        let effective_reputation = if reputation < 0.70 {
+                            0.01  // Very low weight but still in candidate list
+                        } else {
+                            reputation
+                        };
+                        
+                        candidates.push((peer_node_id.clone(), effective_reputation));
+                        println!("[EMERGENCY_SELECTION] ✅ Emergency candidate {} added (effective weight: {:.3})", 
+                                 peer_node_id, effective_reputation);
                     }
                 }
             }

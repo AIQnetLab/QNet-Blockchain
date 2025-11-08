@@ -37,7 +37,7 @@ lazy_static! {
 
 /// Number of hashes to perform between entries
 /// Optimized for QNet: 1-second microblocks need frequent PoH updates
-const HASHES_PER_TICK: u64 = 25_000; // ~10-15ms per tick with hybrid hashing
+const HASHES_PER_TICK: u64 = 5_000; // Reduced from 25K to 5K for 500K hashes/sec total
 
 /// Target tick duration in milliseconds
 /// 10ms provides good balance: 100 updates/sec for smooth entropy
@@ -255,7 +255,7 @@ impl QuantumPoH {
                     *hashes_per_second.write().await = hps;
                     POH_HASH_RATE.set(hps);
                     
-                    // Log performance every 10 seconds
+                    // Log performance every 10 seconds (500K hashes/sec expected)
                     if *count % (HASHES_PER_TICK * TICKS_PER_SLOT * 10) == 0 {
                         println!("[QuantumPoH] ⚡ Performance: {:.2}M hashes/sec, Slot: {}", 
                                 hps / 1_000_000.0, *current_slot.read().await);
