@@ -7645,6 +7645,21 @@ impl SimplifiedP2P {
             return;
         }
         
+        // CRITICAL: Prevent processing duplicate emergency messages for same block
+        // Multiple nodes may send same emergency notification causing issues
+        static LAST_EMERGENCY_HEIGHT: Lazy<Arc<AtomicU64>> = Lazy::new(|| Arc::new(AtomicU64::new(0)));
+        let last_height = LAST_EMERGENCY_HEIGHT.load(Ordering::Relaxed);
+        
+        if last_height == block_height && failed_producer == self.node_id {
+            println!("[FAILOVER] ⚠️ Duplicate emergency message for block #{} - ignoring", block_height);
+            return;
+        }
+        
+        // Update last processed height if we're the failed producer
+        if failed_producer == self.node_id {
+            LAST_EMERGENCY_HEIGHT.store(block_height, Ordering::Relaxed);
+        }
+        
         // CRITICAL FIX: Filter out failover messages for blocks we don't have yet
         // This prevents spam when a node starts with empty database
         let local_height = LOCAL_BLOCKCHAIN_HEIGHT.load(Ordering::Relaxed);
@@ -7734,9 +7749,14 @@ impl SimplifiedP2P {
                 NodeType::Super | NodeType::Full => {
                     println!("[FAILOVER] 🛑 WE are the failed producer - STOPPING block production");
                     EMERGENCY_STOP_PRODUCTION.store(true, Ordering::Relaxed);
-                    // Record the height when we were stopped
-                    EMERGENCY_STOP_HEIGHT.store(block_height, Ordering::Relaxed);
-                    println!("[RECOVERY] 📍 Will auto-recover after 10 blocks (at block #{})", block_height + 10);
+                    // CRITICAL: Only set stop height if not already set (prevent reset by multiple messages)
+                    let current_stop_height = EMERGENCY_STOP_HEIGHT.load(Ordering::Relaxed);
+                    if current_stop_height == 0 {
+                        EMERGENCY_STOP_HEIGHT.store(block_height, Ordering::Relaxed);
+                        println!("[RECOVERY] 📍 Will auto-recover after 10 blocks (at block #{})", block_height + 10);
+                    } else {
+                        println!("[RECOVERY] ⚠️ Already stopped at block #{}, not resetting timer", current_stop_height);
+                    }
                     // Main loop will check this flag and stop producing blocks
                     // This prevents fork creation when emergency failover happens
                 },

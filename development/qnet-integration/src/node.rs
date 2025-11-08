@@ -3521,8 +3521,7 @@ impl BlockchainNode {
                             &Some(p2p.clone()),
                             &node_id,
                             node_type,
-                            Some(storage.clone()),  // Pass storage for entropy
-                            &quantum_poh  // Pass PoH for quantum entropy
+                            Some(storage.clone()),  // Pass storage for deterministic entropy
                             ).await;
                             
                             println!("[PRODUCER] 🆘 Emergency handover to: {}", emergency_producer);
@@ -3730,7 +3729,6 @@ impl BlockchainNode {
                                     &node_id,
                                     node_type,
                                     Some(storage.clone()),
-                                    &quantum_poh  // Pass PoH for quantum entropy
                                 ).await;
                                 
                                 // Broadcast emergency change
@@ -4349,15 +4347,14 @@ impl BlockchainNode {
                                              expected_height_timeout, timeout_duration, current_producer_timeout);
                                     }
                                     
-                                    // EXISTING: Use same emergency selection as implemented in select_emergency_producer (line 1534)
+                                    // EXISTING: Use same emergency selection as implemented in select_emergency_producer
                                     let emergency_producer = crate::node::BlockchainNode::select_emergency_producer(
                                         &current_producer_timeout,
                                         expected_height_timeout, // Use expected height directly (already next block height)
                                         &Some(p2p_timeout.clone()),
                                         &node_id_timeout,
                                         node_type_timeout,
-                                        Some(storage_timeout.clone()),  // Pass storage for entropy
-                                        &quantum_poh_timeout  // Pass PoH for quantum entropy
+                                        Some(storage_timeout.clone()),  // Pass storage for deterministic entropy
                                     ).await;
                                     
                                     println!("[FAILOVER] 🆘 Emergency microblock producer selected: {}", emergency_producer);
@@ -5216,6 +5213,7 @@ impl BlockchainNode {
     // This eliminates guessing and potential misclassification of Full/Super nodes
     
     /// CRITICAL: Emergency producer selection when current producer fails
+    /// NOTE: Does NOT use PoH to ensure 100% determinism even for out-of-sync nodes
     async fn select_emergency_producer(
         failed_producer: &str,
         current_height: u64,
@@ -5223,7 +5221,6 @@ impl BlockchainNode {
         own_node_id: &str, // CRITICAL: Include own node as emergency candidate
         own_node_type: NodeType, // CRITICAL: Use real node type for accurate filtering
         storage: Option<Arc<Storage>>, // Pass storage for failover tracking
-        quantum_poh: &Option<Arc<crate::quantum_poh::QuantumPoH>>, // ADDED: For PoH entropy in emergency
     ) -> String {
         if let Some(p2p) = unified_p2p {
             // CRITICAL FIX: For Genesis phase, use SAME candidate source as normal producer selection
@@ -5480,65 +5477,26 @@ impl BlockchainNode {
             let candidates = valid_candidates;
             
             // CRITICAL: Deterministic emergency selection to prevent race conditions
-            // Use the same selection algorithm as normal rotation but with emergency seed
+            // Uses ONLY data available to ALL nodes regardless of sync status
+            // This ensures 100% determinism even when some nodes are behind
+            // NOTE: We do NOT use PoH, timestamps, or block hashes - only height and failed_producer
             use sha3::{Sha3_256, Digest};
             let mut emergency_hasher = Sha3_256::new();
             
-            // CRITICAL FIX: Add entropy from previous block to prevent same selection
-            // Use the actual previous block (not from round boundary) for emergency situations
-            let entropy_source = if let Some(ref store) = storage {
-                // For emergency, use the most recent block as entropy (current_height will get hash of height-1)
-                Self::get_previous_microblock_hash(store, current_height).await
+            if current_height > 0 {
+                // Use block height and failed producer as entropy
+                // ALL nodes have this information regardless of sync status
+                println!("[EMERGENCY] 🔐 Using deterministic entropy for block #{}", current_height);
+                emergency_hasher.update(b"EMERGENCY_DETERMINISTIC_V3");  // V3: without timestamp/PoH/entropy_source
+                emergency_hasher.update(&current_height.to_le_bytes());
+                emergency_hasher.update(failed_producer.as_bytes());
+                // CRITICAL: NO timestamp, NO PoH, NO entropy_source - only universally available data
+                // This ensures ALL nodes calculate exactly the same hash
             } else {
-                [0u8; 32]
-            };
-            
-            emergency_hasher.update(format!("emergency_producer_{}_{}", failed_producer, current_height).as_bytes());
-            emergency_hasher.update(&entropy_source); // Add entropy from previous block
-            
-            // CRITICAL: Safe PoH for emergency selection with synchronization check
-            // Same approach as regular selection - use PoH from last block, not local state
-            if let Some(ref store) = storage {
-                if current_height > 0 {
-                    // CRITICAL: Check if we're synchronized before using PoH
-                    let local_height = store.get_chain_height().unwrap_or(0);
-                    let poh_source_block = current_height - 1;
-                    
-                    // CRITICAL FIX: ALL nodes must use SAME data for determinism
-                    // If ANY node doesn't have the block, ALL use fallback
-                    let consensus_block = current_height.saturating_sub(1);
-                    
-                    // For emergency selection, we CANNOT use block data that some nodes might not have
-                    // Instead, use deterministic data that ALL nodes have: the block height itself
-                    // This ensures nodes at different sync levels still agree on emergency producer
-                    
-                    if consensus_block > 0 {
-                        // Use block height and failed producer as entropy
-                        // ALL nodes have this information regardless of sync status
-                        println!("[EMERGENCY] 🔐 Using deterministic entropy for block #{}", current_height);
-                        emergency_hasher.update(b"EMERGENCY_DETERMINISTIC_V2");
-                        emergency_hasher.update(&consensus_block.to_le_bytes());
-                        emergency_hasher.update(&current_height.to_le_bytes());
-                        emergency_hasher.update(failed_producer.as_bytes());
-                        
-                        // Add timestamp window to prevent replay but maintain determinism
-                        // Round to nearest 10 seconds so slightly desynced clocks still agree
-                        let time_window = (get_timestamp_safe() / 10) * 10;
-                        emergency_hasher.update(&time_window.to_le_bytes());
-                        println!("[EMERGENCY] 📍 Time window: {}", time_window);
-                    } else {
-                        // Height 0 - genesis emergency
-                        println!("[EMERGENCY] 🎯 Height 0: Using genesis emergency entropy");
-                        emergency_hasher.update(b"EMERGENCY_GENESIS");
-                        emergency_hasher.update(&current_height.to_le_bytes());
-                    }
-                } else {
-                    println!("[EMERGENCY] 🎯 Height 0: Using deterministic entropy (no blocks yet)");
-                    emergency_hasher.update(b"EMERGENCY_GENESIS");
-                }
-            } else {
-                println!("[EMERGENCY] ⚠️ No storage for PoH check");
-                emergency_hasher.update(b"EMERGENCY_NO_STORAGE");
+                // Height 0 - genesis emergency (should never happen but handle gracefully)
+                println!("[EMERGENCY] 🎯 Height 0: Using genesis emergency entropy");
+                emergency_hasher.update(b"EMERGENCY_GENESIS");
+                emergency_hasher.update(&current_height.to_le_bytes());
             }
             
             // CRITICAL: Apply MAX_VALIDATORS limit BEFORE sorting (for scalability)
