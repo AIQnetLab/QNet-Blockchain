@@ -1670,24 +1670,18 @@ impl BlockchainNode {
                     // This ensures all nodes maintain consistent PoH state without blocking block processing
                     if let Some(ref poh) = quantum_poh {
                         if received_block.height > 0 {
-                            // Clone necessary data for async operation
-                            let poh_clone = poh.clone();
-                            let storage_clone = storage.clone();
-                            let block_height = received_block.height;
-                            
-                            // Spawn async task for PoH sync to avoid blocking
-                            tokio::spawn(async move {
-                                // Extract PoH from the received microblock
-                                if let Ok(Some(block_data)) = storage_clone.load_microblock(block_height) {
-                                    if let Ok(microblock) = bincode::deserialize::<qnet_state::MicroBlock>(&block_data) {
-                                        if !microblock.poh_hash.is_empty() && microblock.poh_count > 0 {
-                                            poh_clone.sync_from_checkpoint(&microblock.poh_hash, microblock.poh_count).await;
-                                            println!("[QuantumPoH] ✅ Local PoH synchronized to block #{} (count: {}) [ASYNC]", 
-                                                    microblock.height, microblock.poh_count);
-                                        }
+                            // CRITICAL FIX: Synchronous PoH sync to prevent race conditions
+                            // Producer must wait for PoH sync before creating next block
+                            // This prevents PoH counter regression at rotation boundaries
+                            if let Ok(Some(block_data)) = storage.load_microblock(received_block.height) {
+                                if let Ok(microblock) = bincode::deserialize::<qnet_state::MicroBlock>(&block_data) {
+                                    if !microblock.poh_hash.is_empty() && microblock.poh_count > 0 {
+                                        poh.sync_from_checkpoint(&microblock.poh_hash, microblock.poh_count).await;
+                                        println!("[QuantumPoH] ✅ Local PoH synchronized to block #{} (count: {})", 
+                                                microblock.height, microblock.poh_count);
                                     }
                                 }
-                            });
+                            }
                         }
                     }
                     
@@ -3948,6 +3942,14 @@ impl BlockchainNode {
                         let block_data = bincode::serialize(&microblock).unwrap_or_default();
                         match poh.create_microblock_proof(&block_data).await {
                             Ok(poh_entry) => {
+                                // CRITICAL: Verify PoH counter increased from baseline
+                                if poh_entry.num_hashes <= poh_count {
+                                    println!("[QuantumPoH] ❌ CRITICAL: PoH did not increase! baseline={}, new={}", 
+                                            poh_count, poh_entry.num_hashes);
+                                    println!("[QuantumPoH] 🛑 CANNOT create block without PoH increase - skipping");
+                                    continue; // Skip block creation - wait for PoH to advance
+                                }
+                                
                                 println!("[QuantumPoH] ✅ Microblock #{} mixed into PoH chain (hash_count: {})", 
                                         microblock_height, poh_entry.num_hashes);
                                 // Update block with new PoH state after mixing
@@ -3955,7 +3957,9 @@ impl BlockchainNode {
                                 microblock.poh_count = poh_entry.num_hashes;
                             },
                             Err(e) => {
-                                println!("[QuantumPoH] ⚠️ Failed to mix microblock #{}: {}", microblock_height, e);
+                                println!("[QuantumPoH] ❌ CRITICAL: Failed to mix microblock #{}: {}", microblock_height, e);
+                                println!("[QuantumPoH] 🛑 CANNOT create block without PoH proof - skipping");
+                                continue; // Skip block creation - PoH not available
                             }
                         }
                     }
