@@ -3553,15 +3553,9 @@ impl BlockchainNode {
                         false
                     };
                     
-                    // Clear emergency flag if we were emergency producer
-                    if let Ok(mut emergency_flag) = EMERGENCY_PRODUCER_FLAG.lock() {
-                        if let Some((height, _)) = &*emergency_flag {
-                            if *height == next_block_height {
-                                println!("[EMERGENCY] ✅ Clearing emergency flag after entering production");
-                                *emergency_flag = None;
-                            }
-                        }
-                    }
+                    // CRITICAL FIX: DO NOT clear emergency flag here - it causes deadlock!
+                    // Flag will be cleared AFTER block is successfully created and saved
+                    // This prevents the node from forgetting it's emergency producer in next iteration
                     
                     // CRITICAL FIX: Emergency producer ALWAYS can produce
                     // Skip all checks if we're emergency producer to break deadlock
@@ -3869,8 +3863,30 @@ impl BlockchainNode {
                     // CRITICAL FIX: Get PoH state from PREVIOUS BLOCK for consistency
                     // This ensures all nodes use the same PoH baseline regardless of local state
                     let (poh_hash, poh_count) = if next_block_height > 1 {
+                        // CRITICAL: At rotation boundaries, wait for previous block if needed
+                        // This prevents PoH regression when producer changes
+                        let is_rotation_start = next_block_height > 1 && ((next_block_height - 1) % 30) == 0;
+                        
+                        // Try to load previous block with retry for rotation boundaries
+                        let mut prev_block_result = storage.load_microblock(next_block_height - 1);
+                        
+                        // Retry mechanism for rotation boundaries ONLY
+                        if is_rotation_start && prev_block_result.as_ref().map(|r| r.is_none()).unwrap_or(false) {
+                            println!("[PoH] 🔄 Rotation boundary: waiting for previous block #{}", next_block_height - 1);
+                            
+                            // Try up to 3 times with 500ms delay
+                            for retry in 1..=3 {
+                                tokio::time::sleep(Duration::from_millis(500)).await;
+                                prev_block_result = storage.load_microblock(next_block_height - 1);
+                                if prev_block_result.as_ref().map(|r| r.is_some()).unwrap_or(false) {
+                                    println!("[PoH] ✅ Previous block received after {} retries", retry);
+                                    break;
+                                }
+                            }
+                        }
+                        
                         // Load previous block to get its PoH state
-                        match storage.load_microblock(next_block_height - 1) {
+                        match prev_block_result {
                             Ok(Some(prev_block_data)) => {
                                 match bincode::deserialize::<qnet_state::MicroBlock>(&prev_block_data) {
                                     Ok(prev_block) => {
@@ -3880,26 +3896,29 @@ impl BlockchainNode {
                                         (prev_block.poh_hash.clone(), prev_block.poh_count)
                                     },
                                     Err(e) => {
-                                        println!("[PoH] ⚠️ Cannot deserialize previous block: {}", e);
-                                        // Fallback to local PoH if available
-                                        if let Some(ref poh) = quantum_poh {
-                                            let (hash, count, _slot) = poh.get_state().await;
-                                            (hash, count)
-                                        } else {
-                                            (vec![0u8; 64], 0u64)
-                                        }
+                                        println!("[PoH] ❌ Cannot deserialize previous block #{}: {}", next_block_height - 1, e);
+                                        println!("[PoH] 🔄 Corrupted block data - waiting for re-sync");
+                                        
+                                        // CRITICAL FIX: DO NOT use local PoH as fallback - it causes regression!
+                                        // If block data is corrupted, we must wait for re-sync from network
+                                        // This prevents PoH regression attacks and maintains Byzantine safety
+                                        
+                                        tokio::time::sleep(Duration::from_millis(500)).await;
+                                        continue; // Skip block creation - wait for valid previous block
                                     }
                                 }
                             },
                             _ => {
-                                println!("[PoH] ⚠️ Previous block #{} not found, using local PoH", next_block_height - 1);
-                                // Fallback to local PoH
-                                if let Some(ref poh) = quantum_poh {
-                                    let (hash, count, _slot) = poh.get_state().await;
-                                    (hash, count)
-                                } else {
-                                    (vec![0u8; 64], 0u64)
-                                }
+                                println!("[PoH] ❌ Previous block #{} not found - CANNOT CREATE BLOCK", next_block_height - 1);
+                                println!("[PoH] 🔄 Waiting for previous block to maintain PoH continuity");
+                                
+                                // CRITICAL FIX: DO NOT use local PoH as fallback - it causes regression!
+                                // Producer MUST wait for previous block to maintain chain integrity
+                                // This prevents PoH regression attacks and maintains Byzantine safety
+                                
+                                // Skip this iteration and wait for sync
+                                tokio::time::sleep(Duration::from_millis(500)).await;
+                                continue; // Skip block creation - wait for previous block
                             }
                         }
                     } else {
@@ -4139,6 +4158,19 @@ impl BlockchainNode {
                     // CRITICAL FIX: Only increment height AFTER block is confirmed saved and broadcast
                     // This prevents phantom height where node claims height N without having block N
                     println!("[PRODUCER] ✅ Created and saved block #{}", microblock.height);
+                    
+                    // CRITICAL FIX: Clear emergency flag AFTER successful block creation
+                    // This prevents deadlock where node forgets it's emergency producer
+                    if is_emergency_producer {
+                        if let Ok(mut emergency_flag) = EMERGENCY_PRODUCER_FLAG.lock() {
+                            if let Some((height, _)) = &*emergency_flag {
+                                if *height == microblock.height {
+                                    println!("[EMERGENCY] ✅ Clearing emergency flag after successful block #{} creation", microblock.height);
+                                    *emergency_flag = None;
+                                }
+                            }
+                        }
+                    }
                     
                     // CRITICAL FIX: Update global last block time for stall detection
                     LAST_BLOCK_PRODUCED_TIME.store(get_timestamp_safe(), Ordering::Relaxed);
@@ -6660,6 +6692,8 @@ impl BlockchainNode {
         }
         
         println!("[CONSENSUS] ✅ Executing commit phase for MACROBLOCK round {}", round_id);
+        println!("[CONSENSUS] 🔍 Round ID check: {} % 90 = {} (should be 0 for macroblock)", 
+                 round_id, round_id % 90);
         use qnet_consensus::{commit_reveal::Commit, ConsensusError};
         use sha3::{Sha3_256, Digest};
         
@@ -6720,14 +6754,22 @@ impl BlockchainNode {
                     
                     // PRODUCTION: Broadcast OWN commit to P2P network for other nodes
                     if let Some(p2p) = unified_p2p {
-                        let _ = p2p.broadcast_consensus_commit(
+                        match p2p.broadcast_consensus_commit(
                             round_id,
                             our_id.clone(),
                             commit.commit_hash.clone(),
                             commit.signature.clone(),  // CONSENSUS FIX: Pass signature for Byzantine validation
                             commit.timestamp
-                        );
-                        println!("[CONSENSUS] 📤 Broadcasted OWN commit to {} peers", participants.len() - 1);
+                        ) {
+                            Ok(_) => {
+                                println!("[CONSENSUS] 📤 Successfully broadcasted OWN commit to peers");
+                            }
+                            Err(e) => {
+                                println!("[CONSENSUS] ⚠️ Failed to broadcast commit: {}", e);
+                                println!("[CONSENSUS] 🔍 Round ID: {}, Expected macroblock: {}", 
+                                         round_id, round_id % 90 == 0);
+                            }
+                        }
                     }
                 }
                 Err(ConsensusError::InvalidSignature(msg)) => {
@@ -6832,6 +6874,8 @@ impl BlockchainNode {
         }
         
         println!("[CONSENSUS] ✅ Executing reveal phase for MACROBLOCK round {}", round_id);
+        println!("[CONSENSUS] 🔍 Round ID check: {} % 90 = {} (should be 0 for macroblock)", 
+                 round_id, round_id % 90);
         use qnet_consensus::commit_reveal::Reveal;
         use sha3::{Sha3_256, Digest};
         
@@ -6876,14 +6920,22 @@ impl BlockchainNode {
                     
                     // PRODUCTION: Broadcast OWN reveal to P2P network for other nodes
                     if let Some(p2p) = unified_p2p {
-                        let _ = p2p.broadcast_consensus_reveal(
+                        match p2p.broadcast_consensus_reveal(
                             round_id,
                             our_id.clone(),
                             hex::encode(&reveal.reveal_data), // Convert Vec<u8> to String
                             hex::encode(&reveal.nonce),        // CRITICAL: Include nonce for verification
                             reveal.timestamp
-                        );
-                        println!("[CONSENSUS] 📤 Broadcasted OWN reveal with nonce to {} peers", participants.len() - 1);
+                        ) {
+                            Ok(_) => {
+                                println!("[CONSENSUS] 📤 Successfully broadcasted OWN reveal with nonce to peers");
+                            }
+                            Err(e) => {
+                                println!("[CONSENSUS] ⚠️ Failed to broadcast reveal: {}", e);
+                                println!("[CONSENSUS] 🔍 Round ID: {}, Expected macroblock: {}", 
+                                         round_id, round_id % 90 == 0);
+                            }
+                        }
                     }
                 }
                 Err(e) => {
@@ -7598,10 +7650,15 @@ impl BlockchainNode {
             let consensus_nonce_storage = std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
             let unified_p2p_option = Some(p2p.clone()); // Pass REAL P2P system
             
+            // CRITICAL: Use macroblock height for P2P broadcast, not consensus round number!
+            // P2P expects height (90, 180, 270) to identify macroblock rounds
+            let macroblock_height = round_id; // round_id IS the end_height (90, 180, 270)
+            println!("[CONSENSUS] 🎯 Using macroblock height {} for P2P broadcast", macroblock_height);
+            
             Self::execute_real_commit_phase(
                 &mut consensus_engine,
                 &all_participants,
-                round_id,
+                macroblock_height,  // Pass height for P2P broadcast
                 &unified_p2p_option,
                 &consensus_nonce_storage,
                 node_id,  // Pass the validated node_id
@@ -7613,7 +7670,7 @@ impl BlockchainNode {
             Self::execute_real_reveal_phase(
                 &mut consensus_engine,
                 &all_participants,
-                round_id,
+                macroblock_height,  // Use same height as commit phase
                 &unified_p2p_option,
                 &consensus_nonce_storage,
                 node_id,  // Pass the validated node_id
