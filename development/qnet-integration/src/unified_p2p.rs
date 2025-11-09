@@ -101,6 +101,11 @@ pub static EMERGENCY_STOP_PRODUCTION: Lazy<Arc<AtomicBool>> =
 pub static EMERGENCY_STOP_HEIGHT: Lazy<Arc<AtomicU64>> = 
     Lazy::new(|| Arc::new(AtomicU64::new(0)));
 
+// CRITICAL FIX: Track TIME of emergency stop to prevent deadlock
+// Recovery after 10 seconds (not blocks) to avoid infinite wait
+pub static EMERGENCY_STOP_TIME: Lazy<Arc<AtomicU64>> = 
+    Lazy::new(|| Arc::new(AtomicU64::new(0)));
+
 // CRITICAL: Track emergency failovers in progress to prevent race conditions
 // Format: "emergency_failover_{height}" -> prevents multiple nodes from initiating same failover
 // SCALABILITY: DashSet for lock-free concurrent access with millions of nodes
@@ -7753,7 +7758,13 @@ impl SimplifiedP2P {
                     let current_stop_height = EMERGENCY_STOP_HEIGHT.load(Ordering::Relaxed);
                     if current_stop_height == 0 {
                         EMERGENCY_STOP_HEIGHT.store(block_height, Ordering::Relaxed);
-                        println!("[RECOVERY] 📍 Will auto-recover after 10 blocks (at block #{})", block_height + 10);
+                        // CRITICAL FIX: Also store TIME to prevent deadlock when blocks stop
+                        let current_time = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        EMERGENCY_STOP_TIME.store(current_time, Ordering::Relaxed);
+                        println!("[RECOVERY] 📍 Will auto-recover after 10 seconds (time-based) or 10 blocks");
                     } else {
                         println!("[RECOVERY] ⚠️ Already stopped at block #{}, not resetting timer", current_stop_height);
                     }
@@ -7767,19 +7778,33 @@ impl SimplifiedP2P {
             }
         }
         
-        // Check if we should clear the emergency stop (been stopped for 10+ blocks)
+        // Check if we should clear the emergency stop (been stopped for 10+ blocks OR 10+ seconds)
         // This applies to Super/Full nodes that were previously stopped
         if EMERGENCY_STOP_PRODUCTION.load(Ordering::Relaxed) {
             let stop_height = EMERGENCY_STOP_HEIGHT.load(Ordering::Relaxed);
-            if stop_height > 0 && block_height >= stop_height + 10 {
-                println!("[RECOVERY] ✅ Auto-clearing emergency stop after 10 blocks (stopped at #{}, now at #{})", 
-                        stop_height, block_height);
+            let stop_time = EMERGENCY_STOP_TIME.load(Ordering::Relaxed);
+            let current_time = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            
+            // CRITICAL FIX: Clear stop EITHER after 10 blocks OR 10 seconds (whichever comes first)
+            // This prevents deadlock when network stops producing blocks
+            let blocks_passed = if block_height > stop_height { block_height - stop_height } else { 0 };
+            let seconds_passed = if current_time > stop_time { current_time - stop_time } else { 0 };
+            
+            if stop_height > 0 && (blocks_passed >= 10 || seconds_passed >= 10) {
+                println!("[RECOVERY] ✅ Auto-clearing emergency stop after {} blocks / {} seconds", 
+                        blocks_passed, seconds_passed);
                 EMERGENCY_STOP_PRODUCTION.store(false, Ordering::Relaxed);
                 EMERGENCY_STOP_HEIGHT.store(0, Ordering::Relaxed);
+                EMERGENCY_STOP_TIME.store(0, Ordering::Relaxed);
                 println!("[RECOVERY] 🚀 Node can now resume block production");
             } else if stop_height > 0 {
-                let blocks_remaining = 10 - (block_height - stop_height);
-                println!("[RECOVERY] ⏳ Emergency stop active for {} more blocks", blocks_remaining);
+                let blocks_remaining = 10_u64.saturating_sub(blocks_passed);
+                let seconds_remaining = 10_u64.saturating_sub(seconds_passed);
+                println!("[RECOVERY] ⏳ Emergency stop active for {} more blocks OR {} more seconds", 
+                        blocks_remaining, seconds_remaining);
             }
         }
         

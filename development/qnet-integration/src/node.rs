@@ -15,7 +15,7 @@ pub const MIN_COMPATIBLE_VERSION: u32 = 1;  // Minimum version we can work with
 // PRODUCTION CONSTANTS - No hardcoded magic numbers!
 const ROTATION_INTERVAL_BLOCKS: u64 = 30; // Producer rotation every 30 blocks
 const MIN_BYZANTINE_NODES: usize = 4; // 3f+1 where f=1
-const FAST_SYNC_THRESHOLD: u64 = 50; // Trigger fast sync if behind by 50+ blocks  
+const FAST_SYNC_THRESHOLD: u64 = 10; // Trigger fast sync if behind by 10+ blocks (lowered from 50 for faster detection)  
 const FAST_SYNC_TIMEOUT_SECS: u64 = 60; // Fast sync timeout
 const BACKGROUND_SYNC_TIMEOUT_SECS: u64 = 30; // Background sync timeout
 const SNAPSHOT_FULL_INTERVAL: u64 = 10000; // Full snapshot every 10k blocks
@@ -69,10 +69,15 @@ pub fn set_emergency_producer_flag(block_height: u64, producer: String) {
 }
 
 // CRITICAL: Global synchronization flags for API access
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 static SYNC_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static FAST_SYNC_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 pub static NODE_IS_SYNCHRONIZED: AtomicBool = AtomicBool::new(false);
+
+// CRITICAL FIX: Track last block production time globally for stall detection
+// This prevents network from getting stuck when all nodes stop producing
+static LAST_BLOCK_PRODUCED_TIME: AtomicU64 = AtomicU64::new(0);
+static LAST_BLOCK_PRODUCED_HEIGHT: AtomicU64 = AtomicU64::new(0);
 
 // NOTE: Removed ROTATION_NOTIFY - simple 1-second timing is more reliable
 // Testing showed that natural timing without interrupts prevents race conditions
@@ -1444,9 +1449,14 @@ impl BlockchainNode {
                                             continue;
                                         }
                                         
-                                        // CRITICAL: Rate limit fork attempts (prevent DoS)
+                                        // CRITICAL: Rate limit fork attempts (prevent DoS) 
+                                        // But allow immediate sync if it's our own fork
                                         let last_attempt = *last_fork_attempt.read().await;
-                                        if last_attempt.elapsed().as_secs() < FORK_ATTEMPT_COOLDOWN_SECS {
+                                        let own_fork = if let Some(p2p) = &unified_p2p {
+                                            fork_producer == p2p.get_node_id()
+                                        } else { false };
+                                        
+                                        if !own_fork && last_attempt.elapsed().as_secs() < FORK_ATTEMPT_COOLDOWN_SECS {
                                             println!("[REORG] 🛡️ Fork attempt too soon - rate limited ({}s cooldown)", FORK_ATTEMPT_COOLDOWN_SECS);
                                             
                                             // CRITICAL FIX: If we detect our own blocks being rejected as forks,
@@ -1688,6 +1698,10 @@ impl BlockchainNode {
                         if received_block.height > current_height {
                             *height.write().await = received_block.height;
                             println!("[BLOCKS] 📊 Global height updated to {}", received_block.height);
+                            
+                            // CRITICAL FIX: Update last block time for stall detection
+                            LAST_BLOCK_PRODUCED_TIME.store(get_timestamp_safe(), Ordering::Relaxed);
+                            LAST_BLOCK_PRODUCED_HEIGHT.store(received_block.height, Ordering::Relaxed);
                             
                             // CRITICAL FIX: Update P2P local height for message filtering
                             crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(
@@ -2875,6 +2889,50 @@ impl BlockchainNode {
                         last_production_height = microblock_height;
                         last_production_time = std::time::Instant::now();
                     }
+                    
+                    // CRITICAL FIX: Global network stall detection
+                    // Check if ANY block has been produced recently (by us or others)
+                    let last_block_time = LAST_BLOCK_PRODUCED_TIME.load(Ordering::Relaxed);
+                    let last_block_height = LAST_BLOCK_PRODUCED_HEIGHT.load(Ordering::Relaxed);
+                    let current_time = get_timestamp_safe();
+                    
+                    if last_block_time > 0 && current_time > last_block_time {
+                        let time_since_last_block = current_time - last_block_time;
+                        
+                        // CRITICAL: Trigger emergency if no blocks for 10+ seconds
+                        // This is GLOBAL stall detection, not just local
+                        if time_since_last_block > 10 && microblock_height > 0 {
+                            println!("[STALL] 🚨 NETWORK STALL DETECTED! No blocks for {} seconds", time_since_last_block);
+                            println!("[STALL] 📊 Last block: #{} at timestamp {}", last_block_height, last_block_time);
+                            
+                            // Force emergency producer selection if we're supposed to be producing
+                            if let Some(p2p) = &unified_p2p {
+                                let next_height = microblock_height + 1;
+                                let expected_producer = Self::select_microblock_producer(
+                                    next_height, &unified_p2p, &node_id, node_type,
+                                    Some(&storage), &quantum_poh
+                                ).await;
+                                
+                                if time_since_last_block > 15 {
+                                    println!("[STALL] 🔥 Triggering emergency failover for producer: {}", expected_producer);
+                                    
+                                    // Select emergency producer
+                                    let emergency_producer = Self::select_emergency_producer(
+                                        &expected_producer, next_height, &unified_p2p,
+                                        &node_id, node_type, Some(storage.clone())
+                                    ).await;
+                                    
+                                    // Broadcast emergency change
+                                    if let Err(e) = p2p.broadcast_emergency_producer_change(
+                                        &expected_producer, &emergency_producer, 
+                                        next_height, "network_stall"
+                                    ) {
+                                        println!("[STALL] ⚠️ Failed to broadcast emergency: {}", e);
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 // SYNC FIX: Fast catch-up mode for nodes that are far behind
                 // Using global flags defined at module level
@@ -2936,8 +2994,8 @@ impl BlockchainNode {
                             println!("[SYNC] ⚠️ Node is {} blocks behind network (local: {}, network: {})", 
                                      height_difference, microblock_height, network_height);
                             
-                            // For extreme lag (>50 blocks), use fast sync
-                        if height_difference > 50 {
+                            // For significant lag (>10 blocks), use fast sync
+                        if height_difference > 10 {
                             // RACE CONDITION FIX: Only start fast sync if not already running
                                 if !FAST_SYNC_IN_PROGRESS.swap(true, Ordering::SeqCst) {
                                 println!("[SYNC] ⚡ FAST SYNC MODE: {} blocks behind, catching up...", height_difference);
@@ -4048,6 +4106,10 @@ impl BlockchainNode {
                     // CRITICAL FIX: Only increment height AFTER block is confirmed saved and broadcast
                     // This prevents phantom height where node claims height N without having block N
                     println!("[PRODUCER] ✅ Created and saved block #{}", microblock.height);
+                    
+                    // CRITICAL FIX: Update global last block time for stall detection
+                    LAST_BLOCK_PRODUCED_TIME.store(get_timestamp_safe(), Ordering::Relaxed);
+                    LAST_BLOCK_PRODUCED_HEIGHT.store(microblock.height, Ordering::Relaxed);
                     
                     // CRITICAL: Increment height for next iteration
                     // We only advance after successfully creating and storing the block
