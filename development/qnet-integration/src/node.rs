@@ -3328,7 +3328,10 @@ impl BlockchainNode {
                                 }
                             }
                             
-                            tokio::time::sleep(Duration::from_secs(2)).await;
+                            // CRITICAL FIX: Wait 5 seconds to allow Genesis block processing from P2P queue
+                            // Genesis broadcast takes ~1s, P2P queue processing takes ~2-3s
+                            // This prevents race condition where producer tries to create block #1 before Genesis is processed
+                            tokio::time::sleep(Duration::from_secs(5)).await;
                             continue; // Skip this iteration
                         }
                     }
