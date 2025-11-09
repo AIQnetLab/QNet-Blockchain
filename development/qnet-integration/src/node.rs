@@ -2865,6 +2865,36 @@ impl BlockchainNode {
                     }
                 }
                 
+                // CRITICAL FIX: Check emergency recovery EVERY SECOND, not just on messages
+                // This prevents deadlock when network stops and no messages arrive
+                if crate::unified_p2p::EMERGENCY_STOP_PRODUCTION.load(Ordering::Relaxed) {
+                    let stop_height = crate::unified_p2p::EMERGENCY_STOP_HEIGHT.load(Ordering::Relaxed);
+                    let stop_time = crate::unified_p2p::EMERGENCY_STOP_TIME.load(Ordering::Relaxed);
+                    let current_time = get_timestamp_safe();
+                    
+                    if stop_height > 0 && stop_time > 0 {
+                        let blocks_passed = if microblock_height > stop_height { 
+                            microblock_height - stop_height 
+                        } else { 0 };
+                        let seconds_passed = if current_time > stop_time { 
+                            current_time - stop_time 
+                        } else { 0 };
+                        
+                        // Clear emergency stop after 10 blocks OR 10 seconds
+                        if blocks_passed >= 10 || seconds_passed >= 10 {
+                            println!("[RECOVERY] ✅ Auto-clearing emergency stop in main loop ({}s / {} blocks passed)", 
+                                    seconds_passed, blocks_passed);
+                            crate::unified_p2p::EMERGENCY_STOP_PRODUCTION.store(false, Ordering::Relaxed);
+                            crate::unified_p2p::EMERGENCY_STOP_HEIGHT.store(0, Ordering::Relaxed);
+                            crate::unified_p2p::EMERGENCY_STOP_TIME.store(0, Ordering::Relaxed);
+                            
+                            // CRITICAL: Invalidate producer cache to allow this node to be selected again
+                            Self::invalidate_producer_cache();
+                            println!("[RECOVERY] 🚀 Node can now resume block production");
+                        }
+                    }
+                }
+                
                 // CPU OPTIMIZATION: Log CPU stats every 30 seconds
                 if cpu_check_counter % 30 == 0 {
                     let elapsed = start_time.elapsed().as_secs();
@@ -4447,12 +4477,20 @@ impl BlockchainNode {
                                 if !block_exists {
                                         // CRITICAL FIX: Adaptive timeout based on network conditions
                                         // Synchronous broadcast should arrive faster, but network delays still exist
+                                        
+                                        // CRITICAL FIX: During macroblock consensus, allow more time
+                                        // Consensus runs in background but can affect block production timing
+                                        let blocks_since_last_macro = expected_height_timeout % 90;
+                                        let is_consensus_period = blocks_since_last_macro >= 61 && blocks_since_last_macro <= 90;
+                                        
                                         let timeout_duration = if expected_height_timeout == 1 { 
                                             20  // First block needs more time for network stabilization
                                         } else if expected_height_timeout <= 10 {
                                             10  // Early blocks: 10 seconds for initial sync
+                                        } else if is_consensus_period {
+                                            15  // During consensus: more tolerance (was causing false emergencies)
                                         } else {
-                                            7   // Normal operation: 7 seconds (was 5, too aggressive)
+                                            7   // Normal operation: 7 seconds
                                         };
                                     
                                     // Special logging for rotation boundaries

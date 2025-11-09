@@ -7885,6 +7885,8 @@ impl SimplifiedP2P {
         
         // CRITICAL FIX: Invalidate producer cache to prevent selecting failed producer again
         // This ensures the network will select a new producer in the next round
+        // IMPORTANT: Do this for ALL nodes, not just the emergency producer
+        println!("[FAILOVER] 🔄 Invalidating producer cache after emergency change");
         crate::node::BlockchainNode::invalidate_producer_cache();
     }
     
