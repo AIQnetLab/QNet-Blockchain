@@ -2090,6 +2090,7 @@ impl SimplifiedP2P {
             
             if should_send {
                 let peer_addr = peer.addr.clone();
+                let peer_latency = peer.latency_ms; // Copy latency before move
                 let block_data_clone = Arc::clone(&block_data);
                 
                 // Spawn thread for parallel sending
@@ -2116,9 +2117,19 @@ impl SimplifiedP2P {
                     let peer_ip = peer_addr.split(':').next().unwrap_or(&peer_addr);
                     let url = format!("http://{}:8001/api/v1/p2p/message", peer_ip);
                     
+                    // OPTIMIZATION: Adaptive timeout based on peer latency
+                    // For intercontinental connections, 500ms is too short
+                    let timeout_ms = if peer_latency > 300 {
+                        3000  // Intercontinental (>300ms latency)
+                    } else if peer_latency > 100 {
+                        1500  // Regional (100-300ms latency)
+                    } else {
+                        500   // Local/same datacenter (<100ms latency)
+                    };
+                    
                     let client = reqwest::blocking::Client::builder()
-                        .timeout(Duration::from_millis(500))  // OPTIMIZATION: 500ms timeout for fast broadcast
-                        .connect_timeout(Duration::from_millis(200))  // OPTIMIZATION: Fast connect
+                        .timeout(Duration::from_millis(timeout_ms))  // ADAPTIVE: Based on peer latency
+                        .connect_timeout(Duration::from_millis(timeout_ms / 3))  // Connect timeout is 1/3 of total
                         .tcp_nodelay(true)  // CRITICAL: No Nagle's algorithm delay
                         .tcp_keepalive(Duration::from_secs(HTTP_TCP_KEEPALIVE_SECS))
                         .pool_max_idle_per_host(HTTP_POOL_MAX_IDLE_PER_HOST)

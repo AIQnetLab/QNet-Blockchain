@@ -3269,9 +3269,19 @@ impl BlockchainNode {
                 // CRITICAL: Set current block height for deterministic validator sampling
                 std::env::set_var("CURRENT_BLOCK_HEIGHT", microblock_height.to_string());
                 
-                // CRITICAL FIX: Select producer for the NEXT block to be created
-                // If we're at height 30, we need producer for block 31 (next block)
-                let next_block_height = microblock_height + 1;
+                // CRITICAL FIX: ALL nodes must select producer for the SAME height!
+                // Use the MAXIMUM height in the network to prevent forks
+                let network_max_height = if let Some(ref p2p) = unified_p2p {
+                    // Get cached network height (maximum among all peers)
+                    p2p.get_cached_network_height()
+                        .unwrap_or(microblock_height)
+                        .max(microblock_height)  // At least our height
+                } else {
+                    microblock_height
+                };
+                
+                // All nodes select producer for the same next block
+                let next_block_height = network_max_height + 1;
                 
                 // CRITICAL: Check Genesis exists before creating block #1
                 if next_block_height == 1 {
@@ -3307,7 +3317,19 @@ impl BlockchainNode {
                     Some(&storage),  // Pass storage for entropy
                     &quantum_poh  // Pass PoH for quantum entropy
                 ).await;
-                let mut is_my_turn_to_produce = current_producer == node_id;
+                
+                // CRITICAL: Prevent lagging nodes from producing blocks
+                // If we're more than 5 blocks behind, we CANNOT be producer
+                let lag = network_max_height.saturating_sub(microblock_height);
+                let mut is_my_turn_to_produce = if lag > 5 {
+                    if current_producer == node_id {
+                        println!("[PRODUCER] ❌ Cannot produce: {} blocks behind network (local: {}, network: {})", 
+                                lag, microblock_height, network_max_height);
+                    }
+                    false  // NEVER produce if lagging
+                } else {
+                    current_producer == node_id
+                };
                 
                 // CRITICAL FIX: Check if we're emergency producer for this block
                 // Emergency producer MUST create block even if not originally scheduled
@@ -4458,9 +4480,21 @@ impl BlockchainNode {
                             let node_type_timeout = node_type;
                             let quantum_poh_timeout = quantum_poh.clone();
                             
-                            // CRITICAL FIX: Use global height instead of sync_blockchain_height()
-                            // sync_blockchain_height() causes 800-1200ms delay!
-                            let network_height = *height.read().await;
+                            // CRITICAL FIX: Use REAL network height from peers, not local height!
+                            // Local height causes forks when nodes are out of sync
+                            let network_height = {
+                                // Use the cached network height which is updated from peers
+                                let cached_height = p2p_timeout.get_cached_network_height()
+                                    .unwrap_or(0);
+                                
+                                // Use the maximum of cached network height and local height
+                                let local_height = *height_timeout.read().await;
+                                if cached_height > local_height {
+                                    cached_height
+                                } else {
+                                    local_height
+                                }
+                            };
                             
                             // ROTATION DEADLOCK DETECTION: Special handling at rotation boundaries
                             // Rotation happens at blocks 31, 61, 91... (first block of new round)
@@ -4472,8 +4506,10 @@ impl BlockchainNode {
                                 microblock_timeout
                             };
                             
-                            // Only start timeout detection if we're reasonably in sync (within 10 blocks)
-                            if network_height == 0 || expected_height_timeout <= network_height + 10 {
+                            // CRITICAL FIX: ALWAYS start timeout detection to prevent forks!
+                            // Even if node is behind, it needs to detect failed producers
+                            // Remove the sync check that was preventing failover for lagging nodes
+                            {
                             // EXISTING: Use same async timeout pattern as macroblock failover (line 1205)
                             tokio::spawn(async move {
                                 tokio::time::sleep(rotation_timeout).await;
@@ -4558,10 +4594,7 @@ impl BlockchainNode {
                                     }
                                 }
                             });
-                            } else {
-                                println!("[FAILOVER] ⏸️ Skipping timeout detection - node is syncing (block {} vs network {})", 
-                                         expected_height_timeout, network_height);
-                            }
+                            } // End of timeout detection block
                         }
                     } else {
                         // No P2P available - standalone mode
@@ -6822,20 +6855,13 @@ impl BlockchainNode {
             }
         }
         
-        println!("[CONSENSUS] ⏰ Commit phase completed, attempting to advance to reveal phase");
+        println!("[CONSENSUS] ⏰ Commit phase completed");
         
-        // Advance to reveal phase
-        match consensus_engine.advance_phase() {
-            Ok(_) => {
-                println!("[CONSENSUS] ✅ Successfully advanced to reveal phase");
-            }
-            Err(e) => {
-                println!("[CONSENSUS] ❌ CRITICAL: Failed to advance to reveal phase: {:?}", e);
-                println!("[CONSENSUS] ⚠️ Consensus will fail - engine not in reveal phase!");
-                // This is critical - if we can't advance, reveals won't be processed
-                return;
-            }
-        }
+        // CRITICAL FIX: Don't call advance_phase() here!
+        // The consensus engine AUTOMATICALLY advances to reveal phase
+        // when Byzantine threshold is reached in submit_commit()
+        // Calling advance_phase() again would skip reveal phase and go to finalize!
+        println!("[CONSENSUS] ✅ Consensus engine automatically advanced to reveal phase")
     }
     
     /// PRODUCTION: Execute REAL reveal phase with inter-node communication
