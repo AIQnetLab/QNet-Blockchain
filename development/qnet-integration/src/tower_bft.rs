@@ -24,7 +24,7 @@ pub struct TowerBftConfig {
 impl Default for TowerBftConfig {
     fn default() -> Self {
         Self {
-            base_timeout_ms: 7000,      // 7 seconds base (from existing code)
+            base_timeout_ms: 7000,      // 7 seconds base - network must be optimized to meet this
             timeout_multiplier: 1.5,    // 50% increase per retry
             max_timeout_ms: 20000,      // 20 seconds max (from existing first block timeout)
             min_timeout_ms: 1000,       // 1 second minimum

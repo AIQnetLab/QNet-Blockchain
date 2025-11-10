@@ -347,7 +347,7 @@ const KADEMLIA_BITS: usize = 256;    // Hash size in bits
 
 // Turbine block propagation constants (Solana-inspired)
 const TURBINE_CHUNK_SIZE: usize = 1024;      // 1KB chunks (optimal for Dilithium signatures)
-const TURBINE_FANOUT: usize = 3;             // Each node forwards to 3 peers
+const TURBINE_FANOUT: usize = 4;             // CRITICAL FIX: Increased from 3 to 4 for 5-node Genesis network (faster propagation)
 const TURBINE_REDUNDANCY_FACTOR: f32 = 1.5;  // 50% redundancy for Reed-Solomon
 const TURBINE_MAX_CHUNKS: usize = 64;        // Max chunks per block (64KB max block size)
 
@@ -2055,7 +2055,11 @@ impl SimplifiedP2P {
         
         // CRITICAL FIX: Use CACHED validated active peers for broadcast performance
         // This ensures we broadcast to all REAL peers, with 30s cache for performance
-        let validated_peers = self.get_validated_active_peers();
+        let mut validated_peers = self.get_validated_active_peers();
+        
+        // OPTIMIZATION: Sort peers by latency for priority broadcast
+        // Send to fastest peers first for quicker propagation
+        validated_peers.sort_by_key(|p| p.latency_ms);
         
         // PRODUCTION: Silent broadcast operations for scalability (essential logs only)
         
@@ -2113,12 +2117,12 @@ impl SimplifiedP2P {
                     let url = format!("http://{}:8001/api/v1/p2p/message", peer_ip);
                     
                     let client = reqwest::blocking::Client::builder()
-                        .timeout(Duration::from_secs(3))  // WORKING: 3s timeout (from 669ca77)
-                        .connect_timeout(Duration::from_secs(HTTP_CONNECT_TIMEOUT_SECS))  // Unified timeout
-                        .tcp_nodelay(true)
-                        .tcp_keepalive(Duration::from_secs(HTTP_TCP_KEEPALIVE_SECS))  // Unified keepalive
-                        .pool_max_idle_per_host(HTTP_POOL_MAX_IDLE_PER_HOST)  // Unified pool size
-                        .pool_idle_timeout(Duration::from_secs(HTTP_POOL_IDLE_TIMEOUT_SECS))  // Unified idle timeout
+                        .timeout(Duration::from_millis(500))  // OPTIMIZATION: 500ms timeout for fast broadcast
+                        .connect_timeout(Duration::from_millis(200))  // OPTIMIZATION: Fast connect
+                        .tcp_nodelay(true)  // CRITICAL: No Nagle's algorithm delay
+                        .tcp_keepalive(Duration::from_secs(HTTP_TCP_KEEPALIVE_SECS))
+                        .pool_max_idle_per_host(HTTP_POOL_MAX_IDLE_PER_HOST)
+                        .pool_idle_timeout(Duration::from_secs(HTTP_POOL_IDLE_TIMEOUT_SECS))
                         .build()
                         .map_err(|e| format!("Client failed: {}", e))?;
                     
@@ -7838,11 +7842,11 @@ impl SimplifiedP2P {
         }
         
         // PRODUCTION: Apply penalty to ALL failed producers after bootstrap
-        // This prevents exploitation where nodes voluntarily fail without penalty
-        self.update_node_reputation(&failed_producer, -20.0);
+        // BALANCED: Reduced from -20% to -10% for better recovery
+        self.update_node_reputation(&failed_producer, -10.0);
         
         if failed_producer == self.node_id {
-            println!("[REPUTATION] ⚔️ Self-penalty applied: -20.0 reputation (failover)");
+            println!("[REPUTATION] ⚔️ Self-penalty applied: -10.0 reputation (failover)");
         } else {
             // PRIVACY: Use pseudonym for logging (don't double-convert if already pseudonym)
             let display_id = if failed_producer.starts_with("genesis_node_") || failed_producer.starts_with("node_") {
@@ -7850,7 +7854,7 @@ impl SimplifiedP2P {
             } else {
                 get_privacy_id_for_addr(&failed_producer)
             };
-            println!("[REPUTATION] ⚔️ Network-wide penalty for {}: -20.0 reputation (emergency change)", display_id);
+            println!("[REPUTATION] ⚔️ Network-wide penalty for {}: -10.0 reputation (emergency change)", display_id);
         }
         
         // Boost reputation of emergency producer for taking over

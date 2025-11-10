@@ -2925,25 +2925,23 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
             let registry = crate::activation_validation::BlockchainActivationRegistry::new(None);
             let mut eligible_nodes = registry.get_eligible_nodes().await;
             
-            // CRITICAL FIX: Add Genesis nodes if not in registry (bootstrap phase ONLY)
-            // Genesis nodes are Super nodes that must be pinged for rewards
-            // SCALABILITY: Only add Genesis nodes during initial bootstrap (first 10000 blocks)
-            let current_height = blockchain_for_pings.get_height().await;
-            let is_bootstrap_phase = current_height < 10000;
-            
-            if is_bootstrap_phase && eligible_nodes.len() < 5 {
-                // Add Genesis nodes with default reputation
-                for i in 1..=5 {
-                    let genesis_id = format!("genesis_node_{:03}", i);
-                    // Check if already in list
-                    if !eligible_nodes.iter().any(|(id, _, _)| id == &genesis_id) {
-                        eligible_nodes.push((genesis_id, 70.0, "super".to_string()));
-                    }
+            // CRITICAL FIX: ALWAYS add Genesis nodes for pinging and rewards
+            // Genesis nodes are Super nodes that must ALWAYS receive pings for rewards
+            // They are the backbone of the network and must be incentivized
+            // CRITICAL: Use same format as node.rs:1172 (genesis_node_001, not genesis_node_1)
+            for i in 1..=5 {
+                let genesis_id = format!("genesis_node_{:03}", i);
+                // Check if already in list
+                if !eligible_nodes.iter().any(|(id, _, _)| id == &genesis_id) {
+                    eligible_nodes.push((genesis_id, 70.0, "super".to_string()));
                 }
-                println!("[PING] 🌱 Bootstrap phase (height {}): Added {} Genesis nodes to ping list", 
-                         current_height,
-                         eligible_nodes.iter().filter(|(id, _, _)| id.starts_with("genesis_node_")).count());
             }
+            
+            let current_height = blockchain_for_pings.get_height().await;
+            println!("[PING] 📊 Height {}: Pinging {} eligible nodes (including {} Genesis nodes)", 
+                     current_height,
+                     eligible_nodes.len(),
+                     eligible_nodes.iter().filter(|(id, _, _)| id.starts_with("genesis_node_")).count());
             
             for (node_id, _reputation, node_type) in eligible_nodes {
                 if node_type != "full" && node_type != "super" {
@@ -3050,6 +3048,22 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
             reward_interval.tick().await;
             
             println!("[REWARDS] 💰 Processing 4-hour reward window");
+            
+            // PASSIVE RECOVERY: Give +5% reputation to all online nodes every 4 hours
+            // This allows nodes below 70% threshold to gradually recover
+            if let Some(p2p) = blockchain_for_rewards.get_unified_p2p() {
+                let online_peers = p2p.get_validated_active_peers();
+                for peer in online_peers {
+                    // Only boost nodes that are below 90% (to prevent easy max)
+                    // Use peer.reputation_score which is already 0-100 scale
+                    if peer.reputation_score < 90.0 {
+                        p2p.update_node_reputation(&peer.id, 5.0);
+                        println!("[REPUTATION] 🔄 Passive recovery: {} +5.0% (was {:.1}%, now {:.1}%)", 
+                                 peer.id, peer.reputation_score, peer.reputation_score + 5.0);
+                    }
+                }
+                println!("[REPUTATION] ✅ Passive recovery applied to all online nodes");
+            }
             
             // Process reward window - this will:
             // 1. Calculate rewards for all eligible nodes
