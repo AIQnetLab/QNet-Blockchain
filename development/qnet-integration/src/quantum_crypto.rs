@@ -13,7 +13,9 @@ use base64::{Engine as _, engine::general_purpose};
 use anyhow::{Result, anyhow};
 use crate::node::NodeType;
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use std::sync::RwLock as StdRwLock;  // For performance_stats (non-async)
+use tokio::sync::RwLock;  // For global caches (async-safe)
 use blake3;
 use chacha20poly1305::{ChaCha20Poly1305, Key as ChaChaKey, Nonce as ChachaNonce, KeyInit as ChachaKeyInit};
 use tokio::time::Duration;
@@ -31,6 +33,9 @@ fn safe_preview(s: &str, len: usize) -> &str {
 lazy_static::lazy_static! {
     static ref CRYPTO_CACHE: Arc<RwLock<HashMap<String, CachedActivationData>>> = Arc::new(RwLock::new(HashMap::new()));
     static ref SIGNATURE_CACHE: Arc<RwLock<HashMap<String, CachedSignature>>> = Arc::new(RwLock::new(HashMap::new()));
+    // PRODUCTION: Cache for DilithiumKeyManager to avoid repeated disk I/O
+    // This caches LONG-TERM Dilithium keys (NOT ephemeral keys per NIST/Cisco)
+    static ref KEY_MANAGER_CACHE: Arc<RwLock<HashMap<String, CachedKeyManager>>> = Arc::new(RwLock::new(HashMap::new()));
 }
 
 /// Blockchain phase state for dynamic pricing calculations
@@ -83,6 +88,15 @@ struct CachedSignature {
     is_valid: bool,
     cached_at: u64,
     signature_hash: String,
+}
+
+/// Cached KeyManager for avoiding repeated disk I/O
+/// CRITICAL: This caches LONG-TERM Dilithium keys, NOT ephemeral keys
+/// Safe per NIST/Cisco as these are persistent node keys
+struct CachedKeyManager {
+    manager: Arc<crate::key_manager::DilithiumKeyManager>,
+    cached_at: u64,
+    access_count: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Simple node replacement: 1 wallet = 1 active node per type
@@ -158,7 +172,7 @@ pub struct QNetQuantumCrypto {
     cache_ttl_seconds: u64,
     max_cache_size: usize,
     zero_copy_counter: Arc<std::sync::atomic::AtomicU64>,
-    performance_stats: Arc<RwLock<PerformanceStats>>,
+    performance_stats: Arc<StdRwLock<PerformanceStats>>,
 }
 
 #[derive(Debug, Default)]
@@ -178,7 +192,7 @@ impl QNetQuantumCrypto {
             cache_ttl_seconds: 3600, // 1 hour cache TTL for aggressive caching
             max_cache_size: 10000,   // Cache up to 10k activation codes
             zero_copy_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            performance_stats: Arc::new(RwLock::new(PerformanceStats::default())),
+            performance_stats: Arc::new(StdRwLock::new(PerformanceStats::default())),
         }
     }
 
@@ -207,7 +221,7 @@ impl QNetQuantumCrypto {
         let start_time = std::time::Instant::now();
 
         // PERFORMANCE: Check cache first (zero-copy for cache hits)
-        if let Some(cached) = self.get_from_cache(activation_code) {
+        if let Some(cached) = self.get_from_cache(activation_code).await {
             self.increment_zero_copy_ops();
             self.record_cache_hit();
             println!("🚀 Cache hit - zero-copy activation code decrypt");
@@ -313,7 +327,7 @@ impl QNetQuantumCrypto {
         };
 
         // 9. Cache the result
-        self.cache_activation_data(activation_code, &payload);
+        self.cache_activation_data(activation_code, &payload).await;
 
         // Record performance metrics
         let decrypt_time_ms = start_time.elapsed().as_millis() as u64;
@@ -339,7 +353,7 @@ impl QNetQuantumCrypto {
 
         // Check signature cache first
         {
-            let cache = SIGNATURE_CACHE.read().unwrap();
+            let cache = SIGNATURE_CACHE.read().await;
             if let Some(cached_sig) = cache.get(&cache_key) {
                 let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
                 if current_time - cached_sig.cached_at < self.cache_ttl_seconds {
@@ -354,7 +368,7 @@ impl QNetQuantumCrypto {
 
         // Cache the result
         {
-            let mut cache = SIGNATURE_CACHE.write().unwrap();
+            let mut cache = SIGNATURE_CACHE.write().await;
             cache.insert(cache_key, CachedSignature {
                 is_valid,
                 cached_at: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
@@ -366,8 +380,8 @@ impl QNetQuantumCrypto {
     }
 
     /// Get cached activation data (zero-copy operation)
-    fn get_from_cache(&self, activation_code: &str) -> Option<CachedActivationData> {
-        let cache = CRYPTO_CACHE.read().unwrap();
+    async fn get_from_cache(&self, activation_code: &str) -> Option<CachedActivationData> {
+        let cache = CRYPTO_CACHE.read().await;
         if let Some(cached) = cache.get(activation_code) {
             let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
             if current_time - cached.created_at < self.cache_ttl_seconds {
@@ -378,8 +392,8 @@ impl QNetQuantumCrypto {
     }
 
     /// Cache activation data for aggressive caching
-    fn cache_activation_data(&self, activation_code: &str, payload: &ActivationPayload) {
-        let mut cache = CRYPTO_CACHE.write().unwrap();
+    async fn cache_activation_data(&self, activation_code: &str, payload: &ActivationPayload) {
+        let mut cache = CRYPTO_CACHE.write().await;
         
         // Implement LRU eviction if cache is full
         if cache.len() >= self.max_cache_size {
@@ -457,7 +471,7 @@ impl QNetQuantumCrypto {
             },
             performance: PerformanceMetrics {
                 cache_hit_rate,
-                cache_size: CRYPTO_CACHE.read().unwrap().len(),
+                cache_size: CRYPTO_CACHE.try_read().map(|c| c.len()).unwrap_or(0),
                 avg_decrypt_time_ms,
                 memory_usage_mb: self.estimate_memory_usage(),
                 zero_copy_operations: zero_copy_ops,
@@ -467,8 +481,8 @@ impl QNetQuantumCrypto {
 
     /// Estimate memory usage for monitoring
     fn estimate_memory_usage(&self) -> f64 {
-        let cache_size = CRYPTO_CACHE.read().unwrap().len();
-        let signature_cache_size = SIGNATURE_CACHE.read().unwrap().len();
+        let cache_size = CRYPTO_CACHE.try_read().map(|c| c.len()).unwrap_or(0);
+        let signature_cache_size = SIGNATURE_CACHE.try_read().map(|c| c.len()).unwrap_or(0);
         
         // Rough estimate: each cached activation ~2KB, each signature ~0.5KB
         ((cache_size * 2048) + (signature_cache_size * 512)) as f64 / 1024.0 / 1024.0
@@ -535,19 +549,31 @@ impl QNetQuantumCrypto {
             return Err(anyhow!("Invalid signature length: {}", signature_bytes.len()));
         }
 
-        // 3. CRITICAL: Try consensus_crypto first for REAL verification
-        // Build expected message
-        let expected_message = format!("{}:{}", wallet_address, data);
+        // 3. CRITICAL FIX: Try BOTH message formats for compatibility
+        // Some systems expect "node_id:hash", others just "hash"
         
-        // Try real Dilithium verification through consensus_crypto
-        let is_valid = qnet_consensus::consensus_crypto::verify_consensus_signature(
+        // First try with just the data (new format)
+        let is_valid_new = qnet_consensus::consensus_crypto::verify_consensus_signature(
+            wallet_address,
+            data,  // Just the hash, no prefix
+            &signature.signature
+        ).await;
+        
+        if is_valid_new {
+            println!("✅ Dilithium signature verified successfully");
+            return Ok(true);
+        }
+        
+        // Then try with node_id:hash format (old format)
+        let expected_message = format!("{}:{}", wallet_address, data);
+        let is_valid_old = qnet_consensus::consensus_crypto::verify_consensus_signature(
             wallet_address,
             &expected_message,
             &signature.signature
         ).await;
         
-        if is_valid {
-            println!("✅ REAL Dilithium signature verified via consensus_crypto");
+        if is_valid_old {
+            println!("✅ Dilithium signature verified successfully");
             return Ok(true);
         }
         
@@ -744,23 +770,97 @@ impl QNetQuantumCrypto {
             return Err(anyhow!("Quantum crypto not initialized"));
         }
 
-        let signature_data = format!("{}:{}", node_id, data);
+        // CRITICAL FIX: Do NOT add node_id prefix here
+        // The verification in consensus_crypto.rs expects data WITHOUT prefix
+        // Adding prefix causes "Message mismatch" error in consensus
+        let signature_data = data.to_string();
         
-        // CRITICAL: Use DilithiumKeyManager for persistent keys
+        // CRITICAL: Use cached DilithiumKeyManager to avoid repeated disk I/O
+        // This caches LONG-TERM keys only, NOT ephemeral keys (per NIST/Cisco)
         use crate::key_manager::DilithiumKeyManager;
         use std::path::Path;
+        use std::sync::Arc;
         
-        // Get or create key manager for this node
-        let data_dir = Path::new("keys");
-        let key_manager = DilithiumKeyManager::new(node_id.to_string(), data_dir)?;
+        // Check cache first (using existing TTL pattern)
+        let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let cache_key = node_id.to_string();
         
-        // Initialize (loads existing or generates new)
-        key_manager.initialize().await?;
+        // Get or create cached key manager
+        // First, check if we have a valid cached manager
+        let cached_manager = {
+            let cache = KEY_MANAGER_CACHE.read().await;
+            if let Some(cached) = cache.get(&cache_key) {
+                // Use same TTL as other caches (1 hour = 3600 seconds)
+                if current_time - cached.cached_at < self.cache_ttl_seconds {
+                    // Update access count for monitoring
+                    cached.access_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Some(cached.manager.clone())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        
+        let key_manager = if let Some(manager) = cached_manager {
+            manager
+        } else {
+            // Create new manager outside lock
+            let data_dir = Path::new("keys");
+            let manager = Arc::new(DilithiumKeyManager::new(node_id.to_string(), data_dir)?);
+            manager.initialize().await?;
+            
+            // Now acquire write lock to insert
+            {
+                let mut cache = KEY_MANAGER_CACHE.write().await;
+                
+                // Double-check it wasn't inserted by another task
+                if let Some(cached) = cache.get(&cache_key) {
+                    if current_time - cached.cached_at < self.cache_ttl_seconds {
+                        cached.manager.clone()
+                    } else {
+                        // Insert our newly created manager
+                        cache.insert(cache_key.clone(), CachedKeyManager {
+                            manager: manager.clone(),
+                            cached_at: current_time,
+                            access_count: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+                        });
+                        
+                        // Cleanup old entries if cache too large
+                        if cache.len() > self.max_cache_size {
+                            let mut oldest_key = String::new();
+                            let mut oldest_time = current_time;
+                            for (key, entry) in cache.iter() {
+                                if entry.cached_at < oldest_time {
+                                    oldest_time = entry.cached_at;
+                                    oldest_key = key.clone();
+                                }
+                            }
+                            if !oldest_key.is_empty() {
+                                cache.remove(&oldest_key);
+                            }
+                        }
+                        
+                        manager
+                    }
+                } else {
+                    // Insert our newly created manager
+                    cache.insert(cache_key.clone(), CachedKeyManager {
+                        manager: manager.clone(),
+                        cached_at: current_time,
+                        access_count: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+                    });
+                    
+                    manager
+                }
+            }
+        };
         
         // Get public key for verification
         let public_key_bytes = key_manager.get_public_key()?;
         
-        // Sign using key manager (uses persistent keys)
+        // Sign using cached key manager (uses persistent keys from memory)
         let signature_bytes = key_manager.sign(signature_data.as_bytes())?;
         
         // Build combined format WITHOUT unsafe code

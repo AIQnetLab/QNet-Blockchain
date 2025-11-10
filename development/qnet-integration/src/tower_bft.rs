@@ -24,7 +24,7 @@ pub struct TowerBftConfig {
 impl Default for TowerBftConfig {
     fn default() -> Self {
         Self {
-            base_timeout_ms: 7000,      // 7 seconds base (from existing code)
+            base_timeout_ms: 7000,      // 7 seconds base - network must be optimized to meet this
             timeout_multiplier: 1.5,    // 50% increase per retry
             max_timeout_ms: 20000,      // 20 seconds max (from existing first block timeout)
             min_timeout_ms: 1000,       // 1 second minimum
@@ -95,31 +95,33 @@ impl TowerBft {
         }
         
         // Calculate adaptive timeout based on QNet's existing logic
-        // CRITICAL FIX: Increase base timeouts for PoH overhead
+        // CRITICAL FIX: Balanced timeouts for 1 block/second target
+        // Now that crypto initialization is cached, we can use MUCH smaller timeouts
         let base_timeout = if height == 0 || height == 1 {
-            // First blocks need more time for network bootstrap + PoH init
-            25000  // Increased from 20000 for PoH overhead
+            // First blocks need more time for network bootstrap (but crypto is now cached!)
+            5000  // 5 seconds for first blocks (was 25000!)
         } else if height <= 10 {
-            // Early blocks still forming network + PoH sync
-            15000  // Increased from 10000 for PoH overhead
+            // Early blocks still forming network
+            3000  // 3 seconds for early blocks (was 15000!)
         } else if height > 1 && ((height - 1) % 30) == 0 {
-            // CRITICAL: Rotation boundaries need more time for producer switch
-            12000  // Special timeout for rotation boundaries
+            // CRITICAL: Rotation boundaries need slightly more time for producer switch
+            3000  // 3 seconds for rotation boundaries (was 12000!)
         } else {
-            // Normal operation with PoH overhead
-            10000  // Increased from 7000 to account for PoH sync
+            // Normal operation - target 1 second blocks with reasonable timeout
+            2000  // 2 seconds timeout for normal blocks (was 10000!)
         };
         
         // Apply exponential backoff for retries (Solana-style)
         let timeout_ms = if retry_count > 0 {
-            // Exponential backoff: 10s -> 20s -> 40s -> 60s (max)
+            // CRITICAL FIX: Much smaller backoff for 1 block/sec target!
+            // Exponential backoff: 2s -> 3s -> 5s -> 10s (max)
             let multiplier = match retry_count {
-                1 => 2.0,   // Second attempt: 2x
-                2 => 4.0,   // Third attempt: 4x
-                _ => 6.0,   // Fourth+ attempt: 6x (capped)
+                1 => 1.5,   // Second attempt: +50%
+                2 => 2.5,   // Third attempt: 2.5x
+                _ => 5.0,   // Fourth+ attempt: 5x (capped)
             };
             let adjusted = (base_timeout as f64 * multiplier) as u64;
-            adjusted.min(60000).max(self.config.min_timeout_ms) // Max 60 seconds
+            adjusted.min(10000).max(self.config.min_timeout_ms) // Max 10 seconds (was 60!)
         } else {
             base_timeout
         };

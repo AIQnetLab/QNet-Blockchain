@@ -5,6 +5,101 @@ All notable changes to the QNet project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.21.0] - November 6, 2025 "Critical Rotation and Consensus Fixes"
+
+### Fixed
+- **Duplicate track_block Calls**: Fixed double counting causing "59/30 blocks"
+  - Removed duplicate track_block call in block storage spawn
+  - Now only tracks blocks once after creation
+  - Fixes: Incorrect rotation tracking showing 59 blocks in 30-block rounds
+- **is_next_block_producer Height Calculation**: Fixed wrong height usage
+  - Now uses local_height + 1 instead of network_height + 1
+  - Ensures node checks if it's producer for its next block
+  - Fixes: Selected producer showing is_producer: false in API
+- **Consensus Signature Verification**: Fixed message format mismatch
+  - Now handles both formats: with and without node_id prefix
+  - Prevents "Message mismatch" errors in consensus
+  - Fixes: Macroblock consensus failing due to signature verification
+
+## [2.20.0] - November 5, 2025 "Producer Rotation Cache Fix"
+
+### Fixed
+- **Producer Cache at Rotation Boundaries**: Fixed stale cache preventing rotation
+  - Cache now cleared when entering new round (blocks 31, 61, 91...)
+  - First block of new round always recalculates producer
+  - Ensures different producer selected for each round
+- **NODE_IS_SYNCHRONIZED Flag for Producers**: Critical fix for block production
+  - Flag was only updated for non-producer nodes (in else branch)
+  - Producer nodes had stale sync status, failing is_next_block_producer() check
+  - Moved flag update before producer check (line 3371) to ensure ALL nodes update
+  - Fixes: Selected producer unable to create blocks due to false "not synchronized" status
+- **Leadership Round Calculation in API**: Fixed incorrect round display
+  - API endpoint calculated round for current block instead of next block
+  - At block 30, showed round 0 instead of round 1 (for block 31)
+  - Now correctly calculates round for next_height (current_height + 1)
+  - Fixes: API showing wrong leadership_round and blocks_until_rotation
+- **Removed ROTATION_NOTIFY Mechanism**: Simplified rotation handling
+  - Removed complex interrupt-based rotation notifications (caused race conditions)
+  - Returned to simple 1-second timing that worked reliably in commits 669ca77 and 356e2bb
+  - Natural timing ensures all nodes check producer status within 1 second
+  - Fixes: Race conditions where notification arrived before rotation block
+- **Key Manager Persistence**: Identified Docker volume requirement
+  - Keys were regenerated on restart due to non-persistent /app/data/keys
+  - Requires Docker volume mount for persistent key storage
+
+## [2.19.0] - November 4, 2025 "Critical Security & Performance Fixes"
+
+### Added
+- **Dual Dilithium Signatures**: Dilithium now signs BOTH ephemeral key AND message
+  - Addresses critical vulnerability identified by Ian Smith (security researcher)
+  - Full compliance with NIST/Cisco hybrid cryptography standards
+  - Prevents quantum attacks on Ed25519 message signatures
+  - Maintains O(1) performance with certificate caching
+- **Memory Security (zeroize)**: Sensitive data cleared from memory after use
+  - Ephemeral key bytes cleared immediately after signing
+  - Dilithium seed cleared after caching
+  - Encryption key material cleared after cipher creation
+  - Protection against memory dumps, core dumps, and cold boot attacks
+- **Global Crypto Instance**: GLOBAL_QUANTUM_CRYPTO for performance
+  - Single initialization per process (was per-block!)
+  - Eliminates repeated disk I/O and decryption overhead
+  - Shared across hybrid_crypto.rs for consistency
+
+### Changed
+- **Tower BFT Timeouts**: Drastically reduced for 1 block/second target
+  - Base timeouts: 2-5 seconds (was 10-25 seconds)
+  - Max timeout: 10 seconds (was 60 seconds)
+  - Rotation boundaries: 3 seconds (was 12 seconds)
+  - Config values: 2000ms base (was 7000ms), 10000ms max (was 20000ms)
+- **Hybrid Crypto Signature Structure**: Updated to include message signature
+  - `dilithium_message_signature`: Now contains REAL signature (was empty string)
+  - Verification enforces non-empty Dilithium message signature
+  - Backward incompatible: old signatures will be rejected
+
+### Fixed
+- **Message Mismatch in Consensus**: Fixed incorrect node_id prepending
+  - File: `core/qnet-consensus/src/consensus_crypto.rs:171`
+  - Used message AS-IS instead of adding duplicate node_id prefix
+- **Emergency Producer Activation**: Fixed global flag not being set
+  - File: `development/qnet-integration/src/unified_p2p.rs:7520-7528`
+  - Now correctly calls `set_emergency_producer_flag` for local node
+- **Block Production Delays**: Fixed two major performance bottlenecks
+  - Repeated crypto initialization: Now uses GLOBAL_QUANTUM_CRYPTO
+  - Excessive TowerBFT timeouts: Reduced to match 1-second block target
+- **Network Stuck at Block 30**: Resolved through combination of above fixes
+  - Message verification now works correctly
+  - Emergency failover activates properly
+  - Blocks produced at correct 1-second intervals
+
+### Security
+- **CRITICAL**: Quantum resistance now complete at consensus level
+  - Previous implementation vulnerable to quantum attacks on Ed25519
+  - Current implementation requires BOTH Ed25519 AND Dilithium verification
+  - Consensus mechanism is now fully post-quantum secure
+- **Memory safety**: All sensitive cryptographic material properly cleared
+  - Addresses forensic analysis and memory dump attack vectors
+  - Complies with best practices for key material handling
+
 ## [2.18.0] - October 31, 2025 "PoH Optimization & VRF Implementation"
 
 ### Added

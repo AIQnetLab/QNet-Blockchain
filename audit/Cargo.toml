@@ -85,8 +85,5 @@ name = "reputation_benchmarks"
 harness = false
 path = "02_reputation/benchmarks.rs"
 
-[profile.test]
-opt-level = 2  # Optimize tests for better performance
-
-[profile.bench]
-debug = true   # Include debug info in benchmarks
+# NOTE: Profiles moved to workspace root Cargo.toml
+# Profiles in non-root packages are ignored by Cargo

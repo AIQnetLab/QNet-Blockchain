@@ -39,4 +39,10 @@ strip = true
 lto = "fat"
 codegen-units = 1
 panic = "abort"
-overflow-checks = false 
+overflow-checks = false
+
+[profile.test]
+opt-level = 2  # Optimize tests for better performance
+
+[profile.bench]
+debug = true   # Include debug info in benchmarks 
