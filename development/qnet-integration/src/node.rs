@@ -55,10 +55,14 @@ fn get_timestamp_safe() -> u64 {
 }
 use std::env;
 use std::sync::Mutex;
+use std::collections::HashSet;
 
 // CRITICAL: Global flag for emergency producer activation
 lazy_static::lazy_static! {
     pub static ref EMERGENCY_PRODUCER_FLAG: Mutex<Option<(u64, String)>> = Mutex::new(None);
+    
+    // CRITICAL: Track processed failovers to prevent duplicate events
+    pub static ref PROCESSED_FAILOVERS: Mutex<HashSet<u64>> = Mutex::new(HashSet::new());
 }
 
 // CRITICAL: Public function to set emergency producer flag from other modules
@@ -3269,19 +3273,10 @@ impl BlockchainNode {
                 // CRITICAL: Set current block height for deterministic validator sampling
                 std::env::set_var("CURRENT_BLOCK_HEIGHT", microblock_height.to_string());
                 
-                // CRITICAL FIX: ALL nodes must select producer for the SAME height!
-                // Use the MAXIMUM height in the network to prevent forks
-                let network_max_height = if let Some(ref p2p) = unified_p2p {
-                    // Get cached network height (maximum among all peers)
-                    p2p.get_cached_network_height()
-                        .unwrap_or(microblock_height)
-                        .max(microblock_height)  // At least our height
-                } else {
-                    microblock_height
-                };
-                
-                // All nodes select producer for the same next block
-                let next_block_height = network_max_height + 1;
+                // CRITICAL FIX: Use LOCAL height for deterministic producer selection
+                // All nodes at the same height will select the same producer
+                // Nodes at different heights naturally select different producers (by design)
+                let next_block_height = microblock_height + 1;
                 
                 // CRITICAL: Check Genesis exists before creating block #1
                 if next_block_height == 1 {
@@ -3318,18 +3313,9 @@ impl BlockchainNode {
                     &quantum_poh  // Pass PoH for quantum entropy
                 ).await;
                 
-                // CRITICAL: Prevent lagging nodes from producing blocks
-                // If we're more than 5 blocks behind, we CANNOT be producer
-                let lag = network_max_height.saturating_sub(microblock_height);
-                let mut is_my_turn_to_produce = if lag > 5 {
-                    if current_producer == node_id {
-                        println!("[PRODUCER] ❌ Cannot produce: {} blocks behind network (local: {}, network: {})", 
-                                lag, microblock_height, network_max_height);
-                    }
-                    false  // NEVER produce if lagging
-                } else {
-                    current_producer == node_id
-                };
+                // CRITICAL: Simple producer check - let natural consensus handle lagging
+                // Nodes at different heights naturally won't interfere with each other
+                let mut is_my_turn_to_produce = current_producer == node_id;
                 
                 // CRITICAL FIX: Check if we're emergency producer for this block
                 // Emergency producer MUST create block even if not originally scheduled
@@ -3546,7 +3532,37 @@ impl BlockchainNode {
                     // Skip all checks if we're emergency producer to break deadlock
                     let can_produce = if is_emergency_producer {
                         println!("[EMERGENCY] 🚀 Emergency producer bypassing all checks!");
-                        true  // Emergency producer ALWAYS produces
+                        
+                        // CRITICAL: Before creating emergency block, wait and check if original producer delivered
+                        // This prevents race condition where both producers create the same block
+                        println!("[EMERGENCY] ⏰ Waiting 2 seconds to allow original producer to deliver...");
+                        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                        
+                        // Check if the block already exists from original producer
+                        let block_exists = {
+                            match storage.load_microblock(next_block_height) {
+                                Ok(Some(_)) => {
+                                    println!("[EMERGENCY] ✅ Block #{} already exists from original producer! Skipping emergency production.", next_block_height);
+                                    
+                                    // Clear emergency flag since block exists
+                                    if let Ok(mut emergency_flag) = EMERGENCY_PRODUCER_FLAG.lock() {
+                                        *emergency_flag = None;
+                                        println!("[EMERGENCY] 🔧 Cleared emergency flag - block delivered by original producer");
+                                    }
+                                    true
+                                },
+                                Ok(None) => {
+                                    println!("[EMERGENCY] ❌ Block #{} still missing after wait - proceeding with emergency production", next_block_height);
+                                    false
+                                },
+                                Err(e) => {
+                                    println!("[EMERGENCY] ⚠️ Error checking block existence: {} - proceeding with emergency production", e);
+                                    false
+                                }
+                            }
+                        };
+                        
+                        !block_exists  // Can produce only if block doesn't exist
                     } else {
                         // CRITICAL: Check emergency stop flag first
                         // If we received emergency failover notification, stop producing immediately
@@ -4480,30 +4496,29 @@ impl BlockchainNode {
                             let node_type_timeout = node_type;
                             let quantum_poh_timeout = quantum_poh.clone();
                             
-                            // CRITICAL FIX: Use REAL network height from peers, not local height!
-                            // Local height causes forks when nodes are out of sync
-                            let network_height = {
-                                // Use the cached network height which is updated from peers
-                                let cached_height = p2p_timeout.get_cached_network_height()
-                                    .unwrap_or(0);
-                                
-                                // Use the maximum of cached network height and local height
-                                let local_height = *height_timeout.read().await;
-                                if cached_height > local_height {
-                                    cached_height
-                                } else {
-                                    local_height
-                                }
-                            };
+                            // CRITICAL FIX: Use LOCAL height for consistent failover
+                            // All nodes at the same height will trigger failover at the same time
+                            let network_height = *height_timeout.read().await;
                             
                             // ROTATION DEADLOCK DETECTION: Special handling at rotation boundaries
                             // Rotation happens at blocks 31, 61, 91... (first block of new round)
                             let is_rotation_boundary = expected_height_timeout > 1 && ((expected_height_timeout - 1) % 30) == 0;
-                            let rotation_timeout = if is_rotation_boundary {
-                                // Double timeout at rotation boundaries to account for producer switch
-                                Duration::from_secs(10)
+                            
+                            // CRITICAL FIX: Use ACTUAL timeout values that match logging
+                            // During consensus period (blocks 61-90), allow more time
+                            let blocks_since_last_macro = expected_height_timeout % 90;
+                            let is_consensus_period = blocks_since_last_macro >= 61 && blocks_since_last_macro <= 90;
+                            
+                            let actual_timeout = if expected_height_timeout == 1 { 
+                                Duration::from_secs(20)  // First block needs more time
+                            } else if expected_height_timeout <= 10 {
+                                Duration::from_secs(10)  // Early blocks: 10 seconds
+                            } else if is_consensus_period {
+                                Duration::from_secs(15)  // During consensus: 15 seconds
+                            } else if is_rotation_boundary {
+                                Duration::from_secs(10)  // Rotation boundaries: 10 seconds
                             } else {
-                                microblock_timeout
+                                Duration::from_secs(7)   // Normal operation: 7 seconds
                             };
                             
                             // CRITICAL FIX: ALWAYS start timeout detection to prevent forks!
@@ -4512,7 +4527,7 @@ impl BlockchainNode {
                             {
                             // EXISTING: Use same async timeout pattern as macroblock failover (line 1205)
                             tokio::spawn(async move {
-                                tokio::time::sleep(rotation_timeout).await;
+                                tokio::time::sleep(actual_timeout).await;
                                 
                                 // CRITICAL: Double-check if block was received during timeout period
                                 // This prevents race condition where block arrives just as timeout triggers
@@ -4526,23 +4541,34 @@ impl BlockchainNode {
                                 };
                                 
                                 if !block_exists {
-                                        // CRITICAL FIX: Adaptive timeout based on network conditions
-                                        // Synchronous broadcast should arrive faster, but network delays still exist
-                                        
-                                        // CRITICAL FIX: During macroblock consensus, allow more time
-                                        // Consensus runs in background but can affect block production timing
-                                        let blocks_since_last_macro = expected_height_timeout % 90;
-                                        let is_consensus_period = blocks_since_last_macro >= 61 && blocks_since_last_macro <= 90;
-                                        
-                                        let timeout_duration = if expected_height_timeout == 1 { 
-                                            20  // First block needs more time for network stabilization
-                                        } else if expected_height_timeout <= 10 {
-                                            10  // Early blocks: 10 seconds for initial sync
-                                        } else if is_consensus_period {
-                                            15  // During consensus: more tolerance (was causing false emergencies)
+                                    // CRITICAL: Check if failover was already processed for this height
+                                    // This prevents creating 10000 failover events for the same block
+                                    let already_processed = if let Ok(mut processed) = PROCESSED_FAILOVERS.lock() {
+                                        if processed.contains(&expected_height_timeout) {
+                                            println!("[FAILOVER] ⚠️ Failover already processed for block #{} - skipping duplicate", 
+                                                     expected_height_timeout);
+                                            true
                                         } else {
-                                            7   // Normal operation: 7 seconds (network optimized for fast broadcast)
-                                        };
+                                            // Mark this height as processed
+                                            processed.insert(expected_height_timeout);
+                                            
+                                            // Clean up old entries (keep only last 100 blocks)
+                                            if processed.len() > 100 {
+                                                let min_height = expected_height_timeout.saturating_sub(100);
+                                                processed.retain(|&h| h >= min_height);
+                                            }
+                                            false
+                                        }
+                                    } else {
+                                        false
+                                    };
+                                    
+                                    if already_processed {
+                                        return; // Exit early - failover already handled
+                                    }
+                                    
+                                    // Use the actual timeout duration for logging (calculated above)
+                                    let timeout_duration = actual_timeout.as_secs();
                                     
                                     // Special logging for rotation boundaries
                                     if is_rotation_boundary {

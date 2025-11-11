@@ -3,8 +3,8 @@ use std::fs;
 use std::sync::{Arc, RwLock};
 use anyhow::{Result, anyhow};
 use pqcrypto_dilithium::dilithium3;
+use pqcrypto_traits::sign::{PublicKey as PublicKeyTrait, SecretKey as SecretKeyTrait, SignedMessage as SignedMessageTrait};
 use serde::{Serialize, Deserialize};
-use zeroize::{Zeroize, ZeroizeOnDrop};
 use sha3::{Sha3_256, Sha3_512, Digest};
 use lazy_static::lazy_static;
 
@@ -19,8 +19,8 @@ pub struct DilithiumKeyManager {
     /// Path to key storage
     key_dir: PathBuf,
     
-    /// Cached seed for deterministic key generation
-    seed: Arc<RwLock<Option<[u8; 32]>>>,
+    /// Cached keypair to avoid regeneration
+    cached_keypair: Arc<RwLock<Option<(dilithium3::PublicKey, dilithium3::SecretKey)>>>,
     
     /// Node ID
     node_id: String,
@@ -36,7 +36,7 @@ impl DilithiumKeyManager {
         
         Ok(Self {
             key_dir: final_key_dir,
-            seed: Arc::new(RwLock::new(None)),
+            cached_keypair: Arc::new(RwLock::new(None)),
             node_id,
         })
     }
@@ -156,176 +156,61 @@ impl DilithiumKeyManager {
             }
         }
         
-        // Try to load existing seed
-        match self.load_seed().await {
-            Ok(_) => {
-                println!("[KEY_MANAGER] ✅ Loaded existing Dilithium seed");
-            }
-            Err(e) => {
-                // Generate new if not found
-                println!("[KEY_MANAGER] 📝 No existing seed found ({}), generating new...", e);
-                println!("[KEY_MANAGER] 🔨 Generating new CRYSTALS-Dilithium seed...");
-                self.generate_and_store_seed().await?;
-                println!("[KEY_MANAGER] ✅ Generated and stored new Dilithium seed");
-            }
-        }
-        
+        // Keypair will be loaded or generated on first use (lazy initialization)
         println!("[KEY_MANAGER] 🎉 Key manager initialization complete!");
         Ok(())
     }
     
-    /// Generate new seed and store
-    async fn generate_and_store_seed(&self) -> Result<()> {
-        // Generate deterministic seed from node_id
-        let mut seed = self.generate_seed();
-        
-        // Store encrypted seed on disk
-        self.store_seed(&seed).await?;
-        
-        // Cache seed in memory
-        let mut seed_guard = self.seed.write().unwrap();
-        *seed_guard = Some(seed);
-        
-        // SECURITY: Clear local seed variable from stack memory
-        // The cached version in Arc<RwLock> remains for use
-        seed.zeroize();
-        
-        Ok(())
-    }
-    
-    /// Generate deterministic seed from node_id
-    fn generate_seed(&self) -> [u8; 32] {
-        let mut hasher = Sha3_256::new();
-        hasher.update(self.node_id.as_bytes());
-        hasher.update(b"QNET_DILITHIUM_SEED_V3");
-        let hash = hasher.finalize();
-        
-        let mut seed = [0u8; 32];
-        seed.copy_from_slice(&hash);
-        seed
-    }
-    
-    /// Store seed encrypted on disk
-    async fn store_seed(&self, seed: &[u8]) -> Result<()> {
-        use aes_gcm::{
-            aead::{Aead, KeyInit, OsRng},
-            Aes256Gcm, Nonce, Key
-        };
-        
-        let seed_path = self.key_dir.join("node_dilithium.seed");
-        
-        // Derive encryption key from node_id
-        let mut hasher = Sha3_256::new();
-        hasher.update(self.node_id.as_bytes());
-        hasher.update(b"QNET_KEY_ENCRYPTION_V1");
-        let mut key_material = hasher.finalize();
-        
-        // Create AES-256-GCM cipher
-        let key = Key::<Aes256Gcm>::from_slice(&key_material);
-        let cipher = Aes256Gcm::new(key);
-        
-        // SECURITY: Clear key material after use
-        key_material.zeroize();
-        
-        // Generate random nonce (96 bits for GCM)
-        let nonce_bytes = rand::random::<[u8; 12]>();
-        let nonce = Nonce::from_slice(&nonce_bytes);
-        
-        // Encrypt seed
-        let encrypted = cipher.encrypt(nonce, seed)
-            .map_err(|e| anyhow!("Encryption failed: {}", e))?;
-        
-        // Store: nonce (12 bytes) + encrypted data
-        let mut stored_data = Vec::new();
-        stored_data.extend_from_slice(&nonce_bytes);
-        stored_data.extend_from_slice(&encrypted);
-        
-        // Write encrypted seed
-        fs::write(&seed_path, stored_data)?;
-        
-        // Set restrictive permissions (Unix only)
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&seed_path, fs::Permissions::from_mode(0o600))?;
-        }
-        
-        Ok(())
-    }
-    
-    /// Load seed from disk
-    async fn load_seed(&self) -> Result<()> {
-        let seed_path = self.key_dir.join("node_dilithium.seed");
-        
-        // Check if seed exists
-        if !seed_path.exists() {
-            return Err(anyhow!("Seed not found"));
-        }
-        
-        // Read encrypted seed
-        let stored_data = fs::read(&seed_path)?;
-        if stored_data.len() < 12 {
-            return Err(anyhow!("Invalid seed file"));
-        }
-        
-        // Extract nonce and encrypted data
-        let nonce_bytes = &stored_data[..12];
-        let encrypted = &stored_data[12..];
-        
-        // Derive decryption key
-        let mut hasher = Sha3_256::new();
-        hasher.update(self.node_id.as_bytes());
-        hasher.update(b"QNET_KEY_ENCRYPTION_V1");
-        let mut key_material = hasher.finalize();
-        
-        // Decrypt
-        use aes_gcm::{aead::{Aead, KeyInit}, Aes256Gcm, Nonce, Key};
-        let key = Key::<Aes256Gcm>::from_slice(&key_material);
-        let cipher = Aes256Gcm::new(key);
-        
-        // SECURITY: Clear key material after use
-        key_material.zeroize();
-        let nonce = Nonce::from_slice(nonce_bytes);
-        
-        let mut seed_bytes = cipher.decrypt(nonce, encrypted)
-            .map_err(|e| anyhow!("Decryption failed: {}", e))?;
-        
-        let mut seed = [0u8; 32];
-        seed.copy_from_slice(&seed_bytes[..32.min(seed_bytes.len())]);
-        
-        // Cache seed in memory
-        let mut seed_guard = self.seed.write().unwrap();
-        *seed_guard = Some(seed);
-        
-        // SECURITY: Clear decrypted seed bytes from memory
-        seed_bytes.zeroize();
-        seed.zeroize(); // Clear local copy after caching
-        
-        Ok(())
-    }
-    
-    /// Get deterministic keypair from seed
+    /// Get keypair (loads from disk or generates new, cached for performance)
     fn get_keypair(&self) -> Result<(dilithium3::PublicKey, dilithium3::SecretKey)> {
-        let seed_guard = self.seed.read().unwrap();
-        let seed = seed_guard.as_ref().ok_or_else(|| anyhow!("Seed not initialized"))?;
+        // Check cache first
+        {
+            let cache_guard = self.cached_keypair.read().unwrap();
+            if let Some((pk, sk)) = cache_guard.as_ref() {
+                return Ok((pk.clone(), sk.clone()));
+            }
+        }
         
-        // Generate deterministic keypair from seed
-        // Since pqcrypto doesn't expose seed-based generation,
-        // we generate once and cache the result deterministically
-        Ok(dilithium3::keypair())
+        // Try to load from disk first
+        let key_path = self.key_dir.join("dilithium_keypair.bin");
+        if key_path.exists() {
+            // CRITICAL: If file exists, it MUST be loaded successfully
+            // Generating new keys would cause node identity loss
+            let (pk, sk) = self.load_keypair_from_disk(&key_path)?;
+            
+            // Cache the loaded keypair
+            let mut cache_guard = self.cached_keypair.write().unwrap();
+            *cache_guard = Some((pk.clone(), sk.clone()));
+            return Ok((pk, sk));
+        }
+        
+        // Generate new keypair ONCE and save it
+        println!("[KEY_MANAGER] 🔑 Generating new Dilithium3 keypair (one-time operation)...");
+        
+        // CRITICAL: Generate keypair only ONCE and persist it
+        // This ensures the same keys are used across restarts
+        let (pk, sk) = dilithium3::keypair();
+        
+        // Save to disk immediately for persistence
+        // CRITICAL: Node MUST NOT start without saved keys to prevent identity loss
+        self.save_keypair_to_disk(&pk, &sk, &key_path)?;
+        println!("[KEY_MANAGER] ✅ Dilithium3 keypair saved to disk for persistence");
+        
+        // Cache the keypair
+        {
+            let mut cache_guard = self.cached_keypair.write().unwrap();
+            *cache_guard = Some((pk.clone(), sk.clone()));
+        }
+        
+        Ok((pk, sk))
     }
     
     /// Get public key bytes (1952 bytes for Dilithium3)
     pub fn get_public_key(&self) -> Result<Vec<u8>> {
         let (public_key, _) = self.get_keypair()?;
         
-        // Extract bytes using unsafe transmute (pqcrypto limitation)
-        let pk_bytes = unsafe {
-            let pk_ptr = &public_key as *const _ as *const [u8; 1952];
-            (*pk_ptr).to_vec()
-        };
-        
-        Ok(pk_bytes)
+        // Use trait method to get bytes
+        Ok(PublicKeyTrait::as_bytes(&public_key).to_vec())
     }
     
     /// Sign data with Dilithium-based deterministic signature
@@ -334,30 +219,20 @@ impl DilithiumKeyManager {
     /// 2. Uses SHA3-512 which is quantum-resistant
     /// 3. Signature is deterministic and verifiable
     pub fn sign(&self, data: &[u8]) -> Result<Vec<u8>> {
-        let seed_guard = self.seed.read().unwrap();
-        let seed = seed_guard.as_ref().ok_or_else(|| anyhow!("Seed not initialized"))?;
+        // OPTIMIZATION: Use cached keypair from get_keypair()
+        let (_pk, sk) = self.get_keypair()?;
         
-        // Create quantum-resistant signature using Dilithium seed + SHA3-512
-        let mut hasher = Sha3_512::new();
-        hasher.update(seed);  // Dilithium seed provides quantum entropy
-        hasher.update(data);  // Include message
-        hasher.update(b"QNET_DILITHIUM_SIGN_V1");
-        let signature = hasher.finalize();
+        // Sign with REAL Dilithium3 algorithm
+        let signature = dilithium3::sign(data, &sk);
         
-        // Create 2420-byte signature format (Dilithium3 size)
-        let mut full_signature = vec![0u8; 2420];
+        // Get signed message bytes from Dilithium3
+        let signed_msg_bytes = SignedMessageTrait::as_bytes(&signature);
         
-        // Fill with deterministic pattern based on quantum-resistant hash
-        for i in 0..2420 {
-            let mut chunk_hasher = Sha3_256::new();
-            chunk_hasher.update(&signature);
-            chunk_hasher.update(&(i as u32).to_le_bytes());
-            let chunk = chunk_hasher.finalize();
-            full_signature[i] = chunk[0];
-        }
+        // Extract just the signature part (first 2420 bytes are signature, rest is message)
+        let sig_bytes = &signed_msg_bytes[..2420.min(signed_msg_bytes.len())];
         
-        println!("✅ Generated quantum-resistant Dilithium-seeded signature ({} bytes)", full_signature.len());
-        Ok(full_signature)
+        println!("✅ Generated REAL Dilithium3 quantum-resistant signature ({} bytes)", sig_bytes.len());
+        Ok(sig_bytes.to_vec())
     }
     
     /// Verify signature with public key
@@ -370,61 +245,31 @@ impl DilithiumKeyManager {
             return Ok(false);
         }
         
-        // CRITICAL FIX: We CANNOT recreate the exact signature without the private seed
-        // Instead, verify signature properties:
-        
-        // 1. Check signature entropy (must have high randomness)
-        let unique_bytes: std::collections::HashSet<_> = signature.iter().collect();
-        if unique_bytes.len() < 200 {  // Dilithium signatures have high entropy
-            println!("❌ Insufficient entropy in signature: {} unique bytes", unique_bytes.len());
+        if public_key_bytes.len() != 1952 {
+            println!("❌ Invalid public key length: {} (expected 1952)", public_key_bytes.len());
             return Ok(false);
         }
         
-        // 2. Check signature is not all zeros (common attack)
-        if signature.iter().all(|&b| b == 0) {
-            println!("❌ All-zero signature detected");
-            return Ok(false);
-        }
+        // PRODUCTION: Use REAL Dilithium3 verification
+        let pk = <dilithium3::PublicKey as PublicKeyTrait>::from_bytes(public_key_bytes)
+            .map_err(|_| anyhow!("Invalid public key format"))?;
         
-        // 3. For self-verification (when we have the seed), recreate and compare
-        let seed_guard = self.seed.read().unwrap();
-        if let Some(seed) = seed_guard.as_ref() {
-            // We have the seed - can do exact verification
-            let mut hasher = Sha3_512::new();
-            hasher.update(seed);
-            hasher.update(data);
-            hasher.update(b"QNET_DILITHIUM_SIGN_V1");
-            let expected_base = hasher.finalize();
-            
-            // Recreate full signature
-            let mut expected_signature = vec![0u8; 2420];
-            for i in 0..2420 {
-                let mut chunk_hasher = Sha3_256::new();
-                chunk_hasher.update(&expected_base);
-                chunk_hasher.update(&(i as u32).to_le_bytes());
-                let chunk = chunk_hasher.finalize();
-                expected_signature[i] = chunk[0];
-            }
-            
-            let valid = signature == expected_signature.as_slice();
-            if valid {
-                println!("✅ Quantum-resistant signature verified (self-verification)");
-            } else {
-                println!("❌ Signature mismatch (self-verification)");
-            }
-            return Ok(valid);
-        }
+        // For verification, we need to reconstruct the signed message
+        // Dilithium3 expects signature + message concatenated
+        let mut signed_msg = Vec::with_capacity(signature.len() + data.len());
+        signed_msg.extend_from_slice(signature);
+        signed_msg.extend_from_slice(data);
         
-        // 4. For external verification (no seed), accept high-entropy signatures
-        // This is a limitation of our deterministic approach
-        // In production, would use real pqcrypto-dilithium verification
-        println!("⚠️ External signature verification - checking entropy only");
-        
-        // Accept if has sufficient entropy and structure
-        let valid = unique_bytes.len() >= 200 && !signature.iter().all(|&b| b == 0);
+        // Verify with REAL Dilithium3 algorithm
+        let valid = dilithium3::open(&dilithium3::SignedMessage::from_bytes(&signed_msg).unwrap_or_else(|_| {
+            // If can't parse, create dummy for return false
+            dilithium3::sign(&[], &dilithium3::keypair().1)
+        }), &pk).is_ok();
         
         if valid {
-            println!("✅ Signature accepted (high entropy: {} unique bytes)", unique_bytes.len());
+            println!("✅ REAL Dilithium3 signature verified successfully");
+        } else {
+            println!("❌ Dilithium3 signature verification failed");
         }
         
         Ok(valid)
@@ -442,6 +287,127 @@ impl DilithiumKeyManager {
         use base64::{Engine as _, engine::general_purpose};
         general_purpose::STANDARD.decode(public_key_b64)
             .map_err(|e| anyhow!("Invalid base64: {}", e))
+    }
+    
+    /// Save keypair to disk (encrypted)
+    fn save_keypair_to_disk(&self, pk: &dilithium3::PublicKey, sk: &dilithium3::SecretKey, path: &Path) -> Result<()> {
+        use aes_gcm::{aead::{Aead, KeyInit}, Aes256Gcm, Nonce, Key};
+        
+        // Serialize keypair
+        let pk_bytes = PublicKeyTrait::as_bytes(pk);
+        let sk_bytes = SecretKeyTrait::as_bytes(sk);
+        
+        // Combine into single buffer
+        let mut combined = Vec::new();
+        combined.extend_from_slice(&(pk_bytes.len() as u32).to_le_bytes());
+        combined.extend_from_slice(pk_bytes);
+        combined.extend_from_slice(&(sk_bytes.len() as u32).to_le_bytes());
+        combined.extend_from_slice(sk_bytes);
+        
+        // Derive encryption key from node_id
+        let mut hasher = Sha3_256::new();
+        hasher.update(self.node_id.as_bytes());
+        hasher.update(b"QNET_KEYPAIR_ENCRYPTION_V1");
+        let key_material = hasher.finalize();
+        
+        // Encrypt with AES-256-GCM
+        let key = Key::<Aes256Gcm>::from_slice(&key_material);
+        let cipher = Aes256Gcm::new(key);
+        let nonce_bytes = rand::random::<[u8; 12]>();
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        
+        let encrypted = cipher.encrypt(nonce, combined.as_ref())
+            .map_err(|e| anyhow!("Encryption failed: {}", e))?;
+        
+        // Store: nonce + encrypted data
+        let mut stored = Vec::new();
+        stored.extend_from_slice(&nonce_bytes);
+        stored.extend_from_slice(&encrypted);
+        
+        // Write to disk
+        fs::write(path, stored)?;
+        
+        // Set restrictive permissions (Unix only)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        }
+        
+        Ok(())
+    }
+    
+    /// Load keypair from disk (decrypt)
+    fn load_keypair_from_disk(&self, path: &Path) -> Result<(dilithium3::PublicKey, dilithium3::SecretKey)> {
+        use aes_gcm::{aead::{Aead, KeyInit}, Aes256Gcm, Nonce, Key};
+        
+        // Read encrypted data
+        let stored = fs::read(path)?;
+        if stored.len() < 12 {
+            return Err(anyhow!("Invalid keypair file"));
+        }
+        
+        // Extract nonce and encrypted data
+        let nonce_bytes = &stored[..12];
+        let encrypted = &stored[12..];
+        
+        // Derive decryption key
+        let mut hasher = Sha3_256::new();
+        hasher.update(self.node_id.as_bytes());
+        hasher.update(b"QNET_KEYPAIR_ENCRYPTION_V1");
+        let key_material = hasher.finalize();
+        
+        // Decrypt
+        let key = Key::<Aes256Gcm>::from_slice(&key_material);
+        let cipher = Aes256Gcm::new(key);
+        let nonce = Nonce::from_slice(nonce_bytes);
+        
+        let decrypted = cipher.decrypt(nonce, encrypted)
+            .map_err(|e| anyhow!("Decryption failed: {}", e))?;
+        
+        // Parse keypair
+        if decrypted.len() < 8 {
+            return Err(anyhow!("Invalid decrypted data"));
+        }
+        
+        let mut cursor = 0;
+        
+        // Read public key
+        let pk_len = u32::from_le_bytes([
+            decrypted[cursor], decrypted[cursor+1], 
+            decrypted[cursor+2], decrypted[cursor+3]
+        ]) as usize;
+        cursor += 4;
+        
+        if cursor + pk_len > decrypted.len() {
+            return Err(anyhow!("Invalid public key length"));
+        }
+        
+        let pk_bytes = &decrypted[cursor..cursor+pk_len];
+        let pk = <dilithium3::PublicKey as PublicKeyTrait>::from_bytes(pk_bytes)
+            .map_err(|_| anyhow!("Invalid public key format"))?;
+        cursor += pk_len;
+        
+        // Read secret key
+        if cursor + 4 > decrypted.len() {
+            return Err(anyhow!("Missing secret key length"));
+        }
+        
+        let sk_len = u32::from_le_bytes([
+            decrypted[cursor], decrypted[cursor+1], 
+            decrypted[cursor+2], decrypted[cursor+3]
+        ]) as usize;
+        cursor += 4;
+        
+        if cursor + sk_len > decrypted.len() {
+            return Err(anyhow!("Invalid secret key length"));
+        }
+        
+        let sk_bytes = &decrypted[cursor..cursor+sk_len];
+        let sk = <dilithium3::SecretKey as SecretKeyTrait>::from_bytes(sk_bytes)
+            .map_err(|_| anyhow!("Invalid secret key format"))?;
+        
+        Ok((pk, sk))
     }
 }
 
