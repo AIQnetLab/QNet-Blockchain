@@ -185,9 +185,15 @@ impl HybridCrypto {
         // CRITICAL FIX: Use GLOBAL crypto instance for certificate rotation!
         let mut crypto_guard = crate::node::GLOBAL_QUANTUM_CRYPTO.lock().await;
         if crypto_guard.is_none() {
-            let mut crypto = crate::quantum_crypto::QNetQuantumCrypto::new();
-            let _ = crypto.initialize().await;
-            *crypto_guard = Some(crypto);
+            // Use GLOBAL crypto instance for consistency
+            use crate::node::GLOBAL_QUANTUM_CRYPTO;
+            
+            let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
+            if crypto_guard.is_none() {
+                let mut crypto = crate::quantum_crypto::QNetQuantumCrypto::new();
+                let _ = crypto.initialize().await;
+                *crypto_guard = Some(crypto);
+            }
         }
         let quantum_crypto = crypto_guard.as_ref().unwrap();
         

@@ -18,9 +18,9 @@ LOCAL DATA ONLY:
 • User Preferences: Language settings, display preferences stored locally
 
 NETWORK INTERACTION DATA:
-• Node Status: Your node's participation status is recorded on the public blockchain
+• Validator Status: Your validator node's activity is recorded on the public blockchain
 • Transaction History: Blockchain transactions are publicly visible by design
-• Network Metrics: Node uptime and performance data for reward calculation
+• Network Metrics: Validator node uptime and performance metrics for on-chain validation
 
 ====================
 3. HOW WE USE INFORMATION
@@ -28,8 +28,8 @@ NETWORK INTERACTION DATA:
 
 We use information solely for app functionality:
 • Managing your cryptocurrency wallet
-• Activating and monitoring your node
-• Calculating and distributing network rewards
+• Activating and monitoring your validator node
+• Recording validator activity on the blockchain
 • Providing app features and improvements
 
 ====================
@@ -52,7 +52,8 @@ We DO NOT:
 • Collect analytics without consent
 
 Public Blockchain Data:
-• Node addresses and transactions are visible on the public blockchain
+• Validator node addresses and transactions are visible on the public blockchain
+• Validator activity metrics are recorded on-chain
 • This is inherent to blockchain technology and ensures transparency
 
 ====================
@@ -72,7 +73,7 @@ You have the right to:
 • Export your wallet seed phrase at any time
 • Delete all app data by uninstalling the application
 • Control what information is shared on the blockchain
-• Operate your node pseudonymously
+• Operate your validator node pseudonymously
 
 ====================
 8. CHILDREN'S PRIVACY

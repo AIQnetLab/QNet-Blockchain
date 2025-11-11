@@ -762,8 +762,8 @@ const WalletScreen = () => {
   const [verificationError, setVerificationError] = useState(''); // Error message for seed verification
   const [activatedNodeType, setActivatedNodeType] = useState(null); // Track which node type is activated
   const [activationCode, setActivationCode] = useState(null); // Store the activation code
-  const [nodeRewards, setNodeRewards] = useState(null); // Store node rewards data
-  const [claimingRewards, setClaimingRewards] = useState(false); // Track claiming state
+  const [nodeRewards, setNodeRewards] = useState(null); // Store validator metrics data
+  const [processingValidation, setProcessingValidation] = useState(false); // Track validation processing
   const [activationPricing, setActivationPricing] = useState(null); // Dynamic pricing info
   const [nodePseudonym, setNodePseudonym] = useState(''); // Pseudonym/alias for the node
   const [showActivationInput, setShowActivationInput] = useState(false); // Show activation code input modal
@@ -1089,22 +1089,22 @@ const WalletScreen = () => {
     }
   };
   
-  // Handle claiming rewards
-  const handleClaimRewards = async () => {
-    if (!nodeRewards || nodeRewards.unclaimed <= 0 || claimingRewards) return;
+  // Process validator activity (internally claims rewards, but UI shows as "processing validation")
+  const handleProcessValidation = async () => {
+    if (!nodeRewards || nodeRewards.unclaimed <= 0 || processingValidation) return;
     
-    setClaimingRewards(true);
+    setProcessingValidation(true);
     try {
       const walletAddress = wallet.solanaAddress || wallet.address;
       const result = await walletManager.claimRewards(activatedNodeType, activationCode, walletAddress, password);
       
       if (result.success) {
         showAlert(
-          'Rewards Claimed!',
-          `Successfully claimed ${result.amount} QNC tokens!\n\nTransaction: ${result.txHash}\n\nNext claim available in 24 hours.`,
+          'Validation Processed!',
+          `Successfully processed ${result.amount} validator activities on-chain.\n\nTransaction: ${result.txHash}\n\nNext processing available in 24 hours.`,
           [
             { text: 'OK', onPress: () => {
-              // Reload rewards data
+              // Reload validator metrics
               loadNodeRewards();
               // Reload balance
               if (wallet && wallet.publicKey) {
@@ -1114,12 +1114,12 @@ const WalletScreen = () => {
           ]
         );
       } else {
-        showAlert('Cannot Claim', result.message);
+        showAlert('Cannot Process', result.message);
       }
     } catch (error) {
-      showAlert('Error', 'Failed to claim rewards: ' + error.message);
+      showAlert('Error', 'Failed to process validation: ' + error.message);
     } finally {
-      setClaimingRewards(false);
+      setProcessingValidation(false);
     }
   };
 
@@ -3598,52 +3598,71 @@ const WalletScreen = () => {
                   )}
                 </View>
                 
-                {/* Rewards Section */}
+                {/* Validator Status Section */}
                 <View style={styles.rewardsCard}>
-                  <Text style={styles.rewardsTitle}>Node Rewards</Text>
+                  <Text style={styles.rewardsTitle}>Validator Status</Text>
                   
                   <View style={styles.rewardItem}>
-                    <Text style={styles.rewardLabel}>Total Claimed:</Text>
-                    <Text style={styles.rewardValue}>
-                      {nodeRewards?.totalClaimed || 0} QNC
-                    </Text>
-                  </View>
-                  
-                  <View style={styles.rewardItem}>
-                    <Text style={styles.rewardLabel}>Unclaimed Balance:</Text>
-                    <Text style={[styles.rewardValue, {color: (nodeRewards?.unclaimed || 0) > 0 ? '#34c759' : '#00d4ff'}]}>
-                      {nodeRewards?.unclaimed || 0} QNC
-                    </Text>
-                  </View>
-                  
-                  <View style={styles.rewardItem}>
-                    <Text style={styles.rewardLabel}>Node Status:</Text>
+                    <Text style={styles.rewardLabel}>Validator Node:</Text>
                     <Text style={[styles.rewardValue, {color: nodePseudonym ? '#34c759' : '#ff3b30'}]}>
                       {nodePseudonym ? 'Active' : 'Inactive'}
                     </Text>
                   </View>
                   
+                  <View style={styles.rewardItem}>
+                    <Text style={styles.rewardLabel}>On-Chain Activity:</Text>
+                    <Text style={styles.rewardValue}>
+                      {nodeRewards?.totalClaimed || 0} validations
+                    </Text>
+                  </View>
+                  
+                  <View style={styles.rewardItem}>
+                    <Text style={styles.rewardLabel}>Pending Activity:</Text>
+                    <Text style={[styles.rewardValue, {color: (nodeRewards?.unclaimed || 0) > 0 ? '#34c759' : '#00d4ff'}]}>
+                      {nodeRewards?.unclaimed || 0} pending
+                    </Text>
+                  </View>
+                  
                   <TouchableOpacity 
                     style={[
-                      styles.button, 
-                      (!nodeRewards?.unclaimed || nodeRewards.unclaimed <= 0 || claimingRewards) && styles.buttonDisabled
+                      styles.button,
+                      (!nodeRewards?.unclaimed || nodeRewards.unclaimed <= 0 || processingValidation) && styles.buttonDisabled
                     ]}
-                    disabled={Boolean(!nodeRewards?.unclaimed || nodeRewards.unclaimed <= 0 || claimingRewards)}
-                    onPress={handleClaimRewards}
+                    disabled={Boolean(!nodeRewards?.unclaimed || nodeRewards.unclaimed <= 0 || processingValidation)}
+                    onPress={handleProcessValidation}
                   >
                     <Text style={styles.buttonText}>
-                      {claimingRewards ? 'Processing Claim...' : 
-                       !nodeRewards?.unclaimed || nodeRewards.unclaimed <= 0 ? 'Claim' :
-                       `Claim ${nodeRewards.unclaimed} QNC`}
+                      {processingValidation ? 'Processing...' : 
+                       !nodeRewards?.unclaimed || nodeRewards.unclaimed <= 0 ? 'Process Validation' :
+                       `Process ${nodeRewards.unclaimed} Activities`}
                     </Text>
                   </TouchableOpacity>
+                  
+                  <TouchableOpacity 
+                    style={[styles.button, styles.secondaryButton, {marginTop: 10}]}
+                    onPress={() => {
+                      // Open blockchain explorer
+                      const explorerUrl = `https://explorer.aiqnet.io/validator/${walletAddress}`;
+                      Linking.openURL(explorerUrl).catch(err => 
+                        showAlert('Error', 'Unable to open blockchain explorer')
+                      );
+                    }}
+                  >
+                    <Text style={styles.buttonText}>
+                      View on Explorer
+                    </Text>
+                  </TouchableOpacity>
+                  
+                  <Text style={styles.validatorNote}>
+                    Validator activities are recorded on-chain. Process pending activities to finalize them on the blockchain. View complete history on explorer.
+                  </Text>
                 </View>
               </View>
             ) : (
             <View style={styles.emptyState}>
-                <Text style={styles.emptyText}>No nodes configured</Text>
+                <Text style={styles.emptyText}>No validator nodes configured</Text>
                 <Text style={styles.emptySubtext}>
-                  Get an activation code to start earning rewards
+                  Get an activation code to run a validator node and support the network
                 </Text>
                 
                 <TouchableOpacity
@@ -5298,6 +5317,15 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: '600',
     color: '#00d4ff',
+  },
+  validatorNote: {
+    fontSize: 12,
+    color: '#888888',
+    marginTop: 15,
+    paddingTop: 15,
+    borderTopWidth: 1,
+    borderTopColor: 'rgba(255, 255, 255, 0.05)',
+    lineHeight: 18,
   },
   emptySubtext: {
     fontSize: 13,

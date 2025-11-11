@@ -2249,6 +2249,7 @@ async fn handle_network_ping(
 async fn verify_dilithium_signature(node_id: &str, challenge: &str, signature: &str) -> bool {
     // Use existing QNet quantum crypto system for real Dilithium verification
     use crate::quantum_crypto::QNetQuantumCrypto;
+    use crate::node::GLOBAL_QUANTUM_CRYPTO;
     
     // Basic format validation first
     if node_id.is_empty() || challenge.is_empty() || signature.is_empty() || signature.len() < 32 {
@@ -2257,9 +2258,14 @@ async fn verify_dilithium_signature(node_id: &str, challenge: &str, signature: &
         return false;
     }
     
-    // CRITICAL FIX: Use async directly instead of creating new runtime
-    let mut crypto = QNetQuantumCrypto::new();
-    let _ = crypto.initialize().await;
+    // OPTIMIZATION: Use GLOBAL crypto instance to avoid repeated initialization
+    let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
+    if crypto_guard.is_none() {
+        let mut crypto = QNetQuantumCrypto::new();
+        let _ = crypto.initialize().await;
+        *crypto_guard = Some(crypto);
+    }
+    let crypto = crypto_guard.as_mut().unwrap();
     
     // Create DilithiumSignature struct from string signature
     let dilithium_sig = crate::quantum_crypto::DilithiumSignature {
@@ -2297,10 +2303,16 @@ pub fn generate_quantum_challenge() -> String {
 async fn sign_with_dilithium(node_id: &str, challenge: &str) -> String {
     // Use existing QNet quantum crypto system for real Dilithium signing
     use crate::quantum_crypto::QNetQuantumCrypto;
+    use crate::node::GLOBAL_QUANTUM_CRYPTO;
     
-    // CRITICAL FIX: Use async directly instead of creating new runtime
-    let mut crypto = QNetQuantumCrypto::new();
-    let _ = crypto.initialize().await;
+    // OPTIMIZATION: Use GLOBAL crypto instance to avoid repeated initialization
+    let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
+    if crypto_guard.is_none() {
+        let mut crypto = QNetQuantumCrypto::new();
+        let _ = crypto.initialize().await;
+        *crypto_guard = Some(crypto);
+    }
+    let crypto = crypto_guard.as_mut().unwrap();
     
     match crypto.create_consensus_signature(node_id, challenge).await {
         Ok(dilithium_sig) => {
@@ -4274,10 +4286,16 @@ fn generate_light_node_pseudonym(wallet_address: &str) -> String {
 async fn generate_quantum_signature(node_id: &str, data: &str) -> String {
     // Use EXISTING QNetQuantumCrypto instead of duplicating functionality
     use crate::quantum_crypto::QNetQuantumCrypto;
+    use crate::node::GLOBAL_QUANTUM_CRYPTO;
     
-    // CRITICAL FIX: Use async directly instead of block_on
-    let mut crypto = QNetQuantumCrypto::new();
-    let _ = crypto.initialize().await;
+    // OPTIMIZATION: Use GLOBAL crypto instance to avoid repeated initialization
+    let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
+    if crypto_guard.is_none() {
+        let mut crypto = QNetQuantumCrypto::new();
+        let _ = crypto.initialize().await;
+        *crypto_guard = Some(crypto);
+    }
+    let crypto = crypto_guard.as_mut().unwrap();
     
     match crypto.create_consensus_signature(node_id, data).await {
         Ok(signature) => {
@@ -4795,10 +4813,17 @@ async fn generate_quantum_activation_code(
     hasher.update(b"QNET_ACTIVATION_GENERATION_v2.0");
     let entropy_hash = hasher.finalize();
     
-    // Generate quantum-secure activation code
-    let mut quantum_crypto = QNetQuantumCrypto::new();
-    quantum_crypto.initialize().await
-        .map_err(|e| format!("Quantum crypto initialization failed: {}", e))?;
+    // Generate quantum-secure activation code using GLOBAL instance
+    use crate::node::GLOBAL_QUANTUM_CRYPTO;
+    
+    let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
+    if crypto_guard.is_none() {
+        let mut crypto = QNetQuantumCrypto::new();
+        crypto.initialize().await
+            .map_err(|e| format!("Quantum crypto initialization failed: {}", e))?;
+        *crypto_guard = Some(crypto);
+    }
+    let quantum_crypto = crypto_guard.as_ref().unwrap();
         
     // Create quantum-secure code with extended format QNET-XXXXXX-XXXXXX-XXXXXX (25 chars total)
     let node_type_prefix = match request.node_type.to_lowercase().as_str() {

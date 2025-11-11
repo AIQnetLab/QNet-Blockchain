@@ -2740,8 +2740,9 @@ impl SimplifiedP2P {
         // Check cache actor first
         if let Some(cached_data) = CACHE_ACTOR.height_cache.read().unwrap().as_ref() {
             let age = Instant::now().duration_since(cached_data.timestamp);
-            // Accept cache up to 5 seconds old for API responses
-            if age.as_secs() < 5 {
+            // CRITICAL: Cache TTL reduced to 1 second for 1 block/sec target
+            // 5 seconds was too long and caused producer selection mismatches
+            if age.as_secs() < 1 {
                 return Some(cached_data.data);
             }
         }
@@ -2749,7 +2750,8 @@ impl SimplifiedP2P {
         // Fallback to old cache
         let cache = CACHED_BLOCKCHAIN_HEIGHT.lock().unwrap();
         let age = Instant::now().duration_since(cache.1);
-        if age.as_secs() < 5 && cache.0 > 0 {
+        // CRITICAL: Same 1 second TTL for consistency
+        if age.as_secs() < 1 && cache.0 > 0 {
             return Some(cache.0);
         }
         
@@ -3160,9 +3162,16 @@ impl SimplifiedP2P {
     /// Verify CRYSTALS-Dilithium signature (production implementation)
     async fn verify_dilithium_signature(challenge: &[u8], signature: &str, pubkey: &str) -> Result<bool, String> {
         // PRODUCTION: Real CRYSTALS-Dilithium verification using QNetQuantumCrypto
-        // CRITICAL FIX: Use async directly instead of creating new runtime
+        // OPTIMIZATION: Use GLOBAL crypto instance to avoid repeated initialization
+        use crate::node::GLOBAL_QUANTUM_CRYPTO;
+        
+        let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
+        if crypto_guard.is_none() {
             let mut crypto = crate::quantum_crypto::QNetQuantumCrypto::new();
             let _ = crypto.initialize().await;
+            *crypto_guard = Some(crypto);
+        }
+        let crypto = crypto_guard.as_ref().unwrap();
             
             // Use centralized quantum crypto verification
             use crate::quantum_crypto::DilithiumSignature;
@@ -7176,8 +7185,15 @@ impl SimplifiedP2P {
             Ok(handle) => {
                 let node_id = self.node_id.clone();
                 let result = handle.block_on(async {
-                    let mut crypto = QNetQuantumCrypto::new();
-                    let _ = crypto.initialize().await;
+                    use crate::node::GLOBAL_QUANTUM_CRYPTO;
+                    
+                    let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
+                    if crypto_guard.is_none() {
+                        let mut crypto = QNetQuantumCrypto::new();
+                        let _ = crypto.initialize().await;
+                        *crypto_guard = Some(crypto);
+                    }
+                    let crypto = crypto_guard.as_ref().unwrap();
                     crypto.create_consensus_signature(&node_id, entry_hash).await
                 });
                 
@@ -7984,7 +8000,15 @@ impl SimplifiedP2P {
         match rt {
             Ok(handle) => {
                 let result = handle.block_on(async {
-                    let crypto = QNetQuantumCrypto::new();
+                    use crate::node::GLOBAL_QUANTUM_CRYPTO;
+                    
+                    let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
+                    if crypto_guard.is_none() {
+                        let mut crypto = QNetQuantumCrypto::new();
+                        let _ = crypto.initialize().await;
+                        *crypto_guard = Some(crypto);
+                    }
+                    let crypto = crypto_guard.as_ref().unwrap();
                     crypto.verify_dilithium_signature(&message, &dilithium_sig, node_id).await
                 });
                 
@@ -8056,8 +8080,15 @@ impl SimplifiedP2P {
             match rt {
                 Ok(handle) => {
                     let result = handle.block_on(async {
-                        let mut crypto = QNetQuantumCrypto::new();
-                        let _ = crypto.initialize().await;
+                        use crate::node::GLOBAL_QUANTUM_CRYPTO;
+                        
+                        let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
+                        if crypto_guard.is_none() {
+                            let mut crypto = QNetQuantumCrypto::new();
+                            let _ = crypto.initialize().await;
+                            *crypto_guard = Some(crypto);
+                        }
+                        let crypto = crypto_guard.as_ref().unwrap();
                         crypto.create_consensus_signature(&self.node_id, &message).await
                     });
                     

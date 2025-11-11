@@ -183,7 +183,18 @@ impl BlockValidator {
             .map_err(|e| IntegrationError::ValidationError(format!("Runtime error: {}", e)))?;
         
         let result = rt.block_on(async {
-            let crypto = QNetQuantumCrypto::new();
+            // OPTIMIZATION: Use GLOBAL crypto instance
+            use crate::node::GLOBAL_QUANTUM_CRYPTO;
+            
+            let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
+            if crypto_guard.is_none() {
+                let mut crypto = QNetQuantumCrypto::new();
+                if let Err(e) = crypto.initialize().await {
+                    return Err(anyhow::anyhow!("Crypto init failed: {}", e));
+                }
+                *crypto_guard = Some(crypto);
+            }
+            let crypto = crypto_guard.as_ref().unwrap();
             crypto.verify_dilithium_signature(&message_str, &dilithium_sig, &tx.from).await
         });
         
