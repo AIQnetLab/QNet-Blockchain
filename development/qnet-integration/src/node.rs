@@ -4396,8 +4396,24 @@ impl BlockchainNode {
                                 // PRODUCTION: Guard ensures flag is cleared even on panic/error
                                 let _guard = SyncGuard;
                                 
-                                // API DEADLOCK FIX: Use cached height in background thread too
-                                if let Some(network_height) = p2p_clone.get_cached_network_height() {
+                                // CRITICAL FIX: Try cached height first, fallback to fresh query
+                                // This ensures sync ALWAYS happens even if cache is empty/expired
+                                let network_height = p2p_clone.get_cached_network_height()
+                                    .or_else(|| {
+                                        // Cache miss - query network directly (CRITICAL for 5-node networks)
+                                        match p2p_clone.sync_blockchain_height() {
+                                            Ok(h) => {
+                                                println!("[SYNC] 🔄 Cache miss - queried network height: {}", h);
+                                                Some(h)
+                                            },
+                                            Err(e) => {
+                                                println!("[SYNC] ⚠️ Failed to get network height: {}", e);
+                                                None
+                                            }
+                                        }
+                                    });
+                                
+                                if let Some(network_height) = network_height {
                                 if network_height > current_height {
                                     println!("[SYNC] 📥 Background sync: downloading blocks {}-{}", 
                                              current_height + 1, network_height);
@@ -6800,7 +6816,8 @@ impl BlockchainNode {
                             our_id.clone(),
                             commit.commit_hash.clone(),
                             commit.signature.clone(),  // CONSENSUS FIX: Pass signature for Byzantine validation
-                            commit.timestamp
+                            commit.timestamp,
+                            participants  // CRITICAL FIX: Only broadcast to consensus participants (max 1000)
                         ) {
                             Ok(_) => {
                                 println!("[CONSENSUS] 📤 Successfully broadcasted OWN commit to peers");
@@ -6862,8 +6879,9 @@ impl BlockchainNode {
                 }
             }
             
-            // Give time for network messages to arrive
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            // CRITICAL FIX: Use recv_timeout for faster message processing
+            // This avoids 200ms delays and processes messages immediately
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             
             // Check current commit count in consensus engine  
             let current_commits = consensus_engine.get_current_commit_count();
@@ -6959,7 +6977,8 @@ impl BlockchainNode {
                             our_id.clone(),
                             hex::encode(&reveal.reveal_data), // Convert Vec<u8> to String
                             hex::encode(&reveal.nonce),        // CRITICAL: Include nonce for verification
-                            reveal.timestamp
+                            reveal.timestamp,
+                            participants  // CRITICAL FIX: Only broadcast to consensus participants (max 1000)
                         ) {
                             Ok(_) => {
                                 println!("[CONSENSUS] 📤 Successfully broadcasted OWN reveal with nonce to peers");

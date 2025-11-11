@@ -2149,34 +2149,41 @@ impl SimplifiedP2P {
             }
         }
         
-        // Wait for all sends to complete (but don't fail if some fail)
-        // WORKING: From 669ca77 - simple and reliable
-        let mut success_count = 0;
+        // CRITICAL FIX: Don't wait for slow peers - spawn async monitoring
+        // This prevents blocking the producer when sending to slow/offline peers
         let total = handles.len();
         
-        for (peer_addr, handle) in handles {
-            match handle.join() {
-                Ok(Ok(())) => success_count += 1,
-                Ok(Err(e)) => {
-                    if height <= 5 || height % 10 == 0 {
-                        println!("[P2P] ⚠️ Failed to send block #{} to {}: {}", height, peer_addr, e);
+        // Spawn background task to monitor delivery (non-blocking)
+        let height_copy = height;
+        tokio::spawn(async move {
+            let mut success_count = 0;
+            let start_time = std::time::Instant::now();
+            
+            for (peer_addr, handle) in handles {
+                match handle.join() {
+                    Ok(Ok(())) => success_count += 1,
+                    Ok(Err(e)) => {
+                        if height_copy <= 5 || height_copy % 10 == 0 {
+                            println!("[P2P] ⚠️ Failed to send block #{} to {}: {}", height_copy, peer_addr, e);
+                        }
                     }
+                    Err(_) => println!("[P2P] ⚠️ Thread panicked for {}", peer_addr),
                 }
-                Err(_) => println!("[P2P] ⚠️ Thread panicked for {}", peer_addr),
             }
-        }
+            
+            // Log results asynchronously
+            let elapsed = start_time.elapsed();
+            if success_count > 0 {
+                if height_copy <= 5 || height_copy % 10 == 0 {
+                    println!("[P2P] ✅ Block #{} sent to {}/{} peers in {:?}", height_copy, success_count, total, elapsed);
+                }
+            } else if total > 0 {
+                println!("[P2P] ⚠️ Failed to send block #{} to any peer", height_copy);
+            }
+        });
         
-        // Success if at least one peer received the block
-        if success_count > 0 {
-            if height <= 5 || height % 10 == 0 {
-                println!("[P2P] ✅ Block #{} sent to {}/{} peers (fire-and-forget)", height, success_count, total);
-            }
-            Ok(())
-        } else if total > 0 {
-            Err(format!("Failed to send block #{} to any peer", height))
-        } else {
-            Ok(()) // No peers to send to
-        }
+        // Return immediately without blocking
+        Ok(())
     }
     
     /// Broadcast Genesis block with extended timeout (3 seconds)
@@ -5280,7 +5287,8 @@ impl SimplifiedP2P {
         // Check for missing blocks that could cause consensus issues
         let mut missing_blocks = Vec::new();
         for height in (current_height + 1)..=target_height {
-            if storage.load_microblock(height).is_err() {
+            // CRITICAL FIX: Check for BOTH errors AND missing blocks (Ok(None))
+            if storage.load_microblock(height).unwrap_or(None).is_none() {
                 missing_blocks.push(height);
             }
         }
@@ -5331,8 +5339,8 @@ impl SimplifiedP2P {
         const MAX_CONSECUTIVE_FAILURES: u32 = 3;
         
         for height in start_height..=end_height {
-            // Check if block already exists
-            if storage.load_microblock(height).is_ok() {
+            // CRITICAL FIX: Check if block ACTUALLY exists (not just Ok())
+            if storage.load_microblock(height).unwrap_or(None).is_some() {
                 consecutive_failures = 0;
                 continue;
             }
@@ -7338,8 +7346,8 @@ impl SimplifiedP2P {
         }
     }
 
-    /// PRODUCTION: Broadcast consensus commit to all peers
-    pub fn broadcast_consensus_commit(&self, round_id: u64, node_id: String, commit_hash: String, signature: String, timestamp: u64) -> Result<(), String> {
+    /// PRODUCTION: Broadcast consensus commit to consensus participants only
+    pub fn broadcast_consensus_commit(&self, round_id: u64, node_id: String, commit_hash: String, signature: String, timestamp: u64, participants: &[String]) -> Result<(), String> {
         // CRITICAL: Only broadcast consensus for MACROBLOCK rounds (every 90 blocks)
         // Microblocks use simple producer signatures, NOT Byzantine consensus
         if round_id == 0 || (round_id % 90 != 0) {
@@ -7347,17 +7355,27 @@ impl SimplifiedP2P {
             return Ok(());
         }
         
-        println!("[P2P] 🏛️ Broadcasting consensus commit for MACROBLOCK round {}", round_id);
+        println!("[P2P] 🏛️ Broadcasting consensus commit for MACROBLOCK round {} to {} participants", round_id, participants.len());
         
-        let peers = match self.connected_peers.read() {
-            Ok(peers) => peers.clone(),
-            Err(poisoned) => {
-                println!("[P2P] ⚠️ Mutex poisoned during commit broadcast, recovering...");
-                poisoned.into_inner().clone()
-            }
-        };
-        
-        for (_addr, peer) in peers {
+        // CRITICAL FIX: Only send to consensus participants, not all peers
+        // This reduces network load from O(n²) to O(k²) where k=1000 validators
+        for participant_id in participants {
+            // Find peer info for this participant
+            let peer_info = self.get_peer_by_id_lockfree(participant_id);
+            
+            // If participant is not connected, skip (they might be ourselves or offline)
+            let peer = match peer_info {
+                Some(p) => p,
+                None => {
+                    // Check if it's our own node
+                    if participant_id == &self.node_id {
+                        // Skip broadcasting to ourselves
+                        continue;
+                    }
+                    // Participant not connected, skip
+                    continue;
+                }
+            };
             let consensus_msg = NetworkMessage::ConsensusCommit {
                 round_id,
                 node_id: node_id.clone(),
@@ -7366,16 +7384,28 @@ impl SimplifiedP2P {
                 timestamp,
             };
             
-            // PRODUCTION: Real HTTP POST to peer's P2P message endpoint
-            self.send_network_message(&peer.addr, consensus_msg);
-            println!("[P2P] 📤 Sent commit to peer: {}", peer.addr);
+            // CRITICAL FIX: Use reliable delivery for consensus messages
+            // Consensus MUST arrive, but we spawn async to not block
+            let peer_addr = peer.addr.clone();
+            let msg_clone = consensus_msg.clone();
+            tokio::spawn(async move {
+                for attempt in 1..=3 {
+                    if Self::send_consensus_message_with_retry(&peer_addr, &msg_clone).await {
+                        println!("[P2P] ✅ Commit delivered to {} (attempt {})", peer_addr, attempt);
+                        break;
+                    }
+                    if attempt < 3 {
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    }
+                }
+            });
         }
         
         Ok(())
     }
 
-    /// PRODUCTION: Broadcast consensus reveal to all peers  
-    pub fn broadcast_consensus_reveal(&self, round_id: u64, node_id: String, reveal_data: String, nonce: String, timestamp: u64) -> Result<(), String> {
+    /// PRODUCTION: Broadcast consensus reveal to consensus participants only  
+    pub fn broadcast_consensus_reveal(&self, round_id: u64, node_id: String, reveal_data: String, nonce: String, timestamp: u64, participants: &[String]) -> Result<(), String> {
         // CRITICAL: Only broadcast consensus for MACROBLOCK rounds (every 90 blocks)
         // Microblocks use simple producer signatures, NOT Byzantine consensus
         // BUGFIX: round_id IS the block height (e.g., 90, 180, 270), which are ALL divisible by 90!
@@ -7385,17 +7415,27 @@ impl SimplifiedP2P {
             return Ok(());
         }
         
-        println!("[P2P] 🏛️ Broadcasting consensus reveal for MACROBLOCK round {}", round_id);
+        println!("[P2P] 🏛️ Broadcasting consensus reveal for MACROBLOCK round {} to {} participants", round_id, participants.len());
         
-        let peers = match self.connected_peers.read() {
-            Ok(peers) => peers.clone(),
-            Err(poisoned) => {
-                println!("[P2P] ⚠️ Mutex poisoned during reveal broadcast, recovering...");
-                poisoned.into_inner().clone()
-            }
-        };
-        
-        for (_addr, peer) in peers {
+        // CRITICAL FIX: Only send to consensus participants, not all peers
+        // This reduces network load from O(n²) to O(k²) where k=1000 validators
+        for participant_id in participants {
+            // Find peer info for this participant
+            let peer_info = self.get_peer_by_id_lockfree(participant_id);
+            
+            // If participant is not connected, skip (they might be ourselves or offline)
+            let peer = match peer_info {
+                Some(p) => p,
+                None => {
+                    // Check if it's our own node
+                    if participant_id == &self.node_id {
+                        // Skip broadcasting to ourselves
+                        continue;
+                    }
+                    // Participant not connected, skip
+                    continue;
+                }
+            };
             let consensus_msg = NetworkMessage::ConsensusReveal {
                 round_id,
                 node_id: node_id.clone(),
@@ -7404,14 +7444,69 @@ impl SimplifiedP2P {
                 timestamp,
             };
             
-            // PRODUCTION: Real HTTP POST to peer's P2P message endpoint
-            self.send_network_message(&peer.addr, consensus_msg);
-            println!("[P2P] 📤 Sent reveal to peer: {}", peer.addr);
+            // CRITICAL FIX: Use reliable delivery for consensus messages
+            // Consensus MUST arrive, but we spawn async to not block
+            let peer_addr = peer.addr.clone();
+            let msg_clone = consensus_msg.clone();
+            tokio::spawn(async move {
+                for attempt in 1..=3 {
+                    if Self::send_consensus_message_with_retry(&peer_addr, &msg_clone).await {
+                        println!("[P2P] ✅ Reveal delivered to {} (attempt {})", peer_addr, attempt);
+                        break;
+                    }
+                    if attempt < 3 {
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    }
+                }
+            });
         }
         
         Ok(())
     }
 
+    /// Send consensus message with retry (async for non-blocking)
+    async fn send_consensus_message_with_retry(peer_addr: &str, message: &NetworkMessage) -> bool {
+        use std::time::Duration;
+        
+        // Serialize message once
+        let message_json = match serde_json::to_value(message) {
+            Ok(json) => json,
+            Err(e) => {
+                println!("[P2P] ❌ Failed to serialize consensus message: {}", e);
+                return false;
+            }
+        };
+        
+        let peer_ip = peer_addr.split(':').next().unwrap_or(peer_addr);
+        let url = format!("http://{}:8001/api/v1/p2p/message", peer_ip);
+        
+        // Use fast client with reasonable timeout for consensus
+        let client = match reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .connect_timeout(Duration::from_millis(500))
+            .tcp_nodelay(true)
+            .build() {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+        
+        // Send with timeout
+        match client.post(&url)
+            .json(&message_json)
+            .send()
+            .await {
+            Ok(response) if response.status().is_success() => true,
+            Ok(response) => {
+                println!("[P2P] ⚠️ Consensus message rejected by {}: {}", peer_ip, response.status());
+                false
+            }
+            Err(e) => {
+                println!("[P2P] ⚠️ Failed to send consensus to {}: {}", peer_ip, e);
+                false
+            }
+        }
+    }
+    
     /// Send network message SYNCHRONOUSLY for critical messages (blocks)
     /// Uses blocking HTTP client to ensure delivery before returning
     pub fn send_network_message_sync(&self, peer_addr: &str, message: NetworkMessage) -> Result<(), String> {
