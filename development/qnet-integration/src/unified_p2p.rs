@@ -330,8 +330,8 @@ pub struct SimplifiedP2P {
     /// Consensus message channel
     consensus_tx: Option<tokio::sync::mpsc::UnboundedSender<ConsensusMessage>>,
     
-    /// Block processing channel
-    block_tx: Option<tokio::sync::mpsc::UnboundedSender<ReceivedBlock>>,
+    /// Block processing channel - CRITICAL: Must be Arc for sharing between clones!
+    block_tx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<ReceivedBlock>>>>,
     
     /// Sync request channel for requesting blocks from storage
     sync_request_tx: Option<tokio::sync::mpsc::UnboundedSender<(u64, u64, String)>>,
@@ -481,7 +481,7 @@ impl SimplifiedP2P {
                 Arc::new(Mutex::new(reputation_sys))
             },
             consensus_tx: None,
-            block_tx: None,
+            block_tx: Arc::new(Mutex::new(None)),
             sync_request_tx: None,
             turbine_assemblies: Arc::new(DashMap::new()),
         }
@@ -495,8 +495,8 @@ impl SimplifiedP2P {
     
     /// PRODUCTION: Set block processing channel for storage integration
     pub fn set_block_channel(&mut self, block_tx: tokio::sync::mpsc::UnboundedSender<ReceivedBlock>) {
-        self.block_tx = Some(block_tx);
-        // Block processing channel established
+        *self.block_tx.lock().unwrap() = Some(block_tx);
+        println!("[P2P] ✅ Block processing channel established");
     }
     
     /// Set sync request channel for handling block requests
@@ -523,7 +523,7 @@ impl SimplifiedP2P {
             Some(_) => {},
             None => {},
         }
-        match &self.block_tx {
+        match &*self.block_tx.lock().unwrap() {
             Some(_) => println!("[DIAGNOSTIC] ✅ Block channel: AVAILABLE"),
             None => println!("[DIAGNOSTIC] ❌ Block channel: MISSING - blocks will be discarded!"),
         }
@@ -2584,7 +2584,7 @@ impl SimplifiedP2P {
             }
             
             // Send reconstructed block through normal block channel
-            if let Some(ref block_tx) = self.block_tx {
+            if let Some(ref block_tx) = &*self.block_tx.lock().unwrap() {
                 let received_block = ReceivedBlock {
                     height,
                     data: block_data,
@@ -2688,7 +2688,7 @@ impl SimplifiedP2P {
             println!("[TURBINE] 🔧 Block #{} reconstructed with Reed-Solomon in {:?}", height, elapsed);
             
             // Send reconstructed block through normal block channel
-            if let Some(ref block_tx) = self.block_tx {
+            if let Some(ref block_tx) = &*self.block_tx.lock().unwrap() {
                 let received_block = ReceivedBlock {
                     height,
                     data: block_data,
@@ -5742,13 +5742,14 @@ impl SimplifiedP2P {
                 }
                 
                 // PRODUCTION: Silent diagnostic check for scalability  
-                match &self.block_tx {
+                let block_tx_guard = self.block_tx.lock().unwrap();
+                match &*block_tx_guard {
                     Some(_) => {}, // Silent success
                     None => println!("[DIAGNOSTIC] ❌ Block channel is MISSING - this explains discarded blocks"),
                 }
                 
                 // PRODUCTION: Send block to main node for processing via storage
-                if let Some(ref block_tx) = self.block_tx {
+                if let Some(ref block_tx) = &*block_tx_guard {
                     let received_block = ReceivedBlock {
                         height,
                         data,
@@ -5772,6 +5773,7 @@ impl SimplifiedP2P {
                     println!("[P2P] ⚠️ Block processing channel not available - block #{} discarded", height);
                     println!("[DIAGNOSTIC] 💥 CRITICAL: Block channel was LOST after setup!");
                 }
+                drop(block_tx_guard); // Explicitly drop the lock
             }
             
             NetworkMessage::Transaction { data } => {
@@ -6039,7 +6041,7 @@ impl SimplifiedP2P {
         self.update_peer_last_seen_with_height(&sender_id, Some(to_height));
         
         // CRITICAL: Send blocks to block receiver for processing
-        if let Some(ref block_tx) = self.block_tx {
+        if let Some(ref block_tx) = &*self.block_tx.lock().unwrap() {
             for (height, data) in blocks {
                 // Create ReceivedBlock for processing
                 let received_block = ReceivedBlock {
