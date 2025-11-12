@@ -195,7 +195,11 @@ impl CommitRevealConsensus {
         state.commits.insert(commit.node_id.clone(), commit);
         
         // Check if we have enough commits for Byzantine safety (2f+1 threshold)
-        let byzantine_threshold = (self.config.min_participants * 2 + 2) / 3; // 2f+1 where min_participants = 3f+1
+        // CRITICAL: Use INITIAL participants count, NOT current commits count
+        // Threshold must be based on total participants, not who responded
+        // Otherwise malicious nodes could reduce threshold by not responding!
+        let total_participants = state.participants.len();
+        let byzantine_threshold = (total_participants * 2 + 2) / 3; // 2f+1 for all participants
         if state.commits.len() >= byzantine_threshold {
             // Advance to reveal phase with Byzantine safety
             println!("[CONSENSUS] ✅ Byzantine threshold reached: {}/{} commits", 
@@ -304,7 +308,11 @@ impl CommitRevealConsensus {
             }
             
             // PRODUCTION: Check Byzantine threshold for reveals (2f+1)
-            let byzantine_threshold = (self.config.min_participants * 2 + 2) / 3;
+            // CRITICAL: Use INITIAL participants count, NOT current reveals count
+            // Threshold must be based on total participants, not who revealed
+            // Otherwise malicious nodes could reduce threshold by not revealing!
+            let total_participants = state.participants.len();
+            let byzantine_threshold = (total_participants * 2 + 2) / 3;
             if state.reveals.len() < byzantine_threshold {
                 return Err(ConsensusError::InvalidCommit(
                     format!("Insufficient reveals for Byzantine safety: {}/{}", 

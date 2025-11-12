@@ -129,9 +129,9 @@ impl QuantumPoH {
         // This prevents deadlock when older blocks are received during resync
         let current_count = *self.hash_count.read().await;
         
-        if count <= current_count {
+        if count < current_count {
             // Do NOT sync backward - this would cause PoH regression and block production failure
-            println!("[QuantumPoH] ⚠️ Skipping sync to older checkpoint: {} <= current {}", 
+            println!("[QuantumPoH] ⚠️ Skipping sync to older checkpoint: {} < current {}", 
                     count, current_count);
             return;
         }

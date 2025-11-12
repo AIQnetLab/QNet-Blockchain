@@ -2408,8 +2408,8 @@ impl BlockchainNode {
                                 println!("[Node] 📊 Network is ahead: {} vs local: {}", network_height, local_height);
                                 println!("[Node] 🔄 Syncing {} blocks before production...", network_height - local_height);
                                 
-                                // Download missing blocks
-                                p2p.download_missing_microblocks(&self.storage, local_height, network_height).await;
+                                // OPTIMIZATION: Use parallel download for faster initial sync
+                                p2p.parallel_download_microblocks(&self.storage, local_height, network_height).await;
                                 
                                 // Wait a bit for sync to complete
                                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -3041,22 +3041,41 @@ impl BlockchainNode {
                                 let p2p_clone = p2p.clone();
                                 let storage_clone = storage.clone();
                                 
+                                let height_clone = height.clone();
                                 tokio::spawn(async move {
                                     // PRODUCTION: Guard ensures flag is cleared even on panic/error
                                     let _guard = FastSyncGuard;
                                     
                                     println!("[SYNC] 🚀 Fast downloading blocks {}-{}", sync_from_height, sync_to_height);
                                     
-                                    // TIMEOUT PROTECTION: Add 60-second timeout for entire sync operation
+                                    // TIMEOUT PROTECTION: Adaptive timeout based on blocks to sync
                                     // PRODUCTION: Use parallel download for faster sync
+                                    let blocks_to_sync = sync_to_height.saturating_sub(sync_from_height);
+                                    let timeout_secs = std::cmp::max(60, (blocks_to_sync / 10) + 30);  // Min 60s, ~10 blocks/sec + 30s buffer
+                                    println!("[SYNC] ⏱️ Adaptive timeout: {}s for {} blocks", timeout_secs, blocks_to_sync);
+                                    
                                     let sync_result = tokio::time::timeout(
-                                        Duration::from_secs(60),
+                                        Duration::from_secs(timeout_secs),
                                         p2p_clone.parallel_download_microblocks(&storage_clone, sync_from_height, sync_to_height)
                                     ).await;
                                     
                                     match sync_result {
-                                        Ok(_) => println!("[SYNC] ✅ Fast sync completed successfully"),
-                                        Err(_) => println!("[SYNC] ⚠️ Fast sync timeout after 60s - will retry next cycle"),
+                                        Ok(_) => {
+                                            println!("[SYNC] ✅ Fast sync completed successfully");
+                                            
+                                            // CRITICAL FIX: Update global height after successful fast sync
+                                            // This ensures producer loop knows about the new blocks
+                                            let mut global_height = height_clone.write().await;
+                                            if sync_to_height > *global_height {
+                                                *global_height = sync_to_height;
+                                                println!("[SYNC] 📊 Updated global height to {}", sync_to_height);
+                                                
+                                                // Update last block time to prevent stall detection false positives
+                                                LAST_BLOCK_PRODUCED_TIME.store(get_timestamp_safe(), Ordering::Relaxed);
+                                                LAST_BLOCK_PRODUCED_HEIGHT.store(sync_to_height, Ordering::Relaxed);
+                                            }
+                                        },
+                                        Err(_) => println!("[SYNC] ⚠️ Fast sync timeout after {}s - will retry next cycle", timeout_secs),
                                     }
                                     // Flag automatically cleared by guard drop
                                 });
@@ -4667,12 +4686,12 @@ impl BlockchainNode {
                 // ══════════════════════════════════════════════════════════════════
                 
                 // PRODUCTION: Start consensus SUPER EARLY after block 60 for ZERO downtime
-                // Consensus adaptive with bad network tolerance:
-                // Commit: propagation (1.5-5s) + wait (12-14s, early break) = 2-8s typical
-                // Reveal: propagation (1.5-5s) + wait (12-14s, early break) = 2-8s typical
-                // Finalize: 2-6s
-                // Total: 5 nodes ~9s, 1000 nodes ~26s max (with early break much faster)
-                // Starting at block 61 means it completes by block 90 - Swiss watch precision!
+                // Consensus with reliable propagation:
+                // Commit: propagation (2s for 5 nodes) + wait (12s, early break) = 3-8s typical
+                // Reveal: propagation (2s for 5 nodes) + wait (12s, early break) = 3-8s typical
+                // Finalize: 2-4s
+                // Total: 5 nodes ~8-20s, 100 nodes ~12-24s, 1000 nodes ~16-28s max
+                // Starting at block 61 ensures completion before block 90 - reliable!
                 // CRITICAL FIX: Start EXACTLY at block 61 for deterministic consensus
                 // All nodes must start at the same block to ensure phase synchronization
                 let blocks_since_trigger = microblock_height.saturating_sub(last_macroblock_trigger);
@@ -4802,8 +4821,11 @@ impl BlockchainNode {
                 // CRITICAL: Progressive retry for failed macroblocks
                 // Check every 30 blocks after macroblock boundary
                 let blocks_since_trigger = microblock_height - last_macroblock_trigger;
-                // Retry at blocks 120, 150, 180, 210, 240, 270 (every 30 after 90)
-                if blocks_since_trigger >= 30 && blocks_since_trigger % 30 == 0 && blocks_since_trigger != 90 {
+                // CRITICAL FIX: PFP triggers 30 blocks after expected macroblock
+                // Block 120 (30 after 90), 150 (60 after 90), etc.
+                // Block 210 (30 after 180), 240 (60 after 180), etc.
+                // Don't trigger at macroblock boundaries (90, 180, 270...)
+                if blocks_since_trigger >= 30 && blocks_since_trigger % 30 == 0 && (microblock_height % 90) != 0 {
                     // Check if macroblock still missing
                     let expected_macroblock = last_macroblock_trigger / 90;
                     // CRITICAL FIX: Check for the actual MACROBLOCK, not a microblock!
@@ -6854,14 +6876,20 @@ impl BlockchainNode {
                             }
                         }
                         
-                        // CRITICAL FIX: Propagation grace period after broadcast
-                        // Broadcast uses tokio::spawn (async), need time for messages to reach peers
-                        // PRODUCTION FORMULA: 1500ms base + 300ms per 100 participants (max 5s for 1000 nodes)
-                        // Covers bad network: 1500ms latency + 1000ms retries + 1500ms buffer
-                        // Good network: 1.5s overhead acceptable for Byzantine safety guarantee
-                        let propagation_delay_ms = 1500u64 + ((participants.len() as u64 / 100) * 300).min(3500);
+                        // PRODUCTION: Adaptive propagation delay based on network size
+                        // Small networks (<=10): 3s is enough for first HTTP attempt
+                        // Medium networks (<=100): 4s for moderate load
+                        // Large networks (>100): 5s for heavy load and retries
+                        let propagation_delay_ms = if participants.len() <= 10 {
+                            3000u64  // 3s for small networks
+                        } else if participants.len() <= 100 {
+                            4000u64  // 4s for medium networks  
+                        } else {
+                            5000u64  // 5s for large networks (up to 1000)
+                        };
                         tokio::time::sleep(std::time::Duration::from_millis(propagation_delay_ms)).await;
-                        println!("[CONSENSUS] ⏳ Broadcast propagation delay: {}ms (bad network tolerance)", propagation_delay_ms);
+                        println!("[CONSENSUS] ⏳ Propagation delay: {}ms (adaptive for {} nodes)", 
+                                propagation_delay_ms, participants.len());
                     }
                 }
                 Err(ConsensusError::InvalidSignature(msg)) => {
@@ -7054,14 +7082,20 @@ impl BlockchainNode {
                             }
                         }
                         
-                        // CRITICAL FIX: Propagation grace period after broadcast
-                        // Broadcast uses tokio::spawn (async), need time for messages to reach peers
-                        // PRODUCTION FORMULA: 1500ms base + 300ms per 100 participants (max 5s for 1000 nodes)
-                        // Covers bad network: 1500ms latency + 1000ms retries + 1500ms buffer
-                        // Good network: 1.5s overhead acceptable for Byzantine safety guarantee
-                        let propagation_delay_ms = 1500u64 + ((participants.len() as u64 / 100) * 300).min(3500);
+                        // PRODUCTION: Adaptive propagation delay based on network size
+                        // Small networks (<=10): 3s is enough for first HTTP attempt
+                        // Medium networks (<=100): 4s for moderate load
+                        // Large networks (>100): 5s for heavy load and retries
+                        let propagation_delay_ms = if participants.len() <= 10 {
+                            3000u64  // 3s for small networks
+                        } else if participants.len() <= 100 {
+                            4000u64  // 4s for medium networks  
+                        } else {
+                            5000u64  // 5s for large networks (up to 1000)
+                        };
                         tokio::time::sleep(std::time::Duration::from_millis(propagation_delay_ms)).await;
-                        println!("[CONSENSUS] ⏳ Broadcast propagation delay: {}ms (bad network tolerance)", propagation_delay_ms);
+                        println!("[CONSENSUS] ⏳ Propagation delay: {}ms (adaptive for {} nodes)", 
+                                propagation_delay_ms, participants.len());
                     }
                 }
                 Err(e) => {

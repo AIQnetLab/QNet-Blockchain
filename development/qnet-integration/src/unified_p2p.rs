@@ -2137,19 +2137,21 @@ impl SimplifiedP2P {
                     let peer_ip = peer_addr.split(':').next().unwrap_or(&peer_addr);
                     let url = format!("http://{}:8001/api/v1/p2p/message", peer_ip);
                     
-                    // OPTIMIZATION: Adaptive timeout based on peer latency
-                    // For intercontinental connections, 500ms is too short
-                    let timeout_ms = if peer_latency > 300 {
-                        3000  // Intercontinental (>300ms latency)
-                    } else if peer_latency > 100 {
-                        1500  // Regional (100-300ms latency)
+                    // PRODUCTION: Conservative timeout for unmeasured latency
+                    // Genesis nodes start with latency_ms=10 or 30 (defaults)
+                    // But real latency can be much higher (e.g. 779ms in logs)
+                    // Use conservative 2s until load balancer measures real latency (after 30s)
+                    let timeout_ms = if peer_latency <= 30 {
+                        2000  // Conservative for any default values (10, 30)
+                    } else if peer_latency > 200 {
+                        peer_latency * 3  // High latency: 3x for reliability
                     } else {
-                        500   // Local/same datacenter (<100ms latency)
+                        1000  // Medium latency: 1s is safer than 500ms
                     };
                     
                     let client = reqwest::blocking::Client::builder()
-                        .timeout(Duration::from_millis(timeout_ms))  // ADAPTIVE: Based on peer latency
-                        .connect_timeout(Duration::from_millis(timeout_ms / 3))  // Connect timeout is 1/3 of total
+                        .timeout(Duration::from_millis(timeout_ms as u64))  // ADAPTIVE: Fast for local, sufficient for global
+                        .connect_timeout(Duration::from_millis(200))  // FAST: 200ms connect (from 3c78d24)
                         .tcp_nodelay(true)  // CRITICAL: No Nagle's algorithm delay
                         .tcp_keepalive(Duration::from_secs(HTTP_TCP_KEEPALIVE_SECS))
                         .pool_max_idle_per_host(HTTP_POOL_MAX_IDLE_PER_HOST)
@@ -5356,12 +5358,14 @@ impl SimplifiedP2P {
         if peers.is_empty() { return; }
         
         let mut consecutive_failures = 0;
-        const MAX_CONSECUTIVE_FAILURES: u32 = 3;
+        const MAX_CONSECUTIVE_FAILURES: u32 = 20;  // CRITICAL FIX: Increased from 3 to 20 to handle async broadcast delays
         
-        for height in start_height..=end_height {
+        let mut height = start_height;
+        while height <= end_height {
             // CRITICAL FIX: Check if block ACTUALLY exists (not just Ok())
             if storage.load_microblock(height).unwrap_or(None).is_some() {
                 consecutive_failures = 0;
+                height += 1;
                 continue;
             }
             
@@ -5390,11 +5394,17 @@ impl SimplifiedP2P {
                                         if storage.save_microblock(height, &bytes).is_ok() {
                                             fetched = true;
                                             consecutive_failures = 0;
+                                            
+                                            // CRITICAL FIX: Update LOCAL_BLOCKCHAIN_HEIGHT when syncing
+                                            LOCAL_BLOCKCHAIN_HEIGHT.store(height, Ordering::Relaxed);
                                             break;
                                         }
                                     }
                                 }
                             }
+                        } else if response.status() == reqwest::StatusCode::NOT_FOUND {
+                            // Block not found on this peer - try next peer (don't break, maybe it's propagating)
+                            continue;
                         }
                     },
                     Err(_) => continue,
@@ -5404,137 +5414,22 @@ impl SimplifiedP2P {
             if !fetched {
                 consecutive_failures += 1;
                 if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
-                    println!("[SYNC] ❌ Range {}-{} aborted after {} failures at block {}", 
+                    println!("[SYNC] ⚠️ Range {}-{} hit {} consecutive failures at block {} - waiting 3s for block propagation", 
                              start_height, end_height, MAX_CONSECUTIVE_FAILURES, height);
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
-        }
-    }
-    
-    /// Download missing microblocks from peers (legacy sequential version)
-    pub async fn download_missing_microblocks(&self, storage: &crate::storage::Storage, current_height: u64, target_height: u64) {
-        if target_height <= current_height { return; }
-        let peers = self.connected_peers.read().unwrap().clone();
-        if peers.is_empty() { return; }
-        
-        // SYNC FIX: Batch download status tracking
-        let mut consecutive_failures = 0;
-        const MAX_CONSECUTIVE_FAILURES: u32 = 3;
-        
-        let mut height = current_height + 1;
-        while height <= target_height {
-            // SYNC FIX: Check if block already exists locally before downloading
-            if storage.load_microblock(height).is_ok() {
-                println!("[SYNC] ✅ Block #{} already exists locally, skipping download", height);
-                height += 1;
-                consecutive_failures = 0; // Reset failure counter on success
-                continue;
-            }
-            
-            // RACE CONDITION FIX: Check if another thread is already downloading this block
-            {
-                let mut downloading = DOWNLOADING_BLOCKS.write().unwrap();
-                if downloading.contains(&height) {
-                    println!("[SYNC] ⏳ Block #{} already being downloaded by another thread, skipping", height);
-                    height += 1;
-                    continue;
-                }
-                // Mark this block as being downloaded
-                downloading.insert(height);
-            }
-            
-            let mut fetched = false;
-            for (_addr, peer) in &peers {
-                // Try primary API port first
-                let ip = peer.addr.split(':').next().unwrap_or("");
-                let urls = vec![
-                    format!("http://{}:8001/api/v1/microblock/{}", ip, height),
-                ];
-                // PRODUCTION: Use proper HTTP client instead of curl
-                for url in urls {
-                    // Create HTTP client with production-ready configuration
-                    // SYNC FIX: Reduced timeouts for faster sync
-                    let client = match reqwest::Client::builder()
-                        .timeout(std::time::Duration::from_secs(5)) // SYNC FIX: Reduced from 25s to 5s for faster failure detection
-                        .connect_timeout(std::time::Duration::from_secs(2)) // SYNC FIX: Reduced from 12s to 2s
-                        .user_agent("QNet-Node/1.0")
-                        .tcp_nodelay(true) // Faster responses
-                        .tcp_keepalive(std::time::Duration::from_secs(60)) // Keep connections alive
-                        .build() {
-                        Ok(client) => client,
-                        Err(_) => continue,
-                    };
                     
-                    // Send request
-                    match client.get(&url).send().await {
-                        Ok(response) => {
-                            if response.status().is_success() {
-                                match response.json::<serde_json::Value>().await {
-                                    Ok(val) => {
-                                if let Some(b64) = val.get("data").and_then(|v| v.as_str()) {
-                                    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) {
-                                        if storage.save_microblock(height, &bytes).is_ok() {
-                                            println!("[SYNC] 📦 Downloaded microblock #{} from {}", height, ip);
-                                            fetched = true;
-                                            consecutive_failures = 0; // Reset failure counter
-                                            
-                                            // CRITICAL FIX: Update P2P local height when syncing blocks
-                                            LOCAL_BLOCKCHAIN_HEIGHT.store(height, Ordering::Relaxed);
-                                            
-                                            // RACE CONDITION FIX: Remove from downloading set after successful save
-                                            DOWNLOADING_BLOCKS.write().unwrap().remove(&height);
-                                            break;
-                                        }
-                                    }
-                                }
-                                    },
-                                    Err(_e) => {
-                                        // SYNC FIX: Reduced logging for failed attempts (not all are errors)
-                                        // Continue to next peer silently
-                                    }
-                                }
-                            } else if response.status() == reqwest::StatusCode::NOT_FOUND {
-                                // SYNC FIX: Peer doesn't have this block yet, try next peer
-                                continue;
-                            }
-                        },
-                        Err(_e) => {
-                            // SYNC FIX: Connection failed, try next peer silently
-                            continue;
-                        }
-                    }
+                    // CRITICAL FIX: Don't abort! Wait for blocks to propagate (async broadcast delay)
+                    // Then retry the same block - this handles producer async broadcast delays
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    consecutive_failures = 0;  // Reset counter to retry
+                    // DON'T increment height - retry the same block!
+                } else {
+                    // CRITICAL FIX: Wait longer for blocks to propagate (async broadcast can take 1-3 seconds)
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 }
-                if fetched { break; }
+            } else {
+                // Successfully fetched block - move to next height
+                height += 1;
             }
-            
-            if !fetched {
-                consecutive_failures += 1;
-                println!("[SYNC] ⚠️ Could not fetch microblock #{} from any peer (attempt {}/{})",
-                         height, consecutive_failures, MAX_CONSECUTIVE_FAILURES);
-                
-                // RACE CONDITION FIX: Remove from downloading set if failed to download
-                DOWNLOADING_BLOCKS.write().unwrap().remove(&height);
-                
-                // SYNC FIX: Give up after multiple consecutive failures to prevent infinite loops
-                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
-                    println!("[SYNC] ❌ Sync aborted after {} consecutive failures", MAX_CONSECUTIVE_FAILURES);
-                break;
-            }
-                
-                // SYNC FIX: Small delay before retry to avoid hammering the network
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            }
-            
-            height += 1;
-        }
-        
-        // RACE CONDITION FIX: Clean up any remaining blocks from tracking set
-        // This handles edge cases where sync was interrupted
-        {
-            let mut downloading = DOWNLOADING_BLOCKS.write().unwrap();
-            downloading.clear();
         }
     }
 }
@@ -6255,6 +6150,7 @@ impl SimplifiedP2P {
         
         Ok(())
     }
+    
 }
 
 /// Helper function to convert region enum to string
@@ -7500,12 +7396,12 @@ impl SimplifiedP2P {
         let peer_ip = peer_addr.split(':').next().unwrap_or(peer_addr);
         let url = format!("http://{}:8001/api/v1/p2p/message", peer_ip);
         
-        // PRODUCTION: Increased timeout for bad network tolerance
-        // 5s total timeout covers 2s latency + 2s processing + 1s buffer
-        // Connect timeout 2s for slow network handshakes
+        // PRODUCTION: Fast consensus delivery for 1 block/sec target  
+        // 2s timeout is sufficient for consensus messages with retry mechanism
+        // Faster timeout allows quicker retry attempts if first attempt fails
         let client = match reqwest::Client::builder()
-            .timeout(Duration::from_secs(5))
-            .connect_timeout(Duration::from_secs(2))
+            .timeout(Duration::from_secs(2))
+            .connect_timeout(Duration::from_millis(500))
             .tcp_nodelay(true)
             .build() {
             Ok(c) => c,
