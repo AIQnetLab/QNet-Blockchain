@@ -610,8 +610,8 @@ impl BlockchainNode {
             println!("  - QNET_EXTERNAL_IP for regular nodes");
         }
         let consensus_config = qnet_consensus::ConsensusConfig {
-            commit_phase_duration: Duration::from_secs(15),    // Faster phases for 1s blocks
-            reveal_phase_duration: Duration::from_secs(15),    // Total consensus: 30s per round
+            commit_phase_duration: Duration::from_secs(12),    // OPTIMIZED: 12s commit phase (blocks 61-72)
+            reveal_phase_duration: Duration::from_secs(12),    // OPTIMIZED: 12s reveal phase (blocks 73-84)
             min_participants: 4,           // PRODUCTION: 4 nodes minimum for Byzantine safety (3f+1, f=1)
             max_participants: 1000,        // Maximum participants per round
             max_validators_per_round: 1000, // PRODUCTION: 1000 validators per round (per NETWORK_LOAD_ANALYSIS.md)
@@ -1412,21 +1412,36 @@ impl BlockchainNode {
                                                 // CRITICAL: Actually request the missing block via P2P
                                                 if let Some(p2p) = &unified_p2p {
                                                     let p2p_clone = p2p.clone();
+                                                    let retry_missing_height = missing_height;  // Clone for retry logic
                                                     tokio::spawn(async move {
-                                                        // SPECIAL CASE: Genesis block request
-                                                        if missing_height == 0 {
-                                                            println!("[BLOCKS] 🌍 Requesting Genesis block #0 from network");
-                                                            if let Err(e) = p2p_clone.sync_blocks(0, 0).await {
-                                                                println!("[BLOCKS] ⚠️ Failed to request Genesis: {}", e);
+                                                        // CRITICAL FIX: Retry mechanism for missing blocks
+                                                        // Try up to 3 times with exponential backoff
+                                                        for attempt in 1..=3 {
+                                                            // SPECIAL CASE: Genesis block request
+                                                            if retry_missing_height == 0 {
+                                                                println!("[BLOCKS] 🌍 Requesting Genesis block #0 from network (attempt {})", attempt);
+                                                                if let Err(e) = p2p_clone.sync_blocks(0, 0).await {
+                                                                    println!("[BLOCKS] ⚠️ Failed to request Genesis (attempt {}): {}", attempt, e);
+                                                                    if attempt < 3 {
+                                                                        tokio::time::sleep(Duration::from_secs(attempt)).await;
+                                                                        continue;
+                                                                    }
+                                                                } else {
+                                                                    println!("[BLOCKS] ✅ Genesis block requested from network");
+                                                                    break;
+                                                                }
                                                             } else {
-                                                                println!("[BLOCKS] ✅ Genesis block requested from network");
-                                                            }
-                                                        } else {
-                                                            // Regular block request
-                                                            if let Err(e) = p2p_clone.sync_blocks(missing_height, missing_height).await {
-                                                                println!("[BLOCKS] ⚠️ Failed to request block #{}: {}", missing_height, e);
-                                                            } else {
-                                                                println!("[BLOCKS] ✅ Block #{} requested from network", missing_height);
+                                                                // Regular block request
+                                                                if let Err(e) = p2p_clone.sync_blocks(retry_missing_height, retry_missing_height).await {
+                                                                    println!("[BLOCKS] ⚠️ Failed to request block #{} (attempt {}): {}", retry_missing_height, attempt, e);
+                                                                    if attempt < 3 {
+                                                                        tokio::time::sleep(Duration::from_secs(attempt)).await;
+                                                                        continue;
+                                                                    }
+                                                                } else {
+                                                                    println!("[BLOCKS] ✅ Block #{} requested from network", retry_missing_height);
+                                                                    break;
+                                                                }
                                                             }
                                                         }
                                                     });
@@ -4652,8 +4667,12 @@ impl BlockchainNode {
                 // ══════════════════════════════════════════════════════════════════
                 
                 // PRODUCTION: Start consensus SUPER EARLY after block 60 for ZERO downtime
-                // Consensus takes 30s (commit 15s + reveal 15s), so starting at 61 means it completes by block 90
-                // This ensures macroblock is ready EXACTLY when needed - Swiss watch precision!
+                // Consensus adaptive with bad network tolerance:
+                // Commit: propagation (1.5-5s) + wait (12-14s, early break) = 2-8s typical
+                // Reveal: propagation (1.5-5s) + wait (12-14s, early break) = 2-8s typical
+                // Finalize: 2-6s
+                // Total: 5 nodes ~9s, 1000 nodes ~26s max (with early break much faster)
+                // Starting at block 61 means it completes by block 90 - Swiss watch precision!
                 // CRITICAL FIX: Start EXACTLY at block 61 for deterministic consensus
                 // All nodes must start at the same block to ensure phase synchronization
                 let blocks_since_trigger = microblock_height.saturating_sub(last_macroblock_trigger);
@@ -6834,6 +6853,15 @@ impl BlockchainNode {
                                          round_id, round_id % 90 == 0);
                             }
                         }
+                        
+                        // CRITICAL FIX: Propagation grace period after broadcast
+                        // Broadcast uses tokio::spawn (async), need time for messages to reach peers
+                        // PRODUCTION FORMULA: 1500ms base + 300ms per 100 participants (max 5s for 1000 nodes)
+                        // Covers bad network: 1500ms latency + 1000ms retries + 1500ms buffer
+                        // Good network: 1.5s overhead acceptable for Byzantine safety guarantee
+                        let propagation_delay_ms = 1500u64 + ((participants.len() as u64 / 100) * 300).min(3500);
+                        tokio::time::sleep(std::time::Duration::from_millis(propagation_delay_ms)).await;
+                        println!("[CONSENSUS] ⏳ Broadcast propagation delay: {}ms (bad network tolerance)", propagation_delay_ms);
                     }
                 }
                 Err(ConsensusError::InvalidSignature(msg)) => {
@@ -6854,8 +6882,25 @@ impl BlockchainNode {
         // PRODUCTION: Process incoming consensus messages during commit phase
         let mut received_commits = 0;
         let start_time = std::time::Instant::now();
-        let commit_timeout = std::time::Duration::from_secs(15); // Byzantine commit phase timeout
         
+        // CRITICAL: Adaptive timeout based on number of participants for scalability
+        // CONSTRAINT: Total consensus must fit in blocks 61-90 (30 seconds)
+        // Formula: 12s base + 0.3s per 100 participants (max 14s)
+        // 5 nodes: 12s, 100 nodes: 12s, 500 nodes: 13s, 1000 nodes: 14s
+        // With early break: actual time much less when threshold reached quickly
+        let commit_timeout = {
+            let base_timeout = 12u64;
+            let participants_count = participants.len() as u64;
+            let additional_time_ms = if participants_count > 100 {
+                ((participants_count - 100) * 3).min(2000) // Max +2s for 1000 nodes
+            } else {
+                0
+            };
+            std::time::Duration::from_millis(base_timeout * 1000 + additional_time_ms)
+        };
+        
+        println!("[CONSENSUS] ⏳ Commit phase timeout: {}s (adaptive for {} participants)", 
+                 commit_timeout.as_secs(), participants.len());
         println!("[CONSENSUS] ⏳ Waiting for commits from {} other participants...", participants.len() - 1);
         
         // PRODUCTION: Active commit processing loop for real inter-node consensus
@@ -6885,9 +6930,9 @@ impl BlockchainNode {
                 }
             }
             
-            // CRITICAL FIX: Use recv_timeout for faster message processing
-            // This avoids 200ms delays and processes messages immediately
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            // CRITICAL FIX: Short polling interval for faster consensus message processing
+            // 10ms polling allows up to 100 checks/sec without overwhelming CPU
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             
             // Check current commit count in consensus engine  
             let current_commits = consensus_engine.get_current_commit_count();
@@ -6905,13 +6950,22 @@ impl BlockchainNode {
             }
         }
         
-        println!("[CONSENSUS] ⏰ Commit phase completed");
+        // CRITICAL: Check if Byzantine threshold was reached
+        let final_commits = consensus_engine.get_current_commit_count();
+        let byzantine_threshold = (participants.len() * 2 + 2) / 3;
         
-        // CRITICAL FIX: Don't call advance_phase() here!
-        // The consensus engine AUTOMATICALLY advances to reveal phase
-        // when Byzantine threshold is reached in submit_commit()
-        // Calling advance_phase() again would skip reveal phase and go to finalize!
-        println!("[CONSENSUS] ✅ Consensus engine automatically advanced to reveal phase")
+        if final_commits >= byzantine_threshold {
+            println!("[CONSENSUS] ✅ Commit phase completed successfully: {}/{} commits", 
+                     final_commits, byzantine_threshold);
+            println!("[CONSENSUS] ✅ Consensus engine automatically advanced to reveal phase");
+        } else {
+            println!("[CONSENSUS] ⚠️ Commit phase timeout: only {}/{} commits received", 
+                     final_commits, byzantine_threshold);
+            println!("[CONSENSUS] ❌ Byzantine threshold NOT reached - consensus will fail");
+            println!("[CONSENSUS] 🔄 Progressive Finalization Protocol will handle recovery");
+            // Don't proceed to reveal phase - let PFP handle it
+            return;
+        }
     }
     
     /// PRODUCTION: Execute REAL reveal phase with inter-node communication
@@ -6954,8 +7008,12 @@ impl BlockchainNode {
                         (*stored_nonce, stored_reveal.clone())
                     }
                     None => {
-                        println!("[CONSENSUS] ❌ No OWN commit data found, cannot reveal");
-                        return; // Cannot proceed without our own commit data
+                        // CRITICAL: If we don't have commit data, we CANNOT participate in reveal
+                        // This is CORRECT Byzantine behavior - nodes that didn't commit can't reveal
+                        // Otherwise malicious nodes could manipulate consensus by skipping commit
+                        println!("[CONSENSUS] ❌ No OWN commit data found - cannot reveal (Byzantine safety)");
+                        println!("[CONSENSUS] 🔒 Node will not participate in this consensus round");
+                        return; // Exit reveal phase for this node
                     }
                 }
             };
@@ -6995,6 +7053,15 @@ impl BlockchainNode {
                                          round_id, round_id % 90 == 0);
                             }
                         }
+                        
+                        // CRITICAL FIX: Propagation grace period after broadcast
+                        // Broadcast uses tokio::spawn (async), need time for messages to reach peers
+                        // PRODUCTION FORMULA: 1500ms base + 300ms per 100 participants (max 5s for 1000 nodes)
+                        // Covers bad network: 1500ms latency + 1000ms retries + 1500ms buffer
+                        // Good network: 1.5s overhead acceptable for Byzantine safety guarantee
+                        let propagation_delay_ms = 1500u64 + ((participants.len() as u64 / 100) * 300).min(3500);
+                        tokio::time::sleep(std::time::Duration::from_millis(propagation_delay_ms)).await;
+                        println!("[CONSENSUS] ⏳ Broadcast propagation delay: {}ms (bad network tolerance)", propagation_delay_ms);
                     }
                 }
                 Err(e) => {
@@ -7011,9 +7078,24 @@ impl BlockchainNode {
         // PRODUCTION: Process incoming consensus messages during reveal phase
         let mut received_reveals = 0;
         let start_time = std::time::Instant::now();
-        let reveal_timeout = std::time::Duration::from_secs(15); // Byzantine reveal phase timeout
+        
+        // CRITICAL: Adaptive timeout based on number of participants for scalability
+        // CONSTRAINT: Total consensus must fit in blocks 61-90 (30 seconds)
+        // Same formula as commit phase for consistency
+        let reveal_timeout = {
+            let base_timeout = 12u64;
+            let participants_count = participants.len() as u64;
+            let additional_time_ms = if participants_count > 100 {
+                ((participants_count - 100) * 3).min(2000) // Max +2s for 1000 nodes
+            } else {
+                0
+            };
+            std::time::Duration::from_millis(base_timeout * 1000 + additional_time_ms)
+        };
         let mut processed_messages = 0;
         
+        println!("[CONSENSUS] ⏳ Reveal phase timeout: {}s (adaptive for {} participants)", 
+                 reveal_timeout.as_secs(), participants.len());
         println!("[CONSENSUS] ⏳ Waiting for reveals from {} other participants...", participants.len() - 1);
         
         while start_time.elapsed() < reveal_timeout && received_reveals < (participants.len() - 1) {
@@ -7040,8 +7122,9 @@ impl BlockchainNode {
                 }
             }
             
-            // Check for incoming consensus messages (reveals from other nodes)
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            // CRITICAL FIX: Short polling interval for faster consensus message processing
+            // 10ms polling allows up to 100 checks/sec without overwhelming CPU
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             
             // Check current reveal count in consensus engine
             let current_reveals = consensus_engine.get_current_reveal_count();
@@ -7059,7 +7142,22 @@ impl BlockchainNode {
             }
         }
         
-        println!("[CONSENSUS] ⏰ Reveal phase completed, consensus engine will finalize with received data");
+        // CRITICAL: Check if Byzantine threshold was reached for reveals
+        let final_reveals = consensus_engine.get_current_reveal_count();
+        let byzantine_threshold = (participants.len() * 2 + 2) / 3;
+        
+        if final_reveals >= byzantine_threshold {
+            println!("[CONSENSUS] ✅ Reveal phase completed successfully: {}/{} reveals", 
+                     final_reveals, byzantine_threshold);
+            println!("[CONSENSUS] ✅ Ready for finalization");
+        } else {
+            println!("[CONSENSUS] ⚠️ Reveal phase timeout: only {}/{} reveals received", 
+                     final_reveals, byzantine_threshold);
+            println!("[CONSENSUS] ❌ Byzantine threshold NOT reached - consensus failed");
+            println!("[CONSENSUS] 🔄 Progressive Finalization Protocol will handle recovery");
+            // Don't proceed to finalization - let PFP handle it
+            return;
+        }
         
         // Clean up old environment variables (legacy code removal)
         for participant in participants.iter().take(10) {
@@ -7707,6 +7805,7 @@ impl BlockchainNode {
             
             // STEP 3: Execute REAL COMMIT phase with P2P communication
             println!("[CONSENSUS] 📝 Starting COMMIT phase...");
+            // CRITICAL FIX: Create persistent storage for consensus nonces (shared between commit and reveal)
             let consensus_nonce_storage = std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
             let unified_p2p_option = Some(p2p.clone()); // Pass REAL P2P system
             

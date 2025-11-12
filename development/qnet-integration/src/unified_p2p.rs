@@ -7500,10 +7500,12 @@ impl SimplifiedP2P {
         let peer_ip = peer_addr.split(':').next().unwrap_or(peer_addr);
         let url = format!("http://{}:8001/api/v1/p2p/message", peer_ip);
         
-        // Use fast client with reasonable timeout for consensus
+        // PRODUCTION: Increased timeout for bad network tolerance
+        // 5s total timeout covers 2s latency + 2s processing + 1s buffer
+        // Connect timeout 2s for slow network handshakes
         let client = match reqwest::Client::builder()
-            .timeout(Duration::from_secs(2))
-            .connect_timeout(Duration::from_millis(500))
+            .timeout(Duration::from_secs(5))
+            .connect_timeout(Duration::from_secs(2))
             .tcp_nodelay(true)
             .build() {
             Ok(c) => c,
