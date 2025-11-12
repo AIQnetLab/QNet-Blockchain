@@ -868,10 +868,10 @@ impl PersistentStorage {
         let microblocks_cf = self.db.cf_handle("microblocks")
             .ok_or_else(|| IntegrationError::StorageError("microblocks column family not found".to_string()))?;
         
-        // Macroblocks are stored with key "macroblock_{height}"
-        // where height is the actual macroblock height (90, 180, 270, etc)
-        let macroblock_height = macroblock_index * 90;
-        let key = format!("macroblock_{}", macroblock_height);
+        // CRITICAL FIX: Macroblocks are stored with key "macroblock_{index}"
+        // where index is the macroblock number (1 for blocks 1-90, 2 for blocks 91-180, etc)
+        // NOT the block height! This matches save_macroblock which uses round_number
+        let key = format!("macroblock_{}", macroblock_index);
         
         match self.db.get_cf(&microblocks_cf, key.as_bytes())? {
             Some(data) => Ok(Some(data)),

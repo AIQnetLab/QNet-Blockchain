@@ -4787,8 +4787,8 @@ impl BlockchainNode {
                 if blocks_since_trigger >= 30 && blocks_since_trigger % 30 == 0 && blocks_since_trigger != 90 {
                     // Check if macroblock still missing
                     let expected_macroblock = last_macroblock_trigger / 90;
-                    // Check if macroblock was created by looking for the next microblock
-                    let macroblock_exists = storage.load_microblock(expected_macroblock * 90 + 1)
+                    // CRITICAL FIX: Check for the actual MACROBLOCK, not a microblock!
+                    let macroblock_exists = storage.get_macroblock_by_height(expected_macroblock)
                         .map(|mb| mb.is_some())
                         .unwrap_or(false);
                     
@@ -5115,11 +5115,12 @@ impl BlockchainNode {
                     let last_block_of_prev_round = round_start_block - 1;
                     
                     // Calculate which macroblock we need
-                    // Round 3 (91-120) needs macroblock #0 (blocks 1-90)
-                    // Round 4 (121-150) needs macroblock #0 (blocks 1-90)
-                    // Round 5 (151-180) needs macroblock #0 (blocks 1-90)
-                    // Round 6 (181-210) needs macroblock #1 (blocks 91-180)
-                    let required_macroblock = (last_block_of_prev_round - 1) / 90;
+                    // Round 3 (91-120) needs macroblock #1 (blocks 1-90)
+                    // Round 4 (121-150) needs macroblock #1 (blocks 1-90)
+                    // Round 5 (151-180) needs macroblock #1 (blocks 1-90)
+                    // Round 6 (181-210) needs macroblock #2 (blocks 91-180)
+                    // CRITICAL FIX: Use correct formula without -1 to match save_macroblock
+                    let required_macroblock = last_block_of_prev_round / 90;
                     
                     match store.get_macroblock_by_height(required_macroblock) {
                         Ok(Some(macroblock_data)) => {
@@ -6620,9 +6621,13 @@ impl BlockchainNode {
         // Calculate state root from microblocks
         // CRITICAL FIX: Correct calculation for macroblock boundaries
         // For height 90: blocks 1-90, for height 180: blocks 91-180
-        let macroblock_index = (height - 1) / 90;  // 0-based index
-        let start_height = macroblock_index * 90 + 1;
-        let end_height = (macroblock_index + 1) * 90;
+        // CRITICAL FIX: Use same formula as normal consensus (height / 90) not (height - 1) / 90!
+        let macroblock_index = height / 90;  // Must match trigger_macroblock_consensus formula!
+        // CRITICAL FIX: Adjust boundaries for new index formula
+        // For index 1 (blocks 1-90): start=1, end=90
+        // For index 2 (blocks 91-180): start=91, end=180
+        let start_height = if macroblock_index > 0 { (macroblock_index - 1) * 90 + 1 } else { 1 };
+        let end_height = macroblock_index * 90;
         
         let mut microblock_hashes = Vec::new();
         let mut state_accumulator = [0u8; 32];
@@ -6674,7 +6679,8 @@ impl BlockchainNode {
             const MACROBLOCK_INTERVAL_SECONDS: u64 = 90;  // 90 seconds per macroblock (90 microblocks)
             
             // Macroblock timestamp = genesis + (macroblock_height * 90 seconds)
-            let macroblock_height = (height - 1) / 90;
+            // CRITICAL FIX: Use same formula as macroblock_index (height / 90)
+            let macroblock_height = height / 90;
             genesis_timestamp + (macroblock_height * MACROBLOCK_INTERVAL_SECONDS)
         };
         
@@ -8579,11 +8585,16 @@ impl BlockchainNode {
                     .build() 
                 {
                     if let Ok(response) = client.get(&endpoint).send().await {
-                        if let Ok(text) = response.text().await {
-                            if let Ok(height) = text.trim().parse::<u64>() {
+                        // CRITICAL FIX: API returns JSON, not plain text (same fix as unified_p2p.rs)
+                        if let Ok(json) = response.json::<serde_json::Value>().await {
+                            if let Some(height) = json.get("height").and_then(|h| h.as_u64()) {
                                 heights.push(height);
                                 println!("[SYNC] 📏 Peer {} reports height: {}", peer.id, height);
+                            } else {
+                                println!("[SYNC] ⚠️ Peer {} - malformed JSON response", peer.id);
                             }
+                        } else {
+                            println!("[SYNC] ⚠️ Peer {} - JSON parse error", peer.id);
                         }
                     }
                 }

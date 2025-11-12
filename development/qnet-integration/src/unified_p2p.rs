@@ -1767,16 +1767,34 @@ impl SimplifiedP2P {
                     let endpoint = format!("http://{}:8001/api/v1/height", peer_ip);
                     
                     // Simple HTTP query using reqwest
-                    if let Ok(client) = reqwest::Client::builder()
+                    match reqwest::Client::builder()
                         .timeout(std::time::Duration::from_secs(2))
                         .build() 
                     {
-                        if let Ok(response) = client.get(&endpoint).send().await {
-                            if let Ok(text) = response.text().await {
-                                if let Ok(height) = text.trim().parse::<u64>() {
-                                    peer_heights.push(height);
+                        Ok(client) => {
+                            match client.get(&endpoint).send().await {
+                                Ok(response) => {
+                                    // CRITICAL FIX: API returns JSON, not plain text
+                                    match response.json::<serde_json::Value>().await {
+                                        Ok(json) => {
+                                            if let Some(height) = json.get("height").and_then(|h| h.as_u64()) {
+                                                peer_heights.push(height);
+                                            } else {
+                                                println!("[SYNC] ⚠️ Background: {} - malformed JSON response", peer_ip);
+                                            }
+                                        },
+                                        Err(e) => {
+                                            println!("[SYNC] ⚠️ Background: {} - JSON parse error: {}", peer_ip, e);
+                                        }
+                                    }
+                                },
+                                Err(e) => {
+                                    println!("[SYNC] ⚠️ Background: {} - HTTP error: {}", peer_ip, e);
                                 }
                             }
+                        },
+                        Err(e) => {
+                            println!("[SYNC] ⚠️ Background: client build error: {}", e);
                         }
                     }
                 }
@@ -1794,7 +1812,7 @@ impl SimplifiedP2P {
                     
                     // Update both cache systems
                     if consensus_height > 0 {
-                        println!("[SYNC] 📊 Background sync: network height updated to {}", consensus_height);
+                        println!("[SYNC] 📊 Background: network height {} (from {} peers)", consensus_height, peer_heights.len());
                         
                         // Update new cache actor
                         let epoch = CACHE_ACTOR.increment_epoch();
@@ -1809,6 +1827,8 @@ impl SimplifiedP2P {
                         let mut cache = CACHED_BLOCKCHAIN_HEIGHT.lock().unwrap();
                         *cache = (consensus_height, Instant::now());
                     }
+                } else {
+                    println!("[SYNC] ⚠️ Background: No peer responses - cache not updated");
                 }
                 
                 tokio::time::sleep(std::time::Duration::from_secs(sync_interval)).await;
