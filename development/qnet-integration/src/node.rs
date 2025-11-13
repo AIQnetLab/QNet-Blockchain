@@ -55,14 +55,10 @@ fn get_timestamp_safe() -> u64 {
 }
 use std::env;
 use std::sync::Mutex;
-use std::collections::HashSet;
 
 // CRITICAL: Global flag for emergency producer activation
 lazy_static::lazy_static! {
     pub static ref EMERGENCY_PRODUCER_FLAG: Mutex<Option<(u64, String)>> = Mutex::new(None);
-    
-    // CRITICAL: Track processed failovers to prevent duplicate events
-    pub static ref PROCESSED_FAILOVERS: Mutex<HashSet<u64>> = Mutex::new(HashSet::new());
 }
 
 // CRITICAL: Public function to set emergency producer flag from other modules
@@ -2638,7 +2634,9 @@ impl BlockchainNode {
         tokio::spawn(async move {
             // CRITICAL FIX: Start from current global height, not 0
             let mut microblock_height = *height.read().await;
-            let mut last_macroblock_trigger = 0u64;
+            // CRITICAL FIX: Calculate last_macroblock_trigger from current height
+            // This ensures consensus works even when node starts after block 61
+            let mut last_macroblock_trigger = (microblock_height / 90) * 90;
             let mut consensus_started = false; // Track early consensus start
             
             // GENESIS BLOCK CREATION: Create Genesis Block if blockchain is empty
@@ -4591,31 +4589,9 @@ impl BlockchainNode {
                                 };
                                 
                                 if !block_exists {
-                                    // CRITICAL: Check if failover was already processed for this height
-                                    // This prevents creating 10000 failover events for the same block
-                                    let already_processed = if let Ok(mut processed) = PROCESSED_FAILOVERS.lock() {
-                                        if processed.contains(&expected_height_timeout) {
-                                            println!("[FAILOVER] ⚠️ Failover already processed for block #{} - skipping duplicate", 
-                                                     expected_height_timeout);
-                                            true
-                                        } else {
-                                            // Mark this height as processed
-                                            processed.insert(expected_height_timeout);
-                                            
-                                            // Clean up old entries (keep only last 100 blocks)
-                                            if processed.len() > 100 {
-                                                let min_height = expected_height_timeout.saturating_sub(100);
-                                                processed.retain(|&h| h >= min_height);
-                                            }
-                                            false
-                                        }
-                                    } else {
-                                        false
-                                    };
-                                    
-                                    if already_processed {
-                                        return; // Exit early - failover already handled
-                                    }
+                                    // REMOVED: PROCESSED_FAILOVERS check that was blocking legitimate failovers
+                                    // Each failover attempt should be evaluated independently
+                                    // The P2P layer already has deduplication for network messages
                                     
                                     // Use the actual timeout duration for logging (calculated above)
                                     let timeout_duration = actual_timeout.as_secs();
@@ -4695,7 +4671,9 @@ impl BlockchainNode {
                 // CRITICAL FIX: Start EXACTLY at block 61 for deterministic consensus
                 // All nodes must start at the same block to ensure phase synchronization
                 let blocks_since_trigger = microblock_height.saturating_sub(last_macroblock_trigger);
-                if blocks_since_trigger == 61 && !consensus_started {
+                // Start at block 61 (30 blocks for consensus to complete by block 90)
+                // This gives ~30 seconds for consensus phases (commit, reveal, finalize)
+                if blocks_since_trigger >= 61 && blocks_since_trigger < 90 && !consensus_started {
                     println!("[MACROBLOCK] 🚀 DETERMINISTIC CONSENSUS START at block {} (61 after trigger)", microblock_height);
                     println!("[MACROBLOCK] 📍 Node: {} | Type: {:?} | ALL NODES PARTICIPATE", node_id, node_type);
                     consensus_started = true;
@@ -4809,9 +4787,9 @@ impl BlockchainNode {
                         }
                     });
                     
-                    // CRITICAL: Update trigger for NEXT round calculation
-                    // This ensures next macroblock attempt at block 180, not 90 again
-                    last_macroblock_trigger = microblock_height;
+                    // CRITICAL: Update trigger to the END of current macroblock period
+                    // For consensus at block 151-180, set trigger to 180 (not 151!)
+                    last_macroblock_trigger = last_macroblock_trigger + 90;
                     consensus_started = false; // Reset for next round
                     
                     // CRITICAL: Microblocks continue immediately without ANY pause

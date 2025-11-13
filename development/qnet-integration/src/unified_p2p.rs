@@ -715,6 +715,21 @@ impl SimplifiedP2P {
         self.peer_id_to_addr.get(peer_id).map(|entry| entry.value().clone())
     }
     
+    /// HELPER: Resolve Genesis node address from node ID
+    /// Returns address for Genesis nodes (genesis_node_001 -> IP:8001)
+    /// Returns None for invalid Genesis node IDs
+    fn resolve_genesis_node_address(node_id: &str) -> Option<String> {
+        if let Some(num) = node_id.strip_prefix("genesis_node_") {
+            if let Ok(idx) = num.parse::<usize>() {
+                let genesis_ips = get_genesis_bootstrap_ips();
+                if idx > 0 && idx <= genesis_ips.len() {
+                    return Some(format!("{}:8001", genesis_ips[idx - 1]));
+                }
+            }
+        }
+        None
+    }
+    
     pub fn get_peer_by_id_lockfree(&self, peer_id: &str) -> Option<PeerInfo> {
         // DUAL INDEXING: First get address from ID
         if let Some(addr_entry) = self.peer_id_to_addr.get(peer_id) {
@@ -913,26 +928,14 @@ impl SimplifiedP2P {
         } else if peer_id_or_addr.contains(':') {
             // Already an address
             peer_id_or_addr.to_string()
-        } else {
-            // Try to construct address for Genesis nodes
-            if peer_id_or_addr.starts_with("genesis_node_") {
-                let genesis_ips = get_genesis_bootstrap_ips();
-                if let Some(num) = peer_id_or_addr.strip_prefix("genesis_node_") {
-                    if let Ok(idx) = num.parse::<usize>() {
-                        if idx > 0 && idx <= genesis_ips.len() {
-                            format!("{}:8001", genesis_ips[idx - 1])
-                        } else {
-                            return; // Invalid Genesis node index
-                        }
-                    } else {
-                        return; // Invalid format
-                    }
-                } else {
-                    return; // Invalid format
-                }
-            } else {
-                return; // Unknown peer format
+        } else if peer_id_or_addr.starts_with("genesis_node_") {
+            // Try to construct address for Genesis nodes using helper
+            match Self::resolve_genesis_node_address(peer_id_or_addr) {
+                Some(addr) => addr,
+                None => return, // Invalid Genesis node ID
             }
+        } else {
+            return; // Unknown peer format
         };
         
         // QUANTUM ROUTING: Try lock-free first if should use it
@@ -2137,21 +2140,9 @@ impl SimplifiedP2P {
                     let peer_ip = peer_addr.split(':').next().unwrap_or(&peer_addr);
                     let url = format!("http://{}:8001/api/v1/p2p/message", peer_ip);
                     
-                    // PRODUCTION: Conservative timeout for unmeasured latency
-                    // Genesis nodes start with latency_ms=10 or 30 (defaults)
-                    // But real latency can be much higher (e.g. 779ms in logs)
-                    // Use conservative 2s until load balancer measures real latency (after 30s)
-                    let timeout_ms = if peer_latency <= 30 {
-                        2000  // Conservative for any default values (10, 30)
-                    } else if peer_latency > 200 {
-                        peer_latency * 3  // High latency: 3x for reliability
-                    } else {
-                        1000  // Medium latency: 1s is safer than 500ms
-                    };
-                    
                     let client = reqwest::blocking::Client::builder()
-                        .timeout(Duration::from_millis(timeout_ms as u64))  // ADAPTIVE: Fast for local, sufficient for global
-                        .connect_timeout(Duration::from_millis(200))  // FAST: 200ms connect (from 3c78d24)
+                        .timeout(Duration::from_millis(500))  // OPTIMIZATION: 500ms timeout for fast broadcast (from 3c78d24)
+                        .connect_timeout(Duration::from_millis(200))  // OPTIMIZATION: Fast connect (from 3c78d24)
                         .tcp_nodelay(true)  // CRITICAL: No Nagle's algorithm delay
                         .tcp_keepalive(Duration::from_secs(HTTP_TCP_KEEPALIVE_SECS))
                         .pool_max_idle_per_host(HTTP_POOL_MAX_IDLE_PER_HOST)
@@ -7273,49 +7264,80 @@ impl SimplifiedP2P {
         
         println!("[P2P] 🏛️ Broadcasting consensus commit for MACROBLOCK round {} to {} participants", round_id, participants.len());
         
-        // CRITICAL FIX: Only send to consensus participants, not all peers
-        // This reduces network load from O(n²) to O(k²) where k=1000 validators
+        // SCALABILITY: Collect all peer addresses first (O(n) scan)
+        // Then send in batched async tasks for millions of nodes
+        let mut peer_addresses = Vec::with_capacity(participants.len());
+        
         for participant_id in participants {
-            // Find peer info for this participant
-            let peer_info = self.get_peer_by_id_lockfree(participant_id);
+            // Check if it's our own node first
+            if participant_id == &self.node_id {
+                continue;
+            }
             
-            // If participant is not connected, skip (they might be ourselves or offline)
-            let peer = match peer_info {
-                Some(p) => p,
-                None => {
-                    // Check if it's our own node
-                    if participant_id == &self.node_id {
-                        // Skip broadcasting to ourselves
+            // CRITICAL FIX: For Genesis nodes, construct address directly using helper
+            // Genesis consensus uses node IDs like "genesis_node_001"
+            let peer_addr = if participant_id.starts_with("genesis_node_") {
+                // Genesis node - construct address using helper
+                match Self::resolve_genesis_node_address(participant_id) {
+                    Some(addr) => addr,
+                    None => {
+                        println!("[P2P] ⚠️ Invalid Genesis node ID: {}", participant_id);
                         continue;
                     }
-                    // Participant not connected, skip
-                    continue;
                 }
-            };
-            let consensus_msg = NetworkMessage::ConsensusCommit {
-                round_id,
-                node_id: node_id.clone(),
-                commit_hash: commit_hash.clone(),
-                signature: signature.clone(),  // CONSENSUS FIX: Pass signature for Byzantine validation
-                timestamp,
+            } else {
+                // Non-Genesis: look up in peers (O(1) with DashMap)
+                let peer_info = self.get_peer_by_id_lockfree(participant_id);
+                match peer_info {
+                    Some(p) => p.addr,
+                    None => {
+                        println!("[P2P] ⚠️ Consensus participant {} not found in peers", participant_id);
+                        continue;
+                    }
+                }
             };
             
-            // CRITICAL FIX: Use reliable delivery for consensus messages
-            // Consensus MUST arrive, but we spawn async to not block
-            let peer_addr = peer.addr.clone();
-            let msg_clone = consensus_msg.clone();
-            tokio::spawn(async move {
-                for attempt in 1..=3 {
-                    if Self::send_consensus_message_with_retry(&peer_addr, &msg_clone).await {
-                        println!("[P2P] ✅ Commit delivered to {} (attempt {})", peer_addr, attempt);
-                        break;
-                    }
-                    if attempt < 3 {
-                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    }
-                }
-            });
+            peer_addresses.push(peer_addr);
         }
+        
+        // SCALABILITY: Single tokio task for all sends (not 1000 tasks!)
+        // Use join_all for parallel HTTP requests with bounded concurrency
+        let consensus_msg = NetworkMessage::ConsensusCommit {
+            round_id,
+            node_id: node_id.clone(),
+            commit_hash: commit_hash.clone(),
+            signature: signature.clone(),
+            timestamp,
+        };
+        
+        let total = peer_addresses.len();
+        tokio::spawn(async move {
+            use futures::stream::{self, StreamExt};
+            
+            // SCALABILITY: Bounded parallelism (max 100 concurrent requests)
+            // For 1000 participants: 10 batches of 100, not 1000 tasks!
+            let results = stream::iter(peer_addresses)
+                .map(|peer_addr| {
+                    let msg = consensus_msg.clone();
+                    async move {
+                        for attempt in 1..=3 {
+                            if Self::send_consensus_message_with_retry(&peer_addr, &msg).await {
+                                return (peer_addr, true);
+                            }
+                            if attempt < 3 {
+                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            }
+                        }
+                        (peer_addr, false)
+                    }
+                })
+                .buffer_unordered(100) // Max 100 concurrent
+                .collect::<Vec<_>>()
+                .await;
+            
+            let success = results.iter().filter(|(_, ok)| *ok).count();
+            println!("[P2P] 📊 Consensus commit broadcast: {}/{} delivered", success, total);
+        });
         
         Ok(())
     }
@@ -7333,49 +7355,80 @@ impl SimplifiedP2P {
         
         println!("[P2P] 🏛️ Broadcasting consensus reveal for MACROBLOCK round {} to {} participants", round_id, participants.len());
         
-        // CRITICAL FIX: Only send to consensus participants, not all peers
-        // This reduces network load from O(n²) to O(k²) where k=1000 validators
+        // SCALABILITY: Collect all peer addresses first (O(n) scan)
+        // Then send in batched async tasks for millions of nodes
+        let mut peer_addresses = Vec::with_capacity(participants.len());
+        
         for participant_id in participants {
-            // Find peer info for this participant
-            let peer_info = self.get_peer_by_id_lockfree(participant_id);
+            // Check if it's our own node first
+            if participant_id == &self.node_id {
+                continue;
+            }
             
-            // If participant is not connected, skip (they might be ourselves or offline)
-            let peer = match peer_info {
-                Some(p) => p,
-                None => {
-                    // Check if it's our own node
-                    if participant_id == &self.node_id {
-                        // Skip broadcasting to ourselves
+            // CRITICAL FIX: For Genesis nodes, construct address directly using helper
+            // Genesis consensus uses node IDs like "genesis_node_001"
+            let peer_addr = if participant_id.starts_with("genesis_node_") {
+                // Genesis node - construct address using helper
+                match Self::resolve_genesis_node_address(participant_id) {
+                    Some(addr) => addr,
+                    None => {
+                        println!("[P2P] ⚠️ Invalid Genesis node ID: {}", participant_id);
                         continue;
                     }
-                    // Participant not connected, skip
-                    continue;
                 }
-            };
-            let consensus_msg = NetworkMessage::ConsensusReveal {
-                round_id,
-                node_id: node_id.clone(),
-                reveal_data: reveal_data.clone(),
-                nonce: nonce.clone(),  // CRITICAL: Include nonce for reveal verification
-                timestamp,
+            } else {
+                // Non-Genesis: look up in peers (O(1) with DashMap)
+                let peer_info = self.get_peer_by_id_lockfree(participant_id);
+                match peer_info {
+                    Some(p) => p.addr,
+                    None => {
+                        println!("[P2P] ⚠️ Consensus participant {} not found in peers", participant_id);
+                        continue;
+                    }
+                }
             };
             
-            // CRITICAL FIX: Use reliable delivery for consensus messages
-            // Consensus MUST arrive, but we spawn async to not block
-            let peer_addr = peer.addr.clone();
-            let msg_clone = consensus_msg.clone();
-            tokio::spawn(async move {
-                for attempt in 1..=3 {
-                    if Self::send_consensus_message_with_retry(&peer_addr, &msg_clone).await {
-                        println!("[P2P] ✅ Reveal delivered to {} (attempt {})", peer_addr, attempt);
-                        break;
-                    }
-                    if attempt < 3 {
-                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    }
-                }
-            });
+            peer_addresses.push(peer_addr);
         }
+        
+        // SCALABILITY: Single tokio task for all sends (not 1000 tasks!)
+        // Use buffer_unordered for parallel HTTP requests with bounded concurrency
+        let consensus_msg = NetworkMessage::ConsensusReveal {
+            round_id,
+            node_id: node_id.clone(),
+            reveal_data: reveal_data.clone(),
+            nonce: nonce.clone(),
+            timestamp,
+        };
+        
+        let total = peer_addresses.len();
+        tokio::spawn(async move {
+            use futures::stream::{self, StreamExt};
+            
+            // SCALABILITY: Bounded parallelism (max 100 concurrent requests)
+            // For 1000 participants: 10 batches of 100, not 1000 tasks!
+            let results = stream::iter(peer_addresses)
+                .map(|peer_addr| {
+                    let msg = consensus_msg.clone();
+                    async move {
+                        for attempt in 1..=3 {
+                            if Self::send_consensus_message_with_retry(&peer_addr, &msg).await {
+                                return (peer_addr, true);
+                            }
+                            if attempt < 3 {
+                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            }
+                        }
+                        (peer_addr, false)
+                    }
+                })
+                .buffer_unordered(100) // Max 100 concurrent
+                .collect::<Vec<_>>()
+                .await;
+            
+            let success = results.iter().filter(|(_, ok)| *ok).count();
+            println!("[P2P] 📊 Consensus reveal broadcast: {}/{} delivered", success, total);
+        });
         
         Ok(())
     }
@@ -7396,12 +7449,10 @@ impl SimplifiedP2P {
         let peer_ip = peer_addr.split(':').next().unwrap_or(peer_addr);
         let url = format!("http://{}:8001/api/v1/p2p/message", peer_ip);
         
-        // PRODUCTION: Fast consensus delivery for 1 block/sec target  
-        // 2s timeout is sufficient for consensus messages with retry mechanism
-        // Faster timeout allows quicker retry attempts if first attempt fails
+        // OPTIMIZATION: 500ms timeout for fast consensus delivery (from 3c78d24)
         let client = match reqwest::Client::builder()
-            .timeout(Duration::from_secs(2))
-            .connect_timeout(Duration::from_millis(500))
+            .timeout(Duration::from_millis(500))
+            .connect_timeout(Duration::from_millis(200))
             .tcp_nodelay(true)
             .build() {
             Ok(c) => c,
@@ -7446,11 +7497,10 @@ impl SimplifiedP2P {
         let peer_ip = peer_addr.split(':').next().unwrap_or(peer_addr);
         let url = format!("http://{}:8001/api/v1/p2p/message", peer_ip);
         
-        // CRITICAL: Use blocking HTTP client for synchronous delivery
-        // This ensures block is delivered before we continue
+        // OPTIMIZATION: 500ms timeout for fast synchronous delivery (from 3c78d24)
         let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(5))  // Fast timeout for local network
-            .connect_timeout(Duration::from_secs(2))
+            .timeout(Duration::from_millis(500))
+            .connect_timeout(Duration::from_millis(200))
             .tcp_nodelay(true)  // Disable Nagle's algorithm for faster delivery
             .build()
             .map_err(|e| format!("Client build failed: {}", e))?;
@@ -7534,8 +7584,8 @@ impl SimplifiedP2P {
         tokio::spawn(async move {
             let should_log = should_log_clone;
             let client = match reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(20)) // PRODUCTION: Timeout for Genesis node P2P messages
-                .connect_timeout(std::time::Duration::from_secs(10)) // Connection timeout
+                .timeout(std::time::Duration::from_secs(2)) // OPTIMIZATION: 2s timeout for faster failure detection
+                .connect_timeout(std::time::Duration::from_millis(500)) // OPTIMIZATION: 500ms connect from 3c78d24
                 .user_agent("QNet-Node/1.0") 
                 .tcp_nodelay(true) // Faster message delivery
                 .tcp_keepalive(std::time::Duration::from_secs(30)) // P2P connection persistence
