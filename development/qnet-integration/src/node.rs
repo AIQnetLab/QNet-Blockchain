@@ -4660,7 +4660,8 @@ impl BlockchainNode {
                 // Start at block 61 (30 blocks for consensus to complete by block 90)
                 // This gives ~30 seconds for consensus phases (commit, reveal, finalize)
                 // CRITICAL: Only start if node is synchronized with network
-                if blocks_since_trigger >= 61 && blocks_since_trigger < 90 && !consensus_started {
+                // CRITICAL FIX: Include block 90 to give lagging nodes last chance to join consensus
+                if blocks_since_trigger >= 61 && blocks_since_trigger <= 90 && !consensus_started {
                     if !is_synchronized {
                         println!("[MACROBLOCK] ⚠️ NOT starting consensus - node not synchronized with network");
                         println!("[MACROBLOCK] 🔄 Waiting for sync completion before consensus participation");
