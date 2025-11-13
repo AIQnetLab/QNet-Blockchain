@@ -2631,6 +2631,12 @@ impl BlockchainNode {
         let mut consensus_rx = self.consensus_rx.take();
         let consensus_rx = Arc::new(tokio::sync::Mutex::new(consensus_rx));
         
+        // ARCHITECTURE: Network sync monitoring handled by existing mechanisms:
+        // 1. start_sync_health_monitor() - monitors sync flags for deadlock prevention
+        // 2. Background sync - automatic block synchronization
+        // 3. NODE_IS_SYNCHRONIZED flag - global sync status
+        // No additional monitoring task needed (existing mechanisms are sufficient)
+        
         tokio::spawn(async move {
             // CRITICAL FIX: Start from current global height, not 0
             let mut microblock_height = *height.read().await;
@@ -4512,62 +4518,30 @@ impl BlockchainNode {
                             // CRITICAL FIX: Do NOT reset timing - breaks precision intervals
                             // Timing controlled at end of loop only
                         } else {
-                            // No local block - background sync will handle it with timeout detection
-                            // FIX: Wait for NEXT block height when not producer
-                            println!("[SYNC] ⏳ Waiting for background sync of block #{}", next_block_height);
+                            // ARCHITECTURE: Block not yet received from producer
+                            // Start ASYNCHRONOUS failover monitoring (does NOT block main loop)
+                            // Main loop continues with 1-second timing precision
+                            // Failover runs in background and triggers emergency producer if needed
                             
-                            // ARCHITECTURE FIX: ALL nodes must track timeout for failover!
-                            // Not just the producer - otherwise network stalls if producer fails
-                            // Non-producers wait shorter time but still trigger failover if needed
-                            
-                            // PRODUCTION: Use Tower BFT adaptive timeout
+                            // ARCHITECTURE FIX: Use Tower BFT adaptive timeout for failover detection
+                            // TowerBFT returns optimized timeouts (2-5s) now that crypto is cached
+                            // Old hardcoded values (7-20s) are OBSOLETE and cause nodes to lag
                             let retry_count = 0; // First attempt
-                            let base_timeout = tower_bft.get_timeout(next_block_height, retry_count).await;
+                            let actual_timeout = tower_bft.get_timeout(next_block_height, retry_count).await;
                             
-                            // ARCHITECTURE FIX: All nodes use same timeout for proper failover
-                            // Non-producers should NOT wait 2x longer - this breaks 1 block/sec target!
-                            let microblock_timeout = base_timeout;  // Same for all nodes (7 seconds)
-                            
-                            println!("[TowerBFT] ⏱️ Timeout for block #{}: {:?} (producer: {})", 
-                                    next_block_height, microblock_timeout, current_producer == node_id);
-                            let timeout_start = std::time::Instant::now();
-                            
-                            // Wait with timeout for producer block (same pattern as macroblock timeout in line 1201)
-                            let mut timeout_triggered = false;
-                            // FIX: Use correct height for timeout - waiting for next block
+                            // CRITICAL: Start ASYNC failover monitoring (does NOT block main loop!)
+                            // Failover runs in background, main loop continues immediately
                             let expected_height_timeout = next_block_height;
                             let current_producer_timeout = current_producer.clone();
                             let storage_timeout = storage.clone();
                             let p2p_timeout = p2p.clone();
-                            let height_timeout = height.clone();
                             let node_id_timeout = node_id.clone();
                             let node_type_timeout = node_type;
-                            let quantum_poh_timeout = quantum_poh.clone();
                             
-                            // CRITICAL FIX: Use LOCAL height for consistent failover
-                            // All nodes at the same height will trigger failover at the same time
-                            let network_height = *height_timeout.read().await;
-                            
-                            // ROTATION DEADLOCK DETECTION: Special handling at rotation boundaries
-                            // Rotation happens at blocks 31, 61, 91... (first block of new round)
-                            let is_rotation_boundary = expected_height_timeout > 1 && ((expected_height_timeout - 1) % 30) == 0;
-                            
-                            // CRITICAL FIX: Use ACTUAL timeout values that match logging
-                            // During consensus period (blocks 61-90), allow more time
+                            // Calculate block properties for logging
                             let blocks_since_last_macro = expected_height_timeout % 90;
                             let is_consensus_period = blocks_since_last_macro >= 61 && blocks_since_last_macro <= 90;
-                            
-                            let actual_timeout = if expected_height_timeout == 1 { 
-                                Duration::from_secs(20)  // First block needs more time
-                            } else if expected_height_timeout <= 10 {
-                                Duration::from_secs(10)  // Early blocks: 10 seconds
-                            } else if is_consensus_period {
-                                Duration::from_secs(15)  // During consensus: 15 seconds
-                            } else if is_rotation_boundary {
-                                Duration::from_secs(10)  // Rotation boundaries: 10 seconds
-                            } else {
-                                Duration::from_secs(7)   // Normal operation: 7 seconds
-                            };
+                            let is_rotation_boundary = expected_height_timeout > 1 && ((expected_height_timeout - 1) % 30) == 0;
                             
                             // CRITICAL FIX: ALWAYS start timeout detection to prevent forks!
                             // Even if node is behind, it needs to detect failed producers
@@ -4671,12 +4645,22 @@ impl BlockchainNode {
                 // CRITICAL FIX: Start EXACTLY at block 61 for deterministic consensus
                 // All nodes must start at the same block to ensure phase synchronization
                 let blocks_since_trigger = microblock_height.saturating_sub(last_macroblock_trigger);
+                
+                // ARCHITECTURE FIX: Check node synchronization before starting consensus
+                // Use existing NODE_IS_SYNCHRONIZED flag (set by background sync monitor)
+                let is_synchronized = NODE_IS_SYNCHRONIZED.load(Ordering::Relaxed);
+                
                 // Start at block 61 (30 blocks for consensus to complete by block 90)
                 // This gives ~30 seconds for consensus phases (commit, reveal, finalize)
+                // CRITICAL: Only start if node is synchronized with network
                 if blocks_since_trigger >= 61 && blocks_since_trigger < 90 && !consensus_started {
-                    println!("[MACROBLOCK] 🚀 DETERMINISTIC CONSENSUS START at block {} (61 after trigger)", microblock_height);
-                    println!("[MACROBLOCK] 📍 Node: {} | Type: {:?} | ALL NODES PARTICIPATE", node_id, node_type);
-                    consensus_started = true;
+                    if !is_synchronized {
+                        println!("[MACROBLOCK] ⚠️ NOT starting consensus - node not synchronized with network");
+                        println!("[MACROBLOCK] 🔄 Waiting for sync completion before consensus participation");
+                    } else {
+                        println!("[MACROBLOCK] 🚀 DETERMINISTIC CONSENSUS START at block {} (61 after trigger)", microblock_height);
+                        println!("[MACROBLOCK] 📍 Node: {} | Type: {:?} | Synchronized: ✅", node_id, node_type);
+                        consensus_started = true;
                     
                     // Start consensus in BACKGROUND while microblocks continue
                     let consensus_clone = consensus.clone();
@@ -4727,6 +4711,7 @@ impl BlockchainNode {
                             }
                         }
                     });
+                    } // Close else block for lag check
                 }
                 
                 // PRODUCTION: NON-BLOCKING MACROBLOCK - Swiss watch precision without stops!
