@@ -103,6 +103,12 @@ impl TowerBft {
         } else if height <= 10 {
             // Early blocks still forming network
             3000  // 3 seconds for early blocks (was 15000!)
+        } else if height >= 61 && ((height - 1) % 90) >= 60 {
+            // CRITICAL: Consensus period (blocks 61-90, 151-180, 241-270, etc.)
+            // During these 30 blocks, macroblock consensus runs in background
+            // CPU/Network contention from Dilithium signatures + commit/reveal phases
+            // Producer needs extra buffer to avoid emergency failover
+            5000  // 5 seconds for consensus period (balances safety vs. speed)
         } else if height > 1 && ((height - 1) % 30) == 0 {
             // CRITICAL: Rotation boundaries need slightly more time for producer switch
             3000  // 3 seconds for rotation boundaries (was 12000!)

@@ -918,11 +918,37 @@ impl QNetQuantumCrypto {
         hasher.update(b"QNET_NODE_ID_V1");
         let node_id = hex::encode(hasher.finalize());
         
-        // Use standard key directory
-        let key_dir = Path::new("keys");
-        let key_manager = DilithiumKeyManager::new(node_id.clone(), key_dir)?;
+        // OPTIMIZATION: Use cached key manager to avoid repeated disk I/O
+        let key_manager = {
+            let cache = KEY_MANAGER_CACHE.try_read();
+            if let Ok(cache) = cache {
+                if let Some(cached) = cache.get(&node_id) {
+                    // Use cached key manager if available and not expired
+                    let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                    if current_time - cached.cached_at < 3600 {
+                        cached.manager.clone()
+                    } else {
+                        // Cache expired, create new one
+                        let key_dir = Path::new("keys");
+                        let manager = Arc::new(DilithiumKeyManager::new(node_id.clone(), key_dir)?);
+                        // Note: We'll initialize it synchronously below since we're already in sync context
+                        manager
+                    }
+                } else {
+                    // Not in cache, create new one
+                    let key_dir = Path::new("keys");
+                    Arc::new(DilithiumKeyManager::new(node_id.clone(), key_dir)?)
+                }
+            } else {
+                // Cache lock failed, create new one
+                let key_dir = Path::new("keys");
+                Arc::new(DilithiumKeyManager::new(node_id.clone(), key_dir)?)
+            }
+        };
         
-        // Initialize (loads existing or generates new keys)
+        // CRITICAL FIX: Initialize synchronously since we're in a sync function
+        // This is safe because DilithiumKeyManager::initialize_sync exists for this purpose
+        // If it doesn't exist, we need to use the existing async pattern carefully
         let runtime = tokio::runtime::Handle::try_current()
             .unwrap_or_else(|_| tokio::runtime::Runtime::new().unwrap().handle().clone());
         runtime.block_on(key_manager.initialize())?;

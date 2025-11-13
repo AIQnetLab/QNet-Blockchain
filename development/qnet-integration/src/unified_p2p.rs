@@ -330,8 +330,8 @@ pub struct SimplifiedP2P {
     /// Consensus message channel
     consensus_tx: Option<tokio::sync::mpsc::UnboundedSender<ConsensusMessage>>,
     
-    /// Block processing channel
-    block_tx: Option<tokio::sync::mpsc::UnboundedSender<ReceivedBlock>>,
+    /// Block processing channel - CRITICAL: Must be Arc for sharing between clones!
+    block_tx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<ReceivedBlock>>>>,
     
     /// Sync request channel for requesting blocks from storage
     sync_request_tx: Option<tokio::sync::mpsc::UnboundedSender<(u64, u64, String)>>,
@@ -481,7 +481,7 @@ impl SimplifiedP2P {
                 Arc::new(Mutex::new(reputation_sys))
             },
             consensus_tx: None,
-            block_tx: None,
+            block_tx: Arc::new(Mutex::new(None)),
             sync_request_tx: None,
             turbine_assemblies: Arc::new(DashMap::new()),
         }
@@ -495,8 +495,8 @@ impl SimplifiedP2P {
     
     /// PRODUCTION: Set block processing channel for storage integration
     pub fn set_block_channel(&mut self, block_tx: tokio::sync::mpsc::UnboundedSender<ReceivedBlock>) {
-        self.block_tx = Some(block_tx);
-        // Block processing channel established
+        *self.block_tx.lock().unwrap() = Some(block_tx);
+        println!("[P2P] ✅ Block processing channel established");
     }
     
     /// Set sync request channel for handling block requests
@@ -523,7 +523,7 @@ impl SimplifiedP2P {
             Some(_) => {},
             None => {},
         }
-        match &self.block_tx {
+        match &*self.block_tx.lock().unwrap() {
             Some(_) => println!("[DIAGNOSTIC] ✅ Block channel: AVAILABLE"),
             None => println!("[DIAGNOSTIC] ❌ Block channel: MISSING - blocks will be discarded!"),
         }
@@ -713,6 +713,21 @@ impl SimplifiedP2P {
     pub fn get_peer_address_by_id(&self, peer_id: &str) -> Option<String> {
         // Use dual index for O(1) lookup
         self.peer_id_to_addr.get(peer_id).map(|entry| entry.value().clone())
+    }
+    
+    /// HELPER: Resolve Genesis node address from node ID
+    /// Returns address for Genesis nodes (genesis_node_001 -> IP:8001)
+    /// Returns None for invalid Genesis node IDs
+    fn resolve_genesis_node_address(node_id: &str) -> Option<String> {
+        if let Some(num) = node_id.strip_prefix("genesis_node_") {
+            if let Ok(idx) = num.parse::<usize>() {
+                let genesis_ips = get_genesis_bootstrap_ips();
+                if idx > 0 && idx <= genesis_ips.len() {
+                    return Some(format!("{}:8001", genesis_ips[idx - 1]));
+                }
+            }
+        }
+        None
     }
     
     pub fn get_peer_by_id_lockfree(&self, peer_id: &str) -> Option<PeerInfo> {
@@ -913,26 +928,14 @@ impl SimplifiedP2P {
         } else if peer_id_or_addr.contains(':') {
             // Already an address
             peer_id_or_addr.to_string()
-        } else {
-            // Try to construct address for Genesis nodes
-            if peer_id_or_addr.starts_with("genesis_node_") {
-                let genesis_ips = get_genesis_bootstrap_ips();
-                if let Some(num) = peer_id_or_addr.strip_prefix("genesis_node_") {
-                    if let Ok(idx) = num.parse::<usize>() {
-                        if idx > 0 && idx <= genesis_ips.len() {
-                            format!("{}:8001", genesis_ips[idx - 1])
-                        } else {
-                            return; // Invalid Genesis node index
-                        }
-                    } else {
-                        return; // Invalid format
-                    }
-                } else {
-                    return; // Invalid format
-                }
-            } else {
-                return; // Unknown peer format
+        } else if peer_id_or_addr.starts_with("genesis_node_") {
+            // Try to construct address for Genesis nodes using helper
+            match Self::resolve_genesis_node_address(peer_id_or_addr) {
+                Some(addr) => addr,
+                None => return, // Invalid Genesis node ID
             }
+        } else {
+            return; // Unknown peer format
         };
         
         // QUANTUM ROUTING: Try lock-free first if should use it
@@ -1767,16 +1770,34 @@ impl SimplifiedP2P {
                     let endpoint = format!("http://{}:8001/api/v1/height", peer_ip);
                     
                     // Simple HTTP query using reqwest
-                    if let Ok(client) = reqwest::Client::builder()
+                    match reqwest::Client::builder()
                         .timeout(std::time::Duration::from_secs(2))
                         .build() 
                     {
-                        if let Ok(response) = client.get(&endpoint).send().await {
-                            if let Ok(text) = response.text().await {
-                                if let Ok(height) = text.trim().parse::<u64>() {
-                                    peer_heights.push(height);
+                        Ok(client) => {
+                            match client.get(&endpoint).send().await {
+                                Ok(response) => {
+                                    // CRITICAL FIX: API returns JSON, not plain text
+                                    match response.json::<serde_json::Value>().await {
+                                        Ok(json) => {
+                                            if let Some(height) = json.get("height").and_then(|h| h.as_u64()) {
+                                                peer_heights.push(height);
+                                            } else {
+                                                println!("[SYNC] ⚠️ Background: {} - malformed JSON response", peer_ip);
+                                            }
+                                        },
+                                        Err(e) => {
+                                            println!("[SYNC] ⚠️ Background: {} - JSON parse error: {}", peer_ip, e);
+                                        }
+                                    }
+                                },
+                                Err(e) => {
+                                    println!("[SYNC] ⚠️ Background: {} - HTTP error: {}", peer_ip, e);
                                 }
                             }
+                        },
+                        Err(e) => {
+                            println!("[SYNC] ⚠️ Background: client build error: {}", e);
                         }
                     }
                 }
@@ -1794,7 +1815,7 @@ impl SimplifiedP2P {
                     
                     // Update both cache systems
                     if consensus_height > 0 {
-                        println!("[SYNC] 📊 Background sync: network height updated to {}", consensus_height);
+                        println!("[SYNC] 📊 Background: network height {} (from {} peers)", consensus_height, peer_heights.len());
                         
                         // Update new cache actor
                         let epoch = CACHE_ACTOR.increment_epoch();
@@ -1809,6 +1830,8 @@ impl SimplifiedP2P {
                         let mut cache = CACHED_BLOCKCHAIN_HEIGHT.lock().unwrap();
                         *cache = (consensus_height, Instant::now());
                     }
+                } else {
+                    println!("[SYNC] ⚠️ Background: No peer responses - cache not updated");
                 }
                 
                 tokio::time::sleep(std::time::Duration::from_secs(sync_interval)).await;
@@ -2090,6 +2113,7 @@ impl SimplifiedP2P {
             
             if should_send {
                 let peer_addr = peer.addr.clone();
+                let peer_latency = peer.latency_ms; // Copy latency before move
                 let block_data_clone = Arc::clone(&block_data);
                 
                 // Spawn thread for parallel sending
@@ -2117,8 +2141,8 @@ impl SimplifiedP2P {
                     let url = format!("http://{}:8001/api/v1/p2p/message", peer_ip);
                     
                     let client = reqwest::blocking::Client::builder()
-                        .timeout(Duration::from_millis(500))  // OPTIMIZATION: 500ms timeout for fast broadcast
-                        .connect_timeout(Duration::from_millis(200))  // OPTIMIZATION: Fast connect
+                        .timeout(Duration::from_millis(500))  // OPTIMIZATION: 500ms timeout for fast broadcast (from 3c78d24)
+                        .connect_timeout(Duration::from_millis(200))  // OPTIMIZATION: Fast connect (from 3c78d24)
                         .tcp_nodelay(true)  // CRITICAL: No Nagle's algorithm delay
                         .tcp_keepalive(Duration::from_secs(HTTP_TCP_KEEPALIVE_SECS))
                         .pool_max_idle_per_host(HTTP_POOL_MAX_IDLE_PER_HOST)
@@ -2138,34 +2162,41 @@ impl SimplifiedP2P {
             }
         }
         
-        // Wait for all sends to complete (but don't fail if some fail)
-        // WORKING: From 669ca77 - simple and reliable
-        let mut success_count = 0;
+        // CRITICAL FIX: Don't wait for slow peers - spawn async monitoring
+        // This prevents blocking the producer when sending to slow/offline peers
         let total = handles.len();
         
-        for (peer_addr, handle) in handles {
-            match handle.join() {
-                Ok(Ok(())) => success_count += 1,
-                Ok(Err(e)) => {
-                    if height <= 5 || height % 10 == 0 {
-                        println!("[P2P] ⚠️ Failed to send block #{} to {}: {}", height, peer_addr, e);
+        // Spawn background task to monitor delivery (non-blocking)
+        let height_copy = height;
+        tokio::spawn(async move {
+            let mut success_count = 0;
+            let start_time = std::time::Instant::now();
+            
+            for (peer_addr, handle) in handles {
+                match handle.join() {
+                    Ok(Ok(())) => success_count += 1,
+                    Ok(Err(e)) => {
+                        if height_copy <= 5 || height_copy % 10 == 0 {
+                            println!("[P2P] ⚠️ Failed to send block #{} to {}: {}", height_copy, peer_addr, e);
+                        }
                     }
+                    Err(_) => println!("[P2P] ⚠️ Thread panicked for {}", peer_addr),
                 }
-                Err(_) => println!("[P2P] ⚠️ Thread panicked for {}", peer_addr),
             }
-        }
+            
+            // Log results asynchronously
+            let elapsed = start_time.elapsed();
+            if success_count > 0 {
+                if height_copy <= 5 || height_copy % 10 == 0 {
+                    println!("[P2P] ✅ Block #{} sent to {}/{} peers in {:?}", height_copy, success_count, total, elapsed);
+                }
+            } else if total > 0 {
+                println!("[P2P] ⚠️ Failed to send block #{} to any peer", height_copy);
+            }
+        });
         
-        // Success if at least one peer received the block
-        if success_count > 0 {
-            if height <= 5 || height % 10 == 0 {
-                println!("[P2P] ✅ Block #{} sent to {}/{} peers (fire-and-forget)", height, success_count, total);
-            }
-            Ok(())
-        } else if total > 0 {
-            Err(format!("Failed to send block #{} to any peer", height))
-        } else {
-            Ok(()) // No peers to send to
-        }
+        // Return immediately without blocking
+        Ok(())
     }
     
     /// Broadcast Genesis block with extended timeout (3 seconds)
@@ -2573,7 +2604,7 @@ impl SimplifiedP2P {
             }
             
             // Send reconstructed block through normal block channel
-            if let Some(ref block_tx) = self.block_tx {
+            if let Some(ref block_tx) = &*self.block_tx.lock().unwrap() {
                 let received_block = ReceivedBlock {
                     height,
                     data: block_data,
@@ -2677,7 +2708,7 @@ impl SimplifiedP2P {
             println!("[TURBINE] 🔧 Block #{} reconstructed with Reed-Solomon in {:?}", height, elapsed);
             
             // Send reconstructed block through normal block channel
-            if let Some(ref block_tx) = self.block_tx {
+            if let Some(ref block_tx) = &*self.block_tx.lock().unwrap() {
                 let received_block = ReceivedBlock {
                     height,
                     data: block_data,
@@ -2729,8 +2760,9 @@ impl SimplifiedP2P {
         // Check cache actor first
         if let Some(cached_data) = CACHE_ACTOR.height_cache.read().unwrap().as_ref() {
             let age = Instant::now().duration_since(cached_data.timestamp);
-            // Accept cache up to 5 seconds old for API responses
-            if age.as_secs() < 5 {
+            // CRITICAL: Cache TTL reduced to 1 second for 1 block/sec target
+            // 5 seconds was too long and caused producer selection mismatches
+            if age.as_secs() < 1 {
                 return Some(cached_data.data);
             }
         }
@@ -2738,7 +2770,8 @@ impl SimplifiedP2P {
         // Fallback to old cache
         let cache = CACHED_BLOCKCHAIN_HEIGHT.lock().unwrap();
         let age = Instant::now().duration_since(cache.1);
-        if age.as_secs() < 5 && cache.0 > 0 {
+        // CRITICAL: Same 1 second TTL for consistency
+        if age.as_secs() < 1 && cache.0 > 0 {
             return Some(cache.0);
         }
         
@@ -3149,9 +3182,16 @@ impl SimplifiedP2P {
     /// Verify CRYSTALS-Dilithium signature (production implementation)
     async fn verify_dilithium_signature(challenge: &[u8], signature: &str, pubkey: &str) -> Result<bool, String> {
         // PRODUCTION: Real CRYSTALS-Dilithium verification using QNetQuantumCrypto
-        // CRITICAL FIX: Use async directly instead of creating new runtime
+        // OPTIMIZATION: Use GLOBAL crypto instance to avoid repeated initialization
+        use crate::node::GLOBAL_QUANTUM_CRYPTO;
+        
+        let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
+        if crypto_guard.is_none() {
             let mut crypto = crate::quantum_crypto::QNetQuantumCrypto::new();
             let _ = crypto.initialize().await;
+            *crypto_guard = Some(crypto);
+        }
+        let crypto = crypto_guard.as_ref().unwrap();
             
             // Use centralized quantum crypto verification
             use crate::quantum_crypto::DilithiumSignature;
@@ -5260,7 +5300,8 @@ impl SimplifiedP2P {
         // Check for missing blocks that could cause consensus issues
         let mut missing_blocks = Vec::new();
         for height in (current_height + 1)..=target_height {
-            if storage.load_microblock(height).is_err() {
+            // CRITICAL FIX: Check for BOTH errors AND missing blocks (Ok(None))
+            if storage.load_microblock(height).unwrap_or(None).is_none() {
                 missing_blocks.push(height);
             }
         }
@@ -5308,12 +5349,14 @@ impl SimplifiedP2P {
         if peers.is_empty() { return; }
         
         let mut consecutive_failures = 0;
-        const MAX_CONSECUTIVE_FAILURES: u32 = 3;
+        const MAX_CONSECUTIVE_FAILURES: u32 = 20;  // CRITICAL FIX: Increased from 3 to 20 to handle async broadcast delays
         
-        for height in start_height..=end_height {
-            // Check if block already exists
-            if storage.load_microblock(height).is_ok() {
+        let mut height = start_height;
+        while height <= end_height {
+            // CRITICAL FIX: Check if block ACTUALLY exists (not just Ok())
+            if storage.load_microblock(height).unwrap_or(None).is_some() {
                 consecutive_failures = 0;
+                height += 1;
                 continue;
             }
             
@@ -5342,11 +5385,17 @@ impl SimplifiedP2P {
                                         if storage.save_microblock(height, &bytes).is_ok() {
                                             fetched = true;
                                             consecutive_failures = 0;
+                                            
+                                            // CRITICAL FIX: Update LOCAL_BLOCKCHAIN_HEIGHT when syncing
+                                            LOCAL_BLOCKCHAIN_HEIGHT.store(height, Ordering::Relaxed);
                                             break;
                                         }
                                     }
                                 }
                             }
+                        } else if response.status() == reqwest::StatusCode::NOT_FOUND {
+                            // Block not found on this peer - try next peer (don't break, maybe it's propagating)
+                            continue;
                         }
                     },
                     Err(_) => continue,
@@ -5356,137 +5405,22 @@ impl SimplifiedP2P {
             if !fetched {
                 consecutive_failures += 1;
                 if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
-                    println!("[SYNC] ❌ Range {}-{} aborted after {} failures at block {}", 
+                    println!("[SYNC] ⚠️ Range {}-{} hit {} consecutive failures at block {} - waiting 3s for block propagation", 
                              start_height, end_height, MAX_CONSECUTIVE_FAILURES, height);
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
-        }
-    }
-    
-    /// Download missing microblocks from peers (legacy sequential version)
-    pub async fn download_missing_microblocks(&self, storage: &crate::storage::Storage, current_height: u64, target_height: u64) {
-        if target_height <= current_height { return; }
-        let peers = self.connected_peers.read().unwrap().clone();
-        if peers.is_empty() { return; }
-        
-        // SYNC FIX: Batch download status tracking
-        let mut consecutive_failures = 0;
-        const MAX_CONSECUTIVE_FAILURES: u32 = 3;
-        
-        let mut height = current_height + 1;
-        while height <= target_height {
-            // SYNC FIX: Check if block already exists locally before downloading
-            if storage.load_microblock(height).is_ok() {
-                println!("[SYNC] ✅ Block #{} already exists locally, skipping download", height);
-                height += 1;
-                consecutive_failures = 0; // Reset failure counter on success
-                continue;
-            }
-            
-            // RACE CONDITION FIX: Check if another thread is already downloading this block
-            {
-                let mut downloading = DOWNLOADING_BLOCKS.write().unwrap();
-                if downloading.contains(&height) {
-                    println!("[SYNC] ⏳ Block #{} already being downloaded by another thread, skipping", height);
-                    height += 1;
-                    continue;
-                }
-                // Mark this block as being downloaded
-                downloading.insert(height);
-            }
-            
-            let mut fetched = false;
-            for (_addr, peer) in &peers {
-                // Try primary API port first
-                let ip = peer.addr.split(':').next().unwrap_or("");
-                let urls = vec![
-                    format!("http://{}:8001/api/v1/microblock/{}", ip, height),
-                ];
-                // PRODUCTION: Use proper HTTP client instead of curl
-                for url in urls {
-                    // Create HTTP client with production-ready configuration
-                    // SYNC FIX: Reduced timeouts for faster sync
-                    let client = match reqwest::Client::builder()
-                        .timeout(std::time::Duration::from_secs(5)) // SYNC FIX: Reduced from 25s to 5s for faster failure detection
-                        .connect_timeout(std::time::Duration::from_secs(2)) // SYNC FIX: Reduced from 12s to 2s
-                        .user_agent("QNet-Node/1.0")
-                        .tcp_nodelay(true) // Faster responses
-                        .tcp_keepalive(std::time::Duration::from_secs(60)) // Keep connections alive
-                        .build() {
-                        Ok(client) => client,
-                        Err(_) => continue,
-                    };
                     
-                    // Send request
-                    match client.get(&url).send().await {
-                        Ok(response) => {
-                            if response.status().is_success() {
-                                match response.json::<serde_json::Value>().await {
-                                    Ok(val) => {
-                                if let Some(b64) = val.get("data").and_then(|v| v.as_str()) {
-                                    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) {
-                                        if storage.save_microblock(height, &bytes).is_ok() {
-                                            println!("[SYNC] 📦 Downloaded microblock #{} from {}", height, ip);
-                                            fetched = true;
-                                            consecutive_failures = 0; // Reset failure counter
-                                            
-                                            // CRITICAL FIX: Update P2P local height when syncing blocks
-                                            LOCAL_BLOCKCHAIN_HEIGHT.store(height, Ordering::Relaxed);
-                                            
-                                            // RACE CONDITION FIX: Remove from downloading set after successful save
-                                            DOWNLOADING_BLOCKS.write().unwrap().remove(&height);
-                                            break;
-                                        }
-                                    }
-                                }
-                                    },
-                                    Err(_e) => {
-                                        // SYNC FIX: Reduced logging for failed attempts (not all are errors)
-                                        // Continue to next peer silently
-                                    }
-                                }
-                            } else if response.status() == reqwest::StatusCode::NOT_FOUND {
-                                // SYNC FIX: Peer doesn't have this block yet, try next peer
-                                continue;
-                            }
-                        },
-                        Err(_e) => {
-                            // SYNC FIX: Connection failed, try next peer silently
-                            continue;
-                        }
-                    }
+                    // CRITICAL FIX: Don't abort! Wait for blocks to propagate (async broadcast delay)
+                    // Then retry the same block - this handles producer async broadcast delays
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    consecutive_failures = 0;  // Reset counter to retry
+                    // DON'T increment height - retry the same block!
+                } else {
+                    // CRITICAL FIX: Wait longer for blocks to propagate (async broadcast can take 1-3 seconds)
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 }
-                if fetched { break; }
+            } else {
+                // Successfully fetched block - move to next height
+                height += 1;
             }
-            
-            if !fetched {
-                consecutive_failures += 1;
-                println!("[SYNC] ⚠️ Could not fetch microblock #{} from any peer (attempt {}/{})",
-                         height, consecutive_failures, MAX_CONSECUTIVE_FAILURES);
-                
-                // RACE CONDITION FIX: Remove from downloading set if failed to download
-                DOWNLOADING_BLOCKS.write().unwrap().remove(&height);
-                
-                // SYNC FIX: Give up after multiple consecutive failures to prevent infinite loops
-                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
-                    println!("[SYNC] ❌ Sync aborted after {} consecutive failures", MAX_CONSECUTIVE_FAILURES);
-                break;
-            }
-                
-                // SYNC FIX: Small delay before retry to avoid hammering the network
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            }
-            
-            height += 1;
-        }
-        
-        // RACE CONDITION FIX: Clean up any remaining blocks from tracking set
-        // This handles edge cases where sync was interrupted
-        {
-            let mut downloading = DOWNLOADING_BLOCKS.write().unwrap();
-            downloading.clear();
         }
     }
 }
@@ -5722,13 +5656,14 @@ impl SimplifiedP2P {
                 }
                 
                 // PRODUCTION: Silent diagnostic check for scalability  
-                match &self.block_tx {
+                let block_tx_guard = self.block_tx.lock().unwrap();
+                match &*block_tx_guard {
                     Some(_) => {}, // Silent success
                     None => println!("[DIAGNOSTIC] ❌ Block channel is MISSING - this explains discarded blocks"),
                 }
                 
                 // PRODUCTION: Send block to main node for processing via storage
-                if let Some(ref block_tx) = self.block_tx {
+                if let Some(ref block_tx) = &*block_tx_guard {
                     let received_block = ReceivedBlock {
                         height,
                         data,
@@ -5752,6 +5687,7 @@ impl SimplifiedP2P {
                     println!("[P2P] ⚠️ Block processing channel not available - block #{} discarded", height);
                     println!("[DIAGNOSTIC] 💥 CRITICAL: Block channel was LOST after setup!");
                 }
+                drop(block_tx_guard); // Explicitly drop the lock
             }
             
             NetworkMessage::Transaction { data } => {
@@ -6019,7 +5955,7 @@ impl SimplifiedP2P {
         self.update_peer_last_seen_with_height(&sender_id, Some(to_height));
         
         // CRITICAL: Send blocks to block receiver for processing
-        if let Some(ref block_tx) = self.block_tx {
+        if let Some(ref block_tx) = &*self.block_tx.lock().unwrap() {
             for (height, data) in blocks {
                 // Create ReceivedBlock for processing
                 let received_block = ReceivedBlock {
@@ -6205,6 +6141,7 @@ impl SimplifiedP2P {
         
         Ok(())
     }
+    
 }
 
 /// Helper function to convert region enum to string
@@ -7165,8 +7102,15 @@ impl SimplifiedP2P {
             Ok(handle) => {
                 let node_id = self.node_id.clone();
                 let result = handle.block_on(async {
-                    let mut crypto = QNetQuantumCrypto::new();
-                    let _ = crypto.initialize().await;
+                    use crate::node::GLOBAL_QUANTUM_CRYPTO;
+                    
+                    let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
+                    if crypto_guard.is_none() {
+                        let mut crypto = QNetQuantumCrypto::new();
+                        let _ = crypto.initialize().await;
+                        *crypto_guard = Some(crypto);
+                    }
+                    let crypto = crypto_guard.as_ref().unwrap();
                     crypto.create_consensus_signature(&node_id, entry_hash).await
                 });
                 
@@ -7309,8 +7253,8 @@ impl SimplifiedP2P {
         }
     }
 
-    /// PRODUCTION: Broadcast consensus commit to all peers
-    pub fn broadcast_consensus_commit(&self, round_id: u64, node_id: String, commit_hash: String, signature: String, timestamp: u64) -> Result<(), String> {
+    /// PRODUCTION: Broadcast consensus commit to consensus participants only
+    pub fn broadcast_consensus_commit(&self, round_id: u64, node_id: String, commit_hash: String, signature: String, timestamp: u64, participants: &[String]) -> Result<(), String> {
         // CRITICAL: Only broadcast consensus for MACROBLOCK rounds (every 90 blocks)
         // Microblocks use simple producer signatures, NOT Byzantine consensus
         if round_id == 0 || (round_id % 90 != 0) {
@@ -7318,35 +7262,88 @@ impl SimplifiedP2P {
             return Ok(());
         }
         
-        println!("[P2P] 🏛️ Broadcasting consensus commit for MACROBLOCK round {}", round_id);
+        println!("[P2P] 🏛️ Broadcasting consensus commit for MACROBLOCK round {} to {} participants", round_id, participants.len());
         
-        let peers = match self.connected_peers.read() {
-            Ok(peers) => peers.clone(),
-            Err(poisoned) => {
-                println!("[P2P] ⚠️ Mutex poisoned during commit broadcast, recovering...");
-                poisoned.into_inner().clone()
+        // SCALABILITY: Collect all peer addresses first (O(n) scan)
+        // Then send in batched async tasks for millions of nodes
+        let mut peer_addresses = Vec::with_capacity(participants.len());
+        
+        for participant_id in participants {
+            // Check if it's our own node first
+            if participant_id == &self.node_id {
+                continue;
             }
-        };
-        
-        for (_addr, peer) in peers {
-            let consensus_msg = NetworkMessage::ConsensusCommit {
-                round_id,
-                node_id: node_id.clone(),
-                commit_hash: commit_hash.clone(),
-                signature: signature.clone(),  // CONSENSUS FIX: Pass signature for Byzantine validation
-                timestamp,
+            
+            // CRITICAL FIX: For Genesis nodes, construct address directly using helper
+            // Genesis consensus uses node IDs like "genesis_node_001"
+            let peer_addr = if participant_id.starts_with("genesis_node_") {
+                // Genesis node - construct address using helper
+                match Self::resolve_genesis_node_address(participant_id) {
+                    Some(addr) => addr,
+                    None => {
+                        println!("[P2P] ⚠️ Invalid Genesis node ID: {}", participant_id);
+                        continue;
+                    }
+                }
+            } else {
+                // Non-Genesis: look up in peers (O(1) with DashMap)
+                let peer_info = self.get_peer_by_id_lockfree(participant_id);
+                match peer_info {
+                    Some(p) => p.addr,
+                    None => {
+                        println!("[P2P] ⚠️ Consensus participant {} not found in peers", participant_id);
+                        continue;
+                    }
+                }
             };
             
-            // PRODUCTION: Real HTTP POST to peer's P2P message endpoint
-            self.send_network_message(&peer.addr, consensus_msg);
-            println!("[P2P] 📤 Sent commit to peer: {}", peer.addr);
+            peer_addresses.push(peer_addr);
         }
+        
+        // SCALABILITY: Single tokio task for all sends (not 1000 tasks!)
+        // Use join_all for parallel HTTP requests with bounded concurrency
+        let consensus_msg = NetworkMessage::ConsensusCommit {
+            round_id,
+            node_id: node_id.clone(),
+            commit_hash: commit_hash.clone(),
+            signature: signature.clone(),
+            timestamp,
+        };
+        
+        let total = peer_addresses.len();
+        tokio::spawn(async move {
+            use futures::stream::{self, StreamExt};
+            
+            // SCALABILITY: Bounded parallelism (max 100 concurrent requests)
+            // For 1000 participants: 10 batches of 100, not 1000 tasks!
+            let results = stream::iter(peer_addresses)
+                .map(|peer_addr| {
+                    let msg = consensus_msg.clone();
+                    async move {
+                        for attempt in 1..=3 {
+                            if Self::send_consensus_message_with_retry(&peer_addr, &msg).await {
+                                return (peer_addr, true);
+                            }
+                            if attempt < 3 {
+                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            }
+                        }
+                        (peer_addr, false)
+                    }
+                })
+                .buffer_unordered(100) // Max 100 concurrent
+                .collect::<Vec<_>>()
+                .await;
+            
+            let success = results.iter().filter(|(_, ok)| *ok).count();
+            println!("[P2P] 📊 Consensus commit broadcast: {}/{} delivered", success, total);
+        });
         
         Ok(())
     }
 
-    /// PRODUCTION: Broadcast consensus reveal to all peers  
-    pub fn broadcast_consensus_reveal(&self, round_id: u64, node_id: String, reveal_data: String, nonce: String, timestamp: u64) -> Result<(), String> {
+    /// PRODUCTION: Broadcast consensus reveal to consensus participants only  
+    pub fn broadcast_consensus_reveal(&self, round_id: u64, node_id: String, reveal_data: String, nonce: String, timestamp: u64, participants: &[String]) -> Result<(), String> {
         // CRITICAL: Only broadcast consensus for MACROBLOCK rounds (every 90 blocks)
         // Microblocks use simple producer signatures, NOT Byzantine consensus
         // BUGFIX: round_id IS the block height (e.g., 90, 180, 270), which are ALL divisible by 90!
@@ -7356,33 +7353,129 @@ impl SimplifiedP2P {
             return Ok(());
         }
         
-        println!("[P2P] 🏛️ Broadcasting consensus reveal for MACROBLOCK round {}", round_id);
+        println!("[P2P] 🏛️ Broadcasting consensus reveal for MACROBLOCK round {} to {} participants", round_id, participants.len());
         
-        let peers = match self.connected_peers.read() {
-            Ok(peers) => peers.clone(),
-            Err(poisoned) => {
-                println!("[P2P] ⚠️ Mutex poisoned during reveal broadcast, recovering...");
-                poisoned.into_inner().clone()
+        // SCALABILITY: Collect all peer addresses first (O(n) scan)
+        // Then send in batched async tasks for millions of nodes
+        let mut peer_addresses = Vec::with_capacity(participants.len());
+        
+        for participant_id in participants {
+            // Check if it's our own node first
+            if participant_id == &self.node_id {
+                continue;
             }
-        };
-        
-        for (_addr, peer) in peers {
-            let consensus_msg = NetworkMessage::ConsensusReveal {
-                round_id,
-                node_id: node_id.clone(),
-                reveal_data: reveal_data.clone(),
-                nonce: nonce.clone(),  // CRITICAL: Include nonce for reveal verification
-                timestamp,
+            
+            // CRITICAL FIX: For Genesis nodes, construct address directly using helper
+            // Genesis consensus uses node IDs like "genesis_node_001"
+            let peer_addr = if participant_id.starts_with("genesis_node_") {
+                // Genesis node - construct address using helper
+                match Self::resolve_genesis_node_address(participant_id) {
+                    Some(addr) => addr,
+                    None => {
+                        println!("[P2P] ⚠️ Invalid Genesis node ID: {}", participant_id);
+                        continue;
+                    }
+                }
+            } else {
+                // Non-Genesis: look up in peers (O(1) with DashMap)
+                let peer_info = self.get_peer_by_id_lockfree(participant_id);
+                match peer_info {
+                    Some(p) => p.addr,
+                    None => {
+                        println!("[P2P] ⚠️ Consensus participant {} not found in peers", participant_id);
+                        continue;
+                    }
+                }
             };
             
-            // PRODUCTION: Real HTTP POST to peer's P2P message endpoint
-            self.send_network_message(&peer.addr, consensus_msg);
-            println!("[P2P] 📤 Sent reveal to peer: {}", peer.addr);
+            peer_addresses.push(peer_addr);
         }
+        
+        // SCALABILITY: Single tokio task for all sends (not 1000 tasks!)
+        // Use buffer_unordered for parallel HTTP requests with bounded concurrency
+        let consensus_msg = NetworkMessage::ConsensusReveal {
+            round_id,
+            node_id: node_id.clone(),
+            reveal_data: reveal_data.clone(),
+            nonce: nonce.clone(),
+            timestamp,
+        };
+        
+        let total = peer_addresses.len();
+        tokio::spawn(async move {
+            use futures::stream::{self, StreamExt};
+            
+            // SCALABILITY: Bounded parallelism (max 100 concurrent requests)
+            // For 1000 participants: 10 batches of 100, not 1000 tasks!
+            let results = stream::iter(peer_addresses)
+                .map(|peer_addr| {
+                    let msg = consensus_msg.clone();
+                    async move {
+                        for attempt in 1..=3 {
+                            if Self::send_consensus_message_with_retry(&peer_addr, &msg).await {
+                                return (peer_addr, true);
+                            }
+                            if attempt < 3 {
+                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            }
+                        }
+                        (peer_addr, false)
+                    }
+                })
+                .buffer_unordered(100) // Max 100 concurrent
+                .collect::<Vec<_>>()
+                .await;
+            
+            let success = results.iter().filter(|(_, ok)| *ok).count();
+            println!("[P2P] 📊 Consensus reveal broadcast: {}/{} delivered", success, total);
+        });
         
         Ok(())
     }
 
+    /// Send consensus message with retry (async for non-blocking)
+    async fn send_consensus_message_with_retry(peer_addr: &str, message: &NetworkMessage) -> bool {
+        use std::time::Duration;
+        
+        // Serialize message once
+        let message_json = match serde_json::to_value(message) {
+            Ok(json) => json,
+            Err(e) => {
+                println!("[P2P] ❌ Failed to serialize consensus message: {}", e);
+                return false;
+            }
+        };
+        
+        let peer_ip = peer_addr.split(':').next().unwrap_or(peer_addr);
+        let url = format!("http://{}:8001/api/v1/p2p/message", peer_ip);
+        
+        // OPTIMIZATION: 500ms timeout for fast consensus delivery (from 3c78d24)
+        let client = match reqwest::Client::builder()
+            .timeout(Duration::from_millis(500))
+            .connect_timeout(Duration::from_millis(200))
+            .tcp_nodelay(true)
+            .build() {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+        
+        // Send with timeout
+        match client.post(&url)
+            .json(&message_json)
+            .send()
+            .await {
+            Ok(response) if response.status().is_success() => true,
+            Ok(response) => {
+                println!("[P2P] ⚠️ Consensus message rejected by {}: {}", peer_ip, response.status());
+                false
+            }
+            Err(e) => {
+                println!("[P2P] ⚠️ Failed to send consensus to {}: {}", peer_ip, e);
+                false
+            }
+        }
+    }
+    
     /// Send network message SYNCHRONOUSLY for critical messages (blocks)
     /// Uses blocking HTTP client to ensure delivery before returning
     pub fn send_network_message_sync(&self, peer_addr: &str, message: NetworkMessage) -> Result<(), String> {
@@ -7404,11 +7497,10 @@ impl SimplifiedP2P {
         let peer_ip = peer_addr.split(':').next().unwrap_or(peer_addr);
         let url = format!("http://{}:8001/api/v1/p2p/message", peer_ip);
         
-        // CRITICAL: Use blocking HTTP client for synchronous delivery
-        // This ensures block is delivered before we continue
+        // OPTIMIZATION: 500ms timeout for fast synchronous delivery (from 3c78d24)
         let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(5))  // Fast timeout for local network
-            .connect_timeout(Duration::from_secs(2))
+            .timeout(Duration::from_millis(500))
+            .connect_timeout(Duration::from_millis(200))
             .tcp_nodelay(true)  // Disable Nagle's algorithm for faster delivery
             .build()
             .map_err(|e| format!("Client build failed: {}", e))?;
@@ -7492,8 +7584,8 @@ impl SimplifiedP2P {
         tokio::spawn(async move {
             let should_log = should_log_clone;
             let client = match reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(20)) // PRODUCTION: Timeout for Genesis node P2P messages
-                .connect_timeout(std::time::Duration::from_secs(10)) // Connection timeout
+                .timeout(std::time::Duration::from_secs(2)) // OPTIMIZATION: 2s timeout for faster failure detection
+                .connect_timeout(std::time::Duration::from_millis(500)) // OPTIMIZATION: 500ms connect from 3c78d24
                 .user_agent("QNet-Node/1.0") 
                 .tcp_nodelay(true) // Faster message delivery
                 .tcp_keepalive(std::time::Duration::from_secs(30)) // P2P connection persistence
@@ -7973,7 +8065,15 @@ impl SimplifiedP2P {
         match rt {
             Ok(handle) => {
                 let result = handle.block_on(async {
-                    let crypto = QNetQuantumCrypto::new();
+                    use crate::node::GLOBAL_QUANTUM_CRYPTO;
+                    
+                    let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
+                    if crypto_guard.is_none() {
+                        let mut crypto = QNetQuantumCrypto::new();
+                        let _ = crypto.initialize().await;
+                        *crypto_guard = Some(crypto);
+                    }
+                    let crypto = crypto_guard.as_ref().unwrap();
                     crypto.verify_dilithium_signature(&message, &dilithium_sig, node_id).await
                 });
                 
@@ -8045,8 +8145,15 @@ impl SimplifiedP2P {
             match rt {
                 Ok(handle) => {
                     let result = handle.block_on(async {
-                        let mut crypto = QNetQuantumCrypto::new();
-                        let _ = crypto.initialize().await;
+                        use crate::node::GLOBAL_QUANTUM_CRYPTO;
+                        
+                        let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
+                        if crypto_guard.is_none() {
+                            let mut crypto = QNetQuantumCrypto::new();
+                            let _ = crypto.initialize().await;
+                            *crypto_guard = Some(crypto);
+                        }
+                        let crypto = crypto_guard.as_ref().unwrap();
                         crypto.create_consensus_signature(&self.node_id, &message).await
                     });
                     

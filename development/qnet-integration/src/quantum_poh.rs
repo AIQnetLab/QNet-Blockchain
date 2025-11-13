@@ -125,12 +125,23 @@ impl QuantumPoH {
     /// Synchronize existing PoH instance with a checkpoint
     /// This is used when receiving blocks from other nodes to maintain consistent PoH state
     pub async fn sync_from_checkpoint(&self, hash: &[u8], count: u64) {
+        // CRITICAL FIX: Prevent PoH regression - only sync forward, never backward!
+        // This prevents deadlock when older blocks are received during resync
+        let current_count = *self.hash_count.read().await;
+        
+        if count < current_count {
+            // Do NOT sync backward - this would cause PoH regression and block production failure
+            println!("[QuantumPoH] ⚠️ Skipping sync to older checkpoint: {} < current {}", 
+                    count, current_count);
+            return;
+        }
+        
         *self.current_hash.write().await = hash.to_vec();
         *self.hash_count.write().await = count;
         *self.current_slot.write().await = count / 1_000_000;
         
-        println!("[QuantumPoH] 🔄 Synchronized to checkpoint: count={}, slot={}", 
-                count, count / 1_000_000);
+        println!("[QuantumPoH] 🔄 Synchronized to checkpoint: count={}, slot={} (forward from {})", 
+                count, count / 1_000_000, current_count);
     }
     
     /// Start PoH generator

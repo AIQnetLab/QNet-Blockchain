@@ -383,9 +383,17 @@ impl BlockchainActivationRegistry {
     /// Extract wallet address from activation code using quantum decryption
     async fn extract_wallet_from_activation_code(&self, code: &str) -> Result<String, IntegrationError> {
         // Use quantum crypto to decrypt and get wallet address
-        let mut quantum_crypto = crate::quantum_crypto::QNetQuantumCrypto::new();
-        quantum_crypto.initialize().await
-            .map_err(|e| IntegrationError::CryptoError(format!("Quantum crypto init failed: {}", e)))?;
+        // OPTIMIZATION: Use GLOBAL crypto instance
+        use crate::node::GLOBAL_QUANTUM_CRYPTO;
+        
+        let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
+        if crypto_guard.is_none() {
+            let mut crypto = crate::quantum_crypto::QNetQuantumCrypto::new();
+            crypto.initialize().await
+                .map_err(|e| IntegrationError::CryptoError(format!("Quantum crypto init failed: {}", e)))?;
+            *crypto_guard = Some(crypto);
+        }
+        let quantum_crypto = crypto_guard.as_ref().unwrap();
             
         // SECURITY: NO FALLBACK ALLOWED - quantum decryption MUST work for security
         match quantum_crypto.decrypt_activation_code(code).await {
@@ -1791,9 +1799,17 @@ impl BlockchainActivationRegistry {
     /// Extract activation signature from quantum-secured code
     async fn extract_activation_signature(&self, activation_code: &str) -> Result<String, IntegrationError> {
         // Use quantum crypto module to decrypt and extract signature
-        let mut quantum_crypto = crate::quantum_crypto::QNetQuantumCrypto::new();
-        quantum_crypto.initialize().await
-            .map_err(|e| IntegrationError::CryptoError(format!("Quantum crypto init failed: {}", e)))?;
+        // OPTIMIZATION: Use GLOBAL crypto instance
+        use crate::node::GLOBAL_QUANTUM_CRYPTO;
+        
+        let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
+        if crypto_guard.is_none() {
+            let mut crypto = crate::quantum_crypto::QNetQuantumCrypto::new();
+            crypto.initialize().await
+                .map_err(|e| IntegrationError::CryptoError(format!("Quantum crypto init failed: {}", e)))?;
+            *crypto_guard = Some(crypto);
+        }
+        let quantum_crypto = crypto_guard.as_ref().unwrap();
         
         // Decrypt activation code to get payload with signature
         let payload = quantum_crypto.decrypt_activation_code(activation_code).await
@@ -1902,9 +1918,17 @@ impl BlockchainActivationRegistry {
         // 4. Quantum entropy
         
         // Use quantum crypto to verify derivation
-        let mut quantum_crypto = crate::quantum_crypto::QNetQuantumCrypto::new();
-        quantum_crypto.initialize().await
-            .map_err(|e| IntegrationError::CryptoError(format!("Quantum crypto init failed: {}", e)))?;
+        // OPTIMIZATION: Use GLOBAL crypto instance
+        use crate::node::GLOBAL_QUANTUM_CRYPTO;
+        
+        let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
+        if crypto_guard.is_none() {
+            let mut crypto = crate::quantum_crypto::QNetQuantumCrypto::new();
+            crypto.initialize().await
+                .map_err(|e| IntegrationError::CryptoError(format!("Quantum crypto init failed: {}", e)))?;
+            *crypto_guard = Some(crypto);
+        }
+        let quantum_crypto = crypto_guard.as_ref().unwrap();
         
         // Decrypt payload to get wallet address
         let payload = quantum_crypto.decrypt_activation_code(activation_code).await
@@ -1924,9 +1948,17 @@ impl BlockchainActivationRegistry {
 
     /// Extract transaction hash from activation code (Phase 1: burn tx, Phase 2: transfer tx)
     async fn extract_tx_hash_from_code(&self, activation_code: &str) -> Result<String, IntegrationError> {
-        let mut quantum_crypto = crate::quantum_crypto::QNetQuantumCrypto::new();
-        quantum_crypto.initialize().await
-            .map_err(|e| IntegrationError::CryptoError(format!("Quantum crypto init failed: {}", e)))?;
+        // OPTIMIZATION: Use GLOBAL crypto instance
+        use crate::node::GLOBAL_QUANTUM_CRYPTO;
+        
+        let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
+        if crypto_guard.is_none() {
+            let mut crypto = crate::quantum_crypto::QNetQuantumCrypto::new();
+            crypto.initialize().await
+                .map_err(|e| IntegrationError::CryptoError(format!("Quantum crypto init failed: {}", e)))?;
+            *crypto_guard = Some(crypto);
+        }
+        let quantum_crypto = crypto_guard.as_ref().unwrap();
         
         let payload = quantum_crypto.decrypt_activation_code(activation_code).await
             .map_err(|e| IntegrationError::CryptoError(format!("Decryption failed: {}", e)))?;

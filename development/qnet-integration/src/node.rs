@@ -606,8 +606,8 @@ impl BlockchainNode {
             println!("  - QNET_EXTERNAL_IP for regular nodes");
         }
         let consensus_config = qnet_consensus::ConsensusConfig {
-            commit_phase_duration: Duration::from_secs(15),    // Faster phases for 1s blocks
-            reveal_phase_duration: Duration::from_secs(15),    // Total consensus: 30s per round
+            commit_phase_duration: Duration::from_secs(12),    // OPTIMIZED: 12s commit phase (blocks 61-72)
+            reveal_phase_duration: Duration::from_secs(12),    // OPTIMIZED: 12s reveal phase (blocks 73-84)
             min_participants: 4,           // PRODUCTION: 4 nodes minimum for Byzantine safety (3f+1, f=1)
             max_participants: 1000,        // Maximum participants per round
             max_validators_per_round: 1000, // PRODUCTION: 1000 validators per round (per NETWORK_LOAD_ANALYSIS.md)
@@ -1408,21 +1408,36 @@ impl BlockchainNode {
                                                 // CRITICAL: Actually request the missing block via P2P
                                                 if let Some(p2p) = &unified_p2p {
                                                     let p2p_clone = p2p.clone();
+                                                    let retry_missing_height = missing_height;  // Clone for retry logic
                                                     tokio::spawn(async move {
-                                                        // SPECIAL CASE: Genesis block request
-                                                        if missing_height == 0 {
-                                                            println!("[BLOCKS] 🌍 Requesting Genesis block #0 from network");
-                                                            if let Err(e) = p2p_clone.sync_blocks(0, 0).await {
-                                                                println!("[BLOCKS] ⚠️ Failed to request Genesis: {}", e);
+                                                        // CRITICAL FIX: Retry mechanism for missing blocks
+                                                        // Try up to 3 times with exponential backoff
+                                                        for attempt in 1..=3 {
+                                                            // SPECIAL CASE: Genesis block request
+                                                            if retry_missing_height == 0 {
+                                                                println!("[BLOCKS] 🌍 Requesting Genesis block #0 from network (attempt {})", attempt);
+                                                                if let Err(e) = p2p_clone.sync_blocks(0, 0).await {
+                                                                    println!("[BLOCKS] ⚠️ Failed to request Genesis (attempt {}): {}", attempt, e);
+                                                                    if attempt < 3 {
+                                                                        tokio::time::sleep(Duration::from_secs(attempt)).await;
+                                                                        continue;
+                                                                    }
+                                                                } else {
+                                                                    println!("[BLOCKS] ✅ Genesis block requested from network");
+                                                                    break;
+                                                                }
                                                             } else {
-                                                                println!("[BLOCKS] ✅ Genesis block requested from network");
-                                                            }
-                                                        } else {
-                                                            // Regular block request
-                                                            if let Err(e) = p2p_clone.sync_blocks(missing_height, missing_height).await {
-                                                                println!("[BLOCKS] ⚠️ Failed to request block #{}: {}", missing_height, e);
-                                                            } else {
-                                                                println!("[BLOCKS] ✅ Block #{} requested from network", missing_height);
+                                                                // Regular block request
+                                                                if let Err(e) = p2p_clone.sync_blocks(retry_missing_height, retry_missing_height).await {
+                                                                    println!("[BLOCKS] ⚠️ Failed to request block #{} (attempt {}): {}", retry_missing_height, attempt, e);
+                                                                    if attempt < 3 {
+                                                                        tokio::time::sleep(Duration::from_secs(attempt)).await;
+                                                                        continue;
+                                                                    }
+                                                                } else {
+                                                                    println!("[BLOCKS] ✅ Block #{} requested from network", retry_missing_height);
+                                                                    break;
+                                                                }
                                                             }
                                                         }
                                                     });
@@ -2389,8 +2404,8 @@ impl BlockchainNode {
                                 println!("[Node] 📊 Network is ahead: {} vs local: {}", network_height, local_height);
                                 println!("[Node] 🔄 Syncing {} blocks before production...", network_height - local_height);
                                 
-                                // Download missing blocks
-                                p2p.download_missing_microblocks(&self.storage, local_height, network_height).await;
+                                // OPTIMIZATION: Use parallel download for faster initial sync
+                                p2p.parallel_download_microblocks(&self.storage, local_height, network_height).await;
                                 
                                 // Wait a bit for sync to complete
                                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -2616,10 +2631,18 @@ impl BlockchainNode {
         let mut consensus_rx = self.consensus_rx.take();
         let consensus_rx = Arc::new(tokio::sync::Mutex::new(consensus_rx));
         
+        // ARCHITECTURE: Network sync monitoring handled by existing mechanisms:
+        // 1. start_sync_health_monitor() - monitors sync flags for deadlock prevention
+        // 2. Background sync - automatic block synchronization
+        // 3. NODE_IS_SYNCHRONIZED flag - global sync status
+        // No additional monitoring task needed (existing mechanisms are sufficient)
+        
         tokio::spawn(async move {
             // CRITICAL FIX: Start from current global height, not 0
             let mut microblock_height = *height.read().await;
-            let mut last_macroblock_trigger = 0u64;
+            // CRITICAL FIX: Calculate last_macroblock_trigger from current height
+            // This ensures consensus works even when node starts after block 61
+            let mut last_macroblock_trigger = (microblock_height / 90) * 90;
             let mut consensus_started = false; // Track early consensus start
             
             // GENESIS BLOCK CREATION: Create Genesis Block if blockchain is empty
@@ -2721,6 +2744,13 @@ impl BlockchainNode {
                                         match storage.save_microblock(0, &data) {
                                             Ok(_) => {
                                                 println!("[GENESIS] ✅ Genesis Block created and saved at height 0");
+                                                
+                                                // CRITICAL FIX: Wait 5 seconds before broadcasting Genesis
+                                                // This gives ALL nodes time to fully initialize P2P listeners
+                                                // Without this delay, fast-starting nodes might miss Genesis broadcast
+                                                println!("[GENESIS] ⏳ Waiting 5 seconds for all nodes to initialize...");
+                                                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                                                println!("[GENESIS] ✅ All nodes ready, proceeding with Genesis broadcast");
                                                 
                                                 // CRITICAL: Broadcast Genesis block with extended timeout
                                                 // Genesis is critical - use special method with 3s timeout (vs 200ms for normal blocks)
@@ -3022,22 +3052,41 @@ impl BlockchainNode {
                                 let p2p_clone = p2p.clone();
                                 let storage_clone = storage.clone();
                                 
+                                let height_clone = height.clone();
                                 tokio::spawn(async move {
                                     // PRODUCTION: Guard ensures flag is cleared even on panic/error
                                     let _guard = FastSyncGuard;
                                     
                                     println!("[SYNC] 🚀 Fast downloading blocks {}-{}", sync_from_height, sync_to_height);
                                     
-                                    // TIMEOUT PROTECTION: Add 60-second timeout for entire sync operation
+                                    // TIMEOUT PROTECTION: Adaptive timeout based on blocks to sync
                                     // PRODUCTION: Use parallel download for faster sync
+                                    let blocks_to_sync = sync_to_height.saturating_sub(sync_from_height);
+                                    let timeout_secs = std::cmp::max(60, (blocks_to_sync / 10) + 30);  // Min 60s, ~10 blocks/sec + 30s buffer
+                                    println!("[SYNC] ⏱️ Adaptive timeout: {}s for {} blocks", timeout_secs, blocks_to_sync);
+                                    
                                     let sync_result = tokio::time::timeout(
-                                        Duration::from_secs(60),
+                                        Duration::from_secs(timeout_secs),
                                         p2p_clone.parallel_download_microblocks(&storage_clone, sync_from_height, sync_to_height)
                                     ).await;
                                     
                                     match sync_result {
-                                        Ok(_) => println!("[SYNC] ✅ Fast sync completed successfully"),
-                                        Err(_) => println!("[SYNC] ⚠️ Fast sync timeout after 60s - will retry next cycle"),
+                                        Ok(_) => {
+                                            println!("[SYNC] ✅ Fast sync completed successfully");
+                                            
+                                            // CRITICAL FIX: Update global height after successful fast sync
+                                            // This ensures producer loop knows about the new blocks
+                                            let mut global_height = height_clone.write().await;
+                                            if sync_to_height > *global_height {
+                                                *global_height = sync_to_height;
+                                                println!("[SYNC] 📊 Updated global height to {}", sync_to_height);
+                                                
+                                                // Update last block time to prevent stall detection false positives
+                                                LAST_BLOCK_PRODUCED_TIME.store(get_timestamp_safe(), Ordering::Relaxed);
+                                                LAST_BLOCK_PRODUCED_HEIGHT.store(sync_to_height, Ordering::Relaxed);
+                                            }
+                                        },
+                                        Err(_) => println!("[SYNC] ⚠️ Fast sync timeout after {}s - will retry next cycle", timeout_secs),
                                     }
                                     // Flag automatically cleared by guard drop
                                 });
@@ -3269,8 +3318,9 @@ impl BlockchainNode {
                 // CRITICAL: Set current block height for deterministic validator sampling
                 std::env::set_var("CURRENT_BLOCK_HEIGHT", microblock_height.to_string());
                 
-                // CRITICAL FIX: Select producer for the NEXT block to be created
-                // If we're at height 30, we need producer for block 31 (next block)
+                // CRITICAL FIX: Use LOCAL height for deterministic producer selection
+                // All nodes at the same height will select the same producer
+                // Nodes at different heights naturally select different producers (by design)
                 let next_block_height = microblock_height + 1;
                 
                 // CRITICAL: Check Genesis exists before creating block #1
@@ -3307,6 +3357,9 @@ impl BlockchainNode {
                     Some(&storage),  // Pass storage for entropy
                     &quantum_poh  // Pass PoH for quantum entropy
                 ).await;
+                
+                // CRITICAL: Simple producer check - let natural consensus handle lagging
+                // Nodes at different heights naturally won't interfere with each other
                 let mut is_my_turn_to_produce = current_producer == node_id;
                 
                 // CRITICAL FIX: Check if we're emergency producer for this block
@@ -3524,7 +3577,37 @@ impl BlockchainNode {
                     // Skip all checks if we're emergency producer to break deadlock
                     let can_produce = if is_emergency_producer {
                         println!("[EMERGENCY] 🚀 Emergency producer bypassing all checks!");
-                        true  // Emergency producer ALWAYS produces
+                        
+                        // CRITICAL: Before creating emergency block, wait and check if original producer delivered
+                        // This prevents race condition where both producers create the same block
+                        println!("[EMERGENCY] ⏰ Waiting 2 seconds to allow original producer to deliver...");
+                        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                        
+                        // Check if the block already exists from original producer
+                        let block_exists = {
+                            match storage.load_microblock(next_block_height) {
+                                Ok(Some(_)) => {
+                                    println!("[EMERGENCY] ✅ Block #{} already exists from original producer! Skipping emergency production.", next_block_height);
+                                    
+                                    // Clear emergency flag since block exists
+                                    if let Ok(mut emergency_flag) = EMERGENCY_PRODUCER_FLAG.lock() {
+                                        *emergency_flag = None;
+                                        println!("[EMERGENCY] 🔧 Cleared emergency flag - block delivered by original producer");
+                                    }
+                                    true
+                                },
+                                Ok(None) => {
+                                    println!("[EMERGENCY] ❌ Block #{} still missing after wait - proceeding with emergency production", next_block_height);
+                                    false
+                                },
+                                Err(e) => {
+                                    println!("[EMERGENCY] ⚠️ Error checking block existence: {} - proceeding with emergency production", e);
+                                    false
+                                }
+                            }
+                        };
+                        
+                        !block_exists  // Can produce only if block doesn't exist
                     } else {
                         // CRITICAL: Check emergency stop flag first
                         // If we received emergency failover notification, stop producing immediately
@@ -4358,8 +4441,24 @@ impl BlockchainNode {
                                 // PRODUCTION: Guard ensures flag is cleared even on panic/error
                                 let _guard = SyncGuard;
                                 
-                                // API DEADLOCK FIX: Use cached height in background thread too
-                                if let Some(network_height) = p2p_clone.get_cached_network_height() {
+                                // CRITICAL FIX: Try cached height first, fallback to fresh query
+                                // This ensures sync ALWAYS happens even if cache is empty/expired
+                                let network_height = p2p_clone.get_cached_network_height()
+                                    .or_else(|| {
+                                        // Cache miss - query network directly (CRITICAL for 5-node networks)
+                                        match p2p_clone.sync_blockchain_height() {
+                                            Ok(h) => {
+                                                println!("[SYNC] 🔄 Cache miss - queried network height: {}", h);
+                                                Some(h)
+                                            },
+                                            Err(e) => {
+                                                println!("[SYNC] ⚠️ Failed to get network height: {}", e);
+                                                None
+                                            }
+                                        }
+                                    });
+                                
+                                if let Some(network_height) = network_height {
                                 if network_height > current_height {
                                     println!("[SYNC] 📥 Background sync: downloading blocks {}-{}", 
                                              current_height + 1, network_height);
@@ -4426,57 +4525,38 @@ impl BlockchainNode {
                             // CRITICAL FIX: Do NOT reset timing - breaks precision intervals
                             // Timing controlled at end of loop only
                         } else {
-                            // No local block - background sync will handle it with timeout detection
-                            // FIX: Wait for NEXT block height when not producer
-                            println!("[SYNC] ⏳ Waiting for background sync of block #{}", next_block_height);
+                            // ARCHITECTURE: Block not yet received from producer
+                            // Start ASYNCHRONOUS failover monitoring (does NOT block main loop)
+                            // Main loop continues with 1-second timing precision
+                            // Failover runs in background and triggers emergency producer if needed
                             
-                            // ARCHITECTURE FIX: ALL nodes must track timeout for failover!
-                            // Not just the producer - otherwise network stalls if producer fails
-                            // Non-producers wait shorter time but still trigger failover if needed
-                            
-                            // PRODUCTION: Use Tower BFT adaptive timeout
+                            // ARCHITECTURE FIX: Use Tower BFT adaptive timeout for failover detection
+                            // TowerBFT returns optimized timeouts (2-5s) now that crypto is cached
+                            // Old hardcoded values (7-20s) are OBSOLETE and cause nodes to lag
                             let retry_count = 0; // First attempt
-                            let base_timeout = tower_bft.get_timeout(next_block_height, retry_count).await;
+                            let actual_timeout = tower_bft.get_timeout(next_block_height, retry_count).await;
                             
-                            // ARCHITECTURE FIX: All nodes use same timeout for proper failover
-                            // Non-producers should NOT wait 2x longer - this breaks 1 block/sec target!
-                            let microblock_timeout = base_timeout;  // Same for all nodes (7 seconds)
-                            
-                            println!("[TowerBFT] ⏱️ Timeout for block #{}: {:?} (producer: {})", 
-                                    next_block_height, microblock_timeout, current_producer == node_id);
-                            let timeout_start = std::time::Instant::now();
-                            
-                            // Wait with timeout for producer block (same pattern as macroblock timeout in line 1201)
-                            let mut timeout_triggered = false;
-                            // FIX: Use correct height for timeout - waiting for next block
+                            // CRITICAL: Start ASYNC failover monitoring (does NOT block main loop!)
+                            // Failover runs in background, main loop continues immediately
                             let expected_height_timeout = next_block_height;
                             let current_producer_timeout = current_producer.clone();
                             let storage_timeout = storage.clone();
                             let p2p_timeout = p2p.clone();
-                            let height_timeout = height.clone();
                             let node_id_timeout = node_id.clone();
                             let node_type_timeout = node_type;
-                            let quantum_poh_timeout = quantum_poh.clone();
                             
-                            // CRITICAL FIX: Use global height instead of sync_blockchain_height()
-                            // sync_blockchain_height() causes 800-1200ms delay!
-                            let network_height = *height.read().await;
-                            
-                            // ROTATION DEADLOCK DETECTION: Special handling at rotation boundaries
-                            // Rotation happens at blocks 31, 61, 91... (first block of new round)
+                            // Calculate block properties for logging
+                            let blocks_since_last_macro = expected_height_timeout % 90;
+                            let is_consensus_period = blocks_since_last_macro >= 61 && blocks_since_last_macro <= 90;
                             let is_rotation_boundary = expected_height_timeout > 1 && ((expected_height_timeout - 1) % 30) == 0;
-                            let rotation_timeout = if is_rotation_boundary {
-                                // Double timeout at rotation boundaries to account for producer switch
-                                Duration::from_secs(10)
-                            } else {
-                                microblock_timeout
-                            };
                             
-                            // Only start timeout detection if we're reasonably in sync (within 10 blocks)
-                            if network_height == 0 || expected_height_timeout <= network_height + 10 {
+                            // CRITICAL FIX: ALWAYS start timeout detection to prevent forks!
+                            // Even if node is behind, it needs to detect failed producers
+                            // Remove the sync check that was preventing failover for lagging nodes
+                            {
                             // EXISTING: Use same async timeout pattern as macroblock failover (line 1205)
                             tokio::spawn(async move {
-                                tokio::time::sleep(rotation_timeout).await;
+                                tokio::time::sleep(actual_timeout).await;
                                 
                                 // CRITICAL: Double-check if block was received during timeout period
                                 // This prevents race condition where block arrives just as timeout triggers
@@ -4490,23 +4570,12 @@ impl BlockchainNode {
                                 };
                                 
                                 if !block_exists {
-                                        // CRITICAL FIX: Adaptive timeout based on network conditions
-                                        // Synchronous broadcast should arrive faster, but network delays still exist
-                                        
-                                        // CRITICAL FIX: During macroblock consensus, allow more time
-                                        // Consensus runs in background but can affect block production timing
-                                        let blocks_since_last_macro = expected_height_timeout % 90;
-                                        let is_consensus_period = blocks_since_last_macro >= 61 && blocks_since_last_macro <= 90;
-                                        
-                                        let timeout_duration = if expected_height_timeout == 1 { 
-                                            20  // First block needs more time for network stabilization
-                                        } else if expected_height_timeout <= 10 {
-                                            10  // Early blocks: 10 seconds for initial sync
-                                        } else if is_consensus_period {
-                                            15  // During consensus: more tolerance (was causing false emergencies)
-                                        } else {
-                                            7   // Normal operation: 7 seconds (network optimized for fast broadcast)
-                                        };
+                                    // REMOVED: PROCESSED_FAILOVERS check that was blocking legitimate failovers
+                                    // Each failover attempt should be evaluated independently
+                                    // The P2P layer already has deduplication for network messages
+                                    
+                                    // Use the actual timeout duration for logging (calculated above)
+                                    let timeout_duration = actual_timeout.as_secs();
                                     
                                     // Special logging for rotation boundaries
                                     if is_rotation_boundary {
@@ -4558,10 +4627,7 @@ impl BlockchainNode {
                                     }
                                 }
                             });
-                            } else {
-                                println!("[FAILOVER] ⏸️ Skipping timeout detection - node is syncing (block {} vs network {})", 
-                                         expected_height_timeout, network_height);
-                            }
+                            } // End of timeout detection block
                         }
                     } else {
                         // No P2P available - standalone mode
@@ -4577,15 +4643,31 @@ impl BlockchainNode {
                 // ══════════════════════════════════════════════════════════════════
                 
                 // PRODUCTION: Start consensus SUPER EARLY after block 60 for ZERO downtime
-                // Consensus takes 30s (commit 15s + reveal 15s), so starting at 61 means it completes by block 90
-                // This ensures macroblock is ready EXACTLY when needed - Swiss watch precision!
+                // Consensus with reliable propagation:
+                // Commit: propagation (2s for 5 nodes) + wait (12s, early break) = 3-8s typical
+                // Reveal: propagation (2s for 5 nodes) + wait (12s, early break) = 3-8s typical
+                // Finalize: 2-4s
+                // Total: 5 nodes ~8-20s, 100 nodes ~12-24s, 1000 nodes ~16-28s max
+                // Starting at block 61 ensures completion before block 90 - reliable!
                 // CRITICAL FIX: Start EXACTLY at block 61 for deterministic consensus
                 // All nodes must start at the same block to ensure phase synchronization
                 let blocks_since_trigger = microblock_height.saturating_sub(last_macroblock_trigger);
-                if blocks_since_trigger == 61 && !consensus_started {
-                    println!("[MACROBLOCK] 🚀 DETERMINISTIC CONSENSUS START at block {} (61 after trigger)", microblock_height);
-                    println!("[MACROBLOCK] 📍 Node: {} | Type: {:?} | ALL NODES PARTICIPATE", node_id, node_type);
-                    consensus_started = true;
+                
+                // ARCHITECTURE FIX: Check node synchronization before starting consensus
+                // Use existing NODE_IS_SYNCHRONIZED flag (set by background sync monitor)
+                let is_synchronized = NODE_IS_SYNCHRONIZED.load(Ordering::Relaxed);
+                
+                // Start at block 61 (30 blocks for consensus to complete by block 90)
+                // This gives ~30 seconds for consensus phases (commit, reveal, finalize)
+                // CRITICAL: Only start if node is synchronized with network
+                if blocks_since_trigger >= 61 && blocks_since_trigger < 90 && !consensus_started {
+                    if !is_synchronized {
+                        println!("[MACROBLOCK] ⚠️ NOT starting consensus - node not synchronized with network");
+                        println!("[MACROBLOCK] 🔄 Waiting for sync completion before consensus participation");
+                    } else {
+                        println!("[MACROBLOCK] 🚀 DETERMINISTIC CONSENSUS START at block {} (61 after trigger)", microblock_height);
+                        println!("[MACROBLOCK] 📍 Node: {} | Type: {:?} | Synchronized: ✅", node_id, node_type);
+                        consensus_started = true;
                     
                     // Start consensus in BACKGROUND while microblocks continue
                     let consensus_clone = consensus.clone();
@@ -4636,6 +4718,7 @@ impl BlockchainNode {
                             }
                         }
                     });
+                    } // Close else block for lag check
                 }
                 
                 // PRODUCTION: NON-BLOCKING MACROBLOCK - Swiss watch precision without stops!
@@ -4696,9 +4779,9 @@ impl BlockchainNode {
                         }
                     });
                     
-                    // CRITICAL: Update trigger for NEXT round calculation
-                    // This ensures next macroblock attempt at block 180, not 90 again
-                    last_macroblock_trigger = microblock_height;
+                    // CRITICAL: Update trigger to the END of current macroblock period
+                    // For consensus at block 151-180, set trigger to 180 (not 151!)
+                    last_macroblock_trigger = last_macroblock_trigger + 90;
                     consensus_started = false; // Reset for next round
                     
                     // CRITICAL: Microblocks continue immediately without ANY pause
@@ -4708,12 +4791,15 @@ impl BlockchainNode {
                 // CRITICAL: Progressive retry for failed macroblocks
                 // Check every 30 blocks after macroblock boundary
                 let blocks_since_trigger = microblock_height - last_macroblock_trigger;
-                // Retry at blocks 120, 150, 180, 210, 240, 270 (every 30 after 90)
-                if blocks_since_trigger >= 30 && blocks_since_trigger % 30 == 0 && blocks_since_trigger != 90 {
+                // CRITICAL FIX: PFP triggers 30 blocks after expected macroblock
+                // Block 120 (30 after 90), 150 (60 after 90), etc.
+                // Block 210 (30 after 180), 240 (60 after 180), etc.
+                // Don't trigger at macroblock boundaries (90, 180, 270...)
+                if blocks_since_trigger >= 30 && blocks_since_trigger % 30 == 0 && (microblock_height % 90) != 0 {
                     // Check if macroblock still missing
                     let expected_macroblock = last_macroblock_trigger / 90;
-                    // Check if macroblock was created by looking for the next microblock
-                    let macroblock_exists = storage.load_microblock(expected_macroblock * 90 + 1)
+                    // CRITICAL FIX: Check for the actual MACROBLOCK, not a microblock!
+                    let macroblock_exists = storage.get_macroblock_by_height(expected_macroblock)
                         .map(|mb| mb.is_some())
                         .unwrap_or(false);
                     
@@ -5040,11 +5126,12 @@ impl BlockchainNode {
                     let last_block_of_prev_round = round_start_block - 1;
                     
                     // Calculate which macroblock we need
-                    // Round 3 (91-120) needs macroblock #0 (blocks 1-90)
-                    // Round 4 (121-150) needs macroblock #0 (blocks 1-90)
-                    // Round 5 (151-180) needs macroblock #0 (blocks 1-90)
-                    // Round 6 (181-210) needs macroblock #1 (blocks 91-180)
-                    let required_macroblock = (last_block_of_prev_round - 1) / 90;
+                    // Round 3 (91-120) needs macroblock #1 (blocks 1-90)
+                    // Round 4 (121-150) needs macroblock #1 (blocks 1-90)
+                    // Round 5 (151-180) needs macroblock #1 (blocks 1-90)
+                    // Round 6 (181-210) needs macroblock #2 (blocks 91-180)
+                    // CRITICAL FIX: Use correct formula without -1 to match save_macroblock
+                    let required_macroblock = last_block_of_prev_round / 90;
                     
                     match store.get_macroblock_by_height(required_macroblock) {
                         Ok(Some(macroblock_data)) => {
@@ -6545,9 +6632,13 @@ impl BlockchainNode {
         // Calculate state root from microblocks
         // CRITICAL FIX: Correct calculation for macroblock boundaries
         // For height 90: blocks 1-90, for height 180: blocks 91-180
-        let macroblock_index = (height - 1) / 90;  // 0-based index
-        let start_height = macroblock_index * 90 + 1;
-        let end_height = (macroblock_index + 1) * 90;
+        // CRITICAL FIX: Use same formula as normal consensus (height / 90) not (height - 1) / 90!
+        let macroblock_index = height / 90;  // Must match trigger_macroblock_consensus formula!
+        // CRITICAL FIX: Adjust boundaries for new index formula
+        // For index 1 (blocks 1-90): start=1, end=90
+        // For index 2 (blocks 91-180): start=91, end=180
+        let start_height = if macroblock_index > 0 { (macroblock_index - 1) * 90 + 1 } else { 1 };
+        let end_height = macroblock_index * 90;
         
         let mut microblock_hashes = Vec::new();
         let mut state_accumulator = [0u8; 32];
@@ -6599,7 +6690,8 @@ impl BlockchainNode {
             const MACROBLOCK_INTERVAL_SECONDS: u64 = 90;  // 90 seconds per macroblock (90 microblocks)
             
             // Macroblock timestamp = genesis + (macroblock_height * 90 seconds)
-            let macroblock_height = (height - 1) / 90;
+            // CRITICAL FIX: Use same formula as macroblock_index (height / 90)
+            let macroblock_height = height / 90;
             genesis_timestamp + (macroblock_height * MACROBLOCK_INTERVAL_SECONDS)
         };
         
@@ -6741,7 +6833,8 @@ impl BlockchainNode {
                             our_id.clone(),
                             commit.commit_hash.clone(),
                             commit.signature.clone(),  // CONSENSUS FIX: Pass signature for Byzantine validation
-                            commit.timestamp
+                            commit.timestamp,
+                            participants  // CRITICAL FIX: Only broadcast to consensus participants (max 1000)
                         ) {
                             Ok(_) => {
                                 println!("[CONSENSUS] 📤 Successfully broadcasted OWN commit to peers");
@@ -6752,6 +6845,21 @@ impl BlockchainNode {
                                          round_id, round_id % 90 == 0);
                             }
                         }
+                        
+                        // PRODUCTION: Adaptive propagation delay based on network size
+                        // Small networks (<=10): 3s is enough for first HTTP attempt
+                        // Medium networks (<=100): 4s for moderate load
+                        // Large networks (>100): 5s for heavy load and retries
+                        let propagation_delay_ms = if participants.len() <= 10 {
+                            3000u64  // 3s for small networks
+                        } else if participants.len() <= 100 {
+                            4000u64  // 4s for medium networks  
+                        } else {
+                            5000u64  // 5s for large networks (up to 1000)
+                        };
+                        tokio::time::sleep(std::time::Duration::from_millis(propagation_delay_ms)).await;
+                        println!("[CONSENSUS] ⏳ Propagation delay: {}ms (adaptive for {} nodes)", 
+                                propagation_delay_ms, participants.len());
                     }
                 }
                 Err(ConsensusError::InvalidSignature(msg)) => {
@@ -6772,8 +6880,25 @@ impl BlockchainNode {
         // PRODUCTION: Process incoming consensus messages during commit phase
         let mut received_commits = 0;
         let start_time = std::time::Instant::now();
-        let commit_timeout = std::time::Duration::from_secs(15); // Byzantine commit phase timeout
         
+        // CRITICAL: Adaptive timeout based on number of participants for scalability
+        // CONSTRAINT: Total consensus must fit in blocks 61-90 (30 seconds)
+        // Formula: 12s base + 0.3s per 100 participants (max 14s)
+        // 5 nodes: 12s, 100 nodes: 12s, 500 nodes: 13s, 1000 nodes: 14s
+        // With early break: actual time much less when threshold reached quickly
+        let commit_timeout = {
+            let base_timeout = 12u64;
+            let participants_count = participants.len() as u64;
+            let additional_time_ms = if participants_count > 100 {
+                ((participants_count - 100) * 3).min(2000) // Max +2s for 1000 nodes
+            } else {
+                0
+            };
+            std::time::Duration::from_millis(base_timeout * 1000 + additional_time_ms)
+        };
+        
+        println!("[CONSENSUS] ⏳ Commit phase timeout: {}s (adaptive for {} participants)", 
+                 commit_timeout.as_secs(), participants.len());
         println!("[CONSENSUS] ⏳ Waiting for commits from {} other participants...", participants.len() - 1);
         
         // PRODUCTION: Active commit processing loop for real inter-node consensus
@@ -6803,8 +6928,9 @@ impl BlockchainNode {
                 }
             }
             
-            // Give time for network messages to arrive
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            // CRITICAL FIX: Short polling interval for faster consensus message processing
+            // 10ms polling allows up to 100 checks/sec without overwhelming CPU
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             
             // Check current commit count in consensus engine  
             let current_commits = consensus_engine.get_current_commit_count();
@@ -6822,19 +6948,21 @@ impl BlockchainNode {
             }
         }
         
-        println!("[CONSENSUS] ⏰ Commit phase completed, attempting to advance to reveal phase");
+        // CRITICAL: Check if Byzantine threshold was reached
+        let final_commits = consensus_engine.get_current_commit_count();
+        let byzantine_threshold = (participants.len() * 2 + 2) / 3;
         
-        // Advance to reveal phase
-        match consensus_engine.advance_phase() {
-            Ok(_) => {
-                println!("[CONSENSUS] ✅ Successfully advanced to reveal phase");
-            }
-            Err(e) => {
-                println!("[CONSENSUS] ❌ CRITICAL: Failed to advance to reveal phase: {:?}", e);
-                println!("[CONSENSUS] ⚠️ Consensus will fail - engine not in reveal phase!");
-                // This is critical - if we can't advance, reveals won't be processed
-                return;
-            }
+        if final_commits >= byzantine_threshold {
+            println!("[CONSENSUS] ✅ Commit phase completed successfully: {}/{} commits", 
+                     final_commits, byzantine_threshold);
+            println!("[CONSENSUS] ✅ Consensus engine automatically advanced to reveal phase");
+        } else {
+            println!("[CONSENSUS] ⚠️ Commit phase timeout: only {}/{} commits received", 
+                     final_commits, byzantine_threshold);
+            println!("[CONSENSUS] ❌ Byzantine threshold NOT reached - consensus will fail");
+            println!("[CONSENSUS] 🔄 Progressive Finalization Protocol will handle recovery");
+            // Don't proceed to reveal phase - let PFP handle it
+            return;
         }
     }
     
@@ -6878,8 +7006,12 @@ impl BlockchainNode {
                         (*stored_nonce, stored_reveal.clone())
                     }
                     None => {
-                        println!("[CONSENSUS] ❌ No OWN commit data found, cannot reveal");
-                        return; // Cannot proceed without our own commit data
+                        // CRITICAL: If we don't have commit data, we CANNOT participate in reveal
+                        // This is CORRECT Byzantine behavior - nodes that didn't commit can't reveal
+                        // Otherwise malicious nodes could manipulate consensus by skipping commit
+                        println!("[CONSENSUS] ❌ No OWN commit data found - cannot reveal (Byzantine safety)");
+                        println!("[CONSENSUS] 🔒 Node will not participate in this consensus round");
+                        return; // Exit reveal phase for this node
                     }
                 }
             };
@@ -6907,7 +7039,8 @@ impl BlockchainNode {
                             our_id.clone(),
                             hex::encode(&reveal.reveal_data), // Convert Vec<u8> to String
                             hex::encode(&reveal.nonce),        // CRITICAL: Include nonce for verification
-                            reveal.timestamp
+                            reveal.timestamp,
+                            participants  // CRITICAL FIX: Only broadcast to consensus participants (max 1000)
                         ) {
                             Ok(_) => {
                                 println!("[CONSENSUS] 📤 Successfully broadcasted OWN reveal with nonce to peers");
@@ -6918,6 +7051,21 @@ impl BlockchainNode {
                                          round_id, round_id % 90 == 0);
                             }
                         }
+                        
+                        // PRODUCTION: Adaptive propagation delay based on network size
+                        // Small networks (<=10): 3s is enough for first HTTP attempt
+                        // Medium networks (<=100): 4s for moderate load
+                        // Large networks (>100): 5s for heavy load and retries
+                        let propagation_delay_ms = if participants.len() <= 10 {
+                            3000u64  // 3s for small networks
+                        } else if participants.len() <= 100 {
+                            4000u64  // 4s for medium networks  
+                        } else {
+                            5000u64  // 5s for large networks (up to 1000)
+                        };
+                        tokio::time::sleep(std::time::Duration::from_millis(propagation_delay_ms)).await;
+                        println!("[CONSENSUS] ⏳ Propagation delay: {}ms (adaptive for {} nodes)", 
+                                propagation_delay_ms, participants.len());
                     }
                 }
                 Err(e) => {
@@ -6934,9 +7082,24 @@ impl BlockchainNode {
         // PRODUCTION: Process incoming consensus messages during reveal phase
         let mut received_reveals = 0;
         let start_time = std::time::Instant::now();
-        let reveal_timeout = std::time::Duration::from_secs(15); // Byzantine reveal phase timeout
+        
+        // CRITICAL: Adaptive timeout based on number of participants for scalability
+        // CONSTRAINT: Total consensus must fit in blocks 61-90 (30 seconds)
+        // Same formula as commit phase for consistency
+        let reveal_timeout = {
+            let base_timeout = 12u64;
+            let participants_count = participants.len() as u64;
+            let additional_time_ms = if participants_count > 100 {
+                ((participants_count - 100) * 3).min(2000) // Max +2s for 1000 nodes
+            } else {
+                0
+            };
+            std::time::Duration::from_millis(base_timeout * 1000 + additional_time_ms)
+        };
         let mut processed_messages = 0;
         
+        println!("[CONSENSUS] ⏳ Reveal phase timeout: {}s (adaptive for {} participants)", 
+                 reveal_timeout.as_secs(), participants.len());
         println!("[CONSENSUS] ⏳ Waiting for reveals from {} other participants...", participants.len() - 1);
         
         while start_time.elapsed() < reveal_timeout && received_reveals < (participants.len() - 1) {
@@ -6963,8 +7126,9 @@ impl BlockchainNode {
                 }
             }
             
-            // Check for incoming consensus messages (reveals from other nodes)
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            // CRITICAL FIX: Short polling interval for faster consensus message processing
+            // 10ms polling allows up to 100 checks/sec without overwhelming CPU
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             
             // Check current reveal count in consensus engine
             let current_reveals = consensus_engine.get_current_reveal_count();
@@ -6982,7 +7146,22 @@ impl BlockchainNode {
             }
         }
         
-        println!("[CONSENSUS] ⏰ Reveal phase completed, consensus engine will finalize with received data");
+        // CRITICAL: Check if Byzantine threshold was reached for reveals
+        let final_reveals = consensus_engine.get_current_reveal_count();
+        let byzantine_threshold = (participants.len() * 2 + 2) / 3;
+        
+        if final_reveals >= byzantine_threshold {
+            println!("[CONSENSUS] ✅ Reveal phase completed successfully: {}/{} reveals", 
+                     final_reveals, byzantine_threshold);
+            println!("[CONSENSUS] ✅ Ready for finalization");
+        } else {
+            println!("[CONSENSUS] ⚠️ Reveal phase timeout: only {}/{} reveals received", 
+                     final_reveals, byzantine_threshold);
+            println!("[CONSENSUS] ❌ Byzantine threshold NOT reached - consensus failed");
+            println!("[CONSENSUS] 🔄 Progressive Finalization Protocol will handle recovery");
+            // Don't proceed to finalization - let PFP handle it
+            return;
+        }
         
         // Clean up old environment variables (legacy code removal)
         for participant in participants.iter().take(10) {
@@ -7630,6 +7809,7 @@ impl BlockchainNode {
             
             // STEP 3: Execute REAL COMMIT phase with P2P communication
             println!("[CONSENSUS] 📝 Starting COMMIT phase...");
+            // CRITICAL FIX: Create persistent storage for consensus nonces (shared between commit and reveal)
             let consensus_nonce_storage = std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
             let unified_p2p_option = Some(p2p.clone()); // Pass REAL P2P system
             
@@ -8508,11 +8688,16 @@ impl BlockchainNode {
                     .build() 
                 {
                     if let Ok(response) = client.get(&endpoint).send().await {
-                        if let Ok(text) = response.text().await {
-                            if let Ok(height) = text.trim().parse::<u64>() {
+                        // CRITICAL FIX: API returns JSON, not plain text (same fix as unified_p2p.rs)
+                        if let Ok(json) = response.json::<serde_json::Value>().await {
+                            if let Some(height) = json.get("height").and_then(|h| h.as_u64()) {
                                 heights.push(height);
                                 println!("[SYNC] 📏 Peer {} reports height: {}", peer.id, height);
+                            } else {
+                                println!("[SYNC] ⚠️ Peer {} - malformed JSON response", peer.id);
                             }
+                        } else {
+                            println!("[SYNC] ⚠️ Peer {} - JSON parse error", peer.id);
                         }
                     }
                 }

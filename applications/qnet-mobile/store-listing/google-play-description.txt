@@ -8,14 +8,14 @@ QNet Wallet
 ====================
 SHORT DESCRIPTION (80 chars max)  
 ====================
-Secure quantum-resistant crypto wallet with node activation and staking rewards
+Secure quantum-resistant crypto wallet with blockchain validator node support
 
 ====================
 FULL DESCRIPTION (4000 chars max)
 ====================
 QNet Wallet - Quantum-Resistant Cryptocurrency Wallet
 
-QNet Wallet is a secure, non-custodial cryptocurrency wallet designed for the quantum-resistant QNet blockchain. Store, send, and receive digital assets with military-grade encryption while earning staking rewards through network participation.
+QNet Wallet is a secure, non-custodial cryptocurrency wallet designed for the quantum-resistant QNet blockchain. Store, send, and receive digital assets with military-grade encryption while participating in network validation as a light node operator.
 
 KEY FEATURES:
 
@@ -25,14 +25,14 @@ Non-custodial wallet with full control of your private keys. Generate and restor
 • Send & Receive Crypto
 Instantly send and receive QNet tokens and other supported cryptocurrencies. QR code scanning for easy transactions. Full transaction history and balance tracking.
 
-• Network Participation (Staking)
-Participate in network validation through Proof of Participation (PoP) consensus mechanism. Activate a light node to support network security and receive participation rewards. NOT cryptocurrency mining - only lightweight periodic status checks every 4 hours.
+• Network Validation Node
+Run a light validator node to participate in the Proof of Participation (PoP) consensus mechanism. Support network security and decentralization. NOT cryptocurrency mining - only lightweight periodic status checks every 4 hours. Validator activity is recorded on-chain.
 
 • Quantum-Resistant Security
 Built with future-proof cryptography using CRYSTALS-Kyber and CRYSTALS-Dilithium algorithms to protect against quantum computing threats.
 
 • Multi-Language Support
-Available in English, Chinese, Russian, Spanish, French, German, Japanese, Korean, and more.
+Available in 11 languages: English, Chinese (Simplified), Russian, Spanish, French, German, Japanese, Korean, Portuguese, Arabic, and Italian.
 
 TECHNICAL HIGHLIGHTS:
 
@@ -40,7 +40,7 @@ TECHNICAL HIGHLIGHTS:
 Implements CRYSTALS-Kyber and CRYSTALS-Dilithium algorithms for future-proof security against quantum computing threats.
 
 • Energy Efficient
-Optimized for mobile devices with minimal battery usage. Optional node activation enables staking without mining or intensive computations.
+Optimized for mobile devices with minimal battery usage. Optional validator node activation without mining or intensive computations.
 
 • Decentralized & Non-Custodial
 You control your private keys. Direct blockchain interaction without intermediaries. Open-source and transparent.
@@ -53,22 +53,23 @@ HOW IT WORKS:
 1. Create a new wallet or import existing one
 2. Secure your seed phrase backup
 3. Send, receive, and manage your crypto assets
-4. Optional: Activate a node for staking rewards
+4. Optional: Run a validator node to support the network
 
-QNet Wallet provides all the functionality of a modern cryptocurrency wallet with additional features for network participation. Similar to popular wallets like MetaMask or Trust Wallet, but with quantum-resistant security.
+QNet Wallet provides all the functionality of a modern cryptocurrency wallet with optional validator node features. Similar to popular wallets like MetaMask or Trust Wallet, but with quantum-resistant security and the ability to run a light validation node.
 
 IMPORTANT NOTES:
 
 • Your private keys are never shared or stored on our servers
-• Optional node activation for network participation (Proof of Participation consensus)
+• Optional validator node for network participation (Proof of Participation consensus)
 • NOT cryptocurrency mining - lightweight network validation only
-• Requires maintaining active node status - device must respond to periodic network checks
+• Validator nodes must respond to periodic network health checks
+• All validator activity is recorded on the public blockchain
 • Compatible with blockchain standards
 
-ABOUT NETWORK PARTICIPATION:
-This app implements Proof of Participation (PoP) - a lightweight consensus mechanism for blockchain validation. Your device must respond to periodic network status checks (every 4 hours) to maintain node eligibility. Minimal battery usage (<0.01% daily). This is NOT mining and does not involve intensive computations. Participation rewards are distributed to active nodes that successfully maintain network connectivity.
+ABOUT VALIDATOR NODES:
+This app allows you to run a light validator node using Proof of Participation (PoP) - a lightweight consensus mechanism. Your device responds to periodic network health checks (every 4 hours) to maintain validator status. Minimal battery usage (<0.01% daily). This is NOT mining and does not involve intensive computations. Validator activity and metrics are recorded on the public blockchain. Network protocol automatically manages validator participation based on on-chain activity.
 
-Join users securing their digital assets with quantum-resistant technology.
+Join users securing their digital assets with quantum-resistant technology and supporting decentralized network infrastructure.
 
 For support and documentation, visit: https://aiqnet.io
 
@@ -85,11 +86,36 @@ Everyone
 ====================
 TAGS (for better discovery)
 ====================
-crypto wallet, cryptocurrency wallet, bitcoin wallet, ethereum wallet, blockchain wallet, defi wallet, web3 wallet, non custodial wallet, secure wallet, quantum resistant
+crypto wallet, cryptocurrency wallet, blockchain wallet, defi wallet, web3 wallet, non custodial wallet, secure wallet, quantum resistant, validator node, light node
 
 EMPHASIZE:
 - Cryptocurrency wallet (primary function)
 - Non-custodial and secure
-- Optional staking features (not mining)
+- Optional validator node features (not mining)
 - Similar to MetaMask, Trust Wallet
 - Quantum-resistant security
+- Network participation through validation
+- 11 languages supported
+
+====================
+SUPPORTED LANGUAGES FOR GOOGLE PLAY
+====================
+Store Listing Translations:
+1. English (en-US) - Primary
+2. Chinese Simplified (zh-CN) - 简体中文
+3. Russian (ru-RU) - Русский
+4. Spanish (es-ES) - Español
+5. French (fr-FR) - Français
+6. German (de-DE) - Deutsch
+7. Japanese (ja-JP) - 日本語
+8. Korean (ko-KR) - 한국어
+9. Portuguese (pt-PT) - Português
+10. Arabic (ar) - العربية
+11. Italian (it-IT) - Italiano
+
+Each language should have:
+- Translated app title (30 chars max)
+- Translated short description (80 chars max)
+- Translated full description (4000 chars max)
+- Translated screenshots with localized text
+- Localized app icon (optional)

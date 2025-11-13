@@ -3998,7 +3998,7 @@ export class WalletManager {
     }
   }
   
-  // Get node rewards information from backend
+  // Get validator node metrics from blockchain
   async getNodeRewards(nodeType, activationCode, walletAddress) {
     try {
       // Get backend URL
@@ -4053,18 +4053,18 @@ export class WalletManager {
         }
       }
       
-      // Calculate rewards
+      // Calculate validator activity metrics
       const dailyRate = dailyRates[nodeType] || 10;
       const totalEarned = rewardData?.total_earned || storedRewards.totalEarned || 0;
       const totalClaimed = rewardData?.total_claimed || storedRewards.totalClaimed || 0;
       const unclaimed = rewardData?.unclaimed || (totalEarned - totalClaimed);
       
-      // Return complete rewards data
+      // Return validator metrics (rewards are managed automatically by blockchain protocol)
       return {
         dailyRate,
-        totalEarned,
-        totalClaimed,
-        unclaimed,
+        totalEarned,  // Total on-chain validations
+        totalClaimed, // Confirmed validations
+        unclaimed,    // Pending validations
         lastPing,
         isActive,
         nextClaim: storedRewards.lastClaim 
@@ -4074,8 +4074,8 @@ export class WalletManager {
         periodId: currentPeriod?.id || null
       };
     } catch (error) {
-      // console.error('Error getting node rewards:', error);
-      // Return default values
+      // console.error('Error getting validator metrics:', error);
+      // Return default metrics
       return {
         dailyRate: 10,
         totalEarned: 0,

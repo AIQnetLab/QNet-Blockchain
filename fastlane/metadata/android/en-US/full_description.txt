@@ -1,0 +1,47 @@
+QNet Wallet - Decentralized Cryptocurrency Wallet
+
+QNet Wallet is a secure, open-source mobile wallet for the QNet blockchain ecosystem. Built with privacy and security in mind, it provides users with full control over their digital assets.
+
+KEY FEATURES:
+
+🔐 SECURITY FIRST
+• Non-custodial: You own your keys and your crypto
+• BIP39 mnemonic seed phrase support
+• Secure keychain storage on device
+• No tracking, no analytics, no third-party services
+
+💰 COMPLETE WALLET FUNCTIONALITY
+• Send and receive QNet tokens
+• Transaction history with detailed information
+• QR code support for easy payments
+• Real-time balance updates
+
+🌍 DECENTRALIZED ARCHITECTURE
+• Direct connection to QNet blockchain nodes
+• No central servers required
+• Byzantine fault-tolerant consensus
+• Quantum-resistant cryptography support
+
+🚀 PERFORMANCE
+• Fast transaction processing
+• Optimized for mobile devices
+• Low battery consumption
+• Works on older Android devices (Android 5.0+)
+
+OPEN SOURCE & TRANSPARENT
+• Fully auditable code
+• Community-driven development
+• Regular security updates
+• No hidden functionality
+
+PRIVACY FOCUSED
+• No personal data collection
+• No KYC requirements
+• Optional privacy features
+• Local-only data storage
+
+QNet Wallet puts you in full control of your digital assets while maintaining the highest standards of security and privacy.
+
+SOURCE CODE: https://github.com/AIQnetLab/QNet-Blockchain
+LICENSE: Apache-2.0
+
