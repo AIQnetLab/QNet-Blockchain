@@ -2745,6 +2745,13 @@ impl BlockchainNode {
                                             Ok(_) => {
                                                 println!("[GENESIS] ✅ Genesis Block created and saved at height 0");
                                                 
+                                                // CRITICAL FIX: Wait 5 seconds before broadcasting Genesis
+                                                // This gives ALL nodes time to fully initialize P2P listeners
+                                                // Without this delay, fast-starting nodes might miss Genesis broadcast
+                                                println!("[GENESIS] ⏳ Waiting 5 seconds for all nodes to initialize...");
+                                                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                                                println!("[GENESIS] ✅ All nodes ready, proceeding with Genesis broadcast");
+                                                
                                                 // CRITICAL: Broadcast Genesis block with extended timeout
                                                 // Genesis is critical - use special method with 3s timeout (vs 200ms for normal blocks)
                                                 if let Some(p2p) = &unified_p2p {
