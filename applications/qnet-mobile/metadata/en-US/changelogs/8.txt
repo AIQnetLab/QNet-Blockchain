@@ -1,0 +1,11 @@
+Version 1.0.7 (Build 8)
+
+• Enhanced security with improved keychain storage
+• Optimized network performance for faster transactions
+• Fixed UI rendering issues on older devices
+• Updated cryptographic libraries for better security
+• Improved error handling and user feedback
+• Bug fixes and performance improvements
+• Added support for QR code scanning improvements
+• Enhanced transaction validation
+
