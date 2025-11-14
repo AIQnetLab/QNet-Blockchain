@@ -187,7 +187,7 @@ impl CommitRevealConsensus {
                     return Err(ConsensusError::PhaseTimeout("Commit phase ended and grace period expired".to_string()));
                 }
             } else {
-                return Err(ConsensusError::PhaseTimeout("Commit phase ended".to_string()));
+            return Err(ConsensusError::PhaseTimeout("Commit phase ended".to_string()));
             }
         }
         

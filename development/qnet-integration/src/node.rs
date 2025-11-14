@@ -18,6 +18,7 @@ const MIN_BYZANTINE_NODES: usize = 4; // 3f+1 where f=1
 const FAST_SYNC_THRESHOLD: u64 = 10; // Trigger fast sync if behind by 10+ blocks (lowered from 50 for faster detection)  
 const FAST_SYNC_TIMEOUT_SECS: u64 = 60; // Fast sync timeout
 const BACKGROUND_SYNC_TIMEOUT_SECS: u64 = 30; // Background sync timeout
+const SYNC_DEADLOCK_TIMEOUT_SECS: u64 = 60; // Timeout for detecting stuck sync operations
 const SNAPSHOT_FULL_INTERVAL: u64 = 10000; // Full snapshot every 10k blocks
 const SNAPSHOT_INCREMENTAL_INTERVAL: u64 = 1000; // Incremental snapshot every 1k blocks
 const API_HEALTH_CHECK_RETRIES: u32 = 5; // API health check attempts
@@ -73,6 +74,16 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 static SYNC_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static FAST_SYNC_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 pub static NODE_IS_SYNCHRONIZED: AtomicBool = AtomicBool::new(false);
+
+// DEADLOCK PROTECTION: Track when sync started to detect stuck operations
+static SYNC_START_TIME: AtomicU64 = AtomicU64::new(0);
+static FAST_SYNC_START_TIME: AtomicU64 = AtomicU64::new(0);
+
+// CRITICAL: Global shared storage instance to avoid RocksDB lock conflicts
+// RocksDB does NOT support multiple connections to same database
+lazy_static::lazy_static! {
+    static ref GLOBAL_STORAGE_INSTANCE: std::sync::Mutex<Option<Arc<Storage>>> = std::sync::Mutex::new(None);
+}
 
 // CRITICAL FIX: Track last block production time globally for stall detection
 // This prevents network from getting stuck when all nodes stop producing
@@ -455,6 +466,53 @@ impl BlockchainNode {
         
         let mut reward_manager = self.reward_manager.write().await;
         
+        // CRITICAL: Sync ping histories from storage before processing
+        // This ensures we don't lose pings after restarts
+        let current_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let window_start = current_time - (current_time % (4 * 60 * 60)); // Start of current 4-hour window
+        
+        // Get all registered nodes from reward_manager
+        let registered_nodes = reward_manager.get_all_registered_nodes();
+        
+        // Load ping histories from storage for each registered node
+        for (node_id, node_type) in registered_nodes {
+            match self.storage.get_ping_history(&node_id, window_start) {
+                Ok(ping_attempts) => {
+                    // CRITICAL: Load wallet address from storage (survives restart)
+                    let wallet_address = if let Ok(Some((_, wallet, _))) = self.storage.load_node_registration(&node_id) {
+                        wallet
+                    } else {
+                        // Fallback only if not in storage
+                        reward_manager.get_node_wallet_address(&node_id)
+                            .unwrap_or_else(|| {
+                                let hash = blake3::hash(node_id.as_bytes()).to_hex();
+                                format!("{}eon{}", &hash[..20], &hash[20..40])
+                            })
+                    };
+                    
+                    // Register node (will be ignored if already registered)
+                    if let Err(_) = reward_manager.register_node(node_id.clone(), node_type, wallet_address) {
+                        // Node already registered, that's fine
+                    }
+                    
+                    // Add ping attempts from storage
+                    for (_timestamp, success, response_time_ms) in ping_attempts {
+                        if let Err(e) = reward_manager.record_ping_attempt(&node_id, success, response_time_ms) {
+                            println!("[REWARDS] ⚠️ Failed to restore ping from storage for {}: {}", node_id, e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    println!("[REWARDS] ⚠️ Failed to load ping history for {}: {}", node_id, e);
+                }
+            }
+        }
+        
+        println!("[REWARDS] ✅ Synced ping histories from storage");
+        
         // Process the current window (calculates pending rewards based on ping history)
         reward_manager.force_process_window()
             .map_err(|e| QNetError::ConsensusError(format!("Failed to process reward window: {}", e)))?;
@@ -488,10 +546,54 @@ impl BlockchainNode {
                 let total_supply = (*state).get_total_supply();
                 println!("   🏦 New total supply: {} QNC", total_supply);
                 println!("   📊 Eligible nodes: {}", pending_rewards.len());
+                
+                // CRITICAL: Create system emission transaction for blockchain record
+                if actual_emission > 0 {
+                    let current_time = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    
+                    let mut emission_tx = qnet_state::Transaction {
+                        from: "system_emission".to_string(),
+                        to: Some("system_rewards_pool".to_string()),
+                        amount: actual_emission,
+                        tx_type: qnet_state::TransactionType::RewardDistribution,
+                        timestamp: current_time,
+                        hash: String::new(),
+                        signature: None, // System transaction
+                        gas_price: 0,
+                        gas_limit: 0,
+                        nonce: 0,
+                        data: Some(format!("Emission: {} QNC, Window: {}, Total Supply: {}", 
+                                         actual_emission, current_time / (4 * 60 * 60), total_supply)),
+                    };
+                    
+                    // CRITICAL: Use the CORRECT hash calculation method (blake3, NOT SHA3!)
+                    emission_tx.hash = emission_tx.calculate_hash();
+                    
+                    // Add emission transaction to mempool for blockchain record
+                    if let Err(e) = self.add_transaction_to_mempool(emission_tx).await {
+                        eprintln!("[REWARDS] ⚠️ Failed to add emission tx to mempool: {}", e);
+                    } else {
+                        println!("[REWARDS] 📝 Emission transaction added to mempool for consensus");
+                    }
+                }
             }
             Err(e) => {
                 eprintln!("[REWARDS] ❌ Emission failed: {}", e);
                 return Err(QNetError::ConsensusError(format!("Failed to emit rewards: {}", e)));
+            }
+        }
+        
+        // CRITICAL: Save pending rewards to storage (survive restarts)
+        for (node_id, _amount) in &pending_rewards {
+            if let Some(reward) = reward_manager.get_pending_reward(&node_id) {
+                if let Err(e) = self.storage.save_pending_reward(&node_id, reward) {
+                    eprintln!("[REWARDS] ⚠️ Failed to save pending reward for {}: {}", node_id, e);
+                } else {
+                    println!("[REWARDS] 💾 Saved pending reward for {} to storage", node_id);
+                }
             }
         }
         
@@ -531,7 +633,19 @@ impl BlockchainNode {
         let storage = match Storage::new(data_dir) {
             Ok(storage) => {
                 println!("[Node] 🔍 DEBUG: Storage initialized successfully");
-                Arc::new(storage)
+                
+                let storage_arc = Arc::new(storage);
+                
+                // CRITICAL: Set global storage instance to avoid RocksDB lock conflicts
+                // Registry and other components will use this shared instance
+                *GLOBAL_STORAGE_INSTANCE.lock().unwrap() = Some(storage_arc.clone());
+                println!("[Node] 🔐 Global storage instance set (shared across components)");
+                
+                // PRODUCTION: Set storage path for registry to read activations
+                std::env::set_var("QNET_STORAGE_PATH", data_dir);
+                println!("[Node] 📁 Storage path set: QNET_STORAGE_PATH={}", data_dir);
+                
+                storage_arc
             }
             Err(e) => {
                 println!("[Node] ❌ ERROR: Storage initialization failed: {}", e);
@@ -939,6 +1053,50 @@ impl BlockchainNode {
         let reward_manager = Arc::new(RwLock::new(
             PhaseAwareRewardManager::new(genesis_timestamp)
         ));
+        
+        // CRITICAL: Restore pending rewards from storage (survive restarts)
+        {
+            println!("[REWARDS] 🔄 Recovering pending rewards from storage...");
+            let mut reward_manager_guard = reward_manager.write().await;
+            
+            // Load all pending rewards from storage
+            match storage.get_all_pending_rewards() {
+                Ok(stored_rewards) => {
+                    let reward_count = stored_rewards.len();
+                    if reward_count > 0 {
+                        // Restore each pending reward to reward_manager
+                        for (node_id, reward) in stored_rewards {
+                            // First ensure node is registered (load registration from storage)
+                            if let Ok(Some((node_type_str, wallet, _reputation))) = storage.load_node_registration(&node_id) {
+                                let node_type = match node_type_str.as_str() {
+                                    "light" => RewardNodeType::Light,
+                                    "full" => RewardNodeType::Full,
+                                    "super" => RewardNodeType::Super,
+                                    _ => RewardNodeType::Light,
+                                };
+                                
+                                // Register node if not already registered
+                                if let Err(_) = reward_manager_guard.register_node(node_id.clone(), node_type, wallet) {
+                                    // Already registered, that's fine
+                                }
+                                
+                                // Restore pending reward to reward_manager
+                                let reward_amount = reward.total_reward;
+                                reward_manager_guard.restore_pending_reward(node_id.clone(), reward);
+                                println!("[REWARDS] 💰 Restored pending reward for {}: {} QNC", 
+                                         node_id, reward_amount);
+                            }
+                        }
+                        println!("[REWARDS] ✅ Restored {} pending rewards from storage", reward_count);
+                    } else {
+                        println!("[REWARDS] 📭 No pending rewards to restore");
+                    }
+                }
+                Err(e) => {
+                    println!("[REWARDS] ⚠️ Failed to load pending rewards from storage: {}", e);
+                }
+            }
+        }
         
         // Get node IP for archive registration - use ENV or auto-detect
         let node_ip = match std::env::var("QNET_PUBLIC_IP") {
@@ -2973,6 +3131,7 @@ impl BlockchainNode {
                 impl Drop for FastSyncGuard {
                     fn drop(&mut self) {
                         FAST_SYNC_IN_PROGRESS.store(false, Ordering::SeqCst);
+                        FAST_SYNC_START_TIME.store(0, Ordering::Relaxed); // Clear deadlock timer
                     }
                 }
                 
@@ -3025,9 +3184,30 @@ impl BlockchainNode {
                             println!("[SYNC] ⚠️ Node is {} blocks behind network (local: {}, network: {})", 
                                      height_difference, microblock_height, network_height);
                             
+                            // DEADLOCK DETECTION: Check if fast sync is stuck
+                            let current_time = get_timestamp_safe();
+                            if FAST_SYNC_IN_PROGRESS.load(Ordering::SeqCst) {
+                                let sync_start_time = FAST_SYNC_START_TIME.load(Ordering::Relaxed);
+                                let sync_elapsed = if sync_start_time > 0 {
+                                    current_time.saturating_sub(sync_start_time)
+                                } else {
+                                    0
+                                };
+                                
+                                if sync_elapsed > SYNC_DEADLOCK_TIMEOUT_SECS {
+                                    println!("[SYNC] 🔓 DEADLOCK DETECTED: Fast sync stuck for {}s, force clearing flag", sync_elapsed);
+                                    // CRITICAL: Must reset flag despite race condition risk
+                                    // Better to have potential parallel sync than permanent deadlock
+                                    FAST_SYNC_IN_PROGRESS.store(false, Ordering::SeqCst);
+                                    FAST_SYNC_START_TIME.store(0, Ordering::Relaxed);
+                                    // Continue to start new sync below
+                                }
+                            }
                             
                             // RACE CONDITION FIX: Only start fast sync if not already running
                             if !FAST_SYNC_IN_PROGRESS.swap(true, Ordering::SeqCst) {
+                                // Record sync start time for deadlock detection
+                                FAST_SYNC_START_TIME.store(current_time, Ordering::Relaxed);
                                 println!("[SYNC] ⚡ FAST SYNC MODE: {} blocks behind, catching up...", height_difference);
                                 
                                     // CRITICAL FIX: Do NOT update height before syncing blocks!
@@ -3521,8 +3701,12 @@ impl BlockchainNode {
                                         let sync_from = ((current_height / 30) * 30).saturating_sub(30);
                                         println!("[CONSENSUS] 🔄 Resyncing from block {} to restore consensus", sync_from);
                                         
-                                        // Set sync flags
-                                        FAST_SYNC_IN_PROGRESS.store(true, Ordering::Relaxed);
+                                        // CRITICAL FIX: Check and set atomically to avoid race condition
+                                        // Only set if not already in progress
+                                        if !FAST_SYNC_IN_PROGRESS.load(Ordering::SeqCst) {
+                                            FAST_SYNC_IN_PROGRESS.store(true, Ordering::SeqCst);
+                                            FAST_SYNC_START_TIME.store(get_timestamp_safe(), Ordering::Relaxed);
+                                        }
                                         NODE_IS_SYNCHRONIZED.store(false, Ordering::Relaxed);
                                         
                                         // Trigger sync (will be picked up by sync loop)
@@ -4422,6 +4606,26 @@ impl BlockchainNode {
                         impl Drop for SyncGuard {
                             fn drop(&mut self) {
                                 SYNC_IN_PROGRESS.store(false, Ordering::SeqCst);
+                                SYNC_START_TIME.store(0, Ordering::Relaxed); // Clear deadlock timer
+                            }
+                        }
+                        
+                        // DEADLOCK DETECTION: Check if background sync is stuck
+                        let current_time = get_timestamp_safe();
+                        if SYNC_IN_PROGRESS.load(Ordering::SeqCst) {
+                            let sync_start_time = SYNC_START_TIME.load(Ordering::Relaxed);
+                            let sync_elapsed = if sync_start_time > 0 {
+                                current_time.saturating_sub(sync_start_time)
+                            } else {
+                                0
+                            };
+                            
+                            if sync_elapsed > BACKGROUND_SYNC_TIMEOUT_SECS {
+                                println!("[SYNC] 🔓 DEADLOCK DETECTED: Background sync stuck for {}s, clearing flag", sync_elapsed);
+                                // CRITICAL: Must reset flag or node will be stuck forever
+                                // Risk of race condition is better than permanent deadlock
+                                SYNC_IN_PROGRESS.store(false, Ordering::SeqCst);
+                                SYNC_START_TIME.store(0, Ordering::Relaxed);
                             }
                         }
                         
@@ -4436,6 +4640,7 @@ impl BlockchainNode {
                             
                             // Mark sync as in progress
                             SYNC_IN_PROGRESS.store(true, Ordering::SeqCst);
+                            SYNC_START_TIME.store(current_time, Ordering::Relaxed); // Record start time
                         
                         tokio::spawn(async move {
                                 // PRODUCTION: Guard ensures flag is cleared even on panic/error
@@ -6024,12 +6229,56 @@ impl BlockchainNode {
         // Check if we're a bootstrap node
         if std::env::var("QNET_BOOTSTRAP_ID").is_ok() || 
            std::env::var("QNET_GENESIS_BOOTSTRAP").unwrap_or_default() == "1" {
-            // Bootstrap mode means we're in Genesis phase by definition
+            // CRITICAL FIX: Genesis nodes also transition to Normal phase after 1000 blocks!
+            
+            // STEP 1: Try to get height from P2P cache (fastest, no I/O)
+            if let Some(height) = p2p.get_cached_network_height() {
+                let is_genesis = height < 1000;
+                
                 if let Ok(mut cache) = phase_cache.lock() {
-                    *cache = (true, 0, current_time);
+                    *cache = (is_genesis, height, current_time);
+                }
+                
+                if is_genesis {
+                    println!("[PHASE] Bootstrap node at height {} → Genesis phase (from P2P cache)", height);
+                } else {
+                    println!("[PHASE] ✅ Bootstrap node at height {} → Normal phase - using blockchain registry!", height);
+                }
+                
+                return is_genesis;
             }
-            println!("[PHASE] Bootstrap mode active → Genesis phase");
-            return true; // Bootstrap mode = Genesis phase
+            
+            // STEP 2: Fallback to LOCAL storage (fast, no network calls!)
+            // This handles startup before P2P cache is populated
+            if let Ok(storage_guard) = GLOBAL_STORAGE_INSTANCE.lock() {
+                if let Some(ref storage) = *storage_guard {
+                    if let Ok(local_height) = storage.get_chain_height() {
+                        if local_height > 0 {
+                            let is_genesis = local_height < 1000;
+                            
+                            if let Ok(mut cache) = phase_cache.lock() {
+                                *cache = (is_genesis, local_height, current_time);
+                            }
+                            
+                            if is_genesis {
+                                println!("[PHASE] Bootstrap node at height {} → Genesis phase (from local storage)", local_height);
+                            } else {
+                                println!("[PHASE] ✅ Bootstrap node at height {} → Normal phase - using blockchain registry! (from local storage)", local_height);
+                            }
+                            
+                            return is_genesis;
+                        }
+                    }
+                }
+            }
+            
+            // STEP 3: No data available - safe fallback to Genesis phase
+            // This only happens on FIRST startup with empty storage
+            if let Ok(mut cache) = phase_cache.lock() {
+                *cache = (true, 0, current_time);
+            }
+            println!("[PHASE] Bootstrap mode - no height data available → Genesis phase (safe fallback)");
+            return true;
         }
         
         // No cache and not bootstrap - assume Genesis phase for safety
@@ -6182,9 +6431,19 @@ impl BlockchainNode {
             .or_else(|_| std::env::var("QNET_GENESIS_NODES")
                 .map(|nodes| format!("http://{}:8001", nodes.split(',').next().unwrap_or("127.0.0.1").trim())))
             .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
+        
+        // CRITICAL: Get shared storage reference to avoid RocksDB lock conflicts
+        // Storage is set as global through QNET_STORAGE_INSTANCE
+        let storage_ref = if let Ok(storage_path) = std::env::var("QNET_STORAGE_PATH") {
+            // Try to get from global storage (will be set by node initialization)
+            GLOBAL_STORAGE_INSTANCE.lock().unwrap().clone()
+        } else {
+            None
+        };
             
-        let registry = crate::activation_validation::BlockchainActivationRegistry::new(
-            Some(qnet_rpc)
+        let registry = crate::activation_validation::BlockchainActivationRegistry::new_with_storage(
+            Some(qnet_rpc),
+            storage_ref
         );
         
         // Note: Registry sync is handled internally by the registry system
@@ -9171,8 +9430,9 @@ impl BlockchainNode {
     /// Get wallet address for this node (for activation verification)
     pub fn get_wallet_address(&self) -> String {
         // PRODUCTION: Extract wallet address from stored activation code
-        // For now: generate from node_id (would be replaced with real wallet extraction)
-        format!("{}...eon", &self.node_id[..8])
+        // Generate proper EON address format: {20 hex}eon{20 hex}
+        let hash = blake3::hash(self.node_id.as_bytes()).to_hex();
+        format!("{}eon{}", &hash[..20], &hash[20..40])
     }
     
     /// Extract wallet address from activation code using quantum decryption

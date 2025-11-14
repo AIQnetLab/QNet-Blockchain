@@ -56,10 +56,17 @@ async fn decode_activation_code_quantum_secure(
     code: &str, 
     selected_node_type: NodeType
 ) -> Result<ActivationCodeData, String> {
-    // Initialize quantum crypto module
-    let mut quantum_crypto = QNetQuantumCrypto::new();
-    quantum_crypto.initialize().await
-        .map_err(|e| format!("Failed to initialize quantum crypto: {}", e))?;
+    // Use GLOBAL quantum crypto instance to avoid multiple initializations
+    use qnet_integration::node::GLOBAL_QUANTUM_CRYPTO;
+    
+    let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
+    if crypto_guard.is_none() {
+        let mut crypto = QNetQuantumCrypto::new();
+        crypto.initialize().await
+            .map_err(|e| format!("Failed to initialize quantum crypto: {}", e))?;
+        *crypto_guard = Some(crypto);
+    }
+    let quantum_crypto = crypto_guard.as_ref().unwrap();
 
     // 1. Decrypt activation code using quantum-resistant decryption
     println!("🔓 Decrypting quantum-secure activation code...");
@@ -2573,8 +2580,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::var("QNET_PRODUCTION").unwrap_or_default() == "1" {
         println!("🔐 Recording quantum-secure activation in QNet blockchain...");
         
-        let mut quantum_crypto = qnet_integration::quantum_crypto::QNetQuantumCrypto::new();
-        quantum_crypto.initialize().await?;
+        // Use GLOBAL quantum crypto instance
+        use qnet_integration::node::GLOBAL_QUANTUM_CRYPTO;
+        
+        let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
+        if crypto_guard.is_none() {
+            let mut crypto = qnet_integration::quantum_crypto::QNetQuantumCrypto::new();
+            crypto.initialize().await?;
+            *crypto_guard = Some(crypto);
+        }
+        let quantum_crypto = crypto_guard.as_ref().unwrap();
         
         // Decrypt activation code to get payload
         let payload = quantum_crypto.decrypt_activation_code(&activation_code).await?;
