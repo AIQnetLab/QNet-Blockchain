@@ -288,6 +288,15 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(blockchain_filter.clone())
         .and_then(handle_block_by_hash);
     
+    // Macroblock endpoint - PRODUCTION
+    let macroblock_by_index = api_v1
+        .and(warp::path("macroblock"))
+        .and(warp::path::param::<u64>())
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(blockchain_filter.clone())
+        .and_then(handle_macroblock_by_index);
+    
     // Transaction endpoints
     let transaction_submit = api_v1
         .and(warp::path("transaction"))
@@ -780,7 +789,8 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .or(microblocks_range)
         .or(block_latest)
         .or(block_by_height)
-        .or(block_by_hash);
+        .or(block_by_hash)
+        .or(macroblock_by_index);
         
     let account_routes = account_info
         .or(account_balance)
@@ -1616,6 +1626,53 @@ async fn handle_block_by_hash(
                 "error": "Block with matching hash not found in recent 1000 blocks"
             });
             Ok(warp::reply::json(&response))
+        }
+    }
+}
+
+async fn handle_macroblock_by_index(
+    index: u64,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    match blockchain.get_macroblock(index).await {
+        Ok(Some(macroblock)) => {
+            let response = json!({
+                "index": index,
+                "height": macroblock.height,
+                "timestamp": macroblock.timestamp,
+                "micro_blocks_count": macroblock.micro_blocks.len(),
+                "micro_blocks": macroblock.micro_blocks.iter()
+                    .map(|h| hex::encode(h))
+                    .collect::<Vec<_>>(),
+                "state_root": hex::encode(macroblock.state_root),
+                "consensus_data": {
+                    "next_leader": macroblock.consensus_data.next_leader,
+                    "commits_count": macroblock.consensus_data.commits.len(),
+                    "reveals_count": macroblock.consensus_data.reveals.len(),
+                },
+                "previous_hash": hex::encode(macroblock.previous_hash),
+                "poh_hash": hex::encode(&macroblock.poh_hash),
+                "poh_count": macroblock.poh_count,
+            });
+            Ok(warp::reply::json(&response))
+        }
+        Ok(None) => {
+            let error_response = json!({
+                "error": "Macroblock not found",
+                "index": index,
+                "info": format!("Macroblock #{} would cover blocks {}-{}", 
+                                index, 
+                                (index - 1) * 90 + 1, 
+                                index * 90)
+            });
+            Ok(warp::reply::json(&error_response))
+        }
+        Err(e) => {
+            let error_response = json!({
+                "error": "Failed to get macroblock",
+                "details": e.to_string()
+            });
+            Ok(warp::reply::json(&error_response))
         }
     }
 }

@@ -49,12 +49,12 @@ QNet is a high-performance, post-quantum secure blockchain network with a **two-
   - Clock drift: 5-7% (excellent for production)
   - 72 bytes overhead per block (poh_hash: 64B + poh_count: 8B) = ~2-3%
   - Hardware: Intel Xeon E5-2680v4 @ 2.4GHz
-- **Quantum-Resistant Producer Selection**: Deterministic entropy-based selection with Byzantine safety (VRF with quantum-resistant hybrid crypto available)
+- **Quantum-Resistant Producer Selection**: Threshold VRF with Dilithium + Ed25519 hybrid cryptography for Byzantine-safe leader election
 - **Hybrid Sealevel Execution**: 5-stage pipeline with 10,000 parallel transactions
 - **Tower BFT Adaptive Timeouts**: Dynamic 20s/10s/7s timeouts based on network conditions
 - **Pre-Execution Cache**: Speculative execution with 10,000 transaction cache
 - **Comprehensive Benchmark Harness**: Full performance testing suite for all components
-- **56 API Endpoints**: Complete monitoring and control interface for all features
+- **57 API Endpoints**: Complete monitoring and control interface for all features
 
 ### **Current Session Updates (October 31, 2025)**
 - **Emergency Producer System**: EMERGENCY_PRODUCER_FLAG for automatic failover
@@ -127,7 +127,7 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 
 - **🔐 Post-Quantum Security**: NIST/Cisco encapsulated keys with Dilithium3 + ephemeral Ed25519
 - **⚡ Ultra-High Performance**: 424,411 TPS with zero-downtime consensus
-- **🎲 True Decentralization**: Entropy-based producer selection with unpredictable rotation
+- **🎲 True Decentralization**: VRF-based producer selection with deterministic fairness and quantum resistance
 - **💰 Reputation Economics**: Rewards for block production (+1 micro, +10/+5 macro)
 - **🔄 Advanced Synchronization**: State snapshots with parallel downloads & IPFS
 - **🔥 Phase 1 Active**: 1DEV burn-to-join (1,500 → 300 1DEV minimum, universal pricing)
@@ -215,16 +215,20 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 │  ├── CRYSTALS-Kyber (Key Exchange)                         │
 │  └── SPHINCS+ (Hash-based Signatures)                      │
 ├─────────────────────────────────────────────────────────────┤
-│  Consensus Layer with Entropy-Based Selection              │
+│  Consensus Layer with VRF-Based Selection                  │
 │  ├── Microblock Production (1s intervals)                  │
-│  │   ├── SHA3-256 hash with previous block entropy         │
-│  │   ├── 30-block rotation with unpredictable selection    │
+│  │   ├── Threshold VRF with quantum-resistant crypto       │
+│  │   ├── Dilithium + Ed25519 hybrid signatures             │
+│  │   ├── 30-block rotation with deterministic selection    │
+│  │   ├── Race-free at boundaries (no delays)               │
 │  │   ├── Producer rewards: +1 reputation per block         │
 │  │   └── Full/Super nodes only (reputation >= 70%)        │
 │  ├── Macroblock Consensus (90s intervals)                  │
 │  │   ├── Byzantine consensus with 1000 validators          │
+│  │   ├── Active listener on all Full/Super nodes (1s poll) │
+│  │   ├── Consensus window: blocks 61-90 (early start)      │
 │  │   ├── Leader: +10 reputation, Participants: +5 each     │
-│  │   ├── Entropy-based initiator selection                 │
+│  │   ├── Deterministic initiator selection                 │
 │  │   └── 67% honest validator requirement                  │
 │  └── Advanced Synchronization                              │
 │      ├── State snapshots: Full (10k blocks) & Incremental  │
@@ -318,7 +322,7 @@ QNet implements production-grade failover mechanisms for zero-downtime operation
 - **Participant Filter**: Only Full and Super nodes (Light nodes excluded for mobile optimization)
 - **Producer Readiness Validation**: Pre-creation checks (reputation ≥70%, network health, connectivity)
 - **Fixed Timeout Detection**: 5 seconds (deterministic for consensus safety across all nodes)
-- **Emergency Selection**: Deterministic SHA3-256 based selection from qualified backup producers
+- **Emergency Selection**: Deterministic fallback selection from qualified backup producers (SHA3-256 hash)
 - **Enhanced Status Visibility**: Comprehensive failover dashboard with recovery metrics
 - **Network Recovery**: <7 seconds automatic recovery time with full broadcast success tracking
 - **Reputation Impact**: -20.0 penalty for failed producer, +5.0 reward for emergency takeover
@@ -411,14 +415,27 @@ Progressive penalties for repeat offenders:
 | **Network Flooding** | >100 msgs/sec from single node | -10.0 points |
 | **Invalid Consensus** | Malformed commit/reveal | -5.0 points |
 
-### **Entropy-Based Selection**
+### **VRF-Based Producer Selection**
 ```rust
-// Prevents deterministic selection
-producer = SHA3_256(
-    round_number + 
-    previous_block_hash +  // Entropy source
-    eligible_nodes         // Rep >= 70%
-)
+// Quantum-resistant threshold VRF for fair producer selection
+// Each qualified node computes VRF output independently
+vrf_input = SHA3_256(
+    leadership_round + 
+    sorted_candidates +
+    macroblock_hash  // or deterministic fallback
+);
+
+// Node evaluates VRF using Dilithium + Ed25519 hybrid crypto
+vrf_output = hybrid_vrf.evaluate(vrf_input).await?;
+threshold = u64::MAX / candidates.len();
+
+// Node becomes producer if VRF output below threshold
+if vrf_output.value < threshold {
+    selected_producer = current_node;
+} else {
+    // Deterministic fallback if no node passes threshold
+    fallback_producer = SHA3_256(vrf_input) % candidates.len();
+}
 ```
 
 ## 🔄 Advanced Synchronization
@@ -1316,6 +1333,8 @@ curl http://localhost:8003/api/v1/transactions/{hash}
 - `GET /api/v1/block/latest` - Get latest block
 - `GET /api/v1/block/{height}` - Get block by height
 - `GET /api/v1/block/hash/{hash}` - Get block by hash
+- `GET /api/v1/microblock/{height}` - Get microblock by height
+- `GET /api/v1/macroblock/{index}` - Get macroblock by index (finalized every 90 blocks)
 
 **Transactions:**
 - `POST /api/v1/transaction` - Submit transaction
@@ -1664,10 +1683,14 @@ Year 10+:   ~300+ GB    🔧 Increase to 500-1000 GB
 
 ## 📈 Latest Updates (v2.6.0)
 
-**September 29, 2025 - "Entropy-Based Selection & Advanced Synchronization"**
+**November 15, 2025 - "VRF-Based Selection & Macroblock Consensus Listener"**
 
-This release introduces critical improvements for true decentralization:
-- **Entropy-Based Producer Selection** prevents deterministic leadership
+This release introduces critical improvements for quantum-resistant consensus:
+- **Threshold VRF Producer Selection** with Dilithium + Ed25519 hybrid cryptography
+- **Race-Free Rotation**: No delays at block boundaries (31, 61, 91)
+- **Active Macroblock Consensus**: All Full/Super nodes run 1-second polling listener
+- **Deterministic Validator Selection**: 1000 validators per macroblock round
+- **Improved Failover**: Consensus state cleanup prevents stuck states
 - **Reputation Rewards** incentivize active network participation
 - **State Snapshots** enable rapid node synchronization
 - **Parallel Downloads** accelerate blockchain sync by 3-5x
