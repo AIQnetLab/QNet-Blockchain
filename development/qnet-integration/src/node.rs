@@ -2952,10 +2952,10 @@ impl BlockchainNode {
                                                         
                                                         println!("[GENESIS] 📡 Broadcasting Genesis block (attempt {}/{})", 
                                                                 broadcast_attempts, MAX_GENESIS_ATTEMPTS);
-                                                        
-                                                        // Use dedicated Genesis broadcast with extended timeout
-                                                        match p2p.broadcast_genesis_block(data.clone()) {
-                                                            Ok(_) => {
+                                                    
+                                                    // Use dedicated Genesis broadcast with extended timeout
+                                                    match p2p.broadcast_genesis_block(data.clone()) {
+                                                        Ok(_) => {
                                                                 println!("[GENESIS] ✅ Genesis block broadcast successful (attempt {})", 
                                                                         broadcast_attempts);
                                                                 
@@ -2982,8 +2982,8 @@ impl BlockchainNode {
                                                                         tokio::time::sleep(Duration::from_secs(3)).await;
                                                                     }
                                                                 }
-                                                            }
-                                                            Err(e) => {
+                                                        }
+                                                        Err(e) => {
                                                                 println!("[GENESIS] ⚠️ Broadcast attempt {} failed: {}", 
                                                                         broadcast_attempts, e);
                                                                 if broadcast_attempts < MAX_GENESIS_ATTEMPTS {
@@ -3038,18 +3038,17 @@ impl BlockchainNode {
                     // Other bootstrap nodes (002-005) wait for Genesis from node_001
                     println!("[GENESIS] ⏳ Node {}: Waiting for Genesis block from primary node...", bootstrap_id);
                     
-                    // CRITICAL: Wait for Genesis block before starting production
-                    // This prevents fork at block #1
+                    // CRITICAL: ACTIVELY request Genesis immediately - don't wait passively!
+                    // This ensures fast delivery even if initial broadcast failed
                     let mut genesis_wait_attempts = 0;
-                    const MAX_GENESIS_WAIT: u32 = 60; // 60 seconds max wait
                     
-                    while genesis_wait_attempts < MAX_GENESIS_WAIT {
+                    loop {
                         genesis_wait_attempts += 1;
                         
                         // Check if Genesis block arrived
                         match storage.load_microblock(0) {
                             Ok(Some(_)) => {
-                                println!("[GENESIS] ✅ Genesis block received after {} seconds", 
+                                println!("[GENESIS] ✅ Genesis block received after {} attempts", 
                                         genesis_wait_attempts);
                                 // Update height from storage
                                 if let Ok(stored_height) = storage.get_chain_height() {
@@ -3060,47 +3059,49 @@ impl BlockchainNode {
                                 break;
                             }
                             _ => {
-                                if genesis_wait_attempts % 5 == 0 {
-                                    println!("[GENESIS] ⏳ Still waiting for Genesis... ({}s)", 
-                                            genesis_wait_attempts);
+                                // CRITICAL: Request Genesis EVERY attempt (every 2 seconds)
+                                // This is much more aggressive than waiting passively
+                                if let Some(p2p) = &unified_p2p {
+                                    if genesis_wait_attempts % 2 == 0 {
+                                        println!("[GENESIS] 🔄 Actively requesting Genesis (attempt {})...", 
+                                                genesis_wait_attempts / 2);
+                                    }
+                                    
+                                    // Try to sync Genesis from network
+                                    if let Err(e) = p2p.sync_blocks(0, 0).await {
+                                        if genesis_wait_attempts % 10 == 0 {
+                                            println!("[GENESIS] ⚠️ Sync request failed: {}", e);
+                                        }
+                                    }
                                 }
-                                tokio::time::sleep(Duration::from_secs(1)).await;
+                                
+                                // Log progress every 10 seconds
+                                if genesis_wait_attempts % 5 == 0 {
+                                    println!("[GENESIS] ⏳ Still waiting... ({}s elapsed)", 
+                                            genesis_wait_attempts * 2);
+                                }
+                                
+                                tokio::time::sleep(Duration::from_secs(2)).await;
                             }
                         }
-                    }
-                    
-                    if genesis_wait_attempts >= MAX_GENESIS_WAIT {
-                        println!("[GENESIS] ❌ Genesis block not received after {} seconds", 
-                                MAX_GENESIS_WAIT);
-                        println!("[GENESIS] ⚠️ Proceeding anyway - will sync via P2P");
                     }
                 } else {
-                    // Non-bootstrap nodes will sync Genesis from network
-                    println!("[GENESIS] ⏳ Non-bootstrap node: Waiting for Genesis from network...");
+                    // PRODUCTION: Non-bootstrap nodes join AFTER network starts
+                    // They will sync entire blockchain (including Genesis) via normal sync mechanism
+                    println!("[GENESIS] 📡 Non-bootstrap node: Will sync blockchain from network");
+                    println!("[GENESIS] 💡 Genesis phase only involves 5 bootstrap nodes");
                     
-                    // PRODUCTION: Wait for Genesis with shorter timeout
-                    let mut genesis_wait = 0;
-                    while genesis_wait < 30 {
-                        genesis_wait += 1;
-                        
-                        match storage.load_microblock(0) {
-                            Ok(Some(_)) => {
-                                println!("[GENESIS] ✅ Genesis synced after {} seconds", genesis_wait);
-                                // Update height from storage
-                                if let Ok(stored_height) = storage.get_chain_height() {
-                                    microblock_height = stored_height;
-                                    *height.write().await = stored_height;
-                                }
-                                break;
-                            }
-                            _ => {
-                                if genesis_wait % 10 == 0 {
-                                    println!("[GENESIS] ⏳ Waiting for network sync... ({}s)", genesis_wait);
-                                }
-                                tokio::time::sleep(Duration::from_secs(1)).await;
-                            }
+                    // Check if blockchain already exists (synced from network)
+                    if let Ok(stored_height) = storage.get_chain_height() {
+                        if stored_height > 0 {
+                            println!("[GENESIS] ✅ Blockchain already synced (height: {})", stored_height);
+                            microblock_height = stored_height;
+                            *height.write().await = stored_height;
                         }
                     }
+                    
+                    // No special Genesis waiting - normal sync will handle it
+                    // This is fine because non-bootstrap nodes only join after network is running
                 }
             } else {
                 println!("[GENESIS] ✅ Genesis block found at height 0, proceeding with normal operation");
@@ -5010,7 +5011,7 @@ impl BlockchainNode {
                 if blocks_since_trigger >= 61 && blocks_since_trigger <= 90 && !consensus_started {
                     if !is_synchronized {
                         println!("[MACROBLOCK] ⚠️ Node not synchronized - consensus handled by listener");
-                    } else {
+                            } else {
                         println!("[MACROBLOCK] 📍 Block {} in consensus window (61-90) - handled by consensus listener", microblock_height);
                         consensus_started = true;
                     }
@@ -5404,7 +5405,7 @@ impl BlockchainNode {
                 // CRITICAL: All nodes MUST have same Genesis block for this to work
                 // Genesis broadcast with retry ensures all nodes receive block #0
                 
-                let entropy_source = if let Some(store) = storage {
+            let entropy_source = if let Some(store) = storage {
                 // Get hash of last block from PREVIOUS round for consistency
                 // All nodes in the round will use the same previous block hash as entropy
             // CRITICAL FIX: Correct calculation of round boundaries
@@ -5511,7 +5512,7 @@ impl BlockchainNode {
                 // Optimization: Single candidate
                 println!("[PRODUCER] ✅ Single candidate: {}", candidates[0].0);
                 candidates[0].0.clone()
-            } else {
+                    } else {
                 // QUANTUM-RESISTANT SELECTION using SHA3-512 (NIST approved)
                 use sha3::{Sha3_512, Digest};
                 
@@ -5532,10 +5533,10 @@ impl BlockchainNode {
                 
                 // Convert to selection index (uniform distribution)
                 let selection_value = u64::from_le_bytes([
-                    selection_hash[0], selection_hash[1], selection_hash[2], selection_hash[3],
-                    selection_hash[4], selection_hash[5], selection_hash[6], selection_hash[7],
-                ]);
-                
+                selection_hash[0], selection_hash[1], selection_hash[2], selection_hash[3],
+                selection_hash[4], selection_hash[5], selection_hash[6], selection_hash[7],
+            ]);
+            
                 let selection_index = (selection_value as usize) % candidates.len();
                 let winner = &candidates[selection_index];
                 
@@ -6315,19 +6316,19 @@ impl BlockchainNode {
             // All nodes MUST have same candidate list → all use same reputation value
             // Real reputation is logged but NOT used for candidate filtering
             
-            let real_reputation = Self::get_node_reputation_score(node_id, p2p).await;
-            
+                let real_reputation = Self::get_node_reputation_score(node_id, p2p).await;
+                
             // PRODUCTION: Always include Genesis nodes with FIXED reputation
             // This guarantees deterministic candidate list across all nodes
             all_qualified.push((node_id.clone(), GENESIS_FIXED_REPUTATION));
             
             if real_reputation < 0.70 {
                 println!("[GENESIS] ⚠️ {} included with FIXED 70% (real: {:.1}% - below threshold)", 
-                         node_id, real_reputation * 100.0);
-            } else {
+                             node_id, real_reputation * 100.0);
+                } else {
                 println!("[GENESIS] ✅ {} included with FIXED 70% (real: {:.1}%)", 
-                         node_id, real_reputation * 100.0);
-            }
+                             node_id, real_reputation * 100.0);
+                }
         }
         
         // PRODUCTION SAFETY: Log connectivity status (for monitoring, not for candidate filtering)
@@ -7992,15 +7993,12 @@ impl BlockchainNode {
                     return hash;
             },
             _ => {
-                    // Genesis block not found - use deterministic seed
-                    // This should only happen during initial network formation
-                use sha3::{Sha3_256, Digest};
-                let mut hasher = Sha3_256::new();
-                    hasher.update(b"qnet_genesis_block_2024");
-                    let result = hasher.finalize();
-                    let mut hash = [0u8; 32];
-                    hash.copy_from_slice(&result);
-                    return hash;
+                    // CRITICAL: NO FALLBACK! Genesis MUST exist for block #1
+                    // If Genesis not found - this is a FATAL error
+                    println!("[FATAL] ❌ Genesis block NOT FOUND when creating block #1!");
+                    println!("[FATAL] ❌ Cannot use fallback - would cause fork!");
+                    // Return zeros - this will make producer selection fail safely
+                    return [0u8; 32];
                 }
             }
         }
