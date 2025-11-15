@@ -7903,23 +7903,50 @@ impl SimplifiedP2P {
         println!("[FAILOVER] 💀 Failed producer: {} at block #{}", failed_display, block_height);
         println!("[FAILOVER] 🆘 New producer: {} (emergency activation)", new_display);
         
-        // CRITICAL: If WE are the failed producer, stop producing blocks immediately
-        // But ONLY if we're a Super/Full node that actually produces blocks
+        // CRITICAL: If WE are the failed producer, VERIFY before stopping
+        // Protection against false failover claims
         if failed_producer == self.node_id {
             // Check if we're actually a block-producing node
             match self.node_type {
                 NodeType::Super | NodeType::Full => {
-                    println!("[FAILOVER] 🛑 WE are the failed producer - STOPPING block production");
+                    // CRITICAL FIX: Check if we're actively producing blocks
+                    // Protect against false failover from competing nodes
+                    use crate::node::{LAST_BLOCK_PRODUCED_TIME, LAST_BLOCK_PRODUCED_HEIGHT};
+                    let last_produced_time = LAST_BLOCK_PRODUCED_TIME.load(Ordering::Relaxed);
+                    let last_produced_height = LAST_BLOCK_PRODUCED_HEIGHT.load(Ordering::Relaxed);
+                    let current_time = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    
+                    // Check if we produced a block in the last 5 seconds
+                    let time_since_last_production = current_time.saturating_sub(last_produced_time);
+                    
+                    // PRODUCTION VALUES: 5 seconds timeout (allows for 1-2 missed blocks)
+                    if time_since_last_production <= 5 && last_produced_height > 0 {
+                        println!("[FAILOVER] ⚠️ FALSE FAILOVER DETECTED!");
+                        println!("[FAILOVER] 📊 We produced block #{} just {}s ago", 
+                                last_produced_height, time_since_last_production);
+                        println!("[FAILOVER] ✅ Ignoring false failover - we ARE actively producing!");
+                        
+                        // Track false failovers from this peer
+                        println!("[FAILOVER] ⚠️ False failover claiming new producer: {}", new_producer);
+                        // Could track reputation penalty for false failovers here in future
+                        
+                        // DO NOT STOP - continue producing blocks
+                        return;
+                    }
+                    
+                    // We haven't produced recently - accept the failover
+                    println!("[FAILOVER] 🛑 Accepting failover - last production was {}s ago", 
+                            time_since_last_production);
+                    println!("[FAILOVER] 🛑 STOPPING block production");
+                    
                     EMERGENCY_STOP_PRODUCTION.store(true, Ordering::Relaxed);
                     // CRITICAL: Only set stop height if not already set (prevent reset by multiple messages)
                     let current_stop_height = EMERGENCY_STOP_HEIGHT.load(Ordering::Relaxed);
                     if current_stop_height == 0 {
                         EMERGENCY_STOP_HEIGHT.store(block_height, Ordering::Relaxed);
-                        // CRITICAL FIX: Also store TIME to prevent deadlock when blocks stop
-                        let current_time = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs();
                         EMERGENCY_STOP_TIME.store(current_time, Ordering::Relaxed);
                         println!("[RECOVERY] 📍 Will auto-recover after 10 seconds (time-based) or 10 blocks");
                     } else {

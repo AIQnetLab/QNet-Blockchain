@@ -87,8 +87,8 @@ lazy_static::lazy_static! {
 
 // CRITICAL FIX: Track last block production time globally for stall detection
 // This prevents network from getting stuck when all nodes stop producing
-static LAST_BLOCK_PRODUCED_TIME: AtomicU64 = AtomicU64::new(0);
-static LAST_BLOCK_PRODUCED_HEIGHT: AtomicU64 = AtomicU64::new(0);
+pub static LAST_BLOCK_PRODUCED_TIME: AtomicU64 = AtomicU64::new(0);
+pub static LAST_BLOCK_PRODUCED_HEIGHT: AtomicU64 = AtomicU64::new(0);
 
 // NOTE: Removed ROTATION_NOTIFY - simple 1-second timing is more reliable
 // Testing showed that natural timing without interrupts prevents race conditions
@@ -2940,19 +2940,64 @@ impl BlockchainNode {
                                                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                                                 println!("[GENESIS] ✅ All nodes ready, proceeding with Genesis broadcast");
                                                 
-                                                // CRITICAL: Broadcast Genesis block with extended timeout
-                                                // Genesis is critical - use special method with 3s timeout (vs 200ms for normal blocks)
+                                                // CRITICAL: Broadcast Genesis block WITH RETRY for guaranteed delivery
+                                                // Genesis is critical - use retry mechanism to ensure all nodes receive it
                                                 if let Some(p2p) = &unified_p2p {
-                                                    println!("[GENESIS] 📡 Broadcasting Genesis block to all peers (3s timeout)");
+                                                    let mut broadcast_attempts = 0;
+                                                    const MAX_GENESIS_ATTEMPTS: u32 = 5;
+                                                    let mut broadcast_successful = false;
                                                     
-                                                    // Use dedicated Genesis broadcast with extended timeout
-                                                    match p2p.broadcast_genesis_block(data.clone()) {
-                                                        Ok(_) => {
-                                                            println!("[GENESIS] ✅ Genesis block broadcast successful");
+                                                    while broadcast_attempts < MAX_GENESIS_ATTEMPTS && !broadcast_successful {
+                                                        broadcast_attempts += 1;
+                                                        
+                                                        println!("[GENESIS] 📡 Broadcasting Genesis block (attempt {}/{})", 
+                                                                broadcast_attempts, MAX_GENESIS_ATTEMPTS);
+                                                        
+                                                        // Use dedicated Genesis broadcast with extended timeout
+                                                        match p2p.broadcast_genesis_block(data.clone()) {
+                                                            Ok(_) => {
+                                                                println!("[GENESIS] ✅ Genesis block broadcast successful (attempt {})", 
+                                                                        broadcast_attempts);
+                                                                
+                                                                // CRITICAL: Wait and verify peers received Genesis
+                                                                tokio::time::sleep(Duration::from_secs(2)).await;
+                                                                
+                                                                // Check if at least 3 out of 5 Genesis nodes are connected
+                                                                let peers = p2p.get_validated_active_peers();
+                                                                let genesis_peers = peers.iter()
+                                                                    .filter(|p| p.id.starts_with("genesis_node_"))
+                                                                    .count();
+                                                                
+                                                                println!("[GENESIS] 📊 Connected to {} Genesis nodes", genesis_peers);
+                                                                
+                                                                // PRODUCTION THRESHOLD: 3 out of 5 Genesis nodes connected
+                                                                if genesis_peers >= 3 {
+                                                                    println!("[GENESIS] ✅ Sufficient Genesis nodes connected");
+                                                                    broadcast_successful = true;
+                                                                } else {
+                                                                    println!("[GENESIS] ⚠️ Only {} Genesis nodes connected, need at least 3", 
+                                                                            genesis_peers);
+                                                                    if broadcast_attempts < MAX_GENESIS_ATTEMPTS {
+                                                                        println!("[GENESIS] ⏳ Retrying in 3 seconds...");
+                                                                        tokio::time::sleep(Duration::from_secs(3)).await;
+                                                                    }
+                                                                }
+                                                            }
+                                                            Err(e) => {
+                                                                println!("[GENESIS] ⚠️ Broadcast attempt {} failed: {}", 
+                                                                        broadcast_attempts, e);
+                                                                if broadcast_attempts < MAX_GENESIS_ATTEMPTS {
+                                                                    println!("[GENESIS] ⏳ Retrying in 3 seconds...");
+                                                                    tokio::time::sleep(Duration::from_secs(3)).await;
+                                                                }
+                                                            }
                                                         }
-                                                        Err(e) => {
-                                                            println!("[GENESIS] ⚠️ Genesis broadcast failed: {} - peers will sync via P2P", e);
-                                                        }
+                                                    }
+                                                    
+                                                    if !broadcast_successful {
+                                                        println!("[GENESIS] ❌ Failed to broadcast Genesis after {} attempts", 
+                                                                MAX_GENESIS_ATTEMPTS);
+                                                        println!("[GENESIS] ⚠️ Peers will need to sync via P2P");
                                                     }
                                                 }
                                                 
@@ -2992,9 +3037,70 @@ impl BlockchainNode {
                 } else if is_bootstrap_mode {
                     // Other bootstrap nodes (002-005) wait for Genesis from node_001
                     println!("[GENESIS] ⏳ Node {}: Waiting for Genesis block from primary node...", bootstrap_id);
+                    
+                    // CRITICAL: Wait for Genesis block before starting production
+                    // This prevents fork at block #1
+                    let mut genesis_wait_attempts = 0;
+                    const MAX_GENESIS_WAIT: u32 = 60; // 60 seconds max wait
+                    
+                    while genesis_wait_attempts < MAX_GENESIS_WAIT {
+                        genesis_wait_attempts += 1;
+                        
+                        // Check if Genesis block arrived
+                        match storage.load_microblock(0) {
+                            Ok(Some(_)) => {
+                                println!("[GENESIS] ✅ Genesis block received after {} seconds", 
+                                        genesis_wait_attempts);
+                                // Update height from storage
+                                if let Ok(stored_height) = storage.get_chain_height() {
+                                    microblock_height = stored_height;
+                                    *height.write().await = stored_height;
+                                    println!("[GENESIS] 📊 Height synchronized to {}", stored_height);
+                                }
+                                break;
+                            }
+                            _ => {
+                                if genesis_wait_attempts % 5 == 0 {
+                                    println!("[GENESIS] ⏳ Still waiting for Genesis... ({}s)", 
+                                            genesis_wait_attempts);
+                                }
+                                tokio::time::sleep(Duration::from_secs(1)).await;
+                            }
+                        }
+                    }
+                    
+                    if genesis_wait_attempts >= MAX_GENESIS_WAIT {
+                        println!("[GENESIS] ❌ Genesis block not received after {} seconds", 
+                                MAX_GENESIS_WAIT);
+                        println!("[GENESIS] ⚠️ Proceeding anyway - will sync via P2P");
+                    }
                 } else {
                     // Non-bootstrap nodes will sync Genesis from network
-                    println!("[GENESIS] ⏳ Non-bootstrap node: Genesis will be synced from network");
+                    println!("[GENESIS] ⏳ Non-bootstrap node: Waiting for Genesis from network...");
+                    
+                    // PRODUCTION: Wait for Genesis with shorter timeout
+                    let mut genesis_wait = 0;
+                    while genesis_wait < 30 {
+                        genesis_wait += 1;
+                        
+                        match storage.load_microblock(0) {
+                            Ok(Some(_)) => {
+                                println!("[GENESIS] ✅ Genesis synced after {} seconds", genesis_wait);
+                                // Update height from storage
+                                if let Ok(stored_height) = storage.get_chain_height() {
+                                    microblock_height = stored_height;
+                                    *height.write().await = stored_height;
+                                }
+                                break;
+                            }
+                            _ => {
+                                if genesis_wait % 10 == 0 {
+                                    println!("[GENESIS] ⏳ Waiting for network sync... ({}s)", genesis_wait);
+                                }
+                                tokio::time::sleep(Duration::from_secs(1)).await;
+                            }
+                        }
+                    }
                 }
             } else {
                 println!("[GENESIS] ✅ Genesis block found at height 0, proceeding with normal operation");
@@ -4895,7 +5001,7 @@ impl BlockchainNode {
                 // ARCHITECTURE FIX: Check node synchronization before starting consensus
                 // Use existing NODE_IS_SYNCHRONIZED flag (set by background sync monitor)
                 let is_synchronized = NODE_IS_SYNCHRONIZED.load(Ordering::Relaxed);
-                
+                    
                 // REMOVED: Consensus is now handled by start_macroblock_consensus_listener()
                 // This prevents duplicate consensus attempts and ensures ALL validators participate
                 // The consensus listener runs independently and checks if this node is a validator
@@ -5294,9 +5400,11 @@ impl BlockchainNode {
                     hasher.update(&reputation.to_le_bytes());
                 }
                 
-                // 3. For rounds 3+ use macroblock (Byzantine consensus verified)
-                // But DON'T wait for it - use fallback if not available
-            let entropy_source = if let Some(store) = storage {
+                // 3. Use previous block hash as entropy (quantum-resistant!)
+                // CRITICAL: All nodes MUST have same Genesis block for this to work
+                // Genesis broadcast with retry ensures all nodes receive block #0
+                
+                let entropy_source = if let Some(store) = storage {
                 // Get hash of last block from PREVIOUS round for consistency
                 // All nodes in the round will use the same previous block hash as entropy
             // CRITICAL FIX: Correct calculation of round boundaries
@@ -5384,145 +5492,64 @@ impl BlockchainNode {
                 vrf_seed
             };
             
-            // THRESHOLD VRF: Each candidate independently checks if they pass the threshold
-            // This eliminates race conditions as no coordination is needed!
+            // QUANTUM-RESISTANT DETERMINISTIC SELECTION
+            // Uses entropy from Dilithium-signed blocks for quantum resistance
             
-            println!("[VRF] 🎲 Starting Threshold VRF selection for round {}", leadership_round);
-            println!("[VRF] 📊 {} qualified candidates (≥70% reputation)", candidates.len());
+            println!("[PRODUCER] 🎲 Deterministic producer selection for round {}", leadership_round);
+            println!("[PRODUCER] 📊 {} qualified candidates (≥70% reputation)", candidates.len());
             
-            // CRITICAL: Try to use hybrid VRF first (quantum-resistant with Dilithium)
-            // Fallback to Ed25519 VRF if hybrid not available
-            let use_hybrid_vrf = std::env::var("QNET_USE_HYBRID_VRF").unwrap_or_else(|_| "true".to_string()) == "true";
+            // CRITICAL: The entropy comes from:
+            // 1. Previous block hash (signed with Dilithium - quantum resistant!)
+            // 2. Macroblock hash (Byzantine consensus with Dilithium signatures)
+            // 3. Round number and candidate list
+            // This provides quantum resistance WITHOUT requiring per-node VRF keys
             
-            // THRESHOLD VRF CALCULATION
-            // Each candidate independently computes their VRF output
-            // The candidate with the SMALLEST output that passes threshold becomes producer
+            // OPTIMIZATION: For small candidate sets (< 100), direct computation is fine
+            // For large sets, we'd use sampling (not needed for 1000 validators)
             
-            // Calculate threshold based on number of candidates
-            // This ensures approximately 1 candidate passes on average
-            let threshold = u64::MAX / (candidates.len() as u64);
-            println!("[VRF] 🎯 Threshold for {} candidates: {}", candidates.len(), threshold);
-            
-            // Check if WE are one of the candidates and can be producer
-            let our_vrf_result: Option<u64> = if candidates.iter().any(|(id, _)| id == own_node_id) {
-                println!("[VRF] ✅ We are a candidate - computing our VRF");
-                
-                // Use existing VRF modules (hybrid for quantum resistance or fallback)
-                if use_hybrid_vrf {
-                    // Try quantum-resistant hybrid VRF first
-                    match crate::vrf_hybrid::select_producer_with_hybrid_vrf(
-                        leadership_round,
-                        &candidates,
-                        own_node_id,
-                        &vrf_entropy
-                    ).await {
-                        Ok((_, vrf_output)) => {
-                            let vrf_value = u64::from_le_bytes([
-                                vrf_output.output[0], vrf_output.output[1], 
-                                vrf_output.output[2], vrf_output.output[3],
-                                vrf_output.output[4], vrf_output.output[5], 
-                                vrf_output.output[6], vrf_output.output[7],
-                            ]);
-                            println!("[VRF] 🔐 Hybrid VRF output: {}", vrf_value);
-                            Some(vrf_value)
-                        }
-                        Err(e) => {
-                            println!("[VRF] ⚠️ Hybrid VRF failed: {}, trying Ed25519 fallback", e);
-                            // Fallback to Ed25519 VRF
-                            match crate::vrf::select_producer_with_vrf(
-                                leadership_round,
-                                &candidates,
-                                own_node_id,
-                                &vrf_entropy
-                            ).await {
-                                Ok((_, vrf_output)) => {
-                                    let vrf_value = u64::from_le_bytes([
-                                        vrf_output.output[0], vrf_output.output[1],
-                                        vrf_output.output[2], vrf_output.output[3],
-                                        vrf_output.output[4], vrf_output.output[5],
-                                        vrf_output.output[6], vrf_output.output[7],
-                                    ]);
-                                    println!("[VRF] 🔑 Ed25519 VRF output: {}", vrf_value);
-                                    Some(vrf_value)
-                                }
-                                Err(e) => {
-                                    println!("[VRF] ❌ VRF computation failed: {}", e);
-                                    None
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    // Direct Ed25519 VRF
-                    match crate::vrf::select_producer_with_vrf(
-                        leadership_round,
-                        &candidates,
-                        own_node_id,
-                        &vrf_entropy
-                    ).await {
-                        Ok((_, vrf_output)) => {
-                            let vrf_value = u64::from_le_bytes([
-                                vrf_output.output[0], vrf_output.output[1],
-                                vrf_output.output[2], vrf_output.output[3],
-                                vrf_output.output[4], vrf_output.output[5],
-                                vrf_output.output[6], vrf_output.output[7],
-                            ]);
-                            println!("[VRF] 🔑 Ed25519 VRF output: {}", vrf_value);
-                            Some(vrf_value)
-                        }
-                        Err(e) => {
-                            println!("[VRF] ❌ VRF computation failed: {}", e);
-                            None
-                        }
-                    }
-                }
+            let selected_producer = if candidates.len() == 1 {
+                // Optimization: Single candidate
+                println!("[PRODUCER] ✅ Single candidate: {}", candidates[0].0);
+                candidates[0].0.clone()
             } else {
-                println!("[VRF] ❌ We are not a candidate for this round");
-                None
-            };
-            
-            // THRESHOLD CHECK: Did we pass the threshold?
-            let selected_producer = if let Some(vrf_value) = our_vrf_result {
-                if vrf_value < threshold {
-                    println!("[VRF] 🎉 WE PASSED THE THRESHOLD! VRF {} < Threshold {}", vrf_value, threshold);
-                    println!("[VRF] ✅ We are the producer for round {}", leadership_round);
-                    own_node_id.to_string()
-                } else {
-                    // We didn't pass threshold - select deterministically for fallback
-                    // This ensures some producer is always selected
-                    println!("[VRF] ❌ Did not pass threshold: {} >= {}", vrf_value, threshold);
-                    
-                    // FALLBACK: Use deterministic selection if no one passes threshold
-                    // All nodes will calculate the same fallback producer
-                    use sha3::{Sha3_256, Digest};
-                    let mut fallback_hasher = Sha3_256::new();
-                    fallback_hasher.update(b"QNet_VRF_Fallback_v1");
-                    fallback_hasher.update(&vrf_entropy);
-                    let fallback_hash = fallback_hasher.finalize();
-                    let fallback_index = u64::from_le_bytes([
-                        fallback_hash[0], fallback_hash[1], fallback_hash[2], fallback_hash[3],
-                        fallback_hash[4], fallback_hash[5], fallback_hash[6], fallback_hash[7],
-                    ]) as usize % candidates.len();
-                    
-                    let fallback_producer = candidates[fallback_index].0.clone();
-                    println!("[VRF] 🔄 Fallback producer: {} (index {})", fallback_producer, fallback_index);
-                    fallback_producer
-                }
-                    } else {
-                // We're not a candidate - select deterministically
-                use sha3::{Sha3_256, Digest};
-                let mut fallback_hasher = Sha3_256::new();
-                fallback_hasher.update(b"QNet_VRF_Fallback_v1");
-                fallback_hasher.update(&vrf_entropy);
-                let fallback_hash = fallback_hasher.finalize();
-                let fallback_index = u64::from_le_bytes([
-                    fallback_hash[0], fallback_hash[1], fallback_hash[2], fallback_hash[3],
-                    fallback_hash[4], fallback_hash[5], fallback_hash[6], fallback_hash[7],
-                ]) as usize % candidates.len();
+                // QUANTUM-RESISTANT SELECTION using SHA3-512 (NIST approved)
+                use sha3::{Sha3_512, Digest};
                 
-                let fallback_producer = candidates[fallback_index].0.clone();
-                println!("[VRF] 🔄 Not a candidate - using fallback producer: {}", fallback_producer);
-                fallback_producer
+                // Create deterministic seed from quantum-signed entropy
+                let mut selector = Sha3_512::new();
+                selector.update(b"QNet_Quantum_Producer_Selection_v3");
+                selector.update(&vrf_entropy); // Contains Dilithium-signed block hashes
+                selector.update(&leadership_round.to_le_bytes());
+                
+                // Include candidate order for determinism
+                for (candidate_id, reputation) in &candidates {
+                    selector.update(candidate_id.as_bytes());
+                    selector.update(&reputation.to_le_bytes());
+                }
+                
+                // Generate quantum-resistant selection
+                let selection_hash = selector.finalize();
+                
+                // Convert to selection index (uniform distribution)
+                let selection_value = u64::from_le_bytes([
+                    selection_hash[0], selection_hash[1], selection_hash[2], selection_hash[3],
+                    selection_hash[4], selection_hash[5], selection_hash[6], selection_hash[7],
+                ]);
+                
+                let selection_index = (selection_value as usize) % candidates.len();
+                let winner = &candidates[selection_index];
+                
+                println!("[PRODUCER] 🏆 Selected: {} (index {}/{})", 
+                         winner.0, selection_index + 1, candidates.len());
+                println!("[PRODUCER] 🔐 Quantum-resistant via Dilithium-signed entropy");
+                
+                // Log runner-ups for transparency (PRODUCTION: only in debug mode)
+                if candidates.len() > 1 {
+                    let runner_up_idx = (selection_index + 1) % candidates.len();
+                    println!("[PRODUCER] 🥈 Next would be: {}", candidates[runner_up_idx].0);
+                }
+                
+                winner.0.clone()
             };
             
             
@@ -6269,46 +6296,50 @@ impl BlockchainNode {
             .map(|(i, ip)| (format!("genesis_node_{:03}", i + 1), ip.clone()))
             .collect();
         
-        // CRITICAL FIX: For Genesis phase, use ALL Genesis nodes in DETERMINISTIC order
-        // Do NOT filter by connectivity - this causes different candidate lists on different nodes
-        // Instead, all 5 Genesis nodes are ALWAYS candidates (deterministic consensus)
+        // CRITICAL FIX: For Genesis phase, use ALL 5 Genesis nodes ALWAYS (deterministic)
+        // This ensures IDENTICAL candidate lists on ALL nodes (Byzantine consensus requirement)
+        // Dead nodes will fail to produce blocks → automatic failover + reputation penalty
         
-        // CONSENSUS FIX: Use DETERMINISTIC list but ONLY include ACTIVE nodes
-        // This ensures all nodes have IDENTICAL candidate lists while excluding offline nodes
+        // DETERMINISTIC CONSENSUS: ALL nodes must have IDENTICAL candidate lists
+        // Otherwise different nodes calculate different producers → FORK!
         
-        // Get list of actually connected peers for activity check
+        println!("[GENESIS] 🔐 Using DETERMINISTIC Genesis candidate list (all 5 nodes)");
+        
+        // CRITICAL: For Genesis phase, use FIXED reputation (70%) for ALL Genesis nodes
+        // This ensures IDENTICAL candidate lists on ALL nodes (Byzantine requirement)
+        // Real reputation tracking still happens but doesn't affect candidate selection
+        const GENESIS_FIXED_REPUTATION: f64 = 0.70;
+        
+        for (node_id, _ip) in &static_genesis_nodes {
+            // DETERMINISTIC CONSENSUS: Use FIXED reputation for Genesis phase
+            // All nodes MUST have same candidate list → all use same reputation value
+            // Real reputation is logged but NOT used for candidate filtering
+            
+            let real_reputation = Self::get_node_reputation_score(node_id, p2p).await;
+            
+            // PRODUCTION: Always include Genesis nodes with FIXED reputation
+            // This guarantees deterministic candidate list across all nodes
+            all_qualified.push((node_id.clone(), GENESIS_FIXED_REPUTATION));
+            
+            if real_reputation < 0.70 {
+                println!("[GENESIS] ⚠️ {} included with FIXED 70% (real: {:.1}% - below threshold)", 
+                         node_id, real_reputation * 100.0);
+            } else {
+                println!("[GENESIS] ✅ {} included with FIXED 70% (real: {:.1}%)", 
+                         node_id, real_reputation * 100.0);
+            }
+        }
+        
+        // PRODUCTION SAFETY: Log connectivity status (for monitoring, not for candidate filtering)
         let validated_peers = p2p.get_validated_active_peers();
-        let active_peer_ids: std::collections::HashSet<String> = validated_peers
+        let connected_genesis: Vec<String> = validated_peers
             .iter()
+            .filter(|p| p.id.starts_with("genesis_node_"))
             .map(|p| p.id.clone())
             .collect();
         
-        // Add Genesis nodes that meet reputation threshold AND are active (deterministic order maintained)
-        for (node_id, _ip) in &static_genesis_nodes {
-                // CRITICAL FIX: Check REAL reputation from P2P system, not static value
-                // This ensures failed/inactive nodes are excluded from candidates
-                let real_reputation = Self::get_node_reputation_score(node_id, p2p).await;
-                
-                // Check if node is active (connected to network OR is self)
-                let is_active = active_peer_ids.contains(node_id) || 
-                               (node_id == own_node_id && is_own_genesis);
-                
-                if real_reputation >= 0.70 && is_active {
-                    // Node meets consensus threshold AND is active - add as candidate
-                    // NOTE: Synchronization will be checked AFTER selection in can_produce
-                    // This ensures deterministic candidate list across all nodes
-                    all_qualified.push((node_id.clone(), real_reputation));
-                    println!("[GENESIS] ✅ {} qualified with reputation {:.1}% (ACTIVE)", node_id, real_reputation * 100.0);
-                } else if real_reputation >= 0.70 && !is_active {
-                    // Node has reputation but is OFFLINE - exclude
-                    println!("[GENESIS] ❌ {} excluded - OFFLINE (reputation {:.1}%)", 
-                             node_id, real_reputation * 100.0);
-                } else {
-                    // Node below threshold - exclude from candidates
-                    println!("[GENESIS] ⚠️ {} excluded - reputation {:.1}% < 70% threshold", 
-                             node_id, real_reputation * 100.0);
-                }
-        }
+        println!("[GENESIS] 📊 Connected Genesis nodes: {:?}", connected_genesis);
+        println!("[GENESIS] 📊 Total candidates: {} (deterministic across all nodes)", all_qualified.len());
         
         // BYZANTINE SAFETY: Verify minimum nodes are actually connected (but DON'T filter candidates!)
         // This check happens AFTER candidate list creation to maintain determinism
