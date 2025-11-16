@@ -1,16 +1,82 @@
-//! QNet Hybrid Cryptography Module
+//! # QNet Hybrid Cryptography Module
+//!
+//! ## Overview
 //! Implements Key Encapsulation Mechanism (KEM) with CRYSTALS-Dilithium and Ed25519
-//! Following NIST and Cisco recommendations for post-quantum hybrid cryptography
+//! following NIST and Cisco recommendations for post-quantum hybrid cryptography.
+//!
+//! ## Architecture (v2.19.0)
+//!
+//! ### Dual Signature System
+//! - **Ed25519**: Fast classical signatures (64 bytes)
+//! - **CRYSTALS-Dilithium**: Post-quantum signatures (~2420 bytes)
+//! - **Hybrid**: Both required for validity
+//!
+//! ### Certificate Management
+//! - **Lifetime**: 1 hour (3600 seconds)
+//! - **Rotation**: Automatic before expiration (5 min advance)
+//! - **Storage**: LRU cache (100K certificates)
+//! - **Distribution**: P2P broadcast every 5 minutes
+//!
+//! ## Signature Formats
+//!
+//! ### Compact Signature (Microblocks - 3KB)
+//! ```rust
+//! pub struct CompactHybridSignature {
+//!     pub node_id: String,
+//!     pub cert_serial: String,                    // Reference to cached certificate
+//!     pub message_signature: Vec<u8>,             // Ed25519 (64 bytes)
+//!     pub dilithium_message_signature: String,    // Dilithium (~2420 bytes base64)
+//!     pub signed_at: u64,
+//! }
+//! ```
+//! **Bandwidth**: ~3KB (certificate cached separately)
+//!
+//! ### Full Signature (Macroblocks - 12KB)
+//! ```rust
+//! pub struct HybridSignature {
+//!     pub message_signature: Vec<u8>,         // Ed25519 (64 bytes)
+//!     pub dilithium_signature: String,        // Dilithium (~2420 bytes)
+//!     pub certificate: HybridCertificate,     // Full certificate (~9KB)
+//! }
+//! ```
+//! **Bandwidth**: ~12KB (certificate embedded for immediate verification)
+//!
+//! ## Global Instance Management
+//!
+//! ### GLOBAL_HYBRID_INSTANCES
+//! Thread-safe, globally accessible cache of HybridCrypto instances for all nodes.
+//!
+//! ```rust
+//! // Single source of truth for hybrid crypto
+//! pub static GLOBAL_HYBRID_INSTANCES: OnceCell<...> = ...;
+//! ```
+//!
+//! **Benefits**:
+//! - Prevents duplicate crypto instances
+//! - Thread-safe access via tokio::Mutex
+//! - Automatic certificate rotation
+//! - Consistent across all modules
+//!
+//! ## NIST/Cisco Compliance
+//! - **Post-Quantum**: CRYSTALS-Dilithium (NIST PQC)
+//! - **Classical**: Ed25519 (FIPS 186-4)
+//! - **Hashing**: SHA3-256 (NIST FIPS 202)
+//! - **Certification**: Self-signed with Dilithium signature of Ed25519 key
 
 use anyhow::{Result, anyhow};
 use ed25519_dalek::{SigningKey, VerifyingKey, Signature, Signer, Verifier};
 use rand::{rngs::OsRng, Rng};
 use serde::{Serialize, Deserialize};
-use sha2::Digest;
+use sha3::{Sha3_256, Digest};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH, Duration};
 use base64::{Engine as _, engine::general_purpose};
+
+/// Global hybrid crypto instances for all nodes (thread-safe)
+/// PRODUCTION: Single source of truth for hybrid crypto instances
+pub static GLOBAL_HYBRID_INSTANCES: tokio::sync::OnceCell<Arc<tokio::sync::Mutex<HashMap<String, HybridCrypto>>>> = 
+    tokio::sync::OnceCell::const_new();
 
 /// Helper module for serializing [u8; 64] arrays with serde
 mod base64_bytes {
@@ -78,6 +144,28 @@ pub struct HybridSignature {
     pub certificate: HybridCertificate,
     
     /// Ed25519 signature of the actual message (base64 encoded for serde)
+    #[serde(with = "base64_bytes")]
+    pub message_signature: [u8; 64],
+    
+    /// CRITICAL: Dilithium signature of the SAME message (quantum-resistant)
+    /// Per NIST/Cisco: EVERY message must have BOTH signatures
+    pub dilithium_message_signature: String,
+    
+    /// Timestamp of signature creation
+    pub signed_at: u64,
+}
+
+/// OPTIMIZED: Compact signature for consensus (references cached certificate)
+/// This reduces signature size from 12KB to ~3KB while maintaining quantum resistance
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompactHybridSignature {
+    /// Node ID for certificate lookup
+    pub node_id: String,
+    
+    /// Certificate serial number (for cache lookup)
+    pub cert_serial: String,
+    
+    /// Ed25519 signature of the actual message (base64 encoded)
     #[serde(with = "base64_bytes")]
     pub message_signature: [u8; 64],
     
@@ -211,6 +299,11 @@ impl HybridCrypto {
         })
     }
     
+    /// Get current certificate for broadcasting
+    pub fn get_current_certificate(&self) -> Option<HybridCertificate> {
+        self.current_certificate.clone()
+    }
+    
     /// Check if certificate needs rotation
     pub fn needs_rotation(&self) -> bool {
         let now = SystemTime::now()
@@ -247,6 +340,11 @@ impl HybridCrypto {
         self.last_rotation = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
         
         println!("✅ Certificate rotated: {}", new_certificate.serial_number);
+        
+        // PRODUCTION: Broadcast new certificate to peers for compact signature verification
+        // This is handled by the P2P layer when the node initializes or rotates certificates
+        // The node.rs will call p2p.broadcast_certificate_announce() after rotation
+        
         Ok(())
     }
     
@@ -283,7 +381,10 @@ impl HybridCrypto {
         let quantum_crypto = crypto_guard.as_ref().unwrap();
         
         // Create Dilithium signature for the message
-        let message_hash = hex::encode(blake3::hash(message).as_bytes());
+        // Use SHA3-256 to match the rest of the system
+        let mut hasher = Sha3_256::new();
+        hasher.update(message);
+        let message_hash = hex::encode(hasher.finalize());
         let dilithium_sig = quantum_crypto.create_consensus_signature(&self.node_id, &message_hash).await
             .map_err(|e| anyhow!("Failed to create Dilithium signature: {}", e))?;
         
@@ -293,6 +394,70 @@ impl HybridCrypto {
             dilithium_message_signature: dilithium_sig.signature, // REQUIRED per NIST/Cisco
             signed_at: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
         })
+    }
+    
+    /// OPTIMIZED: Create compact signature for consensus (reduces size from 12KB to 3KB)
+    /// Certificate is cached separately for O(1) verification
+    pub async fn sign_message_compact(&self, message: &[u8]) -> Result<CompactHybridSignature> {
+        // Get current Ed25519 signing key 
+        let signing_key = self.ed25519_signing_key.as_ref()
+            .ok_or_else(|| anyhow!("No Ed25519 signing key available"))?;
+        
+        // Get current certificate for metadata
+        let certificate = self.current_certificate.as_ref()
+            .ok_or_else(|| anyhow!("No current certificate available"))?;
+        
+        // CRITICAL: Ensure certificate is in cache BEFORE creating compact signature
+        self.cache_certificate(certificate).await;
+        
+        // Step 1: Sign with Ed25519
+        let ed25519_signature = signing_key.sign(message);
+        
+        // Step 2: Sign with Dilithium (quantum-resistant)
+        use crate::node::GLOBAL_QUANTUM_CRYPTO;
+        use crate::quantum_crypto::QNetQuantumCrypto;
+        
+        let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
+        if crypto_guard.is_none() {
+            let mut crypto = QNetQuantumCrypto::new();
+            crypto.initialize().await?;
+            *crypto_guard = Some(crypto);
+        }
+        let quantum_crypto = crypto_guard.as_ref().unwrap();
+        
+        // CRITICAL FIX: Message is already SHA3 hash from microblock signing
+        // DO NOT hash again - just convert to hex for Dilithium
+        let message_hash = hex::encode(message);
+        let dilithium_sig = quantum_crypto.create_consensus_signature(&self.node_id, &message_hash).await
+            .map_err(|e| anyhow!("Failed to create Dilithium signature: {}", e))?;
+        
+        Ok(CompactHybridSignature {
+            node_id: self.node_id.clone(),
+            cert_serial: certificate.serial_number.clone(), 
+            message_signature: ed25519_signature.to_bytes(),
+            dilithium_message_signature: dilithium_sig.signature,
+            signed_at: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
+        })
+    }
+    
+    /// Cache certificate for O(1) verification
+    async fn cache_certificate(&self, certificate: &HybridCertificate) {
+        let cache_key = format!("{}_{}", certificate.node_id, certificate.serial_number);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::from_secs(0))
+            .as_secs();
+        
+        let cached = CachedCertificate {
+            certificate: certificate.clone(),
+            verified_at: now,
+            verification_count: 0,
+            is_valid: true,
+        };
+        
+        // Only update global cache (local cache references same instance)
+        CERTIFICATE_CACHE.write().unwrap().insert(cache_key.clone(), cached.clone());
+        self.certificate_cache.write().unwrap().insert(cache_key, cached);
     }
     
     /// Verify hybrid signature per NIST/Cisco ENCAPSULATED KEYS standard
@@ -416,7 +581,10 @@ impl HybridCrypto {
             let quantum_crypto = crypto_guard.as_ref().unwrap();
             
             // Recreate the same message hash used for signing
-            let message_hash = hex::encode(blake3::hash(message).as_bytes());
+            // Use SHA3-256 to match the rest of the system
+        let mut hasher = Sha3_256::new();
+        hasher.update(message);
+        let message_hash = hex::encode(hasher.finalize());
             
             let dilithium_sig = DilithiumSignature {
                 signature: signature.dilithium_message_signature.clone(),
@@ -443,7 +611,7 @@ impl HybridCrypto {
     }
     
     /// Verify Ed25519 signature (fast operation)
-    fn verify_ed25519_signature(
+    pub fn verify_ed25519_signature(
         message: &[u8],
         signature_bytes: &[u8; 64],
         public_key_bytes: &[u8; 32]

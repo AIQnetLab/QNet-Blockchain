@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
 use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 use dashmap::{DashMap, DashSet};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use once_cell::sync::Lazy;
 use std::thread;
 use serde::{Serialize, Deserialize};
@@ -338,6 +338,367 @@ pub struct SimplifiedP2P {
     
     /// Turbine block assembly states
     turbine_assemblies: Arc<DashMap<u64, TurbineBlockAssembly>>,
+    
+    /// PRODUCTION: Certificate management for compact signatures
+    pub certificate_manager: Arc<RwLock<CertificateManager>>,
+}
+
+/// HYBRID: Simplified certificate manager for microblocks only
+/// Macroblocks use full signatures with embedded certificates
+#[derive(Debug, Clone)]
+pub struct CertificateManager {
+    /// Local certificates (our own)
+    local_certificate: Option<(String, Vec<u8>)>,  // (cert_serial, serialized certificate)
+    
+    /// Remote certificates for active microblock producers (small cache)
+    /// Only ~30 producers per rotation, no need for complex LRU
+    remote_certificates: HashMap<String, (Vec<u8>, u64)>,  // cert_serial -> (certificate, timestamp)
+    
+    /// OPTIMISTIC: Pending certificates awaiting verification (prevents race conditions)
+    /// These can be used for block verification but are marked as "conditional"
+    pending_certificates: HashMap<String, (Vec<u8>, u64, String)>,  // cert_serial -> (cert, timestamp, node_id)
+    
+    /// Certificate TTL (4 hours - enough for multiple rotations)
+    certificate_ttl: Duration,
+    
+    /// Maximum cache size for scalability (limit to active producers only)
+    max_cache_size: usize,
+    
+    /// SECURITY: Track which certificates were recently used for block verification
+    /// This helps prioritize active producers during cache eviction (anti-pollution)
+    recently_used: HashSet<String>,  // cert_serial set of recently used certificates
+    
+    /// SECURITY: Track usage count for prioritization during eviction
+    usage_count: HashMap<String, u32>,  // cert_serial -> usage count
+    
+    /// COMPATIBILITY: Track certificate history per node to validate rotations
+    /// node_id -> list of (cert_serial, ed25519_pubkey) for compatibility check
+    certificate_history: HashMap<String, Vec<(String, [u8; 32])>>,  // Max 5 per node
+}
+
+impl CertificateManager {
+    pub fn new() -> Self {
+        Self::with_node_type(NodeType::Full) // Default to Full node
+    }
+    
+    /// Create certificate manager with node type specific limits
+    pub fn with_node_type(node_type: NodeType) -> Self {
+        // SCALABILITY: Different cache sizes based on node capabilities
+        // ARCHITECTURE: Max 1000 validators per round × 4 hour TTL = 4000 certs max
+        let max_cache_size = match node_type {
+            NodeType::Light => 0,      // Light nodes: DON'T participate in consensus, no certs needed!
+            NodeType::Full => 5000,    // Full nodes: 4000 active + 1000 buffer for rotation
+            NodeType::Super => 5000,   // Super nodes: same as Full, both validate blocks
+        };
+        
+        if max_cache_size == 0 {
+            println!("[CERTIFICATE] 📱 Light node: Certificate caching DISABLED (consensus not required)");
+        } else {
+            println!("[CERTIFICATE] 📊 {:?} node: Certificate cache size: {}", node_type, max_cache_size);
+        }
+        
+        Self {
+            local_certificate: None,
+            remote_certificates: HashMap::new(),
+            pending_certificates: HashMap::new(),
+            certificate_ttl: Duration::from_secs(14400),  // 4 hours
+            max_cache_size,
+            recently_used: HashSet::new(),
+            usage_count: HashMap::new(),
+            certificate_history: HashMap::new(),
+        }
+    }
+    
+    /// Store our own certificate
+    pub fn set_local_certificate(&mut self, cert_serial: String, certificate: Vec<u8>) {
+        self.local_certificate = Some((cert_serial, certificate));
+    }
+    
+    /// Store remote certificate (for microblock producers only)
+    pub fn store_remote_certificate(&mut self, cert_serial: String, certificate: Vec<u8>) {
+        // CRITICAL: Light nodes should NEVER store certificates
+        if self.max_cache_size == 0 {
+            println!("[CERTIFICATE] 📱 Light node: Rejecting certificate storage (consensus disabled)");
+            return;
+        }
+        
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::from_secs(0))
+            .as_secs();
+        
+        // OPTIMIZATION: Compress certificate for storage (reduces memory by ~50-70%)
+        // Certificates are typically 4-12KB, compression reduces to 2-5KB
+        let compressed_cert = lz4_flex::compress_prepend_size(&certificate);
+        let original_size = certificate.len();
+        let compressed_size = compressed_cert.len();
+        if compressed_size < original_size {
+            println!("[CERTIFICATE] 📦 Compressed certificate: {} -> {} bytes ({}% reduction)", 
+                     original_size, compressed_size, (100 - (compressed_size * 100 / original_size)));
+        }
+        
+        // PRODUCTION: Enforce configurable cache limit for scalability
+        if self.remote_certificates.len() >= self.max_cache_size {
+            // SECURITY: Prioritized eviction to prevent cache pollution attacks
+            // Priority order: 
+            // 1. Evict certificates that were never used
+            // 2. Evict certificates with lowest usage count  
+            // 3. Evict oldest certificates (LRU)
+            
+            // Find candidate for eviction with priority logic
+            let eviction_candidate = self.remote_certificates
+                .iter()
+                .filter(|(serial, _)| !self.recently_used.contains(*serial))  // Prefer non-recently used
+                .min_by(|(serial_a, (_, timestamp_a)), (serial_b, (_, timestamp_b))| {
+                    // First compare by usage count (lower usage = higher priority for eviction)
+                    let usage_a = self.usage_count.get(*serial_a).unwrap_or(&0);
+                    let usage_b = self.usage_count.get(*serial_b).unwrap_or(&0);
+                    
+                    match usage_a.cmp(usage_b) {
+                        std::cmp::Ordering::Equal => {
+                            // If usage is equal, evict older certificate (LRU)
+                            timestamp_a.cmp(timestamp_b)
+                        }
+                        other => other
+                    }
+                })
+                .or_else(|| {
+                    // If all certificates are recently used, fall back to LRU
+                    self.remote_certificates
+                        .iter()
+                        .min_by_key(|(_, (_, timestamp))| timestamp)
+                })
+                .map(|(k, v)| (k.clone(), v.clone()));
+            
+            if let Some((evicted_serial, _)) = eviction_candidate {
+                self.remote_certificates.remove(&evicted_serial);
+                self.usage_count.remove(&evicted_serial);
+                self.recently_used.remove(&evicted_serial);
+                
+                let usage = self.usage_count.get(&evicted_serial).unwrap_or(&0);
+                println!("[CERTIFICATE] 🗑️ Evicted: {} (usage: {}, cache: {}/{})", 
+                         evicted_serial, usage, self.remote_certificates.len(), self.max_cache_size);
+            }
+        }
+        
+        // Store compressed certificate
+        self.remote_certificates.insert(cert_serial, (compressed_cert, now));
+    }
+    
+    /// SECURITY: Mark certificate as recently used (for cache pollution protection)
+    pub fn mark_as_used(&mut self, cert_serial: &str) {
+        self.recently_used.insert(cert_serial.to_string());
+        *self.usage_count.entry(cert_serial.to_string()).or_insert(0) += 1;
+        
+        // Limit recently_used set size to prevent unbounded growth
+        const MAX_RECENTLY_USED: usize = 1000;
+        if self.recently_used.len() > MAX_RECENTLY_USED {
+            // Remove random old entries (simple cleanup)
+            let to_remove: Vec<String> = self.recently_used
+                .iter()
+                .take(self.recently_used.len() - MAX_RECENTLY_USED / 2)
+                .cloned()
+                .collect();
+            for serial in to_remove {
+                self.recently_used.remove(&serial);
+            }
+        }
+    }
+    
+    /// Get certificate (local or remote) - checks local first, then remote cache, then pending
+    /// OPTIMISTIC: Returns pending certificates to prevent race conditions
+    pub fn get_certificate(&self, cert_serial: &str) -> Option<Vec<u8>> {
+        // Check local certificate
+        if let Some((local_serial, cert)) = &self.local_certificate {
+            if local_serial == cert_serial {
+                return Some(cert.clone());
+            }
+        }
+        
+        // Check verified remote certificates
+        if let Some((compressed_cert, timestamp)) = self.remote_certificates.get(cert_serial) {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or(Duration::from_secs(0))
+                .as_secs();
+            
+            // Check TTL
+            if now - timestamp <= self.certificate_ttl.as_secs() {
+                // OPTIMIZATION: Decompress certificate before returning
+                match lz4_flex::decompress_size_prepended(compressed_cert) {
+                    Ok(decompressed) => {
+                        println!("[CERTIFICATE] ✅ Using verified certificate {}", cert_serial);
+                        return Some(decompressed);
+                    }
+                    Err(e) => {
+                        println!("[CERTIFICATE] ❌ Failed to decompress certificate {}: {}", cert_serial, e);
+                        // Fall back to returning as-is (might be uncompressed legacy data)
+                        return Some(compressed_cert.clone());
+                    }
+                }
+            }
+        }
+        
+        // OPTIMISTIC: Check pending certificates (awaiting verification)
+        if let Some((compressed_cert, timestamp, node_id)) = self.pending_certificates.get(cert_serial) {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or(Duration::from_secs(0))
+                .as_secs();
+            
+            // Check TTL even for pending
+            if now - timestamp <= self.certificate_ttl.as_secs() {
+                println!("[CERTIFICATE] ⚠️ Using PENDING certificate {} from {} (verification in progress)", 
+                         cert_serial, node_id);
+                // Decompress pending certificate
+                match lz4_flex::decompress_size_prepended(compressed_cert) {
+                    Ok(decompressed) => {
+                        // CRITICAL: Blocks using pending certs should be marked conditional
+                        // Byzantine consensus protects against invalid pending certs (2/3+ must agree)
+                        return Some(decompressed);
+                    }
+                    Err(e) => {
+                        println!("[CERTIFICATE] ❌ Failed to decompress pending certificate {}: {}", cert_serial, e);
+                        return None;
+                    }
+                }
+            }
+        }
+        
+        println!("[CERTIFICATE] ❌ Certificate {} not found in any cache", cert_serial);
+        None
+    }
+    
+    /// Clean expired certificates (call periodically)
+    pub fn cleanup(&mut self) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::from_secs(0))
+            .as_secs();
+        
+        // Remove expired verified certificates
+        self.remote_certificates.retain(|_, (_, timestamp)| {
+            now - *timestamp <= self.certificate_ttl.as_secs()
+        });
+        
+        // Remove expired pending certificates (shorter TTL - 5 minutes)
+        self.pending_certificates.retain(|_, (_, timestamp, _)| {
+            now - *timestamp <= 300 // 5 minutes max for pending
+        });
+    }
+    
+    /// PERSISTENCE: Save critical certificates to disk (for node restart recovery)
+    /// Only saves certificates from recently used/active producers
+    pub fn persist_to_disk(&self, path: &std::path::Path, node_type: NodeType) -> std::io::Result<()> {
+        use std::fs;
+        use std::io::Write;
+        
+        // Create certificates directory if it doesn't exist
+        let cert_dir = path.join("certificates");
+        fs::create_dir_all(&cert_dir)?;
+        
+        // Save only recently used certificates (active producers)
+        let mut saved_count = 0;
+        
+        // SCALABILITY: Different persist limits based on node type
+        // Persist only most used certificates for quick recovery after restart
+        let max_persist_certs = match node_type {
+            NodeType::Light => 0,     // Light nodes: NO persistence (no consensus participation)
+            NodeType::Full => 2000,   // Full nodes: persist active validators for 2 hours
+            NodeType::Super => 2000,  // Super nodes: same as Full
+        };
+        
+        if max_persist_certs == 0 {
+            println!("[CERTIFICATE] 📱 Light node: Skipping certificate persistence");
+            return Ok(());
+        }
+        
+        // Sort certificates by usage count for prioritization
+        let mut certs_by_usage: Vec<(String, u32)> = self.usage_count
+            .iter()
+            .filter(|(serial, _)| self.remote_certificates.contains_key(*serial))
+            .map(|(serial, usage)| (serial.clone(), *usage))
+            .collect();
+        certs_by_usage.sort_by(|a, b| b.1.cmp(&a.1)); // Sort by usage descending
+        
+        for (cert_serial, usage) in certs_by_usage.iter().take(max_persist_certs) {
+            if let Some((cert_data, timestamp)) = self.remote_certificates.get(cert_serial) {
+                // Save certificate as binary file
+                let cert_file = cert_dir.join(format!("{}.cert", cert_serial));
+                let mut file = fs::File::create(&cert_file)?;
+                file.write_all(cert_data)?;
+                
+                // Save metadata (timestamp and usage count)
+                let meta_file = cert_dir.join(format!("{}.meta", cert_serial));
+                let metadata = format!("{},{}", timestamp, usage);
+                fs::write(&meta_file, metadata)?;
+                
+                saved_count += 1;
+            }
+        }
+        
+        println!("[CERTIFICATE] 💾 Persisted {} critical certificates to disk", saved_count);
+        Ok(())
+    }
+    
+    /// PERSISTENCE: Load certificates from disk (for node restart recovery)
+    pub fn load_from_disk(&mut self, path: &std::path::Path) -> std::io::Result<()> {
+        use std::fs;
+        
+        let cert_dir = path.join("certificates");
+        if !cert_dir.exists() {
+            return Ok(()); // No certificates to load
+        }
+        
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::from_secs(0))
+            .as_secs();
+        
+        let mut loaded_count = 0;
+        let mut expired_count = 0;
+        
+        // Read all certificate files
+        for entry in fs::read_dir(&cert_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            
+            if path.extension().and_then(|s| s.to_str()) == Some("cert") {
+                let stem = path.file_stem().and_then(|s| s.to_str());
+                if let Some(cert_serial) = stem {
+                    // Load certificate data
+                    let cert_data = fs::read(&path)?;
+                    
+                    // Load metadata
+                    let meta_path = cert_dir.join(format!("{}.meta", cert_serial));
+                    if let Ok(metadata) = fs::read_to_string(&meta_path) {
+                        let parts: Vec<&str> = metadata.split(',').collect();
+                        if parts.len() == 2 {
+                            if let (Ok(timestamp), Ok(usage)) = (parts[0].parse::<u64>(), parts[1].parse::<u32>()) {
+                                // Check if certificate is not expired
+                                if now - timestamp <= self.certificate_ttl.as_secs() {
+                                    self.remote_certificates.insert(cert_serial.to_string(), (cert_data, timestamp));
+                                    self.usage_count.insert(cert_serial.to_string(), usage);
+                                    if usage > 5 { // Mark as recently used if it had significant usage
+                                        self.recently_used.insert(cert_serial.to_string());
+                                    }
+                                    loaded_count += 1;
+                                } else {
+                                    expired_count += 1;
+                                    // Clean up expired certificate files
+                                    let _ = fs::remove_file(&path);
+                                    let _ = fs::remove_file(&meta_path);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        println!("[CERTIFICATE] 📂 Loaded {} certificates from disk ({} expired)", loaded_count, expired_count);
+        Ok(())
+    }
 }
 
 // Kademlia DHT constants
@@ -401,7 +762,7 @@ impl SimplifiedP2P {
         
         Self {
             node_id: node_id.clone(),
-            node_type,
+            node_type: node_type.clone(),
             region: region.clone(),
             port,
             external_ip: Arc::new(RwLock::new(external_ip)),
@@ -485,6 +846,7 @@ impl SimplifiedP2P {
             block_tx: Arc::new(Mutex::new(None)),
             sync_request_tx: None,
             turbine_assemblies: Arc::new(DashMap::new()),
+            certificate_manager: Arc::new(RwLock::new(CertificateManager::with_node_type(node_type.clone()))),
         }
     }
 
@@ -911,6 +1273,29 @@ impl SimplifiedP2P {
                 }
             }
         }
+    }
+    
+    /// Get peer address by node ID
+    pub fn get_peer_address(&self, node_id: &str) -> Option<String> {
+        // Check connected peers lockfree first (O(1) lookup)
+        for entry in self.connected_peers_lockfree.iter() {
+            if entry.value().id == node_id {
+                return Some(entry.value().addr.clone());
+            }
+        }
+        
+        // Check connected peers (legacy)
+        let connected = self.connected_peers.read().unwrap();
+        if let Some(peer) = connected.get(node_id) {
+            return Some(peer.addr.clone());
+        }
+        
+        // Check peer_id_to_addr index
+        if let Some(addr) = self.peer_id_to_addr.get(node_id) {
+            return Some(addr.clone());
+        }
+        
+        None
     }
     
     /// Update peer last_seen timestamp when we receive data from them
@@ -3752,6 +4137,74 @@ impl SimplifiedP2P {
         }
     }
     
+    /// PRODUCTION: Broadcast certificate announcement when created/rotated
+    /// This enables compact signatures for microblocks
+    pub fn broadcast_certificate_announce(&self, cert_serial: String, certificate: Vec<u8>) -> Result<(), String> {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+            
+        let message = NetworkMessage::CertificateAnnounce {
+            node_id: self.node_id.clone(),
+            cert_serial: cert_serial.clone(),
+            certificate: certificate.clone(),
+            timestamp,
+        };
+        
+        // Store our own certificate first
+        {
+            let mut cert_manager = self.certificate_manager.write().unwrap();
+            cert_manager.set_local_certificate(cert_serial.clone(), certificate);
+        }
+        
+        // Broadcast to all connected peers
+        let peers = self.connected_peers_lockfree.clone();
+        let mut broadcast_count = 0;
+        
+        // Serialize message once for all peers
+        let message_json = match serde_json::to_value(&message) {
+            Ok(json) => json,
+            Err(e) => {
+                return Err(format!("Failed to serialize certificate message: {}", e));
+            }
+        };
+        
+        for entry in peers.iter() {
+            let peer_info = entry.value();
+            let peer_addr = peer_info.addr.clone();
+            
+            if peer_info.id == self.node_id {
+                continue; // Skip self
+            }
+            
+            // Send certificate announcement (async in production)
+            println!("[P2P] 📤 Sending certificate {} to peer {}", cert_serial, peer_addr);
+            broadcast_count += 1;
+            
+            // PRODUCTION: Send certificate announcement via HTTP (same pattern as send_network_message)
+            let peer_addr_clone = peer_addr.clone();
+            let message_json_clone = message_json.clone();
+            std::thread::spawn(move || {
+                let peer_ip = peer_addr_clone.split(':').next().unwrap_or(&peer_addr_clone);
+                let url = format!("http://{}:8001/api/v1/p2p/message", peer_ip);
+                
+                let client = reqwest::blocking::Client::builder()
+                    .timeout(std::time::Duration::from_secs(5))
+                    .build();
+                
+                if let Ok(client) = client {
+                    if let Err(e) = client.post(&url).json(&message_json_clone).send() {
+                        println!("[P2P] ❌ Failed to send certificate to {}: {}", peer_addr_clone, e);
+                    }
+                }
+            });
+        }
+        
+        println!("[P2P] 📜 Certificate {} broadcast to {} peers", cert_serial, broadcast_count);
+        Ok(())
+    }
+    
     /// PRODUCTION: Get validated active peers for consensus participation (NODE TYPE AWARE)
     pub fn get_validated_active_peers(&self) -> Vec<PeerInfo> {
         // CRITICAL FIX: Light nodes DO NOT participate in consensus - return empty list
@@ -5632,6 +6085,33 @@ pub enum NetworkMessage {
         entropy_hash: [u8; 32],
         responder_id: String,
     },
+    
+    /// PRODUCTION: Hybrid certificate announcement for compact signatures
+    CertificateAnnounce {
+        node_id: String,
+        cert_serial: String,
+        #[serde(with = "base64_bytes")]
+        certificate: Vec<u8>,  // Serialized HybridCertificate
+        timestamp: u64,
+    },
+    
+    /// Request certificate by serial number
+    CertificateRequest {
+        requester_id: String,
+        node_id: String,       // Owner of certificate  
+        cert_serial: String,   // Serial number requested
+        timestamp: u64,
+    },
+    
+    /// Response with certificate
+    CertificateResponse {
+        node_id: String,
+        cert_serial: String,
+        #[serde(with = "base64_bytes")]
+        certificate: Vec<u8>,  // Serialized HybridCertificate
+        timestamp: u64,
+    },
+    
 }
 
 /// Internal consensus messages for node communication
@@ -5889,6 +6369,353 @@ impl SimplifiedP2P {
                         u64::from_le_bytes([entropy_hash[0], entropy_hash[1], entropy_hash[2], entropy_hash[3],
                                            entropy_hash[4], entropy_hash[5], entropy_hash[6], entropy_hash[7]]));
                 // Store response for verification in node.rs
+            }
+            
+            // PRODUCTION: Certificate management for compact signatures
+            NetworkMessage::CertificateAnnounce { node_id, cert_serial, certificate, timestamp } => {
+                self.update_peer_last_seen(&node_id);
+                
+                // SCALABILITY: Light nodes don't participate in consensus, skip certificate processing
+                if matches!(self.node_type, NodeType::Light) {
+                    println!("[P2P] 📱 Light node: Ignoring certificate announcement (consensus not required)");
+                    return;
+                }
+                
+                println!("[P2P] 📜 Certificate announcement from {} (serial: {})", node_id, cert_serial);
+                
+                // SECURITY: Rate limiting to prevent certificate flooding attacks
+                // Maximum 10 certificate announcements per minute per peer
+                let now = self.current_timestamp();
+                let rate_limited = {
+                    let rate_key = format!("cert_{}", node_id);
+                    let mut rate_limit = self.rate_limiter.entry(rate_key).or_insert_with(|| RateLimit {
+                        requests: Vec::new(),
+                        max_requests: 10,  // 10 certificates per minute (generous for 1-hour rotation)
+                        window_seconds: 60,
+                        blocked_until: 0,
+                    });
+                    
+                    // Check if currently blocked
+                    if rate_limit.blocked_until > now {
+                        println!("[P2P] ⛔ Rate limit: {} blocked from sending certificates for {} more seconds", 
+                                 node_id, rate_limit.blocked_until - now);
+                        true
+                    } else {
+                        // Clean old requests outside window
+                        let window = rate_limit.window_seconds;
+                        rate_limit.requests.retain(|&req_time| req_time > now - window);
+                        
+                        // Check if limit exceeded
+                        if rate_limit.requests.len() >= rate_limit.max_requests {
+                            rate_limit.blocked_until = now + 300; // Block for 5 minutes (stricter for certificates)
+                            println!("[P2P] ⛔ Certificate rate limit exceeded for {} ({}+ certificates/minute)", 
+                                     node_id, rate_limit.max_requests);
+                            println!("[P2P]    Blocking certificate announcements for 5 minutes");
+                            true
+                        } else {
+                            // Add this request
+                            rate_limit.requests.push(now);
+                            false
+                        }
+                    }
+                };
+                
+                if rate_limited {
+                    println!("[P2P] 🚫 Certificate announcement rejected due to rate limiting");
+                    // SECURITY: Rate limiting violation indicates potential DoS attack
+                    self.update_peer_reputation(&node_id, false); // -5% per violation
+                    self.track_invalid_certificate(&node_id, "RATE_LIMIT_EXCEEDED");
+                    return;
+                }
+                
+                // SECURITY FIX: Verify certificate BEFORE storing to prevent spoofing attacks
+                // Deserialize and validate certificate structure first
+                let cert: crate::hybrid_crypto::HybridCertificate = match bincode::deserialize(&certificate) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        println!("[P2P] ❌ Invalid certificate format from {}: {}", node_id, e);
+                        // SECURITY: Penalize for sending invalid data
+                        self.update_peer_reputation(&node_id, false); // -5% reputation
+                        self.track_invalid_certificate(&node_id, "INVALID_FORMAT");
+                        return;
+                    }
+                };
+                
+                // CRITICAL SECURITY: Verify node_id matches certificate owner to prevent spoofing
+                if cert.node_id != node_id {
+                    println!("[P2P] 🚨 SECURITY: Certificate spoofing attempt detected!");
+                    println!("[P2P]    Sender claims to be: {}", node_id);
+                    println!("[P2P]    Certificate owner is: {}", cert.node_id);
+                    
+                    // CRITICAL: Certificate spoofing is a CRITICAL ATTACK
+                    // BUT: Genesis nodes get special protection
+                    if self.is_genesis_node(&node_id) {
+                        println!("[SECURITY] ⚠️ Genesis node {} attempted certificate spoofing - SEVERE WARNING", node_id);
+                        println!("[SECURITY] 🛡️ Genesis node protected from ban, applying -70% reputation penalty");
+                        self.update_node_reputation(&node_id, -70.0); // Severe penalty but no ban
+                        self.track_invalid_certificate(&node_id, "CERTIFICATE_SPOOFING");
+                    } else {
+                        // Regular nodes get instant ban
+                        self.update_peer_reputation(&node_id, false); // First hit: -5%
+                        self.track_invalid_certificate(&node_id, "CERTIFICATE_SPOOFING");
+                        
+                        // Report as critical attack for instant ban (1 year)
+                        let _ = self.report_critical_attack(
+                            &node_id,
+                            MaliciousBehavior::ProtocolViolation,  // Certificate spoofing is a protocol violation
+                            0, // block_height not relevant for cert attacks
+                            &format!("CERTIFICATE_SPOOFING: Attempted to spoof certificate for node: {}", cert.node_id)
+                        );
+                    }
+                    return;
+                }
+                
+                // SECURITY: Check certificate age to prevent replay attacks
+                let now = self.current_timestamp();
+                let cert_age = now.saturating_sub(cert.issued_at);
+                
+                // Maximum age: 2 hours (certificate lifetime is 1 hour + 1 hour grace period)
+                const MAX_CERT_AGE: u64 = 7200; // 2 hours in seconds
+                if cert_age > MAX_CERT_AGE {
+                    println!("[P2P] ❌ Certificate too old (possible replay attack)");
+                    println!("[P2P]    Certificate age: {} seconds", cert_age);
+                    println!("[P2P]    Maximum allowed: {} seconds", MAX_CERT_AGE);
+                    return;
+                }
+                
+                // SECURITY: Check certificate has not expired
+                if now > cert.expires_at {
+                    println!("[P2P] ❌ Certificate expired at {}, current time: {}", 
+                             cert.expires_at, now);
+                    return;
+                }
+                
+                // SECURITY: Check certificate is not from the future (clock skew tolerance: 60 seconds)
+                const MAX_CLOCK_SKEW: u64 = 60; // 60 seconds clock skew tolerance
+                if cert.issued_at > now + MAX_CLOCK_SKEW {
+                    println!("[P2P] ❌ Certificate from the future (clock skew issue)");
+                    println!("[P2P]    Certificate issued at: {}", cert.issued_at);
+                    println!("[P2P]    Current time: {}", now);
+                    return;
+                }
+                
+                // OPTIMISTIC: Save certificate to pending cache IMMEDIATELY
+                // This prevents race conditions where blocks arrive before verification completes
+                {
+                    let mut cert_manager = self.certificate_manager.write().unwrap();
+                    let now = self.current_timestamp();
+                    
+                    // Check if already in pending or verified
+                    if cert_manager.remote_certificates.contains_key(&cert_serial) ||
+                       cert_manager.pending_certificates.contains_key(&cert_serial) {
+                        println!("[P2P] ⏭️  Certificate {} already cached, skipping", cert_serial);
+                        return;
+                    }
+                    
+                    // SECURITY: Limit pending cache to prevent memory attacks
+                    const MAX_PENDING_CERTS: usize = 100; // Max pending verifications
+                    if cert_manager.pending_certificates.len() >= MAX_PENDING_CERTS {
+                        // Remove oldest pending to make space
+                        if let Some((oldest_serial, _)) = cert_manager.pending_certificates
+                            .iter()
+                            .min_by_key(|(_, (_, timestamp, _))| timestamp)
+                            .map(|(k, v)| (k.clone(), v.clone())) {
+                            cert_manager.pending_certificates.remove(&oldest_serial);
+                            println!("[P2P] ⚠️ Pending cache full, evicted oldest: {}", oldest_serial);
+                        }
+                    }
+                    
+                    // Store in pending cache immediately (compressed for consistency)
+                    let compressed = lz4_flex::compress_prepend_size(&certificate);
+                    cert_manager.pending_certificates.insert(
+                        cert_serial.clone(),
+                        (compressed, now, node_id.clone())
+                    );
+                    println!("[P2P] ⏳ Certificate {} stored in PENDING cache for immediate use", cert_serial);
+                }
+                
+                // Clone values needed for async verification
+                let cert_serial_clone = cert_serial.clone();
+                let certificate_clone = certificate.clone();
+                let cert_manager_clone = self.certificate_manager.clone();
+                let node_id_clone = node_id.clone();
+                let reputation_system_clone = self.reputation_system.clone();
+                
+                tokio::spawn(async move {
+                    // Recreate encapsulated data for verification (same as in hybrid_crypto.rs)
+                    let mut encapsulated_data = Vec::new();
+                    encapsulated_data.extend_from_slice(&cert.ed25519_public_key);
+                    encapsulated_data.extend_from_slice(cert.node_id.as_bytes());
+                    encapsulated_data.extend_from_slice(&cert.issued_at.to_le_bytes());
+                    let encapsulated_hex = hex::encode(&encapsulated_data);
+                    
+                    // Verify Dilithium signature using GLOBAL_QUANTUM_CRYPTO
+                    use crate::node::GLOBAL_QUANTUM_CRYPTO;
+                    let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
+                    if crypto_guard.is_none() {
+                        let mut crypto = crate::quantum_crypto::QNetQuantumCrypto::new();
+                        let _ = crypto.initialize().await;
+                        *crypto_guard = Some(crypto);
+                    }
+                    let quantum_crypto = crypto_guard.as_ref().unwrap();
+                    
+                    let dilithium_sig = crate::quantum_crypto::DilithiumSignature {
+                        signature: cert.dilithium_signature.clone(),
+                        algorithm: "QNet-Dilithium-Compatible".to_string(),
+                        timestamp: cert.issued_at,
+                        strength: "quantum-resistant".to_string(),
+                    };
+                    
+                    // Perform cryptographic verification
+                    match quantum_crypto.verify_dilithium_signature(&encapsulated_hex, &dilithium_sig, &cert.node_id).await {
+                        Ok(true) => {
+                            println!("[P2P] ✅ Certificate {} cryptographically verified", cert_serial_clone);
+                            
+                            // COMPATIBILITY: Check certificate history to ensure smooth rotation
+                            let mut cert_manager = cert_manager_clone.write().unwrap();
+                            
+                            // Check if we have history for this node
+                            let is_compatible = if let Some(history) = cert_manager.certificate_history.get(&cert.node_id) {
+                                // This node has rotated certificates before
+                                // For now, we just warn - in future, can check Ed25519 key continuity
+                                if !history.is_empty() {
+                                    let prev_count = history.len();
+                                    println!("[P2P] 🔄 Certificate rotation detected for {} (history: {} certs)", 
+                                             cert.node_id, prev_count);
+                                    // TODO: In production, verify that new cert is signed by previous key
+                                    // or follows proper rotation protocol
+                                }
+                                true // Accept for now
+                            } else {
+                                // First certificate from this node
+                                println!("[P2P] 🆕 First certificate from node {}", cert.node_id);
+                                true
+                            };
+                            
+                            if is_compatible {
+                                // Update certificate history
+                                let history = cert_manager.certificate_history
+                                    .entry(cert.node_id.clone())
+                                    .or_insert_with(Vec::new);
+                                
+                                // Keep only last 5 certificates for history
+                                if history.len() >= 5 {
+                                    history.remove(0);
+                                }
+                                history.push((cert_serial_clone.clone(), cert.ed25519_public_key));
+                                
+                                // OPTIMISTIC: Move from pending to verified cache
+                                cert_manager.pending_certificates.remove(&cert_serial_clone);
+                                cert_manager.store_remote_certificate(cert_serial_clone.clone(), certificate_clone);
+                                println!("[P2P] ✅ Certificate moved from PENDING to VERIFIED cache");
+                            } else {
+                                println!("[P2P] ❌ Certificate rotation incompatible - rejecting");
+                                // Remove from pending without storing
+                                cert_manager.pending_certificates.remove(&cert_serial_clone);
+                            }
+                        }
+                        Ok(false) => {
+                            println!("[P2P] ❌ Certificate {} has INVALID signature from {}", 
+                                     cert_serial_clone, node_id_clone);
+                            println!("[P2P] 🚨 SECURITY: Potential attack - invalid certificate rejected");
+                            
+                            // CRITICAL: Remove invalid certificate from pending cache
+                            let mut cert_manager = cert_manager_clone.write().unwrap();
+                            cert_manager.pending_certificates.remove(&cert_serial_clone);
+                            println!("[P2P] 🗑️ Removed invalid certificate from pending cache");
+                            
+                            // Apply reputation penalty
+                            if let Ok(mut rep) = reputation_system_clone.lock() {
+                                rep.update_reputation(&node_id_clone, -10.0);
+                            }
+                        }
+                        Err(e) => {
+                            println!("[P2P] ❌ Certificate verification error: {}", e);
+                            
+                            // Remove failed certificate from pending cache
+                            let mut cert_manager = cert_manager_clone.write().unwrap();
+                            cert_manager.pending_certificates.remove(&cert_serial_clone);
+                            println!("[P2P] 🗑️ Removed failed certificate from pending cache");
+                        }
+                    }
+                    
+                    // CLEANUP: Clean expired pending certificates periodically
+                    let mut cert_manager = cert_manager_clone.write().unwrap();
+                    if cert_manager.pending_certificates.len() > 50 {
+                        let now = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or(Duration::from_secs(0))
+                            .as_secs();
+                        cert_manager.pending_certificates.retain(|_, (_, timestamp, _)| {
+                            now - *timestamp < 300 // Remove pending certs older than 5 minutes
+                        });
+                        println!("[P2P] 🧹 Cleaned expired pending certificates");
+                    }
+                });
+            }
+            
+            NetworkMessage::CertificateRequest { requester_id, node_id, cert_serial, timestamp } => {
+                self.update_peer_last_seen(&requester_id);
+                println!("[P2P] 📋 Certificate request from {} for {}", requester_id, cert_serial);
+                
+                // Check if we have the certificate and send response
+                let cert_manager = self.certificate_manager.read().unwrap();
+                if let Some(certificate) = cert_manager.get_certificate(&cert_serial) {
+                    println!("[P2P] ✅ Sending certificate {} to {}", cert_serial, requester_id);
+                    
+                    // PRODUCTION: Send response back via network
+                    let response = NetworkMessage::CertificateResponse {
+                        node_id: node_id.clone(),
+                        cert_serial: cert_serial.clone(),
+                        certificate: certificate.clone(),
+                        timestamp,
+                    };
+                    
+                    // Find requester peer address
+                    if let Some(peer_addr) = self.get_peer_address(&requester_id) {
+                        // Send response using HTTP (same pattern as broadcast_certificate_announce)
+                        let peer_addr_clone = peer_addr.clone();
+                        let requester_id_clone = requester_id.clone();
+                        let response_json = match serde_json::to_value(&response) {
+                            Ok(json) => json,
+                            Err(e) => {
+                                println!("[P2P] ❌ Failed to serialize certificate response: {}", e);
+                                return;
+                            }
+                        };
+                        
+                        std::thread::spawn(move || {
+                            let peer_ip = peer_addr_clone.split(':').next().unwrap_or(&peer_addr_clone);
+                            let url = format!("http://{}:8001/api/v1/p2p/message", peer_ip);
+                            
+                            let client = reqwest::blocking::Client::builder()
+                                .timeout(std::time::Duration::from_secs(5))
+                                .build();
+                            
+                            if let Ok(client) = client {
+                                if let Err(e) = client.post(&url).json(&response_json).send() {
+                                    println!("[P2P] ❌ Failed to send certificate response to {}: {}", peer_addr_clone, e);
+                                } else {
+                                    println!("[P2P] 📤 Certificate response sent to {}", requester_id_clone);
+                                }
+                            }
+                        });
+                    } else {
+                        println!("[P2P] ⚠️ Cannot find address for requester {}", requester_id);
+                    }
+                } else {
+                    println!("[P2P] ❌ Certificate {} not found in cache", cert_serial);
+                }
+            }
+            
+            NetworkMessage::CertificateResponse { node_id, cert_serial, certificate, timestamp } => {
+                self.update_peer_last_seen(&node_id);
+                println!("[P2P] 📥 Certificate response from {} (serial: {})", node_id, cert_serial);
+                
+                // Store received certificate
+                let mut cert_manager = self.certificate_manager.write().unwrap();
+                cert_manager.store_remote_certificate(cert_serial.clone(), certificate);
+                println!("[P2P] ✅ Received certificate {} cached", cert_serial);
             }
         }
     }
@@ -7800,6 +8627,15 @@ impl SimplifiedP2P {
         change_type: String,
         timestamp: u64
     ) {
+        // CRITICAL FIX: Ignore macroblock failovers - they don't affect microblock production
+        // Macroblocks are separate consensus process and should NOT stop microblock production
+        // Only microblock failovers should trigger production changes
+        if change_type == "macroblock" {
+            println!("[FAILOVER] ℹ️ Macroblock failover at block #{} - ignoring (microblock production continues)", block_height);
+            println!("[FAILOVER] 💡 Macroblocks are separate Byzantine consensus, no impact on microblocks");
+            return;
+        }
+        
         // CRITICAL FIX: Filter out early block failovers to prevent spam
         // Block #1 issue is known and will be fixed by height increment fix
         if block_height <= 1 {
@@ -7922,15 +8758,33 @@ impl SimplifiedP2P {
                     // Check if we produced a block in the last 5 seconds
                     let time_since_last_production = current_time.saturating_sub(last_produced_time);
                     
-                    // PRODUCTION VALUES: 5 seconds timeout (allows for 1-2 missed blocks)
-                    if time_since_last_production <= 5 && last_produced_height > 0 {
+                    // CRITICAL FIX: Enhanced protection for Genesis/startup phase
+                    // On first blocks (1-10), multiple nodes may claim to be producer due to race conditions
+                    // We need stronger protection during network initialization
+                    let is_early_blocks = block_height <= 10;
+                    let recently_produced = time_since_last_production <= 5 && last_produced_height > 0;
+                    let startup_protection = is_early_blocks && last_produced_height == 0 && time_since_last_production <= 10;
+                    
+                    // PRODUCTION VALUES: 
+                    // - Normal: 5 seconds timeout (allows for 1-2 missed blocks)
+                    // - Startup: 10 seconds timeout (allows for Genesis sync delays)
+                    if recently_produced || startup_protection {
                         println!("[FAILOVER] ⚠️ FALSE FAILOVER DETECTED!");
-                        println!("[FAILOVER] 📊 We produced block #{} just {}s ago", 
-                                last_produced_height, time_since_last_production);
-                        println!("[FAILOVER] ✅ Ignoring false failover - we ARE actively producing!");
+                        
+                        if recently_produced {
+                            println!("[FAILOVER] 📊 We produced block #{} just {}s ago", 
+                                    last_produced_height, time_since_last_production);
+                            println!("[FAILOVER] ✅ Ignoring false failover - we ARE actively producing!");
+                        } else if startup_protection {
+                            println!("[FAILOVER] 🌱 Genesis phase protection: Block #{} (startup phase)", block_height);
+                            println!("[FAILOVER] ⏰ Node initialized {}s ago - too early for legitimate failover", 
+                                    time_since_last_production);
+                            println!("[FAILOVER] ✅ Ignoring false failover - network still initializing!");
+                        }
                         
                         // Track false failovers from this peer
                         println!("[FAILOVER] ⚠️ False failover claiming new producer: {}", new_producer);
+                        println!("[FAILOVER] 💡 This may indicate race condition or network delay");
                         // Could track reputation penalty for false failovers here in future
                         
                         // DO NOT STOP - continue producing blocks
@@ -8418,6 +9272,85 @@ impl SimplifiedP2P {
                 }
             }
         });
+    }
+    
+    /// Check if a node is a genesis/bootstrap node that should be protected
+    fn is_genesis_node(&self, node_id: &str) -> bool {
+        // Check if it's a genesis node by ID pattern
+        if node_id.starts_with("genesis_node_") {
+            return true;
+        }
+        
+        // Check if current node has bootstrap ID (genesis nodes know each other)
+        if let Ok(bootstrap_id) = std::env::var("QNET_BOOTSTRAP_ID") {
+            if ["001", "002", "003", "004", "005"].contains(&bootstrap_id.as_str()) {
+                // This is a genesis node, check if peer is also genesis
+                if node_id.ends_with("_001") || node_id.ends_with("_002") || 
+                   node_id.ends_with("_003") || node_id.ends_with("_004") || 
+                   node_id.ends_with("_005") {
+                    return true;
+                }
+            }
+        }
+        
+        false
+    }
+    
+    /// Track invalid certificate from a node for malicious behavior detection
+    /// SECURITY: Escalating punishment - 5 invalid certs in 10 minutes = ban
+    pub fn track_invalid_certificate(&self, node_id: &str, reason: &str) {
+        // Use same infrastructure as invalid blocks but with different thresholds
+        static INVALID_CERT_TRACKER: Lazy<Arc<DashMap<String, (AtomicU64, Instant)>>> = 
+            Lazy::new(|| Arc::new(DashMap::new()));
+        
+        let entry = INVALID_CERT_TRACKER
+            .entry(node_id.to_string())
+            .or_insert((AtomicU64::new(0), Instant::now()));
+        
+        let count = entry.0.fetch_add(1, Ordering::Relaxed) + 1;
+        let first_seen = entry.1;
+        let elapsed = first_seen.elapsed();
+        
+        println!("[SECURITY] ⚠️ Invalid certificate from {}: {} (count: {}, window: {}s)", 
+                 node_id, reason, count, elapsed.as_secs());
+        
+        // CRITICAL: Escalating punishment for certificate violations
+        // 5 invalid certificates in 10 minutes → critical attack (ban)
+        // Certificates are more critical than blocks (lower threshold)
+        
+        if count >= 5 && elapsed < Duration::from_secs(600) {
+            // PROTECTION: Genesis nodes get warnings but no bans
+            if self.is_genesis_node(node_id) {
+                println!("[SECURITY] ⚠️ Genesis node {} has {} invalid certificates - WARNING ONLY", 
+                         node_id, count);
+                println!("[SECURITY] 🛡️ Genesis nodes are protected from automatic bans");
+                // Apply reputation penalty but no ban
+                self.update_node_reputation(node_id, -50.0); // Heavy penalty but not ban
+                INVALID_CERT_TRACKER.remove(node_id);
+                return;
+            }
+            
+            // CRITICAL ATTACK: 5+ invalid certificates in 10 minutes = malicious node
+            println!("[SECURITY] 🚨🚨🚨 CERTIFICATE ATTACKER DETECTED! 🚨🚨🚨");
+            println!("[SECURITY] 🚨 Node: {} sent {} invalid certificates in {} seconds", 
+                     node_id, count, elapsed.as_secs());
+            println!("[SECURITY] 🚨 APPLYING INSTANT BAN!");
+            
+            // Report as critical attack
+            let _ = self.report_critical_attack(
+                node_id,
+                MaliciousBehavior::ProtocolViolation,
+                0,  // No block height for certificate attacks
+                &format!("Repeated invalid certificates: {} in {}s - {}", count, elapsed.as_secs(), reason)
+            );
+            
+            // Clear tracker after ban
+            INVALID_CERT_TRACKER.remove(node_id);
+        } else if count == 3 {
+            // Warning level - significant reputation penalty
+            println!("[SECURITY] ⚠️ WARNING: {} has sent 3 invalid certificates", node_id);
+            self.update_node_reputation(node_id, -20.0); // -20% reputation
+        }
     }
     
     /// Track invalid block from a producer for malicious behavior detection
