@@ -449,6 +449,120 @@ if all_qualified.len() > MAX_VALIDATORS_PER_ROUND {
 - **Certificate Caching**: Reduces certificate request floods
 - **Validator Sampling**: Limits consensus participation to 1000 nodes
 
+### Certificate Security System
+
+QNet implements 6-layer certificate protection against forgery, replay, and spoofing attacks:
+
+#### Layer 1: Node Identity Verification
+```rust
+if cert.node_id != sender_node_id {
+    reject_certificate();
+    apply_rate_limit_penalty();
+}
+```
+**Protection**: Prevents certificate spoofing (wrong sender)
+
+#### Layer 2: Age Verification
+```rust
+MAX_CERT_AGE = 7200 seconds (2 hours)
+if current_time - cert.issued_at > MAX_CERT_AGE {
+    reject_certificate(); // Replay attack detected
+}
+```
+**Protection**: Prevents replay attacks with old certificates
+
+#### Layer 3: Expiration Check
+```rust
+if current_time > cert.expires_at {
+    reject_certificate(); // Expired
+}
+```
+**Protection**: Enforces 1-hour certificate lifetime
+
+#### Layer 4: Clock Skew Protection
+```rust
+MAX_CLOCK_SKEW = 60 seconds
+if cert.issued_at > current_time + MAX_CLOCK_SKEW {
+    reject_certificate(); // Future timestamp attack
+}
+```
+**Protection**: Prevents timestamp manipulation attacks
+
+#### Layer 5: Cryptographic Verification
+```rust
+// Asynchronous Dilithium3 verification
+tokio::spawn(async move {
+    let is_valid = pqcrypto_dilithium::dilithium3::open(signed_msg, &pk);
+    
+    if !is_valid {
+        remove_from_pending();
+        update_peer_reputation(-20%);
+        track_invalid_certificate();  // 5 failures = ban
+    } else {
+        move_to_verified_cache();
+    }
+});
+```
+**Protection**: Real quantum-resistant signature verification
+
+#### Layer 6: Producer Match Verification
+```rust
+if certificate.node_id != microblock.producer {
+    reject_block(); // Wrong producer
+}
+```
+**Protection**: Ensures certificate matches block producer
+
+#### Optimistic Certificate Acceptance
+
+**Implementation**: Two-tier cache system
+```
+IMMEDIATE: Add to pending_certificates (compressed with LZ4)
+           ├─ Available for block verification instantly
+           └─ Byzantine consensus ensures 2/3+ agreement
+
+ASYNC:     Dilithium verification in background
+           ├─ On success → Move to verified cache
+           └─ On failure → Remove + reputation penalty
+```
+
+**Benefits**:
+- Zero consensus delays
+- Byzantine-safe (2/3+ nodes must agree)
+- Full cryptographic security preserved
+- Race condition eliminated
+
+#### Reputation System Integration
+
+| Violation | Penalty | Escalation |
+|-----------|---------|------------|
+| Invalid certificate format | -20% reputation | 3 violations = -60% |
+| Repeated invalid certs (5×) | 1-year ban | Permanent after 10× |
+| Certificate spoofing | Instant permanent ban | Immediate removal |
+
+**Consensus Threshold**: 70% minimum reputation required
+
+#### Certificate Lifecycle
+
+| Metric | Light Nodes | Full/Super Nodes | Network Scale |
+|--------|-------------|------------------|---------------|
+| **Cache Size** | 0 | 5,000 certs | O(1) regardless of size |
+| **Compression** | N/A | LZ4 (~70% reduction) | 5KB → 1.5KB |
+| **Memory Usage** | 0 MB | ~7.5 MB | Fixed for 1M+ nodes |
+| **Disk Persistence** | 0 | 2,000 certs (2 hours) | Fast recovery |
+| **Lifetime** | N/A | 1 hour (3600s) | Automatic rotation |
+| **TTL** | N/A | 4 hours cache | Grace period |
+
+**Scalability Proof**:
+```
+5 nodes:         100% cached (5 certs)
+1,000 nodes:     100% cached (1,000 certs, max validators)
+1,000,000 nodes: 0.1% cached (1,000 sampled validators)
+100M nodes:      0.001% cached (still 1,000 validators)
+
+Conclusion: Certificate memory remains ~7.5 MB regardless of network size
+```
+
 ---
 
 ## Performance Characteristics
