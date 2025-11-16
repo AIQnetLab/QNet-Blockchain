@@ -1,6 +1,6 @@
 # 🚀 QNet Blockchain - Post-Quantum Decentralized Network
 
-[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+[![License](https://img.shields.io/badge/License-BSL_1.1-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.70+-orange.svg)](https://www.rust-lang.org)
 [![Node.js](https://img.shields.io/badge/node.js-18+-green.svg)](https://nodejs.org)
 [![Performance](https://img.shields.io/badge/TPS-424,411-blue.svg)](https://github.com/AIQnetLab/QNet-Blockchain)
@@ -8,6 +8,37 @@
 ## 🌟 Overview
 
 QNet is a high-performance, post-quantum secure blockchain network with a **two-phase activation system** designed for the next generation of decentralized applications.
+
+## 📜 Licensing
+
+This project uses **dual licensing**:
+
+### 🔐 Blockchain Infrastructure (BSL 1.1)
+- **Components**: 
+  - `core/` - Consensus, mempool, state management, sharding
+  - `development/` - Node implementation, integration, contracts, VM
+  - `audit/` - Security audit tools and compliance tests
+  - `governance/` - DAO and governance mechanisms
+  - `deployment/` - Node deployment and orchestration
+  - `infrastructure/` - API, node infrastructure, backend services
+  - `testing/` - Integration tests, testnet tools
+  - `monitoring/` - Production monitoring and metrics
+- **License**: [Business Source License 1.1](LICENSE)
+- **Usage**: 
+  - ✅ Non-production use (testing, development, evaluation) - **FREE**
+  - ✅ Automatically converts to **Apache 2.0** on **January 1, 2029**
+  - ⚠️ Production use requires commercial license before 2029
+- **Contact**: support@qnet.io for commercial licensing
+
+### 📱 Client Applications (Apache-2.0)
+- **Components**: 
+  - `applications/qnet-mobile/` - Mobile wallet (F-Droid compatible)
+  - `applications/qnet-wallet/` - Browser extension wallet
+  - `applications/qnet-explorer/` - Blockchain explorer
+  - `applications/qnet-cli/` - Command-line tools
+- **License**: [Apache License 2.0](applications/qnet-mobile/LICENSE)
+- **Usage**: **Fully open-source** - use, modify, distribute freely
+- **Note**: All applications connect to blockchain nodes via HTTP API only. No proprietary blockchain code is included.
 
 ### ⚠️ **CRITICAL PHASE SYSTEM**
 - **Phase 1 (Current)**: ONLY 1DEV token activation on Solana blockchain

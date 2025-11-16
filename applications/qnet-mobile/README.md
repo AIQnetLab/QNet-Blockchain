@@ -1,4 +1,23 @@
-This is a new [**React Native**](https://reactnative.dev) project, bootstrapped using [`@react-native-community/cli`](https://github.com/react-native-community/cli).
+# QNet Mobile Wallet
+
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+[![F-Droid](https://img.shields.io/badge/F--Droid-Compatible-green.svg)](https://f-droid.org)
+
+This is the official mobile wallet for QNet Blockchain, built with [**React Native**](https://reactnative.dev) and bootstrapped using [`@react-native-community/cli`](https://github.com/react-native-community/cli).
+
+## 📜 License
+
+This mobile application is licensed under **Apache License 2.0** - fully open-source and F-Droid compatible.
+
+**Important**: The QNet blockchain node software (in the parent repository) uses BSL 1.1 license. However, this mobile app:
+- ✅ Contains **NO blockchain node code**
+- ✅ Contains **NO Rust dependencies**
+- ✅ Connects to nodes via **HTTP API only**
+- ✅ Is **100% Apache 2.0 licensed**
+
+See [LICENSE](LICENSE) for full terms.
+
+---
 
 # Getting Started
 
