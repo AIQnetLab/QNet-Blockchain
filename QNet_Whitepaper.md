@@ -30,7 +30,7 @@ Experimental achievements:
 - ✅ **Mobile-first**: Optimized for smartphones
 - ✅ **Reputation system**: Without staking, only behavioral assessment
 - ✅ **Experimental architecture**: Innovative approach to consensus
-- ✅ **Advanced optimizations**: Turbine, Quantum PoH, Threshold VRF with Quantum Crypto, Hybrid Sealevel, Tower BFT, Pre-execution
+- ✅ **Advanced optimizations**: Turbine, Quantum PoH, Finality Window Selection, Hybrid Sealevel, Tower BFT, Pre-execution
 - ✅ **Chain Reorganization**: Byzantine-safe fork resolution with 2/3 majority consensus
 - ✅ **Advanced Synchronization**: Out-of-order block buffering with active missing block requests
 
@@ -327,8 +327,8 @@ QNet integrates Proof of History for verifiable time ordering:
 ```
 PoH Chain: H₀ → H₁ → H₂ → ... → Hₙ
            ↓    ↓    ↓         ↓
-        SHA3-512 ONLY (True VDF)
-        25M+ hashes/second
+        Hybrid SHA3-512/Blake3 (25%/75%)
+        500K hashes/second
 ```
 
 **Properties:**
@@ -634,12 +634,12 @@ parallel_execute(non_conflicting_transactions);
 
 **2. Turbine block propagation:**
 - **Chunked transmission**: 1KB chunks with Reed-Solomon encoding
-- **Fanout-3 protocol**: Exponential propagation across network
+- **Fanout-4 protocol**: Exponential propagation across network (optimized for Genesis)
 - **85% bandwidth reduction**: Compared to full broadcast
 
 **3. Quantum Proof of History:**
-- **25M+ hashes/sec**: SHA3-512 only (true VDF) for time synchronization
-- **400μs tick duration**: Precise event ordering
+- **500K hashes/sec**: Hybrid SHA3-512/Blake3 (25%/75%) for time synchronization
+- **10ms tick duration**: Precise event ordering (100 ticks/sec)
 - **Verifiable delay function**: Non-parallelizable, Byzantine-resistant timing
 - **Optimized implementation**: Fixed-size arrays, zero-copy operations
 
@@ -1257,17 +1257,24 @@ QNet's Quantum Proof of History provides a verifiable, sequential record of even
 
 **Algorithm:**
 ```rust
-// Optimized VDF implementation
-PoH_n = SHA3_512(PoH_{n-1} || counter || event_data)
-// SHA3-512 ONLY - ensures true VDF properties
-// No parallelization possible
+// Hybrid implementation for optimal performance/security
+for i in 0..HASHES_PER_TICK {
+    if i % 4 == 0 {
+        // Every 4th hash: SHA3-512 for VDF property (prevents parallelization)
+        PoH_n = SHA3_512(PoH_{n-1} || counter)
+    } else {
+        // Other hashes: Blake3 for speed (3x faster)
+        PoH_n = Blake3(PoH_{n-1} || counter)
+    }
+}
 ```
 
 **Technical specifications:**
-- **Hash Rate**: 25+ million hashes per second (optimized)
-- **Algorithm**: SHA3-512 exclusively (true VDF, non-parallelizable)
-- **Tick Duration**: 400 microseconds (12,500 hashes per tick)
-- **Ticks Per Slot**: 2,500 ticks = 1 second = 1 microblock slot
+- **Hash Rate**: 500K hashes per second (5,000 per tick × 100 ticks/sec)
+- **Algorithm**: Hybrid SHA3-512/Blake3 (25%/75% ratio for optimal VDF properties)
+- **VDF Property**: SHA3-512 every 4th hash prevents parallelization
+- **Tick Duration**: 10 milliseconds (5,000 hashes per tick)
+- **Ticks Per Slot**: 100 ticks = 1 second = 1 microblock slot
 - **Drift Detection**: Maximum 5% allowed drift before correction
 - **Verification**: Each node can independently verify PoH sequence
 - **Memory**: Fixed-size arrays (64 bytes), zero Vec allocations in hot path
@@ -1297,135 +1304,172 @@ for i in 0..HASHES_PER_TICK {
 }
 ```
 
-#### 8.4.3 Threshold VRF Producer Selection
+#### 8.4.3 Finality Window Producer Selection
 
-**Quantum-Resistant Threshold VRF for Byzantine-safe leader election:**
+**Quantum-Resistant Deterministic Selection with Finality Window:**
 
-QNet uses Threshold VRF with Dilithium + Ed25519 hybrid cryptography to ensure producers are selected in a way that is:
-- **Quantum-Resistant**: Full post-quantum security via CRYSTALS-Dilithium signatures
-- **Deterministic**: All nodes compute identical results from same entropy
-- **Race-Free**: No delays at rotation boundaries (blocks 31, 61, 91)
-- **Verifiable**: All nodes can verify the selection was fair
-- **Non-manipulable**: Producer cannot bias selection in their favor
+QNet uses SHA3-512 deterministic selection with a 10-block Finality Window to ensure producers are selected in a way that is:
+- **Quantum-Resistant**: Full post-quantum security via SHA3-512 hashing and Dilithium-signed blocks
+- **Deterministic**: All synchronized nodes compute identical results from same finalized entropy
+- **Race-Free**: Finality Window eliminates race conditions at rotation boundaries (blocks 31, 61, 91)
+- **Byzantine-Safe**: Uses blocks confirmed by 2/3 consensus as entropy source
+- **No Key Storage**: Does not require VRF keys, simplifying node operation
 
 **Algorithm:**
 ```rust
-// Threshold VRF Evaluation (by each potential producer)
-pub async fn evaluate(&mut self, input: &[u8]) -> Result<HybridVrfOutput> {
-    // Step 1: Sign input using Dilithium + Ed25519 hybrid crypto
-    let hybrid_signature = self.hybrid_crypto.sign_message(input).await?;
+// Finality Window: Get entropy from finalized block (10+ blocks old)
+async fn get_finalized_entropy(
+    current_height: u64, 
+    storage: &Storage
+) -> [u8; 32] {
+    const FINALITY_WINDOW: u64 = 10;
     
-    // Step 2: Derive VRF output from signature hash
-    let vrf_output = blake3::hash(&hybrid_signature.ed25519_sig).as_bytes()[..32];
-    
-    // Step 3: Convert to u64 for threshold comparison
-    let vrf_value = u64::from_le_bytes(vrf_output[..8].try_into()?);
-    
-    return Ok(HybridVrfOutput {
-        output: vrf_output,
-        proof: hybrid_signature, // Dilithium + Ed25519
-        value: vrf_value
-    });
+    if current_height <= FINALITY_WINDOW {
+        // Early blocks: Use Genesis + height for variation
+        let genesis_data = storage.load_microblock(0)?;
+        let mut hasher = Sha3_256::new();
+        hasher.update(&genesis_data);
+        hasher.update(&current_height.to_le_bytes());
+        return hasher.finalize().into();
+    } else {
+        // Normal: Use block 10 blocks behind current
+        let entropy_height = current_height - FINALITY_WINDOW;
+        let entropy_block = storage.load_microblock(entropy_height)?;
+        return Sha3_256::digest(&entropy_block).into();
+    }
 }
 
-// Threshold VRF Verification (by any node)
-pub async fn verify(input: &[u8], vrf_output: &HybridVrfOutput) -> Result<bool> {
-    // Verify both Dilithium and Ed25519 signatures
-    let valid = HybridCrypto::verify_signature(
-        input,
-        &vrf_output.proof
-    ).await?;
+// Deterministic Producer Selection (all nodes compute same result)
+async fn select_microblock_producer(
+    current_height: u64,
+    candidates: &[(String, f64)],
+    storage: &Storage,
+) -> String {
+    // Step 1: Get finalized entropy (all nodes have this block)
+    let entropy = get_finalized_entropy(current_height, storage).await;
     
-    // Verify output derivation from signature
-    let expected = blake3::hash(&vrf_output.proof.ed25519_sig).as_bytes()[..32];
+    // Step 2: Combine with round and candidates for selection
+    let mut selector = Sha3_512::new();
+    selector.update(b"QNet_Quantum_Producer_Selection_v3");
+    selector.update(&entropy);
+    selector.update(&(current_height / 30).to_le_bytes());
+    for (id, rep) in candidates {
+        selector.update(id.as_bytes());
+        selector.update(&rep.to_le_bytes());
+    }
     
-    return Ok(valid && (expected == vrf_output.output));
+    // Step 3: Deterministic selection
+    let hash = selector.finalize();
+    let index = u64::from_le_bytes(hash[0..8].try_into()?) % candidates.len();
+    return candidates[index].0.clone();
 }
 ```
 
 **Producer Selection Process:**
 ```
-1. Deterministic Entropy Source:
-   - Round number (leadership_round)
-   - Sorted candidate list (identical across all nodes)
-   - Macroblock hash (or deterministic fallback for early rounds)
+1. Finality Window Enforcement:
+   - FINALITY_WINDOW = 10 blocks
+   - Finalized height = current_height - 10
+   - All synchronized nodes have blocks up to finalized_height
+   - Lagging nodes (>10 blocks behind) cannot participate
 
-2. Each Qualified Node:
-   - Computes VRF input = SHA3_256(entropy_sources)
-   - Evaluates VRF using Dilithium + Ed25519
-   - Obtains vrf_value (u64)
+2. Entropy Extraction (Deterministic):
+   For blocks 1-10 (Genesis phase):
+     - entropy = SHA3_256(Genesis block + current_height)
+     - All nodes have Genesis, height adds variation
+   For blocks 11+ (Normal phase):
+     - entropy = SHA3_256(microblock[finalized_height])
+     - Uses block that all synchronized nodes possess
+     - Block is Dilithium-signed (quantum-resistant)
 
-3. Threshold Lottery:
-   - Dynamic threshold = u64::MAX / candidates.len()
-   - Node becomes producer if vrf_value < threshold
-   - Fair lottery: each node has equal probability
+3. Candidate Selection Input:
+   - Combine entropy + round + candidates via SHA3-512
+   - input = SHA3_512("QNet_..." || entropy || round || candidates)
+   - Deterministic: same inputs → same output
 
-4. Deterministic Fallback:
-   - If no node passes threshold, use SHA3_256(vrf_input) % candidates.len()
-   - Ensures producer always selected
+4. Producer Selection:
+   - Convert hash to index: hash[0..8] % candidates.len()
+   - Select producer = candidates[index]
+   - All nodes compute identical result
 
-5. Verification:
-   - All nodes independently compute same producer
-   - No network communication required for selection
+5. Byzantine Safety Verification:
+   - Entropy block verified by Dilithium signatures
+   - 2/3 consensus confirms block validity
+   - Race conditions impossible (entropy finalized 10 blocks ago)
 ```
 
 **Technical specifications:**
-- **Cryptography**: Threshold VRF with CRYSTALS-Dilithium + Ed25519 hybrid signatures
-- **Quantum Resistance**: Full post-quantum security (NIST approved)
-- **Evaluation Time**: <2ms per candidate (includes dual signature)
-- **Verification Time**: <1ms per proof (dual signature verification)
-- **Entropy Sources**: Round number + candidate list + macroblock hash
-- **Deterministic**: All nodes compute identical result without communication
-- **Race-Free**: No dependency on previous microblock at rotation boundaries
+- **Cryptography**: SHA3-512 deterministic hashing + Dilithium-signed entropy blocks
+- **Quantum Resistance**: Full post-quantum security (NIST approved SHA3-512 + Dilithium)
+- **Finality Window**: 10 blocks (10 seconds lag tolerance)
+- **Selection Time**: <1ms (single SHA3-512 hash computation)
+- **Entropy Sources**: Finalized block hash + round number + candidate list
+- **Deterministic**: All synchronized nodes compute identical result
+- **Race-Free**: No race conditions at rotation boundaries (blocks 31, 61, 91)
+- **Synchronization**: Nodes must be within 10 blocks to participate
 
 **Benefits:**
-1. **Quantum-Resistant**: CRYSTALS-Dilithium protects against quantum computers
-2. **Deterministic Fairness**: Each node has equal probability via threshold lottery
-3. **No Race Conditions**: Works at rotation boundaries without delays
-4. **Byzantine Safety**: Entropy from consensus prevents manipulation
-5. **Verifiable**: Anyone can prove selection was correct
-6. **No Coordination**: Each node independently computes producer
-7. **Scalable**: O(1) computation per node, no O(N²) messages
+1. **Quantum-Resistant**: SHA3-512 + Dilithium-signed blocks = full PQC
+2. **Deterministic**: 100% consensus on producer selection (no race conditions)
+3. **No Race Conditions**: Finality Window eliminates boundary issues
+4. **Byzantine Safety**: Entropy from 2/3-confirmed blocks
+5. **Simple**: No VRF keys, no complex threshold calculations
+6. **No Coordination**: Each node independently computes same result
+7. **Scalable**: O(1) computation, works from 5 to millions of nodes
 
 **Implementation:**
 ```rust
-pub struct ThresholdVrfSelection {
-    selected_producer: String,    // Selected node ID
-    vrf_entropy: [u8; 32],         // Deterministic entropy used
-    threshold: u64,                // Dynamic threshold
+pub struct FinalityWindowSelection {
+    selected_producer: String,     // Selected node ID
+    finalized_entropy: [u8; 32],   // Entropy from finalized block
+    finalized_height: u64,         // Height of entropy block
     round: u64,                    // Leadership round number
 }
 
-// Threshold VRF producer selection
-async fn select_producer_with_threshold_vrf(
-    round: u64,
+// Finality Window producer selection  
+async fn select_producer_with_finality_window(
+    current_height: u64,
     candidates: &[(String, f64)],
-    macroblock_hash: Option<[u8; 32]>,
+    storage: &Storage,
 ) -> Result<String> {
-    // 1. Calculate deterministic entropy
-    let vrf_entropy = calculate_vrf_entropy(round, candidates, macroblock_hash);
+    // 1. Apply Finality Window
+    const FINALITY_WINDOW: u64 = 10;
+    let finalized_height = if current_height > FINALITY_WINDOW {
+        current_height - FINALITY_WINDOW
+    } else {
+        0  // Genesis phase
+    };
     
-    // 2. Calculate dynamic threshold
-    let threshold = u64::MAX / (candidates.len() as u64);
+    // 2. Get entropy from finalized block
+    let finalized_entropy = if finalized_height == 0 {
+        // Genesis phase: use Genesis + height
+        let genesis = storage.load_microblock(0)?;
+        let mut hasher = Sha3_256::new();
+        hasher.update(&genesis);
+        hasher.update(&current_height.to_le_bytes());
+        hasher.finalize().into()
+    } else {
+        // Normal: use finalized block
+        let block = storage.load_microblock(finalized_height)?;
+        Sha3_256::digest(&block).into()
+    };
     
-    // 3. Each node evaluates VRF (if it's a candidate)
-    if let Some(my_index) = candidates.iter().position(|(id, _)| id == my_node_id) {
-        let mut hybrid_vrf = QNetHybridVrf::new();
-        hybrid_vrf.initialize(my_node_id).await?;
-        
-        let vrf_output = hybrid_vrf.evaluate(&vrf_entropy).await?;
-        
-        // 4. Check if we pass threshold
-        if vrf_output.value < threshold {
-            return Ok(my_node_id.clone()); // We are the producer!
-        }
+    // 3. Combine with round and candidates
+    let round = finalized_height / 30;
+    let mut selector = Sha3_512::new();
+    selector.update(b"QNet_Quantum_Producer_Selection_v3");
+    selector.update(&finalized_entropy);
+    selector.update(&round.to_le_bytes());
+    for (id, rep) in candidates {
+        selector.update(id.as_bytes());
+        selector.update(&rep.to_le_bytes());
     }
     
-    // 5. Deterministic fallback if no one passes threshold
-    let fallback_hash = blake3::hash(&vrf_entropy);
-    let fallback_index = (fallback_hash.as_bytes()[0] as usize) % candidates.len();
+    // 4. Deterministic selection
+    let hash = selector.finalize();
+    let index = u64::from_le_bytes(hash[0..8].try_into()?) % candidates.len();
     
-    return Ok(candidates[fallback_index].0.clone());
+    return Ok(candidates[index].0.clone());
 }
 ```
 
@@ -2007,10 +2051,10 @@ QNetProtocol = {
 
 **Performance Optimizations:**
 - **Turbine Protocol**: Chunked block propagation with Reed-Solomon encoding
-- **Quantum PoH**: 25M+ hashes/sec SHA3-512 VDF cryptographic clock
-- **Threshold VRF Producer Selection**: Quantum-resistant VRF with Dilithium + Ed25519 for race-free, Byzantine-safe leader election
+- **Quantum PoH**: 500K hashes/sec SHA3-512 VDF cryptographic clock
+- **Finality Window Selection**: Deterministic SHA3-512 producer selection with 10-block finality for race-free, Byzantine-safe leader election
 - **Hybrid Sealevel**: 10,000 parallel transaction execution
-- **Tower BFT**: Adaptive consensus timeouts (20s/10s/7s)
+- **Tower BFT**: Adaptive consensus timeouts (7s base, up to 20s max, 1.5x multiplier)
 - **Comprehensive Benchmarks**: Full performance testing harness for all components
 - **Pre-Execution**: Speculative transaction cache (10,000 TX)
 

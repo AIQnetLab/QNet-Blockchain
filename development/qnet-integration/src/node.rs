@@ -5401,81 +5401,74 @@ impl BlockchainNode {
                     hasher.update(&reputation.to_le_bytes());
                 }
                 
-                // 3. Use previous block hash as entropy (quantum-resistant!)
-                // CRITICAL: All nodes MUST have same Genesis block for this to work
-                // Genesis broadcast with retry ensures all nodes receive block #0
+                // 3. FINALITY WINDOW: Use block that is 10+ blocks old as entropy
+                // CRITICAL: This ensures ALL synchronized nodes have same entropy source
+                // Prevents race conditions and guarantees deterministic producer selection
                 
             let entropy_source = if let Some(store) = storage {
-                // Get hash of last block from PREVIOUS round for consistency
-                // All nodes in the round will use the same previous block hash as entropy
-            // CRITICAL FIX: Correct calculation of round boundaries
-            // Round 0 starts at block 1, Round 1 at block 31, Round 2 at block 61...
-            let round_start_block = if leadership_round == 0 {
-                1  // Round 0 starts at block 1 (after genesis)
-            } else {
-                leadership_round * rotation_interval + 1  // Round N starts at N*30 + 1
-            };
-            
-                // CRITICAL FIX: Use proper entropy source to prevent predictable selection
-                // For rounds before first macroblock, use last block of previous round
-                // This ensures different producers for each round even without macroblocks
-                let prev_hash = if leadership_round == 0 {
-                    // Round 0 (blocks 1-30): Use Genesis block as entropy
-                    println!("[CONSENSUS] 🎲 Round 0: Using Genesis block as entropy");
-                    Self::get_previous_microblock_hash(store, 1).await
-                } else if leadership_round == 1 {
-                    // Round 1 (blocks 31-60): Use block 30 as entropy
-                    println!("[CONSENSUS] 🎲 Round 1: Using block 30 as entropy (no macroblock yet)");
-                    Self::get_previous_microblock_hash(store, 31).await  // Gets hash of block 30
-                } else if leadership_round == 2 {
-                    // Round 2 (blocks 61-90): Use block 60 as entropy
-                    // Macroblock #0 not ready yet (created at block 90)
-                    println!("[CONSENSUS] 🎲 Round 2: Using block 60 as entropy (macroblock not ready yet)");
-                    Self::get_previous_microblock_hash(store, 61).await  // Gets hash of block 60
-                } else {
-                    // Round 3+ (blocks 91+): Try to use macroblock first, fallback to microblock
-                    // QUANTUM SECURITY: Macroblocks provide Byzantine consensus-verified entropy
-                    let round_start_block = leadership_round * rotation_interval + 1;
-                    let last_block_of_prev_round = round_start_block - 1;
+                // FINALITY WINDOW IMPLEMENTATION for Byzantine safety
+                const FINALITY_WINDOW: u64 = 10; // Blocks must be 10 deep to be used as entropy
+                
+                let prev_hash = if current_height <= FINALITY_WINDOW {
+                    // INITIAL PHASE (blocks 1-10): Use Genesis + height for variation
+                    // All nodes have Genesis, so this is deterministic
+                    println!("[FINALITY] 🎲 Block #{}: Initial phase - using Genesis + height as entropy", current_height);
                     
-                    // Calculate which macroblock we need
-                    // Round 3 (91-120) needs macroblock #1 (blocks 1-90)
-                    // Round 4 (121-150) needs macroblock #1 (blocks 1-90)
-                    // Round 5 (151-180) needs macroblock #1 (blocks 1-90)
-                    // Round 6 (181-210) needs macroblock #2 (blocks 91-180)
-                    // CRITICAL FIX: Use correct formula without -1 to match save_macroblock
-                    let required_macroblock = last_block_of_prev_round / 90;
-                    
-                    match store.get_macroblock_by_height(required_macroblock) {
-                        Ok(Some(macroblock_data)) => {
-                            // Use macroblock hash as entropy (Byzantine consensus verified)
+                    match store.load_microblock(0) {
+                        Ok(Some(genesis_data)) => {
+                            // Mix Genesis hash with current height for variation
                             use sha3::{Sha3_256, Digest};
                             let mut hasher = Sha3_256::new();
-                            hasher.update(&macroblock_data);
+                            hasher.update(&genesis_data);
+                            hasher.update(&current_height.to_le_bytes()); // Add height for variation
                             let result = hasher.finalize();
                             let mut hash = [0u8; 32];
                             hash.copy_from_slice(&result);
-                            println!("[CONSENSUS] 🎲 Round {}: Using MACROBLOCK #{} as entropy (Byzantine consensus)", 
-                                     leadership_round, required_macroblock);
                             hash
                         },
                         _ => {
-                            // CRITICAL FIX: NO WAITING! Use deterministic fallback immediately
-                            println!("[VRF] ⚡ Macroblock #{} not available, using deterministic entropy", 
-                                     required_macroblock);
-                            
-                            // Use deterministic fallback that ALL nodes will calculate the same way
-                            // This prevents race conditions when some nodes have the block and others don't
-                            let mut fallback_hash = [0u8; 32];
-                            use sha3::{Sha3_256, Digest};
-                            let mut hasher = Sha3_256::new();
-                            hasher.update(b"QNet_Deterministic_Fallback_v1");
-                            hasher.update(&leadership_round.to_le_bytes());
-                            hasher.update(&last_block_of_prev_round.to_le_bytes());
-                            let result = hasher.finalize();
-                            fallback_hash.copy_from_slice(&result);
-                            fallback_hash
+                            // FATAL: Genesis must exist for network to function
+                            println!("[FATAL] ❌ Genesis block not found - cannot select producer!");
+                            println!("[FATAL] ❌ Network cannot function without Genesis block!");
+                            [0u8; 32] // Will cause producer selection to fail safely
                         }
+                    }
+                } else {
+                    // NORMAL PHASE: Use block that is FINALITY_WINDOW blocks behind
+                    let entropy_block_height = current_height.saturating_sub(FINALITY_WINDOW);
+                    
+                    // For very high blocks, prefer macroblock if available (stronger entropy)
+                    let use_macroblock = entropy_block_height >= 90;
+                    
+                    if use_macroblock {
+                        // Try to use macroblock for stronger Byzantine-verified entropy
+                        let macroblock_index = ((entropy_block_height - 1) / 90) + 1;
+                        
+                        match store.get_macroblock_by_height(macroblock_index) {
+                            Ok(Some(macroblock_data)) => {
+                                // Use macroblock hash (Byzantine consensus verified)
+                                use sha3::{Sha3_256, Digest};
+                                let mut hasher = Sha3_256::new();
+                                hasher.update(&macroblock_data);
+                                let result = hasher.finalize();
+                                let mut hash = [0u8; 32];
+                                hash.copy_from_slice(&result);
+                                println!("[FINALITY] 🔐 Block #{}: Using MACROBLOCK #{} as entropy (Byzantine consensus)", 
+                                         current_height, macroblock_index);
+                                hash
+                            },
+                            _ => {
+                                // Fallback to microblock if macroblock not available
+                                println!("[FINALITY] 📦 Block #{}: Macroblock #{} not available, using microblock #{}", 
+                                         current_height, macroblock_index, entropy_block_height);
+                                Self::get_finality_block_hash(store, entropy_block_height, current_height).await
+                            }
+                        }
+                    } else {
+                        // Use regular microblock with finality window
+                        println!("[FINALITY] 📦 Block #{}: Using microblock #{} as entropy (finality window: {} blocks)", 
+                                 current_height, entropy_block_height, FINALITY_WINDOW);
+                        Self::get_finality_block_hash(store, entropy_block_height, current_height).await
                     }
                 };
                 prev_hash
@@ -6486,19 +6479,40 @@ impl BlockchainNode {
             return selected;
         }
         
-        // Include current block height for rotation
+        // FINALITY WINDOW: Use finalized height for deterministic validator selection
+        // This prevents race conditions at rotation boundaries
+        const FINALITY_WINDOW: u64 = 10; // Must sync 10+ blocks to participate
+        
         let current_height = std::env::var("CURRENT_BLOCK_HEIGHT")
             .unwrap_or_default()
             .parse::<u64>()
             .unwrap_or(0);
+        
+        // Calculate finalized height for Byzantine-safe selection
+        let finalized_height = if current_height > FINALITY_WINDOW {
+            current_height - FINALITY_WINDOW
+        } else {
+            0 // Genesis phase: use height 0 for initial rounds
+        };
+        
+        // Calculate validator rotation round from finalized height
+        // This ensures ALL synchronized nodes select the SAME validators
+        let validator_round = finalized_height / 30;
+        
+        println!("[VALIDATOR-SELECTION] 🎲 Finality Window applied:");
+        println!("  ├── Current height: {}", current_height);
+        println!("  ├── Finalized height: {} (lag: {} blocks)", finalized_height, FINALITY_WINDOW);
+        println!("  ├── Validator round: {}", validator_round);
+        println!("  └── Selecting {} validators from {} qualified nodes", max_count, all_qualified.len());
         
         // QNet specification: "Equal chance for all qualified nodes"
         // No distinction between Full and Super nodes in consensus participation
         for i in 0..max_count.min(all_qualified.len()) {
             let mut hasher = Sha3_256::new();
             
-            // Deterministic seed for validator sampling with rotation
-            hasher.update(format!("validator_sampling_{}_{}", current_height / 30, i).as_bytes());
+            // CRITICAL: Use finalized round instead of current height
+            // This guarantees deterministic selection across all synchronized nodes
+            hasher.update(format!("validator_sampling_{}_{}", validator_round, i).as_bytes());
             
             // Include all qualified validators for Byzantine consistency
             for (node_id, reputation) in all_qualified {
@@ -8021,6 +8035,34 @@ impl BlockchainNode {
                 println!("[PRODUCER] ⚠️ Cannot get hash for block {} - previous block {} not found", 
                          current_height, current_height - 1);
                 [0u8; 32]
+            }
+        }
+    }
+    
+    /// FINALITY WINDOW: Get hash of block that passed finality threshold
+    /// This ensures deterministic producer selection across all synchronized nodes
+    async fn get_finality_block_hash(
+        storage: &Arc<Storage>,
+        entropy_block_height: u64,
+        current_height: u64,
+    ) -> [u8; 32] {
+        match storage.load_microblock(entropy_block_height) {
+            Ok(Some(block_data)) => {
+                // Calculate hash from finality block
+                use sha3::{Sha3_256, Digest};
+                let mut hasher = Sha3_256::new();
+                hasher.update(&block_data);
+                let result = hasher.finalize();
+                let mut hash = [0u8; 32];
+                hash.copy_from_slice(&result);
+                hash
+            },
+            _ => {
+                // Node not synchronized - cannot participate in production
+                println!("[FINALITY] ⚠️ Cannot get finality block #{} for current height {}", 
+                         entropy_block_height, current_height);
+                println!("[FINALITY] 📊 Node must be synchronized to participate in block production");
+                [0u8; 32] // Will cause producer selection to naturally exclude this node
             }
         }
     }

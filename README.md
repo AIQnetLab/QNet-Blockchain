@@ -70,10 +70,10 @@ This project uses **dual licensing**:
 
 ### **Previous Updates (v2.16.0)**
 - **Turbine Block Propagation**: 85% bandwidth reduction with Reed-Solomon erasure coding
-- **Quantum Proof of History (PoH)**: 2.39M hashes/sec with hybrid SHA3-512/Blake3 (25%/75%)
-  - Real test results: 7.2M hashes in 3.01 seconds (verified October 31, 2025)
+- **Quantum Proof of History (PoH)**: 500K hashes/sec with hybrid SHA3-512/Blake3 (25%/75%)
+  - Production config: 5,000 hashes per tick × 100 ticks/sec = 500K hashes/sec
   - 100 ticks per second (10ms intervals) for smooth entropy generation
-  - 25,000 hashes per tick = 2.5M hashes/sec theoretical capacity
+  - 5,000 hashes per tick (optimized for 1-second microblocks)
   - VDF properties via SHA3-512 every 4th hash (prevents parallelization)
   - Integrated into producer selection for unpredictable leader election
   - Checkpoint persistence with zstd compression (every 1M hashes)
@@ -82,7 +82,7 @@ This project uses **dual licensing**:
   - Hardware: Intel Xeon E5-2680v4 @ 2.4GHz
 - **Quantum-Resistant Producer Selection**: Threshold VRF with Dilithium + Ed25519 hybrid cryptography for Byzantine-safe leader election
 - **Hybrid Sealevel Execution**: 5-stage pipeline with 10,000 parallel transactions
-- **Tower BFT Adaptive Timeouts**: Dynamic 20s/10s/7s timeouts based on network conditions
+- **Tower BFT Adaptive Timeouts**: Dynamic 7s base to 20s max (1.5x multiplier) based on network conditions
 - **Pre-Execution Cache**: Speculative execution with 10,000 transaction cache
 - **Comprehensive Benchmark Harness**: Full performance testing suite for all components
 - **57 API Endpoints**: Complete monitoring and control interface for all features
@@ -173,9 +173,9 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 
 #### **Advanced Performance Features**
 - **🌪️ Turbine Protocol**: 85% bandwidth savings with chunked block propagation
-- **⏱️ Quantum PoH**: 31.25M hashes/sec cryptographic clock for precise timing
+- **⏱️ Quantum PoH**: 500K hashes/sec cryptographic clock for precise timing
 - **⚙️ Hybrid Sealevel**: 10,000 parallel transactions with 5-stage pipeline
-- **🎯 Tower BFT**: Adaptive timeouts (20s/10s/7s) for optimal consensus
+- **🎯 Tower BFT**: Adaptive timeouts (7s base to 20s max, 1.5x multiplier) for optimal consensus
 - **🚀 Pre-Execution**: Speculative transaction processing with 10,000 cache size
 
 ### 📊 Performance Metrics
@@ -270,11 +270,11 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 │  Performance Optimization Layer                   │
 │  ├── Turbine Block Propagation                             │
 │  │   ├── 1KB chunks with Reed-Solomon erasure coding       │
-│  │   ├── Fanout-3 exponential propagation                  │
+│  │   ├── Fanout-4 exponential propagation (Genesis optimized) │
 │  │   └── 85% bandwidth reduction                           │
 │  ├── Quantum Proof of History (QPoH)                       │
-│  │   ├── 31.25M hashes/sec cryptographic clock             │
-│  │   ├── SHA3-512 + Blake3 alternating hashing             │
+│  │   ├── 500K hashes/sec cryptographic clock               │
+│  │   ├── SHA3-512 + Blake3 hybrid (25%/75%)                │
 │  │   └── Verifiable delay function                         │
 │  ├── Hybrid Sealevel Execution                             │
 │  │   ├── 5-stage pipeline processing                       │
@@ -331,7 +331,7 @@ QNet implements advanced chain reorganization and synchronization mechanisms for
 - **Quantum-Resistant Genesis**: CRYSTALS-Dilithium signature ensures identical Genesis across all nodes
 
 ### **Proof of History (PoH) Integration**
-- **Cryptographic Clock**: 31.25M hashes/sec SHA3-512 + Blake3 alternating
+- **Cryptographic Clock**: 500K hashes/sec SHA3-512 + Blake3 hybrid (25%/75%)
 - **Verifiable Delay Function**: Time-stamped block ordering without central authority
 - **Block Time Synchronization**: Sub-second precision across distributed network
 - **Historical Proof**: Cryptographic evidence of event ordering and timing

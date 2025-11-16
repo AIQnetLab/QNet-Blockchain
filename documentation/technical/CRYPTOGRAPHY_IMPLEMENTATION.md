@@ -22,11 +22,12 @@ QNet implements **NIST/Cisco recommended post-quantum cryptography** with:
 ## 📋 Table of Contents
 
 1. [Architecture Overview](#architecture-overview)
-2. [Hybrid Cryptography (Consensus)](#hybrid-cryptography-consensus)
-3. [Key Manager (Persistent Keys)](#key-manager-persistent-keys)
-4. [Security Analysis](#security-analysis)
-5. [Implementation Details](#implementation-details)
-6. [Compliance & Standards](#compliance--standards)
+2. [Cryptography Usage by Component](#cryptography-usage-by-component)
+3. [Hybrid Cryptography (Consensus Messages)](#hybrid-cryptography-consensus-messages)
+4. [Key Manager (Block Signatures)](#key-manager-block-signatures)
+5. [Security Analysis](#security-analysis)
+6. [Implementation Details](#implementation-details)
+7. [Compliance & Standards](#compliance--standards)
 
 ---
 
@@ -78,11 +79,33 @@ QNet implements **NIST/Cisco recommended post-quantum cryptography** with:
 
 ---
 
-## 2. Hybrid Cryptography (Consensus)
+## 2. Cryptography Usage by Component
 
-### 2.1 NIST/Cisco Encapsulated Keys Implementation
+### 2.0 Where Each Crypto System is Used
+
+QNet uses **TWO DIFFERENT** cryptographic systems for different purposes:
+
+| Component | Crypto System | Use Case | Key Type |
+|-----------|---------------|----------|----------|
+| **Macroblock Consensus** | Hybrid Crypto (ephemeral) | Commit/Reveal messages | Ephemeral Ed25519 + Dilithium |
+| **Microblock Signatures** | Key Manager (persistent) | Block signing & verification | Dilithium-seeded SHA3-512 |
+| **Macroblock Signatures** | Key Manager (persistent) | Macroblock finalization | Dilithium-seeded SHA3-512 |
+| **Producer Selection** | Finality Window | Deterministic selection | SHA3-512 hash (no keys) |
+
+**Critical distinction:**
+- **Ephemeral keys (hybrid_crypto.rs)**: Only for Byzantine consensus messages (commit/reveal)
+- **Persistent keys (key_manager.rs)**: For all block signatures (micro + macro)
+- **No VRF keys**: Producer selection uses Finality Window (deterministic SHA3-512)
+
+---
+
+## 3. Hybrid Cryptography (Consensus Messages)
+
+### 3.1 NIST/Cisco Encapsulated Keys Implementation
 
 **File:** `development/qnet-integration/src/hybrid_crypto.rs`
+
+**Purpose:** Sign Byzantine consensus commit/reveal messages with ephemeral keys
 
 #### Signature Structure
 
@@ -102,7 +125,7 @@ pub struct HybridSignature {
 }
 ```
 
-### 2.2 Signing Process
+### 3.2 Signing Process
 
 ```rust
 // Step 1: Generate NEW ephemeral Ed25519 key for THIS message
@@ -140,7 +163,7 @@ let ephemeral_certificate = HybridCertificate {
 };
 ```
 
-### 2.3 Verification Process (NO CACHING)
+### 3.3 Verification Process (NO CACHING)
 
 ```rust
 pub async fn verify_signature(
@@ -196,7 +219,7 @@ pub async fn verify_signature(
 }
 ```
 
-### 2.4 Security Properties
+### 3.4 Security Properties
 
 | Property | Implementation | Benefit |
 |----------|----------------|---------|
@@ -208,7 +231,7 @@ pub async fn verify_signature(
 | **Memory Safety** | zeroize() clears sensitive data | Prevents memory dumps |
 | **Quantum-Resistant** | Dilithium protects consensus | Post-quantum secure |
 
-### 2.5 Memory Security (NEW - November 2025)
+### 3.5 Memory Security (NEW - November 2025)
 
 **Critical security enhancement to prevent memory-based attacks:**
 
@@ -238,11 +261,16 @@ key_material.zeroize();  // Clear derived keys
 
 ---
 
-## 3. Key Manager (Persistent Keys)
+## 4. Key Manager (Block Signatures)
 
-### 3.1 Key Storage Architecture
+### 4.1 Key Storage Architecture
 
 **File:** `development/qnet-integration/src/key_manager.rs`
+
+**Purpose:** Sign microblocks and macroblocks with persistent Dilithium-derived keys
+
+**CRITICAL NOTE:** This is **NOT** used for Byzantine consensus commit/reveal messages.
+Those use ephemeral keys from `hybrid_crypto.rs` (Section 3).
 
 #### Storage Structure
 
@@ -260,7 +288,7 @@ struct DilithiumKeyManager {
 }
 ```
 
-### 3.2 Seed Generation
+### 4.2 Seed Generation
 
 ```rust
 // Deterministic seed from node_id
@@ -276,7 +304,7 @@ fn generate_seed(&self) -> [u8; 32] {
 }
 ```
 
-### 3.3 Signature Generation (Quantum-Resistant Hybrid)
+### 4.3 Signature Generation (Quantum-Resistant Hybrid)
 
 ```rust
 pub fn sign(&self, data: &[u8]) -> Result<Vec<u8>> {
@@ -304,7 +332,7 @@ pub fn sign(&self, data: &[u8]) -> Result<Vec<u8>> {
 }
 ```
 
-### 3.4 Key Manager Security Properties
+### 4.4 Key Manager Security Properties
 
 | Property | Value | Description |
 |----------|-------|-------------|
@@ -316,9 +344,9 @@ pub fn sign(&self, data: &[u8]) -> Result<Vec<u8>> {
 
 ---
 
-## 4. Security Analysis
+## 5. Security Analysis
 
-### 4.1 Threat Model
+### 5.1 Threat Model
 
 #### Quantum Threats
 
@@ -338,7 +366,7 @@ pub fn sign(&self, data: &[u8]) -> Result<Vec<u8>> {
 | **Replay Attacks** | Timestamps + expiry | 60-second window |
 | **MITM** | Encapsulated keys | NIST/Cisco standard |
 
-### 4.2 Compliance Matrix
+### 5.2 Compliance Matrix
 
 #### NIST/Cisco Recommendations
 
@@ -358,7 +386,7 @@ pub fn sign(&self, data: &[u8]) -> Result<Vec<u8>> {
 | **FIPS 202** | SHA3-256/512 | ✅ Implemented |
 | **FIPS 197** | AES-256-GCM | ✅ Implemented |
 
-### 4.3 Security Metrics
+### 5.3 Security Metrics
 
 ```
 ┌─────────────────────────────────────────────┐
@@ -376,22 +404,25 @@ pub fn sign(&self, data: &[u8]) -> Result<Vec<u8>> {
 
 ---
 
-## 5. Implementation Details
+## 6. Implementation Details
 
-### 5.1 File Structure
+### 6.1 File Structure
 
 ```
 development/qnet-integration/src/
-├── hybrid_crypto.rs          # Consensus signatures (NIST/Cisco)
-├── key_manager.rs            # Persistent key storage (SHA3-512)
-├── quantum_crypto.rs         # Core crypto operations
-└── vrf_hybrid.rs             # VRF for producer selection
+├── hybrid_crypto.rs          # Consensus commit/reveal signatures (NIST/Cisco ephemeral)
+├── key_manager.rs            # Persistent block signatures (SHA3-512 + Dilithium)
+├── quantum_crypto.rs         # Core crypto operations & Dilithium management
+└── vrf_hybrid.rs             # VRF utilities (not used for producer selection)
 
 core/qnet-consensus/src/
-└── consensus_crypto.rs       # Signature verification
+└── consensus_crypto.rs       # Signature verification for consensus messages
+
+Note: Producer selection now uses Finality Window with deterministic SHA3-512 hashing,
+      not VRF. Entropy comes from Dilithium-signed finalized blocks.
 ```
 
-### 5.2 Dependencies
+### 6.2 Dependencies
 
 ```toml
 [dependencies]
@@ -414,7 +445,7 @@ base64 = "0.21"
 hex = "0.4.3"
 ```
 
-### 5.3 Performance Characteristics
+### 6.3 Performance Characteristics
 
 | Operation | Time | Throughput |
 |-----------|------|------------|
@@ -426,9 +457,9 @@ hex = "0.4.3"
 
 ---
 
-## 6. Compliance & Standards
+## 7. Compliance & Standards
 
-### 6.1 Standards Adherence
+### 7.1 Standards Adherence
 
 #### NIST Post-Quantum Cryptography
 
@@ -443,7 +474,7 @@ hex = "0.4.3"
 - ✅ **Forward Secrecy**: Ephemeral key rotation
 - ✅ **Byzantine Safety**: No caching vulnerabilities
 
-### 6.2 Audit Trail
+### 7.2 Audit Trail
 
 | Date | Component | Finding | Status |
 |------|-----------|---------|--------|
@@ -452,7 +483,7 @@ hex = "0.4.3"
 | Nov 3, 2025 | Consensus | No caching | ✅ Pass |
 | Nov 3, 2025 | Overall | Production ready | ✅ Pass |
 
-### 6.3 Expert Feedback (Ian Smith)
+### 7.3 Expert Feedback (Ian Smith)
 
 **Original Concerns:**
 > "Not noticing that the consensus mechanism is pure ED25519 according to the documentation is a big deal. The large CRYSTALS-Dilithium key needs to sign the *temporary* ED25519 key for *every message.*"

@@ -7922,15 +7922,33 @@ impl SimplifiedP2P {
                     // Check if we produced a block in the last 5 seconds
                     let time_since_last_production = current_time.saturating_sub(last_produced_time);
                     
-                    // PRODUCTION VALUES: 5 seconds timeout (allows for 1-2 missed blocks)
-                    if time_since_last_production <= 5 && last_produced_height > 0 {
+                    // CRITICAL FIX: Enhanced protection for Genesis/startup phase
+                    // On first blocks (1-10), multiple nodes may claim to be producer due to race conditions
+                    // We need stronger protection during network initialization
+                    let is_early_blocks = block_height <= 10;
+                    let recently_produced = time_since_last_production <= 5 && last_produced_height > 0;
+                    let startup_protection = is_early_blocks && last_produced_height == 0 && time_since_last_production <= 10;
+                    
+                    // PRODUCTION VALUES: 
+                    // - Normal: 5 seconds timeout (allows for 1-2 missed blocks)
+                    // - Startup: 10 seconds timeout (allows for Genesis sync delays)
+                    if recently_produced || startup_protection {
                         println!("[FAILOVER] ⚠️ FALSE FAILOVER DETECTED!");
-                        println!("[FAILOVER] 📊 We produced block #{} just {}s ago", 
-                                last_produced_height, time_since_last_production);
-                        println!("[FAILOVER] ✅ Ignoring false failover - we ARE actively producing!");
+                        
+                        if recently_produced {
+                            println!("[FAILOVER] 📊 We produced block #{} just {}s ago", 
+                                    last_produced_height, time_since_last_production);
+                            println!("[FAILOVER] ✅ Ignoring false failover - we ARE actively producing!");
+                        } else if startup_protection {
+                            println!("[FAILOVER] 🌱 Genesis phase protection: Block #{} (startup phase)", block_height);
+                            println!("[FAILOVER] ⏰ Node initialized {}s ago - too early for legitimate failover", 
+                                    time_since_last_production);
+                            println!("[FAILOVER] ✅ Ignoring false failover - network still initializing!");
+                        }
                         
                         // Track false failovers from this peer
                         println!("[FAILOVER] ⚠️ False failover claiming new producer: {}", new_producer);
+                        println!("[FAILOVER] 💡 This may indicate race condition or network delay");
                         // Could track reputation penalty for false failovers here in future
                         
                         // DO NOT STOP - continue producing blocks
