@@ -18,10 +18,4 @@ buildscript {
     }
 }
 
-// F-Droid compatible: Conditionally apply React Native root plugin
-try {
-    apply plugin: "com.facebook.react.rootproject"
-    println("✅ React Native root plugin applied")
-} catch (Exception e) {
-    println("⚠️  React Native root plugin not available - F-Droid mode")
-}
+apply plugin: "com.facebook.react.rootproject"

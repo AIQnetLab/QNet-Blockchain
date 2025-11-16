@@ -1,21 +1,11 @@
 apply plugin: "com.android.application"
 apply plugin: "org.jetbrains.kotlin.android"
-
-// F-Droid compatible: Conditionally apply React Native plugin
-try {
-    apply plugin: "com.facebook.react"
-    println("✅ React Native app plugin applied")
-} catch (Exception e) {
-    println("⚠️  React Native plugin not available - F-Droid standalone mode")
-}
+apply plugin: "com.facebook.react"
 
 /**
  * This is the configuration block to customize your React Native Android app.
  * By default you don't need to apply any configuration, just uncomment the lines you need.
- * NOTE: This block is skipped in F-Droid builds without node_modules
  */
-def hasReactPlugin = project.plugins.hasPlugin('com.facebook.react')
-if (hasReactPlugin) {
 react {
     /* Folders */
     //   The root of your project, i.e. where "package.json" lives. Default is '../..'
@@ -59,16 +49,7 @@ react {
     //
     //   The list of flags to pass to the Hermes compiler. By default is "-O", "-output-source-map"
     // hermesFlags = ["-O", "-output-source-map"]
-
-    /* Autolinking - optional for F-Droid */
-    try {
-        autolinkLibrariesWithApp()
-        println("✅ React Native autolinking applied to app")
-    } catch (Exception e) {
-        println("⚠️  Skipping autolinkLibrariesWithApp() - F-Droid mode")
-    }
 }
-} // Close if (hasReactPlugin)
 
 /**
  * Set this to true to Run Proguard on Release builds to minify the Java bytecode.
@@ -96,28 +77,15 @@ if (keystorePropertiesFile.exists()) {
 }
 
 android {
-    // F-Droid compatible: Fallback values if rootProject.ext not available
-    ndkVersion rootProject.hasProperty("ext") && rootProject.ext.has("ndkVersion") 
-        ? rootProject.ext.ndkVersion 
-        : "27.1.12297006"
-    
-    buildToolsVersion rootProject.hasProperty("ext") && rootProject.ext.has("buildToolsVersion") 
-        ? rootProject.ext.buildToolsVersion 
-        : "36.0.0"
-    
-    compileSdk rootProject.hasProperty("ext") && rootProject.ext.has("compileSdkVersion") 
-        ? rootProject.ext.compileSdkVersion 
-        : 36
+    ndkVersion rootProject.ext.ndkVersion
+    buildToolsVersion rootProject.ext.buildToolsVersion
+    compileSdk rootProject.ext.compileSdkVersion
 
     namespace "com.qnetmobile"
     defaultConfig {
         applicationId "com.qnetmobile"
-        minSdkVersion rootProject.hasProperty("ext") && rootProject.ext.has("minSdkVersion") 
-            ? rootProject.ext.minSdkVersion 
-            : 24
-        targetSdkVersion rootProject.hasProperty("ext") && rootProject.ext.has("targetSdkVersion") 
-            ? rootProject.ext.targetSdkVersion 
-            : 36
+        minSdkVersion rootProject.ext.minSdkVersion
+        targetSdkVersion rootProject.ext.targetSdkVersion
         versionCode 8
         versionName "1.0.7"
     }
@@ -162,19 +130,12 @@ android {
 }
 
 dependencies {
-    // F-Droid compatible: Only include React Native if plugin is available
-    if (hasReactPlugin) {
-        // The version of react-native is set by the React Native Gradle Plugin
-        implementation("com.facebook.react:react-android")
+    // The version of react-native is set by the React Native Gradle Plugin
+    implementation("com.facebook.react:react-android")
 
-        if (hermesEnabled.toBoolean()) {
-            implementation("com.facebook.react:hermes-android")
-        } else {
-            implementation jscFlavor
-        }
+    if (hermesEnabled.toBoolean()) {
+        implementation("com.facebook.react:hermes-android")
     } else {
-        // F-Droid standalone mode: Minimal Android dependencies
-        println("⚠️  Building without React Native dependencies (F-Droid mode)")
-        // Add any minimal required dependencies here if needed
+        implementation jscFlavor
     }
 }

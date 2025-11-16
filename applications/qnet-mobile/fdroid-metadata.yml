@@ -41,12 +41,13 @@ Builds:
     subdir: applications/qnet-mobile/android
     sudo:
       - apt-get update
-      - apt-get install -y openjdk-17-jdk-headless
+      - apt-get install -y openjdk-17-jdk-headless nodejs npm
       - update-java-alternatives -a
+    prebuild:
+      - cd ..
+      - npm ci --legacy-peer-deps
     gradle:
-      - release
-    scandelete:
-      - applications/qnet-mobile/node_modules
+      - yes
 
 AutoUpdateMode: None
 UpdateCheckMode: None
