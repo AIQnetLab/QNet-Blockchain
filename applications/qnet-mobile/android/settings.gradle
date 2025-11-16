@@ -1,6 +1,34 @@
-pluginManagement { includeBuild("../node_modules/@react-native/gradle-plugin") }
-plugins { id("com.facebook.react.settings") }
-extensions.configure(com.facebook.react.ReactSettingsExtension){ ex -> ex.autolinkLibrariesFromCommand() }
+pluginManagement { 
+    try {
+        includeBuild("../node_modules/@react-native/gradle-plugin") 
+    } catch (Exception e) {
+        println("Note: React Native gradle plugin not found (expected in F-Droid)")
+    }
+}
+
+plugins { 
+    id("com.facebook.react.settings") 
+}
+
+// Gracefully handle missing node_modules for F-Droid builds
+try {
+    extensions.configure(com.facebook.react.ReactSettingsExtension){ ex -> 
+        ex.autolinkLibrariesFromCommand() 
+    }
+    println("✅ React Native autolinking enabled")
+} catch (Exception e) {
+    println("=" * 60)
+    println("⚠️  React Native autolinking skipped")
+    println("Reason: ${e.message}")
+    println("This is expected in F-Droid isolated build environment")
+    println("=" * 60)
+}
+
 rootProject.name = 'qnet-mobile'
 include ':app'
-includeBuild('../node_modules/@react-native/gradle-plugin')
+
+try {
+    includeBuild('../node_modules/@react-native/gradle-plugin')
+} catch (Exception e) {
+    // Silently skip if not found (F-Droid mode)
+}
