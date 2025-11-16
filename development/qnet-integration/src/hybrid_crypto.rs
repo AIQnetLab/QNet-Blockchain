@@ -425,10 +425,9 @@ impl HybridCrypto {
         }
         let quantum_crypto = crypto_guard.as_ref().unwrap();
         
-        // Use SHA3-256 to match the rest of the system
-        let mut hasher = Sha3_256::new();
-        hasher.update(message);
-        let message_hash = hex::encode(hasher.finalize());
+        // CRITICAL FIX: Message is already SHA3 hash from microblock signing
+        // DO NOT hash again - just convert to hex for Dilithium
+        let message_hash = hex::encode(message);
         let dilithium_sig = quantum_crypto.create_consensus_signature(&self.node_id, &message_hash).await
             .map_err(|e| anyhow!("Failed to create Dilithium signature: {}", e))?;
         
@@ -612,7 +611,7 @@ impl HybridCrypto {
     }
     
     /// Verify Ed25519 signature (fast operation)
-    fn verify_ed25519_signature(
+    pub fn verify_ed25519_signature(
         message: &[u8],
         signature_bytes: &[u8; 64],
         public_key_bytes: &[u8; 32]

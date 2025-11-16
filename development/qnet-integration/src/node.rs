@@ -1533,7 +1533,7 @@ impl BlockchainNode {
             let store_result = match received_block.block_type.as_str() {
                 "micro" => {
                     // Validate microblock signature and structure
-                    if let Err(e) = Self::validate_received_microblock(&received_block, &storage).await {
+                    if let Err(e) = Self::validate_received_microblock(&received_block, &storage, unified_p2p.as_ref()).await {
                         // CRITICAL FIX: Check if error is due to missing previous block
                         if e.starts_with("MISSING_PREVIOUS:") {
                             // Parse missing block height
@@ -2192,6 +2192,7 @@ impl BlockchainNode {
     async fn validate_received_microblock(
         block: &crate::unified_p2p::ReceivedBlock,
         storage: &Arc<Storage>,
+        p2p: Option<&Arc<SimplifiedP2P>>,
     ) -> Result<(), String> {
         // CRITICAL: Full validation to prevent chain manipulation attacks
         
@@ -2292,7 +2293,7 @@ impl BlockchainNode {
         }
         
         // 5. Verify signature (CRYSTALS-Dilithium)
-        if !Self::verify_microblock_signature(&microblock, &microblock.producer).await? {
+        if !Self::verify_microblock_signature(&microblock, &microblock.producer, p2p).await? {
             // SECURITY: Track invalid signature for malicious behavior detection
             println!("[SECURITY] ❌ Invalid signature detected from producer: {}", microblock.producer);
             
@@ -7878,7 +7879,16 @@ impl BlockchainNode {
         if is_macroblock {
             // MACROBLOCK: Use FULL signature (12KB) with embedded certificate
             // No delay for certificate requests, immediate verification
-            match hybrid.sign_message(commit_hash.as_bytes()).await {
+            // CRITICAL: commit_hash is HEX string, need to decode to actual bytes
+            let commit_bytes = match hex::decode(commit_hash) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    println!("[CONSENSUS] ⚠️ Failed to decode commit hash: {}", e);
+                    drop(instances_guard);
+                    return Self::generate_dilithium_signature(&normalized_node_id, commit_hash).await;
+                }
+            };
+            match hybrid.sign_message(&commit_bytes).await {
                 Ok(full_sig) => {
                     println!("[CONSENSUS] ✅ Generated FULL hybrid signature for MACROBLOCK (12KB)");
                     println!("[CONSENSUS]    Certificate embedded: {}", full_sig.certificate.serial_number);
@@ -7905,7 +7915,16 @@ impl BlockchainNode {
         } else {
             // MICROBLOCK: Use COMPACT signature (3KB) for efficiency
             // Only ~30 producers per rotation, certificates can be pre-synced
-            match hybrid.sign_message_compact(commit_hash.as_bytes()).await {
+            // CRITICAL: commit_hash is HEX string, need to decode to actual bytes
+            let commit_bytes = match hex::decode(commit_hash) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    println!("[CONSENSUS] ⚠️ Failed to decode commit hash: {}", e);
+                    drop(instances_guard);
+                    return Self::generate_dilithium_signature(&normalized_node_id, commit_hash).await;
+                }
+            };
+            match hybrid.sign_message_compact(&commit_bytes).await {
                 Ok(compact_sig) => {
                     println!("[CONSENSUS] ✅ Generated COMPACT hybrid signature for MICROBLOCK (3KB)");
                     println!("[CONSENSUS]    Certificate: {}", compact_sig.cert_serial);
@@ -8022,7 +8041,8 @@ impl BlockchainNode {
         }
         
         // Create COMPACT signature for microblock (3KB)
-        match hybrid.sign_message_compact(microblock_hash_str.as_bytes()).await {
+        // CRITICAL: Sign the raw hash bytes, not the hex string!
+        match hybrid.sign_message_compact(message_hash.as_ref()).await {
             Ok(compact_sig) => {
                 // Serialize compact signature to JSON string
                 let sig_json = serde_json::to_string(&compact_sig).map_err(|e| e.to_string())?;
@@ -8083,7 +8103,11 @@ impl BlockchainNode {
     }
     
     /// PRODUCTION: Verify HYBRID signature for received microblock (supports compact)
-    async fn verify_microblock_signature(microblock: &qnet_state::MicroBlock, producer_pubkey: &str) -> Result<bool, String> {
+    async fn verify_microblock_signature(
+        microblock: &qnet_state::MicroBlock, 
+        producer_pubkey: &str,
+        p2p: Option<&Arc<SimplifiedP2P>>
+    ) -> Result<bool, String> {
         use sha3::{Sha3_256, Digest};
         
         // CRITICAL FIX: Genesis block uses deterministic hash, not hybrid format
@@ -8158,29 +8182,99 @@ impl BlockchainNode {
             }
             
             // STEP 1: Get certificate from P2P cache for Ed25519 verification
-            // In production, request certificate if not cached
             println!("[CRYPTO] 🔐 Verifying compact signature for block #{}", microblock.height);
-            
-            // For now, check basic structure and defer full crypto to async verification
-            // This is safe because Byzantine consensus requires 2/3+ honest nodes
             
             // STEP 2: Verify Ed25519 signature with certificate
             // For decentralized post-quantum blockchain, we need BOTH signatures valid
-            use crate::hybrid_crypto::HybridCrypto;
+            use crate::hybrid_crypto::{HybridCrypto, HybridCertificate};
             use ed25519_dalek::{Signature as Ed25519Signature, VerifyingKey, Verifier};
             
-            // Try to verify Ed25519 using hybrid crypto verification
-            let ed25519_verified = if let Ok(ed_sig_bytes) = compact_sig.message_signature.as_slice().try_into() {
-                let ed_sig_array: [u8; 64] = ed_sig_bytes;
-                // In production, we would get certificate from P2P cache
-                // For now, verify structure is correct
-                let _signature = Ed25519Signature::from_bytes(&ed_sig_array);
-                // Signature format is valid (from_bytes doesn't fail), actual crypto verification needs certificate
-                println!("[CRYPTO] ✅ Ed25519 signature format valid (64 bytes)");
-                true
+            // Get certificate from P2P cache
+            let ed25519_verified = if let Some(p2p_ref) = p2p {
+                // Get certificate from P2P certificate manager
+                let cert_manager = p2p_ref.certificate_manager.read().unwrap();
+                if let Some(cert_data) = cert_manager.get_certificate(&compact_sig.cert_serial) {
+                    drop(cert_manager); // Release lock early
+                    
+                    // Deserialize certificate
+                    if let Ok(certificate) = bincode::deserialize::<HybridCertificate>(&cert_data) {
+                        // Verify certificate belongs to the producer
+                        if certificate.node_id != compact_sig.node_id {
+                            println!("[CRYPTO] ❌ Certificate node_id mismatch: {} != {}", 
+                                     certificate.node_id, compact_sig.node_id);
+                            false
+                        } else if certificate.node_id != microblock.producer {
+                            println!("[CRYPTO] ❌ Certificate doesn't belong to block producer: {} != {}", 
+                                     certificate.node_id, microblock.producer);
+                            false
+                        } else {
+                            // Check certificate expiration
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_secs();
+                            if now > certificate.expires_at {
+                                println!("[CRYPTO] ❌ Certificate expired at {}, now is {}", 
+                                         certificate.expires_at, now);
+                                false
+                            } else {
+                                // Verify Ed25519 signature using certificate's public key
+                                if let Ok(ed_sig_bytes) = compact_sig.message_signature.as_slice().try_into() {
+                                    let ed_sig_array: [u8; 64] = ed_sig_bytes;
+                                    
+                                    // Use HybridCrypto's verify_ed25519_signature method
+                                    // CRITICAL: Sign the raw hash bytes, not the hex string
+                                    let message_hash_bytes = hex::decode(&message_hash_str)
+                                        .map_err(|_| "Invalid hex in message hash")?;
+                                    match HybridCrypto::verify_ed25519_signature(
+                                        &message_hash_bytes,
+                                        &ed_sig_array,
+                                        &certificate.ed25519_public_key
+                                    ) {
+                                        Ok(true) => {
+                                            println!("[CRYPTO] ✅ Ed25519 signature verified with certificate");
+                                            println!("[CRYPTO]    Certificate: {}", certificate.serial_number);
+                                            println!("[CRYPTO]    Producer: {}", certificate.node_id);
+                                            true
+                                        }
+                                        Ok(false) => {
+                                            println!("[CRYPTO] ❌ Ed25519 signature verification failed!");
+                                            false
+                                        }
+                                        Err(e) => {
+                                            println!("[CRYPTO] ❌ Ed25519 verification error: {}", e);
+                                            false
+                                        }
+                                    }
+                                } else {
+                                    println!("[CRYPTO] ❌ Ed25519 signature wrong size!");
+                                    false
+                                }
+                            }
+                        }
+                    } else {
+                        println!("[CRYPTO] ⚠️ Failed to deserialize certificate for {}", compact_sig.cert_serial);
+                        // Byzantine consensus will catch this if majority of nodes fail
+                        false
+                    }
+                } else {
+                    println!("[CRYPTO] ⚠️ Certificate {} not found in cache", compact_sig.cert_serial);
+                    println!("[CRYPTO]    This may happen for new nodes or after restart");
+                    // Byzantine consensus ensures 2/3+ honest nodes have the certificate
+                    false
+                }
             } else {
-                println!("[CRYPTO] ❌ Ed25519 signature wrong size!");
-                false
+                println!("[CRYPTO] ⚠️ No P2P instance available for certificate verification");
+                // Fallback: only check signature format
+                if let Ok(ed_sig_bytes) = compact_sig.message_signature.as_slice().try_into() {
+                    let ed_sig_array: [u8; 64] = ed_sig_bytes;
+                    let _signature = Ed25519Signature::from_bytes(&ed_sig_array);
+                    println!("[CRYPTO] ⚠️ Ed25519 signature format valid but not cryptographically verified");
+                    false // Conservative: reject if we can't fully verify
+                } else {
+                    println!("[CRYPTO] ❌ Ed25519 signature wrong size!");
+                    false
+                }
             };
             
             if !ed25519_verified {
