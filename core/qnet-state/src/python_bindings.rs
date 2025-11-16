@@ -7,8 +7,8 @@ use tokio::runtime::Runtime;
 
 use crate::{
     StateDB, Account, Transaction, TransactionType, Block,
-    ConsensusProof
 };
+use crate::account::{NodeType, ActivationPhase};
 
 /// Python wrapper for StateDB
 #[pyclass]
@@ -161,9 +161,6 @@ impl PyAccount {
     }
     
     #[getter]
-
-    
-    #[getter]
     fn reputation(&self) -> f64 {
         self.inner.reputation
     }
@@ -188,9 +185,10 @@ impl PyTransaction {
     /// Create new transfer transaction
     #[staticmethod]
     fn transfer(from: String, to: String, amount: u64, nonce: u64, gas_price: u64, gas_limit: u64) -> Self {
+        let to_clone = to.clone();
         let mut tx = Transaction {
             hash: String::new(),
-            from,
+            from: from.clone(),
             to: Some(to),
             amount,
             nonce,
@@ -198,7 +196,11 @@ impl PyTransaction {
             gas_limit,
             timestamp: chrono::Utc::now().timestamp_millis() as u64,
             signature: None,
-            tx_type: TransactionType::Transfer,
+            tx_type: TransactionType::Transfer {
+                from,
+                to: to_clone,
+                amount,
+            },
             data: None,
         };
         tx.hash = tx.calculate_hash();
@@ -208,6 +210,21 @@ impl PyTransaction {
     /// Create node activation transaction
     #[staticmethod]
     fn node_activation(from: String, node_type: String, amount: u64, nonce: u64, gas_price: u64, gas_limit: u64) -> Self {
+        // Parse node_type string to enum
+        let node_type_enum = match node_type.to_lowercase().as_str() {
+            "light" => NodeType::Light,
+            "full" => NodeType::Full,
+            "super" => NodeType::Super,
+            _ => NodeType::Light, // Default to Light
+        };
+        
+        // Determine phase: Phase1 if amount == 0 (1DEV burn), Phase2 if amount > 0 (QNC transfer)
+        let phase = if amount == 0 {
+            ActivationPhase::Phase1
+        } else {
+            ActivationPhase::Phase2
+        };
+        
         let mut tx = Transaction {
             hash: String::new(),
             from,
@@ -218,7 +235,11 @@ impl PyTransaction {
             gas_limit,
             timestamp: chrono::Utc::now().timestamp_millis() as u64,
             signature: None,
-            tx_type: TransactionType::NodeActivation,
+            tx_type: TransactionType::NodeActivation {
+                node_type: node_type_enum,
+                amount,
+                phase,
+            },
             data: Some(serde_json::json!({ "node_type": node_type }).to_string()),
         };
         tx.hash = tx.calculate_hash();
@@ -262,9 +283,9 @@ impl PyTransaction {
     
     #[getter]
     fn tx_type(&self) -> String {
-        match self.inner.tx_type {
-            TransactionType::Transfer => "transfer".to_string(),
-            TransactionType::NodeActivation => "node_activation".to_string(),
+        match &self.inner.tx_type {
+            TransactionType::Transfer { .. } => "transfer".to_string(),
+            TransactionType::NodeActivation { .. } => "node_activation".to_string(),
             TransactionType::ContractDeploy => "contract_deploy".to_string(),
             TransactionType::ContractCall => "contract_call".to_string(),
             TransactionType::RewardDistribution => "reward_distribution".to_string(),
@@ -296,23 +317,36 @@ impl PyBlock {
         height: u64,
         previous_hash: String,
         transactions: Vec<PyTransaction>,
-        validator: String,
+        producer: String,
     ) -> Self {
         let txs = transactions.into_iter().map(|tx| tx.inner).collect();
+        
+        // Convert previous_hash from hex string to [u8; 32]
+        let prev_hash_bytes = hex::decode(&previous_hash)
+            .ok()
+            .and_then(|v| {
+                if v.len() == 32 {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&v);
+                    Some(arr)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or([0u8; 32]);
+        
+        // Calculate merkle root (simplified - just use zero for now)
+        let merkle_root = [0u8; 32];
         
         Self {
             inner: Block {
                 height,
                 timestamp: chrono::Utc::now().timestamp_millis() as u64,
-                previous_hash,
+                previous_hash: prev_hash_bytes,
+                merkle_root,
                 transactions: txs,
-                state_root: String::new(),
-                validator,
-                consensus_proof: ConsensusProof {
-                    round: 0,
-                    commits: vec![],
-                    reveals: vec![],
-                },
+                producer,
+                signature: vec![],
             }
         }
     }
@@ -329,17 +363,17 @@ impl PyBlock {
     
     #[getter]
     fn previous_hash(&self) -> String {
-        self.inner.previous_hash.clone()
+        hex::encode(self.inner.previous_hash)
     }
     
     #[getter]
-    fn state_root(&self) -> String {
-        self.inner.state_root.clone()
+    fn merkle_root(&self) -> String {
+        hex::encode(self.inner.merkle_root)
     }
     
     #[getter]
-    fn validator(&self) -> String {
-        self.inner.validator.clone()
+    fn producer(&self) -> String {
+        self.inner.producer.clone()
     }
     
     #[getter]
@@ -349,11 +383,8 @@ impl PyBlock {
             .collect()
     }
     
-    fn hash(&self) -> PyResult<String> {
-        match self.inner.hash() {
-            Ok(hash_bytes) => Ok(hex::encode(hash_bytes)),
-            Err(e) => Err(PyValueError::new_err(format!("Failed to compute hash: {}", e)))
-        }
+    fn hash(&self) -> String {
+        hex::encode(self.inner.hash())
     }
 }
 

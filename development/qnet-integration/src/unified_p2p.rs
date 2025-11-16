@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
 use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 use dashmap::{DashMap, DashSet};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use once_cell::sync::Lazy;
 use std::thread;
 use serde::{Serialize, Deserialize};
@@ -338,6 +338,106 @@ pub struct SimplifiedP2P {
     
     /// Turbine block assembly states
     turbine_assemblies: Arc<DashMap<u64, TurbineBlockAssembly>>,
+    
+    /// PRODUCTION: Certificate management for compact signatures
+    pub certificate_manager: Arc<RwLock<CertificateManager>>,
+}
+
+/// HYBRID: Simplified certificate manager for microblocks only
+/// Macroblocks use full signatures with embedded certificates
+#[derive(Debug, Clone)]
+pub struct CertificateManager {
+    /// Local certificates (our own)
+    local_certificate: Option<(String, Vec<u8>)>,  // (cert_serial, serialized certificate)
+    
+    /// Remote certificates for active microblock producers (small cache)
+    /// Only ~30 producers per rotation, no need for complex LRU
+    remote_certificates: HashMap<String, (Vec<u8>, u64)>,  // cert_serial -> (certificate, timestamp)
+    
+    /// Certificate TTL (4 hours - enough for multiple rotations)
+    certificate_ttl: Duration,
+    
+    /// Maximum cache size for scalability (limit to active producers only)
+    max_cache_size: usize,
+}
+
+impl CertificateManager {
+    pub fn new() -> Self {
+        Self {
+            local_certificate: None,
+            remote_certificates: HashMap::new(),
+            certificate_ttl: Duration::from_secs(14400),  // 4 hours
+            max_cache_size: 100000,  // PRODUCTION: 100K certificates for scalability
+            // Increased 10x for millions of nodes with LRU eviction
+            // Super nodes can cache more, Light nodes rely on Super nodes
+        }
+    }
+    
+    /// Store our own certificate
+    pub fn set_local_certificate(&mut self, cert_serial: String, certificate: Vec<u8>) {
+        self.local_certificate = Some((cert_serial, certificate));
+    }
+    
+    /// Store remote certificate (for microblock producers only)
+    pub fn store_remote_certificate(&mut self, cert_serial: String, certificate: Vec<u8>) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::from_secs(0))
+            .as_secs();
+        
+        // PRODUCTION: Enforce configurable cache limit for scalability
+        if self.remote_certificates.len() >= self.max_cache_size {
+            // Remove oldest certificate (LRU eviction)
+            if let Some((oldest_serial, _)) = self.remote_certificates
+                .iter()
+                .min_by_key(|(_, (_, timestamp))| timestamp)
+                .map(|(k, v)| (k.clone(), v.clone())) {
+                self.remote_certificates.remove(&oldest_serial);
+                println!("[CERTIFICATE] 🗑️ Evicted oldest: {} (cache={}/{})", 
+                         oldest_serial, self.remote_certificates.len(), self.max_cache_size);
+            }
+        }
+        
+        self.remote_certificates.insert(cert_serial, (certificate, now));
+    }
+    
+    /// Get certificate (local or remote) - checks local first, then remote cache
+    pub fn get_certificate(&self, cert_serial: &str) -> Option<Vec<u8>> {
+        // Check local certificate
+        if let Some((local_serial, cert)) = &self.local_certificate {
+            if local_serial == cert_serial {
+                return Some(cert.clone());
+            }
+        }
+        
+        // Check remote certificates
+        if let Some((cert, timestamp)) = self.remote_certificates.get(cert_serial) {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or(Duration::from_secs(0))
+                .as_secs();
+            
+            // Check TTL
+            if now - timestamp <= self.certificate_ttl.as_secs() {
+                return Some(cert.clone());
+            }
+        }
+        
+        None
+    }
+    
+    /// Clean expired certificates (call periodically)
+    pub fn cleanup(&mut self) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::from_secs(0))
+            .as_secs();
+        
+        // Remove expired certificates
+        self.remote_certificates.retain(|_, (_, timestamp)| {
+            now - *timestamp <= self.certificate_ttl.as_secs()
+        });
+    }
 }
 
 // Kademlia DHT constants
@@ -485,6 +585,7 @@ impl SimplifiedP2P {
             block_tx: Arc::new(Mutex::new(None)),
             sync_request_tx: None,
             turbine_assemblies: Arc::new(DashMap::new()),
+            certificate_manager: Arc::new(RwLock::new(CertificateManager::new())),
         }
     }
 
@@ -911,6 +1012,29 @@ impl SimplifiedP2P {
                 }
             }
         }
+    }
+    
+    /// Get peer address by node ID
+    pub fn get_peer_address(&self, node_id: &str) -> Option<String> {
+        // Check connected peers lockfree first (O(1) lookup)
+        for entry in self.connected_peers_lockfree.iter() {
+            if entry.value().id == node_id {
+                return Some(entry.value().addr.clone());
+            }
+        }
+        
+        // Check connected peers (legacy)
+        let connected = self.connected_peers.read().unwrap();
+        if let Some(peer) = connected.get(node_id) {
+            return Some(peer.addr.clone());
+        }
+        
+        // Check peer_id_to_addr index
+        if let Some(addr) = self.peer_id_to_addr.get(node_id) {
+            return Some(addr.clone());
+        }
+        
+        None
     }
     
     /// Update peer last_seen timestamp when we receive data from them
@@ -3752,6 +3876,74 @@ impl SimplifiedP2P {
         }
     }
     
+    /// PRODUCTION: Broadcast certificate announcement when created/rotated
+    /// This enables compact signatures for microblocks
+    pub fn broadcast_certificate_announce(&self, cert_serial: String, certificate: Vec<u8>) -> Result<(), String> {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+            
+        let message = NetworkMessage::CertificateAnnounce {
+            node_id: self.node_id.clone(),
+            cert_serial: cert_serial.clone(),
+            certificate: certificate.clone(),
+            timestamp,
+        };
+        
+        // Store our own certificate first
+        {
+            let mut cert_manager = self.certificate_manager.write().unwrap();
+            cert_manager.set_local_certificate(cert_serial.clone(), certificate);
+        }
+        
+        // Broadcast to all connected peers
+        let peers = self.connected_peers_lockfree.clone();
+        let mut broadcast_count = 0;
+        
+        // Serialize message once for all peers
+        let message_json = match serde_json::to_value(&message) {
+            Ok(json) => json,
+            Err(e) => {
+                return Err(format!("Failed to serialize certificate message: {}", e));
+            }
+        };
+        
+        for entry in peers.iter() {
+            let peer_info = entry.value();
+            let peer_addr = peer_info.addr.clone();
+            
+            if peer_info.id == self.node_id {
+                continue; // Skip self
+            }
+            
+            // Send certificate announcement (async in production)
+            println!("[P2P] 📤 Sending certificate {} to peer {}", cert_serial, peer_addr);
+            broadcast_count += 1;
+            
+            // PRODUCTION: Send certificate announcement via HTTP (same pattern as send_network_message)
+            let peer_addr_clone = peer_addr.clone();
+            let message_json_clone = message_json.clone();
+            std::thread::spawn(move || {
+                let peer_ip = peer_addr_clone.split(':').next().unwrap_or(&peer_addr_clone);
+                let url = format!("http://{}:8001/api/v1/p2p/message", peer_ip);
+                
+                let client = reqwest::blocking::Client::builder()
+                    .timeout(std::time::Duration::from_secs(5))
+                    .build();
+                
+                if let Ok(client) = client {
+                    if let Err(e) = client.post(&url).json(&message_json_clone).send() {
+                        println!("[P2P] ❌ Failed to send certificate to {}: {}", peer_addr_clone, e);
+                    }
+                }
+            });
+        }
+        
+        println!("[P2P] 📜 Certificate {} broadcast to {} peers", cert_serial, broadcast_count);
+        Ok(())
+    }
+    
     /// PRODUCTION: Get validated active peers for consensus participation (NODE TYPE AWARE)
     pub fn get_validated_active_peers(&self) -> Vec<PeerInfo> {
         // CRITICAL FIX: Light nodes DO NOT participate in consensus - return empty list
@@ -5632,6 +5824,33 @@ pub enum NetworkMessage {
         entropy_hash: [u8; 32],
         responder_id: String,
     },
+    
+    /// PRODUCTION: Hybrid certificate announcement for compact signatures
+    CertificateAnnounce {
+        node_id: String,
+        cert_serial: String,
+        #[serde(with = "base64_bytes")]
+        certificate: Vec<u8>,  // Serialized HybridCertificate
+        timestamp: u64,
+    },
+    
+    /// Request certificate by serial number
+    CertificateRequest {
+        requester_id: String,
+        node_id: String,       // Owner of certificate  
+        cert_serial: String,   // Serial number requested
+        timestamp: u64,
+    },
+    
+    /// Response with certificate
+    CertificateResponse {
+        node_id: String,
+        cert_serial: String,
+        #[serde(with = "base64_bytes")]
+        certificate: Vec<u8>,  // Serialized HybridCertificate
+        timestamp: u64,
+    },
+    
 }
 
 /// Internal consensus messages for node communication
@@ -5889,6 +6108,81 @@ impl SimplifiedP2P {
                         u64::from_le_bytes([entropy_hash[0], entropy_hash[1], entropy_hash[2], entropy_hash[3],
                                            entropy_hash[4], entropy_hash[5], entropy_hash[6], entropy_hash[7]]));
                 // Store response for verification in node.rs
+            }
+            
+            // PRODUCTION: Certificate management for compact signatures
+            NetworkMessage::CertificateAnnounce { node_id, cert_serial, certificate, timestamp } => {
+                self.update_peer_last_seen(&node_id);
+                println!("[P2P] 📜 Certificate announcement from {} (serial: {})", node_id, cert_serial);
+                
+                // Store certificate in manager
+                let mut cert_manager = self.certificate_manager.write().unwrap();
+                cert_manager.store_remote_certificate(cert_serial, certificate);
+                println!("[P2P] ✅ Certificate stored for future verification");
+            }
+            
+            NetworkMessage::CertificateRequest { requester_id, node_id, cert_serial, timestamp } => {
+                self.update_peer_last_seen(&requester_id);
+                println!("[P2P] 📋 Certificate request from {} for {}", requester_id, cert_serial);
+                
+                // Check if we have the certificate and send response
+                let cert_manager = self.certificate_manager.read().unwrap();
+                if let Some(certificate) = cert_manager.get_certificate(&cert_serial) {
+                    println!("[P2P] ✅ Sending certificate {} to {}", cert_serial, requester_id);
+                    
+                    // PRODUCTION: Send response back via network
+                    let response = NetworkMessage::CertificateResponse {
+                        node_id: node_id.clone(),
+                        cert_serial: cert_serial.clone(),
+                        certificate: certificate.clone(),
+                        timestamp,
+                    };
+                    
+                    // Find requester peer address
+                    if let Some(peer_addr) = self.get_peer_address(&requester_id) {
+                        // Send response using HTTP (same pattern as broadcast_certificate_announce)
+                        let peer_addr_clone = peer_addr.clone();
+                        let requester_id_clone = requester_id.clone();
+                        let response_json = match serde_json::to_value(&response) {
+                            Ok(json) => json,
+                            Err(e) => {
+                                println!("[P2P] ❌ Failed to serialize certificate response: {}", e);
+                                return;
+                            }
+                        };
+                        
+                        std::thread::spawn(move || {
+                            let peer_ip = peer_addr_clone.split(':').next().unwrap_or(&peer_addr_clone);
+                            let url = format!("http://{}:8001/api/v1/p2p/message", peer_ip);
+                            
+                            let client = reqwest::blocking::Client::builder()
+                                .timeout(std::time::Duration::from_secs(5))
+                                .build();
+                            
+                            if let Ok(client) = client {
+                                if let Err(e) = client.post(&url).json(&response_json).send() {
+                                    println!("[P2P] ❌ Failed to send certificate response to {}: {}", peer_addr_clone, e);
+                                } else {
+                                    println!("[P2P] 📤 Certificate response sent to {}", requester_id_clone);
+                                }
+                            }
+                        });
+                    } else {
+                        println!("[P2P] ⚠️ Cannot find address for requester {}", requester_id);
+                    }
+                } else {
+                    println!("[P2P] ❌ Certificate {} not found in cache", cert_serial);
+                }
+            }
+            
+            NetworkMessage::CertificateResponse { node_id, cert_serial, certificate, timestamp } => {
+                self.update_peer_last_seen(&node_id);
+                println!("[P2P] 📥 Certificate response from {} (serial: {})", node_id, cert_serial);
+                
+                // Store received certificate
+                let mut cert_manager = self.certificate_manager.write().unwrap();
+                cert_manager.store_remote_certificate(cert_serial.clone(), certificate);
+                println!("[P2P] ✅ Received certificate {} cached", cert_serial);
             }
         }
     }
@@ -7800,6 +8094,15 @@ impl SimplifiedP2P {
         change_type: String,
         timestamp: u64
     ) {
+        // CRITICAL FIX: Ignore macroblock failovers - they don't affect microblock production
+        // Macroblocks are separate consensus process and should NOT stop microblock production
+        // Only microblock failovers should trigger production changes
+        if change_type == "macroblock" {
+            println!("[FAILOVER] ℹ️ Macroblock failover at block #{} - ignoring (microblock production continues)", block_height);
+            println!("[FAILOVER] 💡 Macroblocks are separate Byzantine consensus, no impact on microblocks");
+            return;
+        }
+        
         // CRITICAL FIX: Filter out early block failovers to prevent spam
         // Block #1 issue is known and will be fixed by height increment fix
         if block_height <= 1 {

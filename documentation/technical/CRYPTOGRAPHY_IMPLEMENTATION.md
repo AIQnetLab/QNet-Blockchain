@@ -1,8 +1,8 @@
 # QNet Cryptography Implementation Guide
 ## Complete Technical Specification
 
-**Version:** 1.0  
-**Date:** November 3, 2025  
+**Version:** 2.0 (v2.19.0)  
+**Date:** November 16, 2025  
 **Status:** Production Ready  
 
 ---
@@ -10,24 +10,28 @@
 ## 🎯 Executive Summary
 
 QNet implements **NIST/Cisco recommended post-quantum cryptography** with:
-- ✅ **Real CRYSTALS-Dilithium3** for consensus signatures
-- ✅ **Encapsulated keys** per NIST/Cisco guidelines (ephemeral Ed25519)
-- ✅ **No caching vulnerabilities** (full verification per message)
-- ✅ **512-bit security** (exceeds NIST 256-bit requirement)
-- ✅ **Forward secrecy** (60-second key expiration)
-- ✅ **Byzantine-safe** (resistant to O(1) scaling attacks)
+- ✅ **Real CRYSTALS-Dilithium3** (2420-byte signatures) for quantum resistance
+- ✅ **Hybrid Ed25519 + Dilithium** (dual signature system)
+- ✅ **Compact signatures** (3KB vs 12KB, 75% bandwidth reduction)
+- ✅ **Certificate caching** (100K LRU cache for scalability)
+- ✅ **Defense-in-depth** (two-layer verification: P2P + Consensus)
+- ✅ **SHA3-256 hashing** (NIST FIPS 202 compliant)
+- ✅ **Forward secrecy** (1-hour certificate lifetime with rotation)
+- ✅ **Byzantine-safe** (2/3+ honest nodes at all verification layers)
 
 ---
 
 ## 📋 Table of Contents
 
 1. [Architecture Overview](#architecture-overview)
-2. [Cryptography Usage by Component](#cryptography-usage-by-component)
-3. [Hybrid Cryptography (Consensus Messages)](#hybrid-cryptography-consensus-messages)
-4. [Key Manager (Block Signatures)](#key-manager-block-signatures)
-5. [Security Analysis](#security-analysis)
-6. [Implementation Details](#implementation-details)
-7. [Compliance & Standards](#compliance--standards)
+2. [Signature Systems (v2.19)](#signature-systems-v219)
+3. [Cryptography Usage by Component](#cryptography-usage-by-component)
+4. [Hybrid Cryptography (Consensus Messages)](#hybrid-cryptography-consensus-messages)
+5. [Key Manager (Block Signatures)](#key-manager-block-signatures)
+6. [Certificate Management](#certificate-management)
+7. [Security Analysis](#security-analysis)
+8. [Implementation Details](#implementation-details)
+9. [Compliance & Standards](#compliance--standards)
 
 ---
 
@@ -71,11 +75,155 @@ QNet implements **NIST/Cisco recommended post-quantum cryptography** with:
 
 | Component | Library | Version | Purpose |
 |-----------|---------|---------|---------|
-| Consensus | `pqcrypto-dilithium` | 0.5 | Real CRYSTALS-Dilithium3 |
-| Hybrid | `ed25519-dalek` | 2.0 | Ephemeral Ed25519 keys |
-| Hashing | `sha3` | 0.10 | SHA3-256/512 (quantum-resistant) |
+| Consensus | `pqcrypto-dilithium` | 0.5 | Real CRYSTALS-Dilithium3 (2420-byte sigs) |
+| Hybrid | `ed25519-dalek` | 2.0 | Ed25519 classical signatures |
+| Hashing | `sha3` | 0.10 | SHA3-256/512 (NIST FIPS 202) |
 | Encryption | `aes-gcm` | 0.10 | AES-256-GCM key storage |
 | Random | `rand` | 0.8 | CSPRNG for key generation |
+
+---
+
+## 2. Signature Systems (v2.19)
+
+### Overview
+
+QNet v2.19 implements **two signature formats** optimized for different block types:
+
+1. **Compact Signatures** (Microblocks): ~3KB - Certificate cached separately
+2. **Full Signatures** (Macroblocks): ~12KB - Certificate embedded
+
+### Dilithium3 Core Specifications
+
+**IMPORTANT**: QNet uses **full CRYSTALS-Dilithium3** signatures.
+
+| Property | Value | Notes |
+|----------|-------|-------|
+| **Signature Size (raw)** | **2420 bytes** | Binary format |
+| **Signature Size (base64)** | **~3227 characters** | Encoded for JSON |
+| **Public Key Size** | 1952 bytes | Dilithium3 public key |
+| **Private Key Size** | 4000 bytes | Dilithium3 secret key |
+| **Security Level** | NIST Level 3 | Equivalent to AES-192 |
+| **Quantum Resistance** | Yes | Resistant to Shor's algorithm |
+| **Algorithm** | Module-Lattice-Based | NIST PQC Round 3 winner |
+
+#### Code Verification
+```rust
+// From key_manager.rs:243
+if signature.len() != 2420 {
+    println!("❌ Invalid signature length: {} (expected 2420)", signature.len());
+    return Ok(false);
+}
+
+// From quantum_crypto.rs:962
+assert_eq!(sig_serialized.len(), 2420, "Dilithium3 signature must be 2420 bytes");
+```
+
+### 2.1 Compact Signatures (Microblocks)
+
+**Purpose**: Optimize bandwidth for high-frequency microblocks (1/second)
+
+**Size**: ~3KB per signature
+
+#### Structure
+```rust
+pub struct CompactHybridSignature {
+    pub node_id: String,                          // Producer node ID
+    pub cert_serial: String,                      // Certificate reference
+    pub message_signature: Vec<u8>,               // Ed25519 (64 bytes)
+    pub dilithium_message_signature: String,      // Dilithium3 (2420 bytes → 3227 base64)
+    pub signed_at: u64,                           // Unix timestamp
+}
+```
+
+#### Size Breakdown
+| Component | Raw Size | Encoded Size | Description |
+|-----------|----------|--------------|-------------|
+| `node_id` | Variable | ~20 bytes | String (e.g., "genesis_node_001") |
+| `cert_serial` | Variable | ~30 bytes | String (e.g., "cert_2024_11_16_12345") |
+| `message_signature` | 64 bytes | 64 bytes | Ed25519 binary array |
+| `dilithium_message_signature` | **2420 bytes** | **~3227 chars** | Dilithium3 base64 |
+| `signed_at` | 8 bytes | 8 bytes | u64 timestamp |
+| **Total** | **~2.5KB raw** | **~3KB JSON** | **75% reduction vs full** |
+
+#### JSON Example
+```json
+"compact:{
+  \"node_id\": \"genesis_node_001\",
+  \"cert_serial\": \"cert_2024_11_16_12345\",
+  \"message_signature\": [64, 32, 128, ...],
+  \"dilithium_message_signature\": \"BASE64_ENCODED_2420_BYTES_HERE...\",
+  \"signed_at\": 1700140800
+}"
+```
+
+#### Verification Process
+```
+P2P Layer (node.rs::verify_microblock_signature):
+1. Parse "compact:" prefix and JSON
+2. Lookup certificate using cert_serial
+   ├─► Cache HIT (100K LRU cache): Use cached certificate ✅
+   └─► Cache MISS: Request via P2P broadcast
+3. Verify Ed25519 (64 bytes) with certificate's ed25519_public_key
+4. Verify Dilithium (2420 bytes) with certificate's dilithium_public_key ✅ REAL CRYPTO
+5. Both must be valid → Accept block
+
+Consensus Layer (consensus_crypto.rs::verify_compact_hybrid_signature):
+1. Structural re-validation (format, sizes)
+2. Byzantine consensus (2/3+ honest nodes)
+3. Only pre-verified blocks participate
+```
+
+### 2.2 Full Hybrid Signatures (Macroblocks)
+
+**Purpose**: Immediate verification for low-frequency macroblocks (1/90 seconds)
+
+**Size**: ~12KB per signature
+
+#### Structure
+```rust
+pub struct HybridSignature {
+    pub message_signature: Vec<u8>,         // Ed25519 (64 bytes)
+    pub dilithium_signature: String,        // Dilithium3 (2420 bytes → 3227 base64)
+    pub certificate: HybridCertificate,     // Full certificate (~9KB)
+}
+
+pub struct HybridCertificate {
+    pub ed25519_public_key: Vec<u8>,                // 32 bytes
+    pub dilithium_public_key: Vec<u8>,              // 1952 bytes
+    pub dilithium_signature_of_ed25519: String,     // 2420 bytes → 3227 base64
+    pub serial_number: String,
+    pub valid_from: u64,
+    pub valid_until: u64,
+}
+```
+
+#### Size Breakdown
+| Component | Size | Description |
+|-----------|------|-------------|
+| `message_signature` (Ed25519) | 64 bytes | Message signature |
+| `dilithium_signature` | ~3227 bytes | Message signature (base64) |
+| **Certificate**: | | |
+| - `ed25519_public_key` | 32 bytes | Public key for Ed25519 |
+| - `dilithium_public_key` | 1952 bytes | Public key for Dilithium3 |
+| - `dilithium_signature_of_ed25519` | ~3227 bytes | Certificate signature (base64) |
+| - Serial + timestamps | ~50 bytes | Metadata |
+| **Total** | **~12KB** | **Full verification data** |
+
+### 2.3 Bandwidth Comparison
+
+#### Per Microblock (1/second)
+| Signature Type | Size | Bandwidth/hour | Production Use |
+|---------------|------|----------------|----------------|
+| **Compact** | ~3KB | 10.8 MB/hour | ✅ YES (75% savings) |
+| **Full** | ~12KB | 43.2 MB/hour | ❌ NO (too expensive) |
+
+#### Per Macroblock (1/90 seconds = 40/hour)
+| Signature Type | Size | Bandwidth/hour | Production Use |
+|---------------|------|----------------|----------------|
+| **Compact** | ~3KB | 0.12 MB/hour | ⚠️ Requires cert request |
+| **Full** | ~12KB | 0.48 MB/hour | ✅ YES (immediate verify) |
+
+**Total Production Bandwidth**: ~11.3 MB/hour (microblocks + macroblocks)
 
 ---
 

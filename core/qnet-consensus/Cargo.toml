@@ -35,6 +35,9 @@ base64 = "0.22"
 pqcrypto-dilithium = "0.5"
 pqcrypto-traits = "0.3"
 
+# Ed25519 for hybrid signatures
+ed25519-dalek = "2.2"
+
 # Random number generation
 rand = "0.8.5"
 

@@ -3,8 +3,8 @@
 
 **⚠️ EXPERIMENTAL BLOCKCHAIN RESEARCH ⚠️**
 
-**Version**: 1.1.0-experimental  
-**Date**: October 2025  
+**Version**: 2.19.0-experimental  
+**Date**: November 2025  
 **Authors**: QNet Research Team  
 **Status**: Experimental Research Project  
 **Goal**: To prove that one person without multi-million investments can create an advanced blockchain
@@ -24,7 +24,9 @@
 QNet is an experimental post-quantum blockchain created to prove: **one person-operator without technical knowledge, multi-million investments, and funds is capable of building an advanced blockchain**.
 
 Experimental achievements:
-- ✅ **Post-quantum cryptography**: CRYSTALS-Dilithium + Kyber protection  
+- ✅ **Post-quantum cryptography**: CRYSTALS-Dilithium3 (2420-byte signatures) + Ed25519 hybrid  
+- ✅ **Compact Signatures**: 3KB vs 12KB (75% bandwidth reduction) with certificate caching
+- ✅ **Progressive Finalization Protocol**: Self-healing consensus recovery (80% → 1% degradation)
 - ✅ **424,411 TPS**: Proven performance in tests
 - ✅ **Two-phase activation**: 1DEV burn → QNC Pool #3
 - ✅ **Mobile-first**: Optimized for smartphones
@@ -33,6 +35,7 @@ Experimental achievements:
 - ✅ **Advanced optimizations**: Turbine, Quantum PoH, Finality Window Selection, Hybrid Sealevel, Tower BFT, Pre-execution
 - ✅ **Chain Reorganization**: Byzantine-safe fork resolution with 2/3 majority consensus
 - ✅ **Advanced Synchronization**: Out-of-order block buffering with active missing block requests
+- ✅ **Zero-Downtime Architecture**: Microblocks continue during macroblock consensus
 
 Experiment goal: demonstrate the possibility of creating a high-performance post-quantum blockchain by one person-operator.
 
@@ -69,10 +72,12 @@ These characteristics make QNet suitable for mass mobile usage with exchange-gra
 
 QNet presents an experimental blockchain platform with unique characteristics:
 
-1. **Post-quantum cryptography**: Mandatory CRYSTALS-Dilithium with hybrid Ed25519 (both signatures on every message)
-2. **High performance**: 424,411+ TPS achieved in experiments
-3. **Innovative economy**: Reputation system without staking
-4. **Mobile-first design**: Optimized for smartphones and tablets
+1. **Post-quantum cryptography**: CRYSTALS-Dilithium3 (NIST PQC, 2420-byte signatures) with hybrid Ed25519
+2. **Compact signatures**: 75% bandwidth reduction (3KB vs 12KB) via certificate caching
+3. **Progressive Finalization Protocol**: Self-healing consensus with zero-downtime
+4. **High performance**: 424,411+ TPS achieved in experiments
+5. **Innovative economy**: Reputation system without staking
+6. **Mobile-first design**: Optimized for smartphones and tablets
 
 ---
 

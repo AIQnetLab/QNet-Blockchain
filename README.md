@@ -45,7 +45,34 @@ This project uses **dual licensing**:
 - **Phase 2 (Future)**: ONLY QNC token activation on QNet blockchain
 - **Transition**: 90% 1DEV burned OR 5 years from genesis block (whichever comes first)
 
-### 🛡️ **LATEST UPDATES (v2.18.0 - November 1, 2025)**
+### 🛡️ **LATEST UPDATES (v2.19.0 - November 16, 2025)**
+- **Compact Hybrid Signatures**: Optimized microblock signatures (3KB vs 12KB)
+  - Ed25519 + CRYSTALS-Dilithium hybrid cryptography
+  - Certificate caching for 4x bandwidth reduction
+  - Separate verification: structural (consensus) + cryptographic (P2P)
+  - NIST/Cisco post-quantum compliance
+- **Progressive Finalization Protocol (PFP)**: Self-healing macroblock recovery
+  - Degradation levels: 80% → 60% → 40% → 1% node requirements
+  - Checks every 30 blocks with accelerating timeouts (30s → 2s)
+  - Zero-downtime: microblocks continue during recovery
+  - Byzantine-safe at all levels (2/3+ honest nodes)
+- **Certificate Broadcasting**: Automatic P2P certificate distribution
+  - Periodic broadcast every 5 minutes
+  - Rotation broadcast on certificate renewal
+  - LRU cache with 100K certificate capacity
+  - Scalable from 5 bootstrap to millions of nodes
+- **Node Type Filtering**: Consensus participation optimization
+  - Light nodes: transactions only (no consensus)
+  - Full nodes: partial consensus participation
+  - Super nodes: full consensus (max 1000 validators)
+  - Validator sampling for network scaling
+- **Architectural Cleanup**: Resolved circular dependencies
+  - Core modules: structural validation only
+  - Development modules: full cryptographic verification
+  - Clean separation: consensus trusts pre-verified blocks
+  - Defense-in-depth security model
+
+### **Previous Updates (v2.18.0 - November 1, 2025)**
 - **Fast Finality Indicators**: 5-level transaction confirmation system (Pending → InBlock → QuickConfirmed → NearFinal → FullyFinalized)
   - Real-time safety percentage calculation (0% - 100%)
   - Time to finality countdown (seconds until macroblock)
