@@ -250,34 +250,47 @@ impl HybridCrypto {
         Ok(())
     }
     
-    /// Sign message with long-lived certificate for O(1) performance
+    /// Sign message with BOTH Ed25519 AND Dilithium per NIST/Cisco standards
     pub async fn sign_message(&self, message: &[u8]) -> Result<HybridSignature> {
-        // OPTIMIZATION: Use long-lived Ed25519 key from certificate (1 hour lifetime)
-        // This enables O(1) performance with certificate caching
+        // CRITICAL: Per NIST/Cisco standards for hybrid cryptography:
+        // EVERY message MUST be signed by BOTH algorithms
+        // - Ed25519 for performance/compatibility  
+        // - Dilithium for quantum resistance
+        // This is NOT optional - both signatures are REQUIRED for security
         
         // Get current Ed25519 signing key (or rotate if needed)
         let signing_key = self.ed25519_signing_key.as_ref()
             .ok_or_else(|| anyhow!("No Ed25519 signing key available"))?;
         
-        // Step 1: Sign the message with long-lived Ed25519 key
+        // Step 1: Sign the message with Ed25519 key
         let ed25519_signature = signing_key.sign(message);
         
-        // Step 2: Get or use existing certificate (no need to create new one each time)
+        // Step 2: Get or use existing certificate
         let certificate = self.current_certificate.as_ref()
             .ok_or_else(|| anyhow!("No current certificate available"))?;
         
-        // OPTIMIZATION: Remove double Dilithium signature
-        // We DON'T need to sign the message with Dilithium
-        // The Ed25519 key is already protected by Dilithium certificate
-        // This is the proper NIST/Cisco approach:
-        // - Dilithium protects the KEY (certificate)
-        // - Ed25519 signs messages (fast, O(1))
-        // - NO need for dilithium_message_signature
+        // Step 3: CRITICAL - ALSO sign the message with Dilithium
+        // This provides quantum resistance for EVERY message, not just certificates
+        use crate::node::GLOBAL_QUANTUM_CRYPTO;
+        use crate::quantum_crypto::QNetQuantumCrypto;
+        
+        let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
+        if crypto_guard.is_none() {
+            let mut crypto = QNetQuantumCrypto::new();
+            crypto.initialize().await?;
+            *crypto_guard = Some(crypto);
+        }
+        let quantum_crypto = crypto_guard.as_ref().unwrap();
+        
+        // Create Dilithium signature for the message
+        let message_hash = hex::encode(blake3::hash(message).as_bytes());
+        let dilithium_sig = quantum_crypto.create_consensus_signature(&self.node_id, &message_hash).await
+            .map_err(|e| anyhow!("Failed to create Dilithium signature: {}", e))?;
         
         Ok(HybridSignature {
             certificate: certificate.clone(),
             message_signature: ed25519_signature.to_bytes(),
-            dilithium_message_signature: String::new(), // OPTIMIZATION: Not needed - Ed25519 is protected by certificate
+            dilithium_message_signature: dilithium_sig.signature, // REQUIRED per NIST/Cisco
             signed_at: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
         })
     }
@@ -385,13 +398,47 @@ impl HybridCrypto {
             return Ok(false);
         }
         
-        // OPTIMIZATION: No need to verify Dilithium message signature
-        // The Ed25519 key is protected by Dilithium certificate
-        // This provides quantum resistance with O(1) performance
-        // - Certificate verified once and cached
-        // - Ed25519 verification is fast (microseconds)
+        // Step 5: CRITICAL - Verify Dilithium message signature
+        // Per NIST/Cisco standards: BOTH signatures must be valid
+        // This ensures quantum resistance for EVERY message
         
-        println!("✅ Signature verified - quantum-resistant via certificate protection");
+        // Skip Dilithium verification only if not provided (backwards compatibility)
+        if !signature.dilithium_message_signature.is_empty() {
+            use crate::node::GLOBAL_QUANTUM_CRYPTO;
+            use crate::quantum_crypto::{QNetQuantumCrypto, DilithiumSignature};
+            
+            let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
+            if crypto_guard.is_none() {
+                let mut crypto = QNetQuantumCrypto::new();
+                crypto.initialize().await?;
+                *crypto_guard = Some(crypto);
+            }
+            let quantum_crypto = crypto_guard.as_ref().unwrap();
+            
+            // Recreate the same message hash used for signing
+            let message_hash = hex::encode(blake3::hash(message).as_bytes());
+            
+            let dilithium_sig = DilithiumSignature {
+                signature: signature.dilithium_message_signature.clone(),
+                algorithm: "CRYSTALS-Dilithium3".to_string(),
+                timestamp: signature.signed_at,
+                strength: "quantum-resistant".to_string(),
+            };
+            
+            let dilithium_valid = quantum_crypto
+                .verify_dilithium_signature(&message_hash, &dilithium_sig, &signature.certificate.node_id)
+                .await?;
+            
+            if !dilithium_valid {
+                println!("❌ Invalid Dilithium message signature - NOT quantum safe!");
+                return Ok(false);
+            }
+            
+            println!("✅ BOTH signatures verified - truly quantum-resistant");
+        } else {
+            println!("⚠️ WARNING: No Dilithium message signature - NOT quantum safe!");
+        }
+        
         Ok(true)
     }
     

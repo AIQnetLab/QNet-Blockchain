@@ -682,7 +682,9 @@ impl QNetQuantumCrypto {
                 .trim_start_matches('0');
             
             let genesis_node_id = format!("genesis_node_{:03}", bootstrap_id.parse::<u32>().unwrap_or(1));
-            let wallet_address = format!("{}...eon", &genesis_node_id[..8]);  // Same format as get_wallet_address()
+            // Generate proper EON address format: {20 hex}eon{20 hex}
+            let hash = blake3::hash(genesis_node_id.as_bytes()).to_hex();
+            let wallet_address = format!("{}eon{}", &hash[..20], &hash[20..40]);
             
             // Return dummy data for genesis codes
             return Ok(CompatibleActivationData {

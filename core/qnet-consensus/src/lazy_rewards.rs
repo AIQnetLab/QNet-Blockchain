@@ -613,6 +613,18 @@ impl PhaseAwareRewardManager {
     pub fn get_node_wallet_address(&self, node_id: &str) -> Option<String> {
         self.node_ownership.get(node_id).cloned()
     }
+    
+    /// Get all registered nodes with their types
+    pub fn get_all_registered_nodes(&self) -> Vec<(String, NodeType)> {
+        self.ping_histories.iter()
+            .map(|(node_id, history)| (node_id.clone(), history.node_type.clone()))
+            .collect()
+    }
+    
+    /// Restore pending reward from storage (for node restart recovery)
+    pub fn restore_pending_reward(&mut self, node_id: String, reward: PhaseAwareReward) {
+        self.pending_rewards.insert(node_id, reward);
+    }
 }
 
 /// Phase-aware reward statistics

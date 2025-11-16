@@ -7,6 +7,7 @@ use crate::errors::IntegrationError;
 use base64::{Engine as _, engine::general_purpose};
 use blake3;
 use hex;
+use serde_json;
 
 /// Safe string preview utility to prevent index out of bounds errors
 fn safe_preview(s: &str, len: usize) -> &str {
@@ -29,7 +30,6 @@ struct NetworkStats {
 }
 
 /// High-performance activation registry optimized for millions of nodes
-#[derive(Debug)]
 pub struct BlockchainActivationRegistry {
     /// Bloom filter for fast negative lookups (99.9% of requests)
     bloom_filter: RwLock<BloomFilter>,
@@ -51,6 +51,9 @@ pub struct BlockchainActivationRegistry {
     dht_client: Option<DhtClient>,
     /// Load balancer for blockchain RPC endpoints
     rpc_load_balancer: RpcLoadBalancer,
+    /// CRITICAL: Shared storage instance to avoid RocksDB lock conflicts
+    /// RocksDB does NOT support multiple connections to same database
+    storage: Option<std::sync::Arc<crate::storage::Storage>>,
 }
 
 /// Bloom filter for fast negative lookups
@@ -320,6 +323,14 @@ pub struct DhtClient {
 
 impl BlockchainActivationRegistry {
     pub fn new(blockchain_rpc: Option<String>) -> Self {
+        Self::new_with_storage(blockchain_rpc, None)
+    }
+    
+    /// PRODUCTION: Create registry with shared storage to avoid RocksDB lock conflicts
+    pub fn new_with_storage(
+        blockchain_rpc: Option<String>,
+        storage: Option<std::sync::Arc<crate::storage::Storage>>
+    ) -> Self {
         // Initialize with capacity for 10 million activations
         let expected_activations = 10_000_000;
         let false_positive_rate = 0.001; // 0.1%
@@ -351,6 +362,7 @@ impl BlockchainActivationRegistry {
                 connection_pool: vec![] 
             }),
             rpc_load_balancer: RpcLoadBalancer::new(rpc_endpoints),
+            storage, // CRITICAL: Store shared storage reference
         }
     }
 
@@ -1285,14 +1297,28 @@ impl BlockchainActivationRegistry {
             .parse::<u64>()
             .unwrap_or(0);
         
-        // GENESIS FIX: In Genesis mode, populate with Genesis nodes if active_nodes is empty
-        if self.is_genesis_bootstrap_mode() {
-            let active_nodes_read = self.active_nodes.read().await;
-            if active_nodes_read.is_empty() {
-                drop(active_nodes_read);
+        // PRODUCTION FIX: Sync nodes based on network phase
+        let is_genesis = self.is_genesis_bootstrap_mode();
+        
+        // Check if active_nodes is empty and needs population
+        let active_nodes_read = self.active_nodes.read().await;
+        if active_nodes_read.is_empty() {
+            drop(active_nodes_read);
+            
+            if is_genesis {
                 println!("[REGISTRY] 🚀 Genesis mode: Populating with Genesis nodes");
                 self.populate_genesis_active_nodes().await;
             } else {
+                // CRITICAL FIX: For non-Genesis, sync from blockchain instead!
+                println!("[REGISTRY] 🌍 Normal mode: Syncing from blockchain for millions of nodes");
+                if let Err(e) = self.sync_from_blockchain().await {
+                    println!("[REGISTRY] ⚠️ Failed to sync from blockchain: {}", e);
+                    println!("[REGISTRY] 🔄 Fallback: Using Genesis nodes temporarily");
+                    self.populate_genesis_active_nodes().await;
+                }
+            }
+        } else if is_genesis {
+            // Genesis mode with existing nodes - check for periodic refresh
                 // CRITICAL FIX: Don't spam logs - Registry is called frequently
                 let genesis_count = active_nodes_read.len();
                 drop(active_nodes_read);
@@ -1305,10 +1331,36 @@ impl BlockchainActivationRegistry {
                 if blocks_since_sync >= 30 {
                     // Silent refresh - too many logs in production
                     let _ = self.active_nodes.write().await.clear(); // Clear to force refresh
-                    self.populate_genesis_active_nodes().await;
+                    
+                    // CRITICAL FIX: Use sync_from_blockchain() for non-Genesis phase!
+                    // Genesis phase already populated above, so this is for normal operation
+                    if let Err(e) = self.sync_from_blockchain().await {
+                        println!("[REGISTRY] ⚠️ Failed to sync from blockchain: {}", e);
+                        // Fallback to Genesis nodes if sync fails
+                        self.populate_genesis_active_nodes().await;
+                    }
+                    
                     *self.last_sync.write().await = current_height;
                 }
                 // Silent success - no spam logs
+        } else {
+            // CRITICAL FIX: Non-Genesis mode with existing nodes - periodic sync from blockchain
+            drop(active_nodes_read);
+            
+            // CONSENSUS FIX: Use block-based cache invalidation (every 30 blocks)
+            let last_sync = *self.last_sync.read().await;
+            let blocks_since_sync = current_height.saturating_sub(last_sync);
+            
+            // Sync every 30 blocks for deterministic updates
+            if blocks_since_sync >= 30 {
+                println!("[REGISTRY] 🔄 Normal mode: Refreshing from blockchain ({}+ blocks since last sync)", blocks_since_sync);
+                
+                if let Err(e) = self.sync_from_blockchain().await {
+                    println!("[REGISTRY] ⚠️ Failed to sync from blockchain: {}", e);
+                    // Don't fallback to Genesis nodes in normal mode - keep existing data
+                }
+                
+                *self.last_sync.write().await = current_height;
             }
         }
         
@@ -1421,11 +1473,69 @@ impl BlockchainActivationRegistry {
         let current_phase = self.get_current_activation_phase();
         let network_stats = self.get_network_statistics().await;
         
-        // In real implementation: iterate through blocks and extract activation transactions
-        // TODO: Replace with actual blockchain query when storage integration is complete
-        // For now: simulate with dynamic pricing based on network state
-        for i in 0..3 { // Temporary simulation until blockchain query is ready
-            let node_type = match i {
+        // PRODUCTION: Read real activation transactions from blockchain storage
+        // Use shared storage instance to avoid RocksDB lock conflicts
+        if let Some(ref storage) = self.storage {
+            
+            // Iterate through recent blocks and extract activation transactions
+            for block_height in from_height..=snapshot_height {
+                if let Ok(Some(block)) = storage.load_microblock(block_height) {
+                    // Try to parse as MicroBlock (full transactions)
+                    let transactions = if let Ok(microblock) = bincode::deserialize::<qnet_state::MicroBlock>(&block) {
+                        microblock.transactions
+                    } else if let Ok(efficient_block) = bincode::deserialize::<qnet_state::EfficientMicroBlock>(&block) {
+                        // EfficientMicroBlock has only hashes, need to fetch transactions from pool
+                        let mut txs = Vec::new();
+                        for tx_hash in &efficient_block.transaction_hashes {
+                            // Try to get transaction from pool
+                            if let Some(tx) = storage.transaction_pool.get_transaction(tx_hash) {
+                                txs.push(tx);
+                            }
+                        }
+                        txs
+                    } else {
+                        // Can't parse block, skip
+                        continue;
+                    };
+                    
+                    // Check each transaction for activation type
+                    for tx in &transactions {
+                        // Check if this is an activation transaction (to registry address)
+                        if tx.to == Some("qnet_activation_registry".to_string()) {
+                            // Parse activation data from transaction
+                            if let Some(ref data_str) = tx.data {
+                                // Try to parse as activation JSON
+                                if let Ok(activation_json) = serde_json::from_str::<serde_json::Value>(data_str) {
+                                    if activation_json["type"] == "node_activation" {
+                                        // Create activation record from transaction
+                                        let record = ActivationRecord {
+                                            code_hash: activation_json["code_hash"].as_str().unwrap_or("").to_string(),
+                                            wallet_address: activation_json["wallet"].as_str().unwrap_or("").to_string(),
+                                            tx_hash: tx.hash.clone(),
+                                            activated_at: activation_json["activated_at"].as_u64().unwrap_or(0),
+                                            node_type: activation_json["node_type"].as_str().unwrap_or("full").to_string(),
+                                            phase: 1, // Default to phase 1
+                                            activation_amount: 0,
+                                            blockchain_height: block_height,
+                                            is_active: activation_json["is_active"].as_bool().unwrap_or(true),
+                                            device_migrations: vec![], // Parse if needed
+                                        };
+                                        activations.push(record);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            
+            println!("[REGISTRY] 📊 Found {} activations in blocks {}-{}", 
+                     activations.len(), from_height, snapshot_height);
+        } else {
+            // FALLBACK: If no storage path, use temporary simulation
+            println!("[REGISTRY] ⚠️ No storage path, using simulation");
+            for i in 0..3 { // Temporary simulation
+                let node_type = match i {
                 0 => "light".to_string(),
                 1 => "full".to_string(),
                 2 => "super".to_string(),
@@ -1462,6 +1572,7 @@ impl BlockchainActivationRegistry {
             };
             activations.push(activation);
         }
+        } // End of else (simulation fallback)
         
         println!("🔗 Blockchain consensus: Found {} recent activations", activations.len());
         Ok(activations)
@@ -1552,10 +1663,61 @@ impl BlockchainActivationRegistry {
         let tx_hash_bytes = blake3::hash(tx_data.as_bytes());
         let tx_hash = format!("qnet_activation_{}", &tx_hash_bytes.to_hex()[..16]);
         
-        // Submit to consensus engine (mempool -> block production)
+        // PRODUCTION: Create real blockchain transaction
+        use qnet_state::{Transaction, TransactionType};
+        
+        // Create activation data JSON for transaction
+        let activation_json = serde_json::json!({
+            "type": "node_activation",
+            "code_hash": record.code_hash.clone(),
+            "wallet": record.wallet_address.clone(),
+            "node_type": record.node_type.clone(),
+            "activated_at": record.activated_at,
+            "device_migrations": record.device_migrations,
+            "is_active": record.is_active,
+            "phase": record.phase,
+            "activation_amount": record.activation_amount
+        }).to_string();
+        
+        // Create blockchain transaction
+        let transaction = Transaction {
+            hash: tx_hash.clone(),
+            from: record.wallet_address.clone(),
+            to: Some("qnet_activation_registry".to_string()), // Registry contract address
+            amount: 0, // No value transfer, just registration
+            nonce: record.activated_at, // Use timestamp as nonce
+            gas_price: 1, // QNet minimum gas price (from mempool config)
+            gas_limit: 100000, // QNet standard for data transactions
+            data: Some(activation_json), // String, not Vec<u8>
+            signature: None, // Will be signed by node
+            tx_type: TransactionType::ContractCall, // Use tx_type, not transaction_type
+            timestamp: record.activated_at,
+        };
+        
+        // PRODUCTION: Submit to blockchain through mempool
         println!("🔗 Submitting activation transaction: {}", tx_hash);
         
-        // Transaction would be added to mempool and included in next block
+        // Use shared storage instance to avoid RocksDB lock conflicts
+        if let Some(ref storage) = self.storage {
+            // Convert transaction for storage
+            let tx_hash_bytes = hex::decode(&tx_hash).unwrap_or_else(|_| vec![0u8; 32]);
+            if tx_hash_bytes.len() == 32 {
+                let mut hash_array = [0u8; 32];
+                hash_array.copy_from_slice(&tx_hash_bytes);
+                
+                // Store in transaction pool for later inclusion in blocks
+                if let Err(e) = storage.transaction_pool.store_transaction(hash_array, transaction.clone()) {
+                    println!("[REGISTRY] ⚠️ Failed to store activation transaction: {}", e);
+                } else {
+                    println!("[REGISTRY] ✅ Activation transaction stored in pool: {}", tx_hash);
+                }
+            }
+        }
+        
+        // FUTURE: When node instance is available, submit through mempool:
+        // This would be done by passing node reference to registry methods
+        // node.submit_transaction(transaction).await
+        
         Ok(tx_hash)
     }
     

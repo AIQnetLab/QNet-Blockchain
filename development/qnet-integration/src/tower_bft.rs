@@ -111,10 +111,17 @@ impl TowerBft {
             5000  // 5 seconds for consensus period (balances safety vs. speed)
         } else if height > 1 && ((height - 1) % 30) == 0 {
             // CRITICAL: Rotation boundaries need slightly more time for producer switch
-            3000  // 3 seconds for rotation boundaries (was 12000!)
+            // CRITICAL FIX: Increased from 3s to 4s to match normal block timeout
+            // Rotation is when producer changes - needs same buffer as regular blocks
+            4000  // 4 seconds for rotation boundaries (was 3000!)
         } else {
             // Normal operation - target 1 second blocks with reasonable timeout
-            2000  // 2 seconds timeout for normal blocks (was 10000!)
+            // CRITICAL FIX: Increased from 2s to 4s to account for:
+            // - 500ms broadcast timeout per peer (unified_p2p.rs:2144)
+            // - 500ms network latency (WAN conditions)
+            // - 3000ms buffer for async broadcast + race conditions
+            // Real-world testing showed 2-3s was too aggressive for async broadcast architecture
+            4000  // 4 seconds timeout for normal blocks (was 2000!)
         };
         
         // Apply exponential backoff for retries (Solana-style)

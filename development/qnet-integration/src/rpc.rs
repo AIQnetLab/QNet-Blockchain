@@ -288,6 +288,15 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(blockchain_filter.clone())
         .and_then(handle_block_by_hash);
     
+    // Macroblock endpoint - PRODUCTION
+    let macroblock_by_index = api_v1
+        .and(warp::path("macroblock"))
+        .and(warp::path::param::<u64>())
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(blockchain_filter.clone())
+        .and_then(handle_macroblock_by_index);
+    
     // Transaction endpoints
     let transaction_submit = api_v1
         .and(warp::path("transaction"))
@@ -780,7 +789,8 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .or(microblocks_range)
         .or(block_latest)
         .or(block_by_height)
-        .or(block_by_hash);
+        .or(block_by_hash)
+        .or(macroblock_by_index);
         
     let account_routes = account_info
         .or(account_balance)
@@ -1620,6 +1630,53 @@ async fn handle_block_by_hash(
     }
 }
 
+async fn handle_macroblock_by_index(
+    index: u64,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    match blockchain.get_macroblock(index).await {
+        Ok(Some(macroblock)) => {
+            let response = json!({
+                "index": index,
+                "height": macroblock.height,
+                "timestamp": macroblock.timestamp,
+                "micro_blocks_count": macroblock.micro_blocks.len(),
+                "micro_blocks": macroblock.micro_blocks.iter()
+                    .map(|h| hex::encode(h))
+                    .collect::<Vec<_>>(),
+                "state_root": hex::encode(macroblock.state_root),
+                "consensus_data": {
+                    "next_leader": macroblock.consensus_data.next_leader,
+                    "commits_count": macroblock.consensus_data.commits.len(),
+                    "reveals_count": macroblock.consensus_data.reveals.len(),
+                },
+                "previous_hash": hex::encode(macroblock.previous_hash),
+                "poh_hash": hex::encode(&macroblock.poh_hash),
+                "poh_count": macroblock.poh_count,
+            });
+            Ok(warp::reply::json(&response))
+        }
+        Ok(None) => {
+            let error_response = json!({
+                "error": "Macroblock not found",
+                "index": index,
+                "info": format!("Macroblock #{} would cover blocks {}-{}", 
+                                index, 
+                                (index - 1) * 90 + 1, 
+                                index * 90)
+            });
+            Ok(warp::reply::json(&error_response))
+        }
+        Err(e) => {
+            let error_response = json!({
+                "error": "Failed to get macroblock",
+                "details": e.to_string()
+            });
+            Ok(warp::reply::json(&error_response))
+        }
+    }
+}
+
 async fn handle_transaction_submit(
     tx_request: TransactionRequest,
     blockchain: Arc<BlockchainNode>,
@@ -1783,9 +1840,10 @@ async fn handle_batch_claim_rewards(
     
     // Process each node's reward claim
     for node_id in &request.node_ids {
-        // FIXED: Use real reward manager with wallet verification
+        // FIXED: Use blockchain's reward_manager instead of global REWARD_MANAGER
         let claim_result = {
-            let mut reward_manager = REWARD_MANAGER.lock().unwrap();
+            let reward_manager_arc = blockchain.get_reward_manager();
+            let mut reward_manager = reward_manager_arc.write().await;
             reward_manager.claim_rewards(node_id, &request.owner_address)
         };
         
@@ -2182,7 +2240,9 @@ async fn handle_network_ping(
     
     // CRITICAL: Record ping for Full/Super/Genesis nodes in reward system
     {
-        let mut reward_manager = REWARD_MANAGER.lock().unwrap();
+        // FIXED: Use blockchain's reward_manager instead of global REWARD_MANAGER
+        let reward_manager_arc = blockchain.get_reward_manager();
+        let mut reward_manager = reward_manager_arc.write().await;
         
         // Determine node type for reward system
         let reward_node_type = match node_type {
@@ -2212,12 +2272,26 @@ async fn handle_network_ping(
         } else {
             // For Full/Super nodes, wallet should be extracted from activation code
             // For now, use node_id-based placeholder (production would query blockchain registry)
-            format!("wallet_{}eon", &blake3::hash(node_id.as_bytes()).to_hex()[..8])
+            {
+                let hash = blake3::hash(node_id.as_bytes()).to_hex();
+                format!("{}eon{}", &hash[..20], &hash[20..40])
+            }
         };
         
         // Register node if not already registered
         if let Err(_) = reward_manager.register_node(node_id.to_string(), reward_node_type, wallet_address.clone()) {
             // Node already registered, that's fine
+        }
+        
+        // CRITICAL: Save node registration to storage (survive restarts)
+        let node_type_str = match node_type {
+            "super" => "super",
+            "full" => "full",
+            "light" => "light",
+            _ => "light", // Default to light
+        };
+        if let Err(e) = blockchain.get_storage().save_node_registration(node_id, node_type_str, &wallet_address, 70.0) {
+            println!("[STORAGE] ⚠️ Failed to save node registration: {}", e);
         }
         
         // Record the successful ping
@@ -2226,6 +2300,15 @@ async fn handle_network_ping(
         } else {
             println!("[REWARDS] ✅ Ping recorded for {} node {} (wallet: {}...)", 
                      node_type, node_id, &wallet_address[..20.min(wallet_address.len())]);
+        }
+        
+        // CRITICAL: Also save ping to persistent storage for recovery after restart
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        if let Err(e) = blockchain.get_storage().save_ping_attempt(node_id, timestamp, true, response_time) {
+            println!("[STORAGE] ⚠️ Failed to save ping to storage: {}", e);
         }
     }
     
@@ -2353,14 +2436,8 @@ lazy_static::lazy_static! {
     static ref IP_TO_PSEUDONYM_CACHE: dashmap::DashMap<String, (String, std::time::Instant)> = 
         dashmap::DashMap::new();
     
-    static ref REWARD_MANAGER: Mutex<PhaseAwareRewardManager> = {
-        // DYNAMIC: Use current time for reward manager (no fixed genesis dependency)
-        let genesis_timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        Mutex::new(PhaseAwareRewardManager::new(genesis_timestamp))
-    };
+    // REMOVED: REWARD_MANAGER was causing desync issues
+    // Now using blockchain.get_reward_manager() everywhere for proper synchronization
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -2672,50 +2749,63 @@ async fn handle_light_node_ping_response(
     let mut reward_earned = false;
     
     // Update Light node ping record and process reward
-    {
+    let wallet_address = {
         let mut registry = LIGHT_NODE_REGISTRY.lock().unwrap();
         if let Some(light_node) = registry.get_mut(&node_id) {
             light_node.last_ping = now;
             light_node.ping_count += 1;
             reward_earned = light_node.reward_eligible;
             
-            // Record successful ping in reward system
-            if reward_earned {
-                let mut reward_manager = REWARD_MANAGER.lock().unwrap();
+            // Get wallet address from first device while we have the lock
+            if let Some(device) = light_node.devices.first() {
+                Some(device.wallet_address.clone())
+            } else {
+                {
+                    let hash = blake3::hash(node_id.as_bytes()).to_hex();
+                    Some(format!("{}eon{}", &hash[..20], &hash[20..40]))
+                }
+            }
+        } else {
+            {
+                let hash = blake3::hash(node_id.as_bytes()).to_hex();
+                Some(format!("{}eon{}", &hash[..20], &hash[20..40]))
+            }
+        }
+    }; // registry MutexGuard is dropped here
+    
+    // Record successful ping in reward system (after releasing MutexGuard)
+    if reward_earned {
+        if let Some(wallet_addr) = wallet_address {
+            // FIXED: Use blockchain's reward_manager instead of global REWARD_MANAGER
+            let reward_manager_arc = blockchain.get_reward_manager();
+            let mut reward_manager = reward_manager_arc.write().await;
+            
+            if let Err(e) = reward_manager.register_node(node_id.clone(), RewardNodeType::Light, wallet_addr.clone()) {
+                println!("[REWARDS] ⚠️ Failed to register Light node {}: {}", node_id, e);
+            } else {
+                // CRITICAL: Save Light node registration to storage (survive restarts)
+                if let Err(e) = blockchain.get_storage().save_node_registration(&node_id, "light", &wallet_addr, 70.0) {
+                    println!("[STORAGE] ⚠️ Failed to save Light node registration: {}", e);
+                }
                 
-                // FIXED: Register Light node for current reward window with real wallet address
-                // Get wallet address from registered light node
-                let wallet_address = {
-                    let registry = LIGHT_NODE_REGISTRY.lock().unwrap();
-                    if let Some(light_node) = registry.get(&node_id) {
-                        // Use wallet from first device (all devices should have same wallet)
-                        if let Some(device) = light_node.devices.first() {
-                            device.wallet_address.clone()
-                        } else {
-                            format!("missing_{}eon", &blake3::hash(node_id.as_bytes()).to_hex()[..8])
-                        }
-                    } else {
-                        format!("unregistered_{}eon", &blake3::hash(node_id.as_bytes()).to_hex()[..8])
-                    }
-                };
-                
-                if let Err(e) = reward_manager.register_node(node_id.clone(), RewardNodeType::Light, wallet_address) {
-                    println!("[REWARDS] ⚠️ Failed to register Light node {}: {}", node_id, e);
+                // Record successful ping attempt
+                if let Err(e) = reward_manager.record_ping_attempt(&node_id, true, 50) {
+                    println!("[REWARDS] ⚠️ Failed to record ping for {}: {}", node_id, e);
                 } else {
-                    // Record successful ping attempt
-                    if let Err(e) = reward_manager.record_ping_attempt(&node_id, true, 50) {
-                        println!("[REWARDS] ⚠️ Failed to record ping for {}: {}", node_id, e);
-                    } else {
-                        println!("[REWARDS] ✅ Ping recorded for Light node {} - reward pending", node_id);
-                    }
+                    println!("[REWARDS] ✅ Ping recorded for Light node {} - reward pending", node_id);
                 }
             }
             
-            println!("[LIGHT] 📡 Light node {} responded to ping ({}ms)", 
-                     node_id, 
-                     SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() % 1000);
+            // CRITICAL: Also save ping to persistent storage
+            if let Err(e) = blockchain.get_storage().save_ping_attempt(&node_id, now, true, 50) {
+                println!("[STORAGE] ⚠️ Failed to save Light node ping to storage: {}", e);
+            }
         }
     }
+    
+    println!("[LIGHT] 📡 Light node {} responded to ping ({}ms)", 
+             node_id, 
+             SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() % 1000);
     
     Ok(warp::reply::json(&json!({
         "success": true,
@@ -3207,21 +3297,32 @@ async fn handle_claim_rewards(
                 device.wallet_address.clone()
             } else {
                 // Fallback if no devices
-                format!("light_{}eon", &blake3::hash(claim_request.node_id.as_bytes()).to_hex()[..8])
+                {
+                    let hash = blake3::hash(claim_request.node_id.as_bytes()).to_hex();
+                    format!("{}eon{}", &hash[..20], &hash[20..40])
+                }
             }
         } else {
             // Not found in registry
-            format!("unknown_{}eon", &blake3::hash(claim_request.node_id.as_bytes()).to_hex()[..8])
+            {
+                let hash = blake3::hash(claim_request.node_id.as_bytes()).to_hex();
+                format!("{}eon{}", &hash[..20], &hash[20..40])
+            }
         }
     } else {
         // Full/Super nodes - should query blockchain registry
         // For now use placeholder (in production would query activation registry)
-        format!("wallet_{}eon", &blake3::hash(claim_request.node_id.as_bytes()).to_hex()[..8])
+        {
+            let hash = blake3::hash(claim_request.node_id.as_bytes()).to_hex();
+            format!("{}eon{}", &hash[..20], &hash[20..40])
+        }
     };
     
     // Claim rewards from reward manager
     let claim_result = {
-        let mut reward_manager = REWARD_MANAGER.lock().unwrap();
+        // FIXED: Use blockchain's reward_manager instead of global REWARD_MANAGER
+        let reward_manager_arc = blockchain.get_reward_manager();
+        let mut reward_manager = reward_manager_arc.write().await;
         reward_manager.claim_rewards(&claim_request.node_id, &wallet_address)
     };
     
@@ -3267,7 +3368,9 @@ async fn handle_get_pending_rewards(
     
     // Get pending rewards from reward manager
     let reward_info = {
-        let reward_manager = REWARD_MANAGER.lock().unwrap();
+        // FIXED: Use blockchain's reward_manager instead of global REWARD_MANAGER
+        let reward_manager_arc = blockchain.get_reward_manager();
+        let reward_manager = reward_manager_arc.read().await;
         
         // Get pending reward amount
         let pending_amount = reward_manager.get_pending_reward(&node_id)
@@ -3358,7 +3461,9 @@ async fn handle_register_node(
     
     // Register with reward manager
     {
-        let mut reward_manager = REWARD_MANAGER.lock().unwrap();
+        // FIXED: Use blockchain's reward_manager instead of global REWARD_MANAGER
+        let reward_manager_arc = blockchain.get_reward_manager();
+        let mut reward_manager = reward_manager_arc.write().await;
         
         // Register node with reward manager
         use qnet_consensus::lazy_rewards::NodeType;
@@ -3376,6 +3481,11 @@ async fn handle_register_node(
             wallet_address.to_string()
         ) {
             println!("[NODE] Warning: Failed to register node with reward manager: {:?}", e);
+        }
+        
+        // CRITICAL: Save node registration to storage (survive restarts)
+        if let Err(e) = blockchain.get_storage().save_node_registration(&node_id, node_type, &wallet_address, 70.0) {
+            println!("[STORAGE] ⚠️ Failed to save node registration: {}", e);
         }
     }
     
