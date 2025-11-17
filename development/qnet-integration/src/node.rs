@@ -3036,22 +3036,27 @@ impl BlockchainNode {
                                                     let mut instances_guard = instances.lock().await;
                                                     let normalized_id = node_id.replace('-', "_");
                                                     
+                                                    // CRITICAL: Always create/get instance for certificate broadcast
                                                     if !instances_guard.contains_key(&normalized_id) {
                                                         let mut hybrid = HybridCrypto::new(normalized_id.clone());
                                                         if let Err(e) = hybrid.initialize().await {
                                                             println!("[GENESIS] ⚠️ Failed to initialize hybrid crypto: {}", e);
                                                         } else {
-                                                            if let Some(cert) = hybrid.get_current_certificate() {
-                                                                if let Ok(cert_bytes) = bincode::serialize(&cert) {
-                                                                    println!("[GENESIS] 🔐 Broadcasting certificate AFTER Genesis creation: {}", cert.serial_number);
-                                                                    if let Err(e) = p2p.broadcast_certificate_announce(cert.serial_number.clone(), cert_bytes) {
-                                                                        println!("[GENESIS] ⚠️ Certificate broadcast failed: {}", e);
-                                                                    } else {
-                                                                        println!("[GENESIS] ✅ Certificate broadcasted to network");
-                                                                    }
+                                                            instances_guard.insert(normalized_id.clone(), hybrid);
+                                                        }
+                                                    }
+                                                    
+                                                    // CRITICAL: ALWAYS broadcast certificate after Genesis, even if instance existed
+                                                    if let Some(hybrid) = instances_guard.get(&normalized_id) {
+                                                        if let Some(cert) = hybrid.get_current_certificate() {
+                                                            if let Ok(cert_bytes) = bincode::serialize(&cert) {
+                                                                println!("[GENESIS] 🔐 Broadcasting certificate AFTER Genesis creation: {}", cert.serial_number);
+                                                                if let Err(e) = p2p.broadcast_certificate_announce(cert.serial_number.clone(), cert_bytes) {
+                                                                    println!("[GENESIS] ⚠️ Certificate broadcast failed: {}", e);
+                                                                } else {
+                                                                    println!("[GENESIS] ✅ Certificate broadcasted to network");
                                                                 }
                                                             }
-                                                            instances_guard.insert(normalized_id.clone(), hybrid);
                                                         }
                                                     }
                                                 }
@@ -3113,22 +3118,27 @@ impl BlockchainNode {
                                     let mut instances_guard = instances.lock().await;
                                     let normalized_id = node_id.replace('-', "_");
                                     
+                                    // CRITICAL: Always create/get instance for certificate broadcast
                                     if !instances_guard.contains_key(&normalized_id) {
                                         let mut hybrid = HybridCrypto::new(normalized_id.clone());
                                         if let Err(e) = hybrid.initialize().await {
                                             println!("[GENESIS] ⚠️ Failed to initialize hybrid crypto: {}", e);
                                         } else {
-                                            if let Some(cert) = hybrid.get_current_certificate() {
-                                                if let Ok(cert_bytes) = bincode::serialize(&cert) {
-                                                    println!("[GENESIS] 🔐 Broadcasting certificate AFTER Genesis reception: {}", cert.serial_number);
-                                                    if let Err(e) = p2p.broadcast_certificate_announce(cert.serial_number.clone(), cert_bytes) {
-                                                        println!("[GENESIS] ⚠️ Certificate broadcast failed: {}", e);
-                                                    } else {
-                                                        println!("[GENESIS] ✅ Certificate broadcasted to network");
-                                                    }
+                                            instances_guard.insert(normalized_id.clone(), hybrid);
+                                        }
+                                    }
+                                    
+                                    // CRITICAL: ALWAYS broadcast certificate after Genesis, even if instance existed
+                                    if let Some(hybrid) = instances_guard.get(&normalized_id) {
+                                        if let Some(cert) = hybrid.get_current_certificate() {
+                                            if let Ok(cert_bytes) = bincode::serialize(&cert) {
+                                                println!("[GENESIS] 🔐 Broadcasting certificate AFTER Genesis reception: {}", cert.serial_number);
+                                                if let Err(e) = p2p.broadcast_certificate_announce(cert.serial_number.clone(), cert_bytes) {
+                                                    println!("[GENESIS] ⚠️ Certificate broadcast failed: {}", e);
+                                                } else {
+                                                    println!("[GENESIS] ✅ Certificate broadcasted to network");
                                                 }
                                             }
-                                            instances_guard.insert(normalized_id.clone(), hybrid);
                                         }
                                     }
                                 }
@@ -4467,9 +4477,38 @@ impl BlockchainNode {
                         Ok(signature) => {
                             microblock.signature = signature;
                             
+                            // CRITICAL FIX: Broadcast certificate IMMEDIATELY after signing first microblock
+                            // This ensures ANY node (not just genesis_node_001) can have its blocks verified
+                            // by other nodes when it becomes a producer
+                            if microblock_height >= 1 && microblock_height <= 10 {
+                                if let Some(ref p2p) = unified_p2p {
+                                    use crate::hybrid_crypto::GLOBAL_HYBRID_INSTANCES;
+                                    
+                                    let instances = GLOBAL_HYBRID_INSTANCES.get_or_init(|| async {
+                                        Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()))
+                                    }).await;
+                                    
+                                    let instances_guard = instances.lock().await;
+                                    let normalized_id = node_id.replace('-', "_");
+                                    
+                                    if let Some(hybrid) = instances_guard.get(&normalized_id) {
+                                        if let Some(cert) = hybrid.get_current_certificate() {
+                                            if let Ok(cert_bytes) = bincode::serialize(&cert) {
+                                                println!("[CERTIFICATE] 🚀 IMMEDIATE broadcast after producing block #{}: {}", 
+                                                    microblock_height, cert.serial_number);
+                                                if let Err(e) = p2p.broadcast_certificate_announce(cert.serial_number.clone(), cert_bytes) {
+                                                    println!("[CERTIFICATE] ⚠️ Immediate broadcast failed: {}", e);
+                                                } else {
+                                                    println!("[CERTIFICATE] ✅ Certificate broadcasted to network immediately");
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            
                             // PRODUCTION: Broadcast certificate after rotation (every 3600 blocks = 1 hour)
-                            // Initial certificates are already broadcast after Genesis reception
-                            if microblock_height > 0 && microblock_height % 3600 == 1 {
+                            if microblock_height > 10 && microblock_height % 3600 == 1 {
                                 if let Some(ref p2p) = unified_p2p {
                                     use crate::hybrid_crypto::GLOBAL_HYBRID_INSTANCES;
                                     
