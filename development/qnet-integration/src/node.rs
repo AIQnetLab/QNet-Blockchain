@@ -3246,29 +3246,29 @@ impl BlockchainNode {
                 if certificate_broadcast_counter >= 300 && node_type != NodeType::Light {
                     certificate_broadcast_counter = 0;
                     
-                    // Broadcast certificate if we have one
-                    if let Some(ref p2p) = unified_p2p {
-                        use crate::hybrid_crypto::GLOBAL_HYBRID_INSTANCES;
-                        
-                        // Get our node's certificate from global instances
-                        let instances = GLOBAL_HYBRID_INSTANCES.get_or_init(|| async {
-                            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()))
-                        }).await;
-                        
-                        let instances_guard = instances.lock().await;
-                        let normalized_id = node_id.replace('-', "_");
-                        
-                        if let Some(hybrid) = instances_guard.get(&normalized_id) {
-                            if let Some(cert) = hybrid.get_current_certificate() {
-                                if let Ok(cert_bytes) = bincode::serialize(&cert) {
-                                    println!("[CERTIFICATE] 📢 Periodic broadcast: {}", cert.serial_number);
-                                    if let Err(e) = p2p.broadcast_certificate_announce(cert.serial_number, cert_bytes) {
-                                        println!("[CERTIFICATE] ⚠️ Broadcast failed: {}", e);
-                                    }
+                // Broadcast certificate if we have one
+                if let Some(ref p2p) = unified_p2p {
+                    use crate::hybrid_crypto::GLOBAL_HYBRID_INSTANCES;
+                    
+                    // Get our node's certificate from global instances
+                    let instances = GLOBAL_HYBRID_INSTANCES.get_or_init(|| async {
+                        Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()))
+                    }).await;
+                    
+                    let instances_guard = instances.lock().await;
+                    let normalized_id = Self::normalize_node_id(&node_id);
+                    
+                    if let Some(hybrid) = instances_guard.get(&normalized_id) {
+                        if let Some(cert) = hybrid.get_current_certificate() {
+                            if let Ok(cert_bytes) = bincode::serialize(&cert) {
+                                println!("[CERTIFICATE] 📢 Periodic broadcast: {}", cert.serial_number);
+                                if let Err(e) = p2p.broadcast_certificate_announce(cert.serial_number, cert_bytes) {
+                                    println!("[CERTIFICATE] ⚠️ Broadcast failed: {}", e);
                                 }
                             }
                         }
                     }
+                }
                 }
                 
                 // CRITICAL FIX: Sync local microblock_height with global height at loop start
@@ -4480,7 +4480,8 @@ impl BlockchainNode {
                             // CRITICAL FIX: Broadcast certificate IMMEDIATELY after signing first microblock
                             // This ensures ANY node (not just genesis_node_001) can have its blocks verified
                             // by other nodes when it becomes a producer
-                            if microblock_height >= 1 && microblock_height <= 10 {
+                            // IMPORTANT: Use microblock.height (which equals next_block_height), not microblock_height
+                            if microblock.height >= 1 && microblock.height <= 10 {
                                 if let Some(ref p2p) = unified_p2p {
                                     use crate::hybrid_crypto::GLOBAL_HYBRID_INSTANCES;
                                     
@@ -4489,26 +4490,31 @@ impl BlockchainNode {
                                     }).await;
                                     
                                     let instances_guard = instances.lock().await;
-                                    let normalized_id = node_id.replace('-', "_");
+                                    let normalized_id = Self::normalize_node_id(&node_id);
                                     
                                     if let Some(hybrid) = instances_guard.get(&normalized_id) {
                                         if let Some(cert) = hybrid.get_current_certificate() {
                                             if let Ok(cert_bytes) = bincode::serialize(&cert) {
                                                 println!("[CERTIFICATE] 🚀 IMMEDIATE broadcast after producing block #{}: {}", 
-                                                    microblock_height, cert.serial_number);
+                                                    microblock.height, cert.serial_number);
                                                 if let Err(e) = p2p.broadcast_certificate_announce(cert.serial_number.clone(), cert_bytes) {
                                                     println!("[CERTIFICATE] ⚠️ Immediate broadcast failed: {}", e);
                                                 } else {
                                                     println!("[CERTIFICATE] ✅ Certificate broadcasted to network immediately");
                                                 }
                                             }
+                                        } else {
+                                            println!("[CERTIFICATE] ❌ No certificate found for node {}", normalized_id);
                                         }
+                                    } else {
+                                        println!("[CERTIFICATE] ❌ No hybrid instance found for normalized_id: {}", normalized_id);
                                     }
                                 }
                             }
                             
                             // PRODUCTION: Broadcast certificate after rotation (every 3600 blocks = 1 hour)
-                            if microblock_height > 10 && microblock_height % 3600 == 1 {
+                            // IMPORTANT: Use microblock.height (which equals next_block_height), not microblock_height
+                            if microblock.height > 10 && microblock.height % 3600 == 1 {
                                 if let Some(ref p2p) = unified_p2p {
                                     use crate::hybrid_crypto::GLOBAL_HYBRID_INSTANCES;
                                     
@@ -4517,13 +4523,13 @@ impl BlockchainNode {
                                     }).await;
                                     
                                     let instances_guard = instances.lock().await;
-                                    let normalized_id = node_id.replace('-', "_");
+                                    let normalized_id = Self::normalize_node_id(&node_id);
                                     
                                     if let Some(hybrid) = instances_guard.get(&normalized_id) {
                                         if let Some(cert) = hybrid.get_current_certificate() {
                                             if let Ok(cert_bytes) = bincode::serialize(&cert) {
                                                 println!("[CERTIFICATE] 🔄 Certificate rotation broadcast at block #{}: {}", 
-                                                    microblock_height, cert.serial_number);
+                                                    microblock.height, cert.serial_number);
                                                 if let Err(e) = p2p.broadcast_certificate_announce(cert.serial_number, cert_bytes) {
                                                     println!("[CERTIFICATE] ⚠️ Rotation broadcast failed: {}", e);
                                                 } else {

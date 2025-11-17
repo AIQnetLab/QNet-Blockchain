@@ -451,9 +451,8 @@ async fn verify_with_real_dilithium(
                             println!("[CONSENSUS] ✅ Public key available for future verification");
                             return true;
                         } else {
-                            println!("[CONSENSUS] ❌ Message mismatch!");
-                            println!("   Expected: '{}'", expected_msg);
-                            println!("   Got: '{}'", String::from_utf8_lossy(embedded_msg));
+                            // Silent fail for intermediate attempts (certificates use different format)
+                            // Only log final rejection in calling code
                             return false;
                         }
                     }
