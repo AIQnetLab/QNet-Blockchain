@@ -46,8 +46,7 @@ Builds:
     prebuild:
       - cd ..
       - npm ci --legacy-peer-deps
-    gradle:
-      - release
+    gradle: []
 
 AutoUpdateMode: None
 UpdateCheckMode: None
