@@ -47,7 +47,7 @@ Builds:
       - cd ..
       - npm ci --legacy-peer-deps
     gradle:
-      - yes
+      - release
 
 AutoUpdateMode: None
 UpdateCheckMode: None
