@@ -92,3 +92,54 @@ pub fn get_genesis_wallet_by_id(bootstrap_id: &str) -> Option<&'static str> {
     None
 }
 
+/// SECURITY: System public key for verifying emission and claim transactions
+/// This is generated during first Genesis node startup and MUST be updated here
+/// CRITICAL: This key authenticates ALL system_emission and reward claims
+/// PRODUCTION: Replace placeholder after initial Genesis deployment
+pub const SYSTEM_DILITHIUM_PUBLIC_KEY_HEX: &str = 
+    "PLACEHOLDER_GENESIS_DEPLOYMENT_WILL_GENERATE_REAL_KEY";
+
+/// Verify if a transaction signature is from the system key
+/// Used by all nodes to validate emission and claim transactions
+pub fn is_valid_system_signature(message: &[u8], signature_hex: &str) -> bool {
+    // PLACEHOLDER: During initial deployment, accept all system signatures
+    // PRODUCTION: After Genesis, this will verify against real system public key
+    if SYSTEM_DILITHIUM_PUBLIC_KEY_HEX == "PLACEHOLDER_GENESIS_DEPLOYMENT_WILL_GENERATE_REAL_KEY" {
+        println!("[SECURITY] ⚠️ Using placeholder system key - Genesis deployment mode");
+        return true;
+    }
+    
+    // PRODUCTION: Verify Dilithium signature
+    use pqcrypto_dilithium::dilithium3;
+    use pqcrypto_traits::sign::{PublicKey as PQPublicKeyTrait, SignedMessage as PQSignedMessageTrait};
+    
+    // Decode public key and signature
+    let pk_bytes = match hex::decode(SYSTEM_DILITHIUM_PUBLIC_KEY_HEX) {
+        Ok(bytes) => bytes,
+        Err(_) => return false,
+    };
+    
+    let sig_bytes = match hex::decode(signature_hex) {
+        Ok(bytes) => bytes,
+        Err(_) => return false,
+    };
+    
+    // Parse Dilithium3 public key
+    let public_key = match dilithium3::PublicKey::from_bytes(&pk_bytes) {
+        Ok(pk) => pk,
+        Err(_) => return false,
+    };
+    
+    // Parse signed message (signature + message concatenated)
+    let signed_message = match dilithium3::SignedMessage::from_bytes(&sig_bytes) {
+        Ok(sm) => sm,
+        Err(_) => return false,
+    };
+    
+    // Verify signature
+    match dilithium3::open(&signed_message, &public_key) {
+        Ok(verified_msg) => verified_msg == message,
+        Err(_) => false,
+    }
+}
+

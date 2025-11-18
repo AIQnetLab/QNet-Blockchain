@@ -563,6 +563,13 @@ impl PhaseAwareRewardManager {
         self.pool2_transaction_fees
     }
     
+    /// Get current Pool 1 base emission (PUBLIC for validation)
+    /// Returns total Pool 1 emission for current window in nanoQNC
+    /// Used by validators to independently verify emission amounts
+    pub fn get_pool1_base_emission(&self) -> u64 {
+        self.calculate_pool1_base_emission()
+    }
+    
     /// Reset Pool #2 fees after distribution
     pub fn reset_pool2_fees(&mut self) {
         self.pool2_transaction_fees = 0;

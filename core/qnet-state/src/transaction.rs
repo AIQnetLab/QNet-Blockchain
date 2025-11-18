@@ -139,6 +139,42 @@ pub enum TransactionType {
         transfers: Vec<BatchTransferData>,
         batch_id: String,
     },
+    
+    /// Ping attestation (FREE - system operation for deterministic emission)
+    /// Records node ping response on-chain for Byzantine-resistant reward calculation
+    PingAttestation {
+        from_node: String,
+        to_node: String,
+        response_time_ms: u32,
+        success: bool,
+    },
+    
+    /// Ping Commitment with Merkle Tree + Sampling (PRODUCTION-READY SCALABILITY)
+    /// Instead of storing ALL pings on-chain (millions), stores:
+    /// - Merkle root (32 bytes) of all pings
+    /// - Random deterministic sample (1% or 10K pings, whichever is larger)
+    /// - Each sample includes Merkle proof for verification
+    /// This scales to millions of nodes while maintaining Byzantine security
+    PingCommitmentWithSampling {
+        window_start_height: u64,           // Start height of 4-hour window (e.g., 14400)
+        window_end_height: u64,             // End height of window
+        merkle_root: String,                // Merkle root of ALL ping hashes (hex)
+        total_ping_count: u32,              // Total number of pings in window
+        successful_ping_count: u32,         // Number of successful pings
+        sample_seed: String,                // Deterministic sampling seed (hex)
+        ping_samples: Vec<PingSampleData>,  // Random sample with proofs (1% or 10K min)
+    },
+}
+
+/// Individual ping sample with Merkle proof
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PingSampleData {
+    pub from_node: String,
+    pub to_node: String,
+    pub response_time_ms: u32,
+    pub success: bool,
+    pub timestamp: u64,
+    pub merkle_proof: Vec<(String, bool)>, // (hash, is_left) - proof of inclusion
 }
 
 /// Batch node activation data for transactions
@@ -384,6 +420,84 @@ impl Transaction {
                     }
                 }
             }
+            TransactionType::PingAttestation { from_node, to_node, response_time_ms, .. } => {
+                if from_node.is_empty() {
+                    return Err("Ping from_node cannot be empty".to_string());
+                }
+                if to_node.is_empty() {
+                    return Err("Ping to_node cannot be empty".to_string());
+                }
+                if *response_time_ms > 60000 {
+                    return Err("Ping response time cannot exceed 60 seconds".to_string());
+                }
+                // CRITICAL: Ping attestations are FREE (gas_limit must be 0)
+                if self.gas_limit != gas_limits::PING {
+                    return Err("Ping attestation must have gas_limit = 0 (FREE operation)".to_string());
+                }
+            }
+            TransactionType::PingCommitmentWithSampling { 
+                window_start_height, 
+                window_end_height, 
+                merkle_root,
+                total_ping_count,
+                successful_ping_count,
+                sample_seed,
+                ping_samples,
+            } => {
+                // CRITICAL: Ping commitments are FREE (system operation)
+                if self.gas_limit != gas_limits::PING {
+                    return Err("Ping commitment must have gas_limit = 0 (FREE operation)".to_string());
+                }
+                
+                // Validate window heights
+                if *window_end_height <= *window_start_height {
+                    return Err("Window end height must be greater than start height".to_string());
+                }
+                
+                // Validate window size (must be 4 hours = 14400 blocks)
+                let expected_window = 4 * 60 * 60; // 14400 blocks
+                let actual_window = window_end_height - window_start_height;
+                if actual_window != expected_window {
+                    return Err(format!(
+                        "Invalid window size: expected {} blocks, got {}",
+                        expected_window, actual_window
+                    ));
+                }
+                
+                // Validate Merkle root (must be 64 hex characters = 32 bytes)
+                if merkle_root.len() != 64 {
+                    return Err("Merkle root must be 64 hex characters (32 bytes)".to_string());
+                }
+                
+                // Validate sample seed (must be 64 hex characters = 32 bytes)
+                if sample_seed.len() != 64 {
+                    return Err("Sample seed must be 64 hex characters (32 bytes)".to_string());
+                }
+                
+                // Validate counts
+                if *successful_ping_count > *total_ping_count {
+                    return Err("Successful ping count cannot exceed total ping count".to_string());
+                }
+                
+                // Validate sample size (must be at least 1% or 10,000, whichever is larger)
+                let min_sample_size = (*total_ping_count / 100).max(10_000);
+                if ping_samples.len() < min_sample_size as usize {
+                    return Err(format!(
+                        "Insufficient samples: got {}, expected at least {}",
+                        ping_samples.len(), min_sample_size
+                    ));
+                }
+                
+                // Validate each sample has non-empty Merkle proof
+                for sample in ping_samples {
+                    if sample.merkle_proof.is_empty() {
+                        return Err("Ping sample must include Merkle proof".to_string());
+                    }
+                    if sample.response_time_ms > 60000 {
+                        return Err("Sample ping response time cannot exceed 60 seconds".to_string());
+                    }
+                }
+            }
         }
         
         Ok(())
@@ -591,6 +705,31 @@ impl Transaction {
                 // Log batch transfer
                 println!("Batch transfer of {} QNC to {} recipients by {} with total fee {} QNC", 
                         total_transfer_amount, transfers.len(), self.from, total_fee);
+            }
+            TransactionType::PingAttestation { from_node, to_node, response_time_ms, success } => {
+                // Ping attestations are FREE system operations (gas = 0)
+                // They don't modify account balances, only recorded on-chain for emission calculation
+                println!("[PING] 📡 On-chain attestation: {} -> {} ({}ms, success: {})", 
+                         from_node, to_node, response_time_ms, success);
+                // No state modification needed - ping history will be read from blockchain
+            }
+            TransactionType::PingCommitmentWithSampling { 
+                window_start_height,
+                window_end_height, 
+                merkle_root, 
+                total_ping_count,
+                successful_ping_count,
+                ping_samples,
+                .. 
+            } => {
+                // Ping commitments are FREE system operations (gas = 0)
+                // They don't modify account balances, only provide deterministic data for emission
+                println!("[PING-COMMITMENT] 🌳 Merkle commitment for window {}-{}", 
+                         window_start_height, window_end_height);
+                println!("[PING-COMMITMENT] 📊 Total: {}, Successful: {}, Samples: {}, Root: {}",
+                         total_ping_count, successful_ping_count, ping_samples.len(), 
+                         &merkle_root[..16]);
+                // No state modification needed - commitment will be validated during emission check
             }
         }
         

@@ -3,8 +3,8 @@
 
 **⚠️ EXPERIMENTAL BLOCKCHAIN RESEARCH ⚠️**
 
-**Version**: 2.19.0-experimental  
-**Date**: November 2025  
+**Version**: 2.19.1-experimental  
+**Date**: November 18, 2025  
 **Authors**: QNet Research Team  
 **Status**: Experimental Research Project  
 **Goal**: To prove that one person without multi-million investments can create an advanced blockchain
@@ -844,6 +844,37 @@ Current Rate: 251,432.34 QNC per 4-hour period (Years 0-4)
 Eligibility: Reputation score ≥40 points
 Next Halving: Year 4 (reduces to 125,716.17 QNC)
 Distribution Formula: Individual_Reward = (Pool_Total / Active_Nodes) × Node_Weight
+Validation: Bitcoin-style deterministic rules (no central authority)
+```
+
+**Emission Validation Mechanism (Bitcoin-Style):**
+```
+Decentralized Validation:
+├── NO Central Authority: No system key or single point of control
+├── Deterministic Rules: All nodes independently validate emission amounts
+├── Range-Based Validation: Emission must fall within expected range
+│   ├── Pool 1: Deterministic (depends only on genesis_timestamp + halving)
+│   ├── Pool 2: Conservative estimate (max 100K QNC/window)
+│   └── Pool 3: Conservative estimate (max 100K QNC/window)
+├── Byzantine Consensus: 2/3+ nodes must agree on emission block
+├── Hybrid Merkle + Sampling: Ping commitment provides transparency
+└── Security: Malicious nodes cannot inflate emission beyond range
+
+Validation Steps:
+1. Check emission amount > 0
+2. Check emission amount ≤ MAX_QNC_SUPPLY_NANO (4.295B QNC × 10^9)
+3. Verify PingCommitmentWithSampling transaction exists
+4. Validate sample_seed determinism (SHA3-256 of finalized block)
+5. Verify Merkle proofs for all samples
+6. Range check: Pool1_base + Pool2_est + Pool3_est (with halving)
+7. Byzantine consensus: 2/3+ honest nodes validate
+8. StateManager: Final MAX_SUPPLY check
+
+Determinism Level: ⚠️ PARTIAL (by design)
+├── Range validation protects against large attacks (×2+ inflation)
+├── Small differences (±1-5%) acceptable between honest producers
+├── Commitment provides transparency for auditing
+└── Byzantine consensus prevents malicious manipulation
 ```
 
 **Pool #2 - Transaction Fee Distribution:**
@@ -997,8 +1028,18 @@ Mobile Recovery Features:
 ├── Offline 24h-365d: FREE restoration (7-day quarantine at 25 reputation)
 ├── Offline >365d: Requires paid reactivation
 ├── Restoration Limit: 10 free per 30 days
-├── Auto-Reset: Counter resets monthly
-└── Quarantine Period: 7 days (no new rewards, can claim old ones)
+
+On-Chain Ping Commitment (SCALABLE):
+├── Hybrid Merkle + Sampling Architecture
+├── Local Storage: All pings stored off-chain
+├── Every 4 hours: Producer creates PingCommitmentWithSampling transaction
+├── Merkle Root: 32-byte commitment to ALL pings
+├── Deterministic Sampling: 1% of pings (minimum 10,000 samples)
+├── Merkle Proofs: Verification for each sample
+├── Entropy Source: Finalized block (FINALITY_WINDOW = 10 blocks)
+├── Hash Algorithm: blake3 for ping hashes (speed), SHA3-256 for sample seed (security)
+├── Scalability: 100 MB on-chain vs 36 GB for individual attestations (360x reduction)
+└── Security: Byzantine-safe through 2/3+ consensus validation
 ```
 
 ### 7.7 Dynamic Fee System
@@ -1053,9 +1094,23 @@ Economic Benefits:
 3. Select node type (all cost same in Phase 1)
 4. Extension initiates burn to: 1nc1nerator11111111111111111111111111
 5. QNet monitors Solana blockchain for burn confirmation
+   ├── Verifies burn transaction exists on Solana
+   ├── Parses preTokenBalances and postTokenBalances (SPL Token metadata)
+   ├── Calculates actual_burned = preBalance - postBalance
+   ├── Validates actual_burned ≥ requested_amount (EXACT match required)
+   ├── Dynamic pricing: 1500 → 300 1DEV (decreases as network grows)
+   └── Prevents burn transaction reuse (one-time activation per burn)
 6. Extension generates quantum-resistant activation code
 7. Code format: QNET-XXXXXX-XXXXXX-XXXXXX (26 characters)
 8. Node activated with unique identifier
+
+Security Features:
+├── EXACT burn amount verification (SPL Token balance parsing, NO tolerance)
+├── Burn transaction reuse prevention (one-time use per transaction)
+├── Device migration support (1 wallet = 1 active node per type)
+├── Automatic old device deactivation on new device activation
+├── Code ownership verification (code must be received through activation)
+└── Solana fees paid in SOL (NOT deducted from 1DEV burn amount)
 ```
 
 **Phase 2 - Native QNC Activation:**

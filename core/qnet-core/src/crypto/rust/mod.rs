@@ -2,6 +2,7 @@
 
 pub mod production_crypto;
 pub mod utils;
+pub mod merkle;
 
 // Re-export main types for backward compatibility
 pub use production_crypto::{
