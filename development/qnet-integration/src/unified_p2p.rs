@@ -3649,13 +3649,23 @@ impl SimplifiedP2P {
         
         let current_time = std::time::SystemTime::now();
         
-        // Check cache first (refresh every 30 seconds for Genesis stability)
+        // Check cache first (dynamic refresh based on network phase)
         if let Ok(cache) = connectivity_cache.lock() {
             if let Some((cached_working_nodes, cached_time)) = cache.get(&cache_key) {
                 if let Ok(cache_age) = current_time.duration_since(*cached_time) {
-                    if cache_age.as_secs() < 30 { // CACHE FIX: Reduced from 120s to 30s for faster recovery
-                        println!("[FAILOVER] 📋 Using cached Genesis connectivity ({} working, cache age: {}s)", 
-                                 cached_working_nodes.len(), cache_age.as_secs());
+                    // ARCHITECTURE: Use static cache time for deterministic behavior
+                    // All nodes must have same view of connectivity at same time
+                    let cache_ttl = if std::env::var("QNET_BOOTSTRAP_ID").is_ok() {
+                        // Genesis nodes: shorter cache for faster convergence
+                        // But not too short to avoid network spam
+                        20 // 20 seconds for Genesis nodes
+                    } else {
+                        30 // Regular nodes: 30 seconds
+                    };
+                    
+                    if cache_age.as_secs() < cache_ttl {
+                        println!("[FAILOVER] 📋 Using cached Genesis connectivity ({} working, cache age: {}s, TTL: {}s)", 
+                                 cached_working_nodes.len(), cache_age.as_secs(), cache_ttl);
                         return cached_working_nodes.clone();
                     }
                 }
@@ -4010,6 +4020,46 @@ impl SimplifiedP2P {
                 0
             }
         }
+    }
+    
+    /// CRITICAL: Verify all Genesis nodes are actually connected for bootstrap
+    /// This prevents split brain during initial network formation
+    pub async fn verify_all_genesis_connectivity(&self) -> bool {
+        use crate::genesis_constants::GENESIS_NODE_IPS;
+        
+        // Get our own bootstrap ID to exclude self
+        let our_bootstrap_id = std::env::var("QNET_BOOTSTRAP_ID").ok();
+        let our_id = our_bootstrap_id.as_ref()
+            .and_then(|id| id.parse::<usize>().ok())
+            .unwrap_or(0);
+        
+        let connected_peers = self.connected_peers.read().unwrap();
+        
+        // Check each Genesis node (except self)
+        for (ip, id) in GENESIS_NODE_IPS {
+            let node_num: usize = id.parse().unwrap_or(0);
+            
+            // Skip self
+            if node_num == our_id {
+                continue;
+            }
+            
+            let peer_addr = format!("{}:8001", ip);
+            let node_id = format!("genesis_node_{:03}", node_num);
+            
+            // Check if this Genesis node is connected
+            let is_connected = connected_peers.values().any(|peer| {
+                peer.id == node_id || peer.addr == peer_addr
+            });
+            
+            if !is_connected {
+                println!("[P2P] ❌ Genesis node {} ({}) not connected yet", node_id, ip);
+                return false;
+            }
+        }
+        
+        println!("[P2P] ✅ All Genesis nodes verified as connected");
+        true
     }
     
     /// PRODUCTION: Check if peer is actually connected (runtime-safe)
@@ -8627,6 +8677,21 @@ impl SimplifiedP2P {
         change_type: String,
         timestamp: u64
     ) {
+        // CRITICAL FIX: Check message age to prevent stale message spam
+        // ARCHITECTURE: Emergency messages have 60-second TTL to prevent network pollution
+        let current_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        
+        if timestamp > 0 && current_time > timestamp {
+            let message_age = current_time - timestamp;
+            if message_age > 60 {
+                // Message is too old - ignore silently to prevent spam
+                return;
+            }
+        }
+        
         // CRITICAL FIX: Ignore macroblock failovers - they don't affect microblock production
         // Macroblocks are separate consensus process and should NOT stop microblock production
         // Only microblock failovers should trigger production changes

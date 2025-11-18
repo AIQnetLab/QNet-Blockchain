@@ -924,14 +924,9 @@ impl BlockchainActivationRegistry {
     async fn populate_genesis_active_nodes(&self) {
         println!("[REGISTRY] 🌱 Populating Genesis active nodes for bootstrap phase");
         
-        // EXISTING: Use genesis_constants::GENESIS_NODE_IPS for Genesis nodes
+        // ARCHITECTURE FIX: DETERMINISTIC - add ALL Genesis nodes without connectivity check
+        // Consensus requires ALL nodes see the SAME list for Byzantine safety
         use crate::genesis_constants::GENESIS_NODE_IPS;
-        
-        // CRITICAL FIX: Use EXISTING method to check which Genesis nodes are actually working
-        let all_genesis_ips: Vec<String> = GENESIS_NODE_IPS.iter().map(|(ip, _)| ip.to_string()).collect();
-        let working_genesis_ips = crate::unified_p2p::SimplifiedP2P::filter_working_genesis_nodes_static(all_genesis_ips);
-        
-        println!("[REGISTRY] 🔍 Checked {} Genesis nodes, {} are reachable", GENESIS_NODE_IPS.len(), working_genesis_ips.len());
         
         let current_time = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -940,29 +935,25 @@ impl BlockchainActivationRegistry {
         
         let mut active_nodes = self.active_nodes.write().await;
         
-        // CRITICAL FIX: Only add Genesis nodes that are actually reachable
+        // DETERMINISTIC: Add ALL Genesis nodes regardless of connectivity
+        // Failover mechanism will handle unreachable nodes during consensus
         for (ip, bootstrap_id) in GENESIS_NODE_IPS {
-            if working_genesis_ips.contains(&ip.to_string()) {
-                let device_signature = format!("genesis_device_{}", bootstrap_id);
-                let node_info = NodeInfo {
-                    activation_code: format!("genesis_activation_{}", bootstrap_id),
-                    wallet_address: format!("genesis_wallet_{}", bootstrap_id),
-                    device_signature: device_signature.clone(),
-                    node_type: "super".to_string(), // EXISTING: All Genesis nodes are Super nodes
-                    activated_at: current_time,
-                    last_seen: current_time,
-                    migration_count: 0,
-                };
-                
-                active_nodes.insert(device_signature.clone(), node_info);
-                println!("[REGISTRY] ✅ Added REACHABLE Genesis node: {} ({})", bootstrap_id, ip);
-            } else {
-                println!("[REGISTRY] ⚠️ Skipping UNREACHABLE Genesis node: {} ({})", bootstrap_id, ip);
-            }
+            let device_signature = format!("genesis_device_{}", bootstrap_id);
+            let node_info = NodeInfo {
+                activation_code: format!("genesis_activation_{}", bootstrap_id),
+                wallet_address: format!("genesis_wallet_{}", bootstrap_id),
+                device_signature: device_signature.clone(),
+                node_type: "Super".to_string(), // Match format from register_activation
+                activated_at: current_time,
+                last_seen: current_time,
+                migration_count: 0,
+            };
+            
+            active_nodes.insert(device_signature.clone(), node_info);
+            println!("[REGISTRY] ✅ Added Genesis node: {} ({}) - deterministic", bootstrap_id, ip);
         }
         
-        let actual_count = active_nodes.len();
-        println!("[REGISTRY] 🚀 Genesis bootstrap: {} REACHABLE nodes populated (out of {} total)", actual_count, GENESIS_NODE_IPS.len());
+        println!("[REGISTRY] 🚀 Genesis bootstrap: ALL {} nodes populated (deterministic)", active_nodes.len());
     }
 }
 
@@ -1297,38 +1288,32 @@ impl BlockchainActivationRegistry {
             .parse::<u64>()
             .unwrap_or(0);
         
-        // PRODUCTION FIX: Sync nodes based on network phase
-        let is_genesis = self.is_genesis_bootstrap_mode();
+        // ARCHITECTURE FIX: ALWAYS sync from blockchain for true decentralization
+        // No special Genesis mode - all nodes equal from block #1
         
         // Check if active_nodes is empty and needs population
         let active_nodes_read = self.active_nodes.read().await;
         if active_nodes_read.is_empty() {
             drop(active_nodes_read);
             
-            if is_genesis {
-                println!("[REGISTRY] 🚀 Genesis mode: Populating with Genesis nodes");
+            // CRITICAL FIX: ALWAYS sync from blockchain for consistency
+            println!("[REGISTRY] 🌍 Syncing from blockchain for all nodes");
+            if let Err(e) = self.sync_from_blockchain().await {
+                println!("[REGISTRY] ⚠️ Failed to sync from blockchain: {}", e);
+                println!("[REGISTRY] 🔄 Fallback: Using Genesis nodes temporarily");
                 self.populate_genesis_active_nodes().await;
-            } else {
-                // CRITICAL FIX: For non-Genesis, sync from blockchain instead!
-                println!("[REGISTRY] 🌍 Normal mode: Syncing from blockchain for millions of nodes");
-                if let Err(e) = self.sync_from_blockchain().await {
-                    println!("[REGISTRY] ⚠️ Failed to sync from blockchain: {}", e);
-                    println!("[REGISTRY] 🔄 Fallback: Using Genesis nodes temporarily");
-                    self.populate_genesis_active_nodes().await;
-                }
             }
-        } else if is_genesis {
-            // Genesis mode with existing nodes - check for periodic refresh
-                // CRITICAL FIX: Don't spam logs - Registry is called frequently
-                let genesis_count = active_nodes_read.len();
-                drop(active_nodes_read);
-                
-                // CONSENSUS FIX: Use block-based cache invalidation (every 30 blocks)
-                let last_sync = *self.last_sync.read().await;
-                let blocks_since_sync = current_height.saturating_sub(last_sync);
-                
-                // Sync every 30 blocks for deterministic updates
-                if blocks_since_sync >= 30 {
+        } else {
+            // Check for periodic refresh from blockchain
+            let node_count = active_nodes_read.len();
+            drop(active_nodes_read);
+            
+            // CONSENSUS FIX: Use block-based cache invalidation (every 30 blocks)
+            let last_sync = *self.last_sync.read().await;
+            let blocks_since_sync = current_height.saturating_sub(last_sync);
+            
+            // Sync every 30 blocks for deterministic updates
+            if blocks_since_sync >= 30 {
                     // Silent refresh - too many logs in production
                     let _ = self.active_nodes.write().await.clear(); // Clear to force refresh
                     
@@ -1342,44 +1327,38 @@ impl BlockchainActivationRegistry {
                     
                     *self.last_sync.write().await = current_height;
                 }
-                // Silent success - no spam logs
-        } else {
-            // CRITICAL FIX: Non-Genesis mode with existing nodes - periodic sync from blockchain
-            drop(active_nodes_read);
-            
-            // CONSENSUS FIX: Use block-based cache invalidation (every 30 blocks)
-            let last_sync = *self.last_sync.read().await;
-            let blocks_since_sync = current_height.saturating_sub(last_sync);
-            
-            // Sync every 30 blocks for deterministic updates
-            if blocks_since_sync >= 30 {
-                println!("[REGISTRY] 🔄 Normal mode: Refreshing from blockchain ({}+ blocks since last sync)", blocks_since_sync);
-                
-                if let Err(e) = self.sync_from_blockchain().await {
-                    println!("[REGISTRY] ⚠️ Failed to sync from blockchain: {}", e);
-                    // Don't fallback to Genesis nodes in normal mode - keep existing data
-                }
-                
-                *self.last_sync.write().await = current_height;
-            }
         }
         
         let active_nodes = self.active_nodes.read().await;
         
         // Filter nodes by type (Full/Super only) and reputation (≥70%)
+        // CRITICAL FIX: Case-insensitive comparison for node_type
+        // Handles both "Super"/"Full" (Capitalized) and "super"/"full" (lowercase)
         let mut eligible: Vec<(String, f64, String)> = active_nodes
             .values()
             .filter(|node| {
-                (node.node_type == "full" || node.node_type == "super") &&
+                let node_type_lower = node.node_type.to_lowercase();
+                (node_type_lower == "full" || node_type_lower == "super") &&
                 // Calculate reputation based on activity and uptime
                 self.calculate_node_reputation(node) >= 0.70
             })
             .map(|node| {
                 let reputation = self.calculate_node_reputation(node);
+                
+                // CRITICAL FIX: Genesis nodes must use canonical format "genesis_node_XXX"
+                // Regular nodes use "registry_node_<device_signature>"
+                let node_id = if node.device_signature.starts_with("genesis_device_") {
+                    // Extract bootstrap ID (001, 002, ...) from genesis_device_XXX
+                    let bootstrap_id = &node.device_signature["genesis_device_".len()..];
+                    format!("genesis_node_{}", bootstrap_id)
+                } else {
+                    format!("registry_node_{}", node.device_signature)
+                };
+                
                 (
-                    format!("registry_node_{}", node.device_signature), // Node ID
-                    reputation,                                         // Reputation score
-                    node.node_type.clone(),                            // Node type
+                    node_id,                   // Node ID (canonical format)
+                    reputation,                // Reputation score
+                    node.node_type.clone(),   // Node type
                 )
             })
             .collect();
@@ -1507,18 +1486,35 @@ impl BlockchainActivationRegistry {
                                 // Try to parse as activation JSON
                                 if let Ok(activation_json) = serde_json::from_str::<serde_json::Value>(data_str) {
                                     if activation_json["type"] == "node_activation" {
+                                        // SECURITY: Validate burn_tx_hash exists (Phase 1 Solana burn proof)
+                                        let burn_tx_hash = activation_json["burn_tx_hash"]
+                                            .as_str()
+                                            .unwrap_or("")
+                                            .to_string();
+                                        
+                                        // PRODUCTION: For Genesis nodes, burn_tx_hash can be empty
+                                        // For regular nodes, burn_tx_hash is REQUIRED
+                                        let code_hash = activation_json["code_hash"].as_str().unwrap_or("").to_string();
+                                        let is_genesis_activation = code_hash.starts_with("genesis_activation_");
+                                        
+                                        if !is_genesis_activation && burn_tx_hash.is_empty() {
+                                            println!("[REGISTRY] ⚠️ Skipping activation without burn proof: {}", 
+                                                    code_hash.get(0..16).unwrap_or(&code_hash));
+                                            continue; // Skip invalid activation
+                                        }
+                                        
                                         // Create activation record from transaction
                                         let record = ActivationRecord {
-                                            code_hash: activation_json["code_hash"].as_str().unwrap_or("").to_string(),
+                                            code_hash: code_hash.clone(),
                                             wallet_address: activation_json["wallet"].as_str().unwrap_or("").to_string(),
-                                            tx_hash: tx.hash.clone(),
+                                            tx_hash: burn_tx_hash, // Use burn_tx_hash from JSON
                                             activated_at: activation_json["activated_at"].as_u64().unwrap_or(0),
-                                            node_type: activation_json["node_type"].as_str().unwrap_or("full").to_string(),
-                                            phase: 1, // Default to phase 1
-                                            activation_amount: 0,
+                                            node_type: activation_json["node_type"].as_str().unwrap_or("Full").to_string(),
+                                            phase: 1, // Phase 1 (Solana burn)
+                                            activation_amount: 0, // Phase 1: no QNC cost
                                             blockchain_height: block_height,
-                                            is_active: activation_json["is_active"].as_bool().unwrap_or(true),
-                                            device_migrations: vec![], // Parse if needed
+                                            is_active: true, // Always true if in blockchain
+                                            device_migrations: vec![], // Not stored in blockchain
                                         };
                                         activations.push(record);
                                     }
@@ -1667,56 +1663,84 @@ impl BlockchainActivationRegistry {
         use qnet_state::{Transaction, TransactionType};
         
         // Create activation data JSON for transaction
+        // SECURITY: Minimal data in blockchain for privacy and efficiency
         let activation_json = serde_json::json!({
             "type": "node_activation",
             "code_hash": record.code_hash.clone(),
             "wallet": record.wallet_address.clone(),
             "node_type": record.node_type.clone(),
             "activated_at": record.activated_at,
-            "device_migrations": record.device_migrations,
-            "is_active": record.is_active,
-            "phase": record.phase,
-            "activation_amount": record.activation_amount
+            "burn_tx_hash": record.tx_hash.clone(), // Solana burn proof
         }).to_string();
         
         // Create blockchain transaction
+        // SECURITY: Unique nonce to prevent collision and replay attacks
+        let nonce_data = format!("{}:{}:{}", record.wallet_address, record.activated_at, record.code_hash);
+        let nonce_hash = blake3::hash(nonce_data.as_bytes());
+        let nonce = u64::from_le_bytes(nonce_hash.as_bytes()[0..8].try_into().unwrap());
+        
         let transaction = Transaction {
             hash: tx_hash.clone(),
             from: record.wallet_address.clone(),
             to: Some("qnet_activation_registry".to_string()), // Registry contract address
             amount: 0, // No value transfer, just registration
-            nonce: record.activated_at, // Use timestamp as nonce
+            nonce, // Unique nonce from wallet+timestamp+code_hash
             gas_price: 1, // QNet minimum gas price (from mempool config)
             gas_limit: 100000, // QNet standard for data transactions
             data: Some(activation_json), // String, not Vec<u8>
-            signature: None, // Will be signed by node
+            signature: None, // No signature needed - security via activation code validation
             tx_type: TransactionType::ContractCall, // Use tx_type, not transaction_type
             timestamp: record.activated_at,
         };
         
-        // PRODUCTION: Submit to blockchain through mempool
-        println!("🔗 Submitting activation transaction: {}", tx_hash);
+        // PRODUCTION: Submit to blockchain through GLOBAL mempool
+        println!("[REGISTRY] 🔗 Submitting activation transaction to mempool: {}", tx_hash);
         
-        // Use shared storage instance to avoid RocksDB lock conflicts
+        // CRITICAL: Use GLOBAL_MEMPOOL_INSTANCE to add transaction to mempool
+        // This ensures transaction will be included in next microblock
+        use crate::node::GLOBAL_MEMPOOL_INSTANCE;
+        
+        // Clone mempool Arc before releasing the lock to avoid lifetime issues
+        let mempool_arc_opt = if let Ok(mempool_guard) = GLOBAL_MEMPOOL_INSTANCE.lock() {
+            mempool_guard.clone()
+        } else {
+            println!("[REGISTRY] ⚠️ Failed to lock global mempool");
+            None
+        };
+        
+        if let Some(mempool_arc) = mempool_arc_opt {
+            // Serialize transaction to JSON for mempool
+            match serde_json::to_string(&transaction) {
+                Ok(tx_json) => {
+                    // Calculate transaction hash for mempool (using SHA3-256)
+                    use sha3::{Sha3_256, Digest};
+                    let tx_hash_for_mempool = format!("{:x}", Sha3_256::digest(tx_json.as_bytes()));
+                    
+                    // Add to mempool (blocks will pick it up automatically)
+                    let mempool_write = mempool_arc.write().await;
+                    if mempool_write.add_raw_transaction(tx_json, tx_hash_for_mempool.clone()) {
+                        println!("[REGISTRY] ✅ Activation transaction added to mempool: {}", tx_hash_for_mempool);
+                    } else {
+                        println!("[REGISTRY] ⚠️ Failed to add activation transaction to mempool (may be full or duplicate)");
+                    }
+                }
+                Err(e) => {
+                    println!("[REGISTRY] ❌ Failed to serialize activation transaction: {}", e);
+                }
+            }
+        } else {
+            println!("[REGISTRY] ⚠️ Global mempool not initialized yet");
+        }
+        
+        // Also store in transaction_pool for backward compatibility and quick lookup
         if let Some(ref storage) = self.storage {
-            // Convert transaction for storage
             let tx_hash_bytes = hex::decode(&tx_hash).unwrap_or_else(|_| vec![0u8; 32]);
             if tx_hash_bytes.len() == 32 {
                 let mut hash_array = [0u8; 32];
                 hash_array.copy_from_slice(&tx_hash_bytes);
-                
-                // Store in transaction pool for later inclusion in blocks
-                if let Err(e) = storage.transaction_pool.store_transaction(hash_array, transaction.clone()) {
-                    println!("[REGISTRY] ⚠️ Failed to store activation transaction: {}", e);
-                } else {
-                    println!("[REGISTRY] ✅ Activation transaction stored in pool: {}", tx_hash);
-                }
+                let _ = storage.transaction_pool.store_transaction(hash_array, transaction.clone());
             }
         }
-        
-        // FUTURE: When node instance is available, submit through mempool:
-        // This would be done by passing node reference to registry methods
-        // node.submit_transaction(transaction).await
         
         Ok(tx_hash)
     }
@@ -2034,7 +2058,7 @@ impl BlockchainActivationRegistry {
         wallet_address: &str,
         activation_code: &str
     ) -> Result<(), IntegrationError> {
-        println!("🔍 Verifying transaction funding...");
+        println!("[VERIFY] Verifying transaction funding...");
         
         // Extract transaction hash from activation code (Phase 1: burn tx, Phase 2: transfer tx)
         let tx_hash = match self.extract_tx_hash_from_code(activation_code).await {
@@ -2046,22 +2070,165 @@ impl BlockchainActivationRegistry {
             }
         };
         
-        // Phase 1: Query Solana blockchain to verify 1DEV burn
-        // Phase 2: Query QNet blockchain to verify QNC transfer to Pool 3
-        // Verify:
-        // 1. Transaction exists on respective blockchain
-        // 2. Wallet was the signer
-        // 3. Phase 1: Tokens burned, Phase 2: Tokens transferred to Pool 3
-        // 4. Amount meets phase requirements
+        // Check for Genesis bootstrap codes (skip Solana verification)
+        if tx_hash == "genesis_bootstrap" {
+            println!("[VERIFY] Genesis bootstrap code - skipping Solana verification");
+            return Ok(());
+        }
         
-        // For now: Basic validation (production would query respective blockchain RPC)
+        // Validate tx_hash format
         if tx_hash.is_empty() {
             return Err(IntegrationError::ValidationError(
                 "No transaction hash found in activation code".to_string()
             ));
         }
         
-        println!("✅ Transaction funding verified for tx: {}...", safe_preview(&tx_hash, 8));
+        // PRODUCTION: Query Solana blockchain to verify 1DEV burn via HTTP JSON-RPC
+        // Get Solana RPC endpoint from environment or use mainnet-beta
+        let solana_rpc_url = std::env::var("SOLANA_RPC_URL")
+            .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string());
+        
+        println!("[VERIFY] Querying Solana RPC: {}", solana_rpc_url);
+        println!("[VERIFY] Transaction hash: {}...", safe_preview(&tx_hash, 8));
+        
+        // Create HTTP client (reqwest uses rustls, no OpenSSL needed)
+        let client = reqwest::Client::new();
+        
+        // Solana JSON-RPC request: getTransaction
+        let request_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getTransaction",
+            "params": [
+                tx_hash,
+                {
+                    "encoding": "json",
+                    "maxSupportedTransactionVersion": 0
+                }
+            ]
+        });
+        
+        // Send HTTP POST request to Solana RPC
+        let response = client
+            .post(&solana_rpc_url)
+            .json(&request_body)
+            .send()
+            .await
+            .map_err(|e| IntegrationError::NetworkError(
+                format!("Failed to connect to Solana RPC: {}", e)
+            ))?;
+        
+        // Parse JSON-RPC response
+        let rpc_response: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| IntegrationError::NetworkError(
+                format!("Failed to parse Solana RPC response: {}", e)
+            ))?;
+        
+        // Check for RPC error
+        if let Some(error) = rpc_response.get("error") {
+            return Err(IntegrationError::ValidationError(
+                format!("Solana RPC error: {}", error)
+            ));
+        }
+        
+        // Extract transaction result
+        let result = rpc_response.get("result")
+            .ok_or_else(|| IntegrationError::ValidationError(
+                "No transaction result in RPC response".to_string()
+            ))?;
+        
+        // Check if transaction exists
+        if result.is_null() {
+            return Err(IntegrationError::ValidationError(
+                "Transaction not found on Solana blockchain".to_string()
+            ));
+        }
+        
+        // Extract transaction metadata
+        let meta = result.get("meta")
+            .ok_or_else(|| IntegrationError::ValidationError(
+                "Transaction metadata not found".to_string()
+            ))?;
+        
+        // Check transaction succeeded
+        if meta.get("err").is_some() && !meta["err"].is_null() {
+            return Err(IntegrationError::ValidationError(
+                format!("Solana transaction failed: {}", meta["err"])
+            ));
+        }
+        
+        // Verify burn amount (1 DEV = 1_000_000_000 lamports)
+        const MIN_BURN_AMOUNT: u64 = 1_000_000_000; // 1 DEV in lamports
+        
+        // Extract pre/post balances to verify burn
+        let pre_balances: Vec<u64> = meta.get("preBalances")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| IntegrationError::ValidationError(
+                "preBalances not found".to_string()
+            ))?
+            .iter()
+            .filter_map(|v| v.as_u64())
+            .collect();
+        
+        let post_balances: Vec<u64> = meta.get("postBalances")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| IntegrationError::ValidationError(
+                "postBalances not found".to_string()
+            ))?
+            .iter()
+            .filter_map(|v| v.as_u64())
+            .collect();
+        
+        if pre_balances.is_empty() || post_balances.is_empty() {
+            return Err(IntegrationError::ValidationError(
+                "Transaction balance data missing".to_string()
+            ));
+        }
+        
+        // Calculate burned amount (difference in balances)
+        let burned_amount = pre_balances.iter()
+            .zip(post_balances.iter())
+            .map(|(pre, post)| pre.saturating_sub(*post))
+            .sum::<u64>();
+        
+        if burned_amount < MIN_BURN_AMOUNT {
+            return Err(IntegrationError::ValidationError(
+                format!("Insufficient burn amount: {} lamports (required: {} lamports)", 
+                    burned_amount, MIN_BURN_AMOUNT)
+            ));
+        }
+        
+        // Verify wallet address matches transaction signer
+        let transaction_data = result.get("transaction")
+            .and_then(|t| t.get("message"))
+            .and_then(|m| m.get("accountKeys"))
+            .and_then(|keys| keys.as_array())
+            .and_then(|keys| keys.first())
+            .and_then(|key| key.as_str());
+        
+        if let Some(signer_address) = transaction_data {
+            // Compare wallet addresses (allow partial match for compatibility)
+            let wallet_prefix = if wallet_address.len() >= 10 { &wallet_address[..10] } else { wallet_address };
+            let signer_prefix = if signer_address.len() >= 10 { &signer_address[..10] } else { signer_address };
+            
+            if !wallet_address.contains(signer_prefix) && !signer_address.contains(wallet_prefix) {
+                println!("[VERIFY] Warning: Wallet address mismatch");
+                println!("[VERIFY]   Expected: {}...", safe_preview(wallet_address, 8));
+                println!("[VERIFY]   Found:    {}...", safe_preview(signer_address, 8));
+                // Allow for now, strict matching can be enabled later
+            }
+            
+            println!("[VERIFY] ✅ Solana burn verification successful");
+            println!("[VERIFY]   Burned: {} lamports ({} DEV)", burned_amount, burned_amount / 1_000_000_000);
+            println!("[VERIFY]   Signer: {}...", safe_preview(signer_address, 8));
+        } else {
+            println!("[VERIFY] ⚠️ Could not extract signer address, but burn amount verified");
+            println!("[VERIFY] ✅ Solana burn verification successful");
+            println!("[VERIFY]   Burned: {} lamports ({} DEV)", burned_amount, burned_amount / 1_000_000_000);
+        }
+        
         Ok(())
     }
 

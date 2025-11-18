@@ -112,6 +112,13 @@ lazy_static::lazy_static! {
     pub static ref GLOBAL_QUANTUM_CRYPTO: tokio::sync::Mutex<Option<crate::quantum_crypto::QNetQuantumCrypto>> = 
         tokio::sync::Mutex::new(None);
 }
+
+// CRITICAL: Global mempool instance for activation registry integration
+// Allows BlockchainActivationRegistry to submit transactions to mempool
+// without circular dependency on Node
+lazy_static::lazy_static! {
+    pub static ref GLOBAL_MEMPOOL_INSTANCE: std::sync::Mutex<Option<Arc<RwLock<qnet_mempool::SimpleMempool>>>> = std::sync::Mutex::new(None);
+}
 use sha3::{Sha3_256, Digest};
 use serde_json;
 use bincode;
@@ -700,6 +707,11 @@ impl BlockchainNode {
         };
         
         let mempool = Arc::new(RwLock::new(qnet_mempool::SimpleMempool::new(mempool_config)));
+        
+        // CRITICAL: Set global mempool instance for activation registry
+        // This allows Registry to submit transactions without circular dependency
+        *GLOBAL_MEMPOOL_INSTANCE.lock().unwrap() = Some(mempool.clone());
+        println!("[Node] 🔐 Global mempool instance set (shared with activation registry)");
         
         // Generate unique node_id for Byzantine consensus
         let node_id = Self::generate_unique_node_id(node_type).await;
@@ -1369,6 +1381,45 @@ impl BlockchainNode {
                 } else {
                     println!("[REWARDS] ✅ Genesis node registered: {} (wallet: {}...)", 
                              genesis_node_id, &genesis_wallet[..30]);
+                }
+            }
+            
+            // CRITICAL FIX: Register Genesis node in BlockchainActivationRegistry
+            // This ensures ALL nodes see Genesis in Registry for deterministic consensus
+            {
+                let storage_ref = GLOBAL_STORAGE_INSTANCE.lock().unwrap().clone();
+                let registry = crate::activation_validation::BlockchainActivationRegistry::new_with_storage(
+                    None, // Use default RPC
+                    storage_ref
+                );
+                
+                let genesis_node_id = format!("genesis_node_{}", bootstrap_id);
+                let genesis_wallet = crate::genesis_constants::get_genesis_wallet_by_id(&bootstrap_id)
+                    .expect("Genesis wallet must exist")
+                    .to_string();
+                
+                let current_time = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                
+                let node_info = crate::activation_validation::NodeInfo {
+                    activation_code: format!("genesis_activation_{}", bootstrap_id),
+                    wallet_address: genesis_wallet.clone(),
+                    device_signature: format!("genesis_device_{}", bootstrap_id),
+                    node_type: "Super".to_string(),
+                    activated_at: current_time,
+                    last_seen: current_time,
+                    migration_count: 0,
+                };
+                
+                if let Err(e) = registry.register_activation_on_blockchain(
+                    &format!("genesis_activation_{}", bootstrap_id), 
+                    node_info
+                ).await {
+                    println!("[REGISTRY] ⚠️ Failed to register Genesis in blockchain: {}", e);
+                } else {
+                    println!("[REGISTRY] ✅ Genesis node {} registered in blockchain registry", genesis_node_id);
                 }
             }
             
@@ -2546,27 +2597,49 @@ impl BlockchainNode {
                 println!("[Node] 📡 Byzantine consensus requires minimum 4 nodes");
                 
                 // CRITICAL FIX: Wait until we have enough nodes for Byzantine consensus
+                // ARCHITECTURE: Genesis bootstrap requires ALL 5 nodes for deterministic start
+                // This ensures no split brain and consistent producer selection
                 if let Some(ref p2p) = self.unified_p2p {
                     let mut wait_time = 0;
+                    let is_genesis_node = std::env::var("QNET_BOOTSTRAP_ID").is_ok();
+                    
                     loop {
                         let validated_peers = p2p.get_validated_active_peers();
                         let total_nodes = validated_peers.len() + 1; // +1 for self
                         
-                        if total_nodes >= 4 {
+                        // CRITICAL: Genesis nodes MUST wait for ALL 5 nodes
+                        // Regular nodes need only 4 for Byzantine consensus
+                        let required_nodes = if is_genesis_node { 5 } else { 4 };
+                        
+                        if total_nodes >= required_nodes {
                             println!("[Node] ✅ Byzantine consensus ready: {} nodes connected", total_nodes);
-                            println!("[Node] 🚀 All Genesis nodes found, starting production!");
+                            
+                            // CRITICAL: Genesis nodes verify ALL 5 are actually reachable
+                            if is_genesis_node && total_nodes == 5 {
+                                // Double-check connectivity to prevent false positives
+                                let all_reachable = p2p.verify_all_genesis_connectivity().await;
+                                if !all_reachable {
+                                    println!("[Node] ⚠️ Not all Genesis nodes reachable, retrying...");
+                                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                                    wait_time += 2;
+                                    continue;
+                                }
+                            }
+                            
+                            println!("[Node] 🚀 All required nodes found, starting production!");
                             break;
                         }
                         
-                        println!("[Node] ⏳ Waiting for Genesis nodes: {}/4 connected ({}s elapsed)", 
-                                 total_nodes, wait_time);
+                        println!("[Node] ⏳ Waiting for nodes: {}/{} connected ({}s elapsed)", 
+                                 total_nodes, required_nodes, wait_time);
                         
                         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                         wait_time += 5;
                         
-                        // Maximum wait 60 seconds
-                        if wait_time >= 60 {
-                            println!("[Node] ⚠️ Timeout waiting for Genesis nodes, proceeding with {} nodes", total_nodes);
+                        // Maximum wait: 120 seconds for Genesis, 60 for regular
+                        let max_wait = if is_genesis_node { 120 } else { 60 };
+                        if wait_time >= max_wait {
+                            println!("[Node] ⚠️ Timeout waiting for nodes, proceeding with {} nodes", total_nodes);
                             break;
                         }
                     }
@@ -3047,9 +3120,27 @@ impl BlockchainNode {
                                                     }
                                                     
                                                     // CRITICAL: ALWAYS broadcast certificate after Genesis, even if instance existed
+                                                    // ARCHITECTURE: Delay broadcast to ensure all Genesis nodes are ready
                                                     if let Some(hybrid) = instances_guard.get(&normalized_id) {
                                                         if let Some(cert) = hybrid.get_current_certificate() {
                                                             if let Ok(cert_bytes) = bincode::serialize(&cert) {
+                                                                // CRITICAL FIX: Wait for all Genesis nodes to be connected
+                                                                println!("[GENESIS] ⏳ Waiting for all peers before certificate broadcast...");
+                                                                
+                                                                // Ensure all 5 Genesis nodes are connected
+                                                                let mut retry_count = 0;
+                                                                while retry_count < 10 {
+                                                                    let all_connected = p2p.verify_all_genesis_connectivity().await;
+                                                                    if all_connected {
+                                                                        break;
+                                                                    }
+                                                                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                                                                    retry_count += 1;
+                                                                }
+                                                                
+                                                                // Additional delay to ensure peers are ready to receive
+                                                                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                                                                
                                                                 println!("[GENESIS] 🔐 Broadcasting certificate AFTER Genesis creation: {}", cert.serial_number);
                                                                 if let Err(e) = p2p.broadcast_certificate_announce(cert.serial_number.clone(), cert_bytes) {
                                                                     println!("[GENESIS] ⚠️ Certificate broadcast failed: {}", e);
@@ -3129,9 +3220,27 @@ impl BlockchainNode {
                                     }
                                     
                                     // CRITICAL: ALWAYS broadcast certificate after Genesis, even if instance existed
+                                    // ARCHITECTURE: Ensure all peers are connected before certificate broadcast
                                     if let Some(hybrid) = instances_guard.get(&normalized_id) {
                                         if let Some(cert) = hybrid.get_current_certificate() {
                                             if let Ok(cert_bytes) = bincode::serialize(&cert) {
+                                                // CRITICAL FIX: Wait for all Genesis nodes to be connected
+                                                println!("[GENESIS] ⏳ Waiting for all peers before certificate broadcast...");
+                                                
+                                                // Ensure all 5 Genesis nodes are connected
+                                                let mut retry_count = 0;
+                                                while retry_count < 10 {
+                                                    let all_connected = p2p.verify_all_genesis_connectivity().await;
+                                                    if all_connected {
+                                                        break;
+                                                    }
+                                                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                                                    retry_count += 1;
+                                                }
+                                                
+                                                // Additional delay to ensure peers are ready to receive
+                                                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                                                
                                                 println!("[GENESIS] 🔐 Broadcasting certificate AFTER Genesis reception: {}", cert.serial_number);
                                                 if let Err(e) = p2p.broadcast_certificate_announce(cert.serial_number.clone(), cert_bytes) {
                                                     println!("[GENESIS] ⚠️ Certificate broadcast failed: {}", e);
@@ -3634,13 +3743,8 @@ impl BlockchainNode {
                 let own_node_id = node_id.clone(); // Use the validated node_id from startup
                 let is_selected_producer = true; // Will be checked properly in production loop
                 
-                // EXISTING: Use cached phase detection with sophisticated caching
-                // PERFORMANCE: CACHED_PHASE_DETECTION prevents duplicate HTTP calls
-                let network_phase = if let Some(p2p) = &unified_p2p {
-                    Self::is_genesis_bootstrap_phase(p2p).await // EXISTING: Uses CACHED_PHASE_DETECTION internally
-                } else {
-                    true // Solo mode assumes Genesis phase
-                };
+                // ARCHITECTURE: No phases - always use unified logic
+                let network_phase = false; // Deprecated - always use registry
                 
                 let byzantine_safety_required = network_phase; // EXISTING: ONLY Genesis phase for microblock production
                 // EXISTING: Normal phase microblocks use producer signatures only (no Byzantine consensus)
@@ -3910,41 +4014,42 @@ impl BlockchainNode {
                                 }
                             }
                             
-                            // CRITICAL: DO NOT WAIT! Responses will be processed asynchronously
-                            // Verification happens in background without blocking block production
-                            println!("[CONSENSUS] 🔄 Sent entropy requests to {} peers - verification in background", 
+                            // CRITICAL FIX: WAIT for entropy consensus at rotation boundaries
+                            // This prevents forks by ensuring all nodes agree on entropy before proceeding
+                            println!("[CONSENSUS] 🔄 Sent entropy requests to {} peers - waiting for consensus...", 
                                     sample_size - already_have_responses);
+                            
+                            // ARCHITECTURE: Block production MUST wait for entropy consensus at rotation boundaries
+                            // This is critical for preventing forks when VRF selects new producer
+                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await; // Wait for responses
                         } else {
                             println!("[CONSENSUS] ✅ Already have {} entropy responses for block {}", 
                                     already_have_responses, entropy_height);
                         }
                         
-                        // Spawn async task to verify entropy after responses arrive
-                        let storage_clone = storage.clone();
-                        let p2p_clone = unified_p2p.clone();
-                        let our_entropy_clone = our_entropy.clone();
-                        let sample_size_clone = sample_size;
-                        tokio::spawn(async move {
-                            // Wait for responses in background (does not block block production)
-                            tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+                        // CRITICAL FIX: Verify entropy consensus SYNCHRONOUSLY at rotation boundary
+                        // This blocks production until consensus is reached
+                        {
+                            // Give peers time to respond
+                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                             
                             let mut matches = 0;
                             let mut mismatches = 0;
                             
-                            // Check received responses
+                            // Check received responses SYNCHRONOUSLY
                             {
                                 let responses = ENTROPY_RESPONSES.lock().unwrap();
                                 for ((height, responder), peer_entropy) in responses.iter() {
                                     if *height == entropy_height {
-                                        if *peer_entropy == our_entropy_clone {
+                                        if *peer_entropy == our_entropy {
                                             matches += 1;
                                             println!("[CONSENSUS] ✅ Entropy match with {}", responder);
                                         } else {
                                             mismatches += 1;
                                             println!("[CONSENSUS] ❌ Entropy mismatch with {}: expected {:x}, got {:x}",
                                                     responder,
-                                                    u64::from_le_bytes([our_entropy_clone[0], our_entropy_clone[1], our_entropy_clone[2], our_entropy_clone[3],
-                                                                       our_entropy_clone[4], our_entropy_clone[5], our_entropy_clone[6], our_entropy_clone[7]]),
+                                                    u64::from_le_bytes([our_entropy[0], our_entropy[1], our_entropy[2], our_entropy[3],
+                                                                       our_entropy[4], our_entropy[5], our_entropy[6], our_entropy[7]]),
                                                     u64::from_le_bytes([peer_entropy[0], peer_entropy[1], peer_entropy[2], peer_entropy[3],
                                                                        peer_entropy[4], peer_entropy[5], peer_entropy[6], peer_entropy[7]]));
                                         }
@@ -3952,46 +4057,26 @@ impl BlockchainNode {
                                 }
                             }
                             
-                            // If majority disagrees with our entropy, we need to resync
+                            // If majority disagrees with our entropy, we MUST NOT proceed
+                            // ARCHITECTURE: Fork prevention - stop if no entropy consensus
                             if mismatches > 0 && mismatches > matches {
                                 println!("[CONSENSUS] ⚠️ Entropy mismatch detected! {} peers disagree vs {} agree", 
                                         mismatches, matches);
-                                println!("[CONSENSUS] 🔄 Triggering resync to restore consensus");
+                                println!("[CONSENSUS] 🛑 STOPPING production to prevent fork!");
                                 
-                                // CRITICAL: Trigger immediate resync to restore consensus
-                                if let Some(p2p) = &p2p_clone {
-                                    println!("[CONSENSUS] 🔄 Starting emergency resync from network");
-                                    
-                                    // Get current height to know where to sync from
-                                    let current_height = storage_clone.get_chain_height()
-                                        .unwrap_or(0);
-                                    
-                                    // Find the highest peer to sync from
-                                    let peers = p2p.get_validated_active_peers();
-                                    if !peers.is_empty() {
-                                        // Start fast sync from the beginning of current round
-                                        let sync_from = ((current_height / 30) * 30).saturating_sub(30);
-                                        println!("[CONSENSUS] 🔄 Resyncing from block {} to restore consensus", sync_from);
-                                        
-                                        // CRITICAL FIX: Check and set atomically to avoid race condition
-                                        // Only set if not already in progress
-                                        if !FAST_SYNC_IN_PROGRESS.load(Ordering::SeqCst) {
-                                            FAST_SYNC_IN_PROGRESS.store(true, Ordering::SeqCst);
-                                            FAST_SYNC_START_TIME.store(get_timestamp_safe(), Ordering::Relaxed);
-                                        }
-                                        NODE_IS_SYNCHRONIZED.store(false, Ordering::Relaxed);
-                                        
-                                        // Trigger sync (will be picked up by sync loop)
-                                        println!("[CONSENSUS] 🔄 Emergency resync triggered - node will resync on next cycle");
-                                    }
-                                }
+                                // CRITICAL: DO NOT PRODUCE BLOCK WITHOUT ENTROPY CONSENSUS
+                                // This prevents fork at rotation boundary
+                                println!("[CONSENSUS] ❌ Cannot proceed without entropy consensus - skipping block production");
+                                
+                                // Skip this rotation round to prevent fork
+                                continue;
                             } else if matches > 0 {
                                 println!("[CONSENSUS] ✅ Entropy consensus verified: {} peers agree, {} disagree", 
                                         matches, mismatches);
-                            } else if sample_size_clone > 0 {
-                                println!("[CONSENSUS] ⏳ No entropy responses received from {} peers", sample_size_clone);
+                            } else {
+                                println!("[CONSENSUS] ⏳ No entropy responses received from {} peers", sample_size);
                             }
-                        });
+                        }
                     }
                 }
                 
@@ -5834,6 +5919,46 @@ impl BlockchainNode {
     // Light node detection now uses peer.node_type and own_node_type directly
     // This eliminates guessing and potential misclassification of Full/Super nodes
     
+    /// Helper: Get count of recent producer failures for deterministic exclusion
+    /// ARCHITECTURE: Uses actual failover history from blockchain storage
+    async fn get_recent_producer_failures(
+        node_id: &str,
+        current_height: u64,
+        storage: &Arc<Storage>,
+    ) -> usize {
+        // Check last 30 blocks (one rotation period) for failures
+        const CHECK_RANGE: u64 = 30;
+        const FROM_HEIGHT: u64 = 0; // Start from beginning for deterministic history
+        
+        // Get failover history from storage (deterministic across all nodes)
+        match storage.get_failover_history(FROM_HEIGHT, CHECK_RANGE as usize) {
+            Ok(events) => {
+                // Count how many times this node failed as producer in recent blocks
+                let recent_failures = events.iter()
+                    .filter(|event| {
+                        // Check if this node was the failed producer
+                        event.failed_producer == node_id &&
+                        // Only count recent failures (within check range)
+                        event.height + CHECK_RANGE >= current_height &&
+                        event.height <= current_height
+                    })
+                    .count();
+                
+                if recent_failures > 0 {
+                    println!("[FAILOVER] 📊 Node {} has {} recent failures in last {} blocks", 
+                            node_id, recent_failures, CHECK_RANGE);
+                }
+                
+                recent_failures
+            }
+            Err(e) => {
+                println!("[FAILOVER] ⚠️ Could not get failover history: {}", e);
+                // If we can't get history, assume node is OK (fail-open for availability)
+                0
+            }
+        }
+    }
+    
     /// CRITICAL: Emergency producer selection when current producer fails
     /// NOTE: Does NOT use PoH to ensure 100% determinism even for out-of-sync nodes
     async fn select_emergency_producer(
@@ -5845,11 +5970,7 @@ impl BlockchainNode {
         storage: Option<Arc<Storage>>, // Pass storage for failover tracking
     ) -> String {
         if let Some(p2p) = unified_p2p {
-            // CRITICAL FIX: For Genesis phase, use SAME candidate source as normal producer selection
-            let is_genesis_phase = Self::is_genesis_bootstrap_phase(p2p).await;
-            let is_genesis_node = std::env::var("QNET_BOOTSTRAP_ID")
-                .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
-                .unwrap_or(false);
+            // ARCHITECTURE: Always use unified candidate source
             
             // EXISTING: Get qualified candidates excluding the failed producer
             let mut candidates = Vec::new();
@@ -5902,97 +6023,28 @@ impl BlockchainNode {
                          own_node_id, own_node_type);
             };
             
-            // CONSENSUS FIX: For Genesis phase, use DETERMINISTIC list
-            if is_genesis_phase || is_genesis_node {
-                // CRITICAL: Use STATIC Genesis list with EQUAL weights for 100% determinism
-                println!("[EMERGENCY_SELECTION] 🌱 Genesis phase: using STATIC list with EQUAL weights");
+            // Use same candidate source as normal production
+            {
+                // ARCHITECTURE: Use SAME calculate_qualified_candidates for determinism
+                // This ensures emergency selection uses same list as normal selection
+                println!("[EMERGENCY_SELECTION] 📋 Using standard qualified candidates");
                 
-                // CRITICAL: Clear any previously added candidates (e.g. own_node)
-                // We need ONLY the deterministic Genesis list
-                candidates.clear();
+                let qualified = Self::calculate_qualified_candidates(p2p, own_node_id, own_node_type).await;
                 
-                // DETERMINISTIC: Always same 5 Genesis nodes
-                for i in 1..=5 {
-                    let peer_node_id = format!("genesis_node_{:03}", i);
-                    
+                for (node_id, reputation) in qualified {
                     // Exclude failed producer
-                    if peer_node_id == failed_producer {
-                        println!("[EMERGENCY_SELECTION] 💀 Excluding failed producer {} from emergency candidates", peer_node_id);
+                    if node_id == failed_producer {
+                        println!("[EMERGENCY_SELECTION] 💀 Excluding failed producer {} from emergency candidates", node_id);
                         continue;
                     }
                     
-                    // CRITICAL: Use EQUAL weight for ALL to ensure 100% determinism
-                    // Reputation differences can cause slight variations in floating point math
-                    let deterministic_weight = 1.0;
-                    
-                    candidates.push((peer_node_id.clone(), deterministic_weight));
-                    println!("[EMERGENCY_SELECTION] ✅ Genesis emergency candidate {} added (weight: {:.1})", 
-                             peer_node_id, deterministic_weight);
-                }
-            } else {
-                // Normal phase: Try to use cached candidates from current round
-                println!("[EMERGENCY_SELECTION] 📦 Attempting to use cached candidates from current round");
-                
-                // Calculate current round
-                let rotation_interval = 30u64;
-                let leadership_round = if current_height <= 30 {
-                    0
-                } else {
-                    (current_height - 1) / rotation_interval
-                };
-                
-                // Try to get candidates from cache
-                use producer_cache::CACHED_PRODUCER_SELECTION;
-                let mut used_cache = false;
-                
-                if let Some(producer_cache) = CACHED_PRODUCER_SELECTION.get() {
-                    if let Ok(cache) = producer_cache.lock() {
-                        if let Some((_, round_candidates)) = cache.get(&leadership_round) {
-                            // Use cached candidates from current round
-                            println!("[EMERGENCY_SELECTION] 📋 Found {} candidates in round {} cache", 
-                                     round_candidates.len(), leadership_round);
-                            
-                            for (node_id, reputation) in round_candidates {
-                                if node_id == failed_producer {
-                                    println!("[EMERGENCY_SELECTION] 💀 Excluding failed producer {} from cached candidates", node_id);
-                                    continue;
-                                }
-                                candidates.push((node_id.clone(), *reputation));
-                            }
-                            used_cache = true;
-                        }
-                    }
-                }
-                
-                // Fallback if no cache: Use validated peers
-                if !used_cache {
-                    println!("[EMERGENCY_SELECTION] ⚠️ No cached candidates - using validated peers");
-                    let peers = p2p.get_validated_active_peers();
-                    for peer in peers {
-                        let peer_node_id = peer.id.clone();
-                        
-                        // Exclude failed producer
-                        if peer_node_id == failed_producer {
-                            println!("[EMERGENCY_SELECTION] 💀 Excluding failed producer {} from emergency candidates", peer_node_id);
-                            continue;
-                        }
-                        
-                        // CRITICAL: Do NOT filter by reputation to ensure deterministic list
-                        let reputation = Self::get_node_reputation_score(&peer_node_id, p2p).await;
-                        
-                        // Use minimum weight if below threshold (ensures deterministic list)
-                        let effective_reputation = if reputation < 0.70 {
-                            0.01  // Very low weight but still in candidate list
-                        } else {
-                            reputation
-                        };
-                        
-                        candidates.push((peer_node_id.clone(), effective_reputation));
-                        println!("[EMERGENCY_SELECTION] ✅ Emergency candidate {} added (effective weight: {:.3})", 
-                                 peer_node_id, effective_reputation);
-                    }
+                    // Add all others as candidates (no failover history filtering - breaks determinism)
+                    candidates.push((node_id.clone(), reputation));
+                    println!("[EMERGENCY_SELECTION] ✅ Emergency candidate {} added (reputation: {:.1}%)", 
+                             node_id, reputation * 100.0);
                 }
             }
+            
             
             
             // VALIDATION: Filter out any fallback IDs (process-based) from candidates
@@ -6015,7 +6067,7 @@ impl BlockchainNode {
                 println!("[FAILOVER] 💀 CRITICAL: No valid backup producers available!");
                 
                 // EMERGENCY MODE: Use existing Progressive Degradation Protocol
-                if is_genesis_phase {
+                if false { // Deprecated - no longer using phases
                     // Genesis phase: Try progressively lower reputation thresholds
                     println!("[FAILOVER] 🚨 EMERGENCY: Activating reputation degradation for Genesis");
                     
@@ -6292,7 +6344,7 @@ impl BlockchainNode {
     }
     
     /// PRODUCTION: Calculate qualified candidates with validator sampling for scalability
-    /// Implements sampling to prevent millions of validators from participating in consensus
+    /// ARCHITECTURE: Uses BlockchainRegistry ALWAYS for true decentralization from block #1
     async fn calculate_qualified_candidates(
         p2p: &Arc<SimplifiedP2P>,
         own_node_id: &str,
@@ -6300,34 +6352,86 @@ impl BlockchainNode {
     ) -> Vec<(String, f64)> {
         let mut all_qualified: Vec<(String, f64)> = Vec::new();
         
-        // PRODUCTION: Calculate qualified candidates for consensus determinism
+        println!("[CANDIDATES] 📊 Calculating qualified candidates (decentralized)");
         
-        // PRODUCTION: Determine network phase (Genesis vs Normal operation)
-        let is_genesis_phase = Self::is_genesis_bootstrap_phase(p2p).await;
-        
-        // CRITICAL FIX: Additional fallback for Genesis nodes that can't sync
-        // If QNET_BOOTSTRAP_ID is set for Genesis nodes (001-005), force Genesis phase
-        let is_genesis_node = std::env::var("QNET_BOOTSTRAP_ID")
-            .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
-            .unwrap_or(false);
-        
-        let force_genesis_phase = is_genesis_phase || is_genesis_node;
-        
-        if force_genesis_phase {
-            if is_genesis_node && !is_genesis_phase {
-                println!("  ├── 🚨 FALLBACK: Genesis node {} forced into Genesis phase (P2P sync failed)", 
-                        std::env::var("QNET_BOOTSTRAP_ID").unwrap_or_default());
-            }
-            println!("  ├── 🌱 Genesis Phase: Using static Genesis nodes (≤5 nodes)");
-            return Self::get_genesis_qualified_candidates(p2p, own_node_id, own_node_type).await;
+        // STEP 1: Get nodes from BlockchainActivationRegistry
+        let qnet_rpc = std::env::var("QNET_RPC_URL")
+            .or_else(|_| std::env::var("QNET_GENESIS_NODES")
+                .map(|nodes| format!("http://{}:8001", nodes.split(',').next().unwrap_or("127.0.0.1").trim())))
+            .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
+            
+        let storage_ref = if let Ok(_) = std::env::var("QNET_STORAGE_PATH") {
+            GLOBAL_STORAGE_INSTANCE.lock().unwrap().clone()
         } else {
-            println!("  ├── 🌍 Normal Phase: Using blockchain registry (millions of nodes)");
-            return Self::get_registry_qualified_candidates(own_node_id, own_node_type).await;
+            None
+        };
+            
+        let registry = crate::activation_validation::BlockchainActivationRegistry::new_with_storage(
+            Some(qnet_rpc),
+            storage_ref
+        );
+        
+        // Get ALL eligible nodes from registry (including Genesis if registered)
+        // Registry already filters: Full/Super nodes with reputation >= 70%
+        let registry_candidates = registry.get_eligible_nodes().await;
+        println!("[CANDIDATES] 📋 Registry returned {} eligible nodes", registry_candidates.len());
+        
+        // Add all qualified nodes from registry (already filtered by Registry)
+        for (node_id, reputation, node_type_str) in registry_candidates {
+            all_qualified.push((node_id.clone(), reputation));
+            println!("[CANDIDATES]   ├── {} ({}, {:.0}%)", node_id, node_type_str, reputation * 100.0);
+        }
+        
+        // FALLBACK: If registry is empty (network bootstrap), add Genesis nodes
+        if all_qualified.is_empty() {
+            println!("[CANDIDATES] ⚠️ Registry empty - using Genesis bootstrap fallback");
+            for i in 1..=5 {
+                let genesis_id = format!("genesis_node_{:03}", i);
+                all_qualified.push((genesis_id.clone(), 0.70));
+                println!("[CANDIDATES]   ├── Bootstrap: {} (70% fixed)", genesis_id);
+            }
+        }
+        
+        // Add own node if eligible
+        let can_participate = match own_node_type {
+            NodeType::Super | NodeType::Full => {
+                let own_reputation = Self::get_node_reputation_score(own_node_id, p2p).await;
+                own_reputation >= 0.70
+            },
+            NodeType::Light => false,
+        };
+        
+        if can_participate && !all_qualified.iter().any(|(id, _)| id == own_node_id) {
+            all_qualified.push((own_node_id.to_string(), 0.70));
+            println!("[CANDIDATES]   ├── Own node: {} (eligible)", own_node_id);
+        }
+        
+        // Remove duplicates
+        all_qualified.dedup_by(|a, b| a.0 == b.0);
+        
+        println!("[CANDIDATES] 📊 Total qualified: {} nodes", all_qualified.len());
+        
+        // Apply validator sampling for scalability
+        const MAX_VALIDATORS_PER_ROUND: usize = 1000;
+        
+        if all_qualified.len() <= MAX_VALIDATORS_PER_ROUND {
+            all_qualified
+        } else {
+            println!("[CANDIDATES] 📊 Sampling {} validators from {} (scalability)", 
+                     MAX_VALIDATORS_PER_ROUND, all_qualified.len());
+            Self::deterministic_validator_sampling(&all_qualified, MAX_VALIDATORS_PER_ROUND).await
         }
     }
     
-    /// Detect if network is in Genesis bootstrap phase using DETERMINISTIC network height
-    async fn is_genesis_bootstrap_phase(p2p: &Arc<SimplifiedP2P>) -> bool {
+    /// DEPRECATED: No longer using phases - always use unified logic
+    #[allow(dead_code)]
+    async fn is_genesis_bootstrap_phase(_p2p: &Arc<SimplifiedP2P>) -> bool {
+        false // Always return false - we don't use phases anymore
+    }
+    
+    /// Legacy function kept for compatibility
+    #[allow(dead_code)]
+    async fn _is_genesis_bootstrap_phase_old(p2p: &Arc<SimplifiedP2P>) -> bool {
         // PERFORMANCE FIX: Cache phase detection to prevent HTTP spam every microblock
         // Network phase changes very rarely (only once at height 1000)
         use std::sync::{Arc as StdArc, Mutex};
@@ -6447,8 +6551,9 @@ impl BlockchainNode {
         true
     }
     
-    /// Get qualified candidates for Genesis phase (≤5 static nodes)
-    async fn get_genesis_qualified_candidates(
+    /// DEPRECATED: Legacy function - use calculate_qualified_candidates() instead
+    #[allow(dead_code)]
+    async fn _get_genesis_qualified_candidates_legacy(
         p2p: &Arc<SimplifiedP2P>,
         own_node_id: &str,
         own_node_type: NodeType,
@@ -6494,29 +6599,26 @@ impl BlockchainNode {
             .map(|(i, ip)| (format!("genesis_node_{:03}", i + 1), ip.clone()))
             .collect();
         
-        // CRITICAL FIX: For Genesis phase, use ALL 5 Genesis nodes ALWAYS (deterministic)
-        // This ensures IDENTICAL candidate lists on ALL nodes (Byzantine consensus requirement)
-        // Dead nodes will fail to produce blocks → automatic failover + reputation penalty
-        
-        // DETERMINISTIC CONSENSUS: ALL nodes must have IDENTICAL candidate lists
-        // Otherwise different nodes calculate different producers → FORK!
+        // ARCHITECTURE: For Genesis phase, use DETERMINISTIC candidate list
+        // All nodes must see SAME list to ensure Byzantine consensus
+        // Failed nodes will timeout and trigger emergency producer change
         
         println!("[GENESIS] 🔐 Using DETERMINISTIC Genesis candidate list (all 5 nodes)");
         
-        // CRITICAL: For Genesis phase, use FIXED reputation (70%) for ALL Genesis nodes
-        // This ensures IDENTICAL candidate lists on ALL nodes (Byzantine requirement)
-        // Real reputation tracking still happens but doesn't affect candidate selection
+        // CRITICAL: Include ALL Genesis nodes for deterministic consensus
+        // This ensures all nodes calculate same producer selection
         const GENESIS_FIXED_REPUTATION: f64 = 0.70;
         
+        // For Genesis phase, include all 5 nodes deterministically
+        // Connectivity issues will be handled by timeout/failover mechanism
         for (node_id, _ip) in &static_genesis_nodes {
-            // DETERMINISTIC CONSENSUS: Use FIXED reputation for Genesis phase
-            // All nodes MUST have same candidate list → all use same reputation value
-            // Real reputation is logged but NOT used for candidate filtering
+            // During Genesis phase, assume all nodes are candidates
+            // This ensures deterministic producer selection across all nodes
             
-                let real_reputation = Self::get_node_reputation_score(node_id, p2p).await;
+            let real_reputation = Self::get_node_reputation_score(node_id, p2p).await;
                 
-            // PRODUCTION: Always include Genesis nodes with FIXED reputation
-            // This guarantees deterministic candidate list across all nodes
+            // PRODUCTION: Always include ALL Genesis nodes with fixed reputation
+            // Deterministic list ensures all nodes agree on candidates
             all_qualified.push((node_id.clone(), GENESIS_FIXED_REPUTATION));
             
             if real_reputation < 0.70 {
@@ -6582,8 +6684,9 @@ impl BlockchainNode {
         sampled_candidates
     }
     
-    /// Get qualified candidates for Normal phase (millions of nodes via blockchain registry)
-    async fn get_registry_qualified_candidates(
+    /// DEPRECATED: Legacy function - use calculate_qualified_candidates() instead
+    #[allow(dead_code)]
+    async fn _get_registry_qualified_candidates_legacy(
         own_node_id: &str,
         own_node_type: NodeType,
     ) -> Vec<(String, f64)> {
@@ -6594,9 +6697,7 @@ impl BlockchainNode {
             .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
             
         // CRITICAL: Get shared storage reference to avoid RocksDB lock conflicts
-        // Storage is set as global through QNET_STORAGE_INSTANCE
         let storage_ref = if let Ok(storage_path) = std::env::var("QNET_STORAGE_PATH") {
-            // Try to get from global storage (will be set by node initialization)
             GLOBAL_STORAGE_INSTANCE.lock().unwrap().clone()
         } else {
             None
@@ -6607,10 +6708,12 @@ impl BlockchainNode {
             storage_ref
         );
         
-        // Note: Registry sync is handled internally by the registry system
-        println!("  ├── 📊 Using registry data (sync handled internally)");
+        // ARCHITECTURE: Registry already uses FINALITY_WINDOW internally
+        // BlockchainActivationRegistry reads from blockchain with built-in lag
+        // This ensures deterministic results across all nodes
+        println!("  ├── 📊 Using BlockchainActivationRegistry (with built-in FINALITY_WINDOW)");
         
-        // Get eligible nodes from registry
+        // Get eligible nodes from registry (deterministic via blockchain)
         let registry_candidates = registry.get_eligible_nodes().await;
         println!("  ├── Registry returned {} eligible nodes", registry_candidates.len());
         
@@ -7095,25 +7198,17 @@ impl BlockchainNode {
         if let Some(p2p) = unified_p2p {
             let validated_peers = p2p.get_validated_active_peers();
             let available_nodes = validated_peers.len() + 1; // Include self
-            let is_genesis_phase = current_height < 1000;
+        
             
-            println!("[PFP]    Phase: {} | Available nodes: {}", 
-                     if is_genesis_phase { "Genesis" } else { "Normal" },
+            println!("[PFP]    Height: {} | Available nodes: {}", 
+                     current_height,
                      available_nodes);
             
-            // Progressive degradation based on blocks without finalization
-            let (required_nodes, timeout, finalization_type) = if is_genesis_phase {
-                // Genesis phase (5 nodes max)
-                match blocks_without_finalization {
-                    0..=90 => (4, 30, "standard"),      // 80% of 5 = 4 nodes
-                    91..=180 => (3, 10, "checkpoint"),  // 60% of 5 = 3 nodes
-                    181..=270 => (2, 5, "emergency"),   // 40% of 5 = 2 nodes
-                    _ => (1, 2, "critical"),             // Single node
-                }
-            } else {
-                // Normal phase (potentially millions of nodes)
-                // Calculate percentages but cap at 1000 for performance
-                let total_for_consensus = std::cmp::min(available_nodes, 1000);
+            // Progressive degradation based on ACTUAL network size
+            // No artificial phases - use real node count
+            let total_for_consensus = std::cmp::min(available_nodes, 1000); // Cap at 1000 for scalability
+            
+            let (required_nodes, timeout, finalization_type) = {
                 match blocks_without_finalization {
                     0..=90 => {
                         // Standard: 80% of available (max 800)
@@ -8723,25 +8818,9 @@ impl BlockchainNode {
             let round_id = end_height; // Macroblock height as round ID
             
             // STEP 1: Use EXISTING qualified candidates system with validator sampling (1000 max)
-            let mut qualified_candidates = Self::calculate_qualified_candidates(p2p, node_id, node_type).await;
+            let qualified_candidates = Self::calculate_qualified_candidates(p2p, node_id, node_type).await;
             
-            // CRITICAL FIX: Genesis fallback for consensus participants
-            if qualified_candidates.is_empty() {
-                let is_genesis_node = std::env::var("QNET_BOOTSTRAP_ID")
-                    .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
-                    .unwrap_or(false);
-                
-                if is_genesis_node {
-                    println!("[CONSENSUS] 🔧 Using Genesis fallback for consensus participants");
-                    qualified_candidates = vec![
-                        ("genesis_node_001".to_string(), 0.70),
-                        ("genesis_node_002".to_string(), 0.70),
-                        ("genesis_node_003".to_string(), 0.70),
-                        ("genesis_node_004".to_string(), 0.70),
-                        ("genesis_node_005".to_string(), 0.70),
-                    ];
-                }
-            }
+            // No need for additional fallback - calculate_qualified_candidates handles it
             
             let all_participants: Vec<String> = qualified_candidates.into_iter()
                 .map(|(node_id, _reputation)| node_id)
@@ -8750,12 +8829,11 @@ impl BlockchainNode {
                      round_id, all_participants.len());
             
             // CRITICAL FIX: Progressive degradation for macroblock consensus
-            // Matches microblock logic to prevent deadlock in small/Genesis networks
-            let is_genesis_network = std::env::var("QNET_BOOTSTRAP_ID").is_ok();
-            let network_size = p2p.get_validated_active_peers().len() + 1; // Include self
+            // Matches microblock logic to prevent deadlock in small networks
+            let network_size = all_participants.len(); // Use actual participants count
             
-            // Determine required nodes based on network state
-            let required_byzantine_nodes = if is_genesis_network || network_size <= 10 {
+            // Determine required nodes based on ACTUAL network size
+            let required_byzantine_nodes = if network_size <= 10 {
                 // Small network or Genesis: Progressive requirements
                 match end_height {
                     0..=900 => {
@@ -8776,7 +8854,7 @@ impl BlockchainNode {
             };
             
             if all_participants.len() < required_byzantine_nodes {
-                if is_genesis_network || network_size <= 10 {
+                if network_size <= 10 {
                     println!("[CONSENSUS] ⚠️ DEGRADED Byzantine consensus: {}/{} nodes (small/Genesis network)", 
                              all_participants.len(), required_byzantine_nodes);
                     println!("[CONSENSUS] 🔧 Proceeding with reduced safety for network continuity");
@@ -11220,4 +11298,5 @@ impl Clone for BlockchainNode {
         }
     }
 }
+
 
