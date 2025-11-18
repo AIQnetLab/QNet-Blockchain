@@ -2522,13 +2522,22 @@ impl SimplifiedP2P {
                         }
                     };
                     
-                    // Send with fast timeout
+                    // ADAPTIVE TIMEOUT: Base on peer latency + processing buffer
+                    // Formula: timeout = max(base_timeout, peer_latency * 3 + processing_buffer)
+                    // Why *3: Account for variance (99th percentile ≈ 3× median)
+                    // Why +300ms: Block processing time (decompression + Dilithium verification)
+                    let adaptive_timeout_ms = std::cmp::max(
+                        500,  // Minimum 500ms (fast local network)
+                        peer_latency.saturating_mul(3).saturating_add(300)  // Adaptive
+                    );
+                    let adaptive_timeout_ms = std::cmp::min(adaptive_timeout_ms, 2000); // Maximum 2s
+                    
                     let peer_ip = peer_addr.split(':').next().unwrap_or(&peer_addr);
                     let url = format!("http://{}:8001/api/v1/p2p/message", peer_ip);
                     
                     let client = reqwest::blocking::Client::builder()
-                        .timeout(Duration::from_millis(500))  // OPTIMIZATION: 500ms timeout for fast broadcast (from 3c78d24)
-                        .connect_timeout(Duration::from_millis(200))  // OPTIMIZATION: Fast connect (from 3c78d24)
+                        .timeout(Duration::from_millis(adaptive_timeout_ms as u64))  // ADAPTIVE!
+                        .connect_timeout(Duration::from_millis(200))  // Fast connect
                         .tcp_nodelay(true)  // CRITICAL: No Nagle's algorithm delay
                         .tcp_keepalive(Duration::from_secs(HTTP_TCP_KEEPALIVE_SECS))
                         .pool_max_idle_per_host(HTTP_POOL_MAX_IDLE_PER_HOST)
@@ -8387,9 +8396,14 @@ impl SimplifiedP2P {
         let peer_ip = peer_addr.split(':').next().unwrap_or(peer_addr);
         let url = format!("http://{}:8001/api/v1/p2p/message", peer_ip);
         
-        // OPTIMIZATION: 500ms timeout for fast consensus delivery (from 3c78d24)
+        // ADAPTIVE TIMEOUT: For consensus messages (critical path)
+        // Consensus is TIME-SENSITIVE → use conservative timeout
+        // NOTE: Static method, cannot access peer latency - use fixed adaptive formula
+        // 800ms = base (500ms) + processing buffer (300ms for Dilithium + consensus)
+        let adaptive_timeout_ms = 800u64; // Conservative for consensus critical path
+        
         let client = match reqwest::Client::builder()
-            .timeout(Duration::from_millis(500))
+            .timeout(Duration::from_millis(adaptive_timeout_ms as u64))  // ADAPTIVE!
             .connect_timeout(Duration::from_millis(200))
             .tcp_nodelay(true)
             .build() {
@@ -8435,9 +8449,22 @@ impl SimplifiedP2P {
         let peer_ip = peer_addr.split(':').next().unwrap_or(peer_addr);
         let url = format!("http://{}:8001/api/v1/p2p/message", peer_ip);
         
-        // OPTIMIZATION: 500ms timeout for fast synchronous delivery (from 3c78d24)
+        // ADAPTIVE TIMEOUT: For synchronous P2P messages
+        let peer_latency = {
+            let connected = self.connected_peers.read().unwrap();
+            connected.values()
+                .find(|p| p.addr == peer_addr)
+                .map(|p| p.latency_ms)
+                .unwrap_or(100) // Default 100ms if peer not found
+        };
+        let adaptive_timeout_ms = std::cmp::max(
+            500,  // Minimum 500ms
+            peer_latency.saturating_mul(2).saturating_add(200)  // 2× latency + processing
+        );
+        let adaptive_timeout_ms = std::cmp::min(adaptive_timeout_ms, 2000); // Maximum 2s
+        
         let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_millis(500))
+            .timeout(Duration::from_millis(adaptive_timeout_ms as u64))  // ADAPTIVE!
             .connect_timeout(Duration::from_millis(200))
             .tcp_nodelay(true)  // Disable Nagle's algorithm for faster delivery
             .build()

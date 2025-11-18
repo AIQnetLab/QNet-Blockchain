@@ -3783,6 +3783,7 @@ impl BlockchainNode {
             // PRODUCTION: Track certificate management timing  
             let mut certificate_cleanup_counter = 0u64;
             let mut certificate_broadcast_counter = 0u64;
+            let node_start_time = std::time::Instant::now();
             
             while *is_running.read().await {
                 cpu_check_counter += 1;
@@ -3801,9 +3802,18 @@ impl BlockchainNode {
                     }
                 }
                 
-                // PRODUCTION: Periodic certificate broadcast (every 5 minutes)
-                // Ensures new nodes can verify our compact signatures
-                if certificate_broadcast_counter >= 300 && node_type != NodeType::Light {
+                // ADAPTIVE CERTIFICATE BROADCAST: Aggressive → Moderate → Conservative
+                // Solves certificate race condition while remaining scalable
+                let uptime_secs = node_start_time.elapsed().as_secs();
+                let broadcast_interval = if uptime_secs < 120 {
+                    10  // First 2 minutes: every 10 seconds (AGGRESSIVE - solve race condition)
+                } else if uptime_secs < 600 {
+                    60  // 2-10 minutes: every 60 seconds (MODERATE - catch stragglers)
+                } else {
+                    300  // After 10 minutes: every 5 minutes (CONSERVATIVE - maintenance only)
+                };
+                
+                if certificate_broadcast_counter >= broadcast_interval && node_type != NodeType::Light {
                     certificate_broadcast_counter = 0;
                     
                 // Broadcast certificate if we have one
@@ -6269,19 +6279,21 @@ impl BlockchainNode {
                 candidates[0].0.clone()
                     } else {
                 // QUANTUM-RESISTANT SELECTION using SHA3-512 (NIST approved)
+                // CRITICAL FIX: Use ONLY vrf_entropy for selection (candidates already included in vrf_entropy)
+                // This ensures ROTATION works even when candidates list is static (Genesis bootstrap)
                 use sha3::{Sha3_512, Digest};
                 
                 // Create deterministic seed from quantum-signed entropy
                 let mut selector = Sha3_512::new();
-                selector.update(b"QNet_Quantum_Producer_Selection_v3");
-                selector.update(&vrf_entropy); // Contains Dilithium-signed block hashes
+                selector.update(b"QNet_Quantum_Producer_Selection_v4"); // v4: Fixed rotation!
+                selector.update(&vrf_entropy); // Contains: round + candidates + entropy_source
                 selector.update(&leadership_round.to_le_bytes());
+                selector.update(&current_height.to_le_bytes()); // Add height for extra entropy
                 
-                // Include candidate order for determinism
-                for (candidate_id, reputation) in &candidates {
-                    selector.update(candidate_id.as_bytes());
-                    selector.update(&reputation.to_le_bytes());
-                }
+                // REMOVED: candidate list from hash (already in vrf_entropy)
+                // This prevents static candidate lists from causing rotation failure
+                // For small networks (5 Genesis nodes): entropy source CHANGES each round → rotation works
+                // For large networks (millions): candidate sampling CHANGES each round → rotation works
                 
                 // Generate quantum-resistant selection
                 let selection_hash = selector.finalize();
@@ -6298,6 +6310,7 @@ impl BlockchainNode {
                 println!("[PRODUCER] 🏆 Selected: {} (index {}/{})", 
                          winner.0, selection_index + 1, candidates.len());
                 println!("[PRODUCER] 🔐 Quantum-resistant via Dilithium-signed entropy");
+                println!("[PRODUCER] 🔄 Rotation: vrf_entropy changes each round → different producer");
                 
                 // Log runner-ups for transparency (PRODUCTION: only in debug mode)
                 if candidates.len() > 1 {
@@ -6825,43 +6838,25 @@ impl BlockchainNode {
     ) -> Vec<(String, f64)> {
         let mut all_qualified: Vec<(String, f64)> = Vec::new();
         
-        println!("[CANDIDATES] 📊 Calculating qualified candidates (decentralized)");
+        println!("[CANDIDATES] 📊 Calculating qualified candidates (UNIFIED decentralized system)");
         
-        // STEP 1: Get nodes from BlockchainActivationRegistry
-        let qnet_rpc = std::env::var("QNET_RPC_URL")
-            .or_else(|_| std::env::var("QNET_GENESIS_NODES")
-                .map(|nodes| format!("http://{}:8001", nodes.split(',').next().unwrap_or("127.0.0.1").trim())))
-            .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
+        // UNIFIED APPROACH: Use P2P connected peers as PRIMARY source
+        // This works for BOTH Genesis (5 nodes) and Production (millions of nodes)
+        // NO artificial phase separation!
+        
+        let validated_peers = p2p.get_validated_active_peers();
+        println!("[CANDIDATES] 🌐 Found {} validated P2P peers", validated_peers.len());
+        
+        // Add all validated peers with reputation >= 70%
+        for peer in validated_peers {
+            let reputation = Self::get_node_reputation_score(&peer.id, p2p).await;
             
-        let storage_ref = if let Ok(_) = std::env::var("QNET_STORAGE_PATH") {
-            GLOBAL_STORAGE_INSTANCE.lock().unwrap().clone()
-        } else {
-            None
-        };
-            
-        let registry = crate::activation_validation::BlockchainActivationRegistry::new_with_storage(
-            Some(qnet_rpc),
-            storage_ref
-        );
-        
-        // Get ALL eligible nodes from registry (including Genesis if registered)
-        // Registry already filters: Full/Super nodes with reputation >= 70%
-        let registry_candidates = registry.get_eligible_nodes().await;
-        println!("[CANDIDATES] 📋 Registry returned {} eligible nodes", registry_candidates.len());
-        
-        // Add all qualified nodes from registry (already filtered by Registry)
-        for (node_id, reputation, node_type_str) in registry_candidates {
-            all_qualified.push((node_id.clone(), reputation));
-            println!("[CANDIDATES]   ├── {} ({}, {:.0}%)", node_id, node_type_str, reputation * 100.0);
-        }
-        
-        // FALLBACK: If registry is empty (network bootstrap), add Genesis nodes
-        if all_qualified.is_empty() {
-            println!("[CANDIDATES] ⚠️ Registry empty - using Genesis bootstrap fallback");
-            for i in 1..=5 {
-                let genesis_id = format!("genesis_node_{:03}", i);
-                all_qualified.push((genesis_id.clone(), 0.70));
-                println!("[CANDIDATES]   ├── Bootstrap: {} (70% fixed)", genesis_id);
+            if reputation >= 0.70 {
+                all_qualified.push((peer.id.clone(), reputation));
+                println!("[CANDIDATES]   ├── {} ({:?}, {:.1}%)", peer.id, peer.node_type, reputation * 100.0);
+            } else {
+                println!("[CANDIDATES]   ├── {} ({:?}, {:.1}%) - EXCLUDED (below 70% threshold)", 
+                         peer.id, peer.node_type, reputation * 100.0);
             }
         }
         
@@ -6869,22 +6864,42 @@ impl BlockchainNode {
         let can_participate = match own_node_type {
             NodeType::Super | NodeType::Full => {
                 let own_reputation = Self::get_node_reputation_score(own_node_id, p2p).await;
-                own_reputation >= 0.70
+                if own_reputation >= 0.70 {
+                    println!("[CANDIDATES]   ├── Own node: {} ({:?}, {:.1}%) - ELIGIBLE", 
+                             own_node_id, own_node_type, own_reputation * 100.0);
+                    true
+                } else {
+                    println!("[CANDIDATES]   ├── Own node: {} ({:?}, {:.1}%) - EXCLUDED (below threshold)", 
+                             own_node_id, own_node_type, own_reputation * 100.0);
+                    false
+                }
             },
-            NodeType::Light => false,
+            NodeType::Light => {
+                println!("[CANDIDATES]   ├── Own node: {} (Light) - EXCLUDED (Light nodes don't participate)", own_node_id);
+                false
+            }
         };
         
         if can_participate && !all_qualified.iter().any(|(id, _)| id == own_node_id) {
-            all_qualified.push((own_node_id.to_string(), 0.70));
-            println!("[CANDIDATES]   ├── Own node: {} (eligible)", own_node_id);
+            let own_reputation = Self::get_node_reputation_score(own_node_id, p2p).await;
+            all_qualified.push((own_node_id.to_string(), own_reputation));
         }
         
-        // Remove duplicates
+        // Remove duplicates (maintain insertion order for determinism)
         all_qualified.dedup_by(|a, b| a.0 == b.0);
         
-        println!("[CANDIDATES] 📊 Total qualified: {} nodes", all_qualified.len());
+        println!("[CANDIDATES] 📊 Total qualified: {} nodes (reputation >= 70%)", all_qualified.len());
         
-        // Apply validator sampling for scalability
+        // CRITICAL: If NO candidates found, this is a FATAL ERROR for production
+        // Genesis nodes MUST connect to each other via P2P before producer selection
+        if all_qualified.is_empty() {
+            println!("[CANDIDATES] ❌ FATAL: No qualified candidates found!");
+            println!("[CANDIDATES] 📋 This indicates P2P connectivity failure");
+            println!("[CANDIDATES] 🔧 Genesis nodes must connect to each other before block production");
+            println!("[CANDIDATES] 💡 Check QNET_GENESIS_NODES environment variable");
+        }
+        
+        // Apply validator sampling for scalability (works for 5 nodes AND millions)
         const MAX_VALIDATORS_PER_ROUND: usize = 1000;
         
         if all_qualified.len() <= MAX_VALIDATORS_PER_ROUND {
@@ -8968,9 +8983,14 @@ impl BlockchainNode {
                     }
                 } else {
                     println!("[CRYPTO] ⚠️ Certificate {} not found in cache", compact_sig.cert_serial);
-                    println!("[CRYPTO]    This may happen for new nodes or after restart");
+                    println!("[CRYPTO]    Block will be retried - adaptive re-broadcast will provide certificate");
+                    
+                    // REQUEST-ON-DEMAND: Rely on adaptive re-broadcast mechanism
+                    // Producer broadcasts certificates every 10s during first 2 minutes
+                    // This solves race condition: block arrives → rejected → retry succeeds
+                    // ARCHITECTURE: Simple retry + adaptive re-broadcast > complex request mechanism
                     // Byzantine consensus ensures 2/3+ honest nodes have the certificate
-                    false
+                    false // Reject for now, will succeed on retry after next certificate broadcast
                 }
             } else {
                 println!("[CRYPTO] ⚠️ No P2P instance available for certificate verification");
