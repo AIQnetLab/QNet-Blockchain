@@ -2522,13 +2522,22 @@ impl SimplifiedP2P {
                         }
                     };
                     
-                    // Send with fast timeout
+                    // ADAPTIVE TIMEOUT: Base on peer latency + processing buffer
+                    // Formula: timeout = max(base_timeout, peer_latency * 3 + processing_buffer)
+                    // Why *3: Account for variance (99th percentile ≈ 3× median)
+                    // Why +300ms: Block processing time (decompression + Dilithium verification)
+                    let adaptive_timeout_ms = std::cmp::max(
+                        500,  // Minimum 500ms (fast local network)
+                        peer_latency.saturating_mul(3).saturating_add(300)  // Adaptive
+                    );
+                    let adaptive_timeout_ms = std::cmp::min(adaptive_timeout_ms, 2000); // Maximum 2s
+                    
                     let peer_ip = peer_addr.split(':').next().unwrap_or(&peer_addr);
                     let url = format!("http://{}:8001/api/v1/p2p/message", peer_ip);
                     
                     let client = reqwest::blocking::Client::builder()
-                        .timeout(Duration::from_millis(500))  // OPTIMIZATION: 500ms timeout for fast broadcast (from 3c78d24)
-                        .connect_timeout(Duration::from_millis(200))  // OPTIMIZATION: Fast connect (from 3c78d24)
+                        .timeout(Duration::from_millis(adaptive_timeout_ms as u64))  // ADAPTIVE!
+                        .connect_timeout(Duration::from_millis(200))  // Fast connect
                         .tcp_nodelay(true)  // CRITICAL: No Nagle's algorithm delay
                         .tcp_keepalive(Duration::from_secs(HTTP_TCP_KEEPALIVE_SECS))
                         .pool_max_idle_per_host(HTTP_POOL_MAX_IDLE_PER_HOST)
@@ -3649,13 +3658,23 @@ impl SimplifiedP2P {
         
         let current_time = std::time::SystemTime::now();
         
-        // Check cache first (refresh every 30 seconds for Genesis stability)
+        // Check cache first (dynamic refresh based on network phase)
         if let Ok(cache) = connectivity_cache.lock() {
             if let Some((cached_working_nodes, cached_time)) = cache.get(&cache_key) {
                 if let Ok(cache_age) = current_time.duration_since(*cached_time) {
-                    if cache_age.as_secs() < 30 { // CACHE FIX: Reduced from 120s to 30s for faster recovery
-                        println!("[FAILOVER] 📋 Using cached Genesis connectivity ({} working, cache age: {}s)", 
-                                 cached_working_nodes.len(), cache_age.as_secs());
+                    // ARCHITECTURE: Use static cache time for deterministic behavior
+                    // All nodes must have same view of connectivity at same time
+                    let cache_ttl = if std::env::var("QNET_BOOTSTRAP_ID").is_ok() {
+                        // Genesis nodes: shorter cache for faster convergence
+                        // But not too short to avoid network spam
+                        20 // 20 seconds for Genesis nodes
+                    } else {
+                        30 // Regular nodes: 30 seconds
+                    };
+                    
+                    if cache_age.as_secs() < cache_ttl {
+                        println!("[FAILOVER] 📋 Using cached Genesis connectivity ({} working, cache age: {}s, TTL: {}s)", 
+                                 cached_working_nodes.len(), cache_age.as_secs(), cache_ttl);
                         return cached_working_nodes.clone();
                     }
                 }
@@ -4010,6 +4029,46 @@ impl SimplifiedP2P {
                 0
             }
         }
+    }
+    
+    /// CRITICAL: Verify all Genesis nodes are actually connected for bootstrap
+    /// This prevents split brain during initial network formation
+    pub async fn verify_all_genesis_connectivity(&self) -> bool {
+        use crate::genesis_constants::GENESIS_NODE_IPS;
+        
+        // Get our own bootstrap ID to exclude self
+        let our_bootstrap_id = std::env::var("QNET_BOOTSTRAP_ID").ok();
+        let our_id = our_bootstrap_id.as_ref()
+            .and_then(|id| id.parse::<usize>().ok())
+            .unwrap_or(0);
+        
+        let connected_peers = self.connected_peers.read().unwrap();
+        
+        // Check each Genesis node (except self)
+        for (ip, id) in GENESIS_NODE_IPS {
+            let node_num: usize = id.parse().unwrap_or(0);
+            
+            // Skip self
+            if node_num == our_id {
+                continue;
+            }
+            
+            let peer_addr = format!("{}:8001", ip);
+            let node_id = format!("genesis_node_{:03}", node_num);
+            
+            // Check if this Genesis node is connected
+            let is_connected = connected_peers.values().any(|peer| {
+                peer.id == node_id || peer.addr == peer_addr
+            });
+            
+            if !is_connected {
+                println!("[P2P] ❌ Genesis node {} ({}) not connected yet", node_id, ip);
+                return false;
+            }
+        }
+        
+        println!("[P2P] ✅ All Genesis nodes verified as connected");
+        true
     }
     
     /// PRODUCTION: Check if peer is actually connected (runtime-safe)
@@ -8337,9 +8396,14 @@ impl SimplifiedP2P {
         let peer_ip = peer_addr.split(':').next().unwrap_or(peer_addr);
         let url = format!("http://{}:8001/api/v1/p2p/message", peer_ip);
         
-        // OPTIMIZATION: 500ms timeout for fast consensus delivery (from 3c78d24)
+        // ADAPTIVE TIMEOUT: For consensus messages (critical path)
+        // Consensus is TIME-SENSITIVE → use conservative timeout
+        // NOTE: Static method, cannot access peer latency - use fixed adaptive formula
+        // 800ms = base (500ms) + processing buffer (300ms for Dilithium + consensus)
+        let adaptive_timeout_ms = 800u64; // Conservative for consensus critical path
+        
         let client = match reqwest::Client::builder()
-            .timeout(Duration::from_millis(500))
+            .timeout(Duration::from_millis(adaptive_timeout_ms as u64))  // ADAPTIVE!
             .connect_timeout(Duration::from_millis(200))
             .tcp_nodelay(true)
             .build() {
@@ -8385,9 +8449,22 @@ impl SimplifiedP2P {
         let peer_ip = peer_addr.split(':').next().unwrap_or(peer_addr);
         let url = format!("http://{}:8001/api/v1/p2p/message", peer_ip);
         
-        // OPTIMIZATION: 500ms timeout for fast synchronous delivery (from 3c78d24)
+        // ADAPTIVE TIMEOUT: For synchronous P2P messages
+        let peer_latency = {
+            let connected = self.connected_peers.read().unwrap();
+            connected.values()
+                .find(|p| p.addr == peer_addr)
+                .map(|p| p.latency_ms)
+                .unwrap_or(100) // Default 100ms if peer not found
+        };
+        let adaptive_timeout_ms = std::cmp::max(
+            500,  // Minimum 500ms
+            peer_latency.saturating_mul(2).saturating_add(200)  // 2× latency + processing
+        );
+        let adaptive_timeout_ms = std::cmp::min(adaptive_timeout_ms, 2000); // Maximum 2s
+        
         let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_millis(500))
+            .timeout(Duration::from_millis(adaptive_timeout_ms as u64))  // ADAPTIVE!
             .connect_timeout(Duration::from_millis(200))
             .tcp_nodelay(true)  // Disable Nagle's algorithm for faster delivery
             .build()
@@ -8627,6 +8704,21 @@ impl SimplifiedP2P {
         change_type: String,
         timestamp: u64
     ) {
+        // CRITICAL FIX: Check message age to prevent stale message spam
+        // ARCHITECTURE: Emergency messages have 60-second TTL to prevent network pollution
+        let current_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        
+        if timestamp > 0 && current_time > timestamp {
+            let message_age = current_time - timestamp;
+            if message_age > 60 {
+                // Message is too old - ignore silently to prevent spam
+                return;
+            }
+        }
+        
         // CRITICAL FIX: Ignore macroblock failovers - they don't affect microblock production
         // Macroblocks are separate consensus process and should NOT stop microblock production
         // Only microblock failovers should trigger production changes

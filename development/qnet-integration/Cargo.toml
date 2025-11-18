@@ -66,7 +66,7 @@ dashmap = "5.5"
 # Networking
 libp2p = "0.53"
 multiaddr = "0.18"
-reqwest = { version = "0.11", features = ["json", "blocking", "multipart"] }
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls", "multipart", "blocking"] }
 lz4_flex = "0.11"
 chrono = { version = "0.4", features = ["serde"] }
 # FCM push notifications for Light nodes
@@ -93,6 +93,9 @@ reed-solomon-erasure = "6.0"
 
 # HTTP client
 bs58 = "0.5"
+
+ # Solana RPC integration via HTTP (no OpenSSL dependency)
+# Using reqwest for direct JSON-RPC calls to Solana network
 
 # Development and debugging
 log = "0.4.20"

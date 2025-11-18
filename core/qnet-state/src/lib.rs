@@ -21,11 +21,11 @@ mod python_bindings;
 
 pub use account::{Account, AccountState};
 pub use block::{Block, BlockHeader, ConsensusProof, BlockType, MicroBlock, MacroBlock, ConsensusData, LightMicroBlock, BlockHash, EfficientMicroBlock};
-pub use transaction::{Transaction, TransactionReceipt, TransactionType};
+pub use transaction::{Transaction, TransactionReceipt, TransactionType, gas_limits, PingSampleData};
 pub use state_db::StateDB;
 pub use state_manager::StateManager;
 pub use errors::{StateError, StateResult};
-pub use state::{StateManager as State, MAX_QNC_SUPPLY};
+pub use state::{StateManager as State, MAX_QNC_SUPPLY, MAX_QNC_SUPPLY_NANO};
 
 #[cfg(feature = "python")]
 pub use python_bindings::*;

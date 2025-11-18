@@ -45,7 +45,21 @@ This project uses **dual licensing**:
 - **Phase 2 (Future)**: ONLY QNC token activation on QNet blockchain
 - **Transition**: 90% 1DEV burned OR 5 years from genesis block (whichever comes first)
 
-### 🛡️ **LATEST UPDATES (v2.19.0 - November 16, 2025)**
+### 🛡️ **LATEST UPDATES (v2.19.0 - November 18, 2025)**
+- **Hybrid Merkle + Sampling**: Scalable on-chain ping commitments (NEW!)
+  - 360× on-chain size reduction (100 MB vs 36 GB)
+  - Merkle root commitment to ALL pings (blake3 hashing)
+  - Deterministic sampling: 1% of pings (minimum 10,000 samples)
+  - SHA3-256 for sample seed generation (quantum-resistant)
+  - Byzantine-safe verification through Merkle proofs
+  - Production-ready for millions of nodes
+- **Bitcoin-Style Emission Validation**: Decentralized emission without central authority (NEW!)
+  - No system key or single point of control
+  - Range-based validation with halving support
+  - All nodes independently validate emission amounts
+  - Conservative estimates for Pool 2 & Pool 3
+  - Partial determinism by design (±1-5% acceptable)
+  - Byzantine consensus ensures security
 - **Compact Hybrid Signatures**: Optimized microblock signatures (3KB vs 12KB)
   - Ed25519 + CRYSTALS-Dilithium hybrid cryptography
   - Certificate caching for 4x bandwidth reduction

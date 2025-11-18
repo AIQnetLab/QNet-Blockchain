@@ -342,6 +342,72 @@ impl BlockValidator {
                     return Err(IntegrationError::ValidationError("Batch transfers cannot exceed 100 transfers".to_string()));
                 }
             }
+            TransactionType::PingAttestation { from_node, to_node, response_time_ms, .. } => {
+                if from_node.is_empty() {
+                    return Err(IntegrationError::ValidationError("Ping from_node cannot be empty".to_string()));
+                }
+                if to_node.is_empty() {
+                    return Err(IntegrationError::ValidationError("Ping to_node cannot be empty".to_string()));
+                }
+                if *response_time_ms > 60000 {
+                    return Err(IntegrationError::ValidationError("Ping response time cannot exceed 60 seconds".to_string()));
+                }
+                // Ping attestations are FREE system operations
+            }
+            TransactionType::PingCommitmentWithSampling { 
+                window_start_height,
+                window_end_height,
+                merkle_root,
+                total_ping_count,
+                successful_ping_count,
+                sample_seed,
+                ping_samples,
+            } => {
+                // Validate window heights
+                if *window_end_height <= *window_start_height {
+                    return Err(IntegrationError::ValidationError("Window end height must be greater than start".to_string()));
+                }
+                
+                // Validate window size (4 hours = 14400 blocks)
+                const EXPECTED_WINDOW: u64 = 14400;
+                if window_end_height - window_start_height != EXPECTED_WINDOW {
+                    return Err(IntegrationError::ValidationError(format!(
+                        "Invalid window size: expected {} blocks", EXPECTED_WINDOW
+                    )));
+                }
+                
+                // Validate Merkle root format (64 hex chars = 32 bytes)
+                if merkle_root.len() != 64 {
+                    return Err(IntegrationError::ValidationError("Merkle root must be 64 hex characters".to_string()));
+                }
+                
+                // Validate sample seed format (64 hex chars = 32 bytes)
+                if sample_seed.len() != 64 {
+                    return Err(IntegrationError::ValidationError("Sample seed must be 64 hex characters".to_string()));
+                }
+                
+                // Validate counts
+                if *successful_ping_count > *total_ping_count {
+                    return Err(IntegrationError::ValidationError("Successful count exceeds total count".to_string()));
+                }
+                
+                // Validate sample size (1% or 10K min)
+                let min_samples = (*total_ping_count / 100).max(10_000.min(*total_ping_count)) as usize;
+                if ping_samples.len() < min_samples {
+                    return Err(IntegrationError::ValidationError(format!(
+                        "Insufficient samples: {} < {}", ping_samples.len(), min_samples
+                    )));
+                }
+                
+                // Validate each sample has Merkle proof
+                for sample in ping_samples {
+                    if sample.merkle_proof.is_empty() {
+                        return Err(IntegrationError::ValidationError("Sample must include Merkle proof".to_string()));
+                    }
+                }
+                
+                // Ping commitments are FREE system operations
+            }
         }
         
         Ok(())

@@ -6,7 +6,7 @@ pub mod rust;
 // Re-export main crypto functions
 pub use rust::{
     ProductionCrypto, DilithiumParams, SphincsParams, CryptoError, CryptoErrorKind,
-    generate_keypair, sign as rust_sign, verify as rust_verify
+    generate_keypair, sign as rust_sign, verify as rust_verify, merkle
 };
 
 // Convenience functions

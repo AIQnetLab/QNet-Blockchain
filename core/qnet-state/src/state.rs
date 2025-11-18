@@ -6,15 +6,21 @@ use dashmap::DashMap;
 use crate::{Account, Block, Transaction, StateError, StateResult};
 use sha3::{Sha3_256, Digest};
 
-/// Maximum supply of QNC tokens (2^32)
+/// Maximum supply of QNC tokens (2^32 QNC = 4.295 billion QNC)
+/// NOTE: Stored in whole QNC units for readability
+/// Internal operations use nanoQNC (multiply by 10^9)
 pub const MAX_QNC_SUPPLY: u64 = 4_294_967_296;
+
+/// Maximum supply in nanoQNC (smallest units)
+/// Used for internal calculations and comparisons
+pub const MAX_QNC_SUPPLY_NANO: u64 = MAX_QNC_SUPPLY * 1_000_000_000;
 
 /// Chain state information
 #[derive(Debug, Clone)]
 pub struct ChainState {
     /// Current blockchain height
     pub height: u64,
-    /// Total supply of QNC
+    /// Total supply in nanoQNC (smallest units: 1 QNC = 10^9 nanoQNC)
     pub total_supply: u64,
 
     /// Current epoch
@@ -155,11 +161,13 @@ impl StateManager {
     }
     
     /// Emit rewards with MAX_SUPPLY control
+    /// amount: emission amount in nanoQNC (smallest units)
+    /// Returns: actual emitted amount in nanoQNC (may be less if MAX_SUPPLY reached)
     pub fn emit_rewards(&self, amount: u64) -> StateResult<u64> {
         let mut chain_state = self.chain_state.write();
         
-        // Check if we would exceed MAX_SUPPLY
-        let remaining_supply = MAX_QNC_SUPPLY.saturating_sub(chain_state.total_supply);
+        // Check if we would exceed MAX_SUPPLY (all in nanoQNC)
+        let remaining_supply = MAX_QNC_SUPPLY_NANO.saturating_sub(chain_state.total_supply);
         let actual_emission = amount.min(remaining_supply);
         
         if actual_emission == 0 {
@@ -167,12 +175,14 @@ impl StateManager {
             return Ok(0);
         }
         
-        // Update total supply
+        // Update total supply (in nanoQNC)
         chain_state.total_supply += actual_emission;
         
         if actual_emission < amount {
             println!("⚠️ Emission limited: requested {} QNC, emitted {} QNC (remaining: {} QNC)",
-                     amount, actual_emission, MAX_QNC_SUPPLY - chain_state.total_supply);
+                     amount / 1_000_000_000, 
+                     actual_emission / 1_000_000_000, 
+                     (MAX_QNC_SUPPLY_NANO - chain_state.total_supply) / 1_000_000_000);
         }
         
         Ok(actual_emission)
@@ -183,9 +193,9 @@ impl StateManager {
         self.chain_state.read().total_supply
     }
     
-    /// Get remaining supply until MAX_SUPPLY
+    /// Get remaining supply until MAX_SUPPLY (in nanoQNC)
     pub fn get_remaining_supply(&self) -> u64 {
-        MAX_QNC_SUPPLY.saturating_sub(self.get_total_supply())
+        MAX_QNC_SUPPLY_NANO.saturating_sub(self.get_total_supply())
     }
     
     /// Create genesis state
