@@ -4217,8 +4217,9 @@ impl SimplifiedP2P {
             cert_manager.set_local_certificate(cert_serial.clone(), certificate);
         }
         
-        // Broadcast to all connected peers
-        let peers = self.connected_peers_lockfree.clone();
+        // CRITICAL FIX: Use validated peers (deterministic Genesis list) instead of connected_peers_lockfree
+        // This fixes race condition where certificate broadcast happens before TCP connections established
+        let peers = self.get_validated_active_peers();
         let mut broadcast_count = 0;
         
         // Serialize message once for all peers
@@ -4229,8 +4230,7 @@ impl SimplifiedP2P {
             }
         };
         
-        for entry in peers.iter() {
-            let peer_info = entry.value();
+        for peer_info in peers {
             let peer_addr = peer_info.addr.clone();
             
             if peer_info.id == self.node_id {
