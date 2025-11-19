@@ -6432,7 +6432,7 @@ impl BlockchainNode {
                 println!("[PRODUCER] 🏆 Selected: {} (index {}/{})", 
                          winner.0, selection_index + 1, candidates.len());
                 println!("[PRODUCER] 🔐 Quantum-resistant via Dilithium-signed entropy");
-                println!("[PRODUCER] 🔄 VRF recalculates each block → unpredictable rotation")
+                println!("[PRODUCER] 🔄 VRF recalculates each block → unpredictable rotation");
                 
                 winner.0.clone()
             };
