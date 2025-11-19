@@ -142,6 +142,11 @@ android {
 }
 
 dependencies {
+    // CRITICAL: Always include base Android dependencies (required for themes and UI)
+    implementation 'androidx.appcompat:appcompat:1.6.1'
+    implementation 'com.google.android.material:material:1.11.0'
+    implementation 'androidx.core:core-ktx:1.12.0'
+    
     // React Native dependencies - only if RN is available
     if (reactNativeGradle.exists()) {
         // The version of react-native is set by the React Native Gradle Plugin

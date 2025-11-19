@@ -6266,7 +6266,14 @@ impl BlockchainNode {
                 return own_node_id.to_string();
             }
             
-            let candidates = valid_candidates;
+            let mut candidates = valid_candidates;
+            
+            // CRITICAL: Sort candidates to ensure deterministic ordering across ALL nodes
+            // Different nodes may receive peers in different P2P discovery order
+            // WITHOUT sorting: each node calculates DIFFERENT vrf_entropy → DIFFERENT producer (consensus failure!)
+            // WITH sorting: all nodes calculate SAME vrf_entropy → SAME producer (consensus success!)
+            // This is IDENTICAL to emergency selection (line 6841) and macroblock consensus (line 7595)
+            candidates.sort_by(|a, b| a.0.cmp(&b.0));  // Sort by node_id alphabetically
             
             // PRODUCTION: Use Threshold VRF for quantum-resistant producer selection
             // CRITICAL FIX: VRF eliminates race conditions at rotation boundaries
@@ -6281,7 +6288,7 @@ impl BlockchainNode {
                 hasher.update(b"QNet_VRF_Round_Entropy_v1");
                 hasher.update(&leadership_round.to_le_bytes());
                 
-                // 2. Candidate list (deterministically calculated)
+                // 2. Candidate list (NOW SORTED for deterministic entropy)
                 for (candidate_id, reputation) in &candidates {
                     hasher.update(candidate_id.as_bytes());
                     hasher.update(&reputation.to_le_bytes());
@@ -6691,10 +6698,16 @@ impl BlockchainNode {
                     }
                     
                     if !emergency_candidates.is_empty() {
-                        // Select best from degraded candidates
-                        let best = emergency_candidates.iter()
-                            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
-                            .unwrap();
+                        // CRITICAL: Sort for deterministic selection when multiple nodes have same reputation
+                        let mut sorted_degraded = emergency_candidates.clone();
+                        sorted_degraded.sort_by(|a, b| {
+                            match b.1.partial_cmp(&a.1).unwrap() {
+                                std::cmp::Ordering::Equal => a.0.cmp(&b.0), // Tie-break by node_id
+                                other => other,
+                            }
+                        });
+                        
+                        let best = &sorted_degraded[0];
                         println!("[FAILOVER] 🆘 DEGRADED SELECTION: {} (reputation: {:.1}%)", 
                                  best.0, best.1 * 100.0);
                         return best.0.clone();
@@ -6761,11 +6774,21 @@ impl BlockchainNode {
                         if !emergency_candidates.is_empty() {
                             // CRITICAL: Only use emergency producer if reputation >= 50%
                             // This prevents fork creation from low-reputation nodes
-                            let best = emergency_candidates.iter()
+                            let mut eligible: Vec<_> = emergency_candidates.iter()
                                 .filter(|(_, rep)| *rep >= 0.50)  // Hard minimum 50%
-                                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+                                .collect();
                             
-                            if let Some(selected) = best {
+                            if !eligible.is_empty() {
+                                // CRITICAL: Sort for deterministic selection when multiple nodes have same reputation
+                                // Sort by reputation DESC, then by node_id ASC for tie-breaking
+                                eligible.sort_by(|a, b| {
+                                    match b.1.partial_cmp(&a.1).unwrap() {
+                                        std::cmp::Ordering::Equal => a.0.cmp(&b.0), // Tie-break by node_id
+                                        other => other,
+                                    }
+                                });
+                                
+                                let selected = eligible[0];
                                 println!("[FAILOVER] 🆘 EMERGENCY SELECTION: {} (reputation: {:.1}%, threshold: {:.0}%)", 
                                          selected.0, selected.1 * 100.0, threshold * 100.0);
                                 return selected.0.clone();
@@ -6776,9 +6799,12 @@ impl BlockchainNode {
                     // Critical: Network halt protection - give emergency boost to any responding node
                     println!("[FAILOVER] ⚡ CRITICAL: Network halt detected - emergency reputation recovery");
                     
-                    let peers = p2p.get_validated_active_peers();
+                    let mut peers = p2p.get_validated_active_peers();
                     if !peers.is_empty() {
-                        // Boost first available peer
+                        // CRITICAL: Sort peers to ensure ALL nodes boost SAME peer (network recovery consensus)
+                        peers.sort_by(|a, b| a.id.cmp(&b.id));
+                        
+                        // Boost first available peer (now deterministic across all nodes)
                         let emergency_peer = &peers[0];
                         // BALANCED: Reduced from +50% to +20% to prevent instant max reputation
                         p2p.update_node_reputation(&emergency_peer.id, 20.0);
@@ -7269,15 +7295,15 @@ impl BlockchainNode {
         // PRODUCTION: Remove duplicate candidates (using same logic as DHT peer discovery)
         // Each node might appear twice: once as own_node and once as peer
         all_qualified.dedup_by(|a, b| a.0 == b.0); // Remove duplicates by node_id (maintain original order)
-        // CRITICAL FIX: Do NOT sort alphabetically - this breaks rotation determinism
-        // Candidates should maintain their natural order for proper rotation
+        // NOTE: Sorting is NOT done here - it's done by callers (microblock/emergency/macroblock selection)
+        // This allows each caller to sort candidates at the exact point where deterministic ordering is needed
         
         // CRITICAL: Apply validator sampling for scalability (prevent millions of validators)
         // QNet configuration: 1000 validators per round for optimal Byzantine safety + performance
         const MAX_VALIDATORS_PER_ROUND: usize = 1000; // Per NETWORK_LOAD_ANALYSIS.md specification
         
         let sampled_candidates = if all_qualified.len() <= MAX_VALIDATORS_PER_ROUND {
-            // Small network: Use all qualified candidates (already sorted)
+            // Small network: Use all qualified candidates (sorting done by caller)
             all_qualified
         } else {
             // Large network: Apply deterministic sampling for Byzantine consensus
@@ -7355,8 +7381,7 @@ impl BlockchainNode {
         
         println!("  ├── Total qualified from registry: {}", all_qualified.len());
         
-        // CRITICAL FIX: Remove duplicate candidates without alphabetical sorting
-        // Maintain natural order to prevent rotation bias
+        // Remove duplicate candidates (sorting is done by caller for deterministic entropy)
         all_qualified.dedup_by(|a, b| a.0 == b.0);
         
         // Apply validator sampling (same logic as Genesis phase)
@@ -7389,6 +7414,13 @@ impl BlockchainNode {
             return selected;
         }
         
+        // CRITICAL: Sort candidates to ensure deterministic ordering across ALL nodes
+        // Different nodes may receive peers in different P2P discovery order
+        // WITHOUT sorting: each node calculates DIFFERENT sampling hash → DIFFERENT validators (consensus failure!)
+        // WITH sorting: all nodes calculate SAME sampling hash → SAME validators (consensus success!)
+        let mut sorted_qualified = all_qualified.to_vec();
+        sorted_qualified.sort_by(|a, b| a.0.cmp(&b.0));  // Sort by node_id alphabetically
+        
         // FINALITY WINDOW: Use finalized height for deterministic validator selection
         // This prevents race conditions at rotation boundaries
         // Using global constant (10 blocks = safe for production Byzantine consensus)
@@ -7413,19 +7445,19 @@ impl BlockchainNode {
         println!("  ├── Current height: {}", current_height);
         println!("  ├── Finalized height: {} (lag: {} blocks)", finalized_height, FINALITY_WINDOW);
         println!("  ├── Validator round: {}", validator_round);
-        println!("  └── Selecting {} validators from {} qualified nodes", max_count, all_qualified.len());
+        println!("  └── Selecting {} validators from {} qualified nodes", max_count, sorted_qualified.len());
         
         // QNet specification: "Equal chance for all qualified nodes"
         // No distinction between Full and Super nodes in consensus participation
-        for i in 0..max_count.min(all_qualified.len()) {
+        for i in 0..max_count.min(sorted_qualified.len()) {
             let mut hasher = Sha3_256::new();
             
             // CRITICAL: Use finalized round instead of current height
             // This guarantees deterministic selection across all synchronized nodes
             hasher.update(format!("validator_sampling_{}_{}", validator_round, i).as_bytes());
             
-            // Include all qualified validators for Byzantine consistency
-            for (node_id, reputation) in all_qualified {
+            // Include all qualified validators for Byzantine consistency (NOW SORTED!)
+            for (node_id, reputation) in &sorted_qualified {
                 hasher.update(node_id.as_bytes());
                 hasher.update(&reputation.to_le_bytes());
             }
@@ -7436,8 +7468,8 @@ impl BlockchainNode {
                 selection_hash[4], selection_hash[5], selection_hash[6], selection_hash[7],
             ]);
             
-            let selection_index = (selection_number as usize) % all_qualified.len();
-            let selected_validator = all_qualified[selection_index].clone();
+            let selection_index = (selection_number as usize) % sorted_qualified.len();
+            let selected_validator = sorted_qualified[selection_index].clone();
             
             // Avoid duplicates
             if !selected.iter().any(|(id, _)| id == &selected_validator.0) {
@@ -7453,11 +7485,11 @@ impl BlockchainNode {
             }
         }
         
-        // CRITICAL FIX: Do NOT sort validators alphabetically - this breaks rotation fairness
-        // Validators are already selected deterministically via cryptographic hashing
+        // NOTE: Validators are selected deterministically via sorted list and cryptographic hashing
+        // The selection order preserves cryptographic randomness while ensuring consensus
         
-        println!("  ├── Simple sampling complete: {} validators selected from {} qualified (natural order preserved)", 
-                 selected.len(), all_qualified.len());
+        println!("  ├── Simple sampling complete: {} validators selected from {} qualified (deterministic selection)", 
+                 selected.len(), sorted_qualified.len());
         selected
         }
     
@@ -7860,6 +7892,9 @@ impl BlockchainNode {
                 if participants.len() < required_nodes {
                     participants.push(p2p_finalize.get_node_id());
                 }
+                
+                // CRITICAL: Sort participants for deterministic next_leader selection (line 7966)
+                participants.sort();
                 
                 if participants.len() >= required_nodes {
                     // Create emergency macroblock with reduced requirements
@@ -9430,9 +9465,15 @@ impl BlockchainNode {
             
             // No need for additional fallback - calculate_qualified_candidates handles it
             
-            let all_participants: Vec<String> = qualified_candidates.into_iter()
+            let mut all_participants: Vec<String> = qualified_candidates.into_iter()
                 .map(|(node_id, _reputation)| node_id)
                 .collect();
+            
+            // CRITICAL: Sort participants to ensure deterministic ordering across ALL nodes
+            // next_leader selection (line 8966) uses participants.first() - MUST be same on all nodes!
+            // Without sorting: different nodes calculate DIFFERENT next_leader → consensus failure!
+            all_participants.sort();  // Sort alphabetically by node_id
+            
             println!("[CONSENSUS] 🏛️ Initializing Byzantine consensus round {} with {} participants", 
                      round_id, all_participants.len());
             

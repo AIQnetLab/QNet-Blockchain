@@ -23,12 +23,11 @@ This project uses **dual licensing**:
   - `infrastructure/` - API, node infrastructure, backend services
   - `testing/` - Integration tests, testnet tools
   - `monitoring/` - Production monitoring and metrics
-- **License**: [Business Source License 1.1](LICENSE)
+- **License**: [Business Source License 1.1](LICENSE) - **Perpetual Proprietary**
 - **Usage**: 
-  - ✅ Non-production use (testing, development, evaluation) - **FREE**
-  - ✅ Automatically converts to **Apache 2.0** on **January 1, 2029**
-  - ⚠️ Production use requires commercial license before 2029
-- **Contact**: support@qnet.io for commercial licensing
+  - ✅ **Non-production use** (testing, development, evaluation) - **FREE**
+  - ⚠️ **Production use** requires commercial license from AIQnetLab
+  - 🔒 **Proprietary license** - remains under BSL 1.1 indefinitely
 
 ### 📱 Client Applications (Apache-2.0)
 - **Components**: 
@@ -1772,7 +1771,18 @@ See [CHANGELOG.md](documentation/CHANGELOG.md) for detailed release notes.
 
 ## 📄 License
 
-This project is licensed under the Apache License 2.0 - see the [LICENSE] file for details.
+**Blockchain Infrastructure** (BSL 1.1 - Perpetual Proprietary):
+- Core blockchain components, node software, consensus, and infrastructure
+- **Non-production use**: FREE (testing, development, evaluation)
+- **Production use**: Requires commercial license from AIQnetLab
+- **Proprietary**: Remains under BSL 1.1 indefinitely (no open-source conversion)
+- **Protected**: Cannot be used for competing networks or hosted services
+- See [LICENSE](LICENSE) for complete terms
+
+**Client Applications** (Apache 2.0):
+- Mobile wallet, browser extension, explorer, CLI tools
+- **Fully open-source** with no restrictions
+- See individual application LICENSE files for details
 
 ## 🔗 Links
 
