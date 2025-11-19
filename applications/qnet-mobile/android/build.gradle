@@ -16,3 +16,11 @@ buildscript {
         classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:$kotlinVersion")
     }
 }
+
+// CRITICAL: F-Droid requires repositories to be defined for all projects
+allprojects {
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
