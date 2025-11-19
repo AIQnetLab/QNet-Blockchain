@@ -65,7 +65,7 @@ class UnifiedPenaltySystem:
     
     # Unified thresholds (0-100 scale)
     INITIAL_REPUTATION = 50.0
-    REWARDS_THRESHOLD = 40.0
+    REWARDS_THRESHOLD = 70.0
     CONSENSUS_THRESHOLD = 70.0
     BAN_THRESHOLD = 10.0
     

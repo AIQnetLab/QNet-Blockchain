@@ -8756,8 +8756,6 @@ impl SimplifiedP2P {
         if block_height > local_height + 10 {
             // Ignore failover for blocks too far in the future (>10 blocks ahead)
             // This prevents spam from nodes that are far ahead
-            println!("[FAILOVER] 🔇 Ignoring failover for future block #{} (local: {})", 
-                     block_height, local_height);
             return;
         }
         

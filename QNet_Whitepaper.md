@@ -741,10 +741,21 @@ Ping architecture:
 ```
 
 **Real threshold values (from config.ini):**
-- **70+ points** (consensus_threshold = 70.0): Consensus participation
-- **40+ points** (rewards_threshold = 40.0): Receive rewards from all pools
-- **10-39 points**: Network access, but no rewards or consensus
-- **<10 points** (ban_threshold = 10.0): Complete network ban
+- **70+ points** (rewards_threshold = consensus_threshold = 70.0): Full/Super consensus + ALL node types NEW rewards
+- **10-69 points**: Network access, but no NEW rewards (no pings from network), no consensus
+- **<10 points** (ban_threshold = 10.0): Complete network ban (can still claim OLD rewards)
+
+**NEW Rewards eligibility (unified for ALL node types):**
+- **ALL Nodes (Light/Full/Super)**: Reputation ≥70 required for network to ping you → NEW rewards
+- **Light Nodes**: Do NOT participate in consensus (viewing only)
+- **Full/Super Nodes**: Participate in consensus (reputation ≥70 required)
+
+**Claiming rewards logic:**
+- **NEW rewards**: Network pings you ONLY if reputation ≥70 (applies to ALL node types)
+- **OLD accumulated rewards**: NO reputation requirement (only wallet ownership verification)
+- **Minimum claim**: 1 QNC minimum to prevent spam
+- **Claim interval**: 1 hour minimum between claims
+- **Even banned nodes (<10 rep)**: Can claim accumulated OLD rewards
 
 **Reputation rewards/penalties:**
 
@@ -841,7 +852,12 @@ Emission Schedule (6 periods/day × 365 days/year):
 Source: Network inflation (sharp drop halving schedule)
 Distribution: All active nodes proportionally
 Current Rate: 251,432.34 QNC per 4-hour period (Years 0-4)
-Eligibility: Reputation score ≥40 points
+Eligibility (NEW rewards): 
+├── ALL Node Types: Reputation ≥70 (network pings you → NEW rewards)
+├── Light Nodes: Do NOT participate in consensus
+├── Full Nodes: Participate in consensus (reputation ≥70 required)
+└── Super Nodes: Participate in consensus (reputation ≥70 required)
+Claim OLD rewards: No reputation requirement (only wallet ownership, even if banned)
 Next Halving: Year 4 (reduces to 125,716.17 QNC)
 Distribution Formula: Individual_Reward = (Pool_Total / Active_Nodes) × Node_Weight
 Validation: Bitcoin-style deterministic rules (no central authority)
@@ -884,7 +900,10 @@ Distribution Split:
 ├── 70% to Super Nodes (network backbone)
 ├── 30% to Full Nodes (validation support)
 └── 0% to Light Nodes (no transaction processing)
-Eligibility: Active transaction processing + Reputation ≥40
+Eligibility (NEW rewards): 
+├── Full Nodes: Active transaction processing + Reputation ≥70 (network pings)
+└── Super Nodes: Active transaction processing + Reputation ≥70 (network pings)
+Claim OLD rewards: No reputation requirement (only wallet ownership, even if banned)
 Dynamic Scaling: Increases with network usage
 ```
 
@@ -897,7 +916,11 @@ Mechanism:
 ├── Pool #3 redistributes to ALL active nodes
 └── Distribution happens every 4 hours
 Distribution: Equal share to all eligible nodes
-Eligibility: Reputation score ≥40 points
+Eligibility (NEW rewards): 
+├── ALL Node Types: Reputation ≥70 (network pings you → NEW rewards)
+├── Light Nodes: Do NOT participate in consensus
+└── Full/Super Nodes: Participate in consensus
+Claim OLD rewards: No reputation requirement (only wallet ownership, even if banned)
 Innovation: Every new node activation benefits the entire network
 ```
 
@@ -966,8 +989,9 @@ Reputation Score Mechanics:
 └── Protocol Violations: -5 to -30 points (Full/Super only)
 
 Economic Thresholds:
-├── Light Nodes: No reputation requirements (mobile-friendly)
-├── Full/Super: 70+ points for consensus and rewards
+├── ALL Node Types: 70+ points required for NEW rewards (network pings)
+├── Light Nodes: Do NOT participate in consensus
+├── Full/Super: 70+ points required for consensus participation
 ├── Full/Super: 10-69 points - network access only, no rewards
 └── Full/Super: <10 points - complete network ban
 
@@ -1703,10 +1727,20 @@ Reputation Scoring Matrix:
 └── Recovery Rate: Gradual through consistent good behavior
 
 Security Thresholds:
-├── 70+: Full consensus participation
-├── 40+: Reward eligibility (all pools)
-├── 10-39: Limited network access
-└── <10: Network ban enforced
+├── 70+: Full consensus participation (Full/Super) + ALL node types NEW rewards
+├── 10-69: Limited network access (no NEW rewards, no network pings, no consensus)
+└── <10: Network ban enforced (can still claim OLD rewards)
+
+NEW Rewards Distribution (unified for ALL node types):
+├── ALL Nodes: reputation ≥70 required (network pings you → NEW rewards)
+├── Light Nodes: Do NOT participate in consensus (viewing only)
+└── Full/Super Nodes: Participate in consensus (reputation ≥70 required)
+
+OLD Rewards Claiming:
+├── No reputation requirement (only wallet ownership)
+├── Minimum claim: 1 QNC
+├── Claim interval: 1 hour minimum
+└── Even banned nodes (<10 rep) can claim accumulated OLD rewards
 
 Violation Penalties:
 ├── Missed Ping: -1.0 reputation
@@ -1727,9 +1761,10 @@ Recovery Windows:
 
 Quarantine Period:
 ├── Duration: 7 days at 25 reputation
-├── No rewards during 7-day quarantine period
-├── Gradual reputation building required
-└── Light nodes: no reputation system | Full/Super nodes: require reputation >= 70
+├── No NEW rewards during 7-day quarantine (network doesn't ping you, rep 25 < 70)
+├── Can still claim OLD accumulated rewards (no reputation requirement)
+├── Gradual reputation building required to reach 70 for NEW rewards
+└── ALL node types: reputation ≥70 required for NEW rewards (network pings)
 ```
 
 ### 10.2 Regional Optimization
@@ -1935,7 +1970,7 @@ ws://node:8001/ws/transactions // Subscribe to transactions
 | **Macroblock time** | 90 seconds | ✅ Byzantine consensus |
 | **Mobile TPS** | 8,859 | ✅ Crypto operations on device |
 | **Quantum protection** | Dilithium2 + Ed25519 | ✅ Both signatures on every message |
-| **Reputation system** | 70/40/10 thresholds | ✅ Without staking |
+| **Reputation system** | 70/10 thresholds (ALL: ≥70 for NEW rewards) | ✅ Without staking |
 
 ### 14.2 Experimental Architecture
 

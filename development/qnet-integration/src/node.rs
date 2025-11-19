@@ -135,6 +135,13 @@ lazy_static::lazy_static! {
 pub static LAST_BLOCK_PRODUCED_TIME: AtomicU64 = AtomicU64::new(0);
 pub static LAST_BLOCK_PRODUCED_HEIGHT: AtomicU64 = AtomicU64::new(0);
 
+// METRICS: Track retry statistics for monitoring certificate race condition
+// Used to tune retry interval and detect systemic issues
+static RETRY_TOTAL: AtomicU64 = AtomicU64::new(0);           // Total retry attempts
+static RETRY_SUCCESS: AtomicU64 = AtomicU64::new(0);         // Successful retries (validation passed)
+static RETRY_CERT_RACE: AtomicU64 = AtomicU64::new(0);       // Retries due to certificate race
+static RETRY_MISSING_PREV: AtomicU64 = AtomicU64::new(0);    // Retries due to missing previous block
+
 // NOTE: Removed ROTATION_NOTIFY - simple 1-second timing is more reliable
 // Testing showed that natural timing without interrupts prevents race conditions
 
@@ -1695,8 +1702,9 @@ impl BlockchainNode {
         let mut pending_blocks: std::collections::HashMap<u64, (crate::unified_p2p::ReceivedBlock, u8, std::time::Instant)> = 
             std::collections::HashMap::new();
         
-        // Periodic check for pending blocks
-        let mut last_pending_check = std::time::Instant::now();
+        // CRITICAL: Separate timers for retry (fast) and cleanup (slow)
+        let mut last_retry_check = std::time::Instant::now();  // Retry pending blocks every 2s
+        let mut last_cleanup_check = std::time::Instant::now(); // Cleanup expired every 30s
         
         // CRITICAL FIX: Create channel for re-queuing blocks
         let (retry_tx, mut retry_rx) = tokio::sync::mpsc::unbounded_channel::<crate::unified_p2p::ReceivedBlock>();
@@ -1773,8 +1781,38 @@ impl BlockchainNode {
                 "micro" => {
                     // Validate microblock signature and structure
                     if let Err(e) = Self::validate_received_microblock(&received_block, &storage, unified_p2p.as_ref(), None).await {
+                        // CRITICAL FIX: Check if error is due to CERTIFICATE RACE CONDITION
+                        // Block arrives before certificate → buffer for retry when certificate arrives
+                        if e.contains("Invalid signature") && e.contains("from producer") {
+                            // This is likely a certificate race condition
+                            let retry_count = pending_blocks.get(&received_block.height)
+                                .map(|(_, count, _)| count + 1)
+                                .unwrap_or(0);
+                            
+                            if retry_count < 5 { // Max 5 retries for certificate race (more than missing block)
+                                println!("[BLOCKS] 🔐 Buffering block #{} (retry #{}) - waiting for certificate from {}", 
+                                         received_block.height, retry_count, received_block.from_peer);
+                                pending_blocks.insert(
+                                    received_block.height, 
+                                    (received_block.clone(), retry_count, std::time::Instant::now())
+                                );
+                                
+                                // METRICS: Track certificate race condition occurrence
+                                if retry_count == 0 {
+                                    RETRY_CERT_RACE.fetch_add(1, Ordering::Relaxed);
+                                }
+                                
+                                // Certificate will arrive via periodic broadcast (every 10s during first 2 minutes)
+                                // No need to request - adaptive re-broadcast will provide it
+                                println!("[BLOCKS] ⏳ Certificate will arrive via adaptive re-broadcast");
+                                continue; // Skip error logging, this is expected race condition
+                            } else {
+                                println!("[BLOCKS] ❌ Block #{} rejected after {} certificate retries", 
+                                         received_block.height, retry_count);
+                            }
+                        }
                         // CRITICAL FIX: Check if error is due to missing previous block
-                        if e.starts_with("MISSING_PREVIOUS:") {
+                        else if e.starts_with("MISSING_PREVIOUS:") {
                             // Parse missing block height
                             if let Some(height_str) = e.strip_prefix("MISSING_PREVIOUS:") {
                                 if let Ok(missing_height) = height_str.parse::<u64>() {
@@ -1790,6 +1828,11 @@ impl BlockchainNode {
                                             received_block.height, 
                                             (received_block.clone(), retry_count, std::time::Instant::now())
                                         );
+                                        
+                                        // METRICS: Track missing previous block occurrence
+                                        if retry_count == 0 {
+                                            RETRY_MISSING_PREV.fetch_add(1, Ordering::Relaxed);
+                                        }
                                         
                                         // CRITICAL FIX: Actively request the missing block with DDoS protection
                                         if retry_count == 0 { // Only on first attempt
@@ -2075,6 +2118,11 @@ impl BlockchainNode {
                         println!("[BLOCKS] ✅ Block #{} stored successfully", received_block.height);
                     }
                     
+                    // METRICS: Track successful retry (block was in pending_blocks and now stored)
+                    if pending_blocks.contains_key(&received_block.height) {
+                        RETRY_SUCCESS.fetch_add(1, Ordering::Relaxed);
+                    }
+                    
                     // CRITICAL FIX: Check if we're the producer for next block after rotation boundary
                     // This ensures nodes immediately know they're selected after receiving rotation block
                     if received_block.height > 0 && received_block.height % 30 == 0 {
@@ -2194,11 +2242,57 @@ impl BlockchainNode {
                 }
             }
             
-            // Periodic cleanup of stale pending blocks and requests (every 30 seconds)
-            if last_pending_check.elapsed() > std::time::Duration::from_secs(30) {
-                last_pending_check = std::time::Instant::now();
+            // CRITICAL FIX: Fast retry for certificate race condition (every 2 seconds)
+            // This handles: block arrives → buffered → certificate arrives → retry succeeds
+            // Separate from cleanup to minimize latency while avoiding overhead
+            if last_retry_check.elapsed() > std::time::Duration::from_secs(2) {
+                last_retry_check = std::time::Instant::now();
                 
-                // Clean expired pending blocks
+                // CRITICAL: Retry ALL pending blocks (not just consecutive)
+                // This is different from fast-forward logic (which is triggered by successful block storage)
+                // OPTIMIZATION: Collect heights to retry first (avoid cloning in loop)
+                let heights_to_retry: Vec<u64> = pending_blocks.iter()
+                    .filter_map(|(height, (_, retry_count, timestamp))| {
+                        // ADAPTIVE RETRY: Recent blocks only (certificate race resolved quickly)
+                        let elapsed_secs = timestamp.elapsed().as_secs();
+                        if elapsed_secs < 60 && *retry_count < 5 {
+                            Some(*height)
+                        } else {
+                            None  // Old blocks will be cleaned up by separate cleanup timer
+                        }
+                    })
+                    .collect();
+                
+                // Re-queue pending blocks for retry (clone only what we need)
+                if !heights_to_retry.is_empty() {
+                    // PERFORMANCE: Log retry only once per minute (30 retry cycles @ 2s)
+                    static RETRY_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
+                    let log_count = RETRY_LOG_COUNTER.fetch_add(1, Ordering::Relaxed);
+                    if log_count % 30 == 0 {
+                        println!("[BLOCKS] 🔄 Retrying {} pending blocks (certificate/dependency resolution)", 
+                                 heights_to_retry.len());
+                    }
+                    
+                    for height in heights_to_retry {
+                        // Clone only the blocks we're retrying (not all pending blocks)
+                        if let Some((pending_block, _, _)) = pending_blocks.get(&height) {
+                            if let Err(e) = retry_tx.send(pending_block.clone()) {
+                                println!("[BLOCKS] ⚠️ Failed to re-queue block #{}: {:?}", height, e);
+                            } else {
+                                // METRICS: Track retry attempt
+                                RETRY_TOTAL.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // CRITICAL: Periodic cleanup of stale pending blocks and requests (every 30 seconds)
+            // This is separate from retry to avoid unnecessary overhead
+            if last_cleanup_check.elapsed() > std::time::Duration::from_secs(30) {
+                last_cleanup_check = std::time::Instant::now();
+                
+                // Clean expired pending blocks (after 60 seconds)
                 let mut expired = Vec::new();
                 for (height, (_, _, timestamp)) in pending_blocks.iter() {
                     if timestamp.elapsed() > std::time::Duration::from_secs(60) {
@@ -2219,6 +2313,27 @@ impl BlockchainNode {
                 }
                 for height in expired_requests {
                     requested_blocks.remove(&height);
+                }
+                
+                // METRICS: Log retry statistics every 5 minutes (10 cleanup cycles @ 30s)
+                static CLEANUP_COUNTER: AtomicU64 = AtomicU64::new(0);
+                let cleanup_count = CLEANUP_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
+                
+                if cleanup_count % 10 == 0 {
+                    // Log every 5 minutes (10 cycles × 30s = 300s)
+                    let total = RETRY_TOTAL.load(Ordering::Relaxed);
+                    let success = RETRY_SUCCESS.load(Ordering::Relaxed);
+                    let cert_race = RETRY_CERT_RACE.load(Ordering::Relaxed);
+                    let missing_prev = RETRY_MISSING_PREV.load(Ordering::Relaxed);
+                    
+                    if total > 0 {
+                        let success_rate = (success as f64 / total as f64 * 100.0) as u64;
+                        println!("[METRICS] 📊 Retry Statistics (5min window):");
+                        println!("[METRICS]   Total retries: {}", total);
+                        println!("[METRICS]   Successful: {} ({:.1}%)", success, success_rate);
+                        println!("[METRICS]   Certificate race: {}", cert_race);
+                        println!("[METRICS]   Missing previous: {}", missing_prev);
+                    }
                 }
                 
                 // Log status
