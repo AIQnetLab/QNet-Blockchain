@@ -36,7 +36,7 @@ Repo: https://github.com/AIQnetLab/QNet-Blockchain.git
 Builds:
   - versionName: 1.0.7
     versionCode: 8
-    commit: 514a36cb57c0a0c0a3ec2fcbcead4771d9709f17
+    commit: f6fef09e7805380959cc7181e9535761d4f2d0f1
     timeout: 10800
     subdir: applications/qnet-mobile/android
     sudo:
@@ -57,15 +57,8 @@ Builds:
       - governance
       - backups
       - Cargo.toml
-    rm:
-      - applications/qnet-mobile/node_modules/*/android/libs/*.so
-      - applications/qnet-mobile/node_modules/*/android/libs/*.aar
-      - applications/qnet-mobile/node_modules/*/ios/*.a
 
 AutoUpdateMode: None
 UpdateCheckMode: None
 CurrentVersion: 1.0.7
 CurrentVersionCode: 8
-
-NoSourceSince: 1.0.7
-
