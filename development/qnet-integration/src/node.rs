@@ -6432,13 +6432,7 @@ impl BlockchainNode {
                 println!("[PRODUCER] 🏆 Selected: {} (index {}/{})", 
                          winner.0, selection_index + 1, candidates.len());
                 println!("[PRODUCER] 🔐 Quantum-resistant via Dilithium-signed entropy");
-                println!("[PRODUCER] 🔄 Rotation: vrf_entropy changes each round → different producer");
-                
-                // Log runner-ups for transparency (PRODUCTION: only in debug mode)
-                if candidates.len() > 1 {
-                    let runner_up_idx = (selection_index + 1) % candidates.len();
-                    println!("[PRODUCER] 🥈 Next would be: {}", candidates[runner_up_idx].0);
-                }
+                println!("[PRODUCER] 🔄 VRF recalculates each block → unpredictable rotation")
                 
                 winner.0.clone()
             };
@@ -6631,6 +6625,20 @@ impl BlockchainNode {
                          own_node_id, own_node_type);
             };
             
+            // CRITICAL: Re-calculate correct producer to ensure all nodes agree
+            // This fixes race conditions where different nodes have stale/cached producer values
+            let correct_producer = Self::select_microblock_producer(
+                current_height,
+                unified_p2p,
+                own_node_id,
+                own_node_type,
+                storage.as_ref(),
+                &None  // Don't pass PoH to avoid race conditions
+            ).await;
+            
+            println!("[EMERGENCY_SELECTION] 🔄 Recalculated correct producer for block #{}: {}", current_height, correct_producer);
+            println!("[EMERGENCY_SELECTION] ℹ️  Reported failed producer: {} (may be stale)", failed_producer);
+            
             // Use same candidate source as normal production
             {
                 // ARCHITECTURE: Use SAME calculate_qualified_candidates for determinism
@@ -6640,13 +6648,13 @@ impl BlockchainNode {
                 let qualified = Self::calculate_qualified_candidates(p2p, own_node_id, own_node_type).await;
                 
                 for (node_id, reputation) in qualified {
-                    // Exclude failed producer
-                    if node_id == failed_producer {
-                        println!("[EMERGENCY_SELECTION] 💀 Excluding failed producer {} from emergency candidates", node_id);
+                    // Exclude the CORRECT producer (not the stale failed_producer)
+                    // All nodes will recalculate same correct_producer → same exclusion → deterministic!
+                    if node_id == correct_producer {
+                        println!("[EMERGENCY_SELECTION] 💀 Excluding actual producer {} from emergency candidates", node_id);
                         continue;
                     }
                     
-                    // Add all others as candidates (no failover history filtering - breaks determinism)
                     candidates.push((node_id.clone(), reputation));
                     println!("[EMERGENCY_SELECTION] ✅ Emergency candidate {} added (reputation: {:.1}%)", 
                              node_id, reputation * 100.0);
@@ -6668,8 +6676,9 @@ impl BlockchainNode {
                 })
                 .collect();
             
-            println!("[EMERGENCY_SELECTION] 🔍 Emergency candidates: {} valid (excluding failed: {})", 
-                     valid_candidates.len(), failed_producer);
+            println!("[EMERGENCY_SELECTION] 🔍 Emergency candidates: {} valid (excluded: {})", 
+                     valid_candidates.len(), correct_producer);
+            println!("[EMERGENCY_SELECTION] ℹ️  Reported failed: '{}' (may be stale)", failed_producer);
             
             if valid_candidates.is_empty() {
                 println!("[FAILOVER] 💀 CRITICAL: No valid backup producers available!");
@@ -6828,21 +6837,11 @@ impl BlockchainNode {
             use sha3::{Sha3_256, Digest};
             let mut emergency_hasher = Sha3_256::new();
             
-            if current_height > 0 {
-                // Use block height and failed producer as entropy
-                // ALL nodes have this information regardless of sync status
-                println!("[EMERGENCY] 🔐 Using deterministic entropy for block #{}", current_height);
-                emergency_hasher.update(b"EMERGENCY_DETERMINISTIC_V3");  // V3: without timestamp/PoH/entropy_source
-                emergency_hasher.update(&current_height.to_le_bytes());
-                emergency_hasher.update(failed_producer.as_bytes());
-                // CRITICAL: NO timestamp, NO PoH, NO entropy_source - only universally available data
-                // This ensures ALL nodes calculate exactly the same hash
-            } else {
-                // Height 0 - genesis emergency (should never happen but handle gracefully)
-                println!("[EMERGENCY] 🎯 Height 0: Using genesis emergency entropy");
-                emergency_hasher.update(b"EMERGENCY_GENESIS");
-                emergency_hasher.update(&current_height.to_le_bytes());
-            }
+            // Use the recalculated correct_producer (calculated above) for deterministic hash
+            println!("[EMERGENCY] 🔐 Using deterministic entropy for block #{}", current_height);
+            emergency_hasher.update(b"EMERGENCY_DETERMINISTIC_V5_NORMALIZED");  // V5: use recalculated producer
+            emergency_hasher.update(&current_height.to_le_bytes());
+            emergency_hasher.update(correct_producer.as_bytes());  // Use recalculated value, not stale failed_producer
             
             // CRITICAL: Apply MAX_VALIDATORS limit BEFORE sorting (for scalability)
             // Same limit as normal consensus to prevent O(n log n) on millions of nodes
@@ -7031,8 +7030,7 @@ impl BlockchainNode {
         
         println!("[CANDIDATES] 📊 Total qualified: {} nodes (reputation >= 70%)", all_qualified.len());
         
-        // CRITICAL: If NO candidates found, this is a FATAL ERROR for production
-        // Genesis nodes MUST connect to each other via P2P before producer selection
+        // CRITICAL: If NO candidates found, this is a P2P connectivity issue
         if all_qualified.is_empty() {
             println!("[CANDIDATES] ❌ FATAL: No qualified candidates found!");
             println!("[CANDIDATES] 📋 This indicates P2P connectivity failure");

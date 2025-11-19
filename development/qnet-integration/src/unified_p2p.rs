@@ -4276,20 +4276,16 @@ impl SimplifiedP2P {
             _ => {} // Continue with Full/Super node logic
         }
         
-        // CRITICAL FIX: For Genesis nodes, return ONLY CONNECTED peers
-        // This ensures Byzantine safety requires REAL nodes, not phantom ones
+        // CRITICAL FIX: For Genesis bootstrap, return ALL configured peers WITHOUT TCP checks
+        // TCP checks are ONLY for broadcast/failover, NOT for consensus candidate lists
+        // This ensures deterministic consensus: all nodes see SAME candidates for VRF
         if std::env::var("QNET_BOOTSTRAP_ID")
             .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
             .unwrap_or(false) {
-            // PRODUCTION FIX: Use working Genesis nodes from connectivity check
-            // This ensures all nodes see the same set of active peers for consensus
             let genesis_ips = get_genesis_bootstrap_ips();
-            
-            // Use filter_working_genesis_nodes_static to get actually reachable nodes
-            // This is cached for 30 seconds to avoid repeated TCP checks
-            let working_genesis_ips = Self::filter_working_genesis_nodes_static(genesis_ips.clone());
-            
             let mut genesis_peers = Vec::new();
+            
+            println!("[P2P] 📋 Building peer list from bootstrap config (deterministic for consensus)");
             
             for (i, ip) in genesis_ips.iter().enumerate() {
                 let node_id = format!("genesis_node_{:03}", i + 1);
@@ -4297,36 +4293,27 @@ impl SimplifiedP2P {
                 
                 // Skip self to avoid duplication
                 if !self.node_id.contains(&node_id) && !self.node_id.contains(&format!("{:03}", i + 1)) {
-                    // PRODUCTION: Use working_genesis_ips (from cached connectivity check)
-                    // This ensures consistent peer count across all nodes
-                    if working_genesis_ips.contains(ip) {
-                        genesis_peers.push(PeerInfo {
-                            id: node_id.clone(),
-                            addr: peer_addr,
-                            node_type: NodeType::Super,
-                            region: get_genesis_region_by_index(i),
-                            last_seen: chrono::Utc::now().timestamp() as u64,
-                            is_stable: true,
-                            latency_ms: 10,
-                            connection_count: 5,
-                            bandwidth_usage: 1000,
-                            node_id_hash: Vec::new(),
-                            bucket_index: 0,
-                            reputation_score: 70.0, // PRODUCTION: Equal starting reputation
-                            successful_pings: 100,
-                            failed_pings: 0,
-                        });
-                    }
+                    genesis_peers.push(PeerInfo {
+                        id: node_id.clone(),
+                        addr: peer_addr,
+                        node_type: NodeType::Super,
+                        region: get_genesis_region_by_index(i),
+                        last_seen: chrono::Utc::now().timestamp() as u64,
+                        is_stable: true,
+                        latency_ms: 10,
+                        connection_count: 5,
+                        bandwidth_usage: 1000,
+                        node_id_hash: Vec::new(),
+                        bucket_index: 0,
+                        reputation_score: 70.0,
+                        successful_pings: 100,
+                        failed_pings: 0,
+                    });
+                    println!("[P2P]   ├── {}", node_id);
                 }
             }
             
-            // PRODUCTION: Report actual reachable peers (not phantom)
-            let actual_count = genesis_peers.len();
-            if actual_count == 0 && working_genesis_ips.is_empty() {
-                println!("[P2P] 🌱 Genesis mode: No reachable peers found (network issue?)");
-        } else {
-                println!("[P2P] 🌱 Genesis mode: returning {} REACHABLE peers (from connectivity check)", actual_count);
-            }
+            println!("[P2P] ✅ Peer list: {} nodes (NO TCP checks - deterministic)", genesis_peers.len());
             return genesis_peers;
         }
         
