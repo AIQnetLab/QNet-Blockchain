@@ -4280,7 +4280,7 @@ impl SimplifiedP2P {
         // TCP checks are ONLY for broadcast/failover, NOT for consensus candidate lists
         // This ensures deterministic consensus: all nodes see SAME candidates for VRF
         if std::env::var("QNET_BOOTSTRAP_ID")
-            .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
+            .map(|id| ["001", "002", "003", "004", "005"].contains(&id.trim()))
             .unwrap_or(false) {
             let genesis_ips = get_genesis_bootstrap_ips();
             let mut genesis_peers = Vec::new();
@@ -4291,8 +4291,11 @@ impl SimplifiedP2P {
                 let node_id = format!("genesis_node_{:03}", i + 1);
                 let peer_addr = format!("{}:8001", ip);
                 
-                // Skip self to avoid duplication
-                if !self.node_id.contains(&node_id) && !self.node_id.contains(&format!("{:03}", i + 1)) {
+                // CRITICAL FIX: Use exact comparison, not contains()
+                // contains() incorrectly excludes nodes with similar substrings
+                // Example: if self.node_id="genesis_node_005", contains("005") excludes ALL nodes with "005"
+                // This caused certificate broadcast failure for rotated producers!
+                if self.node_id != node_id {  // Exact comparison - only skip if EXACTLY same node
                     genesis_peers.push(PeerInfo {
                         id: node_id.clone(),
                         addr: peer_addr,
@@ -4476,15 +4479,57 @@ impl SimplifiedP2P {
                     
                     validated_peers
                 } else {
-                    // REGULAR NODES: Use standard peer validation (DHT discovered peers)
-                    // SCALABILITY: HashMap.values() for O(n) iteration
-                    let validated_peers: Vec<PeerInfo> = peers.values()
+                    // REGULAR NODES (Super/Full): Deterministic Genesis peers + DHT discovered peers
+                    // CRITICAL: Light nodes already excluded at function start (line 4272-4274)
+                    // This ensures deterministic consensus: all Super/Full nodes see SAME Genesis candidates
+                    let mut all_validated_peers = Vec::new();
+                    
+                    // STEP 1: Add deterministic Genesis peers for consensus (same as Genesis nodes)
+                    // This ensures all nodes agree on Genesis candidates for VRF producer selection
+                    let genesis_ips = get_genesis_bootstrap_ips();
+                    let mut genesis_peer_ids = std::collections::HashSet::new();
+                    
+                    println!("[P2P] 📋 Adding deterministic Genesis peers for consensus (regular node)");
+                    for (i, ip) in genesis_ips.iter().enumerate() {
+                        let node_id = format!("genesis_node_{:03}", i + 1);
+                        let peer_addr = format!("{}:8001", ip);
+                        
+                        // Add all Genesis peers (no self-exclusion for regular nodes)
+                        genesis_peer_ids.insert(node_id.clone());
+                        all_validated_peers.push(PeerInfo {
+                            id: node_id.clone(),
+                            addr: peer_addr,
+                            node_type: NodeType::Super,
+                            region: get_genesis_region_by_index(i),
+                            last_seen: chrono::Utc::now().timestamp() as u64,
+                            is_stable: true,
+                            latency_ms: 10,
+                            connection_count: 5,
+                            bandwidth_usage: 1000,
+                            node_id_hash: Vec::new(),
+                            bucket_index: 0,
+                            reputation_score: 70.0,
+                            successful_pings: 100,
+                            failed_pings: 0,
+                        });
+                        println!("[P2P]   ├── {} (deterministic for consensus)", node_id);
+                    }
+                    
+                    // STEP 2: Add DHT-discovered peers (excluding Genesis to avoid duplicates)
+                    // SCALABILITY: HashMap.values() for O(n) iteration over millions of nodes
+                    let dht_peers: Vec<PeerInfo> = peers.values()
                         .filter(|peer| {
-                            // Basic validation for regular nodes
+                            // Exclude Genesis peers (already added deterministically)
+                            let is_genesis = genesis_peer_ids.contains(&peer.id);
+                            
+                            // Only include Super/Full nodes (Light nodes excluded)
                             let is_consensus_capable = matches!(peer.node_type, NodeType::Super | NodeType::Full);
                             
-                            if is_consensus_capable {
-                                println!("[P2P] ✅ Regular peer {} meets consensus requirements", peer.addr);
+                            if is_genesis {
+                                // Skip - already added deterministically
+                                false
+                            } else if is_consensus_capable {
+                                println!("[P2P] ✅ DHT peer {} meets consensus requirements", peer.addr);
                                 true
                             } else {
                                 println!("[P2P] 📱 Light peer {} excluded from consensus", peer.addr);
@@ -4494,9 +4539,12 @@ impl SimplifiedP2P {
                         .cloned()
                         .collect();
                     
-                    println!("[P2P] ✅ Regular validated peers: {}/{} (DHT-discovered)", 
-                             validated_peers.len(), peers.len());
-                    validated_peers
+                    // Combine Genesis (deterministic) + DHT-discovered peers
+                    all_validated_peers.extend(dht_peers);
+                    
+                    println!("[P2P] ✅ Regular validated peers: {} Genesis (deterministic) + {} DHT-discovered = {} total", 
+                             genesis_ips.len(), all_validated_peers.len() - genesis_ips.len(), all_validated_peers.len());
+                    all_validated_peers
                 }
             }
             Err(e) => {
@@ -8622,6 +8670,23 @@ impl SimplifiedP2P {
         println!("[CONSENSUS] 🏛️ Processing remote commit: round={}, node={}, hash={}", 
                 round_id, node_id, commit_hash);
         
+        // CRITICAL FIX: Reject commits from jailed nodes (reputation < 70%)
+        // This prevents non-deterministic participants lists from causing consensus deadlock
+        let reputation_score = {
+            let reputation_system = self.reputation_system.lock().unwrap();
+            let raw_score = reputation_system.get_reputation(&node_id);
+            raw_score / 100.0  // Convert 0-100 to 0-1
+        };
+        
+        if reputation_score < 0.70 {
+            println!("[CONSENSUS] ❌ Rejecting commit from jailed node: {} (reputation: {:.1}%, required: ≥70%)", 
+                     node_id, reputation_score * 100.0);
+            println!("[CONSENSUS]    Jailed nodes cannot participate in Byzantine consensus");
+            return;  // Early return - do NOT process commit
+        }
+        
+        println!("[CONSENSUS] ✅ Reputation check passed: {} ({:.1}%)", node_id, reputation_score * 100.0);
+        
         // PRODUCTION: Send to consensus engine through channel
         if let Some(ref consensus_tx) = self.consensus_tx {
             let consensus_msg = ConsensusMessage::RemoteCommit {
@@ -8641,7 +8706,7 @@ impl SimplifiedP2P {
             println!("[CONSENSUS] ⚠️ No consensus channel established - commit not processed");
         }
         
-        // Update peer reputation for participation
+        // Update peer reputation for participation (+1% for valid commit)
         self.update_node_reputation(&node_id, 1.0);
     }
 
@@ -8649,6 +8714,23 @@ impl SimplifiedP2P {
     fn handle_remote_consensus_reveal(&self, round_id: u64, node_id: String, reveal_data: String, nonce: String, timestamp: u64) {
         println!("[CONSENSUS] 🏛️ Processing remote reveal: round={}, node={}, reveal_length={}, nonce_length={}", 
                 round_id, node_id, reveal_data.len(), nonce.len());
+        
+        // CRITICAL FIX: Reject reveals from jailed nodes (reputation < 70%)
+        // Must match commit reputation check for consistency
+        let reputation_score = {
+            let reputation_system = self.reputation_system.lock().unwrap();
+            let raw_score = reputation_system.get_reputation(&node_id);
+            raw_score / 100.0  // Convert 0-100 to 0-1
+        };
+        
+        if reputation_score < 0.70 {
+            println!("[CONSENSUS] ❌ Rejecting reveal from jailed node: {} (reputation: {:.1}%, required: ≥70%)", 
+                     node_id, reputation_score * 100.0);
+            println!("[CONSENSUS]    Jailed nodes cannot participate in Byzantine consensus");
+            return;  // Early return - do NOT process reveal
+        }
+        
+        println!("[CONSENSUS] ✅ Reputation check passed: {} ({:.1}%)", node_id, reputation_score * 100.0);
         
         // PRODUCTION: Send to consensus engine through channel
         if let Some(ref consensus_tx) = self.consensus_tx {
@@ -8669,7 +8751,7 @@ impl SimplifiedP2P {
             println!("[CONSENSUS] ⚠️ No consensus channel established - reveal not processed");
         }
         
-        // Update peer reputation for participation
+        // Update peer reputation for participation (+2% for valid reveal)
         self.update_node_reputation(&node_id, 2.0);
     }
     

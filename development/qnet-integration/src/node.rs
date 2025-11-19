@@ -9458,17 +9458,27 @@ impl BlockchainNode {
             // CRITICAL: Execute REAL INTER-NODE CONSENSUS instead of Genesis bootstrap fake
             let round_id = end_height; // Macroblock height as round ID
             
-            // STEP 1: Use EXISTING qualified candidates system with validator sampling (1000 max)
-            let qualified_candidates = Self::calculate_qualified_candidates(p2p, node_id, node_type).await;
+            // CRITICAL FIX: Build participants list WITHOUT reputation filter
+            // Reputation check happens at commit/reveal validation (unified_p2p.rs)
+            // This ensures ALL nodes agree on SAME participants list → deterministic consensus
             
-            // No need for additional fallback - calculate_qualified_candidates handles it
-            
-            let mut all_participants: Vec<String> = qualified_candidates.into_iter()
-                .map(|(node_id, _reputation)| node_id)
+            // Get ALL validated peers (no reputation filter)
+            let validated_peers = p2p.get_validated_active_peers();
+            let mut all_participants: Vec<String> = validated_peers.iter()
+                .map(|peer| peer.id.clone())
                 .collect();
             
+            // Add own node if eligible (Super or Full node type)
+            let can_participate = matches!(node_type, NodeType::Super | NodeType::Full);
+            if can_participate && !all_participants.contains(&node_id.to_string()) {
+                all_participants.push(node_id.to_string());
+            }
+            
+            println!("[CONSENSUS] 📊 Byzantine participants (pre-reputation-filter): {} nodes", all_participants.len());
+            println!("[CONSENSUS]    Jailed nodes will be rejected at commit/reveal validation");
+            
             // CRITICAL: Sort participants to ensure deterministic ordering across ALL nodes
-            // next_leader selection (line 8966) uses participants.first() - MUST be same on all nodes!
+            // next_leader selection uses participants.first() - MUST be same on all nodes!
             // Without sorting: different nodes calculate DIFFERENT next_leader → consensus failure!
             all_participants.sort();  // Sort alphabetically by node_id
             
