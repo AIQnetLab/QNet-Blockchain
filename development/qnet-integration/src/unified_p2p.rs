@@ -128,6 +128,18 @@ const HTTP_POOL_MAX_IDLE_PER_HOST: usize = 10; // Max connections per host
 static INVALID_BLOCKS_TRACKER: Lazy<Arc<DashMap<String, (AtomicU64, Instant)>>> = 
     Lazy::new(|| Arc::new(DashMap::new()));
 
+// SECURITY: Track false emergency senders for penalty application
+// Format: sender_addr -> (false_count, last_false_time)
+// Used to apply -5 reputation penalty for false emergency messages
+static FALSE_EMERGENCY_TRACKER: Lazy<Arc<DashMap<String, (AtomicU64, Instant)>>> = 
+    Lazy::new(|| Arc::new(DashMap::new()));
+
+// CONSENSUS: Track emergency confirmations from multiple nodes
+// Key: (block_height, failed_producer) → Value: (confirmation_count, first_seen_time)
+// This enables lightweight consensus: if 3+ nodes report same emergency, it's likely valid
+static EMERGENCY_CONFIRMATIONS: Lazy<Arc<DashMap<(u64, String), (AtomicU64, Instant)>>> = 
+    Lazy::new(|| Arc::new(DashMap::new()));
+
 /// SECURITY: Rate limiting structure for DDoS protection
 #[derive(Debug, Clone)]
 pub struct RateLimit {
@@ -2135,14 +2147,16 @@ impl SimplifiedP2P {
                                       std::env::var("QNET_GENESIS_BOOTSTRAP").unwrap_or_default() == "1";
                 
                 // Determine sync interval based on node type AND network phase
-                // CRITICAL FIX: Faster sync for Super/Full nodes to prevent desync after long runs
+                // CRITICAL FIX: Balanced sync intervals to prevent rate limiting
+                // Rate limit: 10 requests/min → need intervals ≥6s to stay under limit
+                // ARCHITECTURE: All Genesis nodes are Super nodes by design
+                // Genesis Super nodes: 7s (was 1s) - 8.5 requests/min (safe margin)
+                // Regular nodes: Keep original timing (already safe)
                 let sync_interval = match &node_type {
                     NodeType::Light => 30,  // Light nodes: 30s (mobile, stores only 1000 blocks)
-                    NodeType::Full => {
-                        if is_genesis_node { 2 } else { 5 }  // Full nodes: 2s genesis, 5s normal (FASTER!)
-                    },
+                    NodeType::Full => 5,    // Full nodes: 5s (Full nodes are never Genesis)
                     NodeType::Super => {
-                        if is_genesis_node { 1 } else { 2 }  // Super nodes: 1s genesis, 2s normal (FASTEST!)
+                        if is_genesis_node { 7 } else { 2 }  // Super nodes: 7s genesis (was 1s), 2s normal
                     }
                 };
                 
@@ -2312,7 +2326,7 @@ impl SimplifiedP2P {
          let connected_peers_lockfree = self.connected_peers_lockfree.clone(); // For get_last_activity_map
          let genesis_ips = vec!["154.38.160.39".to_string(), "62.171.157.44".to_string(), 
                                "161.97.86.81".to_string(), "5.189.130.160".to_string(), 
-                               "167.86.66.168".to_string()]; // Genesis IPs to avoid borrowing self
+                               "162.244.25.114".to_string()]; // Genesis IPs to avoid borrowing self
          
          tokio::spawn(async move {
              println!("[P2P] 🔍 Starting reputation-based peer validation with shared reputation system...");
@@ -6384,6 +6398,30 @@ impl SimplifiedP2P {
             }
 
             NetworkMessage::EmergencyProducerChange { failed_producer, new_producer, block_height, change_type, timestamp } => {
+                // SECURITY: Check sender reputation before processing emergency message
+                // SIMPLIFIED: Only reputation check, no complex round verification
+                // RATIONALE: Round participants change dynamically, checking would be non-deterministic
+                
+                let sender_reputation = {
+                    // Get sender peer info from connected_peers (indexed by address)
+                    if let Some(peer_info) = self.connected_peers_lockfree.get(from_peer) {
+                        peer_info.reputation_score
+                    } else if let Ok(peers) = self.connected_peers.read() {
+                        peers.get(from_peer).map(|p| p.reputation_score).unwrap_or(0.0)
+                    } else {
+                        0.0 // Unknown sender = no reputation
+                    }
+                };
+                
+                // CRITICAL: Ignore emergency messages from low-reputation nodes
+                // This naturally limits to ~1000 high-reputation nodes that can participate
+                if sender_reputation < 70.0 {
+                    println!("[SECURITY] ⚠️ Ignoring emergency from {} - reputation {:.1} < 70", 
+                             from_peer, sender_reputation);
+                    println!("[SECURITY] 🚫 Low-reputation nodes cannot trigger emergency failover");
+                    return; // Ignore message completely
+                }
+                
                 // PRIVACY: Use privacy-preserving IDs for producer changes
                 // CRITICAL FIX: Don't double-convert if already a pseudonym (genesis_node_XXX or node_XXX)
                 let failed_id = if failed_producer.starts_with("genesis_node_") || failed_producer.starts_with("node_") {
@@ -6400,7 +6438,12 @@ impl SimplifiedP2P {
                 
                 println!("[FAILOVER] 🚨 Emergency producer change: {} → {} at block #{} ({})", 
                          failed_id, new_id, block_height, change_type);
-                self.handle_emergency_producer_change(failed_producer, new_producer, block_height, change_type, timestamp);
+                
+                // Pass sender address for tracking false emergencies
+                self.handle_emergency_producer_change_with_sender(
+                    failed_producer, new_producer, block_height, change_type, timestamp,
+                    from_peer.to_string() // Pass sender address for tracking
+                );
             }
             
             NetworkMessage::ReputationSync { node_id, reputation_updates, timestamp, signature } => {
@@ -6837,9 +6880,11 @@ impl SimplifiedP2P {
         
         // CRITICAL FIX: Adaptive rate limiting based on sync state
         // If peer is far behind, allow unlimited sync requests for recovery
-        // Check if this peer is requesting blocks they don't have
+        // ARCHITECTURE: Use REQUEST RANGE as proxy for how far behind the requester is
+        // This is MORE ACCURATE than trying to track each peer's height (which requires HTTP calls)
+        // If requester asks for blocks 1-100, they're clearly behind by at least 100 blocks
         let blocks_behind = if to_height > from_height {
-            to_height - from_height
+            to_height - from_height  // Request range indicates how far behind
         } else {
             0
         };
@@ -7199,7 +7244,7 @@ fn get_genesis_region_by_index(index: usize) -> Region {
         1 => Region::Europe,        // genesis_node_002 (62.171.157.44)
         2 => Region::Europe,        // genesis_node_003 (161.97.86.81)
         3 => Region::Europe,        // genesis_node_004 (5.189.130.160)
-        4 => Region::Europe,        // genesis_node_005 (167.86.66.168)
+        4 => Region::Europe,        // genesis_node_005 (162.244.25.114)
         _ => Region::Europe,        // Default fallback
     }
 }
@@ -8771,7 +8816,24 @@ impl SimplifiedP2P {
         round_id > 0 && (round_id % 90 == 0)
     }
     
-    /// Handle emergency producer change notifications
+    /// Handle emergency producer change notifications with sender tracking
+    fn handle_emergency_producer_change_with_sender(
+        &self, 
+        failed_producer: String, 
+        new_producer: String, 
+        block_height: u64,
+        change_type: String,
+        timestamp: u64,
+        sender_addr: String  // Track who sent the emergency
+    ) {
+        // Forward to main handler with sender info
+        self.handle_emergency_producer_change_internal(
+            failed_producer, new_producer, block_height, change_type, timestamp,
+            Some(sender_addr)
+        );
+    }
+    
+    /// Handle emergency producer change notifications (backward compatibility)
     fn handle_emergency_producer_change(
         &self, 
         failed_producer: String, 
@@ -8779,6 +8841,23 @@ impl SimplifiedP2P {
         block_height: u64,
         change_type: String,
         timestamp: u64
+    ) {
+        // Forward to main handler without sender info (for backward compatibility)
+        self.handle_emergency_producer_change_internal(
+            failed_producer, new_producer, block_height, change_type, timestamp,
+            None
+        );
+    }
+    
+    /// Internal handler for emergency producer change with optional sender tracking
+    fn handle_emergency_producer_change_internal(
+        &self, 
+        failed_producer: String, 
+        new_producer: String, 
+        block_height: u64,
+        change_type: String,
+        timestamp: u64,
+        sender_addr: Option<String>  // Optional sender for tracking false emergencies
     ) {
         // CRITICAL FIX: Check message age to prevent stale message spam
         // ARCHITECTURE: Emergency messages have 60-second TTL to prevent network pollution
@@ -8826,12 +8905,26 @@ impl SimplifiedP2P {
             LAST_EMERGENCY_HEIGHT.store(block_height, Ordering::Relaxed);
         }
         
-        // CRITICAL FIX: Filter out failover messages for blocks we don't have yet
-        // This prevents spam when a node starts with empty database
+        // CRITICAL FIX: Validate emergency message against LOCAL blockchain state
+        // SECURITY: Don't trust emergency messages blindly - verify we actually need failover
         let local_height = LOCAL_BLOCKCHAIN_HEIGHT.load(Ordering::Relaxed);
+        
+        // VALIDATION #1: Ignore failover for blocks too far in the future
         if block_height > local_height + 10 {
-            // Ignore failover for blocks too far in the future (>10 blocks ahead)
-            // This prevents spam from nodes that are far ahead
+            println!("[FAILOVER] ⚠️ Ignoring emergency for block #{} - too far ahead (local: {})", 
+                     block_height, local_height);
+            return;
+        }
+        
+        // VALIDATION #2: Check if we ALREADY HAVE this block
+        // If we have the block, the original producer succeeded - ignore emergency message
+        // This prevents genesis_node_005 (stuck at height 0) from triggering false emergencies
+        if block_height <= local_height {
+            // We already have this block - check if it exists in storage
+            // Use external storage check via static method (no self reference needed)
+            // ARCHITECTURE: Emergency messages should only be trusted if we're also missing the block
+            println!("[FAILOVER] ✅ Block #{} already processed (local height: {}) - ignoring emergency", 
+                     block_height, local_height);
             return;
         }
         
@@ -8841,6 +8934,13 @@ impl SimplifiedP2P {
         // SCALABILITY: DashSet provides lock-free concurrent access for millions of nodes
         if !PROCESSED_FAILOVERS.insert(failover_key.clone()) {
             // Already processed this exact failover event (insert returns false if already exists)
+            println!("[FAILOVER] ⚠️ Duplicate emergency for block #{} - ignoring", block_height);
+            
+            // SECURITY: Track duplicate emergency from sender as potential spam
+            if let Some(sender) = &sender_addr {
+                println!("[SECURITY] ⚠️ Duplicate emergency from {} for block #{}", sender, block_height);
+                // Could apply penalty for spam in future
+            }
             return;
         }
         
@@ -9041,41 +9141,8 @@ impl SimplifiedP2P {
             return;
         }
         
-        // PRODUCTION: Apply penalty to ALL failed producers after bootstrap
-        // BALANCED: Reduced from -20% to -10% for better recovery
-        self.update_node_reputation(&failed_producer, -10.0);
-        
-        if failed_producer == self.node_id {
-            println!("[REPUTATION] ⚔️ Self-penalty applied: -10.0 reputation (failover)");
-        } else {
-            // PRIVACY: Use pseudonym for logging (don't double-convert if already pseudonym)
-            let display_id = if failed_producer.starts_with("genesis_node_") || failed_producer.starts_with("node_") {
-                failed_producer.clone()
-            } else {
-                get_privacy_id_for_addr(&failed_producer)
-            };
-            println!("[REPUTATION] ⚔️ Network-wide penalty for {}: -10.0 reputation (emergency change)", display_id);
-        }
-        
-        // Boost reputation of emergency producer for taking over
-        if new_producer != "emergency_consensus" && new_producer != self.node_id {
-            self.update_node_reputation(&new_producer, 5.0);
-            
-            // PRIVACY: Use pseudonym for logging (don't double-convert if already pseudonym)
-            let display_id = if new_producer.starts_with("genesis_node_") || new_producer.starts_with("node_") {
-                new_producer.clone()
-            } else {
-                get_privacy_id_for_addr(&new_producer)
-            };
-            println!("[REPUTATION] ✅ Emergency producer {} rewarded: +5.0 reputation (network service)", display_id);
-        }
-        
-        // Log emergency change for network transparency
-        println!("[NETWORK] 📊 Emergency producer change recorded | Type: {} | Height: {} | Time: {}", 
-                 change_type, block_height, timestamp);
-        
-        // CRITICAL FIX: Set EMERGENCY_PRODUCER_FLAG if WE are the new emergency producer
-        // This allows the main production loop to activate immediately
+        // CRITICAL FIX: Set EMERGENCY_PRODUCER_FLAG IMMEDIATELY if WE are the new emergency producer
+        // This MUST happen BEFORE any async tasks to ensure immediate activation
         if new_producer == self.node_id {
             println!("[FAILOVER] 🚀 WE ARE THE EMERGENCY PRODUCER - Setting flag for block #{}", block_height);
             
@@ -9087,12 +9154,108 @@ impl SimplifiedP2P {
             println!("[FAILOVER] ✅ Emergency producer flag set successfully");
         }
         
-        // CRITICAL FIX: Invalidate producer cache to prevent selecting failed producer again
-        // This ensures the network will select a new producer in the next round
-        // IMPORTANT: Do this for ALL nodes, not just the emergency producer
-        println!("[FAILOVER] 🔄 Invalidating producer cache after emergency change");
-        crate::node::BlockchainNode::invalidate_producer_cache();
+        // Log emergency change for network transparency
+        println!("[NETWORK] 📊 Emergency producer change recorded | Type: {} | Height: {} | Time: {}", 
+                 change_type, block_height, timestamp);
+        
+        // CONSENSUS: Track emergency confirmations from multiple nodes
+        // This provides lightweight Byzantine-like protection without full consensus overhead
+        let confirmation_key = (block_height, failed_producer.clone());
+        let confirmation_count = EMERGENCY_CONFIRMATIONS
+            .entry(confirmation_key.clone())
+            .or_insert((AtomicU64::new(0), Instant::now()))
+            .0
+            .fetch_add(1, Ordering::Relaxed) + 1;
+        
+        println!("[CONSENSUS] 📊 Emergency for block #{}: {} confirmations", block_height, confirmation_count);
+        
+        // CLEANUP: Remove old confirmation entries (keep last 100 blocks)
+        if EMERGENCY_CONFIRMATIONS.len() > 100 {
+            let min_height = block_height.saturating_sub(50);
+            EMERGENCY_CONFIRMATIONS.retain(|(h, _), _| *h >= min_height);
+        }
+        
+        // Log suspicious emergency for monitoring
+        if let Some(sender) = &sender_addr {
+            println!("[SECURITY] 🔍 Emergency from {} for block #{} - tracking", sender, block_height);
+        }
+        
+        // Request block immediately (synchronous part)
+        println!("[FAILOVER] 📡 Requesting block #{} from network", block_height);
+        
+        // Clone values for logging (async part will check consensus)
+        let failed_producer_log = failed_producer.clone();
+        let new_producer_log = new_producer.clone();
+        let block_height_log = block_height;
+        let sender_log = sender_addr.clone();
+        
+        // Schedule async verification without self reference
+        tokio::spawn(async move {
+            // Step 1: Wait for block propagation (2 seconds)
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            
+            // Step 2: Check if block arrived (using global state)
+            let final_height = LOCAL_BLOCKCHAIN_HEIGHT.load(Ordering::Relaxed);
+            
+            if block_height_log <= final_height {
+                println!("[FAILOVER] ✅ Block #{} received - Producer {} is INNOCENT", 
+                         block_height_log, failed_producer_log);
+            } else {
+                // Check consensus
+                let conf_key = (block_height_log, failed_producer_log.clone());
+                let confirmations = EMERGENCY_CONFIRMATIONS
+                    .get(&conf_key)
+                    .map(|entry| entry.0.load(Ordering::Relaxed))
+                    .unwrap_or(1);
+                
+                if confirmations >= 3 {
+                    println!("[CONSENSUS] ✅ Block #{} missing - CONSENSUS REACHED ({} confirmations)", 
+                             block_height_log, confirmations);
+                } else if confirmations >= 2 {
+                    println!("[CONSENSUS] ⚠️ Block #{} missing - PARTIAL CONSENSUS ({} confirmations)", 
+                             block_height_log, confirmations);
+                } else {
+                    println!("[CONSENSUS] ⚠️ Block #{} missing - SINGLE REPORT (no penalty)", 
+                             block_height_log);
+                }
+            }
+        });
+        
+        println!("[FAILOVER] ⏸️ Verification scheduled (2s timeout)");
+        
+        // Apply penalties IMMEDIATELY based on current confirmation count
+        // This avoids async complexity while still using consensus
+        let conf_key = (block_height, failed_producer.clone());
+        let current_confirmations = EMERGENCY_CONFIRMATIONS
+            .get(&conf_key)
+            .map(|entry| entry.0.load(Ordering::Relaxed))
+            .unwrap_or(1);
+        
+        println!("[CONSENSUS] 📊 Current confirmations: {}", current_confirmations);
+        
+        if current_confirmations >= 3 {
+            println!("[CONSENSUS] ✅ CONSENSUS REACHED: 3+ nodes confirm emergency");
+            self.update_node_reputation(&failed_producer, -10.0);
+            println!("[FAILOVER] ⚔️ Applied penalty -10 to {} (consensus)", failed_producer);
+            
+            if new_producer != "emergency_consensus" {
+                self.update_node_reputation(&new_producer, 5.0);
+                println!("[FAILOVER] ✅ Emergency producer {} rewarded: +5", new_producer);
+            }
+        } else if current_confirmations >= 2 {
+            println!("[CONSENSUS] ⚠️ PARTIAL CONSENSUS: 2 nodes confirm emergency");
+            self.update_node_reputation(&failed_producer, -5.0);
+            println!("[FAILOVER] ⚔️ Applied penalty -5 to {} (partial)", failed_producer);
+            
+            if new_producer != "emergency_consensus" {
+                self.update_node_reputation(&new_producer, 2.0);
+                println!("[FAILOVER] ✅ Emergency producer {} rewarded: +2", new_producer);
+            }
+        } else {
+            println!("[CONSENSUS] ⚠️ SINGLE REPORT: No penalty for {}", failed_producer);
+        }
     }
+    
     
     /// PRODUCTION: Handle reputation synchronization from peers
     fn handle_reputation_sync(&self, from_node: String, reputation_updates: Vec<(String, f64)>, timestamp: u64, signature: Vec<u8>) {

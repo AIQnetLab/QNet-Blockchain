@@ -46,7 +46,9 @@ Builds:
       - update-java-alternatives -a
     gradle:
       - yes
-    prebuild: npm --prefix=.. ci --legacy-peer-deps
+    prebuild:
+      - cd ../..
+      - npm ci --prefix=applications/qnet-mobile --legacy-peer-deps
     scanignore:
       - applications/qnet-mobile/node_modules
       - core
