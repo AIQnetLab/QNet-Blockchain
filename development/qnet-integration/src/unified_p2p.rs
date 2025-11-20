@@ -6478,13 +6478,20 @@ impl SimplifiedP2P {
                 println!("[P2P] 📜 Certificate announcement from {} (serial: {})", node_id, cert_serial);
                 
                 // SECURITY: Rate limiting to prevent certificate flooding attacks
-                // Maximum 10 certificate announcements per minute per peer
+                // Maximum 10 certificate announcements per minute per peer (40 for Genesis nodes)
                 let now = self.current_timestamp();
                 let rate_limited = {
                     let rate_key = format!("cert_{}", node_id);
+                    
+                    // CRITICAL: Higher rate limit for Genesis nodes due to periodic broadcast
+                    // Genesis nodes: 6 broadcasts/min × 5 nodes + rotation = ~35 certs/min (need 40)
+                    // Regular nodes: 1-2 broadcasts/min (10 is sufficient)
+                    let is_genesis = node_id.starts_with("genesis_node_");
+                    let max_certs = if is_genesis { 40 } else { 10 };
+                    
                     let mut rate_limit = self.rate_limiter.entry(rate_key).or_insert_with(|| RateLimit {
                         requests: Vec::new(),
-                        max_requests: 10,  // 10 certificates per minute (generous for 1-hour rotation)
+                        max_requests: max_certs,
                         window_seconds: 60,
                         blocked_until: 0,
                     });
