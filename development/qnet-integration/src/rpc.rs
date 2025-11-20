@@ -4377,8 +4377,8 @@ async fn lookup_peer_pseudonym(raw_ip: &str) -> String {
         "154.38.160.39" => return "genesis_node_001".to_string(),
         "62.171.157.44" => return "genesis_node_002".to_string(),
         "161.97.86.81" => return "genesis_node_003".to_string(),
-        "173.212.219.226" => return "genesis_node_004".to_string(),
-        "164.68.108.218" => return "genesis_node_005".to_string(),
+        "5.189.130.160" => return "genesis_node_004".to_string(),
+        "167.86.66.168" => return "genesis_node_005".to_string(),
         _ => {}
     }
     

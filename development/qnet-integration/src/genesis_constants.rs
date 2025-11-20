@@ -26,8 +26,8 @@ pub const GENESIS_NODE_IPS: &[(&str, &str)] = &[
     ("154.38.160.39", "001"),    // Genesis Node #1 - North America
     ("62.171.157.44", "002"),    // Genesis Node #2 - Europe
     ("161.97.86.81", "003"),     // Genesis Node #3 - Europe  
-    ("173.212.219.226", "004"),  // Genesis Node #4 - Europe
-    ("164.68.108.218", "005"),   // Genesis Node #5 - Europe
+    ("5.189.130.160", "004"),  // Genesis Node #4 - Europe
+    ("167.86.66.168", "005"),   // Genesis Node #5 - Europe
 ];
 
 /// Legacy genesis node IDs (backward compatibility)
@@ -76,8 +76,8 @@ pub fn get_genesis_region_by_ip(ip: &str) -> Option<&'static str> {
         "154.38.160.39" => Some("NorthAmerica"), // Genesis Node #1 - North America (from comments)
         "62.171.157.44" => Some("Europe"),       // Genesis Node #2 - Europe (from comments)
         "161.97.86.81" => Some("Europe"),        // Genesis Node #3 - Europe (from comments)
-        "173.212.219.226" => Some("Europe"),     // Genesis Node #4 - Europe (from comments)
-        "164.68.108.218" => Some("Europe"),      // Genesis Node #5 - Europe (CORRECTED)
+        "5.189.130.160" => Some("Europe"),     // Genesis Node #4 - Europe (from comments)
+        "167.86.66.168" => Some("Europe"),      // Genesis Node #5 - Europe (CORRECTED)
         _ => None,
     }
 }

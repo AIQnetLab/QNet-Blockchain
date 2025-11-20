@@ -6260,9 +6260,12 @@ impl BlockchainNode {
                 hasher.update(&leadership_round.to_le_bytes());
                 
                 // 2. Candidate list (NOW SORTED for deterministic entropy)
-                for (candidate_id, reputation) in &candidates {
+                // CRITICAL: Use ONLY node_id, NOT reputation!
+                // Reputation changes dynamically during runtime → non-deterministic entropy → forks!
+                // Example: node_004 gets +2% reputation → different VRF entropy → different producer
+                for (candidate_id, _reputation) in &candidates {
                     hasher.update(candidate_id.as_bytes());
-                    hasher.update(&reputation.to_le_bytes());
+                    // DO NOT use reputation in entropy - it changes during runtime!
                 }
                 
                 // 3. FINALITY WINDOW: Use block that is FINALITY_WINDOW blocks old as entropy
@@ -7426,9 +7429,11 @@ impl BlockchainNode {
             hasher.update(format!("validator_sampling_{}_{}", validator_round, i).as_bytes());
             
             // Include all qualified validators for Byzantine consistency (NOW SORTED!)
-            for (node_id, reputation) in &sorted_qualified {
+            // CRITICAL: Use ONLY node_id, NOT reputation!
+            // Reputation changes dynamically → non-deterministic sampling → consensus failure!
+            for (node_id, _reputation) in &sorted_qualified {
                 hasher.update(node_id.as_bytes());
-                hasher.update(&reputation.to_le_bytes());
+                // DO NOT use reputation in entropy - it changes during runtime!
             }
             
             let selection_hash = hasher.finalize();

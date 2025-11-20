@@ -2311,8 +2311,8 @@ impl SimplifiedP2P {
          let reputation_system = self.reputation_system.clone(); // Use shared system
          let connected_peers_lockfree = self.connected_peers_lockfree.clone(); // For get_last_activity_map
          let genesis_ips = vec!["154.38.160.39".to_string(), "62.171.157.44".to_string(), 
-                               "161.97.86.81".to_string(), "173.212.219.226".to_string(), 
-                               "164.68.108.218".to_string()]; // Genesis IPs to avoid borrowing self
+                               "161.97.86.81".to_string(), "5.189.130.160".to_string(), 
+                               "167.86.66.168".to_string()]; // Genesis IPs to avoid borrowing self
          
          tokio::spawn(async move {
              println!("[P2P] 🔍 Starting reputation-based peer validation with shared reputation system...");
@@ -7198,8 +7198,8 @@ fn get_genesis_region_by_index(index: usize) -> Region {
         0 => Region::NorthAmerica, // genesis_node_001 (154.38.160.39)
         1 => Region::Europe,        // genesis_node_002 (62.171.157.44)
         2 => Region::Europe,        // genesis_node_003 (161.97.86.81)
-        3 => Region::Europe,        // genesis_node_004 (173.212.219.226)
-        4 => Region::Europe,        // genesis_node_005 (164.68.108.218)
+        3 => Region::Europe,        // genesis_node_004 (5.189.130.160)
+        4 => Region::Europe,        // genesis_node_005 (167.86.66.168)
         _ => Region::Europe,        // Default fallback
     }
 }

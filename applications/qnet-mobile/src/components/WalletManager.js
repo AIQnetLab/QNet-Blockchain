@@ -2731,8 +2731,8 @@ export class WalletManager {
       { url: 'http://154.38.160.39:8001', region: 'North America' },
       { url: 'http://62.171.157.44:8001', region: 'Europe' },
       { url: 'http://161.97.86.81:8001', region: 'Europe' },
-      { url: 'http://173.212.219.226:8001', region: 'Europe' },
-      { url: 'http://164.68.108.218:8001', region: 'Europe' }
+      { url: 'http://5.189.130.160:8001', region: 'Europe' },
+      { url: 'http://167.86.66.168:8001', region: 'Europe' }
     ];
     
     // Try to discover new nodes from Genesis nodes
@@ -2802,8 +2802,8 @@ export class WalletManager {
       'http://154.38.160.39:8001',
       'http://62.171.157.44:8001',
       'http://161.97.86.81:8001',
-      'http://173.212.219.226:8001',
-      'http://164.68.108.218:8001'
+      'http://5.189.130.160:8001',
+      'http://167.86.66.168:8001'
     ];
     return genesisNodes[Math.floor(Math.random() * genesisNodes.length)];
   }
