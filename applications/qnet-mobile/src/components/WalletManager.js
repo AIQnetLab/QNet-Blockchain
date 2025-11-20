@@ -2732,7 +2732,7 @@ export class WalletManager {
       { url: 'http://62.171.157.44:8001', region: 'Europe' },
       { url: 'http://161.97.86.81:8001', region: 'Europe' },
       { url: 'http://5.189.130.160:8001', region: 'Europe' },
-      { url: 'http://167.86.66.168:8001', region: 'Europe' }
+      { url: 'http://162.244.25.114:8001', region: 'Europe' }
     ];
     
     // Try to discover new nodes from Genesis nodes
@@ -2803,7 +2803,7 @@ export class WalletManager {
       'http://62.171.157.44:8001',
       'http://161.97.86.81:8001',
       'http://5.189.130.160:8001',
-      'http://167.86.66.168:8001'
+      'http://162.244.25.114:8001'
     ];
     return genesisNodes[Math.floor(Math.random() * genesisNodes.length)];
   }

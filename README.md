@@ -1163,7 +1163,7 @@ docker run -d --name qnet-mainnet-genesis-001 --restart=always \
 62.171.157.44   # Genesis Node 002  
 161.97.86.81    # Genesis Node 003
 5.189.130.160 # Genesis Node 004
-167.86.66.168  # Genesis Node 005
+162.244.25.114  # Genesis Node 005
 ```
 
 **Custom Genesis IPs:**

@@ -1499,7 +1499,7 @@ fn check_genesis_node_duplication(bootstrap_id: &str) -> bool {
                 ("002", "62.171.157.44"),
                 ("003", "161.97.86.81"), 
                 ("004", "5.189.130.160"),
-                ("005", "167.86.66.168"),
+                ("005", "162.244.25.114"),
             ];
             
             // Check if this IP belongs to our Genesis node
@@ -1536,7 +1536,7 @@ fn check_genesis_node_duplication(bootstrap_id: &str) -> bool {
                     ("002", "62.171.157.44"),
                     ("003", "161.97.86.81"), 
                     ("004", "5.189.130.160"),
-                    ("005", "167.86.66.168"),
+                    ("005", "162.244.25.114"),
                 ];
                 
                 let mut is_our_genesis_node = false;
