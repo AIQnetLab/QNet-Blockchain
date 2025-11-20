@@ -4677,6 +4677,33 @@ impl BlockchainNode {
                     // PRODUCTION: This node is selected as microblock producer for this round
                     *is_leader.write().await = true;
                     
+                    // CRITICAL FIX: Broadcast certificate IMMEDIATELY when becoming producer
+                    // This prevents "certificate not found" errors during producer rotation
+                    if let Some(ref p2p) = unified_p2p {
+                        use crate::hybrid_crypto::GLOBAL_HYBRID_INSTANCES;
+                        
+                        let instances = GLOBAL_HYBRID_INSTANCES.get_or_init(|| async {
+                            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()))
+                        }).await;
+                        
+                        let instances_guard = instances.lock().await;
+                        let normalized_id = Self::normalize_node_id(&node_id);
+                        
+                        if let Some(hybrid) = instances_guard.get(&normalized_id) {
+                            if let Some(cert) = hybrid.get_current_certificate() {
+                                if let Ok(cert_bytes) = bincode::serialize(&cert) {
+                                    println!("[CERTIFICATE] 🚀 IMMEDIATE broadcast as new producer for block #{}: {}", 
+                                        next_block_height, cert.serial_number);
+                                    if let Err(e) = p2p.broadcast_certificate_announce(cert.serial_number, cert_bytes) {
+                                        println!("[CERTIFICATE] ⚠️ Producer certificate broadcast failed: {}", e);
+                                    } else {
+                                        println!("[CERTIFICATE] ✅ Producer certificate broadcasted to all peers");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    
                     // Check if we're emergency producer
                     let is_emergency_producer = if let Ok(emergency_flag) = EMERGENCY_PRODUCER_FLAG.lock() {
                         if let Some((height, _)) = &*emergency_flag {
