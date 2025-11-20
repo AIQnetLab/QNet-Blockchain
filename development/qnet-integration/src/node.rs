@@ -684,7 +684,7 @@ impl BlockchainNode {
         
         // STEP 4: Create PingCommitmentWithSampling transaction
         if total_pings > 0 {
-            let commitment_tx = qnet_state::Transaction {
+            let mut commitment_tx = qnet_state::Transaction {
                 from: "system_ping_commitment".to_string(),
                 to: None,
                 amount: 0,
@@ -700,6 +700,7 @@ impl BlockchainNode {
                 timestamp: current_time,
                 hash: String::new(),
                 signature: None, // No signature - system operation
+                public_key: None, // Not needed for system transactions
                 gas_price: 0,
                 gas_limit: 0,
                 nonce: 0,
@@ -772,6 +773,7 @@ impl BlockchainNode {
                         timestamp: current_time,
                         hash: String::new(),
                         signature: None, // No signature - validated through deterministic rules
+                        public_key: None, // Not needed for system transactions
                         gas_price: 0,
                         gas_limit: 0,
                         nonce: 0,

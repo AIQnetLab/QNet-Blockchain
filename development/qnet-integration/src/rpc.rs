@@ -1097,6 +1097,18 @@ async fn tx_submit(
     let gas_price = params["gas_price"].as_u64().unwrap_or(1);
     let gas_limit = params["gas_limit"].as_u64().unwrap_or(10_000); // QNet TRANSFER gas limit
     
+    // PRODUCTION: Require signature for all transactions
+    let signature = params["signature"].as_str().ok_or_else(|| RpcError {
+        code: -32602,
+        message: "Missing signature - all transactions must be signed".to_string(),
+    })?;
+    
+    // PRODUCTION: Require public key for Ed25519 verification
+    let public_key = params["public_key"].as_str().ok_or_else(|| RpcError {
+        code: -32602,
+        message: "Missing public_key - required for signature verification".to_string(),
+    })?;
+    
     // Create transaction
     let mut tx = qnet_state::Transaction {
         hash: String::new(), // will be calculated
@@ -1107,7 +1119,8 @@ async fn tx_submit(
         gas_price,
         gas_limit,
         timestamp: chrono::Utc::now().timestamp() as u64,
-        signature: None, // will be added later
+        signature: Some(signature.to_string()), // PRODUCTION: Required signature
+        public_key: Some(public_key.to_string()), // PRODUCTION: Required for verification
         tx_type: qnet_state::TransactionType::Transfer {
             from: from.to_string(),
             to: to.to_string(),
@@ -1241,6 +1254,18 @@ async fn mempool_submit(
         let nonce = tx_data["nonce"].as_u64().unwrap_or(0);
         let timestamp = tx_data["timestamp"].as_u64().unwrap_or_else(|| chrono::Utc::now().timestamp() as u64);
         
+        // PRODUCTION: Require signature
+        let signature = tx_data["signature"].as_str().ok_or_else(|| RpcError {
+            code: -32602,
+            message: "Missing signature field - all transactions must be signed".to_string(),
+        })?;
+        
+        // PRODUCTION: Require public key
+        let public_key = tx_data["public_key"].as_str().ok_or_else(|| RpcError {
+            code: -32602,
+            message: "Missing public_key field - required for signature verification".to_string(),
+        })?;
+        
         // Create transaction
         let mut tx = qnet_state::Transaction {
             hash: String::new(), // will be calculated
@@ -1251,7 +1276,8 @@ async fn mempool_submit(
             gas_price: 1,
             gas_limit: 10_000, // QNet TRANSFER gas limit
             timestamp,
-            signature: None, // will be added later
+            signature: Some(signature.to_string()), // PRODUCTION: Required signature
+            public_key: Some(public_key.to_string()), // PRODUCTION: Required for verification
             tx_type: qnet_state::TransactionType::Transfer {
                 from: from.to_string(),
                 to: to.to_string(),
@@ -1912,6 +1938,7 @@ async fn handle_batch_claim_rewards(
                     timestamp: current_time,
                     hash: String::new(),
                     signature: None, // No signature - already validated through claim process
+                    public_key: None, // Not needed for system transactions
                     gas_price: 0, // No gas for rewards
                     gas_limit: 0, // No gas for rewards
                     nonce: 0,

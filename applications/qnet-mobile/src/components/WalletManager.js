@@ -4,6 +4,12 @@ import CryptoJS from 'crypto-js';
 import 'react-native-get-random-values'; // Must be imported first
 import { Connection, Keypair, PublicKey } from '@solana/web3.js';
 import { derivePath } from 'ed25519-hd-key';
+import { 
+  initDilithium, 
+  generateDilithiumKeypair, 
+  createHybridSignature,
+  isDilithiumAvailable 
+} from '../crypto/DilithiumWasm';
 import * as bip39 from 'bip39';
 
 export class WalletManager {
@@ -11,6 +17,20 @@ export class WalletManager {
     this.connection = new Connection('https://api.devnet.solana.com', 'confirmed');
     this.keyCache = null; // Cache derived key for faster unlock
     this.keyCachePassword = null; // Track which password the key is for
+    this.dilithiumReady = false; // Track WASM initialization
+    
+    // Initialize Dilithium WASM asynchronously
+    initDilithium().then(success => {
+      this.dilithiumReady = success;
+      if (success) {
+        console.log('[WalletManager] ✅ Dilithium WASM ready');
+      } else {
+        console.log('[WalletManager] ⚠️ Dilithium WASM not available, using Ed25519 only');
+      }
+    }).catch(err => {
+      console.error('[WalletManager] Dilithium init error:', err);
+      this.dilithiumReady = false;
+    });
     
     // BIP39 wordlist (2048 words)
     this.BIP39_WORDLIST = [
@@ -2654,6 +2674,20 @@ export class WalletManager {
         delete walletData.mnemonic; // Clear from memory immediately
       }
       
+      // PRODUCTION: Generate Dilithium3 keys if WASM is available
+      if (isDilithiumAvailable() && !walletData.dilithiumPublicKey) {
+        console.log('[Wallet] Generating Dilithium3 post-quantum keys via WASM...');
+        try {
+          const dilithiumKeys = await generateDilithiumKeypair();
+          walletData.dilithiumPublicKey = dilithiumKeys.publicKey;
+          walletData.dilithiumPrivateKey = dilithiumKeys.privateKey;
+          console.log('[Wallet] ✅ Real Dilithium3 keys generated');
+        } catch (error) {
+          console.error('[Wallet] ❌ Dilithium key generation failed:', error);
+          console.log('[Wallet] ⚠️ Continuing with Ed25519 only');
+        }
+      }
+      
       // Create storage data with mnemonic
       const storageData = {
         ...walletData,
@@ -4323,12 +4357,53 @@ export class WalletManager {
         throw new Error('Failed to load wallet for signing');
       }
       
-      // Create signature using wallet's secret key
-      // In production, this will be replaced with Dilithium signature
+      // PRODUCTION: Create signature (Hybrid if Dilithium available, Ed25519 otherwise)
       const message = `claim_rewards:${nodeId}:${walletAddress}:${Date.now()}`;
       const messageBytes = new TextEncoder().encode(message);
-      const signature = nacl.sign.detached(messageBytes, walletData.secretKey);
-      const quantumSignature = Buffer.from(signature).toString('base64');
+      
+      // Ed25519 signature (always required)
+      const ed25519Sig = nacl.sign.detached(messageBytes, walletData.secretKey);
+      
+      let quantumSignature;
+      let signatureFormat = 'ed25519';
+      
+      // Try to create hybrid signature if Dilithium keys available
+      if (isDilithiumAvailable() && walletData.dilithiumPrivateKey) {
+        try {
+          console.log('[Rewards] Creating hybrid signature (Ed25519 + Dilithium3)...');
+          const hybridSig = await createHybridSignature(
+            messageBytes,
+            Buffer.from(ed25519Sig).toString('base64'),
+            walletData.dilithiumPrivateKey
+          );
+          quantumSignature = `hybrid:${hybridSig}`;
+          signatureFormat = 'hybrid';
+          console.log('[Rewards] ✅ Hybrid signature created');
+        } catch (error) {
+          console.error('[Rewards] ❌ Hybrid signature failed, falling back to Ed25519:', error);
+          quantumSignature = Buffer.from(ed25519Sig).toString('hex');
+        }
+      } else {
+        // Fallback to Ed25519 only
+        quantumSignature = Buffer.from(ed25519Sig).toString('hex');
+        console.log('[Rewards] Using Ed25519-only signature');
+      }
+      
+      // Get public key for verification (32 bytes hex)
+      const publicKeyHex = Buffer.from(walletData.publicKey).toString('hex');
+      
+      // Prepare request body
+      const requestBody = {
+        node_id: nodeId,
+        quantum_signature: quantumSignature,
+        public_key: publicKeyHex,  // PRODUCTION: Required for Ed25519 verification
+        signature_format: signatureFormat  // 'ed25519' or 'hybrid'
+      };
+      
+      // Add Dilithium public key if hybrid signature
+      if (signatureFormat === 'hybrid' && walletData.dilithiumPublicKey) {
+        requestBody.dilithium_public_key = walletData.dilithiumPublicKey;
+      }
       
       // Submit claim request to official API
       const claimResponse = await fetch(`${apiUrl}/api/v1/rewards/claim`, {
@@ -4336,10 +4411,7 @@ export class WalletManager {
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({
-          node_id: nodeId,
-          quantum_signature: quantumSignature
-        })
+        body: JSON.stringify(requestBody)
       });
       
       if (!claimResponse.ok) {

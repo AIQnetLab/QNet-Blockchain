@@ -580,6 +580,7 @@ impl Mempool {
                 .unwrap()
                 .as_secs(),
             signature: None,
+            public_key: None, // Not needed for placeholder transaction
             tx_type: qnet_state::transaction::TransactionType::Transfer {
                 from: "unknown".to_string(),
                 to: "unknown".to_string(),

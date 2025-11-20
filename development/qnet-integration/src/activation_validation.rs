@@ -1689,6 +1689,7 @@ impl BlockchainActivationRegistry {
             gas_limit: 100000, // QNet standard for data transactions
             data: Some(activation_json), // String, not Vec<u8>
             signature: None, // No signature needed - security via activation code validation
+            public_key: None, // Not needed for activation transactions
             tx_type: TransactionType::ContractCall, // Use tx_type, not transaction_type
             timestamp: record.activated_at,
         };
