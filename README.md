@@ -173,7 +173,8 @@ This project uses **dual licensing**:
 
 **QNet production testnet is ready for deployment with advanced consensus and synchronization.**
 
-- ✅ **Post-Quantum Cryptography**: CRYSTALS-Dilithium3 with NIST/Cisco encapsulated keys
+- ✅ **Post-Quantum Cryptography**: CRYSTALS-Dilithium3 with NIST/Cisco encapsulated keys (nodes)
+- ✅ **Client Cryptography**: Ed25519 signatures for mobile/browser (20μs operations)
 - ✅ **Entropy-Based Consensus**: True decentralization with unpredictable producer rotation
 - ✅ **Reputation System**: Economic incentives for network participation
 - ✅ **State Snapshots**: Full & incremental snapshots with LZ4 compression
@@ -196,7 +197,7 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 
 ### 🎯 Key Features
 
-- **🔐 Post-Quantum Security**: NIST/Cisco encapsulated keys with Dilithium3 + ephemeral Ed25519
+- **🔐 Post-Quantum Security**: NIST/Cisco encapsulated keys with Dilithium3 + Ed25519 (nodes) | Ed25519-only for clients (mobile/browser)
 - **⚡ Ultra-High Performance**: 424,411 TPS with zero-downtime consensus
 - **🎲 True Decentralization**: VRF-based producer selection with deterministic fairness and quantum resistance
 - **💰 Reputation Economics**: Rewards for block production (+1 micro, +10/+5 macro)

@@ -260,14 +260,15 @@ impl HybridCrypto {
         // Generate serial number
         let serial_number = format!("CERT-{}-{}", self.node_id, now);
         
-        // Create certificate data to sign
-        let cert_data = format!(
-            "CERTIFICATE:{}:{}:{}:{}",
-            self.node_id,
-            hex::encode(verifying_key.as_bytes()),
-            now,
-            expires_at
-        );
+        // CRITICAL: ENCAPSULATED KEY per NIST/Cisco standard
+        // Dilithium MUST sign the RAW Ed25519 public key bytes
+        // This is the CORRECT hybrid cryptography approach
+        let mut encapsulated_data = Vec::new();
+        encapsulated_data.extend_from_slice(verifying_key.as_bytes()); // 32 bytes Ed25519 key
+        encapsulated_data.extend_from_slice(self.node_id.as_bytes());
+        encapsulated_data.extend_from_slice(&now.to_le_bytes());
+        
+        let encapsulated_hex = hex::encode(&encapsulated_data);
         
         // Sign with Dilithium (using quantum_crypto module)
         // CRITICAL FIX: Use GLOBAL crypto instance for certificate rotation!
@@ -286,7 +287,7 @@ impl HybridCrypto {
         let quantum_crypto = crypto_guard.as_ref().unwrap();
         
         let dilithium_sig = quantum_crypto
-            .create_consensus_signature(&self.node_id, &cert_data)
+            .create_consensus_signature(&self.node_id, &encapsulated_hex)
             .await?;
         
         Ok(HybridCertificate {

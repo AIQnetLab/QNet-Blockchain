@@ -85,7 +85,7 @@ impl BlockValidator {
             return Err(IntegrationError::ValidationError("Transaction signature cannot be empty".to_string()));
         }
         
-        // For testnet, implement real signature validation
+        // PRODUCTION: Real cryptographic signature validation
         match self.verify_ed25519_signature(tx, signature) {
             Ok(is_valid) => {
                 if is_valid {
@@ -95,10 +95,8 @@ impl BlockValidator {
                 }
             }
             Err(e) => {
-                // Log error but don't fail validation for testnet compatibility
-                eprintln!("Signature validation error: {}", e);
-                // For testnet, accept transactions with non-empty signatures
-                Ok(())
+                // CRITICAL: Reject transaction if signature verification fails
+                Err(IntegrationError::ValidationError(format!("Signature verification failed: {}", e)))
             }
         }
     }
@@ -148,8 +146,9 @@ impl BlockValidator {
         
         let signature = Signature::from_bytes(&sig_bytes.try_into().unwrap());
         
-        // Create message to verify
-        let message = self.create_signing_message(tx)?;
+        // PRODUCTION: Create CLIENT signing message (without nonce/timestamp - client doesn't know them yet)
+        // Client signs: "transfer:from:to:amount:gas_price:gas_limit"
+        let message = self.create_client_signing_message(tx)?;
         
         // PRODUCTION: Real cryptographic verification
         match verifying_key.verify(&message, &signature) {
@@ -296,6 +295,30 @@ impl BlockValidator {
         // Hash the message for signing
         let hash = Sha3_256::digest(&message);
         Ok(hash.to_vec())
+    }
+    
+    /// PRODUCTION: Create CLIENT signing message (for Ed25519 signatures from mobile/browser)
+    /// Client signs BEFORE knowing nonce/timestamp (those are set by server)
+    /// Format: "transfer:from:to:amount:gas_price:gas_limit"
+    fn create_client_signing_message(&self, tx: &Transaction) -> IntegrationResult<Vec<u8>> {
+        // Client signs simple text message (they don't know nonce/timestamp yet)
+        let message = match &tx.tx_type {
+            TransactionType::Transfer { from, to, amount } => {
+                format!("transfer:{}:{}:{}:{}:{}", 
+                    from, to, amount, tx.gas_price, tx.gas_limit)
+            }
+            TransactionType::RewardDistribution => {
+                // For reward claims: "claim_rewards:node_id:wallet_address"
+                format!("claim_rewards:{}:{}", tx.from, tx.to.as_ref().unwrap_or(&String::new()))
+            }
+            _ => {
+                return Err(IntegrationError::ValidationError(
+                    "Unsupported transaction type for client signing".to_string()
+                ));
+            }
+        };
+        
+        Ok(message.into_bytes())
     }
     
     // REMOVED: extract_public_key_from_address - no longer needed

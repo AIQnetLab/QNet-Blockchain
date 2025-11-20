@@ -6,8 +6,7 @@ members = [
     "core/qnet-state",
     "core/qnet-sharding",
     "development/qnet-integration",
-    "audit",
-    "applications/qnet-mobile/rust-dilithium"
+    "audit"
 ]
 resolver = "2"
 

@@ -292,6 +292,7 @@ Block 150: PFP Level 2
 - **Storage**: Minimal (recent state only)
 - **Bandwidth**: Low (receive blocks, no validation)
 - **Target Users**: Mobile wallets, IoT devices
+- **Cryptography**: Ed25519 ONLY (no Dilithium)
 
 **Filtering**:
 ```rust
@@ -301,6 +302,25 @@ match self.node_type {
     }
 }
 ```
+
+**Transaction Signing (Light Nodes / Clients):**
+```javascript
+// Mobile/Browser clients use Ed25519 for optimal performance
+// Format: "transfer:from:to:amount:gas_price:gas_limit"
+const message = `transfer:${from}:${to}:${amount}:1:10000`;
+const signature = nacl.sign.detached(messageBytes, secretKey);
+
+// Transaction includes:
+// - signature: 64 bytes (Ed25519)
+// - public_key: 32 bytes (Ed25519)
+// - No Dilithium (reserved for node consensus)
+```
+
+**Performance:**
+- Sign: ~20μs
+- Verify: ~20μs
+- Size: 96 bytes (signature + public key)
+- Energy: Low (mobile-friendly)
 
 ### Full Nodes
 - **Purpose**: Network validation and relay

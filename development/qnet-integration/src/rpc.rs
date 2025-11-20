@@ -2393,6 +2393,72 @@ async fn handle_network_ping(
 }
 
 // PRODUCTION: Quantum-secure signature verification using CRYSTALS-Dilithium
+/// PRODUCTION: Verify Ed25519 signature from client (mobile/browser)
+/// Clients sign simple text messages, NOT binary format like nodes
+async fn verify_ed25519_client_signature(
+    node_id: &str,
+    wallet_address: &str,
+    signature_hex: &str,
+    public_key_hex: &str
+) -> bool {
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    
+    // Basic validation
+    if signature_hex.len() != 128 {  // 64 bytes = 128 hex chars
+        println!("[CRYPTO] ❌ Invalid Ed25519 signature length: {}", signature_hex.len());
+        return false;
+    }
+    
+    if public_key_hex.len() != 64 {  // 32 bytes = 64 hex chars
+        println!("[CRYPTO] ❌ Invalid Ed25519 public key length: {}", public_key_hex.len());
+        return false;
+    }
+    
+    // Decode public key
+    let pubkey_bytes = match hex::decode(public_key_hex) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            println!("[CRYPTO] ❌ Failed to decode public key: {}", e);
+            return false;
+        }
+    };
+    
+    let verifying_key = match VerifyingKey::from_bytes(pubkey_bytes.as_slice().try_into().unwrap()) {
+        Ok(key) => key,
+        Err(e) => {
+            println!("[CRYPTO] ❌ Invalid Ed25519 public key: {}", e);
+            return false;
+        }
+    };
+    
+    // Decode signature
+    let sig_bytes = match hex::decode(signature_hex) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            println!("[CRYPTO] ❌ Failed to decode signature: {}", e);
+            return false;
+        }
+    };
+    
+    let signature = Signature::from_bytes(sig_bytes.as_slice().try_into().unwrap());
+    
+    // Create message: "claim_rewards:node_id:wallet_address"
+    let message = format!("claim_rewards:{}:{}", node_id, wallet_address);
+    let message_bytes = message.as_bytes();
+    
+    // Verify signature
+    match verifying_key.verify(message_bytes, &signature) {
+        Ok(_) => {
+            println!("[CRYPTO] ✅ Ed25519 client signature verified for {}", node_id);
+            true
+        }
+        Err(e) => {
+            println!("[CRYPTO] ❌ Ed25519 signature verification failed: {}", e);
+            false
+        }
+    }
+}
+
 async fn verify_dilithium_signature(node_id: &str, challenge: &str, signature: &str) -> bool {
     // Use existing QNet quantum crypto system for real Dilithium verification
     use crate::quantum_crypto::QNetQuantumCrypto;
@@ -3325,24 +3391,28 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
 #[derive(Debug, serde::Deserialize)]
 struct ClaimRewardsRequest {
     node_id: String,
+    wallet_address: String,
     quantum_signature: String,
+    public_key: String,
 }
 
 async fn handle_claim_rewards(
     claim_request: ClaimRewardsRequest,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
-    // Verify quantum signature
-    let signature_valid = verify_dilithium_signature(
-        &claim_request.node_id, 
-        "claim_rewards", 
-        &claim_request.quantum_signature
+    // PRODUCTION: Verify Ed25519 signature from client (NOT Dilithium - that's for node consensus only)
+    // Client signs: "claim_rewards:node_id:wallet_address"
+    let signature_valid = verify_ed25519_client_signature(
+        &claim_request.node_id,
+        &claim_request.wallet_address,
+        &claim_request.quantum_signature,
+        &claim_request.public_key
     ).await;
     
     if !signature_valid {
         return Ok(warp::reply::json(&json!({
             "success": false,
-            "error": "Invalid quantum signature for reward claim"
+            "error": "Invalid Ed25519 signature for reward claim"
         })));
     }
     
@@ -3384,44 +3454,98 @@ async fn handle_claim_rewards(
         }
     };
     
-    // Claim rewards from reward manager
-    let claim_result = {
-        // FIXED: Use blockchain's reward_manager instead of global REWARD_MANAGER
+    // PRODUCTION: Check pending rewards BEFORE creating transaction
+    let reward_amount = {
         let reward_manager_arc = blockchain.get_reward_manager();
-        let mut reward_manager = reward_manager_arc.write().await;
-        reward_manager.claim_rewards(&claim_request.node_id, &wallet_address)
+        let reward_manager = reward_manager_arc.read().await;
+        match reward_manager.get_pending_reward(&claim_request.node_id) {
+            Some(reward) => reward.total_reward,
+            None => {
+                return Ok(warp::reply::json(&json!({
+                    "success": false,
+                    "error": "No pending rewards available"
+                })));
+            }
+        }
     };
     
-    if claim_result.success {
-        if let Some(reward) = claim_result.reward {
-            println!("[REWARDS] 💰 Rewards claimed by {}: {:.9} QNC total", 
-                     claim_request.node_id, 
-                     reward.total_reward as f64 / 1_000_000_000.0);
+    // Check minimum claim amount (1 QNC = 1_000_000_000 smallest units)
+    const MIN_CLAIM_AMOUNT: u64 = 1_000_000_000;
+    if reward_amount < MIN_CLAIM_AMOUNT {
+        return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": format!("Minimum claim amount is 1 QNC (current: {:.9} QNC)", 
+                           reward_amount as f64 / 1_000_000_000.0)
+        })));
+    }
+    
+    // PRODUCTION: Create RewardDistribution transaction for blockchain transparency
+    // This ensures all reward claims are recorded on-chain and auditable
+    let mut tx = qnet_state::Transaction {
+        hash: String::new(), // will be calculated
+        from: claim_request.node_id.clone(), // Node claiming rewards
+        to: Some(claim_request.wallet_address.clone()), // User's wallet receiving rewards
+        amount: reward_amount,
+        nonce: 0, // will be set by state
+        gas_price: 0, // No gas for reward claims
+        gas_limit: 0, // No gas for reward claims
+        timestamp: chrono::Utc::now().timestamp() as u64,
+        signature: Some(claim_request.quantum_signature.clone()), // User's Ed25519 signature
+        public_key: Some(claim_request.public_key.clone()), // User's Ed25519 public key
+        tx_type: qnet_state::TransactionType::RewardDistribution,
+        data: None,
+    };
+    
+    // Calculate transaction hash
+    tx.hash = tx.calculate_hash();
+    
+    println!("[REWARDS] 📝 Creating RewardDistribution transaction:");
+    println!("[REWARDS]    Node: {}", claim_request.node_id);
+    println!("[REWARDS]    Wallet: {}...", &claim_request.wallet_address[..16.min(claim_request.wallet_address.len())]);
+    println!("[REWARDS]    Amount: {:.9} QNC", reward_amount as f64 / 1_000_000_000.0);
+    println!("[REWARDS]    TxHash: {}", tx.hash);
+    
+    // Submit transaction to blockchain
+    match blockchain.submit_transaction(tx.clone()).await {
+        Ok(tx_hash) => {
+            println!("[REWARDS] ✅ Reward claim transaction submitted: {}", tx_hash);
             
-            Ok(warp::reply::json(&json!({
-                "success": true,
-                "message": claim_result.message,
-                "reward": {
-                    "total_qnc": reward.total_reward as f64 / 1_000_000_000.0,
-                    "pool1_base": reward.pool1_base_emission as f64 / 1_000_000_000.0,
-                    "pool2_fees": reward.pool2_transaction_fees as f64 / 1_000_000_000.0,
-                    "pool3_activation": reward.pool3_activation_bonus as f64 / 1_000_000_000.0,
-                    "phase": format!("{:?}", reward.current_phase)
-                },
-                "next_claim_time": claim_result.next_claim_time
-            })))
-        } else {
+            // CRITICAL: Mark rewards as claimed in reward_manager AFTER successful blockchain submission
+            let claim_result = {
+                let reward_manager_arc = blockchain.get_reward_manager();
+                let mut reward_manager = reward_manager_arc.write().await;
+                reward_manager.claim_rewards(&claim_request.node_id, &claim_request.wallet_address)
+            };
+            
+            if let Some(reward) = claim_result.reward {
+                Ok(warp::reply::json(&json!({
+                    "success": true,
+                    "message": "Reward claim transaction submitted to blockchain",
+                    "tx_hash": tx_hash,
+                    "reward": {
+                        "total_qnc": reward.total_reward as f64 / 1_000_000_000.0,
+                        "pool1_base": reward.pool1_base_emission as f64 / 1_000_000_000.0,
+                        "pool2_fees": reward.pool2_transaction_fees as f64 / 1_000_000_000.0,
+                        "pool3_activation": reward.pool3_activation_bonus as f64 / 1_000_000_000.0,
+                        "phase": format!("{:?}", reward.current_phase)
+                    },
+                    "next_claim_time": claim_result.next_claim_time
+                })))
+            } else {
+                Ok(warp::reply::json(&json!({
+                    "success": true,
+                    "message": "Reward claim transaction submitted",
+                    "tx_hash": tx_hash
+                })))
+            }
+        }
+        Err(e) => {
+            println!("[REWARDS] ❌ Failed to submit reward claim transaction: {}", e);
             Ok(warp::reply::json(&json!({
                 "success": false,
-                "error": "No reward data available"
+                "error": format!("Failed to submit transaction: {}", e)
             })))
         }
-    } else {
-        Ok(warp::reply::json(&json!({
-            "success": false,
-            "error": claim_result.message,
-            "next_claim_time": claim_result.next_claim_time
-        })))
     }
 }
 
