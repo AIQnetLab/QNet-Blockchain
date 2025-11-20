@@ -44,9 +44,9 @@ Builds:
       - apt-get update
       - apt-get install -y openjdk-17-jdk-headless nodejs npm
       - update-java-alternatives -a
-    prebuild: npm --prefix=.. ci --legacy-peer-deps
     gradle:
       - yes
+    prebuild: npm --prefix=.. ci --legacy-peer-deps
     scanignore:
       - applications/qnet-mobile/node_modules
       - core
