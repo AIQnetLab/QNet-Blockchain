@@ -5162,38 +5162,9 @@ impl BlockchainNode {
                             
                             // CRITICAL FIX: Broadcast certificate IMMEDIATELY after signing first microblock
                             // This ensures ANY node (not just genesis_node_001) can have its blocks verified
-                            // by other nodes when it becomes a producer
-                            // IMPORTANT: Use microblock.height (which equals next_block_height), not microblock_height
-                            if microblock.height >= 1 && microblock.height <= 10 {
-                                if let Some(ref p2p) = unified_p2p {
-                                    use crate::hybrid_crypto::GLOBAL_HYBRID_INSTANCES;
-                                    
-                                    let instances = GLOBAL_HYBRID_INSTANCES.get_or_init(|| async {
-                                        Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()))
-                                    }).await;
-                                    
-                                    let instances_guard = instances.lock().await;
-                                    let normalized_id = Self::normalize_node_id(&node_id);
-                                    
-                                    if let Some(hybrid) = instances_guard.get(&normalized_id) {
-                                        if let Some(cert) = hybrid.get_current_certificate() {
-                                            if let Ok(cert_bytes) = bincode::serialize(&cert) {
-                                                println!("[CERTIFICATE] 🚀 IMMEDIATE broadcast after producing block #{}: {}", 
-                                                    microblock.height, cert.serial_number);
-                                                if let Err(e) = p2p.broadcast_certificate_announce(cert.serial_number.clone(), cert_bytes) {
-                                                    println!("[CERTIFICATE] ⚠️ Immediate broadcast failed: {}", e);
-                                                } else {
-                                                    println!("[CERTIFICATE] ✅ Certificate broadcasted to network immediately");
-                                                }
-                                            }
-                                        } else {
-                                            println!("[CERTIFICATE] ❌ No certificate found for node {}", normalized_id);
-                                        }
-                                    } else {
-                                        println!("[CERTIFICATE] ❌ No hybrid instance found for normalized_id: {}", normalized_id);
-                                    }
-                                }
-                            }
+                            // REMOVED: Immediate broadcast after each block (causes rate limiting)
+                            // Periodic broadcast (every 30 seconds) is sufficient for certificate distribution
+                            // This reduces network load and prevents rate limit warnings
                             
                             // PRODUCTION: Broadcast certificate after rotation (every 3600 blocks = 1 hour)
                             // IMPORTANT: Use microblock.height (which equals next_block_height), not microblock_height
