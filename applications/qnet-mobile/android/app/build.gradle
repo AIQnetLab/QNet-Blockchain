@@ -86,32 +86,6 @@ if (keystorePropertiesFile.exists()) {
     keystoreProperties.load(new FileInputStream(keystorePropertiesFile))
 }
 
-// CRITICAL: Install npm dependencies before compilation (F-Droid fix)
-task installNpmDeps(type: Exec) {
-    description = 'Install npm dependencies if node_modules missing'
-    workingDir '../../'
-    
-    // Check if node_modules exists
-    def nodeModulesDir = file('../../node_modules')
-    onlyIf { !nodeModulesDir.exists() }
-    
-    // Use npm ci for reproducible builds
-    commandLine 'npm', 'ci'
-    
-    doFirst {
-        println('[FDROID] Installing npm dependencies...')
-    }
-    doLast {
-        println('[FDROID] ✅ npm dependencies installed')
-    }
-}
-
-// Run npm install before preBuild
-tasks.whenTaskAdded { task ->
-    if (task.name == 'preBuild') {
-        task.dependsOn installNpmDeps
-    }
-}
 
 android {
     ndkVersion rootProject.ext.ndkVersion

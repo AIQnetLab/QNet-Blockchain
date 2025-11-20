@@ -44,11 +44,11 @@ Builds:
       - apt-get update
       - apt-get install -y openjdk-17-jdk-headless nodejs npm
       - update-java-alternatives -a
+    init:
+      - cd ../../applications/qnet-mobile
+      - npm ci --legacy-peer-deps
     gradle:
       - yes
-    prebuild:
-      - cd ..
-      - npm ci --legacy-peer-deps
     scanignore:
       - applications/qnet-mobile/node_modules
       - core
