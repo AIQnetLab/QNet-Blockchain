@@ -45,7 +45,7 @@ Builds:
       - apt-get install -y openjdk-17-jdk-headless nodejs npm
       - update-java-alternatives -a
     init:
-      - cd applications/qnet-mobile
+      - cd ..
       - npm ci --legacy-peer-deps
     gradle:
       - yes
