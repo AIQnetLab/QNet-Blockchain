@@ -44,8 +44,8 @@ Builds:
       - apt-get update
       - apt-get install -y openjdk-17-jdk-headless nodejs npm
       - update-java-alternatives -a
-    init:
-      - npm ci --legacy-peer-deps --prefix ..
+    prebuild:
+      - cd .. && npm ci --legacy-peer-deps
     gradle:
       - yes
     scanignore:
