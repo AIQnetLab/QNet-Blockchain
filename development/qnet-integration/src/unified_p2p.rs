@@ -6453,14 +6453,19 @@ impl SimplifiedP2P {
                 // SIMPLIFIED: Only reputation check, no complex round verification
                 // RATIONALE: Round participants change dynamically, checking would be non-deterministic
                 
+                // CRITICAL FIX: Get reputation from ReputationManager, not connected_peers
+                // Step 1: Convert IP address to node_id using existing mapping
+                let sender_node_id = get_privacy_id_for_addr(from_peer);
+                
+                // Step 2: Get reputation from the authoritative ReputationManager
                 let sender_reputation = {
-                    // Get sender peer info from connected_peers (indexed by address)
-                    if let Some(peer_info) = self.connected_peers_lockfree.get(from_peer) {
-                        peer_info.reputation_score
-                    } else if let Ok(peers) = self.connected_peers.read() {
-                        peers.get(from_peer).map(|p| p.reputation_score).unwrap_or(0.0)
+                    if let Ok(reputation_system) = self.reputation_system.lock() {
+                        // ReputationManager stores reputation on 0-100 scale
+                        reputation_system.get_reputation(&sender_node_id)
                     } else {
-                        0.0 // Unknown sender = no reputation
+                        // If we can't access reputation system, default to 0 (reject)
+                        println!("[SECURITY] ⚠️ Cannot access reputation system for {}", sender_node_id);
+                        0.0
                     }
                 };
                 
@@ -6468,7 +6473,7 @@ impl SimplifiedP2P {
                 // This naturally limits to ~1000 high-reputation nodes that can participate
                 if sender_reputation < 70.0 {
                     println!("[SECURITY] ⚠️ Ignoring emergency from {} - reputation {:.1} < 70", 
-                             from_peer, sender_reputation);
+                             sender_node_id, sender_reputation);
                     println!("[SECURITY] 🚫 Low-reputation nodes cannot trigger emergency failover");
                     return; // Ignore message completely
                 }
