@@ -1,13 +1,12 @@
 Categories:
   - Money
-  - Security
+  - Wallet
 License: Apache-2.0
 AuthorName: QNet Lab
 AuthorEmail: qnetquantumnetwork@gmail.com
 AuthorWebSite: https://aiqnet.io/
 WebSite: https://aiqnet.io/
 SourceCode: https://github.com/AIQnetLab/QNet-Blockchain
-
 
 AutoName: QNet Wallet
 Summary: Decentralized cryptocurrency wallet for QNet blockchain
@@ -37,25 +36,34 @@ Repo: https://github.com/AIQnetLab/QNet-Blockchain.git
 Builds:
   - versionName: 1.0.7
     versionCode: 8
-    commit: 1d48ec49c6fccd01a55d2efc9054abf144744fed
+    commit: f0d3e264574dc4e313dcdcae9fe4efa0d5596d11
     timeout: 10800
     subdir: applications/qnet-mobile/android
     sudo:
+      - echo "deb https://deb.debian.org/debian trixie main" > /etc/apt/sources.list.d/trixie.list
       - apt-get update
-      - apt-get install -y nodejs npm
+      - apt-get install -y -t trixie npm
+      - sysctl fs.inotify.max_user_watches=524288 || true
     gradle:
       - yes
     prebuild:
       - cd ..
       - npm ci --legacy-peer-deps
     scanignore:
-      - applications/qnet-mobile/node_modules/react-native/sdks/hermes/linux64-bin/hermesc
-      - applications/qnet-mobile/node_modules/react-native-async-storage/async-storage/android/build.gradle
+      - applications/qnet-mobile/node_modules/react-native/sdks/hermesc/linux64-bin/hermesc
+      - applications/qnet-mobile/node_modules/@react-native-async-storage/async-storage/android/build.gradle
       - applications/qnet-mobile/node_modules/react-native-get-random-values/android/build.gradle
       - applications/qnet-mobile/node_modules/react-native-safe-area-context/android/build.gradle
       - applications/qnet-mobile/node_modules/react-native-svg/android/build.gradle
     scandelete:
       - applications/qnet-mobile/node_modules
+      - core
+      - development
+      - audit
+      - testing
+      - governance
+      - backups
+      - Cargo.toml
 
 AutoUpdateMode: None
 UpdateCheckMode: None
