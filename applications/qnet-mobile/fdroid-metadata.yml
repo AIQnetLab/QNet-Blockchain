@@ -42,22 +42,20 @@ Builds:
     subdir: applications/qnet-mobile/android
     sudo:
       - apt-get update
-      - apt-get install -y openjdk-17-jdk-headless nodejs npm
-      - update-java-alternatives -a
+      - apt-get install -y nodejs npm
     gradle:
       - yes
     prebuild:
-      - cd ../..
-      - npm ci --prefix=applications/qnet-mobile --legacy-peer-deps
+      - cd ..
+      - npm ci --legacy-peer-deps
     scanignore:
+      - applications/qnet-mobile/node_modules/react-native/sdks/hermes/linux64-bin/hermesc
+      - applications/qnet-mobile/node_modules/react-native-async-storage/async-storage/android/build.gradle
+      - applications/qnet-mobile/node_modules/react-native-get-random-values/android/build.gradle
+      - applications/qnet-mobile/node_modules/react-native-safe-area-context/android/build.gradle
+      - applications/qnet-mobile/node_modules/react-native-svg/android/build.gradle
+    scandelete:
       - applications/qnet-mobile/node_modules
-      - core
-      - development
-      - audit
-      - testing
-      - governance
-      - backups
-      - Cargo.toml
 
 AutoUpdateMode: None
 UpdateCheckMode: None
