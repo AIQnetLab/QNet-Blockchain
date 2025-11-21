@@ -135,6 +135,13 @@ pub struct HybridCertificate {
     
     /// Certificate serial number for revocation
     pub serial_number: String,
+    
+    /// PRODUCTION: Ed25519 signature from previous key (for rotation chain verification)
+    /// This proves that the owner of the old key authorized the new key
+    /// Format: base64-encoded Ed25519 signature (64 bytes) of new_ed25519_public_key
+    /// None for first certificate (no previous key)
+    #[serde(default)]
+    pub rotation_signature: Option<String>,
 }
 
 /// Hybrid Signature containing both certificate and message signature
@@ -297,6 +304,7 @@ impl HybridCrypto {
             issued_at: now,
             expires_at,
             serial_number,
+            rotation_signature: None, // Will be set during rotation if needed
         })
     }
     
@@ -332,7 +340,20 @@ impl HybridCrypto {
         let new_verifying_key = new_signing_key.verifying_key();
         
         // Create new certificate
-        let new_certificate = self.create_certificate(&new_verifying_key).await?;
+        let mut new_certificate = self.create_certificate(&new_verifying_key).await?;
+        
+        // PRODUCTION: Sign new certificate with OLD Ed25519 key for rotation chain verification
+        // This proves that the owner of the old key authorized the new key
+        if let Some(old_signing_key) = &self.ed25519_signing_key {
+            // Sign the new Ed25519 public key with the old signing key
+            let signature = old_signing_key.sign(new_verifying_key.as_bytes());
+            let signature_base64 = base64::engine::general_purpose::STANDARD.encode(signature.to_bytes());
+            new_certificate.rotation_signature = Some(signature_base64);
+            println!("🔐 Certificate rotation signed with previous key for chain verification");
+        } else {
+            // First certificate (no previous key)
+            println!("🆕 First certificate - no rotation signature needed");
+        }
         
         // Atomic replacement
         self.ed25519_signing_key = Some(new_signing_key);

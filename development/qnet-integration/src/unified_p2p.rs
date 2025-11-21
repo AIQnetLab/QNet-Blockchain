@@ -16,6 +16,7 @@ use serde_json;
 use base64::Engine;
 use sha3::{Sha3_256, Digest};
 use reed_solomon_erasure::galois_8::ReedSolomon;
+use futures::{future, stream, StreamExt};
 
 // Import QNet consensus components for proper peer validation
 use qnet_consensus::reputation::{NodeReputation, ReputationConfig, MaliciousBehavior};
@@ -2214,9 +2215,12 @@ impl SimplifiedP2P {
                     let peer_ip = peer.addr.split(':').next().unwrap_or("");
                     let endpoint = format!("http://{}:8001/api/v1/height", peer_ip);
                     
-                    // Simple HTTP query using reqwest
+                    // Simple HTTP query using reqwest with connection pooling
                     match reqwest::Client::builder()
                         .timeout(std::time::Duration::from_secs(2))
+                        .tcp_keepalive(std::time::Duration::from_secs(HTTP_TCP_KEEPALIVE_SECS))
+                        .pool_max_idle_per_host(HTTP_POOL_MAX_IDLE_PER_HOST)
+                        .pool_idle_timeout(std::time::Duration::from_secs(HTTP_POOL_IDLE_TIMEOUT_SECS))
                         .build() 
                     {
                         Ok(client) => {
@@ -2414,6 +2418,63 @@ impl SimplifiedP2P {
                  // Validate all connected peers
                 let mut to_remove: Vec<String> = Vec::new(); // Store addresses, not indices
                  {
+                    // SCALABILITY: Collect ALL peers for parallel checking (not just Genesis)
+                    // This fixes overlapping HTTP requests for Full/Super nodes
+                    let all_peers_to_check: Vec<(String, String, bool)> = {
+                        let connected = match connected_peers.read() {
+                            Ok(peers) => peers,
+                            Err(poisoned) => {
+                                println!("[P2P] ⚠️ Connected peers mutex poisoned during read");
+                                poisoned.into_inner()
+                            }
+                        };
+                        
+                        connected.iter()
+                            .map(|(addr, peer)| {
+                                let is_genesis = peer.id.contains("genesis_") || genesis_ips.contains(&peer.addr);
+                                (addr.clone(), peer.addr.clone(), is_genesis)
+                            })
+                            .collect()
+                    };
+                    
+                    // SCALABILITY: Parallel connectivity checks for ALL nodes using buffer_unordered
+                    // Genesis nodes: critical for consensus (checked every iteration)
+                    // Full/Super nodes: potential producers (checked to prevent overlapping)
+                    // Light nodes: no consensus participation (but still checked for network health)
+                    let connectivity_results = if !all_peers_to_check.is_empty() {
+                        use futures::stream::{self, StreamExt};
+                        
+                        // ADAPTIVE CONCURRENCY: Scale with network size for optimal performance
+                        // Small networks: gentle (avoid overwhelming)
+                        // Large networks: aggressive (finish before next iteration)
+                        let peer_count = all_peers_to_check.len();
+                        let concurrency = match peer_count {
+                            0..=10 => 5,      // Small network: 5 concurrent (Genesis bootstrap)
+                            11..=50 => 10,    // Medium: 10 concurrent (early network)
+                            51..=200 => 20,   // Growing: 20 concurrent
+                            201..=500 => 30,  // Large: 30 concurrent
+                            _ => 50,          // Massive (500+): 50 concurrent (for 1000 producers)
+                        };
+                        
+                        println!("[P2P] 🔄 Checking {} peers with concurrency={} (adaptive)", peer_count, concurrency);
+                        
+                        let results = stream::iter(all_peers_to_check)
+                            .map(|(addr, peer_addr, is_genesis)| async move {
+                                // Use spawn_blocking for blocking I/O
+                                let is_reachable = tokio::task::spawn_blocking(move || {
+                                    Self::test_peer_connectivity_static(&peer_addr)
+                                }).await.unwrap_or(false);
+                                (addr, is_reachable, is_genesis)
+                            })
+                            .buffer_unordered(concurrency) // Adaptive concurrency based on network size
+                            .collect::<Vec<_>>()
+                            .await;
+                        results
+                    } else {
+                        Vec::new()
+                    };
+                    
+                    // Now apply results and check reputation
                     let mut connected = match connected_peers.write() {
                          Ok(peers) => peers,
                          Err(poisoned) => {
@@ -2421,18 +2482,32 @@ impl SimplifiedP2P {
                              poisoned.into_inner()
                          }
                      };
+                     
+                    // Apply connectivity results for ALL peers
+                    for (addr, is_reachable, is_genesis) in connectivity_results {
+                        if let Some(peer) = connected.get_mut(&addr) {
+                            if !is_reachable {
+                                if is_genesis {
+                                    // CRITICAL FIX: Do NOT remove Genesis nodes from connected_peers
+                                    // Genesis nodes are trusted anchors - temporary unavailability ≠ dead node
+                                    peer.is_stable = false;
+                                    println!("[P2P] ⚠️ Genesis peer {} temporarily unreachable (kept in peers, marked unstable)", peer.id);
+                                } else {
+                                    // Full/Super/Light nodes: Mark as unstable, will be removed if reputation is low
+                                    peer.is_stable = false;
+                                    println!("[P2P] ⚠️ Peer {} unreachable (marked unstable)", peer.id);
+                                }
+                            } else {
+                                // Peer is reachable - mark as stable
+                                peer.is_stable = true;
+                            }
+                        }
+                    }
+                    
                     // SCALABILITY: O(1) HashMap operations for millions of nodes
+                    // Reputation check for all peers (connectivity already checked above in parallel)
                     for (addr, peer) in connected.iter_mut() {
-                       // SCALABILITY: For Genesis peers, check TCP connectivity every 5s (Genesis) or 30s (normal)
-                       // This prevents phantom Genesis peers from accumulating
                        let is_genesis_peer = peer.id.contains("genesis_") || genesis_ips.contains(&peer.addr);
-                       
-                       // Check if peer is still reachable (Genesis only, others use reputation)
-                       if is_genesis_peer && !Self::test_peer_connectivity_static(&peer.addr) {
-                           println!("[P2P] ❌ Genesis peer {} no longer reachable, removing", peer.id);
-                           to_remove.push(addr.clone());
-                           continue; // Skip reputation check for unreachable peers
-                       }
                        
                          // Check peer reputation using shared system
                          let reputation = if let Ok(rep_sys) = reputation_system.lock() {
@@ -2447,10 +2522,12 @@ impl SimplifiedP2P {
                                  peer.id, reputation);
                             to_remove.push(addr.clone());
                          } else {
-                             // Update peer stability based on reputation
+                             // Update peer stability based on reputation and connectivity
                              if is_genesis_peer {
                                 // Genesis peers: Stay connected but can lose stability for bad behavior
-                                peer.is_stable = reputation > 70.0; // Must maintain 70% for stability
+                                // Stability requires BOTH good reputation AND connectivity
+                                let has_good_reputation = reputation >= 70.0;
+                                peer.is_stable = peer.is_stable && has_good_reputation; // AND with connectivity result
                                 
                                 if reputation < 70.0 {
                                     println!("[P2P] ⚠️ Genesis peer {} unstable due to low reputation: {:.1}%", peer.id, reputation);
@@ -2461,7 +2538,9 @@ impl SimplifiedP2P {
                                 }
                             } else {
                                 // Regular peers: Standard reputation handling
-                                peer.is_stable = reputation > 75.0;
+                                // Stability requires BOTH good reputation AND connectivity
+                                let has_good_reputation = reputation >= 70.0;
+                                peer.is_stable = peer.is_stable && has_good_reputation; // AND with connectivity result
                              }
                          }
                      }
@@ -3200,6 +3279,9 @@ impl SimplifiedP2P {
             .timeout(Duration::from_millis(600))  // PERFORMANCE: 600ms timeout for chunks
             .connect_timeout(Duration::from_millis(200))  // Fast connect for chunks
             .tcp_nodelay(true)
+            .tcp_keepalive(Duration::from_secs(HTTP_TCP_KEEPALIVE_SECS))
+            .pool_max_idle_per_host(HTTP_POOL_MAX_IDLE_PER_HOST)
+            .pool_idle_timeout(Duration::from_secs(HTTP_POOL_IDLE_TIMEOUT_SECS))
             .build()
             .map_err(|e| format!("Client failed: {}", e))?;
         
@@ -3381,7 +3463,9 @@ impl SimplifiedP2P {
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(5)) // EXISTING: Same as check_api_readiness_static (quick API checks)
             .connect_timeout(Duration::from_secs(3)) // EXISTING: Same as check_api_readiness_static (quick connect)
-            .tcp_keepalive(Duration::from_secs(30)) // Keep connections alive
+            .tcp_keepalive(Duration::from_secs(HTTP_TCP_KEEPALIVE_SECS)) // Keep connections alive
+            .pool_max_idle_per_host(HTTP_POOL_MAX_IDLE_PER_HOST)
+            .pool_idle_timeout(Duration::from_secs(HTTP_POOL_IDLE_TIMEOUT_SECS))
             .build()
             .map_err(|e| format!("HTTP client error: {}", e))?;
         
@@ -4315,6 +4399,9 @@ impl SimplifiedP2P {
                 // Use async reqwest client instead of blocking
                 let client = reqwest::Client::builder()
                     .timeout(std::time::Duration::from_secs(5))
+                    .tcp_keepalive(std::time::Duration::from_secs(HTTP_TCP_KEEPALIVE_SECS))
+                    .pool_max_idle_per_host(HTTP_POOL_MAX_IDLE_PER_HOST)
+                    .pool_idle_timeout(std::time::Duration::from_secs(HTTP_POOL_IDLE_TIMEOUT_SECS))
                     .build();
                 
                 if let Ok(client) = client {
@@ -4373,7 +4460,7 @@ impl SimplifiedP2P {
                         bandwidth_usage: 1000,
                         node_id_hash: Vec::new(),
                         bucket_index: 0,
-                        reputation_score: 70.0,
+                        reputation_score: 70.0, // CORRECT: Default consensus threshold
                         successful_pings: 100,
                         failed_pings: 0,
                     });
@@ -5094,7 +5181,9 @@ impl SimplifiedP2P {
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(5)) // EXISTING: Same as check_api_readiness_static (quick API checks)
             .connect_timeout(Duration::from_secs(3)) // EXISTING: Same as check_api_readiness_static (quick connect)
-            .tcp_keepalive(Duration::from_secs(30)) // Keep connections alive
+            .tcp_keepalive(Duration::from_secs(HTTP_TCP_KEEPALIVE_SECS)) // Keep connections alive
+            .pool_max_idle_per_host(HTTP_POOL_MAX_IDLE_PER_HOST)
+            .pool_idle_timeout(Duration::from_secs(HTTP_POOL_IDLE_TIMEOUT_SECS))
             .build()
             .map_err(|e| format!("HTTP client error: {}", e))?;
         
@@ -5487,10 +5576,13 @@ impl SimplifiedP2P {
     fn check_api_readiness_static(ip: &str) -> bool {
         use std::time::Duration;
         
-        // PRODUCTION: Extended timeout for international Genesis nodes
+        // PRODUCTION: Extended timeout for international Genesis nodes with connection pooling
         let client = match reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(5)) // INCREASED: 5s timeout for Genesis node API checks
             .connect_timeout(Duration::from_secs(3)) // INCREASED: 3s connection timeout
+            .tcp_keepalive(Duration::from_secs(HTTP_TCP_KEEPALIVE_SECS))
+            .pool_max_idle_per_host(HTTP_POOL_MAX_IDLE_PER_HOST)
+            .pool_idle_timeout(Duration::from_secs(HTTP_POOL_IDLE_TIMEOUT_SECS))
             .build() {
             Ok(client) => client,
             Err(_) => return false,
@@ -6044,6 +6136,9 @@ impl SimplifiedP2P {
                     .connect_timeout(std::time::Duration::from_secs(2))
                     .user_agent("QNet-Node/1.0")
                     .tcp_nodelay(true)
+                    .tcp_keepalive(std::time::Duration::from_secs(HTTP_TCP_KEEPALIVE_SECS))
+                    .pool_max_idle_per_host(HTTP_POOL_MAX_IDLE_PER_HOST)
+                    .pool_idle_timeout(std::time::Duration::from_secs(HTTP_POOL_IDLE_TIMEOUT_SECS))
                     .build() {
                     Ok(client) => client,
                     Err(_) => continue,
@@ -6180,6 +6275,8 @@ pub enum NetworkMessage {
         block_height: u64,
         change_type: String, // "microblock" or "macroblock"
         timestamp: u64,
+        #[serde(default)] // BACKWARD COMPATIBILITY: Optional for old messages
+        sender_node_id: Option<String>, // PRODUCTION: Explicit sender identification for Docker/NAT
     },
     
     /// Turbine chunk for efficient block propagation
@@ -6448,23 +6545,51 @@ impl SimplifiedP2P {
                 self.handle_turbine_chunk(from_peer, chunk);
             }
 
-            NetworkMessage::EmergencyProducerChange { failed_producer, new_producer, block_height, change_type, timestamp } => {
+            NetworkMessage::EmergencyProducerChange { failed_producer, new_producer, block_height, change_type, timestamp, sender_node_id } => {
                 // SECURITY: Check sender reputation before processing emergency message
                 // SIMPLIFIED: Only reputation check, no complex round verification
                 // RATIONALE: Round participants change dynamically, checking would be non-deterministic
                 
-                // CRITICAL FIX: Get reputation from ReputationManager, not connected_peers
-                // Step 1: Convert IP address to node_id using existing mapping
-                let sender_node_id = get_privacy_id_for_addr(from_peer);
-                
-                // Step 2: Get reputation from the authoritative ReputationManager
+                // PRODUCTION: Get sender reputation using explicit sender_node_id (if provided) or fallback to IP resolution
+                // This fixes Docker/NAT issues where from_peer IP doesn't match public IP
                 let sender_reputation = {
-                    if let Ok(reputation_system) = self.reputation_system.lock() {
-                        // ReputationManager stores reputation on 0-100 scale
-                        reputation_system.get_reputation(&sender_node_id)
+                    let resolved_sender_id = if let Some(explicit_id) = sender_node_id {
+                        // PRODUCTION: Use explicit sender_node_id from message (Docker/NAT safe)
+                        println!("[SECURITY] ✅ Using explicit sender_node_id: {}", explicit_id);
+                        explicit_id
                     } else {
-                        // If we can't access reputation system, default to 0 (reject)
-                        println!("[SECURITY] ⚠️ Cannot access reputation system for {}", sender_node_id);
+                        // PRODUCTION: IP resolution for nodes on different servers (public IPs)
+                        let sender_ip = if from_peer.contains(':') {
+                            from_peer.split(':').next().unwrap_or(from_peer)
+                        } else {
+                            from_peer
+                        };
+                        
+                        // Convert IP to node_id using EXISTING logic
+                        // FAST PATH: Check Genesis nodes first (O(1))
+                        match sender_ip {
+                            "154.38.160.39" => "genesis_node_001".to_string(),
+                            "62.171.157.44" => "genesis_node_002".to_string(),
+                            "161.97.86.81" => "genesis_node_003".to_string(),
+                            "5.189.130.160" => "genesis_node_004".to_string(),
+                            "162.244.25.114" => "genesis_node_005".to_string(),
+                            _ => {
+                                // Non-Genesis node: use privacy ID
+                                // PRODUCTION: All nodes should send explicit sender_node_id
+                                // This fallback only for Genesis nodes with public IPs
+                                get_privacy_id_for_addr(sender_ip)
+                            }
+                        }
+                    };
+                    
+                    // Get reputation from NodeReputation system
+                    if let Ok(reputation_system) = self.reputation_system.lock() {
+                        let rep = reputation_system.get_reputation(&resolved_sender_id);
+                        println!("[SECURITY] 🔍 Emergency from {}: reputation {:.1}", 
+                                 resolved_sender_id, rep);
+                        rep
+                    } else {
+                        println!("[SECURITY] ⚠️ Failed to access reputation system");
                         0.0
                     }
                 };
@@ -6473,7 +6598,7 @@ impl SimplifiedP2P {
                 // This naturally limits to ~1000 high-reputation nodes that can participate
                 if sender_reputation < 70.0 {
                     println!("[SECURITY] ⚠️ Ignoring emergency from {} - reputation {:.1} < 70", 
-                             sender_node_id, sender_reputation);
+                             from_peer, sender_reputation);
                     println!("[SECURITY] 🚫 Low-reputation nodes cannot trigger emergency failover");
                     return; // Ignore message completely
                 }
@@ -6777,18 +6902,79 @@ impl SimplifiedP2P {
                             // Check if we have history for this node
                             let is_compatible = if let Some(history) = cert_manager.certificate_history.get(&cert.node_id) {
                                 // This node has rotated certificates before
-                                // For now, we just warn - in future, can check Ed25519 key continuity
                                 if !history.is_empty() {
                                     let prev_count = history.len();
                                     println!("[P2P] 🔄 Certificate rotation detected for {} (history: {} certs)", 
                                              cert.node_id, prev_count);
-                                    // TODO: In production, verify that new cert is signed by previous key
-                                    // or follows proper rotation protocol
+                                    
+                                    // PRODUCTION: Verify rotation signature with previous key
+                                    // MANDATORY: All certificate rotations MUST be signed by the previous key
+                                    // This creates an unbreakable chain of trust from the first certificate
+                                    if let Some(rotation_sig_b64) = &cert.rotation_signature {
+                                        // Get previous Ed25519 public key from history
+                                        let (_prev_serial, prev_ed25519_key) = &history[history.len() - 1];
+                                        
+                                        // Decode rotation signature
+                                        match base64::engine::general_purpose::STANDARD.decode(rotation_sig_b64) {
+                                            Ok(sig_bytes) if sig_bytes.len() == 64 => {
+                                                // Create Ed25519 signature and verifying key
+                                                use ed25519_dalek::{Signature, VerifyingKey, Verifier};
+                                                
+                                                match Signature::from_slice(&sig_bytes) {
+                                                    Ok(signature) => {
+                                                        match VerifyingKey::from_bytes(prev_ed25519_key) {
+                                                            Ok(prev_verifying_key) => {
+                                                                // Verify that new key is signed by old key
+                                                                match prev_verifying_key.verify(&cert.ed25519_public_key, &signature) {
+                                                                    Ok(_) => {
+                                                                        println!("[P2P] ✅ Rotation signature verified - chain of trust maintained");
+                                                                        true
+                                                                    }
+                                                                    Err(_) => {
+                                                                        println!("[P2P] ❌ SECURITY: Rotation signature INVALID - rejecting certificate");
+                                                                        println!("[P2P] 🚨 Potential attack: unauthorized key rotation attempt");
+                                                                        false
+                                                                    }
+                                                                }
+                                                            }
+                                                            Err(_) => {
+                                                                println!("[P2P] ⚠️ Failed to parse previous Ed25519 key");
+                                                                false
+                                                            }
+                                                        }
+                                                    }
+                                                    Err(_) => {
+                                                        println!("[P2P] ⚠️ Failed to parse rotation signature");
+                                                        false
+                                                    }
+                                                }
+                                            }
+                                            _ => {
+                                                println!("[P2P] ⚠️ Invalid rotation signature format");
+                                                false
+                                            }
+                                        }
+                                    } else {
+                                        // PRODUCTION: No rotation signature - MANDATORY for rotations
+                                        // This is a critical security requirement to prevent unauthorized key takeover
+                                        println!("[P2P] ❌ SECURITY: Certificate rotation WITHOUT signature - REJECTING!");
+                                        println!("[P2P] 🚨 ATTACK DETECTED: Attempting rotation without proof of previous key ownership");
+                                        println!("[P2P] 🔐 All rotations MUST be signed by previous key to maintain chain of trust");
+                                        false
+                                    }
+                                } else {
+                                    // Empty history but node exists - should not happen
+                                    println!("[P2P] ⚠️ Node has empty certificate history - accepting");
+                                    true
                                 }
-                                true // Accept for now
                             } else {
                                 // First certificate from this node
                                 println!("[P2P] 🆕 First certificate from node {}", cert.node_id);
+                                
+                                // First certificate should NOT have rotation signature
+                                if cert.rotation_signature.is_some() {
+                                    println!("[P2P] ⚠️ First certificate has rotation signature - suspicious but accepting");
+                                }
                                 true
                             };
                             
@@ -6895,6 +7081,9 @@ impl SimplifiedP2P {
                             // Use async client for better resource management
                             let client = reqwest::Client::builder()
                                 .timeout(std::time::Duration::from_secs(5))
+                                .tcp_keepalive(std::time::Duration::from_secs(HTTP_TCP_KEEPALIVE_SECS))
+                                .pool_max_idle_per_host(HTTP_POOL_MAX_IDLE_PER_HOST)
+                                .pool_idle_timeout(std::time::Duration::from_secs(HTTP_POOL_IDLE_TIMEOUT_SECS))
                                 .build();
                             
                             if let Ok(client) = client {
@@ -7516,6 +7705,9 @@ impl SimplifiedP2P {
             .timeout(Duration::from_secs(10))
             .connect_timeout(Duration::from_secs(5))
             .user_agent("QNet-Node/1.0")
+            .tcp_keepalive(Duration::from_secs(HTTP_TCP_KEEPALIVE_SECS))
+            .pool_max_idle_per_host(HTTP_POOL_MAX_IDLE_PER_HOST)
+            .pool_idle_timeout(Duration::from_secs(HTTP_POOL_IDLE_TIMEOUT_SECS))
             .build()
             .map_err(|e| format!("HTTP client error: {}", e))?;
         
@@ -8011,6 +8203,9 @@ impl SimplifiedP2P {
                 tokio::spawn(async move {
                     if let Ok(client) = reqwest::Client::builder()
                         .timeout(std::time::Duration::from_secs(5))
+                        .tcp_keepalive(std::time::Duration::from_secs(HTTP_TCP_KEEPALIVE_SECS))
+                        .pool_max_idle_per_host(HTTP_POOL_MAX_IDLE_PER_HOST)
+                        .pool_idle_timeout(std::time::Duration::from_secs(HTTP_POOL_IDLE_TIMEOUT_SECS))
                         .build() {
                         
                         match client.post(&url)
@@ -8047,6 +8242,9 @@ impl SimplifiedP2P {
             tokio::spawn(async move {
                 if let Ok(client) = reqwest::Client::builder()
                     .timeout(std::time::Duration::from_secs(5))
+                    .tcp_keepalive(std::time::Duration::from_secs(HTTP_TCP_KEEPALIVE_SECS))
+                    .pool_max_idle_per_host(HTTP_POOL_MAX_IDLE_PER_HOST)
+                    .pool_idle_timeout(std::time::Duration::from_secs(HTTP_POOL_IDLE_TIMEOUT_SECS))
                     .build() {
                     
                     match client.post(&url)
@@ -8554,6 +8752,9 @@ impl SimplifiedP2P {
             .timeout(Duration::from_millis(adaptive_timeout_ms as u64))  // ADAPTIVE!
             .connect_timeout(Duration::from_millis(200))
             .tcp_nodelay(true)
+            .tcp_keepalive(Duration::from_secs(HTTP_TCP_KEEPALIVE_SECS))
+            .pool_max_idle_per_host(HTTP_POOL_MAX_IDLE_PER_HOST)
+            .pool_idle_timeout(Duration::from_secs(HTTP_POOL_IDLE_TIMEOUT_SECS))
             .build() {
             Ok(c) => c,
             Err(_) => return false,
@@ -8615,6 +8816,9 @@ impl SimplifiedP2P {
             .timeout(Duration::from_millis(adaptive_timeout_ms as u64))  // ADAPTIVE!
             .connect_timeout(Duration::from_millis(200))
             .tcp_nodelay(true)  // Disable Nagle's algorithm for faster delivery
+            .tcp_keepalive(Duration::from_secs(HTTP_TCP_KEEPALIVE_SECS))
+            .pool_max_idle_per_host(HTTP_POOL_MAX_IDLE_PER_HOST)
+            .pool_idle_timeout(Duration::from_secs(HTTP_POOL_IDLE_TIMEOUT_SECS))
             .build()
             .map_err(|e| format!("Client build failed: {}", e))?;
         
@@ -8701,7 +8905,9 @@ impl SimplifiedP2P {
                 .connect_timeout(std::time::Duration::from_millis(500)) // OPTIMIZATION: 500ms connect from 3c78d24
                 .user_agent("QNet-Node/1.0") 
                 .tcp_nodelay(true) // Faster message delivery
-                .tcp_keepalive(std::time::Duration::from_secs(30)) // P2P connection persistence
+                .tcp_keepalive(std::time::Duration::from_secs(HTTP_TCP_KEEPALIVE_SECS)) // P2P connection persistence
+                .pool_max_idle_per_host(HTTP_POOL_MAX_IDLE_PER_HOST)
+                .pool_idle_timeout(std::time::Duration::from_secs(HTTP_POOL_IDLE_TIMEOUT_SECS))
                 .build() {
                 Ok(client) => client,
                 Err(e) => {
@@ -9932,6 +10138,7 @@ impl SimplifiedP2P {
                 block_height,
                 change_type: change_type.to_string(),
                 timestamp,
+                sender_node_id: Some(self.node_id.clone()), // PRODUCTION: Explicit sender for Docker/NAT
             };
             
             // CRITICAL: Send emergency message to peer
