@@ -503,21 +503,65 @@ impl CertificateManager {
         *self.usage_count.entry(cert_serial.to_string()).or_insert(0) += 1;
         
         // Limit recently_used set size to prevent unbounded growth
-        const MAX_RECENTLY_USED: usize = 1000;
+        // SCALABILITY: Support 1000 validators + 500 buffer for rotation = 1500
+        const MAX_RECENTLY_USED: usize = 1500;
+        
+        // Add monitoring for cache size
+        if self.recently_used.len() > 1400 {
+            println!("[CERTIFICATE] ⚠️ recently_used approaching limit: {}/1500", 
+                     self.recently_used.len());
+        }
+        
         if self.recently_used.len() > MAX_RECENTLY_USED {
-            // Remove random old entries (simple cleanup)
-            let to_remove: Vec<String> = self.recently_used
+            // CRITICAL: HashSet has no order! We must remove based on usage_count instead
+            // Sort by usage count and remove least used
+            let mut usage_list: Vec<(String, u32)> = self.recently_used
                 .iter()
-                .take(self.recently_used.len() - MAX_RECENTLY_USED / 2)
-                .cloned()
+                .map(|serial| {
+                    let usage = self.usage_count.get(serial).unwrap_or(&0);
+                    (serial.clone(), *usage)
+                })
                 .collect();
+            
+            // Sort by usage (ascending) - least used first
+            usage_list.sort_by_key(|(_, usage)| *usage);
+            
+            // Remove least used entries (keep most active 1400)
+            let to_remove_count = self.recently_used.len() - 1400;
+            let to_remove: Vec<String> = usage_list
+                .iter()
+                .take(to_remove_count)
+                .map(|(serial, _)| serial.clone())
+                .collect();
+            
+            println!("[CERTIFICATE] 🗑️ Cleaning recently_used: removing {} least-used entries (keeping 1400 most active)", 
+                     to_remove.len());
+            
             for serial in to_remove {
                 self.recently_used.remove(&serial);
+                // Also remove from usage_count to keep consistent
+                self.usage_count.remove(&serial);
             }
         }
     }
     
     /// Get certificate (local or remote) - checks local first, then remote cache, then pending
+    /// Get certificate and mark as used atomically (prevents race conditions)
+    pub fn get_and_mark_used(&mut self, cert_serial: &str) -> Option<Vec<u8>> {
+        // First get the certificate
+        let result = self.get_certificate(cert_serial);
+        
+        // If found, mark as used
+        if result.is_some() {
+            self.mark_as_used(cert_serial);
+        }
+        
+        result
+    }
+    
+    /// REMOVED: This optimization broke usage counting!
+    /// Every access MUST go through mark_as_used to track usage properly
+    
     /// OPTIMISTIC: Returns pending certificates to prevent race conditions
     pub fn get_certificate(&self, cert_serial: &str) -> Option<Vec<u8>> {
         // Check local certificate
@@ -540,6 +584,7 @@ impl CertificateManager {
                 match lz4_flex::decompress_size_prepended(compressed_cert) {
                     Ok(decompressed) => {
                         println!("[CERTIFICATE] ✅ Using verified certificate {}", cert_serial);
+                        // NOTE: Caller must call mark_as_used() separately due to &self immutability
                         return Some(decompressed);
                     }
                     Err(e) => {
@@ -2984,11 +3029,14 @@ impl SimplifiedP2P {
             .cloned()
             .collect();
         
-        // Forward chunk asynchronously
+        // Forward chunk asynchronously using tokio for better thread management
         for peer in forward_targets {
             let peer_addr = peer.addr.clone();
             let chunk_clone = chunk.clone();
             
+            // CRITICAL: Don't use spawn_blocking with blocking HTTP - it's worse than std::thread!
+            // For Turbine chunks, we keep std::thread::spawn as chunks are time-critical
+            // and the 600ms timeout prevents thread accumulation
             std::thread::spawn(move || {
                 let _ = Self::send_turbine_chunk(peer_addr, chunk_clone);
             });
@@ -4255,19 +4303,22 @@ impl SimplifiedP2P {
             println!("[P2P] 📤 Sending certificate {} to peer {}", cert_serial, peer_addr);
             broadcast_count += 1;
             
-            // PRODUCTION: Send certificate announcement via HTTP (same pattern as send_network_message)
+            // PRODUCTION: Send certificate announcement via HTTP using tokio for better concurrency
             let peer_addr_clone = peer_addr.clone();
             let message_json_clone = message_json.clone();
-            std::thread::spawn(move || {
+            
+            // Use tokio::spawn to prevent thread accumulation during mass certificate broadcasts
+            tokio::spawn(async move {
                 let peer_ip = peer_addr_clone.split(':').next().unwrap_or(&peer_addr_clone);
                 let url = format!("http://{}:8001/api/v1/p2p/message", peer_ip);
                 
-                let client = reqwest::blocking::Client::builder()
+                // Use async reqwest client instead of blocking
+                let client = reqwest::Client::builder()
                     .timeout(std::time::Duration::from_secs(5))
                     .build();
                 
                 if let Ok(client) = client {
-                    if let Err(e) = client.post(&url).json(&message_json_clone).send() {
+                    if let Err(e) = client.post(&url).json(&message_json_clone).send().await {
                         println!("[P2P] ❌ Failed to send certificate to {}: {}", peer_addr_clone, e);
                     }
                 }
@@ -6803,8 +6854,11 @@ impl SimplifiedP2P {
                 println!("[P2P] 📋 Certificate request from {} for {}", requester_id, cert_serial);
                 
                 // Check if we have the certificate and send response
-                let cert_manager = self.certificate_manager.read().unwrap();
-                if let Some(certificate) = cert_manager.get_certificate(&cert_serial) {
+                // MUST use write lock to track usage_count for proper LRU
+                let mut cert_manager = self.certificate_manager.write().unwrap();
+                if let Some(certificate) = cert_manager.get_and_mark_used(&cert_serial) {
+                    drop(cert_manager); // Release lock before network operations
+                    
                     println!("[P2P] ✅ Sending certificate {} to {}", cert_serial, requester_id);
                     
                     // PRODUCTION: Send response back via network
@@ -6828,16 +6882,18 @@ impl SimplifiedP2P {
                             }
                         };
                         
-                        std::thread::spawn(move || {
+                        // Use tokio::spawn for certificate response to prevent thread accumulation
+                        tokio::spawn(async move {
                             let peer_ip = peer_addr_clone.split(':').next().unwrap_or(&peer_addr_clone);
                             let url = format!("http://{}:8001/api/v1/p2p/message", peer_ip);
                             
-                            let client = reqwest::blocking::Client::builder()
+                            // Use async client for better resource management
+                            let client = reqwest::Client::builder()
                                 .timeout(std::time::Duration::from_secs(5))
                                 .build();
                             
                             if let Ok(client) = client {
-                                if let Err(e) = client.post(&url).json(&response_json).send() {
+                                if let Err(e) = client.post(&url).json(&response_json).send().await {
                                     println!("[P2P] ❌ Failed to send certificate response to {}: {}", peer_addr_clone, e);
                                 } else {
                                     println!("[P2P] 📤 Certificate response sent to {}", requester_id_clone);
