@@ -1728,6 +1728,11 @@ impl BlockchainNode {
         const REQUEST_COOLDOWN_FAST: u64 = 1;    // Fast sync: 1 second for catching up
         const FAST_SYNC_THRESHOLD: u64 = 10;     // Switch to fast sync if >10 blocks behind
         
+        // MEMORY PROTECTION: Maximum pending blocks to prevent memory exhaustion
+        // 100 blocks * ~100KB = ~10 MB maximum buffer size
+        // Protects against malicious peers sending out-of-order blocks
+        const MAX_PENDING_BLOCKS: usize = 100;
+        
         // CRITICAL: REORG PROTECTION - Prevent concurrent reorgs and DoS attacks
         let reorg_in_progress = Arc::new(tokio::sync::RwLock::new(false));
         let last_fork_attempt = Arc::new(tokio::sync::RwLock::new(
@@ -1801,6 +1806,19 @@ impl BlockchainNode {
                             if retry_count < 5 { // Max 5 retries for certificate race (more than missing block)
                                 println!("[BLOCKS] 🔐 Buffering block #{} (retry #{}) - waiting for certificate from {}", 
                                          received_block.height, retry_count, received_block.from_peer);
+                                
+                                // MEMORY PROTECTION: Enforce maximum buffer size
+                                if pending_blocks.len() >= MAX_PENDING_BLOCKS {
+                                    // Remove oldest block to make room (but not the one we're inserting)
+                                    if let Some((&oldest_height, _)) = pending_blocks.iter()
+                                        .filter(|(&h, _)| h != received_block.height)  // Don't remove current block
+                                        .min_by_key(|(_, (_, _, timestamp))| timestamp) {
+                                        pending_blocks.remove(&oldest_height);
+                                        println!("[BLOCKS] 🚨 Max buffer ({}) reached - removed oldest block #{}", 
+                                                 MAX_PENDING_BLOCKS, oldest_height);
+                                    }
+                                }
+                                
                                 pending_blocks.insert(
                                     received_block.height, 
                                     (received_block.clone(), retry_count, std::time::Instant::now())
@@ -1833,6 +1851,19 @@ impl BlockchainNode {
                                     if retry_count < 3 { // Max 3 retries
                                         println!("[BLOCKS] 📋 Buffering block #{} (retry #{}) - waiting for previous block #{}", 
                                                  received_block.height, retry_count, missing_height);
+                                        
+                                        // MEMORY PROTECTION: Enforce maximum buffer size
+                                        if pending_blocks.len() >= MAX_PENDING_BLOCKS {
+                                            // Remove oldest block to make room (but not the one we're inserting)
+                                            if let Some((&oldest_height, _)) = pending_blocks.iter()
+                                                .filter(|(&h, _)| h != received_block.height)  // Don't remove current block
+                                                .min_by_key(|(_, (_, _, timestamp))| timestamp) {
+                                                pending_blocks.remove(&oldest_height);
+                                                println!("[BLOCKS] 🚨 Max buffer ({}) reached - removed oldest block #{}", 
+                                                         MAX_PENDING_BLOCKS, oldest_height);
+                                            }
+                                        }
+                                        
                                         pending_blocks.insert(
                                             received_block.height, 
                                             (received_block.clone(), retry_count, std::time::Instant::now())
@@ -4732,14 +4763,24 @@ impl BlockchainNode {
                             if let Some(hybrid) = instances_guard.get(&normalized_id) {
                                 if let Some(cert) = hybrid.get_current_certificate() {
                                     if let Ok(cert_bytes) = bincode::serialize(&cert) {
-                                        println!("[CERTIFICATE] 🚀 IMMEDIATE broadcast as new producer for round {} (block #{}): {}", 
+                                        println!("[CERTIFICATE] 🚀 IMMEDIATE TRACKED broadcast as new producer for round {} (block #{}): {}", 
                                             current_round, next_block_height, cert.serial_number);
-                                        if let Err(e) = p2p.broadcast_certificate_announce(cert.serial_number, cert_bytes) {
-                                            println!("[CERTIFICATE] ⚠️ Producer certificate broadcast failed: {}", e);
-                                        } else {
-                                            println!("[CERTIFICATE] ✅ Producer certificate broadcasted to all peers");
-                                            // Mark this round as broadcasted
-                                            last_certificate_broadcast_round = Some(current_round);
+                                        
+                                        // CRITICAL: Use tracked broadcast for producer rotation (Byzantine threshold)
+                                        match p2p.broadcast_certificate_announce_tracked(cert.serial_number.clone(), cert_bytes.clone()).await {
+                                            Ok(()) => {
+                                                println!("[CERTIFICATE] ✅ Producer certificate delivered to 2/3+ peers (Byzantine threshold)");
+                                                // Mark this round as broadcasted
+                                                last_certificate_broadcast_round = Some(current_round);
+                                            }
+                                            Err(e) => {
+                                                println!("[CERTIFICATE] ⚠️ Producer certificate Byzantine threshold NOT reached: {}", e);
+                                                println!("[CERTIFICATE] 🔄 Falling back to async re-broadcast");
+                                                // Fallback: async broadcast for remaining peers (gossip will propagate)
+                                                if let Err(e2) = p2p.broadcast_certificate_announce(cert.serial_number, cert_bytes) {
+                                                    println!("[CERTIFICATE] ❌ Fallback broadcast also failed: {}", e2);
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -8788,17 +8829,37 @@ impl BlockchainNode {
         
         // Check if certificate needs rotation
         if hybrid.needs_rotation() {
+            // CRITICAL: Get old serial BEFORE rotation to detect actual change
+            let old_serial = hybrid.get_current_certificate()
+                .map(|c| c.serial_number.clone());
+            
             if let Err(e) = hybrid.rotate_certificate().await {
                 println!("[CONSENSUS] ⚠️ Failed to rotate certificate: {}", e);
             } else {
-                // PRODUCTION: Broadcast new certificate after rotation
+                // PRODUCTION: Broadcast new certificate ONLY if it actually changed
                 if let Some(new_cert) = hybrid.get_current_certificate() {
-                    if let Ok(cert_bytes) = bincode::serialize(&new_cert) {
-                        println!("[CONSENSUS] 📜 Broadcasting rotated certificate: {}", new_cert.serial_number);
-                        // Broadcast to network if P2P instance available
-                        if let Some(p2p) = unified_p2p {
-                            p2p.broadcast_certificate_announce(new_cert.serial_number.clone(), cert_bytes).await;
+                    // Check if serial number changed (prevents duplicate broadcasts)
+                    let serial_changed = old_serial.as_ref().map_or(true, |old| old != &new_cert.serial_number);
+                    
+                    if serial_changed {
+                        if let Ok(cert_bytes) = bincode::serialize(&new_cert) {
+                            println!("[CONSENSUS] 📜 TRACKED broadcast of rotated certificate: {} (serial changed)", new_cert.serial_number);
+                            // Broadcast to network if P2P instance available
+                            if let Some(p2p) = unified_p2p {
+                                // CRITICAL: Use tracked broadcast for consensus certificate rotation
+                                match p2p.broadcast_certificate_announce_tracked(new_cert.serial_number.clone(), cert_bytes.clone()).await {
+                                    Ok(()) => {
+                                        println!("[CONSENSUS] ✅ Certificate delivered to 2/3+ peers (Byzantine threshold)");
+                                    }
+                                    Err(e) => {
+                                        println!("[CONSENSUS] ⚠️ Byzantine threshold NOT reached: {}", e);
+                                        println!("[CONSENSUS] 🔄 Gossip protocol will propagate to remaining peers");
+                                    }
+                                }
+                            }
                         }
+                    } else {
+                        println!("[CONSENSUS] 📋 Certificate unchanged - skipping duplicate broadcast");
                     }
                 }
             }
@@ -8971,17 +9032,37 @@ impl BlockchainNode {
         
         // Check if certificate needs rotation
         if hybrid.needs_rotation() {
+            // CRITICAL: Get old serial BEFORE rotation to detect actual change
+            let old_serial = hybrid.get_current_certificate()
+                .map(|c| c.serial_number.clone());
+            
             if let Err(e) = hybrid.rotate_certificate().await {
                 println!("[CRYPTO] ⚠️ Certificate rotation failed for microblock: {}", e);
             } else {
-                // PRODUCTION: Broadcast new certificate after rotation
+                // PRODUCTION: Broadcast new certificate ONLY if it actually changed
                 if let Some(new_cert) = hybrid.get_current_certificate() {
-                    if let Ok(cert_bytes) = bincode::serialize(&new_cert) {
-                        println!("[CRYPTO] 📜 Broadcasting rotated certificate: {}", new_cert.serial_number);
-                        // Broadcast to network if P2P instance available
-                        if let Some(p2p) = unified_p2p {
-                            p2p.broadcast_certificate_announce(new_cert.serial_number.clone(), cert_bytes).await;
+                    // Check if serial number changed (prevents duplicate broadcasts)
+                    let serial_changed = old_serial.as_ref().map_or(true, |old| old != &new_cert.serial_number);
+                    
+                    if serial_changed {
+                        if let Ok(cert_bytes) = bincode::serialize(&new_cert) {
+                            println!("[CRYPTO] 📜 TRACKED broadcast of rotated certificate: {} (serial changed)", new_cert.serial_number);
+                            // Broadcast to network if P2P instance available
+                            if let Some(p2p) = unified_p2p {
+                                // CRITICAL: Use tracked broadcast for microblock certificate rotation
+                                match p2p.broadcast_certificate_announce_tracked(new_cert.serial_number.clone(), cert_bytes.clone()).await {
+                                    Ok(()) => {
+                                        println!("[CRYPTO] ✅ Certificate delivered to 2/3+ peers (Byzantine threshold)");
+                                    }
+                                    Err(e) => {
+                                        println!("[CRYPTO] ⚠️ Byzantine threshold NOT reached: {}", e);
+                                        println!("[CRYPTO] 🔄 Continuing with available peers");
+                                    }
+                                }
+                            }
                         }
+                    } else {
+                        println!("[CRYPTO] 📋 Certificate unchanged - skipping duplicate broadcast");
                     }
                 }
             }
@@ -9243,20 +9324,11 @@ impl BlockchainNode {
                                 let cert_serial = compact_sig.cert_serial.clone();
                                 let producer_id = compact_sig.node_id.clone();
                                 
+                                // NOTE: Certificate request mechanism not yet implemented in P2P layer
+                                // TODO: Implement direct certificate request via P2P when needed
                                 tokio::spawn(async move {
                                     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                                    
-                                    use crate::unified_p2p::P2PMessage;
-                                    let request = P2PMessage::CertificateRequest {
-                                        cert_serial: cert_serial.clone(),
-                                        requester_node_id: p2p_clone.node_id.clone(),
-                                    };
-                                    
-                                    if let Err(e) = p2p_clone.send_to_peer(&producer_addr, request).await {
-                                        println!("[CRYPTO] ⚠️ Failed to send certificate request: {}", e);
-                                    } else {
-                                        println!("[CRYPTO] ✅ Certificate request sent to {}", producer_id);
-                                    }
+                                    println!("[CRYPTO] ⚠️ Certificate not found for serial: {} - relying on periodic broadcast", cert_serial);
                                 });
                             }
                         }

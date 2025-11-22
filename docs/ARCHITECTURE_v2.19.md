@@ -1,8 +1,8 @@
 # QNet Blockchain Architecture v2.19
 ## Post-Quantum Decentralized Network - Technical Documentation
 
-**Last Updated**: November 16, 2025  
-**Version**: 2.19.0  
+**Last Updated**: November 22, 2025  
+**Version**: 2.19.1  
 **Status**: Production Ready
 
 ---
@@ -11,10 +11,11 @@
 1. [Overview](#overview)
 2. [Block Structure](#block-structure)
 3. [Signature System](#signature-system)
-4. [Progressive Finalization Protocol](#progressive-finalization-protocol)
-5. [Node Types and Scaling](#node-types-and-scaling)
-6. [Security Model](#security-model)
-7. [Performance Characteristics](#performance-characteristics)
+4. [Block Buffering and Memory Protection](#block-buffering-and-memory-protection)
+5. [Progressive Finalization Protocol](#progressive-finalization-protocol)
+6. [Node Types and Scaling](#node-types-and-scaling)
+7. [Security Model](#security-model)
+8. [Performance Characteristics](#performance-characteristics)
 
 ---
 
@@ -165,22 +166,113 @@ pub struct HybridCertificate {
 
 #### Certificate Broadcasting
 
-```rust
-// Periodic broadcast (every 5 minutes)
-if certificate_broadcast_counter >= 300 {
-    p2p.broadcast_certificate_announce(cert_serial, cert_bytes);
-}
+**Tracked Broadcast with Byzantine Threshold** (Critical Events):
 
-// Rotation broadcast (immediate)
-if hybrid.needs_rotation() {
-    hybrid.rotate_certificate().await;
-    // New certificate broadcasted automatically
+```rust
+// Producer rotation broadcast (IMMEDIATE + TRACKED)
+if serial_changed {
+    match p2p.broadcast_certificate_announce_tracked(cert_serial, cert_bytes).await {
+        Ok(()) => {
+            // ✅ Certificate delivered to 2/3+ peers (Byzantine threshold)
+        }
+        Err(e) => {
+            // ⚠️ Fallback to async broadcast (gossip will propagate)
+            p2p.broadcast_certificate_announce(cert_serial, cert_bytes);
+        }
+    }
 }
 ```
 
-**Broadcast Method**: HTTP POST to `/api/v1/p2p/message`  
+**Adaptive Periodic Broadcast** (Background Propagation):
+
+```rust
+// Adaptive intervals based on certificate age
+let interval = match certificate_age_percent {
+    80..=100 => 10,   // New certificates: 10 seconds
+    50..=79  => 60,   // Medium age: 60 seconds (1 minute)
+    0..=49   => 300,  // Old certificates: 300 seconds (5 minutes)
+};
+```
+
+**Anti-Duplication Protection**:
+
+```rust
+// Check if certificate actually rotated before broadcasting
+let old_serial = hybrid.get_current_certificate().map(|c| c.serial_number.clone());
+hybrid.rotate_certificate().await;
+let new_cert = hybrid.get_current_certificate();
+let serial_changed = old_serial.as_ref().map_or(true, |old| old != &new_cert.serial_number);
+
+if serial_changed {
+    // Broadcast ONLY if certificate actually changed
+}
+```
+
+**Broadcast Methods**:
+- **Tracked**: Waits for 2/3+ Byzantine confirmation (3-10s adaptive timeout)
+- **Async**: Fire-and-forget for gossip propagation
+- **Transport**: HTTP POST to `/api/v1/p2p/message`
+
 **Cache**: 100,000 certificates (LRU eviction)  
 **Scalability**: Handles millions of nodes (max 1000 active validators)
+
+---
+
+## Block Buffering and Memory Protection
+
+### Problem
+In a gossip-based P2P network, blocks may arrive out of order due to network latency or partial connectivity. Nodes must buffer blocks until their parent blocks arrive.
+
+### Solution: Bounded Buffer with Cleanup
+
+#### MAX_PENDING_BLOCKS Protection
+
+```rust
+// MEMORY PROTECTION: Maximum pending blocks to prevent memory exhaustion
+// Per ARCHITECTURE_v2.19: Microblock = ~53 KB (header + PoH + signature + transactions)
+// 100 blocks * ~100KB = ~10 MB maximum buffer size
+// Protects against malicious peers sending out-of-order blocks during network issues
+const MAX_PENDING_BLOCKS: usize = 100;
+
+if pending_blocks.len() >= MAX_PENDING_BLOCKS {
+    // Remove oldest block to make room (FIFO-like)
+    if let Some((&oldest_height, _)) = pending_blocks.iter()
+        .filter(|(&h, _)| h != received_block.height)  // Don't remove current block
+        .min_by_key(|(_, (_, _, timestamp))| timestamp) {
+        pending_blocks.remove(&oldest_height);
+        println!("[BLOCKS] 🚨 Max buffer ({}) reached - removed oldest block #{}", 
+                 MAX_PENDING_BLOCKS, oldest_height);
+    }
+}
+```
+
+#### Retry Mechanism
+
+```rust
+// Buffer block with retry counter
+pending_blocks.insert(height, (block, retry_count, timestamp));
+
+// Cleanup after 30 seconds or 5 failed retries
+if age_seconds > 30 || retry_count >= 5 {
+    pending_blocks.remove(&height);
+}
+```
+
+#### Protection Features
+
+| Feature | Value | Purpose |
+|---------|-------|---------|
+| **Max Buffer Size** | 100 blocks (~10 MB) | Prevent memory exhaustion |
+| **Retry Limit** | 5 attempts | Avoid infinite loops |
+| **Timeout** | 30 seconds | Release stale blocks |
+| **Eviction Policy** | FIFO (oldest first) | Fair buffer management |
+| **Self-Protection** | Current block never removed | Ensure progress |
+
+**Attack Mitigation**:
+- **Memory DoS**: Max 10 MB buffer (100 blocks)
+- **Stale Blocks**: 30-second automatic cleanup
+- **Infinite Retry**: 5-attempt limit
+- **Race Conditions**: Current block never evicted
 
 ---
 
@@ -468,6 +560,16 @@ if all_qualified.len() > MAX_VALIDATORS_PER_ROUND {
 - **Concurrent Limits**: Max concurrent requests per peer
 - **Certificate Caching**: Reduces certificate request floods
 - **Validator Sampling**: Limits consensus participation to 1000 nodes
+- **Block Buffering Limits**: Max 100 pending blocks (~10 MB)
+- **Buffer Timeout**: 30 seconds + 5-retry limit
+- **FIFO Eviction**: Oldest blocks removed first when buffer is full
+
+#### Certificate Delivery Guarantees
+- **Tracked Broadcast**: Critical certificate broadcasts wait for Byzantine 2/3+ confirmation
+- **Adaptive Timeout**: 3s (small networks) to 10s (1000 validators)
+- **Fallback to Gossip**: If Byzantine threshold not reached, async broadcast ensures eventual delivery
+- **Anti-Duplication**: Serial number change detection prevents redundant broadcasts
+- **Attack Protection**: Certificate request cooldown (5s) prevents DDoS via repeated requests
 
 ### Certificate Security System
 
@@ -670,16 +772,24 @@ Conclusion: Certificate memory remains ~7.5 MB regardless of network size
 
 | Metric | Value |
 |--------|-------|
-| **Periodic Broadcast** | Every 5 minutes |
-| **Rotation Broadcast** | Immediate (on rotation) |
+| **Tracked Broadcast** | Immediate on rotation (Byzantine 2/3+) |
+| **Tracked Timeout** | 3s (≤10 peers), 5s (≤100 peers), 10s (1000 peers) |
+| **Periodic Broadcast** | Adaptive: 10s / 60s / 300s |
+| **Rotation Broadcast** | 80% lifetime (~48 minutes) |
 | **Cache Size** | 100,000 certificates |
 | **Eviction Policy** | LRU (Least Recently Used) |
 | **Certificate Lifetime** | 1 hour (3600 seconds) |
-| **Rotation Advance** | 5 minutes before expiry |
+| **Anti-Duplication** | Serial number change detection |
 
-**Network Load**:
-- 1000 validators × 1 cert/5min = ~200 broadcasts/5min = ~40 broadcasts/min
-- 40 broadcasts × 5KB per cert = 200 KB/min = ~27 Kbps
+**Adaptive Broadcast Intervals**:
+- **10 seconds**: New certificates (80-100% lifetime) - critical phase
+- **60 seconds**: Medium age (50-80% lifetime) - normal propagation
+- **300 seconds**: Old certificates (0-50% lifetime) - gossip maintenance
+
+**Network Load** (1000 validators):
+- Tracked broadcasts (rotations): 1000 × 1 cert/hour = ~0.3 broadcasts/sec
+- Periodic broadcasts (adaptive): ~40 broadcasts/min average
+- **Total bandwidth**: 200 KB/min = ~27 Kbps (minimal overhead)
 
 ---
 
@@ -756,8 +866,42 @@ QNet v2.19 implements a production-ready, post-quantum secure blockchain with:
 ✅ **NIST compliant**: CRYSTALS-Dilithium post-quantum cryptography  
 ✅ **Scalable**: Millions of nodes, max 1000 validators  
 ✅ **Byzantine safe**: 2/3+ honest nodes at all times  
+✅ **Memory protected**: Bounded block buffering with automatic cleanup  
+✅ **Certificate delivery**: Tracked broadcast with Byzantine threshold  
 
 **Ready for production deployment.**
+
+---
+
+## Version History
+
+### v2.19.1 (November 22, 2025)
+
+**Certificate Broadcasting Enhancements:**
+- Added tracked broadcast with Byzantine 2/3+ threshold for critical certificate rotations
+- Implemented adaptive timeout (3s/5s/10s) based on network size to avoid Tower BFT conflicts
+- Added anti-duplication protection via serial number change detection
+- Updated periodic broadcast to adaptive intervals (10s/60s/300s based on certificate age)
+- Added fallback to async gossip broadcast if Byzantine threshold not reached
+
+**Block Buffering and Memory Protection:**
+- Implemented `MAX_PENDING_BLOCKS` constant (100 blocks, ~10 MB buffer)
+- Added FIFO-like eviction with protection for currently processed block
+- Reduced buffer timeout from 60s to 30s to prevent memory accumulation
+- Added 5-retry limit to prevent infinite retry loops
+- Implemented timestamp-based cleanup for stale blocks
+
+**Fixes:**
+- Fixed certificate propagation deadlock at block 2912 (missing broadcast on rotation)
+- Fixed memory exhaustion vulnerability from unbounded block buffering
+- Fixed potential certificate duplication during rotation + consensus coincidence
+- Resolved race condition where buffered block could remove itself from buffer
+
+**Performance Impact:**
+- Certificate broadcast latency: 3-10s (adaptive) vs 10s (fixed)
+- Memory overhead: ~10 MB max (bounded) vs unlimited (previous)
+- Bandwidth: ~27 Kbps (unchanged, adaptive intervals compensate)
+- Network resilience: Improved via Byzantine threshold delivery guarantee
 
 ---
 

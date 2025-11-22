@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
-use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicBool, AtomicUsize, Ordering};
 use dashmap::{DashMap, DashSet};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use once_cell::sync::Lazy;
@@ -4414,6 +4414,155 @@ impl SimplifiedP2P {
         
         println!("[P2P] 📜 Certificate {} broadcast to {} peers", cert_serial, broadcast_count);
         Ok(())
+    }
+    
+    /// PRODUCTION: Broadcast certificate with delivery tracking and Byzantine threshold validation
+    /// Returns Ok if 2/3+ peers confirmed delivery, Err otherwise
+    /// This ensures Byzantine fault tolerance for critical certificate propagation
+    pub async fn broadcast_certificate_announce_tracked(
+        &self, 
+        cert_serial: String, 
+        certificate: Vec<u8>
+    ) -> Result<(), String> {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        
+        // Store locally first (immediate availability)
+        {
+            let mut cert_manager = self.certificate_manager.write().unwrap();
+            cert_manager.set_local_certificate(cert_serial.clone(), certificate.clone());
+        }
+        
+        // Get validated peers
+        let peers = self.get_validated_active_peers();
+        
+        if peers.is_empty() {
+            println!("[P2P] ⚠️ No peers available for tracked certificate broadcast");
+            return Ok(()); // No peers is OK (single node network)
+        }
+        
+        let total_peers = peers.len();
+        let byzantine_threshold = (total_peers * 2 + 2) / 3; // Ceiling of 2/3
+        
+        println!("[P2P] 📜 TRACKED broadcast of certificate {} to {} peers (need {}/{})", 
+                 cert_serial, total_peers, byzantine_threshold, total_peers);
+        
+        // Prepare message once
+        let message = NetworkMessage::CertificateAnnounce {
+            node_id: self.node_id.clone(),
+            cert_serial: cert_serial.clone(),
+            certificate: certificate.clone(),
+            timestamp,
+        };
+        
+        let message_json = match serde_json::to_value(&message) {
+            Ok(json) => Arc::new(json),
+            Err(e) => {
+                return Err(format!("Failed to serialize certificate message: {}", e));
+            }
+        };
+        
+        // Atomic counter for successful deliveries
+        let success_count = Arc::new(AtomicUsize::new(0));
+        
+        // Create async tasks for each peer
+        let mut tasks = Vec::new();
+        
+        for peer_info in peers {
+            if peer_info.id == self.node_id {
+                continue; // Skip self
+            }
+            
+            let peer_addr = peer_info.addr.clone();
+            let message_json_clone = Arc::clone(&message_json);
+            let success_count_clone = Arc::clone(&success_count);
+            let cert_serial_clone = cert_serial.clone();
+            
+            // Create async task for this peer
+            let task = tokio::spawn(async move {
+                let peer_ip = peer_addr.split(':').next().unwrap_or(&peer_addr);
+                let url = format!("http://{}:8001/api/v1/p2p/message", peer_ip);
+                
+                // Use async client with reasonable timeout
+                let client = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(5))
+                    .tcp_keepalive(std::time::Duration::from_secs(HTTP_TCP_KEEPALIVE_SECS))
+                    .pool_max_idle_per_host(HTTP_POOL_MAX_IDLE_PER_HOST)
+                    .pool_idle_timeout(std::time::Duration::from_secs(HTTP_POOL_IDLE_TIMEOUT_SECS))
+                    .build();
+                
+                if let Ok(client) = client {
+                    match client.post(&url).json(&*message_json_clone).send().await {
+                        Ok(response) if response.status().is_success() => {
+                            // Success - increment counter
+                            success_count_clone.fetch_add(1, Ordering::SeqCst);
+                            println!("[P2P] ✅ Certificate {} delivered to {}", cert_serial_clone, peer_addr);
+                        }
+                        Ok(response) => {
+                            println!("[P2P] ⚠️ Certificate {} failed to {} (HTTP {})", 
+                                     cert_serial_clone, peer_addr, response.status());
+                        }
+                        Err(e) => {
+                            println!("[P2P] ⚠️ Certificate {} failed to {}: {}", 
+                                     cert_serial_clone, peer_addr, e);
+                        }
+                    }
+                }
+            });
+            
+            tasks.push(task);
+        }
+        
+        // Wait for all tasks to complete (with adaptive timeout)
+        let broadcast_start = std::time::Instant::now();
+        
+        // ADAPTIVE TIMEOUT: Scale based on network size
+        // Small networks (<=10): 3s is sufficient (local/fast network)
+        // Medium networks (<=100): 5s for moderate WAN latency
+        // Large networks (>100): 10s for global distribution
+        let timeout_secs = if total_peers <= 10 {
+            3  // 3s for small networks (doesn't conflict with Tower BFT 4s timeout)
+        } else if total_peers <= 100 {
+            5  // 5s for medium networks
+        } else {
+            10 // 10s for large networks (1000 validators)
+        };
+        let timeout = tokio::time::Duration::from_secs(timeout_secs);
+        
+        match tokio::time::timeout(timeout, futures::future::join_all(tasks)).await {
+            Ok(_) => {
+                let delivery_time = broadcast_start.elapsed();
+                let successful = success_count.load(Ordering::SeqCst);
+                
+                println!("[P2P] 📊 Certificate {} delivery: {}/{} peers ({:.1}%) in {:?}", 
+                         cert_serial, successful, total_peers, 
+                         (successful as f64 / total_peers as f64) * 100.0,
+                         delivery_time);
+                
+                // Check Byzantine threshold
+                if successful >= byzantine_threshold {
+                    println!("[P2P] ✅ Byzantine threshold reached: {}/{} ≥ 2/3", 
+                             successful, total_peers);
+                    Ok(())
+                } else {
+                    let err = format!(
+                        "Byzantine threshold NOT reached: {}/{} < 2/3 (need {})",
+                        successful, total_peers, byzantine_threshold
+                    );
+                    println!("[P2P] ❌ {}", err);
+                    Err(err)
+                }
+            }
+            Err(_) => {
+                let successful = success_count.load(Ordering::SeqCst);
+                Err(format!(
+                    "Certificate broadcast timeout: only {}/{} confirmed in 10s",
+                    successful, total_peers
+                ))
+            }
+        }
     }
     
     /// PRODUCTION: Get validated active peers for consensus participation (NODE TYPE AWARE)

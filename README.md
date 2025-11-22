@@ -44,7 +44,7 @@ This project uses **dual licensing**:
 - **Phase 2 (Future)**: ONLY QNC token activation on QNet blockchain
 - **Transition**: 90% 1DEV burned OR 5 years from genesis block (whichever comes first)
 
-### 🛡️ **LATEST UPDATES (v2.19.0 - November 18, 2025)**
+### 🛡️ **LATEST UPDATES (v2.19.1 - November 22, 2025)**
 - **Hybrid Merkle + Sampling**: Scalable on-chain ping commitments (NEW!)
   - 360× on-chain size reduction (100 MB vs 36 GB)
   - Merkle root commitment to ALL pings (blake3 hashing)
@@ -69,11 +69,18 @@ This project uses **dual licensing**:
   - Checks every 30 blocks with accelerating timeouts (30s → 2s)
   - Zero-downtime: microblocks continue during recovery
   - Byzantine-safe at all levels (2/3+ honest nodes)
-- **Certificate Broadcasting**: Automatic P2P certificate distribution
-  - Periodic broadcast every 5 minutes
-  - Rotation broadcast on certificate renewal
+- **Certificate Broadcasting**: Byzantine-safe P2P certificate distribution
+  - Tracked broadcast with 2/3+ Byzantine threshold for critical rotations
+  - Adaptive timeout (3s/5s/10s) based on network size
+  - Adaptive periodic intervals (10s/60s/300s) based on certificate age
+  - Anti-duplication via serial number change detection
   - LRU cache with 100K certificate capacity
   - Scalable from 5 bootstrap to millions of nodes
+- **Block Buffering**: Memory-protected out-of-order block handling
+  - Bounded buffer (100 blocks, ~10 MB maximum)
+  - FIFO eviction with current block protection
+  - 30-second timeout + 5-retry limit
+  - Prevents memory exhaustion attacks
 - **Node Type Filtering**: Consensus participation optimization
   - Light nodes: transactions only (no consensus)
   - Full nodes: partial consensus participation

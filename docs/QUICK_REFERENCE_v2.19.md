@@ -70,15 +70,30 @@ Consensus Layer (consensus_crypto.rs)
 ## 📡 Certificate Management
 
 ### Broadcasting
-- **Periodic**: Every 5 minutes
-- **On Rotation**: Immediate
+- **Tracked Broadcast**: Byzantine 2/3+ threshold (critical rotations)
+- **Adaptive Timeout**: 3s (≤10 peers), 5s (≤100 peers), 10s (1000 validators)
+- **Periodic Intervals**: 10s (new) / 60s (medium) / 300s (old certs)
+- **On Rotation**: Immediate tracked broadcast (80% lifetime)
+- **Anti-Duplication**: Serial number change detection
 - **Method**: HTTP POST to `/api/v1/p2p/message`
 
 ### Caching
 - **Capacity**: 100,000 certificates
 - **Eviction**: LRU (Least Recently Used)
 - **Lifetime**: 1 hour
-- **Rotation**: 5 minutes before expiry
+- **Rotation**: 80% lifetime (~48 minutes)
+
+## 🔄 Block Buffering
+
+### Memory Protection
+- **Max Pending**: 100 blocks (~10 MB)
+- **Timeout**: 30 seconds per block
+- **Retry Limit**: 5 attempts
+- **Eviction**: FIFO (oldest first)
+- **Protection**: Current block never removed
+
+### Purpose
+Handles out-of-order block arrival in gossip P2P network while preventing memory exhaustion attacks.
 
 ## 📊 Performance
 
@@ -142,6 +157,7 @@ const FINALITY_WINDOW: u64 = 10;               // Blocks for finality
 const MAX_VALIDATORS_PER_ROUND: usize = 1000;  // Consensus limit
 const CERTIFICATE_LIFETIME_SECS: u64 = 3600;   // 1 hour
 const MAX_CACHE_SIZE: usize = 100000;          // Certificate cache
+const MAX_PENDING_BLOCKS: usize = 100;         // Block buffer limit
 ```
 
 ## 🔗 Documentation
@@ -157,6 +173,8 @@ const MAX_CACHE_SIZE: usize = 100000;          // Certificate cache
 3. **Byzantine Safety**: All PFP levels maintain 2/3+ requirement (except Level 4 emergency)
 4. **Scalability**: Max 1000 validators regardless of total nodes
 5. **NIST Compliant**: Post-quantum cryptography (CRYSTALS-Dilithium)
+6. **Memory Protected**: Bounded block buffering (~10 MB max)
+7. **Tracked Delivery**: Byzantine 2/3+ threshold for critical certificates
 
 ## 📞 Support
 
