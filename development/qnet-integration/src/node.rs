@@ -162,6 +162,13 @@ lazy_static::lazy_static! {
 lazy_static::lazy_static! {
     pub static ref GLOBAL_MEMPOOL_INSTANCE: std::sync::Mutex<Option<Arc<RwLock<qnet_mempool::SimpleMempool>>>> = std::sync::Mutex::new(None);
 }
+
+// CRITICAL: Track certificate requests to prevent DDoS (request flooding)
+// Maps certificate_serial -> last_request_timestamp
+lazy_static::lazy_static! {
+    static ref REQUESTED_CERTIFICATES: Mutex<std::collections::HashMap<String, u64>> = Mutex::new(std::collections::HashMap::new());
+}
+
 use sha3::{Sha3_256, Digest};
 use serde_json;
 use bincode;
@@ -2275,8 +2282,9 @@ impl BlockchainNode {
                 let heights_to_retry: Vec<u64> = pending_blocks.iter()
                     .filter_map(|(height, (_, retry_count, timestamp))| {
                         // ADAPTIVE RETRY: Recent blocks only (certificate race resolved quickly)
+                        // REDUCED TIMEOUT: 30 seconds (from 60) to prevent memory accumulation
                         let elapsed_secs = timestamp.elapsed().as_secs();
-                        if elapsed_secs < 60 && *retry_count < 5 {
+                        if elapsed_secs < 30 && *retry_count < 5 {
                             Some(*height)
                         } else {
                             None  // Old blocks will be cleaned up by separate cleanup timer
@@ -2313,10 +2321,11 @@ impl BlockchainNode {
             if last_cleanup_check.elapsed() > std::time::Duration::from_secs(30) {
                 last_cleanup_check = std::time::Instant::now();
                 
-                // Clean expired pending blocks (after 60 seconds)
+                // Clean expired pending blocks (after 30 seconds)
+                // REDUCED TIMEOUT: Prevents memory accumulation during certificate propagation issues
                 let mut expired = Vec::new();
                 for (height, (_, _, timestamp)) in pending_blocks.iter() {
-                    if timestamp.elapsed() > std::time::Duration::from_secs(60) {
+                    if timestamp.elapsed() > std::time::Duration::from_secs(30) {
                         expired.push(*height);
                     }
                 }
@@ -5219,7 +5228,7 @@ impl BlockchainNode {
                     }
                     
                     // PRODUCTION: Generate CRYSTALS-Dilithium signature for microblock
-                    match Self::sign_microblock_with_dilithium(&microblock, &node_id).await {
+                    match Self::sign_microblock_with_dilithium(&microblock, &node_id, unified_p2p.as_ref()).await {
                         Ok(signature) => {
                             microblock.signature = signature;
                             
@@ -8156,7 +8165,12 @@ impl BlockchainNode {
             
             // Generate REAL signature for OUR node only
             // CRITICAL: This is for MACROBLOCK consensus - use full signatures
-            let signature = Self::generate_consensus_signature(&our_id, &commit_hash, true).await;
+            let signature = Self::generate_consensus_signature(
+                &our_id,
+                &commit_hash,
+                true,
+                unified_p2p.as_ref()
+            ).await;
             
             let commit = Commit {
                 node_id: our_id.clone(),
@@ -8722,7 +8736,12 @@ impl BlockchainNode {
     
     /// PRODUCTION: Generate consensus signature using hybrid cryptography for O(1) performance
     /// CRITICAL: is_macroblock parameter determines signature type (full vs compact)
-    async fn generate_consensus_signature(node_id: &str, commit_hash: &str, is_macroblock: bool) -> String {
+    async fn generate_consensus_signature(
+        node_id: &str,
+        commit_hash: &str,
+        is_macroblock: bool,
+        unified_p2p: Option<&Arc<SimplifiedP2P>>
+    ) -> String {
         // CRITICAL: Normalize node_id for consistent signature format
         let normalized_node_id = Self::normalize_node_id(node_id);
         
@@ -8776,8 +8795,10 @@ impl BlockchainNode {
                 if let Some(new_cert) = hybrid.get_current_certificate() {
                     if let Ok(cert_bytes) = bincode::serialize(&new_cert) {
                         println!("[CONSENSUS] 📜 Broadcasting rotated certificate: {}", new_cert.serial_number);
-                        // Note: Actual broadcast handled by P2P layer
-                        // In production, would call: p2p.broadcast_certificate_announce(new_cert.serial_number, cert_bytes)
+                        // Broadcast to network if P2P instance available
+                        if let Some(p2p) = unified_p2p {
+                            p2p.broadcast_certificate_announce(new_cert.serial_number.clone(), cert_bytes).await;
+                        }
                     }
                 }
             }
@@ -8891,7 +8912,11 @@ impl BlockchainNode {
     }
     
     /// PRODUCTION: Sign microblock with HYBRID cryptography (compact signatures)
-    async fn sign_microblock_with_dilithium(microblock: &qnet_state::MicroBlock, node_id: &str) -> Result<Vec<u8>, String> {
+    async fn sign_microblock_with_dilithium(
+        microblock: &qnet_state::MicroBlock,
+        node_id: &str,
+        unified_p2p: Option<&Arc<SimplifiedP2P>>
+    ) -> Result<Vec<u8>, String> {
         use sha3::{Sha3_256, Digest};
         
         // Create message to sign (microblock hash without signature)
@@ -8948,6 +8973,17 @@ impl BlockchainNode {
         if hybrid.needs_rotation() {
             if let Err(e) = hybrid.rotate_certificate().await {
                 println!("[CRYPTO] ⚠️ Certificate rotation failed for microblock: {}", e);
+            } else {
+                // PRODUCTION: Broadcast new certificate after rotation
+                if let Some(new_cert) = hybrid.get_current_certificate() {
+                    if let Ok(cert_bytes) = bincode::serialize(&new_cert) {
+                        println!("[CRYPTO] 📜 Broadcasting rotated certificate: {}", new_cert.serial_number);
+                        // Broadcast to network if P2P instance available
+                        if let Some(p2p) = unified_p2p {
+                            p2p.broadcast_certificate_announce(new_cert.serial_number.clone(), cert_bytes).await;
+                        }
+                    }
+                }
             }
         }
         
@@ -9171,14 +9207,63 @@ impl BlockchainNode {
                     }
                 } else {
                     println!("[CRYPTO] ⚠️ Certificate {} not found in cache", compact_sig.cert_serial);
-                    println!("[CRYPTO]    Block will be retried - adaptive re-broadcast will provide certificate");
                     
-                    // REQUEST-ON-DEMAND: Rely on adaptive re-broadcast mechanism
-                    // Producer broadcasts certificates every 10s during first 2 minutes
-                    // This solves race condition: block arrives → rejected → retry succeeds
-                    // ARCHITECTURE: Simple retry + adaptive re-broadcast > complex request mechanism
-                    // Byzantine consensus ensures 2/3+ honest nodes have the certificate
-                    false // Reject for now, will succeed on retry after next certificate broadcast
+                    // ACTIVE REQUEST: Send CertificateRequest to producer if not recently requested
+                    if let Some(p2p_ref) = p2p {
+                        let now = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or(Duration::from_secs(0))
+                            .as_secs();
+                        
+                        // DDoS PROTECTION: Check if we already requested this certificate recently (5s cooldown)
+                        let should_request = {
+                            let mut requested = REQUESTED_CERTIFICATES.lock().unwrap();
+                            if let Some(&last_request) = requested.get(&compact_sig.cert_serial) {
+                                if now - last_request < 5 {
+                                    false // Too soon, skip request
+                                } else {
+                                    requested.insert(compact_sig.cert_serial.clone(), now);
+                                    true
+                                }
+                            } else {
+                                requested.insert(compact_sig.cert_serial.clone(), now);
+                                true
+                            }
+                        };
+                        
+                        if should_request {
+                            println!("[CRYPTO] 📤 Requesting missing certificate {} from producer {}", 
+                                compact_sig.cert_serial, compact_sig.node_id);
+                            
+                            // Get producer address
+                            if let Some(producer_addr) = p2p_ref.get_peer_address(&compact_sig.node_id) {
+                                // Random delay (0-1000ms) to prevent thundering herd
+                                let delay_ms = (now % 1000) as u64;
+                                let p2p_clone = p2p_ref.clone();
+                                let cert_serial = compact_sig.cert_serial.clone();
+                                let producer_id = compact_sig.node_id.clone();
+                                
+                                tokio::spawn(async move {
+                                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                                    
+                                    use crate::unified_p2p::P2PMessage;
+                                    let request = P2PMessage::CertificateRequest {
+                                        cert_serial: cert_serial.clone(),
+                                        requester_node_id: p2p_clone.node_id.clone(),
+                                    };
+                                    
+                                    if let Err(e) = p2p_clone.send_to_peer(&producer_addr, request).await {
+                                        println!("[CRYPTO] ⚠️ Failed to send certificate request: {}", e);
+                                    } else {
+                                        println!("[CRYPTO] ✅ Certificate request sent to {}", producer_id);
+                                    }
+                                });
+                            }
+                        }
+                    }
+                    
+                    println!("[CRYPTO]    Block will be buffered and retried after certificate arrives");
+                    false // Reject for now, will succeed on retry after certificate arrives
                 }
             } else {
                 println!("[CRYPTO] ⚠️ No P2P instance available for certificate verification");
