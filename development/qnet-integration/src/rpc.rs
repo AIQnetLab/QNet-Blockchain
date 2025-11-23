@@ -3309,15 +3309,14 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
             if let Some(p2p) = blockchain_for_reputation.get_unified_p2p() {
                 let online_peers = p2p.get_validated_active_peers();
                 for peer in online_peers {
-                    // CRITICAL: Only boost nodes below 70% threshold (0.70 in float)
-                    // Don't boost above 90% to prevent easy max reputation
-                    if peer.reputation_score < 70.0 {
-                        p2p.update_node_reputation(&peer.id, 5.0);
-                        println!("[REPUTATION] 🔄 Passive recovery: {} +5.0% (was {:.1}%, now {:.1}%)", 
-                                 peer.id, peer.reputation_score, peer.reputation_score + 5.0);
+                    // CRITICAL: Only boost nodes below consensus threshold
+                    if !peer.is_consensus_qualified() {
+                        p2p.update_node_reputation(&peer.id, crate::unified_p2p::ReputationEvent::ConsensusParticipation);
+                        println!("[REPUTATION] 🔄 Passive recovery: {} (consensus: {:.1}%)", 
+                                 peer.id, peer.consensus_score);
                     }
                 }
-                println!("[REPUTATION] ✅ Passive recovery applied to all online nodes below 70%");
+                println!("[REPUTATION] ✅ Passive recovery applied to all online nodes below consensus threshold");
             }
         }
     });

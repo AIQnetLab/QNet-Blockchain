@@ -1,8 +1,8 @@
 # QNet Blockchain Architecture v2.19
 ## Post-Quantum Decentralized Network - Technical Documentation
 
-**Last Updated**: November 22, 2025  
-**Version**: 2.19.1  
+**Last Updated**: November 23, 2025  
+**Version**: 2.19.2  
 **Status**: Production Ready
 
 ---
@@ -14,8 +14,9 @@
 4. [Block Buffering and Memory Protection](#block-buffering-and-memory-protection)
 5. [Progressive Finalization Protocol](#progressive-finalization-protocol)
 6. [Node Types and Scaling](#node-types-and-scaling)
-7. [Security Model](#security-model)
-8. [Performance Characteristics](#performance-characteristics)
+7. [Reputation System](#reputation-system)
+8. [Security Model](#security-model)
+9. [Performance Characteristics](#performance-characteristics)
 
 ---
 
@@ -483,6 +484,155 @@ if all_qualified.len() > MAX_VALIDATORS_PER_ROUND {
 100,000,000 Nodes (Light nodes):
   └─► 1,000 sampled from Super/Full only (<0.01%)
 ```
+
+---
+
+## Reputation System
+
+### Byzantine-Safe Split Reputation
+
+QNet uses a **two-dimensional reputation model** to separate Byzantine attacks from network performance issues:
+
+```rust
+pub struct PeerInfo {
+    consensus_score: f64,  // 0-100: Byzantine behavior (malicious attacks)
+    network_score: f64,    // 0-100: Network performance (timeouts, latency)
+}
+```
+
+#### Reputation Scores
+
+| Score Type | Affects | Events | Threshold |
+|------------|---------|--------|-----------|
+| **consensus_score** | Byzantine eligibility | Invalid blocks, malicious behavior | ≥ 70% for consensus |
+| **network_score** | Peer prioritization | Timeouts, latency, availability | Used for sync ordering |
+
+**Key Principle**: Byzantine attacks (`consensus_score`) are separate from network issues (`network_score`)
+
+#### Reputation Events
+
+```rust
+// CONSENSUS EVENTS (affect consensus_score)
+ValidBlock              // +5.0 consensus_score
+InvalidBlock            // -20.0 consensus_score
+ConsensusParticipation  // +2.0 consensus_score
+MaliciousBehavior       // -50.0 consensus_score
+
+// NETWORK EVENTS (affect network_score)
+SuccessfulResponse      // +1.0 network_score
+TimeoutFailure          // -2.0 network_score (NOT malicious!)
+ConnectionFailure       // -5.0 network_score
+FastResponse            // +3.0 network_score
+```
+
+### Peer Blacklist System
+
+#### Blacklist Categories
+
+| Type | Reason | Duration | Use Case |
+|------|--------|----------|----------|
+| **Soft** | Network performance | 15-60s (escalates) | Timeouts, slow responses |
+| **Hard** | Byzantine attacks | Permanent* | Invalid blocks, malicious behavior |
+
+*Hard blacklist removed when `consensus_score` ≥ 70% (reputation recovered)
+
+#### Escalation Logic
+
+```rust
+// Soft Blacklist (Network issues)
+SlowResponse:      15s + (15s × violations)
+SyncTimeout:       30s + (30s × violations)
+ConnectionFailure: 60s + (60s × violations)
+
+// Hard Blacklist (Byzantine attacks)
+InvalidBlocks:      Permanent (until reputation ≥ 70%)
+MaliciousBehavior:  Permanent (until reputation ≥ 70%)
+```
+
+### Peer Selection for Sync
+
+**Priority Order** (descending):
+1. **Node Type**: Super > Full (Light nodes excluded)
+2. **Blacklist**: Not blacklisted
+3. **Consensus Score**: ≥ 70% (Byzantine threshold)
+4. **Network Score**: Higher = better latency
+5. **Reputation Recovery**: Hard blacklist auto-removed when `consensus_score` ≥ 70%
+
+```rust
+pub fn get_sync_peers_filtered(&self, max_peers: usize) -> Vec<PeerInfo> {
+    // 1. Exclude Light nodes (don't store full blocks)
+    // 2. Filter blacklisted peers (soft: temporary, hard: until reputation recovered)
+    // 3. Check Byzantine threshold (consensus_score ≥ 70%)
+    // 4. Sort by network_score (latency) + consensus_score (reliability)
+    // 5. Return top-N peers
+}
+```
+
+### Reputation Gossip Protocol
+
+**Transport**: HTTP POST (NOT TCP)  
+**Interval**: Every 5 minutes  
+**Signature**: SHA3-256 (quantum-safe)  
+**Scope**: Super + Full nodes only (Light nodes excluded)
+
+```rust
+// Reputation sync via HTTP gossip
+NetworkMessage::ReputationSync {
+    node_id: String,
+    reputation_updates: Vec<(String, f64)>,
+    timestamp: u64,
+    signature: Vec<u8>, // SHA3-256 based
+}
+```
+
+**Why HTTP over TCP**:
+- ✅ More reliable in WAN/Docker environments
+- ✅ Connection pooling for millions of nodes
+- ✅ Consistent error handling
+- ✅ NAT/firewall friendly
+
+### Byzantine Threshold Check
+
+```rust
+pub fn is_consensus_qualified(&self) -> bool {
+    // CRITICAL: Light nodes NEVER participate in consensus
+    if self.node_type == NodeType::Light {
+        return false;
+    }
+    // CRITICAL: Only consensus_score matters (NOT network_score!)
+    self.consensus_score >= 70.0
+}
+```
+
+**Universal 70% Threshold**: Applies to ALL node types (Genesis, Super, Full)
+
+**Node Type Matrix**:
+- **Light**: ❌ Never in consensus (only receive macroblock headers)
+- **Full**: ✅ If `consensus_score` ≥ 70%
+- **Super**: ✅ If `consensus_score` ≥ 70%
+
+### Finality Window for Entropy
+
+**Problem**: Nodes at different heights causing false entropy mismatches
+
+**Solution**: Use `FINALITY_WINDOW` (10 blocks back) for entropy consensus
+
+```rust
+// BEFORE (caused false positives):
+let entropy_height = ((next_block_height - 1) / 30) * 30;
+
+// AFTER (Byzantine-safe):
+let entropy_height = if next_block_height > FINALITY_WINDOW {
+    next_block_height - FINALITY_WINDOW  // 10 blocks back
+} else {
+    0  // Genesis phase
+};
+```
+
+**Benefits**:
+- ✅ All synchronized nodes have the same finalized block
+- ✅ Lagging nodes (`peer_entropy == 0`) don't cause false positives
+- ✅ REAL fork detection (not just sync lag)
 
 ---
 

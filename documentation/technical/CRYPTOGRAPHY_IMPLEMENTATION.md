@@ -1,8 +1,8 @@
 # QNet Cryptography Implementation Guide
 ## Complete Technical Specification
 
-**Version:** 2.0 (v2.19.0)  
-**Date:** November 16, 2025  
+**Version:** 2.0 (v2.19.2)  
+**Date:** November 23, 2025  
 **Status:** Production Ready  
 
 ---

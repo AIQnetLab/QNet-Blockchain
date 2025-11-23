@@ -95,6 +95,58 @@ Consensus Layer (consensus_crypto.rs)
 ### Purpose
 Handles out-of-order block arrival in gossip P2P network while preventing memory exhaustion attacks.
 
+## 🎯 Reputation System
+
+### Split Reputation Model
+
+| Score | Purpose | Threshold | Events |
+|-------|---------|-----------|--------|
+| **consensus_score** | Byzantine safety | ≥ 70% for consensus | Invalid blocks (-20), Valid blocks (+5) |
+| **network_score** | Peer prioritization | No threshold | Timeouts (-2), Fast response (+3) |
+
+**Key**: Network timeouts DON'T affect Byzantine eligibility!
+
+### Peer Blacklist
+
+| Type | Reason | Duration | Recovery |
+|------|--------|----------|----------|
+| **Soft** | Network issues | 15-60s (escalates) | Auto-expires |
+| **Hard** | Byzantine attacks | Permanent | When consensus_score ≥ 70% |
+
+### Reputation Events
+
+```
+CONSENSUS (consensus_score):
+  ValidBlock:             +5.0
+  InvalidBlock:          -20.0
+  ConsensusParticipation: +2.0
+  MaliciousBehavior:     -50.0
+
+NETWORK (network_score):
+  SuccessfulResponse:     +1.0
+  TimeoutFailure:         -2.0
+  ConnectionFailure:      -5.0
+  FastResponse:           +3.0
+```
+
+### Gossip Protocol
+
+- **Transport**: HTTP POST (NOT TCP)
+- **Interval**: Every 5 minutes
+- **Scope**: Super + Full nodes only
+- **Signature**: SHA3-256 quantum-safe
+- **URL**: `/api/v1/p2p/message`
+
+### Byzantine Threshold
+
+```rust
+// Universal 70% threshold (ALL node types)
+is_consensus_qualified() {
+    if node_type == Light { return false; }  // Light NEVER in consensus
+    return consensus_score >= 70.0;          // Byzantine threshold
+}
+```
+
 ## 📊 Performance
 
 ### Throughput

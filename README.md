@@ -44,15 +44,41 @@ This project uses **dual licensing**:
 - **Phase 2 (Future)**: ONLY QNC token activation on QNet blockchain
 - **Transition**: 90% 1DEV burned OR 5 years from genesis block (whichever comes first)
 
-### 🛡️ **LATEST UPDATES (v2.19.1 - November 22, 2025)**
-- **Hybrid Merkle + Sampling**: Scalable on-chain ping commitments (NEW!)
+### 🛡️ **LATEST UPDATES (v2.19.2 - November 23, 2025)**
+- **Split Reputation System**: Byzantine-safe separation of behavior metrics (NEW!)
+  - `consensus_score` (0-100): Byzantine behavior detection (invalid blocks, malicious attacks)
+  - `network_score` (0-100): Network performance tracking (timeouts, latency)
+  - WAN latency penalties don't affect consensus eligibility (70% threshold on consensus_score only)
+  - Network performance tracked separately for peer prioritization
+  - Combined reputation for peer selection: 70% consensus + 30% network
+- **Finality Window Entropy Consensus**: Race-condition-free producer selection (NEW!)
+  - Uses block height - 10 (FINALITY_WINDOW) for entropy source
+  - All synchronized nodes have identical entropy blocks
+  - Prevents false entropy mismatches when nodes at different heights
+  - Byzantine-safe: entropy from 2/3+ confirmed blocks
+- **Peer Blacklist System**: Intelligent sync peer filtering (NEW!)
+  - Soft blacklist: Temporary (network issues, auto-expires)
+  - Hard blacklist: Permanent until reputation recovers (Byzantine attacks)
+  - Escalation: Repeated failures increase blacklist duration
+  - Auto-removal: Hard blacklist cleared when consensus_score ≥ 70%
+- **Peer Prioritization**: Optimized block synchronization (NEW!)
+  - Priority by node type: Super > Full (Light nodes excluded from sync sources)
+  - Blacklist filtering: Offline/malicious peers skipped
+  - Reputation-based ordering: consensus_score + network_score (latency)
+  - Top-20 peer sampling: Avoids stuck sync on single unavailable peer
+- **HTTP Gossip Reputation Sync**: Reliable cross-node reputation sharing (NEW!)
+  - Migrated from unreliable TCP to HTTP POST (existing P2P infrastructure)
+  - Gossip protocol: Efficient O(log n) propagation
+  - Byzantine-safe weighted average: 70% local + 30% remote
+  - Prevents reputation desynchronization across network
+- **Hybrid Merkle + Sampling**: Scalable on-chain ping commitments
   - 360× on-chain size reduction (100 MB vs 36 GB)
   - Merkle root commitment to ALL pings (blake3 hashing)
   - Deterministic sampling: 1% of pings (minimum 10,000 samples)
   - SHA3-256 for sample seed generation (quantum-resistant)
   - Byzantine-safe verification through Merkle proofs
   - Production-ready for millions of nodes
-- **Bitcoin-Style Emission Validation**: Decentralized emission without central authority (NEW!)
+- **Bitcoin-Style Emission Validation**: Decentralized emission without central authority
   - No system key or single point of control
   - Range-based validation with halving support
   - All nodes independently validate emission amounts

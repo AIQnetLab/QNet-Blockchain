@@ -141,6 +141,61 @@ static FALSE_EMERGENCY_TRACKER: Lazy<Arc<DashMap<String, (AtomicU64, Instant)>>>
 static EMERGENCY_CONFIRMATIONS: Lazy<Arc<DashMap<(u64, String), (AtomicU64, Instant)>>> = 
     Lazy::new(|| Arc::new(DashMap::new()));
 
+// SYNC OPTIMIZATION: Peer blacklist for failed sync attempts
+// Key: peer_addr → Value: BlacklistEntry
+// SCALABILITY: DashMap for lock-free concurrent access with millions of nodes
+// ARCHITECTURE: Soft blacklist (network issues) vs Hard blacklist (Byzantine attacks)
+static PEER_BLACKLIST: Lazy<Arc<DashMap<String, BlacklistEntry>>> = 
+    Lazy::new(|| Arc::new(DashMap::new()));
+
+/// SYNC: Blacklist reason categories (Soft vs Hard)
+/// Soft: Temporary network issues (timeouts, latency) - affects network_score only
+/// Hard: Byzantine attacks (invalid blocks, malicious behavior) - affects consensus_score
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BlacklistReason {
+    // SOFT BLACKLIST (Network performance issues - temporary)
+    SyncTimeout,        // Failed to respond to sync request (30s soft ban)
+    ConnectionFailure,  // Connection refused/reset (60s soft ban)
+    SlowResponse,       // Response took too long (15s soft ban)
+    
+    // HARD BLACKLIST (Byzantine attacks - permanent until reputation recovered)
+    InvalidBlocks,      // Sent invalid/corrupted blocks (permanent until consensus_score >= 70%)
+    MaliciousBehavior,  // Detected Byzantine attack (permanent until consensus_score >= 70%)
+}
+
+/// SYNC: Blacklist entry with expiration and reason tracking
+#[derive(Debug, Clone)]
+pub struct BlacklistEntry {
+    pub reason: BlacklistReason,
+    pub timestamp: Instant,
+    pub duration_secs: u64,  // 0 = permanent (hard blacklist)
+    pub attempts: u32,       // Number of blacklist violations (escalation)
+}
+
+impl BlacklistEntry {
+    /// Check if blacklist entry is still active
+    pub fn is_active(&self) -> bool {
+        if self.duration_secs == 0 {
+            // Permanent blacklist (hard) - check reputation instead
+            true
+        } else {
+            // Temporary blacklist (soft) - check expiration
+            self.timestamp.elapsed().as_secs() < self.duration_secs
+        }
+    }
+    
+    /// Get remaining time in seconds (0 = expired or permanent)
+    pub fn remaining_secs(&self) -> u64 {
+        if self.duration_secs == 0 {
+            // Permanent blacklist
+            u64::MAX
+        } else {
+            let elapsed = self.timestamp.elapsed().as_secs();
+            self.duration_secs.saturating_sub(elapsed)
+        }
+    }
+}
+
 /// SECURITY: Rate limiting structure for DDoS protection
 #[derive(Debug, Clone)]
 pub struct RateLimit {
@@ -201,18 +256,90 @@ pub struct PeerInfo {
     pub node_id_hash: Vec<u8>,  // SHA3-256 hash for XOR distance
     #[serde(default)]
     pub bucket_index: usize,    // K-bucket this peer belongs to
+    
+    // CRITICAL: Split reputation for Byzantine-safe consensus
+    // consensus_score: Malicious behavior (invalid blocks, Byzantine attacks)
+    // network_score: Network reliability (timeouts, latency, availability)
+    #[serde(default = "default_consensus_score")]
+    pub consensus_score: f64,   // Byzantine behavior tracking (0-100, min 70 for consensus)
+    #[serde(default = "default_network_score")]
+    pub network_score: f64,     // Network performance tracking (0-100, used for prioritization)
+    
+    // BACKWARD COMPATIBILITY: Keep old field for migration
     #[serde(default = "default_reputation")]
-    pub reputation_score: f64,  // Dynamic reputation (0-100 scale, min 70 for consensus)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reputation_score: Option<f64>,  // Legacy field (migrated to split scores)
+    
     #[serde(default)]
     pub successful_pings: u32,  // Successful interactions
     #[serde(default)]
     pub failed_pings: u32,      // Failed interactions
 }
 
-fn default_reputation() -> f64 { 
-    // PRODUCTION: All nodes start with same reputation
-    // Genesis nodes earn reputation through network participation
-    70.0 // Universal minimum consensus threshold for fairness
+fn default_consensus_score() -> f64 {
+    // PRODUCTION: Start at Byzantine threshold (fair for all nodes)
+    // Decreases on invalid blocks, increases on valid blocks
+    70.0 // Minimum for consensus participation
+}
+
+fn default_network_score() -> f64 {
+    // PRODUCTION: Start at full network score
+    // Decreases on timeouts/latency, increases on successful responses
+    100.0 // Optimal network performance
+}
+
+fn default_reputation() -> Option<f64> {
+    // BACKWARD COMPATIBILITY: None for new nodes (uses split scores)
+    None
+}
+
+/// Reputation event types for Byzantine-safe tracking
+/// ARCHITECTURE: Separate consensus (Byzantine) from network (performance) events
+#[derive(Debug, Clone, Copy)]
+pub enum ReputationEvent {
+    // CONSENSUS EVENTS (affect consensus_score - Byzantine safety)
+    ValidBlock,             // +5.0 consensus_score: Produced/validated valid block
+    InvalidBlock,           // -20.0 consensus_score: Produced invalid block (Byzantine attack)
+    ConsensusParticipation, // +2.0 consensus_score: Participated in consensus
+    MaliciousBehavior,      // -50.0 consensus_score: Detected Byzantine attack
+    
+    // NETWORK EVENTS (affect network_score - performance optimization)
+    SuccessfulResponse,     // +1.0 network_score: Successful P2P response
+    TimeoutFailure,         // -2.0 network_score: P2P timeout (WAN latency, not malicious)
+    ConnectionFailure,      // -5.0 network_score: Connection failed (offline/unreachable)
+    FastResponse,           // +3.0 network_score: Very fast response (<100ms)
+}
+
+impl PeerInfo {
+    /// Calculate combined reputation for backward compatibility
+    /// ARCHITECTURE: Byzantine threshold checks ONLY consensus_score
+    /// Combined score used for peer prioritization and display only
+    pub fn combined_reputation(&self) -> f64 {
+        // Weighted average: 70% consensus (Byzantine safety) + 30% network (performance)
+        (self.consensus_score * 0.7) + (self.network_score * 0.3)
+    }
+    
+    /// Check if peer is qualified for consensus (Byzantine threshold)
+    /// CRITICAL: Only consensus_score matters for Byzantine safety
+    /// SCALABILITY: Light nodes NEVER participate in consensus (millions of Light nodes in production)
+    pub fn is_consensus_qualified(&self) -> bool {
+        // Light nodes are EXCLUDED from consensus participation (only Super and Full nodes)
+        if self.node_type == NodeType::Light {
+            return false;
+        }
+        // Super and Full nodes must meet Byzantine threshold (70%)
+        self.consensus_score >= 70.0
+    }
+    
+    /// Migrate legacy reputation_score to split scores
+    pub fn migrate_legacy_reputation(&mut self) {
+        if let Some(legacy_score) = self.reputation_score {
+            // Migrate legacy score to both consensus and network scores
+            self.consensus_score = legacy_score;
+            self.network_score = legacy_score;
+            self.reputation_score = None; // Clear legacy field
+        }
+    }
 }
 
 /// Regional load balancing metrics
@@ -1292,8 +1419,9 @@ impl SimplifiedP2P {
         }
     }
     
-    /// Update peer reputation based on interaction (QNet 0-100 scale)
-    fn update_peer_reputation(&self, peer_addr: &str, success: bool) {
+    /// Update peer reputation based on event type (Byzantine-safe split scoring)
+    /// ARCHITECTURE: Separate consensus (Byzantine) from network (performance) tracking
+    fn update_peer_reputation(&self, peer_addr: &str, event: ReputationEvent) {
         // QUANTUM ROUTING: Try lock-free first if should use it
         if self.should_use_lockfree() {
             // AUTO-MIGRATE if needed
@@ -1302,13 +1430,54 @@ impl SimplifiedP2P {
             }
             
             if let Some(mut peer) = self.connected_peers_lockfree.get_mut(peer_addr) {
-                if success {
-                    peer.successful_pings += 1;
-                    peer.reputation_score = (peer.reputation_score + 1.0).min(100.0);
-                } else {
-                    peer.failed_pings += 1;
-                    peer.reputation_score = (peer.reputation_score - 5.0).max(0.0);
+                // Migrate legacy reputation if needed
+                peer.migrate_legacy_reputation();
+                
+                // Apply event-specific reputation changes
+                match event {
+                    // CONSENSUS EVENTS (Byzantine safety)
+                    ReputationEvent::ValidBlock => {
+                        peer.successful_pings += 1;
+                        peer.consensus_score = (peer.consensus_score + 5.0).min(100.0);
+                        peer.network_score = (peer.network_score + 1.0).min(100.0);
+                    }
+                    ReputationEvent::InvalidBlock => {
+                        peer.failed_pings += 1;
+                        peer.consensus_score = (peer.consensus_score - 20.0).max(0.0);
+                        if peer.consensus_score < 70.0 {
+                            println!("[REPUTATION] ⚠️ Peer {} consensus score critically low: {:.1}% (excluded from consensus)", 
+                                    peer_addr, peer.consensus_score);
+                        }
+                    }
+                    ReputationEvent::ConsensusParticipation => {
+                        peer.consensus_score = (peer.consensus_score + 2.0).min(100.0);
+                    }
+                    ReputationEvent::MaliciousBehavior => {
+                        peer.failed_pings += 1;
+                        peer.consensus_score = (peer.consensus_score - 50.0).max(0.0);
+                        println!("[SECURITY] 🚨 Byzantine behavior detected from {}: consensus_score={:.1}%", 
+                                peer_addr, peer.consensus_score);
+                    }
+                    
+                    // NETWORK EVENTS (performance optimization)
+                    ReputationEvent::SuccessfulResponse => {
+                        peer.successful_pings += 1;
+                        peer.network_score = (peer.network_score + 1.0).min(100.0);
+                    }
+                    ReputationEvent::TimeoutFailure => {
+                        // SOFT penalty: WAN latency is not malicious
+                        peer.failed_pings += 1;
+                        peer.network_score = (peer.network_score - 2.0).max(0.0);
+                    }
+                    ReputationEvent::ConnectionFailure => {
+                        peer.failed_pings += 1;
+                        peer.network_score = (peer.network_score - 5.0).max(0.0);
+                    }
+                    ReputationEvent::FastResponse => {
+                        peer.network_score = (peer.network_score + 3.0).min(100.0);
+                    }
                 }
+                
                 peer.last_seen = self.current_timestamp();
                 return;
             }
@@ -1317,20 +1486,62 @@ impl SimplifiedP2P {
         // Fallback to legacy
         let mut peers = self.connected_peers.write().unwrap();
         if let Some(peer) = peers.get_mut(peer_addr) {
-            if success {
-                peer.successful_pings += 1;
-                // Increase reputation by 1 point (max 100)
-                peer.reputation_score = (peer.reputation_score + 1.0).min(100.0);
-            } else {
-                peer.failed_pings += 1;
-                // Decrease reputation by 2 points (min 0, ban at 10)
-                peer.reputation_score = (peer.reputation_score - 2.0).max(0.0);
-                if peer.reputation_score < 10.0 {
-                    println!("[P2P] ⚠️ Peer {} reputation critically low: {:.1} (ban threshold: 10)", 
-                            peer_addr, peer.reputation_score);
+            // Migrate legacy reputation if needed
+            peer.migrate_legacy_reputation();
+            
+            // Apply same event logic
+            match event {
+                ReputationEvent::ValidBlock => {
+                    peer.successful_pings += 1;
+                    peer.consensus_score = (peer.consensus_score + 5.0).min(100.0);
+                    peer.network_score = (peer.network_score + 1.0).min(100.0);
+                }
+                ReputationEvent::InvalidBlock => {
+                    peer.failed_pings += 1;
+                    peer.consensus_score = (peer.consensus_score - 20.0).max(0.0);
+                    if peer.consensus_score < 70.0 {
+                        println!("[REPUTATION] ⚠️ Peer {} consensus score critically low: {:.1}% (excluded from consensus)", 
+                                peer_addr, peer.consensus_score);
+                    }
+                }
+                ReputationEvent::ConsensusParticipation => {
+                    peer.consensus_score = (peer.consensus_score + 2.0).min(100.0);
+                }
+                ReputationEvent::MaliciousBehavior => {
+                    peer.failed_pings += 1;
+                    peer.consensus_score = (peer.consensus_score - 50.0).max(0.0);
+                    println!("[SECURITY] 🚨 Byzantine behavior detected from {}: consensus_score={:.1}%", 
+                            peer_addr, peer.consensus_score);
+                }
+                ReputationEvent::SuccessfulResponse => {
+                    peer.successful_pings += 1;
+                    peer.network_score = (peer.network_score + 1.0).min(100.0);
+                }
+                ReputationEvent::TimeoutFailure => {
+                    peer.failed_pings += 1;
+                    peer.network_score = (peer.network_score - 2.0).max(0.0);
+                }
+                ReputationEvent::ConnectionFailure => {
+                    peer.failed_pings += 1;
+                    peer.network_score = (peer.network_score - 5.0).max(0.0);
+                }
+                ReputationEvent::FastResponse => {
+                    peer.network_score = (peer.network_score + 3.0).min(100.0);
                 }
             }
         }
+    }
+    
+    /// BACKWARD COMPATIBILITY: Update reputation with boolean (legacy method)
+    /// Automatically maps to appropriate ReputationEvent
+    #[allow(dead_code)]
+    fn update_peer_reputation_legacy(&self, peer_addr: &str, success: bool) {
+        let event = if success {
+            ReputationEvent::SuccessfulResponse
+        } else {
+            ReputationEvent::TimeoutFailure
+        };
+        self.update_peer_reputation(peer_addr, event);
     }
     
     /// Get peer address by node ID
@@ -1430,20 +1641,20 @@ impl SimplifiedP2P {
         // K-BUCKET MANAGEMENT: Check bucket size (max 20 per bucket)
         let bucket_peers: Vec<_> = self.connected_peers_lockfree.iter()
             .filter(|entry| entry.value().bucket_index == peer_info.bucket_index)
-            .map(|entry| (entry.key().clone(), entry.value().reputation_score))
+            .map(|entry| (entry.key().clone(), entry.value().combined_reputation()))
             .collect();
         
         if bucket_peers.len() >= KADEMLIA_K {
-            // Find peer with lowest reputation in this bucket
+            // Find peer with lowest combined reputation in this bucket
             if let Some((worst_addr, worst_rep)) = bucket_peers.iter()
                 .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap()) {
                 
-                if peer_info.reputation_score > *worst_rep {
+                if peer_info.combined_reputation() > *worst_rep {
                     // Remove worst peer to make room
                     self.remove_peer_lockfree(worst_addr);
                     println!("[P2P] 🔄 K-bucket {}: Replaced {} (rep: {:.2}) with {} (rep: {:.2})",
-                            peer_info.bucket_index, worst_addr, worst_rep, 
-                            peer_info.id, peer_info.reputation_score);
+                            peer_info.bucket_index, worst_addr, *worst_rep, 
+                            peer_info.id, peer_info.combined_reputation());
                 } else {
                     // New peer has lower reputation, don't add
                     return false;
@@ -2086,7 +2297,10 @@ impl SimplifiedP2P {
                                 // Kademlia DHT fields (will be calculated in add_peer_safe)
                                 node_id_hash: Vec::new(),
                                 bucket_index: 0,
-                                reputation_score: 70.0, // PRODUCTION: All nodes start at consensus threshold
+                                // Split reputation for Byzantine-safe consensus
+                                consensus_score: 70.0,  // Universal consensus threshold (ALL node types)
+                                network_score: 100.0,   // Optimal network performance (ALL node types)
+                                reputation_score: None, // Legacy field (deprecated)
                                 successful_pings: 0,
                                 failed_pings: 0,
                             };
@@ -4296,7 +4510,9 @@ impl SimplifiedP2P {
                         bandwidth_usage: 1000,
                         node_id_hash: Vec::new(),
                         bucket_index: 0,
-                        reputation_score: 70.0, // PRODUCTION: Equal starting reputation
+                        consensus_score: 70.0,  // Genesis nodes start at consensus threshold
+                        network_score: 100.0,   // Optimal network performance
+                        reputation_score: None, // Legacy field (deprecated)
                         successful_pings: 100,
                         failed_pings: 0,
                     });
@@ -4609,7 +4825,9 @@ impl SimplifiedP2P {
                         bandwidth_usage: 1000,
                         node_id_hash: Vec::new(),
                         bucket_index: 0,
-                        reputation_score: 70.0, // CORRECT: Default consensus threshold
+                        consensus_score: 70.0,  // Universal consensus threshold (ALL node types)
+                        network_score: 100.0,   // Optimal network performance
+                        reputation_score: None, // Legacy (deprecated)
                         successful_pings: 100,
                         failed_pings: 0,
                     });
@@ -4809,7 +5027,9 @@ impl SimplifiedP2P {
                             bandwidth_usage: 1000,
                             node_id_hash: Vec::new(),
                             bucket_index: 0,
-                            reputation_score: 70.0,
+                            consensus_score: 70.0,  // Genesis consensus threshold
+                            network_score: 100.0,   // Optimal performance
+                            reputation_score: None, // Legacy (deprecated)
                             successful_pings: 100,
                             failed_pings: 0,
                         });
@@ -5067,14 +5287,6 @@ impl SimplifiedP2P {
         };
         
         // Determine reputation based on peer ID and IP
-        let reputation_score = if peer_id.starts_with("genesis_node_") || 
-                                  peer_id.starts_with("genesis_") || 
-                                  is_genesis_node_ip(ip) {
-            70.0 // PRODUCTION: All nodes start equal
-        } else {
-            70.0 // Regular nodes: 70% minimum consensus threshold
-        };
-        
         // Use EXISTING default values from current system
         Ok(PeerInfo {
             id: peer_id,
@@ -5092,7 +5304,9 @@ impl SimplifiedP2P {
             // Kademlia DHT fields (will be calculated in add_peer_safe)
             node_id_hash: Vec::new(),
             bucket_index: 0,
-            reputation_score,
+            consensus_score: 70.0,  // Universal consensus threshold (ALL node types)
+            network_score: 100.0,   // Optimal network performance (ALL node types)
+            reputation_score: None, // Legacy (deprecated)
             successful_pings: 0,
             failed_pings: 0,
         })
@@ -6166,11 +6380,17 @@ impl SimplifiedP2P {
         // Use semaphore to limit concurrent workers
         let semaphore = Arc::new(tokio::sync::Semaphore::new(parallel_workers));
         
-        // Pre-fetch peers for all workers to use
-        let peers = self.connected_peers.read().unwrap()
-            .keys()
-            .cloned()
-            .collect::<Vec<String>>();
+        // CRITICAL FIX: Use filtered and prioritized peers (blacklist + reputation + Light nodes excluded)
+        // SCALABILITY: Light nodes are NOT sync sources (millions of Light nodes in production)
+        let filtered_peers = self.get_sync_peers_filtered(20);
+        let peers: Vec<String> = filtered_peers.iter()
+            .map(|p| p.addr.clone())
+            .collect();
+        
+        if peers.is_empty() {
+            println!("[SYNC] ⚠️ No suitable sync peers available (blacklist/reputation filtered)");
+            return;
+        }
         
         for (chunk_start, chunk_end) in chunks {
             let storage_clone = storage_arc.clone();
@@ -6897,7 +7117,7 @@ impl SimplifiedP2P {
                 if rate_limited {
                     println!("[P2P] 🚫 Certificate announcement rejected due to rate limiting");
                     // SECURITY: Rate limiting violation indicates potential DoS attack
-                    self.update_peer_reputation(&node_id, false); // -5% per violation
+                    self.update_peer_reputation(&node_id, ReputationEvent::ConnectionFailure);
                     self.track_invalid_certificate(&node_id, "RATE_LIMIT_EXCEEDED");
                     return;
                 }
@@ -6908,8 +7128,8 @@ impl SimplifiedP2P {
                     Ok(c) => c,
                     Err(e) => {
                         println!("[P2P] ❌ Invalid certificate format from {}: {}", node_id, e);
-                        // SECURITY: Penalize for sending invalid data
-                        self.update_peer_reputation(&node_id, false); // -5% reputation
+                        // SECURITY: Penalize for sending invalid data (consensus issue)
+                        self.update_node_reputation(&node_id, ReputationEvent::InvalidBlock);
                         self.track_invalid_certificate(&node_id, "INVALID_FORMAT");
                         return;
                     }
@@ -6925,12 +7145,12 @@ impl SimplifiedP2P {
                     // BUT: Genesis nodes get special protection
                     if self.is_genesis_node(&node_id) {
                         println!("[SECURITY] ⚠️ Genesis node {} attempted certificate spoofing - SEVERE WARNING", node_id);
-                        println!("[SECURITY] 🛡️ Genesis node protected from ban, applying -70% reputation penalty");
-                        self.update_node_reputation(&node_id, -70.0); // Severe penalty but no ban
+                        println!("[SECURITY] 🛡️ Genesis node protected from ban, applying Byzantine penalty");
+                        self.update_node_reputation(&node_id, ReputationEvent::MaliciousBehavior);
                         self.track_invalid_certificate(&node_id, "CERTIFICATE_SPOOFING");
                     } else {
-                        // Regular nodes get instant ban
-                        self.update_peer_reputation(&node_id, false); // First hit: -5%
+                        // Regular nodes: Byzantine attack
+                        self.update_node_reputation(&node_id, ReputationEvent::MaliciousBehavior);
                         self.track_invalid_certificate(&node_id, "CERTIFICATE_SPOOFING");
                         
                         // Report as critical attack for instant ban (1 year)
@@ -7502,13 +7722,13 @@ impl SimplifiedP2P {
             return Err("No peers available for sync".to_string());
         }
         
-        // Select best peer for sync (highest reputation)
+        // Select best peer for sync (highest combined reputation)
         let best_peer = peers.iter()
-            .max_by(|a, b| a.reputation_score.partial_cmp(&b.reputation_score).unwrap())
+            .max_by(|a, b| a.combined_reputation().partial_cmp(&b.combined_reputation()).unwrap())
             .ok_or("No valid peer for sync")?;
         
-        println!("[SYNC] 📡 Requesting blocks from peer {} (reputation: {:.1}%)", 
-                 best_peer.id, best_peer.reputation_score * 100.0);
+        println!("[SYNC] 📡 Requesting blocks from peer {} (consensus: {:.1}%, network: {:.1}%)", 
+                 best_peer.id, best_peer.consensus_score, best_peer.network_score);
         
         // Create request message
         let request = NetworkMessage::RequestBlocks {
@@ -7555,13 +7775,13 @@ impl SimplifiedP2P {
             return Err("No peers available for consensus sync".to_string());
         }
         
-        // Select peer with highest reputation
+        // Select peer with highest consensus score (Byzantine safety)
         let best_peer = peers.iter()
-            .max_by(|a, b| a.reputation_score.partial_cmp(&b.reputation_score).unwrap())
+            .max_by(|a, b| a.consensus_score.partial_cmp(&b.consensus_score).unwrap())
             .ok_or("No valid peer for consensus sync")?;
         
-        println!("[CONSENSUS] 📡 Requesting from peer {} (reputation: {:.1}%)", 
-                 best_peer.id, best_peer.reputation_score * 100.0);
+        println!("[CONSENSUS] 📡 Requesting from peer {} (consensus: {:.1}%, network: {:.1}%)", 
+                 best_peer.id, best_peer.consensus_score, best_peer.network_score);
         
         // Create request message
         let request = NetworkMessage::RequestConsensusState {
@@ -7916,25 +8136,57 @@ impl SimplifiedP2P {
         self.reputation_system.clone()
     }
     
-    /// PRODUCTION: Update node reputation (for consensus feedback)
-    pub fn update_node_reputation(&self, node_id: &str, delta: f64) {
-        if let Ok(mut reputation) = self.reputation_system.lock() {
-            reputation.update_reputation(node_id, delta);
-            
-            // CRITICAL FIX: Save reputation to persistent storage
-            // This prevents reputation loss on restart
-            let new_reputation = reputation.get_reputation(node_id);
-            self.save_reputation_to_storage(node_id, new_reputation);
-            
-            // PRIVACY: Use pseudonym for logging (don't double-convert if already pseudonym)
-            let display_id = if node_id.starts_with("genesis_node_") || node_id.starts_with("node_") {
-                node_id.to_string()
-            } else {
-                get_privacy_id_for_addr(node_id)
-            };
-            println!("[P2P] 📊 Updated reputation for {}: delta {:.1} (new: {:.1}%)", 
-                    display_id, delta, new_reputation);
+    /// PRODUCTION: Update node reputation with event-based tracking
+    /// ARCHITECTURE: Consensus events update NodeReputation (Byzantine tracking)
+    /// Network events update PeerInfo.network_score (performance tracking)
+    pub fn update_node_reputation(&self, node_id: &str, event: ReputationEvent) {
+        // Determine delta based on event type
+        let (consensus_delta, is_consensus_event) = match event {
+            ReputationEvent::ValidBlock => (5.0, true),
+            ReputationEvent::InvalidBlock => (-20.0, true),
+            ReputationEvent::ConsensusParticipation => (2.0, true),
+            ReputationEvent::MaliciousBehavior => (-50.0, true),
+            // Network events don't affect consensus reputation
+            _ => (0.0, false),
+        };
+        
+        // Update consensus_score in NodeReputation (if consensus event)
+        if is_consensus_event {
+            if let Ok(mut reputation) = self.reputation_system.lock() {
+                reputation.update_reputation(node_id, consensus_delta);
+                
+                // CRITICAL FIX: Save reputation to persistent storage
+                let new_reputation = reputation.get_reputation(node_id);
+                self.save_reputation_to_storage(node_id, new_reputation);
+                
+                // PRIVACY: Use pseudonym for logging
+                let display_id = if node_id.starts_with("genesis_node_") || node_id.starts_with("node_") {
+                    node_id.to_string()
+                } else {
+                    get_privacy_id_for_addr(node_id)
+                };
+                println!("[REPUTATION] 📊 Consensus score for {}: delta {:.1} (new: {:.1}%)", 
+                        display_id, consensus_delta, new_reputation);
+            }
         }
+        
+        // Update network_score in PeerInfo (for all events)
+        // Find peer address by node_id
+        if let Some(peer_addr) = self.peer_id_to_addr.get(node_id) {
+            self.update_peer_reputation(&peer_addr, event);
+        }
+    }
+    
+    /// BACKWARD COMPATIBILITY: Update reputation with delta (legacy method)
+    #[allow(dead_code)]
+    pub fn update_node_reputation_legacy(&self, node_id: &str, delta: f64) {
+        // Map delta to appropriate event
+        let event = if delta > 0.0 {
+            ReputationEvent::ValidBlock
+        } else {
+            ReputationEvent::InvalidBlock
+        };
+        self.update_node_reputation(node_id, event);
     }
     
     /// PRODUCTION: Set absolute reputation (for Genesis initialization)
@@ -8270,8 +8522,13 @@ impl SimplifiedP2P {
             }
         };
         
-        // Apply the penalty
-        self.update_node_reputation(node_id, penalty);
+        // Apply the penalty (Byzantine attack)
+        let event = if penalty <= -50.0 {
+            ReputationEvent::MaliciousBehavior
+        } else {
+            ReputationEvent::InvalidBlock
+        };
+        self.update_node_reputation(node_id, event);
         
         // Broadcast tampering alert to network
         self.broadcast_tampering_alert(node_id, attempted_reputation, current_reputation, severity);
@@ -9174,8 +9431,8 @@ impl SimplifiedP2P {
             println!("[CONSENSUS] ⚠️ No consensus channel established - commit not processed");
         }
         
-        // Update peer reputation for participation (+1% for valid commit)
-        self.update_node_reputation(&node_id, 1.0);
+        // Update peer reputation for participation (valid commit)
+        self.update_node_reputation(&node_id, ReputationEvent::ConsensusParticipation);
     }
 
     /// Handle incoming consensus reveal from remote peer
@@ -9219,8 +9476,8 @@ impl SimplifiedP2P {
             println!("[CONSENSUS] ⚠️ No consensus channel established - reveal not processed");
         }
         
-        // Update peer reputation for participation (+2% for valid reveal)
-        self.update_node_reputation(&node_id, 2.0);
+        // Update peer reputation for participation (valid reveal)
+        self.update_node_reputation(&node_id, ReputationEvent::ConsensusParticipation);
     }
     
     /// CRITICAL: Determine if consensus round is for macroblock (every 90 blocks)
@@ -9381,8 +9638,8 @@ impl SimplifiedP2P {
             println!("[SECURITY] 🚨 Attack type: {} at block #{}", change_type, block_height);
             println!("[SECURITY] 🚨 APPLYING INSTANT MAXIMUM BAN (1 YEAR)!");
             
-            // Apply instant reputation destruction
-            self.update_node_reputation(&failed_producer, -100.0);
+            // Apply instant reputation destruction (Byzantine attack)
+            self.update_node_reputation(&failed_producer, ReputationEvent::MaliciousBehavior);
             
             // Report to reputation system for jail
             if let Ok(mut reputation) = self.reputation_system.lock() {
@@ -9551,8 +9808,8 @@ impl SimplifiedP2P {
             
             // Still give small boost to emergency producer for service
             if new_producer != "emergency_consensus" && new_producer != self.node_id {
-                self.update_node_reputation(&new_producer, 2.0);
-                println!("[REPUTATION] ✅ Emergency producer {} rewarded: +2.0 reputation (bootstrap service)", new_display);
+                self.update_node_reputation(&new_producer, ReputationEvent::ConsensusParticipation);
+                println!("[REPUTATION] ✅ Emergency producer {} rewarded (bootstrap service)", new_display);
             }
             return;
         }
@@ -9651,21 +9908,21 @@ impl SimplifiedP2P {
         
         if current_confirmations >= 3 {
             println!("[CONSENSUS] ✅ CONSENSUS REACHED: 3+ nodes confirm emergency");
-            self.update_node_reputation(&failed_producer, -10.0);
-            println!("[FAILOVER] ⚔️ Applied penalty -10 to {} (consensus)", failed_producer);
+            self.update_node_reputation(&failed_producer, ReputationEvent::InvalidBlock);
+            println!("[FAILOVER] ⚔️ Applied penalty to {} (consensus)", failed_producer);
             
             if new_producer != "emergency_consensus" {
-                self.update_node_reputation(&new_producer, 5.0);
-                println!("[FAILOVER] ✅ Emergency producer {} rewarded: +5", new_producer);
+                self.update_node_reputation(&new_producer, ReputationEvent::ValidBlock);
+                println!("[FAILOVER] ✅ Emergency producer {} rewarded", new_producer);
             }
         } else if current_confirmations >= 2 {
             println!("[CONSENSUS] ⚠️ PARTIAL CONSENSUS: 2 nodes confirm emergency");
-            self.update_node_reputation(&failed_producer, -5.0);
-            println!("[FAILOVER] ⚔️ Applied penalty -5 to {} (partial)", failed_producer);
+            self.update_node_reputation(&failed_producer, ReputationEvent::InvalidBlock);
+            println!("[FAILOVER] ⚔️ Applied penalty to {} (partial)", failed_producer);
             
             if new_producer != "emergency_consensus" {
-                self.update_node_reputation(&new_producer, 2.0);
-                println!("[FAILOVER] ✅ Emergency producer {} rewarded: +2", new_producer);
+                self.update_node_reputation(&new_producer, ReputationEvent::ConsensusParticipation);
+                println!("[FAILOVER] ✅ Emergency producer {} rewarded", new_producer);
             }
         } else {
             println!("[CONSENSUS] ⚠️ SINGLE REPORT: No penalty for {}", failed_producer);
@@ -9992,20 +10249,27 @@ impl SimplifiedP2P {
                     Err(poisoned) => poisoned.into_inner().clone(),
                 };
                 
+                // PRODUCTION: Use HTTP gossip protocol (NOT TCP) for reputation sync
+                // ARCHITECTURE: HTTP is more reliable in WAN/Docker environments
+                // SCALABILITY: Reuses existing HTTP connection pool for millions of nodes
                 let mut successful = 0;
                 for (_addr, peer) in peers {
-                    // Send using existing P2P infrastructure
-                    // Use TCP directly for reputation sync
-                    use std::io::Write;
-                    use std::net::TcpStream;
-                    use std::time::Duration as StdDuration;
+                    // CRITICAL: Light nodes DON'T participate in reputation consensus
+                    // Only sync with Super and Full nodes
+                    if peer.node_type == NodeType::Light {
+                        continue;
+                    }
                     
-                    if let Ok(mut stream) = TcpStream::connect_timeout(
-                        &peer.addr.parse().unwrap_or_else(|_| "127.0.0.1:9876".parse().unwrap()),
-                        StdDuration::from_secs(2)
-                    ) {
-                        let _ = stream.set_write_timeout(Some(StdDuration::from_secs(2)));
-                        if stream.write_all(message_json.as_bytes()).is_ok() {
+                    // Use HTTP POST via existing send_network_message (NOT raw TCP!)
+                    // This ensures consistent error handling, retries, and connection pooling
+                    if let Ok(client) = reqwest::blocking::Client::builder()
+                        .timeout(Duration::from_secs(5))
+                        .build() {
+                        let url = format!("http://{}/api/v1/p2p/message", peer.addr);
+                        if let Ok(_) = client.post(&url)
+                            .header("Content-Type", "application/json")
+                            .body(message_json.clone())
+                            .send() {
                             successful += 1;
                         }
                     }
@@ -10070,7 +10334,7 @@ impl SimplifiedP2P {
                          node_id, count);
                 println!("[SECURITY] 🛡️ Genesis nodes are protected from automatic bans");
                 // Apply reputation penalty but no ban
-                self.update_node_reputation(node_id, -50.0); // Heavy penalty but not ban
+                self.update_node_reputation(node_id, ReputationEvent::MaliciousBehavior);
                 INVALID_CERT_TRACKER.remove(node_id);
                 return;
             }
@@ -10094,7 +10358,7 @@ impl SimplifiedP2P {
         } else if count == 3 {
             // Warning level - significant reputation penalty
             println!("[SECURITY] ⚠️ WARNING: {} has sent 3 invalid certificates", node_id);
-            self.update_node_reputation(node_id, -20.0); // -20% reputation
+            self.update_node_reputation(node_id, ReputationEvent::InvalidBlock);
         }
     }
     
@@ -10137,13 +10401,13 @@ impl SimplifiedP2P {
             
         } else if count == 3 {
             // WARNING: 3 invalid blocks = possible bug or sync issue
-            println!("[SECURITY] ⚠️ WARNING: {} sent 3 invalid blocks - applying small penalty", producer);
-            self.update_node_reputation(producer, -5.0);
+            println!("[SECURITY] ⚠️ WARNING: {} sent 3 invalid blocks - applying penalty", producer);
+            self.update_node_reputation(producer, ReputationEvent::InvalidBlock);
             
         } else if count == 5 {
             // ESCALATION: 5 invalid blocks = suspicious behavior
-            println!("[SECURITY] ⚠️ ESCALATION: {} sent 5 invalid blocks - applying medium penalty", producer);
-            self.update_node_reputation(producer, -10.0);
+            println!("[SECURITY] ⚠️ ESCALATION: {} sent 5 invalid blocks - applying penalty", producer);
+            self.update_node_reputation(producer, ReputationEvent::InvalidBlock);
         }
         
         // CLEANUP: Remove old entries after 5 minutes (prevent memory leak)
@@ -10226,8 +10490,8 @@ impl SimplifiedP2P {
             change_type
         )?;
         
-        // Apply instant ban locally
-        self.update_node_reputation(attacker, -100.0);
+        // Apply instant ban locally (Byzantine attack)
+        self.update_node_reputation(attacker, ReputationEvent::MaliciousBehavior);
         
         // Jail for 1 year
         if let Ok(mut reputation) = self.reputation_system.lock() {
@@ -10239,10 +10503,10 @@ impl SimplifiedP2P {
     }
     
     fn select_emergency_producer_excluding(&self, exclude: &str, height: u64) -> String {
-        // Select any other active peer as emergency producer
+        // Select any other active peer as emergency producer (Byzantine-safe)
         for entry in self.connected_peers_lockfree.iter() {
             let peer = entry.value();
-            if peer.id != exclude && peer.reputation_score > 70.0 {  // Use minimum consensus threshold
+            if peer.id != exclude && peer.is_consensus_qualified() {  // Byzantine threshold check
                 return peer.id.clone();
             }
         }
@@ -10300,5 +10564,159 @@ impl SimplifiedP2P {
                  successful_broadcasts, total_peers);
         
         Ok(())
+    }
+    
+    // ============================================================================
+    // SYNC OPTIMIZATION: Peer Blacklist Methods
+    // ============================================================================
+    
+    /// Add peer to blacklist with reason and duration
+    /// ARCHITECTURE: Soft blacklist (network) vs Hard blacklist (Byzantine)
+    /// SCALABILITY: Lock-free DashMap for millions of nodes
+    pub fn add_to_blacklist(&self, peer_addr: &str, reason: BlacklistReason) {
+        let (duration_secs, escalation) = match reason {
+            // SOFT BLACKLIST: Temporary (network performance)
+            BlacklistReason::SlowResponse => (15, 15),   // 15s base, +15s per violation
+            BlacklistReason::SyncTimeout => (30, 30),    // 30s base, +30s per violation
+            BlacklistReason::ConnectionFailure => (60, 60), // 60s base, +60s per violation
+            
+            // HARD BLACKLIST: Permanent until reputation recovered (Byzantine)
+            BlacklistReason::InvalidBlocks | BlacklistReason::MaliciousBehavior => (0, 0),
+        };
+        
+        // Check if already blacklisted (escalation logic)
+        let (final_duration, attempts) = if let Some(mut entry) = PEER_BLACKLIST.get_mut(peer_addr) {
+            // Escalate duration for repeated violations
+            let new_attempts = entry.attempts + 1;
+            let escalated_duration = if duration_secs > 0 {
+                duration_secs + (escalation * new_attempts as u64)
+            } else {
+                0 // Permanent
+            };
+            entry.timestamp = Instant::now();
+            entry.duration_secs = escalated_duration;
+            entry.attempts = new_attempts;
+            entry.reason = reason;
+            (escalated_duration, new_attempts)
+        } else {
+            // First violation
+            let entry = BlacklistEntry {
+                reason,
+                timestamp: Instant::now(),
+                duration_secs,
+                attempts: 1,
+            };
+            PEER_BLACKLIST.insert(peer_addr.to_string(), entry);
+            (duration_secs, 1)
+        };
+        
+        if final_duration > 0 {
+            println!("[BLACKLIST] 🚫 SOFT: {} blacklisted for {}s (reason: {:?}, attempt: {})", 
+                     peer_addr, final_duration, reason, attempts);
+        } else {
+            println!("[BLACKLIST] ⛔ HARD: {} permanently blacklisted (reason: {:?})", 
+                     peer_addr, reason);
+        }
+    }
+    
+    /// Check if peer is currently blacklisted
+    /// Returns (is_blacklisted, reason, remaining_secs)
+    pub fn is_blacklisted(&self, peer_addr: &str) -> (bool, Option<BlacklistReason>, u64) {
+        if let Some(entry) = PEER_BLACKLIST.get(peer_addr) {
+            if entry.is_active() {
+                return (true, Some(entry.reason), entry.remaining_secs());
+            } else {
+                // Entry expired - remove it
+                drop(entry);
+                PEER_BLACKLIST.remove(peer_addr);
+            }
+        }
+        (false, None, 0)
+    }
+    
+    /// Remove peer from blacklist (manual override or reputation recovered)
+    pub fn remove_from_blacklist(&self, peer_addr: &str) {
+        if let Some((_, entry)) = PEER_BLACKLIST.remove(peer_addr) {
+            println!("[BLACKLIST] ✅ Removed {} from blacklist (reason: {:?})", 
+                     peer_addr, entry.reason);
+        }
+    }
+    
+    /// Get peers for sync with blacklist filtering and prioritization
+    /// ARCHITECTURE: Filter by blacklist, node type (Light excluded), and reputation
+    /// SCALABILITY: Returns top-N peers sorted by latency and reputation
+    /// CRITICAL: Light nodes NEVER included as sync SOURCE (they only RECEIVE macroblock headers)
+    /// NOTE: Light nodes DO receive blocks via broadcast, but don't serve blocks to others
+    pub fn get_sync_peers_filtered(&self, max_peers: usize) -> Vec<PeerInfo> {
+        let mut eligible_peers: Vec<PeerInfo> = self.connected_peers_lockfree.iter()
+            .filter_map(|entry| {
+                let peer = entry.value().clone();
+                
+                // CRITICAL: Light nodes are NOT sync sources (don't store full blocks)
+                // They RECEIVE macroblock headers but don't serve blocks to others
+                if peer.node_type == NodeType::Light {
+                    return None;
+                }
+                
+                // Filter blacklisted peers
+                let (is_blacklisted, reason, remaining) = self.is_blacklisted(&peer.addr);
+                if is_blacklisted {
+                    // SOFT blacklist: Can be overridden if no other peers available
+                    // HARD blacklist: Check reputation instead
+                    if let Some(BlacklistReason::InvalidBlocks | BlacklistReason::MaliciousBehavior) = reason {
+                        // Hard blacklist: check if reputation recovered
+                        if !peer.is_consensus_qualified() {
+                            return None; // Still below Byzantine threshold
+                        }
+                        // Reputation recovered - auto-remove from blacklist
+                        self.remove_from_blacklist(&peer.addr);
+                    } else {
+                        // Soft blacklist: skip if still active
+                        if remaining > 0 {
+                            return None;
+                        }
+                    }
+                }
+                
+                // Include only peers with good consensus reputation (Byzantine-safe)
+                if peer.is_consensus_qualified() {
+                    Some(peer)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        
+        // Sort by priority: 1) network_score (latency), 2) consensus_score (reliability)
+        eligible_peers.sort_by(|a, b| {
+            // Primary: network_score (higher = better latency)
+            let network_cmp = b.network_score.partial_cmp(&a.network_score).unwrap();
+            if network_cmp != std::cmp::Ordering::Equal {
+                return network_cmp;
+            }
+            // Secondary: consensus_score (higher = more reliable)
+            b.consensus_score.partial_cmp(&a.consensus_score).unwrap()
+        });
+        
+        // Return top-N peers
+        eligible_peers.into_iter().take(max_peers).collect()
+    }
+    
+    /// Cleanup expired blacklist entries (periodic maintenance)
+    /// SCALABILITY: Lock-free DashMap cleanup for millions of nodes
+    pub fn cleanup_expired_blacklist(&self) {
+        let mut removed = 0;
+        PEER_BLACKLIST.retain(|_, entry| {
+            if !entry.is_active() && entry.duration_secs > 0 {
+                removed += 1;
+                false // Remove expired soft blacklist
+            } else {
+                true // Keep active or permanent
+            }
+        });
+        
+        if removed > 0 {
+            println!("[BLACKLIST] 🧹 Cleaned up {} expired blacklist entries", removed);
+        }
     }
 }

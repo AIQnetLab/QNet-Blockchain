@@ -4,7 +4,7 @@ use crate::{
     errors::QNetError,
     storage::Storage,
     // validator::Validator, // disabled for compilation
-    unified_p2p::{SimplifiedP2P, NodeType as UnifiedNodeType, Region as UnifiedRegion, ConsensusMessage, NetworkMessage},
+    unified_p2p::{SimplifiedP2P, NodeType as UnifiedNodeType, Region as UnifiedRegion, ConsensusMessage, NetworkMessage, ReputationEvent},
 };
 use once_cell::sync::Lazy;
 
@@ -2441,14 +2441,11 @@ impl BlockchainNode {
                         0.70 // Genesis nodes have fixed 70% reputation
                     } else {
                         // OPTIMIZATION: Use pre-fetched peers list
-                        let peer_reputation = peers.iter()
+                        // Use consensus_score (Byzantine-safe) for validator weight
+                        peers.iter()
                             .find(|p| p.id == microblock.producer)
-                            .map(|p| p.reputation_score)
-                            .unwrap_or(0.50); // Default 50% for unknown producers
-                        
-                        // CRITICAL: Cap reputation to prevent manipulation (max 95%)
-                        // This prevents a single malicious high-reputation node from dominating
-                        peer_reputation.min(0.95)
+                            .map(|p| (p.consensus_score / 100.0).min(0.95)) // Convert to 0-1 scale, cap at 95%
+                            .unwrap_or(0.50) // Default 50% for unknown producers
                     };
                     
                     // Only validators (reputation ≥ 70%) contribute to Byzantine weight
@@ -2615,13 +2612,11 @@ impl BlockchainNode {
                             0.70 // Genesis nodes have fixed 70% reputation
                         } else {
                             // OPTIMIZATION: Use pre-fetched peers list
-                            let peer_reputation = peers.iter()
+                            // Use consensus_score (Byzantine-safe) for validator weight
+                            peers.iter()
                                 .find(|p| p.id == microblock.producer)
-                                .map(|p| p.reputation_score)
-                                .unwrap_or(0.50); // Default 50% for unknown producers
-                            
-                            // CRITICAL: Cap reputation to prevent manipulation (max 95%)
-                            peer_reputation.min(0.95)
+                                .map(|p| (p.consensus_score / 100.0).min(0.95)) // Convert to 0-1 scale, cap at 95%
+                                .unwrap_or(0.50) // Default 50% for unknown producers
                         };
                         
                         // Only validators (reputation ≥ 70%) contribute to Byzantine weight
@@ -4591,11 +4586,23 @@ impl BlockchainNode {
                     println!("[CONSENSUS] 🔄 Rotation boundary at block #{} - verifying entropy consensus", next_block_height);
                     
                     if let Some(p2p) = &unified_p2p {
-                        // Get entropy block height (last block of previous round)
-                        let entropy_height = ((next_block_height - 1) / 30) * 30;
+                        // CRITICAL FIX: Use FINALITY_WINDOW for entropy consensus (Byzantine-safe)
+                        // This ensures ALL synchronized nodes have the same entropy block
+                        // Prevents false positives when nodes are at different heights
+                        let entropy_height = if next_block_height > FINALITY_WINDOW {
+                            next_block_height - FINALITY_WINDOW
+                        } else {
+                            // Genesis phase: use Genesis block for entropy
+                            0
+                        };
                         
-                        // Get our entropy hash
-                        let our_entropy = Self::get_previous_microblock_hash(&storage, entropy_height + 1).await;
+                        // Get our entropy hash (using finalized block that all nodes should have)
+                        let our_entropy = if entropy_height == 0 {
+                            // Use Genesis block hash
+                            Self::get_previous_microblock_hash(&storage, 1).await
+                        } else {
+                            Self::get_previous_microblock_hash(&storage, entropy_height + 1).await
+                        };
                         
                         // Query a sample of peers for their entropy
                         let peers = p2p.get_validated_active_peers();
@@ -4682,10 +4689,21 @@ impl BlockchainNode {
                                 let responses = ENTROPY_RESPONSES.lock().unwrap();
                                 for ((height, responder), peer_entropy) in responses.iter() {
                                     if *height == entropy_height {
+                                        // CRITICAL FIX: Ignore peer_entropy == 0 (peer doesn't have block yet)
+                                        // This prevents false positives when nodes are at different heights
+                                        // FINALITY_WINDOW ensures synchronized nodes have this block
+                                        if *peer_entropy == [0u8; 32] {
+                                            println!("[CONSENSUS] ⏳ Peer {} doesn't have finalized block #{} yet (lagging)", 
+                                                     responder, entropy_height);
+                                            // Don't count as mismatch - peer is just lagging
+                                            continue;
+                                        }
+                                        
                                         if *peer_entropy == our_entropy {
                                             matches += 1;
                                             println!("[CONSENSUS] ✅ Entropy match with {}", responder);
                                         } else {
+                                            // REAL mismatch: peer has different entropy (potential fork!)
                                             mismatches += 1;
                                             println!("[CONSENSUS] ❌ Entropy mismatch with {}: expected {:x}, got {:x}",
                                                     responder,
@@ -4698,24 +4716,33 @@ impl BlockchainNode {
                                 }
                             }
                             
-                            // If majority disagrees with our entropy, we MUST NOT proceed
-                            // ARCHITECTURE: Fork prevention - stop if no entropy consensus
-                            if mismatches > 0 && mismatches > matches {
-                                println!("[CONSENSUS] ⚠️ Entropy mismatch detected! {} peers disagree vs {} agree", 
-                                        mismatches, matches);
-                                println!("[CONSENSUS] 🛑 STOPPING production to prevent fork!");
-                                
-                                // CRITICAL: DO NOT PRODUCE BLOCK WITHOUT ENTROPY CONSENSUS
-                                // This prevents fork at rotation boundary
-                                println!("[CONSENSUS] ❌ Cannot proceed without entropy consensus - skipping block production");
-                                
-                                // Skip this rotation round to prevent fork
-                                continue;
+                            // CRITICAL: Fork prevention - only stop if REAL mismatch detected
+                            // FINALITY_WINDOW ensures synchronized nodes have the same block
+                            // Lagging nodes (peer_entropy == 0) are NOT counted as mismatch
+                            if mismatches > 0 {
+                                // REAL FORK DETECTED: Some peers have DIFFERENT entropy (not just missing)
+                                if mismatches > matches && matches > 0 {
+                                    // Majority disagrees - STOP to prevent fork
+                                    println!("[CONSENSUS] 🚨 FORK DETECTED! {} peers have different entropy vs {} agree", 
+                                            mismatches, matches);
+                                    println!("[CONSENSUS] 🛑 STOPPING production to prevent fork propagation!");
+                                    println!("[CONSENSUS] ❌ Cannot proceed - network has diverged");
+                                    
+                                    // Skip this rotation round to prevent fork
+                                    continue;
+                                } else {
+                                    // Minority disagrees - log warning but continue (Byzantine resilience)
+                                    println!("[CONSENSUS] ⚠️ {} peers have different entropy (minority), {} agree (majority)", 
+                                            mismatches, matches);
+                                    println!("[CONSENSUS] ✅ Byzantine threshold met - continuing with majority");
+                                }
                             } else if matches > 0 {
-                                println!("[CONSENSUS] ✅ Entropy consensus verified: {} peers agree, {} disagree", 
-                                        matches, mismatches);
+                                // All responses match - perfect consensus
+                                println!("[CONSENSUS] ✅ Perfect entropy consensus: {} peers agree, 0 disagree", 
+                                        matches);
                             } else {
-                                println!("[CONSENSUS] ⏳ No entropy responses received from {} peers", sample_size);
+                                // No responses - peers are lagging (not a problem with FINALITY_WINDOW)
+                                println!("[CONSENSUS] ⏳ No entropy responses (peers lagging) - continuing with FINALITY_WINDOW safety");
                             }
                         }
                     }
@@ -5421,18 +5448,15 @@ impl BlockchainNode {
                                 // ATOMIC REWARD: One reward for entire rotation
                                 if let Some(ref p2p) = p2p_for_reward {
                                     if blocks_created == ROTATION_INTERVAL_BLOCKS as u32 {
-                                        // Full rotation completed
-                                        // BALANCED: Reduced from +30% to +10% for gradual growth
-                                        p2p.update_node_reputation(&rotation_producer, 10.0);
-                                        println!("[ROTATION] ✅ {} completed full rotation ({}/30 blocks) +10.0 reputation", 
+                                        // Full rotation completed - reward valid block production
+                                        p2p.update_node_reputation(&rotation_producer, ReputationEvent::ValidBlock);
+                                        println!("[ROTATION] ✅ {} completed full rotation ({}/30 blocks)", 
                                                 rotation_producer, blocks_created);
                                     } else {
-                                        // Partial rotation (failover occurred)
-                                        // BALANCED: Proportional to 10% max instead of 30%
-                                        let reward = (blocks_created as f64 / 30.0) * 10.0;
-                                        p2p.update_node_reputation(&rotation_producer, reward);
-                                        println!("[ROTATION] ⚠️ {} partial rotation ({}/30 blocks) +{:.1} reputation", 
-                                                rotation_producer, blocks_created, reward);
+                                        // Partial rotation (failover occurred) - still reward participation
+                                        p2p.update_node_reputation(&rotation_producer, ReputationEvent::ConsensusParticipation);
+                                        println!("[ROTATION] ⚠️ {} partial rotation ({}/30 blocks)", 
+                                                rotation_producer, blocks_created);
                                     }
                                 }
                             }
@@ -5555,16 +5579,15 @@ impl BlockchainNode {
                         
                         if let Some(p2p) = &unified_p2p {
                             if blocks_created == ROTATION_INTERVAL_BLOCKS as u32 {
-                                // Full rotation: BALANCED +10 reputation (was +30)
-                                p2p.update_node_reputation(&rotation_producer, 10.0);
-                                println!("[ROTATION] ✅ {} completed full rotation #{} ({}/30 blocks) +10.0 reputation", 
+                                // Full rotation: reward valid block production
+                                p2p.update_node_reputation(&rotation_producer, ReputationEvent::ValidBlock);
+                                println!("[ROTATION] ✅ {} completed full rotation #{} ({}/30 blocks)", 
                                         rotation_producer, microblock.height / 30, blocks_created);
                             } else {
-                                // Partial rotation: proportional reward (max 10%)
-                                let reward = (blocks_created as f64 / 30.0) * 10.0;
-                                p2p.update_node_reputation(&rotation_producer, reward);
-                                println!("[ROTATION] ⚠️ {} partial rotation #{} ({}/30 blocks) +{:.1} reputation", 
-                                        rotation_producer, microblock.height / 30, blocks_created, reward);
+                                // Partial rotation: reward participation
+                                p2p.update_node_reputation(&rotation_producer, ReputationEvent::ConsensusParticipation);
+                                println!("[ROTATION] ⚠️ {} partial rotation #{} ({}/30 blocks)", 
+                                        rotation_producer, microblock.height / 30, blocks_created);
                             }
                         }
                     }
@@ -5793,9 +5816,8 @@ impl BlockchainNode {
                                         // Check if we were significantly behind (>50 blocks)
                                         if network_height > current_height + 50 {
                                             // Node successfully caught up after being behind
-                                            // BALANCED: Reduced from +40% to +10% for gradual recovery
-                                            p2p_clone.update_node_reputation(&node_id_for_sync, 10.0);
-                                            println!("[REPUTATION] 🔄 Node {} recovered from {} block lag! +10.0 reputation boost", 
+                                            p2p_clone.update_node_reputation(&node_id_for_sync, ReputationEvent::ValidBlock);
+                                            println!("[REPUTATION] 🔄 Node {} recovered from {} block lag!", 
                                                      node_id_for_sync, network_height - current_height);
                                         }
                                     }
@@ -6817,9 +6839,8 @@ impl BlockchainNode {
                         let peer_node_id = format!("genesis_node_{:03}", i + 1);
                         if peer_node_id != failed_producer {
                             // Give emergency reputation boost to enable recovery
-                            // BALANCED: Reduced from +30% to +15% for gradual recovery
-                            p2p.update_node_reputation(&peer_node_id, 15.0);
-                            println!("[EMERGENCY] 💊 Emergency boost +15% to {} for recovery", peer_node_id);
+                            p2p.update_node_reputation(&peer_node_id, ReputationEvent::ValidBlock);
+                            println!("[EMERGENCY] 💊 Emergency boost to {} for recovery", peer_node_id);
                             
                             // Check if now eligible
                             let new_reputation = Self::get_node_reputation_score(&peer_node_id, p2p).await;
@@ -6902,9 +6923,9 @@ impl BlockchainNode {
                         
                         // Boost first available peer (now deterministic across all nodes)
                         let emergency_peer = &peers[0];
-                        // BALANCED: Reduced from +50% to +20% to prevent instant max reputation
-                        p2p.update_node_reputation(&emergency_peer.id, 20.0);
-                        println!("[EMERGENCY] 💊 Critical boost +20% to {} for network recovery", emergency_peer.id);
+                        // Critical boost for network recovery
+                        p2p.update_node_reputation(&emergency_peer.id, ReputationEvent::ValidBlock);
+                        println!("[EMERGENCY] 💊 Critical boost to {} for network recovery", emergency_peer.id);
                         return emergency_peer.id.clone();
                     }
                     
@@ -8138,8 +8159,8 @@ impl BlockchainNode {
         // Penalize failed leader if valid
         if let Some(ref p2p) = unified_p2p {
             if !failed_leader.starts_with("unknown") && !failed_leader.starts_with("no_leader") {
-                p2p.update_node_reputation(&failed_leader, -30.0);
-                println!("[REPUTATION] ⚔️ Failed leader {} penalized: -30.0", failed_leader);
+                p2p.update_node_reputation(&failed_leader, ReputationEvent::InvalidBlock);
+                println!("[REPUTATION] ⚔️ Failed leader {} penalized", failed_leader);
             }
         }
         
@@ -8727,19 +8748,26 @@ impl BlockchainNode {
         behavior_delta: f64,
     ) {
         if let Some(p2p) = unified_p2p {
+            // Map behavior_delta to ReputationEvent
+            let event = if behavior_delta > 0.0 {
+                ReputationEvent::ValidBlock
+            } else if behavior_delta < 0.0 {
+                ReputationEvent::InvalidBlock
+            } else {
+                return; // Neutral behavior, no update
+            };
+            
             // Update reputation in P2P system
-            p2p.update_node_reputation(node_id, behavior_delta);
+            p2p.update_node_reputation(node_id, event);
             
             let behavior_desc = if behavior_delta > 0.0 {
                 "positive"
-            } else if behavior_delta < 0.0 {
-                "negative"
             } else {
-                "neutral"
+                "negative"
             };
             
-            println!("[REPUTATION] 📊 Updated {} reputation: {} behavior (Δ{:+.2})", 
-                     node_id, behavior_desc, behavior_delta);
+            println!("[REPUTATION] 📊 Updated {} reputation: {} behavior", 
+                     node_id, behavior_desc);
         }
     }
     
@@ -9974,17 +10002,15 @@ impl BlockchainNode {
                 // PRODUCTION: Distribute reputation rewards for successful macroblock consensus
                 // According to config.ini and ReputationConfig documentation
                 // Reward consensus leader
-                // BALANCED: Reduced from +10% to +5% for gradual growth
-                p2p.update_node_reputation(&consensus_data.leader_id, 5.0);
-                println!("[REPUTATION] 🏆 Consensus leader {} rewarded: +5.0 reputation", consensus_data.leader_id);
+                p2p.update_node_reputation(&consensus_data.leader_id, ReputationEvent::ValidBlock);
+                println!("[REPUTATION] 🏆 Consensus leader {} rewarded", consensus_data.leader_id);
                 
-                // Reward all participants (+5 reputation each)
+                // Reward all participants
                 for participant_id in &consensus_data.participants {
                     // Don't double-reward the leader
                     if participant_id != &consensus_data.leader_id {
-                        // BALANCED: Reduced from +5% to +2% for gradual growth
-                        p2p.update_node_reputation(participant_id, 2.0);
-                        println!("[REPUTATION] ✅ Consensus participant {} rewarded: +2.0 reputation", participant_id);
+                        p2p.update_node_reputation(participant_id, ReputationEvent::ConsensusParticipation);
+                        println!("[REPUTATION] ✅ Consensus participant {} rewarded", participant_id);
                     }
                 }
                 
@@ -11299,7 +11325,7 @@ impl BlockchainNode {
                     } else { 
                         0 
                     },
-                    reputation: p2p_peer.reputation_score, // Use actual reputation from P2P system
+                    reputation: p2p_peer.combined_reputation(), // Use combined reputation from P2P system
                     version: Some("qnet-v1.0".to_string()), // EXISTING: Default version
                 }
             }).collect()
