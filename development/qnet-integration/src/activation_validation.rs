@@ -1719,7 +1719,8 @@ impl BlockchainActivationRegistry {
                     
                     // Add to mempool (blocks will pick it up automatically)
                     let mempool_write = mempool_arc.write().await;
-                    if mempool_write.add_raw_transaction(tx_json, tx_hash_for_mempool.clone()) {
+                    // PRODUCTION: Add with gas_price for priority ordering
+                    if mempool_write.add_raw_transaction(tx_json, tx_hash_for_mempool.clone(), transaction.gas_price) {
                         println!("[REGISTRY] ✅ Activation transaction added to mempool: {}", tx_hash_for_mempool);
                     } else {
                         println!("[REGISTRY] ⚠️ Failed to add activation transaction to mempool (may be full or duplicate)");

@@ -13,6 +13,7 @@ pub mod priority;
 pub mod validation;
 pub mod metrics;
 pub mod simple_mempool;
+pub mod mev_protection;
 
 
 #[cfg(feature = "python")]
@@ -24,6 +25,7 @@ pub use mempool::Mempool;
 pub use priority::TxPriority;
 pub use validation::SimpleValidator;
 pub use simple_mempool::{SimpleMempool, SimpleMempoolConfig};
+pub use mev_protection::{TxBundle, MevProtectedMempool, BundleAllocationConfig};
 
 /// Prelude for common imports
 pub mod prelude {

@@ -147,6 +147,60 @@ is_consensus_qualified() {
 }
 ```
 
+## 🛡️ MEV Protection & Priority Mempool
+
+### Private Bundle Submission (v2.19.3)
+
+| Component | Value | Description |
+|-----------|-------|-------------|
+| **Max TXs per Bundle** | 10 | Prevents block space monopolization |
+| **Reputation Gate** | 80%+ | Proven trustworthy nodes only |
+| **Gas Premium** | +20% | Economic incentive for inclusion |
+| **Max Lifetime** | 60s | 60 microblocks maximum |
+| **Rate Limiting** | 10/min | Per-user anti-spam protection |
+| **Block Allocation** | 0-20% | Dynamic, 80-100% for public TXs |
+| **Signature** | Dilithium3 | Post-quantum verification |
+
+### Priority Mempool (Public TXs)
+
+```
+BTreeMap<gas_price, Vec<TX>>  (highest gas_price first!)
+├── 500,000 nano QNC  → TX_1, TX_2  (processed first)
+├── 200,000 nano QNC  → TX_3, TX_4
+└── 100,000 nano QNC  → TX_5, TX_6  (processed last)
+```
+
+**Min Gas Price**: 100,000 nano QNC (0.0001 QNC base fee)
+
+### API Endpoints
+
+```bash
+# Submit MEV bundle
+POST /api/v1/bundle/submit
+
+# Check bundle status
+GET /api/v1/bundle/{id}/status
+
+# Cancel bundle
+DELETE /api/v1/bundle/{id}
+
+# Mempool status (includes MEV info)
+GET /api/v1/mempool/status
+```
+
+### Block Composition
+
+```
+Dynamic Allocation (per microblock):
+┌────────────────────────────────────┐
+│ MEV Bundles:   0-20% (if demand)  │ ← Dynamic
+│ Public TXs:    80-100% (guaranteed)│ ← Guaranteed
+└────────────────────────────────────┘
+Total: 100% block utilization
+```
+
+**Key**: Public transaction throughput is ALWAYS protected (80% minimum)!
+
 ## 📊 Performance
 
 ### Throughput

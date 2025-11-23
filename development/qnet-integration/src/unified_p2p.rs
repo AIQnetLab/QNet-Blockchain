@@ -113,9 +113,10 @@ pub static EMERGENCY_STOP_TIME: Lazy<Arc<AtomicU64>> =
 static EMERGENCY_FAILOVERS_IN_PROGRESS: Lazy<Arc<DashSet<String>>> = 
     Lazy::new(|| Arc::new(DashSet::new()));
 
-// PRODUCTION: Peer cleanup interval - use existing CERTIFICATE_LIFETIME_SECS pattern
-// Clean up inactive peers after 1 hour (same as certificate lifetime)
-const PEER_INACTIVE_TIMEOUT_SECS: u64 = 3600; // 1 hour - same as hybrid_crypto::CERTIFICATE_LIFETIME_SECS
+// PRODUCTION: Peer cleanup interval
+// Clean up inactive peers after 30 minutes (reasonable timeout for network health)
+// NOTE: Independent from certificate lifetime (270s) - peers can be temporarily inactive
+const PEER_INACTIVE_TIMEOUT_SECS: u64 = 1800; // 30 minutes - balanced cleanup interval
 
 // PRODUCTION: Unified HTTP client settings for consistency and scalability
 const HTTP_CONNECT_TIMEOUT_SECS: u64 = 3;  // Quick connect for P2P
@@ -541,7 +542,7 @@ impl CertificateManager {
             local_certificate: None,
             remote_certificates: HashMap::new(),
             pending_certificates: HashMap::new(),
-            certificate_ttl: Duration::from_secs(14400),  // 4 hours
+            certificate_ttl: Duration::from_secs(540),  // 9 minutes (2× certificate lifetime for multi-rotation cache)
             max_cache_size,
             recently_used: HashSet::new(),
             usage_count: HashMap::new(),
@@ -891,9 +892,8 @@ const KADEMLIA_K: usize = 20;        // K-bucket size
 const KADEMLIA_ALPHA: usize = 3;     // Concurrent queries
 const KADEMLIA_BITS: usize = 256;    // Hash size in bits
 
-// Turbine block propagation constants (Solana-inspired)
+// Turbine block propagation constants
 const TURBINE_CHUNK_SIZE: usize = 1024;      // 1KB chunks (optimal for Dilithium signatures)
-const TURBINE_FANOUT: usize = 4;             // CRITICAL FIX: Increased from 3 to 4 for 5-node Genesis network (faster propagation)
 const TURBINE_REDUNDANCY_FACTOR: f32 = 1.5;  // 50% redundancy for Reed-Solomon
 const TURBINE_MAX_CHUNKS: usize = 64;        // Max chunks per block (64KB max block size)
 
@@ -1337,7 +1337,7 @@ impl SimplifiedP2P {
     }
     
     /// PRODUCTION: Clean up inactive peers to prevent memory leak
-    /// Uses same timeout as certificate lifetime (3600 seconds)
+    /// Uses 30-minute timeout (independent of certificate lifetime)
     pub fn cleanup_inactive_peers(&self) {
         let now = self.current_timestamp();
         let threshold = now.saturating_sub(PEER_INACTIVE_TIMEOUT_SECS);
@@ -3083,9 +3083,14 @@ impl SimplifiedP2P {
         // Generate Reed-Solomon parity chunks (simplified for now)
         let parity_chunks = self.generate_parity_chunks(&chunks, parity_count);
         
+        // ADAPTIVE FANOUT: Calculate optimal fanout based on network size and latency
+        let turbine_fanout = self.get_turbine_fanout();
+        
         if height % 10 == 0 {
-            println!("[TURBINE] 🚀 Broadcasting block #{} as {} chunks + {} parity ({}x reduction in bandwidth)", 
-                     height, total_chunks, parity_count, validated_peers.len() / TURBINE_FANOUT);
+            let avg_latency = self.get_average_peer_latency();
+            let producers = self.get_qualified_producers_count();
+            println!("[TURBINE] 🚀 Broadcasting block #{} as {} chunks + {} parity (fanout={}, producers={}, latency={}ms)", 
+                     height, total_chunks, parity_count, turbine_fanout, producers, avg_latency);
         }
         
         // Build Kademlia-based routing tree for each chunk
@@ -3104,8 +3109,8 @@ impl SimplifiedP2P {
                 is_parity: false,
             };
             
-            // Select TURBINE_FANOUT peers for this chunk using Kademlia distance
-            let target_peers = self.select_turbine_targets(&routing_tree, chunk_index, TURBINE_FANOUT);
+            // Select adaptive fanout peers for this chunk using Kademlia distance
+            let target_peers = self.select_turbine_targets(&routing_tree, chunk_index, turbine_fanout);
             
             for peer in target_peers {
                 let peer_addr = peer.addr.clone();
@@ -3129,8 +3134,8 @@ impl SimplifiedP2P {
                 is_parity: true,
             };
             
-            // Different peers for parity chunks for redundancy
-            let target_peers = self.select_turbine_targets(&routing_tree, total_chunks + parity_index, TURBINE_FANOUT);
+            // Different peers for parity chunks for redundancy (use same adaptive fanout)
+            let target_peers = self.select_turbine_targets(&routing_tree, total_chunks + parity_index, turbine_fanout);
             
             for peer in target_peers {
                 let peer_addr = peer.addr.clone();
@@ -3312,13 +3317,14 @@ impl SimplifiedP2P {
             return;
         }
         
-        // Select TURBINE_FANOUT peers to forward to (excluding sender)
+        // Select adaptive fanout peers to forward to (excluding sender)
         let validated_peers = self.get_validated_active_peers();
         let routing_tree = self.build_turbine_routing_tree(&validated_peers);
+        let turbine_fanout = self.get_turbine_fanout();
         
         let forward_targets: Vec<_> = routing_tree.iter()
             .filter(|p| p.addr != original_sender)
-            .take(TURBINE_FANOUT)
+            .take(turbine_fanout)
             .cloned()
             .collect();
         
@@ -5162,6 +5168,76 @@ impl SimplifiedP2P {
             0.5  // Degraded
         } else {
             0.0  // Isolated (not necessarily bad for standalone)
+        }
+    }
+    
+    /// Get count of qualified producers (consensus_score >= 70%)
+    /// CRITICAL: Used for adaptive Turbine fanout calculation
+    /// SCALABILITY: Counts only Super and Full nodes (Light nodes excluded)
+    pub fn get_qualified_producers_count(&self) -> usize {
+        // Count peers that meet Byzantine threshold for consensus
+        self.connected_peers_lockfree.iter()
+            .filter(|entry| entry.value().is_consensus_qualified())
+            .count()
+    }
+    
+    /// Get average peer latency for network performance estimation
+    /// CRITICAL: Used for adaptive Turbine fanout calculation
+    /// Returns average latency_ms across all qualified producers
+    pub fn get_average_peer_latency(&self) -> u64 {
+        let qualified_peers: Vec<u32> = self.connected_peers_lockfree.iter()
+            .filter(|entry| entry.value().is_consensus_qualified())
+            .map(|entry| entry.value().latency_ms)
+            .collect();
+        
+        if qualified_peers.is_empty() {
+            // Default: assume regional latency (50ms) if no peers available
+            return 50;
+        }
+        
+        // Calculate average latency
+        let sum: u64 = qualified_peers.iter().map(|&l| l as u64).sum();
+        sum / qualified_peers.len() as u64
+    }
+    
+    /// Calculate adaptive Turbine fanout based on network size and latency
+    /// ARCHITECTURE: Balance between propagation speed and bandwidth usage
+    /// CRITICAL: Ensures blocks propagate within 50% of block time (500ms for 1s blocks)
+    /// 
+    /// Formula rationale:
+    /// - Genesis (5-50 producers): fanout=4 → 2 hops × latency
+    /// - Small (51-200 producers, LAN <50ms): fanout=8 → 3 hops × latency = ~150ms ✅
+    /// - Small (51-200 producers, WAN >50ms): fanout=16 → 2 hops × latency = ~400ms ✅
+    /// - Medium (201-1000 producers, LAN <50ms): fanout=8 → 4 hops × latency = ~200ms ✅
+    /// - Medium (201-1000 producers, WAN >50ms): fanout=16 → 3 hops × latency = ~600ms ✅
+    /// - Large (>1000 producers): fanout=32 → 3 hops for 32K nodes
+    pub fn get_turbine_fanout(&self) -> usize {
+        let producers = self.get_qualified_producers_count();
+        let latency = self.get_average_peer_latency();
+        
+        // ARCHITECTURE: Adaptive fanout ensures < 50% block time propagation
+        match (producers, latency) {
+            // GENESIS PHASE (5-50 producers):
+            // fanout=4 provides 2 hops for 16 nodes, 3 hops for 64 nodes
+            // Latency impact: 2-3 hops × latency < 500ms for any latency
+            (0..=50, _) => 4,
+            
+            // SMALL NETWORK (51-200 producers):
+            // LAN (<50ms): fanout=8 → 3 hops = 150ms ✅
+            // WAN (>50ms): fanout=16 → 2 hops = 400ms ✅
+            (51..=200, 0..=50) => 8,
+            (51..=200, _) => 16,
+            
+            // MEDIUM NETWORK (201-1000 producers):
+            // LAN (<50ms): fanout=8 → 4 hops = 200ms ✅
+            // WAN (>50ms): fanout=16 → 3 hops = 600ms ✅
+            (201..=1000, 0..=50) => 8,
+            (201..=1000, _) => 16,
+            
+            // LARGE NETWORK (>1000 producers - future-proof):
+            // fanout=32 → 3 hops for 32,768 nodes
+            // Even at 200ms WAN latency: 3 × 200ms = 600ms < 1000ms ✅
+            _ => 32,
         }
     }
     
@@ -7168,8 +7244,9 @@ impl SimplifiedP2P {
                 let now = self.current_timestamp();
                 let cert_age = now.saturating_sub(cert.issued_at);
                 
-                // Maximum age: 2 hours (certificate lifetime is 1 hour + 1 hour grace period)
-                const MAX_CERT_AGE: u64 = 7200; // 2 hours in seconds
+                // Maximum age: 9 minutes (certificate lifetime is 4.5 min + 4.5 min grace period)
+                // SECURITY: Prevents replay attacks while allowing propagation time
+                const MAX_CERT_AGE: u64 = 540; // 9 minutes (2× certificate lifetime)
                 if cert_age > MAX_CERT_AGE {
                     println!("[P2P] ❌ Certificate too old (possible replay attack)");
                     println!("[P2P]    Certificate age: {} seconds", cert_age);
@@ -8205,6 +8282,32 @@ impl SimplifiedP2P {
             };
             println!("[P2P] 🔐 Set absolute reputation for {}: {:.1}% (saved)", display_id, reputation);
         }
+    }
+    
+    /// Get combined reputation score for a node (consensus_score * 0.7 + network_score * 0.3)
+    /// MEV PROTECTION: Used for bundle submission reputation checks
+    /// Returns 70.0 (default consensus threshold) if peer not found
+    pub fn get_node_combined_reputation(&self, node_id: &str) -> f64 {
+        // First check peer_id_to_addr index for O(1) lookup
+        if let Some(addr_entry) = self.peer_id_to_addr.get(node_id) {
+            let addr = addr_entry.value().clone();
+            drop(addr_entry); // Release lock before next lookup
+            
+            // Get peer info from connected_peers_lockfree
+            if let Some(peer_entry) = self.connected_peers_lockfree.get(&addr) {
+                return peer_entry.value().combined_reputation();
+            }
+        }
+        
+        // Fallback: iterate connected_peers_lockfree (slower but comprehensive)
+        for entry in self.connected_peers_lockfree.iter() {
+            if entry.value().id == node_id {
+                return entry.value().combined_reputation();
+            }
+        }
+        
+        // Not found: return default consensus threshold
+        70.0
     }
     
     /// PRODUCTION: Check if node is banned
@@ -9932,6 +10035,8 @@ impl SimplifiedP2P {
     
     /// PRODUCTION: Handle reputation synchronization from peers
     fn handle_reputation_sync(&self, from_node: String, reputation_updates: Vec<(String, f64)>, timestamp: u64, signature: Vec<u8>) {
+        use sha3::{Sha3_256, Digest}; // For gossip propagation
+        
         // PRIVACY: Use pseudonym for logging
         let from_display = if from_node.starts_with("genesis_node_") || from_node.starts_with("node_") {
             from_node.clone()
@@ -9951,8 +10056,9 @@ impl SimplifiedP2P {
         }
         
         // PRODUCTION: Apply weighted average of reputations from multiple sources
+        let mut significant_updates = 0;
         if let Ok(mut reputation_system) = self.reputation_system.lock() {
-            for (node_id, new_reputation) in reputation_updates {
+            for (node_id, new_reputation) in &reputation_updates {
                 let current = reputation_system.get_reputation(&node_id);
                 
                 // PRODUCTION: Use weighted average (70% local, 30% remote) to prevent manipulation
@@ -9961,6 +10067,7 @@ impl SimplifiedP2P {
                 // Only update if change is significant (>1%)
                 if (weighted_reputation - current).abs() > 1.0 {
                     reputation_system.set_reputation(&node_id, weighted_reputation);
+                    significant_updates += 1;
                     
                     // PRIVACY: Use pseudonyms for logging
                     let node_display = if node_id.starts_with("genesis_node_") || node_id.starts_with("node_") {
@@ -9973,6 +10080,98 @@ impl SimplifiedP2P {
                             node_display, current, weighted_reputation, from_display);
                 }
             }
+        }
+        
+        // GOSSIP PROPAGATION: Re-gossip to random peers (exponential propagation!)
+        // ARCHITECTURE: This is the KEY to O(log n) complexity
+        // Each node that receives gossip re-sends to fanout peers
+        // Example: 1 → 4 → 16 → 64 → 256 → 1024 → 4096 (7 hops for 4K nodes)
+        if significant_updates > 0 {
+            // RE-GOSSIP: Forward to RANDOM subset of peers (exclude sender!)
+            let peers = self.get_validated_active_peers();
+            
+            // Filter qualified peers (exclude Light nodes and sender)
+            let qualified_peers: Vec<_> = peers.iter()
+                .filter(|p| {
+                    p.node_type != NodeType::Light && 
+                    p.is_consensus_qualified() &&
+                    p.id != from_node // DON'T send back to sender!
+                })
+                .collect();
+            
+            if qualified_peers.is_empty() {
+                return; // No peers to re-gossip
+            }
+            
+            // ADAPTIVE FANOUT: Use same logic as initial gossip
+            let gossip_fanout = self.get_turbine_fanout(); // Reuse existing method!
+            
+            // KADEMLIA RANDOM SELECTION: Select diverse peers
+            let mut selection_hasher = Sha3_256::new();
+            selection_hasher.update(self.node_id.as_bytes());
+            selection_hasher.update(&timestamp.to_le_bytes());
+            selection_hasher.update(b"QNET_REGOSSIP_V1");
+            let selection_seed = selection_hasher.finalize();
+            
+            let mut sorted_peers: Vec<_> = qualified_peers.into_iter().cloned().collect();
+            sorted_peers.sort_by_key(|peer| {
+                // XOR distance (Kademlia-like)
+                let mut peer_hasher = Sha3_256::new();
+                peer_hasher.update(peer.id.as_bytes());
+                peer_hasher.update(&selection_seed);
+                let peer_hash = peer_hasher.finalize();
+                u64::from_le_bytes([
+                    peer_hash[0], peer_hash[1], peer_hash[2], peer_hash[3],
+                    peer_hash[4], peer_hash[5], peer_hash[6], peer_hash[7],
+                ])
+            });
+            
+            // Select top-N peers for re-gossip
+            let gossip_targets: Vec<_> = sorted_peers.into_iter()
+                .take(gossip_fanout)
+                .collect();
+            
+            // RE-GOSSIP: Forward message to selected peers (async, non-blocking)
+            let sync_msg = NetworkMessage::ReputationSync {
+                node_id: from_node.clone(), // Keep ORIGINAL sender for signature verification
+                reputation_updates: reputation_updates.clone(),
+                timestamp,
+                signature: signature.clone(),
+            };
+            
+            let message_json = match serde_json::to_string(&sync_msg) {
+                Ok(json) => json,
+                Err(e) => {
+                    println!("[REPUTATION] ❌ Failed to serialize re-gossip message: {}", e);
+                    return;
+                }
+            };
+            
+            // Send re-gossip messages asynchronously
+            let mut regossip_count = 0;
+            for peer in gossip_targets {
+                // Use HTTP POST (same as initial gossip)
+                let message_clone = message_json.clone();
+                let peer_addr = peer.addr.clone();
+                
+                // Spawn async task (non-blocking)
+                std::thread::spawn(move || {
+                    if let Ok(client) = reqwest::blocking::Client::builder()
+                        .timeout(Duration::from_secs(5))
+                        .build() {
+                        let url = format!("http://{}/api/v1/p2p/message", peer_addr);
+                        let _ = client.post(&url)
+                            .header("Content-Type", "application/json")
+                            .body(message_clone)
+                            .send();
+                    }
+                });
+                
+                regossip_count += 1;
+            }
+            
+            println!("[REPUTATION] 🌐 Re-gossiped {} updates to {} peers (fanout={})", 
+                     significant_updates, regossip_count, gossip_fanout);
         }
     }
     
@@ -10243,25 +10442,76 @@ impl SimplifiedP2P {
                     }
                 };
                 
-                // Send to all connected peers
+                // GOSSIP PROTOCOL: Send to RANDOM subset of peers (NOT broadcast!)
+                // ARCHITECTURE: O(log n) complexity vs O(n) broadcast
+                // SCALABILITY: Supports millions of nodes with exponential propagation
                 let peers = match connected_peers.read() {
                     Ok(peers) => peers.clone(),
                     Err(poisoned) => poisoned.into_inner().clone(),
                 };
                 
-                // PRODUCTION: Use HTTP gossip protocol (NOT TCP) for reputation sync
-                // ARCHITECTURE: HTTP is more reliable in WAN/Docker environments
-                // SCALABILITY: Reuses existing HTTP connection pool for millions of nodes
-                let mut successful = 0;
-                for (_addr, peer) in peers {
-                    // CRITICAL: Light nodes DON'T participate in reputation consensus
-                    // Only sync with Super and Full nodes
-                    if peer.node_type == NodeType::Light {
-                        continue;
-                    }
+                // Filter qualified Super/Full nodes (Light nodes excluded)
+                let qualified_peers: Vec<_> = peers.iter()
+                    .filter(|(_, peer)| {
+                        peer.node_type != NodeType::Light && peer.is_consensus_qualified()
+                    })
+                    .collect();
+                
+                if qualified_peers.is_empty() {
+                    println!("[REPUTATION] ⚠️ No qualified peers for gossip sync - skipping iteration #{}", iteration);
+                    continue;
+                }
+                
+                // ADAPTIVE FANOUT: Use same fanout as Turbine for consistency
+                // PRODUCTION: Fanout=4 (small network) to fanout=32 (large network)
+                let gossip_fanout = {
+                    let producers = qualified_peers.len();
+                    let avg_latency = connected_peers_lockfree.iter()
+                        .filter(|e| e.value().is_consensus_qualified())
+                        .map(|e| e.value().latency_ms as u64)
+                        .sum::<u64>() / qualified_peers.len().max(1) as u64;
                     
-                    // Use HTTP POST via existing send_network_message (NOT raw TCP!)
-                    // This ensures consistent error handling, retries, and connection pooling
+                    // Same logic as get_turbine_fanout() (unified_p2p.rs:10715-10731)
+                    match (producers, avg_latency) {
+                        (0..=50, _) => 4,
+                        (51..=200, 0..=50) => 8,
+                        (51..=200, _) => 16,
+                        (201..=1000, 0..=50) => 8,
+                        (201..=1000, _) => 16,
+                        _ => 32,
+                    }
+                };
+                
+                // KADEMLIA-BASED RANDOM SELECTION: Use XOR distance for peer diversity
+                // ARCHITECTURE: Same as Turbine routing (no duplication)
+                let mut selection_hasher = Sha3_256::new();
+                selection_hasher.update(node_id.as_bytes());
+                selection_hasher.update(&iteration.to_le_bytes());
+                selection_hasher.update(b"QNET_GOSSIP_REPUTATION_V1");
+                let selection_seed = selection_hasher.finalize();
+                
+                let mut sorted_peers: Vec<_> = qualified_peers.into_iter().collect();
+                sorted_peers.sort_by_key(|(addr, _)| {
+                    // XOR distance from selection_seed (Kademlia-like)
+                    let mut peer_hasher = Sha3_256::new();
+                    peer_hasher.update(addr.as_bytes());
+                    peer_hasher.update(&selection_seed);
+                    let peer_hash = peer_hasher.finalize();
+                    u64::from_le_bytes([
+                        peer_hash[0], peer_hash[1], peer_hash[2], peer_hash[3],
+                        peer_hash[4], peer_hash[5], peer_hash[6], peer_hash[7],
+                    ])
+                });
+                
+                // Select top-N peers by Kademlia distance
+                let gossip_targets: Vec<_> = sorted_peers.into_iter()
+                    .take(gossip_fanout)
+                    .collect();
+                
+                // Send gossip messages to selected peers
+                let mut successful = 0;
+                for (_addr, peer) in gossip_targets {
+                    // Use HTTP POST for reliability (same as before)
                     if let Ok(client) = reqwest::blocking::Client::builder()
                         .timeout(Duration::from_secs(5))
                         .build() {
@@ -10276,8 +10526,8 @@ impl SimplifiedP2P {
                 }
                 
                 if successful > 0 {
-                    println!("[REPUTATION] 📤 Sync #{}: Broadcasted {} reputations to {} peers", 
-                             iteration, reputation_updates.len(), successful);
+                    println!("[REPUTATION] 🌐 Gossip #{}: Sent {} reputations to {}/{} peers (fanout={})", 
+                             iteration, reputation_updates.len(), successful, gossip_fanout, gossip_fanout);
                 }
             }
         });

@@ -66,7 +66,7 @@ impl Default for MempoolConfig {
         Self {
             max_size,
             max_per_account,
-            min_gas_price: 1,
+            min_gas_price: 100_000, // PRODUCTION: 0.0001 QNC (BASE_FEE_NANO_QNC)
             tx_expiry: Duration::from_secs(1800), // 30 minutes for faster turnover
             eviction_interval: Duration::from_secs(30), // More frequent cleanup
             enable_priority_senders: true,

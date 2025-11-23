@@ -41,7 +41,7 @@ impl Default for DefaultEvictionPolicy {
     fn default() -> Self {
         Self {
             max_age: Duration::from_secs(3600),
-            min_gas_price: 1,
+            min_gas_price: 100_000, // PRODUCTION: 0.0001 QNC (BASE_FEE_NANO_QNC)
             strategy: EvictionStrategy::Combined,
         }
     }

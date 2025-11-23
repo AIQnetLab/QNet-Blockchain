@@ -19,8 +19,8 @@ const FAST_SYNC_THRESHOLD: u64 = 10; // Trigger fast sync if behind by 10+ block
 const FAST_SYNC_TIMEOUT_SECS: u64 = 60; // Fast sync timeout
 const BACKGROUND_SYNC_TIMEOUT_SECS: u64 = 30; // Background sync timeout
 const SYNC_DEADLOCK_TIMEOUT_SECS: u64 = 60; // Timeout for detecting stuck sync operations
-const SNAPSHOT_FULL_INTERVAL: u64 = 10000; // Full snapshot every 10k blocks
-const SNAPSHOT_INCREMENTAL_INTERVAL: u64 = 1000; // Incremental snapshot every 1k blocks
+const SNAPSHOT_FULL_INTERVAL: u64 = 43200; // Full snapshot every 12 hours (43,200 microblocks = 480 macroblocks)
+const SNAPSHOT_INCREMENTAL_INTERVAL: u64 = 3600; // Incremental snapshot every 1 hour (3,600 microblocks = 40 macroblocks)
 const API_HEALTH_CHECK_RETRIES: u32 = 5; // API health check attempts
 const API_HEALTH_CHECK_DELAY_SECS: u64 = 2; // Delay between health checks
 
@@ -446,6 +446,10 @@ pub struct BlockchainNode {
     
     // Malicious behavior detection
     signed_block_tracker: Arc<SignedBlockTracker>,
+    
+    // MEV PROTECTION: Optional private bundle mempool (0-20% dynamic allocation)
+    // ARCHITECTURE: Protects critical transactions (DeFi, arbitrage) from front-running
+    mev_mempool: Option<Arc<qnet_mempool::MevProtectedMempool>>,
     
     // Rotation tracking for atomic rewards
     rotation_tracker: Arc<RotationTracker>,
@@ -1487,6 +1491,31 @@ impl BlockchainNode {
         let (block_event_tx, _block_event_rx) = tokio::sync::broadcast::channel(100);
         println!("[BlockEvents] 📡 Initialized event-based block notification system");
         
+        // MEV PROTECTION: Initialize optional private bundle mempool
+        // ARCHITECTURE: Dynamic 0-20% allocation protects public TX throughput
+        let mev_mempool = if env::var("QNET_ENABLE_MEV_PROTECTION").unwrap_or_default() == "1" {
+            let bundle_config = qnet_mempool::BundleAllocationConfig {
+                min_allocation: 0.0,     // 0% minimum (no reservation when no demand)
+                max_allocation: 0.20,    // 20% maximum (protects public TXs ≥80%)
+                max_txs_per_bundle: 10,  // Max 10 TXs per bundle (Ethereum standard)
+                min_reputation: 80.0,    // 80% reputation required (anti-spam)
+                gas_premium: 1.20,       // +20% gas (compensates block space inefficiency)
+                max_lifetime_sec: 60,    // 60 seconds max (prevents mempool bloat)
+                submission_fanout: 3,    // Submit to 3 producers (load distribution)
+            };
+            
+            let mev_pool = Arc::new(qnet_mempool::MevProtectedMempool::new(
+                mempool.clone(),
+                bundle_config,
+            ));
+            
+            println!("[MEV] ✅ MEV protection enabled: 0-20% dynamic allocation");
+            Some(mev_pool)
+        } else {
+            println!("[MEV] ℹ️  MEV protection disabled (public mempool only)");
+            None
+        };
+        
         let blockchain = Self {
             storage,
             state,
@@ -1499,6 +1528,7 @@ impl BlockchainNode {
             node_type,
             region,
             signed_block_tracker: Arc::new(SignedBlockTracker::new()),
+            mev_mempool,
             rotation_tracker: Arc::new(RotationTracker::new()),
             p2p_port,
             bootstrap_peers,
@@ -1555,6 +1585,27 @@ impl BlockchainNode {
                 block_event_tx_for_blocks,
             ).await;
         });
+        
+        // MEV PROTECTION: Start periodic bundle cleanup task
+        if let Some(ref mev_pool) = blockchain.mev_mempool {
+            let mev_pool_for_cleanup = mev_pool.clone();
+            tokio::spawn(async move {
+                println!("[MEV] 🧹 Started periodic bundle cleanup task (every 30s)");
+                loop {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    
+                    let current_time = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs();
+                    
+                    let removed = mev_pool_for_cleanup.cleanup_expired_bundles(current_time);
+                    if removed > 0 {
+                        println!("[MEV] 🗑️ Cleaned up {} expired bundles", removed);
+                    }
+                }
+            });
+        }
         
         // Register Genesis nodes in reward system and start processing
         if std::env::var("QNET_BOOTSTRAP_ID").is_ok() {
@@ -3487,6 +3538,7 @@ impl BlockchainNode {
         
         let is_running = self.is_running.clone();
         let mempool = self.mempool.clone();
+        let mev_mempool = self.mev_mempool.clone();
         let storage = self.storage.clone();
         let height = self.height.clone();
         let unified_p2p = self.unified_p2p.clone();
@@ -3978,14 +4030,15 @@ impl BlockchainNode {
                 }
                 
                 // ADAPTIVE CERTIFICATE BROADCAST: Aggressive → Moderate → Conservative
-                // Solves certificate race condition while remaining scalable
+                // ARCHITECTURE: Aligned with certificate lifetime (270s = 4.5 minutes)
+                // Ensures certificates propagate before expiration (54s grace period)
                 let uptime_secs = node_start_time.elapsed().as_secs();
                 let broadcast_interval = if uptime_secs < 120 {
-                    10  // First 2 minutes: every 10 seconds (AGGRESSIVE - solve race condition)
-                } else if uptime_secs < 600 {
-                    60  // 2-10 minutes: every 60 seconds (MODERATE - catch stragglers)
+                    10  // First 2 minutes: every 10 seconds (AGGRESSIVE - critical initial propagation)
+                } else if uptime_secs < 300 {
+                    30  // 2-5 minutes: every 30 seconds (MODERATE - covers 1+ cert lifetime)
                 } else {
-                    300  // After 10 minutes: every 5 minutes (CONSERVATIVE - maintenance only)
+                    120  // After 5 minutes: every 2 minutes (CONSERVATIVE - maintenance, ~50% of lifetime)
                 };
                 
                 if certificate_broadcast_counter >= broadcast_interval && node_type != NodeType::Light {
@@ -4985,9 +5038,82 @@ impl BlockchainNode {
                         }
                     }
                     
-                    // Get transactions from mempool using batch processing
-                    // NOTE: If emission block, mempool now contains emission transaction as FIRST tx
-                    let tx_jsons = {
+                    // MEV PROTECTION: Get transactions with bundle priority
+                    // ARCHITECTURE: Dynamic 0-20% allocation for bundles, 80-100% for public TXs
+                    // NOTE: If emission block, mempool contains emission transaction as FIRST tx
+                    let tx_jsons = if let Some(ref mev_pool) = mev_mempool {
+                        // MEV-AWARE BLOCK BUILDING
+                        let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                        let mut block_txs = Vec::new();
+                        
+                        // STEP 1: BUNDLE TXS (dynamic 0-20% allocation)
+                        // OPTIMIZATION: Single call to get bundles + allocation (no double filtering!)
+                        let (valid_bundles, bundle_allocation) = mev_pool.get_bundles_with_allocation(
+                            max_tx_per_microblock, 
+                            current_time, 
+                            1000
+                        );
+                        
+                        // Track actual bundle TX count for accurate metrics
+                        let mut bundle_tx_count = 0;
+                        
+                        for bundle in valid_bundles {
+                            if block_txs.len() + bundle.transactions.len() <= bundle_allocation {
+                                // ATOMICITY: Check ALL TXs exist before including bundle
+                                let mut all_txs_exist = true;
+                                let mut bundle_txs = Vec::new();
+                                
+                                for tx_hash in &bundle.transactions {
+                                    if let Some(tx_json) = mempool.read().await.get_raw_transaction(tx_hash) {
+                                        bundle_txs.push(tx_json);
+                                    } else {
+                                        println!("[MEV] ⚠️ Bundle {} rejected: TX {} not found in mempool", 
+                                                 bundle.bundle_id, tx_hash);
+                                        all_txs_exist = false;
+                                        break; // Stop checking
+                                    }
+                                }
+                                
+                                // Only include bundle if ALL TXs exist (atomic!)
+                                if all_txs_exist {
+                                    let bundle_len = bundle_txs.len();
+                                    block_txs.extend(bundle_txs);
+                                    bundle_tx_count += bundle_len;
+                                    println!("[MEV] ✅ Included bundle {} ({} TXs) at block #{}", 
+                                             bundle.bundle_id, bundle_len, next_block_height);
+                                }
+                            } else {
+                                break; // Bundle space exhausted
+                            }
+                        }
+                        
+                        // STEP 2: PUBLIC TXS (remaining 80-100% space)
+                        let remaining_space = max_tx_per_microblock.saturating_sub(block_txs.len());
+                        if remaining_space > 0 {
+                            let public_txs = {
+                                let mempool_guard = mempool.read().await;
+                                mempool_guard.get_pending_transactions(remaining_space)
+                            };
+                            block_txs.extend(public_txs);
+                        }
+                        
+                        // METRICS: Accurate bundle vs public TX counts
+                        let public_tx_count = block_txs.len().saturating_sub(bundle_tx_count);
+                        if bundle_tx_count > 0 {
+                            let bundle_percent = (bundle_tx_count as f64 / block_txs.len() as f64) * 100.0;
+                            let public_percent = (public_tx_count as f64 / block_txs.len() as f64) * 100.0;
+                            println!("[MEV] 📊 Block #{}: {} bundle TXs ({:.1}%), {} public TXs ({:.1}%), {} total", 
+                                     next_block_height, 
+                                     bundle_tx_count,
+                                     bundle_percent,
+                                     public_tx_count,
+                                     public_percent,
+                                     block_txs.len());
+                        }
+                        
+                        block_txs
+                    } else {
+                        // NO MEV PROTECTION: Use public mempool only
                         let mempool_guard = mempool.read().await;
                         mempool_guard.get_pending_transactions(max_tx_per_microblock)
                     };
@@ -5306,9 +5432,10 @@ impl BlockchainNode {
                             // Periodic broadcast (every 30 seconds) is sufficient for certificate distribution
                             // This reduces network load and prevents rate limit warnings
                             
-                            // PRODUCTION: Broadcast certificate after rotation (every 3600 blocks = 1 hour)
+                            // PRODUCTION: Broadcast certificate after rotation (every 270 blocks = 4.5 minutes)
                             // IMPORTANT: Use microblock.height (which equals next_block_height), not microblock_height
-                            if microblock.height > 10 && microblock.height % 3600 == 1 {
+                            // ARCHITECTURE: Aligns with certificate lifetime (270s = 3 macroblocks)
+                            if microblock.height > 10 && microblock.height % 270 == 1 {
                                 if let Some(ref p2p) = unified_p2p {
                                     use crate::hybrid_crypto::GLOBAL_HYBRID_INSTANCES;
                                     
@@ -5613,7 +5740,7 @@ impl BlockchainNode {
                         println!("[BLOCK] ✅ Rotation complete at #{} | Next producer will be selected", microblock_height);
                     }
                     
-                    // PRODUCTION: Create incremental snapshots every 1,000 blocks, full every 10,000
+                    // PRODUCTION: Create incremental snapshots every 1 hour (3,600 blocks), full every 12 hours (43,200 blocks)
                     if microblock_height % SNAPSHOT_INCREMENTAL_INTERVAL == 0 && microblock_height > 0 {
                         // Create snapshot synchronously (avoids Send issues with RocksDB)
                         // This is fast enough to not block production
@@ -9416,9 +9543,10 @@ impl BlockchainNode {
                 }
                 Err(e) => {
                     println!("[CRYPTO] ❌ Dilithium verification error: {}", e);
-                    // Bootstrap phase tolerance for initial network setup
-                    if microblock.height < 100 {
-                        println!("[CRYPTO] ⚠️  Bootstrap phase (block #{}) - allowing for network initialization", microblock.height);
+                    // Bootstrap phase tolerance for initial network setup, only for Genesis nodes
+                    // SECURITY: Limited to genesis_node_* producers only to prevent bypass exploitation
+                    if microblock.height < 100 && microblock.producer.starts_with("genesis_node_") {
+                        println!("[CRYPTO] ⚠️  Bootstrap phase (block #{}) - allowing Genesis node for network initialization", microblock.height);
                         return Ok(true);
                     }
                     return Ok(false);
@@ -10261,6 +10389,21 @@ impl BlockchainNode {
         Ok(mempool.size())
     }
     
+    /// Get mempool Arc for RPC access
+    pub fn get_mempool(&self) -> Arc<tokio::sync::RwLock<qnet_mempool::SimpleMempool>> {
+        self.mempool.clone()
+    }
+    
+    /// Get MEV mempool if enabled
+    pub fn get_mev_mempool(&self) -> Option<Arc<qnet_mempool::MevProtectedMempool>> {
+        self.mev_mempool.clone()
+    }
+    
+    /// Get P2P for reputation lookups
+    pub fn get_p2p(&self) -> Option<Arc<SimplifiedP2P>> {
+        self.unified_p2p.clone()
+    }
+    
     pub async fn get_block(&self, height: u64) -> Result<Option<qnet_state::Block>, QNetError> {
         // CRITICAL FIX: We store MicroBlocks, not Blocks
         // Convert MicroBlock to Block format for API compatibility
@@ -10398,7 +10541,8 @@ impl BlockchainNode {
             let mut mempool = self.mempool.write().await;
             let tx_json = serde_json::to_string(&tx).unwrap();
             let tx_hash = format!("{:x}", sha3::Sha3_256::digest(tx_json.as_bytes()));
-            mempool.add_raw_transaction(tx_json, tx_hash);
+            // PRODUCTION: Add with gas_price for priority ordering (anti-spam protection)
+            mempool.add_raw_transaction(tx_json, tx_hash, tx.gas_price);
         }
         
         // Broadcast to network only after successful validation
@@ -12165,6 +12309,7 @@ impl Clone for BlockchainNode {
             node_type: self.node_type,
             region: self.region,
             signed_block_tracker: self.signed_block_tracker.clone(),
+            mev_mempool: self.mev_mempool.clone(),
             rotation_tracker: self.rotation_tracker.clone(),
             p2p_port: self.p2p_port,
             bootstrap_peers: self.bootstrap_peers.clone(),

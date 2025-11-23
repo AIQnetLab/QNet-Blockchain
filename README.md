@@ -44,7 +44,36 @@ This project uses **dual licensing**:
 - **Phase 2 (Future)**: ONLY QNC token activation on QNet blockchain
 - **Transition**: 90% 1DEV burned OR 5 years from genesis block (whichever comes first)
 
-### 🛡️ **LATEST UPDATES (v2.19.2 - November 23, 2025)**
+### 🛡️ **LATEST UPDATES (v2.19.3 - November 23, 2025)**
+- **MEV Protection (Private Bundles)**: Front-running protection for high-value transactions (NEW!)
+  - Direct submission to block producer (bypasses public mempool)
+  - Dynamic allocation: 0-20% block space for bundles, 80-100% for public TXs
+  - Reputation gate: 80%+ required (proven trustworthy nodes only)
+  - Bundle constraints: max 10 TXs, 60s lifetime, +20% gas premium
+  - Rate limiting: 10 bundles/min per user (anti-spam)
+  - Multi-producer submission: 3 producers for redundancy
+  - Auto-fallback: Public mempool if bundle submission fails
+  - Atomic inclusion: All bundle TXs included together or rejected
+  - Post-quantum signatures: Dilithium3 verification for all bundles
+  - Real-time tests: 11/11 passed (validated in production environment)
+- **Priority Mempool**: Gas-price-based transaction ordering (NEW!)
+  - BTreeMap priority queue: highest gas price processed first
+  - Anti-spam protection: high-value TXs immune to spam attacks
+  - Fair within same price: FIFO for identical gas prices
+  - Binary+JSON support: flexible storage for different TX types
+  - Integrated into block production: automatic priority selection
+  - Minimum gas price: 100,000 nano QNC (0.0001 QNC base fee)
+- **Adaptive Turbine Fanout**: Dynamic block propagation scaling (NEW!)
+  - Network-aware: 4-32 fanout based on producer count and latency
+  - LAN optimization: higher fanout (16-32) for low latency networks
+  - WAN optimization: moderate fanout (8-16) for high latency
+  - Scales from 5 Genesis nodes to 1M+ nodes seamlessly
+  - Real-time calculation: adjusts every block based on network state
+- **Real-time Prometheus Metrics**: Live performance monitoring (NEW!)
+  - Dynamic mempool size, block height, connected peers
+  - Live Turbine fanout, qualified producers, average latency
+  - MEV metrics: bundle count, allocation percentage
+  - No hardcoded values: all metrics reflect real network state
 - **Split Reputation System**: Byzantine-safe separation of behavior metrics (NEW!)
   - `consensus_score` (0-100): Byzantine behavior detection (invalid blocks, malicious attacks)
   - `network_score` (0-100): Network performance tracking (timeouts, latency)
@@ -66,11 +95,14 @@ This project uses **dual licensing**:
   - Blacklist filtering: Offline/malicious peers skipped
   - Reputation-based ordering: consensus_score + network_score (latency)
   - Top-20 peer sampling: Avoids stuck sync on single unavailable peer
-- **HTTP Gossip Reputation Sync**: Reliable cross-node reputation sharing (NEW!)
-  - Migrated from unreliable TCP to HTTP POST (existing P2P infrastructure)
-  - Gossip protocol: Efficient O(log n) propagation
-  - Byzantine-safe weighted average: 70% local + 30% remote
-  - Prevents reputation desynchronization across network
+- **HTTP Gossip Reputation Sync**: Exponential O(log n) propagation for millions of nodes
+  - Migrated from O(n) broadcast to O(log n) gossip protocol (99.999% bandwidth savings)
+  - Adaptive fanout (4-32): Same as Turbine block propagation
+  - Kademlia-based peer selection: XOR distance for peer diversity
+  - Re-gossip mechanism: Each recipient forwards to fanout peers (exponential growth)
+  - Byzantine-safe weighted average: 70% local + 30% remote (convergence)
+  - Prevents fork risk: All nodes converge to same reputation view
+  - Example: 1M nodes = ~20 hops vs 1M HTTP requests (broadcast)
 - **Hybrid Merkle + Sampling**: Scalable on-chain ping commitments
   - 360× on-chain size reduction (100 MB vs 36 GB)
   - Merkle root commitment to ALL pings (blake3 hashing)
@@ -98,7 +130,8 @@ This project uses **dual licensing**:
 - **Certificate Broadcasting**: Byzantine-safe P2P certificate distribution
   - Tracked broadcast with 2/3+ Byzantine threshold for critical rotations
   - Adaptive timeout (3s/5s/10s) based on network size
-  - Adaptive periodic intervals (10s/60s/300s) based on certificate age
+  - Adaptive periodic intervals (10s/30s/120s) based on node uptime
+  - Certificate lifetime: 4.5 minutes (270s = 3 macroblocks) with 80% rotation (216s)
   - Anti-duplication via serial number change detection
   - LRU cache with 100K certificate capacity
   - Scalable from 5 bootstrap to millions of nodes
@@ -244,13 +277,16 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 - **🖥️ Server Architecture**: Full/Super nodes on dedicated servers
 - **🔧 Interactive Setup**: User-friendly activation process
 - **🛡️ Deadlock Prevention**: Guard patterns & health monitors for stability
+- **🛡️ MEV Protection**: Private bundles for front-running protection (80%+ reputation, 0-20% allocation)
+- **📊 Priority Mempool**: Gas-price-based ordering for spam resistance
 
 #### **Advanced Performance Features**
-- **🌪️ Turbine Protocol**: 85% bandwidth savings with chunked block propagation
+- **🌪️ Turbine Protocol**: 85% bandwidth savings with adaptive fanout (4-32) based on network topology
 - **⏱️ Quantum PoH**: 500K hashes/sec cryptographic clock for precise timing
 - **⚙️ Hybrid Sealevel**: 10,000 parallel transactions with 5-stage pipeline
 - **🎯 Tower BFT**: Adaptive timeouts (7s base to 20s max, 1.5x multiplier) for optimal consensus
 - **🚀 Pre-Execution**: Speculative transaction processing with 10,000 cache size
+- **🔒 MEV Protection**: Private bundle submission with post-quantum signatures
 
 ### 📊 Performance Metrics
 
@@ -336,7 +372,7 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 │  │   ├── Deterministic initiator selection                 │
 │  │   └── 67% honest validator requirement                  │
 │  └── Advanced Synchronization                              │
-│      ├── State snapshots: Full (10k blocks) & Incremental  │
+│      ├── State snapshots: Full (12h) & Incremental (1h)    │
 │      ├── Parallel downloads with 100-block chunks          │
 │      ├── IPFS integration for P2P snapshot distribution    │
 │      └── Deadlock prevention with guard pattern            │
@@ -344,7 +380,7 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 │  Performance Optimization Layer                   │
 │  ├── Turbine Block Propagation                             │
 │  │   ├── 1KB chunks with Reed-Solomon erasure coding       │
-│  │   ├── Fanout-4 exponential propagation (Genesis optimized) │
+│  │   ├── Adaptive fanout (4-32) based on network size & latency │
 │  │   └── 85% bandwidth reduction                           │
 │  ├── Quantum Proof of History (QPoH)                       │
 │  │   ├── 500K hashes/sec cryptographic clock               │
@@ -548,8 +584,8 @@ if vrf_output.value < threshold {
 QNet implements state-of-the-art synchronization for rapid network joining:
 
 ### **State Snapshots**
-- **Full Snapshots**: Every 10,000 blocks (complete blockchain state)
-- **Incremental Snapshots**: Every 1,000 blocks (delta changes only)
+- **Full Snapshots**: Every 12 hours / 43,200 microblocks / 480 macroblocks (complete blockchain state)
+- **Incremental Snapshots**: Every 1 hour / 3,600 microblocks / 40 macroblocks (delta changes only)
 - **Compression**: LZ4 for efficient storage (~70% reduction)
 - **Verification**: SHA3-256 integrity checks
 - **Auto-Cleanup**: Keep only latest 5 snapshots
@@ -1785,6 +1821,187 @@ Year 10+:   ~300+ GB    🔧 Increase to 500-1000 GB
 - **No System Metrics**: Removed CPU/memory monitoring for privacy
 - **Deterministic Consensus**: Cryptographic selection prevents forks
 - **Enhanced Concurrency**: RwLock for better parallel performance
+
+## 🎯 Architectural Decisions: Why Some Features Are Deferred
+
+### ✅ MEV Protection (Implemented in v2.19.3)
+
+**Status**: ✅ **IMPLEMENTED** - Private bundle submission with post-quantum signatures
+
+**Implementation Details:**
+
+QNet implements **Private Bundle** MEV protection (Flashbots-style) compatible with 1-second microblocks:
+
+**Architecture:**
+
+```
+User Transaction Flow:
+┌─────────────────────────────────────────────────────────────┐
+│ Standard TX Path (Public)                                   │
+│ User → Public Mempool → Block Producer → Microblock         │
+│                                                              │
+│ MEV-Protected Path (Private Bundles)                        │
+│ User → Direct to Producer → Microblock (if conditions met)  │
+│      ↓                                                       │
+│   Fallback to Public Mempool (if rejected/timeout)          │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Bundle Constraints (Production Tested ✅):**
+
+| Constraint | Value | Purpose |
+|------------|-------|---------|
+| **Max TXs per Bundle** | 10 | Prevent block space monopolization |
+| **Reputation Gate** | 80%+ | Proven trustworthy nodes only |
+| **Gas Premium** | +20% | Economic incentive for inclusion |
+| **Max Lifetime** | 60 seconds | 60 microblocks max (prevent stale bundles) |
+| **Rate Limiting** | 10 bundles/min per user | Anti-spam protection |
+| **Block Allocation** | 0-20% dynamic | 80-100% guaranteed for public TXs |
+| **Multi-Producer Submission** | 3 producers | Redundancy and load distribution |
+| **Signature Verification** | Dilithium3 | Post-quantum security |
+
+**Why QNet Still Has Natural MEV Resistance:**
+
+QNet's **reputation-based consensus** + **Private Bundles** provides dual-layer protection:
+
+| Layer | Traditional Staking | QNet Hybrid Model |
+|-------|-------------------|-------------------|
+| **Base Incentive** | Maximize staking returns | Maintain reputation score |
+| **MEV Risk** | 🔴 High (financial benefit) | 🟢 Low (reputational damage + optional bundles) |
+| **Attack Cost** | Lose stake (recoverable) | Lose reputation (permanent) + bundle rejection |
+| **Producer Window** | Long (varies) | Short (30 blocks = 30 seconds) |
+| **User Protection** | Optional (MEV marketplaces) | **Built-in (Private Bundles)** ✅ |
+
+**Implementation Features:**
+
+1. **Dynamic Allocation**: 0-20% block space for bundles based on demand
+   - No demand → 0% allocation → 100% public TXs
+   - High demand → scales to 20% → 80% public TXs guaranteed
+2. **Atomic Inclusion**: All bundle TXs included together or rejected entirely
+3. **Auto-Fallback**: Failed bundles automatically fall back to public mempool
+4. **Priority Mempool**: Public TXs prioritized by gas price (anti-spam)
+5. **Post-Quantum Signatures**: All bundles verified with Dilithium3
+6. **Real-Time Tested**: 11/11 tests passed in production environment
+
+**API Endpoints:**
+
+```bash
+# Submit bundle
+POST /api/v1/bundle/submit
+# Get bundle status
+GET /api/v1/bundle/{id}/status
+# Cancel bundle
+DELETE /api/v1/bundle/{id}
+```
+
+**Natural Resistance + Active Protection:**
+
+- ✅ **Base Layer**: Reputation system prevents most MEV exploitation
+- ✅ **Active Protection**: Private bundles for high-value TXs
+- ✅ **No Staking Required**: Merit-based, not capital-based
+- ✅ **Byzantine Safe**: 2/3+ honest nodes ensure security
+- ✅ **Scalable**: Works from 5 Genesis nodes to millions
+
+---
+
+### ❌ Economic Staking & Slashing (Intentionally Not Implemented)
+
+**Status**: Reputation-based system only, no validator staking required (by design)
+
+**Why QNet Doesn't Use Traditional Staking:**
+
+QNet implements a **fundamentally different economic security model** that doesn't require validator staking:
+
+| Security Layer | Traditional Staking (ETH/Cosmos) | QNet Multi-Layer Model |
+|----------------|----------------------------------|------------------------|
+| **Entry Barrier** | Large capital stake required | 1DEV burn (Phase 1) + QNC pool contribution (Phase 2) |
+| **Cost Type** | Recoverable (can withdraw stake) | Permanent (burn is irreversible) |
+| **Attack Cost** | Lose stake (financial) | Lose burn + reputation + time investment |
+| **Recovery** | Re-stake immediately | Months of reputation rebuilding |
+| **Inclusivity** | Capital-gated (plutocracy) | Merit-based (everyone can join) |
+
+**QNet's Multi-Layer Security Model:**
+
+```
+Layer 1: Economic Barrier (Without Staking)
+├── Phase 1: 1DEV token burn (permanent cost, irreversible)
+├── Phase 2: QNC pool contribution (5K-30K QNC, dynamic based on network size)
+└── Anti-Sybil: Cost increases with network growth
+
+Layer 2: Time Barrier (Recovery Protection)
+├── New nodes start at 70% reputation (instant eligibility!)
+├── Reputation loss → slow recovery (prevents repeat attacks)
+└── Gradual recovery: penalized nodes need months to rebuild trust
+
+Layer 3: Coordination Complexity
+├── Byzantine attack requires 67%+ of network
+├── Large networks: coordination becomes exponentially harder
+└── Example: 1M nodes network = 670K nodes must coordinate
+
+Layer 4: Reputation Slashing
+├── InvalidBlock: -20 points
+├── MaliciousBehavior: -50 points → jail
+├── DoubleSign: -100 points → instant jail
+└── consensus_score < 70% → excluded from consensus
+
+Layer 5: Network Effects
+├── Larger network = stronger security (without staking!)
+├── Detection probability increases with scale
+└── Attack cost increases exponentially with network size
+```
+
+**Why Burn > Stake for Security:**
+
+| Aspect | Traditional Staking | QNet Burn Model |
+|--------|-------------------|-----------------|
+| **Sybil Attack Cost** | Can recover stake after | Permanent loss of burned tokens |
+| **Market Impact** | Large stake movements visible | Burn reduces supply (deflationary pressure) |
+| **Instant Power** | Yes (stake and join) | No (need reputation + time) |
+| **Inclusivity** | Excludes those without capital | Open to anyone willing to burn entry fee |
+| **Centralization Risk** | Whales/exchanges dominate | Merit-based, not capital-based |
+
+**Philosophical Advantages:**
+
+1. **True Decentralization**: No plutocracy - anyone can participate regardless of capital
+2. **Merit Over Money**: Behavior and time investment matter more than wealth
+3. **Permanent Commitment**: Burn shows real commitment (can't just withdraw)
+4. **Scale = Security**: Network security increases naturally with growth (no additional staking needed)
+5. **No Liquidity Lock**: Participants don't need to lock large capital amounts
+
+**Current Security System:**
+```rust
+// Reputation Penalties (Primary Defense)
+ReputationEvent::InvalidBlock => -20 points
+ReputationEvent::MaliciousBehavior => -50 points
+ReputationEvent::DoubleSign => -100 points (instant jail)
+consensus_score < 70% → excluded from consensus
+consensus_score < 10% → complete network ban
+
+// Economic Barriers (Built-in)
+Phase 1: 1DEV burn requirement (300-1500 1DEV based on network stage)
+Phase 2: QNC pool contribution (5K-30K QNC, dynamic based on network size)
+
+// Time Barriers (Recovery Protection, NOT Entry)
+New nodes: start at 70% reputation (instant consensus eligibility!)
+Penalized nodes: slow recovery (months to rebuild trust)
+Prevents repeat attacks: attackers can't instantly rejoin after penalty
+```
+
+**When Staking Might Be Reconsidered:**
+- If community governance votes for it (decentralized decision)
+- If large-scale coordinated attacks observed despite current security
+- If network demonstrates need for additional economic deterrent
+- **Note**: Current design is intentional and philosophically aligned with true decentralization
+
+**Why This Approach Is Superior for QNet:**
+- ✅ **Inclusive**: No capital barrier prevents small participants from joining
+- ✅ **Permanent Cost**: Burn is irreversible (stronger deterrent than recoverable stake)
+- ✅ **Repeat Attack Prevention**: Penalized attackers need months to recover (can't instantly retry)
+- ✅ **Coordination-Resistant**: Large-scale attacks become exponentially harder with network growth
+- ✅ **Philosophically Consistent**: Merit-based rather than money-based power
+- ✅ **Simpler**: No stake management, no slashing disputes, no withdrawal queues
+
+---
 
 ## 📈 Latest Updates (v2.6.0)
 

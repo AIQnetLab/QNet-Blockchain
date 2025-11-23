@@ -3207,6 +3207,7 @@ dependencies = [
  "priority-queue",
  "prometheus",
  "pyo3",
+ "qnet-consensus",
  "qnet-state",
  "rayon",
  "serde",

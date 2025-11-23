@@ -13,6 +13,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 # Local dependencies
 qnet-state = { path = "../qnet-state" }
+qnet-consensus = { path = "../qnet-consensus" }
 
 # Async runtime
 tokio = { version = "1.35", features = ["full"] }

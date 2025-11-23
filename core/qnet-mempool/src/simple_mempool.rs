@@ -3,7 +3,7 @@
 use dashmap::DashMap;
 use std::sync::Arc;
 use parking_lot::RwLock;
-use std::collections::VecDeque;
+use std::collections::{VecDeque, BTreeMap};
 use serde::{Serialize, Deserialize};
 use bincode;
 use hex;
@@ -20,7 +20,7 @@ impl Default for SimpleMempoolConfig {
     fn default() -> Self {
         Self {
             max_size: 500_000, // Production default: 500k transactions
-            min_gas_price: 1,
+            min_gas_price: 100_000, // PRODUCTION: 0.0001 QNC (BASE_FEE_NANO_QNC from qnet-state)
         }
     }
 }
@@ -32,29 +32,35 @@ enum TxStorage {
     Binary(Vec<u8>),
 }
 
-/// Optimized mempool implementation with binary support
+/// Optimized mempool implementation with binary support and priority queue
+/// ARCHITECTURE: Priority-based transaction ordering for spam protection
 pub struct SimpleMempool {
     config: SimpleMempoolConfig,
     transactions: Arc<DashMap<String, TxStorage>>, // hash -> json or binary
-    queue: Arc<RwLock<VecDeque<String>>>, // ordered hashes
+    // PRODUCTION: Priority queue (BTreeMap) sorted by gas_price descending
+    // Key: gas_price (u64), Value: FIFO queue of tx hashes at that price
+    by_gas_price: Arc<RwLock<BTreeMap<u64, VecDeque<String>>>>,
     use_binary: bool, // Toggle for binary storage
 }
 
 impl SimpleMempool {
-    /// Create new optimized mempool
+    /// Create new optimized mempool with priority queue
+    /// PRODUCTION: Priority-based ordering for spam protection (highest gas_price first)
     pub fn new(config: SimpleMempoolConfig) -> Self {
         // Use binary for large mempools (>100k)
         let use_binary = config.max_size > 100_000;
         Self {
             config,
             transactions: Arc::new(DashMap::new()),
-            queue: Arc::new(RwLock::new(VecDeque::new())),
+            by_gas_price: Arc::new(RwLock::new(BTreeMap::new())),
             use_binary,
         }
     }
     
-    /// Add raw transaction (optimized with binary option)
-    pub fn add_raw_transaction(&self, tx_json: String, hash: String) -> bool {
+    /// Add raw transaction (optimized with binary option and priority queue)
+    /// PRODUCTION: Priority-based insertion for spam protection
+    /// gas_price: Transaction gas price for priority sorting (higher = earlier processing)
+    pub fn add_raw_transaction(&self, tx_json: String, hash: String, gas_price: u64) -> bool {
         if self.transactions.len() >= self.config.max_size {
             return false;
         }
@@ -78,12 +84,22 @@ impl SimpleMempool {
         };
         
         self.transactions.insert(hash.clone(), storage);
-        self.queue.write().push_back(hash);
+        
+        // PRODUCTION: Add to priority queue (sorted by gas_price descending)
+        // FIFO order within same gas_price (fair for same-price transactions)
+        let mut priority_queue = self.by_gas_price.write();
+        priority_queue
+            .entry(gas_price)
+            .or_insert_with(VecDeque::new)
+            .push_back(hash);
+        
         true
     }
     
-    /// Add binary transaction directly
-    pub fn add_binary_transaction(&self, tx_bytes: Vec<u8>, hash: String) -> bool {
+    /// Add binary transaction directly with priority
+    /// PRODUCTION: Priority-based insertion for spam protection
+    /// gas_price: Transaction gas price for priority sorting (higher = earlier processing)
+    pub fn add_binary_transaction(&self, tx_bytes: Vec<u8>, hash: String, gas_price: u64) -> bool {
         if self.transactions.len() >= self.config.max_size {
             return false;
         }
@@ -100,7 +116,14 @@ impl SimpleMempool {
         }
         
         self.transactions.insert(hash.clone(), TxStorage::Binary(tx_bytes));
-        self.queue.write().push_back(hash);
+        
+        // PRODUCTION: Add to priority queue (sorted by gas_price descending)
+        let mut priority_queue = self.by_gas_price.write();
+        priority_queue
+            .entry(gas_price)
+            .or_insert_with(VecDeque::new)
+            .push_back(hash);
+        
         true
     }
     
@@ -134,34 +157,54 @@ impl SimpleMempool {
         })
     }
     
-    /// Get pending transactions
+    /// Get pending transactions (PRIORITY ORDER: highest gas_price first)
+    /// PRODUCTION: Anti-spam protection - high-paying transactions processed first
+    /// ARCHITECTURE: Prevents spam attacks from blocking legitimate high-value transactions
     pub fn get_pending_transactions(&self, limit: usize) -> Vec<String> {
-        let queue = self.queue.read();
-        queue.iter()
+        let priority_queue = self.by_gas_price.read();
+        
+        // Iterate from HIGHEST gas_price to LOWEST (BTreeMap.iter().rev())
+        // Within same gas_price: FIFO order (fair for same-price transactions)
+        priority_queue.iter()
+            .rev()  // CRITICAL: Reverse iteration for highest-first
+            .flat_map(|(_gas_price, hashes)| hashes.iter())
             .take(limit)
             .filter_map(|hash| self.get_raw_transaction(hash))
             .collect()
     }
     
-    /// Remove transaction
+    /// Remove transaction (must remove from both transactions map AND priority queue)
+    /// CRITICAL: Maintains consistency between storage and priority queue
     pub fn remove_transaction(&self, hash: &str) -> bool {
         if self.transactions.remove(hash).is_some() {
-            let mut queue = self.queue.write();
-            queue.retain(|h| h != hash);
+            // CRITICAL: Also remove from priority queue
+            // Iterate all gas_price levels to find and remove this hash
+            let mut priority_queue = self.by_gas_price.write();
+            for (_gas_price, hashes) in priority_queue.iter_mut() {
+                hashes.retain(|h| h != hash);
+            }
+            // OPTIMIZATION: Remove empty gas_price entries to save memory
+            priority_queue.retain(|_, hashes| !hashes.is_empty());
             true
         } else {
             false
         }
     }
     
-    /// Clear all transactions
+    /// Clear all transactions (both storage and priority queue)
+    /// CRITICAL: Clears both data structures to maintain consistency
     pub fn clear(&self) {
         self.transactions.clear();
-        self.queue.write().clear();
+        self.by_gas_price.write().clear();
     }
     
     /// Get mempool size
     pub fn size(&self) -> usize {
         self.transactions.len()
+    }
+    
+    /// Get minimum gas price from config
+    pub fn get_min_gas_price(&self) -> u64 {
+        self.config.min_gas_price
     }
 } 

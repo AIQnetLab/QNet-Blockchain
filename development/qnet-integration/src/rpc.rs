@@ -326,10 +326,39 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
     let mempool_transactions = api_v1
         .and(warp::path("mempool"))
         .and(warp::path("transactions"))
+
         .and(warp::path::end())
         .and(warp::get())
         .and(blockchain_filter.clone())
         .and_then(handle_mempool_transactions);
+    
+    // MEV PROTECTION: Bundle endpoints for private transaction submission
+    // ARCHITECTURE: Flashbots-style bundles with 0-20% dynamic allocation
+    let bundle_submit = api_v1
+        .and(warp::path("bundle"))
+        .and(warp::path("submit"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::body::json())
+        .and(blockchain_filter.clone())
+        .and_then(handle_bundle_submit);
+    
+    let bundle_status = api_v1
+        .and(warp::path("bundle"))
+        .and(warp::path::param::<String>())
+        .and(warp::path("status"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(blockchain_filter.clone())
+        .and_then(handle_bundle_status);
+    
+    let bundle_cancel = api_v1
+        .and(warp::path("bundle"))
+        .and(warp::path::param::<String>())
+        .and(warp::path::end())
+        .and(warp::delete())
+        .and(blockchain_filter.clone())
+        .and_then(handle_bundle_cancel);
     
         // Peer discovery endpoint (for P2P network) - BIDIRECTIONAL REGISTRATION
     let peers_endpoint = api_v1
@@ -802,6 +831,10 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .or(transaction_get)
         .or(mempool_status)
         .or(mempool_transactions);
+    
+    let bundle_routes = bundle_submit
+        .or(bundle_status)
+        .or(bundle_cancel);
         
     let node_routes = node_discovery
         .or(node_health)
@@ -863,6 +896,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .or(blockchain_routes)
         .or(account_routes)
         .or(transaction_routes)
+        .or(bundle_routes)
         .or(node_routes)
         .or(light_node_routes)
         .or(consensus_routes)
@@ -1855,6 +1889,226 @@ async fn handle_mempool_transactions(
     Ok(warp::reply::json(&response))
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// MEV PROTECTION HANDLERS
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// POST /api/v1/bundle/submit
+/// Submit a transaction bundle for MEV protection
+/// ARCHITECTURE: Flashbots-style bundles with 0-20% dynamic allocation
+async fn handle_bundle_submit(
+    bundle_request: serde_json::Value,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    use qnet_mempool::TxBundle;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    
+    // Check if MEV mempool is enabled
+    let mev_mempool = match blockchain.get_mev_mempool() {
+        Some(pool) => pool,
+        None => {
+            let error_response = json!({
+                "success": false,
+                "error": "MEV protection not enabled on this node"
+            });
+            return Ok(warp::reply::json(&error_response));
+        }
+    };
+    
+    // Parse bundle request
+    let transactions = match bundle_request["transactions"].as_array() {
+        Some(txs) => txs.iter().filter_map(|v| v.as_str().map(String::from)).collect::<Vec<_>>(),
+        None => {
+            let error_response = json!({
+                "success": false,
+                "error": "Missing 'transactions' array field"
+            });
+            return Ok(warp::reply::json(&error_response));
+        }
+    };
+    
+    let min_timestamp = bundle_request["min_timestamp"].as_u64().unwrap_or_else(|| {
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+    });
+    
+    let max_timestamp = bundle_request["max_timestamp"].as_u64().unwrap_or_else(|| {
+        min_timestamp + 60 // Default: 60 seconds window
+    });
+    
+    let reverting_tx_hashes = bundle_request["reverting_tx_hashes"]
+        .as_array()
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    
+    let signature = match bundle_request["signature"].as_str() {
+        Some(sig) => hex::decode(sig).unwrap_or_default(),
+        None => {
+            let error_response = json!({
+                "success": false,
+                "error": "Missing 'signature' field"
+            });
+            return Ok(warp::reply::json(&error_response));
+        }
+    };
+    
+    let submitter_pubkey = match bundle_request["submitter_pubkey"].as_str() {
+        Some(pk) => hex::decode(pk).unwrap_or_default(),
+        None => {
+            let error_response = json!({
+                "success": false,
+                "error": "Missing 'submitter_pubkey' field"
+            });
+            return Ok(warp::reply::json(&error_response));
+        }
+    };
+    
+    // Calculate total gas price for bundle
+    let mempool_arc = blockchain.get_mempool();
+    let mempool = mempool_arc.read().await;
+    let mut total_gas_price = 0u64;
+    for tx_hash in &transactions {
+        if let Some(tx_json) = mempool.get_raw_transaction(&tx_hash) {
+            if let Ok(tx_data) = serde_json::from_str::<serde_json::Value>(&tx_json) {
+                if let Some(gas_price) = tx_data["gas_price"].as_u64() {
+                    total_gas_price = total_gas_price.saturating_add(gas_price);
+                }
+            }
+        }
+    }
+    drop(mempool);
+    
+    // Create bundle
+    let bundle = TxBundle {
+        bundle_id: String::new(), // Will be generated in add_bundle
+        transactions,
+        min_timestamp,
+        max_timestamp,
+        reverting_tx_hashes,
+        signature,
+        submitter_pubkey,
+        total_gas_price,
+    };
+    
+    // Get REAL reputation for bundle submitter
+    // SECURITY: This is used for MEV bundle reputation check (min 80% required)
+    // ARCHITECTURE: Combined reputation = consensus_score * 0.7 + network_score * 0.3
+    let submitter_node_id = hex::encode(&bundle.submitter_pubkey);
+    let submitter_reputation = if let Some(p2p) = blockchain.get_p2p() {
+        p2p.get_node_combined_reputation(&submitter_node_id)
+    } else {
+        70.0 // Default if P2P not initialized (consensus threshold)
+    };
+    
+    // Get current time
+    let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    
+    // Add bundle to MEV mempool
+    match mev_mempool.add_bundle(bundle, submitter_reputation, current_time).await {
+        Ok(bundle_id) => {
+            let response = json!({
+                "success": true,
+                "bundle_id": bundle_id,
+                "message": "Bundle submitted successfully"
+            });
+            Ok(warp::reply::json(&response))
+        }
+        Err(e) => {
+            let error_response = json!({
+                "success": false,
+                "error": format!("Failed to add bundle: {}", e)
+            });
+            Ok(warp::reply::json(&error_response))
+        }
+    }
+}
+
+/// GET /api/v1/bundle/{bundle_id}/status
+/// Get status of a submitted bundle
+async fn handle_bundle_status(
+    bundle_id: String,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    
+    // Check if MEV mempool is enabled
+    let mev_mempool = match blockchain.get_mev_mempool() {
+        Some(pool) => pool,
+        None => {
+            let error_response = json!({
+                "success": false,
+                "error": "MEV protection not enabled on this node"
+            });
+            return Ok(warp::reply::json(&error_response));
+        }
+    };
+    
+    // Get bundle
+    match mev_mempool.get_bundle(&bundle_id) {
+        Some(bundle) => {
+            let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+            let status = if current_time < bundle.min_timestamp {
+                "pending"
+            } else if current_time > bundle.max_timestamp {
+                "expired"
+            } else {
+                "active"
+            };
+            
+            let response = json!({
+                "success": true,
+                "bundle_id": bundle_id,
+                "status": status,
+                "transaction_count": bundle.transactions.len(),
+                "total_gas_price": bundle.total_gas_price,
+                "min_timestamp": bundle.min_timestamp,
+                "max_timestamp": bundle.max_timestamp
+            });
+            Ok(warp::reply::json(&response))
+        }
+        None => {
+            let error_response = json!({
+                "success": false,
+                "error": "Bundle not found"
+            });
+            Ok(warp::reply::json(&error_response))
+        }
+    }
+}
+
+/// DELETE /api/v1/bundle/{bundle_id}
+/// Cancel a submitted bundle
+async fn handle_bundle_cancel(
+    bundle_id: String,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    // Check if MEV mempool is enabled
+    let mev_mempool = match blockchain.get_mev_mempool() {
+        Some(pool) => pool,
+        None => {
+            let error_response = json!({
+                "success": false,
+                "error": "MEV protection not enabled on this node"
+            });
+            return Ok(warp::reply::json(&error_response));
+        }
+    };
+    
+    // Remove bundle
+    if mev_mempool.remove_bundle(&bundle_id) {
+        let response = json!({
+            "success": true,
+            "message": "Bundle cancelled successfully"
+        });
+        Ok(warp::reply::json(&response))
+    } else {
+        let error_response = json!({
+            "success": false,
+            "error": "Bundle not found"
+        });
+        Ok(warp::reply::json(&error_response))
+    }
+}
+
 async fn handle_batch_claim_rewards(
     request: BatchRewardClaimRequest,
     blockchain: Arc<BlockchainNode>,
@@ -2755,10 +3009,22 @@ async fn handle_node_secure_info(
 
 // Handler for Turbine metrics
 async fn handle_turbine_metrics(blockchain: Arc<BlockchainNode>) -> Result<impl warp::Reply, warp::Rejection> {
+    // PRODUCTION: Get real-time Turbine metrics from P2P network
+    let (fanout, producers, latency) = if let Some(unified_p2p) = blockchain.get_unified_p2p() {
+        let fanout = unified_p2p.get_turbine_fanout();
+        let producers = unified_p2p.get_qualified_producers_count();
+        let latency = unified_p2p.get_average_peer_latency();
+        (fanout, producers, latency)
+    } else {
+        (4, 0, 50) // Defaults if P2P not available
+    };
+    
     let metrics = json!({
         "enabled": true,
         "chunk_size": 1024,
-        "fanout": 3,
+        "fanout": fanout,  // REAL-TIME: Adaptive fanout (4-32)
+        "qualified_producers": producers,  // REAL-TIME: Producers with reputation >= 70%
+        "average_latency_ms": latency,  // REAL-TIME: Network performance
         "redundancy_factor": 1.5,
         "max_chunks": 64,
         "max_block_size": 65536,
@@ -5148,11 +5414,17 @@ async fn handle_block_statistics(
 async fn handle_performance_metrics(
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
+    // REAL-TIME: Get actual mempool size
     let mempool_size = blockchain.get_mempool_size().await
         .unwrap_or(0);
     
-    // Calculate TPS from recent blocks
+    // REAL-TIME: Get current chain height
     let current_height = blockchain.get_height().await;
+    
+    // REAL-TIME: Get peer count
+    let peer_count = blockchain.get_peer_count().await.unwrap_or(0);
+    
+    // Calculate TPS from recent blocks (simplified estimation)
     let tps_current = if current_height > 100 {
         // Estimate TPS based on mempool processing rate
         mempool_size as f64 / 100.0 // Rough estimate
@@ -5161,8 +5433,10 @@ async fn handle_performance_metrics(
     };
     
     let metrics = json!({
-        "mempool_size": mempool_size,
+        "mempool_size": mempool_size,  // REAL-TIME
         "mempool_capacity": 500000,
+        "current_height": current_height,  // REAL-TIME
+        "peers_connected": peer_count,  // REAL-TIME
         "tps_current": tps_current,
         "tps_peak": 1000.0, // System design capacity
         "block_production_rate": 1.0, // 1 block per second by design
