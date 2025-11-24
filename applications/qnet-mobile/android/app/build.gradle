@@ -157,7 +157,7 @@ dependencies {
     implementation 'com.google.android.material:material:1.11.0'
     implementation 'androidx.core:core-ktx:1.12.0'
     
-    // React Native dependencies - only if RN is available
+    // React Native dependencies - ALWAYS include (F-Droid will download from Maven)
     if (reactNativeGradle.exists()) {
         // The version of react-native is set by the React Native Gradle Plugin
         implementation("com.facebook.react:react-android")
@@ -168,6 +168,10 @@ dependencies {
             implementation jscFlavor
         }
     } else {
-        println("⚠️  Building without React Native dependencies")
+        // F-Droid build: Download React Native from Maven Central
+        println("⚠️  React Native not in node_modules - using Maven dependencies for F-Droid")
+        implementation 'com.facebook.react:react-android:0.81.4'  // Match package.json version
+        implementation 'com.facebook.soloader:soloader:0.11.0'
+        implementation jscFlavor
     }
 }
