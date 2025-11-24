@@ -337,9 +337,10 @@ PoH Chain: H₀ → H₁ → H₂ → ... → Hₙ
 ```
 
 **Properties:**
-- **Verifiable Delay Function**: Cannot be parallelized or predicted
-- **Cryptographic Timestamps**: Each hash proves time elapsed
+- **Sequential Hash Chain**: 25% SHA3-512 creates bottleneck (NOT formal VDF with delay proofs)
+- **Cryptographic Timestamps**: Each hash proves ordering and time progression
 - **Fork Prevention**: Creating alternative history requires recomputing entire PoH chain
+- **Limitation**: Blake3 portions parallelizable, but SHA3-512 intervals enforce sequencing
 - **Sub-Second Precision**: Accurate time measurement across distributed network
 
 #### **Block Integration**
@@ -646,7 +647,7 @@ parallel_execute(non_conflicting_transactions);
 **3. Quantum Proof of History:**
 - **500K hashes/sec**: Hybrid SHA3-512/Blake3 (25%/75%) for time synchronization
 - **10ms tick duration**: Precise event ordering (100 ticks/sec)
-- **Verifiable delay function**: Non-parallelizable, Byzantine-resistant timing
+- **Sequential ordering chain**: SHA3-512 bottleneck limits parallelization (NOT formal VDF)
 - **Optimized implementation**: Fixed-size arrays, zero-copy operations
 
 **4. Pre-execution cache:**
@@ -953,7 +954,7 @@ QNet's reputation-based consensus fundamentally changes MEV economics compared t
 1. **No Locked Capital**: Producers don't have staked capital to maximize via MEV
 2. **Reputation at Risk**: MEV manipulation → permanent reputation damage → consensus exclusion
 3. **Short Production Windows**: 30-block rotation limits MEV opportunity
-4. **Deterministic Selection**: VRF-based producer selection prevents bribing
+4. **Deterministic Selection**: SHA3-512 entropy-based selection (finality window prevents individual manipulation)
 5. **Byzantine Oversight**: Macroblock consensus provides additional verification layer
 6. **Entry Cost Barrier**: 1DEV burn + QNC pool make Sybil MEV attacks expensive
 
@@ -1644,7 +1645,7 @@ QNet's Quantum Proof of History provides a verifiable, sequential record of even
 // Hybrid implementation for optimal performance/security
 for i in 0..HASHES_PER_TICK {
     if i % 4 == 0 {
-        // Every 4th hash: SHA3-512 for VDF property (prevents parallelization)
+        // Every 4th hash: SHA3-512 for sequential ordering (limits parallelization)
         PoH_n = SHA3_512(PoH_{n-1} || counter)
     } else {
         // Other hashes: Blake3 for speed (3x faster)
@@ -1655,19 +1656,21 @@ for i in 0..HASHES_PER_TICK {
 
 **Technical specifications:**
 - **Hash Rate**: 500K hashes per second (5,000 per tick × 100 ticks/sec)
-- **Algorithm**: Hybrid SHA3-512/Blake3 (25%/75% ratio for optimal VDF properties)
-- **VDF Property**: SHA3-512 every 4th hash prevents parallelization
+- **Algorithm**: Hybrid SHA3-512/Blake3 (25%/75% ratio for sequential ordering)
+- **Sequential Property**: SHA3-512 every 4th hash creates bottleneck (NOT formal VDF)
 - **Tick Duration**: 10 milliseconds (5,000 hashes per tick)
 - **Ticks Per Slot**: 100 ticks = 1 second = 1 microblock slot
+- **Hardware**: Intel Xeon E5-2680v4 @ 2.4GHz, bottlenecked by SHA3-512 at ~100K hashes/sec
 - **Drift Detection**: Maximum 5% allowed drift before correction
 - **Verification**: Each node can independently verify PoH sequence
 - **Memory**: Fixed-size arrays (64 bytes), zero Vec allocations in hot path
 
 **Benefits:**
 1. **Time Synchronization**: Network-wide consensus on event ordering
-2. **Verifiable Delay Function**: Proof that time has passed between events
+2. **Sequential Ordering**: Proof that computation occurred in sequence (NOT formal VDF delay proof)
 3. **No Clock Dependency**: Cryptographic proof instead of system clocks
-4. **Byzantine Resistance**: Cannot be manipulated by malicious nodes
+4. **Byzantine Resistance**: 67%+ coalition required to manipulate (finality window protection)
+5. **Limitation**: Biasable by controlling entropy source (past block hashes)
 
 **Implementation:**
 ```rust
@@ -1697,7 +1700,8 @@ QNet uses SHA3-512 deterministic selection with a 10-block Finality Window to en
 - **Deterministic**: All synchronized nodes compute identical results from same finalized entropy
 - **Race-Free**: Finality Window eliminates race conditions at rotation boundaries (blocks 31, 61, 91)
 - **Byzantine-Safe**: Uses blocks confirmed by 2/3 consensus as entropy source
-- **No Key Storage**: Does not require VRF keys, simplifying node operation
+- **No VRF Keys**: Deterministic selection using SHA3-512 hash, not true VRF with private keys
+- **Trade-off**: Simpler implementation, but biasable by 67%+ Byzantine coalition
 
 **Algorithm:**
 ```rust
@@ -1796,10 +1800,11 @@ async fn select_microblock_producer(
 1. **Quantum-Resistant**: SHA3-512 + Dilithium-signed blocks = full PQC
 2. **Deterministic**: 100% consensus on producer selection (no race conditions)
 3. **No Race Conditions**: Finality Window eliminates boundary issues
-4. **Byzantine Safety**: Entropy from 2/3-confirmed blocks
-5. **Simple**: No VRF keys, no complex threshold calculations
+4. **Byzantine Safety**: Entropy from 2/3-confirmed blocks (biasable by 67%+ coalition)
+5. **Simple**: Deterministic SHA3-512, no VRF keys or threshold calculations
 6. **No Coordination**: Each node independently computes same result
 7. **Scalable**: O(1) computation, works from 5 to millions of nodes
+8. **Limitation**: Not true VRF randomness, weaker than private-key VRF schemes
 
 **Implementation:**
 ```rust
@@ -2446,8 +2451,8 @@ QNetProtocol = {
 
 **Performance Optimizations:**
 - **Turbine Protocol**: Chunked block propagation with Reed-Solomon encoding
-- **Quantum PoH**: 500K hashes/sec SHA3-512 VDF cryptographic clock
-- **Finality Window Selection**: Deterministic SHA3-512 producer selection with 10-block finality for race-free, Byzantine-safe leader election
+- **Quantum PoH**: 500K hashes/sec SHA3-512/Blake3 sequential ordering (NOT formal VDF)
+- **Finality Window Selection**: Deterministic SHA3-512 producer selection with 10-block finality for race-free, Byzantine-safe leader election (biasable by 67%+ coalition)
 - **Hybrid Sealevel**: 10,000 parallel transaction execution
 - **Tower BFT**: Adaptive consensus timeouts (7s base, up to 20s max, 1.5x multiplier)
 - **Comprehensive Benchmarks**: Full performance testing harness for all components

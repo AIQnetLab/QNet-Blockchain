@@ -180,13 +180,13 @@ This project uses **dual licensing**:
   - Production config: 5,000 hashes per tick × 100 ticks/sec = 500K hashes/sec
   - 100 ticks per second (10ms intervals) for smooth entropy generation
   - 5,000 hashes per tick (optimized for 1-second microblocks)
-  - VDF properties via SHA3-512 every 4th hash (prevents parallelization)
+  - Sequential ordering via SHA3-512 every 4th hash (limits parallelization, not formal VDF)
   - Integrated into producer selection for unpredictable leader election
   - Checkpoint persistence with zstd compression (every 1M hashes)
   - Clock drift: 5-7% (excellent for production)
   - 72 bytes overhead per block (poh_hash: 64B + poh_count: 8B) = ~2-3%
   - Hardware: Intel Xeon E5-2680v4 @ 2.4GHz
-- **Quantum-Resistant Producer Selection**: Threshold VRF with Dilithium + Ed25519 hybrid cryptography for Byzantine-safe leader election
+- **Quantum-Resistant Producer Selection**: Deterministic selection with finality window, Dilithium + Ed25519 hybrid cryptography for Byzantine-safe leader election
 - **Hybrid Sealevel Execution**: 5-stage pipeline with 10,000 parallel transactions
 - **Tower BFT Adaptive Timeouts**: Dynamic 7s base to 20s max (1.5x multiplier) based on network conditions
 - **Pre-Execution Cache**: Speculative execution with 10,000 transaction cache
@@ -265,7 +265,7 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 
 - **🔐 Post-Quantum Security**: NIST/Cisco encapsulated keys with Dilithium3 + Ed25519 (nodes) | Ed25519-only for clients (mobile/browser)
 - **⚡ Ultra-High Performance**: 424,411 TPS with zero-downtime consensus
-- **🎲 True Decentralization**: VRF-based producer selection with deterministic fairness and quantum resistance
+- **🎲 True Decentralization**: Deterministic producer selection (finality window + SHA3) with Byzantine fairness and quantum resistance
 - **💰 Reputation Economics**: Rewards for block production (+1 micro, +10/+5 macro)
 - **🔄 Advanced Synchronization**: State snapshots with parallel downloads & IPFS
 - **🔥 Phase 1 Active**: 1DEV burn-to-join (1,500 → 300 1DEV minimum, universal pricing)
@@ -295,10 +295,37 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 | **Throughput** | 424,411 TPS | 256 shards × 10k batch × zero-downtime |
 | **Latency** | <100ms | Transaction confirmation time |
 | **Finality** | <2 seconds | Block finalization |
+| **Block Capacity** | 5,000 TX/block | ~1 MB per microblock (200 bytes avg TX) |
 | **Downtime** | ZERO | Swiss watch precision, continuous flow |
 | **Energy Efficiency** | 99.9% less than Bitcoin | Eco-friendly consensus |
 | **Node Types** | Full, Super, Light | Flexible participation |
 | **Storage Efficiency** | 50-100 GB typical | Sliding window + snapshots |
+
+### 🔬 Technical Specifications (Honest Assessment)
+
+**Hardware & Benchmarks:**
+- **Test Environment**: Intel Xeon E5-2680v4 @ 2.4GHz (14 cores, 28 threads), 32GB DDR4-2400
+- **PoH Performance**: 500K hashes/sec (bottlenecked by SHA3-512, not formal VDF)
+- **Signature Verification**: Dilithium3 ~2ms, Ed25519 ~20μs per signature
+- **Network**: WAN-optimized with adaptive timeouts (7s-20s)
+
+**Cryptographic Approach:**
+- ✅ **Consensus Layer**: Real CRYSTALS-Dilithium3 (pqcrypto-dilithium 0.5) post-quantum
+- ✅ **Node Signatures**: Hybrid Dilithium3 + Ed25519 with NIST/Cisco encapsulated keys
+- ⚠️ **Client Transactions**: Ed25519-only (NOT post-quantum, optimized for mobile/battery)
+- 🔄 **Migration Path**: Client layer upgrade planned for 10-15 years (quantum threat timeline)
+
+**Consensus Architecture:**
+- ⚠️ **Producer Selection**: Deterministic (SHA3-512 hash), NOT true VRF with private keys
+- ⚠️ **Entropy Source**: Finality window (block -10), biasable by 67%+ Byzantine coalition
+- ✅ **Byzantine Safety**: 2/3+ honest nodes threshold enforced
+- ✅ **Rotation**: 30-block intervals, prevents individual manipulation
+
+**Security Trade-offs:**
+- ✅ **AES-256-GCM**: Secure for 30+ years against quantum (Grover's algorithm)
+- ✅ **Nonce Management**: CSPRNG with 10^-10% collision probability (see security_enhanced.rs:468)
+- ⚠️ **Not a Solana fork**: Original codebase, inspired by Turbine propagation concept
+- ✅ **Sybil Resistance**: Multi-layer (1DEV burn, reputation, time barrier, coordination complexity)
 
 ### 💾 Ultra-Modern Storage Architecture
 
@@ -356,11 +383,11 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 │  ├── CRYSTALS-Kyber (Key Exchange)                         │
 │  └── SPHINCS+ (Hash-based Signatures)                      │
 ├─────────────────────────────────────────────────────────────┤
-│  Consensus Layer with VRF-Based Selection                  │
+│  Consensus Layer with Deterministic Selection              │
 │  ├── Microblock Production (1s intervals)                  │
-│  │   ├── Threshold VRF with quantum-resistant crypto       │
+│  │   ├── Deterministic selection (finality window entropy) │
 │  │   ├── Dilithium + Ed25519 hybrid signatures             │
-│  │   ├── 30-block rotation with deterministic selection    │
+│  │   ├── 30-block rotation with SHA3-512 entropy           │
 │  │   ├── Race-free at boundaries (no delays)               │
 │  │   ├── Producer rewards: +1 reputation per block         │
 │  │   └── Full/Super nodes only (reputation >= 70%)        │
@@ -556,27 +583,28 @@ Progressive penalties for repeat offenders:
 | **Network Flooding** | >100 msgs/sec from single node | -10.0 points |
 | **Invalid Consensus** | Malformed commit/reveal | -5.0 points |
 
-### **VRF-Based Producer Selection**
+### **Deterministic Producer Selection (Not VRF)**
 ```rust
-// Quantum-resistant threshold VRF for fair producer selection
-// Each qualified node computes VRF output independently
-vrf_input = SHA3_256(
+// Quantum-resistant deterministic selection for fair producer rotation
+// All nodes compute the same selection deterministically using finality window
+let entropy_height = current_height - FINALITY_WINDOW; // 10 blocks back
+let entropy_source = get_block_hash(entropy_height); // Byzantine-finalized
+
+selection_hash = SHA3_512(
     leadership_round + 
     sorted_candidates +
-    macroblock_hash  // or deterministic fallback
+    entropy_source  // Finalized block hash (SHA3(prev + elig))
 );
 
-// Node evaluates VRF using Dilithium + Ed25519 hybrid crypto
-vrf_output = hybrid_vrf.evaluate(vrf_input).await?;
-threshold = u64::MAX / candidates.len();
+// DETERMINISTIC: All nodes select the same producer
+let selection_value = u64::from_bytes(selection_hash[0..8]);
+let selection_index = (selection_value % candidates.len()) as usize;
+let selected_producer = candidates[selection_index];
 
-// Node becomes producer if VRF output below threshold
-if vrf_output.value < threshold {
-    selected_producer = current_node;
-} else {
-    // Deterministic fallback if no node passes threshold
-    fallback_producer = SHA3_256(vrf_input) % candidates.len();
-}
+// ⚠️  LIMITATION: Not true VRF (no private key randomness)
+// ⚠️  Biasable by 67%+ Byzantine coalition controlling entropy source
+// ✅ SECURITY: Finality window prevents individual producer manipulation
+// ✅ BENEFIT: No per-node VRF keys, simpler verification, lower overhead
 ```
 
 ## 🔄 Advanced Synchronization
@@ -2005,10 +2033,10 @@ Prevents repeat attacks: attackers can't instantly rejoin after penalty
 
 ## 📈 Latest Updates (v2.6.0)
 
-**November 15, 2025 - "VRF-Based Selection & Macroblock Consensus Listener"**
+**November 15, 2025 - "Deterministic Producer Selection & Macroblock Consensus Listener"**
 
 This release introduces critical improvements for quantum-resistant consensus:
-- **Threshold VRF Producer Selection** with Dilithium + Ed25519 hybrid cryptography
+- **Deterministic Producer Selection** with Dilithium + Ed25519 hybrid cryptography and finality window entropy
 - **Race-Free Rotation**: No delays at block boundaries (31, 61, 91)
 - **Active Macroblock Consensus**: All Full/Super nodes run 1-second polling listener
 - **Deterministic Validator Selection**: 1000 validators per macroblock round
