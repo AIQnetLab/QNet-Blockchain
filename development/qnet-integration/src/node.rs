@@ -4659,7 +4659,26 @@ impl BlockchainNode {
                         
                         // Query a sample of peers for their entropy
                         let peers = p2p.get_validated_active_peers();
-                        let sample_size = std::cmp::min(5, peers.len()); // Sample up to 5 peers
+                        
+                        // ARCHITECTURE: Adaptive sample size for Byzantine consensus
+                        // CRITICAL: Sample from QUALIFIED PRODUCERS (reputation ≥70%, Super/Full only)
+                        // This ensures Byzantine-safe consensus (Light nodes excluded, malicious nodes excluded)
+                        // 
+                        // SCALABILITY: Network may have millions of nodes, but only ~1000 active producers per round
+                        // Sample size scales with QUALIFIED PRODUCERS, not total network size
+                        // 
+                        // Byzantine safety: Need 60%+ of sampled peers to agree
+                        // Genesis (5-50 qualified): sample all (100% coverage)
+                        // Small (51-200 qualified): sample 20 (10% minimum, Byzantine-safe)
+                        // Medium (201-1000 qualified): sample 50 (5% minimum, Byzantine-safe)
+                        // Large (1000+ qualified): sample 100 (10% of active producers, Byzantine-safe)
+                        let qualified_producers = p2p.get_qualified_producers_count();
+                        let sample_size = match qualified_producers {
+                            0..=50 => std::cmp::min(peers.len(), 50),        // Genesis: sample all
+                            51..=200 => std::cmp::min(peers.len(), 20),      // Small: 10%
+                            201..=1000 => std::cmp::min(peers.len(), 50),    // Medium: 5%
+                            _ => std::cmp::min(peers.len(), 100),            // Large: 10% of 1000 producers
+                        };
                         
                         let mut entropy_matches = 0;
                         let mut entropy_mismatches = 0;
@@ -4722,42 +4741,114 @@ impl BlockchainNode {
                             
                             // ARCHITECTURE: Block production MUST wait for entropy consensus at rotation boundaries
                             // This is critical for preventing forks when VRF selects new producer
-                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await; // Wait for responses
+                            // OPTIMIZATION: Dynamic wait instead of fixed timeout
+                            // Wait until Byzantine threshold (60%) OR max timeout (2 seconds)
+                            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await; // Initial wait for network propagation
                         } else {
                             println!("[CONSENSUS] ✅ Already have {} entropy responses for block {}", 
                                     already_have_responses, entropy_height);
                         }
                         
-                        // CRITICAL FIX: Verify entropy consensus SYNCHRONOUSLY at rotation boundary
-                        // This blocks production until consensus is reached
+                        // CRITICAL FIX: Dynamic wait for entropy consensus with Byzantine threshold
+                        // This blocks production until consensus is reached OR timeout
                         {
-                            // Give peers time to respond
-                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                            // OPTIMIZATION: Dynamic wait with adaptive timeout
+                            // Timeout scales with network size and latency for optimal performance
+                            // Byzantine threshold: 60% of sampled peers (Byzantine-safe majority)
+                            let consensus_start = std::time::Instant::now();
                             
-                            let mut matches = 0;
-                            let mut mismatches = 0;
+                            // ARCHITECTURE: Adaptive timeout based on network conditions
+                            // Uses same logic as Turbine fanout (unified_p2p.rs:5215-5243)
+                            let avg_latency = p2p.get_average_peer_latency();
+                            let max_consensus_wait = match (qualified_producers, avg_latency) {
+                                // GENESIS PHASE (5-50 producers):
+                                // WAN latency expected, allow 2 seconds for certificate verification
+                                (0..=50, _) => tokio::time::Duration::from_millis(2000),
+                                
+                                // SMALL NETWORK (51-200 producers):
+                                // LAN: 1 second sufficient, WAN: 2 seconds for safety
+                                (51..=200, 0..=50) => tokio::time::Duration::from_millis(1000),
+                                (51..=200, _) => tokio::time::Duration::from_millis(2000),
+                                
+                                // MEDIUM/LARGE NETWORK (201+ producers):
+                                // Assume datacenter deployment, 1 second sufficient
+                                // LAN: 1 second, WAN: 1.5 seconds (most producers in same region)
+                                (201..=1000, 0..=50) => tokio::time::Duration::from_millis(1000),
+                                (201..=1000, _) => tokio::time::Duration::from_millis(1500),
+                                
+                                // VERY LARGE (1000+ producers):
+                                // Production deployment with regional clustering
+                                _ => tokio::time::Duration::from_millis(1000),
+                            };
                             
-                            // Check received responses SYNCHRONOUSLY
-                            {
+                            let byzantine_threshold = ((sample_size as f64 * 0.6).ceil() as usize).max(1); // 60% of peers, minimum 1
+                            
+                            println!("[CONSENSUS] 🎯 Waiting for Byzantine threshold: {}/{} responses (60%)", 
+                                     byzantine_threshold, sample_size);
+                            
+                            // OPTIMIZATION: Dynamic wait loop - check responses every 100ms
+                            // Exit early if Byzantine threshold reached OR timeout
+                            let mut consensus_reached = false;
+                            let mut matches;
+                            let mut mismatches;
+                            
+                            loop {
+                                // Check received responses
+                                matches = 0;
+                                mismatches = 0;
+                                
+                                {
+                                    let responses = ENTROPY_RESPONSES.lock().unwrap();
+                                    for ((height, responder), peer_entropy) in responses.iter() {
+                                        if *height == entropy_height {
+                                            // CRITICAL FIX: Ignore peer_entropy == 0 (peer doesn't have block yet)
+                                            // This prevents false positives when nodes are at different heights
+                                            // FINALITY_WINDOW ensures synchronized nodes have this block
+                                            if *peer_entropy == [0u8; 32] {
+                                                // Don't count as mismatch - peer is just lagging
+                                                continue;
+                                            }
+                                            
+                                            if *peer_entropy == our_entropy {
+                                                matches += 1;
+                                            } else {
+                                                // REAL mismatch: peer has different entropy (potential fork!)
+                                                mismatches += 1;
+                                            }
+                                        }
+                                    }
+                                }
+                                
+                                // OPTIMIZATION: Check if Byzantine threshold reached
+                                // 60% of peers must agree (3 out of 5 for Genesis)
+                                if matches >= byzantine_threshold {
+                                    let elapsed_ms = consensus_start.elapsed().as_millis();
+                                    println!("[CONSENSUS] ✅ Byzantine threshold reached: {} matches in {}ms", 
+                                             matches, elapsed_ms);
+                                    consensus_reached = true;
+                                    break;
+                                }
+                                
+                                // Check timeout
+                                if consensus_start.elapsed() >= max_consensus_wait {
+                                    let elapsed_ms = consensus_start.elapsed().as_millis();
+                                    println!("[CONSENSUS] ⏰ Timeout reached after {}ms: {} matches, {} mismatches", 
+                                             elapsed_ms, matches, mismatches);
+                                    break;
+                                }
+                                
+                                // Wait 100ms before checking again
+                                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                            }
+                            
+                            // Log final results with responder details
+                            if consensus_reached || matches > 0 {
                                 let responses = ENTROPY_RESPONSES.lock().unwrap();
                                 for ((height, responder), peer_entropy) in responses.iter() {
-                                    if *height == entropy_height {
-                                        // CRITICAL FIX: Ignore peer_entropy == 0 (peer doesn't have block yet)
-                                        // This prevents false positives when nodes are at different heights
-                                        // FINALITY_WINDOW ensures synchronized nodes have this block
-                                        if *peer_entropy == [0u8; 32] {
-                                            println!("[CONSENSUS] ⏳ Peer {} doesn't have finalized block #{} yet (lagging)", 
-                                                     responder, entropy_height);
-                                            // Don't count as mismatch - peer is just lagging
-                                            continue;
-                                        }
-                                        
+                                    if *height == entropy_height && *peer_entropy != [0u8; 32] {
                                         if *peer_entropy == our_entropy {
-                                            matches += 1;
                                             println!("[CONSENSUS] ✅ Entropy match with {}", responder);
                                         } else {
-                                            // REAL mismatch: peer has different entropy (potential fork!)
-                                            mismatches += 1;
                                             println!("[CONSENSUS] ❌ Entropy mismatch with {}: expected {:x}, got {:x}",
                                                     responder,
                                                     u64::from_le_bytes([our_entropy[0], our_entropy[1], our_entropy[2], our_entropy[3],
@@ -4777,12 +4868,12 @@ impl BlockchainNode {
                                 if mismatches > matches && matches > 0 {
                                     // Majority disagrees - STOP to prevent fork
                                     println!("[CONSENSUS] 🚨 FORK DETECTED! {} peers have different entropy vs {} agree", 
-                                            mismatches, matches);
+                                        mismatches, matches);
                                     println!("[CONSENSUS] 🛑 STOPPING production to prevent fork propagation!");
                                     println!("[CONSENSUS] ❌ Cannot proceed - network has diverged");
-                                    
-                                    // Skip this rotation round to prevent fork
-                                    continue;
+                                
+                                // Skip this rotation round to prevent fork
+                                continue;
                                 } else {
                                     // Minority disagrees - log warning but continue (Byzantine resilience)
                                     println!("[CONSENSUS] ⚠️ {} peers have different entropy (minority), {} agree (majority)", 
@@ -4795,6 +4886,10 @@ impl BlockchainNode {
                                         matches);
                             } else {
                                 // No responses - peers are lagging (not a problem with FINALITY_WINDOW)
+                                // ARCHITECTURE: FINALITY_WINDOW ensures entropy block is Byzantine-finalized
+                                // If producer has correct block → entropy is correct
+                                // If producer has wrong block → other nodes will reject its blocks
+                                // Liveness: Network must continue even if peers are slow to respond
                                 println!("[CONSENSUS] ⏳ No entropy responses (peers lagging) - continuing with FINALITY_WINDOW safety");
                             }
                         }
@@ -4850,8 +4945,8 @@ impl BlockchainNode {
                                         match p2p.broadcast_certificate_announce_tracked(cert.serial_number.clone(), cert_bytes.clone()).await {
                                             Ok(()) => {
                                                 println!("[CERTIFICATE] ✅ Producer certificate delivered to 2/3+ peers (Byzantine threshold)");
-                                                // Mark this round as broadcasted
-                                                last_certificate_broadcast_round = Some(current_round);
+                                            // Mark this round as broadcasted
+                                            last_certificate_broadcast_round = Some(current_round);
                                             }
                                             Err(e) => {
                                                 println!("[CERTIFICATE] ⚠️ Producer certificate Byzantine threshold NOT reached: {}", e);
@@ -4883,41 +4978,59 @@ impl BlockchainNode {
                     // Flag will be cleared AFTER block is successfully created and saved
                     // This prevents the node from forgetting it's emergency producer in next iteration
                     
-                    // CRITICAL FIX: Emergency producer ALWAYS can produce
-                    // Skip all checks if we're emergency producer to break deadlock
+                    // CRITICAL FIX: Emergency producer MUST check sync status before producing
+                    // Prevents emergency production when node is behind due to fork or network issues
                     let can_produce = if is_emergency_producer {
-                        println!("[EMERGENCY] 🚀 Emergency producer bypassing all checks!");
+                        println!("[EMERGENCY] 🚀 Emergency producer activated for block #{}", next_block_height);
                         
-                        // CRITICAL: Before creating emergency block, wait and check if original producer delivered
-                        // This prevents race condition where both producers create the same block
-                        println!("[EMERGENCY] ⏰ Waiting 2 seconds to allow original producer to deliver...");
-                        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                        // CRITICAL: Check if we're synchronized before emergency production
+                        // This prevents creating blocks when node is behind due to fork
+                        let local_height = storage.get_chain_height().unwrap_or(0);
                         
-                        // Check if the block already exists from original producer
-                        let block_exists = {
-                            match storage.load_microblock(next_block_height) {
-                                Ok(Some(_)) => {
-                                    println!("[EMERGENCY] ✅ Block #{} already exists from original producer! Skipping emergency production.", next_block_height);
-                                    
-                                    // Clear emergency flag since block exists
-                                    if let Ok(mut emergency_flag) = EMERGENCY_PRODUCER_FLAG.lock() {
-                                        *emergency_flag = None;
-                                        println!("[EMERGENCY] 🔧 Cleared emergency flag - block delivered by original producer");
-                                    }
-                                    true
-                                },
-                                Ok(None) => {
-                                    println!("[EMERGENCY] ❌ Block #{} still missing after wait - proceeding with emergency production", next_block_height);
-                                    false
-                                },
-                                Err(e) => {
-                                    println!("[EMERGENCY] ⚠️ Error checking block existence: {} - proceeding with emergency production", e);
-                                    false
-                                }
+                        if local_height < next_block_height - 1 {
+                            println!("[EMERGENCY] ⚠️ Cannot produce block #{} - we are at height #{} (behind!)", 
+                                     next_block_height, local_height);
+                            println!("[EMERGENCY] 🔄 Node is lagging or has fork - clearing emergency flag");
+                            println!("[EMERGENCY] 💡 Background sync will resolve the issue");
+                            
+                            // Clear emergency flag - we can't produce
+                            if let Ok(mut emergency_flag) = EMERGENCY_PRODUCER_FLAG.lock() {
+                                *emergency_flag = None;
+                                println!("[EMERGENCY] 🔧 Cleared emergency flag - node not synchronized");
                             }
-                        };
-                        
-                        !block_exists  // Can produce only if block doesn't exist
+                            
+                            false // Cannot produce
+                        } else {
+                            // We are synchronized - check if block already exists
+                            println!("[EMERGENCY] ✅ Node synchronized at height {} - checking if block exists", local_height);
+                            println!("[EMERGENCY] ⏰ Waiting 2 seconds to allow original producer to deliver...");
+                            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                            
+                            let block_exists = {
+                                match storage.load_microblock(next_block_height) {
+                                    Ok(Some(_)) => {
+                                        println!("[EMERGENCY] ✅ Block #{} already exists from original producer! Skipping emergency production.", next_block_height);
+                                        
+                                        // Clear emergency flag since block exists
+                                        if let Ok(mut emergency_flag) = EMERGENCY_PRODUCER_FLAG.lock() {
+                                            *emergency_flag = None;
+                                            println!("[EMERGENCY] 🔧 Cleared emergency flag - block delivered by original producer");
+                                        }
+                                        true
+                                    },
+                                    Ok(None) => {
+                                        println!("[EMERGENCY] ❌ Block #{} still missing after wait - proceeding with emergency production", next_block_height);
+                                        false
+                                    },
+                                    Err(e) => {
+                                        println!("[EMERGENCY] ⚠️ Error checking block existence: {} - proceeding with emergency production", e);
+                                        false
+                                    }
+                                }
+                            };
+                            
+                            !block_exists  // Can produce only if block doesn't exist
+                        }
                     } else {
                         // CRITICAL: Check emergency stop flag first
                         // If we received emergency failover notification, stop producing immediately
@@ -6607,7 +6720,7 @@ impl BlockchainNode {
                 [0u8; 32]
             };
             
-                // Add macroblock entropy if available (but don't wait for it!)
+                // Add finality window entropy (ONLY source for determinism!)
                 hasher.update(&entropy_source);
                 
                 let result = hasher.finalize();
@@ -8997,10 +9110,10 @@ impl BlockchainNode {
                     let serial_changed = old_serial.as_ref().map_or(true, |old| old != &new_cert.serial_number);
                     
                     if serial_changed {
-                        if let Ok(cert_bytes) = bincode::serialize(&new_cert) {
+                    if let Ok(cert_bytes) = bincode::serialize(&new_cert) {
                             println!("[CONSENSUS] 📜 TRACKED broadcast of rotated certificate: {} (serial changed)", new_cert.serial_number);
-                            // Broadcast to network if P2P instance available
-                            if let Some(p2p) = unified_p2p {
+                        // Broadcast to network if P2P instance available
+                        if let Some(p2p) = unified_p2p {
                                 // CRITICAL: Use tracked broadcast for consensus certificate rotation
                                 match p2p.broadcast_certificate_announce_tracked(new_cert.serial_number.clone(), cert_bytes.clone()).await {
                                     Ok(()) => {
@@ -9200,10 +9313,10 @@ impl BlockchainNode {
                     let serial_changed = old_serial.as_ref().map_or(true, |old| old != &new_cert.serial_number);
                     
                     if serial_changed {
-                        if let Ok(cert_bytes) = bincode::serialize(&new_cert) {
+                    if let Ok(cert_bytes) = bincode::serialize(&new_cert) {
                             println!("[CRYPTO] 📜 TRACKED broadcast of rotated certificate: {} (serial changed)", new_cert.serial_number);
-                            // Broadcast to network if P2P instance available
-                            if let Some(p2p) = unified_p2p {
+                        // Broadcast to network if P2P instance available
+                        if let Some(p2p) = unified_p2p {
                                 // CRITICAL: Use tracked broadcast for microblock certificate rotation
                                 match p2p.broadcast_certificate_announce_tracked(new_cert.serial_number.clone(), cert_bytes.clone()).await {
                                     Ok(()) => {

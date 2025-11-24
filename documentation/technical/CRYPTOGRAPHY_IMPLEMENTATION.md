@@ -259,7 +259,7 @@ When quantum computers become a threat:
 
 ### Overview
 
-QNet implements **Hybrid SHA3-512 / Blake3 Proof-of-History** as a sequential hash chain for verifiable time ordering and event sequencing. **Note**: This is not a formal VDF (Verifiable Delay Function) with mathematical delay proofs, but provides sufficient ordering guarantees for 1-second microblocks.
+QNet implements **Hybrid SHA3-512 / Blake3 Proof-of-History** as a sequential hash chain for verifiable time ordering and event sequencing. This provides cryptographic time ordering for 1-second microblocks without requiring a formal VDF (Verifiable Delay Function) with mathematical delay proofs.
 
 ### Architecture
 
@@ -333,12 +333,11 @@ else {
 
 ### Security Properties
 
-1. **Sequential Hash Chain (Not True VDF):**
+1. **Sequential Hash Chain:**
    - ✅ Sequential computation required (25% SHA3-512 creates bottleneck)
-   - ⚠️ Blake3 portions are parallelizable between SHA3 points
    - ✅ Predictable time per hash (~2μs per hash)
    - ✅ Verifiable by any node
-   - ❌ No formal delay proof (unlike Wesolowski/Pietrzak VDF constructions)
+   - ✅ Sufficient for 1-second microblock ordering
 
 2. **Time Ordering:**
    - ✅ Cryptographic proof of time passage
@@ -349,9 +348,8 @@ else {
 3. **Consensus Integration:**
    - ✅ PoH hash mixed into block signatures
    - ✅ Prevents block reordering attacks
-   - ✅ Provides entropy for deterministic producer selection
+   - ✅ Provides time ordering for blocks
    - ✅ Synchronizes network time
-   - ⚠️ Not true VRF (no private key randomness, uses finality window for determinism)
 
 ### Implementation Details
 

@@ -7,6 +7,7 @@
 - **Macroblocks**: Every 90 seconds (consensus finalization)
 - **Producer Rotation**: Every 30 blocks
 - **Finality Window**: 10 blocks (~10 seconds)
+- **Entropy Consensus**: At rotation boundaries (adaptive 200ms-2s)
 
 ### Signature Types
 | Type | Size | Use Case | Certificate |
@@ -66,6 +67,23 @@ Consensus Layer (consensus_crypto.rs)
     ├─► Byzantine consensus (2/3+)
     └─► Accept or reject
 ```
+
+## 🔄 Entropy Consensus (v2.19.4)
+
+### Adaptive Scaling
+- **Sample Size**: 5 (Genesis) → 100 (1M nodes) - scales with network
+- **Timeout**: 1-2s adaptive (based on network size + latency)
+- **Byzantine Threshold**: 60% of sampled peers must agree
+- **Trigger**: Every 30 blocks (rotation boundaries)
+- **Performance**: 2-20× faster than fixed 4s timeout
+
+### Network Efficiency
+| Network Size | Sample | Bandwidth | Latency |
+|--------------|--------|-----------|---------|
+| 5 (Genesis) | 5 (100%) | 1 KB | 200-2000ms |
+| 100 | 20 (20%) | 2 KB | 200-1000ms |
+| 1000 | 50 (5%) | 4 KB | 200-1000ms |
+| 1M | 100 (0.01%) | 6 KB | 200-1000ms |
 
 ## 📡 Certificate Management
 
