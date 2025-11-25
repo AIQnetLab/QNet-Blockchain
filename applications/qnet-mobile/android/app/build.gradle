@@ -179,4 +179,11 @@ dependencies {
         // Use JSC since Hermes requires react.gradle for proper configuration
         implementation jscFlavor
     }
+    
+    // Firebase
+    implementation platform('com.google.firebase:firebase-bom:32.7.0')
+    implementation 'com.google.firebase:firebase-messaging'
 }
+
+// Apply Google Services plugin at the bottom
+apply plugin: 'com.google.gms.google-services'

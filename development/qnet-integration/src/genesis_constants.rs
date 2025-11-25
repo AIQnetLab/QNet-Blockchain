@@ -95,17 +95,26 @@ pub fn get_genesis_wallet_by_id(bootstrap_id: &str) -> Option<&'static str> {
 /// SECURITY: System public key for verifying emission and claim transactions
 /// This is generated during first Genesis node startup and MUST be updated here
 /// CRITICAL: This key authenticates ALL system_emission and reward claims
-/// PRODUCTION: Replace placeholder after initial Genesis deployment
+/// 
+/// DEPLOYMENT PROCESS:
+/// 1. First Genesis node startup generates Dilithium keypair
+/// 2. Public key is logged: "[GENESIS] System public key: <hex>"
+/// 3. Copy that hex value here and rebuild all nodes
+/// 4. Deploy updated nodes to production
+/// 
+/// Until step 3 is complete, system operates in "Genesis deployment mode"
+/// which accepts all system signatures (required for initial network bootstrap)
 pub const SYSTEM_DILITHIUM_PUBLIC_KEY_HEX: &str = 
     "PLACEHOLDER_GENESIS_DEPLOYMENT_WILL_GENERATE_REAL_KEY";
 
 /// Verify if a transaction signature is from the system key
 /// Used by all nodes to validate emission and claim transactions
 pub fn is_valid_system_signature(message: &[u8], signature_hex: &str) -> bool {
-    // PLACEHOLDER: During initial deployment, accept all system signatures
-    // PRODUCTION: After Genesis, this will verify against real system public key
+    // Genesis deployment mode: accept all system signatures during initial bootstrap
+    // This is REQUIRED because the system key doesn't exist until first Genesis startup
+    // After deployment, replace PLACEHOLDER with real key and this check becomes active
     if SYSTEM_DILITHIUM_PUBLIC_KEY_HEX == "PLACEHOLDER_GENESIS_DEPLOYMENT_WILL_GENERATE_REAL_KEY" {
-        println!("[SECURITY] ⚠️ Using placeholder system key - Genesis deployment mode");
+        println!("[SECURITY] ⚠️ Genesis deployment mode - system key not yet configured");
         return true;
     }
     

@@ -105,12 +105,18 @@ pub enum QNetError {
     AccountNotFound(String),
 }
 
-// TODO: Implement proper mempool error conversion
-// impl From<qnet_mempool::MempoolError> for QNetError {
-//     fn from(err: qnet_mempool::MempoolError) -> Self {
-//         QNetError::MempoolError(err.to_string())
-//     }
-// }
+// PRODUCTION: Mempool error conversion for transaction handling
+impl From<qnet_mempool::MempoolError> for QNetError {
+    fn from(err: qnet_mempool::MempoolError) -> Self {
+        QNetError::MempoolError(err.to_string())
+    }
+}
+
+impl From<qnet_mempool::MempoolError> for IntegrationError {
+    fn from(err: qnet_mempool::MempoolError) -> Self {
+        IntegrationError::MempoolError(err.to_string())
+    }
+}
 
 impl From<crate::validator::ValidationError> for IntegrationError {
     fn from(err: crate::validator::ValidationError) -> Self {

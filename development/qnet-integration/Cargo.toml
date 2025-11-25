@@ -51,6 +51,9 @@ base64ct = "1.5.0"
 pqcrypto = "0.18"
 pqcrypto-dilithium = "0.5"
 pqcrypto-traits = "0.3"
+
+# RSA for FCM V1 API JWT signing
+rsa = { version = "0.9", features = ["sha2", "pem"] }
 aes-gcm = "0.10"
 zeroize = { version = "1.6", features = ["derive"] }
 rand_chacha = "0.3"

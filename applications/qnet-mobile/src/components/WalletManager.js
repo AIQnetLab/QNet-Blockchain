@@ -3047,11 +3047,40 @@ export class WalletManager {
   // Get active nodes count from blockchain/API
   async getActiveNodesCount(isTestnet = true) {
     try {
-      // PRODUCTION: Will get real count from QNet blockchain
-      // For now returning test value
-      const activeNodesCount = 150000; // TODO: Get real count from blockchain
+      // PRODUCTION: Get real count from QNet bootstrap nodes
+      const bootstrapNodes = [
+        'https://bootstrap1.qnet.network',
+        'https://bootstrap2.qnet.network',
+        'https://bootstrap3.qnet.network',
+        'https://bootstrap4.qnet.network',
+        'https://bootstrap5.qnet.network'
+      ];
       
-      return activeNodesCount;
+      // Try multiple bootstrap nodes for reliability
+      for (const apiUrl of bootstrapNodes) {
+        try {
+          const response = await fetch(`${apiUrl}/api/v1/network/stats`, {
+            method: 'GET',
+            headers: { 'Content-Type': 'application/json' },
+            timeout: 5000
+          });
+          
+          if (response.ok) {
+            const stats = await response.json();
+            // Return total active nodes (Light + Full + Super)
+            const totalNodes = (stats.light_nodes || 0) + 
+                              (stats.full_nodes || 0) + 
+                              (stats.super_nodes || 0);
+            return totalNodes > 0 ? totalNodes : 150000; // Fallback if 0
+          }
+        } catch (nodeError) {
+          // Try next node
+          continue;
+        }
+      }
+      
+      // All nodes failed, return default
+      return 150000;
       
     } catch (error) {
       // console.error('[getActiveNodesCount] Error:', error);

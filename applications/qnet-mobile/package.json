@@ -12,6 +12,8 @@
   "dependencies": {
     "@react-native-async-storage/async-storage": "^2.2.0",
     "@react-native-clipboard/clipboard": "^1.16.3",
+    "@react-native-firebase/app": "^23.5.0",
+    "@react-native-firebase/messaging": "^23.5.0",
     "@react-native/new-app-screen": "0.81.4",
     "@solana/spl-token": "^0.4.14",
     "@solana/web3.js": "^1.98.4",
