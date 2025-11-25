@@ -169,7 +169,8 @@ impl QNetBlockchain {
         let tx_json = serde_json::to_string(&tx).map_err(|e| IntegrationError::SerializationError(e.to_string()))?;
         let tx_hash = format!("{:x}", sha3::Sha3_256::digest(tx_json.as_bytes()));
         
-        self.mempool.add_raw_transaction(tx_json, tx_hash);
+        // PRODUCTION: Add with gas_price for priority ordering (anti-spam protection)
+        self.mempool.add_raw_transaction(tx_json, tx_hash, tx.gas_price);
         Ok(())
     }
     

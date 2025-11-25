@@ -205,6 +205,9 @@ impl PersistentStorage {
             ColumnFamilyDescriptor::new("failover_events", failover_opts),
             ColumnFamilyDescriptor::new("snapshots", Options::default()),
             ColumnFamilyDescriptor::new("tx_index", Options::default()), // O(1) transaction lookups
+            ColumnFamilyDescriptor::new("tx_by_address", Options::default()), // Index: address -> [tx_hashes]
+            ColumnFamilyDescriptor::new("attestations", Options::default()), // Light node attestations
+            ColumnFamilyDescriptor::new("heartbeats", Options::default()),   // Full/Super node heartbeats
         ];
         
         let db = match DB::open_cf_descriptors(&opts, path, cfs) {
@@ -225,6 +228,8 @@ impl PersistentStorage {
             .ok_or_else(|| IntegrationError::StorageError("transactions column family not found".to_string()))?;
         let tx_index_cf = self.db.cf_handle("tx_index")
             .ok_or_else(|| IntegrationError::StorageError("tx_index column family not found".to_string()))?;
+        let tx_by_addr_cf = self.db.cf_handle("tx_by_address")
+            .ok_or_else(|| IntegrationError::StorageError("tx_by_address column family not found".to_string()))?;
         
         let block_key = format!("block_{}", block.height);
         let block_data = bincode::serialize(block)
@@ -249,6 +254,17 @@ impl PersistentStorage {
             
             // INDEX: tx_hash -> block_height for O(1) transaction location
             batch.put_cf(&tx_index_cf, tx_key.as_bytes(), &block.height.to_be_bytes());
+            
+            // INDEX: address -> tx_hash for account transaction queries
+            // Key format: addr_{address}_{timestamp}_{tx_hash} for chronological ordering
+            let timestamp = tx.timestamp;
+            let from_key = format!("addr_{}_{:016x}_{}", tx.from, timestamp, tx.hash);
+            batch.put_cf(&tx_by_addr_cf, from_key.as_bytes(), tx.hash.as_bytes());
+            
+            if let Some(ref to) = tx.to {
+                let to_key = format!("addr_{}_{:016x}_{}", to, timestamp, tx.hash);
+                batch.put_cf(&tx_by_addr_cf, to_key.as_bytes(), tx.hash.as_bytes());
+            }
         }
         
         // Update chain height
@@ -1100,6 +1116,95 @@ impl PersistentStorage {
             }
         }
     }
+    
+    /// Get transactions for an address (paginated, most recent first)
+    pub async fn get_transactions_by_address(&self, address: &str, page: usize, per_page: usize) -> IntegrationResult<Vec<qnet_state::Transaction>> {
+        let tx_by_addr_cf = self.db.cf_handle("tx_by_address")
+            .ok_or_else(|| IntegrationError::StorageError("tx_by_address column family not found".to_string()))?;
+        let tx_cf = self.db.cf_handle("transactions")
+            .ok_or_else(|| IntegrationError::StorageError("transactions column family not found".to_string()))?;
+        
+        let prefix = format!("addr_{}_", address);
+        
+        // Iterate in reverse to get most recent first (keys are sorted by timestamp)
+        let iter = self.db.iterator_cf(
+            &tx_by_addr_cf,
+            rocksdb::IteratorMode::From(
+                format!("{}~", prefix).as_bytes(), // ~ is after hex digits in ASCII
+                rocksdb::Direction::Reverse
+            )
+        );
+        
+        let mut transactions = Vec::new();
+        let skip = page * per_page;
+        let mut count = 0;
+        let mut seen_hashes = std::collections::HashSet::new();
+        
+        for item in iter {
+            let (key, value) = item?;
+            let key_str = std::str::from_utf8(&key).unwrap_or("");
+            
+            if !key_str.starts_with(&prefix) {
+                break;
+            }
+            
+            // Get tx_hash from value
+            let tx_hash = std::str::from_utf8(&value).unwrap_or("");
+            
+            // Deduplicate (same tx may appear twice if from==to)
+            if seen_hashes.contains(tx_hash) {
+                continue;
+            }
+            seen_hashes.insert(tx_hash.to_string());
+            
+            count += 1;
+            if count <= skip {
+                continue;
+            }
+            
+            // Fetch full transaction
+            let tx_key = format!("tx_{}", tx_hash);
+            if let Some(tx_data) = self.db.get_cf(&tx_cf, tx_key.as_bytes())? {
+                if let Ok(tx) = bincode::deserialize::<qnet_state::Transaction>(&tx_data) {
+                    transactions.push(tx);
+                    if transactions.len() >= per_page {
+                        break;
+                    }
+                }
+            }
+        }
+        
+        Ok(transactions)
+    }
+    
+    /// Count transactions for an address
+    pub async fn count_transactions_by_address(&self, address: &str) -> IntegrationResult<usize> {
+        let tx_by_addr_cf = self.db.cf_handle("tx_by_address")
+            .ok_or_else(|| IntegrationError::StorageError("tx_by_address column family not found".to_string()))?;
+        
+        let prefix = format!("addr_{}_", address);
+        let iter = self.db.iterator_cf(&tx_by_addr_cf, rocksdb::IteratorMode::From(prefix.as_bytes(), rocksdb::Direction::Forward));
+        
+        let mut count = 0;
+        let mut seen_hashes = std::collections::HashSet::new();
+        
+        for item in iter {
+            let (key, value) = item?;
+            let key_str = std::str::from_utf8(&key).unwrap_or("");
+            
+            if !key_str.starts_with(&prefix) {
+                break;
+            }
+            
+            let tx_hash = std::str::from_utf8(&value).unwrap_or("");
+            if !seen_hashes.contains(tx_hash) {
+                seen_hashes.insert(tx_hash.to_string());
+                count += 1;
+            }
+        }
+        
+        Ok(count)
+    }
 }
 
 /// Storage modes for different node types
@@ -1685,6 +1790,26 @@ impl Storage {
     /// Get transaction block height
     pub async fn get_transaction_block_height(&self, tx_hash: &str) -> IntegrationResult<u64> {
         self.persistent.get_transaction_block_height(tx_hash).await
+    }
+    
+    /// Get transactions for an address (paginated)
+    pub async fn get_transactions_by_address(&self, address: &str, page: usize, per_page: usize) -> IntegrationResult<Vec<qnet_state::Transaction>> {
+        self.persistent.get_transactions_by_address(address, page, per_page).await
+    }
+    
+    /// Count transactions for an address
+    pub async fn count_transactions_by_address(&self, address: &str) -> IntegrationResult<usize> {
+        self.persistent.count_transactions_by_address(address).await
+    }
+    
+    /// Get reputation history for a node
+    pub fn get_reputation_history(&self, node_id: &str, limit: usize) -> IntegrationResult<Vec<serde_json::Value>> {
+        self.get_reputation_history_internal(node_id, limit)
+    }
+    
+    /// Save reputation change event
+    pub fn save_reputation_change(&self, node_id: &str, old_value: f64, new_value: f64, reason: &str) -> IntegrationResult<()> {
+        self.save_reputation_change_internal(node_id, old_value, new_value, reason)
     }
 
     pub fn update_activation_for_migration(&self, code: &str, node_type: u8, timestamp: u64, new_device_signature: &str) -> IntegrationResult<()> {
@@ -2866,6 +2991,257 @@ impl Storage {
         }
         
         Ok(())
+    }
+    
+    // ============================================
+    // PRODUCTION: REPUTATION HISTORY STORAGE
+    // ============================================
+    
+    /// Save reputation change event (for audit trail and history)
+    fn save_reputation_change_internal(&self, node_id: &str, old_value: f64, new_value: f64, reason: &str) -> IntegrationResult<()> {
+        let rep_cf = self.persistent.db.cf_handle("node_registry")
+            .ok_or_else(|| IntegrationError::StorageError("node_registry column family not found".to_string()))?;
+        
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        
+        // Key: rep_history_{node_id}_{timestamp} for chronological ordering
+        let key = format!("rep_history_{}_{}", node_id, timestamp);
+        let data = serde_json::json!({
+            "node_id": node_id,
+            "old_value": old_value,
+            "new_value": new_value,
+            "delta": new_value - old_value,
+            "reason": reason,
+            "timestamp": timestamp
+        });
+        
+        self.persistent.db.put_cf(&rep_cf, key.as_bytes(), data.to_string().as_bytes())?;
+        
+        // Cleanup old history (keep only last 7 days)
+        self.cleanup_old_reputation_history(node_id, timestamp - (7 * 86400))?;
+        
+        Ok(())
+    }
+    
+    /// Get reputation history for a node
+    fn get_reputation_history_internal(&self, node_id: &str, limit: usize) -> IntegrationResult<Vec<serde_json::Value>> {
+        let rep_cf = self.persistent.db.cf_handle("node_registry")
+            .ok_or_else(|| IntegrationError::StorageError("node_registry column family not found".to_string()))?;
+        
+        let mut history = Vec::new();
+        let prefix = format!("rep_history_{}_", node_id);
+        
+        // Iterate in reverse to get most recent first
+        let iter = self.persistent.db.iterator_cf(
+            &rep_cf, 
+            rocksdb::IteratorMode::From(
+                format!("{}~", prefix).as_bytes(), // ~ is after digits in ASCII
+                rocksdb::Direction::Reverse
+            )
+        );
+        
+        for item in iter {
+            let (key, value) = item?;
+            let key_str = std::str::from_utf8(&key).unwrap_or("");
+            
+            if !key_str.starts_with(&prefix) {
+                break;
+            }
+            
+            if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&value) {
+                history.push(parsed);
+                if history.len() >= limit {
+                    break;
+                }
+            }
+        }
+        
+        Ok(history)
+    }
+    
+    /// Cleanup old reputation history records
+    fn cleanup_old_reputation_history(&self, node_id: &str, cutoff_timestamp: u64) -> IntegrationResult<()> {
+        let rep_cf = self.persistent.db.cf_handle("node_registry")
+            .ok_or_else(|| IntegrationError::StorageError("node_registry column family not found".to_string()))?;
+        
+        let prefix = format!("rep_history_{}_", node_id);
+        let iter = self.persistent.db.iterator_cf(&rep_cf, rocksdb::IteratorMode::From(prefix.as_bytes(), rocksdb::Direction::Forward));
+        
+        let mut batch = WriteBatch::default();
+        for item in iter {
+            let (key, value) = item?;
+            let key_str = std::str::from_utf8(&key).unwrap_or("");
+            
+            if !key_str.starts_with(&prefix) {
+                break;
+            }
+            
+            if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&value) {
+                let timestamp = parsed["timestamp"].as_u64().unwrap_or(0);
+                if timestamp < cutoff_timestamp {
+                    batch.delete_cf(&rep_cf, &key);
+                }
+            }
+        }
+        
+        if batch.len() > 0 {
+            self.persistent.db.write(batch)?;
+        }
+        
+        Ok(())
+    }
+    
+    // ============================================
+    // PRODUCTION: ATTESTATION STORAGE (Light nodes)
+    // ============================================
+    
+    /// Save Light node attestation (persistent for reward calculation)
+    pub fn save_attestation(&self, light_node_id: &str, slot: u64, pinger_id: &str, timestamp: u64) -> IntegrationResult<()> {
+        let att_cf = self.persistent.db.cf_handle("attestations")
+            .ok_or_else(|| IntegrationError::StorageError("attestations column family not found".to_string()))?;
+        
+        // Key: att_{light_node_id}_{slot} for deduplication
+        let key = format!("att_{}_{}", light_node_id, slot);
+        let data = json!({
+            "light_node_id": light_node_id,
+            "slot": slot,
+            "pinger_id": pinger_id,
+            "timestamp": timestamp
+        });
+        
+        self.persistent.db.put_cf(&att_cf, key.as_bytes(), data.to_string().as_bytes())?;
+        Ok(())
+    }
+    
+    /// Check if attestation exists for Light node in slot
+    pub fn has_attestation(&self, light_node_id: &str, slot: u64) -> IntegrationResult<bool> {
+        let att_cf = self.persistent.db.cf_handle("attestations")
+            .ok_or_else(|| IntegrationError::StorageError("attestations column family not found".to_string()))?;
+        
+        let key = format!("att_{}_{}", light_node_id, slot);
+        Ok(self.persistent.db.get_cf(&att_cf, key.as_bytes())?.is_some())
+    }
+    
+    /// Count attestations for Light node in 4h window (for reward eligibility)
+    pub fn count_attestations_in_window(&self, light_node_id: &str, window_start_slot: u64, window_end_slot: u64) -> IntegrationResult<u32> {
+        let att_cf = self.persistent.db.cf_handle("attestations")
+            .ok_or_else(|| IntegrationError::StorageError("attestations column family not found".to_string()))?;
+        
+        let mut count = 0u32;
+        for slot in window_start_slot..=window_end_slot {
+            let key = format!("att_{}_{}", light_node_id, slot);
+            if self.persistent.db.get_cf(&att_cf, key.as_bytes())?.is_some() {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+    
+    /// Cleanup old attestations (older than 24 hours)
+    pub fn cleanup_old_attestations(&self, cutoff_timestamp: u64) -> IntegrationResult<u32> {
+        let att_cf = self.persistent.db.cf_handle("attestations")
+            .ok_or_else(|| IntegrationError::StorageError("attestations column family not found".to_string()))?;
+        
+        let iter = self.persistent.db.iterator_cf(&att_cf, rocksdb::IteratorMode::Start);
+        let mut batch = WriteBatch::default();
+        let mut removed = 0u32;
+        
+        for item in iter {
+            let (key, value) = item?;
+            if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&value) {
+                let timestamp = parsed["timestamp"].as_u64().unwrap_or(0);
+                if timestamp < cutoff_timestamp {
+                    batch.delete_cf(&att_cf, &key);
+                    removed += 1;
+                }
+            }
+        }
+        
+        if batch.len() > 0 {
+            self.persistent.db.write(batch)?;
+        }
+        
+        Ok(removed)
+    }
+    
+    // ============================================
+    // PRODUCTION: HEARTBEAT STORAGE (Full/Super nodes)
+    // ============================================
+    
+    /// Save Full/Super node heartbeat (persistent for reward calculation)
+    pub fn save_heartbeat(&self, node_id: &str, heartbeat_index: u8, timestamp: u64, block_height: u64) -> IntegrationResult<()> {
+        let hb_cf = self.persistent.db.cf_handle("heartbeats")
+            .ok_or_else(|| IntegrationError::StorageError("heartbeats column family not found".to_string()))?;
+        
+        // Key: hb_{node_id}_{4h_window}_{index} for deduplication per window
+        let window = timestamp - (timestamp % (4 * 60 * 60));
+        let key = format!("hb_{}_{}_{}", node_id, window, heartbeat_index);
+        let data = json!({
+            "node_id": node_id,
+            "heartbeat_index": heartbeat_index,
+            "timestamp": timestamp,
+            "block_height": block_height,
+            "window": window
+        });
+        
+        self.persistent.db.put_cf(&hb_cf, key.as_bytes(), data.to_string().as_bytes())?;
+        Ok(())
+    }
+    
+    /// Count heartbeats for node in 4h window (for reward eligibility)
+    pub fn count_heartbeats_in_window(&self, node_id: &str, window_timestamp: u64) -> IntegrationResult<u8> {
+        let hb_cf = self.persistent.db.cf_handle("heartbeats")
+            .ok_or_else(|| IntegrationError::StorageError("heartbeats column family not found".to_string()))?;
+        
+        let mut count = 0u8;
+        for index in 0..10 {
+            let key = format!("hb_{}_{}_{}", node_id, window_timestamp, index);
+            if self.persistent.db.get_cf(&hb_cf, key.as_bytes())?.is_some() {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+    
+    /// Check heartbeat eligibility (8/10 for Full, 9/10 for Super)
+    pub fn check_heartbeat_eligibility(&self, node_id: &str, node_type: &str, window_timestamp: u64) -> IntegrationResult<(u8, u8, bool)> {
+        let count = self.count_heartbeats_in_window(node_id, window_timestamp)?;
+        let required = match node_type {
+            "super" => 9,
+            "full" => 8,
+            _ => 10,
+        };
+        Ok((count, required, count >= required))
+    }
+    
+    /// Cleanup old heartbeats (older than 24 hours)
+    pub fn cleanup_old_heartbeats(&self, cutoff_timestamp: u64) -> IntegrationResult<u32> {
+        let hb_cf = self.persistent.db.cf_handle("heartbeats")
+            .ok_or_else(|| IntegrationError::StorageError("heartbeats column family not found".to_string()))?;
+        
+        let iter = self.persistent.db.iterator_cf(&hb_cf, rocksdb::IteratorMode::Start);
+        let mut batch = WriteBatch::default();
+        let mut removed = 0u32;
+        
+        for item in iter {
+            let (key, value) = item?;
+            if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&value) {
+                let timestamp = parsed["timestamp"].as_u64().unwrap_or(0);
+                if timestamp < cutoff_timestamp {
+                    batch.delete_cf(&hb_cf, &key);
+                    removed += 1;
+                }
+            }
+        }
+        
+        if batch.len() > 0 {
+            self.persistent.db.write(batch)?;
+        }
+        
+        Ok(removed)
     }
     
     // ===== FAILOVER EVENT METHODS =====

@@ -66,7 +66,7 @@ impl Default for MempoolConfig {
         Self {
             max_size,
             max_per_account,
-            min_gas_price: 1,
+            min_gas_price: 100_000, // PRODUCTION: 0.0001 QNC (BASE_FEE_NANO_QNC)
             tx_expiry: Duration::from_secs(1800), // 30 minutes for faster turnover
             eviction_interval: Duration::from_secs(30), // More frequent cleanup
             enable_priority_senders: true,
@@ -160,10 +160,8 @@ impl Mempool {
             return Err(MempoolError::DuplicateTransaction(tx.hash.clone()));
         }
         
-        // Fast path for testing
-        if std::env::var("QNET_SKIP_VALIDATION").is_ok() {
-            return self.add_transaction_fast_path(tx).await;
-        }
+        // PRODUCTION: Always validate transactions (no skip option for security)
+        // Validates: signature, balance, nonce, gas
         
         // Validate transaction
         let validation = self.validator.validate(&tx).await?;
@@ -244,62 +242,23 @@ impl Mempool {
         Ok(())
     }
     
-    /// Fast path for adding transactions without validation
-    async fn add_transaction_fast_path(&self, tx: Transaction) -> MempoolResult<()> {
-        // Check mempool capacity
-        if self.transactions.len() >= self.config.max_size {
-            self.evict_transactions(1);
-        }
-        
-        // Calculate priority
-        let priority = self.priority_calc.calculate_priority(&tx);
-        
-        // Create entry
-        let entry = TxEntry {
-            tx: tx.clone(),
-            priority: priority.clone(),
-            added_at: Instant::now(),
-        };
-        
-        // Add to collections
-        self.transactions.insert(tx.hash.clone(), entry);
-        
-        self.by_sender
-            .entry(tx.from.clone())
-            .or_insert_with(BTreeMap::new)
-            .insert(tx.nonce, tx.hash.clone());
-        
-        self.priority_queue.write().push(tx.hash.clone(), priority);
-        
-        Ok(())
-    }
+    // REMOVED: add_transaction_fast_path - no skip validation in production
     
     /// Add batch of transactions for high performance
+    /// PRODUCTION: All transactions are validated (parallel or sequential)
     pub async fn add_transaction_batch(&self, txs: Vec<Transaction>) -> MempoolResult<Vec<String>> {
         let parallel_validation = env::var("QNET_PARALLEL_VALIDATION").unwrap_or_default() == "1";
-        let fast_path = env::var("QNET_SKIP_VALIDATION").is_ok();
         
         if parallel_validation && txs.len() > 10 {
             self.add_transaction_batch_parallel(txs).await
         } else {
-            // Sequential processing
+            // Sequential processing with full validation
             let mut successful_hashes = Vec::with_capacity(txs.len());
             
-            if fast_path {
-                // Fast batch processing without validation
-                for tx in txs {
-                    if self.transactions.len() < self.config.max_size {
-                        if let Ok(()) = self.add_transaction_fast_path(tx.clone()).await {
-                            successful_hashes.push(tx.hash);
-                        }
-                    }
-                }
-            } else {
-                // Normal batch processing with validation
-                for tx in txs {
-                    if let Ok(()) = self.add_transaction(tx.clone()).await {
-                        successful_hashes.push(tx.hash);
-                    }
+            // PRODUCTION: Always validate all transactions
+            for tx in txs {
+                if let Ok(()) = self.add_transaction(tx.clone()).await {
+                    successful_hashes.push(tx.hash);
                 }
             }
             
@@ -316,15 +275,12 @@ impl Mempool {
         info!("Starting parallel batch processing for {} transactions", tx_count);
         
         // Phase 1: Parallel validation and priority calculation
+        // PRODUCTION: Always validate (basic checks in parallel, full validation in phase 2)
         let validation_results: Vec<_> = txs.into_par_iter()
             .map(|tx| {
-                let is_valid = if env::var("QNET_SKIP_VALIDATION").is_ok() {
-                    true
-                } else {
-                    // Basic validation that can be done in parallel
-                    !tx.hash.is_empty() && !tx.from.is_empty() && 
-                    tx.to.as_ref().map_or(false, |to| !to.is_empty()) && tx.amount > 0
-                };
+                // Basic validation that can be done in parallel
+                let is_valid = !tx.hash.is_empty() && !tx.from.is_empty() && 
+                    tx.to.as_ref().map_or(false, |to| !to.is_empty()) && tx.amount > 0;
                 
                 let priority = self.priority_calc.calculate_priority(&tx);
                 
@@ -580,6 +536,7 @@ impl Mempool {
                 .unwrap()
                 .as_secs(),
             signature: None,
+            public_key: None, // Not needed for placeholder transaction
             tx_type: qnet_state::transaction::TransactionType::Transfer {
                 from: "unknown".to_string(),
                 to: "unknown".to_string(),

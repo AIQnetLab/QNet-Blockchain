@@ -1,6 +1,29 @@
 # Mobile Node Network Ping Optimization Explained
 
-## 🤔 Problem
+**Updated**: November 25, 2025 (v2.19.4)
+
+> **Current Implementation**: QNet v2.19.4 uses **FCM V1 API push notifications** to ping Light nodes. See `ARCHITECTURE_v2.19.md` for details.
+
+## Current Implementation (v2.19.4)
+
+```
+1. Full/Super node determines it's time to ping a Light node (sharded assignment)
+2. Full/Super sends FCM push notification via Firebase Cloud Messaging V1 API
+3. Light node receives push, wakes up, signs challenge with Ed25519
+4. Light node sends signed response back to pinger
+5. Pinger creates attestation (dual-signed: Light Ed25519 + Pinger Dilithium)
+6. Attestation gossiped to network and stored in RocksDB
+```
+
+**Key features**:
+- Only Genesis nodes send FCM (rate limited to 500/sec)
+- OAuth2 authentication with Service Account JSON
+- Access token cached for 55 minutes
+- Light node reputation fixed at 70 (immutable)
+
+---
+
+## 🤔 Problem (Legacy Context)
 
 Traditional approach with regular heartbeats drains mobile device batteries:
 - Constant connection maintenance
@@ -127,7 +150,7 @@ impl FullNode {
     
     /// Periodic check of mobile node status
     pub async fn check_mobile_nodes(&self) {
-        let timeout = Duration::from_secs(3600); // 1 hour for mobile
+        let timeout = Duration::from_secs(14400); // 4 hours (reward window) for mobile
         
         self.mobile_nodes.retain(|_, status| {
             if status.last_seen.elapsed() > timeout {

@@ -1,4 +1,5 @@
 //! Batch transaction processor for high performance
+//! PRODUCTION: All transactions are always validated (signature, balance, nonce)
 
 use qnet_state::transaction::Transaction;
 use qnet_mempool::Mempool;
@@ -7,10 +8,10 @@ use tokio::sync::RwLock;
 use crate::errors::QNetError;
 
 /// Batch processor for high-performance transaction handling
+/// PRODUCTION: Always validates all transactions for security
 pub struct BatchProcessor {
     mempool: Arc<RwLock<Mempool>>,
     batch_size: usize,
-    skip_validation: bool,
 }
 
 impl BatchProcessor {
@@ -19,47 +20,27 @@ impl BatchProcessor {
         Self {
             mempool,
             batch_size,
-            skip_validation: std::env::var("QNET_SKIP_VALIDATION").is_ok(),
         }
     }
     
     /// Process a batch of transactions
+    /// PRODUCTION: All transactions are validated (signature, balance, nonce)
     pub async fn process_batch(&self, transactions: Vec<Transaction>) -> Result<Vec<String>, QNetError> {
-        if self.skip_validation {
-            // Fast path for testing - add all transactions without validation
-            let mut results = Vec::with_capacity(transactions.len());
-            
-            // Get write lock once for entire batch
+        let mut results = Vec::with_capacity(transactions.len());
+        
+        for tx in transactions {
+            let hash = hex::encode(&tx.hash);
             let mempool = self.mempool.write().await;
             
-            for tx in transactions {
-                let hash = hex::encode(&tx.hash);
-                // Direct add without validation
-                if let Err(e) = mempool.add_transaction(tx).await {
-                    eprintln!("Failed to add transaction: {}", e);
-                } else {
-                    results.push(hash);
-                }
+            // PRODUCTION: add_transaction validates signature, balance, nonce
+            if let Err(e) = mempool.add_transaction(tx).await {
+                eprintln!("Failed to add transaction: {}", e);
+            } else {
+                results.push(hash);
             }
-            
-            Ok(results)
-        } else {
-            // Normal path with validation
-            let mut results = Vec::with_capacity(transactions.len());
-            
-            for tx in transactions {
-                let hash = hex::encode(&tx.hash);
-                let mempool = self.mempool.write().await;
-                
-                if let Err(e) = mempool.add_transaction(tx).await {
-                    eprintln!("Failed to add transaction: {}", e);
-                } else {
-                    results.push(hash);
-                }
-            }
-            
-            Ok(results)
         }
+        
+        Ok(results)
     }
     
     /// Process transactions in parallel batches
@@ -97,7 +78,6 @@ impl Clone for BatchProcessor {
         Self {
             mempool: self.mempool.clone(),
             batch_size: self.batch_size,
-            skip_validation: self.skip_validation,
         }
     }
-} 
+}

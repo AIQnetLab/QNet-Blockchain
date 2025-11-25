@@ -1,13 +1,35 @@
 # Ping Randomization Strategy for Millions of Nodes
 
-## 🚨 The Problem: Synchronized Ping Storm
+**Updated**: November 25, 2025 (v2.19.4)
+
+> **NOTE**: This document describes the legacy time-slot approach. QNet v2.19.4 implements a **256-shard deterministic ping system** instead. See `ARCHITECTURE_v2.19.md` for current implementation.
+
+## Current Implementation (v2.19.4): 256-Shard System
+
+```rust
+// Light node assignment to shard (deterministic)
+let shard_id = sha3_256(light_node_id)[0]; // First byte = 0-255
+
+// Each shard is assigned to specific Full/Super nodes
+// Pinger rotates every 4-hour window based on block entropy
+```
+
+**Key differences from time-slot approach**:
+- **Sharding**: Nodes divided into 256 shards (not time slots)
+- **Push-based**: Full/Super nodes ping Light nodes via FCM (not Light nodes pinging)
+- **Attestations**: Dual-signed (Light Ed25519 + Pinger Dilithium)
+- **Heartbeats**: Full/Super nodes self-attest (10 per 4-hour window)
+
+---
+
+## 🚨 Legacy: The Problem: Synchronized Ping Storm
 
 If all nodes ping at exact intervals:
 - 1 million nodes × ping every 4 hours = **1 million simultaneous pings** 💥
 - Network spike every 4 hours could crash the system
 - Full nodes can't handle millions of connections at once
 
-## 🎲 Solution: Randomized Time Slots
+## 🎲 Legacy Solution: Randomized Time Slots
 
 ### 1. Time Window Division
 

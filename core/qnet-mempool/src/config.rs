@@ -49,7 +49,7 @@ impl Default for MempoolConfig {
             max_size,
             max_per_sender,
             tx_ttl_seconds,
-            min_gas_price: 1,
+            min_gas_price: 100_000, // PRODUCTION: 0.0001 QNC (BASE_FEE_NANO_QNC)
             max_gas_limit: 10_000_000,
             enable_metrics: true,
             eviction_interval_seconds: 30, // More frequent cleanup

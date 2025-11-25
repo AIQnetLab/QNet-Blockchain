@@ -23,12 +23,11 @@ This project uses **dual licensing**:
   - `infrastructure/` - API, node infrastructure, backend services
   - `testing/` - Integration tests, testnet tools
   - `monitoring/` - Production monitoring and metrics
-- **License**: [Business Source License 1.1](LICENSE)
+- **License**: [Business Source License 1.1](LICENSE) - **Perpetual Proprietary**
 - **Usage**: 
-  - ✅ Non-production use (testing, development, evaluation) - **FREE**
-  - ✅ Automatically converts to **Apache 2.0** on **January 1, 2029**
-  - ⚠️ Production use requires commercial license before 2029
-- **Contact**: support@qnet.io for commercial licensing
+  - ✅ **Non-production use** (testing, development, evaluation) - **FREE**
+  - ⚠️ **Production use** requires commercial license from AIQnetLab
+  - 🔒 **Proprietary license** - remains under BSL 1.1 indefinitely
 
 ### 📱 Client Applications (Apache-2.0)
 - **Components**: 
@@ -45,15 +44,75 @@ This project uses **dual licensing**:
 - **Phase 2 (Future)**: ONLY QNC token activation on QNet blockchain
 - **Transition**: 90% 1DEV burned OR 5 years from genesis block (whichever comes first)
 
-### 🛡️ **LATEST UPDATES (v2.19.0 - November 18, 2025)**
-- **Hybrid Merkle + Sampling**: Scalable on-chain ping commitments (NEW!)
+### 🛡️ **LATEST UPDATES (v2.19.3 - November 23, 2025)**
+- **MEV Protection (Private Bundles)**: Front-running protection for high-value transactions (NEW!)
+  - Direct submission to block producer (bypasses public mempool)
+  - Dynamic allocation: 0-20% block space for bundles, 80-100% for public TXs
+  - Reputation gate: 80%+ required (proven trustworthy nodes only)
+  - Bundle constraints: max 10 TXs, 60s lifetime, +20% gas premium
+  - Rate limiting: 10 bundles/min per user (anti-spam)
+  - Multi-producer submission: 3 producers for redundancy
+  - Auto-fallback: Public mempool if bundle submission fails
+  - Atomic inclusion: All bundle TXs included together or rejected
+  - Post-quantum signatures: Dilithium3 verification for all bundles
+  - Real-time tests: 11/11 passed (validated in production environment)
+- **Priority Mempool**: Gas-price-based transaction ordering (NEW!)
+  - BTreeMap priority queue: highest gas price processed first
+  - Anti-spam protection: high-value TXs immune to spam attacks
+  - Fair within same price: FIFO for identical gas prices
+  - Binary+JSON support: flexible storage for different TX types
+  - Integrated into block production: automatic priority selection
+  - Minimum gas price: 100,000 nano QNC (0.0001 QNC base fee)
+- **Adaptive Turbine Fanout**: Dynamic block propagation scaling (NEW!)
+  - Network-aware: 4-32 fanout based on producer count and latency
+  - LAN optimization: higher fanout (16-32) for low latency networks
+  - WAN optimization: moderate fanout (8-16) for high latency
+  - Scales from 5 Genesis nodes to 1M+ nodes seamlessly
+  - Real-time calculation: adjusts every block based on network state
+- **Real-time Prometheus Metrics**: Live performance monitoring (NEW!)
+  - Dynamic mempool size, block height, connected peers
+  - Live Turbine fanout, qualified producers, average latency
+  - MEV metrics: bundle count, allocation percentage
+  - No hardcoded values: all metrics reflect real network state
+- **Split Reputation System**: Byzantine-safe separation of behavior metrics (NEW!)
+  - `consensus_score` (0-100): Byzantine behavior detection (invalid blocks, malicious attacks)
+  - `network_score` (0-100): Network performance tracking (timeouts, latency)
+  - WAN latency penalties don't affect consensus eligibility (70% threshold on consensus_score only)
+  - Network performance tracked separately for peer prioritization
+  - Combined reputation for peer selection: 70% consensus + 30% network
+- **Adaptive Entropy Consensus**: Scalable Byzantine-safe producer rotation (v2.19.4)
+  - **Finality Window**: Uses block height - 10 for entropy source (Byzantine-safe)
+  - **Adaptive Sample Size**: 5 (Genesis) → 100 (1M nodes) - scales with network
+  - **Dynamic Wait**: 200ms-2s adaptive timeout (2-20× faster than fixed 4s)
+  - **Byzantine Threshold**: 60% of sampled peers must agree
+  - **Network Efficient**: < 1 KB/s bandwidth, 0.002% CPU overhead
+  - **Scalability**: O(log log n) sample growth, O(1) latency
+- **Peer Blacklist System**: Intelligent sync peer filtering (NEW!)
+  - Soft blacklist: Temporary (network issues, auto-expires)
+  - Hard blacklist: Permanent until reputation recovers (Byzantine attacks)
+  - Escalation: Repeated failures increase blacklist duration
+  - Auto-removal: Hard blacklist cleared when consensus_score ≥ 70%
+- **Peer Prioritization**: Optimized block synchronization (NEW!)
+  - Priority by node type: Super > Full (Light nodes excluded from sync sources)
+  - Blacklist filtering: Offline/malicious peers skipped
+  - Reputation-based ordering: consensus_score + network_score (latency)
+  - Top-20 peer sampling: Avoids stuck sync on single unavailable peer
+- **HTTP Gossip Reputation Sync**: Exponential O(log n) propagation for millions of nodes
+  - Migrated from O(n) broadcast to O(log n) gossip protocol (99.999% bandwidth savings)
+  - Adaptive fanout (4-32): Same as Turbine block propagation
+  - Kademlia-based peer selection: XOR distance for peer diversity
+  - Re-gossip mechanism: Each recipient forwards to fanout peers (exponential growth)
+  - Byzantine-safe weighted average: 70% local + 30% remote (convergence)
+  - Prevents fork risk: All nodes converge to same reputation view
+  - Example: 1M nodes = ~20 hops vs 1M HTTP requests (broadcast)
+- **Hybrid Merkle + Sampling**: Scalable on-chain ping commitments
   - 360× on-chain size reduction (100 MB vs 36 GB)
   - Merkle root commitment to ALL pings (blake3 hashing)
   - Deterministic sampling: 1% of pings (minimum 10,000 samples)
   - SHA3-256 for sample seed generation (quantum-resistant)
   - Byzantine-safe verification through Merkle proofs
   - Production-ready for millions of nodes
-- **Bitcoin-Style Emission Validation**: Decentralized emission without central authority (NEW!)
+- **Bitcoin-Style Emission Validation**: Decentralized emission without central authority
   - No system key or single point of control
   - Range-based validation with halving support
   - All nodes independently validate emission amounts
@@ -70,11 +129,19 @@ This project uses **dual licensing**:
   - Checks every 30 blocks with accelerating timeouts (30s → 2s)
   - Zero-downtime: microblocks continue during recovery
   - Byzantine-safe at all levels (2/3+ honest nodes)
-- **Certificate Broadcasting**: Automatic P2P certificate distribution
-  - Periodic broadcast every 5 minutes
-  - Rotation broadcast on certificate renewal
+- **Certificate Broadcasting**: Byzantine-safe P2P certificate distribution
+  - Tracked broadcast with 2/3+ Byzantine threshold for critical rotations
+  - Adaptive timeout (3s/5s/10s) based on network size
+  - Adaptive periodic intervals (10s/30s/120s) based on node uptime
+  - Certificate lifetime: 4.5 minutes (270s = 3 macroblocks) with 80% rotation (216s)
+  - Anti-duplication via serial number change detection
   - LRU cache with 100K certificate capacity
   - Scalable from 5 bootstrap to millions of nodes
+- **Block Buffering**: Memory-protected out-of-order block handling
+  - Bounded buffer (100 blocks, ~10 MB maximum)
+  - FIFO eviction with current block protection
+  - 30-second timeout + 5-retry limit
+  - Prevents memory exhaustion attacks
 - **Node Type Filtering**: Consensus participation optimization
   - Light nodes: transactions only (no consensus)
   - Full nodes: partial consensus participation
@@ -115,13 +182,13 @@ This project uses **dual licensing**:
   - Production config: 5,000 hashes per tick × 100 ticks/sec = 500K hashes/sec
   - 100 ticks per second (10ms intervals) for smooth entropy generation
   - 5,000 hashes per tick (optimized for 1-second microblocks)
-  - VDF properties via SHA3-512 every 4th hash (prevents parallelization)
+  - Sequential ordering via SHA3-512 every 4th hash (limits parallelization, not formal VDF)
   - Integrated into producer selection for unpredictable leader election
   - Checkpoint persistence with zstd compression (every 1M hashes)
   - Clock drift: 5-7% (excellent for production)
   - 72 bytes overhead per block (poh_hash: 64B + poh_count: 8B) = ~2-3%
   - Hardware: Intel Xeon E5-2680v4 @ 2.4GHz
-- **Quantum-Resistant Producer Selection**: Threshold VRF with Dilithium + Ed25519 hybrid cryptography for Byzantine-safe leader election
+- **Quantum-Resistant Producer Selection**: Deterministic selection with finality window, Dilithium + Ed25519 hybrid cryptography for Byzantine-safe leader election
 - **Hybrid Sealevel Execution**: 5-stage pipeline with 10,000 parallel transactions
 - **Tower BFT Adaptive Timeouts**: Dynamic 7s base to 20s max (1.5x multiplier) based on network conditions
 - **Pre-Execution Cache**: Speculative execution with 10,000 transaction cache
@@ -174,7 +241,8 @@ This project uses **dual licensing**:
 
 **QNet production testnet is ready for deployment with advanced consensus and synchronization.**
 
-- ✅ **Post-Quantum Cryptography**: CRYSTALS-Dilithium3 with NIST/Cisco encapsulated keys
+- ✅ **Post-Quantum Cryptography**: CRYSTALS-Dilithium3 with NIST/Cisco encapsulated keys (nodes)
+- ✅ **Client Cryptography**: Ed25519 signatures for mobile/browser (20μs operations)
 - ✅ **Entropy-Based Consensus**: True decentralization with unpredictable producer rotation
 - ✅ **Reputation System**: Economic incentives for network participation
 - ✅ **State Snapshots**: Full & incremental snapshots with LZ4 compression
@@ -197,9 +265,9 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 
 ### 🎯 Key Features
 
-- **🔐 Post-Quantum Security**: NIST/Cisco encapsulated keys with Dilithium3 + ephemeral Ed25519
+- **🔐 Post-Quantum Security**: NIST/Cisco encapsulated keys with Dilithium3 + Ed25519 (nodes) | Ed25519-only for clients (mobile/browser)
 - **⚡ Ultra-High Performance**: 424,411 TPS with zero-downtime consensus
-- **🎲 True Decentralization**: VRF-based producer selection with deterministic fairness and quantum resistance
+- **🎲 True Decentralization**: Deterministic producer selection (finality window + SHA3) with Byzantine fairness and quantum resistance
 - **💰 Reputation Economics**: Rewards for block production (+1 micro, +10/+5 macro)
 - **🔄 Advanced Synchronization**: State snapshots with parallel downloads & IPFS
 - **🔥 Phase 1 Active**: 1DEV burn-to-join (1,500 → 300 1DEV minimum, universal pricing)
@@ -211,13 +279,16 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 - **🖥️ Server Architecture**: Full/Super nodes on dedicated servers
 - **🔧 Interactive Setup**: User-friendly activation process
 - **🛡️ Deadlock Prevention**: Guard patterns & health monitors for stability
+- **🛡️ MEV Protection**: Private bundles for front-running protection (80%+ reputation, 0-20% allocation)
+- **📊 Priority Mempool**: Gas-price-based ordering for spam resistance
 
 #### **Advanced Performance Features**
-- **🌪️ Turbine Protocol**: 85% bandwidth savings with chunked block propagation
+- **🌪️ Turbine Protocol**: 85% bandwidth savings with adaptive fanout (4-32) based on network topology
 - **⏱️ Quantum PoH**: 500K hashes/sec cryptographic clock for precise timing
 - **⚙️ Hybrid Sealevel**: 10,000 parallel transactions with 5-stage pipeline
 - **🎯 Tower BFT**: Adaptive timeouts (7s base to 20s max, 1.5x multiplier) for optimal consensus
 - **🚀 Pre-Execution**: Speculative transaction processing with 10,000 cache size
+- **🔒 MEV Protection**: Private bundle submission with post-quantum signatures
 
 ### 📊 Performance Metrics
 
@@ -226,10 +297,37 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 | **Throughput** | 424,411 TPS | 256 shards × 10k batch × zero-downtime |
 | **Latency** | <100ms | Transaction confirmation time |
 | **Finality** | <2 seconds | Block finalization |
+| **Block Capacity** | 5,000 TX/block | ~1 MB per microblock (200 bytes avg TX) |
 | **Downtime** | ZERO | Swiss watch precision, continuous flow |
 | **Energy Efficiency** | 99.9% less than Bitcoin | Eco-friendly consensus |
 | **Node Types** | Full, Super, Light | Flexible participation |
 | **Storage Efficiency** | 50-100 GB typical | Sliding window + snapshots |
+
+### 🔬 Technical Specifications (Honest Assessment)
+
+**Hardware & Benchmarks:**
+- **Test Environment**: Intel Xeon E5-2680v4 @ 2.4GHz (14 cores, 28 threads), 32GB DDR4-2400
+- **PoH Performance**: 500K hashes/sec (hybrid SHA3-512/Blake3, sequential ordering chain)
+- **Signature Verification**: Dilithium3 ~2ms, Ed25519 ~20μs per signature
+- **Network**: WAN-optimized with adaptive timeouts (7s-20s)
+
+**Cryptographic Approach:**
+- ✅ **Consensus Layer**: Real CRYSTALS-Dilithium3 (pqcrypto-dilithium 0.5) - fully post-quantum
+- ✅ **Node Signatures**: Hybrid Dilithium3 + Ed25519 with NIST/Cisco encapsulated keys
+- ⚠️ **Client Transactions**: Ed25519-only (NOT post-quantum, optimized for mobile/battery)
+- 🔄 **Migration Path**: Client layer upgrade planned when quantum threat becomes imminent (10-15 years)
+
+**Consensus Architecture:**
+- ⚠️ **Producer Selection**: Deterministic SHA3-512 (finality window), NOT true VRF with private keys
+- ⚠️ **Fairness**: 7/10 - Biasable by 67%+ Byzantine coalition (economically expensive)
+- ✅ **Byzantine Safety**: 2/3+ honest nodes threshold enforced at all layers
+- ✅ **Rotation**: 30-block intervals (30 seconds), limits manipulation window
+
+**Security Trade-offs:**
+- ✅ **AES-256-GCM**: Grover-resistant (2^128 operations = 10^38 years attack time)
+- ✅ **Nonce Management**: CSPRNG with 2^96 space, 10^-10% collision probability
+- ⚠️ **Architecture Inspiration**: Turbine propagation concept inspired by Solana (original implementation)
+- ✅ **Sybil Resistance**: Multi-layer (1DEV burn + QNC pool, reputation, time barrier, 67%+ coordination cost)
 
 ### 💾 Ultra-Modern Storage Architecture
 
@@ -287,11 +385,11 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 │  ├── CRYSTALS-Kyber (Key Exchange)                         │
 │  └── SPHINCS+ (Hash-based Signatures)                      │
 ├─────────────────────────────────────────────────────────────┤
-│  Consensus Layer with VRF-Based Selection                  │
+│  Consensus Layer with Deterministic Selection              │
 │  ├── Microblock Production (1s intervals)                  │
-│  │   ├── Threshold VRF with quantum-resistant crypto       │
+│  │   ├── Deterministic selection (finality window entropy) │
 │  │   ├── Dilithium + Ed25519 hybrid signatures             │
-│  │   ├── 30-block rotation with deterministic selection    │
+│  │   ├── 30-block rotation with SHA3-512 entropy           │
 │  │   ├── Race-free at boundaries (no delays)               │
 │  │   ├── Producer rewards: +1 reputation per block         │
 │  │   └── Full/Super nodes only (reputation >= 70%)        │
@@ -303,7 +401,7 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 │  │   ├── Deterministic initiator selection                 │
 │  │   └── 67% honest validator requirement                  │
 │  └── Advanced Synchronization                              │
-│      ├── State snapshots: Full (10k blocks) & Incremental  │
+│      ├── State snapshots: Full (12h) & Incremental (1h)    │
 │      ├── Parallel downloads with 100-block chunks          │
 │      ├── IPFS integration for P2P snapshot distribution    │
 │      └── Deadlock prevention with guard pattern            │
@@ -311,7 +409,7 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 │  Performance Optimization Layer                   │
 │  ├── Turbine Block Propagation                             │
 │  │   ├── 1KB chunks with Reed-Solomon erasure coding       │
-│  │   ├── Fanout-4 exponential propagation (Genesis optimized) │
+│  │   ├── Adaptive fanout (4-32) based on network size & latency │
 │  │   └── 85% bandwidth reduction                           │
 │  ├── Quantum Proof of History (QPoH)                       │
 │  │   ├── 500K hashes/sec cryptographic clock               │
@@ -377,6 +475,21 @@ QNet implements advanced chain reorganization and synchronization mechanisms for
 - **Block Time Synchronization**: Sub-second precision across distributed network
 - **Historical Proof**: Cryptographic evidence of event ordering and timing
 - **Fork Prevention**: PoH creates immutable timeline making forks computationally expensive
+- **Node Type Optimization**: PoH runs ONLY on Full/Super nodes (Light nodes excluded to save mobile battery/CPU)
+- **Network Synchronization**: Local PoH syncs with network consensus on block receipt
+- **Checkpointing**: Automatic checkpoints every 1M hashes for fast node restart
+- **Drift Detection**: Automatic clock drift monitoring with 5% tolerance threshold
+
+### **Light Node Ping System (Sharded)**
+- **Scalability**: 256-shard system supports 25.6M+ Light nodes (100K per shard)
+- **Deterministic Pinger Selection**: Each Light node has Primary + 2 Backup pingers
+- **FCM Push Notifications**: Full/Super nodes send pings via Firebase Cloud Messaging
+- **Challenge-Response**: Light node signs random challenge to prove liveness
+- **Dual Signatures**: Attestation includes both Light node and Pinger Dilithium signatures
+- **Gossip Protocol**: Attestations propagated to all nodes for reward eligibility
+- **Rate Limiting**: 500 FCM requests/sec limit (Google API compliance)
+- **Slot-Based Deduplication**: One attestation per 1-minute slot per Light node
+- **Reward Eligibility**: Light nodes must respond to pings to receive Pool #3 rewards
 
 ### **Network Synchronization Metrics**
 - **Sync Speed**: Up to 10,000 blocks/second with parallel processing
@@ -433,7 +546,7 @@ QNet implements an economic reputation system that incentivizes network particip
 | **Lead Macroblock Consensus** | +10 | Every 90 seconds |
 | **Participate in Consensus** | +5 | Every 90 seconds |
 | **Emergency Producer** | +5 | On failover events |
-| **Successful Ping** | +1 | Every 4 hours |
+| **Successful Heartbeat** | +1 | Every 4 hours (Full/Super only) |
 
 ### **Reputation System (Atomic Rewards)**
 | Action | Penalty/Reward | Impact |
@@ -444,17 +557,17 @@ QNet implements an economic reputation system that incentivizes network particip
 | **Successful Macroblock Leader** | +10.0 | Consensus leadership |
 | **Successful Macroblock Participant** | +5.0 | Consensus participation |
 | **Failed Macroblock** | -30.0 | Consensus failure |
-| **Failed Ping** | -2.0 | Connection issue |
+| **Missed Heartbeat** | -1.0 | Connection issue (Full/Super only) |
 | **Double-Sign** | -50.0 | Byzantine fault |
 | **Emergency Producer** | +5.0 | Network service |
-| **Recovery Rate** | +0.7%/hour | ONLY if active (had ping) |
+| **Recovery Rate** | +0.7%/hour | ONLY if active (had heartbeat/attestation) |
 
 ### **Reputation Thresholds**
-- **70+ points**: Eligible for consensus participation (70% minimum)
-- **40+ points**: Eligible for rewards from all pools
-- **10-39 points**: Network access only, no rewards
-- **<10 points**: Network ban (7-day recovery period)
+- **70+ points**: Eligible for consensus participation AND rewards (70% minimum)
+- **10-69 points**: Network access only, no new rewards (can claim old accumulated rewards)
+- **<10 points**: Network ban (7-day recovery period, can still claim old rewards)
 - **Maximum**: 100 points (hard cap)
+- **Light nodes**: Fixed at 70 (immutable, always eligible for rewards)
 
 ### **Anti-Malicious Protection System**
 
@@ -487,27 +600,28 @@ Progressive penalties for repeat offenders:
 | **Network Flooding** | >100 msgs/sec from single node | -10.0 points |
 | **Invalid Consensus** | Malformed commit/reveal | -5.0 points |
 
-### **VRF-Based Producer Selection**
+### **Deterministic Producer Selection (Not VRF)**
 ```rust
-// Quantum-resistant threshold VRF for fair producer selection
-// Each qualified node computes VRF output independently
-vrf_input = SHA3_256(
+// Quantum-resistant deterministic selection for fair producer rotation
+// All nodes compute the same selection deterministically using finality window
+let entropy_height = current_height - FINALITY_WINDOW; // 10 blocks back
+let entropy_source = get_block_hash(entropy_height); // Byzantine-finalized
+
+selection_hash = SHA3_512(
     leadership_round + 
     sorted_candidates +
-    macroblock_hash  // or deterministic fallback
+    entropy_source  // Finalized block hash (SHA3(prev + elig))
 );
 
-// Node evaluates VRF using Dilithium + Ed25519 hybrid crypto
-vrf_output = hybrid_vrf.evaluate(vrf_input).await?;
-threshold = u64::MAX / candidates.len();
+// DETERMINISTIC: All nodes select the same producer
+let selection_value = u64::from_bytes(selection_hash[0..8]);
+let selection_index = (selection_value % candidates.len()) as usize;
+let selected_producer = candidates[selection_index];
 
-// Node becomes producer if VRF output below threshold
-if vrf_output.value < threshold {
-    selected_producer = current_node;
-} else {
-    // Deterministic fallback if no node passes threshold
-    fallback_producer = SHA3_256(vrf_input) % candidates.len();
-}
+// ⚠️  LIMITATION: Not true VRF (no private key randomness)
+// ⚠️  Biasable by 67%+ Byzantine coalition controlling entropy source
+// ✅ SECURITY: Finality window prevents individual producer manipulation
+// ✅ BENEFIT: No per-node VRF keys, simpler verification, lower overhead
 ```
 
 ## 🔄 Advanced Synchronization
@@ -515,8 +629,8 @@ if vrf_output.value < threshold {
 QNet implements state-of-the-art synchronization for rapid network joining:
 
 ### **State Snapshots**
-- **Full Snapshots**: Every 10,000 blocks (complete blockchain state)
-- **Incremental Snapshots**: Every 1,000 blocks (delta changes only)
+- **Full Snapshots**: Every 12 hours / 43,200 microblocks / 480 macroblocks (complete blockchain state)
+- **Incremental Snapshots**: Every 1 hour / 3,600 microblocks / 40 macroblocks (delta changes only)
 - **Compression**: LZ4 for efficient storage (~70% reduction)
 - **Verification**: SHA3-256 integrity checks
 - **Auto-Cleanup**: Keep only latest 5 snapshots
@@ -1115,41 +1229,77 @@ docker logs qnet-node | grep "\[DEBUG\]\|\[INFO\]\|\[WARN\]\|\[ERROR\]"
 For genesis bootstrap nodes (production network initialization):
 
 ```bash
-# TESTNET Genesis Nodes:
-# Genesis Node #001 (NorthAmerica)
-docker run -d --name qnet-testnet-genesis-001 --restart=always \
-  -e QNET_NETWORK=testnet \
+# PRODUCTION Genesis Nodes (each on separate server):
+# Genesis Node #001 (154.38.160.39 - North America)
+docker run -d --name qnet-genesis-001 --restart=always \
   -e QNET_PRODUCTION=1 \
   -e QNET_BOOTSTRAP_ID=001 \
+  -e DOCKER_ENV=1 \
+  -e QNET_AGGRESSIVE_PRUNING=0 \
+  -e QNET_MAX_STORAGE_GB=2000 \
   -p 9876:9876 -p 9877:9877 -p 8001:8001 \
-  -v $(pwd)/testnet_genesis_001:/app/data \
+  -v $(pwd)/genesis_001_data:/app/data \
   qnet-production
 
-# Genesis Node #002 (Europe) 
-docker run -d --name qnet-testnet-genesis-002 --restart=always \
-  -e QNET_NETWORK=testnet \
+# Genesis Node #002 (62.171.157.44 - Europe)
+docker run -d --name qnet-genesis-002 --restart=always \
   -e QNET_PRODUCTION=1 \
   -e QNET_BOOTSTRAP_ID=002 \
-  -p 9878:9876 -p 9879:9877 -p 8002:8001 \
-  -v $(pwd)/testnet_genesis_002:/app/data \
+  -e DOCKER_ENV=1 \
+  -e QNET_AGGRESSIVE_PRUNING=0 \
+  -e QNET_MAX_STORAGE_GB=2000 \
+  -p 9876:9876 -p 9877:9877 -p 8001:8001 \
+  -v $(pwd)/genesis_002_data:/app/data \
   qnet-production
 
-# MAINNET Genesis Nodes:
-# Genesis Node #001 (NorthAmerica)
-docker run -d --name qnet-mainnet-genesis-001 --restart=always \
-  -e QNET_NETWORK=mainnet \
+# Genesis Node #003 (161.97.86.81 - Europe)
+docker run -d --name qnet-genesis-003 --restart=always \
   -e QNET_PRODUCTION=1 \
-  -e QNET_BOOTSTRAP_ID=001 \
+  -e QNET_BOOTSTRAP_ID=003 \
+  -e DOCKER_ENV=1 \
+  -e QNET_AGGRESSIVE_PRUNING=0 \
+  -e QNET_MAX_STORAGE_GB=2000 \
   -p 9876:9876 -p 9877:9877 -p 8001:8001 \
-  -v $(pwd)/mainnet_genesis_001:/app/data \
+  -v $(pwd)/genesis_003_data:/app/data \
+  qnet-production
+
+# Genesis Node #004 (5.189.130.160 - Europe)
+docker run -d --name qnet-genesis-004 --restart=always \
+  -e QNET_PRODUCTION=1 \
+  -e QNET_BOOTSTRAP_ID=004 \
+  -e DOCKER_ENV=1 \
+  -e QNET_AGGRESSIVE_PRUNING=0 \
+  -e QNET_MAX_STORAGE_GB=2000 \
+  -p 9876:9876 -p 9877:9877 -p 8001:8001 \
+  -v $(pwd)/genesis_004_data:/app/data \
+  qnet-production
+
+# Genesis Node #005 (162.244.25.114 - Europe)
+docker run -d --name qnet-genesis-005 --restart=always \
+  -e QNET_PRODUCTION=1 \
+  -e QNET_BOOTSTRAP_ID=005 \
+  -e DOCKER_ENV=1 \
+  -e QNET_AGGRESSIVE_PRUNING=0 \
+  -e QNET_MAX_STORAGE_GB=2000 \
+  -p 9876:9876 -p 9877:9877 -p 8001:8001 \
+  -v $(pwd)/genesis_005_data:/app/data \
   qnet-production
 ```
 
+**Auto-Configured Production Settings (QNET_PRODUCTION=1):**
+- ✅ Sharding: 256 shards enabled
+- ✅ Parallel validation: 16 threads
+- ✅ P2P compression: enabled
+- ✅ Batch size: 10,000 transactions
+- ✅ Mempool: 2M transactions capacity
+- ✅ High frequency mode: enabled
+- ✅ PoH: 500K hashes/sec (Full/Super nodes only)
+
 **Genesis Node Requirements:**
 - Set `QNET_BOOTSTRAP_ID` to 001-005 for genesis nodes
-- Use different ports for multiple nodes on same server
-- Create separate data directories for each node  
-- Ensure proper file permissions: `chmod 777 node_data_XXX/`
+- Each genesis node runs on its own server (same ports: 9876, 9877, 8001)
+- IP addresses are hardcoded in `genesis_constants.rs` - nodes auto-discover each other
+- Create data directory: `mkdir -p genesis_XXX_data && chmod 755 genesis_XXX_data/`
 
 **🔒 Genesis Node Security (IP-Based Authorization):**
 - **IP Restriction**: Genesis nodes can ONLY run from pre-authorized IP addresses
@@ -1163,8 +1313,8 @@ docker run -d --name qnet-mainnet-genesis-001 --restart=always \
 154.38.160.39   # Genesis Node 001
 62.171.157.44   # Genesis Node 002  
 161.97.86.81    # Genesis Node 003
-173.212.219.226 # Genesis Node 004
-164.68.108.218  # Genesis Node 005
+5.189.130.160 # Genesis Node 004
+162.244.25.114  # Genesis Node 005
 ```
 
 **Custom Genesis IPs:**
@@ -1174,52 +1324,35 @@ export QNET_GENESIS_NODES="ip1,ip2,ip3,ip4,ip5"
 # Or create genesis-nodes.json config file
 ```
 
-### Quick Testnet Launch (5 Genesis Nodes)
+### Quick Production Launch (5 Genesis Nodes)
 
-For rapid testnet deployment with coordinated genesis nodes:
+For production deployment with 5 Genesis nodes on separate servers:
 
 ```bash
-# Quick testnet startup for developers
-# Note: This is for QNet team development only
-# Regular users should only run individual nodes (see commands above)
-
-# Start 5 genesis nodes manually:
+# Build Docker image (run once on each server)
 docker build -f development/qnet-integration/Dockerfile.production -t qnet-production .
 
-# Genesis Node 1
-docker run -d --name qnet-genesis-001 --restart=always \
-  -e QNET_NETWORK=testnet \
-  -e QNET_PRODUCTION=1 \
-  -e QNET_BOOTSTRAP_ID=001 \
-  -p 9876:9876 -p 9877:9877 -p 8001:8001 \
-  -v $(pwd)/genesis_001:/app/data \
-  qnet-production
-
-# Genesis Node 2  
-docker run -d --name qnet-genesis-002 --restart=always \
-  -e QNET_NETWORK=testnet \
-  -e QNET_PRODUCTION=1 \
-  -e QNET_BOOTSTRAP_ID=002 \
-  -p 9878:9876 -p 9879:9877 -p 8002:8001 \
-  -v $(pwd)/genesis_002:/app/data \
-  qnet-production
-
-# Repeat for nodes 003, 004, 005...
+# Then run the appropriate command on each server:
+# Server 154.38.160.39 → QNET_BOOTSTRAP_ID=001
+# Server 62.171.157.44 → QNET_BOOTSTRAP_ID=002
+# Server 161.97.86.81 → QNET_BOOTSTRAP_ID=003
+# Server 5.189.130.160 → QNET_BOOTSTRAP_ID=004
+# Server 162.244.25.114 → QNET_BOOTSTRAP_ID=005
 
 # Monitor nodes
 docker logs -f qnet-genesis-001
 
-# Stop all
-docker stop qnet-genesis-001 qnet-genesis-002 qnet-genesis-003 qnet-genesis-004 qnet-genesis-005
-docker rm qnet-genesis-001 qnet-genesis-002 qnet-genesis-003 qnet-genesis-004 qnet-genesis-005
+# Stop node
+docker stop qnet-genesis-001
+docker rm qnet-genesis-001
 ```
 
 **Genesis Node Endpoints:**
-- Genesis Node 1: http://localhost:8001
-- Genesis Node 2: http://localhost:8002  
-- Genesis Node 3: http://localhost:8003
-- Genesis Node 4: http://localhost:8004
-- Genesis Node 5: http://localhost:8005
+- Genesis Node 001: http://154.38.160.39:8001
+- Genesis Node 002: http://62.171.157.44:8001
+- Genesis Node 003: http://161.97.86.81:8001
+- Genesis Node 004: http://5.189.130.160:8001
+- Genesis Node 005: http://162.244.25.114:8001
 
 **Note**: Activation codes are generated automatically by QNet consensus when burn transactions are detected on Solana.
 
@@ -1719,17 +1852,19 @@ Year 10+:   ~300+ GB    🔧 Increase to 500-1000 GB
 | **Consensus Threshold** | ≥ 70% | Minimum to participate in consensus |
 
 **Reputation Consequences:**
-- **<70% Reputation**: Excluded from consensus participation
-- **<10% Reputation**: Automatically banned from network
-- **Hourly Decay**: -1% automatic reputation decay for inactive nodes
+- **<70% Reputation**: Excluded from consensus participation AND new rewards
+- **<10% Reputation**: Automatically banned from network (can still claim old rewards)
+- **Hourly Decay**: -1% automatic reputation decay for inactive Full/Super nodes
+- **Light Nodes**: Fixed 70% reputation (immutable, always eligible for rewards)
 
 **Universal Node Security (Full Decentralization):**
-- **Starting Reputation**: 70% for ALL nodes (consensus threshold)
+- **Starting Reputation**: 70% for Full/Super nodes (consensus threshold)
+- **Light Node Reputation**: Fixed at 70% (immutable by design)
 - **No Special Protection**: Genesis nodes = Regular nodes
-- **Full Penalties Apply**: Any node can be reduced to 0% and banned
-- **Merit-Based System**: ALL nodes must maintain good behavior
-- **Consensus Participation**: ≥70% required for everyone
-- **True Equality**: No privileged nodes in the network
+- **Full Penalties Apply**: Any Full/Super node can be reduced to 0% and banned
+- **Merit-Based System**: Full/Super nodes must maintain good behavior
+- **Consensus Participation**: ≥70% required for Full/Super nodes
+- **Light Nodes**: Never participate in consensus (rewards only)
 
 #### 🔧 **Node Migration Support:**
 - **Data Transfer**: Archive responsibilities transfer with node migration
@@ -1753,12 +1888,193 @@ Year 10+:   ~300+ GB    🔧 Increase to 500-1000 GB
 - **Deterministic Consensus**: Cryptographic selection prevents forks
 - **Enhanced Concurrency**: RwLock for better parallel performance
 
+## 🎯 Architectural Decisions: Why Some Features Are Deferred
+
+### ✅ MEV Protection (Implemented in v2.19.3)
+
+**Status**: ✅ **IMPLEMENTED** - Private bundle submission with post-quantum signatures
+
+**Implementation Details:**
+
+QNet implements **Private Bundle** MEV protection (Flashbots-style) compatible with 1-second microblocks:
+
+**Architecture:**
+
+```
+User Transaction Flow:
+┌─────────────────────────────────────────────────────────────┐
+│ Standard TX Path (Public)                                   │
+│ User → Public Mempool → Block Producer → Microblock         │
+│                                                              │
+│ MEV-Protected Path (Private Bundles)                        │
+│ User → Direct to Producer → Microblock (if conditions met)  │
+│      ↓                                                       │
+│   Fallback to Public Mempool (if rejected/timeout)          │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Bundle Constraints (Production Tested ✅):**
+
+| Constraint | Value | Purpose |
+|------------|-------|---------|
+| **Max TXs per Bundle** | 10 | Prevent block space monopolization |
+| **Reputation Gate** | 80%+ | Proven trustworthy nodes only |
+| **Gas Premium** | +20% | Economic incentive for inclusion |
+| **Max Lifetime** | 60 seconds | 60 microblocks max (prevent stale bundles) |
+| **Rate Limiting** | 10 bundles/min per user | Anti-spam protection |
+| **Block Allocation** | 0-20% dynamic | 80-100% guaranteed for public TXs |
+| **Multi-Producer Submission** | 3 producers | Redundancy and load distribution |
+| **Signature Verification** | Dilithium3 | Post-quantum security |
+
+**Why QNet Still Has Natural MEV Resistance:**
+
+QNet's **reputation-based consensus** + **Private Bundles** provides dual-layer protection:
+
+| Layer | Traditional Staking | QNet Hybrid Model |
+|-------|-------------------|-------------------|
+| **Base Incentive** | Maximize staking returns | Maintain reputation score |
+| **MEV Risk** | 🔴 High (financial benefit) | 🟢 Low (reputational damage + optional bundles) |
+| **Attack Cost** | Lose stake (recoverable) | Lose reputation (permanent) + bundle rejection |
+| **Producer Window** | Long (varies) | Short (30 blocks = 30 seconds) |
+| **User Protection** | Optional (MEV marketplaces) | **Built-in (Private Bundles)** ✅ |
+
+**Implementation Features:**
+
+1. **Dynamic Allocation**: 0-20% block space for bundles based on demand
+   - No demand → 0% allocation → 100% public TXs
+   - High demand → scales to 20% → 80% public TXs guaranteed
+2. **Atomic Inclusion**: All bundle TXs included together or rejected entirely
+3. **Auto-Fallback**: Failed bundles automatically fall back to public mempool
+4. **Priority Mempool**: Public TXs prioritized by gas price (anti-spam)
+5. **Post-Quantum Signatures**: All bundles verified with Dilithium3
+6. **Real-Time Tested**: 11/11 tests passed in production environment
+
+**API Endpoints:**
+
+```bash
+# Submit bundle
+POST /api/v1/bundle/submit
+# Get bundle status
+GET /api/v1/bundle/{id}/status
+# Cancel bundle
+DELETE /api/v1/bundle/{id}
+```
+
+**Natural Resistance + Active Protection:**
+
+- ✅ **Base Layer**: Reputation system prevents most MEV exploitation
+- ✅ **Active Protection**: Private bundles for high-value TXs
+- ✅ **No Staking Required**: Merit-based, not capital-based
+- ✅ **Byzantine Safe**: 2/3+ honest nodes ensure security
+- ✅ **Scalable**: Works from 5 Genesis nodes to millions
+
+---
+
+### ❌ Economic Staking & Slashing (Intentionally Not Implemented)
+
+**Status**: Reputation-based system only, no validator staking required (by design)
+
+**Why QNet Doesn't Use Traditional Staking:**
+
+QNet implements a **fundamentally different economic security model** that doesn't require validator staking:
+
+| Security Layer | Traditional Staking (ETH/Cosmos) | QNet Multi-Layer Model |
+|----------------|----------------------------------|------------------------|
+| **Entry Barrier** | Large capital stake required | 1DEV burn (Phase 1) + QNC pool contribution (Phase 2) |
+| **Cost Type** | Recoverable (can withdraw stake) | Permanent (burn is irreversible) |
+| **Attack Cost** | Lose stake (financial) | Lose burn + reputation + time investment |
+| **Recovery** | Re-stake immediately | Months of reputation rebuilding |
+| **Inclusivity** | Capital-gated (plutocracy) | Merit-based (everyone can join) |
+
+**QNet's Multi-Layer Security Model:**
+
+```
+Layer 1: Economic Barrier (Without Staking)
+├── Phase 1: 1DEV token burn (permanent cost, irreversible)
+├── Phase 2: QNC pool contribution (5K-30K QNC, dynamic based on network size)
+└── Anti-Sybil: Cost increases with network growth
+
+Layer 2: Time Barrier (Recovery Protection)
+├── New nodes start at 70% reputation (instant eligibility!)
+├── Reputation loss → slow recovery (prevents repeat attacks)
+└── Gradual recovery: penalized nodes need months to rebuild trust
+
+Layer 3: Coordination Complexity
+├── Byzantine attack requires 67%+ of network
+├── Large networks: coordination becomes exponentially harder
+└── Example: 1M nodes network = 670K nodes must coordinate
+
+Layer 4: Reputation Slashing
+├── InvalidBlock: -20 points
+├── MaliciousBehavior: -50 points → jail
+├── DoubleSign: -100 points → instant jail
+└── consensus_score < 70% → excluded from consensus
+
+Layer 5: Network Effects
+├── Larger network = stronger security (without staking!)
+├── Detection probability increases with scale
+└── Attack cost increases exponentially with network size
+```
+
+**Why Burn > Stake for Security:**
+
+| Aspect | Traditional Staking | QNet Burn Model |
+|--------|-------------------|-----------------|
+| **Sybil Attack Cost** | Can recover stake after | Permanent loss of burned tokens |
+| **Market Impact** | Large stake movements visible | Burn reduces supply (deflationary pressure) |
+| **Instant Power** | Yes (stake and join) | No (need reputation + time) |
+| **Inclusivity** | Excludes those without capital | Open to anyone willing to burn entry fee |
+| **Centralization Risk** | Whales/exchanges dominate | Merit-based, not capital-based |
+
+**Philosophical Advantages:**
+
+1. **True Decentralization**: No plutocracy - anyone can participate regardless of capital
+2. **Merit Over Money**: Behavior and time investment matter more than wealth
+3. **Permanent Commitment**: Burn shows real commitment (can't just withdraw)
+4. **Scale = Security**: Network security increases naturally with growth (no additional staking needed)
+5. **No Liquidity Lock**: Participants don't need to lock large capital amounts
+
+**Current Security System:**
+```rust
+// Reputation Penalties (Primary Defense)
+ReputationEvent::InvalidBlock => -20 points
+ReputationEvent::MaliciousBehavior => -50 points
+ReputationEvent::DoubleSign => -100 points (instant jail)
+consensus_score < 70% → excluded from consensus
+consensus_score < 10% → complete network ban
+
+// Economic Barriers (Built-in)
+Phase 1: 1DEV burn requirement (300-1500 1DEV based on network stage)
+Phase 2: QNC pool contribution (5K-30K QNC, dynamic based on network size)
+
+// Time Barriers (Recovery Protection, NOT Entry)
+New nodes: start at 70% reputation (instant consensus eligibility!)
+Penalized nodes: slow recovery (months to rebuild trust)
+Prevents repeat attacks: attackers can't instantly rejoin after penalty
+```
+
+**When Staking Might Be Reconsidered:**
+- If community governance votes for it (decentralized decision)
+- If large-scale coordinated attacks observed despite current security
+- If network demonstrates need for additional economic deterrent
+- **Note**: Current design is intentional and philosophically aligned with true decentralization
+
+**Why This Approach Is Superior for QNet:**
+- ✅ **Inclusive**: No capital barrier prevents small participants from joining
+- ✅ **Permanent Cost**: Burn is irreversible (stronger deterrent than recoverable stake)
+- ✅ **Repeat Attack Prevention**: Penalized attackers need months to recover (can't instantly retry)
+- ✅ **Coordination-Resistant**: Large-scale attacks become exponentially harder with network growth
+- ✅ **Philosophically Consistent**: Merit-based rather than money-based power
+- ✅ **Simpler**: No stake management, no slashing disputes, no withdrawal queues
+
+---
+
 ## 📈 Latest Updates (v2.6.0)
 
-**November 15, 2025 - "VRF-Based Selection & Macroblock Consensus Listener"**
+**November 15, 2025 - "Deterministic Producer Selection & Macroblock Consensus Listener"**
 
 This release introduces critical improvements for quantum-resistant consensus:
-- **Threshold VRF Producer Selection** with Dilithium + Ed25519 hybrid cryptography
+- **Deterministic Producer Selection** with Dilithium + Ed25519 hybrid cryptography and finality window entropy
 - **Race-Free Rotation**: No delays at block boundaries (31, 61, 91)
 - **Active Macroblock Consensus**: All Full/Super nodes run 1-second polling listener
 - **Deterministic Validator Selection**: 1000 validators per macroblock round
@@ -1772,7 +2088,18 @@ See [CHANGELOG.md](documentation/CHANGELOG.md) for detailed release notes.
 
 ## 📄 License
 
-This project is licensed under the Apache License 2.0 - see the [LICENSE] file for details.
+**Blockchain Infrastructure** (BSL 1.1 - Perpetual Proprietary):
+- Core blockchain components, node software, consensus, and infrastructure
+- **Non-production use**: FREE (testing, development, evaluation)
+- **Production use**: Requires commercial license from AIQnetLab
+- **Proprietary**: Remains under BSL 1.1 indefinitely (no open-source conversion)
+- **Protected**: Cannot be used for competing networks or hosted services
+- See [LICENSE](LICENSE) for complete terms
+
+**Client Applications** (Apache 2.0):
+- Mobile wallet, browser extension, explorer, CLI tools
+- **Fully open-source** with no restrictions
+- See individual application LICENSE files for details
 
 ## 🔗 Links
 

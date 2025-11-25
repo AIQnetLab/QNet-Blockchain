@@ -1,6 +1,6 @@
 Categories:
   - Money
-  - Security
+  - Wallet
 License: Apache-2.0
 AuthorName: QNet Lab
 AuthorEmail: qnetquantumnetwork@gmail.com
@@ -36,22 +36,36 @@ Repo: https://github.com/AIQnetLab/QNet-Blockchain.git
 Builds:
   - versionName: 1.0.7
     versionCode: 8
-    commit: 1e3d4d4
+    commit: 196624c62b08fcdc02d5d5081aa59c150e8bd646
     timeout: 10800
     subdir: applications/qnet-mobile/android
     sudo:
+      - echo "deb https://deb.debian.org/debian trixie main" > /etc/apt/sources.list.d/trixie.list
       - apt-get update
-      - apt-get install -y openjdk-17-jdk-headless nodejs npm
-      - update-java-alternatives -a
+      - apt-get install -y -t trixie npm
+      - sysctl fs.inotify.max_user_watches=524288 || true
+    gradle:
+      - yes
     prebuild:
       - cd ..
       - npm ci --legacy-peer-deps
-    gradle: []
+    scanignore:
+      - applications/qnet-mobile/node_modules/react-native/sdks/hermesc/linux64-bin/hermesc
+      - applications/qnet-mobile/node_modules/@react-native-async-storage/async-storage/android/build.gradle
+      - applications/qnet-mobile/node_modules/react-native-get-random-values/android/build.gradle
+      - applications/qnet-mobile/node_modules/react-native-safe-area-context/android/build.gradle
+      - applications/qnet-mobile/node_modules/react-native-svg/android/build.gradle
+    scandelete:
+      - applications/qnet-mobile/node_modules
+      - core
+      - development
+      - audit
+      - testing
+      - governance
+      - backups
+      - Cargo.toml
 
 AutoUpdateMode: None
 UpdateCheckMode: None
 CurrentVersion: 1.0.7
 CurrentVersionCode: 8
-
-NoSourceSince: 1.0.7
-

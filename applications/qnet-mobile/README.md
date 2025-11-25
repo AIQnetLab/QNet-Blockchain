@@ -19,6 +19,55 @@ See [LICENSE](LICENSE) for full terms.
 
 ---
 
+## 🔐 Security & Cryptography
+
+### Transaction Signing
+
+QNet Mobile Wallet uses **Ed25519 signatures** for all transactions:
+
+- ✅ **Fast**: 20μs sign/verify operations
+- ✅ **Secure**: 128-bit security level (RFC 8032)
+- ✅ **Small**: 64-byte signatures
+- ✅ **Mobile-friendly**: Low energy consumption
+- ✅ **Battle-tested**: Used by Signal, Tor, SSH
+
+### Key Management
+
+- **BIP39 Mnemonic**: 12-word recovery phrase
+- **HD Derivation**: Hierarchical deterministic keys
+- **Secure Storage**: AES-256-GCM encrypted
+- **No Cloud**: Keys never leave your device
+
+### Transaction Types
+
+#### 1. Transfer (sendQNC)
+```javascript
+// Client signs: "transfer:from:to:amount:1:10000"
+// Server verifies Ed25519 signature
+// Transaction recorded on blockchain
+```
+
+#### 2. Reward Claims
+```javascript
+// Client signs: "claim_rewards:node_id:wallet_address"
+// Server verifies Ed25519 signature
+// Creates RewardDistribution transaction
+// All nodes verify and record on blockchain
+```
+
+### Why Ed25519 (not Dilithium)?
+
+| Aspect | Ed25519 | Dilithium |
+|--------|---------|-----------|
+| Speed | 20μs | 100ms (5000x slower) |
+| Size | 64 bytes | 2420 bytes (38x larger) |
+| Energy | Low | High |
+| Mobile | ✅ Perfect | ❌ Too heavy |
+
+**Note**: Dilithium is used for node consensus (long-term security), while Ed25519 is optimal for client transactions (user experience).
+
+---
+
 # Getting Started
 
 > **Note**: Make sure you have completed the [Set Up Your Environment](https://reactnative.dev/docs/set-up-your-environment) guide before proceeding.

@@ -98,7 +98,7 @@ def scan_for_nodes(port=8000):
     # Add known node addresses
     known_addresses = [
         "95.164.7.199",
-        "173.212.219.226"
+        "5.189.130.160"
     ]
     
     for addr in known_addresses:

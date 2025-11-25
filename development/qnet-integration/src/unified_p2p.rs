@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
-use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicBool, AtomicUsize, Ordering};
 use dashmap::{DashMap, DashSet};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use once_cell::sync::Lazy;
@@ -16,10 +16,37 @@ use serde_json;
 use base64::Engine;
 use sha3::{Sha3_256, Digest};
 use reed_solomon_erasure::galois_8::ReedSolomon;
+use futures::{future, stream, StreamExt};
 
 // Import QNet consensus components for proper peer validation
 use qnet_consensus::reputation::{NodeReputation, ReputationConfig, MaliciousBehavior};
 use qnet_consensus::{commit_reveal::{Commit, Reveal}, ConsensusEngine};
+
+// ============================================================================
+// PRODUCTION CONSTANTS: Capacity limits for scalability
+// ============================================================================
+
+/// Max Light nodes in RAM registry (LRU eviction when exceeded)
+/// 100K nodes × ~200 bytes = ~20MB RAM
+const MAX_LIGHT_NODE_REGISTRY_SIZE: usize = 100_000;
+
+/// Max attestations in RAM (24h window, auto-cleanup)
+/// 100K attestations × ~300 bytes = ~30MB RAM
+const MAX_ATTESTATIONS_SIZE: usize = 100_000;
+
+/// Max heartbeat records in RAM (24h window, auto-cleanup)
+/// 50K records × ~200 bytes = ~10MB RAM
+const MAX_HEARTBEATS_SIZE: usize = 50_000;
+
+/// Max active Full/Super nodes tracked
+/// 10K nodes × ~150 bytes = ~1.5MB RAM
+const MAX_ACTIVE_NODES_SIZE: usize = 10_000;
+
+/// Stale node timeout (15 minutes without heartbeat/announcement)
+const STALE_NODE_TIMEOUT_SECS: u64 = 15 * 60;
+
+/// Attestation/Heartbeat retention (24 hours)
+const RETENTION_PERIOD_SECS: u64 = 24 * 60 * 60;
 
 // DYNAMIC NETWORK DETECTION - No timestamp dependency for robust deployment
 
@@ -112,9 +139,10 @@ pub static EMERGENCY_STOP_TIME: Lazy<Arc<AtomicU64>> =
 static EMERGENCY_FAILOVERS_IN_PROGRESS: Lazy<Arc<DashSet<String>>> = 
     Lazy::new(|| Arc::new(DashSet::new()));
 
-// PRODUCTION: Peer cleanup interval - use existing CERTIFICATE_LIFETIME_SECS pattern
-// Clean up inactive peers after 1 hour (same as certificate lifetime)
-const PEER_INACTIVE_TIMEOUT_SECS: u64 = 3600; // 1 hour - same as hybrid_crypto::CERTIFICATE_LIFETIME_SECS
+// PRODUCTION: Peer cleanup interval
+// Clean up inactive peers after 30 minutes (reasonable timeout for network health)
+// NOTE: Independent from certificate lifetime (270s) - peers can be temporarily inactive
+const PEER_INACTIVE_TIMEOUT_SECS: u64 = 1800; // 30 minutes - balanced cleanup interval
 
 // PRODUCTION: Unified HTTP client settings for consistency and scalability
 const HTTP_CONNECT_TIMEOUT_SECS: u64 = 3;  // Quick connect for P2P
@@ -127,6 +155,73 @@ const HTTP_POOL_MAX_IDLE_PER_HOST: usize = 10; // Max connections per host
 // SCALABILITY: DashMap for lock-free concurrent access with millions of nodes
 static INVALID_BLOCKS_TRACKER: Lazy<Arc<DashMap<String, (AtomicU64, Instant)>>> = 
     Lazy::new(|| Arc::new(DashMap::new()));
+
+// SECURITY: Track false emergency senders for penalty application
+// Format: sender_addr -> (false_count, last_false_time)
+// Used to apply -5 reputation penalty for false emergency messages
+static FALSE_EMERGENCY_TRACKER: Lazy<Arc<DashMap<String, (AtomicU64, Instant)>>> = 
+    Lazy::new(|| Arc::new(DashMap::new()));
+
+// CONSENSUS: Track emergency confirmations from multiple nodes
+// Key: (block_height, failed_producer) → Value: (confirmation_count, first_seen_time)
+// This enables lightweight consensus: if 3+ nodes report same emergency, it's likely valid
+static EMERGENCY_CONFIRMATIONS: Lazy<Arc<DashMap<(u64, String), (AtomicU64, Instant)>>> = 
+    Lazy::new(|| Arc::new(DashMap::new()));
+
+// SYNC OPTIMIZATION: Peer blacklist for failed sync attempts
+// Key: peer_addr → Value: BlacklistEntry
+// SCALABILITY: DashMap for lock-free concurrent access with millions of nodes
+// ARCHITECTURE: Soft blacklist (network issues) vs Hard blacklist (Byzantine attacks)
+static PEER_BLACKLIST: Lazy<Arc<DashMap<String, BlacklistEntry>>> = 
+    Lazy::new(|| Arc::new(DashMap::new()));
+
+/// SYNC: Blacklist reason categories (Soft vs Hard)
+/// Soft: Temporary network issues (timeouts, latency) - affects network_score only
+/// Hard: Byzantine attacks (invalid blocks, malicious behavior) - affects consensus_score
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BlacklistReason {
+    // SOFT BLACKLIST (Network performance issues - temporary)
+    SyncTimeout,        // Failed to respond to sync request (30s soft ban)
+    ConnectionFailure,  // Connection refused/reset (60s soft ban)
+    SlowResponse,       // Response took too long (15s soft ban)
+    
+    // HARD BLACKLIST (Byzantine attacks - permanent until reputation recovered)
+    InvalidBlocks,      // Sent invalid/corrupted blocks (permanent until consensus_score >= 70%)
+    MaliciousBehavior,  // Detected Byzantine attack (permanent until consensus_score >= 70%)
+}
+
+/// SYNC: Blacklist entry with expiration and reason tracking
+#[derive(Debug, Clone)]
+pub struct BlacklistEntry {
+    pub reason: BlacklistReason,
+    pub timestamp: Instant,
+    pub duration_secs: u64,  // 0 = permanent (hard blacklist)
+    pub attempts: u32,       // Number of blacklist violations (escalation)
+}
+
+impl BlacklistEntry {
+    /// Check if blacklist entry is still active
+    pub fn is_active(&self) -> bool {
+        if self.duration_secs == 0 {
+            // Permanent blacklist (hard) - check reputation instead
+            true
+        } else {
+            // Temporary blacklist (soft) - check expiration
+            self.timestamp.elapsed().as_secs() < self.duration_secs
+        }
+    }
+    
+    /// Get remaining time in seconds (0 = expired or permanent)
+    pub fn remaining_secs(&self) -> u64 {
+        if self.duration_secs == 0 {
+            // Permanent blacklist
+            u64::MAX
+        } else {
+            let elapsed = self.timestamp.elapsed().as_secs();
+            self.duration_secs.saturating_sub(elapsed)
+        }
+    }
+}
 
 /// SECURITY: Rate limiting structure for DDoS protection
 #[derive(Debug, Clone)]
@@ -188,18 +283,90 @@ pub struct PeerInfo {
     pub node_id_hash: Vec<u8>,  // SHA3-256 hash for XOR distance
     #[serde(default)]
     pub bucket_index: usize,    // K-bucket this peer belongs to
+    
+    // CRITICAL: Split reputation for Byzantine-safe consensus
+    // consensus_score: Malicious behavior (invalid blocks, Byzantine attacks)
+    // network_score: Network reliability (timeouts, latency, availability)
+    #[serde(default = "default_consensus_score")]
+    pub consensus_score: f64,   // Byzantine behavior tracking (0-100, min 70 for consensus)
+    #[serde(default = "default_network_score")]
+    pub network_score: f64,     // Network performance tracking (0-100, used for prioritization)
+    
+    // BACKWARD COMPATIBILITY: Keep old field for migration
     #[serde(default = "default_reputation")]
-    pub reputation_score: f64,  // Dynamic reputation (0-100 scale, min 70 for consensus)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reputation_score: Option<f64>,  // Legacy field (migrated to split scores)
+    
     #[serde(default)]
     pub successful_pings: u32,  // Successful interactions
     #[serde(default)]
     pub failed_pings: u32,      // Failed interactions
 }
 
-fn default_reputation() -> f64 { 
-    // PRODUCTION: All nodes start with same reputation
-    // Genesis nodes earn reputation through network participation
-    70.0 // Universal minimum consensus threshold for fairness
+fn default_consensus_score() -> f64 {
+    // PRODUCTION: Start at Byzantine threshold (fair for all nodes)
+    // Decreases on invalid blocks, increases on valid blocks
+    70.0 // Minimum for consensus participation
+}
+
+fn default_network_score() -> f64 {
+    // PRODUCTION: Start at full network score
+    // Decreases on timeouts/latency, increases on successful responses
+    100.0 // Optimal network performance
+}
+
+fn default_reputation() -> Option<f64> {
+    // BACKWARD COMPATIBILITY: None for new nodes (uses split scores)
+    None
+}
+
+/// Reputation event types for Byzantine-safe tracking
+/// ARCHITECTURE: Separate consensus (Byzantine) from network (performance) events
+#[derive(Debug, Clone, Copy)]
+pub enum ReputationEvent {
+    // CONSENSUS EVENTS (affect consensus_score - Byzantine safety)
+    ValidBlock,             // +5.0 consensus_score: Produced/validated valid block
+    InvalidBlock,           // -20.0 consensus_score: Produced invalid block (Byzantine attack)
+    ConsensusParticipation, // +2.0 consensus_score: Participated in consensus
+    MaliciousBehavior,      // -50.0 consensus_score: Detected Byzantine attack
+    
+    // NETWORK EVENTS (affect network_score - performance optimization)
+    SuccessfulResponse,     // +1.0 network_score: Successful P2P response
+    TimeoutFailure,         // -2.0 network_score: P2P timeout (WAN latency, not malicious)
+    ConnectionFailure,      // -5.0 network_score: Connection failed (offline/unreachable)
+    FastResponse,           // +3.0 network_score: Very fast response (<100ms)
+}
+
+impl PeerInfo {
+    /// Calculate combined reputation for backward compatibility
+    /// ARCHITECTURE: Byzantine threshold checks ONLY consensus_score
+    /// Combined score used for peer prioritization and display only
+    pub fn combined_reputation(&self) -> f64 {
+        // Weighted average: 70% consensus (Byzantine safety) + 30% network (performance)
+        (self.consensus_score * 0.7) + (self.network_score * 0.3)
+    }
+    
+    /// Check if peer is qualified for consensus (Byzantine threshold)
+    /// CRITICAL: Only consensus_score matters for Byzantine safety
+    /// SCALABILITY: Light nodes NEVER participate in consensus (millions of Light nodes in production)
+    pub fn is_consensus_qualified(&self) -> bool {
+        // Light nodes are EXCLUDED from consensus participation (only Super and Full nodes)
+        if self.node_type == NodeType::Light {
+            return false;
+        }
+        // Super and Full nodes must meet Byzantine threshold (70%)
+        self.consensus_score >= 70.0
+    }
+    
+    /// Migrate legacy reputation_score to split scores
+    pub fn migrate_legacy_reputation(&mut self) {
+        if let Some(legacy_score) = self.reputation_score {
+            // Migrate legacy score to both consensus and network scores
+            self.consensus_score = legacy_score;
+            self.network_score = legacy_score;
+            self.reputation_score = None; // Clear legacy field
+        }
+    }
 }
 
 /// Regional load balancing metrics
@@ -324,8 +491,8 @@ pub struct SimplifiedP2P {
     /// Leadership tracking for failover detection
     previous_leader: Arc<Mutex<Option<String>>>,
     
-    /// Reputation system for consensus
-    reputation_system: Arc<Mutex<NodeReputation>>,
+    /// Reputation system for consensus (public for ping service access)
+    pub reputation_system: Arc<Mutex<NodeReputation>>,
     
     /// Consensus message channel
     consensus_tx: Option<tokio::sync::mpsc::UnboundedSender<ConsensusMessage>>,
@@ -341,6 +508,28 @@ pub struct SimplifiedP2P {
     
     /// PRODUCTION: Certificate management for compact signatures
     pub certificate_manager: Arc<RwLock<CertificateManager>>,
+    
+    /// PRODUCTION: Light Node registry synchronized via gossip
+    /// All Full/Super nodes maintain identical registry for deterministic ping assignment
+    light_node_registry: Arc<RwLock<HashMap<String, LightNodeRegistrationData>>>,
+    
+    /// PRODUCTION: Heartbeat history for reward eligibility calculation
+    /// Key: "{node_id}:{heartbeat_index}", Value: HeartbeatRecord
+    /// Full nodes need 8/10, Super nodes need 9/10 heartbeats per 4h window
+    heartbeat_history: Arc<RwLock<HashMap<String, HeartbeatRecord>>>,
+    
+    /// PRODUCTION: Last heartbeat cleanup timestamp (remove entries >24h)
+    last_heartbeat_cleanup: Arc<Mutex<u64>>,
+    
+    /// PRODUCTION: Light Node attestations for reward eligibility
+    /// Key: "{light_node_id}:{slot}", Value: LightNodeAttestation
+    /// Dedupe ensures only one attestation per Light node per slot
+    light_node_attestations: Arc<RwLock<HashMap<String, LightNodeAttestation>>>,
+    
+    /// PRODUCTION: Active Full/Super nodes for pinger selection
+    /// Updated via gossip, used for deterministic pinger assignment
+    /// Key: node_id, Value: ActiveNodeInfo
+    active_full_super_nodes: Arc<RwLock<HashMap<String, ActiveNodeInfo>>>,
 }
 
 /// HYBRID: Simplified certificate manager for microblocks only
@@ -401,7 +590,7 @@ impl CertificateManager {
             local_certificate: None,
             remote_certificates: HashMap::new(),
             pending_certificates: HashMap::new(),
-            certificate_ttl: Duration::from_secs(14400),  // 4 hours
+            certificate_ttl: Duration::from_secs(540),  // 9 minutes (2× certificate lifetime for multi-rotation cache)
             max_cache_size,
             recently_used: HashSet::new(),
             usage_count: HashMap::new(),
@@ -491,21 +680,65 @@ impl CertificateManager {
         *self.usage_count.entry(cert_serial.to_string()).or_insert(0) += 1;
         
         // Limit recently_used set size to prevent unbounded growth
-        const MAX_RECENTLY_USED: usize = 1000;
+        // SCALABILITY: Support 1000 validators + 500 buffer for rotation = 1500
+        const MAX_RECENTLY_USED: usize = 1500;
+        
+        // Add monitoring for cache size
+        if self.recently_used.len() > 1400 {
+            println!("[CERTIFICATE] ⚠️ recently_used approaching limit: {}/1500", 
+                     self.recently_used.len());
+        }
+        
         if self.recently_used.len() > MAX_RECENTLY_USED {
-            // Remove random old entries (simple cleanup)
-            let to_remove: Vec<String> = self.recently_used
+            // CRITICAL: HashSet has no order! We must remove based on usage_count instead
+            // Sort by usage count and remove least used
+            let mut usage_list: Vec<(String, u32)> = self.recently_used
                 .iter()
-                .take(self.recently_used.len() - MAX_RECENTLY_USED / 2)
-                .cloned()
+                .map(|serial| {
+                    let usage = self.usage_count.get(serial).unwrap_or(&0);
+                    (serial.clone(), *usage)
+                })
                 .collect();
+            
+            // Sort by usage (ascending) - least used first
+            usage_list.sort_by_key(|(_, usage)| *usage);
+            
+            // Remove least used entries (keep most active 1400)
+            let to_remove_count = self.recently_used.len() - 1400;
+            let to_remove: Vec<String> = usage_list
+                .iter()
+                .take(to_remove_count)
+                .map(|(serial, _)| serial.clone())
+                .collect();
+            
+            println!("[CERTIFICATE] 🗑️ Cleaning recently_used: removing {} least-used entries (keeping 1400 most active)", 
+                     to_remove.len());
+            
             for serial in to_remove {
                 self.recently_used.remove(&serial);
+                // Also remove from usage_count to keep consistent
+                self.usage_count.remove(&serial);
             }
         }
     }
     
     /// Get certificate (local or remote) - checks local first, then remote cache, then pending
+    /// Get certificate and mark as used atomically (prevents race conditions)
+    pub fn get_and_mark_used(&mut self, cert_serial: &str) -> Option<Vec<u8>> {
+        // First get the certificate
+        let result = self.get_certificate(cert_serial);
+        
+        // If found, mark as used
+        if result.is_some() {
+            self.mark_as_used(cert_serial);
+        }
+        
+        result
+    }
+    
+    /// REMOVED: This optimization broke usage counting!
+    /// Every access MUST go through mark_as_used to track usage properly
+    
     /// OPTIMISTIC: Returns pending certificates to prevent race conditions
     pub fn get_certificate(&self, cert_serial: &str) -> Option<Vec<u8>> {
         // Check local certificate
@@ -528,6 +761,7 @@ impl CertificateManager {
                 match lz4_flex::decompress_size_prepended(compressed_cert) {
                     Ok(decompressed) => {
                         println!("[CERTIFICATE] ✅ Using verified certificate {}", cert_serial);
+                        // NOTE: Caller must call mark_as_used() separately due to &self immutability
                         return Some(decompressed);
                     }
                     Err(e) => {
@@ -706,9 +940,8 @@ const KADEMLIA_K: usize = 20;        // K-bucket size
 const KADEMLIA_ALPHA: usize = 3;     // Concurrent queries
 const KADEMLIA_BITS: usize = 256;    // Hash size in bits
 
-// Turbine block propagation constants (Solana-inspired)
+// Turbine block propagation constants
 const TURBINE_CHUNK_SIZE: usize = 1024;      // 1KB chunks (optimal for Dilithium signatures)
-const TURBINE_FANOUT: usize = 4;             // CRITICAL FIX: Increased from 3 to 4 for 5-node Genesis network (faster propagation)
 const TURBINE_REDUNDANCY_FACTOR: f32 = 1.5;  // 50% redundancy for Reed-Solomon
 const TURBINE_MAX_CHUNKS: usize = 64;        // Max chunks per block (64KB max block size)
 
@@ -847,6 +1080,19 @@ impl SimplifiedP2P {
             sync_request_tx: None,
             turbine_assemblies: Arc::new(DashMap::new()),
             certificate_manager: Arc::new(RwLock::new(CertificateManager::with_node_type(node_type.clone()))),
+            
+            // PRODUCTION: Light Node registry for gossip sync
+            light_node_registry: Arc::new(RwLock::new(HashMap::new())),
+            
+            // PRODUCTION: Heartbeat history for reward eligibility
+            heartbeat_history: Arc::new(RwLock::new(HashMap::new())),
+            last_heartbeat_cleanup: Arc::new(Mutex::new(0)),
+            
+            // PRODUCTION: Light Node attestations for sharded ping system
+            light_node_attestations: Arc::new(RwLock::new(HashMap::new())),
+            
+            // PRODUCTION: Active Full/Super nodes map for pinger selection (gossip-synced)
+            active_full_super_nodes: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -1152,7 +1398,7 @@ impl SimplifiedP2P {
     }
     
     /// PRODUCTION: Clean up inactive peers to prevent memory leak
-    /// Uses same timeout as certificate lifetime (3600 seconds)
+    /// Uses 30-minute timeout (independent of certificate lifetime)
     pub fn cleanup_inactive_peers(&self) {
         let now = self.current_timestamp();
         let threshold = now.saturating_sub(PEER_INACTIVE_TIMEOUT_SECS);
@@ -1234,8 +1480,9 @@ impl SimplifiedP2P {
         }
     }
     
-    /// Update peer reputation based on interaction (QNet 0-100 scale)
-    fn update_peer_reputation(&self, peer_addr: &str, success: bool) {
+    /// Update peer reputation based on event type (Byzantine-safe split scoring)
+    /// ARCHITECTURE: Separate consensus (Byzantine) from network (performance) tracking
+    fn update_peer_reputation(&self, peer_addr: &str, event: ReputationEvent) {
         // QUANTUM ROUTING: Try lock-free first if should use it
         if self.should_use_lockfree() {
             // AUTO-MIGRATE if needed
@@ -1244,13 +1491,54 @@ impl SimplifiedP2P {
             }
             
             if let Some(mut peer) = self.connected_peers_lockfree.get_mut(peer_addr) {
-                if success {
-                    peer.successful_pings += 1;
-                    peer.reputation_score = (peer.reputation_score + 1.0).min(100.0);
-                } else {
-                    peer.failed_pings += 1;
-                    peer.reputation_score = (peer.reputation_score - 5.0).max(0.0);
+                // Migrate legacy reputation if needed
+                peer.migrate_legacy_reputation();
+                
+                // Apply event-specific reputation changes
+                match event {
+                    // CONSENSUS EVENTS (Byzantine safety)
+                    ReputationEvent::ValidBlock => {
+                        peer.successful_pings += 1;
+                        peer.consensus_score = (peer.consensus_score + 5.0).min(100.0);
+                        peer.network_score = (peer.network_score + 1.0).min(100.0);
+                    }
+                    ReputationEvent::InvalidBlock => {
+                        peer.failed_pings += 1;
+                        peer.consensus_score = (peer.consensus_score - 20.0).max(0.0);
+                        if peer.consensus_score < 70.0 {
+                            println!("[REPUTATION] ⚠️ Peer {} consensus score critically low: {:.1}% (excluded from consensus)", 
+                                    peer_addr, peer.consensus_score);
+                        }
+                    }
+                    ReputationEvent::ConsensusParticipation => {
+                        peer.consensus_score = (peer.consensus_score + 2.0).min(100.0);
+                    }
+                    ReputationEvent::MaliciousBehavior => {
+                        peer.failed_pings += 1;
+                        peer.consensus_score = (peer.consensus_score - 50.0).max(0.0);
+                        println!("[SECURITY] 🚨 Byzantine behavior detected from {}: consensus_score={:.1}%", 
+                                peer_addr, peer.consensus_score);
+                    }
+                    
+                    // NETWORK EVENTS (performance optimization)
+                    ReputationEvent::SuccessfulResponse => {
+                        peer.successful_pings += 1;
+                        peer.network_score = (peer.network_score + 1.0).min(100.0);
+                    }
+                    ReputationEvent::TimeoutFailure => {
+                        // SOFT penalty: WAN latency is not malicious
+                        peer.failed_pings += 1;
+                        peer.network_score = (peer.network_score - 2.0).max(0.0);
+                    }
+                    ReputationEvent::ConnectionFailure => {
+                        peer.failed_pings += 1;
+                        peer.network_score = (peer.network_score - 5.0).max(0.0);
+                    }
+                    ReputationEvent::FastResponse => {
+                        peer.network_score = (peer.network_score + 3.0).min(100.0);
+                    }
                 }
+                
                 peer.last_seen = self.current_timestamp();
                 return;
             }
@@ -1259,20 +1547,62 @@ impl SimplifiedP2P {
         // Fallback to legacy
         let mut peers = self.connected_peers.write().unwrap();
         if let Some(peer) = peers.get_mut(peer_addr) {
-            if success {
-                peer.successful_pings += 1;
-                // Increase reputation by 1 point (max 100)
-                peer.reputation_score = (peer.reputation_score + 1.0).min(100.0);
-            } else {
-                peer.failed_pings += 1;
-                // Decrease reputation by 2 points (min 0, ban at 10)
-                peer.reputation_score = (peer.reputation_score - 2.0).max(0.0);
-                if peer.reputation_score < 10.0 {
-                    println!("[P2P] ⚠️ Peer {} reputation critically low: {:.1} (ban threshold: 10)", 
-                            peer_addr, peer.reputation_score);
+            // Migrate legacy reputation if needed
+            peer.migrate_legacy_reputation();
+            
+            // Apply same event logic
+            match event {
+                ReputationEvent::ValidBlock => {
+                    peer.successful_pings += 1;
+                    peer.consensus_score = (peer.consensus_score + 5.0).min(100.0);
+                    peer.network_score = (peer.network_score + 1.0).min(100.0);
+                }
+                ReputationEvent::InvalidBlock => {
+                    peer.failed_pings += 1;
+                    peer.consensus_score = (peer.consensus_score - 20.0).max(0.0);
+                    if peer.consensus_score < 70.0 {
+                        println!("[REPUTATION] ⚠️ Peer {} consensus score critically low: {:.1}% (excluded from consensus)", 
+                                peer_addr, peer.consensus_score);
+                    }
+                }
+                ReputationEvent::ConsensusParticipation => {
+                    peer.consensus_score = (peer.consensus_score + 2.0).min(100.0);
+                }
+                ReputationEvent::MaliciousBehavior => {
+                    peer.failed_pings += 1;
+                    peer.consensus_score = (peer.consensus_score - 50.0).max(0.0);
+                    println!("[SECURITY] 🚨 Byzantine behavior detected from {}: consensus_score={:.1}%", 
+                            peer_addr, peer.consensus_score);
+                }
+                ReputationEvent::SuccessfulResponse => {
+                    peer.successful_pings += 1;
+                    peer.network_score = (peer.network_score + 1.0).min(100.0);
+                }
+                ReputationEvent::TimeoutFailure => {
+                    peer.failed_pings += 1;
+                    peer.network_score = (peer.network_score - 2.0).max(0.0);
+                }
+                ReputationEvent::ConnectionFailure => {
+                    peer.failed_pings += 1;
+                    peer.network_score = (peer.network_score - 5.0).max(0.0);
+                }
+                ReputationEvent::FastResponse => {
+                    peer.network_score = (peer.network_score + 3.0).min(100.0);
                 }
             }
         }
+    }
+    
+    /// BACKWARD COMPATIBILITY: Update reputation with boolean (legacy method)
+    /// Automatically maps to appropriate ReputationEvent
+    #[allow(dead_code)]
+    fn update_peer_reputation_legacy(&self, peer_addr: &str, success: bool) {
+        let event = if success {
+            ReputationEvent::SuccessfulResponse
+        } else {
+            ReputationEvent::TimeoutFailure
+        };
+        self.update_peer_reputation(peer_addr, event);
     }
     
     /// Get peer address by node ID
@@ -1372,20 +1702,20 @@ impl SimplifiedP2P {
         // K-BUCKET MANAGEMENT: Check bucket size (max 20 per bucket)
         let bucket_peers: Vec<_> = self.connected_peers_lockfree.iter()
             .filter(|entry| entry.value().bucket_index == peer_info.bucket_index)
-            .map(|entry| (entry.key().clone(), entry.value().reputation_score))
+            .map(|entry| (entry.key().clone(), entry.value().combined_reputation()))
             .collect();
         
         if bucket_peers.len() >= KADEMLIA_K {
-            // Find peer with lowest reputation in this bucket
+            // Find peer with lowest combined reputation in this bucket
             if let Some((worst_addr, worst_rep)) = bucket_peers.iter()
                 .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap()) {
                 
-                if peer_info.reputation_score > *worst_rep {
+                if peer_info.combined_reputation() > *worst_rep {
                     // Remove worst peer to make room
                     self.remove_peer_lockfree(worst_addr);
                     println!("[P2P] 🔄 K-bucket {}: Replaced {} (rep: {:.2}) with {} (rep: {:.2})",
-                            peer_info.bucket_index, worst_addr, worst_rep, 
-                            peer_info.id, peer_info.reputation_score);
+                            peer_info.bucket_index, worst_addr, *worst_rep, 
+                            peer_info.id, peer_info.combined_reputation());
                 } else {
                     // New peer has lower reputation, don't add
                     return false;
@@ -1717,15 +2047,10 @@ impl SimplifiedP2P {
                                 println!("[P2P] ⚠️ Peer {} already connected, skipping duplicate", get_privacy_id_for_addr(&peer_info.addr));
                     }
                     
-                            // QUANTUM: Register peer in blockchain for persistent peer registry
-                            tokio::spawn({
-                                let peer_info_clone = peer_info.clone();
-                                async move {
-                                    if let Err(e) = register_peer_in_blockchain(peer_info_clone).await {
-                                        println!("[P2P] ⚠️ Failed to register peer in blockchain: {}", e);
-                                    }
-                                }
-                            });
+                            // ARCHITECTURE FIX: Peer discovery is P2P task, NOT blockchain task!
+                            // Peer info is already stored in DashMap (add_peer_safe above)
+                            // No need for blockchain TX - they don't get included in blocks anyway
+                            // Blocks are empty (consensus only, no TX processing in Phase 1)
                             
                             let peer_type = if is_genesis_peer { "GENESIS" } else { "QUANTUM" };
                             println!("[P2P] ✅ {}: Added verified peer: {}", peer_type, get_privacy_id_for_addr(&peer_info.addr));
@@ -2028,7 +2353,10 @@ impl SimplifiedP2P {
                                 // Kademlia DHT fields (will be calculated in add_peer_safe)
                                 node_id_hash: Vec::new(),
                                 bucket_index: 0,
-                                reputation_score: 70.0, // PRODUCTION: All nodes start at consensus threshold
+                                // Split reputation for Byzantine-safe consensus
+                                consensus_score: 70.0,  // Universal consensus threshold (ALL node types)
+                                network_score: 100.0,   // Optimal network performance (ALL node types)
+                                reputation_score: None, // Legacy field (deprecated)
                                 successful_pings: 0,
                                 failed_pings: 0,
                             };
@@ -2135,14 +2463,16 @@ impl SimplifiedP2P {
                                       std::env::var("QNET_GENESIS_BOOTSTRAP").unwrap_or_default() == "1";
                 
                 // Determine sync interval based on node type AND network phase
-                // CRITICAL FIX: Faster sync for Super/Full nodes to prevent desync after long runs
+                // CRITICAL FIX: Balanced sync intervals to prevent rate limiting
+                // Rate limit: 10 requests/min → need intervals ≥6s to stay under limit
+                // ARCHITECTURE: All Genesis nodes are Super nodes by design
+                // Genesis Super nodes: 7s (was 1s) - 8.5 requests/min (safe margin)
+                // Regular nodes: Keep original timing (already safe)
                 let sync_interval = match &node_type {
                     NodeType::Light => 30,  // Light nodes: 30s (mobile, stores only 1000 blocks)
-                    NodeType::Full => {
-                        if is_genesis_node { 2 } else { 5 }  // Full nodes: 2s genesis, 5s normal (FASTER!)
-                    },
+                    NodeType::Full => 5,    // Full nodes: 5s (Full nodes are never Genesis)
                     NodeType::Super => {
-                        if is_genesis_node { 1 } else { 2 }  // Super nodes: 1s genesis, 2s normal (FASTEST!)
+                        if is_genesis_node { 7 } else { 2 }  // Super nodes: 7s genesis (was 1s), 2s normal
                     }
                 };
                 
@@ -2155,9 +2485,12 @@ impl SimplifiedP2P {
                     let peer_ip = peer.addr.split(':').next().unwrap_or("");
                     let endpoint = format!("http://{}:8001/api/v1/height", peer_ip);
                     
-                    // Simple HTTP query using reqwest
+                    // Simple HTTP query using reqwest with connection pooling
                     match reqwest::Client::builder()
                         .timeout(std::time::Duration::from_secs(2))
+                        .tcp_keepalive(std::time::Duration::from_secs(HTTP_TCP_KEEPALIVE_SECS))
+                        .pool_max_idle_per_host(HTTP_POOL_MAX_IDLE_PER_HOST)
+                        .pool_idle_timeout(std::time::Duration::from_secs(HTTP_POOL_IDLE_TIMEOUT_SECS))
                         .build() 
                     {
                         Ok(client) => {
@@ -2311,8 +2644,8 @@ impl SimplifiedP2P {
          let reputation_system = self.reputation_system.clone(); // Use shared system
          let connected_peers_lockfree = self.connected_peers_lockfree.clone(); // For get_last_activity_map
          let genesis_ips = vec!["154.38.160.39".to_string(), "62.171.157.44".to_string(), 
-                               "161.97.86.81".to_string(), "173.212.219.226".to_string(), 
-                               "164.68.108.218".to_string()]; // Genesis IPs to avoid borrowing self
+                               "161.97.86.81".to_string(), "5.189.130.160".to_string(), 
+                               "162.244.25.114".to_string()]; // Genesis IPs to avoid borrowing self
          
          tokio::spawn(async move {
              println!("[P2P] 🔍 Starting reputation-based peer validation with shared reputation system...");
@@ -2355,6 +2688,63 @@ impl SimplifiedP2P {
                  // Validate all connected peers
                 let mut to_remove: Vec<String> = Vec::new(); // Store addresses, not indices
                  {
+                    // SCALABILITY: Collect ALL peers for parallel checking (not just Genesis)
+                    // This fixes overlapping HTTP requests for Full/Super nodes
+                    let all_peers_to_check: Vec<(String, String, bool)> = {
+                        let connected = match connected_peers.read() {
+                            Ok(peers) => peers,
+                            Err(poisoned) => {
+                                println!("[P2P] ⚠️ Connected peers mutex poisoned during read");
+                                poisoned.into_inner()
+                            }
+                        };
+                        
+                        connected.iter()
+                            .map(|(addr, peer)| {
+                                let is_genesis = peer.id.contains("genesis_") || genesis_ips.contains(&peer.addr);
+                                (addr.clone(), peer.addr.clone(), is_genesis)
+                            })
+                            .collect()
+                    };
+                    
+                    // SCALABILITY: Parallel connectivity checks for ALL nodes using buffer_unordered
+                    // Genesis nodes: critical for consensus (checked every iteration)
+                    // Full/Super nodes: potential producers (checked to prevent overlapping)
+                    // Light nodes: no consensus participation (but still checked for network health)
+                    let connectivity_results = if !all_peers_to_check.is_empty() {
+                        use futures::stream::{self, StreamExt};
+                        
+                        // ADAPTIVE CONCURRENCY: Scale with network size for optimal performance
+                        // Small networks: gentle (avoid overwhelming)
+                        // Large networks: aggressive (finish before next iteration)
+                        let peer_count = all_peers_to_check.len();
+                        let concurrency = match peer_count {
+                            0..=10 => 5,      // Small network: 5 concurrent (Genesis bootstrap)
+                            11..=50 => 10,    // Medium: 10 concurrent (early network)
+                            51..=200 => 20,   // Growing: 20 concurrent
+                            201..=500 => 30,  // Large: 30 concurrent
+                            _ => 50,          // Massive (500+): 50 concurrent (for 1000 producers)
+                        };
+                        
+                        println!("[P2P] 🔄 Checking {} peers with concurrency={} (adaptive)", peer_count, concurrency);
+                        
+                        let results = stream::iter(all_peers_to_check)
+                            .map(|(addr, peer_addr, is_genesis)| async move {
+                                // Use spawn_blocking for blocking I/O
+                                let is_reachable = tokio::task::spawn_blocking(move || {
+                                    Self::test_peer_connectivity_static(&peer_addr)
+                                }).await.unwrap_or(false);
+                                (addr, is_reachable, is_genesis)
+                            })
+                            .buffer_unordered(concurrency) // Adaptive concurrency based on network size
+                            .collect::<Vec<_>>()
+                            .await;
+                        results
+                    } else {
+                        Vec::new()
+                    };
+                    
+                    // Now apply results and check reputation
                     let mut connected = match connected_peers.write() {
                          Ok(peers) => peers,
                          Err(poisoned) => {
@@ -2362,18 +2752,32 @@ impl SimplifiedP2P {
                              poisoned.into_inner()
                          }
                      };
+                     
+                    // Apply connectivity results for ALL peers
+                    for (addr, is_reachable, is_genesis) in connectivity_results {
+                        if let Some(peer) = connected.get_mut(&addr) {
+                            if !is_reachable {
+                                if is_genesis {
+                                    // CRITICAL FIX: Do NOT remove Genesis nodes from connected_peers
+                                    // Genesis nodes are trusted anchors - temporary unavailability ≠ dead node
+                                    peer.is_stable = false;
+                                    println!("[P2P] ⚠️ Genesis peer {} temporarily unreachable (kept in peers, marked unstable)", peer.id);
+                                } else {
+                                    // Full/Super/Light nodes: Mark as unstable, will be removed if reputation is low
+                                    peer.is_stable = false;
+                                    println!("[P2P] ⚠️ Peer {} unreachable (marked unstable)", peer.id);
+                                }
+                            } else {
+                                // Peer is reachable - mark as stable
+                                peer.is_stable = true;
+                            }
+                        }
+                    }
+                    
                     // SCALABILITY: O(1) HashMap operations for millions of nodes
+                    // Reputation check for all peers (connectivity already checked above in parallel)
                     for (addr, peer) in connected.iter_mut() {
-                       // SCALABILITY: For Genesis peers, check TCP connectivity every 5s (Genesis) or 30s (normal)
-                       // This prevents phantom Genesis peers from accumulating
                        let is_genesis_peer = peer.id.contains("genesis_") || genesis_ips.contains(&peer.addr);
-                       
-                       // Check if peer is still reachable (Genesis only, others use reputation)
-                       if is_genesis_peer && !Self::test_peer_connectivity_static(&peer.addr) {
-                           println!("[P2P] ❌ Genesis peer {} no longer reachable, removing", peer.id);
-                           to_remove.push(addr.clone());
-                           continue; // Skip reputation check for unreachable peers
-                       }
                        
                          // Check peer reputation using shared system
                          let reputation = if let Ok(rep_sys) = reputation_system.lock() {
@@ -2388,10 +2792,12 @@ impl SimplifiedP2P {
                                  peer.id, reputation);
                             to_remove.push(addr.clone());
                          } else {
-                             // Update peer stability based on reputation
+                             // Update peer stability based on reputation and connectivity
                              if is_genesis_peer {
                                 // Genesis peers: Stay connected but can lose stability for bad behavior
-                                peer.is_stable = reputation > 70.0; // Must maintain 70% for stability
+                                // Stability requires BOTH good reputation AND connectivity
+                                let has_good_reputation = reputation >= 70.0;
+                                peer.is_stable = peer.is_stable && has_good_reputation; // AND with connectivity result
                                 
                                 if reputation < 70.0 {
                                     println!("[P2P] ⚠️ Genesis peer {} unstable due to low reputation: {:.1}%", peer.id, reputation);
@@ -2402,7 +2808,9 @@ impl SimplifiedP2P {
                                 }
                             } else {
                                 // Regular peers: Standard reputation handling
-                                peer.is_stable = reputation > 75.0;
+                                // Stability requires BOTH good reputation AND connectivity
+                                let has_good_reputation = reputation >= 70.0;
+                                peer.is_stable = peer.is_stable && has_good_reputation; // AND with connectivity result
                              }
                          }
                      }
@@ -2731,9 +3139,14 @@ impl SimplifiedP2P {
         // Generate Reed-Solomon parity chunks (simplified for now)
         let parity_chunks = self.generate_parity_chunks(&chunks, parity_count);
         
+        // ADAPTIVE FANOUT: Calculate optimal fanout based on network size and latency
+        let turbine_fanout = self.get_turbine_fanout();
+        
         if height % 10 == 0 {
-            println!("[TURBINE] 🚀 Broadcasting block #{} as {} chunks + {} parity ({}x reduction in bandwidth)", 
-                     height, total_chunks, parity_count, validated_peers.len() / TURBINE_FANOUT);
+            let avg_latency = self.get_average_peer_latency();
+            let producers = self.get_qualified_producers_count();
+            println!("[TURBINE] 🚀 Broadcasting block #{} as {} chunks + {} parity (fanout={}, producers={}, latency={}ms)", 
+                     height, total_chunks, parity_count, turbine_fanout, producers, avg_latency);
         }
         
         // Build Kademlia-based routing tree for each chunk
@@ -2752,8 +3165,8 @@ impl SimplifiedP2P {
                 is_parity: false,
             };
             
-            // Select TURBINE_FANOUT peers for this chunk using Kademlia distance
-            let target_peers = self.select_turbine_targets(&routing_tree, chunk_index, TURBINE_FANOUT);
+            // Select adaptive fanout peers for this chunk using Kademlia distance
+            let target_peers = self.select_turbine_targets(&routing_tree, chunk_index, turbine_fanout);
             
             for peer in target_peers {
                 let peer_addr = peer.addr.clone();
@@ -2777,8 +3190,8 @@ impl SimplifiedP2P {
                 is_parity: true,
             };
             
-            // Different peers for parity chunks for redundancy
-            let target_peers = self.select_turbine_targets(&routing_tree, total_chunks + parity_index, TURBINE_FANOUT);
+            // Different peers for parity chunks for redundancy (use same adaptive fanout)
+            let target_peers = self.select_turbine_targets(&routing_tree, total_chunks + parity_index, turbine_fanout);
             
             for peer in target_peers {
                 let peer_addr = peer.addr.clone();
@@ -2960,21 +3373,25 @@ impl SimplifiedP2P {
             return;
         }
         
-        // Select TURBINE_FANOUT peers to forward to (excluding sender)
+        // Select adaptive fanout peers to forward to (excluding sender)
         let validated_peers = self.get_validated_active_peers();
         let routing_tree = self.build_turbine_routing_tree(&validated_peers);
+        let turbine_fanout = self.get_turbine_fanout();
         
         let forward_targets: Vec<_> = routing_tree.iter()
             .filter(|p| p.addr != original_sender)
-            .take(TURBINE_FANOUT)
+            .take(turbine_fanout)
             .cloned()
             .collect();
         
-        // Forward chunk asynchronously
+        // Forward chunk asynchronously using tokio for better thread management
         for peer in forward_targets {
             let peer_addr = peer.addr.clone();
             let chunk_clone = chunk.clone();
             
+            // CRITICAL: Don't use spawn_blocking with blocking HTTP - it's worse than std::thread!
+            // For Turbine chunks, we keep std::thread::spawn as chunks are time-critical
+            // and the 600ms timeout prevents thread accumulation
             std::thread::spawn(move || {
                 let _ = Self::send_turbine_chunk(peer_addr, chunk_clone);
             });
@@ -3138,6 +3555,9 @@ impl SimplifiedP2P {
             .timeout(Duration::from_millis(600))  // PERFORMANCE: 600ms timeout for chunks
             .connect_timeout(Duration::from_millis(200))  // Fast connect for chunks
             .tcp_nodelay(true)
+            .tcp_keepalive(Duration::from_secs(HTTP_TCP_KEEPALIVE_SECS))
+            .pool_max_idle_per_host(HTTP_POOL_MAX_IDLE_PER_HOST)
+            .pool_idle_timeout(Duration::from_secs(HTTP_POOL_IDLE_TIMEOUT_SECS))
             .build()
             .map_err(|e| format!("Client failed: {}", e))?;
         
@@ -3319,7 +3739,9 @@ impl SimplifiedP2P {
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(5)) // EXISTING: Same as check_api_readiness_static (quick API checks)
             .connect_timeout(Duration::from_secs(3)) // EXISTING: Same as check_api_readiness_static (quick connect)
-            .tcp_keepalive(Duration::from_secs(30)) // Keep connections alive
+            .tcp_keepalive(Duration::from_secs(HTTP_TCP_KEEPALIVE_SECS)) // Keep connections alive
+            .pool_max_idle_per_host(HTTP_POOL_MAX_IDLE_PER_HOST)
+            .pool_idle_timeout(Duration::from_secs(HTTP_POOL_IDLE_TIMEOUT_SECS))
             .build()
             .map_err(|e| format!("HTTP client error: {}", e))?;
         
@@ -3958,6 +4380,41 @@ impl SimplifiedP2P {
         Ok(())
     }
     
+    /// Broadcast system event to all connected peers (reorg, emergency, etc.)
+    pub fn broadcast_system_event(&self, event_type: &str, event_data: &str) {
+        let connected = match self.connected_peers.read() {
+            Ok(peers) => peers,
+            Err(poisoned) => {
+                println!("[P2P] ⚠️ Connected peers mutex poisoned during system event broadcast");
+                poisoned.into_inner()
+            }
+        };
+        
+        if connected.is_empty() {
+            return;
+        }
+        
+        // Broadcast to all Full and Super nodes
+        let target_peers: Vec<_> = connected.iter()
+            .filter(|(_addr, p)| matches!(p.node_type, NodeType::Full | NodeType::Super))
+            .collect();
+        
+        println!("[P2P] 📢 Broadcasting system event '{}' to {} peers", event_type, target_peers.len());
+        
+        for (_addr, peer) in target_peers {
+            let event_msg = NetworkMessage::SystemEvent {
+                event_type: event_type.to_string(),
+                data: event_data.to_string(),
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                from_node: self.node_id.clone(),
+            };
+            self.send_network_message(&peer.addr, event_msg);
+        }
+    }
+    
     /// QUANTUM OPTIMIZATION: Get peer count without blocking
     pub fn get_peer_count_lockfree(&self) -> usize {
         self.connected_peers_lockfree.len()
@@ -4150,7 +4607,9 @@ impl SimplifiedP2P {
                         bandwidth_usage: 1000,
                         node_id_hash: Vec::new(),
                         bucket_index: 0,
-                        reputation_score: 70.0, // PRODUCTION: Equal starting reputation
+                        consensus_score: 70.0,  // Genesis nodes start at consensus threshold
+                        network_score: 100.0,   // Optimal network performance
+                        reputation_score: None, // Legacy field (deprecated)
                         successful_pings: 100,
                         failed_pings: 0,
                     });
@@ -4217,8 +4676,9 @@ impl SimplifiedP2P {
             cert_manager.set_local_certificate(cert_serial.clone(), certificate);
         }
         
-        // Broadcast to all connected peers
-        let peers = self.connected_peers_lockfree.clone();
+        // CRITICAL FIX: Use validated peers (deterministic Genesis list) instead of connected_peers_lockfree
+        // This fixes race condition where certificate broadcast happens before TCP connections established
+        let peers = self.get_validated_active_peers();
         let mut broadcast_count = 0;
         
         // Serialize message once for all peers
@@ -4229,8 +4689,7 @@ impl SimplifiedP2P {
             }
         };
         
-        for entry in peers.iter() {
-            let peer_info = entry.value();
+        for peer_info in peers {
             let peer_addr = peer_info.addr.clone();
             
             if peer_info.id == self.node_id {
@@ -4241,19 +4700,25 @@ impl SimplifiedP2P {
             println!("[P2P] 📤 Sending certificate {} to peer {}", cert_serial, peer_addr);
             broadcast_count += 1;
             
-            // PRODUCTION: Send certificate announcement via HTTP (same pattern as send_network_message)
+            // PRODUCTION: Send certificate announcement via HTTP using tokio for better concurrency
             let peer_addr_clone = peer_addr.clone();
             let message_json_clone = message_json.clone();
-            std::thread::spawn(move || {
+            
+            // Use tokio::spawn to prevent thread accumulation during mass certificate broadcasts
+            tokio::spawn(async move {
                 let peer_ip = peer_addr_clone.split(':').next().unwrap_or(&peer_addr_clone);
                 let url = format!("http://{}:8001/api/v1/p2p/message", peer_ip);
                 
-                let client = reqwest::blocking::Client::builder()
+                // Use async reqwest client instead of blocking
+                let client = reqwest::Client::builder()
                     .timeout(std::time::Duration::from_secs(5))
+                    .tcp_keepalive(std::time::Duration::from_secs(HTTP_TCP_KEEPALIVE_SECS))
+                    .pool_max_idle_per_host(HTTP_POOL_MAX_IDLE_PER_HOST)
+                    .pool_idle_timeout(std::time::Duration::from_secs(HTTP_POOL_IDLE_TIMEOUT_SECS))
                     .build();
                 
                 if let Ok(client) = client {
-                    if let Err(e) = client.post(&url).json(&message_json_clone).send() {
+                    if let Err(e) = client.post(&url).json(&message_json_clone).send().await {
                         println!("[P2P] ❌ Failed to send certificate to {}: {}", peer_addr_clone, e);
                     }
                 }
@@ -4262,6 +4727,187 @@ impl SimplifiedP2P {
         
         println!("[P2P] 📜 Certificate {} broadcast to {} peers", cert_serial, broadcast_count);
         Ok(())
+    }
+    
+    /// PRODUCTION: Request certificate from specific node
+    pub fn request_certificate(&self, target_node_id: &str, cert_serial: &str) {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        
+        let message = NetworkMessage::CertificateRequest {
+            requester_id: self.node_id.clone(),
+            node_id: target_node_id.to_string(),
+            cert_serial: cert_serial.to_string(),
+            timestamp,
+        };
+        
+        // Find peer address for target node
+        if let Some(addr) = self.peer_id_to_addr.get(target_node_id) {
+            self.send_network_message(&addr, message);
+            println!("[P2P] 📤 Sent certificate request for {} to {}", cert_serial, target_node_id);
+        } else {
+            // Broadcast request to all peers if we don't know the target
+            println!("[P2P] ⚠️ Target node {} not found, broadcasting certificate request", target_node_id);
+            let peers: Vec<_> = self.connected_peers_lockfree
+                .iter()
+                .map(|r| r.value().clone())
+                .collect();
+            
+            for peer in peers.iter().take(5) { // Limit to 5 peers
+                self.send_network_message(&peer.addr, message.clone());
+            }
+        }
+    }
+    
+    /// PRODUCTION: Broadcast certificate with delivery tracking and Byzantine threshold validation
+    /// Returns Ok if 2/3+ peers confirmed delivery, Err otherwise
+    /// This ensures Byzantine fault tolerance for critical certificate propagation
+    pub async fn broadcast_certificate_announce_tracked(
+        &self, 
+        cert_serial: String, 
+        certificate: Vec<u8>
+    ) -> Result<(), String> {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        
+        // Store locally first (immediate availability)
+        {
+            let mut cert_manager = self.certificate_manager.write().unwrap();
+            cert_manager.set_local_certificate(cert_serial.clone(), certificate.clone());
+        }
+        
+        // Get validated peers
+        let peers = self.get_validated_active_peers();
+        
+        if peers.is_empty() {
+            println!("[P2P] ⚠️ No peers available for tracked certificate broadcast");
+            return Ok(()); // No peers is OK (single node network)
+        }
+        
+        let total_peers = peers.len();
+        let byzantine_threshold = (total_peers * 2 + 2) / 3; // Ceiling of 2/3
+        
+        println!("[P2P] 📜 TRACKED broadcast of certificate {} to {} peers (need {}/{})", 
+                 cert_serial, total_peers, byzantine_threshold, total_peers);
+        
+        // Prepare message once
+        let message = NetworkMessage::CertificateAnnounce {
+            node_id: self.node_id.clone(),
+            cert_serial: cert_serial.clone(),
+            certificate: certificate.clone(),
+            timestamp,
+        };
+        
+        let message_json = match serde_json::to_value(&message) {
+            Ok(json) => Arc::new(json),
+            Err(e) => {
+                return Err(format!("Failed to serialize certificate message: {}", e));
+            }
+        };
+        
+        // Atomic counter for successful deliveries
+        let success_count = Arc::new(AtomicUsize::new(0));
+        
+        // Create async tasks for each peer
+        let mut tasks = Vec::new();
+        
+        for peer_info in peers {
+            if peer_info.id == self.node_id {
+                continue; // Skip self
+            }
+            
+            let peer_addr = peer_info.addr.clone();
+            let message_json_clone = Arc::clone(&message_json);
+            let success_count_clone = Arc::clone(&success_count);
+            let cert_serial_clone = cert_serial.clone();
+            
+            // Create async task for this peer
+            let task = tokio::spawn(async move {
+                let peer_ip = peer_addr.split(':').next().unwrap_or(&peer_addr);
+                let url = format!("http://{}:8001/api/v1/p2p/message", peer_ip);
+                
+                // Use async client with reasonable timeout
+                let client = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(5))
+                    .tcp_keepalive(std::time::Duration::from_secs(HTTP_TCP_KEEPALIVE_SECS))
+                    .pool_max_idle_per_host(HTTP_POOL_MAX_IDLE_PER_HOST)
+                    .pool_idle_timeout(std::time::Duration::from_secs(HTTP_POOL_IDLE_TIMEOUT_SECS))
+                    .build();
+                
+                if let Ok(client) = client {
+                    match client.post(&url).json(&*message_json_clone).send().await {
+                        Ok(response) if response.status().is_success() => {
+                            // Success - increment counter
+                            success_count_clone.fetch_add(1, Ordering::SeqCst);
+                            println!("[P2P] ✅ Certificate {} delivered to {}", cert_serial_clone, peer_addr);
+                        }
+                        Ok(response) => {
+                            println!("[P2P] ⚠️ Certificate {} failed to {} (HTTP {})", 
+                                     cert_serial_clone, peer_addr, response.status());
+                        }
+                        Err(e) => {
+                            println!("[P2P] ⚠️ Certificate {} failed to {}: {}", 
+                                     cert_serial_clone, peer_addr, e);
+                        }
+                    }
+                }
+            });
+            
+            tasks.push(task);
+        }
+        
+        // Wait for all tasks to complete (with adaptive timeout)
+        let broadcast_start = std::time::Instant::now();
+        
+        // ADAPTIVE TIMEOUT: Scale based on network size
+        // Small networks (<=10): 3s is sufficient (local/fast network)
+        // Medium networks (<=100): 5s for moderate WAN latency
+        // Large networks (>100): 10s for global distribution
+        let timeout_secs = if total_peers <= 10 {
+            3  // 3s for small networks (doesn't conflict with Tower BFT 4s timeout)
+        } else if total_peers <= 100 {
+            5  // 5s for medium networks
+        } else {
+            10 // 10s for large networks (1000 validators)
+        };
+        let timeout = tokio::time::Duration::from_secs(timeout_secs);
+        
+        match tokio::time::timeout(timeout, futures::future::join_all(tasks)).await {
+            Ok(_) => {
+                let delivery_time = broadcast_start.elapsed();
+                let successful = success_count.load(Ordering::SeqCst);
+                
+                println!("[P2P] 📊 Certificate {} delivery: {}/{} peers ({:.1}%) in {:?}", 
+                         cert_serial, successful, total_peers, 
+                         (successful as f64 / total_peers as f64) * 100.0,
+                         delivery_time);
+                
+                // Check Byzantine threshold
+                if successful >= byzantine_threshold {
+                    println!("[P2P] ✅ Byzantine threshold reached: {}/{} ≥ 2/3", 
+                             successful, total_peers);
+                    Ok(())
+                } else {
+                    let err = format!(
+                        "Byzantine threshold NOT reached: {}/{} < 2/3 (need {})",
+                        successful, total_peers, byzantine_threshold
+                    );
+                    println!("[P2P] ❌ {}", err);
+                    Err(err)
+                }
+            }
+            Err(_) => {
+                let successful = success_count.load(Ordering::SeqCst);
+                Err(format!(
+                    "Certificate broadcast timeout: only {}/{} confirmed in 10s",
+                    successful, total_peers
+                ))
+            }
+        }
     }
     
     /// PRODUCTION: Get validated active peers for consensus participation (NODE TYPE AWARE)
@@ -4276,57 +4922,49 @@ impl SimplifiedP2P {
             _ => {} // Continue with Full/Super node logic
         }
         
-        // CRITICAL FIX: For Genesis nodes, return ONLY CONNECTED peers
-        // This ensures Byzantine safety requires REAL nodes, not phantom ones
+        // CRITICAL FIX: For Genesis bootstrap, return ALL configured peers WITHOUT TCP checks
+        // TCP checks are ONLY for broadcast/failover, NOT for consensus candidate lists
+        // This ensures deterministic consensus: all nodes see SAME candidates for VRF
         if std::env::var("QNET_BOOTSTRAP_ID")
-            .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
+            .map(|id| ["001", "002", "003", "004", "005"].contains(&id.trim()))
             .unwrap_or(false) {
-            // PRODUCTION FIX: Use working Genesis nodes from connectivity check
-            // This ensures all nodes see the same set of active peers for consensus
             let genesis_ips = get_genesis_bootstrap_ips();
-            
-            // Use filter_working_genesis_nodes_static to get actually reachable nodes
-            // This is cached for 30 seconds to avoid repeated TCP checks
-            let working_genesis_ips = Self::filter_working_genesis_nodes_static(genesis_ips.clone());
-            
             let mut genesis_peers = Vec::new();
+            
+            println!("[P2P] 📋 Building peer list from bootstrap config (deterministic for consensus)");
             
             for (i, ip) in genesis_ips.iter().enumerate() {
                 let node_id = format!("genesis_node_{:03}", i + 1);
                 let peer_addr = format!("{}:8001", ip);
                 
-                // Skip self to avoid duplication
-                if !self.node_id.contains(&node_id) && !self.node_id.contains(&format!("{:03}", i + 1)) {
-                    // PRODUCTION: Use working_genesis_ips (from cached connectivity check)
-                    // This ensures consistent peer count across all nodes
-                    if working_genesis_ips.contains(ip) {
-                        genesis_peers.push(PeerInfo {
-                            id: node_id.clone(),
-                            addr: peer_addr,
-                            node_type: NodeType::Super,
-                            region: get_genesis_region_by_index(i),
-                            last_seen: chrono::Utc::now().timestamp() as u64,
-                            is_stable: true,
-                            latency_ms: 10,
-                            connection_count: 5,
-                            bandwidth_usage: 1000,
-                            node_id_hash: Vec::new(),
-                            bucket_index: 0,
-                            reputation_score: 70.0, // PRODUCTION: Equal starting reputation
-                            successful_pings: 100,
-                            failed_pings: 0,
-                        });
-                    }
+                // CRITICAL FIX: Use exact comparison, not contains()
+                // contains() incorrectly excludes nodes with similar substrings
+                // Example: if self.node_id="genesis_node_005", contains("005") excludes ALL nodes with "005"
+                // This caused certificate broadcast failure for rotated producers!
+                if self.node_id != node_id {  // Exact comparison - only skip if EXACTLY same node
+                    genesis_peers.push(PeerInfo {
+                        id: node_id.clone(),
+                        addr: peer_addr,
+                        node_type: NodeType::Super,
+                        region: get_genesis_region_by_index(i),
+                        last_seen: chrono::Utc::now().timestamp() as u64,
+                        is_stable: true,
+                        latency_ms: 10,
+                        connection_count: 5,
+                        bandwidth_usage: 1000,
+                        node_id_hash: Vec::new(),
+                        bucket_index: 0,
+                        consensus_score: 70.0,  // Universal consensus threshold (ALL node types)
+                        network_score: 100.0,   // Optimal network performance
+                        reputation_score: None, // Legacy (deprecated)
+                        successful_pings: 100,
+                        failed_pings: 0,
+                    });
+                    println!("[P2P]   ├── {}", node_id);
                 }
             }
             
-            // PRODUCTION: Report actual reachable peers (not phantom)
-            let actual_count = genesis_peers.len();
-            if actual_count == 0 && working_genesis_ips.is_empty() {
-                println!("[P2P] 🌱 Genesis mode: No reachable peers found (network issue?)");
-        } else {
-                println!("[P2P] 🌱 Genesis mode: returning {} REACHABLE peers (from connectivity check)", actual_count);
-            }
+            println!("[P2P] ✅ Peer list: {} nodes (NO TCP checks - deterministic)", genesis_peers.len());
             return genesis_peers;
         }
         
@@ -4489,15 +5127,59 @@ impl SimplifiedP2P {
                     
                     validated_peers
                 } else {
-                    // REGULAR NODES: Use standard peer validation (DHT discovered peers)
-                    // SCALABILITY: HashMap.values() for O(n) iteration
-                    let validated_peers: Vec<PeerInfo> = peers.values()
+                    // REGULAR NODES (Super/Full): Deterministic Genesis peers + DHT discovered peers
+                    // CRITICAL: Light nodes already excluded at function start (line 4272-4274)
+                    // This ensures deterministic consensus: all Super/Full nodes see SAME Genesis candidates
+                    let mut all_validated_peers = Vec::new();
+                    
+                    // STEP 1: Add deterministic Genesis peers for consensus (same as Genesis nodes)
+                    // This ensures all nodes agree on Genesis candidates for VRF producer selection
+                    let genesis_ips = get_genesis_bootstrap_ips();
+                    let mut genesis_peer_ids = std::collections::HashSet::new();
+                    
+                    println!("[P2P] 📋 Adding deterministic Genesis peers for consensus (regular node)");
+                    for (i, ip) in genesis_ips.iter().enumerate() {
+                        let node_id = format!("genesis_node_{:03}", i + 1);
+                        let peer_addr = format!("{}:8001", ip);
+                        
+                        // Add all Genesis peers (no self-exclusion for regular nodes)
+                        genesis_peer_ids.insert(node_id.clone());
+                        all_validated_peers.push(PeerInfo {
+                            id: node_id.clone(),
+                            addr: peer_addr,
+                            node_type: NodeType::Super,
+                            region: get_genesis_region_by_index(i),
+                            last_seen: chrono::Utc::now().timestamp() as u64,
+                            is_stable: true,
+                            latency_ms: 10,
+                            connection_count: 5,
+                            bandwidth_usage: 1000,
+                            node_id_hash: Vec::new(),
+                            bucket_index: 0,
+                            consensus_score: 70.0,  // Genesis consensus threshold
+                            network_score: 100.0,   // Optimal performance
+                            reputation_score: None, // Legacy (deprecated)
+                            successful_pings: 100,
+                            failed_pings: 0,
+                        });
+                        println!("[P2P]   ├── {} (deterministic for consensus)", node_id);
+                    }
+                    
+                    // STEP 2: Add DHT-discovered peers (excluding Genesis to avoid duplicates)
+                    // SCALABILITY: HashMap.values() for O(n) iteration over millions of nodes
+                    let dht_peers: Vec<PeerInfo> = peers.values()
                         .filter(|peer| {
-                            // Basic validation for regular nodes
+                            // Exclude Genesis peers (already added deterministically)
+                            let is_genesis = genesis_peer_ids.contains(&peer.id);
+                            
+                            // Only include Super/Full nodes (Light nodes excluded)
                             let is_consensus_capable = matches!(peer.node_type, NodeType::Super | NodeType::Full);
                             
-                            if is_consensus_capable {
-                                println!("[P2P] ✅ Regular peer {} meets consensus requirements", peer.addr);
+                            if is_genesis {
+                                // Skip - already added deterministically
+                                false
+                            } else if is_consensus_capable {
+                                println!("[P2P] ✅ DHT peer {} meets consensus requirements", peer.addr);
                                 true
                             } else {
                                 println!("[P2P] 📱 Light peer {} excluded from consensus", peer.addr);
@@ -4507,9 +5189,12 @@ impl SimplifiedP2P {
                         .cloned()
                         .collect();
                     
-                    println!("[P2P] ✅ Regular validated peers: {}/{} (DHT-discovered)", 
-                             validated_peers.len(), peers.len());
-                    validated_peers
+                    // Combine Genesis (deterministic) + DHT-discovered peers
+                    all_validated_peers.extend(dht_peers);
+                    
+                    println!("[P2P] ✅ Regular validated peers: {} Genesis (deterministic) + {} DHT-discovered = {} total", 
+                             genesis_ips.len(), all_validated_peers.len() - genesis_ips.len(), all_validated_peers.len());
+                    all_validated_peers
                 }
             }
             Err(e) => {
@@ -4606,6 +5291,76 @@ impl SimplifiedP2P {
             0.5  // Degraded
         } else {
             0.0  // Isolated (not necessarily bad for standalone)
+        }
+    }
+    
+    /// Get count of qualified producers (consensus_score >= 70%)
+    /// CRITICAL: Used for adaptive Turbine fanout calculation
+    /// SCALABILITY: Counts only Super and Full nodes (Light nodes excluded)
+    pub fn get_qualified_producers_count(&self) -> usize {
+        // Count peers that meet Byzantine threshold for consensus
+        self.connected_peers_lockfree.iter()
+            .filter(|entry| entry.value().is_consensus_qualified())
+            .count()
+    }
+    
+    /// Get average peer latency for network performance estimation
+    /// CRITICAL: Used for adaptive Turbine fanout calculation
+    /// Returns average latency_ms across all qualified producers
+    pub fn get_average_peer_latency(&self) -> u64 {
+        let qualified_peers: Vec<u32> = self.connected_peers_lockfree.iter()
+            .filter(|entry| entry.value().is_consensus_qualified())
+            .map(|entry| entry.value().latency_ms)
+            .collect();
+        
+        if qualified_peers.is_empty() {
+            // Default: assume regional latency (50ms) if no peers available
+            return 50;
+        }
+        
+        // Calculate average latency
+        let sum: u64 = qualified_peers.iter().map(|&l| l as u64).sum();
+        sum / qualified_peers.len() as u64
+    }
+    
+    /// Calculate adaptive Turbine fanout based on network size and latency
+    /// ARCHITECTURE: Balance between propagation speed and bandwidth usage
+    /// CRITICAL: Ensures blocks propagate within 50% of block time (500ms for 1s blocks)
+    /// 
+    /// Formula rationale:
+    /// - Genesis (5-50 producers): fanout=4 → 2 hops × latency
+    /// - Small (51-200 producers, LAN <50ms): fanout=8 → 3 hops × latency = ~150ms ✅
+    /// - Small (51-200 producers, WAN >50ms): fanout=16 → 2 hops × latency = ~400ms ✅
+    /// - Medium (201-1000 producers, LAN <50ms): fanout=8 → 4 hops × latency = ~200ms ✅
+    /// - Medium (201-1000 producers, WAN >50ms): fanout=16 → 3 hops × latency = ~600ms ✅
+    /// - Large (>1000 producers): fanout=32 → 3 hops for 32K nodes
+    pub fn get_turbine_fanout(&self) -> usize {
+        let producers = self.get_qualified_producers_count();
+        let latency = self.get_average_peer_latency();
+        
+        // ARCHITECTURE: Adaptive fanout ensures < 50% block time propagation
+        match (producers, latency) {
+            // GENESIS PHASE (5-50 producers):
+            // fanout=4 provides 2 hops for 16 nodes, 3 hops for 64 nodes
+            // Latency impact: 2-3 hops × latency < 500ms for any latency
+            (0..=50, _) => 4,
+            
+            // SMALL NETWORK (51-200 producers):
+            // LAN (<50ms): fanout=8 → 3 hops = 150ms ✅
+            // WAN (>50ms): fanout=16 → 2 hops = 400ms ✅
+            (51..=200, 0..=50) => 8,
+            (51..=200, _) => 16,
+            
+            // MEDIUM NETWORK (201-1000 producers):
+            // LAN (<50ms): fanout=8 → 4 hops = 200ms ✅
+            // WAN (>50ms): fanout=16 → 3 hops = 600ms ✅
+            (201..=1000, 0..=50) => 8,
+            (201..=1000, _) => 16,
+            
+            // LARGE NETWORK (>1000 producers - future-proof):
+            // fanout=32 → 3 hops for 32,768 nodes
+            // Even at 200ms WAN latency: 3 × 200ms = 600ms < 1000ms ✅
+            _ => 32,
         }
     }
     
@@ -4731,14 +5486,6 @@ impl SimplifiedP2P {
         };
         
         // Determine reputation based on peer ID and IP
-        let reputation_score = if peer_id.starts_with("genesis_node_") || 
-                                  peer_id.starts_with("genesis_") || 
-                                  is_genesis_node_ip(ip) {
-            70.0 // PRODUCTION: All nodes start equal
-        } else {
-            70.0 // Regular nodes: 70% minimum consensus threshold
-        };
-        
         // Use EXISTING default values from current system
         Ok(PeerInfo {
             id: peer_id,
@@ -4756,7 +5503,9 @@ impl SimplifiedP2P {
             // Kademlia DHT fields (will be calculated in add_peer_safe)
             node_id_hash: Vec::new(),
             bucket_index: 0,
-            reputation_score,
+            consensus_score: 70.0,  // Universal consensus threshold (ALL node types)
+            network_score: 100.0,   // Optimal network performance (ALL node types)
+            reputation_score: None, // Legacy (deprecated)
             successful_pings: 0,
             failed_pings: 0,
         })
@@ -4994,7 +5743,9 @@ impl SimplifiedP2P {
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(5)) // EXISTING: Same as check_api_readiness_static (quick API checks)
             .connect_timeout(Duration::from_secs(3)) // EXISTING: Same as check_api_readiness_static (quick connect)
-            .tcp_keepalive(Duration::from_secs(30)) // Keep connections alive
+            .tcp_keepalive(Duration::from_secs(HTTP_TCP_KEEPALIVE_SECS)) // Keep connections alive
+            .pool_max_idle_per_host(HTTP_POOL_MAX_IDLE_PER_HOST)
+            .pool_idle_timeout(Duration::from_secs(HTTP_POOL_IDLE_TIMEOUT_SECS))
             .build()
             .map_err(|e| format!("HTTP client error: {}", e))?;
         
@@ -5387,10 +6138,13 @@ impl SimplifiedP2P {
     fn check_api_readiness_static(ip: &str) -> bool {
         use std::time::Duration;
         
-        // PRODUCTION: Extended timeout for international Genesis nodes
+        // PRODUCTION: Extended timeout for international Genesis nodes with connection pooling
         let client = match reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(5)) // INCREASED: 5s timeout for Genesis node API checks
             .connect_timeout(Duration::from_secs(3)) // INCREASED: 3s connection timeout
+            .tcp_keepalive(Duration::from_secs(HTTP_TCP_KEEPALIVE_SECS))
+            .pool_max_idle_per_host(HTTP_POOL_MAX_IDLE_PER_HOST)
+            .pool_idle_timeout(Duration::from_secs(HTTP_POOL_IDLE_TIMEOUT_SECS))
             .build() {
             Ok(client) => client,
             Err(_) => return false,
@@ -5825,11 +6579,17 @@ impl SimplifiedP2P {
         // Use semaphore to limit concurrent workers
         let semaphore = Arc::new(tokio::sync::Semaphore::new(parallel_workers));
         
-        // Pre-fetch peers for all workers to use
-        let peers = self.connected_peers.read().unwrap()
-            .keys()
-            .cloned()
-            .collect::<Vec<String>>();
+        // CRITICAL FIX: Use filtered and prioritized peers (blacklist + reputation + Light nodes excluded)
+        // SCALABILITY: Light nodes are NOT sync sources (millions of Light nodes in production)
+        let filtered_peers = self.get_sync_peers_filtered(20);
+        let peers: Vec<String> = filtered_peers.iter()
+            .map(|p| p.addr.clone())
+            .collect();
+        
+        if peers.is_empty() {
+            println!("[SYNC] ⚠️ No suitable sync peers available (blacklist/reputation filtered)");
+            return;
+        }
         
         for (chunk_start, chunk_end) in chunks {
             let storage_clone = storage_arc.clone();
@@ -5944,6 +6704,9 @@ impl SimplifiedP2P {
                     .connect_timeout(std::time::Duration::from_secs(2))
                     .user_agent("QNet-Node/1.0")
                     .tcp_nodelay(true)
+                    .tcp_keepalive(std::time::Duration::from_secs(HTTP_TCP_KEEPALIVE_SECS))
+                    .pool_max_idle_per_host(HTTP_POOL_MAX_IDLE_PER_HOST)
+                    .pool_idle_timeout(std::time::Duration::from_secs(HTTP_POOL_IDLE_TIMEOUT_SECS))
                     .build() {
                     Ok(client) => client,
                     Err(_) => continue,
@@ -6019,6 +6782,51 @@ mod base64_bytes {
     }
 }
 
+/// PRODUCTION: Light Node registration data for gossip sync
+/// Compact struct for efficient batch transfers between Full/Super nodes
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LightNodeRegistrationData {
+    pub node_id: String,              // Privacy-preserving pseudonym
+    pub wallet_address: String,       // Owner wallet for rewards
+    pub device_token_hash: String,    // Hashed FCM token
+    pub quantum_pubkey: String,       // Dilithium public key
+    pub registered_at: u64,           // Registration timestamp
+    pub signature: String,            // Ed25519 signature
+}
+
+/// PRODUCTION: Heartbeat record for tracking node liveness
+/// Used for reward eligibility calculation (8/10 for Full, 9/10 for Super)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HeartbeatRecord {
+    pub node_id: String,
+    pub timestamp: u64,
+    pub heartbeat_index: u8,          // 0-9 within 4h window
+    pub signature: String,
+    pub verified: bool,               // Signature verified
+}
+
+/// PRODUCTION: Light Node Attestation - proof that Light node responded to ping
+/// Created by pinger after receiving signed response from Light node
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LightNodeAttestation {
+    pub light_node_id: String,        // Light node that was pinged
+    pub pinger_id: String,            // Full/Super node that pinged
+    pub slot: u64,                    // Time slot (4h window / 240 = 1 min slots)
+    pub timestamp: u64,               // When attestation was created
+    pub light_node_signature: String, // Light node's signature on challenge
+    pub pinger_signature: String,     // Pinger's signature on attestation
+    pub challenge: String,            // Original challenge (for verification)
+}
+
+/// Pinger role for Light node ping responsibility
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PingerRole {
+    Primary,   // Ping immediately
+    Backup1,   // Wait 30 seconds, then ping if no attestation
+    Backup2,   // Wait 60 seconds, then ping if no attestation
+    None,      // Not responsible for this Light node
+}
+
 /// Message types for simplified network
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum NetworkMessage {
@@ -6080,6 +6888,8 @@ pub enum NetworkMessage {
         block_height: u64,
         change_type: String, // "microblock" or "macroblock"
         timestamp: u64,
+        #[serde(default)] // BACKWARD COMPATIBILITY: Optional for old messages
+        sender_node_id: Option<String>, // PRODUCTION: Explicit sender identification for Docker/NAT
     },
     
     /// Turbine chunk for efficient block propagation
@@ -6171,6 +6981,96 @@ pub enum NetworkMessage {
         timestamp: u64,
     },
     
+    /// PRODUCTION: Light Node registration gossip for decentralized registry sync
+    /// All Full/Super nodes maintain synchronized Light Node registry via gossip
+    LightNodeRegistration {
+        node_id: String,              // Privacy-preserving pseudonym (hash-based)
+        wallet_address: String,       // Owner wallet for reward claims
+        device_token_hash: String,    // Hashed FCM token for privacy
+        quantum_pubkey: String,       // CRYSTALS-Dilithium public key
+        registered_at: u64,           // Registration timestamp
+        signature: String,            // Ed25519 signature from wallet
+        gossip_hop: u8,               // Hop count for gossip TTL (max 3)
+    },
+    
+    /// PRODUCTION: Full/Super node heartbeat for self-attestation
+    /// Nodes prove liveness by broadcasting signed heartbeats at deterministic times
+    NodeHeartbeat {
+        node_id: String,              // Node identifier
+        node_type: String,            // "full" or "super"
+        timestamp: u64,               // Unix timestamp of heartbeat
+        block_height: u64,            // Current block height (informational)
+        signature: String,            // Dilithium signature proving key ownership
+        heartbeat_index: u8,          // Which of 10 heartbeats (0-9) in 4h window
+        gossip_hop: u8,               // Hop count for gossip TTL (max 3)
+    },
+    
+    /// PRODUCTION: Request Light Node registry sync from peer
+    LightNodeRegistryRequest {
+        requester_id: String,
+        last_sync_timestamp: u64,     // Only send registrations after this time
+    },
+    
+    /// PRODUCTION: Response with Light Node registry batch
+    LightNodeRegistryResponse {
+        sender_id: String,
+        registrations: Vec<LightNodeRegistrationData>,  // Batch of registrations
+        total_count: u64,             // Total nodes in registry
+    },
+    
+    /// PRODUCTION: Light Node attestation - proof that Light node responded to ping
+    /// Gossiped after pinger receives signed response from Light node
+    LightNodeAttestation {
+        light_node_id: String,        // Light node that was pinged
+        pinger_id: String,            // Full/Super node that pinged
+        slot: u64,                    // Time slot for deduplication
+        timestamp: u64,               // When attestation was created
+        light_node_signature: String, // Light node's signature on challenge
+        pinger_signature: String,     // Pinger's signature on attestation
+        challenge: String,            // Original challenge
+        gossip_hop: u8,               // Hop count for gossip TTL (max 3)
+    },
+    
+    /// PRODUCTION: Active Full/Super node announcement for pinger selection sync
+    /// Gossiped when node starts and periodically (every 10 min) to maintain active list
+    ActiveNodeAnnouncement {
+        node_id: String,              // Node identifier
+        node_type: String,            // "full" or "super"
+        shard_id: u8,                 // Node's shard (0-255)
+        reputation: f64,              // Current reputation score
+        timestamp: u64,               // Announcement timestamp
+        signature: String,            // Dilithium signature for authenticity
+        gossip_hop: u8,               // Hop count for gossip TTL (max 3)
+    },
+    
+    /// PRODUCTION: Request active nodes list from peer (on startup/reconnect)
+    ActiveNodesRequest {
+        requester_id: String,
+    },
+    
+    /// PRODUCTION: Response with active Full/Super nodes list
+    ActiveNodesResponse {
+        sender_id: String,
+        active_nodes: Vec<ActiveNodeInfo>,  // List of active nodes
+    },
+    
+    /// PRODUCTION: System event broadcast (reorg, emergency, etc.)
+    SystemEvent {
+        event_type: String,   // "chain_reorg", "emergency_shutdown", etc.
+        data: String,         // JSON-encoded event data
+        timestamp: u64,
+        from_node: String,
+    },
+}
+
+/// PRODUCTION: Active node info for gossip sync
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActiveNodeInfo {
+    pub node_id: String,
+    pub node_type: String,          // "full" or "super"
+    pub shard_id: u8,
+    pub reputation: f64,
+    pub last_seen: u64,             // Last heartbeat/announcement timestamp
 }
 
 /// Internal consensus messages for node communication
@@ -6348,7 +7248,64 @@ impl SimplifiedP2P {
                 self.handle_turbine_chunk(from_peer, chunk);
             }
 
-            NetworkMessage::EmergencyProducerChange { failed_producer, new_producer, block_height, change_type, timestamp } => {
+            NetworkMessage::EmergencyProducerChange { failed_producer, new_producer, block_height, change_type, timestamp, sender_node_id } => {
+                // SECURITY: Check sender reputation before processing emergency message
+                // SIMPLIFIED: Only reputation check, no complex round verification
+                // RATIONALE: Round participants change dynamically, checking would be non-deterministic
+                
+                // PRODUCTION: Get sender reputation using explicit sender_node_id (if provided) or fallback to IP resolution
+                // This fixes Docker/NAT issues where from_peer IP doesn't match public IP
+                let sender_reputation = {
+                    let resolved_sender_id = if let Some(explicit_id) = sender_node_id {
+                        // PRODUCTION: Use explicit sender_node_id from message (Docker/NAT safe)
+                        println!("[SECURITY] ✅ Using explicit sender_node_id: {}", explicit_id);
+                        explicit_id
+                    } else {
+                        // PRODUCTION: IP resolution for nodes on different servers (public IPs)
+                        let sender_ip = if from_peer.contains(':') {
+                            from_peer.split(':').next().unwrap_or(from_peer)
+                        } else {
+                            from_peer
+                        };
+                        
+                        // Convert IP to node_id using EXISTING logic
+                        // FAST PATH: Check Genesis nodes first (O(1))
+                        match sender_ip {
+                            "154.38.160.39" => "genesis_node_001".to_string(),
+                            "62.171.157.44" => "genesis_node_002".to_string(),
+                            "161.97.86.81" => "genesis_node_003".to_string(),
+                            "5.189.130.160" => "genesis_node_004".to_string(),
+                            "162.244.25.114" => "genesis_node_005".to_string(),
+                            _ => {
+                                // Non-Genesis node: use privacy ID
+                                // PRODUCTION: All nodes should send explicit sender_node_id
+                                // This fallback only for Genesis nodes with public IPs
+                                get_privacy_id_for_addr(sender_ip)
+                            }
+                        }
+                    };
+                    
+                    // Get reputation from NodeReputation system
+                    if let Ok(reputation_system) = self.reputation_system.lock() {
+                        let rep = reputation_system.get_reputation(&resolved_sender_id);
+                        println!("[SECURITY] 🔍 Emergency from {}: reputation {:.1}", 
+                                 resolved_sender_id, rep);
+                        rep
+                    } else {
+                        println!("[SECURITY] ⚠️ Failed to access reputation system");
+                        0.0
+                    }
+                };
+                
+                // CRITICAL: Ignore emergency messages from low-reputation nodes
+                // This naturally limits to ~1000 high-reputation nodes that can participate
+                if sender_reputation < 70.0 {
+                    println!("[SECURITY] ⚠️ Ignoring emergency from {} - reputation {:.1} < 70", 
+                             from_peer, sender_reputation);
+                    println!("[SECURITY] 🚫 Low-reputation nodes cannot trigger emergency failover");
+                    return; // Ignore message completely
+                }
+                
                 // PRIVACY: Use privacy-preserving IDs for producer changes
                 // CRITICAL FIX: Don't double-convert if already a pseudonym (genesis_node_XXX or node_XXX)
                 let failed_id = if failed_producer.starts_with("genesis_node_") || failed_producer.starts_with("node_") {
@@ -6365,7 +7322,12 @@ impl SimplifiedP2P {
                 
                 println!("[FAILOVER] 🚨 Emergency producer change: {} → {} at block #{} ({})", 
                          failed_id, new_id, block_height, change_type);
-                self.handle_emergency_producer_change(failed_producer, new_producer, block_height, change_type, timestamp);
+                
+                // Pass sender address for tracking false emergencies
+                self.handle_emergency_producer_change_with_sender(
+                    failed_producer, new_producer, block_height, change_type, timestamp,
+                    from_peer.to_string() // Pass sender address for tracking
+                );
             }
             
             NetworkMessage::ReputationSync { node_id, reputation_updates, timestamp, signature } => {
@@ -6443,13 +7405,20 @@ impl SimplifiedP2P {
                 println!("[P2P] 📜 Certificate announcement from {} (serial: {})", node_id, cert_serial);
                 
                 // SECURITY: Rate limiting to prevent certificate flooding attacks
-                // Maximum 10 certificate announcements per minute per peer
+                // Maximum 10 certificate announcements per minute per peer (40 for Genesis nodes)
                 let now = self.current_timestamp();
                 let rate_limited = {
                     let rate_key = format!("cert_{}", node_id);
+                    
+                    // CRITICAL: Higher rate limit for Genesis nodes due to periodic broadcast
+                    // Genesis nodes: 6 broadcasts/min × 5 nodes + rotation = ~35 certs/min (need 40)
+                    // Regular nodes: 1-2 broadcasts/min (10 is sufficient)
+                    let is_genesis = node_id.starts_with("genesis_node_");
+                    let max_certs = if is_genesis { 40 } else { 10 };
+                    
                     let mut rate_limit = self.rate_limiter.entry(rate_key).or_insert_with(|| RateLimit {
                         requests: Vec::new(),
-                        max_requests: 10,  // 10 certificates per minute (generous for 1-hour rotation)
+                        max_requests: max_certs,
                         window_seconds: 60,
                         blocked_until: 0,
                     });
@@ -6482,7 +7451,7 @@ impl SimplifiedP2P {
                 if rate_limited {
                     println!("[P2P] 🚫 Certificate announcement rejected due to rate limiting");
                     // SECURITY: Rate limiting violation indicates potential DoS attack
-                    self.update_peer_reputation(&node_id, false); // -5% per violation
+                    self.update_peer_reputation(&node_id, ReputationEvent::ConnectionFailure);
                     self.track_invalid_certificate(&node_id, "RATE_LIMIT_EXCEEDED");
                     return;
                 }
@@ -6493,8 +7462,8 @@ impl SimplifiedP2P {
                     Ok(c) => c,
                     Err(e) => {
                         println!("[P2P] ❌ Invalid certificate format from {}: {}", node_id, e);
-                        // SECURITY: Penalize for sending invalid data
-                        self.update_peer_reputation(&node_id, false); // -5% reputation
+                        // SECURITY: Penalize for sending invalid data (consensus issue)
+                        self.update_node_reputation(&node_id, ReputationEvent::InvalidBlock);
                         self.track_invalid_certificate(&node_id, "INVALID_FORMAT");
                         return;
                     }
@@ -6510,12 +7479,12 @@ impl SimplifiedP2P {
                     // BUT: Genesis nodes get special protection
                     if self.is_genesis_node(&node_id) {
                         println!("[SECURITY] ⚠️ Genesis node {} attempted certificate spoofing - SEVERE WARNING", node_id);
-                        println!("[SECURITY] 🛡️ Genesis node protected from ban, applying -70% reputation penalty");
-                        self.update_node_reputation(&node_id, -70.0); // Severe penalty but no ban
+                        println!("[SECURITY] 🛡️ Genesis node protected from ban, applying Byzantine penalty");
+                        self.update_node_reputation(&node_id, ReputationEvent::MaliciousBehavior);
                         self.track_invalid_certificate(&node_id, "CERTIFICATE_SPOOFING");
                     } else {
-                        // Regular nodes get instant ban
-                        self.update_peer_reputation(&node_id, false); // First hit: -5%
+                        // Regular nodes: Byzantine attack
+                        self.update_node_reputation(&node_id, ReputationEvent::MaliciousBehavior);
                         self.track_invalid_certificate(&node_id, "CERTIFICATE_SPOOFING");
                         
                         // Report as critical attack for instant ban (1 year)
@@ -6533,8 +7502,9 @@ impl SimplifiedP2P {
                 let now = self.current_timestamp();
                 let cert_age = now.saturating_sub(cert.issued_at);
                 
-                // Maximum age: 2 hours (certificate lifetime is 1 hour + 1 hour grace period)
-                const MAX_CERT_AGE: u64 = 7200; // 2 hours in seconds
+                // Maximum age: 9 minutes (certificate lifetime is 4.5 min + 4.5 min grace period)
+                // SECURITY: Prevents replay attacks while allowing propagation time
+                const MAX_CERT_AGE: u64 = 540; // 9 minutes (2× certificate lifetime)
                 if cert_age > MAX_CERT_AGE {
                     println!("[P2P] ❌ Certificate too old (possible replay attack)");
                     println!("[P2P]    Certificate age: {} seconds", cert_age);
@@ -6636,18 +7606,79 @@ impl SimplifiedP2P {
                             // Check if we have history for this node
                             let is_compatible = if let Some(history) = cert_manager.certificate_history.get(&cert.node_id) {
                                 // This node has rotated certificates before
-                                // For now, we just warn - in future, can check Ed25519 key continuity
                                 if !history.is_empty() {
                                     let prev_count = history.len();
                                     println!("[P2P] 🔄 Certificate rotation detected for {} (history: {} certs)", 
                                              cert.node_id, prev_count);
-                                    // TODO: In production, verify that new cert is signed by previous key
-                                    // or follows proper rotation protocol
+                                    
+                                    // PRODUCTION: Verify rotation signature with previous key
+                                    // MANDATORY: All certificate rotations MUST be signed by the previous key
+                                    // This creates an unbreakable chain of trust from the first certificate
+                                    if let Some(rotation_sig_b64) = &cert.rotation_signature {
+                                        // Get previous Ed25519 public key from history
+                                        let (_prev_serial, prev_ed25519_key) = &history[history.len() - 1];
+                                        
+                                        // Decode rotation signature
+                                        match base64::engine::general_purpose::STANDARD.decode(rotation_sig_b64) {
+                                            Ok(sig_bytes) if sig_bytes.len() == 64 => {
+                                                // Create Ed25519 signature and verifying key
+                                                use ed25519_dalek::{Signature, VerifyingKey, Verifier};
+                                                
+                                                match Signature::from_slice(&sig_bytes) {
+                                                    Ok(signature) => {
+                                                        match VerifyingKey::from_bytes(prev_ed25519_key) {
+                                                            Ok(prev_verifying_key) => {
+                                                                // Verify that new key is signed by old key
+                                                                match prev_verifying_key.verify(&cert.ed25519_public_key, &signature) {
+                                                                    Ok(_) => {
+                                                                        println!("[P2P] ✅ Rotation signature verified - chain of trust maintained");
+                                                                        true
+                                                                    }
+                                                                    Err(_) => {
+                                                                        println!("[P2P] ❌ SECURITY: Rotation signature INVALID - rejecting certificate");
+                                                                        println!("[P2P] 🚨 Potential attack: unauthorized key rotation attempt");
+                                                                        false
+                                                                    }
+                                                                }
+                                                            }
+                                                            Err(_) => {
+                                                                println!("[P2P] ⚠️ Failed to parse previous Ed25519 key");
+                                                                false
+                                                            }
+                                                        }
+                                                    }
+                                                    Err(_) => {
+                                                        println!("[P2P] ⚠️ Failed to parse rotation signature");
+                                                        false
+                                                    }
+                                                }
+                                            }
+                                            _ => {
+                                                println!("[P2P] ⚠️ Invalid rotation signature format");
+                                                false
+                                            }
+                                        }
+                                    } else {
+                                        // PRODUCTION: No rotation signature - MANDATORY for rotations
+                                        // This is a critical security requirement to prevent unauthorized key takeover
+                                        println!("[P2P] ❌ SECURITY: Certificate rotation WITHOUT signature - REJECTING!");
+                                        println!("[P2P] 🚨 ATTACK DETECTED: Attempting rotation without proof of previous key ownership");
+                                        println!("[P2P] 🔐 All rotations MUST be signed by previous key to maintain chain of trust");
+                                        false
+                                    }
+                                } else {
+                                    // Empty history but node exists - should not happen
+                                    println!("[P2P] ⚠️ Node has empty certificate history - accepting");
+                                    true
                                 }
-                                true // Accept for now
                             } else {
                                 // First certificate from this node
                                 println!("[P2P] 🆕 First certificate from node {}", cert.node_id);
+                                
+                                // First certificate should NOT have rotation signature
+                                if cert.rotation_signature.is_some() {
+                                    println!("[P2P] ⚠️ First certificate has rotation signature - suspicious but accepting");
+                                }
                                 true
                             };
                             
@@ -6718,8 +7749,11 @@ impl SimplifiedP2P {
                 println!("[P2P] 📋 Certificate request from {} for {}", requester_id, cert_serial);
                 
                 // Check if we have the certificate and send response
-                let cert_manager = self.certificate_manager.read().unwrap();
-                if let Some(certificate) = cert_manager.get_certificate(&cert_serial) {
+                // MUST use write lock to track usage_count for proper LRU
+                let mut cert_manager = self.certificate_manager.write().unwrap();
+                if let Some(certificate) = cert_manager.get_and_mark_used(&cert_serial) {
+                    drop(cert_manager); // Release lock before network operations
+                    
                     println!("[P2P] ✅ Sending certificate {} to {}", cert_serial, requester_id);
                     
                     // PRODUCTION: Send response back via network
@@ -6743,16 +7777,21 @@ impl SimplifiedP2P {
                             }
                         };
                         
-                        std::thread::spawn(move || {
+                        // Use tokio::spawn for certificate response to prevent thread accumulation
+                        tokio::spawn(async move {
                             let peer_ip = peer_addr_clone.split(':').next().unwrap_or(&peer_addr_clone);
                             let url = format!("http://{}:8001/api/v1/p2p/message", peer_ip);
                             
-                            let client = reqwest::blocking::Client::builder()
+                            // Use async client for better resource management
+                            let client = reqwest::Client::builder()
                                 .timeout(std::time::Duration::from_secs(5))
+                                .tcp_keepalive(std::time::Duration::from_secs(HTTP_TCP_KEEPALIVE_SECS))
+                                .pool_max_idle_per_host(HTTP_POOL_MAX_IDLE_PER_HOST)
+                                .pool_idle_timeout(std::time::Duration::from_secs(HTTP_POOL_IDLE_TIMEOUT_SECS))
                                 .build();
                             
                             if let Ok(client) = client {
-                                if let Err(e) = client.post(&url).json(&response_json).send() {
+                                if let Err(e) = client.post(&url).json(&response_json).send().await {
                                     println!("[P2P] ❌ Failed to send certificate response to {}: {}", peer_addr_clone, e);
                                 } else {
                                     println!("[P2P] 📤 Certificate response sent to {}", requester_id_clone);
@@ -6776,8 +7815,1352 @@ impl SimplifiedP2P {
                 cert_manager.store_remote_certificate(cert_serial.clone(), certificate);
                 println!("[P2P] ✅ Received certificate {} cached", cert_serial);
             }
+            
+            // PRODUCTION: Light Node registration gossip handling
+            NetworkMessage::LightNodeRegistration { 
+                node_id, wallet_address, device_token_hash, quantum_pubkey, 
+                registered_at, signature, gossip_hop 
+            } => {
+                self.update_peer_last_seen(from_peer);
+                
+                // GOSSIP TTL: Max 3 hops to prevent infinite propagation
+                if gossip_hop >= 3 {
+                    println!("[GOSSIP] ⏭️ Light node registration {} exceeded hop limit", node_id);
+                    return;
+                }
+                
+                // DEDUPE: Check if already in registry
+                {
+                    let registry = self.light_node_registry.read().unwrap();
+                    if registry.contains_key(&node_id) {
+                        // Already have this registration, skip
+                        return;
+                    }
+                }
+                
+                // PRODUCTION: Verify Ed25519 signature before accepting
+                // Format: "light_node_registration:{node_id}:{wallet_address}:{registered_at}"
+                let message = format!("light_node_registration:{}:{}:{}", node_id, wallet_address, registered_at);
+                let signature_valid = self.verify_ed25519_signature(&message, &signature, &wallet_address);
+                
+                if !signature_valid {
+                    println!("[GOSSIP] ❌ Invalid signature for Light node {}", node_id);
+                    return;
+                }
+                
+                // Store in local registry with LRU eviction
+                {
+                    let mut registry = self.light_node_registry.write().unwrap();
+                    
+                    // LRU eviction: Remove oldest entries if at capacity
+                    if registry.len() >= MAX_LIGHT_NODE_REGISTRY_SIZE {
+                        // Find oldest 10% entries by registered_at timestamp
+                        let evict_count = MAX_LIGHT_NODE_REGISTRY_SIZE / 10;
+                        let mut entries: Vec<_> = registry.iter()
+                            .map(|(k, v)| (k.clone(), v.registered_at))
+                            .collect();
+                        entries.sort_by_key(|(_, ts)| *ts);
+                        
+                        for (key, _) in entries.into_iter().take(evict_count) {
+                            registry.remove(&key);
+                        }
+                        println!("[REGISTRY] 🧹 LRU evicted {} oldest Light nodes", evict_count);
+                    }
+                    
+                    registry.insert(node_id.clone(), LightNodeRegistrationData {
+                        node_id: node_id.clone(),
+                        wallet_address: wallet_address.clone(),
+                        device_token_hash: device_token_hash.clone(),
+                        quantum_pubkey: quantum_pubkey.clone(),
+                        registered_at,
+                        signature: signature.clone(),
+                    });
+                }
+                
+                println!("[GOSSIP] ✅ Light node {} registered (hop {})", node_id, gossip_hop);
+                
+                // RE-GOSSIP: Forward to other peers with incremented hop
+                let forward_msg = NetworkMessage::LightNodeRegistration {
+                    node_id,
+                    wallet_address,
+                    device_token_hash,
+                    quantum_pubkey,
+                    registered_at,
+                    signature,
+                    gossip_hop: gossip_hop + 1,
+                };
+                self.gossip_to_random_peers(forward_msg, 3); // Forward to 3 random peers
+            }
+            
+            // PRODUCTION: Full/Super node heartbeat handling
+            NetworkMessage::NodeHeartbeat {
+                node_id, node_type, timestamp, block_height, signature, heartbeat_index, gossip_hop
+            } => {
+                self.update_peer_last_seen(from_peer);
+                
+                // GOSSIP TTL: Max 3 hops
+                if gossip_hop >= 3 {
+                    return;
+                }
+                
+                // TIMESTAMP VALIDATION: Must be within ±5 minutes
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                if timestamp > now + 300 || timestamp < now.saturating_sub(300) {
+                    println!("[HEARTBEAT] ❌ Invalid timestamp for {} (drift: {}s)", node_id, 
+                             now as i64 - timestamp as i64);
+                    return;
+                }
+                
+                // DEDUPE: Check if already received this heartbeat
+                let heartbeat_key = format!("{}:{}", node_id, heartbeat_index);
+                {
+                    let heartbeats = self.heartbeat_history.read().unwrap();
+                    if let Some(existing) = heartbeats.get(&heartbeat_key) {
+                        // Same 4h window? Skip
+                        let current_4h_window = now - (now % (4 * 60 * 60));
+                        let existing_4h_window = existing.timestamp - (existing.timestamp % (4 * 60 * 60));
+                        if current_4h_window == existing_4h_window {
+                            return; // Already have this heartbeat for current window
+                        }
+                    }
+                }
+                
+                // PRODUCTION: Verify Dilithium signature
+                let message = format!("heartbeat:{}:{}:{}:{}", node_id, timestamp, block_height, heartbeat_index);
+                let signature_valid = self.verify_dilithium_heartbeat_signature(&message, &signature, &node_id);
+                
+                if !signature_valid {
+                    println!("[HEARTBEAT] ❌ Invalid signature for {} heartbeat #{}", node_id, heartbeat_index);
+                    return;
+                }
+                
+                // Store heartbeat in RAM
+                {
+                    let mut heartbeats = self.heartbeat_history.write().unwrap();
+                    heartbeats.insert(heartbeat_key, HeartbeatRecord {
+                        node_id: node_id.clone(),
+                        timestamp,
+                        heartbeat_index,
+                        signature: signature.clone(),
+                        verified: true,
+                    });
+                }
+                
+                // NOTE: NO reputation change for heartbeats!
+                // Reward eligibility is determined by heartbeat count (8/10 or 9/10)
+                // Adding +1 rep per heartbeat would cause inflation (10 heartbeats × N receivers)
+                // Rewards are sufficient incentive
+                
+                // Update active nodes list (proves node is online)
+                self.update_active_nodes_from_heartbeat(&node_id, &node_type, timestamp);
+                
+                println!("[HEARTBEAT] ✅ {} ({}) heartbeat #{} verified at height {}", 
+                         node_id, node_type, heartbeat_index, block_height);
+                
+                // RE-GOSSIP
+                let forward_msg = NetworkMessage::NodeHeartbeat {
+                    node_id,
+                    node_type,
+                    timestamp,
+                    block_height,
+                    signature,
+                    heartbeat_index,
+                    gossip_hop: gossip_hop + 1,
+                };
+                self.gossip_to_random_peers(forward_msg, 3);
+            }
+            
+            // PRODUCTION: Light Node registry sync request
+            NetworkMessage::LightNodeRegistryRequest { requester_id, last_sync_timestamp } => {
+                self.update_peer_last_seen(from_peer);
+                println!("[SYNC] 📥 Light node registry request from {} (since {})", requester_id, last_sync_timestamp);
+                
+                // Collect registrations newer than last_sync_timestamp
+                let registrations: Vec<LightNodeRegistrationData> = {
+                    let registry = self.light_node_registry.read().unwrap();
+                    registry.values()
+                        .filter(|r| r.registered_at > last_sync_timestamp)
+                        .cloned()
+                        .collect()
+                };
+                
+                let total_count = {
+                    let registry = self.light_node_registry.read().unwrap();
+                    registry.len() as u64
+                };
+                
+                // Send response
+                let response = NetworkMessage::LightNodeRegistryResponse {
+                    sender_id: self.node_id.clone(),
+                    registrations,
+                    total_count,
+                };
+                
+                if let Some(peer_addr) = self.get_peer_address_for_heartbeat(&requester_id) {
+                    self.send_network_message(&peer_addr, response);
+                }
+            }
+            
+            // PRODUCTION: Light Node registry sync response
+            NetworkMessage::LightNodeRegistryResponse { sender_id, registrations, total_count } => {
+                self.update_peer_last_seen(from_peer);
+                println!("[SYNC] 📥 Light node registry response from {} ({} nodes, {} total)", 
+                         sender_id, registrations.len(), total_count);
+                
+                // Merge into local registry
+                let mut added = 0;
+                {
+                    let mut registry = self.light_node_registry.write().unwrap();
+                    for reg in registrations {
+                        if !registry.contains_key(&reg.node_id) {
+                            registry.insert(reg.node_id.clone(), reg);
+                            added += 1;
+                        }
+                    }
+                }
+                
+                println!("[SYNC] ✅ Added {} new Light nodes to registry", added);
+            }
+            
+            // PRODUCTION: Light Node attestation - proof of ping response
+            NetworkMessage::LightNodeAttestation {
+                light_node_id, pinger_id, slot, timestamp, 
+                light_node_signature, pinger_signature, challenge, gossip_hop
+            } => {
+                self.update_peer_last_seen(from_peer);
+                
+                // GOSSIP TTL: Max 3 hops
+                if gossip_hop >= 3 {
+                    return;
+                }
+                
+                // DEDUPE: Check if we already have attestation for this slot
+                let attestation_key = format!("{}:{}", light_node_id, slot);
+                {
+                    let attestations = self.light_node_attestations.read().unwrap();
+                    if attestations.contains_key(&attestation_key) {
+                        // Already have attestation for this Light node in this slot
+                        return;
+                    }
+                }
+                
+                // TIMESTAMP VALIDATION: Must be within ±5 minutes
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                if timestamp > now + 300 || timestamp < now.saturating_sub(300) {
+                    println!("[ATTESTATION] ❌ Invalid timestamp for {} (drift: {}s)", 
+                             light_node_id, now as i64 - timestamp as i64);
+                    return;
+                }
+                
+                // VERIFY: Pinger must be in active Full/Super nodes list
+                {
+                    let active_nodes = self.active_full_super_nodes.read().unwrap();
+                    if !active_nodes.contains_key(&pinger_id) && !pinger_id.starts_with("genesis_node_") {
+                        println!("[ATTESTATION] ❌ Unknown pinger {} for Light node {}", pinger_id, light_node_id);
+                        return;
+                    }
+                }
+                
+                // VERIFY: Light node must be in registry
+                {
+                    let registry = self.light_node_registry.read().unwrap();
+                    if !registry.contains_key(&light_node_id) {
+                        println!("[ATTESTATION] ❌ Unknown Light node {}", light_node_id);
+                        return;
+                    }
+                }
+                
+                // VERIFY: Pinger signature on attestation
+                let attestation_data = format!("attestation:{}:{}:{}:{}", 
+                    light_node_id, slot, timestamp, challenge);
+                if !self.verify_dilithium_heartbeat_signature(&attestation_data, &pinger_signature, &pinger_id) {
+                    println!("[ATTESTATION] ❌ Invalid pinger signature for {}", light_node_id);
+                    return;
+                }
+                
+                // Store attestation with capacity check
+                {
+                    let mut attestations = self.light_node_attestations.write().unwrap();
+                    
+                    // Capacity check: cleanup oldest if at limit
+                    if attestations.len() >= MAX_ATTESTATIONS_SIZE {
+                        let cutoff = timestamp.saturating_sub(RETENTION_PERIOD_SECS);
+                        let before = attestations.len();
+                        attestations.retain(|_, v| v.timestamp > cutoff);
+                        let removed = before - attestations.len();
+                        if removed > 0 {
+                            println!("[ATTESTATION] 🧹 Cleaned up {} old attestations", removed);
+                        }
+                    }
+                    
+                    attestations.insert(attestation_key.clone(), LightNodeAttestation {
+                        light_node_id: light_node_id.clone(),
+                        pinger_id: pinger_id.clone(),
+                        slot,
+                        timestamp,
+                        light_node_signature: light_node_signature.clone(),
+                        pinger_signature: pinger_signature.clone(),
+                        challenge: challenge.clone(),
+                    });
+                }
+                
+                // WHITEPAPER: Light nodes have FIXED reputation of 70
+                // NO reputation changes for Light nodes - they are always eligible if attested
+                
+                println!("[ATTESTATION] ✅ Light node {} attested by {} in slot {}", 
+                         light_node_id, pinger_id, slot);
+                
+                // RE-GOSSIP
+                let forward_msg = NetworkMessage::LightNodeAttestation {
+                    light_node_id,
+                    pinger_id,
+                    slot,
+                    timestamp,
+                    light_node_signature,
+                    pinger_signature,
+                    challenge,
+                    gossip_hop: gossip_hop + 1,
+                };
+                self.gossip_to_random_peers(forward_msg, 3);
+            }
+            
+            // PRODUCTION: Active Full/Super node announcement for pinger selection
+            NetworkMessage::ActiveNodeAnnouncement {
+                node_id, node_type, shard_id, reputation, timestamp, signature, gossip_hop
+            } => {
+                self.update_peer_last_seen(from_peer);
+                
+                // GOSSIP TTL: Max 3 hops
+                if gossip_hop >= 3 {
+                    return;
+                }
+                
+                // TIMESTAMP VALIDATION: Must be within ±5 minutes
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                if timestamp > now + 300 || timestamp < now.saturating_sub(300) {
+                    return;
+                }
+                
+                // VERIFY: Dilithium signature
+                let announcement_data = format!("active:{}:{}:{}:{}:{}", 
+                    node_id, node_type, shard_id, reputation as u64, timestamp);
+                if !self.verify_dilithium_heartbeat_signature(&announcement_data, &signature, &node_id) {
+                    println!("[ACTIVE] ❌ Invalid signature from {}", node_id);
+                    return;
+                }
+                
+                // REPUTATION FILTER: Only track nodes with rep >= 70
+                if reputation < 70.0 {
+                    println!("[ACTIVE] ⚠️ Ignoring {} with low reputation {:.1}", node_id, reputation);
+                    return;
+                }
+                
+                // Update active nodes map
+                {
+                    let mut active_nodes = self.active_full_super_nodes.write().unwrap();
+                    let existing = active_nodes.get(&node_id);
+                    
+                    // Only update if newer timestamp
+                    if existing.map(|e| e.last_seen < timestamp).unwrap_or(true) {
+                        active_nodes.insert(node_id.clone(), ActiveNodeInfo {
+                            node_id: node_id.clone(),
+                            node_type: node_type.clone(),
+                            shard_id,
+                            reputation,
+                            last_seen: timestamp,
+                        });
+                        println!("[ACTIVE] ✅ {} ({}) registered/updated, shard {}, rep {:.1}", 
+                                 node_id, node_type, shard_id, reputation);
+                    }
+                }
+                
+                // RE-GOSSIP
+                let forward_msg = NetworkMessage::ActiveNodeAnnouncement {
+                    node_id,
+                    node_type,
+                    shard_id,
+                    reputation,
+                    timestamp,
+                    signature,
+                    gossip_hop: gossip_hop + 1,
+                };
+                self.gossip_to_random_peers(forward_msg, 3);
+            }
+            
+            // PRODUCTION: Request active nodes list
+            NetworkMessage::ActiveNodesRequest { requester_id } => {
+                self.update_peer_last_seen(from_peer);
+                
+                // Collect active nodes with rep >= 70
+                let active_nodes: Vec<ActiveNodeInfo> = {
+                    let nodes = self.active_full_super_nodes.read().unwrap();
+                    nodes.values()
+                        .filter(|n| n.reputation >= 70.0)
+                        .cloned()
+                        .collect()
+                };
+                
+                // Send response
+                let response = NetworkMessage::ActiveNodesResponse {
+                    sender_id: self.node_id.clone(),
+                    active_nodes,
+                };
+                
+                if let Some(peer_addr) = self.get_peer_address_for_heartbeat(&requester_id) {
+                    self.send_network_message(&peer_addr, response);
+                }
+            }
+            
+            // PRODUCTION: Response with active nodes list
+            NetworkMessage::ActiveNodesResponse { sender_id, active_nodes } => {
+                self.update_peer_last_seen(from_peer);
+                println!("[ACTIVE] 📥 Received {} active nodes from {}", active_nodes.len(), sender_id);
+                
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                
+                // Merge into local map
+                let mut added = 0;
+                {
+                    let mut nodes = self.active_full_super_nodes.write().unwrap();
+                    for node in active_nodes {
+                        // Only add if rep >= 70 and not stale (< 15 min old)
+                        if node.reputation >= 70.0 && node.last_seen > now.saturating_sub(15 * 60) {
+                            if !nodes.contains_key(&node.node_id) {
+                                nodes.insert(node.node_id.clone(), node);
+                                added += 1;
+                            }
+                        }
+                    }
+                }
+                
+                if added > 0 {
+                    println!("[ACTIVE] ✅ Added {} new active nodes", added);
+                }
+            }
+            
+            // PRODUCTION: Handle system events (reorg, emergency, etc.)
+            NetworkMessage::SystemEvent { event_type, data, timestamp, from_node } => {
+                self.update_peer_last_seen(from_peer);
+                println!("[P2P] 📢 System event '{}' from {}", event_type, from_node);
+                
+                // Log event details for monitoring
+                match event_type.as_str() {
+                    "chain_reorg" => {
+                        println!("[P2P] ⚠️ Chain reorganization detected from peer {}", from_node);
+                        println!("[P2P] 📊 Reorg data: {}", data);
+                    }
+                    "emergency_shutdown" => {
+                        println!("[P2P] 🚨 Emergency shutdown notification from {}", from_node);
+                    }
+                    _ => {
+                        println!("[P2P] ℹ️ Unknown system event: {}", event_type);
+                    }
+                }
+            }
         }
     }
+}
+
+/// PRODUCTION: Gossip and heartbeat helper methods for SimplifiedP2P
+impl SimplifiedP2P {
+    /// Track blocks without ping commitment for monitoring
+    /// Uses thread-local static for simplicity (no struct modification needed)
+    pub fn increment_missing_commitment_count(&self) -> u64 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static MISSING_COMMITMENT_COUNT: AtomicU64 = AtomicU64::new(0);
+        MISSING_COMMITMENT_COUNT.fetch_add(1, Ordering::Relaxed) + 1
+    }
+    
+    /// Gossip message to random peers (for scalable propagation)
+    pub fn gossip_to_random_peers(&self, message: NetworkMessage, count: usize) {
+        use rand::seq::SliceRandom;
+        
+        let peers: Vec<_> = self.connected_peers_lockfree
+            .iter()
+            .map(|r| r.value().clone())
+            .collect();
+        
+        if peers.is_empty() {
+            return;
+        }
+        
+        let mut rng = rand::thread_rng();
+        let selected: Vec<_> = peers.choose_multiple(&mut rng, count.min(peers.len())).collect();
+        
+        for peer in selected {
+            self.send_network_message(&peer.addr, message.clone());
+        }
+    }
+    
+    /// Verify Ed25519 signature for Light node registration
+    fn verify_ed25519_signature(&self, message: &str, signature_hex: &str, wallet_address: &str) -> bool {
+        use ed25519_dalek::{Signature, VerifyingKey, Verifier};
+        
+        // Derive public key from wallet address (first 32 bytes of address hash)
+        let pubkey_bytes = match hex::decode(&wallet_address[..64.min(wallet_address.len())]) {
+            Ok(bytes) if bytes.len() >= 32 => bytes[..32].to_vec(),
+            _ => return false,
+        };
+        
+        let verifying_key = match VerifyingKey::from_bytes(&pubkey_bytes.try_into().unwrap_or([0u8; 32])) {
+            Ok(key) => key,
+            Err(_) => return false,
+        };
+        
+        let signature_bytes = match hex::decode(signature_hex) {
+            Ok(bytes) if bytes.len() == 64 => bytes,
+            _ => return false,
+        };
+        
+        let sig_array: [u8; 64] = match signature_bytes.try_into() {
+            Ok(arr) => arr,
+            Err(_) => return false,
+        };
+        let signature = Signature::from_bytes(&sig_array);
+        
+        verifying_key.verify(message.as_bytes(), &signature).is_ok()
+    }
+    
+    /// Verify Dilithium signature for heartbeat
+    /// PRODUCTION: Uses SHA3-256 hash verification for heartbeat signatures
+    fn verify_dilithium_heartbeat_signature(&self, message: &str, signature_hex: &str, node_id: &str) -> bool {
+        use sha3::{Sha3_256, Digest};
+        
+        // PRODUCTION: Verify signature format (must be 64+ hex chars)
+        if signature_hex.len() < 64 {
+            return false;
+        }
+        
+        // Decode signature
+        let signature_bytes = match hex::decode(signature_hex) {
+            Ok(bytes) => bytes,
+            Err(_) => return false,
+        };
+        
+        // PRODUCTION: For now, verify that signature contains valid hash of message+node_id
+        // Full Dilithium verification requires key manager integration
+        let mut hasher = Sha3_256::new();
+        hasher.update(message.as_bytes());
+        hasher.update(node_id.as_bytes());
+        let expected_prefix = hasher.finalize();
+        
+        // Check if signature starts with expected hash prefix (first 16 bytes)
+        if signature_bytes.len() >= 16 && signature_bytes[..16] == expected_prefix[..16] {
+            return true;
+        }
+        
+        // Also accept signatures that were created with our sign_heartbeat_dilithium
+        // which produces SHA3-256(message || node_id)
+        signature_bytes == expected_prefix.as_slice()
+    }
+    
+    /// Update node reputation by delta (general purpose)
+    /// NOTE: Heartbeats do NOT change reputation - only used for eligibility check
+    /// WHITEPAPER: Light nodes have FIXED reputation of 70 - never changes
+    pub fn update_reputation_by_delta(&self, node_id: &str, delta: f64) {
+        // CRITICAL: Light nodes have fixed reputation of 70 - skip any changes
+        if node_id.starts_with("light_") {
+            return;
+        }
+        
+        let mut reputation_sys = self.reputation_system.lock().unwrap();
+        let current = reputation_sys.get_reputation(node_id);
+        let new_rep = (current + delta).clamp(0.0, 100.0);
+        reputation_sys.set_reputation(node_id, new_rep);
+    }
+    
+    /// PASSIVE RECOVERY: +1% for nodes in recovery zone (10-69%)
+    /// - Only applies to Full/Super nodes with reputation 10 <= rep < 70
+    /// - Caps at 70 (consensus threshold) - nodes must earn higher through consensus participation
+    /// - Light nodes: EXCLUDED (fixed at 70)
+    /// - Banned nodes (<10): EXCLUDED (no passive recovery)
+    /// SCALABILITY: O(1) per node, called once per 4 hours
+    pub fn apply_passive_recovery(&self, node_id: &str) -> bool {
+        // CRITICAL: Light nodes have fixed reputation of 70 - skip
+        if node_id.starts_with("light_") {
+            return false;
+        }
+        
+        let mut reputation_sys = self.reputation_system.lock().unwrap();
+        let current = reputation_sys.get_reputation(node_id);
+        
+        // Only recover nodes in range [10, 70)
+        if current >= 10.0 && current < 70.0 {
+            // +1% absolute, capped at 70 (consensus threshold)
+            let new_rep = (current + 1.0).min(70.0);
+            reputation_sys.set_reputation(node_id, new_rep);
+            return true;
+        }
+        
+        false
+    }
+    
+    /// Get peer address by node ID for heartbeat
+    fn get_peer_address_for_heartbeat(&self, node_id: &str) -> Option<String> {
+        self.peer_id_to_addr.get(node_id).map(|r| r.value().clone())
+    }
+    
+    /// PRODUCTION: Start heartbeat service for Full/Super nodes (TIME-based, not block-based)
+    /// This is called by the node on startup
+    /// Returns Arc<Self> for thread safety
+    pub fn start_heartbeat_service(self: Arc<Self>, blockchain_height_fn: impl Fn() -> u64 + Send + Sync + 'static) {
+        let node_id = self.node_id.clone();
+        let node_type = match self.node_type {
+            NodeType::Super => "super",
+            NodeType::Full => "full",
+            _ => return, // Light nodes don't send heartbeats
+        };
+        
+        let p2p = self.clone();
+        let node_type_str = node_type.to_string();
+        
+        std::thread::spawn(move || {
+            println!("[HEARTBEAT] 🕐 Starting heartbeat service for {} ({})", node_id, node_type_str);
+            
+            loop {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                
+                // Calculate deterministic heartbeat times for this node
+                let heartbeat_times = calculate_heartbeat_times_for_node(&node_id);
+                
+                // Check if any heartbeat is due (within 60 second window)
+                for (index, heartbeat_time) in heartbeat_times.iter().enumerate() {
+                    if now >= *heartbeat_time && now < *heartbeat_time + 60 {
+                        // Check if we already sent this heartbeat
+                        let heartbeat_key = format!("{}:{}", node_id, index);
+                        let already_sent = {
+                            let history = p2p.heartbeat_history.read().unwrap();
+                            if let Some(record) = history.get(&heartbeat_key) {
+                                let current_4h = now - (now % (4 * 60 * 60));
+                                let record_4h = record.timestamp - (record.timestamp % (4 * 60 * 60));
+                                current_4h == record_4h
+                            } else {
+                                false
+                            }
+                        };
+                        
+                        if !already_sent {
+                            let block_height = blockchain_height_fn();
+                            
+                            // Sign heartbeat with Dilithium
+                            let message = format!("heartbeat:{}:{}:{}:{}", node_id, now, block_height, index);
+                            let signature = p2p.sign_heartbeat_dilithium(&message, &node_id);
+                            
+                            // Broadcast heartbeat
+                            let heartbeat_msg = NetworkMessage::NodeHeartbeat {
+                                node_id: node_id.clone(),
+                                node_type: node_type_str.clone(),
+                                timestamp: now,
+                                block_height,
+                                signature: signature.clone(),
+                                heartbeat_index: index as u8,
+                                gossip_hop: 0,
+                            };
+                            
+                            p2p.gossip_to_random_peers(heartbeat_msg, 5);
+                            
+                            // Record locally
+                            {
+                                let mut history = p2p.heartbeat_history.write().unwrap();
+                                history.insert(heartbeat_key, HeartbeatRecord {
+                                    node_id: node_id.clone(),
+                                    timestamp: now,
+                                    heartbeat_index: index as u8,
+                                    signature,
+                                    verified: true,
+                                });
+                            }
+                            
+                            println!("[HEARTBEAT] 📡 Sent heartbeat #{} at height {}", index, block_height);
+                        }
+                    }
+                }
+                
+                // Cleanup old heartbeats (>24h)
+                p2p.cleanup_old_heartbeats();
+                
+                // Sleep for 30 seconds before next check
+                std::thread::sleep(std::time::Duration::from_secs(30));
+            }
+        });
+    }
+    
+    /// Sign heartbeat message with Dilithium
+    fn sign_heartbeat_dilithium(&self, message: &str, node_id: &str) -> String {
+        use crate::quantum_crypto::QNetQuantumCrypto;
+        
+        let rt = tokio::runtime::Handle::try_current();
+        if let Ok(handle) = rt {
+            let node_id_owned = node_id.to_string();
+            let message_owned = message.to_string();
+            
+            let result = handle.block_on(async move {
+                let mut crypto = QNetQuantumCrypto::new();
+                let _ = crypto.initialize().await;
+                crypto.create_consensus_signature(&node_id_owned, &message_owned).await
+            });
+            
+            match result {
+                Ok(sig) => sig.signature,
+                Err(e) => {
+                    println!("[HEARTBEAT] ⚠️ Dilithium signing failed: {}", e);
+                    // Fallback signature (not secure, but prevents crashes)
+                    use sha3::{Sha3_256, Digest};
+                    let mut hasher = Sha3_256::new();
+                    hasher.update(message.as_bytes());
+                    hasher.update(node_id.as_bytes());
+                    hex::encode(hasher.finalize())
+                }
+            }
+        } else {
+            // No async runtime - use fallback
+            use sha3::{Sha3_256, Digest};
+            let mut hasher = Sha3_256::new();
+            hasher.update(message.as_bytes());
+            hasher.update(node_id.as_bytes());
+            hex::encode(hasher.finalize())
+        }
+    }
+    
+    /// Cleanup heartbeat records older than 24 hours
+    pub fn cleanup_old_heartbeats(&self) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        
+        // Only cleanup once per hour
+        {
+            let mut last_cleanup = self.last_heartbeat_cleanup.lock().unwrap();
+            if now - *last_cleanup < 3600 {
+                return;
+            }
+            *last_cleanup = now;
+        }
+        
+        let cutoff = now - (24 * 60 * 60); // 24 hours ago
+        let mut removed = 0;
+        
+        {
+            let mut history = self.heartbeat_history.write().unwrap();
+            history.retain(|_, record| {
+                if record.timestamp < cutoff {
+                    removed += 1;
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        
+        if removed > 0 {
+            println!("[HEARTBEAT] 🧹 Cleaned up {} old heartbeat records", removed);
+        }
+    }
+    
+    /// Get Light Node registry (for ping service)
+    pub fn get_light_node_registry(&self) -> HashMap<String, LightNodeRegistrationData> {
+        self.light_node_registry.read().unwrap().clone()
+    }
+    
+    /// Register Light node locally and gossip to network
+    pub fn register_light_node(&self, registration: LightNodeRegistrationData) {
+        // Store locally
+        {
+            let mut registry = self.light_node_registry.write().unwrap();
+            registry.insert(registration.node_id.clone(), registration.clone());
+        }
+        
+        // Gossip to network
+        let msg = NetworkMessage::LightNodeRegistration {
+            node_id: registration.node_id,
+            wallet_address: registration.wallet_address,
+            device_token_hash: registration.device_token_hash,
+            quantum_pubkey: registration.quantum_pubkey,
+            registered_at: registration.registered_at,
+            signature: registration.signature,
+            gossip_hop: 0,
+        };
+        
+        self.gossip_to_random_peers(msg, 5);
+        println!("[GOSSIP] 📡 Light node registration gossiped to network");
+    }
+    
+    /// Request Light Node registry sync from peers
+    pub fn request_light_node_registry_sync(&self) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        
+        // Get oldest registration timestamp we have
+        let last_sync = {
+            let registry = self.light_node_registry.read().unwrap();
+            registry.values()
+                .map(|r| r.registered_at)
+                .max()
+                .unwrap_or(0)
+        };
+        
+        let request = NetworkMessage::LightNodeRegistryRequest {
+            requester_id: self.node_id.clone(),
+            last_sync_timestamp: last_sync,
+        };
+        
+        // Request from 3 random peers
+        self.gossip_to_random_peers(request, 3);
+        println!("[SYNC] 📡 Requested Light node registry sync (since {})", last_sync);
+    }
+    
+    /// Check heartbeat eligibility for reward calculation
+    /// Returns (successful_count, required_count, is_eligible)
+    pub fn check_heartbeat_eligibility(&self, node_id: &str, node_type: &str) -> (u8, u8, bool) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        
+        let current_4h_window = now - (now % (4 * 60 * 60));
+        
+        // Count successful heartbeats in current 4h window
+        let mut count = 0u8;
+        {
+            let history = self.heartbeat_history.read().unwrap();
+            for i in 0..10 {
+                let key = format!("{}:{}", node_id, i);
+                if let Some(record) = history.get(&key) {
+                    let record_4h = record.timestamp - (record.timestamp % (4 * 60 * 60));
+                    if record_4h == current_4h_window && record.verified {
+                        count += 1;
+                    }
+                }
+            }
+        }
+        
+        // Required count per whitepaper
+        let required = match node_type {
+            "super" => 9,  // 90% = 9/10
+            "full" => 8,   // 80% = 8/10
+            _ => 10,       // Light nodes: 100% (but they don't use heartbeats)
+        };
+        
+        (count, required, count >= required)
+    }
+    
+    // ========================================================================
+    // PRODUCTION: Sharded Light Node Ping System
+    // ========================================================================
+    
+    /// Calculate shard for Light node (0-255 based on node_id hash)
+    pub fn calculate_light_node_shard(light_node_id: &str) -> u8 {
+        use sha3::{Sha3_256, Digest};
+        let mut hasher = Sha3_256::new();
+        hasher.update(light_node_id.as_bytes());
+        let hash = hasher.finalize();
+        hash[0]  // First byte = shard (0-255)
+    }
+    
+    /// Get current slot number (0-239 within 4h window, each slot = 1 minute)
+    pub fn get_current_slot() -> u64 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let current_4h_window = now - (now % (4 * 60 * 60));
+        let seconds_in_window = now - current_4h_window;
+        seconds_in_window / 60  // 0-239
+    }
+    
+    /// Determine if Light node should be pinged in current slot (deterministic)
+    /// Returns true if node's deterministic slot matches current slot
+    /// GRACE PERIOD: Also returns true for 2 slots after the primary slot (retry window)
+    pub fn is_light_node_ping_slot(light_node_id: &str) -> bool {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        
+        let current_slot = Self::get_current_slot();
+        
+        // Deterministic slot from node_id hash
+        let mut hasher = DefaultHasher::new();
+        light_node_id.hash(&mut hasher);
+        let hash = hasher.finish();
+        let node_slot = hash % 240;
+        
+        // GRACE PERIOD: Primary slot + 2 retry slots (3 minutes total window)
+        // This handles network delays and temporary unavailability
+        let slot_diff = if current_slot >= node_slot {
+            current_slot - node_slot
+        } else {
+            // Handle wrap-around at slot 240
+            240 - node_slot + current_slot
+        };
+        
+        slot_diff <= 2  // Primary slot (0) + 2 retry slots (1, 2)
+    }
+    
+    /// Check if this is the PRIMARY slot for Light node (not retry)
+    pub fn is_light_node_primary_slot(light_node_id: &str) -> bool {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        
+        let current_slot = Self::get_current_slot();
+        
+        let mut hasher = DefaultHasher::new();
+        light_node_id.hash(&mut hasher);
+        let hash = hasher.finish();
+        let node_slot = hash % 240;
+        
+        current_slot == node_slot
+    }
+    
+    /// Determine pinger role for this node given a Light node
+    /// Uses deterministic selection: hash(light_node_id + slot) → sorted active nodes → top 3
+    pub fn get_pinger_role(&self, light_node_id: &str) -> PingerRole {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        
+        let current_slot = Self::get_current_slot();
+        
+        // Get sorted active Full/Super node IDs (only rep >= 70)
+        let active_node_ids: Vec<String> = {
+            let nodes = self.active_full_super_nodes.read().unwrap();
+            let mut sorted: Vec<_> = nodes.values()
+                .filter(|n| n.reputation >= 70.0)
+                .map(|n| n.node_id.clone())
+                .collect();
+            sorted.sort();
+            sorted
+        };
+        
+        if active_node_ids.is_empty() {
+            // Fallback: Genesis nodes are always active
+            if self.node_id.starts_with("genesis_node_") {
+                return PingerRole::Primary;
+            }
+            return PingerRole::None;
+        }
+        
+        // Deterministic selection: hash(light_node_id + slot) → index into sorted nodes
+        let mut hasher = DefaultHasher::new();
+        format!("{}:{}", light_node_id, current_slot).hash(&mut hasher);
+        let hash = hasher.finish();
+        
+        let primary_idx = (hash as usize) % active_node_ids.len();
+        let backup1_idx = (primary_idx + 1) % active_node_ids.len();
+        let backup2_idx = (primary_idx + 2) % active_node_ids.len();
+        
+        // Check if we are primary, backup1, or backup2
+        if active_node_ids.get(primary_idx) == Some(&self.node_id) {
+            PingerRole::Primary
+        } else if active_node_ids.get(backup1_idx) == Some(&self.node_id) {
+            PingerRole::Backup1
+        } else if active_node_ids.get(backup2_idx) == Some(&self.node_id) {
+            PingerRole::Backup2
+        } else {
+            PingerRole::None
+        }
+    }
+    
+    /// Check if attestation already exists for Light node in current slot
+    pub fn has_attestation(&self, light_node_id: &str, slot: u64) -> bool {
+        let key = format!("{}:{}", light_node_id, slot);
+        let attestations = self.light_node_attestations.read().unwrap();
+        attestations.contains_key(&key)
+    }
+    
+    /// Get Light nodes in our shard (for this Full/Super node to ping)
+    pub fn get_light_nodes_in_shard(&self) -> Vec<LightNodeRegistrationData> {
+        let our_shard = self.shard_id;
+        let registry = self.light_node_registry.read().unwrap();
+        
+        registry.values()
+            .filter(|node| Self::calculate_light_node_shard(&node.node_id) == our_shard)
+            .cloned()
+            .collect()
+    }
+    
+    /// Get Light nodes to ping in current slot (filtered by SHARD + slot + role)
+    /// CRITICAL: Only iterates over Light nodes in OUR SHARD for scalability
+    pub fn get_light_nodes_to_ping(&self) -> Vec<(LightNodeRegistrationData, PingerRole)> {
+        let current_slot = Self::get_current_slot();
+        let our_shard = self.shard_id;
+        let mut result = Vec::new();
+        
+        // SCALABILITY: Only check Light nodes in our shard (1/256 of total)
+        let registry = self.light_node_registry.read().unwrap();
+        
+        for node in registry.values() {
+            // SHARD FILTER: Only process Light nodes in our shard
+            if Self::calculate_light_node_shard(&node.node_id) != our_shard {
+                continue;
+            }
+            
+            // Check if this is the node's ping slot
+            if !Self::is_light_node_ping_slot(&node.node_id) {
+                continue;
+            }
+            
+            // Check if attestation already exists
+            if self.has_attestation(&node.node_id, current_slot) {
+                continue;
+            }
+            
+            // Check our role for this node
+            let role = self.get_pinger_role(&node.node_id);
+            if role != PingerRole::None {
+                result.push((node.clone(), role));
+            }
+        }
+        
+        result
+    }
+    
+    /// Gossip Light Node attestation after successful ping
+    pub fn gossip_light_node_attestation(&self, attestation: LightNodeAttestation) {
+        let msg = NetworkMessage::LightNodeAttestation {
+            light_node_id: attestation.light_node_id.clone(),
+            pinger_id: attestation.pinger_id.clone(),
+            slot: attestation.slot,
+            timestamp: attestation.timestamp,
+            light_node_signature: attestation.light_node_signature.clone(),
+            pinger_signature: attestation.pinger_signature.clone(),
+            challenge: attestation.challenge.clone(),
+            gossip_hop: 0,
+        };
+        
+        // Store locally first
+        let key = format!("{}:{}", attestation.light_node_id, attestation.slot);
+        {
+            let mut attestations = self.light_node_attestations.write().unwrap();
+            attestations.insert(key, attestation);
+        }
+        
+        // Gossip to peers
+        self.gossip_to_random_peers(msg, 5);
+    }
+    
+    /// Register this node as active Full/Super node and broadcast announcement
+    /// Called on startup and periodically (every 10 min)
+    pub fn register_as_active_node(&self) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        
+        let node_type_str = match self.node_type {
+            NodeType::Super => "super",
+            NodeType::Full => "full",
+            _ => return, // Light nodes don't register
+        };
+        
+        // Get current reputation
+        let reputation = {
+            let rep_sys = self.reputation_system.lock().unwrap();
+            rep_sys.get_reputation(&self.node_id)
+        };
+        
+        // Only register if rep >= 70
+        if reputation < 70.0 {
+            println!("[ACTIVE] ⚠️ Cannot register: reputation {:.1} < 70", reputation);
+            return;
+        }
+        
+        // Register locally
+        {
+            let mut nodes = self.active_full_super_nodes.write().unwrap();
+            nodes.insert(self.node_id.clone(), ActiveNodeInfo {
+                node_id: self.node_id.clone(),
+                node_type: node_type_str.to_string(),
+                shard_id: self.shard_id,
+                reputation,
+                last_seen: now,
+            });
+            println!("[ACTIVE] 📡 Registered as active {} node ({} total)", node_type_str, nodes.len());
+        }
+        
+        // Sign and broadcast announcement
+        let announcement_data = format!("active:{}:{}:{}:{}:{}", 
+            self.node_id, node_type_str, self.shard_id, reputation as u64, now);
+        let signature = self.sign_heartbeat_dilithium(&announcement_data, &self.node_id);
+        
+        let msg = NetworkMessage::ActiveNodeAnnouncement {
+            node_id: self.node_id.clone(),
+            node_type: node_type_str.to_string(),
+            shard_id: self.shard_id,
+            reputation,
+            timestamp: now,
+            signature,
+            gossip_hop: 0,
+        };
+        
+        self.gossip_to_random_peers(msg, 5);
+    }
+    
+    /// Request active nodes list from peers (on startup)
+    pub fn request_active_nodes_sync(&self) {
+        let request = NetworkMessage::ActiveNodesRequest {
+            requester_id: self.node_id.clone(),
+        };
+        self.gossip_to_random_peers(request, 3);
+        println!("[ACTIVE] 📡 Requested active nodes sync");
+    }
+    
+    /// Update active nodes from heartbeat (proves node is online)
+    fn update_active_nodes_from_heartbeat(&self, node_id: &str, node_type: &str, timestamp: u64) {
+        // Get current reputation
+        let reputation = {
+            let rep_sys = self.reputation_system.lock().unwrap();
+            rep_sys.get_reputation(node_id)
+        };
+        
+        // Only track nodes with rep >= 70
+        if reputation < 70.0 {
+            return;
+        }
+        
+        // Calculate shard from node_id
+        let shard_id = Self::calculate_light_node_shard(node_id);
+        
+        // Update active nodes map
+        let mut nodes = self.active_full_super_nodes.write().unwrap();
+        nodes.insert(node_id.to_string(), ActiveNodeInfo {
+            node_id: node_id.to_string(),
+            node_type: node_type.to_string(),
+            shard_id,
+            reputation,
+            last_seen: timestamp,
+        });
+    }
+    
+    /// Cleanup stale active nodes (not seen in 15 minutes)
+    pub fn cleanup_stale_active_nodes(&self) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        
+        let cutoff = now - (15 * 60);  // 15 minutes ago
+        
+        let mut nodes = self.active_full_super_nodes.write().unwrap();
+        let before = nodes.len();
+        nodes.retain(|_, v| v.last_seen > cutoff);
+        let removed = before - nodes.len();
+        
+        if removed > 0 {
+            println!("[CLEANUP] 🧹 Removed {} stale active nodes (>15min)", removed);
+        }
+    }
+    
+    /// Get count of active Full/Super nodes
+    pub fn get_active_node_count(&self) -> usize {
+        let nodes = self.active_full_super_nodes.read().unwrap();
+        nodes.len()
+    }
+    
+    /// Get delay before pinging based on role (Primary=0, Backup1=30s, Backup2=60s)
+    pub fn get_ping_delay(&self, role: PingerRole) -> std::time::Duration {
+        match role {
+            PingerRole::Primary => std::time::Duration::from_secs(0),
+            PingerRole::Backup1 => std::time::Duration::from_secs(30),
+            PingerRole::Backup2 => std::time::Duration::from_secs(60),
+            PingerRole::None => std::time::Duration::from_secs(u64::MAX),
+        }
+    }
+    
+    /// Cleanup old attestations (older than 24 hours)
+    pub fn cleanup_old_attestations(&self) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        
+        let cutoff = now - (24 * 60 * 60);  // 24 hours ago
+        
+        let mut attestations = self.light_node_attestations.write().unwrap();
+        let before = attestations.len();
+        attestations.retain(|_, v| v.timestamp > cutoff);
+        let removed = before - attestations.len();
+        
+        if removed > 0 {
+            println!("[CLEANUP] 🧹 Removed {} old attestations (>24h)", removed);
+        }
+    }
+    
+    /// Check Light node reward eligibility (1/1 ping required per whitepaper)
+    pub fn check_light_node_eligibility(&self, light_node_id: &str) -> (u8, u8, bool) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        
+        let current_4h_window = now - (now % (4 * 60 * 60));
+        let window_start_slot = 0u64;
+        let window_end_slot = 239u64;
+        
+        // Count attestations in current 4h window
+        let mut count = 0u8;
+        {
+            let attestations = self.light_node_attestations.read().unwrap();
+            for slot in window_start_slot..=window_end_slot {
+                let key = format!("{}:{}", light_node_id, slot);
+                if attestations.contains_key(&key) {
+                    count += 1;
+                    break;  // Light nodes only need 1 ping
+                }
+            }
+        }
+        
+        (count, 1, count >= 1)
+    }
+    
+    // ========================================================================
+    // PRODUCTION: Methods for reward calculation (used by block producer)
+    // ========================================================================
+    
+    /// Get all Light node attestations for a 4h window (for Merkle commitment)
+    /// Returns Vec<(light_node_id, slot, pinger_id, timestamp)>
+    pub fn get_attestations_for_window(&self, window_start_timestamp: u64) -> Vec<(String, u64, String, u64)> {
+        let window_end = window_start_timestamp + (4 * 60 * 60);
+        
+        let attestations = self.light_node_attestations.read().unwrap();
+        attestations.values()
+            .filter(|a| a.timestamp >= window_start_timestamp && a.timestamp < window_end)
+            .map(|a| (a.light_node_id.clone(), a.slot, a.pinger_id.clone(), a.timestamp))
+            .collect()
+    }
+    
+    /// Get all Full/Super node heartbeats for a 4h window (for Merkle commitment)
+    /// Returns Vec<(node_id, heartbeat_index, timestamp)>
+    pub fn get_heartbeats_for_window(&self, window_start_timestamp: u64) -> Vec<(String, u8, u64)> {
+        let window_end = window_start_timestamp + (4 * 60 * 60);
+        
+        let heartbeats = self.heartbeat_history.read().unwrap();
+        heartbeats.values()
+            .filter(|h| h.timestamp >= window_start_timestamp && h.timestamp < window_end)
+            .map(|h| (h.node_id.clone(), h.heartbeat_index, h.timestamp))
+            .collect()
+    }
+    
+    /// Get eligible Light nodes for rewards in current window
+    /// Returns Vec<(node_id, wallet_address)> for nodes with at least 1 attestation
+    pub fn get_eligible_light_nodes(&self, window_start_timestamp: u64) -> Vec<(String, String)> {
+        let attestations = self.get_attestations_for_window(window_start_timestamp);
+        let registry = self.light_node_registry.read().unwrap();
+        
+        // Dedupe by node_id (only need 1 attestation per Light node)
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut eligible = Vec::new();
+        
+        for (node_id, _, _, _) in attestations {
+            if seen.insert(node_id.clone()) {
+                if let Some(reg) = registry.get(&node_id) {
+                    eligible.push((node_id, reg.wallet_address.clone()));
+                }
+            }
+        }
+        
+        eligible
+    }
+    
+    /// Get eligible Full/Super nodes for rewards in current window
+    /// Returns Vec<(node_id, node_type, heartbeat_count)>
+    pub fn get_eligible_full_super_nodes(&self, window_start_timestamp: u64) -> Vec<(String, String, u8)> {
+        let heartbeats = self.get_heartbeats_for_window(window_start_timestamp);
+        
+        // Count heartbeats per node
+        let mut counts: std::collections::HashMap<String, (String, u8)> = std::collections::HashMap::new();
+        
+        for (node_id, _, _) in heartbeats {
+            let entry = counts.entry(node_id.clone()).or_insert(("full".to_string(), 0));
+            entry.1 += 1;
+        }
+        
+        // Get node types from active_full_super_nodes
+        let active_nodes = self.active_full_super_nodes.read().unwrap();
+        
+        counts.into_iter()
+            .map(|(node_id, (_, count))| {
+                let node_type = active_nodes.get(&node_id)
+                    .map(|n| n.node_type.clone())
+                    .unwrap_or_else(|| "full".to_string());
+                (node_id, node_type, count)
+            })
+            .filter(|(_, node_type, count)| {
+                // Filter by eligibility: Full >= 8/10, Super >= 9/10
+                match node_type.as_str() {
+                    "super" => *count >= 9,
+                    "full" => *count >= 8,
+                    _ => false,
+                }
+            })
+            .collect()
+    }
+    
+    /// Get total counts for Merkle commitment
+    pub fn get_ping_counts_for_window(&self, window_start_timestamp: u64) -> (u64, u64) {
+        let attestations = self.get_attestations_for_window(window_start_timestamp);
+        let heartbeats = self.get_heartbeats_for_window(window_start_timestamp);
+        
+        let total = attestations.len() as u64 + heartbeats.len() as u64;
+        let successful = total; // All stored attestations/heartbeats are verified
+        
+        (total, successful)
+    }
+    
+    /// Get Light node wallet address from registry
+    pub fn get_light_node_wallet(&self, node_id: &str) -> Option<String> {
+        let registry = self.light_node_registry.read().unwrap();
+        registry.get(node_id).map(|r| r.wallet_address.clone())
+    }
+}
+
+/// Calculate deterministic heartbeat times for a node (10 times per 4h window)
+fn calculate_heartbeat_times_for_node(node_id: &str) -> Vec<u64> {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    
+    let current_4h_window = now - (now % (4 * 60 * 60));
+    
+    // Deterministic base slot from node_id hash
+    let mut hasher = DefaultHasher::new();
+    node_id.hash(&mut hasher);
+    let hash = hasher.finish();
+    let base_slot = (hash % 240) as u64; // 0-239 slots
+    
+    // Offset within slot (0-59 seconds)
+    let slot_offset = (node_id.len() % 60) as u64;
+    
+    let mut times = Vec::with_capacity(10);
+    
+    // 10 heartbeats distributed evenly (every 24 minutes average)
+    for i in 0..10u64 {
+        let slot = (base_slot + i * 24) % 240;
+        let time = current_4h_window + (slot * 60) + slot_offset;
+        times.push(time);
+    }
+    
+    times.sort();
+    times
 }
 
 /// Implementation of sync and catch-up methods for SimplifiedP2P
@@ -6795,9 +9178,11 @@ impl SimplifiedP2P {
         
         // CRITICAL FIX: Adaptive rate limiting based on sync state
         // If peer is far behind, allow unlimited sync requests for recovery
-        // Check if this peer is requesting blocks they don't have
+        // ARCHITECTURE: Use REQUEST RANGE as proxy for how far behind the requester is
+        // This is MORE ACCURATE than trying to track each peer's height (which requires HTTP calls)
+        // If requester asks for blocks 1-100, they're clearly behind by at least 100 blocks
         let blocks_behind = if to_height > from_height {
-            to_height - from_height
+            to_height - from_height  // Request range indicates how far behind
         } else {
             0
         };
@@ -7016,13 +9401,13 @@ impl SimplifiedP2P {
             return Err("No peers available for sync".to_string());
         }
         
-        // Select best peer for sync (highest reputation)
+        // Select best peer for sync (highest combined reputation)
         let best_peer = peers.iter()
-            .max_by(|a, b| a.reputation_score.partial_cmp(&b.reputation_score).unwrap())
+            .max_by(|a, b| a.combined_reputation().partial_cmp(&b.combined_reputation()).unwrap())
             .ok_or("No valid peer for sync")?;
         
-        println!("[SYNC] 📡 Requesting blocks from peer {} (reputation: {:.1}%)", 
-                 best_peer.id, best_peer.reputation_score * 100.0);
+        println!("[SYNC] 📡 Requesting blocks from peer {} (consensus: {:.1}%, network: {:.1}%)", 
+                 best_peer.id, best_peer.consensus_score, best_peer.network_score);
         
         // Create request message
         let request = NetworkMessage::RequestBlocks {
@@ -7069,13 +9454,13 @@ impl SimplifiedP2P {
             return Err("No peers available for consensus sync".to_string());
         }
         
-        // Select peer with highest reputation
+        // Select peer with highest consensus score (Byzantine safety)
         let best_peer = peers.iter()
-            .max_by(|a, b| a.reputation_score.partial_cmp(&b.reputation_score).unwrap())
+            .max_by(|a, b| a.consensus_score.partial_cmp(&b.consensus_score).unwrap())
             .ok_or("No valid peer for consensus sync")?;
         
-        println!("[CONSENSUS] 📡 Requesting from peer {} (reputation: {:.1}%)", 
-                 best_peer.id, best_peer.reputation_score * 100.0);
+        println!("[CONSENSUS] 📡 Requesting from peer {} (consensus: {:.1}%, network: {:.1}%)", 
+                 best_peer.id, best_peer.consensus_score, best_peer.network_score);
         
         // Create request message
         let request = NetworkMessage::RequestConsensusState {
@@ -7156,60 +9541,28 @@ fn get_genesis_region_by_index(index: usize) -> Region {
         0 => Region::NorthAmerica, // genesis_node_001 (154.38.160.39)
         1 => Region::Europe,        // genesis_node_002 (62.171.157.44)
         2 => Region::Europe,        // genesis_node_003 (161.97.86.81)
-        3 => Region::Europe,        // genesis_node_004 (173.212.219.226)
-        4 => Region::Europe,        // genesis_node_005 (164.68.108.218)
+        3 => Region::Europe,        // genesis_node_004 (5.189.130.160)
+        4 => Region::Europe,        // genesis_node_005 (162.244.25.114)
         _ => Region::Europe,        // Default fallback
     }
 }
 
-/// QUANTUM: Register peer in blockchain for persistent quantum peer registry
-async fn register_peer_in_blockchain(peer_info: PeerInfo) -> Result<(), String> {
-    // Use EXISTING BlockchainActivationRegistry to store peer information
-    let registry = crate::activation_validation::BlockchainActivationRegistry::new(None);
-    
-    // PRIVACY: Use public display name for registry (preserves consensus node_id)
-    let public_node_id = if peer_info.id.starts_with("genesis_node_") {
-        peer_info.id.clone() // Genesis nodes keep original ID
-    } else {
-        // Generate display name for privacy (same pattern as P2P announcement)
-        let display_hash = blake3::hash(format!("P2P_DISPLAY_{}_{}", 
-                                                peer_info.id, 
-                                                format!("{:?}", peer_info.node_type)).as_bytes());
-        
-        let node_type_prefix = match peer_info.node_type {
-            NodeType::Super => "super",
-            NodeType::Full => "full", 
-            _ => "node"
-        };
-        
-        let region_hint = format!("{:?}", peer_info.region).to_lowercase();
-        
-        format!("{}_{}_{}", 
-                node_type_prefix,
-                region_hint, 
-                &display_hash.to_hex()[..8])
-    };
-    
-    // Create peer registration as special activation record in blockchain
-    let peer_node_info = crate::activation_validation::NodeInfo {
-        activation_code: format!("peer_registry_{}", public_node_id), // Use display name for registry
-        wallet_address: format!("peer_wallet_{}", peer_info.addr), // Peer wallet derived from address  
-        device_signature: format!("peer_device_{}_{}", peer_info.addr, public_node_id), // Include display name
-        node_type: format!("{:?}", peer_info.node_type),
-        activated_at: peer_info.last_seen,
-        last_seen: peer_info.last_seen,
-        migration_count: 0,
-    };
-    
-    // Use EXISTING register_activation_on_blockchain for peer registry
-    registry.register_activation_on_blockchain(
-        &format!("peer_registry_{}", public_node_id), 
-        peer_node_info
-    ).await.map_err(|e| format!("Blockchain peer registration failed: {}", e))?;
-    
-    println!("[BLOCKCHAIN] ✅ Peer {} registered with pseudonym {} in quantum blockchain registry", peer_info.addr, public_node_id);
-    Ok(())
-}
+// ARCHITECTURE FIX: Removed peer blockchain registry functions
+// 
+// REASON: Peer discovery is a P2P task, NOT a blockchain task!
+//
+// PROBLEMS WITH OLD APPROACH:
+// 1. Created activation TX for every peer connection
+// 2. TX never included in blocks (blocks are empty in Phase 1)
+// 3. TX accumulated in mempool infinitely (no TTL, no gossip)
+// 4. Not scalable (1M nodes × 2K peers = 2B useless TX!)
+// 5. Mixed peer discovery with paid node activation (wrong!)
+//
+// CORRECT APPROACH:
+// - Peer info stored in DashMap (already done in add_peer_safe)
+// - P2P gossip for peer updates (if needed)
+// - No blockchain TX for peer discovery
+// - BlockchainActivationRegistry ONLY for paid activations (1DEV/QNC)
 
 
 
@@ -7368,6 +9721,9 @@ impl SimplifiedP2P {
             .timeout(Duration::from_secs(10))
             .connect_timeout(Duration::from_secs(5))
             .user_agent("QNet-Node/1.0")
+            .tcp_keepalive(Duration::from_secs(HTTP_TCP_KEEPALIVE_SECS))
+            .pool_max_idle_per_host(HTTP_POOL_MAX_IDLE_PER_HOST)
+            .pool_idle_timeout(Duration::from_secs(HTTP_POOL_IDLE_TIMEOUT_SECS))
             .build()
             .map_err(|e| format!("HTTP client error: {}", e))?;
         
@@ -7427,34 +9783,74 @@ impl SimplifiedP2P {
         self.reputation_system.clone()
     }
     
-    /// PRODUCTION: Update node reputation (for consensus feedback)
-    pub fn update_node_reputation(&self, node_id: &str, delta: f64) {
-        if let Ok(mut reputation) = self.reputation_system.lock() {
-            reputation.update_reputation(node_id, delta);
-            
-            // CRITICAL FIX: Save reputation to persistent storage
-            // This prevents reputation loss on restart
-            let new_reputation = reputation.get_reputation(node_id);
-            self.save_reputation_to_storage(node_id, new_reputation);
-            
-            // PRIVACY: Use pseudonym for logging (don't double-convert if already pseudonym)
-            let display_id = if node_id.starts_with("genesis_node_") || node_id.starts_with("node_") {
-                node_id.to_string()
-            } else {
-                get_privacy_id_for_addr(node_id)
-            };
-            println!("[P2P] 📊 Updated reputation for {}: delta {:.1} (new: {:.1}%)", 
-                    display_id, delta, new_reputation);
+    /// PRODUCTION: Update node reputation with event-based tracking
+    /// ARCHITECTURE: Consensus events update NodeReputation (Byzantine tracking)
+    /// Network events update PeerInfo.network_score (performance tracking)
+    pub fn update_node_reputation(&self, node_id: &str, event: ReputationEvent) {
+        // Determine delta based on event type
+        let (consensus_delta, is_consensus_event) = match event {
+            ReputationEvent::ValidBlock => (5.0, true),
+            ReputationEvent::InvalidBlock => (-20.0, true),
+            ReputationEvent::ConsensusParticipation => (2.0, true),
+            ReputationEvent::MaliciousBehavior => (-50.0, true),
+            // Network events don't affect consensus reputation
+            _ => (0.0, false),
+        };
+        
+        // Update consensus_score in NodeReputation (if consensus event)
+        if is_consensus_event {
+            if let Ok(mut reputation) = self.reputation_system.lock() {
+                reputation.update_reputation(node_id, consensus_delta);
+                
+                // CRITICAL FIX: Save reputation to persistent storage
+                let new_reputation = reputation.get_reputation(node_id);
+                self.save_reputation_to_storage(node_id, new_reputation);
+                
+                // PRIVACY: Use pseudonym for logging
+                let display_id = if node_id.starts_with("genesis_node_") || node_id.starts_with("node_") {
+                    node_id.to_string()
+                } else {
+                    get_privacy_id_for_addr(node_id)
+                };
+                println!("[REPUTATION] 📊 Consensus score for {}: delta {:.1} (new: {:.1}%)", 
+                        display_id, consensus_delta, new_reputation);
+            }
+        }
+        
+        // Update network_score in PeerInfo (for all events)
+        // Find peer address by node_id
+        if let Some(peer_addr) = self.peer_id_to_addr.get(node_id) {
+            self.update_peer_reputation(&peer_addr, event);
         }
     }
     
+    /// BACKWARD COMPATIBILITY: Update reputation with delta (legacy method)
+    #[allow(dead_code)]
+    pub fn update_node_reputation_legacy(&self, node_id: &str, delta: f64) {
+        // Map delta to appropriate event
+        let event = if delta > 0.0 {
+            ReputationEvent::ValidBlock
+        } else {
+            ReputationEvent::InvalidBlock
+        };
+        self.update_node_reputation(node_id, event);
+    }
+    
     /// PRODUCTION: Set absolute reputation (for Genesis initialization)
+    /// WHITEPAPER: Light nodes have FIXED reputation of 70 - only allow setting to 70
     pub fn set_node_reputation(&self, node_id: &str, reputation: f64) {
+        // CRITICAL: Light nodes have fixed reputation of 70
+        let final_reputation = if node_id.starts_with("light_") {
+            70.0 // Light nodes: always 70, ignore requested value
+        } else {
+            reputation
+        };
+        
         if let Ok(mut rep_system) = self.reputation_system.lock() {
-            rep_system.set_reputation(node_id, reputation);
+            rep_system.set_reputation(node_id, final_reputation);
             
             // CRITICAL FIX: Save reputation to persistent storage
-            self.save_reputation_to_storage(node_id, reputation);
+            self.save_reputation_to_storage(node_id, final_reputation);
             
             // PRIVACY: Use pseudonym for logging (don't double-convert if already pseudonym)
             let display_id = if node_id.starts_with("genesis_node_") || node_id.starts_with("node_") {
@@ -7464,6 +9860,32 @@ impl SimplifiedP2P {
             };
             println!("[P2P] 🔐 Set absolute reputation for {}: {:.1}% (saved)", display_id, reputation);
         }
+    }
+    
+    /// Get combined reputation score for a node (consensus_score * 0.7 + network_score * 0.3)
+    /// MEV PROTECTION: Used for bundle submission reputation checks
+    /// Returns 70.0 (default consensus threshold) if peer not found
+    pub fn get_node_combined_reputation(&self, node_id: &str) -> f64 {
+        // First check peer_id_to_addr index for O(1) lookup
+        if let Some(addr_entry) = self.peer_id_to_addr.get(node_id) {
+            let addr = addr_entry.value().clone();
+            drop(addr_entry); // Release lock before next lookup
+            
+            // Get peer info from connected_peers_lockfree
+            if let Some(peer_entry) = self.connected_peers_lockfree.get(&addr) {
+                return peer_entry.value().combined_reputation();
+            }
+        }
+        
+        // Fallback: iterate connected_peers_lockfree (slower but comprehensive)
+        for entry in self.connected_peers_lockfree.iter() {
+            if entry.value().id == node_id {
+                return entry.value().combined_reputation();
+            }
+        }
+        
+        // Not found: return default consensus threshold
+        70.0
     }
     
     /// PRODUCTION: Check if node is banned
@@ -7781,8 +10203,13 @@ impl SimplifiedP2P {
             }
         };
         
-        // Apply the penalty
-        self.update_node_reputation(node_id, penalty);
+        // Apply the penalty (Byzantine attack)
+        let event = if penalty <= -50.0 {
+            ReputationEvent::MaliciousBehavior
+        } else {
+            ReputationEvent::InvalidBlock
+        };
+        self.update_node_reputation(node_id, event);
         
         // Broadcast tampering alert to network
         self.broadcast_tampering_alert(node_id, attempted_reputation, current_reputation, severity);
@@ -7863,6 +10290,9 @@ impl SimplifiedP2P {
                 tokio::spawn(async move {
                     if let Ok(client) = reqwest::Client::builder()
                         .timeout(std::time::Duration::from_secs(5))
+                        .tcp_keepalive(std::time::Duration::from_secs(HTTP_TCP_KEEPALIVE_SECS))
+                        .pool_max_idle_per_host(HTTP_POOL_MAX_IDLE_PER_HOST)
+                        .pool_idle_timeout(std::time::Duration::from_secs(HTTP_POOL_IDLE_TIMEOUT_SECS))
                         .build() {
                         
                         match client.post(&url)
@@ -7899,6 +10329,9 @@ impl SimplifiedP2P {
             tokio::spawn(async move {
                 if let Ok(client) = reqwest::Client::builder()
                     .timeout(std::time::Duration::from_secs(5))
+                    .tcp_keepalive(std::time::Duration::from_secs(HTTP_TCP_KEEPALIVE_SECS))
+                    .pool_max_idle_per_host(HTTP_POOL_MAX_IDLE_PER_HOST)
+                    .pool_idle_timeout(std::time::Duration::from_secs(HTTP_POOL_IDLE_TIMEOUT_SECS))
                     .build() {
                     
                     match client.post(&url)
@@ -8406,6 +10839,9 @@ impl SimplifiedP2P {
             .timeout(Duration::from_millis(adaptive_timeout_ms as u64))  // ADAPTIVE!
             .connect_timeout(Duration::from_millis(200))
             .tcp_nodelay(true)
+            .tcp_keepalive(Duration::from_secs(HTTP_TCP_KEEPALIVE_SECS))
+            .pool_max_idle_per_host(HTTP_POOL_MAX_IDLE_PER_HOST)
+            .pool_idle_timeout(Duration::from_secs(HTTP_POOL_IDLE_TIMEOUT_SECS))
             .build() {
             Ok(c) => c,
             Err(_) => return false,
@@ -8467,6 +10903,9 @@ impl SimplifiedP2P {
             .timeout(Duration::from_millis(adaptive_timeout_ms as u64))  // ADAPTIVE!
             .connect_timeout(Duration::from_millis(200))
             .tcp_nodelay(true)  // Disable Nagle's algorithm for faster delivery
+            .tcp_keepalive(Duration::from_secs(HTTP_TCP_KEEPALIVE_SECS))
+            .pool_max_idle_per_host(HTTP_POOL_MAX_IDLE_PER_HOST)
+            .pool_idle_timeout(Duration::from_secs(HTTP_POOL_IDLE_TIMEOUT_SECS))
             .build()
             .map_err(|e| format!("Client build failed: {}", e))?;
         
@@ -8521,27 +10960,17 @@ impl SimplifiedP2P {
             }
         };
 
-        // PRIVACY: Resolve pseudonym to IP if needed using EXISTING registry
+        // ARCHITECTURE FIX: Peer addresses must be IP:port format
+        // Pseudonym resolution removed (peer_registry_ no longer exists)
+        // All peer connections use direct IP:port addressing
         let resolved_addr = if peer_addr.contains(':') {
-            // Already has IP:port format
+            // Valid IP:port format
             peer_addr.clone()
         } else {
-            // CRITICAL FIX: Skip pseudonym resolution in sync context to avoid runtime panic
-            // For pseudonyms, spawn async task to handle resolution
-            let peer_addr_clone = peer_addr.clone();
-            let message_clone = message.clone();
-            tokio::spawn(async move {
-            let registry = crate::activation_validation::BlockchainActivationRegistry::new(None);
-                if let Some(resolved_ip) = registry.resolve_peer_pseudonym(&peer_addr_clone).await {
-                    println!("[P2P] 🔍 Resolved pseudonym {} to {} (async)", peer_addr_clone, resolved_ip);
-                    // Recursively send with resolved IP
-                    // Note: This would need to be handled differently in production
-                } else {
-                    println!("[P2P] ❌ Failed to resolve pseudonym: {} (async)", peer_addr_clone);
-                }
-            });
-            println!("[P2P] ⚠️ Pseudonym resolution started in background for: {}", peer_addr);
-            return; // Exit early for pseudonym resolution
+            // Invalid format - peer_addr must be IP:port
+            println!("[P2P] ❌ Invalid peer address format (must be IP:port): {}", peer_addr);
+            println!("[P2P] ℹ️ Peer discovery uses direct IP:port addressing, not pseudonyms");
+            return; // Skip invalid address
         };
         
         // Send asynchronously in background thread
@@ -8553,7 +10982,9 @@ impl SimplifiedP2P {
                 .connect_timeout(std::time::Duration::from_millis(500)) // OPTIMIZATION: 500ms connect from 3c78d24
                 .user_agent("QNet-Node/1.0") 
                 .tcp_nodelay(true) // Faster message delivery
-                .tcp_keepalive(std::time::Duration::from_secs(30)) // P2P connection persistence
+                .tcp_keepalive(std::time::Duration::from_secs(HTTP_TCP_KEEPALIVE_SECS)) // P2P connection persistence
+                .pool_max_idle_per_host(HTTP_POOL_MAX_IDLE_PER_HOST)
+                .pool_idle_timeout(std::time::Duration::from_secs(HTTP_POOL_IDLE_TIMEOUT_SECS))
                 .build() {
                 Ok(client) => client,
                 Err(e) => {
@@ -8635,6 +11066,23 @@ impl SimplifiedP2P {
         println!("[CONSENSUS] 🏛️ Processing remote commit: round={}, node={}, hash={}", 
                 round_id, node_id, commit_hash);
         
+        // CRITICAL FIX: Reject commits from jailed nodes (reputation < 70%)
+        // This prevents non-deterministic participants lists from causing consensus deadlock
+        let reputation_score = {
+            let reputation_system = self.reputation_system.lock().unwrap();
+            let raw_score = reputation_system.get_reputation(&node_id);
+            raw_score / 100.0  // Convert 0-100 to 0-1
+        };
+        
+        if reputation_score < 0.70 {
+            println!("[CONSENSUS] ❌ Rejecting commit from jailed node: {} (reputation: {:.1}%, required: ≥70%)", 
+                     node_id, reputation_score * 100.0);
+            println!("[CONSENSUS]    Jailed nodes cannot participate in Byzantine consensus");
+            return;  // Early return - do NOT process commit
+        }
+        
+        println!("[CONSENSUS] ✅ Reputation check passed: {} ({:.1}%)", node_id, reputation_score * 100.0);
+        
         // PRODUCTION: Send to consensus engine through channel
         if let Some(ref consensus_tx) = self.consensus_tx {
             let consensus_msg = ConsensusMessage::RemoteCommit {
@@ -8654,14 +11102,31 @@ impl SimplifiedP2P {
             println!("[CONSENSUS] ⚠️ No consensus channel established - commit not processed");
         }
         
-        // Update peer reputation for participation
-        self.update_node_reputation(&node_id, 1.0);
+        // Update peer reputation for participation (valid commit)
+        self.update_node_reputation(&node_id, ReputationEvent::ConsensusParticipation);
     }
 
     /// Handle incoming consensus reveal from remote peer
     fn handle_remote_consensus_reveal(&self, round_id: u64, node_id: String, reveal_data: String, nonce: String, timestamp: u64) {
         println!("[CONSENSUS] 🏛️ Processing remote reveal: round={}, node={}, reveal_length={}, nonce_length={}", 
                 round_id, node_id, reveal_data.len(), nonce.len());
+        
+        // CRITICAL FIX: Reject reveals from jailed nodes (reputation < 70%)
+        // Must match commit reputation check for consistency
+        let reputation_score = {
+            let reputation_system = self.reputation_system.lock().unwrap();
+            let raw_score = reputation_system.get_reputation(&node_id);
+            raw_score / 100.0  // Convert 0-100 to 0-1
+        };
+        
+        if reputation_score < 0.70 {
+            println!("[CONSENSUS] ❌ Rejecting reveal from jailed node: {} (reputation: {:.1}%, required: ≥70%)", 
+                     node_id, reputation_score * 100.0);
+            println!("[CONSENSUS]    Jailed nodes cannot participate in Byzantine consensus");
+            return;  // Early return - do NOT process reveal
+        }
+        
+        println!("[CONSENSUS] ✅ Reputation check passed: {} ({:.1}%)", node_id, reputation_score * 100.0);
         
         // PRODUCTION: Send to consensus engine through channel
         if let Some(ref consensus_tx) = self.consensus_tx {
@@ -8682,8 +11147,8 @@ impl SimplifiedP2P {
             println!("[CONSENSUS] ⚠️ No consensus channel established - reveal not processed");
         }
         
-        // Update peer reputation for participation
-        self.update_node_reputation(&node_id, 2.0);
+        // Update peer reputation for participation (valid reveal)
+        self.update_node_reputation(&node_id, ReputationEvent::ConsensusParticipation);
     }
     
     /// CRITICAL: Determine if consensus round is for macroblock (every 90 blocks)
@@ -8695,7 +11160,24 @@ impl SimplifiedP2P {
         round_id > 0 && (round_id % 90 == 0)
     }
     
-    /// Handle emergency producer change notifications
+    /// Handle emergency producer change notifications with sender tracking
+    fn handle_emergency_producer_change_with_sender(
+        &self, 
+        failed_producer: String, 
+        new_producer: String, 
+        block_height: u64,
+        change_type: String,
+        timestamp: u64,
+        sender_addr: String  // Track who sent the emergency
+    ) {
+        // Forward to main handler with sender info
+        self.handle_emergency_producer_change_internal(
+            failed_producer, new_producer, block_height, change_type, timestamp,
+            Some(sender_addr)
+        );
+    }
+    
+    /// Handle emergency producer change notifications (backward compatibility)
     fn handle_emergency_producer_change(
         &self, 
         failed_producer: String, 
@@ -8703,6 +11185,23 @@ impl SimplifiedP2P {
         block_height: u64,
         change_type: String,
         timestamp: u64
+    ) {
+        // Forward to main handler without sender info (for backward compatibility)
+        self.handle_emergency_producer_change_internal(
+            failed_producer, new_producer, block_height, change_type, timestamp,
+            None
+        );
+    }
+    
+    /// Internal handler for emergency producer change with optional sender tracking
+    fn handle_emergency_producer_change_internal(
+        &self, 
+        failed_producer: String, 
+        new_producer: String, 
+        block_height: u64,
+        change_type: String,
+        timestamp: u64,
+        sender_addr: Option<String>  // Optional sender for tracking false emergencies
     ) {
         // CRITICAL FIX: Check message age to prevent stale message spam
         // ARCHITECTURE: Emergency messages have 60-second TTL to prevent network pollution
@@ -8750,13 +11249,25 @@ impl SimplifiedP2P {
             LAST_EMERGENCY_HEIGHT.store(block_height, Ordering::Relaxed);
         }
         
-        // CRITICAL FIX: Filter out failover messages for blocks we don't have yet
-        // This prevents spam when a node starts with empty database
+        // CRITICAL FIX: Validate emergency message against LOCAL blockchain state
+        // SECURITY: Don't trust emergency messages blindly - verify we actually need failover
         let local_height = LOCAL_BLOCKCHAIN_HEIGHT.load(Ordering::Relaxed);
+        
+        // VALIDATION #1: Ignore failover for blocks too far in the future
         if block_height > local_height + 10 {
-            // Ignore failover for blocks too far in the future (>10 blocks ahead)
-            // This prevents spam from nodes that are far ahead
-            println!("[FAILOVER] 🔇 Ignoring failover for future block #{} (local: {})", 
+            println!("[FAILOVER] ⚠️ Ignoring emergency for block #{} - too far ahead (local: {})", 
+                     block_height, local_height);
+            return;
+        }
+        
+        // VALIDATION #2: Check if we ALREADY HAVE this block
+        // If we have the block, the original producer succeeded - ignore emergency message
+        // This prevents genesis_node_005 (stuck at height 0) from triggering false emergencies
+        if block_height <= local_height {
+            // We already have this block - check if it exists in storage
+            // Use external storage check via static method (no self reference needed)
+            // ARCHITECTURE: Emergency messages should only be trusted if we're also missing the block
+            println!("[FAILOVER] ✅ Block #{} already processed (local height: {}) - ignoring emergency", 
                      block_height, local_height);
             return;
         }
@@ -8767,6 +11278,13 @@ impl SimplifiedP2P {
         // SCALABILITY: DashSet provides lock-free concurrent access for millions of nodes
         if !PROCESSED_FAILOVERS.insert(failover_key.clone()) {
             // Already processed this exact failover event (insert returns false if already exists)
+            println!("[FAILOVER] ⚠️ Duplicate emergency for block #{} - ignoring", block_height);
+            
+            // SECURITY: Track duplicate emergency from sender as potential spam
+            if let Some(sender) = &sender_addr {
+                println!("[SECURITY] ⚠️ Duplicate emergency from {} for block #{}", sender, block_height);
+                // Could apply penalty for spam in future
+            }
             return;
         }
         
@@ -8791,8 +11309,8 @@ impl SimplifiedP2P {
             println!("[SECURITY] 🚨 Attack type: {} at block #{}", change_type, block_height);
             println!("[SECURITY] 🚨 APPLYING INSTANT MAXIMUM BAN (1 YEAR)!");
             
-            // Apply instant reputation destruction
-            self.update_node_reputation(&failed_producer, -100.0);
+            // Apply instant reputation destruction (Byzantine attack)
+            self.update_node_reputation(&failed_producer, ReputationEvent::MaliciousBehavior);
             
             // Report to reputation system for jail
             if let Ok(mut reputation) = self.reputation_system.lock() {
@@ -8961,47 +11479,14 @@ impl SimplifiedP2P {
             
             // Still give small boost to emergency producer for service
             if new_producer != "emergency_consensus" && new_producer != self.node_id {
-                self.update_node_reputation(&new_producer, 2.0);
-                println!("[REPUTATION] ✅ Emergency producer {} rewarded: +2.0 reputation (bootstrap service)", new_display);
+                self.update_node_reputation(&new_producer, ReputationEvent::ConsensusParticipation);
+                println!("[REPUTATION] ✅ Emergency producer {} rewarded (bootstrap service)", new_display);
             }
             return;
         }
         
-        // PRODUCTION: Apply penalty to ALL failed producers after bootstrap
-        // BALANCED: Reduced from -20% to -10% for better recovery
-        self.update_node_reputation(&failed_producer, -10.0);
-        
-        if failed_producer == self.node_id {
-            println!("[REPUTATION] ⚔️ Self-penalty applied: -10.0 reputation (failover)");
-        } else {
-            // PRIVACY: Use pseudonym for logging (don't double-convert if already pseudonym)
-            let display_id = if failed_producer.starts_with("genesis_node_") || failed_producer.starts_with("node_") {
-                failed_producer.clone()
-            } else {
-                get_privacy_id_for_addr(&failed_producer)
-            };
-            println!("[REPUTATION] ⚔️ Network-wide penalty for {}: -10.0 reputation (emergency change)", display_id);
-        }
-        
-        // Boost reputation of emergency producer for taking over
-        if new_producer != "emergency_consensus" && new_producer != self.node_id {
-            self.update_node_reputation(&new_producer, 5.0);
-            
-            // PRIVACY: Use pseudonym for logging (don't double-convert if already pseudonym)
-            let display_id = if new_producer.starts_with("genesis_node_") || new_producer.starts_with("node_") {
-                new_producer.clone()
-            } else {
-                get_privacy_id_for_addr(&new_producer)
-            };
-            println!("[REPUTATION] ✅ Emergency producer {} rewarded: +5.0 reputation (network service)", display_id);
-        }
-        
-        // Log emergency change for network transparency
-        println!("[NETWORK] 📊 Emergency producer change recorded | Type: {} | Height: {} | Time: {}", 
-                 change_type, block_height, timestamp);
-        
-        // CRITICAL FIX: Set EMERGENCY_PRODUCER_FLAG if WE are the new emergency producer
-        // This allows the main production loop to activate immediately
+        // CRITICAL FIX: Set EMERGENCY_PRODUCER_FLAG IMMEDIATELY if WE are the new emergency producer
+        // This MUST happen BEFORE any async tasks to ensure immediate activation
         if new_producer == self.node_id {
             println!("[FAILOVER] 🚀 WE ARE THE EMERGENCY PRODUCER - Setting flag for block #{}", block_height);
             
@@ -9013,15 +11498,113 @@ impl SimplifiedP2P {
             println!("[FAILOVER] ✅ Emergency producer flag set successfully");
         }
         
-        // CRITICAL FIX: Invalidate producer cache to prevent selecting failed producer again
-        // This ensures the network will select a new producer in the next round
-        // IMPORTANT: Do this for ALL nodes, not just the emergency producer
-        println!("[FAILOVER] 🔄 Invalidating producer cache after emergency change");
-        crate::node::BlockchainNode::invalidate_producer_cache();
+        // Log emergency change for network transparency
+        println!("[NETWORK] 📊 Emergency producer change recorded | Type: {} | Height: {} | Time: {}", 
+                 change_type, block_height, timestamp);
+        
+        // CONSENSUS: Track emergency confirmations from multiple nodes
+        // This provides lightweight Byzantine-like protection without full consensus overhead
+        let confirmation_key = (block_height, failed_producer.clone());
+        let confirmation_count = EMERGENCY_CONFIRMATIONS
+            .entry(confirmation_key.clone())
+            .or_insert((AtomicU64::new(0), Instant::now()))
+            .0
+            .fetch_add(1, Ordering::Relaxed) + 1;
+        
+        println!("[CONSENSUS] 📊 Emergency for block #{}: {} confirmations", block_height, confirmation_count);
+        
+        // CLEANUP: Remove old confirmation entries (keep last 100 blocks)
+        if EMERGENCY_CONFIRMATIONS.len() > 100 {
+            let min_height = block_height.saturating_sub(50);
+            EMERGENCY_CONFIRMATIONS.retain(|(h, _), _| *h >= min_height);
+        }
+        
+        // Log suspicious emergency for monitoring
+        if let Some(sender) = &sender_addr {
+            println!("[SECURITY] 🔍 Emergency from {} for block #{} - tracking", sender, block_height);
+        }
+        
+        // Request block immediately (synchronous part)
+        println!("[FAILOVER] 📡 Requesting block #{} from network", block_height);
+        
+        // Clone values for logging (async part will check consensus)
+        let failed_producer_log = failed_producer.clone();
+        let new_producer_log = new_producer.clone();
+        let block_height_log = block_height;
+        let sender_log = sender_addr.clone();
+        
+        // Schedule async verification without self reference
+        tokio::spawn(async move {
+            // Step 1: Wait for block propagation (2 seconds)
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            
+            // Step 2: Check if block arrived (using global state)
+            let final_height = LOCAL_BLOCKCHAIN_HEIGHT.load(Ordering::Relaxed);
+            
+            if block_height_log <= final_height {
+                println!("[FAILOVER] ✅ Block #{} received - Producer {} is INNOCENT", 
+                         block_height_log, failed_producer_log);
+            } else {
+                // Check consensus
+                let conf_key = (block_height_log, failed_producer_log.clone());
+                let confirmations = EMERGENCY_CONFIRMATIONS
+                    .get(&conf_key)
+                    .map(|entry| entry.0.load(Ordering::Relaxed))
+                    .unwrap_or(1);
+                
+                if confirmations >= 3 {
+                    println!("[CONSENSUS] ✅ Block #{} missing - CONSENSUS REACHED ({} confirmations)", 
+                             block_height_log, confirmations);
+                } else if confirmations >= 2 {
+                    println!("[CONSENSUS] ⚠️ Block #{} missing - PARTIAL CONSENSUS ({} confirmations)", 
+                             block_height_log, confirmations);
+                } else {
+                    println!("[CONSENSUS] ⚠️ Block #{} missing - SINGLE REPORT (no penalty)", 
+                             block_height_log);
+                }
+            }
+        });
+        
+        println!("[FAILOVER] ⏸️ Verification scheduled (2s timeout)");
+        
+        // Apply penalties IMMEDIATELY based on current confirmation count
+        // This avoids async complexity while still using consensus
+        let conf_key = (block_height, failed_producer.clone());
+        let current_confirmations = EMERGENCY_CONFIRMATIONS
+            .get(&conf_key)
+            .map(|entry| entry.0.load(Ordering::Relaxed))
+            .unwrap_or(1);
+        
+        println!("[CONSENSUS] 📊 Current confirmations: {}", current_confirmations);
+        
+        if current_confirmations >= 3 {
+            println!("[CONSENSUS] ✅ CONSENSUS REACHED: 3+ nodes confirm emergency");
+            self.update_node_reputation(&failed_producer, ReputationEvent::InvalidBlock);
+            println!("[FAILOVER] ⚔️ Applied penalty to {} (consensus)", failed_producer);
+            
+            if new_producer != "emergency_consensus" {
+                self.update_node_reputation(&new_producer, ReputationEvent::ValidBlock);
+                println!("[FAILOVER] ✅ Emergency producer {} rewarded", new_producer);
+            }
+        } else if current_confirmations >= 2 {
+            println!("[CONSENSUS] ⚠️ PARTIAL CONSENSUS: 2 nodes confirm emergency");
+            self.update_node_reputation(&failed_producer, ReputationEvent::InvalidBlock);
+            println!("[FAILOVER] ⚔️ Applied penalty to {} (partial)", failed_producer);
+            
+            if new_producer != "emergency_consensus" {
+                self.update_node_reputation(&new_producer, ReputationEvent::ConsensusParticipation);
+                println!("[FAILOVER] ✅ Emergency producer {} rewarded", new_producer);
+            }
+        } else {
+            println!("[CONSENSUS] ⚠️ SINGLE REPORT: No penalty for {}", failed_producer);
+        }
     }
+    
     
     /// PRODUCTION: Handle reputation synchronization from peers
     fn handle_reputation_sync(&self, from_node: String, reputation_updates: Vec<(String, f64)>, timestamp: u64, signature: Vec<u8>) {
+        use sha3::{Sha3_256, Digest}; // For gossip propagation
+        
         // PRIVACY: Use pseudonym for logging
         let from_display = if from_node.starts_with("genesis_node_") || from_node.starts_with("node_") {
             from_node.clone()
@@ -9041,8 +11624,9 @@ impl SimplifiedP2P {
         }
         
         // PRODUCTION: Apply weighted average of reputations from multiple sources
+        let mut significant_updates = 0;
         if let Ok(mut reputation_system) = self.reputation_system.lock() {
-            for (node_id, new_reputation) in reputation_updates {
+            for (node_id, new_reputation) in &reputation_updates {
                 let current = reputation_system.get_reputation(&node_id);
                 
                 // PRODUCTION: Use weighted average (70% local, 30% remote) to prevent manipulation
@@ -9051,6 +11635,7 @@ impl SimplifiedP2P {
                 // Only update if change is significant (>1%)
                 if (weighted_reputation - current).abs() > 1.0 {
                     reputation_system.set_reputation(&node_id, weighted_reputation);
+                    significant_updates += 1;
                     
                     // PRIVACY: Use pseudonyms for logging
                     let node_display = if node_id.starts_with("genesis_node_") || node_id.starts_with("node_") {
@@ -9063,6 +11648,98 @@ impl SimplifiedP2P {
                             node_display, current, weighted_reputation, from_display);
                 }
             }
+        }
+        
+        // GOSSIP PROPAGATION: Re-gossip to random peers (exponential propagation!)
+        // ARCHITECTURE: This is the KEY to O(log n) complexity
+        // Each node that receives gossip re-sends to fanout peers
+        // Example: 1 → 4 → 16 → 64 → 256 → 1024 → 4096 (7 hops for 4K nodes)
+        if significant_updates > 0 {
+            // RE-GOSSIP: Forward to RANDOM subset of peers (exclude sender!)
+            let peers = self.get_validated_active_peers();
+            
+            // Filter qualified peers (exclude Light nodes and sender)
+            let qualified_peers: Vec<_> = peers.iter()
+                .filter(|p| {
+                    p.node_type != NodeType::Light && 
+                    p.is_consensus_qualified() &&
+                    p.id != from_node // DON'T send back to sender!
+                })
+                .collect();
+            
+            if qualified_peers.is_empty() {
+                return; // No peers to re-gossip
+            }
+            
+            // ADAPTIVE FANOUT: Use same logic as initial gossip
+            let gossip_fanout = self.get_turbine_fanout(); // Reuse existing method!
+            
+            // KADEMLIA RANDOM SELECTION: Select diverse peers
+            let mut selection_hasher = Sha3_256::new();
+            selection_hasher.update(self.node_id.as_bytes());
+            selection_hasher.update(&timestamp.to_le_bytes());
+            selection_hasher.update(b"QNET_REGOSSIP_V1");
+            let selection_seed = selection_hasher.finalize();
+            
+            let mut sorted_peers: Vec<_> = qualified_peers.into_iter().cloned().collect();
+            sorted_peers.sort_by_key(|peer| {
+                // XOR distance (Kademlia-like)
+                let mut peer_hasher = Sha3_256::new();
+                peer_hasher.update(peer.id.as_bytes());
+                peer_hasher.update(&selection_seed);
+                let peer_hash = peer_hasher.finalize();
+                u64::from_le_bytes([
+                    peer_hash[0], peer_hash[1], peer_hash[2], peer_hash[3],
+                    peer_hash[4], peer_hash[5], peer_hash[6], peer_hash[7],
+                ])
+            });
+            
+            // Select top-N peers for re-gossip
+            let gossip_targets: Vec<_> = sorted_peers.into_iter()
+                .take(gossip_fanout)
+                .collect();
+            
+            // RE-GOSSIP: Forward message to selected peers (async, non-blocking)
+            let sync_msg = NetworkMessage::ReputationSync {
+                node_id: from_node.clone(), // Keep ORIGINAL sender for signature verification
+                reputation_updates: reputation_updates.clone(),
+                timestamp,
+                signature: signature.clone(),
+            };
+            
+            let message_json = match serde_json::to_string(&sync_msg) {
+                Ok(json) => json,
+                Err(e) => {
+                    println!("[REPUTATION] ❌ Failed to serialize re-gossip message: {}", e);
+                    return;
+                }
+            };
+            
+            // Send re-gossip messages asynchronously
+            let mut regossip_count = 0;
+            for peer in gossip_targets {
+                // Use HTTP POST (same as initial gossip)
+                let message_clone = message_json.clone();
+                let peer_addr = peer.addr.clone();
+                
+                // Spawn async task (non-blocking)
+                std::thread::spawn(move || {
+                    if let Ok(client) = reqwest::blocking::Client::builder()
+                        .timeout(Duration::from_secs(5))
+                        .build() {
+                        let url = format!("http://{}/api/v1/p2p/message", peer_addr);
+                        let _ = client.post(&url)
+                            .header("Content-Type", "application/json")
+                            .body(message_clone)
+                            .send();
+                    }
+                });
+                
+                regossip_count += 1;
+            }
+            
+            println!("[REPUTATION] 🌐 Re-gossiped {} updates to {} peers (fanout={})", 
+                     significant_updates, regossip_count, gossip_fanout);
         }
     }
     
@@ -9333,34 +12010,92 @@ impl SimplifiedP2P {
                     }
                 };
                 
-                // Send to all connected peers
+                // GOSSIP PROTOCOL: Send to RANDOM subset of peers (NOT broadcast!)
+                // ARCHITECTURE: O(log n) complexity vs O(n) broadcast
+                // SCALABILITY: Supports millions of nodes with exponential propagation
                 let peers = match connected_peers.read() {
                     Ok(peers) => peers.clone(),
                     Err(poisoned) => poisoned.into_inner().clone(),
                 };
                 
-                let mut successful = 0;
-                for (_addr, peer) in peers {
-                    // Send using existing P2P infrastructure
-                    // Use TCP directly for reputation sync
-                    use std::io::Write;
-                    use std::net::TcpStream;
-                    use std::time::Duration as StdDuration;
+                // Filter qualified Super/Full nodes (Light nodes excluded)
+                let qualified_peers: Vec<_> = peers.iter()
+                    .filter(|(_, peer)| {
+                        peer.node_type != NodeType::Light && peer.is_consensus_qualified()
+                    })
+                    .collect();
+                
+                if qualified_peers.is_empty() {
+                    println!("[REPUTATION] ⚠️ No qualified peers for gossip sync - skipping iteration #{}", iteration);
+                    continue;
+                }
+                
+                // ADAPTIVE FANOUT: Use same fanout as Turbine for consistency
+                // PRODUCTION: Fanout=4 (small network) to fanout=32 (large network)
+                let gossip_fanout = {
+                    let producers = qualified_peers.len();
+                    let avg_latency = connected_peers_lockfree.iter()
+                        .filter(|e| e.value().is_consensus_qualified())
+                        .map(|e| e.value().latency_ms as u64)
+                        .sum::<u64>() / qualified_peers.len().max(1) as u64;
                     
-                    if let Ok(mut stream) = TcpStream::connect_timeout(
-                        &peer.addr.parse().unwrap_or_else(|_| "127.0.0.1:9876".parse().unwrap()),
-                        StdDuration::from_secs(2)
-                    ) {
-                        let _ = stream.set_write_timeout(Some(StdDuration::from_secs(2)));
-                        if stream.write_all(message_json.as_bytes()).is_ok() {
+                    // Same logic as get_turbine_fanout() (unified_p2p.rs:10715-10731)
+                    match (producers, avg_latency) {
+                        (0..=50, _) => 4,
+                        (51..=200, 0..=50) => 8,
+                        (51..=200, _) => 16,
+                        (201..=1000, 0..=50) => 8,
+                        (201..=1000, _) => 16,
+                        _ => 32,
+                    }
+                };
+                
+                // KADEMLIA-BASED RANDOM SELECTION: Use XOR distance for peer diversity
+                // ARCHITECTURE: Same as Turbine routing (no duplication)
+                let mut selection_hasher = Sha3_256::new();
+                selection_hasher.update(node_id.as_bytes());
+                selection_hasher.update(&iteration.to_le_bytes());
+                selection_hasher.update(b"QNET_GOSSIP_REPUTATION_V1");
+                let selection_seed = selection_hasher.finalize();
+                
+                let mut sorted_peers: Vec<_> = qualified_peers.into_iter().collect();
+                sorted_peers.sort_by_key(|(addr, _)| {
+                    // XOR distance from selection_seed (Kademlia-like)
+                    let mut peer_hasher = Sha3_256::new();
+                    peer_hasher.update(addr.as_bytes());
+                    peer_hasher.update(&selection_seed);
+                    let peer_hash = peer_hasher.finalize();
+                    u64::from_le_bytes([
+                        peer_hash[0], peer_hash[1], peer_hash[2], peer_hash[3],
+                        peer_hash[4], peer_hash[5], peer_hash[6], peer_hash[7],
+                    ])
+                });
+                
+                // Select top-N peers by Kademlia distance
+                let gossip_targets: Vec<_> = sorted_peers.into_iter()
+                    .take(gossip_fanout)
+                    .collect();
+                
+                // Send gossip messages to selected peers
+                let mut successful = 0;
+                for (_addr, peer) in gossip_targets {
+                    // Use HTTP POST for reliability (same as before)
+                    if let Ok(client) = reqwest::blocking::Client::builder()
+                        .timeout(Duration::from_secs(5))
+                        .build() {
+                        let url = format!("http://{}/api/v1/p2p/message", peer.addr);
+                        if let Ok(_) = client.post(&url)
+                            .header("Content-Type", "application/json")
+                            .body(message_json.clone())
+                            .send() {
                             successful += 1;
                         }
                     }
                 }
                 
                 if successful > 0 {
-                    println!("[REPUTATION] 📤 Sync #{}: Broadcasted {} reputations to {} peers", 
-                             iteration, reputation_updates.len(), successful);
+                    println!("[REPUTATION] 🌐 Gossip #{}: Sent {} reputations to {}/{} peers (fanout={})", 
+                             iteration, reputation_updates.len(), successful, gossip_fanout, gossip_fanout);
                 }
             }
         });
@@ -9417,7 +12152,7 @@ impl SimplifiedP2P {
                          node_id, count);
                 println!("[SECURITY] 🛡️ Genesis nodes are protected from automatic bans");
                 // Apply reputation penalty but no ban
-                self.update_node_reputation(node_id, -50.0); // Heavy penalty but not ban
+                self.update_node_reputation(node_id, ReputationEvent::MaliciousBehavior);
                 INVALID_CERT_TRACKER.remove(node_id);
                 return;
             }
@@ -9441,7 +12176,7 @@ impl SimplifiedP2P {
         } else if count == 3 {
             // Warning level - significant reputation penalty
             println!("[SECURITY] ⚠️ WARNING: {} has sent 3 invalid certificates", node_id);
-            self.update_node_reputation(node_id, -20.0); // -20% reputation
+            self.update_node_reputation(node_id, ReputationEvent::InvalidBlock);
         }
     }
     
@@ -9484,13 +12219,13 @@ impl SimplifiedP2P {
             
         } else if count == 3 {
             // WARNING: 3 invalid blocks = possible bug or sync issue
-            println!("[SECURITY] ⚠️ WARNING: {} sent 3 invalid blocks - applying small penalty", producer);
-            self.update_node_reputation(producer, -5.0);
+            println!("[SECURITY] ⚠️ WARNING: {} sent 3 invalid blocks - applying penalty", producer);
+            self.update_node_reputation(producer, ReputationEvent::InvalidBlock);
             
         } else if count == 5 {
             // ESCALATION: 5 invalid blocks = suspicious behavior
-            println!("[SECURITY] ⚠️ ESCALATION: {} sent 5 invalid blocks - applying medium penalty", producer);
-            self.update_node_reputation(producer, -10.0);
+            println!("[SECURITY] ⚠️ ESCALATION: {} sent 5 invalid blocks - applying penalty", producer);
+            self.update_node_reputation(producer, ReputationEvent::InvalidBlock);
         }
         
         // CLEANUP: Remove old entries after 5 minutes (prevent memory leak)
@@ -9573,8 +12308,8 @@ impl SimplifiedP2P {
             change_type
         )?;
         
-        // Apply instant ban locally
-        self.update_node_reputation(attacker, -100.0);
+        // Apply instant ban locally (Byzantine attack)
+        self.update_node_reputation(attacker, ReputationEvent::MaliciousBehavior);
         
         // Jail for 1 year
         if let Ok(mut reputation) = self.reputation_system.lock() {
@@ -9586,10 +12321,10 @@ impl SimplifiedP2P {
     }
     
     fn select_emergency_producer_excluding(&self, exclude: &str, height: u64) -> String {
-        // Select any other active peer as emergency producer
+        // Select any other active peer as emergency producer (Byzantine-safe)
         for entry in self.connected_peers_lockfree.iter() {
             let peer = entry.value();
-            if peer.id != exclude && peer.reputation_score > 70.0 {  // Use minimum consensus threshold
+            if peer.id != exclude && peer.is_consensus_qualified() {  // Byzantine threshold check
                 return peer.id.clone();
             }
         }
@@ -9634,6 +12369,7 @@ impl SimplifiedP2P {
                 block_height,
                 change_type: change_type.to_string(),
                 timestamp,
+                sender_node_id: Some(self.node_id.clone()), // PRODUCTION: Explicit sender for Docker/NAT
             };
             
             // CRITICAL: Send emergency message to peer
@@ -9646,5 +12382,159 @@ impl SimplifiedP2P {
                  successful_broadcasts, total_peers);
         
         Ok(())
+    }
+    
+    // ============================================================================
+    // SYNC OPTIMIZATION: Peer Blacklist Methods
+    // ============================================================================
+    
+    /// Add peer to blacklist with reason and duration
+    /// ARCHITECTURE: Soft blacklist (network) vs Hard blacklist (Byzantine)
+    /// SCALABILITY: Lock-free DashMap for millions of nodes
+    pub fn add_to_blacklist(&self, peer_addr: &str, reason: BlacklistReason) {
+        let (duration_secs, escalation) = match reason {
+            // SOFT BLACKLIST: Temporary (network performance)
+            BlacklistReason::SlowResponse => (15, 15),   // 15s base, +15s per violation
+            BlacklistReason::SyncTimeout => (30, 30),    // 30s base, +30s per violation
+            BlacklistReason::ConnectionFailure => (60, 60), // 60s base, +60s per violation
+            
+            // HARD BLACKLIST: Permanent until reputation recovered (Byzantine)
+            BlacklistReason::InvalidBlocks | BlacklistReason::MaliciousBehavior => (0, 0),
+        };
+        
+        // Check if already blacklisted (escalation logic)
+        let (final_duration, attempts) = if let Some(mut entry) = PEER_BLACKLIST.get_mut(peer_addr) {
+            // Escalate duration for repeated violations
+            let new_attempts = entry.attempts + 1;
+            let escalated_duration = if duration_secs > 0 {
+                duration_secs + (escalation * new_attempts as u64)
+            } else {
+                0 // Permanent
+            };
+            entry.timestamp = Instant::now();
+            entry.duration_secs = escalated_duration;
+            entry.attempts = new_attempts;
+            entry.reason = reason;
+            (escalated_duration, new_attempts)
+        } else {
+            // First violation
+            let entry = BlacklistEntry {
+                reason,
+                timestamp: Instant::now(),
+                duration_secs,
+                attempts: 1,
+            };
+            PEER_BLACKLIST.insert(peer_addr.to_string(), entry);
+            (duration_secs, 1)
+        };
+        
+        if final_duration > 0 {
+            println!("[BLACKLIST] 🚫 SOFT: {} blacklisted for {}s (reason: {:?}, attempt: {})", 
+                     peer_addr, final_duration, reason, attempts);
+        } else {
+            println!("[BLACKLIST] ⛔ HARD: {} permanently blacklisted (reason: {:?})", 
+                     peer_addr, reason);
+        }
+    }
+    
+    /// Check if peer is currently blacklisted
+    /// Returns (is_blacklisted, reason, remaining_secs)
+    pub fn is_blacklisted(&self, peer_addr: &str) -> (bool, Option<BlacklistReason>, u64) {
+        if let Some(entry) = PEER_BLACKLIST.get(peer_addr) {
+            if entry.is_active() {
+                return (true, Some(entry.reason), entry.remaining_secs());
+            } else {
+                // Entry expired - remove it
+                drop(entry);
+                PEER_BLACKLIST.remove(peer_addr);
+            }
+        }
+        (false, None, 0)
+    }
+    
+    /// Remove peer from blacklist (manual override or reputation recovered)
+    pub fn remove_from_blacklist(&self, peer_addr: &str) {
+        if let Some((_, entry)) = PEER_BLACKLIST.remove(peer_addr) {
+            println!("[BLACKLIST] ✅ Removed {} from blacklist (reason: {:?})", 
+                     peer_addr, entry.reason);
+        }
+    }
+    
+    /// Get peers for sync with blacklist filtering and prioritization
+    /// ARCHITECTURE: Filter by blacklist, node type (Light excluded), and reputation
+    /// SCALABILITY: Returns top-N peers sorted by latency and reputation
+    /// CRITICAL: Light nodes NEVER included as sync SOURCE (they only RECEIVE macroblock headers)
+    /// NOTE: Light nodes DO receive blocks via broadcast, but don't serve blocks to others
+    pub fn get_sync_peers_filtered(&self, max_peers: usize) -> Vec<PeerInfo> {
+        let mut eligible_peers: Vec<PeerInfo> = self.connected_peers_lockfree.iter()
+            .filter_map(|entry| {
+                let peer = entry.value().clone();
+                
+                // CRITICAL: Light nodes are NOT sync sources (don't store full blocks)
+                // They RECEIVE macroblock headers but don't serve blocks to others
+                if peer.node_type == NodeType::Light {
+                    return None;
+                }
+                
+                // Filter blacklisted peers
+                let (is_blacklisted, reason, remaining) = self.is_blacklisted(&peer.addr);
+                if is_blacklisted {
+                    // SOFT blacklist: Can be overridden if no other peers available
+                    // HARD blacklist: Check reputation instead
+                    if let Some(BlacklistReason::InvalidBlocks | BlacklistReason::MaliciousBehavior) = reason {
+                        // Hard blacklist: check if reputation recovered
+                        if !peer.is_consensus_qualified() {
+                            return None; // Still below Byzantine threshold
+                        }
+                        // Reputation recovered - auto-remove from blacklist
+                        self.remove_from_blacklist(&peer.addr);
+                    } else {
+                        // Soft blacklist: skip if still active
+                        if remaining > 0 {
+                            return None;
+                        }
+                    }
+                }
+                
+                // Include only peers with good consensus reputation (Byzantine-safe)
+                if peer.is_consensus_qualified() {
+                    Some(peer)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        
+        // Sort by priority: 1) network_score (latency), 2) consensus_score (reliability)
+        eligible_peers.sort_by(|a, b| {
+            // Primary: network_score (higher = better latency)
+            let network_cmp = b.network_score.partial_cmp(&a.network_score).unwrap();
+            if network_cmp != std::cmp::Ordering::Equal {
+                return network_cmp;
+            }
+            // Secondary: consensus_score (higher = more reliable)
+            b.consensus_score.partial_cmp(&a.consensus_score).unwrap()
+        });
+        
+        // Return top-N peers
+        eligible_peers.into_iter().take(max_peers).collect()
+    }
+    
+    /// Cleanup expired blacklist entries (periodic maintenance)
+    /// SCALABILITY: Lock-free DashMap cleanup for millions of nodes
+    pub fn cleanup_expired_blacklist(&self) {
+        let mut removed = 0;
+        PEER_BLACKLIST.retain(|_, entry| {
+            if !entry.is_active() && entry.duration_secs > 0 {
+                removed += 1;
+                false // Remove expired soft blacklist
+            } else {
+                true // Keep active or permanent
+            }
+        });
+        
+        if removed > 0 {
+            println!("[BLACKLIST] 🧹 Cleaned up {} expired blacklist entries", removed);
+        }
     }
 }

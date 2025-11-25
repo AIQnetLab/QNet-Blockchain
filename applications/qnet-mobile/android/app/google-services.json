@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "551363496708",
+    "project_id": "qnet-wallet",
+    "storage_bucket": "qnet-wallet.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:551363496708:android:b24eb6db356a9f62cbde51",
+        "android_client_info": {
+          "package_name": "com.qnetmobile"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBc_n-TGo7wkwmK_JPseaF0lrkpujAOxvE"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

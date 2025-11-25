@@ -60,6 +60,7 @@ pub fn create_genesis_block(config: GenesisConfig) -> IntegrationResult<Block> {
         gas_limit: 0,
         timestamp: config.timestamp,
         signature: Some("genesis".to_string()),
+        public_key: None, // Not needed for genesis transactions
         tx_type: TransactionType::CreateAccount {
             address: "system_rewards_pool".to_string(),
             initial_balance: 0, // Starts empty - Pool 1 emission happens every 4 hours
@@ -77,6 +78,7 @@ pub fn create_genesis_block(config: GenesisConfig) -> IntegrationResult<Block> {
             amount,
             nonce: 0,
             gas_price: 0, // no gas for genesis
+            public_key: None, // Not needed for genesis transactions
             gas_limit: 0, // no gas limit
             timestamp: config.timestamp,
             signature: Some("genesis".to_string()),

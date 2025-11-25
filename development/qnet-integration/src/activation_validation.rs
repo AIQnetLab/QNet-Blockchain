@@ -1689,6 +1689,7 @@ impl BlockchainActivationRegistry {
             gas_limit: 100000, // QNet standard for data transactions
             data: Some(activation_json), // String, not Vec<u8>
             signature: None, // No signature needed - security via activation code validation
+            public_key: None, // Not needed for activation transactions
             tx_type: TransactionType::ContractCall, // Use tx_type, not transaction_type
             timestamp: record.activated_at,
         };
@@ -1718,7 +1719,8 @@ impl BlockchainActivationRegistry {
                     
                     // Add to mempool (blocks will pick it up automatically)
                     let mempool_write = mempool_arc.write().await;
-                    if mempool_write.add_raw_transaction(tx_json, tx_hash_for_mempool.clone()) {
+                    // PRODUCTION: Add with gas_price for priority ordering
+                    if mempool_write.add_raw_transaction(tx_json, tx_hash_for_mempool.clone(), transaction.gas_price) {
                         println!("[REGISTRY] ✅ Activation transaction added to mempool: {}", tx_hash_for_mempool);
                     } else {
                         println!("[REGISTRY] ⚠️ Failed to add activation transaction to mempool (may be full or duplicate)");
@@ -2656,12 +2658,48 @@ impl BlockchainActivationRegistry {
         
         // Check environment variable for phase override (for testing)
         if let Ok(phase) = std::env::var("QNET_ACTIVATION_PHASE") {
-            return phase.parse::<u8>().unwrap_or(2); // Default to Phase 2
+            return phase.parse::<u8>().unwrap_or(2);
         }
         
-        // TODO: Query Solana blockchain for actual burn percentage
-        // For now: default to Phase 2 (mainnet is in Phase 2)
-        2
+        // Check time-based phase transition (5 years from launch: Nov 2024)
+        // Launch date: November 1, 2024
+        let launch_timestamp: u64 = 1730419200; // Nov 1, 2024 00:00:00 UTC
+        let five_years_seconds: u64 = 5 * 365 * 24 * 60 * 60;
+        let current_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        
+        // If 5 years have passed, we're in Phase 2
+        if current_time > launch_timestamp + five_years_seconds {
+            return 2;
+        }
+        
+        // Check burn percentage from cached value or Solana
+        // Cache burn percentage to avoid frequent RPC calls
+        let burn_percentage = self.get_cached_burn_percentage();
+        
+        // Phase 1 ends when 90% is burned
+        if burn_percentage >= 90.0 {
+            return 2;
+        }
+        
+        // Still in Phase 1
+        1
+    }
+    
+    /// Get cached burn percentage (updated periodically by background task)
+    fn get_cached_burn_percentage(&self) -> f64 {
+        // Check environment variable for cached value
+        if let Ok(percentage) = std::env::var("QNET_BURN_PERCENTAGE") {
+            return percentage.parse::<f64>().unwrap_or(0.0);
+        }
+        
+        // Default: assume we're still early in Phase 1
+        // Background task should update QNET_BURN_PERCENTAGE from Solana RPC
+        // Query: Get 1DEV token supply vs total supply (1B)
+        // Burned = Total Supply - Circulating Supply
+        0.0
     }
     
     /// Get network statistics for dynamic pricing

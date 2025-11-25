@@ -280,9 +280,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Tracks blocks produced per rotation round
   - Calculates rewards at rotation boundaries
   - Handles partial rotations from failovers
-- **Reputation Recovery Logic**: 
-  - Recovery rate remains +0.7%/hour towards 70%
-  - But now ONLY applies to active nodes (had recent ping)
+- **Reputation Recovery Logic** (Updated v2.19.4): 
+  - Recovery rate: +1% every 4 hours (not per hour)
+  - ONLY applies to Full/Super nodes with reputation in [10, 70) range
+  - Capped at 70 (consensus threshold) - must earn higher through consensus
+  - Light nodes: EXCLUDED (fixed reputation of 70)
+  - Banned nodes (<10): EXCLUDED from passive recovery
 
 ## [2.12.0] - October 2, 2025 "95% Decentralization with Stability Protection"
 

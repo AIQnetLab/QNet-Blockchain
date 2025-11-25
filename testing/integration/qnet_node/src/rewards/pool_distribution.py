@@ -58,9 +58,7 @@ class PoolDistributor:
         self.distribution_interval = 4 * 60 * 60  # 4 hours in seconds
         
         # Minimum reputation for NEW rewards by node type:
-        # Light nodes: 0.0 (any reputation, mobile-friendly)
-        # Full/Super nodes: 70.0 (must maintain network quality)
-        self.min_reputation_light = 0.0
+        self.min_reputation_light = 70.0
         self.min_reputation_full_super = 70.0
         
         # CORRECT LOGIC: Network pings nodes in randomized slots 
@@ -155,7 +153,7 @@ class PoolDistributor:
         return False
     
     def get_eligible_nodes(self) -> List[ActiveNode]:
-        """Get nodes eligible for NEW rewards (Light: any rep | Full/Super: rep >= 70, not in quarantine, responded to ping)"""
+        """Get nodes eligible for NEW rewards (ALL nodes: rep >= 70, not in quarantine, responded to ping)"""
         current_time = int(time.time())
         eligible = []
         

@@ -16,7 +16,7 @@ pub struct PyMempoolConfig {
 #[pymethods]
 impl PyMempoolConfig {
     #[new]
-    #[pyo3(signature = (max_size=500000, min_gas_price=1))]
+    #[pyo3(signature = (max_size=500000, min_gas_price=100000))]
     fn new(
         max_size: usize,
         min_gas_price: u64,
@@ -55,9 +55,12 @@ impl PyMempool {
     }
     
     fn add_transaction(&self, tx_json: &str) -> PyResult<String> {
-        // Simple validation - just check if it's valid JSON
-        let _: serde_json::Value = serde_json::from_str(tx_json)
+        // Parse transaction JSON to extract gas_price
+        let tx: serde_json::Value = serde_json::from_str(tx_json)
             .map_err(|e| PyValueError::new_err(format!("Invalid transaction JSON: {}", e)))?;
+        
+        // Extract gas_price from transaction (default to 1 if missing)
+        let gas_price = tx["gas_price"].as_u64().unwrap_or(1);
         
         // Generate a simple hash
         use sha2::{Sha256, Digest};
@@ -65,8 +68,8 @@ impl PyMempool {
         hasher.update(tx_json.as_bytes());
         let hash = hex::encode(hasher.finalize());
         
-        // Store in mempool
-        if self.inner.add_raw_transaction(tx_json.to_string(), hash.clone()) {
+        // Store in mempool with priority
+        if self.inner.add_raw_transaction(tx_json.to_string(), hash.clone(), gas_price) {
             Ok(hash)
         } else {
             Err(PyValueError::new_err("Failed to add transaction to mempool"))

@@ -75,6 +75,7 @@
 //! - **Scalability**: Supports millions of nodes (max 1000 validators in consensus)
 
 use base64::{Engine as _, engine::general_purpose};
+use pqcrypto_traits::sign::{PublicKey as PQPublicKey, SignedMessage as PQSignedMessage};
 
 /// Verify consensus signature using hybrid cryptography
 pub async fn verify_consensus_signature(
@@ -387,7 +388,7 @@ async fn verify_with_real_dilithium(
     signature_bytes: &[u8],
 ) -> bool {
     // PRODUCTION: ALWAYS use real CRYSTALS-Dilithium - NO FALLBACK
-    println!("[CONSENSUS] 🔐 Using CRYSTALS-Dilithium verification (quantum-resistant)");
+    println!("[CONSENSUS] 🔐 Using CRYSTALS-Dilithium3 verification (NIST post-quantum)");
     
     // Verify signature structure
     if signature_bytes.iter().all(|&b| b == 0) {
@@ -404,64 +405,102 @@ async fn verify_with_real_dilithium(
     }
     
     // Parse combined format if it matches our structure
-    if signature_bytes.len() > 8 {
-        // Try to parse as our combined format
-        // Format: [sig_len(4)] + [signature(2420) + message] + [pk_len(4)] + [public_key(1952)]
-        let signed_len = u32::from_le_bytes([
-            signature_bytes[0],
-            signature_bytes[1],
-            signature_bytes[2],
-            signature_bytes[3],
-        ]) as usize;
-        
-        // Validate format
-        if signed_len > 2420 && 4 + signed_len < signature_bytes.len() {
-            // Extract public key from the end of signature
-            let pk_len_start = 4 + signed_len;
-            if pk_len_start + 4 <= signature_bytes.len() {
-                let pk_len = u32::from_le_bytes([
-                    signature_bytes[pk_len_start],
-                    signature_bytes[pk_len_start + 1],
-                    signature_bytes[pk_len_start + 2],
-                    signature_bytes[pk_len_start + 3],
-                ]) as usize;
-                
-                let pk_start = pk_len_start + 4;
-                if pk_start + pk_len == signature_bytes.len() && pk_len == 1952 {
-                    // Valid format with embedded public key!
-                    println!("[CONSENSUS] ✅ Found embedded public key (1952 bytes)");
-                    
-                    // Extract and verify message
-                    // CRITICAL FIX: Message already contains "node_id:data" format from create_consensus_signature
-                    // DO NOT add node_id again - it causes duplication!
-                    let expected_msg = message.to_string();  // Use message AS-IS
-                    let msg_in_sig_start = 4 + 2420;  // After length + signature
-                    let msg_len = signed_len - 2420;
-                    
-                    if msg_in_sig_start + msg_len <= pk_len_start {
-                        let embedded_msg = &signature_bytes[msg_in_sig_start..msg_in_sig_start + msg_len];
-                        
-                        // CRITICAL FIX: Handle both formats - with and without node_id prefix
-                        // Check if message already contains node_id prefix
-                        let expected_with_prefix = format!("{}:{}", node_id, expected_msg);
-                        
-                        if embedded_msg == expected_msg.as_bytes() || embedded_msg == expected_with_prefix.as_bytes() {
-                            println!("[CONSENSUS] ✅ Message matches embedded data");
-                            println!("[CONSENSUS] ✅ Dilithium signature structurally valid");
-                            println!("[CONSENSUS] ✅ Public key available for future verification");
-                            return true;
-                        } else {
-                            // Silent fail for intermediate attempts (certificates use different format)
-                            // Only log final rejection in calling code
-                            return false;
-                        }
-                    }
-                }
-            }
-        }
+    // Format: [sig_len(4)] + [signature(2420) + message] + [pk_len(4)] + [public_key(1952)]
+    if signature_bytes.len() < 8 {
+        println!("[CONSENSUS] ❌ Signature too short for combined format");
+        return false;
     }
     
-    // Strict validation: reject if we can't verify properly
-    println!("[CONSENSUS] ❌ Cannot verify Dilithium signature - invalid format or missing data");
-    false  // CRITICAL: Default to REJECT, not accept!
+    let signed_len = u32::from_le_bytes([
+        signature_bytes[0],
+        signature_bytes[1],
+        signature_bytes[2],
+        signature_bytes[3],
+    ]) as usize;
+    
+    // Validate format
+    if signed_len <= 2420 || 4 + signed_len >= signature_bytes.len() {
+        println!("[CONSENSUS] ❌ Invalid combined format structure");
+        return false;
+    }
+    
+    // Extract public key from the end of signature
+    let pk_len_start = 4 + signed_len;
+    if pk_len_start + 4 > signature_bytes.len() {
+        println!("[CONSENSUS] ❌ Missing public key length field");
+        return false;
+    }
+    
+    let pk_len = u32::from_le_bytes([
+        signature_bytes[pk_len_start],
+        signature_bytes[pk_len_start + 1],
+        signature_bytes[pk_len_start + 2],
+        signature_bytes[pk_len_start + 3],
+    ]) as usize;
+    
+    let pk_start = pk_len_start + 4;
+    
+    // CRITICAL: Dilithium3 public key MUST be exactly 1952 bytes (NIST standard)
+    use pqcrypto_dilithium::dilithium3;
+    if pk_len != dilithium3::public_key_bytes() {
+        println!("[CONSENSUS] ❌ Invalid public key size: {} (expected {})", 
+                 pk_len, dilithium3::public_key_bytes());
+        return false;
+    }
+    
+    if pk_start + pk_len != signature_bytes.len() {
+        println!("[CONSENSUS] ❌ Signature length mismatch");
+        return false;
+    }
+    
+    // Extract components
+    let signed_message_bytes = &signature_bytes[4..4 + signed_len];  // signature + message
+    let public_key_bytes = &signature_bytes[pk_start..pk_start + pk_len];
+    
+    println!("[CONSENSUS] 📦 Extracted: signed_msg={} bytes, pubkey={} bytes", 
+             signed_message_bytes.len(), public_key_bytes.len());
+    
+    // Parse Dilithium3 public key
+    let public_key = match dilithium3::PublicKey::from_bytes(public_key_bytes) {
+        Ok(pk) => pk,
+        Err(_) => {
+            println!("[CONSENSUS] ❌ Failed to parse Dilithium3 public key");
+            return false;
+        }
+    };
+    
+    // Parse signed message (signature + message combined)
+    let signed_message = match dilithium3::SignedMessage::from_bytes(signed_message_bytes) {
+        Ok(sm) => sm,
+        Err(_) => {
+            println!("[CONSENSUS] ❌ Failed to parse Dilithium3 signed message");
+            return false;
+        }
+    };
+    
+    // PRODUCTION: Real CRYSTALS-Dilithium3 verification using pqcrypto
+    match dilithium3::open(&signed_message, &public_key) {
+        Ok(recovered_message) => {
+            // Verify recovered message matches expected
+            let expected_msg = message.as_bytes();
+            let expected_with_prefix = format!("{}:{}", node_id, message);
+            
+            if recovered_message == expected_msg || recovered_message == expected_with_prefix.as_bytes() {
+                println!("[CONSENSUS] ✅ Dilithium3 signature VERIFIED (quantum-resistant)");
+                println!("[CONSENSUS] ✅ Message integrity confirmed");
+                println!("[CONSENSUS] ✅ Public key: {}...", hex::encode(&public_key_bytes[..8]));
+                return true;
+            } else {
+                println!("[CONSENSUS] ❌ Message mismatch after verification");
+                println!("[CONSENSUS]    Expected: {}", message);
+                println!("[CONSENSUS]    Recovered: {} bytes", recovered_message.len());
+                return false;
+            }
+        }
+        Err(_) => {
+            println!("[CONSENSUS] ❌ Dilithium3 signature verification FAILED");
+            println!("[CONSENSUS]    Possible reasons: forged signature, wrong key, tampered data");
+            return false;
+        }
+    }
 }

@@ -222,8 +222,12 @@ pub struct Transaction {
     /// Timestamp
     pub timestamp: u64,
     
-    /// Signature
+    /// Signature (Ed25519 or Hybrid format)
     pub signature: Option<String>,
+    
+    /// Public key for signature verification (Ed25519 32 bytes, hex encoded)
+    /// Required for client transactions to verify signature
+    pub public_key: Option<String>,
     
     /// Transaction type
     pub tx_type: TransactionType,
@@ -311,6 +315,7 @@ impl Transaction {
             gas_limit,
             timestamp,
             signature,
+            public_key: None, // Optional: Set by client for Ed25519 verification
             tx_type,
             data,
         };
