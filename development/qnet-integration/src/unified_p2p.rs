@@ -8366,12 +8366,12 @@ impl SimplifiedP2P {
         signature_bytes == expected_prefix.as_slice()
     }
     
-    /// Update node reputation by delta (+1 for heartbeat, -1 for missed)
+    /// Update node reputation by delta (general purpose)
+    /// NOTE: Heartbeats do NOT change reputation - only used for eligibility check
     /// WHITEPAPER: Light nodes have FIXED reputation of 70 - never changes
     pub fn update_reputation_by_delta(&self, node_id: &str, delta: f64) {
         // CRITICAL: Light nodes have fixed reputation of 70 - skip any changes
         if node_id.starts_with("light_") {
-            // Light nodes: reputation is always 70, no changes allowed
             return;
         }
         
@@ -8379,12 +8379,32 @@ impl SimplifiedP2P {
         let current = reputation_sys.get_reputation(node_id);
         let new_rep = (current + delta).clamp(0.0, 100.0);
         reputation_sys.set_reputation(node_id, new_rep);
-        
-        if delta > 0.0 {
-            println!("[REPUTATION] ⬆️ {} reputation: {:.1} → {:.1}", node_id, current, new_rep);
-        } else {
-            println!("[REPUTATION] ⬇️ {} reputation: {:.1} → {:.1}", node_id, current, new_rep);
+    }
+    
+    /// PASSIVE RECOVERY: +1% for nodes in recovery zone (10-69%)
+    /// - Only applies to Full/Super nodes with reputation 10 <= rep < 70
+    /// - Caps at 70 (consensus threshold) - nodes must earn higher through consensus participation
+    /// - Light nodes: EXCLUDED (fixed at 70)
+    /// - Banned nodes (<10): EXCLUDED (no passive recovery)
+    /// SCALABILITY: O(1) per node, called once per 4 hours
+    pub fn apply_passive_recovery(&self, node_id: &str) -> bool {
+        // CRITICAL: Light nodes have fixed reputation of 70 - skip
+        if node_id.starts_with("light_") {
+            return false;
         }
+        
+        let mut reputation_sys = self.reputation_system.lock().unwrap();
+        let current = reputation_sys.get_reputation(node_id);
+        
+        // Only recover nodes in range [10, 70)
+        if current >= 10.0 && current < 70.0 {
+            // +1% absolute, capped at 70 (consensus threshold)
+            let new_rep = (current + 1.0).min(70.0);
+            reputation_sys.set_reputation(node_id, new_rep);
+            return true;
+        }
+        
+        false
     }
     
     /// Get peer address by node ID for heartbeat

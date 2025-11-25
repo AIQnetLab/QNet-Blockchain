@@ -1,65 +1,12 @@
 apply plugin: "com.android.application"
 apply plugin: "org.jetbrains.kotlin.android"
 
-// Conditionally apply React Native if available (after npm ci)
-def reactNativeGradle = file("../../node_modules/react-native/react.gradle")
-if (reactNativeGradle.exists()) {
-    apply from: reactNativeGradle
-    println("✅ React Native applied from node_modules")
-} else {
-    println("⚠️  React Native not found - building without RN (expected before npm ci)")
+// Apply React Native plugin if available
+def rnCliGradle = file("../../node_modules/@react-native-community/cli-platform-android/native_modules.gradle")
+if (rnCliGradle.exists()) {
+    apply from: rnCliGradle
+    println("✅ React Native CLI plugin applied")
 }
-
-/**
- * This is the configuration block to customize your React Native Android app.
- * By default you don't need to apply any configuration, just uncomment the lines you need.
- */
-if (project.hasProperty('react')) {
-react {
-    /* Folders */
-    //   The root of your project, i.e. where "package.json" lives. Default is '../..'
-    // root = file("../../")
-    //   The folder where the react-native NPM package is. Default is ../../node_modules/react-native
-    // reactNativeDir = file("../../node_modules/react-native")
-    //   The folder where the react-native Codegen package is. Default is ../../node_modules/@react-native/codegen
-    // codegenDir = file("../../node_modules/@react-native/codegen")
-    //   The cli.js file which is the React Native CLI entrypoint. Default is ../../node_modules/react-native/cli.js
-    // cliFile = file("../../node_modules/react-native/cli.js")
-
-    /* Variants */
-    //   The list of variants to that are debuggable. For those we're going to
-    //   skip the bundling of the JS bundle and the assets. By default is just 'debug'.
-    //   If you add flavors like lite, prod, etc. you'll have to list your debuggableVariants.
-    // debuggableVariants = ["liteDebug", "prodDebug"]
-
-    /* Bundling */
-    //   A list containing the node command and its flags. Default is just 'node'.
-    // nodeExecutableAndArgs = ["node"]
-    //
-    //   The command to run when bundling. By default is 'bundle'
-    // bundleCommand = "ram-bundle"
-    //
-    //   The path to the CLI configuration file. Default is empty.
-    // bundleConfig = file(../rn-cli.config.js)
-    //
-    //   The name of the generated asset file containing your JS bundle
-    // bundleAssetName = "MyApplication.android.bundle"
-    //
-    //   The entry file for bundle generation. Default is 'index.android.js' or 'index.js'
-    // entryFile = file("../js/MyApplication.android.js")
-    //
-    //   A list of extra flags to pass to the 'bundle' commands.
-    //   See https://github.com/react-native-community/cli/blob/main/docs/commands.md#bundle
-    // extraPackagerArgs = []
-
-    /* Hermes Commands */
-    //   The hermes compiler command to run. By default it is 'hermesc'
-    // hermesCommand = "$rootDir/my-custom-hermesc/bin/hermesc"
-    //
-    //   The list of flags to pass to the Hermes compiler. By default is "-O", "-output-source-map"
-    // hermesFlags = ["-O", "-output-source-map"]
-}
-} // Close if (project.hasProperty('react'))
 
 /**
  * Set this to true to Run Proguard on Release builds to minify the Java bytecode.
@@ -68,14 +15,6 @@ def enableProguardInReleaseBuilds = true
 
 /**
  * The preferred build flavor of JavaScriptCore (JSC)
- *
- * For example, to use the international variant, you can use:
- * `def jscFlavor = io.github.react-native-community:jsc-android-intl:2026004.+`
- *
- * The international variant includes ICU i18n library and necessary data
- * allowing to use e.g. `Date.toLocaleString` and `String.localeCompare` that
- * give correct results when using with locales other than en-US. Note that
- * this variant is about 6MiB larger per architecture than default.
  */
 def jscFlavor = 'io.github.react-native-community:jsc-android:2026004.+'
 
@@ -100,6 +39,12 @@ android {
         versionCode 8
         versionName "1.0.7"
     }
+    
+    // Generate BuildConfig
+    buildFeatures {
+        buildConfig true
+    }
+    
     signingConfigs {
         debug {
             storeFile file('debug.keystore')
@@ -157,32 +102,25 @@ dependencies {
     implementation 'com.google.android.material:material:1.11.0'
     implementation 'androidx.core:core-ktx:1.12.0'
     
-    // React Native dependencies - conditional based on node_modules availability
-    if (reactNativeGradle.exists()) {
-        // Normal build: React Native from node_modules
-        // The version of react-native is set by the React Native Gradle Plugin
-        implementation("com.facebook.react:react-android")
-
-        // Check hermesEnabled only if react.gradle is applied (defines this property)
-        if (project.hasProperty('hermesEnabled') && hermesEnabled.toBoolean()) {
-            implementation("com.facebook.react:hermes-android")
-        } else {
-            implementation jscFlavor
-        }
+    // React Native
+    implementation 'com.facebook.react:react-android:0.81.4'
+    implementation 'com.facebook.soloader:soloader:0.11.0'
+    
+    // Hermes engine
+    if (rootProject.ext.hermesEnabled) {
+        implementation 'com.facebook.react:hermes-android:0.81.4'
     } else {
-        // F-Droid build: Download React Native from Maven Central
-        // This happens when Gradle configuration runs before prebuild installs node_modules
-        println("⚠️  React Native not in node_modules - using Maven dependencies for F-Droid")
-        implementation 'com.facebook.react:react-android:0.81.4'  // Match package.json version
-        implementation 'com.facebook.soloader:soloader:0.11.0'
-        
-        // Use JSC since Hermes requires react.gradle for proper configuration
         implementation jscFlavor
     }
     
     // Firebase
     implementation platform('com.google.firebase:firebase-bom:32.7.0')
     implementation 'com.google.firebase:firebase-messaging'
+}
+
+// Apply native modules if available
+if (rnCliGradle.exists()) {
+    applyNativeModulesAppBuildGradle(project)
 }
 
 // Apply Google Services plugin at the bottom

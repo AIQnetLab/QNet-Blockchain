@@ -1,4 +1,4 @@
-# QNet v2.19 - Quick Reference Guide
+# QNet v2.19.4 - Quick Reference Guide
 
 ## 📚 Key Concepts
 
@@ -16,11 +16,22 @@
 | **Full** | 12KB | Macroblocks (low frequency) | Embedded |
 
 ### Node Types
-| Type | Consensus | Storage | Bandwidth | Target |
-|------|-----------|---------|-----------|--------|
-| **Light** | ❌ No | Minimal | Low | Mobile, IoT |
-| **Full** | ⚠️ Partial | Full chain | Medium | Validators |
-| **Super** | ✅ Always | Full + history | High | Producers |
+| Type | Consensus | Storage | Bandwidth | Target | Reputation | PoH |
+|------|-----------|---------|-----------|--------|------------|-----|
+| **Light** | ❌ No | Minimal | Low | Mobile, IoT | Fixed 70 | ❌ No |
+| **Full** | ⚠️ Partial | Full chain | Medium | Validators | Variable | ✅ Yes |
+| **Super** | ✅ Always | Full + history | High | Producers | Variable | ✅ Yes |
+
+### Proof of History (PoH)
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| **Hash Rate** | 500K/sec | SHA3-512 (25%) + Blake3 (75%) |
+| **Tick Duration** | 10ms | 100 ticks per second |
+| **Hashes per Tick** | 5,000 | 500K / 100 = 5,000 |
+| **Hashes per Slot** | 500,000 | 1-second microblock alignment |
+| **Checkpoint Interval** | 1M hashes | ~2 seconds |
+| **Max Drift** | 5% | Auto-warning on clock drift |
+| **Node Types** | Full/Super only | Light nodes excluded (battery saving) |
 
 ## 🔄 Progressive Finalization Protocol (PFP)
 
@@ -98,8 +109,9 @@ Consensus Layer (consensus_crypto.rs)
 ### Caching
 - **Capacity**: 100,000 certificates
 - **Eviction**: LRU (Least Recently Used)
-- **Lifetime**: 1 hour
-- **Rotation**: 80% lifetime (~48 minutes)
+- **Lifetime**: 4.5 minutes (270 seconds)
+- **Rotation**: 80% lifetime (216 seconds)
+- **Cache TTL**: 9 minutes (2× lifetime for grace period)
 
 ## 🔄 Block Buffering
 
@@ -123,6 +135,49 @@ Handles out-of-order block arrival in gossip P2P network while preventing memory
 | **network_score** | Peer prioritization | No threshold | Timeouts (-2), Fast response (+3) |
 
 **Key**: Network timeouts DON'T affect Byzantine eligibility!
+
+### Light Node Reputation (Fixed)
+- Light nodes ALWAYS have reputation = 70
+- Cannot be changed by any events
+- Rationale: Mobile devices have unstable connectivity
+
+### Light Node Ping System
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| **Shards** | 256 | 100K Light nodes per shard |
+| **Max Light Nodes** | 25.6M | 256 × 100K |
+| **Ping Method** | FCM Push | Firebase Cloud Messaging V1 API |
+| **Pinger Selection** | Deterministic | Primary + 2 Backups per Light node |
+| **Slot Duration** | 1 minute | 240 slots per 4-hour window |
+| **Challenge-Response** | Dilithium signed | Light node signs random challenge |
+| **Attestation** | Dual signature | Light + Pinger signatures |
+| **FCM Rate Limit** | 500/sec | Google API compliance |
+
+## 💰 Reward System
+
+### Three Pools
+| Pool | Source | Distribution |
+|------|--------|--------------|
+| **Pool 1** | Base Emission | Equal share to ALL eligible nodes |
+| **Pool 2** | Transaction Fees | 70% Super / 30% Full / 0% Light |
+| **Pool 3** | Activation Bonus | Phase 2 only (1DEV burns) |
+
+### Lazy Rewards
+- Rewards accumulate automatically every 4 hours
+- Claim anytime via `/api/v1/rewards/claim`
+- No missed windows, no gas wars
+
+### Eligibility
+| Node Type | Ping Requirement | Reputation |
+|-----------|------------------|------------|
+| **Light** | 1+ attestation per window | Any (fixed 70) |
+| **Full** | 8+ heartbeats (80%) | ≥ 70% |
+| **Super** | 9+ heartbeats (90%) | ≥ 70% |
+
+### Halving Schedule
+- Years 0-20: Normal halving (÷2 every 4 years)
+- Year 20-24: Sharp drop (÷10)
+- Year 24+: Resume normal halving
 
 ### Peer Blacklist
 
@@ -256,15 +311,33 @@ Node Bandwidth:  ~700 Kbps average
 
 ## 🚀 Quick Commands
 
-### Build
+### Build Docker Image
 ```bash
-cargo build --release --no-default-features
+docker build -f development/qnet-integration/Dockerfile.production -t qnet-production .
 ```
 
-### Run Super Node
+### Run Genesis Node (Production)
 ```bash
-QNET_BOOTSTRAP_ID=001 QNET_NODE_TYPE=super cargo run --release
+# On server with IP matching QNET_BOOTSTRAP_ID (001-005)
+docker run -d --name qnet-genesis-001 --restart=always \
+  -e QNET_PRODUCTION=1 \
+  -e QNET_BOOTSTRAP_ID=001 \
+  -e DOCKER_ENV=1 \
+  -e QNET_AGGRESSIVE_PRUNING=0 \
+  -e QNET_MAX_STORAGE_GB=2000 \
+  -p 9876:9876 -p 9877:9877 -p 8001:8001 \
+  -v $(pwd)/genesis_001_data:/app/data \
+  qnet-production
 ```
+
+### Genesis Node IPs (Hardcoded)
+| Node | IP | Region |
+|------|-----|--------|
+| 001 | 154.38.160.39 | North America |
+| 002 | 62.171.157.44 | Europe |
+| 003 | 161.97.86.81 | Europe |
+| 004 | 5.189.130.160 | Europe |
+| 005 | 162.244.25.114 | Europe |
 
 ### Check Compilation
 ```bash
@@ -279,9 +352,24 @@ const ROTATION_INTERVAL_BLOCKS: u64 = 30;      // Producer rotation
 const MACROBLOCK_INTERVAL: u64 = 90;           // Macroblock creation
 const FINALITY_WINDOW: u64 = 10;               // Blocks for finality
 const MAX_VALIDATORS_PER_ROUND: usize = 1000;  // Consensus limit
-const CERTIFICATE_LIFETIME_SECS: u64 = 3600;   // 1 hour
+const CERTIFICATE_LIFETIME_SECS: u64 = 270;    // 4.5 minutes
 const MAX_CACHE_SIZE: usize = 100000;          // Certificate cache
 const MAX_PENDING_BLOCKS: usize = 100;         // Block buffer limit
+
+// PoH constants (quantum_poh.rs)
+const HASHES_PER_TICK: u64 = 5_000;            // Hashes per 10ms tick
+const TICK_DURATION_US: u64 = 10_000;          // 10ms = 10,000 microseconds
+const HASHES_PER_SLOT: u64 = 500_000;          // 500K hashes = 1 second
+const MAX_DRIFT_PERCENT: f64 = 0.05;           // 5% clock drift tolerance
+const MAX_ACCEPTABLE_DRIFT: u64 = 50_000_000;  // 50M hashes max resync
+
+// Reward system constants
+const EMISSION_INTERVAL_BLOCKS: u64 = 14400;   // 4 hours (1 block/sec)
+const INITIAL_POOL1_EMISSION: u64 = 251_432;   // QNC per 4-hour window
+const PING_SHARDS: u8 = 256;                   // Light node shards
+const MAX_LIGHT_NODES_PER_SHARD: usize = 100_000;
+const HEARTBEATS_PER_WINDOW: u8 = 10;          // Full/Super heartbeats
+const GRACE_PERIOD_SECS: u64 = 180;            // 3 minutes
 ```
 
 ## 🔗 Documentation

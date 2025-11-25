@@ -1,8 +1,8 @@
 # QNet Cryptography Implementation Guide
 ## Complete Technical Specification
 
-**Version:** 2.0 (v2.19.3)  
-**Date:** November 23, 2025  
+**Version:** 2.1 (v2.19.4)  
+**Date:** November 25, 2025  
 **Status:** Production Ready  
 
 ---
@@ -454,11 +454,49 @@ if drift.abs() > MAX_DRIFT_PERCENT {
 
 ---
 
-## 1.3 Ping Commitment Cryptography (v2.19.0)
+## 1.3 Ping Commitment Cryptography (v2.19.4)
 
 ### Overview
 
 QNet implements a **Hybrid Merkle + Sampling** architecture for on-chain ping commitments, providing scalability and transparency for emission validation.
+
+### Light Node Attestations
+
+Light nodes are pinged by Full/Super nodes and respond with Ed25519 signatures:
+
+```rust
+struct LightNodeAttestation {
+    light_node_id: String,
+    pinger_node_id: String,
+    slot: u64,
+    timestamp: u64,
+    light_node_signature: Vec<u8>,      // Ed25519 (64 bytes) - Light node signs challenge
+    pinger_dilithium_signature: String, // Dilithium (2420 bytes) - Pinger attests
+}
+```
+
+**Dual Signature Requirement**:
+- Light node signs the challenge with Ed25519 (proves liveness)
+- Pinger signs the attestation with Dilithium (proves observation)
+
+### Full/Super Node Heartbeats
+
+Full/Super nodes self-attest via heartbeats:
+
+```rust
+struct FullNodeHeartbeat {
+    node_id: String,
+    node_type: String,      // "full" or "super"
+    heartbeat_index: u8,    // 0-9 (10 per 4-hour window)
+    timestamp: u64,
+    dilithium_signature: String, // Dilithium (2420 bytes)
+}
+```
+
+**Eligibility Requirements**:
+- Full nodes: 8+ heartbeats (80% success rate)
+- Super nodes: 9+ heartbeats (90% success rate)
+- Reputation ≥ 70% required
 
 ### Hash Algorithm Selection
 
@@ -892,7 +930,7 @@ pub struct HybridSignature {
         ed25519_public_key: [u8; 32],        // Ephemeral key
         dilithium_signature: String,          // Signs encapsulated data
         issued_at: u64,
-        expires_at: u64,                      // 60-second lifetime
+        expires_at: u64,                      // 270-second lifetime (4.5 minutes)
         serial_number: String,
     },
     message_signature: [u8; 64],             // Ed25519 signs message (fast)
@@ -1219,7 +1257,7 @@ let key = hasher.finalize(); // 256-bit AES key
 |--------|-----------|------------|
 | **Shor's Algorithm** | Factor RSA/ECC | Dilithium (lattice-based) ✅ |
 | **Grover's Algorithm** | Hash search | SHA3-512 (512→256 bit) ✅ |
-| **Quantum Replay** | Reuse signatures | Ephemeral keys (1h rotation) ✅ |
+| **Quantum Replay** | Reuse signatures | Ephemeral keys (4.5min rotation) ✅ |
 
 #### Classical Threats
 
@@ -1228,7 +1266,7 @@ let key = hasher.finalize(); // 256-bit AES key
 | **Signature Forgery** | Dilithium + Ed25519 | Dual signatures |
 | **Key Extraction** | AES-256-GCM | Encrypted storage |
 | **Byzantine Attacks** | No caching | Full verification |
-| **Replay Attacks** | Timestamps + expiry | 60-second window |
+| **Replay Attacks** | Timestamps + expiry | 270-second window (certificate lifetime) |
 | **MITM** | Encapsulated keys | NIST/Cisco standard |
 
 ### 5.2 Certificate Security (v2.19.0)
@@ -1249,7 +1287,7 @@ QNet implements comprehensive protection against certificate forgery and replay 
 ┌─────────────────────────────────────────────────────────┐
 │  Layer 2: Age Verification (Replay Protection)          │
 ├─────────────────────────────────────────────────────────┤
-│  MAX_CERT_AGE = 7200s (2 hours)                         │
+│  MAX_CERT_AGE = 540s (9 minutes = 2× certificate lifetime) │
 │  if cert_age > MAX_CERT_AGE {                           │
 │      ❌ REJECT (replay attack detected)                 │
 │  }                                                       │
@@ -1381,15 +1419,14 @@ Certificate TTL: 9 minutes (540s cache retention, 2× lifetime)
 Producer Rotation: 30 blocks = 30 seconds
 Max Validators: 1000 (architectural limit)
 
-Active Certificates per Hour:
-- 1000 validators × 1 cert/hour = 1000 certs
-- With 4-hour TTL: 1000 × 4 = 4000 max active
-- Buffer (20%): 4000 × 1.25 = 5000 cache size ✅
+Active Certificates per 9-minute TTL window:
+- 1000 validators × ~2 certs per 9 min = 2000 certs max
+- Buffer (20%): 2000 × 2.5 = 5000 cache size ✅
 
 Network Scale Test:
 - 5 bootstrap nodes → 100% cached (5 certs)
 - 1,000 nodes → 100% cached (1000 certs, max validators)
-- 1,000,000 nodes → 0.5% cached (1000 sampled validators)
+- 1,000,000 nodes → 0.1% cached (1000 sampled validators)
 - 100,000,000 nodes → 0.001% cached (still 1000 validators)
 
 Conclusion: O(1) scaling regardless of network size

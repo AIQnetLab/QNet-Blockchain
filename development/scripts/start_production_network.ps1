@@ -3,8 +3,8 @@
 
 param(
     [int]$NodeCount = 8,
-    [int]$StartPort = 9876,
-    [switch]$SkipValidation = $false
+    [int]$StartPort = 9876
+    # REMOVED: SkipValidation - all transactions MUST be validated in production
 )
 
 Write-Host "=== Starting QNet Production Network with $NodeCount nodes ===" -ForegroundColor Green
@@ -40,10 +40,8 @@ $env:QNET_P2P_COMPRESSION = "1"
 $env:QNET_HIGH_THROUGHPUT = "1"
 $env:QNET_CREATE_EMPTY_BLOCKS = "1"
 
-if ($SkipValidation) {
-    $env:QNET_SKIP_VALIDATION = "1"
-    Write-Host "VALIDATION SKIPPED - TEST MODE ONLY" -ForegroundColor Red
-}
+# PRODUCTION: All transactions are ALWAYS validated (signature, balance, nonce)
+# No skip_validation option - removed for security
 
 # Display configuration
 Write-Host "`nProduction Configuration:" -ForegroundColor Green

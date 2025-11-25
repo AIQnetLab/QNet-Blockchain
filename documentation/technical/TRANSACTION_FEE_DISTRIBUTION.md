@@ -94,33 +94,40 @@ pub struct FeeAccumulator {
 5. **Batch Distribution**: Send rewards in a single transaction to minimize overhead
 6. **Reset Accumulator**: Start new collection period
 
-### Node Eligibility Requirements
+### Node Eligibility Requirements (v2.19.4)
 
 **Full Nodes must maintain:**
-- 95% uptime over the last 24 hours
+- 8+ heartbeats per 4-hour window (80% success rate of 10 heartbeats)
+- Reputation score ≥ 70%
 - Full blockchain sync (within 10 blocks of tip)
-- Minimum 100 Mbps network bandwidth
 - Open P2P ports for network connectivity
 
 **Super Nodes must maintain:**
-- 99% uptime over the last 24 hours
+- 9+ heartbeats per 4-hour window (90% success rate of 10 heartbeats)
+- Reputation score ≥ 70%
 - Full archival blockchain data
-- Minimum 1 Gbps network bandwidth
-- Public API endpoints with < 100ms latency
-- Additional services (block explorer API, historical data, etc.)
+- Public API endpoints
+- Block production capability
 
-### Uptime Monitoring
+**Light Nodes:**
+- 1+ attestation per 4-hour window (pinged by Full/Super nodes)
+- Reputation fixed at 70 (immutable)
+- Receive Pool 1 only (0% of transaction fees)
+
+### Heartbeat System (v2.19.4)
 ```rust
-pub struct NodeMonitor {
-    /// Node health checks every 5 minutes
-    pub check_interval: u64,
-    
-    /// Minimum checks passed for eligibility (95% = 273/288 daily checks)
-    pub min_checks_full_node: u32,
-    
-    /// Minimum checks passed for super node (99% = 285/288 daily checks)
-    pub min_checks_super_node: u32,
+pub struct FullNodeHeartbeat {
+    node_id: String,
+    node_type: String,      // "full" or "super"
+    heartbeat_index: u8,    // 0-9 (10 per 4-hour window)
+    timestamp: u64,
+    dilithium_signature: String,
 }
+
+// Eligibility check
+const HEARTBEATS_PER_WINDOW: u8 = 10;
+const FULL_NODE_MIN_HEARTBEATS: u8 = 8;   // 80%
+const SUPER_NODE_MIN_HEARTBEATS: u8 = 9;  // 90%
 ```
 
 ## Benefits of 4-Hour Distribution

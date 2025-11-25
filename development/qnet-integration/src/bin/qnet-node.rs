@@ -2796,6 +2796,9 @@ fn configure_production_mode() {
     // Server device type validation
     println!("🖥️  Configuring production mode for server deployment...");
     
+    // PRODUCTION: All transactions are ALWAYS validated (signature, balance, nonce)
+    // No skip_validation option exists - removed for security
+    
     // Always enable microblocks for production
     std::env::set_var("QNET_ENABLE_MICROBLOCKS", "1");
     std::env::set_var("QNET_MICROBLOCK_DEFAULT", "1");

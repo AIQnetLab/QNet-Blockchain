@@ -3,8 +3,8 @@
 
 **⚠️ EXPERIMENTAL BLOCKCHAIN RESEARCH ⚠️**
 
-**Version**: 2.19.3-experimental  
-**Date**: November 23, 2025  
+**Version**: 2.19.4-experimental  
+**Date**: November 25, 2025  
 **Authors**: QNet Research Team  
 **Status**: Experimental Research Project  
 **Goal**: To prove that one person without multi-million investments can create an advanced blockchain
@@ -799,18 +799,20 @@ COMBINED REPUTATION (Peer Selection):
   └── 70% consensus_score + 30% network_score
 ```
 
-**Ping-based participation (every 4 hours):**
+**Ping/Heartbeat-based participation (every 4 hours) - v2.19.4:**
 
 ```
 Response requirements:
-├── Light Nodes: 100% (binary: responded in current 4h window or not)
-├── Full Nodes: 80% (8+ out of 10 pings in current window)
-└── Super Nodes: 90% (9+ out of 10 pings in current window)
+├── Light Nodes: 1+ attestation per window (pinged by Full/Super via FCM push)
+├── Full Nodes: 80% (8+ out of 10 heartbeats in current window)
+└── Super Nodes: 90% (9+ out of 10 heartbeats in current window)
 
-Ping architecture:
-├── Light: Network pings mobile device → rewards
-├── Full/Super: Network pings server directly → rewards  
-└── Mobile monitoring: viewing only, no pings
+Architecture (v2.19.4):
+├── Light: Full/Super nodes ping via FCM V1 API → Light signs challenge → attestation
+├── Full/Super: Self-attest via Dilithium-signed heartbeats (10 per 4h window)
+├── 256-shard system: Light nodes assigned to shards based on SHA3-256(node_id)[0]
+├── Light node reputation: Fixed at 70 (immutable, not affected by events)
+└── Mobile monitoring: viewing only, no attestations
 ```
 
 **Real threshold values:**
@@ -1182,16 +1184,15 @@ Emission Schedule (6 periods/day × 365 days/year):
 **Pool #1 - Base Emission Rewards:**
 ```
 Source: Network inflation (sharp drop halving schedule)
-Distribution: All active nodes proportionally
+Distribution: EQUALLY divided among ALL eligible nodes (Light + Full + Super)
 Current Rate: 251,432.34 QNC per 4-hour period (Years 0-4)
 Eligibility (NEW rewards): 
-├── ALL Node Types: Reputation ≥70 (network pings you → NEW rewards)
-├── Light Nodes: Do NOT participate in consensus
-├── Full Nodes: Participate in consensus (reputation ≥70 required)
-└── Super Nodes: Participate in consensus (reputation ≥70 required)
+├── Light Nodes: 1+ attestation per window + reputation = 70 (fixed)
+├── Full Nodes: 8+ heartbeats (80%) + reputation ≥70
+└── Super Nodes: 9+ heartbeats (90%) + reputation ≥70
 Claim OLD rewards: No reputation requirement (only wallet ownership, even if banned)
 Next Halving: Year 4 (reduces to 125,716.17 QNC)
-Distribution Formula: Individual_Reward = (Pool_Total / Active_Nodes) × Node_Weight
+Distribution Formula: Individual_Reward = Pool_Total / Eligible_Node_Count (EQUAL share)
 Validation: Bitcoin-style deterministic rules (no central authority)
 ```
 
@@ -1229,17 +1230,17 @@ Determinism Level: ⚠️ PARTIAL (by design)
 ```
 Source: Network transaction fees
 Distribution Split:
-├── 70% to Super Nodes (network backbone)
-├── 30% to Full Nodes (validation support)
+├── 70% to Super Nodes (divided equally among all eligible Super nodes)
+├── 30% to Full Nodes (divided equally among all eligible Full nodes)
 └── 0% to Light Nodes (no transaction processing)
 Eligibility (NEW rewards): 
-├── Full Nodes: Active transaction processing + Reputation ≥70 (network pings)
-└── Super Nodes: Active transaction processing + Reputation ≥70 (network pings)
+├── Full Nodes: 8+ heartbeats (80%) + reputation ≥70
+└── Super Nodes: 9+ heartbeats (90%) + reputation ≥70
 Claim OLD rewards: No reputation requirement (only wallet ownership, even if banned)
 Dynamic Scaling: Increases with network usage
 ```
 
-**Pool #3 - Activation Pool (Critical Innovation):**
+**Pool #3 - Activation Pool (Critical Innovation, Phase 2 only):**
 ```
 Source: ALL node activation fees in Phase 2
 Mechanism: 
@@ -1249,9 +1250,9 @@ Mechanism:
 └── Distribution happens every 4 hours
 Distribution: Equal share to all eligible nodes
 Eligibility (NEW rewards): 
-├── ALL Node Types: Reputation ≥70 (network pings you → NEW rewards)
-├── Light Nodes: Do NOT participate in consensus
-└── Full/Super Nodes: Participate in consensus
+├── Light Nodes: 1+ attestation per window + reputation = 70 (fixed)
+├── Full Nodes: 8+ heartbeats (80%) + reputation ≥70
+└── Super Nodes: 9+ heartbeats (90%) + reputation ≥70
 Claim OLD rewards: No reputation requirement (only wallet ownership, even if banned)
 Innovation: Every new node activation benefits the entire network
 ```
@@ -1312,23 +1313,23 @@ Reputation System Benefits:
 ├── Fair Distribution: Small holders can participate equally
 └── Energy Efficient: Behavior-based trust vs computational proof
 
-Reputation Score Mechanics:
-├── Light Nodes: No reputation system (mobile devices)
+Reputation Score Mechanics (v2.19.4):
+├── Light Nodes: Fixed at 70 (immutable, always eligible for rewards)
 ├── Full/Super Initial Score: 70 points (consensus minimum)
 ├── Full/Super Range: 0-100 points
-├── Success Bonus: +1 per successful ping (Full/Super only)
-├── Failure Penalty: -1 per missed ping (Full/Super only)
+├── Heartbeats: NO reputation change (heartbeats only for eligibility check)
+├── Passive Recovery: +1% every 4 hours for Full/Super nodes in range [10, 70)
 └── Protocol Violations: -5 to -30 points (Full/Super only)
 
 Economic Thresholds:
-├── ALL Node Types: 70+ points required for NEW rewards (network pings)
-├── Light Nodes: Do NOT participate in consensus
-├── Full/Super: 70+ points required for consensus participation
-├── Full/Super: 10-69 points - network access only, no rewards
-└── Full/Super: <10 points - complete network ban
+├── Light Nodes: Fixed 70 reputation, 1+ attestation = eligible for Pool 1
+├── Full Nodes: 70+ points + 7+ heartbeats (70%) = eligible for Pool 1 + Pool 2
+├── Super Nodes: 70+ points + 9+ heartbeats (90%) = eligible for Pool 1 + Pool 2
+├── Full/Super: 10-69 points - network access only, no new rewards
+└── Full/Super: <10 points - complete network ban (can claim old rewards)
 
-Penalties by Violation Type:
-├── Missed Ping: -1.0 reputation
+Penalties by Violation Type (Full/Super only, Light nodes unaffected):
+├── Missed Heartbeat: NO penalty (heartbeats only for eligibility, not reputation)
 ├── Invalid Block: -5.0 reputation
 ├── Consensus Failure: -10.0 reputation
 ├── Extended Offline (24h+): -15.0 reputation
@@ -1353,43 +1354,78 @@ Restoration Features:
 └── Grace period: 24 hours before penalties begin
 ```
 
-### 7.6 Ping-Based Participation System
+### 7.6 Ping/Heartbeat Participation System (v2.19.4)
 
-**Network-Initiated Ping Architecture:**
+**Network-Initiated Ping Architecture (Light Nodes):**
 
 ```
 NOT MINING - Simple Network Health Check:
-├── Frequency: Every 4 hours
-├── Response Window: 60 seconds
-├── Computation: Zero (simple acknowledgment)
+├── Frequency: 1+ per 4-hour window (network pings Light nodes)
+├── Response Window: 3 minutes (grace period)
+├── Computation: Ed25519 signature (~20μs)
 ├── Battery Impact: <0.5% daily
 ├── Data Usage: <1MB daily
 └── CPU Usage: Negligible (like push notifications)
 
-Ping Distribution System:
-├── 240 time slots per 4-hour window (1 minute each)
-├── Deterministic slot assignment (based on node_id hash)
-├── Super Nodes: Priority slots 1-24 (10x frequency)
-├── Full/Light Nodes: All 240 slots (standard frequency)
-├── Multiple Device Support: Up to 3 devices per wallet
-└── Push Notifications: 5-minute advance warning
+256-Shard Ping System (v2.19.4):
+├── Light node ID → SHA3-256 → First byte → Shard (0-255)
+├── Each shard assigned to specific Full/Super nodes (deterministic)
+├── Pinger rotates every 4-hour window based on block entropy
+├── Max 100K Light nodes per shard (LRU eviction)
+├── FCM V1 API: OAuth2 + Service Account JSON authentication
+├── Rate limiting: 500 requests/second (FCM limit)
+└── Only Genesis nodes send FCM push notifications
+
+Light Node Attestation Structure:
+├── light_node_id: String
+├── pinger_node_id: String  
+├── light_node_signature: Ed25519 (64 bytes) - Light node signs challenge
+├── pinger_dilithium_signature: Dilithium (2420 bytes) - Pinger attests
+└── timestamp: u64
+```
+
+**Self-Attestation Architecture (Full/Super Nodes):**
+
+```
+Heartbeat System (v2.19.4):
+├── Frequency: 10 heartbeats per 4-hour window (~24 min apart)
+├── Self-attestation: Node signs own heartbeat with Dilithium
+├── Gossip: Heartbeats broadcast via P2P gossip protocol
+├── Storage: Persisted in RocksDB for reward calculation
+
+Heartbeat Structure:
+├── node_id: String
+├── node_type: "full" or "super"
+├── heartbeat_index: u8 (0-9)
+├── timestamp: u64
+└── dilithium_signature: String (2420 bytes)
 
 Response Requirements by Node Type:
-├── Light Nodes: 100% response rate (binary)
-├── Full Nodes: 80% success rate minimum
-└── Super Nodes: 90% success rate minimum
+├── Light Nodes: 1+ attestation per window (not 100%)
+├── Full Nodes: 80% success rate (8+ out of 10 heartbeats)
+└── Super Nodes: 90% success rate (9+ out of 10 heartbeats)
 
-Mobile Recovery Features:
-├── Offline <24h: Reputation preserved
+Light Node Reputation: Fixed at 70 (immutable by design)
+├── Mobile devices have unstable connectivity
+├── Network issues should not affect reward eligibility
+├── Light nodes don't participate in consensus
+└── Simplifies reward calculation
+```
+
+**Mobile Recovery Features:**
+```
+├── Offline <24h: Reputation preserved (grace period)
 ├── Offline 24h-365d: FREE restoration (7-day quarantine at 25 reputation)
 ├── Offline >365d: Requires paid reactivation
 ├── Restoration Limit: 10 free per 30 days
+```
 
-On-Chain Ping Commitment (SCALABLE):
+**On-Chain Ping Commitment (SCALABLE):**
+```
 ├── Hybrid Merkle + Sampling Architecture
-├── Local Storage: All pings stored off-chain
+├── Local Storage: All attestations/heartbeats stored in RocksDB
 ├── Every 4 hours: Producer creates PingCommitmentWithSampling transaction
-├── Merkle Root: 32-byte commitment to ALL pings
+├── Merkle Root: 32-byte commitment to ALL pings (parallel with rayon)
 ├── Deterministic Sampling: 1% of pings (minimum 10,000 samples)
 ├── Merkle Proofs: Verification for each sample
 ├── Entropy Source: Finalized block (FINALITY_WINDOW = 10 blocks)
@@ -2055,11 +2091,13 @@ Core Innovation:
 └── Energy-efficient consensus
 
 Reputation Scoring Matrix:
-├── Starting Score: 50 (neutral baseline)
-├── Success Actions: +1 per positive behavior
-├── Minor Failures: -1 to -2 points
-├── Major Violations: -5 to -30 points
-└── Recovery Rate: Gradual through consistent good behavior
+├── Starting Score: 70 (consensus threshold)
+├── Consensus Events: +2 to +5 per valid block/participation
+├── Minor Failures: -2 to -5 points (timeouts, connection issues)
+├── Major Violations: -20 to -50 points (invalid blocks, Byzantine behavior)
+├── Passive Recovery: +1% every 4 hours for Full/Super in range [10, 70) - capped at 70
+├── Recovery Time: 10% → 70% = 60 cycles × 4h = 240 hours = 10 days
+└── Heartbeats: NO reputation change (only for reward eligibility check)
 
 Security Thresholds:
 ├── 70+: Full consensus participation (Full/Super) + ALL node types NEW rewards

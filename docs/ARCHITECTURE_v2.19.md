@@ -1,8 +1,8 @@
 # QNet Blockchain Architecture v2.19
 ## Post-Quantum Decentralized Network - Technical Documentation
 
-**Last Updated**: November 23, 2025  
-**Version**: 2.19.3  
+**Last Updated**: November 25, 2025  
+**Version**: 2.19.4  
 **Status**: Production Ready
 
 ---
@@ -15,9 +15,10 @@
 5. [Progressive Finalization Protocol](#progressive-finalization-protocol)
 6. [Node Types and Scaling](#node-types-and-scaling)
 7. [Reputation System](#reputation-system)
-8. [MEV Protection & Priority Mempool](#mev-protection--priority-mempool)
-9. [Security Model](#security-model)
-10. [Performance Characteristics](#performance-characteristics)
+8. [Reward System](#reward-system)
+9. [MEV Protection & Priority Mempool](#mev-protection--priority-mempool)
+10. [Security Model](#security-model)
+11. [Performance Characteristics](#performance-characteristics)
 
 ---
 
@@ -389,6 +390,8 @@ Block 150: PFP Level 2
 - **Bandwidth**: Low (receive blocks, no validation)
 - **Target Users**: Mobile wallets, IoT devices
 - **Cryptography**: Ed25519 ONLY (no Dilithium)
+- **Reputation**: Fixed at 70 (immutable, not affected by network events)
+- **Rewards**: Eligible for Pool 1 base emission (equal share with all nodes)
 
 **Filtering**:
 ```rust
@@ -628,6 +631,34 @@ pub fn is_consensus_qualified(&self) -> bool {
 - **Full**: ✅ If `consensus_score` ≥ 70%
 - **Super**: ✅ If `consensus_score` ≥ 70%
 
+### Light Node Reputation (Fixed)
+
+**IMPORTANT**: Light node reputation is **always 70** and cannot be changed.
+
+```rust
+pub fn update_reputation_by_delta(&self, node_id: &str, delta: f64) {
+    if node_id.starts_with("light_") {
+        return; // Light nodes: reputation is always 70, no changes allowed
+    }
+    // ... rest of reputation update logic
+}
+
+pub fn set_node_reputation(&self, node_id: &str, reputation: f64) {
+    let final_reputation = if node_id.starts_with("light_") {
+        70.0 // Light nodes: always 70, ignore requested value
+    } else {
+        reputation
+    };
+    // ... rest of reputation set logic
+}
+```
+
+**Rationale**:
+- Light nodes are mobile devices (unstable connectivity)
+- Network issues should not affect reward eligibility
+- Light nodes don't participate in consensus (no Byzantine risk)
+- Simplifies reward calculation (no reputation tracking needed)
+
 ### Finality Window for Entropy
 
 **Problem**: Nodes at different heights causing false entropy mismatches
@@ -709,6 +740,262 @@ loop {
 - Sample size: O(log log n) - grows slowly with network size
 - Bandwidth: O(log n) - 1 KB (5 nodes) → 6 KB (1M nodes)
 - Latency: O(1) - constant regardless of network size
+
+---
+
+## Reward System
+
+### Overview
+
+QNet implements a **Phase-Aware Three-Pool Reward System** with lazy reward accumulation:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ REWARD POOLS (4-hour emission window)                       │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │ POOL 1: Base Emission                                │   │
+│  │ • 251,432 QNC per 4-hour window (initial)           │   │
+│  │ • Halving every 4 years (sharp drop at year 20)     │   │
+│  │ • Divided EQUALLY among ALL eligible nodes          │   │
+│  │ • Light + Full + Super all receive equal share      │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                                                              │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │ POOL 2: Transaction Fees                             │   │
+│  │ • 70% to Super nodes (divided equally among Super)  │   │
+│  │ • 30% to Full nodes (divided equally among Full)    │   │
+│  │ • 0% to Light nodes (don't process transactions)    │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                                                              │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │ POOL 3: Activation Bonus (Phase 2 only)             │   │
+│  │ • Funded by 1DEV token burns                        │   │
+│  │ • Distributed to newly activated nodes              │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Lazy Rewards
+
+**Key Feature**: Rewards accumulate automatically and can be claimed at any time.
+
+```rust
+// Rewards accumulate in pending_rewards (RocksDB)
+struct PendingReward {
+    node_id: String,
+    wallet_address: String,
+    pool1_base_emission: u64,
+    pool2_transaction_fees: u64,
+    pool3_activation_bonus: u64,
+    total_reward: u64,
+    last_updated: u64,
+}
+
+// User claims via API when ready
+POST /api/v1/rewards/claim
+{
+    "node_id": "light_abc123",
+    "wallet_address": "QNet...",
+    "signature": "ed25519_signature",
+    "public_key": "ed25519_pubkey"
+}
+```
+
+**Benefits**:
+- ✅ No missed reward windows
+- ✅ No gas wars for claiming
+- ✅ Claim when gas is cheap
+- ✅ Batch multiple windows
+
+### Ping/Attestation System (Light Nodes)
+
+**Architecture**: 256-shard deterministic pinging
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ SHARDED PING SYSTEM                                         │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│  Light Node ID → SHA3-256 → First byte → Shard (0-255)     │
+│                                                              │
+│  Each shard:                                                │
+│  • Assigned to specific Full/Super nodes (deterministic)   │
+│  • Pinger rotates every 4-hour window                      │
+│  • Max 100K Light nodes per shard (LRU eviction)           │
+│                                                              │
+│  Ping Flow:                                                 │
+│  1. Full/Super node sends FCM push to Light node           │
+│  2. Light node wakes, signs challenge with Ed25519         │
+│  3. Light node returns signed response                     │
+│  4. Full/Super creates attestation (dual Dilithium sigs)   │
+│  5. Attestation gossiped to network                        │
+│  6. Stored in RocksDB for reward calculation               │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Attestation Structure**:
+```rust
+struct LightNodeAttestation {
+    light_node_id: String,
+    pinger_node_id: String,
+    slot: u64,
+    timestamp: u64,
+    light_node_signature: Vec<u8>,    // Ed25519 (Light node)
+    pinger_dilithium_signature: String, // Dilithium (Pinger)
+}
+```
+
+**Eligibility**: Light node needs at least 1 successful attestation per 4-hour window.
+
+### Heartbeat System (Full/Super Nodes)
+
+**Architecture**: Self-attestation for Full/Super nodes
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ HEARTBEAT SYSTEM                                            │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│  Full/Super nodes send 10 heartbeats per 4-hour window     │
+│                                                              │
+│  Heartbeat Flow:                                            │
+│  1. Node creates heartbeat with current timestamp          │
+│  2. Signs with Dilithium (quantum-resistant)               │
+│  3. Broadcasts via P2P gossip                              │
+│  4. Other nodes verify and store                           │
+│  5. At reward time, count heartbeats per node              │
+│                                                              │
+│  Eligibility:                                               │
+│  • Full: 8+ heartbeats (80% success rate)                  │
+│  • Super: 9+ heartbeats (90% success rate)                 │
+│  • Reputation >= 70% required                              │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Heartbeat Structure**:
+```rust
+struct FullNodeHeartbeat {
+    node_id: String,
+    node_type: String,  // "full" or "super"
+    heartbeat_index: u8, // 0-9 (10 per window)
+    timestamp: u64,
+    dilithium_signature: String,
+}
+```
+
+### FCM Push Notifications (Light Nodes)
+
+**Architecture**: Only Genesis nodes send FCM notifications
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ FCM V1 API Integration                                      │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│  Authentication:                                            │
+│  • OAuth2 with Service Account JSON                        │
+│  • Access token cached for 55 minutes                      │
+│  • Environment: GOOGLE_APPLICATION_CREDENTIALS             │
+│                                                              │
+│  Rate Limiting:                                             │
+│  • 500 requests/second (FCM limit)                         │
+│  • Semaphore-based concurrency control                     │
+│                                                              │
+│  Message Format:                                            │
+│  {                                                          │
+│    "message": {                                             │
+│      "token": "device_fcm_token",                          │
+│      "data": {                                              │
+│        "type": "ping_challenge",                           │
+│        "node_id": "light_abc123",                          │
+│        "challenge": "random_challenge_string",             │
+│        "timestamp": "1700000000"                           │
+│      }                                                      │
+│    }                                                        │
+│  }                                                          │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Reward Calculation
+
+**Deterministic Merkle + Sampling**:
+
+```rust
+// STEP 1: Collect all attestations/heartbeats for window
+let attestations = storage.get_attestations_for_window(window_start);
+let heartbeats = storage.get_heartbeats_for_window(window_start);
+
+// STEP 2: Build Merkle tree (parallel with rayon)
+let ping_hashes: Vec<String> = all_pings.par_iter()
+    .map(|ping| ping.calculate_hash())  // blake3
+    .collect();
+let merkle_root = build_merkle_tree(&ping_hashes);
+
+// STEP 3: Deterministic sampling (SHA3-256 seed)
+let entropy_block = storage.load_microblock(current_height - FINALITY_WINDOW)?;
+let sample_seed = sha3_256(b"QNet_Ping_Sampling_v1" || entropy_block || window_start);
+let sampled_pings = deterministic_sample(&all_pings, sample_seed, SAMPLE_SIZE);
+
+// STEP 4: Calculate rewards per node
+let pool1_per_node = pool1_emission / eligible_nodes_count;
+let pool2_super = (pool2_fees * 70 / 100) / super_nodes_count;
+let pool2_full = (pool2_fees * 30 / 100) / full_nodes_count;
+
+// STEP 5: Store pending rewards (lazy accumulation)
+for node in eligible_nodes {
+    let reward = match node.node_type {
+        Light => pool1_per_node,
+        Full => pool1_per_node + pool2_full,
+        Super => pool1_per_node + pool2_super,
+    };
+    storage.save_pending_reward(&node.id, reward)?;
+}
+```
+
+### Halving Schedule
+
+| Years | Pool 1 Emission (per 4h) | Halving Factor |
+|-------|--------------------------|----------------|
+| 0-4 | 251,432 QNC | 1x |
+| 4-8 | 125,716 QNC | ÷2 |
+| 8-12 | 62,858 QNC | ÷2 |
+| 12-16 | 31,429 QNC | ÷2 |
+| 16-20 | 15,714 QNC | ÷2 |
+| **20-24** | **1,571 QNC** | **÷10 (sharp drop)** |
+| 24+ | Resume ÷2 | Normal halving |
+
+### Grace Period
+
+**3-minute grace period** before marking nodes offline:
+
+- Accounts for network latency
+- Prevents false negatives from temporary disconnects
+- Applied to both Light attestations and Full/Super heartbeats
+
+### Storage (RocksDB)
+
+| Data Type | Column Family | Retention |
+|-----------|---------------|-----------|
+| Light attestations | `attestations` | 4 hours + 1 window buffer |
+| Full/Super heartbeats | `heartbeats` | 4 hours + 1 window buffer |
+| Pending rewards | `pending_rewards` | Until claimed |
+| Reputation history | `reputation_history` | 30 days |
+
+### Scalability
+
+| Metric | Value | Notes |
+|--------|-------|-------|
+| Max Light nodes | 25.6M | 256 shards × 100K per shard |
+| Attestations per window | 240K+ | 1M Light nodes × 1 ping × 24% online |
+| Merkle tree depth | ~18 levels | log2(240K) |
+| Sample size | 1% (min 10K) | Statistically valid |
+| On-chain commitment | ~100 MB | vs 36 GB individual attestations |
 
 ---
 
@@ -1216,7 +1503,7 @@ Conclusion: Certificate memory remains ~7.5 MB regardless of network size
 | **Tracked Broadcast** | Immediate on rotation (Byzantine 2/3+) |
 | **Tracked Timeout** | 3s (≤10 peers), 5s (≤100 peers), 10s (1000 peers) |
 | **Periodic Broadcast** | Adaptive: 10s / 60s / 300s |
-| **Rotation Broadcast** | 80% lifetime (~48 minutes) |
+| **Rotation Broadcast** | 80% lifetime (216 seconds) |
 | **Cache Size** | 100,000 certificates |
 | **Eviction Policy** | LRU (Least Recently Used) |
 | **Certificate Lifetime** | 4.5 minutes (270 seconds = 3 macroblocks) |
@@ -1317,6 +1604,53 @@ QNet v2.19 implements a production-ready, post-quantum secure blockchain with:
 ---
 
 ## Version History
+
+### v2.19.4 (November 25, 2025)
+
+**Reward System Complete Implementation:**
+- Implemented sharded ping system (256 shards) for Light node pinging
+- Added deterministic pinger selection algorithm
+- Light node attestations with dual Dilithium signatures
+- Full/Super node heartbeats (10 per 4-hour window)
+- Grace period (3 minutes) before marking nodes offline
+- Lazy rewards accumulation for all node types
+- Parallel Merkle hashing with rayon
+
+**P2P & Gossip Enhancements:**
+- Light node registry gossip synchronization
+- Full/Super node registration gossip on API calls
+- Active node announcements broadcast
+- System events P2P broadcast (reorg, etc.)
+- LRU eviction for scalability (100K Light nodes max per shard)
+
+**Storage Improvements:**
+- Attestations persistence in RocksDB
+- Heartbeats persistence in RocksDB
+- Pending rewards persistence
+- Transaction indexing by address (tx_by_address CF)
+- Reputation history storage and cleanup
+
+**FCM V1 API Migration:**
+- Migrated from legacy FCM to V1 API
+- OAuth2 authentication with Service Account JSON
+- Access token caching (55 min TTL)
+- Rate limiting (500 req/sec)
+- Only Genesis nodes send FCM notifications
+
+**Mobile Integration:**
+- Firebase SDK integration (iOS + Android)
+- FCM message handling for ping challenges
+- Ping response with Ed25519 signature
+- Token refresh and registration
+
+**Fixes:**
+- Light node reputation fixed at 70 (immutable by design)
+- Removed all TODO/placeholder comments
+- Mempool error conversion implemented
+- Certificate request via P2P
+- Activation phase real logic (not placeholder)
+
+---
 
 ### v2.19.1 (November 22, 2025)
 

@@ -475,6 +475,21 @@ QNet implements advanced chain reorganization and synchronization mechanisms for
 - **Block Time Synchronization**: Sub-second precision across distributed network
 - **Historical Proof**: Cryptographic evidence of event ordering and timing
 - **Fork Prevention**: PoH creates immutable timeline making forks computationally expensive
+- **Node Type Optimization**: PoH runs ONLY on Full/Super nodes (Light nodes excluded to save mobile battery/CPU)
+- **Network Synchronization**: Local PoH syncs with network consensus on block receipt
+- **Checkpointing**: Automatic checkpoints every 1M hashes for fast node restart
+- **Drift Detection**: Automatic clock drift monitoring with 5% tolerance threshold
+
+### **Light Node Ping System (Sharded)**
+- **Scalability**: 256-shard system supports 25.6M+ Light nodes (100K per shard)
+- **Deterministic Pinger Selection**: Each Light node has Primary + 2 Backup pingers
+- **FCM Push Notifications**: Full/Super nodes send pings via Firebase Cloud Messaging
+- **Challenge-Response**: Light node signs random challenge to prove liveness
+- **Dual Signatures**: Attestation includes both Light node and Pinger Dilithium signatures
+- **Gossip Protocol**: Attestations propagated to all nodes for reward eligibility
+- **Rate Limiting**: 500 FCM requests/sec limit (Google API compliance)
+- **Slot-Based Deduplication**: One attestation per 1-minute slot per Light node
+- **Reward Eligibility**: Light nodes must respond to pings to receive Pool #3 rewards
 
 ### **Network Synchronization Metrics**
 - **Sync Speed**: Up to 10,000 blocks/second with parallel processing
@@ -531,7 +546,7 @@ QNet implements an economic reputation system that incentivizes network particip
 | **Lead Macroblock Consensus** | +10 | Every 90 seconds |
 | **Participate in Consensus** | +5 | Every 90 seconds |
 | **Emergency Producer** | +5 | On failover events |
-| **Successful Ping** | +1 | Every 4 hours |
+| **Successful Heartbeat** | +1 | Every 4 hours (Full/Super only) |
 
 ### **Reputation System (Atomic Rewards)**
 | Action | Penalty/Reward | Impact |
@@ -542,17 +557,17 @@ QNet implements an economic reputation system that incentivizes network particip
 | **Successful Macroblock Leader** | +10.0 | Consensus leadership |
 | **Successful Macroblock Participant** | +5.0 | Consensus participation |
 | **Failed Macroblock** | -30.0 | Consensus failure |
-| **Failed Ping** | -2.0 | Connection issue |
+| **Missed Heartbeat** | -1.0 | Connection issue (Full/Super only) |
 | **Double-Sign** | -50.0 | Byzantine fault |
 | **Emergency Producer** | +5.0 | Network service |
-| **Recovery Rate** | +0.7%/hour | ONLY if active (had ping) |
+| **Recovery Rate** | +0.7%/hour | ONLY if active (had heartbeat/attestation) |
 
 ### **Reputation Thresholds**
-- **70+ points**: Eligible for consensus participation (70% minimum)
-- **40+ points**: Eligible for rewards from all pools
-- **10-39 points**: Network access only, no rewards
-- **<10 points**: Network ban (7-day recovery period)
+- **70+ points**: Eligible for consensus participation AND rewards (70% minimum)
+- **10-69 points**: Network access only, no new rewards (can claim old accumulated rewards)
+- **<10 points**: Network ban (7-day recovery period, can still claim old rewards)
 - **Maximum**: 100 points (hard cap)
+- **Light nodes**: Fixed at 70 (immutable, always eligible for rewards)
 
 ### **Anti-Malicious Protection System**
 
@@ -1214,41 +1229,77 @@ docker logs qnet-node | grep "\[DEBUG\]\|\[INFO\]\|\[WARN\]\|\[ERROR\]"
 For genesis bootstrap nodes (production network initialization):
 
 ```bash
-# TESTNET Genesis Nodes:
-# Genesis Node #001 (NorthAmerica)
-docker run -d --name qnet-testnet-genesis-001 --restart=always \
-  -e QNET_NETWORK=testnet \
+# PRODUCTION Genesis Nodes (each on separate server):
+# Genesis Node #001 (154.38.160.39 - North America)
+docker run -d --name qnet-genesis-001 --restart=always \
   -e QNET_PRODUCTION=1 \
   -e QNET_BOOTSTRAP_ID=001 \
+  -e DOCKER_ENV=1 \
+  -e QNET_AGGRESSIVE_PRUNING=0 \
+  -e QNET_MAX_STORAGE_GB=2000 \
   -p 9876:9876 -p 9877:9877 -p 8001:8001 \
-  -v $(pwd)/testnet_genesis_001:/app/data \
+  -v $(pwd)/genesis_001_data:/app/data \
   qnet-production
 
-# Genesis Node #002 (Europe) 
-docker run -d --name qnet-testnet-genesis-002 --restart=always \
-  -e QNET_NETWORK=testnet \
+# Genesis Node #002 (62.171.157.44 - Europe)
+docker run -d --name qnet-genesis-002 --restart=always \
   -e QNET_PRODUCTION=1 \
   -e QNET_BOOTSTRAP_ID=002 \
-  -p 9878:9876 -p 9879:9877 -p 8002:8001 \
-  -v $(pwd)/testnet_genesis_002:/app/data \
+  -e DOCKER_ENV=1 \
+  -e QNET_AGGRESSIVE_PRUNING=0 \
+  -e QNET_MAX_STORAGE_GB=2000 \
+  -p 9876:9876 -p 9877:9877 -p 8001:8001 \
+  -v $(pwd)/genesis_002_data:/app/data \
   qnet-production
 
-# MAINNET Genesis Nodes:
-# Genesis Node #001 (NorthAmerica)
-docker run -d --name qnet-mainnet-genesis-001 --restart=always \
-  -e QNET_NETWORK=mainnet \
+# Genesis Node #003 (161.97.86.81 - Europe)
+docker run -d --name qnet-genesis-003 --restart=always \
   -e QNET_PRODUCTION=1 \
-  -e QNET_BOOTSTRAP_ID=001 \
+  -e QNET_BOOTSTRAP_ID=003 \
+  -e DOCKER_ENV=1 \
+  -e QNET_AGGRESSIVE_PRUNING=0 \
+  -e QNET_MAX_STORAGE_GB=2000 \
   -p 9876:9876 -p 9877:9877 -p 8001:8001 \
-  -v $(pwd)/mainnet_genesis_001:/app/data \
+  -v $(pwd)/genesis_003_data:/app/data \
+  qnet-production
+
+# Genesis Node #004 (5.189.130.160 - Europe)
+docker run -d --name qnet-genesis-004 --restart=always \
+  -e QNET_PRODUCTION=1 \
+  -e QNET_BOOTSTRAP_ID=004 \
+  -e DOCKER_ENV=1 \
+  -e QNET_AGGRESSIVE_PRUNING=0 \
+  -e QNET_MAX_STORAGE_GB=2000 \
+  -p 9876:9876 -p 9877:9877 -p 8001:8001 \
+  -v $(pwd)/genesis_004_data:/app/data \
+  qnet-production
+
+# Genesis Node #005 (162.244.25.114 - Europe)
+docker run -d --name qnet-genesis-005 --restart=always \
+  -e QNET_PRODUCTION=1 \
+  -e QNET_BOOTSTRAP_ID=005 \
+  -e DOCKER_ENV=1 \
+  -e QNET_AGGRESSIVE_PRUNING=0 \
+  -e QNET_MAX_STORAGE_GB=2000 \
+  -p 9876:9876 -p 9877:9877 -p 8001:8001 \
+  -v $(pwd)/genesis_005_data:/app/data \
   qnet-production
 ```
 
+**Auto-Configured Production Settings (QNET_PRODUCTION=1):**
+- ✅ Sharding: 256 shards enabled
+- ✅ Parallel validation: 16 threads
+- ✅ P2P compression: enabled
+- ✅ Batch size: 10,000 transactions
+- ✅ Mempool: 2M transactions capacity
+- ✅ High frequency mode: enabled
+- ✅ PoH: 500K hashes/sec (Full/Super nodes only)
+
 **Genesis Node Requirements:**
 - Set `QNET_BOOTSTRAP_ID` to 001-005 for genesis nodes
-- Use different ports for multiple nodes on same server
-- Create separate data directories for each node  
-- Ensure proper file permissions: `chmod 777 node_data_XXX/`
+- Each genesis node runs on its own server (same ports: 9876, 9877, 8001)
+- IP addresses are hardcoded in `genesis_constants.rs` - nodes auto-discover each other
+- Create data directory: `mkdir -p genesis_XXX_data && chmod 755 genesis_XXX_data/`
 
 **🔒 Genesis Node Security (IP-Based Authorization):**
 - **IP Restriction**: Genesis nodes can ONLY run from pre-authorized IP addresses
@@ -1273,52 +1324,35 @@ export QNET_GENESIS_NODES="ip1,ip2,ip3,ip4,ip5"
 # Or create genesis-nodes.json config file
 ```
 
-### Quick Testnet Launch (5 Genesis Nodes)
+### Quick Production Launch (5 Genesis Nodes)
 
-For rapid testnet deployment with coordinated genesis nodes:
+For production deployment with 5 Genesis nodes on separate servers:
 
 ```bash
-# Quick testnet startup for developers
-# Note: This is for QNet team development only
-# Regular users should only run individual nodes (see commands above)
-
-# Start 5 genesis nodes manually:
+# Build Docker image (run once on each server)
 docker build -f development/qnet-integration/Dockerfile.production -t qnet-production .
 
-# Genesis Node 1
-docker run -d --name qnet-genesis-001 --restart=always \
-  -e QNET_NETWORK=testnet \
-  -e QNET_PRODUCTION=1 \
-  -e QNET_BOOTSTRAP_ID=001 \
-  -p 9876:9876 -p 9877:9877 -p 8001:8001 \
-  -v $(pwd)/genesis_001:/app/data \
-  qnet-production
-
-# Genesis Node 2  
-docker run -d --name qnet-genesis-002 --restart=always \
-  -e QNET_NETWORK=testnet \
-  -e QNET_PRODUCTION=1 \
-  -e QNET_BOOTSTRAP_ID=002 \
-  -p 9878:9876 -p 9879:9877 -p 8002:8001 \
-  -v $(pwd)/genesis_002:/app/data \
-  qnet-production
-
-# Repeat for nodes 003, 004, 005...
+# Then run the appropriate command on each server:
+# Server 154.38.160.39 → QNET_BOOTSTRAP_ID=001
+# Server 62.171.157.44 → QNET_BOOTSTRAP_ID=002
+# Server 161.97.86.81 → QNET_BOOTSTRAP_ID=003
+# Server 5.189.130.160 → QNET_BOOTSTRAP_ID=004
+# Server 162.244.25.114 → QNET_BOOTSTRAP_ID=005
 
 # Monitor nodes
 docker logs -f qnet-genesis-001
 
-# Stop all
-docker stop qnet-genesis-001 qnet-genesis-002 qnet-genesis-003 qnet-genesis-004 qnet-genesis-005
-docker rm qnet-genesis-001 qnet-genesis-002 qnet-genesis-003 qnet-genesis-004 qnet-genesis-005
+# Stop node
+docker stop qnet-genesis-001
+docker rm qnet-genesis-001
 ```
 
 **Genesis Node Endpoints:**
-- Genesis Node 1: http://localhost:8001
-- Genesis Node 2: http://localhost:8002  
-- Genesis Node 3: http://localhost:8003
-- Genesis Node 4: http://localhost:8004
-- Genesis Node 5: http://localhost:8005
+- Genesis Node 001: http://154.38.160.39:8001
+- Genesis Node 002: http://62.171.157.44:8001
+- Genesis Node 003: http://161.97.86.81:8001
+- Genesis Node 004: http://5.189.130.160:8001
+- Genesis Node 005: http://162.244.25.114:8001
 
 **Note**: Activation codes are generated automatically by QNet consensus when burn transactions are detected on Solana.
 
@@ -1818,17 +1852,19 @@ Year 10+:   ~300+ GB    🔧 Increase to 500-1000 GB
 | **Consensus Threshold** | ≥ 70% | Minimum to participate in consensus |
 
 **Reputation Consequences:**
-- **<70% Reputation**: Excluded from consensus participation
-- **<10% Reputation**: Automatically banned from network
-- **Hourly Decay**: -1% automatic reputation decay for inactive nodes
+- **<70% Reputation**: Excluded from consensus participation AND new rewards
+- **<10% Reputation**: Automatically banned from network (can still claim old rewards)
+- **Hourly Decay**: -1% automatic reputation decay for inactive Full/Super nodes
+- **Light Nodes**: Fixed 70% reputation (immutable, always eligible for rewards)
 
 **Universal Node Security (Full Decentralization):**
-- **Starting Reputation**: 70% for ALL nodes (consensus threshold)
+- **Starting Reputation**: 70% for Full/Super nodes (consensus threshold)
+- **Light Node Reputation**: Fixed at 70% (immutable by design)
 - **No Special Protection**: Genesis nodes = Regular nodes
-- **Full Penalties Apply**: Any node can be reduced to 0% and banned
-- **Merit-Based System**: ALL nodes must maintain good behavior
-- **Consensus Participation**: ≥70% required for everyone
-- **True Equality**: No privileged nodes in the network
+- **Full Penalties Apply**: Any Full/Super node can be reduced to 0% and banned
+- **Merit-Based System**: Full/Super nodes must maintain good behavior
+- **Consensus Participation**: ≥70% required for Full/Super nodes
+- **Light Nodes**: Never participate in consensus (rewards only)
 
 #### 🔧 **Node Migration Support:**
 - **Data Transfer**: Archive responsibilities transfer with node migration

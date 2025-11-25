@@ -1261,9 +1261,7 @@ async fn mempool_submit(
         vec![params]
     };
     
-    // Check if fast mode is enabled
-    let skip_validation = std::env::var("QNET_SKIP_VALIDATION").is_ok();
-    
+    // PRODUCTION: Always validate transactions (no skip option)
     let mut results = Vec::new();
     let mut all_transactions = Vec::new();
     
@@ -1325,23 +1323,11 @@ async fn mempool_submit(
         all_transactions.push(tx);
     }
     
-    if skip_validation {
-        // Fast path - add all transactions without validation
-        for tx in all_transactions {
-            let hash = tx.hash.clone();
-            // Use direct mempool access through node method
-            match blockchain.add_transaction_to_mempool(tx).await {
-                Ok(_) => results.push(json!({ "hash": hash, "success": true })),
-                Err(e) => results.push(json!({ "hash": hash, "success": false, "error": e.to_string() })),
-            }
-        }
-    } else {
-        // Normal path with validation
-        for tx in all_transactions {
-            match blockchain.submit_transaction(tx).await {
-                Ok(hash) => results.push(json!({ "hash": hash, "success": true })),
-                Err(e) => results.push(json!({ "hash": "", "success": false, "error": e.to_string() })),
-            }
+    // PRODUCTION: Always validate all transactions (signature, balance, nonce)
+    for tx in all_transactions {
+        match blockchain.submit_transaction(tx).await {
+            Ok(hash) => results.push(json!({ "hash": hash, "success": true })),
+            Err(e) => results.push(json!({ "hash": "", "success": false, "error": e.to_string() })),
         }
     }
     
@@ -3769,8 +3755,11 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
     // Emission now happens as part of block production (every 14,400 blocks = 4 hours)
     // See node.rs block production logic for emission integration
     
-    // PASSIVE RECOVERY: Restore reputation for online nodes every 4 hours
-    // This is SEPARATE from emission - reputation recovery happens for ALL online nodes
+    // PASSIVE RECOVERY: Restore reputation for Full/Super nodes BELOW consensus threshold
+    // RULE: +1% every 4 hours for nodes with reputation 10-69 (not banned, below threshold)
+    // Light nodes: EXCLUDED (fixed reputation of 70)
+    // Nodes >= 70: EXCLUDED (already at/above threshold, no recovery needed)
+    // Nodes < 10: EXCLUDED (banned, must appeal or wait for manual review)
     let blockchain_for_reputation = blockchain.clone();
     tokio::spawn(async move {
         // Wait for network initialization
@@ -3783,19 +3772,35 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
             
             println!("[REPUTATION] 🔄 Processing passive recovery (every 4 hours)");
             
-            // PASSIVE RECOVERY: Give +5% reputation to all online nodes every 4 hours
-            // This allows nodes below 70% threshold to gradually recover
+            // PASSIVE RECOVERY: +1% reputation for Full/Super nodes with 10 <= rep < 70
+            // This allows gradual recovery to consensus threshold (70%)
+            // Recovery time from 10% to 70%: 60 × 4h = 240 hours = 10 days
             if let Some(p2p) = blockchain_for_reputation.get_unified_p2p() {
                 let online_peers = p2p.get_validated_active_peers();
-                for peer in online_peers {
-                    // CRITICAL: Only boost nodes below consensus threshold
-                    if !peer.is_consensus_qualified() {
-                        p2p.update_node_reputation(&peer.id, crate::unified_p2p::ReputationEvent::ConsensusParticipation);
-                        println!("[REPUTATION] 🔄 Passive recovery: {} (consensus: {:.1}%)", 
-                                 peer.id, peer.consensus_score);
+                let total_peers = online_peers.len();
+                let mut recovered_count = 0;
+                
+                // SCALABILITY: Process in batches for large networks
+                // O(n) where n = online peers, but each operation is O(1)
+                for peer in &online_peers {
+                    // apply_passive_recovery handles all checks:
+                    // - Skips Light nodes (fixed at 70)
+                    // - Only recovers nodes in [10, 70) range
+                    // - Caps at 70 (consensus threshold)
+                    if p2p.apply_passive_recovery(&peer.id) {
+                        recovered_count += 1;
+                        println!("[REPUTATION] 🔄 Passive recovery: {} ({:.1}% → {:.1}%)", 
+                                 peer.id, peer.consensus_score, (peer.consensus_score + 1.0).min(70.0));
                     }
                 }
-                println!("[REPUTATION] ✅ Passive recovery applied to all online nodes below consensus threshold");
+                
+                if recovered_count > 0 {
+                    println!("[REPUTATION] ✅ Passive recovery +1% applied to {} Full/Super nodes (10-69% range)", 
+                             recovered_count);
+                } else {
+                    println!("[REPUTATION] ℹ️ No nodes in recovery range (10-69%) - {} online peers checked", 
+                             total_peers);
+                }
             }
         }
     });
