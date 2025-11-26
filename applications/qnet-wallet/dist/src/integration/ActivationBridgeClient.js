@@ -660,10 +660,14 @@ export class ActivationBridgeClient {
 
     /**
      * Validate activation code format
+     * Format: QNET-XXXXXX-XXXXXX-XXXXXX (25 chars total)
+     * Segment 1: NodeType marker + Timestamp
+     * Segment 2: Encrypted wallet part 1
+     * Segment 3: Encrypted wallet part 2 + entropy
      */
     validateActivationCode(code) {
-        // QNet activation codes format: QNET-XXXXXX-YYYYYY
-        const pattern = /^QNET-[A-Z0-9]{6}-[A-Z0-9]{6}$/;
+        // QNet activation codes format: QNET-XXXXXX-XXXXXX-XXXXXX (25 chars)
+        const pattern = /^QNET-[A-Z0-9]{6}-[A-Z0-9]{6}-[A-Z0-9]{6}$/;
         return pattern.test(code);
     }
 
@@ -676,10 +680,17 @@ export class ActivationBridgeClient {
         }
 
         const parts = code.split('-');
+        // Extract node type from first char of segment1
+        const nodeTypeMarker = parts[1][0];
+        const nodeTypes = { 'L': 'Light', 'F': 'Full', 'S': 'Super' };
+        
         return {
             prefix: parts[0], // 'QNET'
-            nodeId: parts[1], // 6-character node ID
-            checksum: parts[2] // 6-character checksum
+            segment1: parts[1], // NodeType + Timestamp (6 chars)
+            segment2: parts[2], // Encrypted wallet part 1 (6 chars)
+            segment3: parts[3], // Encrypted wallet part 2 + entropy (6 chars)
+            nodeType: nodeTypes[nodeTypeMarker] || 'Unknown',
+            timestampPart: parts[1].substring(1) // Last 5 chars of segment1
         };
     }
 

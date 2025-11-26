@@ -5,6 +5,301 @@ All notable changes to the QNet project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.19.11] - November 26, 2025 "Security: WebSocket Rate Limiting"
+
+### 🛡️ Security Enhancement - WebSocket DDoS Protection
+- **NEW** `WsRateLimiter` struct for connection flood protection
+- **LIMITS**:
+  - Max 5 WebSocket connections per IP address
+  - Max 10,000 total WebSocket connections per node
+  - Returns HTTP 429 "Too Many Requests" when exceeded
+- **CLEANUP**: Connection count automatically decremented on disconnect
+- **MONITORING**: Real-time stats (total connections, unique IPs)
+
+### Implementation Details
+```rust
+// rpc.rs - New WebSocket Rate Limiter
+struct WsRateLimiter {
+    connections_per_ip: DashMap<IpAddr, u32>,
+    total_connections: AtomicU32,
+    max_per_ip: 5,
+    max_total: 10_000,
+}
+```
+
+### API Changes
+- WebSocket endpoint now checks rate limit before upgrading connection
+- New `handle_ws_connection_with_cleanup()` ensures proper cleanup
+
+### Documentation Updates
+- **UPDATED** `API_REFERENCE.md` - Added WebSocket rate limiting section
+
+---
+
+## [2.19.10] - November 26, 2025 "Critical Fix: Lossless Compression + Dead Code Removal"
+
+### 🔴 CRITICAL FIX - Lossy Compression Bug
+- **REMOVED** Pattern Recognition compression from `save_microblock_efficient()`
+- **REASON**: Pattern compression was **LOSSY** - data could not be reconstructed!
+  - SimpleTransfer: 140→16 bytes BUT `find_transaction_by_hash()` would FAIL
+  - NodeActivation, RewardDistribution: Same problem
+- **SOLUTION**: Now using **ONLY Zstd-3** (lossless, ~50% reduction)
+- Pattern Recognition kept **ONLY for statistics** (no actual compression)
+
+### Fixed - Code Duplication
+- **REMOVED** duplicate Pattern Recognition code from `save_block_with_delta()`
+- **UNIFIED** storage paths: `save_block_with_delta()` now delegates to `save_microblock()`
+- All block saving now goes through single unified path with Zstd compression
+
+### Fixed - Transaction Decompression
+- **SIMPLIFIED** `find_transaction_by_hash()` - removed complex pattern logic
+- Now supports only:
+  1. Zstd-compressed (check magic number 0x28B52FFD)
+  2. Uncompressed raw transaction (legacy)
+- Fully lossless - all transactions can be reconstructed
+
+### Removed - Dead Code (Delta Encoding)
+- **DELETED** `BlockDelta` struct - was never used in production
+- **DELETED** `DeltaChange` enum - was never used in production
+- **DELETED** `calculate_block_delta()` function - was never called
+- **DELETED** `apply_block_delta()` function - was never called
+
+### Removed - Dead Code (Shard Assignment)
+- **DELETED** `node_shards` from PerformanceConfig - was defined but never used
+- **DELETED** `super_node_shards` from PerformanceConfig - was defined but never used
+- Reason: Sharding is for parallel TX processing, NOT storage partitioning
+- All nodes receive all blocks; storage differs by tier (Light/Full/Super)
+
+### Documentation Updates
+- **UPDATED** `QNet_Whitepaper.md` - corrected sharding explanation
+- **UPDATED** `NETWORK_LOAD_ANALYSIS.md` - corrected sharding explanation
+- **UPDATED** `README.md` - corrected node types table (storage, not shards)
+
+### Storage Estimates (CORRECTED - Zstd only)
+| Scenario | Raw | With Zstd-3 (~50%) |
+|----------|-----|-------------------|
+| 500 TPS, 1 year (Super) | ~2.2 TB | **~1.1 TB** |
+| 500 TPS, 30 days (Full) | ~180 GB | **~90 GB** |
+| 100 TPS, 1 year (Super) | ~440 GB | **~220 GB** |
+
+### Technical Details
+- **Compression**: Zstd-3 for all transactions (lossless, ~50% reduction)
+- **Pattern Recognition**: Statistics only, no actual compression
+- **EfficientMicroBlock**: Stores TX hashes only, full TX stored separately
+
+---
+
+## [2.19.9] - November 26, 2025 "Tiered Storage Architecture + Graceful Degradation"
+
+### Architecture Clarification
+- **CRITICAL FIX**: Clarified that QNet uses **Transaction/Compute Sharding** for parallel processing, NOT State Sharding for storage division
+- All nodes receive ALL blocks via P2P broadcast
+- Storage differs by node type (what is stored and for how long), not by which shards
+
+### Added - Graceful Degradation System
+- **StorageHealth** enum: Healthy (< 70%), Warning (70-85%), Critical (85-95%), Full (>= 95%)
+- **GracefulDegradation** manager: Automatically downgrades storage tier when disk fills:
+  - Super → Full (enables pruning)
+  - Full → Light (headers only)
+  - Automatic restoration when storage becomes healthy again (after 1 hour)
+- **LightNodeRotation**: Auto-cleanup old headers to maintain ~100MB limit
+  - FIFO rotation - oldest headers deleted first
+  - Light nodes NEVER fill up - data is automatically rotated
+
+### Added - Storage Health Methods
+- `get_storage_health()` - returns current health status
+- `check_and_apply_degradation()` - applies graceful degradation if needed
+- `get_effective_storage_mode()` - returns current mode (may be degraded)
+- `is_storage_degraded()` - checks if currently degraded
+- `rotate_light_headers()` - rotates old headers in Light mode
+
+### Changed
+- **Refactored Storage Architecture** (storage.rs)
+  - Removed incorrect `ShardConfig` (was dividing storage by shards)
+  - Added correct `StorageTierConfig` (tiered by node type)
+  - New tiered storage model:
+    - **Light nodes**: Headers only, ~100 MB (auto-rotating, NEVER fills up)
+    - **Full nodes**: Full blocks + pruning, ~500 GB, last 30 days
+    - **Super/Bootstrap nodes**: Full history, ~2 TB, no pruning
+  - `save_microblock_tiered()` now checks degradation every 100 blocks
+  - `should_store_full_blocks()` now uses effective mode (may be degraded)
+
+### Storage Behavior
+| Situation | Action |
+|-----------|--------|
+| Storage < 70% | Normal operation |
+| Storage 70-85% | Warning logged, aggressive pruning |
+| Storage 85-95% | Emergency cleanup triggered |
+| Storage >= 95% | Graceful degradation (Super→Full→Light) |
+| Light node full | Auto-rotate old headers (FIFO) |
+
+### Storage Estimates (NEAR-style)
+| TPS | Light Node | Full Node (30 days) | Super Node (1 year) |
+|-----|------------|---------------------|---------------------|
+| 100 | ~100 MB | ~36 GB | ~440 GB |
+| 1K | ~100 MB | ~360 GB | ~4.4 TB |
+| 10K | ~100 MB | ~500 GB (pruned) | ~44 TB |
+
+### Documentation
+- **ARCHITECTURE_v2.19.md**: Added "Sharding vs Storage Architecture" section
+- Clarified that sharding = parallel processing, storage = tiered by node type
+
+---
+
+## [2.19.8] - November 26, 2025 "Dynamic Sharding & Full Compression Stack"
+
+### Added
+- **PRODUCTION: Transaction Compression** (storage.rs)
+  - All transactions now compressed with Zstd-3 on save (~30-50% reduction)
+  - Automatic decompression on read (backward compatible with legacy data)
+  - Background recompression of old transactions with stronger Zstd levels:
+    - 8-30 days old: Zstd-9 (~50% reduction)
+    - 31-365 days old: Zstd-15 (~60% reduction)
+    - 1+ years old: Zstd-22 (~80% reduction)
+  - `recompress_old_transactions_sync()` - processes 10K TX per batch, non-blocking
+
+### Changed
+- **Dynamic Shard Configuration** (qnet-sharding/lib.rs)
+  - Changed MIN_SHARDS from 100 to 1 (start with single shard for small networks)
+  - Changed MAX_SHARDS from 1,000,000 to 256 (practical limit for 1M+ TPS)
+  - New scaling: 0-1K→1, 1K-10K→4, 10K-50K→16, 50K-100K→64, 100K-500K→128, 500K+→256
+  - Each shard handles ~4K TPS, total capacity scales linearly
+
+### Storage Optimization
+- **Full Compression Stack Now Active:**
+  - ✅ Zstd-3 for new transactions (fast, ~30-50% reduction)
+  - ✅ Adaptive Zstd for old transactions (Zstd-9/15/22 based on age)
+  - ✅ Adaptive Zstd for blocks (already existed)
+  - ✅ EfficientMicroBlock format (hashes only, ~80% reduction)
+  - ✅ Transaction pruning (sliding window)
+
+### Documentation
+- **README.md**: Updated Light node storage (50-100 MB, not GB), dynamic shard scaling table
+- **ARCHITECTURE_v2.19.md**: Added Storage Optimization & Pruning section with full details
+- **QNet_Whitepaper.md**: Updated Section 8.3 Data Storage with pruning system
+- **CRYPTOGRAPHY_IMPLEMENTATION.md**: Added Section 8 (Storage & Data Integrity)
+
+### Testing
+- Can force 256 shards for testing: `QNET_SHARD_COUNT=256 ./qnet-node`
+- System auto-adjusts to optimal count based on actual network size
+
+---
+
+## [2.19.7] - November 26, 2025 "Critical Security: Nonce Validation + Transaction Pruning"
+
+### Added
+- **CRITICAL SECURITY: Nonce Validation at All Levels**
+  - Added nonce check in `apply_to_state` (transaction.rs) for ALL transaction types:
+    - Transfer, NodeActivation, ContractDeploy, ContractCall
+    - BatchRewardClaims, BatchNodeActivations, BatchTransfers
+  - Added nonce check in `submit_transaction` (node.rs) BEFORE mempool insertion
+  - Prevents Replay Attacks and Double Spend vulnerabilities
+  - New accounts must start with nonce=1
+
+- **PRODUCTION: Transaction Pruning** (storage.rs)
+  - Added `prune_old_transactions()` - removes transactions from pruned blocks
+  - Cleans up 3 Column Families: `transactions`, `tx_index`, `tx_by_address`
+  - Automatically called after block pruning in `prune_old_blocks()`
+  - Forces RocksDB compaction to reclaim disk space
+  - Batch processing (1000 tx/batch) to avoid memory issues
+
+### Fixed
+- **CRITICAL: Replay Attack Prevention**
+  - Previously `apply_to_state` only incremented nonce but never validated it
+  - Now validates `tx.nonce == sender.nonce + 1` before any state modification
+- **CRITICAL: DoS Protection for Mempool**
+  - Previously mempool accepted transactions with any nonce value
+  - Now rejects invalid nonces immediately at API level (saves resources)
+- **CRITICAL: Transaction Storage Leak**
+  - Previously transactions were NEVER deleted even when blocks were pruned
+  - Now transactions are properly cleaned up along with their blocks
+  - Estimated storage savings: 40-60% for Full nodes with pruning enabled
+
+### Security
+- Closed potential Double Spend vulnerability
+- Closed potential Replay Attack vulnerability
+- Added DoS protection against mempool flooding with invalid nonces
+
+---
+
+## [2.19.6] - November 26, 2025 "Smart Polling & API Enhancements"
+
+### Added
+- **WebSocket Real-time Events**: Full WebSocket infrastructure for live updates
+  - `ws://node:8001/ws/subscribe` endpoint with channel subscriptions
+  - Channels: `blocks`, `account:{address}`, `contract:{address}`, `mempool`, `tx:{hash}`
+  - Event types: NewBlock, BalanceUpdate, ContractEvent, TxConfirmed, PendingTx
+  - Global broadcaster with 1000-event buffer
+- **Smart Contract API**: Complete REST API for WASM smart contracts
+  - `POST /api/v1/contract/deploy` - Deploy contracts with hybrid signatures
+  - `POST /api/v1/contract/call` - Call contract methods
+  - `GET /api/v1/contract/{address}` - Get contract info
+  - `GET /api/v1/contract/{address}/state` - Query contract state
+  - `POST /api/v1/contract/estimate-gas` - Estimate gas costs
+- **Mandatory Ed25519 Signatures**: All transaction endpoints now require signatures
+  - `TransactionRequest` and `BatchTransferRequest` require `signature` and `public_key`
+  - Server-side Ed25519 verification for all transfers
+- **Hybrid Signatures for Contracts**: MANDATORY Dilithium + Ed25519 for contract operations
+  - Contract deploy and state-changing calls require both signatures
+  - NIST FIPS 186-5 (Ed25519) + NIST FIPS 204 (Dilithium) compliance
+
+### Changed
+- **Smart Polling for Light Nodes**: Battery-efficient polling mechanism
+  - Changed from 15-minute periodic polling to smart wake-up
+  - App wakes ~2 minutes before calculated ping slot (once per 4-hour window)
+  - `minimumFetchInterval: 240` (4 hours) instead of 15 minutes
+  - Added time-to-ping validation before API calls (prevents wasted requests)
+  - Reduced battery consumption by ~94% (6 wake-ups/day vs 96)
+- **API Rate Limiting**: Enhanced DDoS protection
+  - Per-IP rate limiting for critical endpoints
+  - Separate limits: transaction (30/min), activation (10/min), claim_rewards (5/min)
+- **EON Address Validation**: Server-side validation with checksum verification
+  - Validates format, length, and checksum for all EON addresses
+  - Prevents invalid addresses from entering the system
+
+### Fixed
+- **Documentation Updates**: Corrected polling description in QUICK_REFERENCE_v2.19.md
+  - Changed "15-min check" to "Smart wake-up ~2 min before calculated slot"
+- **API_REFERENCE.md**: Added detailed smart polling explanation with response examples
+- **CRITICAL: Removed ALL reputation bonuses except passive recovery**:
+  - Removed `ReputationEvent::SuccessfulResponse` (+1 per response) - DELETED
+  - Removed `ReputationEvent::FastResponse` (+3 for <100ms) - DELETED
+  - Removed `uptime_bonus` (+1%/day, max 30%) - DELETED
+  - Renamed `ValidBlock` → `FullRotationComplete` (+5 → +2 for completing 30 blocks)
+  - Reduced `ConsensusParticipation` (+2 → +1)
+  - Passive recovery: +1 every 4h if score [10, 70) AND NOT jailed
+  - Jailed nodes EXCLUDED from passive recovery (must wait for jail to expire)
+  - Updated all documentation: QUICK_REFERENCE, ARCHITECTURE, Whitepaper, README
+- **PROGRESSIVE JAIL SYSTEM**: Fair system with 6 chances for regular offenses
+  - 1st offense: 1 hour → 30%
+  - 2nd offense: 24 hours → 25%
+  - 3rd offense: 7 days → 20%
+- **JAIL NETWORK SYNCHRONIZATION**: Jail status now syncs across all nodes
+  - Added `jail_updates` to `ReputationSync` message
+  - Jail status propagates via gossip protocol (O(log n) complexity)
+  - Permanent bans (critical attacks) sync immediately network-wide
+  - Added `apply_jail_sync()` method for receiving jail from peers
+  - Added `get_all_jail_statuses()` for broadcast
+- **JAIL PERSISTENCE**: Jail survives node restart
+  - `save_jail_to_storage()` - saves jail to `./data/jail/jail_statuses.json`
+  - `load_jail_from_storage()` - loads active jails on startup
+  - `load_jail_statuses_on_startup()` - called in `start()` method
+  - Automatically filters expired jails (only loads active ones)
+  - 4th offense: 30 days → 15%
+  - 5th offense: 3 months → 12%
+  - 6+ offenses: 1 year → 10% (CAN still return!)
+  - CRITICAL ATTACKS ONLY get PERMANENT BAN: DatabaseSubstitution, ChainFork, StorageDeletion
+  - Genesis nodes follow same rules - equal treatment for all
+
+### Security
+- **CORS Whitelist**: Production mode uses origin whitelist instead of allow_any_origin
+- **Rate Limiting**: IP-based limits prevent API abuse
+- **Transaction Signatures**: All transfers now cryptographically verified
+- **CRITICAL FIX: verify_ed25519_client_signature**: Fixed message format bug
+  - Function was ignoring passed message and constructing "claim_rewards:..." internally
+  - Now correctly uses the PASSED message for verification
+  - Fixes: Transfers, batch transfers, contract calls all using correct message formats
+
 ## [2.21.0] - November 6, 2025 "Critical Rotation and Consensus Fixes"
 
 ### Fixed
@@ -290,19 +585,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [2.12.0] - October 2, 2025 "95% Decentralization with Stability Protection"
 
 ### Added
-- **95% Decentralization**: Minimal Genesis protection for network stability
-  - Genesis nodes cannot be permanently banned (critical infrastructure)
-  - At <10% reputation: 30-day jail instead of ban for Genesis
-  - After critical jail: Restore to 10% (alive but no consensus)
-  - Regular nodes: Full penalties and permanent ban possible
-  - Balance between decentralization and network survival
-- **Jail System**: Universal progressive suspension for ALL nodes
-  - 1st offense: 1 hour jail
-  - 2nd offense: 24 hours jail  
-  - 3rd offense: 7 days jail
-  - 4th offense: 30 days jail
-  - 5th offense: 3 months jail
-  - 6+ offenses: 1 year maximum for ALL nodes
+- **PROGRESSIVE JAIL SYSTEM**: Fair system with 6 chances (updated in v2.19.7)
+  - 1st: 1h → 30%, 2nd: 24h → 25%, 3rd: 7d → 20%
+  - 4th: 30d → 15%, 5th: 3m → 12%, 6+: 1y → 10% (can return!)
+  - CRITICAL ATTACKS ONLY = PERMANENT BAN (DatabaseSubstitution, ChainFork, StorageDeletion)
+  - Genesis nodes follow same rules - equal treatment
 - **Double-Sign Detection**: Automatic detection and evidence collection
   - Tracks last 100 block heights for signature verification
   - Immediate jail + -50 reputation penalty

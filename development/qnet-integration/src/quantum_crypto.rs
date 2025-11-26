@@ -286,33 +286,77 @@ impl QNetQuantumCrypto {
         let timestamp = self.extract_timestamp_from_segment(segment1)?;
 
         // 4. Extract wallet data from segments 2 and 3
-        let segment2 = parts[2]; // First 4 hex chars of encrypted wallet
-        let segment3 = parts[3]; // Next 4 hex chars + entropy (we ignore entropy)
+        // Format: QNET-XXXXXX-XXXXXX-XXXXXX (6 chars per segment)
+        let segment2 = parts[2]; // First 6 hex chars of encrypted wallet
+        let segment3 = parts[3]; // Next 4 hex chars of wallet + 2 chars entropy (or 4+4)
         
-        // Reconstruct encrypted wallet hex (take first 4 chars from segment3, ignore entropy)
-        let wallet_part1 = format!("{:0>8}", segment2); // Pad to 8 chars
-        let wallet_part2 = format!("{:0>8}", &segment3[..4.min(segment3.len())]); // Take first 4, pad to 8
-        let encrypted_wallet_hex = format!("{}{}", wallet_part1, wallet_part2);
+        // Reconstruct encrypted wallet hex
+        // segment2 = encrypted_wallet[0:6]
+        // segment3 = encrypted_wallet[6:10] + entropy[0:2] OR encrypted_wallet[6:10] + entropy[0:4]
+        // We need to extract wallet parts, ignoring entropy
+        let wallet_part1 = segment2; // 6 chars
+        let wallet_part2 = &segment3[..4.min(segment3.len())]; // First 4 chars (rest is entropy)
+        let encrypted_wallet_hex = format!("{}{}", wallet_part1, wallet_part2); // 10 chars total
 
-        // 5. Query blockchain for burn transaction (we need it for decryption key)
-        let burn_tx = self.get_burn_tx_from_blockchain(activation_code, &node_type).await?;
+        // 5. Query blockchain for burn transaction AND amount (we need both for decryption key)
+        // CRITICAL: Must use the EXACT amount that was used during code generation!
+        let (burn_tx, burn_amount) = self.get_burn_tx_and_amount_from_blockchain(activation_code, &node_type).await?;
 
-        // 6. Create decryption key (same as route.ts logic with DYNAMIC PRICING)
-        let burn_amount = self.get_dynamic_burn_amount(activation_code, &node_type).await?;
-        
+        // 6. Create decryption key (same as route.ts logic)
+        // key_material = f"{burn_tx}:{node_type}:{burn_amount}"
         let key_material = format!("{}:{}:{}", burn_tx, node_type, burn_amount);
         let encryption_key = self.sha256_hash(&key_material)[..32].to_string();
+        
+        println!("🔑 Decryption key derived from:");
+        println!("   burn_tx: {}...", safe_preview(&burn_tx, 8));
+        println!("   node_type: {}", node_type);
+        println!("   burn_amount: {}", burn_amount);
 
-        // 7. XOR decrypt wallet address (reverse of route.ts logic)
+        // 7. XOR decrypt wallet PREFIX (only first 5 bytes are in the code)
         let encrypted_wallet = hex::decode(&encrypted_wallet_hex)
             .map_err(|e| anyhow!("Invalid hex in encrypted wallet: {}", e))?;
             
-        let decrypted_wallet = self.xor_decrypt(&encrypted_wallet, &encryption_key)?;
+        let decrypted_wallet_prefix = self.xor_decrypt(&encrypted_wallet, &encryption_key)?;
+        
+        // 8. Get FULL wallet address from ActivationRecord
+        // The code only contains a prefix for verification, full wallet is in registry
+        let registry = crate::activation_validation::BlockchainActivationRegistry::new(None);
+        let code_hash = registry.hash_activation_code_for_blockchain(activation_code)
+            .map_err(|e| anyhow!("Failed to hash activation code: {}", e))?;
+        
+        let full_wallet = match registry.get_activation_record_by_hash(&code_hash).await {
+            Ok(Some(record)) => {
+                // Verify that decrypted prefix matches stored wallet prefix
+                let stored_prefix = if record.wallet_address.len() >= decrypted_wallet_prefix.len() {
+                    &record.wallet_address[..decrypted_wallet_prefix.len()]
+                } else {
+                    &record.wallet_address
+                };
+                
+                if stored_prefix != decrypted_wallet_prefix {
+                    println!("⚠️ Wallet prefix mismatch - code may be corrupted or forged");
+                    println!("   Decrypted: {}...", safe_preview(&decrypted_wallet_prefix, 8));
+                    println!("   Stored: {}...", safe_preview(stored_prefix, 8));
+                    // Continue with stored wallet - it's authoritative
+                }
+                
+                record.wallet_address.clone()
+            }
+            Ok(None) => {
+                // No record found - use decrypted prefix as fallback (Genesis nodes)
+                println!("⚠️ No activation record found, using decrypted prefix as wallet");
+                decrypted_wallet_prefix.clone()
+            }
+            Err(e) => {
+                println!("⚠️ Registry query failed: {}, using decrypted prefix", e);
+                decrypted_wallet_prefix.clone()
+            }
+        };
 
-        // 8. Create activation payload (simplified, route.ts compatible)
+        // 9. Create activation payload
         let payload = ActivationPayload {
             burn_tx,
-            wallet: decrypted_wallet,
+            wallet: full_wallet,
             node_type,
             timestamp,
             signature: DilithiumSignature {
@@ -1100,6 +1144,10 @@ impl QNetQuantumCrypto {
             activated_at: payload.timestamp,
             last_seen: payload.timestamp,
             migration_count: 0,
+            node_id: String::new(), // Will be set when node starts
+            burn_tx_hash: payload.burn_tx.clone(), // CRITICAL: Store burn_tx for XOR decryption
+            phase: 1, // Default to Phase 1 (will be determined from activation code)
+            burn_amount: 1500, // Default Phase 1 base price - will be overwritten from registry
         };
         
         // Register activation on blockchain using existing infrastructure
@@ -1180,13 +1228,54 @@ impl QNetQuantumCrypto {
     }
 
     /// Get burn transaction hash from blockchain records
+    /// Get burn_tx AND burn_amount from blockchain registry
+    /// CRITICAL: Both values must match what was used during code generation for XOR decryption!
+    async fn get_burn_tx_and_amount_from_blockchain(&self, activation_code: &str, node_type: &str) -> Result<(String, u64)> {
+        // PRODUCTION: Query QNet blockchain activation registry
+        let registry = crate::activation_validation::BlockchainActivationRegistry::new(None);
+        
+        // Hash the activation code (registry stores hashes, not plaintext codes)
+        let code_hash = registry.hash_activation_code_for_blockchain(activation_code)
+            .map_err(|e| anyhow!("Failed to hash activation code: {}", e))?;
+        
+        // Query registry for activation record
+        match registry.get_activation_record_by_hash(&code_hash).await {
+            Ok(Some(record)) => {
+                if !record.tx_hash.is_empty() {
+                    println!("🔗 Retrieved from blockchain registry:");
+                    println!("   burn_tx: {}...", safe_preview(&record.tx_hash, 8));
+                    println!("   burn_amount: {}", record.activation_amount);
+                    return Ok((record.tx_hash, record.activation_amount));
+                }
+            }
+            Ok(None) => {
+                println!("⚠️ No activation record found for code hash: {}...", safe_preview(&code_hash, 8));
+            }
+            Err(e) => {
+                println!("⚠️ Registry query failed: {}", e);
+            }
+        }
+        
+        // FALLBACK: For Genesis nodes or codes without registry entry
+        // Genesis nodes use predefined values
+        if activation_code.starts_with("QNET-BOOT") {
+            let fallback_tx = format!("genesis_burn_{}", &blake3::hash(activation_code.as_bytes()).to_hex()[..16]);
+            println!("⚠️ Using Genesis fallback: tx={}, amount=0", safe_preview(&fallback_tx, 8));
+            return Ok((fallback_tx, 0)); // Genesis nodes don't use XOR encryption
+        }
+        
+        // For non-Genesis codes without registry entry, use default Phase 1 base price
+        // This is a fallback and may cause decryption failure if actual price was different
+        let fallback_tx = format!("unknown_burn_{}", &blake3::hash(activation_code.as_bytes()).to_hex()[..16]);
+        let fallback_amount = 1500u64; // Phase 1 base price
+        println!("⚠️ Using fallback (may fail): tx={}, amount={}", safe_preview(&fallback_tx, 8), fallback_amount);
+        Ok((fallback_tx, fallback_amount))
+    }
+    
+    /// DEPRECATED: Use get_burn_tx_and_amount_from_blockchain instead
+    #[allow(dead_code)]
     async fn get_burn_tx_from_blockchain(&self, activation_code: &str, node_type: &str) -> Result<String> {
-        // PRODUCTION: Query QNet blockchain for burn transaction associated with this activation code
-        // For now, generate a deterministic burn_tx based on activation code for compatibility
-        
-        let burn_tx = format!("burn_tx_{}", &blake3::hash(activation_code.as_bytes()).to_hex()[..16]);
-        
-        println!("🔗 Retrieved burn_tx from blockchain: {}...", safe_preview(&burn_tx, 8));
+        let (burn_tx, _) = self.get_burn_tx_and_amount_from_blockchain(activation_code, node_type).await?;
         Ok(burn_tx)
     }
 

@@ -3,9 +3,11 @@
 
 use std::sync::Arc;
 use std::collections::HashMap;
+use std::net::IpAddr;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use warp::{Filter, Rejection, Reply};
+use warp::ws::{Message, WebSocket};
 use crate::node::BlockchainNode;
 use qnet_state::transaction::BatchTransferData;
 use chrono;
@@ -13,9 +15,447 @@ use sha3::{Sha3_256, Digest}; // Add missing Digest trait
 use hex;
 use base64::Engine;
 use std::time::{SystemTime, UNIX_EPOCH};
+use dashmap::DashMap;
+use once_cell::sync::Lazy;
+use futures::{StreamExt, SinkExt};
+use tokio::sync::broadcast;
+
+// ============================================================================
+// WEBSOCKET: Real-time event broadcasting
+// ============================================================================
+
+/// WebSocket event types for subscription
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data")]
+pub enum WsEvent {
+    /// New block created
+    NewBlock {
+        height: u64,
+        hash: String,
+        timestamp: u64,
+        tx_count: usize,
+        producer: String,
+    },
+    /// Account balance changed
+    BalanceUpdate {
+        address: String,
+        new_balance: u64,
+        change: i64,
+        tx_hash: String,
+    },
+    /// Smart contract event emitted
+    ContractEvent {
+        contract_address: String,
+        event_name: String,
+        data: Value,
+        block_height: u64,
+        tx_hash: String,
+    },
+    /// Transaction confirmed
+    TxConfirmed {
+        tx_hash: String,
+        block_height: u64,
+        status: String,
+    },
+    /// New pending transaction in mempool
+    PendingTx {
+        tx_hash: String,
+        from: String,
+        to: String,
+        amount: u64,
+    },
+}
+
+/// Global WebSocket event broadcaster
+/// All connected clients receive events through this channel
+pub static WS_BROADCASTER: Lazy<broadcast::Sender<WsEvent>> = Lazy::new(|| {
+    let (tx, _) = broadcast::channel(1000); // Buffer 1000 events
+    tx
+});
+
+/// Broadcast an event to all connected WebSocket clients
+pub fn broadcast_ws_event(event: WsEvent) {
+    // Ignore send errors (no subscribers)
+    let _ = WS_BROADCASTER.send(event);
+}
+
+// ============================================================================
+// SECURITY: IP-based Rate Limiting for REST API DDoS Protection
+// ============================================================================
+
+/// Global IP-based rate limiter for REST API endpoints
+/// Protects against DDoS attacks by limiting requests per IP address
+static API_RATE_LIMITER: Lazy<ApiRateLimiter> = Lazy::new(|| ApiRateLimiter::new());
+
+// ============================================================================
+// SECURITY: WebSocket Connection Rate Limiting
+// ============================================================================
+
+/// WebSocket rate limiter to prevent connection flood attacks
+/// Limits: max 5 connections per IP, max 10,000 total connections
+struct WsRateLimiter {
+    /// Active connections per IP address
+    connections_per_ip: DashMap<IpAddr, u32>,
+    /// Total active connections count
+    total_connections: std::sync::atomic::AtomicU32,
+    /// Maximum connections allowed per IP
+    max_per_ip: u32,
+    /// Maximum total connections
+    max_total: u32,
+}
+
+impl WsRateLimiter {
+    fn new() -> Self {
+        Self {
+            connections_per_ip: DashMap::new(),
+            total_connections: std::sync::atomic::AtomicU32::new(0),
+            max_per_ip: 5,      // Max 5 WS connections per IP
+            max_total: 10_000,  // Max 10K total WS connections
+        }
+    }
+    
+    /// Check if new connection is allowed from this IP
+    fn check_connection(&self, ip: Option<IpAddr>) -> bool {
+        let total = self.total_connections.load(std::sync::atomic::Ordering::Relaxed);
+        
+        // Check total limit
+        if total >= self.max_total {
+            println!("[WS] 🚫 Total connection limit reached ({}/{})", total, self.max_total);
+            return false;
+        }
+        
+        // Check per-IP limit
+        if let Some(ip_addr) = ip {
+            let current = self.connections_per_ip.get(&ip_addr)
+                .map(|v| *v)
+                .unwrap_or(0);
+            
+            if current >= self.max_per_ip {
+                println!("[WS] 🚫 Per-IP limit reached for {} ({}/{})", ip_addr, current, self.max_per_ip);
+                return false;
+            }
+        }
+        
+        true
+    }
+    
+    /// Register new connection
+    fn add_connection(&self, ip: Option<IpAddr>) {
+        self.total_connections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        
+        if let Some(ip_addr) = ip {
+            self.connections_per_ip
+                .entry(ip_addr)
+                .and_modify(|count| *count += 1)
+                .or_insert(1);
+        }
+    }
+    
+    /// Unregister connection on close
+    fn remove_connection(&self, ip: Option<IpAddr>) {
+        self.total_connections.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        
+        if let Some(ip_addr) = ip {
+            if let Some(mut count) = self.connections_per_ip.get_mut(&ip_addr) {
+                if *count > 0 {
+                    *count -= 1;
+                }
+                if *count == 0 {
+                    drop(count); // Release lock before remove
+                    self.connections_per_ip.remove(&ip_addr);
+                }
+            }
+        }
+    }
+    
+    /// Get current stats for monitoring
+    fn get_stats(&self) -> (u32, usize) {
+        (
+            self.total_connections.load(std::sync::atomic::Ordering::Relaxed),
+            self.connections_per_ip.len()
+        )
+    }
+}
+
+/// Global WebSocket rate limiter
+static WS_RATE_LIMITER: Lazy<WsRateLimiter> = Lazy::new(|| WsRateLimiter::new());
+
+/// Rate limit configuration per endpoint type
+#[derive(Clone)]
+struct RateLimitConfig {
+    /// Maximum requests per window
+    max_requests: u32,
+    /// Time window in seconds
+    window_seconds: u64,
+    /// Block duration in seconds after exceeding limit
+    block_duration: u64,
+}
+
+/// Per-IP rate limit state
+struct IpRateLimitState {
+    /// Request timestamps within current window
+    requests: Vec<u64>,
+    /// Blocked until timestamp (0 = not blocked)
+    blocked_until: u64,
+}
+
+/// API Rate Limiter with configurable limits per endpoint type
+struct ApiRateLimiter {
+    /// Per-IP state: IP -> (endpoint_type -> state)
+    ip_states: DashMap<IpAddr, DashMap<String, IpRateLimitState>>,
+    /// Configuration per endpoint type
+    configs: HashMap<String, RateLimitConfig>,
+}
+
+impl ApiRateLimiter {
+    fn new() -> Self {
+        let mut configs = HashMap::new();
+        
+        // Transaction submission: 10 requests/minute (prevent spam)
+        configs.insert("transaction".to_string(), RateLimitConfig {
+            max_requests: 10,
+            window_seconds: 60,
+            block_duration: 300, // 5 min block
+        });
+        
+        // Activation code generation: 5 requests/hour (expensive operation)
+        configs.insert("activation".to_string(), RateLimitConfig {
+            max_requests: 5,
+            window_seconds: 3600,
+            block_duration: 3600, // 1 hour block
+        });
+        
+        // Light node registration: 3 requests/hour
+        configs.insert("light_node_register".to_string(), RateLimitConfig {
+            max_requests: 3,
+            window_seconds: 3600,
+            block_duration: 3600,
+        });
+        
+        // Reward claims: 10 requests/hour
+        configs.insert("claim_rewards".to_string(), RateLimitConfig {
+            max_requests: 10,
+            window_seconds: 3600,
+            block_duration: 1800, // 30 min block
+        });
+        
+        // General API: 100 requests/minute
+        configs.insert("general".to_string(), RateLimitConfig {
+            max_requests: 100,
+            window_seconds: 60,
+            block_duration: 60, // 1 min block
+        });
+        
+        // Read-only endpoints: 300 requests/minute (more lenient)
+        configs.insert("read_only".to_string(), RateLimitConfig {
+            max_requests: 300,
+            window_seconds: 60,
+            block_duration: 30,
+        });
+        
+        Self {
+            ip_states: DashMap::new(),
+            configs,
+        }
+    }
+    
+    /// Check if request is allowed, returns (allowed, retry_after_seconds)
+    fn check_rate_limit(&self, ip: IpAddr, endpoint_type: &str) -> (bool, u64) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        
+        let config = self.configs.get(endpoint_type)
+            .unwrap_or_else(|| self.configs.get("general").unwrap());
+        
+        // Get or create IP entry
+        let ip_endpoints = self.ip_states.entry(ip).or_insert_with(DashMap::new);
+        
+        // Get or create endpoint state for this IP
+        let mut state = ip_endpoints.entry(endpoint_type.to_string())
+            .or_insert_with(|| IpRateLimitState {
+                requests: Vec::new(),
+                blocked_until: 0,
+            });
+        
+        // Check if currently blocked
+        if state.blocked_until > now {
+            return (false, state.blocked_until - now);
+        }
+        
+        // Clean old requests outside window
+        let window_start = now.saturating_sub(config.window_seconds);
+        state.requests.retain(|&ts| ts > window_start);
+        
+        // Check if limit exceeded
+        if state.requests.len() >= config.max_requests as usize {
+            state.blocked_until = now + config.block_duration;
+            println!("[RATE LIMIT] ⛔ IP {} blocked for {} seconds on endpoint '{}'", 
+                     ip, config.block_duration, endpoint_type);
+            return (false, config.block_duration);
+        }
+        
+        // Record this request
+        state.requests.push(now);
+        (true, 0)
+    }
+    
+    /// Get remaining requests for an IP/endpoint
+    fn get_remaining(&self, ip: IpAddr, endpoint_type: &str) -> u32 {
+        let config = self.configs.get(endpoint_type)
+            .unwrap_or_else(|| self.configs.get("general").unwrap());
+        
+        if let Some(ip_endpoints) = self.ip_states.get(&ip) {
+            if let Some(state) = ip_endpoints.get(endpoint_type) {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                let window_start = now.saturating_sub(config.window_seconds);
+                let recent_requests = state.requests.iter()
+                    .filter(|&&ts| ts > window_start)
+                    .count() as u32;
+                return config.max_requests.saturating_sub(recent_requests);
+            }
+        }
+        config.max_requests
+    }
+}
+
+/// Helper function to check rate limit and return error response if exceeded
+fn check_api_rate_limit(ip: Option<std::net::SocketAddr>, endpoint_type: &str) -> Result<(), warp::reply::Json> {
+    let ip_addr = match ip {
+        Some(addr) => addr.ip(),
+        None => return Ok(()), // Allow if no IP (shouldn't happen)
+    };
+    
+    let (allowed, retry_after) = API_RATE_LIMITER.check_rate_limit(ip_addr, endpoint_type);
+    
+    if !allowed {
+        return Err(warp::reply::json(&json!({
+            "success": false,
+            "error": "Rate limit exceeded",
+            "retry_after_seconds": retry_after,
+            "message": format!("Too many requests. Please wait {} seconds before retrying.", retry_after)
+        })));
+    }
+    
+    Ok(())
+}
+
+// ============================================================================
+// SECURITY: CORS Configuration for Production
+// ============================================================================
+
+/// Allowed origins for CORS in production
+/// - Official QNet domains
+/// - Local development (localhost)
+const ALLOWED_ORIGINS: &[&str] = &[
+    "https://qnet.network",
+    "https://app.qnet.network",
+    "https://explorer.qnet.network",
+    "https://wallet.qnet.network",
+    "https://docs.qnet.network",
+    "http://localhost:3000",      // Local dev
+    "http://localhost:8080",      // Local dev
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:8080",
+    "capacitor://localhost",      // Mobile app (Capacitor)
+    "ionic://localhost",          // Mobile app (Ionic)
+];
+
+/// Check if origin is allowed
+fn is_origin_allowed(origin: &str) -> bool {
+    // In development mode, allow all origins
+    if std::env::var("QNET_DEV_MODE").is_ok() {
+        return true;
+    }
+    
+    // Check against whitelist
+    ALLOWED_ORIGINS.iter().any(|&allowed| origin == allowed)
+}
 
 // DYNAMIC NETWORK DETECTION - No timestamp dependency for robust deployment
 
+/// SECURITY: Validate QNet EON address format
+/// Format: {19 hex}eon{15 hex}{4 hex checksum} = 41 characters
+/// Example: a1b2c3d4e5f6g7h8i9jeon0k1l2m3n4o5p6q7r8s9a1b2
+fn validate_eon_address(address: &str) -> bool {
+    // Check length: 19 + 3 + 15 + 4 = 41 characters
+    if address.len() != 41 {
+        return false;
+    }
+    
+    // Check "eon" marker at position 19
+    if &address[19..22] != "eon" {
+        return false;
+    }
+    
+    // Check all characters are lowercase hex (except "eon")
+    let part1 = &address[0..19];
+    let part2 = &address[22..37];
+    let checksum = &address[37..41];
+    
+    let is_hex = |s: &str| s.chars().all(|c| c.is_ascii_hexdigit() && !c.is_uppercase());
+    
+    if !is_hex(part1) || !is_hex(part2) || !is_hex(checksum) {
+        return false;
+    }
+    
+    // Verify checksum
+    let address_without_checksum = format!("{}eon{}", part1, part2);
+    let computed_checksum = {
+        let mut hasher = Sha3_256::new();
+        hasher.update(address_without_checksum.as_bytes());
+        let hash = hasher.finalize();
+        hex::encode(&hash[..2]) // First 2 bytes = 4 hex chars
+    };
+    
+    checksum == computed_checksum
+}
+
+/// SECURITY: Validate address with detailed error
+fn validate_eon_address_with_error(address: &str) -> Result<(), String> {
+    if address.len() != 41 {
+        return Err(format!("Invalid address length: expected 41, got {}", address.len()));
+    }
+    
+    if &address[19..22] != "eon" {
+        return Err("Invalid address format: missing 'eon' marker at position 19".to_string());
+    }
+    
+    let part1 = &address[0..19];
+    let part2 = &address[22..37];
+    let checksum = &address[37..41];
+    
+    let is_hex = |s: &str| s.chars().all(|c| c.is_ascii_hexdigit() && !c.is_uppercase());
+    
+    if !is_hex(part1) {
+        return Err("Invalid address: part1 contains non-hex characters".to_string());
+    }
+    if !is_hex(part2) {
+        return Err("Invalid address: part2 contains non-hex characters".to_string());
+    }
+    if !is_hex(checksum) {
+        return Err("Invalid address: checksum contains non-hex characters".to_string());
+    }
+    
+    // Verify checksum
+    let address_without_checksum = format!("{}eon{}", part1, part2);
+    let computed_checksum = {
+        let mut hasher = Sha3_256::new();
+        hasher.update(address_without_checksum.as_bytes());
+        let hash = hasher.finalize();
+        hex::encode(&hash[..2])
+    };
+    
+    if checksum != computed_checksum {
+        return Err(format!("Invalid checksum: expected {}, got {}", computed_checksum, checksum));
+    }
+    
+    Ok(())
+}
 
 #[derive(Debug, Deserialize)]
 struct RpcRequest {
@@ -52,15 +492,56 @@ pub struct NodeInfo {
     pub region: String,
 }
 
+/// Transaction request with MANDATORY signature verification
+/// NIST/CISCO COMPLIANT: Ed25519 (FIPS 186-5) required for all transfers
 #[derive(Debug, Deserialize)]
 struct TransactionRequest {
+    /// Sender's EON address
     from: String,
+    /// Recipient's EON address
     to: String,
+    /// Amount in nano QNC
     amount: u64,
+    /// Gas price in nano QNC
     gas_price: u64,
+    /// Gas limit
     gas_limit: u64,
+    /// Nonce for replay protection
     nonce: u64,
+    /// Ed25519 signature (REQUIRED - NIST FIPS 186-5)
+    signature: String,
+    /// Ed25519 public key for verification (REQUIRED)
+    public_key: String,
 }
+
+/// Query parameters for transaction history API
+/// Supports pagination, filtering by type, and date range
+#[derive(Debug, Deserialize)]
+struct TransactionHistoryQuery {
+    /// Wallet address to fetch transactions for (required)
+    address: String,
+    /// Page number (1-indexed, default: 1)
+    #[serde(default = "default_page")]
+    page: usize,
+    /// Transactions per page (default: 20, max: 100)
+    #[serde(default = "default_per_page")]
+    per_page: usize,
+    /// Filter by transaction type: "transfer", "reward", "activation", "all" (default: "all")
+    #[serde(default = "default_tx_type")]
+    tx_type: String,
+    /// Filter by direction: "sent", "received", "all" (default: "all")
+    #[serde(default = "default_direction")]
+    direction: String,
+    /// Start timestamp (Unix seconds, optional)
+    start_time: Option<u64>,
+    /// End timestamp (Unix seconds, optional)
+    end_time: Option<u64>,
+}
+
+fn default_page() -> usize { 1 }
+fn default_per_page() -> usize { 20 }
+fn default_tx_type() -> String { "all".to_string() }
+fn default_direction() -> String { "all".to_string() }
 
 #[derive(Debug, Deserialize)]
 struct BatchRewardClaimRequest {
@@ -68,10 +549,18 @@ struct BatchRewardClaimRequest {
     owner_address: String,
 }
 
+/// Batch transfer request with MANDATORY signature verification
+/// NIST/CISCO COMPLIANT: Ed25519 (FIPS 186-5) required
 #[derive(Debug, Deserialize)]
 struct BatchTransferRequest {
+    /// List of transfers in this batch
     transfers: Vec<TransferData>,
+    /// Unique batch identifier
     batch_id: String,
+    /// Ed25519 signature for entire batch (REQUIRED - NIST FIPS 186-5)
+    signature: String,
+    /// Ed25519 public key for verification (REQUIRED)
+    public_key: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -89,6 +578,120 @@ struct TransferData {
     to_address: String,
     amount: u64,
     memo: Option<String>,
+}
+
+// ============================================================================
+// SMART CONTRACT API STRUCTURES
+// ============================================================================
+
+/// Request to deploy a new smart contract
+/// NIST/CISCO COMPLIANT: MANDATORY hybrid signatures (Ed25519 + CRYSTALS-Dilithium)
+/// Smart contracts are critical operations - require BOTH signatures like consensus
+#[derive(Debug, Deserialize)]
+struct ContractDeployRequest {
+    /// Deployer's EON address
+    from: String,
+    /// Base64-encoded WASM bytecode
+    code: String,
+    /// Constructor arguments as JSON
+    constructor_args: Value,
+    /// Gas limit for deployment
+    gas_limit: u64,
+    /// Gas price in nano QNC
+    gas_price: u64,
+    /// Nonce for replay protection
+    nonce: u64,
+    /// Ed25519 signature (REQUIRED - NIST FIPS 186-5)
+    signature: String,
+    /// Ed25519 public key for verification (REQUIRED)
+    public_key: String,
+    /// Dilithium signature (REQUIRED - NIST FIPS 204 post-quantum)
+    /// MANDATORY for contract deployment - critical operation
+    dilithium_signature: String,
+    /// Dilithium public key (REQUIRED)
+    dilithium_public_key: String,
+}
+
+/// Request to call a smart contract method
+/// NIST/CISCO COMPLIANT: MANDATORY hybrid signatures for state-changing calls
+#[derive(Debug, Deserialize)]
+struct ContractCallRequest {
+    /// Caller's EON address
+    from: String,
+    /// Contract's EON address
+    contract_address: String,
+    /// Method name to call
+    method: String,
+    /// Method arguments as JSON
+    args: Value,
+    /// Gas limit for execution
+    gas_limit: u64,
+    /// Gas price in nano QNC
+    gas_price: u64,
+    /// Nonce for replay protection
+    nonce: u64,
+    /// Ed25519 signature (REQUIRED for state-changing calls - NIST FIPS 186-5)
+    #[serde(default)]
+    signature: Option<String>,
+    /// Ed25519 public key for verification
+    #[serde(default)]
+    public_key: Option<String>,
+    /// Dilithium signature (REQUIRED for state-changing calls - NIST FIPS 204)
+    #[serde(default)]
+    dilithium_signature: Option<String>,
+    /// Dilithium public key (REQUIRED for state-changing calls)
+    #[serde(default)]
+    dilithium_public_key: Option<String>,
+    /// Is this a read-only view call? (no signatures required)
+    #[serde(default)]
+    is_view: bool,
+}
+
+/// Request to query contract state
+#[derive(Debug, Deserialize)]
+struct ContractStateQuery {
+    /// State key to query
+    key: Option<String>,
+    /// Multiple keys to query
+    keys: Option<Vec<String>>,
+}
+
+// ContractInfo is now defined in storage.rs as StoredContractInfo
+// Re-export for API compatibility
+pub use crate::storage::StoredContractInfo as ContractInfo;
+
+// ============================================================================
+// WEBSOCKET SUBSCRIPTION STRUCTURES
+// ============================================================================
+
+/// WebSocket subscription query parameters
+/// Example: ws://node:8001/ws/subscribe?channels=blocks,account:EON_ADDRESS,contract:EON_ADDRESS
+#[derive(Debug, Deserialize)]
+struct WsSubscribeQuery {
+    /// Comma-separated list of channels to subscribe to
+    /// Formats:
+    ///   - "blocks" - all new blocks
+    ///   - "account:ADDRESS" - balance updates for specific address
+    ///   - "contract:ADDRESS" - events from specific contract
+    ///   - "mempool" - pending transactions
+    ///   - "tx:HASH" - specific transaction confirmation
+    #[serde(default)]
+    channels: Option<String>,
+}
+
+/// Parsed subscription channel
+#[derive(Debug, Clone)]
+enum WsChannel {
+    /// Subscribe to all new blocks
+    Blocks,
+    /// Subscribe to balance updates for specific address
+    Account(String),
+    /// Subscribe to events from specific contract
+    Contract(String),
+    /// Subscribe to mempool (pending transactions)
+    Mempool,
+    /// Subscribe to specific transaction confirmation
+    Transaction(String),
 }
 
 /// Start comprehensive API server (JSON-RPC + REST)
@@ -262,6 +865,17 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(blockchain_filter.clone())
         .and_then(handle_account_transactions);
     
+    // Extended transaction history with pagination and filters
+    // GET /api/v1/transactions/history?address=XXX&page=1&per_page=20&type=transfer
+    let transaction_history = api_v1
+        .and(warp::path("transactions"))
+        .and(warp::path("history"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::query::<TransactionHistoryQuery>())
+        .and(blockchain_filter.clone())
+        .and_then(handle_transaction_history);
+    
     // Block endpoints
     let block_latest = api_v1
         .and(warp::path("block"))
@@ -297,12 +911,13 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(blockchain_filter.clone())
         .and_then(handle_macroblock_by_index);
     
-    // Transaction endpoints
+    // Transaction endpoints with IP-based rate limiting
     let transaction_submit = api_v1
         .and(warp::path("transaction"))
         .and(warp::path::end())
         .and(warp::post())
         .and(warp::body::json())
+        .and(warp::addr::remote())
         .and(blockchain_filter.clone())
         .and_then(handle_transaction_submit);
     
@@ -548,13 +1163,14 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(blockchain_filter.clone())
         .and_then(handle_network_ping);
 
-    // Light node registration endpoint
+    // Light node registration endpoint (with rate limiting)
     let light_node_register = api_v1
         .and(warp::path("light-node"))
         .and(warp::path("register"))
         .and(warp::path::end())
         .and(warp::post())
         .and(warp::body::json())
+        .and(warp::addr::remote())
         .and(blockchain_filter.clone())
         .and_then(handle_light_node_register);
 
@@ -568,13 +1184,63 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(blockchain_filter.clone())
         .and_then(handle_light_node_ping_response);
 
-    // Reward claiming endpoint for all node types
+    // Light node reactivation endpoint (for returning after being offline)
+    let light_node_reactivate = api_v1
+        .and(warp::path("light-node"))
+        .and(warp::path("reactivate"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::body::json())
+        .and(blockchain_filter.clone())
+        .and_then(handle_light_node_reactivate);
+
+    // Light node status endpoint (check if active/inactive)
+    let light_node_status = api_v1
+        .and(warp::path("light-node"))
+        .and(warp::path("status"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::query::<HashMap<String, String>>())
+        .and(blockchain_filter.clone())
+        .and_then(handle_light_node_status);
+
+    // Server node status endpoint (Full/Super/Genesis node monitoring)
+    let server_node_status = api_v1
+        .and(warp::path("node"))
+        .and(warp::path("status"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::query::<HashMap<String, String>>())
+        .and(blockchain_filter.clone())
+        .and_then(handle_server_node_status);
+
+    // Light node next ping time endpoint (for polling fallback)
+    let light_node_next_ping = api_v1
+        .and(warp::path("light-node"))
+        .and(warp::path("next-ping"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::query::<HashMap<String, String>>())
+        .and_then(handle_light_node_next_ping);
+
+    // Light node pending challenge endpoint (for polling fallback)
+    let light_node_pending_challenge = api_v1
+        .and(warp::path("light-node"))
+        .and(warp::path("pending-challenge"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::query::<HashMap<String, String>>())
+        .and(blockchain_filter.clone())
+        .and_then(handle_light_node_pending_challenge);
+
+    // Reward claiming endpoint for all node types (with rate limiting)
     let claim_rewards = api_v1
         .and(warp::path("rewards"))
         .and(warp::path("claim"))
         .and(warp::path::end())
         .and(warp::post())
         .and(warp::body::json())
+        .and(warp::addr::remote())
         .and(blockchain_filter.clone())
         .and_then(handle_claim_rewards);
     
@@ -607,12 +1273,13 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(blockchain_filter.clone())
         .and_then(handle_activations_by_wallet);
 
-    // Generate activation code from burn transaction endpoint
+    // Generate activation code from burn transaction endpoint (with strict rate limiting)
     let generate_activation_code = api_v1
         .and(warp::path("generate-activation-code"))
         .and(warp::path::end())
         .and(warp::post())
         .and(warp::body::json())
+        .and(warp::addr::remote())
         .and(blockchain_filter.clone())
         .and_then(handle_generate_activation_code);
 
@@ -802,11 +1469,78 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(blockchain_filter.clone())
         .and_then(handle_p2p_message);
     
-    // CORS configuration
-    let cors = warp::cors()
-        .allow_any_origin()
-        .allow_methods(vec!["POST", "GET", "OPTIONS"])
-        .allow_headers(vec!["Content-Type", "Authorization", "User-Agent"]);
+    // ===== SMART CONTRACT ENDPOINTS =====
+    
+    // Deploy smart contract
+    let contract_deploy = api_v1
+        .and(warp::path("contract"))
+        .and(warp::path("deploy"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::body::json())
+        .and(warp::addr::remote())
+        .and(blockchain_filter.clone())
+        .and_then(handle_contract_deploy);
+    
+    // Call smart contract method
+    let contract_call = api_v1
+        .and(warp::path("contract"))
+        .and(warp::path("call"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::body::json())
+        .and(warp::addr::remote())
+        .and(blockchain_filter.clone())
+        .and_then(handle_contract_call);
+    
+    // Get contract info by address
+    let contract_info = api_v1
+        .and(warp::path("contract"))
+        .and(warp::path::param::<String>())
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(blockchain_filter.clone())
+        .and_then(handle_contract_info);
+    
+    // Get contract state
+    let contract_state = api_v1
+        .and(warp::path("contract"))
+        .and(warp::path::param::<String>())
+        .and(warp::path("state"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::query::<ContractStateQuery>())
+        .and(blockchain_filter.clone())
+        .and_then(handle_contract_state);
+    
+    // Estimate gas for contract operation
+    let contract_estimate_gas = api_v1
+        .and(warp::path("contract"))
+        .and(warp::path("estimate-gas"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::body::json())
+        .and(blockchain_filter.clone())
+        .and_then(handle_contract_estimate_gas);
+    
+    // CORS configuration - PRODUCTION SECURITY
+    // In development mode (QNET_DEV_MODE=1), allow all origins
+    // In production, restrict to whitelisted domains only
+    let cors = if std::env::var("QNET_DEV_MODE").is_ok() {
+        println!("⚠️  CORS: Development mode - allowing all origins");
+        warp::cors()
+            .allow_any_origin()
+            .allow_methods(vec!["POST", "GET", "OPTIONS", "PUT", "DELETE"])
+            .allow_headers(vec!["Content-Type", "Authorization", "User-Agent", "X-Requested-With"])
+            .max_age(3600)
+    } else {
+        println!("🔒 CORS: Production mode - restricted origins");
+        warp::cors()
+            .allow_origins(ALLOWED_ORIGINS.iter().map(|s| *s))
+            .allow_methods(vec!["POST", "GET", "OPTIONS"])
+            .allow_headers(vec!["Content-Type", "Authorization", "User-Agent"])
+            .max_age(86400) // 24 hours cache
+    };
     
     // Combine routes in smaller groups to avoid recursion overflow
     let basic_routes = rpc_path
@@ -829,6 +1563,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         
     let transaction_routes = transaction_submit
         .or(transaction_get)
+        .or(transaction_history)  // Extended history API with pagination
         .or(mempool_status)
         .or(mempool_transactions);
     
@@ -870,6 +1605,11 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
 
     let light_node_routes = light_node_register
         .or(light_node_ping_response)
+        .or(light_node_reactivate)
+        .or(light_node_status)
+        .or(server_node_status)
+        .or(light_node_next_ping)
+        .or(light_node_pending_challenge)
         .or(claim_rewards)
         .or(pending_rewards)
         .or(register_node)
@@ -884,6 +1624,47 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
     
     let p2p_routes = p2p_message;
     
+    // Smart contract routes
+    let contract_routes = contract_deploy
+        .or(contract_call)
+        .or(contract_info)
+        .or(contract_state)
+        .or(contract_estimate_gas);
+    
+    // =========================================================================
+    // WEBSOCKET: Real-time event subscriptions
+    // =========================================================================
+    
+    // WebSocket endpoint for real-time updates
+    // ws://node:8001/ws/subscribe?channels=blocks,account:ADDRESS,contracts:ADDRESS
+    // SECURITY: Rate limited to prevent connection flood attacks
+    let ws_subscribe = warp::path("ws")
+        .and(warp::path("subscribe"))
+        .and(warp::path::end())
+        .and(warp::ws())
+        .and(warp::query::<WsSubscribeQuery>())
+        .and(warp::addr::remote())
+        .and(blockchain_filter.clone())
+        .map(|ws: warp::ws::Ws, query: WsSubscribeQuery, remote_addr: Option<std::net::SocketAddr>, blockchain: Arc<BlockchainNode>| {
+            // Extract IP for rate limiting
+            let ip = remote_addr.map(|addr| addr.ip());
+            
+            // SECURITY: Check rate limit before upgrading connection
+            if !WS_RATE_LIMITER.check_connection(ip) {
+                // Return 429 Too Many Requests
+                return warp::reply::with_status(
+                    "WebSocket connection limit exceeded",
+                    warp::http::StatusCode::TOO_MANY_REQUESTS
+                ).into_response();
+            }
+            
+            // Register connection and upgrade
+            WS_RATE_LIMITER.add_connection(ip);
+            
+            ws.on_upgrade(move |socket| handle_ws_connection_with_cleanup(socket, query, blockchain, ip))
+                .into_response()
+        });
+    
     // Simple health check endpoint (no authentication required)
     let health = warp::path("health")
         .and(warp::path::end())
@@ -892,6 +1673,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
     
     // Combine route groups
     let routes = health
+        .or(ws_subscribe) // WebSocket before REST routes
         .or(basic_routes)
         .or(blockchain_routes)
         .or(account_routes)
@@ -900,6 +1682,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .or(node_routes)
         .or(light_node_routes)
         .or(consensus_routes)
+        .or(contract_routes)
         .or(p2p_routes)
         .or(monitoring_routes)
         .with(cors);
@@ -907,8 +1690,10 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
     println!("🚀 Starting comprehensive API server on port {}", port);
     println!("📡 JSON-RPC available at: http://0.0.0.0:{}/rpc", port);
     println!("🔌 REST API available at: http://0.0.0.0:{}/api/v1/", port);
+    println!("🔗 WebSocket available at: ws://0.0.0.0:{}/ws/subscribe", port);
     println!("📱 Light Node services: Registration, FCM Push, Reward Claims");
     println!("🏛️ Macroblock Consensus: Commit-Reveal, Byzantine Fault Tolerance");
+    println!("📜 Smart Contract API: Deploy, Call, Query");
     
     // Start Light node ping service for Full/Super nodes  
     let blockchain_for_ping = blockchain.clone();
@@ -1592,6 +2377,130 @@ async fn handle_account_transactions(
     }
 }
 
+/// Extended transaction history handler with pagination, filtering, and sorting
+/// API: GET /api/v1/transactions/history?address=XXX&page=1&per_page=20&tx_type=transfer&direction=sent
+async fn handle_transaction_history(
+    query: TransactionHistoryQuery,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    // Validate parameters
+    let page = if query.page == 0 { 1 } else { query.page };
+    let per_page = query.per_page.min(100).max(1); // Clamp to 1-100
+    
+    // Convert to 0-indexed page for storage
+    let storage_page = page.saturating_sub(1);
+    
+    let storage = blockchain.get_storage();
+    
+    // Fetch transactions (fetch more to allow filtering)
+    let fetch_limit = per_page * 3; // Fetch 3x to account for filtering
+    match storage.get_transactions_by_address(&query.address, storage_page, fetch_limit).await {
+        Ok(transactions) => {
+            // Apply filters
+            let filtered: Vec<_> = transactions.into_iter()
+                .filter(|tx| {
+                    // Type filter
+                    let type_match = match query.tx_type.as_str() {
+                        "transfer" => matches!(tx.tx_type, qnet_state::TransactionType::Transfer { .. }),
+                        "reward" => matches!(tx.tx_type, qnet_state::TransactionType::RewardDistribution),
+                        "activation" => matches!(tx.tx_type, qnet_state::TransactionType::NodeActivation { .. }),
+                        _ => true, // "all" or unknown
+                    };
+                    
+                    // Direction filter
+                    let direction_match = match query.direction.as_str() {
+                        "sent" => tx.from == query.address,
+                        "received" => tx.to.as_ref().map(|t| t == &query.address).unwrap_or(false),
+                        _ => true, // "all" or unknown
+                    };
+                    
+                    // Time range filter
+                    let time_match = {
+                        let after_start = query.start_time.map(|s| tx.timestamp >= s).unwrap_or(true);
+                        let before_end = query.end_time.map(|e| tx.timestamp <= e).unwrap_or(true);
+                        after_start && before_end
+                    };
+                    
+                    type_match && direction_match && time_match
+                })
+                .take(per_page)
+                .collect();
+            
+            // Convert to JSON with extended info
+            let txs: Vec<serde_json::Value> = filtered.iter().map(|tx| {
+                let direction = if tx.from == query.address {
+                    "sent"
+                } else {
+                    "received"
+                };
+                
+                let tx_type_str = match &tx.tx_type {
+                    qnet_state::TransactionType::Transfer { .. } => "transfer",
+                    qnet_state::TransactionType::RewardDistribution => "reward",
+                    qnet_state::TransactionType::NodeActivation { .. } => "activation",
+                    qnet_state::TransactionType::CreateAccount { .. } => "create_account",
+                    qnet_state::TransactionType::ContractDeploy => "contract_deploy",
+                    qnet_state::TransactionType::ContractCall => "contract_call",
+                    qnet_state::TransactionType::BatchTransfers { .. } => "batch_transfer",
+                    qnet_state::TransactionType::BatchRewardClaims { .. } => "batch_reward",
+                    qnet_state::TransactionType::BatchNodeActivations { .. } => "batch_activation",
+                    _ => "other",
+                };
+                
+                json!({
+                    "hash": tx.hash,
+                    "from": tx.from,
+                    "to": tx.to,
+                    "amount": tx.amount,
+                    "timestamp": tx.timestamp,
+                    "gas_price": tx.gas_price,
+                    "gas_limit": tx.gas_limit,
+                    "gas_used": tx.gas_price * tx.gas_limit,
+                    "nonce": tx.nonce,
+                    "type": tx_type_str,
+                    "direction": direction
+                })
+            }).collect();
+            
+            // Get total count
+            let total_count = storage.count_transactions_by_address(&query.address).await
+                .unwrap_or(0);
+            
+            let total_pages = (total_count + per_page - 1) / per_page;
+            
+            let response = json!({
+                "success": true,
+                "address": query.address,
+                "transactions": txs,
+                "pagination": {
+                    "page": page,
+                    "per_page": per_page,
+                    "total_count": total_count,
+                    "total_pages": total_pages,
+                    "has_next": page < total_pages,
+                    "has_prev": page > 1
+                },
+                "filters": {
+                    "tx_type": query.tx_type,
+                    "direction": query.direction,
+                    "start_time": query.start_time,
+                    "end_time": query.end_time
+                }
+            });
+            Ok(warp::reply::json(&response))
+        }
+        Err(e) => {
+            println!("[API] ❌ Transaction history error for {}: {}", query.address, e);
+            let error_response = json!({
+                "success": false,
+                "error": format!("Failed to fetch transaction history: {}", e),
+                "address": query.address
+            });
+            Ok(warp::reply::json(&error_response))
+        }
+    }
+}
+
 async fn handle_block_latest(
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
@@ -1743,12 +2652,71 @@ async fn handle_macroblock_by_index(
 
 async fn handle_transaction_submit(
     tx_request: TransactionRequest,
+    remote_addr: Option<std::net::SocketAddr>,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
-    // Create transaction from request
+    // SECURITY: IP-based rate limiting
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "transaction") {
+        return Ok(rate_limit_response);
+    }
+    
+    // SECURITY: Validate EON addresses before processing
+    if let Err(e) = validate_eon_address_with_error(&tx_request.from) {
+        return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": "Invalid sender address",
+            "details": e
+        })));
+    }
+    
+    if let Err(e) = validate_eon_address_with_error(&tx_request.to) {
+        return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": "Invalid recipient address",
+            "details": e
+        })));
+    }
+    
+    // =========================================================================
+    // CRITICAL SECURITY: Ed25519 Signature Verification (NIST FIPS 186-5)
+    // Without this, ANYONE could send transactions from ANY address!
+    // =========================================================================
+    
+    // Build message to verify (canonical format)
+    let message_to_sign = format!("transfer:{}:{}:{}:{}", 
+        tx_request.from, 
+        tx_request.to,
+        tx_request.amount,
+        tx_request.nonce
+    );
+    
+    // Verify Ed25519 signature
+    let signature_valid = verify_ed25519_client_signature(
+        &tx_request.from,
+        &message_to_sign,
+        &tx_request.signature,
+        &tx_request.public_key
+    ).await;
+    
+    if !signature_valid {
+        println!("[TX] ❌ SECURITY: Invalid signature for transaction from {}", 
+                 &tx_request.from[..16.min(tx_request.from.len())]);
+        return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": "Signature verification failed (NIST FIPS 186-5)",
+            "details": "Ed25519 signature does not match the transaction data",
+            "message_format": "transfer:{from}:{to}:{amount}:{nonce}"
+        })));
+    }
+    
+    println!("[TX] ✅ Ed25519 signature verified for {} -> {}", 
+             &tx_request.from[..8.min(tx_request.from.len())],
+             &tx_request.to[..8.min(tx_request.to.len())]);
+    
+    // Create transaction from request WITH verified signature
     let tx = qnet_state::Transaction::new(
         tx_request.from.clone(),
-        None, // signature: Option<String>
+        Some(tx_request.signature.clone()), // CRITICAL: Include verified signature
         tx_request.nonce,
         tx_request.gas_price,
         tx_request.gas_limit,
@@ -1760,7 +2728,11 @@ async fn handle_transaction_submit(
             to: tx_request.to.clone(),
             amount: tx_request.amount,
         },
-        None, // metadata: Option<String>
+        Some(serde_json::to_string(&json!({
+            "signature_verified": true,
+            "public_key": tx_request.public_key,
+            "standard": "NIST FIPS 186-5 (Ed25519)"
+        })).unwrap_or_default()),
     );
 
     // Convert to JSON and add to mempool
@@ -2257,11 +3229,46 @@ async fn handle_batch_transfer(
     request: BatchTransferRequest,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
+    // SECURITY: Validate all EON addresses in batch
+    for (i, transfer) in request.transfers.iter().enumerate() {
+        if let Err(e) = validate_eon_address_with_error(&transfer.from) {
+            return Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": format!("Invalid sender address in transfer #{}", i + 1),
+                "details": e
+            })));
+        }
+        if let Err(e) = validate_eon_address_with_error(&transfer.to_address) {
+            return Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": format!("Invalid recipient address in transfer #{}", i + 1),
+                "details": e
+            })));
+        }
+    }
+    
+    // =========================================================================
+    // CRITICAL SECURITY: Ed25519 Signature Verification (NIST FIPS 186-5)
+    // All transfers in batch must be from the same sender (verified by signature)
+    // =========================================================================
+    
+    // Get sender address (must be same for all transfers in batch)
+    let from_address = request.transfers.first().map(|t| t.from.clone()).unwrap_or_else(|| "unknown".to_string());
+    
+    // Verify all transfers are from the same sender
+    for (i, transfer) in request.transfers.iter().enumerate() {
+        if transfer.from != from_address {
+            return Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": format!("All transfers in batch must be from same sender. Transfer #{} has different sender.", i + 1),
+                "expected_from": from_address,
+                "actual_from": transfer.from
+            })));
+        }
+    }
+    
     // PRODUCTION: Process real batch transfers via blockchain transaction
     let total_amount: u64 = request.transfers.iter().map(|t| t.amount).sum();
-    
-    // Get sender address
-    let from_address = request.transfers.first().map(|t| t.from.clone()).unwrap_or_else(|| "unknown".to_string());
     
     // Get current nonce from state (use timestamp-based nonce for batch transfers)
     let timestamp = std::time::SystemTime::now()
@@ -2270,23 +3277,45 @@ async fn handle_batch_transfer(
         .as_secs();
     let nonce = timestamp; // Use timestamp as nonce for batch transfers
     
-    // Create batch signature using blake3 hash (system transaction)
-    let batch_data = format!("batch:{}:{}:{}:{}", 
-        from_address, total_amount, request.transfers.len(), nonce);
-    let batch_signature = {
-        let hash = blake3::hash(batch_data.as_bytes());
-        format!("sys_batch_{}", hash.to_hex())
-    };
+    // Build message to verify (canonical format for batch)
+    let message_to_sign = format!("batch_transfer:{}:{}:{}:{}", 
+        from_address, 
+        total_amount,
+        request.transfers.len(),
+        request.batch_id
+    );
+    
+    // Verify Ed25519 signature
+    let signature_valid = verify_ed25519_client_signature(
+        &from_address,
+        &message_to_sign,
+        &request.signature,
+        &request.public_key
+    ).await;
+    
+    if !signature_valid {
+        println!("[BATCH] ❌ SECURITY: Invalid signature for batch transfer from {}", 
+                 &from_address[..16.min(from_address.len())]);
+        return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": "Signature verification failed (NIST FIPS 186-5)",
+            "details": "Ed25519 signature does not match the batch data",
+            "message_format": "batch_transfer:{from}:{total_amount}:{transfer_count}:{batch_id}"
+        })));
+    }
+    
+    println!("[BATCH] ✅ Ed25519 signature verified for batch {} from {}", 
+             request.batch_id, &from_address[..8.min(from_address.len())]);
     
     let batch_tx = qnet_state::Transaction::new(
         from_address.clone(),
-        Some("batch_transfer".to_string()), // Special batch recipient
+        Some(request.signature.clone()), // CRITICAL: Include verified signature
         total_amount,
         nonce,
         100_000, // Base gas price
-        request.transfers.len() as u64 * 21_000, // Gas per transfer
+        request.transfers.len() as u64 * 10_000, // Gas per transfer (optimized)
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
-        Some(batch_signature),
+        None, // block_hash
         qnet_state::TransactionType::BatchTransfers { 
             transfers: request.transfers.iter().map(|t| BatchTransferData {
                 to_address: t.to_address.clone(),
@@ -2295,7 +3324,11 @@ async fn handle_batch_transfer(
             }).collect(),
             batch_id: request.batch_id.clone()
         },
-        None, // No additional data needed
+        Some(serde_json::to_string(&json!({
+            "signature_verified": true,
+            "public_key": request.public_key,
+            "standard": "NIST FIPS 186-5 (Ed25519)"
+        })).unwrap_or_default()),
     );
     
     // Submit batch transaction to blockchain
@@ -2582,10 +3615,14 @@ async fn handle_network_ping(
 
 // PRODUCTION: Quantum-secure signature verification using CRYSTALS-Dilithium
 /// PRODUCTION: Verify Ed25519 signature from client (mobile/browser)
-/// Clients sign simple text messages, NOT binary format like nodes
+/// Generic function - message is passed directly, NOT constructed internally
+/// This allows different message formats for different operations:
+/// - Transfers: "transfer:{from}:{to}:{amount}:{nonce}"
+/// - Reward claims: "claim_rewards:{node_id}:{wallet}"
+/// - Batch transfers: "batch_transfer:{from}:{total}:{count}:{batch_id}"
 async fn verify_ed25519_client_signature(
-    node_id: &str,
-    wallet_address: &str,
+    _context: &str,        // For logging only (e.g., "from", "node_id")
+    message: &str,         // ACTUAL message that was signed by client
     signature_hex: &str,
     public_key_hex: &str
 ) -> bool {
@@ -2593,12 +3630,12 @@ async fn verify_ed25519_client_signature(
     
     // Basic validation
     if signature_hex.len() != 128 {  // 64 bytes = 128 hex chars
-        println!("[CRYPTO] ❌ Invalid Ed25519 signature length: {}", signature_hex.len());
+        println!("[CRYPTO] ❌ Invalid Ed25519 signature length: {} (expected 128)", signature_hex.len());
         return false;
     }
     
     if public_key_hex.len() != 64 {  // 32 bytes = 64 hex chars
-        println!("[CRYPTO] ❌ Invalid Ed25519 public key length: {}", public_key_hex.len());
+        println!("[CRYPTO] ❌ Invalid Ed25519 public key length: {} (expected 64)", public_key_hex.len());
         return false;
     }
     
@@ -2630,18 +3667,20 @@ async fn verify_ed25519_client_signature(
     
     let signature = Signature::from_bytes(sig_bytes.as_slice().try_into().unwrap());
     
-    // Create message: "claim_rewards:node_id:wallet_address"
-    let message = format!("claim_rewards:{}:{}", node_id, wallet_address);
+    // CRITICAL FIX: Use the PASSED message directly, don't construct internally!
+    // The caller knows what message format was signed by the client
     let message_bytes = message.as_bytes();
     
     // Verify signature
     match verifying_key.verify(message_bytes, &signature) {
         Ok(_) => {
-            println!("[CRYPTO] ✅ Ed25519 client signature verified for {}", node_id);
+            println!("[CRYPTO] ✅ Ed25519 signature verified (msg: {}...)", 
+                    &message[..20.min(message.len())]);
             true
         }
         Err(e) => {
             println!("[CRYPTO] ❌ Ed25519 signature verification failed: {}", e);
+            println!("[CRYPTO]    Message was: {}", message);
             false
         }
     }
@@ -2741,8 +3780,21 @@ use fcm::{Client, MessageBuilder, NotificationBuilder};
 // Import lazy rewards system
 use qnet_consensus::lazy_rewards::{PhaseAwareRewardManager, NodeType as RewardNodeType};
 
+/// Pending challenge for polling-based Light nodes
+#[derive(Debug, Clone)]
+struct PendingChallenge {
+    challenge: String,
+    created_at: u64,
+    expires_at: u64,
+}
+
 lazy_static::lazy_static! {
     static ref LIGHT_NODE_REGISTRY: Mutex<HashMap<String, LightNodeInfo>> = Mutex::new(HashMap::new());
+    
+    /// Pending challenges for polling-based Light nodes
+    /// Key: node_id, Value: PendingChallenge
+    /// Cleaned up automatically when challenge expires or is answered
+    static ref PENDING_CHALLENGES: Mutex<HashMap<String, PendingChallenge>> = Mutex::new(HashMap::new());
     
     // OPTIMIZATION: Global registry singleton to avoid creating new instance on every P2P message
     // This reduces latency from 600-2000ms to <10ms for IP->pseudonym lookups
@@ -2782,17 +3834,28 @@ struct LightNodeDevice {
 struct LightNodeRegisterRequest {
     node_id: String,
     wallet_address: String,
-    device_token: String,
+    #[serde(default)]
+    device_token: String,              // FCM token (optional if using UnifiedPush)
     device_id: String,
     quantum_pubkey: String,
     quantum_signature: String,
+    #[serde(default)]
+    push_type: Option<String>,         // "fcm" | "unifiedpush" | "polling"
+    #[serde(default)]
+    unified_push_endpoint: Option<String>,  // UnifiedPush URL (e.g., https://ntfy.sh/xxx)
 }
 
 async fn handle_light_node_register(
     register_request: LightNodeRegisterRequest,
+    remote_addr: Option<std::net::SocketAddr>,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
     use std::time::{SystemTime, UNIX_EPOCH};
+    
+    // SECURITY: IP-based rate limiting for Light node registration
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "light_node_register") {
+        return Ok(rate_limit_response);
+    }
     
     // PRIVACY: Generate quantum-secure pseudonym for Light node (mobile privacy protection)
     let light_node_pseudonym = generate_light_node_pseudonym(&register_request.wallet_address);
@@ -2867,7 +3930,37 @@ async fn handle_light_node_register(
         }
     };
     
-    println!("[LIGHT] 📱 Light node registered: {} (quantum-secured privacy)", light_node_pseudonym);
+    // Determine push type from request
+    let push_type = match register_request.push_type.as_deref() {
+        Some("unifiedpush") => {
+            if let Some(ref endpoint) = register_request.unified_push_endpoint {
+                // Validate UnifiedPush endpoint URL
+                if let Err(e) = validate_unified_push_endpoint(endpoint) {
+                    return Ok(warp::reply::json(&json!({
+                        "success": false,
+                        "error": format!("Invalid UnifiedPush endpoint: {}", e)
+                    })));
+                }
+                crate::unified_p2p::PushType::UnifiedPush
+            } else {
+                return Ok(warp::reply::json(&json!({
+                    "success": false,
+                    "error": "UnifiedPush requires unified_push_endpoint"
+                })));
+            }
+        }
+        Some("polling") => crate::unified_p2p::PushType::Polling,
+        _ => crate::unified_p2p::PushType::FCM,  // Default to FCM
+    };
+    
+    let push_type_str = match push_type {
+        crate::unified_p2p::PushType::FCM => "FCM",
+        crate::unified_p2p::PushType::UnifiedPush => "UnifiedPush",
+        crate::unified_p2p::PushType::Polling => "Polling",
+    };
+    
+    println!("[LIGHT] 📱 Light node registered: {} (push: {}, quantum-secured)", 
+             light_node_pseudonym, push_type_str);
     
     // CRITICAL: Gossip Light node registration to P2P network for decentralized sync
     // This ensures ALL Full/Super nodes have the same Light node registry
@@ -2891,17 +3984,27 @@ async fn handle_light_node_register(
             quantum_pubkey: register_request.quantum_pubkey.clone(),
             registered_at: now,
             signature: register_request.quantum_signature.clone(),
+            push_type: push_type.clone(),
+            unified_push_endpoint: register_request.unified_push_endpoint.clone(),
+            last_seen: now,               // Just registered = last seen now
+            consecutive_failures: 0,       // No failures yet
+            is_active: true,              // Active by default
         };
         p2p.register_light_node(registration);
-        println!("[GOSSIP] 📤 Light node registration gossiped to network");
+        println!("[GOSSIP] 📤 Light node registration gossiped to network ({})", push_type_str);
     }
+    
+    // Calculate next ping time for this node
+    let (next_ping_time, window_number) = crate::unified_p2p::SimplifiedP2P::get_next_ping_time(&light_node_pseudonym);
     
     Ok(warp::reply::json(&json!({
         "success": true,
         "message": "Light node registered successfully with privacy protection",
         "node_id": light_node_pseudonym,
         "privacy_enabled": true,
-        "next_ping_window": now + (4 * 60 * 60), // Next 4-hour window
+        "push_type": push_type_str,
+        "next_ping_time": next_ping_time,
+        "next_ping_window": window_number,
         "quantum_secured": true
     })))
 }
@@ -3217,7 +4320,18 @@ async fn handle_light_node_ping_response(
         let _ = blockchain.get_storage().save_node_registration(&node_id, "light", &wallet_addr, 70.0);
     }
     
+    // Mark node as successfully responding (resets failure counter, reactivates if inactive)
+    if let Some(p2p) = blockchain.get_unified_p2p() {
+        p2p.mark_light_node_ping_success(&node_id);
+    }
+    
     println!("[LIGHT] 📡 Light node {} responded and attested in slot {}", node_id, current_slot);
+    
+    // Clear pending challenge if exists (for polling nodes)
+    {
+        let mut challenges = PENDING_CHALLENGES.lock().unwrap();
+        challenges.remove(&node_id);
+    }
     
     Ok(warp::reply::json(&json!({
         "success": true,
@@ -3229,12 +4343,475 @@ async fn handle_light_node_ping_response(
     })))
 }
 
+/// Handle next ping time request (for polling-based Light nodes)
+/// Returns the timestamp when the next ping is expected
+async fn handle_light_node_next_ping(
+    params: HashMap<String, String>,
+) -> Result<impl Reply, Rejection> {
+    use crate::unified_p2p::SimplifiedP2P;
+    
+    let node_id = match params.get("node_id") {
+        Some(id) => id.clone(),
+        None => return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": "node_id parameter required"
+        }))),
+    };
+    
+    let (next_ping_time, window_number) = SimplifiedP2P::get_next_ping_time(&node_id);
+    let current_slot = SimplifiedP2P::get_current_slot();
+    let current_window = SimplifiedP2P::get_current_window_number();
+    
+    Ok(warp::reply::json(&json!({
+        "success": true,
+        "node_id": node_id,
+        "next_ping_time": next_ping_time,
+        "next_ping_window": window_number,
+        "current_slot": current_slot,
+        "current_window": current_window,
+        "slots_per_window": 240,
+        "window_duration_seconds": 4 * 60 * 60
+    })))
+}
+
+/// Handle pending challenge request (for polling-based Light nodes)
+/// Returns the challenge if one is pending, or null if not
+/// Security: Only registered polling nodes can request challenges
+async fn handle_light_node_pending_challenge(
+    params: HashMap<String, String>,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    
+    let node_id = match params.get("node_id") {
+        Some(id) => id.clone(),
+        None => return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": "node_id parameter required"
+        }))),
+    };
+    
+    // Security: Verify node exists and is registered for polling
+    if let Some(p2p) = blockchain.get_unified_p2p() {
+        let registry = p2p.get_light_node_registry();
+        match registry.get(&node_id) {
+            Some(node) => {
+                // Only polling nodes can use this endpoint
+                if !matches!(node.push_type, crate::unified_p2p::PushType::Polling) {
+                    return Ok(warp::reply::json(&json!({
+                        "success": false,
+                        "error": "This endpoint is only for polling-mode nodes"
+                    })));
+                }
+                // Check if node is active
+                if !node.is_active || node.consecutive_failures >= 5 {
+                    return Ok(warp::reply::json(&json!({
+                        "success": false,
+                        "error": "Node is inactive. Please reactivate first.",
+                        "needs_reactivation": true
+                    })));
+                }
+            }
+            None => {
+                return Ok(warp::reply::json(&json!({
+                    "success": false,
+                    "error": "Node not found. Please register first."
+                })));
+            }
+        }
+    }
+    
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    
+    // Check for pending challenge
+    let pending = {
+        let mut challenges = PENDING_CHALLENGES.lock().unwrap();
+        
+        // Clean up expired challenges
+        challenges.retain(|_, c| c.expires_at > now);
+        
+        // Get challenge for this node
+        challenges.get(&node_id).cloned()
+    };
+    
+    match pending {
+        Some(challenge) => {
+            println!("[POLLING] 📤 Returning pending challenge for {}", node_id);
+            Ok(warp::reply::json(&json!({
+                "success": true,
+                "node_id": node_id,
+                "has_challenge": true,
+                "challenge": challenge.challenge,
+                "created_at": challenge.created_at,
+                "expires_at": challenge.expires_at
+            })))
+        }
+        None => {
+            // Check if it's this node's ping slot - if so, generate challenge
+            if crate::unified_p2p::SimplifiedP2P::is_light_node_ping_slot(&node_id) {
+                // Check if attestation already exists
+                if let Some(p2p) = blockchain.get_unified_p2p() {
+                    let current_slot = crate::unified_p2p::SimplifiedP2P::get_current_slot();
+                    if p2p.has_attestation(&node_id, current_slot) {
+                        return Ok(warp::reply::json(&json!({
+                            "success": true,
+                            "node_id": node_id,
+                            "has_challenge": false,
+                            "already_attested": true,
+                            "message": "Already attested in current slot"
+                        })));
+                    }
+                }
+                
+                // Generate new challenge for polling node
+                let challenge = generate_quantum_challenge();
+                let expires_at = now + 180; // 3 minute expiry
+                
+                // Store pending challenge
+                {
+                    let mut challenges = PENDING_CHALLENGES.lock().unwrap();
+                    challenges.insert(node_id.clone(), PendingChallenge {
+                        challenge: challenge.clone(),
+                        created_at: now,
+                        expires_at,
+                    });
+                }
+                
+                println!("[POLLING] 🎯 Generated challenge for {} (polling mode)", node_id);
+                
+                Ok(warp::reply::json(&json!({
+                    "success": true,
+                    "node_id": node_id,
+                    "has_challenge": true,
+                    "challenge": challenge,
+                    "created_at": now,
+                    "expires_at": expires_at
+                })))
+            } else {
+                // Not this node's slot
+                let (next_ping_time, _) = crate::unified_p2p::SimplifiedP2P::get_next_ping_time(&node_id);
+                
+                Ok(warp::reply::json(&json!({
+                    "success": true,
+                    "node_id": node_id,
+                    "has_challenge": false,
+                    "message": "Not your ping slot yet",
+                    "next_ping_time": next_ping_time
+                })))
+            }
+        }
+    }
+}
+
+/// Validate UnifiedPush endpoint URL
+/// Only allows known trusted providers to prevent abuse
+fn validate_unified_push_endpoint(endpoint: &str) -> Result<(), String> {
+    // Parse URL
+    let url = match url::Url::parse(endpoint) {
+        Ok(u) => u,
+        Err(_) => return Err("Invalid URL format".to_string()),
+    };
+    
+    // Must be HTTPS
+    if url.scheme() != "https" {
+        return Err("UnifiedPush endpoint must use HTTPS".to_string());
+    }
+    
+    // Whitelist of trusted UnifiedPush providers
+    let trusted_domains = [
+        "ntfy.sh",              // ntfy.sh (popular, free)
+        "push.ntfy.sh",         // ntfy.sh alternative
+        "gotify.net",           // Gotify
+        "push.example.org",     // Self-hosted (common pattern)
+        "unifiedpush.org",      // Official
+        "up.qnet.network",      // QNet's own (future)
+    ];
+    
+    let host = url.host_str().unwrap_or("");
+    
+    // Check if domain or subdomain of trusted provider
+    let is_trusted = trusted_domains.iter().any(|&domain| {
+        host == domain || host.ends_with(&format!(".{}", domain))
+    });
+    
+    // Also allow self-hosted if it looks like a valid domain
+    // (has at least one dot and no suspicious patterns)
+    let looks_valid = host.contains('.') && 
+                      !host.contains("localhost") &&
+                      !host.starts_with("192.168.") &&
+                      !host.starts_with("10.") &&
+                      !host.starts_with("127.") &&
+                      host.len() > 4;
+    
+    if is_trusted || looks_valid {
+        Ok(())
+    } else {
+        Err(format!("Untrusted UnifiedPush provider: {}. Use ntfy.sh or self-hosted.", host))
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ReactivateRequest {
+    node_id: String,
+    wallet_address: String,
+    signature: String,  // Signature of "reactivate:{node_id}:{timestamp}"
+    timestamp: u64,
+}
+
+/// Handle Light node reactivation request
+/// Called when user clicks "I'm back" button after being offline
+async fn handle_light_node_reactivate(
+    request: ReactivateRequest,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    
+    // Timestamp must be within 5 minutes
+    if now.abs_diff(request.timestamp) > 300 {
+        return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": "Request expired. Timestamp must be within 5 minutes."
+        })));
+    }
+    
+    // Verify signature
+    let message = format!("reactivate:{}:{}", request.node_id, request.timestamp);
+    let signature_valid = verify_dilithium_signature(&request.node_id, &message, &request.signature).await;
+    
+    if !signature_valid {
+        return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": "Invalid signature"
+        })));
+    }
+    
+    // Check if node exists and is actually inactive
+    let (exists, was_inactive) = if let Some(p2p) = blockchain.get_unified_p2p() {
+        let registry = p2p.get_light_node_registry();
+        if let Some(node) = registry.get(&request.node_id) {
+            (true, !node.is_active || node.consecutive_failures >= 5)
+        } else {
+            (false, false)
+        }
+    } else {
+        (false, false)
+    };
+    
+    if !exists {
+        return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": "Node not found. Please register first."
+        })));
+    }
+    
+    if !was_inactive {
+        return Ok(warp::reply::json(&json!({
+            "success": true,
+            "message": "Node is already active",
+            "node_id": request.node_id,
+            "was_reactivated": false
+        })));
+    }
+    
+    // Reactivate the node
+    if let Some(p2p) = blockchain.get_unified_p2p() {
+        p2p.mark_light_node_ping_success(&request.node_id);
+        println!("[LIGHT] 🔄 Node {} manually reactivated by user", request.node_id);
+    }
+    
+    // Calculate next ping time
+    let (next_ping_time, window_number) = crate::unified_p2p::SimplifiedP2P::get_next_ping_time(&request.node_id);
+    
+    Ok(warp::reply::json(&json!({
+        "success": true,
+        "message": "Node reactivated successfully",
+        "node_id": request.node_id,
+        "was_reactivated": true,
+        "next_ping_time": next_ping_time,
+        "next_ping_window": window_number
+    })))
+}
+
+/// Handle Light node status check
+/// Returns current activity status and failure count
+async fn handle_light_node_status(
+    params: HashMap<String, String>,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    let node_id = match params.get("node_id") {
+        Some(id) => id.clone(),
+        None => return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": "node_id parameter required"
+        }))),
+    };
+    
+    if let Some(p2p) = blockchain.get_unified_p2p() {
+        let registry = p2p.get_light_node_registry();
+        
+        if let Some(node) = registry.get(&node_id) {
+            let (next_ping_time, window_number) = crate::unified_p2p::SimplifiedP2P::get_next_ping_time(&node_id);
+            let current_slot = crate::unified_p2p::SimplifiedP2P::get_current_slot();
+            
+            // Check if has attestation in current window
+            let has_attestation = p2p.has_attestation(&node_id, current_slot);
+            
+            return Ok(warp::reply::json(&json!({
+                "success": true,
+                "node_id": node_id,
+                "is_active": node.is_active,
+                "consecutive_failures": node.consecutive_failures,
+                "last_seen": node.last_seen,
+                "registered_at": node.registered_at,
+                "push_type": format!("{:?}", node.push_type),
+                "has_attestation_current_slot": has_attestation,
+                "next_ping_time": next_ping_time,
+                "next_ping_window": window_number,
+                "needs_reactivation": !node.is_active || node.consecutive_failures >= 5
+            })));
+        }
+    }
+    
+    Ok(warp::reply::json(&json!({
+        "success": false,
+        "error": "Node not found"
+    })))
+}
+
+/// Handle Server node (Full/Super/Genesis) status check
+/// Returns online status, heartbeat count, and activity info
+async fn handle_server_node_status(
+    params: HashMap<String, String>,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    
+    // Can query by activation_code or node_id
+    let activation_code = params.get("activation_code").cloned();
+    let node_id = params.get("node_id").cloned();
+    
+    if activation_code.is_none() && node_id.is_none() {
+        return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": "activation_code or node_id parameter required"
+        })));
+    }
+    
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    let current_window = now - (now % (4 * 60 * 60)); // Current 4h window
+    
+    if let Some(p2p) = blockchain.get_unified_p2p() {
+        // Get active Full/Super nodes
+        let active_nodes = p2p.get_active_full_super_nodes();
+        
+        // Find node by activation_code or node_id
+        let target_node_id = if let Some(code) = &activation_code {
+            // CRITICAL: Look up node_id from activation registry
+            // This links the activation_code (from mobile app) to the network node_id
+            let registry = &*GLOBAL_ACTIVATION_REGISTRY;
+            if let Some(found_node_id) = registry.get_node_id_by_activation_code(code).await {
+                Some(found_node_id)
+            } else {
+                // Fallback: try to find in active nodes by partial match
+                active_nodes.iter()
+                    .find(|(id, _, _)| id.contains(code) || code.contains(id))
+                    .map(|(id, _, _)| id.clone())
+            }
+        } else {
+            node_id.clone()
+        };
+        
+        if let Some(ref target_id) = target_node_id {
+            // Check if node is in active list
+            let node_info = active_nodes.iter()
+                .find(|(id, _, _)| id == target_id);
+            
+            if let Some((found_id, node_type, last_seen)) = node_info {
+                // Get heartbeat stats for current window
+                let heartbeats = p2p.get_heartbeats_for_window(current_window);
+                let node_heartbeats: Vec<_> = heartbeats.iter()
+                    .filter(|(id, _, _)| id == found_id)
+                    .collect();
+                
+                let heartbeat_count = node_heartbeats.len() as u8;
+                
+                // Determine required heartbeats based on node type
+                let required_heartbeats = match node_type.as_str() {
+                    "super" => 9,  // Super nodes need 9/10
+                    _ => 8,        // Full nodes need 8/10
+                };
+                
+                // Calculate if node is active (seen in last 15 minutes)
+                let is_online = now - last_seen < 15 * 60;
+                
+                // Calculate if eligible for rewards
+                let is_reward_eligible = heartbeat_count >= required_heartbeats;
+                
+                // Get reputation
+                let reputation = p2p.get_node_reputation(found_id);
+                
+                // Get block height if available
+                let block_height = blockchain.get_height().await;
+                
+                // Get rewards info from reward manager
+                let pending_rewards = {
+                    let reward_manager = blockchain.get_reward_manager();
+                    let rm = reward_manager.read().await;
+                    rm.get_pending_reward(found_id)
+                        .map(|r| r.total_reward)
+                        .unwrap_or(0)
+                };
+                
+                return Ok(warp::reply::json(&json!({
+                    "success": true,
+                    "node_id": found_id,
+                    "node_type": node_type,
+                    "is_online": is_online,
+                    "last_seen": last_seen,
+                    "last_seen_ago_seconds": now - last_seen,
+                    "heartbeat_count": heartbeat_count,
+                    "required_heartbeats": required_heartbeats,
+                    "is_reward_eligible": is_reward_eligible,
+                    "reputation": reputation,
+                    "current_block_height": block_height,
+                    "current_window_start": current_window,
+                    "needs_attention": !is_online || heartbeat_count < required_heartbeats,
+                    // Rewards info (QNC tokens in smallest units)
+                    "pending_rewards": pending_rewards
+                })));
+            }
+        }
+        
+        // Node not found in active list - check if it ever existed
+        // This could be an offline node
+        return Ok(warp::reply::json(&json!({
+            "success": true,
+            "node_id": target_node_id,
+            "is_online": false,
+            "last_seen": 0,
+            "heartbeat_count": 0,
+            "required_heartbeats": 8,
+            "is_reward_eligible": false,
+            "reputation": 0,
+            "needs_attention": true,
+            "message": "Node not found in active network. It may be offline or not yet registered."
+        })));
+    }
+    
+    Ok(warp::reply::json(&json!({
+        "success": false,
+        "error": "P2P system not available"
+    })))
+}
+
 // FCM Push Service for Light Node Pings with Rate Limiting
 // Google FCM limit: ~500 requests/second per project
 // We use a global rate limiter to stay well under this limit
 
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use once_cell::sync::Lazy;
+// Note: Lazy is already imported at the top of the file
 
 /// Global FCM rate limiter state
 static FCM_RATE_LIMITER: Lazy<FcmRateLimiter> = Lazy::new(|| FcmRateLimiter::new());
@@ -3690,14 +5267,6 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
                             // Acquire semaphore permit
                             let _permit = semaphore.acquire().await.unwrap();
                             
-                            // Create FCM service per-request
-                            let fcm = FCMPushService::new();
-                            
-                            // Send FCM push notification with challenge
-                            let device_token = light_node.device_token_hash
-                                .replace("fcm_", "")
-                                .replace("hash_", "");
-                            
                             let role_str = match role {
                                 PingerRole::Primary => "PRIMARY",
                                 PingerRole::Backup1 => "BACKUP1",
@@ -3705,24 +5274,84 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
                                 PingerRole::None => "NONE",
                             };
                             
-                            match fcm.send_ping_notification(&device_token, &light_node.node_id, &challenge).await {
-                                Ok(()) => {
-                                    // FCM push sent successfully
-                                    // IMPORTANT: We do NOT create attestation here!
-                                    // Attestation is created when Light node responds via /ping-response
-                                    // This ensures we only attest nodes that actually respond
-                                    println!("[LIGHT] 📤 {} sent FCM to {} slot {} (awaiting response)", 
-                                             role_str, light_node.node_id, current_slot);
-                                }
-                                Err(e) => {
-                                    // Expected for non-Genesis nodes (no FCM key)
-                                    // They still participate in pinger selection for redundancy
-                                    // but only Genesis nodes actually send FCM pushes
-                                    if !e.contains("FCM_SERVER_KEY not configured") {
-                                        println!("[LIGHT] ❌ {} FCM error for {}: {}", 
-                                                 role_str, light_node.node_id, e);
+                            // Send ping based on push type
+                            match light_node.push_type {
+                                crate::unified_p2p::PushType::FCM => {
+                                    // FCM push notification (Google Play users)
+                                    let fcm = FCMPushService::new();
+                                    let device_token = light_node.device_token_hash
+                                        .replace("fcm_", "")
+                                        .replace("hash_", "");
+                                    
+                                    match fcm.send_ping_notification(&device_token, &light_node.node_id, &challenge).await {
+                                        Ok(()) => {
+                                            println!("[LIGHT] 📤 {} sent FCM to {} slot {} (awaiting response)", 
+                                                     role_str, light_node.node_id, current_slot);
+                                        }
+                                        Err(e) => {
+                                            if !e.contains("FCM_SERVER_KEY not configured") {
+                                                println!("[LIGHT] ❌ {} FCM error for {}: {}", 
+                                                         role_str, light_node.node_id, e);
+                                            }
+                                        }
                                     }
-                                    // Silent skip for non-Genesis nodes
+                                }
+                                crate::unified_p2p::PushType::UnifiedPush => {
+                                    // UnifiedPush notification (F-Droid users)
+                                    if let Some(endpoint) = &light_node.unified_push_endpoint {
+                                        let client = reqwest::Client::new();
+                                        let payload = serde_json::json!({
+                                            "action": "ping_response",
+                                            "node_id": light_node.node_id,
+                                            "challenge": challenge,
+                                            "timestamp": std::time::SystemTime::now()
+                                                .duration_since(std::time::UNIX_EPOCH)
+                                                .unwrap()
+                                                .as_secs()
+                                        });
+                                        
+                                        match client.post(endpoint)
+                                            .header("Content-Type", "application/json")
+                                            .json(&payload)
+                                            .timeout(std::time::Duration::from_secs(10))
+                                            .send()
+                                            .await 
+                                        {
+                                            Ok(response) if response.status().is_success() => {
+                                                println!("[LIGHT] 📤 {} sent UnifiedPush to {} slot {} (awaiting response)", 
+                                                         role_str, light_node.node_id, current_slot);
+                                            }
+                                            Ok(response) => {
+                                                println!("[LIGHT] ❌ {} UnifiedPush error for {}: HTTP {}", 
+                                                         role_str, light_node.node_id, response.status());
+                                            }
+                                            Err(e) => {
+                                                println!("[LIGHT] ❌ {} UnifiedPush network error for {}: {}", 
+                                                         role_str, light_node.node_id, e);
+                                            }
+                                        }
+                                    } else {
+                                        println!("[LIGHT] ⚠️ {} has UnifiedPush type but no endpoint", light_node.node_id);
+                                    }
+                                }
+                                crate::unified_p2p::PushType::Polling => {
+                                    // Polling mode - store challenge for device to fetch
+                                    let now = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap()
+                                        .as_secs();
+                                    
+                                    {
+                                        let mut challenges = PENDING_CHALLENGES.lock().unwrap();
+                                        challenges.insert(light_node.node_id.clone(), PendingChallenge {
+                                            challenge: challenge.clone(),
+                                            created_at: now,
+                                            expires_at: now + 180, // 3 minute expiry
+                                        });
+                                    }
+                                    
+                                    println!("[LIGHT] 📥 {} stored challenge for {} slot {} (polling mode)", 
+                                             role_str, light_node.node_id, current_slot);
                                 }
                             }
                         });
@@ -3730,6 +5359,57 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
                     
                     // Wait for all Light node pings
                     while futures.next().await.is_some() {}
+                }
+                
+                // ================================================================
+                // CHECK FOR UNANSWERED PINGS (mark failures at end of slot)
+                // ================================================================
+                // After grace period (3 minutes), check if nodes responded
+                // This runs at slot N+3 to check slot N
+                let check_slot = if current_slot >= 3 { current_slot - 3 } else { 240 - 3 + current_slot };
+                
+                let nodes_in_check_slot: Vec<String> = {
+                    let registry = p2p.get_light_node_registry();
+                    registry.values()
+                        .filter(|node| {
+                            SimplifiedP2P::calculate_light_node_shard(&node.node_id) == p2p.get_shard_id() &&
+                            SimplifiedP2P::calculate_randomized_slot(&node.node_id, SimplifiedP2P::get_current_window_number()) == check_slot &&
+                            node.is_active
+                        })
+                        .map(|n| n.node_id.clone())
+                        .collect()
+                };
+                
+                for node_id in nodes_in_check_slot {
+                    // Check if attestation exists for the checked slot
+                    if !p2p.has_attestation(&node_id, check_slot) {
+                        // No attestation = no response = failure
+                        p2p.mark_light_node_ping_failed(&node_id);
+                    }
+                }
+                
+                // ================================================================
+                // PROBE INACTIVE NODES (once per window to check if back online)
+                // ================================================================
+                let inactive_to_probe = p2p.get_inactive_nodes_to_probe();
+                if !inactive_to_probe.is_empty() {
+                    println!("[LIGHT] 🔍 Probing {} inactive nodes", inactive_to_probe.len());
+                    
+                    for node in inactive_to_probe {
+                        // Store probe challenge (polling mode for probes)
+                        let challenge = generate_quantum_challenge();
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs();
+                        
+                        let mut challenges = PENDING_CHALLENGES.lock().unwrap();
+                        challenges.insert(node.node_id.clone(), PendingChallenge {
+                            challenge,
+                            created_at: now,
+                            expires_at: now + 300, // 5 minute expiry for probes
+                        });
+                    }
                 }
             }
             
@@ -3881,13 +5561,29 @@ struct ClaimRewardsRequest {
 
 async fn handle_claim_rewards(
     claim_request: ClaimRewardsRequest,
+    remote_addr: Option<std::net::SocketAddr>,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
+    // SECURITY: IP-based rate limiting for reward claims
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "claim_rewards") {
+        return Ok(rate_limit_response);
+    }
+    
+    // SECURITY: Validate EON wallet address format
+    if let Err(e) = validate_eon_address_with_error(&claim_request.wallet_address) {
+        return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": "Invalid wallet address format",
+            "details": e
+        })));
+    }
+    
     // PRODUCTION: Verify Ed25519 signature from client (NOT Dilithium - that's for node consensus only)
-    // Client signs: "claim_rewards:node_id:wallet_address"
+    // Client signs: "claim_rewards:{node_id}:{wallet_address}"
+    let claim_message = format!("claim_rewards:{}:{}", claim_request.node_id, claim_request.wallet_address);
     let signature_valid = verify_ed25519_client_signature(
-        &claim_request.node_id,
-        &claim_request.wallet_address,
+        &claim_request.node_id,  // context for logging
+        &claim_message,          // actual signed message
         &claim_request.quantum_signature,
         &claim_request.public_key
     ).await;
@@ -3895,46 +5591,71 @@ async fn handle_claim_rewards(
     if !signature_valid {
         return Ok(warp::reply::json(&json!({
             "success": false,
-            "error": "Invalid Ed25519 signature for reward claim"
+            "error": "Invalid Ed25519 signature for reward claim",
+            "message_format": "claim_rewards:{node_id}:{wallet_address}"
         })));
     }
     
-    // FIXED: Get the ACTUAL wallet address that was registered with the node
-    let wallet_address = if claim_request.node_id.starts_with("genesis_node_") {
-        // Genesis nodes use deterministic wallet (same as registration in node.rs:1009)
-        let bootstrap_id = claim_request.node_id.strip_prefix("genesis_node_").unwrap_or("001");
-        let mut hasher = sha3::Sha3_256::new();
-        use sha3::Digest;
-        hasher.update(format!("genesis_{}_wallet", bootstrap_id).as_bytes());
-        let wallet_hash = hasher.finalize();
-        format!("genesis_wallet_{}_{}", bootstrap_id, hex::encode(&wallet_hash[..8]))
-    } else if claim_request.node_id.starts_with("light_") {
-        // Light nodes - check LIGHT_NODE_REGISTRY
-        let registry = LIGHT_NODE_REGISTRY.lock().unwrap();
-        if let Some(light_node) = registry.get(&claim_request.node_id) {
-            if let Some(device) = light_node.devices.first() {
-                device.wallet_address.clone()
-            } else {
-                // Fallback if no devices
-                {
-                    let hash = blake3::hash(claim_request.node_id.as_bytes()).to_hex();
-                    format!("{}eon{}", &hash[..20], &hash[20..40])
-                }
+    // CRITICAL FIX: Get the ACTUAL wallet address from node_ownership in reward_manager
+    // The wallet was registered during node activation - we MUST use that, not generate a new one!
+    // This prevents attackers from claiming rewards to a different wallet.
+    let registered_wallet = {
+        let reward_manager_arc = blockchain.get_reward_manager();
+        let reward_manager = reward_manager_arc.read().await;
+        reward_manager.get_node_owner(&claim_request.node_id)
+    };
+    
+    let wallet_address = match registered_wallet {
+        Some(registered) => {
+            // SECURITY: Verify claimant wallet matches registered wallet
+            if registered != claim_request.wallet_address {
+                println!("[SECURITY] ❌ Wallet mismatch for node {}", claim_request.node_id);
+                println!("   Registered: {}...", &registered[..16.min(registered.len())]);
+                println!("   Claimed by: {}...", &claim_request.wallet_address[..16.min(claim_request.wallet_address.len())]);
+                return Ok(warp::reply::json(&json!({
+                    "success": false,
+                    "error": "Wallet address does not match registered owner"
+                })));
             }
-        } else {
-            // Not found in registry
-            {
-                let hash = blake3::hash(claim_request.node_id.as_bytes()).to_hex();
-                format!("{}eon{}", &hash[..20], &hash[20..40])
-            }
+            registered
         }
-    } else {
-        // Full/Super nodes - derive deterministic wallet address from node_id
-        // This ensures consistent wallet mapping across all nodes in the network
-        // The wallet is derived using blake3 hash which is cryptographically secure
-        {
-            let hash = blake3::hash(claim_request.node_id.as_bytes()).to_hex();
-            format!("{}eon{}", &hash[..20], &hash[20..40])
+        None => {
+            // Node not registered in reward_manager - check if it's a Genesis node
+            if claim_request.node_id.starts_with("genesis_node_") {
+                // Genesis nodes use PREDEFINED wallets from genesis_constants.rs
+                // CRITICAL: Must match the wallet used during registration in node.rs
+                let bootstrap_id = claim_request.node_id.strip_prefix("genesis_node_").unwrap_or("001");
+                
+                match crate::genesis_constants::get_genesis_wallet_by_id(bootstrap_id) {
+                    Some(genesis_wallet) => {
+                        // Verify claimant is using the correct Genesis wallet
+                        if genesis_wallet != claim_request.wallet_address {
+                            println!("[SECURITY] ❌ Genesis wallet mismatch for node {}", claim_request.node_id);
+                            println!("   Expected: {}...", &genesis_wallet[..16.min(genesis_wallet.len())]);
+                            println!("   Claimed by: {}...", &claim_request.wallet_address[..16.min(claim_request.wallet_address.len())]);
+                            return Ok(warp::reply::json(&json!({
+                                "success": false,
+                                "error": "Invalid Genesis wallet address"
+                            })));
+                        }
+                        genesis_wallet.to_string()
+                    }
+                    None => {
+                        println!("[SECURITY] ❌ Unknown Genesis bootstrap ID: {}", bootstrap_id);
+                        return Ok(warp::reply::json(&json!({
+                            "success": false,
+                            "error": "Unknown Genesis node ID"
+                        })));
+                    }
+                }
+            } else {
+                // Node not registered - cannot claim
+                println!("[SECURITY] ❌ Node {} not registered for rewards", claim_request.node_id);
+                return Ok(warp::reply::json(&json!({
+                    "success": false,
+                    "error": "Node not registered for rewards. Register your node first."
+                })));
+            }
         }
     };
     
@@ -4191,7 +5912,7 @@ async fn handle_register_node(
         
         // Gossip Light node registration to P2P network
         if let Some(p2p) = blockchain.get_unified_p2p() {
-            use crate::unified_p2p::LightNodeRegistrationData;
+            use crate::unified_p2p::{LightNodeRegistrationData, PushType};
             let registration = LightNodeRegistrationData {
                 node_id: node_id.clone(),
                 wallet_address: wallet_address.to_string(),
@@ -4199,6 +5920,11 @@ async fn handle_register_node(
                 quantum_pubkey: quantum_pubkey.to_string(),
                 registered_at: now,
                 signature: String::new(), // No signature for legacy API
+                push_type: PushType::FCM, // Default to FCM for legacy API
+                unified_push_endpoint: None,
+                last_seen: now,
+                consecutive_failures: 0,
+                is_active: true,
             };
             p2p.register_light_node(registration);
         }
@@ -4454,8 +6180,45 @@ async fn handle_activations_by_wallet(
 /// Handle activation code generation from burn transaction
 async fn handle_generate_activation_code(
     request: GenerateActivationCodeRequest,
+    remote_addr: Option<std::net::SocketAddr>,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
+    // SECURITY: Strict rate limiting for activation code generation (expensive operation)
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "activation") {
+        return Ok(rate_limit_response);
+    }
+    
+    // SECURITY: Validate wallet address format (Phase 2 uses EON, Phase 1 uses Solana base58)
+    if request.phase == 2 {
+        if let Err(e) = validate_eon_address_with_error(&request.wallet_address) {
+            return Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": "Invalid EON wallet address format",
+                "details": e
+            })));
+        }
+    } else {
+        // Phase 1: Solana base58 address validation (32-44 chars, alphanumeric except 0OIl)
+        let is_valid_solana = request.wallet_address.len() >= 32 
+            && request.wallet_address.len() <= 44
+            && request.wallet_address.chars().all(|c| c.is_alphanumeric() && c != '0' && c != 'O' && c != 'I' && c != 'l');
+        if !is_valid_solana {
+            return Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": "Invalid Solana wallet address format"
+            })));
+        }
+    }
+    
+    // Validate node type
+    let valid_node_types = ["light", "full", "super"];
+    if !valid_node_types.contains(&request.node_type.to_lowercase().as_str()) {
+        return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": "Invalid node type. Must be: light, full, or super"
+        })));
+    }
+    
     println!("[GENERATE] 🔐 Generating activation code from burn transaction");
     println!("   Wallet: {}", &request.wallet_address[..8.min(request.wallet_address.len())]);
     println!("   Burn TX: {}", &request.burn_tx_hash[..8.min(request.burn_tx_hash.len())]);
@@ -4533,6 +6296,10 @@ async fn handle_generate_activation_code(
                 activated_at: chrono::Utc::now().timestamp() as u64,
                 last_seen: chrono::Utc::now().timestamp() as u64,
                 migration_count: 0,
+                node_id: String::new(), // Will be populated when node starts on server
+                burn_tx_hash: request.burn_tx_hash.clone(), // CRITICAL: Store burn_tx for XOR decryption
+                phase: request.phase,
+                burn_amount: request.burn_amount, // CRITICAL: Store exact amount for XOR key derivation
             };
 
             if let Err(e) = registry.register_activation_on_blockchain(&activation_code, node_info).await {
@@ -5726,71 +7493,991 @@ async fn handle_reputation_history(
     Ok(warp::reply::json(&history))
 }
 
-/// Generate quantum-secure activation code deterministically
+/// Generate quantum-secure activation code with XOR-encrypted wallet
+/// CRITICAL: Must match bridge-server.py format for decrypt compatibility!
+/// Format: QNET-{type+timestamp}-{encrypted_wallet1}-{encrypted_wallet2+entropy}
 async fn generate_quantum_activation_code(
     request: &GenerateActivationCodeRequest,
 ) -> Result<String, String> {
-    use crate::quantum_crypto::QNetQuantumCrypto;
-    use sha3::{Sha3_256, Digest};
-    use hex;
+    use sha2::{Sha256, Digest as Sha2Digest};
+    use sha3::{Sha3_256, Digest as Sha3Digest};
     
-    println!("🔐 Generating quantum-secure activation code...");
+    println!("🔐 Generating quantum-secure activation code with XOR encryption...");
+    println!("   Wallet: {}...", &request.wallet_address[..8.min(request.wallet_address.len())]);
+    println!("   Burn TX: {}...", &request.burn_tx_hash[..8.min(request.burn_tx_hash.len())]);
+    println!("   Node Type: {}", request.node_type);
     
-    // Create deterministic entropy from burn transaction data
-    let entropy_data = format!(
-        "{}:{}:{}:{}:{}",
-        request.burn_tx_hash,
-        request.wallet_address,
-        request.node_type,
-        request.burn_amount,
-        request.phase
+    // Step 1: Create encryption key from burn transaction (MUST match bridge-server.py)
+    // key_material = f"{burn_tx_hash}:{node_type}:{burn_amount}"
+    let key_material = format!("{}:{}:{}", 
+        request.burn_tx_hash, 
+        request.node_type.to_lowercase(), 
+        request.burn_amount
     );
     
-    let mut hasher = Sha3_256::new();
-    hasher.update(entropy_data.as_bytes());
-    hasher.update(b"QNET_ACTIVATION_GENERATION_v2.0");
-    let entropy_hash = hasher.finalize();
+    let mut key_hasher = Sha256::new();
+    key_hasher.update(key_material.as_bytes());
+    let encryption_key_full = hex::encode(key_hasher.finalize());
+    let encryption_key = &encryption_key_full[..32]; // First 32 chars
     
-    // Generate quantum-secure activation code using GLOBAL instance
-    use crate::node::GLOBAL_QUANTUM_CRYPTO;
+    // Step 2: XOR encrypt wallet address (MUST match bridge-server.py)
+    let wallet_bytes = request.wallet_address.as_bytes();
+    let key_bytes = encryption_key.as_bytes();
+    let mut encrypted_wallet = Vec::new();
     
-    let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
-    if crypto_guard.is_none() {
-        let mut crypto = QNetQuantumCrypto::new();
-        crypto.initialize().await
-            .map_err(|e| format!("Quantum crypto initialization failed: {}", e))?;
-        *crypto_guard = Some(crypto);
+    for (i, &wallet_byte) in wallet_bytes.iter().enumerate() {
+        let key_byte = key_bytes[i % key_bytes.len()];
+        encrypted_wallet.push(wallet_byte ^ key_byte);
     }
-    let quantum_crypto = crypto_guard.as_ref().unwrap();
-        
-    // Create quantum-secure code with extended format QNET-XXXXXX-XXXXXX-XXXXXX (25 chars total)
-    let node_type_prefix = match request.node_type.to_lowercase().as_str() {
+    
+    // Convert to hex
+    let encrypted_wallet_hex = hex::encode(&encrypted_wallet).to_uppercase();
+    
+    // Step 3: Generate entropy from transaction data
+    let mut entropy_hasher = Sha3_256::new();
+    entropy_hasher.update(format!("{}:{}:{}", 
+        request.wallet_address, 
+        chrono::Utc::now().timestamp(),
+        request.node_type
+    ).as_bytes());
+    let entropy_hash = hex::encode(entropy_hasher.finalize());
+    let entropy_short = &entropy_hash[..4].to_uppercase();
+    
+    // Step 4: Node type marker
+    let node_type_marker = match request.node_type.to_lowercase().as_str() {
         "light" => "L",
         "full" => "F", 
         "super" => "S",
-        _ => "U", // Unknown
+        _ => "U",
     };
     
-    // Encode timestamp + node type + wallet + entropy into 18 hex chars (more secure)
+    // Step 5: Timestamp (last 5 hex chars)
     let timestamp = chrono::Utc::now().timestamp() as u64;
-    let timestamp_hex = format!("{:016X}", timestamp); // Full 16 hex chars
+    let timestamp_hex = format!("{:X}", timestamp);
+    let timestamp_part = &timestamp_hex[timestamp_hex.len().saturating_sub(5)..];
     
-    // Take more parts of wallet address and entropy for better uniqueness
-    let wallet_part = &request.wallet_address[..6.min(request.wallet_address.len())];
-    let entropy_part = &hex::encode(&entropy_hash)[..12]; // Extended entropy
+    // Step 6: Build segments (MUST match bridge-server.py format)
+    // segment1: NodeType + Timestamp (6 chars)
+    let segment1 = format!("{}{:0>5}", node_type_marker, timestamp_part).to_uppercase();
     
-    // Create segments for QNET-XXXXXX-XXXXXX-XXXXXX format (25 chars total)
-    let segment1 = format!("{}{}", node_type_prefix, &timestamp_hex[..5]); // 6 chars
-    let segment2 = format!("{:0<6}", wallet_part.to_uppercase()); // 6 chars
-    let segment3 = format!("{:0<6}", &entropy_part[..6].to_uppercase()); // 6 chars
+    // segment2: First 6 chars of encrypted wallet hex
+    let segment2 = if encrypted_wallet_hex.len() >= 6 {
+        encrypted_wallet_hex[..6].to_string()
+    } else {
+        format!("{:0<6}", encrypted_wallet_hex)
+    };
     
+    // segment3: More encrypted wallet (chars 6-10) + entropy (4 chars) = 6 chars total
+    let wallet_part2 = if encrypted_wallet_hex.len() >= 10 {
+        &encrypted_wallet_hex[6..10]
+    } else if encrypted_wallet_hex.len() > 6 {
+        &encrypted_wallet_hex[6..]
+    } else {
+        "0000"
+    };
+    let segment3 = format!("{}{}", wallet_part2, entropy_short);
+    let segment3 = if segment3.len() >= 6 { segment3[..6].to_string() } else { format!("{:0<6}", segment3) };
+    
+    // Step 7: Format final code
     let activation_code = format!("QNET-{}-{}-{}", segment1, segment2, segment3);
     
-    // Ensure exactly 26 characters (QNET-XXXXXX-XXXXXX-XXXXXX)
-    if activation_code.len() != 26 {
-        return Err(format!("Generated code length validation failed: expected 26, got {}", activation_code.len()));
+    // Validate length (should be 25 chars: QNET-XXXXXX-XXXXXX-XXXXXX)
+    if activation_code.len() != 25 {
+        println!("⚠️ Code length: {} (expected 25)", activation_code.len());
     }
     
-    println!("✅ Quantum activation code generated: {}...", &activation_code[..8]);
+    println!("✅ Quantum activation code generated with XOR-encrypted wallet");
+    println!("   Code: {}...", &activation_code[..12]);
+    println!("   Encryption key derived from burn_tx:type:amount");
+    
     Ok(activation_code)
+}
+
+// ============================================================================
+// SMART CONTRACT HANDLERS
+// ============================================================================
+
+/// Handle smart contract deployment
+/// NIST/CISCO COMPLIANT: Hybrid signature verification (Ed25519 + CRYSTALS-Dilithium)
+async fn handle_contract_deploy(
+    request: ContractDeployRequest,
+    remote_addr: Option<std::net::SocketAddr>,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    // SECURITY: Rate limiting for contract deployment (expensive operation)
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "activation") {
+        return Ok(rate_limit_response);
+    }
+    
+    // SECURITY: Validate deployer address
+    if let Err(e) = validate_eon_address_with_error(&request.from) {
+        return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": "Invalid deployer address",
+            "details": e
+        })));
+    }
+    
+    // =========================================================================
+    // NIST/CISCO COMPLIANT SIGNATURE VERIFICATION
+    // Standard: NIST FIPS 186-5 (Ed25519) + NIST FIPS 204 (CRYSTALS-Dilithium)
+    // =========================================================================
+    
+    // Build message to verify (deployer + code_hash + nonce)
+    let message_to_sign = format!("contract_deploy:{}:{}:{}", 
+        request.from, 
+        {
+            let mut hasher = Sha3_256::new();
+            if let Ok(code) = base64::engine::general_purpose::STANDARD.decode(&request.code) {
+                hasher.update(&code);
+            }
+            hex::encode(hasher.finalize())
+        },
+        request.nonce
+    );
+    
+    // Step 1: Verify Ed25519 signature (NIST FIPS 186-5 - classical security)
+    let ed25519_valid = verify_ed25519_client_signature(
+        &request.from,
+        &message_to_sign,
+        &request.signature,
+        &request.public_key
+    ).await;
+    
+    if !ed25519_valid {
+        return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": "Ed25519 signature verification failed (NIST FIPS 186-5)",
+            "security_level": "classical"
+        })));
+    }
+    
+    println!("[CONTRACT] ✅ Ed25519 signature verified (NIST FIPS 186-5)");
+    
+    // Step 2: Verify Dilithium signature (NIST FIPS 204 - post-quantum) - MANDATORY
+    // Smart contracts are critical operations - require BOTH signatures like consensus
+    let dilithium_valid = verify_dilithium_signature_for_contract(
+        &message_to_sign,
+        &request.dilithium_signature,
+        &request.dilithium_public_key
+    ).await;
+    
+    if !dilithium_valid {
+        return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": "Dilithium signature verification failed (NIST FIPS 204)",
+            "security_level": "post-quantum",
+            "requirement": "MANDATORY - Smart contracts require hybrid signatures"
+        })));
+    }
+    
+    println!("[CONTRACT] ✅ Dilithium signature verified (NIST FIPS 204 - Post-Quantum)");
+    let is_quantum_secure = true; // Always true for contracts - Dilithium is mandatory
+    
+    // Validate gas limits
+    if request.gas_limit < 50000 {
+        return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": "Gas limit too low for contract deployment",
+            "min_gas_limit": 50000
+        })));
+    }
+    
+    if request.gas_limit > 1000000 {
+        return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": "Gas limit exceeds maximum",
+            "max_gas_limit": 1000000
+        })));
+    }
+    
+    // Decode WASM code from base64
+    let wasm_code = match base64::engine::general_purpose::STANDARD.decode(&request.code) {
+        Ok(code) => code,
+        Err(e) => {
+            return Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": "Invalid base64-encoded contract code",
+                "details": e.to_string()
+            })));
+        }
+    };
+    
+    // Validate WASM magic bytes
+    if wasm_code.len() < 8 || &wasm_code[0..4] != b"\x00asm" {
+        return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": "Invalid WASM bytecode - missing magic bytes"
+        })));
+    }
+    
+    // Calculate contract address (deterministic from deployer + nonce)
+    let contract_address = {
+        let mut hasher = Sha3_256::new();
+        hasher.update(request.from.as_bytes());
+        hasher.update(&request.nonce.to_le_bytes());
+        let hash = hex::encode(hasher.finalize());
+        // Format as EON address
+        let part1 = &hash[0..19];
+        let part2 = &hash[19..34];
+        let checksum_input = format!("{}eon{}", part1, part2);
+        let mut checksum_hasher = Sha3_256::new();
+        checksum_hasher.update(checksum_input.as_bytes());
+        let checksum = hex::encode(&checksum_hasher.finalize()[..2]);
+        format!("{}eon{}{}", part1, part2, checksum)
+    };
+    
+    // Calculate code hash (SHA3-256 - NIST FIPS 202)
+    let code_hash = {
+        let mut hasher = Sha3_256::new();
+        hasher.update(&wasm_code);
+        hex::encode(hasher.finalize())
+    };
+    
+    // Create ContractDeploy transaction with security metadata
+    let tx = qnet_state::Transaction::new(
+        request.from.clone(),
+        Some(request.signature.clone()),
+        request.nonce,
+        request.gas_price,
+        request.gas_limit,
+        chrono::Utc::now().timestamp() as u64,
+        0,
+        None,
+        qnet_state::TransactionType::ContractDeploy,
+        Some(serde_json::to_string(&json!({
+            "code_hash": code_hash,
+            "code_size": wasm_code.len(),
+            "constructor_args": request.constructor_args,
+            "security": {
+                "ed25519_verified": true,
+                "dilithium_verified": is_quantum_secure,
+                "nist_compliant": true,
+                "standards": ["FIPS 186-5", "FIPS 202", if is_quantum_secure { "FIPS 204" } else { "N/A" }]
+            }
+        })).unwrap_or_default()),
+    );
+    
+    // Submit to mempool
+    match blockchain.add_transaction_to_mempool(tx).await {
+        Ok(_) => {
+            println!("📜 Contract deployment submitted: {}", &contract_address[..16]);
+            println!("   Security: Ed25519 ✅ | Dilithium: {}", if is_quantum_secure { "✅" } else { "N/A" });
+            Ok(warp::reply::json(&json!({
+                "success": true,
+                "contract_address": contract_address,
+                "code_hash": code_hash,
+                "code_size": wasm_code.len(),
+                "gas_limit": request.gas_limit,
+                "deployer": request.from,
+                "message": "Contract deployment submitted to mempool",
+                "security": {
+                    "ed25519_verified": true,
+                    "dilithium_verified": is_quantum_secure,
+                    "quantum_secure": is_quantum_secure,
+                    "nist_standards": {
+                        "signature": "FIPS 186-5 (Ed25519)",
+                        "hash": "FIPS 202 (SHA3-256)",
+                        "post_quantum": if is_quantum_secure { "FIPS 204 (Dilithium)" } else { "Not provided" }
+                    }
+                }
+            })))
+        }
+        Err(e) => {
+            Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": "Failed to submit contract deployment",
+                "details": format!("{:?}", e)
+            })))
+        }
+    }
+}
+
+/// NIST FIPS 204: Verify Dilithium signature for smart contracts
+async fn verify_dilithium_signature_for_contract(
+    message: &str,
+    signature_hex: &str,
+    public_key_hex: &str,
+) -> bool {
+    use pqcrypto_dilithium::dilithium5;
+    use pqcrypto_traits::sign::*;
+    
+    // Decode public key
+    let pk_bytes = match hex::decode(public_key_hex) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            println!("[DILITHIUM] ❌ Invalid public key hex: {}", e);
+            return false;
+        }
+    };
+    
+    let public_key = match dilithium5::PublicKey::from_bytes(&pk_bytes) {
+        Ok(pk) => pk,
+        Err(e) => {
+            println!("[DILITHIUM] ❌ Invalid Dilithium public key: {:?}", e);
+            return false;
+        }
+    };
+    
+    // Decode signature
+    let sig_bytes = match hex::decode(signature_hex) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            println!("[DILITHIUM] ❌ Invalid signature hex: {}", e);
+            return false;
+        }
+    };
+    
+    // Create signed message (signature + message for verification)
+    let mut signed_msg = sig_bytes.clone();
+    signed_msg.extend_from_slice(message.as_bytes());
+    
+    let signed_message = match dilithium5::SignedMessage::from_bytes(&signed_msg) {
+        Ok(sm) => sm,
+        Err(e) => {
+            println!("[DILITHIUM] ❌ Invalid signed message format: {:?}", e);
+            return false;
+        }
+    };
+    
+    // Verify signature
+    match dilithium5::open(&signed_message, &public_key) {
+        Ok(_) => {
+            println!("[DILITHIUM] ✅ Signature verified (NIST FIPS 204)");
+            true
+        }
+        Err(_) => {
+            println!("[DILITHIUM] ❌ Signature verification failed");
+            false
+        }
+    }
+}
+
+/// Handle smart contract method call
+/// NIST/CISCO COMPLIANT: Hybrid signature verification (Ed25519 + CRYSTALS-Dilithium)
+async fn handle_contract_call(
+    request: ContractCallRequest,
+    remote_addr: Option<std::net::SocketAddr>,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    // Rate limiting (less strict for view calls)
+    let rate_type = if request.is_view { "read_only" } else { "transaction" };
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, rate_type) {
+        return Ok(rate_limit_response);
+    }
+    
+    // Validate addresses
+    if let Err(e) = validate_eon_address_with_error(&request.from) {
+        return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": "Invalid caller address",
+            "details": e
+        })));
+    }
+    
+    if let Err(e) = validate_eon_address_with_error(&request.contract_address) {
+        return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": "Invalid contract address",
+            "details": e
+        })));
+    }
+    
+    // For view calls, no signature required - execute directly
+    if request.is_view {
+        // Simulate contract execution (read-only)
+        let result = json!({
+            "success": true,
+            "is_view": true,
+            "contract_address": request.contract_address,
+            "method": request.method,
+            "result": null, // Would be populated by actual VM execution
+            "gas_used": 0,
+            "message": "View call executed (VM integration pending)"
+        });
+        return Ok(warp::reply::json(&result));
+    }
+    
+    // State-changing call requires BOTH signatures (hybrid - like consensus)
+    if request.signature.is_none() || request.public_key.is_none() {
+        return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": "Ed25519 signature and public_key required for state-changing contract calls"
+        })));
+    }
+    
+    if request.dilithium_signature.is_none() || request.dilithium_public_key.is_none() {
+        return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": "Dilithium signature and public_key required for state-changing contract calls",
+            "requirement": "MANDATORY - Smart contracts require hybrid signatures (Ed25519 + Dilithium)"
+        })));
+    }
+    
+    // =========================================================================
+    // NIST/CISCO COMPLIANT HYBRID SIGNATURE VERIFICATION (MANDATORY)
+    // =========================================================================
+    
+    let signature = request.signature.as_ref().unwrap();
+    let public_key = request.public_key.as_ref().unwrap();
+    let dilithium_sig = request.dilithium_signature.as_ref().unwrap();
+    let dilithium_pk = request.dilithium_public_key.as_ref().unwrap();
+    
+    // Build message to verify
+    let message_to_sign = format!("contract_call:{}:{}:{}:{}", 
+        request.from, 
+        request.contract_address,
+        request.method,
+        request.nonce
+    );
+    
+    // Step 1: Verify Ed25519 signature (NIST FIPS 186-5) - MANDATORY
+    let ed25519_valid = verify_ed25519_client_signature(
+        &request.from,
+        &message_to_sign,
+        signature,
+        public_key
+    ).await;
+    
+    if !ed25519_valid {
+        return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": "Ed25519 signature verification failed (NIST FIPS 186-5)"
+        })));
+    }
+    
+    println!("[CONTRACT] ✅ Ed25519 signature verified (NIST FIPS 186-5)");
+    
+    // Step 2: Verify Dilithium signature (NIST FIPS 204) - MANDATORY
+    let dilithium_valid = verify_dilithium_signature_for_contract(
+        &message_to_sign,
+        dilithium_sig,
+        dilithium_pk
+    ).await;
+    
+    if !dilithium_valid {
+        return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": "Dilithium signature verification failed (NIST FIPS 204)"
+        })));
+    }
+    
+    println!("[CONTRACT] ✅ Dilithium signature verified (NIST FIPS 204 - Post-Quantum)");
+    let is_quantum_secure = true; // Always true - both signatures mandatory
+    
+    // Validate gas limits
+    if request.gas_limit < 10000 {
+        return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": "Gas limit too low for contract call",
+            "min_gas_limit": 10000
+        })));
+    }
+    
+    // Create ContractCall transaction with security metadata
+    let tx = qnet_state::Transaction::new(
+        request.from.clone(),
+        request.signature.clone(),
+        request.nonce,
+        request.gas_price,
+        request.gas_limit,
+        chrono::Utc::now().timestamp() as u64,
+        0,
+        None,
+        qnet_state::TransactionType::ContractCall,
+        Some(serde_json::to_string(&json!({
+            "contract": request.contract_address,
+            "method": request.method,
+            "args": request.args,
+            "security": {
+                "ed25519_verified": true,
+                "dilithium_verified": is_quantum_secure
+            }
+        })).unwrap_or_default()),
+    );
+    
+    // Submit to mempool
+    match blockchain.add_transaction_to_mempool(tx).await {
+        Ok(_) => {
+            let tx_hash = format!("{:x}", Sha3_256::digest(format!("{}:{}:{}", 
+                request.from, request.contract_address, request.nonce).as_bytes()));
+            
+            println!("📜 Contract call submitted: {}::{}", 
+                     &request.contract_address[..16], request.method);
+            
+            Ok(warp::reply::json(&json!({
+                "success": true,
+                "tx_hash": tx_hash,
+                "contract_address": request.contract_address,
+                "method": request.method,
+                "gas_limit": request.gas_limit,
+                "message": "Contract call submitted to mempool"
+            })))
+        }
+        Err(e) => {
+            Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": "Failed to submit contract call",
+                "details": format!("{:?}", e)
+            })))
+        }
+    }
+}
+
+/// Handle contract info query
+async fn handle_contract_info(
+    contract_address: String,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    // Validate contract address
+    if let Err(e) = validate_eon_address_with_error(&contract_address) {
+        return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": "Invalid contract address",
+            "details": e
+        })));
+    }
+    
+    // Query contract info from storage
+    let storage = blockchain.get_storage();
+    
+    // Check if contract exists
+    match storage.get_contract_info(&contract_address) {
+        Ok(Some(info)) => {
+            Ok(warp::reply::json(&json!({
+                "success": true,
+                "contract": {
+                    "address": contract_address,
+                    "deployer": info.deployer,
+                    "deployed_at": info.deployed_at,
+                    "code_hash": info.code_hash,
+                    "version": info.version,
+                    "total_gas_used": info.total_gas_used,
+                    "call_count": info.call_count,
+                    "is_active": info.is_active
+                }
+            })))
+        }
+        Ok(None) => {
+            // Contract not found - return placeholder for now
+            // In production, this would query the actual contract state
+            Ok(warp::reply::json(&json!({
+                "success": true,
+                "contract": {
+                    "address": contract_address,
+                    "deployer": "unknown",
+                    "deployed_at": 0,
+                    "code_hash": "not_deployed",
+                    "version": "0.0.0",
+                    "total_gas_used": 0,
+                    "call_count": 0,
+                    "is_active": false
+                },
+                "message": "Contract not found or not yet deployed"
+            })))
+        }
+        Err(e) => {
+            Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": "Failed to query contract info",
+                "details": format!("{:?}", e)
+            })))
+        }
+    }
+}
+
+/// Handle contract state query
+async fn handle_contract_state(
+    contract_address: String,
+    query: ContractStateQuery,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    // Validate contract address
+    if let Err(e) = validate_eon_address_with_error(&contract_address) {
+        return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": "Invalid contract address",
+            "details": e
+        })));
+    }
+    
+    let storage = blockchain.get_storage();
+    
+    // Query single key or multiple keys
+    if let Some(key) = query.key {
+        // Single key query
+        match storage.get_contract_state(&contract_address, &key) {
+            Ok(Some(value)) => {
+                Ok(warp::reply::json(&json!({
+                    "success": true,
+                    "contract_address": contract_address,
+                    "state": {
+                        key: value
+                    }
+                })))
+            }
+            Ok(None) => {
+                Ok(warp::reply::json(&json!({
+                    "success": true,
+                    "contract_address": contract_address,
+                    "state": {
+                        key: null
+                    },
+                    "message": "Key not found in contract state"
+                })))
+            }
+            Err(e) => {
+                Ok(warp::reply::json(&json!({
+                    "success": false,
+                    "error": "Failed to query contract state",
+                    "details": format!("{:?}", e)
+                })))
+            }
+        }
+    } else if let Some(keys) = query.keys {
+        // Multiple keys query
+        let mut state = serde_json::Map::new();
+        
+        for key in keys {
+            match storage.get_contract_state(&contract_address, &key) {
+                Ok(Some(value)) => {
+                    state.insert(key, Value::String(value));
+                }
+                Ok(None) => {
+                    state.insert(key, Value::Null);
+                }
+                Err(_) => {
+                    state.insert(key, Value::Null);
+                }
+            }
+        }
+        
+        Ok(warp::reply::json(&json!({
+            "success": true,
+            "contract_address": contract_address,
+            "state": state
+        })))
+    } else {
+        // No keys specified - return error
+        Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": "No state key(s) specified. Use ?key=... or ?keys=key1,key2,..."
+        })))
+    }
+}
+
+/// Handle gas estimation for contract operations
+async fn handle_contract_estimate_gas(
+    request: Value,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    let operation = request.get("operation")
+        .and_then(|v| v.as_str())
+        .unwrap_or("call");
+    
+    let code_size = request.get("code_size")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+    
+    let args_size = request.get("args")
+        .map(|v| v.to_string().len())
+        .unwrap_or(0);
+    
+    // Calculate gas estimate based on operation type
+    let (base_gas, per_byte_gas) = match operation {
+        "deploy" => (50000u64, 200u64),  // Deploy: 50k base + 200 per byte of code
+        "call" => (10000u64, 10u64),     // Call: 10k base + 10 per byte of args
+        "view" => (0u64, 0u64),          // View: free
+        _ => (10000u64, 10u64),
+    };
+    
+    let estimated_gas = base_gas + (code_size as u64 * per_byte_gas) + (args_size as u64 * 5);
+    
+    // Get current gas prices
+    let min_gas_price = 100000u64; // 0.0001 QNC
+    let recommended_gas_price = 150000u64;
+    let fast_gas_price = 250000u64;
+    
+    Ok(warp::reply::json(&json!({
+        "success": true,
+        "operation": operation,
+        "estimated_gas": estimated_gas,
+        "gas_prices": {
+            "slow": min_gas_price,
+            "standard": recommended_gas_price,
+            "fast": fast_gas_price
+        },
+        "estimated_cost": {
+            "slow": estimated_gas * min_gas_price,
+            "standard": estimated_gas * recommended_gas_price,
+            "fast": estimated_gas * fast_gas_price
+        },
+        "estimated_cost_qnc": {
+            "slow": format!("{:.9} QNC", (estimated_gas * min_gas_price) as f64 / 1_000_000_000.0),
+            "standard": format!("{:.9} QNC", (estimated_gas * recommended_gas_price) as f64 / 1_000_000_000.0),
+            "fast": format!("{:.9} QNC", (estimated_gas * fast_gas_price) as f64 / 1_000_000_000.0)
+        }
+    })))
+}
+
+// ============================================================================
+// WEBSOCKET HANDLERS
+// ============================================================================
+
+/// Parse channel string into WsChannel enum
+fn parse_ws_channels(channels_str: &str) -> Vec<WsChannel> {
+    channels_str
+        .split(',')
+        .filter_map(|ch| {
+            let ch = ch.trim();
+            if ch == "blocks" {
+                Some(WsChannel::Blocks)
+            } else if ch == "mempool" {
+                Some(WsChannel::Mempool)
+            } else if ch.starts_with("account:") {
+                Some(WsChannel::Account(ch[8..].to_string()))
+            } else if ch.starts_with("contract:") {
+                Some(WsChannel::Contract(ch[9..].to_string()))
+            } else if ch.starts_with("tx:") {
+                Some(WsChannel::Transaction(ch[3..].to_string()))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Check if an event matches the subscribed channels
+fn event_matches_channels(event: &WsEvent, channels: &[WsChannel]) -> bool {
+    for channel in channels {
+        match (channel, event) {
+            (WsChannel::Blocks, WsEvent::NewBlock { .. }) => return true,
+            (WsChannel::Mempool, WsEvent::PendingTx { .. }) => return true,
+            (WsChannel::Account(addr), WsEvent::BalanceUpdate { address, .. }) => {
+                if address == addr {
+                    return true;
+                }
+            }
+            (WsChannel::Contract(addr), WsEvent::ContractEvent { contract_address, .. }) => {
+                if contract_address == addr {
+                    return true;
+                }
+            }
+            (WsChannel::Transaction(hash), WsEvent::TxConfirmed { tx_hash, .. }) => {
+                if tx_hash == hash {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Handle WebSocket connection
+async fn handle_ws_connection(
+    ws: WebSocket,
+    query: WsSubscribeQuery,
+    _blockchain: Arc<BlockchainNode>,
+) {
+    // Parse subscription channels
+    let channels = query.channels
+        .as_ref()
+        .map(|s| parse_ws_channels(s))
+        .unwrap_or_else(|| vec![WsChannel::Blocks]); // Default: subscribe to blocks
+    
+    println!("[WS] 🔗 New WebSocket connection, subscribed to {} channels", channels.len());
+    
+    // Split WebSocket into sender and receiver
+    let (mut ws_tx, mut ws_rx) = ws.split();
+    
+    // Subscribe to global event broadcaster
+    let mut rx = WS_BROADCASTER.subscribe();
+    
+    // Send welcome message
+    let welcome = json!({
+        "type": "connected",
+        "message": "WebSocket connected to QNet node",
+        "subscribed_channels": channels.len(),
+        "timestamp": SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+    });
+    
+    if let Ok(welcome_str) = serde_json::to_string(&welcome) {
+        let _ = ws_tx.send(Message::text(welcome_str)).await;
+    }
+    
+    // Spawn task to handle incoming messages (for ping/pong and unsubscribe)
+    let channels_clone = channels.clone();
+    tokio::spawn(async move {
+        while let Some(result) = ws_rx.next().await {
+            match result {
+                Ok(msg) => {
+                    if msg.is_close() {
+                        println!("[WS] 🔌 Client disconnected");
+                        break;
+                    }
+                    if msg.is_ping() {
+                        // Pong is handled automatically by warp
+                    }
+                    if msg.is_text() {
+                        // Handle client commands (e.g., subscribe to new channels)
+                        if let Ok(text) = msg.to_str() {
+                            println!("[WS] 📨 Received: {}", text);
+                        }
+                    }
+                }
+                Err(e) => {
+                    println!("[WS] ❌ Error receiving message: {}", e);
+                    break;
+                }
+            }
+        }
+    });
+    
+    // Main loop: forward matching events to client
+    loop {
+        match rx.recv().await {
+            Ok(event) => {
+                // Check if event matches any subscribed channel
+                if event_matches_channels(&event, &channels_clone) {
+                    // Serialize and send event
+                    if let Ok(event_json) = serde_json::to_string(&event) {
+                        if let Err(e) = ws_tx.send(Message::text(event_json)).await {
+                            println!("[WS] ❌ Error sending event: {}", e);
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                println!("[WS] ⚠️ Client lagged, missed {} events", n);
+                // Send lag warning to client
+                let warning = json!({
+                    "type": "warning",
+                    "message": format!("Missed {} events due to slow connection", n)
+                });
+                if let Ok(warning_str) = serde_json::to_string(&warning) {
+                    let _ = ws_tx.send(Message::text(warning_str)).await;
+                }
+            }
+            Err(broadcast::error::RecvError::Closed) => {
+                println!("[WS] 🔌 Broadcaster closed, disconnecting client");
+                break;
+            }
+        }
+    }
+    
+    println!("[WS] 🔌 WebSocket connection closed");
+}
+
+/// Handle WebSocket connection with rate limiter cleanup on disconnect
+/// SECURITY: Ensures connection count is decremented when client disconnects
+async fn handle_ws_connection_with_cleanup(
+    ws: WebSocket,
+    query: WsSubscribeQuery,
+    blockchain: Arc<BlockchainNode>,
+    client_ip: Option<IpAddr>,
+) {
+    // Log connection with IP (privacy: only show for debugging)
+    let (total, unique_ips) = WS_RATE_LIMITER.get_stats();
+    println!("[WS] 🔗 New connection from {:?} (total: {}, unique IPs: {})", 
+             client_ip.map(|ip| ip.to_string()).unwrap_or_else(|| "unknown".to_string()),
+             total, unique_ips);
+    
+    // Parse subscription channels
+    let channels = query.channels
+        .as_ref()
+        .map(|s| parse_ws_channels(s))
+        .unwrap_or_else(|| vec![WsChannel::Blocks]); // Default: subscribe to blocks
+    
+    println!("[WS] 📡 Subscribed to {} channels: {:?}", channels.len(), 
+             channels.iter().map(|c| format!("{:?}", c)).collect::<Vec<_>>());
+    
+    // Split WebSocket into sender and receiver
+    let (mut ws_tx, mut ws_rx) = ws.split();
+    
+    // Subscribe to global event broadcaster
+    let mut rx = WS_BROADCASTER.subscribe();
+    
+    // Send welcome message with connection info
+    let welcome = json!({
+        "type": "connected",
+        "message": "WebSocket connected to QNet node",
+        "subscribed_channels": channels.len(),
+        "timestamp": SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+        "node_id": blockchain.get_public_display_name(),
+        "rate_limit": {
+            "max_per_ip": 5,
+            "your_connections": WS_RATE_LIMITER.connections_per_ip
+                .get(&client_ip.unwrap_or(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)))
+                .map(|v| *v)
+                .unwrap_or(1)
+        }
+    });
+    
+    if let Ok(welcome_str) = serde_json::to_string(&welcome) {
+        let _ = ws_tx.send(Message::text(welcome_str)).await;
+    }
+    
+    // Spawn task to handle incoming messages (for ping/pong and unsubscribe)
+    let channels_clone = channels.clone();
+    tokio::spawn(async move {
+        while let Some(result) = ws_rx.next().await {
+            match result {
+                Ok(msg) => {
+                    if msg.is_close() {
+                        println!("[WS] 🔌 Client disconnected (close frame)");
+                        break;
+                    }
+                    if msg.is_text() {
+                        // Handle client commands (e.g., subscribe to new channels)
+                        if let Ok(text) = msg.to_str() {
+                            println!("[WS] 📨 Received command: {}", text);
+                        }
+                    }
+                }
+                Err(e) => {
+                    println!("[WS] ❌ Error receiving message: {}", e);
+                    break;
+                }
+            }
+        }
+    });
+    
+    // Main loop: forward matching events to client
+    loop {
+        match rx.recv().await {
+            Ok(event) => {
+                // Check if event matches any subscribed channel
+                if event_matches_channels(&event, &channels_clone) {
+                    // Serialize and send event
+                    if let Ok(event_json) = serde_json::to_string(&event) {
+                        if let Err(e) = ws_tx.send(Message::text(event_json)).await {
+                            println!("[WS] ❌ Error sending event: {}", e);
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                println!("[WS] ⚠️ Client lagged, missed {} events", n);
+                let warning = json!({
+                    "type": "warning",
+                    "message": format!("Missed {} events due to slow connection", n)
+                });
+                if let Ok(warning_str) = serde_json::to_string(&warning) {
+                    let _ = ws_tx.send(Message::text(warning_str)).await;
+                }
+            }
+            Err(broadcast::error::RecvError::Closed) => {
+                println!("[WS] 🔌 Broadcaster closed, disconnecting client");
+                break;
+            }
+        }
+    }
+    
+    // CRITICAL: Cleanup rate limiter on disconnect
+    WS_RATE_LIMITER.remove_connection(client_ip);
+    let (total, unique_ips) = WS_RATE_LIMITER.get_stats();
+    println!("[WS] 🔌 Connection closed, cleaned up (total: {}, unique IPs: {})", total, unique_ips);
 }

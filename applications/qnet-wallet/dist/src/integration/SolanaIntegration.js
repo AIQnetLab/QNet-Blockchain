@@ -256,7 +256,7 @@ export class SolanaIntegration {
             // 5. Encrypt payload with CRYSTALS-Kyber 1024 (quantum-resistant)
             const encryptedPayload = await this.quantumCrypto.encryptWithKyber(JSON.stringify(payload));
 
-            // 6. Format as QNET-XXXX-XXXX-XXXX (16 characters total)
+            // 6. Format as QNET-XXXXXX-XXXXXX-XXXXXX (25 characters total)
             const activationCode = await this.formatQuantumActivationCode(encryptedPayload, nodeType);
 
             console.log(`✅ Quantum-secure activation code generated successfully`);
@@ -284,7 +284,7 @@ export class SolanaIntegration {
     }
 
     /**
-     * Format encrypted payload as QNET-XXXX-XXXX-XXXX activation code
+     * Format encrypted payload as QNET-XXXXXX-XXXXXX-XXXXXX activation code (25 chars)
      */
     async formatQuantumActivationCode(encryptedPayload, nodeType) {
         try {
@@ -294,13 +294,13 @@ export class SolanaIntegration {
             // Create deterministic hash from payload for code generation
             const hash = await this.quantumCrypto.createSecureHash(base64Payload);
             
-            // Extract 12 characters for the 3 segments (4 chars each)
-            const hashHex = hash.substring(0, 12).toUpperCase();
+            // Extract 18 characters for the 3 segments (6 chars each) = 25 total with QNET- prefix and dashes
+            const hashHex = hash.substring(0, 18).toUpperCase();
             
-            // Format as QNET-XXXX-XXXX-XXXX
-            const segment1 = hashHex.substring(0, 4);
-            const segment2 = hashHex.substring(4, 8);
-            const segment3 = hashHex.substring(8, 12);
+            // Format as QNET-XXXXXX-XXXXXX-XXXXXX (25 chars total)
+            const segment1 = hashHex.substring(0, 6);
+            const segment2 = hashHex.substring(6, 12);
+            const segment3 = hashHex.substring(12, 18);
             
             return `QNET-${segment1}-${segment2}-${segment3}`;
 
@@ -318,9 +318,9 @@ export class SolanaIntegration {
         try {
             console.log('🔍 Validating quantum activation code...');
 
-            // 1. Validate format
-            if (!activationCode || !activationCode.match(/^QNET-[A-F0-9]{4}-[A-F0-9]{4}-[A-F0-9]{4}$/)) {
-                throw new Error('Invalid activation code format');
+            // 1. Validate format: QNET-XXXXXX-XXXXXX-XXXXXX (25 chars, 6-char segments)
+            if (!activationCode || !activationCode.match(/^QNET-[A-Z0-9]{6}-[A-Z0-9]{6}-[A-Z0-9]{6}$/)) {
+                throw new Error('Invalid activation code format. Expected: QNET-XXXXXX-XXXXXX-XXXXXX (25 chars)');
             }
 
             // 2. This is a preview validation - full validation happens on server
@@ -331,7 +331,7 @@ export class SolanaIntegration {
             
             return {
                 valid: true,
-                format: 'QNET-XXXX-XXXX-XXXX',
+                format: 'QNET-XXXXXX-XXXXXX-XXXXXX',
                 quantumSecure: true,
                 walletBound: true,
                 serverValidationRequired: true

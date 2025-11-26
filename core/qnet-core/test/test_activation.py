@@ -50,11 +50,11 @@ class QNetAPITests(unittest.TestCase):
                 self.test_code = response.json()["activation_code"]
                 logger.info(f"Generated test activation code: {self.test_code}")
             else:
-                self.test_code = "QNET-TEST-TEST-TEST"
+                self.test_code = "QNET-TESTES-TESTES-TESTES"  # 25 chars format
                 logger.warning(f"Using fallback test code: {self.test_code}")
         except Exception as e:
             logger.error(f"Error generating test code: {e}")
-            self.test_code = "QNET-TEST-TEST-TEST"
+            self.test_code = "QNET-TESTES-TESTES-TESTES"  # 25 chars format
     
     def test_generate_code(self):
         """Test code generation endpoint"""
@@ -284,7 +284,7 @@ if __name__ == "__main__":
     load_tester = LoadTestingSuite()
     load_tester.run_load_test("token/wallet_codes/test_wallet1", "GET")
     load_tester.run_load_test("token/verify_code", "POST", {
-        "activation_code": "QNET-TEST-TEST-TEST",
+        "activation_code": "QNET-TESTES-TESTES-TESTES",  # 25 chars format
         "node_id": "load_test_node",
         "node_address": "127.0.0.1:8000"
     })

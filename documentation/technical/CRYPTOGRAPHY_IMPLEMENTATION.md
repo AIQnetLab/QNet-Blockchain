@@ -1762,3 +1762,110 @@ QNet's cryptographic implementation achieves:
 
 **Status:** ✅ **APPROVED FOR PRODUCTION DEPLOYMENT**
 
+---
+
+## 8. Storage & Data Integrity (v2.19.7)
+
+### 8.1 Cryptographic Data Protection
+
+All persistent data in QNet uses cryptographic integrity verification:
+
+| Data Type | Hash Algorithm | Purpose |
+|-----------|----------------|---------|
+| **Blocks** | SHA3-256 | Block hash verification |
+| **Transactions** | SHA3-256 | TX integrity |
+| **Snapshots** | SHA3-256 | State integrity |
+| **Reputation** | SHA3-256 | Tamper detection |
+| **Jail Status** | SHA3-256 | Batched file integrity |
+
+### 8.2 Storage Architecture by Node Type (v2.19.10)
+
+| Node Type | Storage | What is Stored | Pruning |
+|-----------|---------|----------------|---------|
+| **Light** | **~100 MB** | Headers only (FIFO rotation) | Auto-rotate oldest |
+| **Full** | **~500 GB** | Full blocks + transactions | 30-day window |
+| **Super** | **~2 TB** | Complete history | No pruning (archival) |
+
+**Compression**: Zstd-3 for all transactions (~50% reduction, lossless)
+
+**Note (v2.19.10)**: Sharding is for parallel TX processing, NOT storage partitioning. All nodes receive all blocks via P2P broadcast.
+
+### 8.3 Transaction Pruning (v2.19.7)
+
+**Production-ready pruning system:**
+
+```rust
+// Removes old transaction data from RocksDB
+pub fn prune_old_transactions(&self, prune_before_height: u64) -> Result<u64>
+// Cleans: transactions, tx_index, tx_by_address Column Families
+// Forces RocksDB compaction to reclaim disk space
+```
+
+**Storage Impact:**
+
+| Without Pruning | With Pruning | Savings |
+|-----------------|--------------|---------|
+| 2+ TB/year | ~260 GB | **87%** |
+
+### 8.4 Snapshot Integrity
+
+**SHA3-256 verification for all snapshots:**
+
+```rust
+// Snapshot creation with integrity hash
+let snapshot_hash = sha3_256(snapshot_data);
+save_snapshot(snapshot_data, snapshot_hash);
+
+// Verification on load
+let loaded_hash = sha3_256(loaded_data);
+assert_eq!(loaded_hash, stored_hash, "Snapshot corrupted!");
+```
+
+**Properties:**
+- ✅ **Tamper detection**: Any modification detected
+- ✅ **Quantum-resistant**: SHA3-256 (NIST FIPS 202)
+- ✅ **Auto-cleanup**: Keep last 5 snapshots only
+- ✅ **Compression**: Zstd-15 (~70% reduction)
+
+### 8.5 Dynamic Sharding (v2.19.10)
+
+**Sharding = Parallel TX Processing, NOT Storage Partitioning**
+
+All nodes receive ALL blocks via P2P broadcast. Shards determine which transactions can be processed in parallel, not what data each node stores.
+
+**Automatic shard scaling based on network size:**
+
+| Network Size | Shards | Processing Capacity |
+|--------------|--------|---------------------|
+| 0-1K nodes | 1 | ~4K TPS |
+| 1K-10K nodes | 4 | ~16K TPS |
+| 10K-50K nodes | 16 | ~64K TPS |
+| 50K-100K nodes | 64 | ~256K TPS |
+| 100K-500K nodes | 128 | ~512K TPS |
+| 500K+ nodes | 256 | ~1M+ TPS |
+
+**Storage is determined by NODE TYPE, not shards:**
+- Light: ~100 MB (headers only)
+- Full: ~500 GB (30-day pruning)
+- Super: ~2 TB (full history)
+
+**Implementation:**
+```rust
+pub fn get_optimal_shard_count(network_size: usize) -> u32 {
+    match network_size {
+        0..=1_000 => 1,
+        1_001..=10_000 => 4,
+        10_001..=50_000 => 16,
+        50_001..=100_000 => 64,
+        100_001..=500_000 => 128,
+        _ => 256,
+    }
+}
+```
+
+**Testing with 256 shards:**
+```bash
+QNET_SHARD_COUNT=256 ./qnet-node  # Force 256 shards for testing
+# System will auto-adjust to optimal count based on actual network size
+```
+

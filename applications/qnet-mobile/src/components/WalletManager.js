@@ -3282,43 +3282,86 @@ export class WalletManager {
     }
   }
   
-  // Generate secure activation code (like extension)
-  generateActivationCode(nodeType = 'full', address = '', seedPhrase = null) {
+  // REQUEST activation code from server after burn verification
+  // CRITICAL: Codes are ONLY generated server-side after verifying burn transaction!
+  // Mobile app does NOT generate codes - it receives them from server
+  // 
+  // Phase 1: Burn 1DEV on Solana → Server verifies → Server generates code
+  // Phase 2: Transfer QNC to Pool 3 → Server verifies → Server generates code
+  //
+  // This method is DEPRECATED - use requestActivationCodeFromServer() instead
+  // Kept for backward compatibility with stored codes only
+  generateActivationCode(nodeType = 'full', walletAddress = '', seedPhrase = null) {
+    console.warn('[DEPRECATED] generateActivationCode() should not be used for new activations');
+    console.warn('   Use requestActivationCodeFromServer() after burn transaction');
+    
+    // For backward compatibility with existing stored codes only
+    // New activations MUST go through server
+    if (!walletAddress) {
+      throw new Error('Wallet address required');
+    }
+    
+    // Generate deterministic preview code (NOT valid for activation)
+    // This is only for display purposes until server provides real code
+    const seedData = seedPhrase 
+      ? `${seedPhrase}-${nodeType}-QNET_ACTIVATION_V2`
+      : `${nodeType}-${walletAddress}-activation`;
+    const entropy = CryptoJS.SHA256(seedData).toString(CryptoJS.enc.Hex);
+    
+    const entropyUpper = entropy.toUpperCase();
+    const segment1 = entropyUpper.substring(0, 6);
+    const segment2 = entropyUpper.substring(6, 12);
+    const segment3 = entropyUpper.substring(12, 18);
+    
+    // PREVIEW code - NOT valid for actual activation
+    return `QNET-${segment1}-${segment2}-${segment3}`;
+  }
+  
+  // Request activation code from server after burn verification
+  // Phase 1: burnTxHash = Solana 1DEV burn transaction
+  // Phase 2: burnTxHash = QNet QNC transfer to Pool 3 transaction
+  async requestActivationCodeFromServer(nodeType, walletAddress, burnTxHash, phase = 1) {
     try {
-      if (!address) {
-        throw new Error('Address required for activation code generation');
+      const apiUrl = this.getRandomBootstrapNode();
+      
+      // Get dynamic pricing info for Phase 2
+      let burnAmount = 0;
+      if (phase === 2) {
+        const pricingResponse = await fetch(`${apiUrl}/api/v1/pricing/${nodeType}`);
+        const pricing = await pricingResponse.json();
+        burnAmount = pricing.current_price || 0;
       }
       
-      // Mobile can generate codes for all node types
-      // The actual activation will happen on appropriate platform
+      // Request code generation from server
+      const response = await fetch(`${apiUrl}/api/v1/generate-activation-code`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          wallet_address: walletAddress,
+          burn_tx_hash: burnTxHash,
+          node_type: nodeType,
+          burn_amount: burnAmount,
+          phase: phase
+        })
+      });
       
-      // Generate DETERMINISTIC activation code from seed phrase
-      // Same seed + nodeType = always same code (for sync between devices)
-      let entropy;
+      const result = await response.json();
       
-      if (seedPhrase) {
-        // Use seed phrase for deterministic generation (wallet restore case)
-        const seedData = `${seedPhrase}-${nodeType}-QNET_ACTIVATION_V2`;
-        entropy = CryptoJS.SHA256(seedData).toString(CryptoJS.enc.Hex);
-      } else {
-        // Fallback to address-based generation for backward compatibility
-        const data = `${nodeType}-${address}-activation`;
-        entropy = CryptoJS.SHA256(data).toString(CryptoJS.enc.Hex);
+      if (!result.success) {
+        throw new Error(result.error || 'Failed to generate activation code');
       }
       
-      // Create three 6-character segments from entropy
-      const entropyUpper = entropy.toUpperCase();
-      const segment1 = entropyUpper.substring(0, 6);
-      const segment2 = entropyUpper.substring(6, 12);
-      const segment3 = entropyUpper.substring(12, 18);
-      
-      // Format as QNET-XXXXXX-XXXXXX-XXXXXX (25 chars total)
-      const code = `QNET-${segment1}-${segment2}-${segment3}`;
-      
-      return code;
+      return {
+        success: true,
+        activationCode: result.activation_code,
+        walletAddress: result.wallet_address,
+        nodeType: result.node_type,
+        phase: result.phase,
+        burnTxHash: burnTxHash
+      };
     } catch (error) {
-      // console.error('Error generating activation code:', error);
-      throw new Error('Failed to generate secure activation code');
+      console.error('Error requesting activation code:', error);
+      throw error;
     }
   }
   
@@ -3329,14 +3372,17 @@ export class WalletManager {
       const existingCodesStr = await AsyncStorage.getItem('qnet_activation_codes');
       let encryptedCodes = existingCodesStr ? JSON.parse(existingCodesStr) : {};
       
-      // Store activation metadata (timestamp, tx signature, etc)
-      if (metadata.timestamp || metadata.signature) {
-        await AsyncStorage.setItem(`qnet_activation_meta_${nodeType}`, JSON.stringify({
-          timestamp: metadata.timestamp || Date.now(),
-          signature: metadata.signature || null,
-          nodeType: nodeType
-        }));
-      }
+      // Store activation metadata (timestamp, tx signature, phase, wallet address)
+      // CRITICAL: phase determines which wallet address to use for claims
+      // Phase 1: Solana address, Phase 2: QNet address
+      await AsyncStorage.setItem(`qnet_activation_meta_${nodeType}`, JSON.stringify({
+        timestamp: metadata.timestamp || Date.now(),
+        signature: metadata.signature || null,
+        burnTxHash: metadata.burnTxHash || null,
+        nodeType: nodeType,
+        phase: metadata.phase || 1,  // Default to Phase 1
+        walletAddress: metadata.walletAddress || null  // The address used for activation
+      }));
       
       // Generate random salt and IV for this specific code
       const salt = CryptoJS.lib.WordArray.random(16);
@@ -3412,6 +3458,7 @@ export class WalletManager {
   }
 
   // Synchronize activation codes from blockchain (called on wallet restore)
+  // PRODUCTION: Codes are retrieved from QNet blockchain registry, NOT generated locally
   async syncActivationCodes(walletAddress, seedPhrase, password) {
     try {
       // Check for existing stored codes first (local cache)
@@ -3431,17 +3478,83 @@ export class WalletManager {
         if (metaData) {
           const meta = JSON.parse(metaData);
           console.log(`Found activation metadata for ${nodeType} node`);
-          // Generate code for this node type
-          if (seedPhrase) {
-            const code = this.generateActivationCode(nodeType, walletAddress, seedPhrase);
-            if (code && password) {
-              await this.storeActivationCode(code, nodeType, password);
-              return { [nodeType]: code };
+          
+          // PRODUCTION: Retrieve code from server using burn_tx_hash
+          if (meta.burnTxHash && password) {
+            try {
+              const result = await this.requestActivationCodeFromServer(
+                nodeType, 
+                walletAddress, 
+                meta.burnTxHash,
+                meta.phase || 1
+              );
+              if (result.success && result.activationCode) {
+                await this.storeActivationCode(result.activationCode, nodeType, password);
+                return { [nodeType]: result.activationCode };
+              }
+            } catch (e) {
+              console.warn('Failed to retrieve code from server:', e.message);
             }
           }
         }
       }
       
+      // Query QNet blockchain for activations by wallet
+      const apiUrl = this.getRandomBootstrapNode();
+      try {
+        const response = await fetch(
+          `${apiUrl}/api/v1/activations/by-wallet?wallet=${encodeURIComponent(walletAddress)}`,
+          { method: 'GET', timeout: 10000 }
+        );
+        
+        if (response.ok) {
+          const result = await response.json();
+          if (result.success && result.activations && result.activations.length > 0) {
+            // Found activations on blockchain
+            const activation = result.activations[0]; // Use first activation
+            const code = activation.activation_code;
+            const nodeType = activation.node_type;
+            
+            if (code && nodeType && password) {
+              await this.storeActivationCode(code, nodeType, password, { fromBlockchain: true });
+              return { [nodeType]: code };
+            }
+          }
+        }
+      } catch (e) {
+        console.warn('Failed to query blockchain for activations:', e.message);
+      }
+      
+      // Fallback: Check Solana for burn transactions
+      const activatedNodes = await this.checkBlockchainForActivations(walletAddress);
+      
+      // If burn found but no code in QNet registry, user needs to re-activate
+      if (activatedNodes && activatedNodes.length > 0) {
+        console.log('[syncActivationCodes] ⚠️ Burn found but no activation code in registry');
+        console.log('   User may need to complete activation on QNet network');
+        
+        // Check if we already have a stored code
+        const existingCodes = await this.getStoredActivationCodes(password);
+        if (existingCodes && Object.keys(existingCodes).length > 0) {
+          return existingCodes;
+        }
+        
+        // Cannot generate code locally - must be done by server
+        // Return null to indicate activation is incomplete
+        return null;
+      }
+      
+      // No activations found
+      return null;
+    } catch (error) {
+      console.error('Error syncing activation codes:', error);
+      return null;
+    }
+  }
+  
+  // DEPRECATED: Old sync logic kept for reference
+  async _legacySyncActivationCodes(walletAddress, seedPhrase, password) {
+    try {
       // Check cache for recent blockchain check
       const cacheKey = `blockchain_check_${walletAddress}`;
       const cachedResult = await AsyncStorage.getItem(cacheKey);
@@ -3452,7 +3565,8 @@ export class WalletManager {
         if (cacheAge < 30 * 1000) {
           console.log('Using cached blockchain check result');
           if (cached.activatedNodes && cached.activatedNodes.length > 0) {
-            // Process cached result
+            // Process cached result - but codes should come from server!
+            console.warn('[DEPRECATED] Using legacy code generation - should use server');
             const codes = {};
             if (seedPhrase) {
               codes.light = this.generateActivationCode('light', walletAddress, seedPhrase);
@@ -3470,7 +3584,7 @@ export class WalletManager {
         }
       }
       
-      // Generate deterministic codes from seed
+      // Generate deterministic codes from seed (DEPRECATED - for backward compatibility only)
       const codes = {};
       if (seedPhrase) {
         codes.light = this.generateActivationCode('light', walletAddress, seedPhrase);
@@ -3959,17 +4073,45 @@ export class WalletManager {
         throw new Error('Failed to burn tokens for activation');
       }
       
-    // Only generate code AFTER successful burn
-    const activationCode = this.generateActivationCode('light', walletAddress, mnemonic);
-    
-    // Store the activation code with transaction signature
-    await this.storeActivationCode(activationCode, 'light', password);
-    
-    // Direct connection to bootstrap node - fully decentralized
+    // PRODUCTION: Request activation code from server AFTER successful burn
+    // Server verifies burn transaction and generates code with embedded wallet
     const apiUrl = this.getRandomBootstrapNode();
     
+    let activationCode;
     try {
-      // Create registration message
+      const codeResult = await this.requestActivationCodeFromServer(
+        'light',
+        walletAddress,
+        burnResult.signature,
+        1 // Phase 1: 1DEV burn
+      );
+      
+      if (!codeResult.success || !codeResult.activationCode) {
+        throw new Error('Server failed to generate activation code');
+      }
+      
+      activationCode = codeResult.activationCode;
+    } catch (codeError) {
+      console.error('Failed to get activation code from server:', codeError);
+      throw new Error('Burn successful but failed to get activation code. Please contact support.');
+    }
+    
+    // Store the activation code with transaction signature
+    await this.storeActivationCode(activationCode, 'light', password, {
+      burnTxHash: burnResult.signature,
+      phase: 1,
+      walletAddress: walletAddress
+    });
+    
+    // Store activation metadata for wallet restore
+    await AsyncStorage.setItem(`qnet_activation_meta_light`, JSON.stringify({
+      burnTxHash: burnResult.signature,
+      phase: 1,
+      timestamp: Date.now()
+    }));
+    
+    try {
+      // Create registration message for P2P network
       const registrationMessage = {
         node_id: activationCode,
         public_key: walletData.publicKey,
@@ -3977,6 +4119,7 @@ export class WalletManager {
         port: 0, // Mobile nodes don't listen on ports
         node_type: 'light',
         activation_tx: burnResult.signature,
+        wallet_address: walletAddress,
         timestamp: Date.now()
       };
       
@@ -3988,8 +4131,8 @@ export class WalletManager {
         new Uint8Array(walletData.secretKey)
       );
       
-      // Send registration to backend
-      const response = await fetch(`${apiUrl}/api/nodes`, {
+      // Register node with P2P network
+      const response = await fetch(`${apiUrl}/api/v1/nodes`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -4001,16 +4144,16 @@ export class WalletManager {
       });
       
       if (!response.ok) {
-        // Log error but don't fail - node is already activated on-chain
-        // console.error('Backend registration failed:', response.status);
+        console.warn('P2P registration failed:', response.status);
+        // Don't fail - node is activated, just not registered for pings yet
       }
       
       // Store initial ping time
       await AsyncStorage.setItem(`node_last_ping_${walletAddress}`, Date.now().toString());
       
     } catch (apiError) {
-      // Backend registration failed but node is activated on-chain
-      // console.error('Backend registration error:', apiError);
+      // P2P registration failed but node is activated on-chain
+      console.warn('P2P registration error:', apiError.message);
     }
     
     return {
@@ -4295,48 +4438,62 @@ export class WalletManager {
   }
   
   // Claim accumulated rewards with blockchain integration
-  async claimRewards(nodeType, activationCode, walletAddress, password) {
+  // Works for ALL node types: Light, Full, Super, Genesis
+  // Server validates pending rewards - client just sends claim request
+  async claimRewards(nodeType, activationCode, walletAddress, password, serverPendingRewards = null) {
     try {
-      // Get current rewards status
-      const rewards = await this.getNodeRewards(nodeType, activationCode, walletAddress);
-      if (!rewards) {
-        return {
-          success: false,
-          message: 'Unable to fetch rewards data'
-        };
-      }
-      
-      if (!rewards.unclaimed || rewards.unclaimed <= 0) {
-        return {
-          success: false,
-          message: 'No unclaimed rewards'
-        };
-      }
-      
-      // Check if can claim (1h cooldown for lazy rewards)
-      if (rewards.nextClaim && Date.now() < rewards.nextClaim) {
-        const minutesLeft = Math.ceil((rewards.nextClaim - Date.now()) / (60 * 1000));
-        if (minutesLeft > 60) {
-          const hoursLeft = Math.ceil(minutesLeft / 60);
+      // For LIGHT nodes: Check local rewards tracking
+      // For SERVER nodes (Full/Super/Genesis): Skip local check, server knows pending rewards
+      if (nodeType === 'light') {
+        const rewards = await this.getNodeRewards(nodeType, activationCode, walletAddress);
+        if (!rewards) {
           return {
             success: false,
-            message: `Next claim in ${hoursLeft} hours`
-          };
-        } else {
-          return {
-            success: false,
-            message: `Next claim in ${minutesLeft} minutes`
+            message: 'Unable to fetch rewards data'
           };
         }
-      }
-      
-      // Check minimum claim amount (1 QNC)
-      const MIN_CLAIM_QNC = 1.0;
-      if (rewards.unclaimed < MIN_CLAIM_QNC) {
-        return {
-          success: false,
-          message: `Minimum claim amount is ${MIN_CLAIM_QNC} QNC`
-        };
+        
+        if (!rewards.unclaimed || rewards.unclaimed <= 0) {
+          return {
+            success: false,
+            message: 'No unclaimed rewards'
+          };
+        }
+        
+        // Check if can claim (1h cooldown for lazy rewards)
+        if (rewards.nextClaim && Date.now() < rewards.nextClaim) {
+          const minutesLeft = Math.ceil((rewards.nextClaim - Date.now()) / (60 * 1000));
+          if (minutesLeft > 60) {
+            const hoursLeft = Math.ceil(minutesLeft / 60);
+            return {
+              success: false,
+              message: `Next claim in ${hoursLeft} hours`
+            };
+          } else {
+            return {
+              success: false,
+              message: `Next claim in ${minutesLeft} minutes`
+            };
+          }
+        }
+        
+        // Check minimum claim amount (1 QNC)
+        const MIN_CLAIM_QNC = 1.0;
+        if (rewards.unclaimed < MIN_CLAIM_QNC) {
+          return {
+            success: false,
+            message: `Minimum claim amount is ${MIN_CLAIM_QNC} QNC`
+          };
+        }
+      } else {
+        // SERVER NODES: Just verify there are pending rewards from server status
+        // The actual validation happens on the server
+        if (serverPendingRewards !== null && serverPendingRewards <= 0) {
+          return {
+            success: false,
+            message: 'No pending rewards on server'
+          };
+        }
       }
       
       // Get backend URL - use official API endpoints

@@ -222,6 +222,7 @@ With proper randomization at 10M+ nodes:
 - **Accumulated rewards**: Always withdrawable regardless of node status
 - **Reward fairness**: Binary success for Light nodes, percentage for servers (current 4-hour window)
 - **Battery friendly**: Light nodes ping only 1 time per 4-hour reward window
+- **Smart Polling**: F-Droid users without UnifiedPush use battery-efficient smart wake-up (~2 min before slot, not continuous polling)
 - **Privacy compliant**: All device IDs and IPs hashed, no personal data collection
 - **Hash security**: SHA-256 truncated - irreversible even if compromised
 - **✅ PRODUCTION DEPLOYED**: Performance validated with 50/50 cross-shard success rate achieved

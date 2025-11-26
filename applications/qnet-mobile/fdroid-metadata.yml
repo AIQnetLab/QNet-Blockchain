@@ -29,6 +29,7 @@ Description: |-
     * Works offline for key management
     * No KYC requirements
     * Privacy-focused design
+    * Light node ping system for network participation
 
 RepoType: git
 Repo: https://github.com/AIQnetLab/QNet-Blockchain.git
@@ -36,7 +37,7 @@ Repo: https://github.com/AIQnetLab/QNet-Blockchain.git
 Builds:
   - versionName: 1.0.7
     versionCode: 8
-    commit: 196624c62b08fcdc02d5d5081aa59c150e8bd646
+    commit: bc62d74d30b46e316c5f8d9771aad8368c7412b4
     timeout: 10800
     subdir: applications/qnet-mobile/android
     sudo:

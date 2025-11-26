@@ -23,6 +23,11 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import Clipboard from '@react-native-clipboard/clipboard';
 import WalletManager from '../components/WalletManager';
 import QRCode from 'react-native-qrcode-svg';
+import { 
+  checkNodeStatus, 
+  reactivateNode, 
+  checkServerNodeStatus
+} from '../services/PushService';
 
 // 1DEV Burn Tracker Contract (same as browser extension)
 const BURN_CONTRACT_PROGRAM_ID = 'D7g7mkL8o1YEex6ZgETJEQyyHV7uuUMvV3Fy3u83igJ7';
@@ -768,6 +773,9 @@ const WalletScreen = () => {
   const [nodePseudonym, setNodePseudonym] = useState(''); // Pseudonym/alias for the node
   const [showActivationInput, setShowActivationInput] = useState(false); // Show activation code input modal
   const [activationInputCode, setActivationInputCode] = useState(''); // Input activation code
+  const [lightNodeStatus, setLightNodeStatus] = useState(null); // Light node network status
+  const [serverNodeStatus, setServerNodeStatus] = useState(null); // Full/Super node network status
+  const [reactivatingNode, setReactivatingNode] = useState(false); // Reactivation in progress
   const [nodeActivating, setNodeActivating] = useState(false); // Node activation in progress
   const [unlockError, setUnlockError] = useState(''); // Error message for unlock screen
 
@@ -884,27 +892,42 @@ const WalletScreen = () => {
   }, [wallet, password]); // Run when wallet loads
   
   // Load node rewards when on node tab
+  // Load node data when on node tab
+  // ARCHITECTURE:
+  // - Light nodes: App is the node, needs local rewards tracking + network ping status
+  // - Full/Super/Genesis: Server is the node, app just monitors via single API call
   useEffect(() => {
     if (activeTab === 'node' && activatedNodeType && activationCode) {
-      let rewardsInterval;
       
-      // Load rewards immediately
+      if (activatedNodeType === 'light') {
+        // LIGHT NODES: App IS the node
+        // - Load rewards (local tracking)
+        // - Check ping status from network
+        // - Start ping interval for responding to challenges
         loadNodeRewards();
-      
-        // Refresh rewards every 30 seconds
-      rewardsInterval = setInterval(loadNodeRewards, 30000);
+        loadLightNodeStatus();
         
-        // Start ping interval if not already running
+        // Start ping interval if not already running (for responding to challenges)
         if (!global.nodePingInterval) {
           startNodePingInterval();
         }
         
-      // Cleanup function
-      return () => {
-        if (rewardsInterval) clearInterval(rewardsInterval);
-      };
+        // NO POLLING - user can pull-to-refresh
+        // Light nodes get push notifications for pings anyway
+        
+      } else {
+        // FULL/SUPER/GENESIS NODES: Server IS the node
+        // - Single API call gets ALL info (status, heartbeats, rewards)
+        // - Server handles heartbeats automatically every 24 min
+        // - Rewards calculated at end of 4h window on server
+        loadServerNodeStatus();
+        
+        // NO POLLING - server nodes don't need real-time updates from app
+        // User can pull-to-refresh when they want to check
+        // This saves battery significantly!
       }
-  }, [activeTab, activatedNodeType, activationCode]); // Load when tab opens and we have activation
+      }
+  }, [activeTab, activatedNodeType, activationCode, nodePseudonym]); // Load when tab opens
   
   // Load dynamic pricing when on activate tab
   useEffect(() => {
@@ -934,6 +957,66 @@ const WalletScreen = () => {
       setActivationPricing(pricing);
     } catch (error) {
       setActivationPricing(null);
+    }
+  };
+  
+  // Load Light node network status (for ping system)
+  const loadLightNodeStatus = async () => {
+    if (activatedNodeType !== 'light' || !nodePseudonym) return;
+    
+    try {
+      const status = await checkNodeStatus();
+      setLightNodeStatus(status);
+      
+      if (status.needsReactivation) {
+        console.log('[Node] Light node needs reactivation');
+      }
+    } catch (error) {
+      console.error('Failed to load Light node status:', error);
+    }
+  };
+  
+  // Load Server node (Full/Super/Genesis) network status
+  // This single API call returns ALL info: status, heartbeats, rewards
+  const loadServerNodeStatus = async () => {
+    if (activatedNodeType === 'light' || !activationCode) return;
+    
+    try {
+      const status = await checkServerNodeStatus(activationCode);
+      setServerNodeStatus(status);
+      
+      // Also load pseudonym for display
+      await loadNodePseudonym(activationCode);
+      
+      if (status.needsAttention) {
+        console.log('[Node] Server node needs attention:', status.message);
+      }
+    } catch (error) {
+      console.error('Failed to load server node status:', error);
+    }
+  };
+  
+  // Handle Light node reactivation ("I'm Back" button)
+  const handleReactivateNode = async () => {
+    if (reactivatingNode) return;
+    
+    setReactivatingNode(true);
+    try {
+      const result = await reactivateNode();
+      
+      if (result.success) {
+        showAlert('Success', result.wasReactivated ? 
+          'Your node has been reactivated! Next ping scheduled.' : 
+          'Your node is already active.');
+        // Reload status
+        await loadLightNodeStatus();
+      } else {
+        showAlert('Error', result.error || 'Failed to reactivate node');
+      }
+    } catch (error) {
+      showAlert('Error', 'Network error. Please try again.');
+    } finally {
+      setReactivatingNode(false);
     }
   };
   
@@ -1089,22 +1172,49 @@ const WalletScreen = () => {
     }
   };
   
-  // Process validator activity (internally claims rewards, but UI shows as "processing validation")
+  // Get the correct wallet address for claims based on activation phase
+  // Phase 1: Solana address (1DEV burn)
+  // Phase 2: QNet address (QNC transfer)
+  const getWalletAddressForClaim = async () => {
+    try {
+      // Check activation metadata for phase
+      const metaStr = await AsyncStorage.getItem(`qnet_activation_meta_${activatedNodeType}`);
+      if (metaStr) {
+        const meta = JSON.parse(metaStr);
+        if (meta.phase === 2) {
+          // Phase 2: Use QNet address
+          return wallet.qnetAddress || wallet.address;
+        }
+        // If walletAddress was stored during activation, use it
+        if (meta.walletAddress) {
+          return meta.walletAddress;
+        }
+      }
+      // Default: Phase 1 uses Solana address
+      return wallet.solanaAddress || wallet.address;
+    } catch (e) {
+      // Fallback to Solana address
+      return wallet.solanaAddress || wallet.address;
+    }
+  };
+  
+  // Claim rewards for Light nodes (local tracking)
   const handleProcessValidation = async () => {
     if (!nodeRewards || nodeRewards.unclaimed <= 0 || processingValidation) return;
     
     setProcessingValidation(true);
     try {
-      const walletAddress = wallet.solanaAddress || wallet.address;
+      // Get correct wallet address based on activation phase
+      const walletAddress = await getWalletAddressForClaim();
       const result = await walletManager.claimRewards(activatedNodeType, activationCode, walletAddress, password);
       
       if (result.success) {
         showAlert(
-          'Validation Processed!',
-          `Successfully processed ${result.amount} validator activities on-chain.\n\nTransaction: ${result.txHash}\n\nNext processing available in 24 hours.`,
+          'Rewards Claimed!',
+          `Successfully claimed ${result.amount} QNC rewards.\n\nTransaction: ${result.txHash}`,
           [
             { text: 'OK', onPress: () => {
-              // Reload validator metrics
+              // Reload rewards
               loadNodeRewards();
               // Reload balance
               if (wallet && wallet.publicKey) {
@@ -1114,10 +1224,54 @@ const WalletScreen = () => {
           ]
         );
       } else {
-        showAlert('Cannot Process', result.message);
+        showAlert('Cannot Claim', result.message);
       }
     } catch (error) {
-      showAlert('Error', 'Failed to process validation: ' + error.message);
+      showAlert('Error', 'Failed to claim rewards: ' + error.message);
+    } finally {
+      setProcessingValidation(false);
+    }
+  };
+  
+  // Claim rewards for Server nodes (Full/Super/Genesis) - uses server-side pending rewards
+  const handleClaimServerNodeRewards = async () => {
+    const pendingRewards = serverNodeStatus?.pendingRewards || 0;
+    if (pendingRewards <= 0 || processingValidation) return;
+    
+    setProcessingValidation(true);
+    try {
+      // Get correct wallet address based on activation phase
+      const walletAddress = await getWalletAddressForClaim();
+      // Pass serverPendingRewards so claimRewards knows this is a server node claim
+      const result = await walletManager.claimRewards(
+        activatedNodeType, 
+        activationCode, 
+        walletAddress, 
+        password,
+        pendingRewards  // Server pending rewards
+      );
+      
+      if (result.success) {
+        const claimedAmount = (pendingRewards / 1e9).toFixed(4);
+        showAlert(
+          'Rewards Claimed!',
+          `Successfully claimed ${claimedAmount} QNC rewards from your ${activatedNodeType} node.\n\nTransaction: ${result.txHash}`,
+          [
+            { text: 'OK', onPress: () => {
+              // Reload server node status (will show updated pending rewards)
+              loadServerNodeStatus();
+              // Reload balance
+              if (wallet && wallet.publicKey) {
+                loadBalance(wallet.publicKey);
+              }
+            }}
+          ]
+        );
+      } else {
+        showAlert('Cannot Claim', result.message);
+      }
+    } catch (error) {
+      showAlert('Error', 'Failed to claim rewards: ' + error.message);
     } finally {
       setProcessingValidation(false);
     }
@@ -3555,9 +3709,27 @@ const WalletScreen = () => {
                     </Text>
                       )}
                     </View>
-                    <View style={[styles.statusBadge, nodePseudonym ? styles.statusBadgeActivated : styles.statusBadgeActive]}>
-                      <Text style={[styles.statusBadgeText, !nodePseudonym && styles.statusBadgeTextActive]}>
-                        {nodePseudonym ? 'ACTIVATED' : 'CODE RECEIVED'}
+                    <View style={[
+                      styles.statusBadge, 
+                      nodePseudonym 
+                        ? ((activatedNodeType === 'light' && lightNodeStatus?.needsReactivation) ||
+                           (activatedNodeType !== 'light' && serverNodeStatus?.success && !serverNodeStatus?.isOnline)
+                            ? styles.statusBadgeInactive  // Red for inactive node
+                            : styles.statusBadgeActivated)  // Green for active
+                        : styles.statusBadgeActive  // Yellow for code received
+                    ]}>
+                      <Text style={[
+                        styles.statusBadgeText, 
+                        !nodePseudonym && styles.statusBadgeTextActive,
+                        ((activatedNodeType === 'light' && lightNodeStatus?.needsReactivation) ||
+                         (activatedNodeType !== 'light' && serverNodeStatus?.success && !serverNodeStatus?.isOnline)) && {color: '#ff3b30'}
+                      ]}>
+                        {!nodePseudonym 
+                          ? 'CODE RECEIVED' 
+                          : ((activatedNodeType === 'light' && lightNodeStatus?.needsReactivation) ||
+                             (activatedNodeType !== 'light' && serverNodeStatus?.success && !serverNodeStatus?.isOnline))
+                              ? 'OFFLINE' 
+                              : 'ONLINE'}
                       </Text>
                     </View>
                   </View>
@@ -3565,14 +3737,51 @@ const WalletScreen = () => {
                   {/* Action Button based on node type */}
                   {activatedNodeType === 'light' ? (
                     nodePseudonym ? (
-                      <TouchableOpacity 
-                        style={[styles.button, styles.buttonDisabled]}
-                        disabled={true}
-                      >
-                        <Text style={styles.buttonText}>
-                          Activated
-                        </Text>
-                      </TouchableOpacity>
+                      <>
+                        {/* Light Node Network Status */}
+                        {lightNodeStatus?.needsReactivation ? (
+                          <View style={[styles.serverActivationNotice, {backgroundColor: '#ff3b3020', borderColor: '#ff3b30'}]}>
+                            <Text style={[styles.serverActivationText, {color: '#ff3b30'}]}>
+                              ⚠️ Node Inactive - Missed {lightNodeStatus.consecutiveFailures || 0} pings
+                            </Text>
+                            <Text style={styles.serverActivationSubtext}>
+                              Your node was offline and needs reactivation
+                            </Text>
+                          </View>
+                        ) : lightNodeStatus?.isActive ? (
+                          <View style={[styles.serverActivationNotice, {backgroundColor: '#34c75920', borderColor: '#34c759'}]}>
+                            <Text style={[styles.serverActivationText, {color: '#34c759'}]}>
+                              ✅ Node Active - Responding to pings
+                            </Text>
+                            <Text style={styles.serverActivationSubtext}>
+                              Next ping: {lightNodeStatus.nextPingTime ? 
+                                new Date(lightNodeStatus.nextPingTime * 1000).toLocaleTimeString() : 'Soon'}
+                            </Text>
+                          </View>
+                        ) : null}
+                        
+                        {/* Reactivation Button - Only shown when needed */}
+                        {lightNodeStatus?.needsReactivation ? (
+                          <TouchableOpacity 
+                            style={[styles.button, styles.primaryButton, reactivatingNode && styles.buttonDisabled]}
+                            onPress={handleReactivateNode}
+                            disabled={reactivatingNode}
+                          >
+                            <Text style={styles.buttonText}>
+                              {reactivatingNode ? 'Reactivating...' : "🔄 I'm Back - Reactivate Node"}
+                            </Text>
+                          </TouchableOpacity>
+                        ) : (
+                          <TouchableOpacity 
+                            style={[styles.button, styles.buttonDisabled]}
+                            disabled={true}
+                          >
+                            <Text style={styles.buttonText}>
+                              Activated
+                            </Text>
+                          </TouchableOpacity>
+                        )}
+                      </>
                     ) : (
                     <TouchableOpacity 
                       style={[styles.button, styles.secondaryButton]}
@@ -3587,14 +3796,40 @@ const WalletScreen = () => {
                     </TouchableOpacity>
                     )
                   ) : (
-                    <View style={styles.serverActivationNotice}>
-                      <Text style={styles.serverActivationText}>
-                        {activatedNodeType === 'full' ? 'Full' : 'Super'} nodes require server activation
-                      </Text>
-                      <Text style={styles.serverActivationSubtext}>
-                        Use your activation code on a dedicated server
-                      </Text>
-                    </View>
+                    <>
+                      {/* Server Node Status from Network */}
+                      {serverNodeStatus?.success ? (
+                        serverNodeStatus.isOnline ? (
+                          <View style={[styles.serverActivationNotice, {backgroundColor: '#34c75920', borderColor: '#34c759'}]}>
+                            <Text style={[styles.serverActivationText, {color: '#34c759'}]}>
+                              ✅ Server Online - {serverNodeStatus.heartbeatCount}/{serverNodeStatus.requiredHeartbeats} heartbeats
+                            </Text>
+                            <Text style={styles.serverActivationSubtext}>
+                              Reputation: {serverNodeStatus.reputation?.toFixed(1) || 'N/A'} • 
+                              Block: {serverNodeStatus.currentBlockHeight || 'N/A'}
+                            </Text>
+                          </View>
+                        ) : (
+                          <View style={[styles.serverActivationNotice, {backgroundColor: '#ff3b3020', borderColor: '#ff3b30'}]}>
+                            <Text style={[styles.serverActivationText, {color: '#ff3b30'}]}>
+                              ⚠️ Server Offline - Last seen {Math.floor((serverNodeStatus.lastSeenAgoSeconds || 0) / 60)} min ago
+                            </Text>
+                            <Text style={styles.serverActivationSubtext}>
+                              {serverNodeStatus.message || 'Check your server is running'}
+                            </Text>
+                          </View>
+                        )
+                      ) : (
+                        <View style={styles.serverActivationNotice}>
+                          <Text style={styles.serverActivationText}>
+                            {activatedNodeType === 'full' ? 'Full' : 'Super'} nodes require server activation
+                          </Text>
+                          <Text style={styles.serverActivationSubtext}>
+                            Use your activation code on a dedicated server
+                          </Text>
+                        </View>
+                      )}
+                    </>
                   )}
                 </View>
                 
@@ -3604,39 +3839,120 @@ const WalletScreen = () => {
                   
                   <View style={styles.rewardItem}>
                     <Text style={styles.rewardLabel}>Validator Node:</Text>
-                    <Text style={[styles.rewardValue, {color: nodePseudonym ? '#34c759' : '#ff3b30'}]}>
-                      {nodePseudonym ? 'Active' : 'Inactive'}
+                    <Text style={[styles.rewardValue, {
+                      color: !nodePseudonym 
+                        ? '#ff3b30'  // Red - not activated
+                        : (activatedNodeType === 'light' && lightNodeStatus?.needsReactivation)
+                          ? '#ff9500'  // Orange - Light node needs reactivation
+                          : (activatedNodeType !== 'light' && serverNodeStatus?.success && !serverNodeStatus?.isOnline)
+                            ? '#ff3b30'  // Red - Server offline
+                            : '#34c759'  // Green - active
+                    }]}>
+                      {!nodePseudonym 
+                        ? 'Inactive' 
+                        : (activatedNodeType === 'light' && lightNodeStatus?.needsReactivation)
+                          ? 'Needs Reactivation'
+                          : (activatedNodeType !== 'light' && serverNodeStatus?.success && !serverNodeStatus?.isOnline)
+                            ? 'Server Offline'
+                            : 'Active'}
                     </Text>
                   </View>
                   
-                  <View style={styles.rewardItem}>
-                    <Text style={styles.rewardLabel}>On-Chain Activity:</Text>
-                    <Text style={styles.rewardValue}>
-                      {nodeRewards?.totalClaimed || 0} validations
-                    </Text>
-                  </View>
+                  {/* LIGHT NODES: Show local ping/reward tracking */}
+                  {activatedNodeType === 'light' && (
+                    <>
+                      <View style={styles.rewardItem}>
+                        <Text style={styles.rewardLabel}>Ping Responses:</Text>
+                        <Text style={styles.rewardValue}>
+                          {nodeRewards?.totalClaimed || 0} successful
+                        </Text>
+                      </View>
+                      
+                      <View style={styles.rewardItem}>
+                        <Text style={styles.rewardLabel}>Pending Rewards:</Text>
+                        <Text style={[styles.rewardValue, {color: (nodeRewards?.unclaimed || 0) > 0 ? '#34c759' : '#00d4ff'}]}>
+                          {nodeRewards?.unclaimed || 0} pending
+                        </Text>
+                      </View>
+                    </>
+                  )}
                   
-                  <View style={styles.rewardItem}>
-                    <Text style={styles.rewardLabel}>Pending Activity:</Text>
-                    <Text style={[styles.rewardValue, {color: (nodeRewards?.unclaimed || 0) > 0 ? '#34c759' : '#00d4ff'}]}>
-                      {nodeRewards?.unclaimed || 0} pending
-                    </Text>
-                  </View>
+                  {/* SERVER NODES (Full/Super/Genesis): Show server-side data */}
+                  {activatedNodeType !== 'light' && serverNodeStatus?.success && (
+                    <>
+                      <View style={styles.rewardItem}>
+                        <Text style={styles.rewardLabel}>Heartbeats (4h window):</Text>
+                        <Text style={[styles.rewardValue, {
+                          color: serverNodeStatus.isRewardEligible ? '#34c759' : '#ff9500'
+                        }]}>
+                          {serverNodeStatus.heartbeatCount || 0}/{serverNodeStatus.requiredHeartbeats || 8} 
+                          {serverNodeStatus.isRewardEligible ? ' ✓' : ' (need more)'}
+                        </Text>
+                      </View>
+                      
+                      <View style={styles.rewardItem}>
+                        <Text style={styles.rewardLabel}>Reputation:</Text>
+                        <Text style={[styles.rewardValue, {
+                          color: (serverNodeStatus.reputation || 0) >= 70 ? '#34c759' : '#ff9500'
+                        }]}>
+                          {serverNodeStatus.reputation?.toFixed(1) || '0.0'}
+                        </Text>
+                      </View>
+                      
+                      <View style={styles.rewardItem}>
+                        <Text style={styles.rewardLabel}>Pending Rewards:</Text>
+                        <Text style={[styles.rewardValue, {
+                          color: (serverNodeStatus.pendingRewards || 0) > 0 ? '#34c759' : '#00d4ff'
+                        }]}>
+                          {((serverNodeStatus.pendingRewards || 0) / 1e9).toFixed(4)} QNC
+                        </Text>
+                      </View>
+                      
+                      <View style={styles.rewardItem}>
+                        <Text style={styles.rewardLabel}>Block Height:</Text>
+                        <Text style={styles.rewardValue}>
+                          {serverNodeStatus.currentBlockHeight?.toLocaleString() || 'N/A'}
+                        </Text>
+                      </View>
+                    </>
+                  )}
                   
-                  <TouchableOpacity 
-                    style={[
-                      styles.button,
-                      (!nodeRewards?.unclaimed || nodeRewards.unclaimed <= 0 || processingValidation) && styles.buttonDisabled
-                    ]}
-                    disabled={Boolean(!nodeRewards?.unclaimed || nodeRewards.unclaimed <= 0 || processingValidation)}
-                    onPress={handleProcessValidation}
-                  >
-                    <Text style={styles.buttonText}>
-                      {processingValidation ? 'Processing...' : 
-                       !nodeRewards?.unclaimed || nodeRewards.unclaimed <= 0 ? 'Process Validation' :
-                       `Process ${nodeRewards.unclaimed} Activities`}
-                    </Text>
-                  </TouchableOpacity>
+                  {/* ALL NODES use Lazy Rewards - owner must claim */}
+                  {/* LIGHT NODES: Use local nodeRewards tracking */}
+                  {activatedNodeType === 'light' && (
+                    <TouchableOpacity 
+                      style={[
+                        styles.button,
+                        (!nodeRewards?.unclaimed || nodeRewards.unclaimed <= 0 || processingValidation) && styles.buttonDisabled
+                      ]}
+                      disabled={Boolean(!nodeRewards?.unclaimed || nodeRewards.unclaimed <= 0 || processingValidation)}
+                      onPress={handleProcessValidation}
+                    >
+                      <Text style={styles.buttonText}>
+                        {processingValidation ? 'Claiming...' : 
+                         !nodeRewards?.unclaimed || nodeRewards.unclaimed <= 0 ? 'Claim Rewards' :
+                         `Claim ${nodeRewards.unclaimed} Rewards`}
+                      </Text>
+                    </TouchableOpacity>
+                  )}
+                  
+                  {/* SERVER NODES: Use serverNodeStatus.pendingRewards */}
+                  {activatedNodeType !== 'light' && serverNodeStatus?.success && (
+                    <TouchableOpacity 
+                      style={[
+                        styles.button,
+                        ((serverNodeStatus.pendingRewards || 0) <= 0 || processingValidation) && styles.buttonDisabled
+                      ]}
+                      disabled={Boolean((serverNodeStatus.pendingRewards || 0) <= 0 || processingValidation)}
+                      onPress={handleClaimServerNodeRewards}
+                    >
+                      <Text style={styles.buttonText}>
+                        {processingValidation ? 'Claiming...' : 
+                         (serverNodeStatus.pendingRewards || 0) <= 0 ? 'Claim Rewards' :
+                         `Claim ${((serverNodeStatus.pendingRewards || 0) / 1e9).toFixed(4)} QNC`}
+                      </Text>
+                    </TouchableOpacity>
+                  )}
                   
                   <TouchableOpacity 
                     style={[styles.button, styles.secondaryButton, {marginTop: 10}]}
@@ -5234,6 +5550,10 @@ const styles = StyleSheet.create({
   },
   statusBadgeActivated: {
     backgroundColor: 'rgba(52, 199, 89, 0.2)',
+  },
+  statusBadgeInactive: {
+    backgroundColor: 'rgba(255, 59, 48, 0.2)',
+    borderColor: '#ff3b30',
   },
   statusBadgeText: {
     fontSize: 11,

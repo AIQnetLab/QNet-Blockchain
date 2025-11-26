@@ -138,11 +138,11 @@ async fn decode_activation_code_quantum_secure(
 
 // Validate activation code matches expected node type and payment
 fn validate_activation_code_node_type(code: &str, expected_type: NodeType, current_phase: u8, current_pricing: &PricingInfo) -> Result<(), String> {
-    println!("\n🔍 === Activation Code Validation (DEVELOPMENT MODE) ===");
+    println!("\n🔍 === Activation Code Validation ===");
     
-    // Production mode - validate QNET activation codes only
-    if !code.starts_with("QNET-") || code.len() != 17 {
-        return Err("Invalid activation code format. Expected: QNET-XXXX-XXXX-XXXX".to_string());
+    // Production mode - validate QNET activation codes (25 chars: QNET-XXXXXX-XXXXXX-XXXXXX)
+    if !code.starts_with("QNET-") || code.len() != 25 {
+        return Err("Invalid activation code format. Expected: QNET-XXXXXX-XXXXXX-XXXXXX (25 chars)".to_string());
     }
     
     println!("   ✅ QNET activation code format validated");

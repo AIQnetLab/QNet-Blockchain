@@ -783,17 +783,26 @@ pub struct PeerInfo {
 
 ```
 CONSENSUS SCORE (Byzantine Safety):
-  ├── ValidBlock: +5.0
+  ├── FullRotationComplete: +2.0 (for completing all 30 blocks)
   ├── InvalidBlock: -20.0
   ├── MaliciousBehavior: -50.0
-  ├── ConsensusParticipation: +2.0
+  ├── ConsensusParticipation: +1.0
   └── Threshold: ≥70% for consensus participation
 
-NETWORK SCORE (Peer Performance):
-  ├── SuccessfulResponse: +1.0
+NETWORK SCORE (Peer Performance - PENALTIES ONLY):
   ├── TimeoutFailure: -2.0
   ├── ConnectionFailure: -5.0
   └── No threshold (used for prioritization only)
+
+PASSIVE RECOVERY (once per 4h, if score [10, 70), NOT jailed):
+  └── +1.0 reputation
+
+PROGRESSIVE JAIL (6 chances for regular offenses):
+  ├── 1st: 1h → 30%    4th: 30d → 15%
+  ├── 2nd: 24h → 25%   5th: 3m → 12%
+  ├── 3rd: 7d → 20%    6+: 1y → 10% (can return!)
+  └── CRITICAL ATTACKS → PERMANENT BAN (no return):
+      DatabaseSubstitution, ChainFork, StorageDeletion
 
 COMBINED REPUTATION (Peer Selection):
   └── 70% consensus_score + 30% network_score
@@ -807,12 +816,15 @@ Response requirements:
 ├── Full Nodes: 80% (8+ out of 10 heartbeats in current window)
 └── Super Nodes: 90% (9+ out of 10 heartbeats in current window)
 
-Architecture (v2.19.4):
+Architecture (v2.19.10):
 ├── Light: Full/Super nodes ping via FCM V1 API → Light signs challenge → attestation
 ├── Full/Super: Self-attest via Dilithium-signed heartbeats (10 per 4h window)
-├── 256-shard system: Light nodes assigned to shards based on SHA3-256(node_id)[0]
+├── 256-shard ping system: Light nodes assigned to pingers based on SHA3-256(node_id)[0]
 ├── Light node reputation: Fixed at 70 (immutable, not affected by events)
+├── Storage: Tiered (Light ~100MB headers, Full ~500GB pruned, Super ~2TB full)
 └── Mobile monitoring: viewing only, no attestations
+
+> **Note (v2.19.10)**: Sharding is for parallel TX processing, NOT storage partitioning. All nodes receive all blocks via P2P.
 ```
 
 **Real threshold values:**
@@ -832,18 +844,24 @@ Architecture (v2.19.4):
 - **Claim interval**: 1 hour minimum between claims
 - **Even banned nodes (<10 rep)**: Can claim accumulated OLD rewards
 
-**Reputation rewards/penalties:**
+**Reputation Points (NOT QNC tokens):**
 
-| Action | Reputation Change | Notes |
-|--------|------------------|-------|
-| Produce microblock | +1 per block | 30 blocks per rotation |
-| Lead macroblock consensus | +10 | Once per 90 seconds |
-| Participate in consensus | +5 | Once per 90 seconds |
-| Emergency producer | +5 | During failover |
-| Failed microblock | -20 | Production failure |
-| Failed macroblock | -30 | Consensus failure |
-| Missed ping | -1 | Every 4 hours |
-| Successful ping | +1 | Every 4 hours |
+| Action | Rep Points | Notes |
+|--------|------------|-------|
+| Full Rotation Complete | +2.0 | For completing all 30 blocks in rotation |
+| Consensus participation | +1.0 | Per consensus round |
+| Failed microblock | -20.0 | Production failure |
+| Failed macroblock | -30.0 | Consensus failure |
+| Double-Sign | -50.0 | Byzantine fault + jail |
+| Malicious behavior | -50.0 | Byzantine attack detected |
+| Passive recovery | +1.0 | Every 4h if score [10, 70) and NOT jailed |
+
+**Network Score (affects peer prioritization only):**
+
+| Event | Penalty | Notes |
+|-------|---------|-------|
+| Timeout failure | -2.0 | WAN latency (not malicious) |
+| Connection failure | -5.0 | Offline/unreachable |
 
 **Reputation Gossip Protocol (v2.19.3):**
 
@@ -1318,7 +1336,7 @@ Reputation Score Mechanics (v2.19.4):
 ├── Full/Super Initial Score: 70 points (consensus minimum)
 ├── Full/Super Range: 0-100 points
 ├── Heartbeats: NO reputation change (heartbeats only for eligibility check)
-├── Passive Recovery: +1% every 4 hours for Full/Super nodes in range [10, 70)
+├── Passive Recovery: +1.0 every 4 hours for Full/Super nodes in range [10, 70) and NOT jailed
 └── Protocol Violations: -5 to -30 points (Full/Super only)
 
 Economic Thresholds:
@@ -1367,14 +1385,15 @@ NOT MINING - Simple Network Health Check:
 ├── Data Usage: <1MB daily
 └── CPU Usage: Negligible (like push notifications)
 
-256-Shard Ping System (v2.19.4):
-├── Light node ID → SHA3-256 → First byte → Shard (0-255)
-├── Each shard assigned to specific Full/Super nodes (deterministic)
+256-Shard Ping System (v2.19.10):
+├── Light node ID → SHA3-256 → First byte → Pinger assignment (0-255)
 ├── Pinger rotates every 4-hour window based on block entropy
 ├── Max 100K Light nodes per shard (LRU eviction)
 ├── FCM V1 API: OAuth2 + Service Account JSON authentication
 ├── Rate limiting: 500 requests/second (FCM limit)
 └── Only Genesis nodes send FCM push notifications
+
+> **Clarification**: "Shards" in ping system refers to pinger assignment for load balancing, NOT storage partitioning. All nodes receive and store blocks according to their tier (Light/Full/Super).
 
 Light Node Attestation Structure:
 ├── light_node_id: String
@@ -1665,6 +1684,35 @@ pub struct QNetSignature {
 - **Compression**: Zstd for 40-60% size reduction
 - **Block cache**: Acceleration of frequently requested data
 - **Archiving**: Automatic compression of old blocks
+
+**Node-Specific Storage Requirements:**
+
+| Node Type | Storage | Data Stored |
+|-----------|---------|-------------|
+| **Light** | **50-100 MB** | Headers ONLY (no blocks, no transactions) |
+| **Full** | ~50 GB | Sliding window (100K blocks) + snapshots |
+| **Super** | 400+ GB | Full history with archival |
+
+**Pruning System (v2.19.7):**
+
+| Pruning Type | What is Removed | Trigger |
+|--------------|-----------------|---------|
+| **Block Pruning** | Old microblocks/macroblocks | Sliding window (100K blocks) |
+| **Transaction Pruning** | Old TX data from 3 CFs | After block pruning |
+| **Microblock Pruning** | Microblocks after macroblock | After finalization |
+| **Snapshot Cleanup** | Old state snapshots | Keep last 5 only |
+
+**Storage Savings:**
+- Without pruning: **2+ TB/year** (transactions grow forever)
+- With pruning: **~260 GB** (sliding window)
+- **Savings: ~87%**
+
+**Snapshot System:**
+- Full snapshots: Every 12 hours
+- Incremental snapshots: Every 1 hour
+- Compression: Zstd-15 (~70% reduction)
+- Integrity: SHA3-256 verification
+- Auto-cleanup: Last 5 snapshots only
 
 ### 8.4 Advanced Performance Optimizations
 
@@ -2092,10 +2140,11 @@ Core Innovation:
 
 Reputation Scoring Matrix:
 ├── Starting Score: 70 (consensus threshold)
-├── Consensus Events: +2 to +5 per valid block/participation
+├── FullRotationComplete: +2.0 (completed 30 blocks)
+├── ConsensusParticipation: +1.0 (per consensus round)
 ├── Minor Failures: -2 to -5 points (timeouts, connection issues)
 ├── Major Violations: -20 to -50 points (invalid blocks, Byzantine behavior)
-├── Passive Recovery: +1% every 4 hours for Full/Super in range [10, 70) - capped at 70
+├── Passive Recovery: +1.0 every 4 hours for Full/Super in range [10, 70), NOT jailed
 ├── Recovery Time: 10% → 70% = 60 cycles × 4h = 240 hours = 10 days
 └── Heartbeats: NO reputation change (only for reward eligibility check)
 

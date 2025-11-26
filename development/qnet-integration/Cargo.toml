@@ -90,6 +90,7 @@ zstd = "0.13"
 rayon = "1.10"
 rand = "0.8.5"
 dirs = "5.0"
+url = "2.5"
 
 # Reed-Solomon erasure coding for Turbine
 reed-solomon-erasure = "6.0"

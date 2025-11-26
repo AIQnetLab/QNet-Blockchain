@@ -113,32 +113,30 @@ Every node seeing every transaction is impossible at scale.
 
 #### Solution: Sharded Transaction Processing
 ```rust
-struct ShardedNetwork {
-    // Nodes only see transactions in their shard
-    shard_count: u32,  // e.g., 100 shards
-    
-    // Light nodes don't see transactions at all
-    // Full nodes see their shard only
-    // Super nodes see multiple shards
+// UPDATED v2.19.10: Sharding is for PARALLEL PROCESSING, not storage partitioning
+// All nodes receive ALL blocks via P2P broadcast
+// Storage differs by TIER (what is kept and for how long), not by shard
+
+struct TieredStorage {
+    // All nodes receive all blocks, but store differently:
+    // Light: Headers only (~100MB, auto-rotating)
+    // Full: Full blocks + 30-day pruning (~500GB)
+    // Super: Full history, no pruning (~2TB)
 }
 
-fn get_node_shards(node_type: NodeType) -> Vec<ShardId> {
+fn get_storage_behavior(node_type: NodeType) -> StorageTier {
     match node_type {
-        NodeType::Light => vec![],  // No transaction data
-        NodeType::Full => vec![hash(node_id) % shard_count],  // One shard
-        NodeType::Super => {
-            // Multiple shards based on capacity
-            let shard_count = 3;  // See 3 shards
-            (0..shard_count).map(|i| (hash(node_id) + i) % total_shards).collect()
-        }
+        NodeType::Light => StorageTier::HeadersOnly,  // ~100MB, FIFO rotation
+        NodeType::Full => StorageTier::PrunedHistory, // ~500GB, 30-day window
+        NodeType::Super => StorageTier::FullHistory,  // ~2TB, no pruning
     }
 }
 ```
 
-**Result**: 
-- Light nodes: 0 bandwidth for transactions
-- Full nodes: 1 MB/s (1/100th of total)
-- Super nodes: 3 MB/s (3/100th of total)
+**Result (v2.19.10)**: 
+- Light nodes: ~100MB storage (headers only, auto-rotating)
+- Full nodes: ~500GB storage (30-day pruning window)
+- Super nodes: ~2TB storage (full history, archival role)
 
 ### 4. Consensus Participation Load
 

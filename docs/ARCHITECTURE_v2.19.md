@@ -519,16 +519,25 @@ pub struct PeerInfo {
 
 ```rust
 // CONSENSUS EVENTS (affect consensus_score)
-ValidBlock              // +5.0 consensus_score
+FullRotationComplete    // +2.0 consensus_score (for completing all 30 blocks)
 InvalidBlock            // -20.0 consensus_score
-ConsensusParticipation  // +2.0 consensus_score
+ConsensusParticipation  // +1.0 consensus_score
 MaliciousBehavior       // -50.0 consensus_score
 
-// NETWORK EVENTS (affect network_score)
-SuccessfulResponse      // +1.0 network_score
+// NETWORK EVENTS (PENALTIES ONLY - no bonuses!)
 TimeoutFailure          // -2.0 network_score (NOT malicious!)
 ConnectionFailure       // -5.0 network_score
-FastResponse            // +3.0 network_score
+
+// PASSIVE RECOVERY (once per 4h, if score [10, 70), NOT jailed)
+// +1.0 reputation
+
+// PROGRESSIVE JAIL (6 chances for regular offenses):
+// 1st: 1h → 30%    4th: 30d → 15%
+// 2nd: 24h → 25%   5th: 3m → 12%
+// 3rd: 7d → 20%    6+: 1y → 10% (can return!)
+//
+// CRITICAL ATTACKS → PERMANENT BAN (no return):
+// DatabaseSubstitution, ChainFork, StorageDeletion
 ```
 
 ### Peer Blacklist System
@@ -986,6 +995,49 @@ for node in eligible_nodes {
 | Full/Super heartbeats | `heartbeats` | 4 hours + 1 window buffer |
 | Pending rewards | `pending_rewards` | Until claimed |
 | Reputation history | `reputation_history` | 30 days |
+
+### Storage Optimization & Pruning (v2.19.7)
+
+**Node-Specific Storage Requirements:**
+
+| Node Type | Storage | Data Stored |
+|-----------|---------|-------------|
+| **Light** | **50-100 MB** | Headers only, NO blocks/transactions |
+| **Full** | ~50 GB | Sliding window (100K blocks) + snapshots |
+| **Super** | 400+ GB | Full history with archival |
+
+**Pruning System (production):**
+
+```rust
+// Block pruning - removes old microblocks/macroblocks
+pub fn prune_old_blocks(&self, keep_blocks: u64) -> Result<u64>
+
+// Transaction pruning (v2.19.7) - removes old TX data
+pub fn prune_old_transactions(&self, prune_before_height: u64) -> Result<u64>
+// Cleans: transactions, tx_index, tx_by_address Column Families
+
+// Microblock pruning after macroblock finalization
+pub fn prune_finalized_microblocks(&self, macroblock_height: u64) -> Result<u64>
+
+// Snapshot cleanup - keeps only last 5 snapshots
+pub fn cleanup_old_snapshots(&self) -> Result<u64>
+```
+
+**Storage Savings with Transaction Pruning:**
+
+| Component | Without Pruning | With Pruning | Savings |
+|-----------|-----------------|--------------|---------|
+| transactions CF | ∞ (grows forever) | ~200 GB | 90%+ |
+| tx_index CF | ∞ (grows forever) | ~20 GB | 90%+ |
+| tx_by_address CF | ∞ (grows forever) | ~40 GB | 90%+ |
+| **Total** | **2+ TB/year** | **~260 GB** | **~87%** |
+
+**Snapshot System:**
+- Full state snapshots every 12 hours
+- Incremental snapshots every 1 hour
+- Zstd-15 compression (~70% reduction)
+- SHA3-256 integrity verification
+- Auto-cleanup: keeps last 5 snapshots only
 
 ### Scalability
 
@@ -1525,25 +1577,57 @@ Conclusion: Certificate memory remains ~7.5 MB regardless of network size
 
 ## Production Deployment
 
+### Sharding vs Storage Architecture
+
+**IMPORTANT**: QNet uses **Transaction/Compute Sharding** for parallel processing, NOT State Sharding for storage division.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    QNET ARCHITECTURE                             │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  SHARDING = Parallel transaction PROCESSING (CPU cores)         │
+│  - Transactions distributed across shards for parallel execution│
+│  - 1 shard ≈ 10,000 TPS                                         │
+│  - Dynamic scaling: 1-256 shards based on network size          │
+│                                                                  │
+│  STORAGE = Tiered by node type (Light/Full/Super)               │
+│  - ALL nodes receive ALL blocks via P2P broadcast               │
+│  - Storage differs by WHAT is kept and for HOW LONG             │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Tiered Storage Model
+
+| Node Type | What is Stored | Pruning | Max Storage |
+|-----------|----------------|---------|-------------|
+| **Light** | Block headers only | Last 1,000 blocks | ~100 MB |
+| **Full** | Full blocks | Last 30 days | ~500 GB |
+| **Super/Bootstrap** | Full history | Never | ~2 TB |
+
 ### Minimum Requirements
 
 #### Light Node
 - **CPU**: 1 core (2 GHz)
 - **RAM**: 512 MB
-- **Storage**: 10 GB (pruned)
+- **Storage**: 100 MB SSD (headers only)
 - **Bandwidth**: 1 Mbps
+- **Use case**: Mobile wallets, IoT devices
 
 #### Full Node
 - **CPU**: 4 cores (2.4 GHz)
 - **RAM**: 8 GB
-- **Storage**: 1 TB SSD
+- **Storage**: 500 GB SSD (30 days history)
 - **Bandwidth**: 10 Mbps
+- **Use case**: Desktop/server nodes, consensus participation
 
-#### Super Node
+#### Super/Bootstrap Node
 - **CPU**: 8 cores (2.4 GHz+)
 - **RAM**: 16 GB
-- **Storage**: 2 TB NVMe SSD
+- **Storage**: 2 TB NVMe SSD (full history)
 - **Bandwidth**: 100 Mbps
+- **Use case**: Network backbone, historical data serving
 
 ### Recommended Configuration
 

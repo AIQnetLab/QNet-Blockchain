@@ -199,8 +199,6 @@ pub enum Region {
 pub struct PerformanceConfig {
     pub enable_sharding: bool,
     pub shard_count: usize,
-    pub node_shards: usize,
-    pub super_node_shards: usize,
     
     pub parallel_validation: bool,
     pub parallel_threads: usize,
@@ -291,12 +289,9 @@ impl Default for PerformanceConfig {
         
         Self {
             enable_sharding: env::var("QNET_ENABLE_SHARDING").unwrap_or_default() == "1",
-            // PRODUCTION: 256 shards for 400k+ TPS (aligns with existing P2P sharding)
+            // PRODUCTION: 256 shards for 400k+ TPS (parallel processing)
+            // NOTE: Shards are for TX processing parallelism, NOT storage partitioning
             shard_count: env::var("QNET_SHARD_COUNT").unwrap_or_default().parse().unwrap_or(256),
-            // PRODUCTION: Each node handles multiple shards for redundancy
-            node_shards: env::var("QNET_NODE_SHARDS").unwrap_or_default().parse().unwrap_or(8),
-            // PRODUCTION: Super nodes handle more shards for network stability
-            super_node_shards: env::var("QNET_SUPER_NODE_SHARDS").unwrap_or_default().parse().unwrap_or(32),
             
             parallel_validation: auto_parallel_validation,
             // AUTO-TUNE: Use all available CPU cores for maximum throughput
@@ -1864,6 +1859,7 @@ impl BlockchainNode {
                     .unwrap()
                     .as_secs();
                 
+                let genesis_node_id = format!("genesis_node_{}", bootstrap_id);
                 let node_info = crate::activation_validation::NodeInfo {
                     activation_code: format!("genesis_activation_{}", bootstrap_id),
                     wallet_address: genesis_wallet.clone(),
@@ -1872,6 +1868,10 @@ impl BlockchainNode {
                     activated_at: current_time,
                     last_seen: current_time,
                     migration_count: 0,
+                    node_id: genesis_node_id.clone(), // CRITICAL: Link to network node
+                    burn_tx_hash: format!("genesis_burn_{}", bootstrap_id), // Genesis nodes have special burn_tx
+                    phase: 1, // Genesis nodes are Phase 1
+                    burn_amount: 0, // Genesis nodes don't use XOR encryption
                 };
                 
                 if let Err(e) = registry.register_activation_on_blockchain(
@@ -6013,7 +6013,7 @@ impl BlockchainNode {
                                 if let Some(ref p2p) = p2p_for_reward {
                                     if blocks_created == ROTATION_INTERVAL_BLOCKS as u32 {
                                         // Full rotation completed - reward valid block production
-                                        p2p.update_node_reputation(&rotation_producer, ReputationEvent::ValidBlock);
+                                        p2p.update_node_reputation(&rotation_producer, ReputationEvent::FullRotationComplete);
                                         println!("[ROTATION] ✅ {} completed full rotation ({}/30 blocks)", 
                                                 rotation_producer, blocks_created);
                                     } else {
@@ -6144,7 +6144,7 @@ impl BlockchainNode {
                         if let Some(p2p) = &unified_p2p {
                             if blocks_created == ROTATION_INTERVAL_BLOCKS as u32 {
                                 // Full rotation: reward valid block production
-                                p2p.update_node_reputation(&rotation_producer, ReputationEvent::ValidBlock);
+                                p2p.update_node_reputation(&rotation_producer, ReputationEvent::FullRotationComplete);
                                 println!("[ROTATION] ✅ {} completed full rotation #{} ({}/30 blocks)", 
                                         rotation_producer, microblock.height / 30, blocks_created);
                             } else {
@@ -6187,7 +6187,8 @@ impl BlockchainNode {
                                 
                                 // STORAGE OPTIMIZATION: Trigger pruning after snapshot for non-archive nodes
                                 // This ensures we have a valid snapshot before removing old blocks
-                                if microblock_height % 10_000 == 0 {
+                                // INTERVAL: 14400 blocks = 4 hours (aligned with reward window)
+                                if microblock_height % 14_400 == 0 {
                                     let storage_for_pruning = Arc::clone(&storage);
                                     tokio::spawn(async move {
                                         match storage_for_pruning.prune_old_blocks() {
@@ -6380,7 +6381,7 @@ impl BlockchainNode {
                                         // Check if we were significantly behind (>50 blocks)
                                         if network_height > current_height + 50 {
                                             // Node successfully caught up after being behind
-                                            p2p_clone.update_node_reputation(&node_id_for_sync, ReputationEvent::ValidBlock);
+                                            p2p_clone.update_node_reputation(&node_id_for_sync, ReputationEvent::FullRotationComplete);
                                             println!("[REPUTATION] 🔄 Node {} recovered from {} block lag!", 
                                                      node_id_for_sync, network_height - current_height);
                                         }
@@ -7403,7 +7404,7 @@ impl BlockchainNode {
                         let peer_node_id = format!("genesis_node_{:03}", i + 1);
                         if peer_node_id != failed_producer {
                             // Give emergency reputation boost to enable recovery
-                            p2p.update_node_reputation(&peer_node_id, ReputationEvent::ValidBlock);
+                            p2p.update_node_reputation(&peer_node_id, ReputationEvent::FullRotationComplete);
                             println!("[EMERGENCY] 💊 Emergency boost to {} for recovery", peer_node_id);
                             
                             // Check if now eligible
@@ -7488,7 +7489,7 @@ impl BlockchainNode {
                         // Boost first available peer (now deterministic across all nodes)
                         let emergency_peer = &peers[0];
                         // Critical boost for network recovery
-                        p2p.update_node_reputation(&emergency_peer.id, ReputationEvent::ValidBlock);
+                        p2p.update_node_reputation(&emergency_peer.id, ReputationEvent::FullRotationComplete);
                         println!("[EMERGENCY] 💊 Critical boost to {} for network recovery", emergency_peer.id);
                         return emergency_peer.id.clone();
                     }
@@ -9314,7 +9315,7 @@ impl BlockchainNode {
         if let Some(p2p) = unified_p2p {
             // Map behavior_delta to ReputationEvent
             let event = if behavior_delta > 0.0 {
-                ReputationEvent::ValidBlock
+                ReputationEvent::FullRotationComplete
             } else if behavior_delta < 0.0 {
                 ReputationEvent::InvalidBlock
             } else {
@@ -10573,7 +10574,7 @@ impl BlockchainNode {
                 // PRODUCTION: Distribute reputation rewards for successful macroblock consensus
                 // According to config.ini and ReputationConfig documentation
                 // Reward consensus leader
-                p2p.update_node_reputation(&consensus_data.leader_id, ReputationEvent::ValidBlock);
+                p2p.update_node_reputation(&consensus_data.leader_id, ReputationEvent::FullRotationComplete);
                 println!("[REPUTATION] 🏆 Consensus leader {} rewarded", consensus_data.leader_id);
                 
                 // Reward all participants
@@ -10962,9 +10963,31 @@ impl BlockchainNode {
             }
         }
         
-        // Check sender balance in state
+        // CRITICAL SECURITY: Check nonce BEFORE adding to mempool
+        // This prevents DoS attacks where attacker floods mempool with invalid nonces
         {
             let state = self.state.read().await;
+            
+            // Check nonce
+            if let Some(account) = state.get_account(&tx.from) {
+                let expected_nonce = account.nonce + 1;
+                if tx.nonce != expected_nonce {
+                    return Err(QNetError::ValidationError(format!(
+                        "Invalid nonce: expected {}, got {} (anti-replay protection)",
+                        expected_nonce, tx.nonce
+                    )));
+                }
+            } else {
+                // New account: nonce must be 1 (first transaction)
+                if tx.nonce != 1 {
+                    return Err(QNetError::ValidationError(format!(
+                        "Invalid nonce for new account: expected 1, got {}",
+                        tx.nonce
+                    )));
+                }
+            }
+            
+            // Check balance
             let sender_balance = state.get_balance(&tx.from);
             let required_balance = tx.amount + (tx.gas_price * tx.gas_limit);
             
@@ -11555,16 +11578,63 @@ impl BlockchainNode {
             }
         }
         
-        // FIXED: Extract real wallet address from activation code - NO FALLBACKS for security
-        let wallet_address = match self.extract_wallet_from_activation_code(code).await {
-            Ok(wallet) => wallet,
+        // FIXED: Extract FULL payload from activation code - NO FALLBACKS for security
+        // This gives us wallet_address, burn_tx, node_type, and phase all at once
+        let activation_payload = match self.decrypt_activation_code_full(code).await {
+            Ok(payload) => payload,
             Err(e) => {
-                println!("❌ CRITICAL: Cannot extract wallet from activation code: {}", e);
+                println!("❌ CRITICAL: Cannot decrypt activation code: {}", e);
                 println!("   Code: {}...", &code[..8.min(code.len())]);
-                println!("   Node activation FAILED - security requires real wallet");
-                return Err(QNetError::ValidationError(format!("Wallet extraction failed - invalid activation code: {}", e)));
+                println!("   Node activation FAILED - security requires valid activation code");
+                return Err(QNetError::ValidationError(format!("Activation code decryption failed: {}", e)));
             }
         };
+        
+        let wallet_address = activation_payload.wallet.clone();
+        let burn_tx_hash = activation_payload.burn_tx.clone();
+        
+        // Determine phase from activation payload (default to 1 for legacy codes)
+        // Phase 1: 1DEV burn on Solana, Phase 2: QNC transfer to Pool 3
+        let phase = if burn_tx_hash.starts_with("genesis_") || burn_tx_hash.starts_with("QNET-BOOT") {
+            1 // Genesis nodes are always Phase 1
+        } else if burn_tx_hash.len() == 88 || burn_tx_hash.len() == 87 {
+            // Solana transaction signatures are 87-88 base58 chars
+            1 // Phase 1 - Solana burn
+        } else if burn_tx_hash.starts_with("qnet_tx_") || burn_tx_hash.len() == 64 {
+            // QNet transaction hashes are 64 hex chars
+            2 // Phase 2 - QNet transfer
+        } else {
+            1 // Default to Phase 1
+        };
+        
+        // Get burn_amount from registry (was stored when code was generated)
+        // CRITICAL: Must match the amount used in key_material for XOR encryption!
+        let burn_amount = {
+            let registry_temp = crate::activation_validation::BlockchainActivationRegistry::new(
+                Some(qnet_rpc.clone())
+            );
+            let code_hash_temp = registry_temp.hash_activation_code_for_blockchain(code)
+                .unwrap_or_else(|_| blake3::hash(code.as_bytes()).to_hex().to_string());
+            
+            match registry_temp.get_activation_record_by_hash(&code_hash_temp).await {
+                Ok(Some(record)) => {
+                    println!("   Burn Amount: {} (from registry)", record.activation_amount);
+                    record.activation_amount
+                }
+                _ => {
+                    // Fallback for Genesis nodes or codes without registry entry
+                    let default_amount = if phase == 1 { 1500u64 } else { 5000u64 };
+                    println!("   Burn Amount: {} (default for Phase {})", default_amount, phase);
+                    default_amount
+                }
+            }
+        };
+        
+        println!("📋 Activation payload extracted:");
+        println!("   Wallet: {}...", &wallet_address[..16.min(wallet_address.len())]);
+        println!("   Burn TX: {}...", &burn_tx_hash[..16.min(burn_tx_hash.len())]);
+        println!("   Phase: {}", phase);
+        println!("   Burn Amount: {}", burn_amount);
             
         // Create node info for blockchain registry with secure hash
         let registry = crate::activation_validation::BlockchainActivationRegistry::new(
@@ -11581,6 +11651,10 @@ impl BlockchainNode {
             activated_at: timestamp,
             last_seen: timestamp,
             migration_count: 0,
+            node_id: self.node_id.clone(), // CRITICAL: Link activation_code to network node_id
+            burn_tx_hash: burn_tx_hash.clone(), // CRITICAL: Store burn_tx for XOR decryption
+            phase, // Determined from burn_tx format
+            burn_amount, // CRITICAL: Store exact amount for XOR key derivation
         };
         
         // FIXED: Register activation with device migration support
@@ -11595,6 +11669,15 @@ impl BlockchainNode {
         // Save to local storage
         self.storage.save_activation_code(code, node_type_id, timestamp)
             .map_err(|e| QNetError::StorageError(e.to_string()))?;
+        
+        // CRITICAL: Save burn_tx_hash for future XOR decryption (e.g., after node restart)
+        // This allows the node to re-derive the encryption key without re-querying blockchain
+        if let Err(e) = self.storage.save_activation_burn_tx(&burn_tx_hash) {
+            println!("⚠️ Warning: Failed to save burn_tx_hash: {}", e);
+            // Non-fatal - burn_tx can be retrieved from registry if needed
+        } else {
+            println!("✅ Burn TX hash saved for future decryption");
+        }
         
         // Register Full/Super nodes in reward system (not Genesis or Light nodes)
         // Light nodes register through mobile app via RPC
@@ -11764,6 +11847,13 @@ impl BlockchainNode {
     
     /// Extract wallet address from activation code using quantum decryption
     pub async fn extract_wallet_from_activation_code(&self, code: &str) -> Result<String, QNetError> {
+        let payload = self.decrypt_activation_code_full(code).await?;
+        Ok(payload.wallet)
+    }
+    
+    /// Decrypt activation code and return full payload (wallet, burn_tx, node_type, etc.)
+    /// CRITICAL: This is the single source of truth for activation data extraction
+    pub async fn decrypt_activation_code_full(&self, code: &str) -> Result<crate::quantum_crypto::ActivationPayload, QNetError> {
         // CRITICAL FIX: Use GLOBAL crypto instance to avoid repeated initialization!
         let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
         if crypto_guard.is_none() {
@@ -11775,12 +11865,12 @@ impl BlockchainNode {
             
         // SECURITY: NO FALLBACK ALLOWED - quantum decryption MUST work
         match quantum_crypto.decrypt_activation_code(code).await {
-            Ok(payload) => Ok(payload.wallet),
+            Ok(payload) => Ok(payload),
             Err(e) => {
                 println!("❌ CRITICAL: Quantum decryption failed in node.rs: {}", e);
                 println!("   Code: {}...", &code[..8.min(code.len())]);
                 println!("   This activation code is invalid, corrupted, or crypto system is broken");
-                Err(QNetError::ValidationError(format!("Quantum wallet extraction failed - invalid activation code: {}", e)))
+                Err(QNetError::ValidationError(format!("Quantum decryption failed - invalid activation code: {}", e)))
             }
         }
     }

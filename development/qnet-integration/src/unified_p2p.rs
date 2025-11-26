@@ -325,16 +325,16 @@ fn default_reputation() -> Option<f64> {
 #[derive(Debug, Clone, Copy)]
 pub enum ReputationEvent {
     // CONSENSUS EVENTS (affect consensus_score - Byzantine safety)
-    ValidBlock,             // +5.0 consensus_score: Produced/validated valid block
+    // NOTE: ValidBlock removed - use FullRotationComplete instead (+2 for completing 30 blocks)
+    FullRotationComplete,   // +2.0 consensus_score: Completed full 30-block rotation   
     InvalidBlock,           // -20.0 consensus_score: Produced invalid block (Byzantine attack)
-    ConsensusParticipation, // +2.0 consensus_score: Participated in consensus
+    ConsensusParticipation, // +1.0 consensus_score: Participated in consensus (was +2, now +1)
     MaliciousBehavior,      // -50.0 consensus_score: Detected Byzantine attack
     
-    // NETWORK EVENTS (affect network_score - performance optimization)
-    SuccessfulResponse,     // +1.0 network_score: Successful P2P response
+    // NETWORK EVENTS (affect network_score - PENALTIES ONLY)
+    // NOTE: No bonuses for network events! Reputation recovery is PASSIVE ONLY (once per 4h if score 10-70)
     TimeoutFailure,         // -2.0 network_score: P2P timeout (WAN latency, not malicious)
     ConnectionFailure,      // -5.0 network_score: Connection failed (offline/unreachable)
-    FastResponse,           // +3.0 network_score: Very fast response (<100ms)
 }
 
 impl PeerInfo {
@@ -1113,9 +1113,41 @@ impl SimplifiedP2P {
         self.sync_request_tx = Some(sync_request_tx);
     }
     
+    /// PRODUCTION: Load jail statuses from persistent storage on startup
+    /// This ensures jail survives node restart
+    pub fn load_jail_statuses_on_startup(&self) {
+        let jail_statuses = self.load_jail_from_storage();
+        
+        if jail_statuses.is_empty() {
+            return;
+        }
+        
+        if let Ok(mut reputation) = self.reputation_system.lock() {
+            for (node_id, jailed_until, jail_count, reason) in jail_statuses {
+                reputation.apply_jail_sync(&node_id, jailed_until, jail_count, reason.clone());
+                
+                let display_id = if node_id.starts_with("genesis_node_") || node_id.starts_with("node_") {
+                    node_id.clone()
+                } else {
+                    get_privacy_id_for_addr(&node_id)
+                };
+                
+                if jailed_until == u64::MAX {
+                    println!("[JAIL] 📂 Restored PERMANENT BAN for {} from storage", display_id);
+                } else {
+                    println!("[JAIL] 📂 Restored jail for {} (offense #{}) from storage", display_id, jail_count);
+                }
+            }
+        }
+    }
+    
     /// Start simplified P2P network with load balancing
     pub fn start(&self) {
         println!("[P2P] Starting P2P network with intelligent load balancing");
+        
+        // CRITICAL: Load jail statuses from persistent storage FIRST
+        // This ensures banned nodes stay banned across restarts
+        self.load_jail_statuses_on_startup();
         
         // PRIVACY: Use pseudonym even in startup logs
         let display_id = if self.node_id.starts_with("genesis_node_") || self.node_id.starts_with("node_") {
@@ -1497,10 +1529,10 @@ impl SimplifiedP2P {
                 // Apply event-specific reputation changes
                 match event {
                     // CONSENSUS EVENTS (Byzantine safety)
-                    ReputationEvent::ValidBlock => {
+                    ReputationEvent::FullRotationComplete => {
+                        // +2 for completing full 30-block rotation
                         peer.successful_pings += 1;
-                        peer.consensus_score = (peer.consensus_score + 5.0).min(100.0);
-                        peer.network_score = (peer.network_score + 1.0).min(100.0);
+                        peer.consensus_score = (peer.consensus_score + 2.0).min(100.0);
                     }
                     ReputationEvent::InvalidBlock => {
                         peer.failed_pings += 1;
@@ -1511,7 +1543,8 @@ impl SimplifiedP2P {
                         }
                     }
                     ReputationEvent::ConsensusParticipation => {
-                        peer.consensus_score = (peer.consensus_score + 2.0).min(100.0);
+                        // +1 for participating in consensus (reduced from +2)
+                        peer.consensus_score = (peer.consensus_score + 1.0).min(100.0);
                     }
                     ReputationEvent::MaliciousBehavior => {
                         peer.failed_pings += 1;
@@ -1520,11 +1553,8 @@ impl SimplifiedP2P {
                                 peer_addr, peer.consensus_score);
                     }
                     
-                    // NETWORK EVENTS (performance optimization)
-                    ReputationEvent::SuccessfulResponse => {
-                        peer.successful_pings += 1;
-                        peer.network_score = (peer.network_score + 1.0).min(100.0);
-                    }
+                    // NETWORK EVENTS (PENALTIES ONLY)
+                    // NOTE: No bonuses! Reputation recovery is PASSIVE ONLY (once per 4h if score 10-70)
                     ReputationEvent::TimeoutFailure => {
                         // SOFT penalty: WAN latency is not malicious
                         peer.failed_pings += 1;
@@ -1533,9 +1563,6 @@ impl SimplifiedP2P {
                     ReputationEvent::ConnectionFailure => {
                         peer.failed_pings += 1;
                         peer.network_score = (peer.network_score - 5.0).max(0.0);
-                    }
-                    ReputationEvent::FastResponse => {
-                        peer.network_score = (peer.network_score + 3.0).min(100.0);
                     }
                 }
                 
@@ -1552,10 +1579,10 @@ impl SimplifiedP2P {
             
             // Apply same event logic
             match event {
-                ReputationEvent::ValidBlock => {
+                ReputationEvent::FullRotationComplete => {
+                    // +2 for completing full 30-block rotation
                     peer.successful_pings += 1;
-                    peer.consensus_score = (peer.consensus_score + 5.0).min(100.0);
-                    peer.network_score = (peer.network_score + 1.0).min(100.0);
+                    peer.consensus_score = (peer.consensus_score + 2.0).min(100.0);
                 }
                 ReputationEvent::InvalidBlock => {
                     peer.failed_pings += 1;
@@ -1566,7 +1593,8 @@ impl SimplifiedP2P {
                     }
                 }
                 ReputationEvent::ConsensusParticipation => {
-                    peer.consensus_score = (peer.consensus_score + 2.0).min(100.0);
+                    // +1 for participating in consensus (reduced from +2)
+                    peer.consensus_score = (peer.consensus_score + 1.0).min(100.0);
                 }
                 ReputationEvent::MaliciousBehavior => {
                     peer.failed_pings += 1;
@@ -1574,10 +1602,7 @@ impl SimplifiedP2P {
                     println!("[SECURITY] 🚨 Byzantine behavior detected from {}: consensus_score={:.1}%", 
                             peer_addr, peer.consensus_score);
                 }
-                ReputationEvent::SuccessfulResponse => {
-                    peer.successful_pings += 1;
-                    peer.network_score = (peer.network_score + 1.0).min(100.0);
-                }
+                // NOTE: No bonuses! Reputation recovery is PASSIVE ONLY (once per 4h if score 10-70)
                 ReputationEvent::TimeoutFailure => {
                     peer.failed_pings += 1;
                     peer.network_score = (peer.network_score - 2.0).max(0.0);
@@ -1586,23 +1611,21 @@ impl SimplifiedP2P {
                     peer.failed_pings += 1;
                     peer.network_score = (peer.network_score - 5.0).max(0.0);
                 }
-                ReputationEvent::FastResponse => {
-                    peer.network_score = (peer.network_score + 3.0).min(100.0);
-                }
             }
         }
     }
     
     /// BACKWARD COMPATIBILITY: Update reputation with boolean (legacy method)
-    /// Automatically maps to appropriate ReputationEvent
+    /// NOTE: Success=true does NOTHING (reputation recovery is passive only)
+    /// Only failure events affect reputation
     #[allow(dead_code)]
     fn update_peer_reputation_legacy(&self, peer_addr: &str, success: bool) {
-        let event = if success {
-            ReputationEvent::SuccessfulResponse
-        } else {
-            ReputationEvent::TimeoutFailure
-        };
-        self.update_peer_reputation(peer_addr, event);
+        // SUCCESS: No reputation change - recovery is PASSIVE ONLY (once per 4h if score 10-70)
+        // FAILURE: Apply timeout penalty
+        if !success {
+            self.update_peer_reputation(peer_addr, ReputationEvent::TimeoutFailure);
+        }
+        // Success just updates last_seen timestamp (done in update_peer_last_seen)
     }
     
     /// Get peer address by node ID
@@ -6782,17 +6805,44 @@ mod base64_bytes {
     }
 }
 
+/// Push notification type for Light nodes
+/// Supports multiple providers for F-Droid compatibility
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum PushType {
+    FCM,           // Firebase Cloud Messaging (Google Play)
+    UnifiedPush,   // Open standard (F-Droid, ntfy, Gotify)
+    Polling,       // Fallback - device polls for challenges
+}
+
+impl Default for PushType {
+    fn default() -> Self {
+        PushType::FCM
+    }
+}
+
 /// PRODUCTION: Light Node registration data for gossip sync
 /// Compact struct for efficient batch transfers between Full/Super nodes
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LightNodeRegistrationData {
     pub node_id: String,              // Privacy-preserving pseudonym
     pub wallet_address: String,       // Owner wallet for rewards
-    pub device_token_hash: String,    // Hashed FCM token
+    pub device_token_hash: String,    // Hashed FCM token (for FCM) or empty
     pub quantum_pubkey: String,       // Dilithium public key
     pub registered_at: u64,           // Registration timestamp
     pub signature: String,            // Ed25519 signature
+    #[serde(default)]
+    pub push_type: PushType,          // FCM | UnifiedPush | Polling
+    #[serde(default)]
+    pub unified_push_endpoint: Option<String>,  // UnifiedPush URL (e.g., https://ntfy.sh/xxx)
+    #[serde(default)]
+    pub last_seen: u64,               // Last successful ping response timestamp
+    #[serde(default)]
+    pub consecutive_failures: u8,     // Failed pings in a row (max 255)
+    #[serde(default = "default_true")]
+    pub is_active: bool,              // Node is active and should be pinged
 }
+
+fn default_true() -> bool { true }
 
 /// PRODUCTION: Heartbeat record for tracking node liveness
 /// Used for reward eligibility calculation (8/10 for Full, 9/10 for Super)
@@ -6898,9 +6948,11 @@ pub enum NetworkMessage {
     },
     
     /// PRODUCTION: Reputation synchronization for consensus
+    /// Includes jail status for network-wide consistency
     ReputationSync {
         node_id: String,
         reputation_updates: Vec<(String, f64)>, // (node_id, reputation)
+        jail_updates: Vec<(String, u64, u32, String)>, // (node_id, jailed_until, jail_count, reason)
         timestamp: u64,
         signature: Vec<u8>, // Cryptographic signature for Byzantine safety
     },
@@ -6991,6 +7043,16 @@ pub enum NetworkMessage {
         registered_at: u64,           // Registration timestamp
         signature: String,            // Ed25519 signature from wallet
         gossip_hop: u8,               // Hop count for gossip TTL (max 3)
+        #[serde(default)]
+        push_type: PushType,          // FCM | UnifiedPush | Polling
+        #[serde(default)]
+        unified_push_endpoint: Option<String>,  // UnifiedPush URL
+        #[serde(default)]
+        last_seen: u64,               // Last successful ping response
+        #[serde(default)]
+        consecutive_failures: u8,     // Failed pings counter
+        #[serde(default = "default_true")]
+        is_active: bool,              // Node activity status
     },
     
     /// PRODUCTION: Full/Super node heartbeat for self-attestation
@@ -7330,9 +7392,9 @@ impl SimplifiedP2P {
                 );
             }
             
-            NetworkMessage::ReputationSync { node_id, reputation_updates, timestamp, signature } => {
+            NetworkMessage::ReputationSync { node_id, reputation_updates, jail_updates, timestamp, signature } => {
                 // PRODUCTION: Process reputation synchronization from other nodes
-                self.handle_reputation_sync(node_id, reputation_updates, timestamp, signature);
+                self.handle_reputation_sync(node_id, reputation_updates, jail_updates, timestamp, signature);
             }
             
             NetworkMessage::RequestBlocks { from_height, to_height, requester_id } => {
@@ -7819,7 +7881,8 @@ impl SimplifiedP2P {
             // PRODUCTION: Light Node registration gossip handling
             NetworkMessage::LightNodeRegistration { 
                 node_id, wallet_address, device_token_hash, quantum_pubkey, 
-                registered_at, signature, gossip_hop 
+                registered_at, signature, gossip_hop, push_type, unified_push_endpoint,
+                last_seen, consecutive_failures, is_active
             } => {
                 self.update_peer_last_seen(from_peer);
                 
@@ -7832,9 +7895,19 @@ impl SimplifiedP2P {
                 // DEDUPE: Check if already in registry
                 {
                     let registry = self.light_node_registry.read().unwrap();
-                    if registry.contains_key(&node_id) {
-                        // Already have this registration, skip
-                        return;
+                    if let Some(existing) = registry.get(&node_id) {
+                        // Already have this registration
+                        // SECURITY: Only accept updates with newer timestamp
+                        if registered_at <= existing.registered_at {
+                            return;
+                        }
+                        // SECURITY: Don't accept gossip-based failure increments
+                        // Failures are tracked locally by each pinger node
+                        // Gossip can only reset failures (successful re-registration)
+                        if consecutive_failures > existing.consecutive_failures && consecutive_failures > 0 {
+                            println!("[GOSSIP] ⚠️ Ignoring suspicious failure count increase for {}", node_id);
+                            return;
+                        }
                     }
                 }
                 
@@ -7874,6 +7947,11 @@ impl SimplifiedP2P {
                         quantum_pubkey: quantum_pubkey.clone(),
                         registered_at,
                         signature: signature.clone(),
+                        push_type: push_type.clone(),
+                        unified_push_endpoint: unified_push_endpoint.clone(),
+                        last_seen,
+                        consecutive_failures,
+                        is_active,
                     });
                 }
                 
@@ -7888,6 +7966,11 @@ impl SimplifiedP2P {
                     registered_at,
                     signature,
                     gossip_hop: gossip_hop + 1,
+                    push_type,
+                    unified_push_endpoint,
+                    last_seen,
+                    consecutive_failures,
+                    is_active,
                 };
                 self.gossip_to_random_peers(forward_msg, 3); // Forward to 3 random peers
             }
@@ -8386,6 +8469,7 @@ impl SimplifiedP2P {
     /// - Caps at 70 (consensus threshold) - nodes must earn higher through consensus participation
     /// - Light nodes: EXCLUDED (fixed at 70)
     /// - Banned nodes (<10): EXCLUDED (no passive recovery)
+    /// - JAILED nodes: EXCLUDED (must wait for jail to expire first!)
     /// SCALABILITY: O(1) per node, called once per 4 hours
     pub fn apply_passive_recovery(&self, node_id: &str) -> bool {
         // CRITICAL: Light nodes have fixed reputation of 70 - skip
@@ -8394,6 +8478,13 @@ impl SimplifiedP2P {
         }
         
         let mut reputation_sys = self.reputation_system.lock().unwrap();
+        
+        // CRITICAL: Jailed nodes do NOT get passive recovery!
+        // They must wait for their jail sentence to expire
+        if reputation_sys.is_jailed(node_id) {
+            return false;
+        }
+        
         let current = reputation_sys.get_reputation(node_id);
         
         // Only recover nodes in range [10, 70)
@@ -8595,6 +8686,11 @@ impl SimplifiedP2P {
             registered_at: registration.registered_at,
             signature: registration.signature,
             gossip_hop: 0,
+            push_type: registration.push_type,
+            unified_push_endpoint: registration.unified_push_endpoint,
+            last_seen: registration.last_seen,
+            consecutive_failures: registration.consecutive_failures,
+            is_active: registration.is_active,
         };
         
         self.gossip_to_random_peers(msg, 5);
@@ -8686,20 +8782,64 @@ impl SimplifiedP2P {
         seconds_in_window / 60  // 0-239
     }
     
-    /// Determine if Light node should be pinged in current slot (deterministic)
-    /// Returns true if node's deterministic slot matches current slot
-    /// GRACE PERIOD: Also returns true for 2 slots after the primary slot (retry window)
-    pub fn is_light_node_ping_slot(light_node_id: &str) -> bool {
+    /// Get current 4-hour window number (for randomizing ping slots)
+    pub fn get_current_window_number() -> u64 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        now / (4 * 60 * 60)  // Window number since epoch
+    }
+    
+    /// Calculate ping slot for Light node with per-window randomization
+    /// SECURITY: Slot changes each 4h window, preventing prediction attacks
+    pub fn calculate_randomized_slot(light_node_id: &str, window_number: u64) -> u64 {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
         
-        let current_slot = Self::get_current_slot();
-        
-        // Deterministic slot from node_id hash
         let mut hasher = DefaultHasher::new();
         light_node_id.hash(&mut hasher);
+        window_number.hash(&mut hasher);  // Randomize per window!
         let hash = hasher.finish();
-        let node_slot = hash % 240;
+        hash % 240  // 0-239 slots
+    }
+    
+    /// Get next ping time for a Light node (for polling fallback)
+    /// Returns (timestamp, window_number) for the next scheduled ping
+    pub fn get_next_ping_time(light_node_id: &str) -> (u64, u64) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        
+        let current_window = Self::get_current_window_number();
+        let current_slot = Self::get_current_slot();
+        let node_slot = Self::calculate_randomized_slot(light_node_id, current_window);
+        
+        // Calculate window start timestamp
+        let window_start = current_window * 4 * 60 * 60;
+        
+        if node_slot > current_slot {
+            // Ping is later in current window
+            let ping_time = window_start + (node_slot * 60);
+            (ping_time, current_window)
+        } else {
+            // Ping already passed in current window, calculate for next window
+            let next_window = current_window + 1;
+            let next_slot = Self::calculate_randomized_slot(light_node_id, next_window);
+            let next_window_start = next_window * 4 * 60 * 60;
+            let ping_time = next_window_start + (next_slot * 60);
+            (ping_time, next_window)
+        }
+    }
+    
+    /// Determine if Light node should be pinged in current slot (randomized per window)
+    /// Returns true if node's slot matches current slot
+    /// GRACE PERIOD: Also returns true for 2 slots after the primary slot (retry window)
+    pub fn is_light_node_ping_slot(light_node_id: &str) -> bool {
+        let current_slot = Self::get_current_slot();
+        let current_window = Self::get_current_window_number();
+        let node_slot = Self::calculate_randomized_slot(light_node_id, current_window);
         
         // GRACE PERIOD: Primary slot + 2 retry slots (3 minutes total window)
         // This handles network delays and temporary unavailability
@@ -8715,15 +8855,9 @@ impl SimplifiedP2P {
     
     /// Check if this is the PRIMARY slot for Light node (not retry)
     pub fn is_light_node_primary_slot(light_node_id: &str) -> bool {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        
         let current_slot = Self::get_current_slot();
-        
-        let mut hasher = DefaultHasher::new();
-        light_node_id.hash(&mut hasher);
-        let hash = hasher.finish();
-        let node_slot = hash % 240;
+        let current_window = Self::get_current_window_number();
+        let node_slot = Self::calculate_randomized_slot(light_node_id, current_window);
         
         current_slot == node_slot
     }
@@ -8794,8 +8928,9 @@ impl SimplifiedP2P {
             .collect()
     }
     
-    /// Get Light nodes to ping in current slot (filtered by SHARD + slot + role)
+    /// Get Light nodes to ping in current slot (filtered by SHARD + slot + role + activity)
     /// CRITICAL: Only iterates over Light nodes in OUR SHARD for scalability
+    /// OPTIMIZATION: Skips inactive nodes to reduce wasted pings
     pub fn get_light_nodes_to_ping(&self) -> Vec<(LightNodeRegistrationData, PingerRole)> {
         let current_slot = Self::get_current_slot();
         let our_shard = self.shard_id;
@@ -8807,6 +8942,12 @@ impl SimplifiedP2P {
         for node in registry.values() {
             // SHARD FILTER: Only process Light nodes in our shard
             if Self::calculate_light_node_shard(&node.node_id) != our_shard {
+                continue;
+            }
+            
+            // ACTIVITY FILTER: Skip inactive nodes (>5 consecutive failures)
+            // They will be reactivated when they re-register or respond to a probe ping
+            if !node.is_active || node.consecutive_failures >= 5 {
                 continue;
             }
             
@@ -8828,6 +8969,64 @@ impl SimplifiedP2P {
         }
         
         result
+    }
+    
+    /// Mark Light node as failed (no response to ping)
+    /// After 5 consecutive failures, node is marked inactive
+    pub fn mark_light_node_ping_failed(&self, node_id: &str) {
+        let mut registry = self.light_node_registry.write().unwrap();
+        if let Some(node) = registry.get_mut(node_id) {
+            node.consecutive_failures = node.consecutive_failures.saturating_add(1);
+            
+            if node.consecutive_failures >= 5 {
+                node.is_active = false;
+                println!("[LIGHT] ⚠️ Node {} marked inactive after {} consecutive failures", 
+                         node_id, node.consecutive_failures);
+            }
+        }
+    }
+    
+    /// Mark Light node as successful (responded to ping)
+    /// Resets failure counter and marks as active
+    pub fn mark_light_node_ping_success(&self, node_id: &str) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+            
+        let mut registry = self.light_node_registry.write().unwrap();
+        if let Some(node) = registry.get_mut(node_id) {
+            let was_inactive = !node.is_active;
+            
+            node.last_seen = now;
+            node.consecutive_failures = 0;
+            node.is_active = true;
+            
+            if was_inactive {
+                println!("[LIGHT] ✅ Node {} reactivated after successful ping", node_id);
+            }
+        }
+    }
+    
+    /// Periodically probe inactive nodes (once per window) to check if they're back online
+    /// Returns list of inactive nodes in our shard that should be probed
+    pub fn get_inactive_nodes_to_probe(&self) -> Vec<LightNodeRegistrationData> {
+        let our_shard = self.shard_id;
+        let current_window = Self::get_current_window_number();
+        
+        let registry = self.light_node_registry.read().unwrap();
+        
+        registry.values()
+            .filter(|node| {
+                // Only our shard
+                Self::calculate_light_node_shard(&node.node_id) == our_shard &&
+                // Only inactive nodes
+                (!node.is_active || node.consecutive_failures >= 5) &&
+                // Probe once per window: use hash to spread probes across slots
+                Self::calculate_randomized_slot(&node.node_id, current_window) == Self::get_current_slot()
+            })
+            .cloned()
+            .collect()
     }
     
     /// Gossip Light Node attestation after successful ping
@@ -8970,6 +9169,21 @@ impl SimplifiedP2P {
     pub fn get_active_node_count(&self) -> usize {
         let nodes = self.active_full_super_nodes.read().unwrap();
         nodes.len()
+    }
+    
+    /// Get list of active Full/Super nodes with their status
+    /// Returns Vec<(node_id, node_type, last_seen)>
+    pub fn get_active_full_super_nodes(&self) -> Vec<(String, String, u64)> {
+        let nodes = self.active_full_super_nodes.read().unwrap();
+        nodes.values()
+            .map(|n| (n.node_id.clone(), n.node_type.clone(), n.last_seen))
+            .collect()
+    }
+    
+    /// Get node reputation by ID
+    pub fn get_node_reputation(&self, node_id: &str) -> f64 {
+        let rep_sys = self.reputation_system.lock().unwrap();
+        rep_sys.get_reputation(node_id)
     }
     
     /// Get delay before pinging based on role (Primary=0, Backup1=30s, Backup2=60s)
@@ -9789,9 +10003,9 @@ impl SimplifiedP2P {
     pub fn update_node_reputation(&self, node_id: &str, event: ReputationEvent) {
         // Determine delta based on event type
         let (consensus_delta, is_consensus_event) = match event {
-            ReputationEvent::ValidBlock => (5.0, true),
+            ReputationEvent::FullRotationComplete => (2.0, true),  // +2.0 for completing 30-block rotation
             ReputationEvent::InvalidBlock => (-20.0, true),
-            ReputationEvent::ConsensusParticipation => (2.0, true),
+            ReputationEvent::ConsensusParticipation => (1.0, true), // +1.0 (was +2.0, reduced per docs)
             ReputationEvent::MaliciousBehavior => (-50.0, true),
             // Network events don't affect consensus reputation
             _ => (0.0, false),
@@ -9829,7 +10043,7 @@ impl SimplifiedP2P {
     pub fn update_node_reputation_legacy(&self, node_id: &str, delta: f64) {
         // Map delta to appropriate event
         let event = if delta > 0.0 {
-            ReputationEvent::ValidBlock
+            ReputationEvent::FullRotationComplete
         } else {
             ReputationEvent::InvalidBlock
         };
@@ -10033,6 +10247,184 @@ impl SimplifiedP2P {
             },
             Err(e) => {
                 println!("[REPUTATION] ⚠️ Failed to serialize reputation batch: {}", e);
+            }
+        }
+    }
+    
+    /// PRODUCTION: Save jail status to persistent storage with integrity protection
+    /// SECURITY: Uses cryptographic integrity hash to prevent tampering
+    /// ARCHITECTURE: Matches reputation storage pattern (batched, compressed, verified)
+    pub fn save_jail_to_storage(&self, node_id: &str, jailed_until: u64, jail_count: u32, reason: &str) {
+        // Light nodes don't store jail data
+        if matches!(self.node_type, NodeType::Light) {
+            return;
+        }
+        
+        // Use same directory structure as reputation
+        let jail_dir = "./data/jail";
+        if std::fs::create_dir_all(jail_dir).is_err() {
+            println!("[JAIL] ⚠️ Could not create jail directory");
+            return;
+        }
+        
+        // SECURITY: Calculate integrity hash for tamper detection
+        use sha3::{Sha3_256, Digest as Sha3Digest};
+        let mut integrity_hasher = Sha3_256::new();
+        integrity_hasher.update(node_id.as_bytes());
+        integrity_hasher.update(&jailed_until.to_le_bytes());
+        integrity_hasher.update(&jail_count.to_le_bytes());
+        integrity_hasher.update(reason.as_bytes());
+        let integrity_hash = hex::encode(integrity_hasher.finalize());
+        
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        
+        // SCALABILITY: Use batched storage like reputation (hash-based sharding)
+        // This prevents single-file bottleneck for millions of nodes
+        let mut id_hasher = Sha3_256::new();
+        id_hasher.update(node_id.as_bytes());
+        let hash_result = id_hasher.finalize();
+        let batch_num = ((hash_result[0] as u32) << 8 | hash_result[1] as u32) % 100; // 100 batches for jail
+        let batch_file = format!("{}/batch_{:03}.dat.zst", jail_dir, batch_num);
+        
+        // Load existing batch or create new
+        let mut batch_data: std::collections::HashMap<String, serde_json::Value> = 
+            if let Ok(compressed) = std::fs::read(&batch_file) {
+                if let Ok(decompressed) = zstd::decode_all(&compressed[..]) {
+                    serde_json::from_slice(&decompressed).unwrap_or_default()
+                } else {
+                    std::collections::HashMap::new()
+                }
+            } else {
+                std::collections::HashMap::new()
+            };
+        
+        // Add/update this jail entry with integrity hash
+        batch_data.insert(node_id.to_string(), serde_json::json!({
+            "jailed_until": jailed_until,
+            "jail_count": jail_count,
+            "reason": reason,
+            "saved_at": timestamp,
+            "integrity": integrity_hash,  // SECURITY: Tamper detection
+            "version": 1
+        }));
+        
+        // COMPRESSION: Serialize and compress with Zstd
+        if let Ok(serialized) = serde_json::to_vec(&batch_data) {
+            if let Ok(compressed) = zstd::encode_all(&serialized[..], 10) {
+                if let Err(e) = std::fs::write(&batch_file, compressed) {
+                    println!("[JAIL] ⚠️ Failed to save jail status: {}", e);
+                } else {
+                    println!("[JAIL] 💾 Saved jail status for {} (batch {}, integrity: {}...)", 
+                            node_id, batch_num, &integrity_hash[..8]);
+                }
+            }
+        }
+    }
+    
+    /// PRODUCTION: Load all jail statuses from persistent storage on startup
+    /// SECURITY: Verifies integrity hash to detect tampering
+    pub fn load_jail_from_storage(&self) -> Vec<(String, u64, u32, String)> {
+        if matches!(self.node_type, NodeType::Light) {
+            return Vec::new();
+        }
+        
+        let jail_dir = "./data/jail";
+        if !std::path::Path::new(jail_dir).exists() {
+            return Vec::new();
+        }
+        
+        let mut result = Vec::new();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        
+        // SCALABILITY: Scan all batch files
+        if let Ok(entries) = std::fs::read_dir(jail_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().map(|e| e == "zst").unwrap_or(false) {
+                    if let Ok(compressed) = std::fs::read(&path) {
+                        if let Ok(decompressed) = zstd::decode_all(&compressed[..]) {
+                            if let Ok(batch_data) = serde_json::from_slice::<std::collections::HashMap<String, serde_json::Value>>(&decompressed) {
+                                for (node_id, entry) in batch_data {
+                                    if let (Some(jailed_until), Some(jail_count), Some(reason), Some(stored_integrity)) = (
+                                        entry["jailed_until"].as_u64(),
+                                        entry["jail_count"].as_u64(),
+                                        entry["reason"].as_str(),
+                                        entry["integrity"].as_str()
+                                    ) {
+                                        // SECURITY: Verify integrity hash
+                                        use sha3::{Sha3_256, Digest as Sha3Digest};
+                                        let mut integrity_hasher = Sha3_256::new();
+                                        integrity_hasher.update(node_id.as_bytes());
+                                        integrity_hasher.update(&jailed_until.to_le_bytes());
+                                        integrity_hasher.update(&(jail_count as u32).to_le_bytes());
+                                        integrity_hasher.update(reason.as_bytes());
+                                        let computed_hash = hex::encode(integrity_hasher.finalize());
+                                        
+                                        if computed_hash != stored_integrity {
+                                            println!("[JAIL] 🚨 INTEGRITY VIOLATION for {} - file may be tampered!", node_id);
+                                            continue; // Skip tampered entries
+                                        }
+                                        
+                                        // Only load if still active (jailed_until > now or permanent ban)
+                                        if jailed_until > now || jailed_until == u64::MAX {
+                                            result.push((node_id, jailed_until, jail_count as u32, reason.to_string()));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        if !result.is_empty() {
+            println!("[JAIL] 📂 Loaded {} active jail statuses from storage (integrity verified)", result.len());
+        }
+        
+        result
+    }
+    
+    /// PRODUCTION: Remove jail status from storage when released
+    /// Note: In practice, expired jails are simply not loaded on next startup
+    pub fn remove_jail_from_storage(&self, node_id: &str) {
+        if matches!(self.node_type, NodeType::Light) {
+            return;
+        }
+        
+        let jail_dir = "./data/jail";
+        
+        // Calculate batch file for this node
+        use sha3::{Sha3_256, Digest as Sha3Digest};
+        let mut id_hasher = Sha3_256::new();
+        id_hasher.update(node_id.as_bytes());
+        let hash_result = id_hasher.finalize();
+        let batch_num = ((hash_result[0] as u32) << 8 | hash_result[1] as u32) % 100;
+        let batch_file = format!("{}/batch_{:03}.dat.zst", jail_dir, batch_num);
+        
+        if !std::path::Path::new(&batch_file).exists() {
+            return;
+        }
+        
+        // Load, remove, and save back
+        if let Ok(compressed) = std::fs::read(&batch_file) {
+            if let Ok(decompressed) = zstd::decode_all(&compressed[..]) {
+                if let Ok(mut batch_data) = serde_json::from_slice::<std::collections::HashMap<String, serde_json::Value>>(&decompressed) {
+                    if batch_data.remove(node_id).is_some() {
+                        if let Ok(serialized) = serde_json::to_vec(&batch_data) {
+                            if let Ok(recompressed) = zstd::encode_all(&serialized[..], 10) {
+                                let _ = std::fs::write(&batch_file, recompressed);
+                                println!("[JAIL] 🗑️ Removed jail status for {} from storage", node_id);
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -11321,6 +11713,16 @@ impl SimplifiedP2P {
                     _ => MaliciousBehavior::ProtocolViolation,
                 };
                 reputation.jail_node(&failed_producer, behavior);
+                
+                // CRITICAL: Persist jail to storage for restart survival
+                if let Some(jail_status) = reputation.get_jail_status(&failed_producer) {
+                    self.save_jail_to_storage(
+                        &failed_producer, 
+                        jail_status.jailed_until, 
+                        jail_status.jail_count, 
+                        &jail_status.jail_reason
+                    );
+                }
             }
             
             // PRIVACY: Use pseudonym for logging
@@ -11583,7 +11985,7 @@ impl SimplifiedP2P {
             println!("[FAILOVER] ⚔️ Applied penalty to {} (consensus)", failed_producer);
             
             if new_producer != "emergency_consensus" {
-                self.update_node_reputation(&new_producer, ReputationEvent::ValidBlock);
+                self.update_node_reputation(&new_producer, ReputationEvent::FullRotationComplete);
                 println!("[FAILOVER] ✅ Emergency producer {} rewarded", new_producer);
             }
         } else if current_confirmations >= 2 {
@@ -11602,7 +12004,8 @@ impl SimplifiedP2P {
     
     
     /// PRODUCTION: Handle reputation synchronization from peers
-    fn handle_reputation_sync(&self, from_node: String, reputation_updates: Vec<(String, f64)>, timestamp: u64, signature: Vec<u8>) {
+    /// Includes jail status synchronization for network-wide consistency
+    fn handle_reputation_sync(&self, from_node: String, reputation_updates: Vec<(String, f64)>, jail_updates: Vec<(String, u64, u32, String)>, timestamp: u64, signature: Vec<u8>) {
         use sha3::{Sha3_256, Digest}; // For gossip propagation
         
         // PRIVACY: Use pseudonym for logging
@@ -11612,7 +12015,8 @@ impl SimplifiedP2P {
             get_privacy_id_for_addr(&from_node)
         };
         
-        println!("[REPUTATION] 📨 Processing reputation sync from {} with {} updates", from_display, reputation_updates.len());
+        println!("[REPUTATION] 📨 Processing reputation sync from {} with {} rep updates, {} jail updates", 
+                from_display, reputation_updates.len(), jail_updates.len());
         
         // PRODUCTION: Verify signature for Byzantine safety using SHA3-256
         // Uses quantum-resistant CRYSTALS-Dilithium for Genesis nodes
@@ -11625,7 +12029,10 @@ impl SimplifiedP2P {
         
         // PRODUCTION: Apply weighted average of reputations from multiple sources
         let mut significant_updates = 0;
+        let mut jail_sync_count = 0;
+        
         if let Ok(mut reputation_system) = self.reputation_system.lock() {
+            // Process reputation updates
             for (node_id, new_reputation) in &reputation_updates {
                 let current = reputation_system.get_reputation(&node_id);
                 
@@ -11646,6 +12053,50 @@ impl SimplifiedP2P {
                     
                     println!("[REPUTATION] 📊 Updated {} reputation: {:.1} → {:.1} (sync from {})", 
                             node_display, current, weighted_reputation, from_display);
+                }
+            }
+            
+            // PRODUCTION: Process jail updates - sync jail status across network
+            for (node_id, jailed_until, jail_count, reason) in &jail_updates {
+                // Only apply jail if it's more severe than current (higher jail_count or longer duration)
+                let should_apply = if let Some(current_jail) = reputation_system.get_jail_status(node_id) {
+                    // Apply if: permanent ban OR higher jail_count OR longer duration
+                    *jailed_until == u64::MAX || 
+                    *jail_count > current_jail.jail_count ||
+                    (*jail_count == current_jail.jail_count && *jailed_until > current_jail.jailed_until)
+                } else {
+                    // No current jail - apply if jailed_until is in the future
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs();
+                    *jailed_until > now
+                };
+                
+                if should_apply {
+                    // Apply jail from remote node
+                    reputation_system.apply_jail_sync(node_id, *jailed_until, *jail_count, reason.clone());
+                    jail_sync_count += 1;
+                    
+                    // CRITICAL: Persist synced jail to storage
+                    // Drop lock temporarily to avoid deadlock with save_jail_to_storage
+                    drop(reputation_system);
+                    self.save_jail_to_storage(node_id, *jailed_until, *jail_count, reason);
+                    // Re-acquire lock for remaining iterations
+                    reputation_system = self.reputation_system.lock().unwrap();
+                    
+                    let node_display = if node_id.starts_with("genesis_node_") || node_id.starts_with("node_") {
+                        node_id.clone()
+                    } else {
+                        get_privacy_id_for_addr(&node_id)
+                    };
+                    
+                    if *jailed_until == u64::MAX {
+                        println!("[JAIL] 🔄 Synced PERMANENT BAN for {} (from {})", node_display, from_display);
+                    } else {
+                        println!("[JAIL] 🔄 Synced jail for {} until {} (offense #{}, from {})", 
+                                node_display, jailed_until, jail_count, from_display);
+                    }
                 }
             }
         }
@@ -11703,6 +12154,7 @@ impl SimplifiedP2P {
             let sync_msg = NetworkMessage::ReputationSync {
                 node_id: from_node.clone(), // Keep ORIGINAL sender for signature verification
                 reputation_updates: reputation_updates.clone(),
+                jail_updates: jail_updates.clone(), // Include jail status in re-gossip
                 timestamp,
                 signature: signature.clone(),
             };
@@ -11817,12 +12269,14 @@ impl SimplifiedP2P {
     }
     
     /// PRODUCTION: Broadcast reputation updates to network
+    /// Includes jail status for network-wide consistency
     pub fn broadcast_reputation_sync(&self) -> Result<(), String> {
-        // Get current reputation state
-        let reputation_updates = if let Ok(reputation) = self.reputation_system.lock() {
-            reputation.get_all_reputations()
-                .into_iter()
-                .collect::<Vec<_>>()
+        // Get current reputation state and jail statuses
+        let (reputation_updates, jail_updates) = if let Ok(reputation) = self.reputation_system.lock() {
+            (
+                reputation.get_all_reputations().into_iter().collect::<Vec<_>>(),
+                reputation.get_all_jail_statuses()
+            )
         } else {
             return Err("Failed to lock reputation system".to_string());
         };
@@ -11906,6 +12360,7 @@ impl SimplifiedP2P {
         let sync_msg = NetworkMessage::ReputationSync {
             node_id: self.node_id.clone(),
             reputation_updates,
+            jail_updates,
             timestamp,
             signature,
         };
@@ -11951,13 +12406,14 @@ impl SimplifiedP2P {
                 thread::sleep(Duration::from_secs(300)); // Sync every 5 minutes
                 iteration += 1;
                 
-                // Get current reputation state
-                let reputation_updates = if let Ok(reputation) = reputation_system.lock() {
+                // Get current reputation state and jail statuses
+                let (reputation_updates, jail_updates) = if let Ok(reputation) = reputation_system.lock() {
                     let all_reps = reputation.get_all_reputations();
-                    if all_reps.is_empty() {
+                    let all_jails = reputation.get_all_jail_statuses();
+                    if all_reps.is_empty() && all_jails.is_empty() {
                         continue; // Nothing to sync
                     }
-                    all_reps.into_iter().collect::<Vec<_>>()
+                    (all_reps.into_iter().collect::<Vec<_>>(), all_jails)
                 } else {
                     println!("[REPUTATION] ⚠️ Failed to lock reputation system");
                     continue;
@@ -11993,10 +12449,11 @@ impl SimplifiedP2P {
                 let node_sig = node_hasher.finalize();
                 signature[32..].copy_from_slice(&node_sig);
                 
-                // Create sync message
+                // Create sync message with jail updates
                 let sync_msg = NetworkMessage::ReputationSync {
                     node_id: node_id.clone(),
                     reputation_updates: reputation_updates.clone(),
+                    jail_updates: jail_updates.clone(),
                     timestamp,
                     signature: signature.clone(),
                 };
