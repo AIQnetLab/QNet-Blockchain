@@ -44,7 +44,14 @@ This project uses **dual licensing**:
 - **Phase 2 (Future)**: ONLY QNC token activation on QNet blockchain
 - **Transition**: 90% 1DEV burned OR 5 years from genesis block (whichever comes first)
 
-### 🛡️ **LATEST UPDATES (v2.19.6 - November 26, 2025)**
+### 🛡️ **LATEST UPDATES (v2.19.11 - November 26, 2025)**
+- **REAL Dilithium3 Signatures**: Full NIST FIPS 204 cryptographic verification with `dilithium3::open()`
+- **Secure Key Storage**: Random encryption keys (NOT derived from public node_id) with SHA3-256 integrity
+- **No Fallback Signatures**: Removed SHA3-256 fallback - operations skip if Dilithium unavailable
+- **Standardized Algorithm**: All signatures use "CRYSTALS-Dilithium3" identifier
+- **WebSocket Rate Limiting**: DDoS protection for real-time connections
+
+### 🛡️ **Previous Updates (v2.19.6 - November 26, 2025)**
 - **WebSocket Real-time Events**: Live updates for blocks, balances, contracts, and transactions
 - **Smart Contract REST API**: Deploy, call, query WASM contracts with hybrid signatures
 - **Smart Polling for Light Nodes**: Battery-efficient polling (~94% fewer wake-ups)

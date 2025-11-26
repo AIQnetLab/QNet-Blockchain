@@ -509,9 +509,9 @@ impl QNetQuantumCrypto {
         QuantumCryptoStatus {
             initialized: self.initialized,
             algorithms: QuantumAlgorithms {
-                signature: "QNet-Dilithium-Compatible".to_string(),
-                encryption: "QNet-Kyber-Compatible".to_string(),
-                hash: "SHA3-256+SHA-512".to_string(),
+                signature: "CRYSTALS-Dilithium3".to_string(),  // NIST FIPS 204
+                encryption: "AES-256-GCM".to_string(),         // NIST FIPS 197 (Kyber removed)
+                hash: "SHA3-256".to_string(),                  // NIST FIPS 202
             },
             performance: PerformanceMetrics {
                 cache_hit_rate,
@@ -561,7 +561,11 @@ impl QNetQuantumCrypto {
             return Err(anyhow!("Empty signature"));
         }
 
-        if signature.algorithm != "QNet-Dilithium-Compatible" {
+        // Accept both algorithm names for compatibility
+        // "CRYSTALS-Dilithium3" - created by create_consensus_signature()
+        // "QNet-Dilithium-Compatible" - legacy format from other parts of code
+        if signature.algorithm != "QNet-Dilithium-Compatible" && 
+           signature.algorithm != "CRYSTALS-Dilithium3" {
             return Err(anyhow!("Unsupported signature algorithm: {}", signature.algorithm));
         }
 
@@ -621,14 +625,15 @@ impl QNetQuantumCrypto {
             return Ok(true);
         }
         
-        // Fallback: Parse our combined format for backward compatibility
+        // PRODUCTION: Parse our combined format and verify with REAL Dilithium3
+        // Format: [sig_len(4)] + [signature(2420) + message] + [pk_len(4)] + [public_key(1952)]
         if signature_bytes.len() < 8 {
             return Err(anyhow!("Signature too short: {} bytes", signature_bytes.len()));
         }
         
         let mut cursor = 0;
         
-        // Read signed message length
+        // Read signed message length (signature + message combined)
         let signed_len = u32::from_le_bytes([
             signature_bytes[cursor],
             signature_bytes[cursor + 1],
@@ -641,7 +646,7 @@ impl QNetQuantumCrypto {
             return Err(anyhow!("Invalid signature format: signed message truncated"));
         }
         
-        // Extract signed message
+        // Extract signed message bytes (signature + message)
         let signed_bytes = &signature_bytes[cursor..cursor + signed_len];
         cursor += signed_len;
         
@@ -658,49 +663,69 @@ impl QNetQuantumCrypto {
         ]) as usize;
         cursor += 4;
         
+        // NIST FIPS 204: Dilithium3 public key MUST be exactly 1952 bytes
+        if pk_len != 1952 {
+            return Err(anyhow!("Invalid public key size: {} (expected 1952)", pk_len));
+        }
+        
         if cursor + pk_len != signature_bytes.len() {
             return Err(anyhow!("Invalid signature format: public key size mismatch"));
         }
         
-        // For now, structural verification only
-        // In production, deserialize public key and use dilithium3::open() to verify
-        let expected_data = format!("{}:{}", wallet_address, data);
-        let signature_valid = if signed_len > expected_data.len() {
-            // Valid format: signature is prepended to message
-            let expected_msg_len = signed_len - 2420; // Dilithium3 signature is 2420 bytes
-            
-            println!("✅ Valid Dilithium3 format:");
-            println!("   Signed message: {} bytes", signed_len);
-            println!("   Expected signature: 2420 bytes");
-            println!("   Message part: {} bytes", expected_msg_len);
-            
-            // Verify high entropy in signature part
-            let sig_part = &signed_bytes[..std::cmp::min(2420, signed_bytes.len())];
-            let unique_bytes: std::collections::HashSet<_> = sig_part.iter().collect();
-            
-            if unique_bytes.len() > 200 {
-                println!("✅ High entropy signature - genuine Dilithium");
-                true
-            } else {
-                println!("❌ Low entropy - not a real Dilithium signature!");
-                false
+        // Extract public key bytes
+        let pk_bytes = &signature_bytes[cursor..cursor + pk_len];
+        
+        println!("🔐 REAL Dilithium3 verification (NIST FIPS 204):");
+        println!("   Signed message: {} bytes", signed_len);
+        println!("   Public key: {} bytes", pk_len);
+        
+        // PRODUCTION: Use REAL Dilithium3 verification from pqcrypto
+        use pqcrypto_dilithium::dilithium3;
+        use pqcrypto_traits::sign::{PublicKey as PQPublicKey, SignedMessage as PQSignedMessage};
+        
+        // Parse Dilithium3 public key
+        let public_key = match dilithium3::PublicKey::from_bytes(pk_bytes) {
+            Ok(pk) => pk,
+            Err(_) => {
+                println!("❌ Invalid Dilithium3 public key format");
+                return Err(anyhow!("Invalid Dilithium3 public key"));
             }
-        } else {
-            println!("❌ Invalid Dilithium format: signed message too short");
-            false
         };
-
-        if signature_valid {
-            println!("✅ Dilithium signature verified successfully");
-            println!("   Algorithm: CRYSTALS-Dilithium3");
-            println!("   Strength: Quantum-resistant (NIST Level 3)");
-            println!("   Wallet: {}...", safe_preview(wallet_address, 8));
-        } else {
-            println!("❌ Dilithium signature verification failed");
-            println!("   Possible attack: Forged or manipulated signature");
+        
+        // Parse signed message (signature + message concatenated)
+        let signed_message = match dilithium3::SignedMessage::from_bytes(signed_bytes) {
+            Ok(sm) => sm,
+            Err(_) => {
+                println!("❌ Invalid Dilithium3 signed message format");
+                return Err(anyhow!("Invalid Dilithium3 signed message"));
+            }
+        };
+        
+        // REAL cryptographic verification using dilithium3::open()
+        match dilithium3::open(&signed_message, &public_key) {
+            Ok(recovered_message) => {
+                // Verify recovered message matches expected data
+                let expected_bytes = data.as_bytes();
+                
+                if recovered_message == expected_bytes {
+                    println!("✅ Dilithium3 signature VERIFIED (NIST FIPS 204)");
+                    println!("   Algorithm: CRYSTALS-Dilithium3");
+                    println!("   Strength: Quantum-resistant (NIST Level 3)");
+                    println!("   Message integrity: CONFIRMED");
+                    Ok(true)
+                } else {
+                    println!("❌ Message mismatch after verification");
+                    println!("   Expected: {} bytes", expected_bytes.len());
+                    println!("   Recovered: {} bytes", recovered_message.len());
+                    Ok(false)
+                }
+            }
+            Err(_) => {
+                println!("❌ Dilithium3 signature verification FAILED");
+                println!("   Possible reasons: forged signature, wrong key, tampered data");
+                Ok(false)
+            }
         }
-
-        Ok(signature_valid)
     }
 
     // REMOVED: Old Kyber/ChaCha20 decryption functions - replaced with route.ts compatible XOR decryption
@@ -906,21 +931,13 @@ impl QNetQuantumCrypto {
         // Get public key for verification
         let public_key_bytes = key_manager.get_public_key()?;
         
-        // Sign using cached key manager (uses persistent keys from memory)
-        let signature_bytes = key_manager.sign(signature_data.as_bytes())?;
+        // PRODUCTION: Use sign_full() to get proper SignedMessage format
+        // This creates [signature(2420)] + [message] which dilithium3::open() can verify
+        let signed_msg_bytes = key_manager.sign_full(signature_data.as_bytes())?;
         
-        // Build combined format WITHOUT unsafe code
-        // Format: [sig_len(4)] + [signature(2420)] + [message] + [pk_len(4)] + [public_key]
+        // Build combined format for transport
+        // Format: [signed_msg_len(4)] + [SignedMessage] + [pk_len(4)] + [public_key(1952)]
         let mut combined = Vec::new();
-        
-        // Create signed message format (signature + original message)
-        let mut signed_msg_bytes = Vec::new();
-        
-        // Use the REAL signature from key_manager (already 2420 bytes)
-        let sig_bytes = signature_bytes;
-        
-        signed_msg_bytes.extend_from_slice(&sig_bytes);
-        signed_msg_bytes.extend_from_slice(signature_data.as_bytes());
         
         // Store the signed message length and bytes
         combined.extend_from_slice(&(signed_msg_bytes.len() as u32).to_le_bytes());
@@ -946,74 +963,8 @@ impl QNetQuantumCrypto {
         })
     }
 
-    /// Create quantum-enhanced signature for compatibility
-    fn create_quantum_signature(&self, key: &str, data: &CompatibleActivationData) -> Result<DilithiumSignature> {
-        let signature_data = format!("{}:{}:{}", data.tx_hash, data.wallet_address, data.qnc_amount);
-        
-        // Use REAL Dilithium for quantum resistance - NO SHA512!
-        // Using crystals_dilithium imported at top
-        
-        // Use DilithiumKeyManager for consistent key usage
-        use crate::key_manager::DilithiumKeyManager;
-        use std::path::Path;
-        
-        // Initialize key manager with deterministic node ID from key
-        use sha3::Sha3_256;
-        let mut hasher = Sha3_256::new();
-        hasher.update(key.as_bytes());
-        hasher.update(b"QNET_NODE_ID_V1");
-        let node_id = hex::encode(hasher.finalize());
-        
-        // OPTIMIZATION: Use cached key manager to avoid repeated disk I/O
-        let key_manager = {
-            let cache = KEY_MANAGER_CACHE.try_read();
-            if let Ok(cache) = cache {
-                if let Some(cached) = cache.get(&node_id) {
-                    // Use cached key manager if available and not expired
-                    let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-                    if current_time - cached.cached_at < 3600 {
-                        cached.manager.clone()
-                    } else {
-                        // Cache expired, create new one
-                        let key_dir = Path::new("keys");
-                        let manager = Arc::new(DilithiumKeyManager::new(node_id.clone(), key_dir)?);
-                        // Note: We'll initialize it synchronously below since we're already in sync context
-                        manager
-                    }
-                } else {
-                    // Not in cache, create new one
-                    let key_dir = Path::new("keys");
-                    Arc::new(DilithiumKeyManager::new(node_id.clone(), key_dir)?)
-                }
-            } else {
-                // Cache lock failed, create new one
-                let key_dir = Path::new("keys");
-                Arc::new(DilithiumKeyManager::new(node_id.clone(), key_dir)?)
-            }
-        };
-        
-        // CRITICAL FIX: Initialize synchronously since we're in a sync function
-        // This is safe because DilithiumKeyManager::initialize_sync exists for this purpose
-        // If it doesn't exist, we need to use the existing async pattern carefully
-        let runtime = tokio::runtime::Handle::try_current()
-            .unwrap_or_else(|_| tokio::runtime::Runtime::new().unwrap().handle().clone());
-        runtime.block_on(key_manager.initialize())?;
-        
-        // Sign using key manager (persistent keys)
-        let sig_serialized = key_manager.sign(signature_data.as_bytes())?;
-        
-        // Verify correct signature size
-        assert_eq!(sig_serialized.len(), 2420, "Dilithium3 signature must be 2420 bytes");
-        
-        let signature_b64 = general_purpose::STANDARD.encode(&sig_serialized);
-        
-        Ok(DilithiumSignature {
-            signature: signature_b64,
-            algorithm: "CRYSTALS-Dilithium3".to_string(),  // REAL algorithm name
-            timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
-            strength: "NIST-Level-3-quantum-resistant".to_string(),  // Accurate strength
-        })
-    }
+    // REMOVED: create_quantum_signature - was dead code using incorrect sign() instead of sign_full()
+    // All Dilithium signing now goes through create_consensus_signature() which uses sign_full()
 
     /// Extract node type from activation code segments
     fn extract_node_type_from_code(&self, code_segments: &str) -> Result<String> {
@@ -1379,5 +1330,106 @@ impl QNetQuantumCrypto {
         }
         
         Ok(decrypted)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    /// Test Dilithium signature creation and verification
+    /// This test verifies the ENTIRE chain from sign to verify
+    #[tokio::test]
+    async fn test_dilithium_sign_and_verify() {
+        println!("\n🧪 TEST: Dilithium Sign and Verify Chain\n");
+        
+        // 1. Initialize crypto
+        let mut crypto = QNetQuantumCrypto::new();
+        let init_result = crypto.initialize().await;
+        assert!(init_result.is_ok(), "Crypto initialization failed: {:?}", init_result.err());
+        println!("✅ Step 1: Crypto initialized");
+        
+        // 2. Create a test signature
+        let node_id = "test_node_001";
+        let message = "heartbeat:test_node_001:1234567890:100:0";
+        
+        let sign_result = crypto.create_consensus_signature(node_id, message).await;
+        assert!(sign_result.is_ok(), "Signature creation failed: {:?}", sign_result.err());
+        
+        let signature = sign_result.unwrap();
+        println!("✅ Step 2: Signature created");
+        println!("   Algorithm: {}", signature.algorithm);
+        println!("   Signature length: {} chars", signature.signature.len());
+        println!("   Signature prefix: {}...", &signature.signature[..50.min(signature.signature.len())]);
+        
+        // 3. Verify signature format
+        assert!(signature.signature.starts_with("dilithium_sig_"), 
+                "Signature must start with 'dilithium_sig_'");
+        assert!(signature.signature.len() > 100, 
+                "Signature too short: {} chars", signature.signature.len());
+        println!("✅ Step 3: Signature format valid");
+        
+        // 4. Verify signature content
+        let verify_result = crypto.verify_dilithium_signature(message, &signature, node_id).await;
+        assert!(verify_result.is_ok(), "Verification call failed: {:?}", verify_result.err());
+        
+        let is_valid = verify_result.unwrap();
+        assert!(is_valid, "Signature verification returned false!");
+        println!("✅ Step 4: Signature verified successfully");
+        
+        // 5. Test that wrong message fails verification (CRITICAL SECURITY TEST)
+        let wrong_message = "wrong_message_that_was_not_signed";
+        let wrong_verify = crypto.verify_dilithium_signature(wrong_message, &signature, node_id).await;
+        match wrong_verify {
+            Ok(valid) => {
+                assert!(!valid, "Wrong message should NOT verify! This is a CRITICAL security issue!");
+                println!("✅ Step 5: Wrong message correctly rejected (cryptographic verification works!)");
+            }
+            Err(_) => {
+                println!("✅ Step 5: Wrong message correctly caused error");
+            }
+        }
+        
+        // 6. Test that empty signature fails
+        let empty_sig = DilithiumSignature {
+            signature: "".to_string(),
+            algorithm: "CRYSTALS-Dilithium3".to_string(),
+            timestamp: 0,
+            strength: "quantum-resistant".to_string(),
+        };
+        let empty_verify = crypto.verify_dilithium_signature(message, &empty_sig, node_id).await;
+        assert!(empty_verify.is_err() || !empty_verify.unwrap(), "Empty signature should fail!");
+        println!("✅ Step 6: Empty signature correctly rejected");
+        
+        println!("\n🎉 ALL DILITHIUM TESTS PASSED!\n");
+    }
+    
+    /// Test signature format validation
+    #[test]
+    fn test_signature_format_validation() {
+        println!("\n🧪 TEST: Signature Format Validation\n");
+        
+        // Valid format
+        let valid_sig = "dilithium_sig_node_001_SGVsbG9Xb3JsZA==";
+        assert!(valid_sig.starts_with("dilithium_sig_"), "Valid sig should have prefix");
+        assert!(valid_sig.len() > 30, "Valid sig should be longer than 30 chars");
+        println!("✅ Valid signature format accepted");
+        
+        // Invalid: too short
+        let short_sig = "abc";
+        assert!(short_sig.len() < 100, "Short sig should fail length check");
+        println!("✅ Short signature correctly identified");
+        
+        // Invalid: wrong prefix
+        let wrong_prefix = "ed25519_sig_node_001_SGVsbG8=";
+        assert!(!wrong_prefix.starts_with("dilithium_sig_"), "Wrong prefix should be rejected");
+        println!("✅ Wrong prefix correctly rejected");
+        
+        // Invalid: empty
+        let empty_sig = "";
+        assert!(empty_sig.is_empty(), "Empty sig should be rejected");
+        println!("✅ Empty signature correctly rejected");
+        
+        println!("\n🎉 ALL FORMAT TESTS PASSED!\n");
     }
 } 

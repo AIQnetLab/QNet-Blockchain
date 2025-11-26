@@ -213,7 +213,7 @@ impl BlockValidator {
         // Create Dilithium signature struct
         let dilithium_sig = DilithiumSignature {
             signature: signature_hex.to_string(),
-            algorithm: "QNet-Dilithium-Compatible".to_string(),
+            algorithm: "CRYSTALS-Dilithium3".to_string(),
             timestamp: tx.timestamp,
             strength: "quantum-resistant".to_string(),
         };

@@ -5166,8 +5166,8 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
         // BOOTSTRAP SYNC: Wait for active nodes list to populate
         // ================================================================
         if let Some(p2p) = blockchain_for_pings.get_unified_p2p() {
-            // Register ourselves first
-            p2p.register_as_active_node();
+            // Register ourselves first (ASYNC - proper Dilithium signature)
+            p2p.register_as_active_node_async().await;
             
             // Request active nodes from peers
             p2p.request_active_nodes_sync();
@@ -5215,7 +5215,7 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
             if let Some(p2p) = blockchain_for_pings.get_unified_p2p() {
                 // Re-announce ourselves every 10 minutes to stay in active list
                 if last_reannounce.elapsed().as_secs() >= 600 {
-                    p2p.register_as_active_node();
+                    p2p.register_as_active_node_async().await;
                     p2p.cleanup_stale_active_nodes();
                     last_reannounce = std::time::Instant::now();
                     println!("[PING] 🔄 Re-announced as active node, cleaned stale nodes");
@@ -5933,8 +5933,8 @@ async fn handle_register_node(
         // Note: Full/Super nodes also auto-register via start_light_node_ping_service
         // This is a backup for manual API registration
         if let Some(p2p) = blockchain.get_unified_p2p() {
-            // Trigger active node announcement
-            p2p.register_as_active_node();
+            // Trigger active node announcement (ASYNC - proper Dilithium signature)
+            p2p.register_as_active_node_async().await;
             println!("[NODE] 📡 {} node announced to P2P network", node_type);
         }
     }

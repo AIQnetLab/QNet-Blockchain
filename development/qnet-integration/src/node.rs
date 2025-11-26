@@ -9967,7 +9967,7 @@ impl BlockchainNode {
             // Create Dilithium signature for verification
             let dilithium_sig = DilithiumSignature {
                 signature: compact_sig.dilithium_message_signature.clone(),
-                algorithm: "QNet-Dilithium-Compatible".to_string(),
+                algorithm: "CRYSTALS-Dilithium3".to_string(),
                 timestamp: compact_sig.signed_at,
                 strength: "quantum-resistant".to_string(),
             };
@@ -9987,12 +9987,8 @@ impl BlockchainNode {
                 }
                 Err(e) => {
                     println!("[CRYPTO] ❌ Dilithium verification error: {}", e);
-                    // Bootstrap phase tolerance for initial network setup, only for Genesis nodes
-                    // SECURITY: Limited to genesis_node_* producers only to prevent bypass exploitation
-                    if microblock.height < 100 && microblock.producer.starts_with("genesis_node_") {
-                        println!("[CRYPTO] ⚠️  Bootstrap phase (block #{}) - allowing Genesis node for network initialization", microblock.height);
-                        return Ok(true);
-                    }
+                    // SECURITY: NO BYPASS - Dilithium verification is MANDATORY
+                    // Quantum attacker cannot forge Dilithium signatures
                     return Ok(false);
                 }
             }
@@ -10027,7 +10023,7 @@ impl BlockchainNode {
         let signature = DilithiumSignature {
             signature: String::from_utf8(microblock.signature.clone())
                 .unwrap_or_else(|_| hex::encode(&microblock.signature)),  // Fallback to hex if not UTF-8
-            algorithm: "QNet-Dilithium-Compatible".to_string(),
+            algorithm: "CRYSTALS-Dilithium3".to_string(),
             timestamp: microblock.timestamp,
             strength: "quantum-resistant".to_string(),
         };

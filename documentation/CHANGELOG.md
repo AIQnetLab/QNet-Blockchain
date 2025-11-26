@@ -5,7 +5,44 @@ All notable changes to the QNet project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [2.19.11] - November 26, 2025 "Security: WebSocket Rate Limiting"
+## [2.19.11] - November 26, 2025 "Security: Dilithium Key Storage + WebSocket Rate Limiting"
+
+### SECURITY FIX - Dilithium Key Storage
+
+**Problem**: Encryption key for Dilithium keypairs was derived from public `node_id`
+**Impact**: Attacker knowing node_id could decrypt keypair file
+**Solution**: Random 32-byte encryption key with integrity protection
+
+#### New Key Storage Architecture
+```
+keys/
+├── .qnet_encryption_secret   # 40 bytes: [random_key(32)] + [sha3_hash(8)]
+│   └── Permissions: 0600 (Unix) / Hidden+System (Windows)
+└── dilithium_keypair.bin     # AES-256-GCM encrypted with random key
+```
+
+#### Security Improvements
+- **Random Encryption Key**: 32 bytes from CSPRNG (NOT derived from public data)
+- **Integrity Hash**: SHA3-256 (8 bytes) detects tampering
+- **Tamper Detection**: Clear error if secret file modified
+- **Environment Override**: `QNET_KEY_ENCRYPTION_SECRET` for CI/advanced users
+- **Platform Permissions**: 0600 (Unix) / Hidden+System (Windows)
+- **Legacy Upgrade**: Auto-migrates old secrets without integrity hash
+
+### FIX - Real Dilithium Verification
+
+**Problem**: `verify_dilithium_signature` was using entropy check, not real crypto
+**Impact**: Signatures were not cryptographically verified!
+**Solution**: Now uses `dilithium3::open()` for real verification
+
+#### Changes
+- **FIXED** `verify_dilithium_signature()` - uses `dilithium3::open()` for real verification
+- **FIXED** `create_consensus_signature()` - uses `sign_full()` returning complete SignedMessage
+- **ADDED** `sign_full()` method returning [signature(2420)] + [message] format
+- **STANDARDIZED** Algorithm string: "CRYSTALS-Dilithium3" everywhere
+- **REMOVED** SHA3-256 fallback - operations skip if Dilithium unavailable
+- **REMOVED** `create_quantum_signature()` - dead code using incorrect sign()
+- **REMOVED** Genesis node bypass in signature verification
 
 ### 🛡️ Security Enhancement - WebSocket DDoS Protection
 - **NEW** `WsRateLimiter` struct for connection flood protection
@@ -16,22 +53,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **CLEANUP**: Connection count automatically decremented on disconnect
 - **MONITORING**: Real-time stats (total connections, unique IPs)
 
-### Implementation Details
-```rust
-// rpc.rs - New WebSocket Rate Limiter
-struct WsRateLimiter {
-    connections_per_ip: DashMap<IpAddr, u32>,
-    total_connections: AtomicU32,
-    max_per_ip: 5,
-    max_total: 10_000,
-}
-```
-
-### API Changes
-- WebSocket endpoint now checks rate limit before upgrading connection
-- New `handle_ws_connection_with_cleanup()` ensures proper cleanup
-
 ### Documentation Updates
+- **UPDATED** `CRYPTOGRAPHY_IMPLEMENTATION.md` v2.2 - New key storage architecture
+- **UPDATED** `QNet_Whitepaper.md` v2.19.11 - Corrected key management section
+- **UPDATED** `README.md` - Added v2.19.11 security updates
 - **UPDATED** `API_REFERENCE.md` - Added WebSocket rate limiting section
 
 ---

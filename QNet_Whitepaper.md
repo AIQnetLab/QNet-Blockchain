@@ -3,8 +3,8 @@
 
 **⚠️ EXPERIMENTAL BLOCKCHAIN RESEARCH ⚠️**
 
-**Version**: 2.19.4-experimental  
-**Date**: November 25, 2025  
+**Version**: 2.19.11-experimental  
+**Date**: November 26, 2025  
 **Authors**: QNet Research Team  
 **Status**: Experimental Research Project  
 **Goal**: To prove that one person without multi-million investments can create an advanced blockchain
@@ -386,11 +386,11 @@ MicroBlock {
    - Signature size: 2420 bytes
    - Quantum security: 128 bits
 
-2. **CRYSTALS-Kyber** (encryption):
-   - Standardized by NIST in 2024
-   - Key encapsulation
-   - Public key size: 1568 bytes
-   - Quantum security: 256 bits
+2. **AES-256-GCM** (encryption):
+   - NIST FIPS 197 standard
+   - Key storage encryption
+   - 128-bit post-quantum security (Grover's algorithm)
+   - Note: Kyber reserved for future key exchange
 
 3. **SHA3-256** (hashing):
    - Quantum-resistant to Grover's algorithm  
@@ -409,7 +409,7 @@ struct HybridSignature {
         ed25519_public_key: [u8; 32],        // Ephemeral key
         dilithium_signature: String,          // Signs encapsulated data
         issued_at: u64,
-        expires_at: u64,                      // 1 minute lifetime
+        expires_at: u64,                      // 4.5 minute lifetime (270s)
         serial_number: String,
     },
     message_signature: [u8; 64],             // Ed25519 signs message
@@ -420,11 +420,11 @@ struct HybridSignature {
 // Signing Process:
 // 1. Generate NEW ephemeral Ed25519 key
 // 2. Sign message with ephemeral key
-// 3. Create encapsulated_data = ephemeral_key || SHA3-256(message) || timestamp
+// 3. Create encapsulated_data = ephemeral_key || node_id || timestamp
 // 4. Sign encapsulated_data with Dilithium (NOT the message!)
-// 5. Certificate expires in 60 seconds
+// 5. Certificate expires in 270 seconds (4.5 minutes)
 
-// Verification Process (NO CACHING):
+// Verification Process (Certificate caching OK):
 // 1. Check certificate expiration
 // 2. Recreate encapsulated_data
 // 3. Verify Dilithium signature on encapsulated_data
@@ -435,10 +435,10 @@ struct HybridSignature {
 **Key Features:**
 1. **Ephemeral Keys**: NEW Ed25519 key for each certificate (4.5-minute rotation = 270s)
 2. **Encapsulation**: Dilithium signs (ephemeral_key + message_hash), not message
-3. **Certificate Caching**: LRU cache (100K) for performance, Byzantine-safe (2/3+ threshold)
+3. **Certificate Caching**: LRU cache (100K) for certificate verification only
 4. **Quantum Security**: 10^15 years attack time (NIST Security Level 3)
-4. **Forward Secrecy**: Keys expire in 60 seconds
-5. **NIST Compliant**: Follows Cisco/NIST post-quantum recommendations
+5. **Forward Secrecy**: Keys expire in 270 seconds (4.5 minutes, 80% rotation)
+6. **NIST Compliant**: Follows Cisco/NIST post-quantum recommendations
 
 **Security Advantages:**
 - ✅ Full quantum protection (Dilithium protects every message's key)
@@ -447,33 +447,36 @@ struct HybridSignature {
 - ✅ Byzantine-safe (no caching vulnerabilities)
 - ✅ Forward secrecy (old keys can't decrypt new messages)
 
-### 4.3 Key Management
+### 4.3 Key Management (v2.19.11 Security Update)
 
-**QNet implements secure Dilithium key storage:**
+**QNet implements secure Dilithium key storage with REAL CRYSTALS-Dilithium3:**
 
 ```rust
 // Key Storage (DilithiumKeyManager)
-struct KeyStorage {
-    seed: [u8; 32],                    // Deterministic seed from node_id
-    encryption: AES256GCM,             // Encrypt seed on disk
-    algorithm: SHA3-512,               // Dilithium-seeded signatures
-    security_level: 512-bit,           // Exceeds NIST 256-bit requirement
+struct DilithiumKeyManager {
+    key_dir: PathBuf,
+    cached_keypair: Arc<RwLock<Option<(PublicKey, SecretKey)>>>,
+    node_id: String,
 }
 
-// Key Generation
-seed = SHA3-256(node_id || "QNET_DILITHIUM_SEED_V3")
-encrypted_seed = AES-256-GCM(seed, key=SHA3-256(node_id || "ENCRYPTION_KEY"))
+// Storage Structure:
+// keys/.qnet_encryption_secret  ← 40 bytes: [random_key(32)] + [sha3_hash(8)]
+// keys/dilithium_keypair.bin    ← AES-256-GCM encrypted keypair
 
-// Signature Generation (Quantum-Resistant)
-signature = SHA3-512(seed || data || "QNET_DILITHIUM_SIGN_V1")
-// Expanded to 2420 bytes (Dilithium3 format)
+// Key Generation (REAL Dilithium3)
+let (pk, sk) = dilithium3::keypair();  // pqcrypto_dilithium crate
+
+// Signature Generation (REAL Dilithium3)
+let signature = dilithium3::sign(data, &sk);  // 2420 bytes
+// Returns SignedMessage for dilithium3::open() verification
 ```
 
-**Storage Properties:**
-- **Size**: 32 bytes seed (vs 4000 bytes raw key)
-- **Security**: AES-256-GCM encryption
-- **Deterministic**: Same seed = same signatures
-- **Quantum-resistant**: Uses Dilithium-derived entropy + SHA3-512
+**Security Properties (v2.19.11):**
+- **Random Encryption Key**: 32 bytes from CSPRNG (NOT derived from public node_id)
+- **Integrity Protection**: SHA3-256 hash (8 bytes) detects tampering
+- **Tamper Detection**: Clear error if secret file modified
+- **Real Dilithium3**: Uses `pqcrypto_dilithium::dilithium3` (NIST FIPS 204)
+- **AES-256-GCM**: Encrypted keypair storage (NIST FIPS 197)
 
 ### 4.4 QNet's Quantum Readiness
 
@@ -481,13 +484,13 @@ signature = SHA3-512(seed || data || "QNET_DILITHIUM_SIGN_V1")
 
 | Component | Algorithm | Size | Security Level | Implementation |
 |-----------|-----------|------|----------------|----------------|
-| **Consensus Signatures** | CRYSTALS-Dilithium3 | 2420 bytes | Quantum-resistant | Real pqcrypto-dilithium |
+| **Consensus Signatures** | CRYSTALS-Dilithium3 | 2420 bytes | NIST Level 3 | Real pqcrypto-dilithium |
 | **Hybrid Certificates** | Dilithium + Ed25519 | 2484 bytes | Quantum-resistant | Encapsulated keys (NIST) |
-| **Key Storage** | Dilithium seed | 32 bytes encrypted | 256-bit + AES-256-GCM | Deterministic generation |
-| **Message Signing** | Ed25519 (ephemeral) | 64 bytes | Fast verification | 1-minute lifetime |
-| **Key Manager Signatures** | SHA3-512 (Dilithium-seeded) | 2420 bytes | 512-bit security | Quantum-resistant hybrid |
-| **Key Exchange** | CRYSTALS-Kyber | 1568 bytes | Quantum-resistant | Future implementation |
-| **Hashing** | SHA3-256/512 | 32/64 bytes | Grover-resistant | All operations |
+| **Key Storage** | Dilithium3 keypair | ~6KB encrypted | AES-256-GCM | Random encryption key |
+| **Encryption Key** | Random 32 bytes | 40 bytes file | SHA3-256 integrity | NOT derived from node_id |
+| **Message Signing** | Ed25519 (ephemeral) | 64 bytes | Fast verification | 4.5-minute lifetime |
+| **Heartbeat Signatures** | CRYSTALS-Dilithium3 | 2420 bytes | NIST Level 3 | sign_full() → open() |
+| **Hashing** | SHA3-256 | 32 bytes | Grover-resistant | All operations |
 
 **Cryptographic Architecture:**
 
@@ -499,41 +502,45 @@ signature = SHA3-512(seed || data || "QNET_DILITHIUM_SIGN_V1")
 │  2. Sign message with ephemeral Ed25519                 │
 │  3. Create encapsulated data:                           │
 │     - Ephemeral public key (32 bytes)                   │
-│     - SHA3-256(message) (32 bytes)                      │
+│     - Node ID (variable length)                         │
 │     - Timestamp (8 bytes)                               │
 │  4. Sign encapsulated data with Dilithium               │
-│  5. Create certificate (expires in 60 seconds)          │
+│  5. Create certificate (expires in 270 seconds)         │
 ├─────────────────────────────────────────────────────────┤
-│  VERIFICATION (No Caching!)                             │
+│  VERIFICATION (Certificate Caching OK)                  │
 ├─────────────────────────────────────────────────────────┤
 │  1. Check certificate NOT expired                       │
-│  2. Recreate encapsulated data from certificate         │
-│  3. Verify Dilithium signature on encapsulated data     │
-│  4. Verify Ed25519 signature on message                 │
-│  5. Both must pass - NO caching per NIST/Cisco          │
+│  2. Verify Dilithium signature on encapsulated data     │
+│     (cached after first verification - O(1) lookup)     │
+│  3. Verify Ed25519 signature on message (EVERY time)    │
+│  4. Verify Dilithium message signature (EVERY time)     │
+│  5. ALL signatures must pass for quantum resistance     │
 └─────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────┐
-│  KEY MANAGER SIGNATURES (Quantum-Resistant Hybrid)      │
+│  KEY MANAGER SIGNATURES (REAL Dilithium3)               │
 ├─────────────────────────────────────────────────────────┤
-│  Storage:                                               │
-│    Seed (32 bytes) → AES-256-GCM encrypted              │
+│  Storage (v2.19.11):                                    │
+│    .qnet_encryption_secret → Random 32 bytes + hash     │
+│    dilithium_keypair.bin → AES-256-GCM encrypted        │
 │  Signature:                                             │
-│    SHA3-512(Dilithium_seed || data) → 2420 bytes        │
+│    dilithium3::sign(data, secret_key) → 2420 bytes      │
+│  Verification:                                          │
+│    dilithium3::open(signed_message, public_key)         │
 │  Security:                                              │
-│    512-bit cryptographic strength                       │
-│    Dilithium-derived quantum entropy                    │
-│    Deterministic and verifiable                         │
+│    NIST Level 3 (equivalent to AES-192)                 │
+│    Random encryption key (NOT from public node_id)      │
+│    SHA3-256 integrity hash for tamper detection         │
 └─────────────────────────────────────────────────────────┘
 ```
 
 **Security Properties:**
-- ✅ **Quantum-resistant**: All signatures protected by Dilithium or SHA3-512
-- ✅ **Forward secrecy**: Ephemeral keys expire in 60 seconds
+- ✅ **Real Dilithium3**: Uses `pqcrypto_dilithium::dilithium3` (NIST FIPS 204)
+- ✅ **Random Encryption**: Key NOT derived from public identifiers
+- ✅ **Tamper Detection**: SHA3-256 integrity hash on encryption secret
+- ✅ **Forward secrecy**: Ephemeral keys expire in 4.5 minutes
 - ✅ **Byzantine-safe**: No O(1) caching vulnerabilities
-- ✅ **NIST compliant**: Follows official post-quantum standards
-- ✅ **512-bit security**: Exceeds 256-bit NIST requirement
-- ✅ **Deterministic**: Same inputs = same signatures (consensus critical)
+- ✅ **NIST compliant**: FIPS 204 (Dilithium) + FIPS 197 (AES-GCM)
 
 **Unique feature**: QNet is the **first blockchain** to implement NIST/Cisco encapsulated keys for quantum-resistant hybrid signatures with per-message ephemeral key rotation
 
