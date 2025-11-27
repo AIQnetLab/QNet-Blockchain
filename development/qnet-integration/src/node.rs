@@ -1304,6 +1304,10 @@ impl BlockchainNode {
         // Create sync request channel for handling block requests
         let (sync_request_tx, mut sync_request_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, u64, String)>();
         
+        // PRODUCTION v2.19.12: Create macroblock sync channels
+        let (macroblock_tx, mut macroblock_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (macroblock_sync_tx, mut macroblock_sync_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, u64, String)>();
+        
         println!("[UnifiedP2P] 🔍 DEBUG: Creating SimplifiedP2P instance...");
         let mut unified_p2p_instance = SimplifiedP2P::new(
             node_id.clone(),
@@ -1318,6 +1322,10 @@ impl BlockchainNode {
         // PRODUCTION: Set block processing channel for received blocks
         unified_p2p_instance.set_block_channel(block_tx);
         unified_p2p_instance.set_sync_request_channel(sync_request_tx);
+        
+        // PRODUCTION v2.19.12: Set macroblock sync channels
+        unified_p2p_instance.set_macroblock_channel(macroblock_tx);
+        unified_p2p_instance.set_macroblock_sync_channel(macroblock_sync_tx);
         
         // CRITICAL: Initialize all Genesis node reputations deterministically at startup
         // This prevents race conditions where different nodes see different candidate lists
@@ -1902,6 +1910,28 @@ impl BlockchainNode {
             }
         });
         
+        // PRODUCTION v2.19.12: Start macroblock sync request handler
+        let blockchain_for_macrosync = blockchain.clone();
+        tokio::spawn(async move {
+            while let Some((from_index, to_index, requester_id)) = macroblock_sync_rx.recv().await {
+                // Handle macroblock sync request
+                if let Err(e) = blockchain_for_macrosync.handle_macroblock_sync_request(from_index, to_index, requester_id).await {
+                    println!("[MACROBLOCK-SYNC] ❌ Failed to handle sync request: {}", e);
+                }
+            }
+        });
+        
+        // PRODUCTION v2.19.12: Start macroblock receiver handler
+        let blockchain_for_macroblocks = blockchain.clone();
+        tokio::spawn(async move {
+            while let Some(received_macroblock) = macroblock_rx.recv().await {
+                // Process received macroblock
+                if let Err(e) = blockchain_for_macroblocks.process_received_macroblock(received_macroblock).await {
+                    println!("[MACROBLOCK-SYNC] ❌ Failed to process macroblock: {}", e);
+                }
+            }
+        });
+        
         // CRITICAL FIX: Perform initial sync with network on startup
         // This prevents nodes from getting stuck on old blocks
         println!("[SYNC] 🔄 Performing initial network sync...");
@@ -1937,7 +1967,43 @@ impl BlockchainNode {
                                 tokio::time::sleep(Duration::from_millis(100)).await;
                             }
                             
-                            println!("[SYNC] ✅ Initial sync complete");
+                            println!("[SYNC] ✅ Microblock sync complete");
+                            
+                            // PRODUCTION v2.19.12: Sync macroblocks after microblocks
+                            // Macroblocks are needed for:
+                            // - Light nodes (they only store macroblock headers)
+                            // - State verification (state_root validation)
+                            // - Consensus history (commit/reveal data)
+                            let local_macroblock_index = local_height / 90;
+                            let network_macroblock_index = network_height / 90;
+                            
+                            if network_macroblock_index > local_macroblock_index {
+                                println!("[MACROBLOCK-SYNC] 🔄 Syncing macroblocks {} to {}...", 
+                                         local_macroblock_index + 1, network_macroblock_index);
+                                
+                                // Sync macroblocks in batches of 10
+                                let mut current_macro = local_macroblock_index + 1;
+                                while current_macro <= network_macroblock_index {
+                                    let batch_end = std::cmp::min(current_macro + 9, network_macroblock_index);
+                                    
+                                    println!("[MACROBLOCK-SYNC] 📦 Requesting macroblocks {}-{}...", current_macro, batch_end);
+                                    if let Err(e) = p2p.sync_macroblocks(current_macro, batch_end).await {
+                                        println!("[MACROBLOCK-SYNC] ⚠️ Sync failed at macroblock {}: {}", current_macro, e);
+                                        break;
+                                    }
+                                    
+                                    current_macro = batch_end + 1;
+                                    
+                                    // Delay between batches
+                                    tokio::time::sleep(Duration::from_millis(200)).await;
+                                }
+                                
+                                println!("[MACROBLOCK-SYNC] ✅ Macroblock sync complete");
+                            } else {
+                                println!("[MACROBLOCK-SYNC] ✅ Macroblocks synchronized (index: {})", local_macroblock_index);
+                            }
+                            
+                            println!("[SYNC] ✅ Initial sync complete (microblocks + macroblocks)");
                         } else {
                             println!("[SYNC] ✅ Node is synchronized (height: {})", local_height);
                         }
@@ -5696,8 +5762,8 @@ impl BlockchainNode {
                         // This prevents PoH regression when producer changes
                         let is_rotation_start = next_block_height > 1 && ((next_block_height - 1) % 30) == 0;
                         
-                        // Try to load previous block with retry for rotation boundaries
-                        let mut prev_block_result = storage.load_microblock(next_block_height - 1);
+                        // Use auto-format loader that handles both EfficientMicroBlock and legacy MicroBlock
+                        let mut prev_block_result = storage.load_microblock_auto_format(next_block_height - 1);
                         
                         // Retry mechanism for rotation boundaries ONLY
                         if is_rotation_start && prev_block_result.as_ref().map(|r| r.is_none()).unwrap_or(false) {
@@ -5706,7 +5772,7 @@ impl BlockchainNode {
                             // Try up to 3 times with 500ms delay
                             for retry in 1..=3 {
                                 tokio::time::sleep(Duration::from_millis(500)).await;
-                                prev_block_result = storage.load_microblock(next_block_height - 1);
+                                prev_block_result = storage.load_microblock_auto_format(next_block_height - 1);
                                 if prev_block_result.as_ref().map(|r| r.is_some()).unwrap_or(false) {
                                     println!("[PoH] ✅ Previous block received after {} retries", retry);
                                     break;
@@ -5719,38 +5785,15 @@ impl BlockchainNode {
                         static POH_WAIT_RETRY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                         
                         match prev_block_result {
-                            Ok(Some(prev_block_data)) => {
-                                match bincode::deserialize::<qnet_state::MicroBlock>(&prev_block_data) {
-                                    Ok(prev_block) => {
-                                        // Reset retry counter on success
-                                        POH_WAIT_RETRY.store(0, std::sync::atomic::Ordering::SeqCst);
-                                        // Use previous block's PoH as baseline
-                                        println!("[PoH] 📊 Using PoH from block #{}: count={}", 
-                                                prev_block.height, prev_block.poh_count);
-                                        (prev_block.poh_hash.clone(), prev_block.poh_count)
-                                    },
-                                    Err(e) => {
-                                        let retry = POH_WAIT_RETRY.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-                                        println!("[PoH] ❌ Cannot deserialize previous block #{}: {} (retry {}/5)", next_block_height - 1, e, retry);
-                                        
-                                        if retry >= 5 {
-                                            // FALLBACK: Use local PoH to prevent node from getting stuck
-                                            POH_WAIT_RETRY.store(0, std::sync::atomic::Ordering::SeqCst);
-                                            println!("[PoH] ⚠️ FALLBACK: Using local PoH after {} retries", retry);
-                                            if let Some(ref poh) = quantum_poh {
-                                                let (hash, count, _slot) = poh.get_state().await;
-                                                (hash, count)
-                                            } else {
-                                                (vec![0u8; 64], next_block_height * 500_000) // Estimate based on block height
-                                            }
-                                        } else {
-                                            tokio::time::sleep(Duration::from_millis(200)).await;
-                                            continue;
-                                        }
-                                    }
-                                }
+                            Ok(Some(prev_block)) => {
+                                // Reset retry counter on success
+                                POH_WAIT_RETRY.store(0, std::sync::atomic::Ordering::SeqCst);
+                                // Use previous block's PoH as baseline
+                                println!("[PoH] 📊 Using PoH from block #{}: count={}", 
+                                        prev_block.height, prev_block.poh_count);
+                                (prev_block.poh_hash.clone(), prev_block.poh_count)
                             },
-                            _ => {
+                            Ok(None) => {
                                 let retry = POH_WAIT_RETRY.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                                 println!("[PoH] ❌ Previous block #{} not found (retry {}/5)", next_block_height - 1, retry);
                                 
@@ -5758,6 +5801,25 @@ impl BlockchainNode {
                                     // FALLBACK: Use local PoH to prevent node from getting stuck
                                     POH_WAIT_RETRY.store(0, std::sync::atomic::Ordering::SeqCst);
                                     println!("[PoH] ⚠️ FALLBACK: Using local PoH after {} retries - node must continue", retry);
+                                    if let Some(ref poh) = quantum_poh {
+                                        let (hash, count, _slot) = poh.get_state().await;
+                                        (hash, count)
+                                    } else {
+                                        (vec![0u8; 64], next_block_height * 500_000) // Estimate based on block height
+                                    }
+                                } else {
+                                    tokio::time::sleep(Duration::from_millis(200)).await;
+                                    continue;
+                                }
+                            },
+                            Err(e) => {
+                                let retry = POH_WAIT_RETRY.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                                println!("[PoH] ❌ Error loading previous block #{}: {} (retry {}/5)", next_block_height - 1, e, retry);
+                                
+                                if retry >= 5 {
+                                    // FALLBACK: Use local PoH to prevent node from getting stuck
+                                    POH_WAIT_RETRY.store(0, std::sync::atomic::Ordering::SeqCst);
+                                    println!("[PoH] ⚠️ FALLBACK: Using local PoH after {} retries", retry);
                                     if let Some(ref poh) = quantum_poh {
                                         let (hash, count, _slot) = poh.get_state().await;
                                         (hash, count)
@@ -10844,6 +10906,28 @@ impl BlockchainNode {
         self.unified_p2p.clone()
     }
     
+    // =========================================================================
+    // SNAPSHOT API (v2.19.12) - For P2P Fast Sync
+    // =========================================================================
+    
+    /// Get latest snapshot height for P2P sync
+    pub fn get_latest_snapshot_height(&self) -> Result<Option<u64>, QNetError> {
+        self.storage.get_latest_snapshot_height()
+            .map_err(|e| QNetError::StorageError(e.to_string()))
+    }
+    
+    /// Get snapshot IPFS CID if available
+    pub fn get_snapshot_ipfs_cid(&self, height: u64) -> Result<Option<String>, QNetError> {
+        self.storage.get_snapshot_ipfs_cid(height)
+            .map_err(|e| QNetError::StorageError(e.to_string()))
+    }
+    
+    /// Get raw snapshot data for P2P download
+    pub fn get_snapshot_data(&self, height: u64) -> Result<Option<Vec<u8>>, QNetError> {
+        self.storage.get_snapshot_data(height)
+            .map_err(|e| QNetError::StorageError(e.to_string()))
+    }
+    
     pub async fn get_block(&self, height: u64) -> Result<Option<qnet_state::Block>, QNetError> {
         // CRITICAL FIX: We store MicroBlocks, not Blocks
         // Convert MicroBlock to Block format for API compatibility
@@ -11143,6 +11227,16 @@ impl BlockchainNode {
                                 println!("[SYNC] 📱 Light node: syncing only recent history");
                                 let sync_from = std::cmp::max(1, network_height.saturating_sub(1000));
                                 self.sync_blocks(sync_from, network_height).await?;
+                                
+                                // PRODUCTION v2.19.12: Light nodes sync macroblocks (headers only)
+                                // This is essential for Light nodes to verify state
+                                let local_macro_index = current_height / 90;
+                                let network_macro_index = network_height / 90;
+                                if network_macro_index > local_macro_index {
+                                    println!("[MACROBLOCK-SYNC] 📱 Light node: syncing macroblocks {}-{}", 
+                                             local_macro_index + 1, network_macro_index);
+                                    self.sync_macroblocks(local_macro_index + 1, network_macro_index).await?;
+                                }
                             }
                             NodeType::Full | NodeType::Super => {
                                 // Full/Super nodes sync complete history
@@ -11151,6 +11245,16 @@ impl BlockchainNode {
                                 
                                 // Sync to network height
                                 self.sync_blocks(sync_from, network_height).await?;
+                                
+                                // PRODUCTION v2.19.12: Sync macroblocks for Full/Super nodes
+                                // Macroblocks contain consensus data and state roots
+                                let local_macro_index = current_height / 90;
+                                let network_macro_index = network_height / 90;
+                                if network_macro_index > local_macro_index {
+                                    println!("[MACROBLOCK-SYNC] 🔄 Syncing macroblocks {}-{}", 
+                                             local_macro_index + 1, network_macro_index);
+                                    self.sync_macroblocks(local_macro_index + 1, network_macro_index).await?;
+                                }
                             }
                         }
                     } else {
@@ -11235,6 +11339,144 @@ impl BlockchainNode {
         
         Ok(())
     }
+    
+    // =========================================================================
+    // MACROBLOCK SYNC METHODS (PRODUCTION v2.19.12)
+    // =========================================================================
+    
+    /// Handle incoming macroblock sync request from peer
+    /// PRODUCTION: Full macroblock sync support for new nodes joining network
+    pub async fn handle_macroblock_sync_request(&self, from_index: u64, to_index: u64, requester_id: String) -> Result<(), QNetError> {
+        println!("[MACROBLOCK-SYNC] 📥 Processing sync request from {} for macroblocks {}-{}", 
+                 requester_id, from_index, to_index);
+        
+        // Get macroblocks from storage
+        let macroblocks_data = self.storage.get_macroblocks_range(from_index, to_index).await?;
+        
+        println!("[MACROBLOCK-SYNC] 📊 get_macroblocks_range({}, {}) returned {} macroblocks", 
+                 from_index, to_index, macroblocks_data.len());
+        
+        if let Some(ref p2p) = self.unified_p2p {
+            // Send macroblocks batch to requester
+            let response = NetworkMessage::MacroblocksBatch {
+                macroblocks: macroblocks_data.clone(),
+                from_index,
+                to_index,
+                sender_id: self.node_id.clone(),
+            };
+            
+            // SCALABILITY: Try O(1) lookup first, then fallback to O(n) for Genesis
+            let peer_addr = if let Some(addr) = p2p.get_peer_address_by_id(&requester_id) {
+                Some(addr)
+            } else {
+                // Fallback for Genesis nodes
+                let peers = p2p.get_validated_active_peers();
+                peers.iter().find(|p| p.id == requester_id).map(|p| p.addr.clone())
+            };
+            
+            if let Some(addr) = peer_addr {
+                p2p.send_network_message(&addr, response);
+                println!("[MACROBLOCK-SYNC] 📤 Sent {} macroblocks to {}", macroblocks_data.len(), requester_id);
+            } else {
+                println!("[MACROBLOCK-SYNC] ⚠️ Requester {} not found in peers", requester_id);
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// Process received macroblock from network sync
+    /// PRODUCTION: Validates and saves macroblock to storage
+    pub async fn process_received_macroblock(&self, received: crate::unified_p2p::ReceivedBlock) -> Result<(), QNetError> {
+        let index = received.height;  // For macroblocks, height = index
+        
+        println!("[MACROBLOCK-SYNC] 📦 Processing received macroblock #{} from {}", 
+                 index, received.from_peer);
+        
+        // Decompress if needed
+        let data = if received.data.len() >= 4 && received.data[0..4] == [0x28, 0xb5, 0x2f, 0xfd] {
+            zstd::decode_all(&received.data[..])
+                .map_err(|e| QNetError::StorageError(format!("Decompression failed: {}", e)))?
+        } else {
+            received.data.clone()
+        };
+        
+        // Deserialize and validate macroblock
+        let macroblock: qnet_state::MacroBlock = bincode::deserialize(&data)
+            .map_err(|e| QNetError::ValidationError(format!("Invalid macroblock format: {}", e)))?;
+        
+        // Basic validation
+        if macroblock.height != index {
+            return Err(QNetError::ValidationError(format!(
+                "Macroblock height mismatch: expected {}, got {}", index, macroblock.height
+            )));
+        }
+        
+        // Check if we already have this macroblock
+        if let Ok(Some(_)) = self.storage.get_macroblock_by_height(index) {
+            println!("[MACROBLOCK-SYNC] ℹ️ Macroblock #{} already exists, skipping", index);
+            return Ok(());
+        }
+        
+        // Validate microblock hashes exist (if we have the microblocks)
+        let expected_start = if index == 1 { 1 } else { (index - 1) * 90 + 1 };
+        let expected_end = index * 90;
+        
+        let mut missing_microblocks = Vec::new();
+        for height in expected_start..=expected_end {
+            if self.storage.load_microblock(height)?.is_none() {
+                missing_microblocks.push(height);
+            }
+        }
+        
+        if !missing_microblocks.is_empty() {
+            println!("[MACROBLOCK-SYNC] ⚠️ Macroblock #{} references {} missing microblocks (first: {})", 
+                     index, missing_microblocks.len(), missing_microblocks[0]);
+            // Don't reject - we might be syncing macroblocks before microblocks
+            // The macroblock will be useful for Light nodes that only need headers
+        }
+        
+        // Save macroblock to storage
+        self.storage.save_macroblock(index, &macroblock).await?;
+        
+        println!("[MACROBLOCK-SYNC] ✅ Macroblock #{} saved successfully ({} microblock hashes)", 
+                 index, macroblock.micro_blocks.len());
+        
+        Ok(())
+    }
+    
+    /// Sync macroblocks from network
+    /// PRODUCTION: Requests macroblocks from peers and waits for response
+    pub async fn sync_macroblocks(&self, from_index: u64, to_index: u64) -> Result<(), QNetError> {
+        if let Some(ref p2p) = self.unified_p2p {
+            println!("[MACROBLOCK-SYNC] 🔄 Starting macroblock sync from {} to {}", from_index, to_index);
+            
+            // Use batch sync for efficiency (max 10 macroblocks per request)
+            let mut current = from_index;
+            while current <= to_index {
+                let batch_end = std::cmp::min(current + 9, to_index);
+                
+                if let Err(e) = p2p.sync_macroblocks(current, batch_end).await {
+                    println!("[MACROBLOCK-SYNC] ⚠️ Failed to request macroblocks {}-{}: {}", current, batch_end, e);
+                    // Continue with next batch instead of failing completely
+                }
+                
+                current = batch_end + 1;
+                
+                // Small delay between batches to avoid overwhelming peers
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            
+            println!("[MACROBLOCK-SYNC] ✅ Macroblock sync requests sent!");
+            Ok(())
+        } else {
+            Err(QNetError::NetworkError("P2P system not available".to_string()))
+        }
+    }
+    
+    // =========================================================================
+    // END MACROBLOCK SYNC METHODS
+    // =========================================================================
     
     /// Start health monitor for sync flags (prevents permanent deadlock)
     fn start_sync_health_monitor() {

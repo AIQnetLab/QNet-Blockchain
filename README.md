@@ -44,7 +44,14 @@ This project uses **dual licensing**:
 - **Phase 2 (Future)**: ONLY QNC token activation on QNet blockchain
 - **Transition**: 90% 1DEV burned OR 5 years from genesis block (whichever comes first)
 
-### 🛡️ **LATEST UPDATES (v2.19.11 - November 26, 2025)**
+### 🛡️ **LATEST UPDATES (v2.19.12 - November 27, 2025)**
+- **Full Macroblock Sync**: Complete P2P synchronization for macroblocks (RequestMacroblocks, MacroblocksBatch)
+- **Snapshot API**: New endpoints `/api/v1/snapshot/latest` and `/api/v1/snapshot/{height}` for fast sync
+- **Light Node Support**: Macroblocks synced for state verification, headers rotated to save space
+- **Async Runtime Fixes**: Isolated `block_on` calls prevent "nested runtime" panics
+- **Balance Restoration**: Balances restored from snapshots or block replay during synchronization
+
+### 🛡️ **SECURITY UPDATES (v2.19.11 - November 26, 2025)**
 - **REAL Dilithium3 Signatures**: Full NIST FIPS 204 cryptographic verification with `dilithium3::open()`
 - **Secure Key Storage**: Random encryption keys (NOT derived from public node_id) with SHA3-256 integrity
 - **No Fallback Signatures**: Removed SHA3-256 fallback - operations skip if Dilithium unavailable
@@ -1558,8 +1565,14 @@ curl http://localhost:8003/api/v1/transactions/{hash}
 
 **Account Management:**
 - `GET /api/v1/account/{address}` - Get account information
-- `GET /api/v1/account/{address}/balance` - Get account balance
+- `GET /api/v1/account/{address}/balance` - Get account balance (QNC)
 - `GET /api/v1/account/{address}/transactions` - Get transaction history
+- `GET /api/v1/account/{address}/tokens` - Get all QRC-20 tokens for address
+
+**QRC-20 Tokens (v2.19.12):**
+- `POST /api/v1/token/deploy` - Deploy new QRC-20 token
+- `GET /api/v1/token/{address}` - Get token info (name, symbol, decimals, supply)
+- `GET /api/v1/token/{address}/balance/{holder}` - Get token balance for holder
 
 **Blockchain Data:**
 - `GET /api/v1/block/latest` - Get latest block

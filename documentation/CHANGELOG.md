@@ -5,6 +5,131 @@ All notable changes to the QNet project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.19.12] - November 27, 2025 "Macroblock Sync + QRC-20 Tokens + Snapshot API"
+
+### 🪙 NEW - QRC-20 Token Support (REAL Implementation!)
+
+**Problem**: Custom tokens were only mock/stub implementation
+**Solution**: Full QRC-20 token VM with real state management
+
+#### New Contract VM Module (`contract_vm.rs`)
+- `ContractVM` - Full token execution engine
+- `QRC20Token` - Token metadata structure
+- `TokenRegistry` - Global token tracking
+- `ContractResult` - Execution results with gas
+
+#### QRC-20 Methods Implemented
+- `deploy_qrc20_token()` - Deploy new token
+- `transfer_qrc20()` - Transfer tokens
+- `balance_of_qrc20()` - Query balance
+- `approve_qrc20()` - Set allowance
+- `transfer_from_qrc20()` - Transfer with allowance
+- `get_token_info()` - Query token metadata
+
+#### New REST API Endpoints
+```
+POST /api/v1/token/deploy       → Deploy QRC-20 token
+GET  /api/v1/token/{address}    → Get token info
+GET  /api/v1/token/{address}/balance/{holder} → Get token balance
+GET  /api/v1/account/{address}/tokens → Get all tokens for address
+```
+
+#### Contract Call VM Integration
+- View calls now execute through real VM
+- State changes stored in RocksDB
+- Token balances persist across restarts
+
+### 🔧 FIX - Removed Stubs and Placeholders
+
+- **last_claim_time**: Now reads from storage (was hardcoded 0)
+- **contract_call view**: Now executes through ContractVM (was "VM integration pending")
+- **Token execution**: Real implementation (Python API was mock)
+
+---
+
+## [2.19.12-alpha] - November 27, 2025 "Macroblock Sync + Snapshot API + Async Runtime Fixes"
+
+### 🔄 NEW - Full Macroblock Synchronization
+
+**Problem**: New nodes could not sync macroblocks from network
+**Impact**: Light nodes couldn't verify state, consensus history was lost
+**Solution**: Complete P2P macroblock sync implementation
+
+#### New NetworkMessage Types
+```rust
+RequestMacroblocks { from_index, to_index, requester_id }
+MacroblocksBatch { macroblocks, from_index, to_index, sender_id }
+```
+
+#### New Methods
+- `sync_macroblocks()` - Request macroblocks from peers
+- `handle_macroblock_request()` - Process incoming requests (rate limited: 5/min)
+- `handle_macroblocks_batch()` - Process received macroblocks
+- `get_macroblocks_range()` - Storage method for batch retrieval
+- `process_received_macroblock()` - Validate and save received macroblocks
+
+#### Integration Points
+- **Initial Sync**: Macroblocks synced after microblocks at startup
+- **start_sync_if_needed()**: All node types (Light/Full/Super) sync macroblocks
+- **Light Nodes**: Receive macroblock headers for state verification
+- **Rate Limiting**: 5 requests/minute, 2-minute block on exceed
+- **Batch Size**: Max 10 macroblocks per request (~1MB)
+
+### 📸 NEW - Snapshot API Endpoints
+
+**Problem**: P2P snapshot sync required RPC endpoints that didn't exist
+**Solution**: Added snapshot discovery and download endpoints
+
+#### New REST API Endpoints
+```
+GET /api/v1/snapshot/latest  → {"height", "ipfs_cid", "available", "node_id"}
+GET /api/v1/snapshot/{height} → Binary snapshot data (compressed)
+```
+
+#### New Methods
+- `get_snapshot_data()` - Storage method to retrieve raw snapshot
+- `get_latest_snapshot_height()` - BlockchainNode wrapper
+- `get_snapshot_ipfs_cid()` - BlockchainNode wrapper
+
+#### Fast Sync Flow
+1. New node queries `/api/v1/snapshot/latest` from peers
+2. Downloads snapshot via `/api/v1/snapshot/{height}` or IPFS
+3. Loads snapshot with `load_state_snapshot()`
+4. Syncs remaining blocks from snapshot height
+
+### 🔧 FIX - Async Runtime Panics
+
+**Problem**: `block_on` called from async context caused panics
+**Impact**: Node crashes during P2P message handling
+**Solution**: Isolated runtime in `std::thread::spawn`
+
+#### Fixed Functions
+- `verify_reputation_signature()` - Now uses thread isolation
+- `sign_audit_entry()` - Now uses thread isolation
+- `verify_dilithium_heartbeat_signature()` - Already fixed in previous version
+
+### 📊 Storage Architecture
+
+#### Balance Storage
+- **In-Memory**: DashMap (lock-free) for fast access
+- **Persistence**: Restored from block replay or snapshot during sync
+- **On Restart**: Node loads snapshot → syncs remaining blocks → balances restored
+
+#### Snapshot System (Already Implemented)
+- `save_state_snapshot()` - Called automatically at each MacroBlock
+- `load_state_snapshot()` - Restores accounts from compressed snapshot
+- `download_and_load_snapshot()` - P2P snapshot download
+- `fast_sync_with_snapshot()` - Integrated in node startup
+- IPFS support via `IPFS_GATEWAY_URL` environment variable
+
+#### Light Node Data Rotation
+- `rotate_light_headers()` - Removes old headers (keeps last 1000)
+- `prune_for_light_node()` - Converts full blocks to headers
+- `LightMicroBlock` - Header-only format (~100 bytes)
+- Macroblocks synced for state verification
+
+---
+
 ## [2.19.11] - November 26, 2025 "Security: Dilithium Key Storage + WebSocket Rate Limiting"
 
 ### SECURITY FIX - Dilithium Key Storage

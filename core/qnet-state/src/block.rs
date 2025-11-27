@@ -96,6 +96,10 @@ pub struct EfficientMicroBlock {
     pub previous_hash: [u8; 32],
     /// Merkle root of transaction hashes
     pub merkle_root: [u8; 32],
+    /// Proof of History hash at block creation (SHA3-512 produces 64 bytes)
+    pub poh_hash: Vec<u8>,
+    /// Proof of History counter at block creation
+    pub poh_count: u64,
 }
 
 /// Light microblock header for mobile nodes
@@ -359,6 +363,8 @@ impl EfficientMicroBlock {
             signature: vec![],
             previous_hash,
             merkle_root,
+            poh_hash: vec![],
+            poh_count: 0,
         }
     }
     
@@ -402,6 +408,8 @@ impl EfficientMicroBlock {
             signature: microblock.signature.clone(),
             previous_hash: microblock.previous_hash,
             merkle_root: microblock.merkle_root,
+            poh_hash: microblock.poh_hash.clone(),
+            poh_count: microblock.poh_count,
         }
     }
     

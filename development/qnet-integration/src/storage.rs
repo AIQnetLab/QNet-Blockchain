@@ -1354,7 +1354,8 @@ impl PersistentStorage {
         Ok(())
     }
     
-    /// Get microblock range for batch sync
+    /// Get microblock range for batch sync (raw format)
+    /// NOTE: Use Storage::get_microblocks_range for network sync (it converts to full MicroBlock)
     pub async fn get_microblocks_range(&self, from: u64, to: u64) -> IntegrationResult<Vec<(u64, Vec<u8>)>> {
         let mut microblocks = Vec::new();
         
@@ -1366,7 +1367,7 @@ impl PersistentStorage {
         
         Ok(microblocks)
     }
-    
+
     /// Legacy: Get block range for old Block format (only genesis)  
     pub async fn get_blocks_range(&self, from: u64, to: u64) -> IntegrationResult<Vec<qnet_state::Block>> {
         let mut blocks = Vec::new();
@@ -2210,7 +2211,7 @@ impl Storage {
                      height, total_original_size, total_compressed_size, tx_savings);
         }
         
-        // Step 2: Create EfficientMicroBlock with hashes only
+        // Step 2: Create EfficientMicroBlock with hashes only (includes PoH data)
         let efficient_block = qnet_state::EfficientMicroBlock {
             height: microblock.height,
             timestamp: microblock.timestamp,
@@ -2219,6 +2220,8 @@ impl Storage {
             signature: microblock.signature.clone(),
             previous_hash: microblock.previous_hash,
             merkle_root: microblock.merkle_root,
+            poh_hash: microblock.poh_hash.clone(),
+            poh_count: microblock.poh_count,
         };
         
         // Serialize EfficientMicroBlock (much smaller than full MicroBlock)
@@ -2598,9 +2601,77 @@ impl Storage {
         self.persistent.clear_sync_progress()
     }
     
-    /// Get microblocks range for batch sync  
+    /// Get microblocks range for batch sync
+    /// CRITICAL: Returns full MicroBlock format for network sync (not EfficientMicroBlock)
+    /// This ensures receiving nodes can deserialize blocks with full transaction data
     pub async fn get_microblocks_range(&self, from: u64, to: u64) -> IntegrationResult<Vec<(u64, Vec<u8>)>> {
-        self.persistent.get_microblocks_range(from, to).await
+        let mut microblocks = Vec::new();
+        
+        // Get RocksDB column family for transactions
+        let tx_cf = self.persistent.db.cf_handle("transactions")
+            .ok_or_else(|| IntegrationError::StorageError("transactions column family not found".to_string()))?;
+        
+        for height in from..=to {
+            if let Some(raw_data) = self.load_microblock(height)? {
+                // CRITICAL: Convert EfficientMicroBlock back to full MicroBlock for network sync
+                // First try to deserialize as EfficientMicroBlock (new format)
+                if let Ok(efficient_block) = bincode::deserialize::<qnet_state::EfficientMicroBlock>(&raw_data) {
+                    // Reconstruct full MicroBlock with transactions from PERSISTENT storage
+                    let mut transactions = Vec::with_capacity(efficient_block.transaction_hashes.len());
+                    
+                    for tx_hash in &efficient_block.transaction_hashes {
+                        let tx_hash_hex = hex::encode(tx_hash);
+                        
+                        // First try in-memory cache for speed
+                        if let Some(tx) = self.transaction_pool.get_transaction(tx_hash) {
+                            transactions.push(tx);
+                            continue;
+                        }
+                        
+                        // Fallback to persistent RocksDB storage
+                        let tx_key = format!("tx_{}", tx_hash_hex);
+                        if let Ok(Some(data)) = self.persistent.db.get_cf(&tx_cf, tx_key.as_bytes()) {
+                            // Decompress if Zstd-compressed
+                            let tx_data = if data.len() >= 4 && data[0..4] == [0x28, 0xb5, 0x2f, 0xfd] {
+                                zstd::decode_all(&data[..]).unwrap_or(data.to_vec())
+                            } else {
+                                data.to_vec()
+                            };
+                            
+                            if let Ok(tx) = bincode::deserialize::<qnet_state::Transaction>(&tx_data) {
+                                // Cache for future use
+                                let _ = self.transaction_pool.store_transaction(*tx_hash, tx.clone());
+                                transactions.push(tx);
+                            }
+                        }
+                    }
+                    
+                    // Create full MicroBlock
+                    let full_block = qnet_state::MicroBlock {
+                        height: efficient_block.height,
+                        timestamp: efficient_block.timestamp,
+                        transactions,
+                        producer: efficient_block.producer,
+                        signature: efficient_block.signature,
+                        previous_hash: efficient_block.previous_hash,
+                        merkle_root: efficient_block.merkle_root,
+                        poh_hash: efficient_block.poh_hash,
+                        poh_count: efficient_block.poh_count,
+                    };
+                    
+                    // Serialize as full MicroBlock for network transmission
+                    let full_data = bincode::serialize(&full_block)
+                        .map_err(|e| IntegrationError::SerializationError(e.to_string()))?;
+                    
+                    microblocks.push((height, full_data));
+                } else {
+                    // Already in MicroBlock format (legacy) - use as-is
+                    microblocks.push((height, raw_data));
+                }
+            }
+        }
+        
+        Ok(microblocks)
     }
     
     /// Legacy: Get blocks range for old Block format
@@ -2613,7 +2684,66 @@ impl Storage {
         self.transaction_pool.get_stats()
     }
     
+    // =========================================================================
+    // MACROBLOCK SYNC METHODS (PRODUCTION v2.19.12)
+    // =========================================================================
+    
+    /// Get macroblocks range for batch sync
+    /// PRODUCTION: Returns serialized MacroBlock data for network transmission
+    /// 
+    /// Architecture:
+    /// - Macroblocks are indexed by INDEX (not height): index 1 = blocks 1-90
+    /// - Max 10 macroblocks per batch (~1MB max)
+    /// - Decompresses if stored compressed
+    pub async fn get_macroblocks_range(&self, from_index: u64, to_index: u64) -> IntegrationResult<Vec<(u64, Vec<u8>)>> {
+        let mut macroblocks = Vec::new();
+        
+        // SCALABILITY: Limit to 10 macroblocks per batch
+        let actual_to = if to_index > from_index && to_index - from_index > 10 {
+            from_index + 9
+        } else {
+            to_index
+        };
+        
+        for index in from_index..=actual_to {
+            if let Some(raw_data) = self.get_macroblock_by_height(index)? {
+                // Decompress if needed (Zstd magic bytes check)
+                let data = if raw_data.len() >= 4 && raw_data[0..4] == [0x28, 0xb5, 0x2f, 0xfd] {
+                    zstd::decode_all(&raw_data[..]).unwrap_or(raw_data)
+                } else {
+                    raw_data
+                };
+                
+                // Verify it's a valid MacroBlock before sending
+                if bincode::deserialize::<qnet_state::MacroBlock>(&data).is_ok() {
+                    macroblocks.push((index, data));
+                } else {
+                    println!("[MACROBLOCK-SYNC] ⚠️ Invalid macroblock data at index {}", index);
+                }
+            }
+        }
+        
+        println!("[MACROBLOCK-SYNC] 📦 Prepared {} macroblocks for sync (indices {}-{})", 
+                 macroblocks.len(), from_index, actual_to);
+        
+        Ok(macroblocks)
+    }
+    
+    /// Get the latest macroblock index
+    /// PRODUCTION: Used to determine sync target
+    pub fn get_latest_macroblock_index(&self) -> IntegrationResult<u64> {
+        let chain_height = self.get_chain_height()?;
+        if chain_height == 0 {
+            Ok(0)
+        } else {
+            // Macroblock index = (height / 90), but only if that macroblock is complete
+            let complete_macroblocks = chain_height / 90;
+            Ok(complete_macroblocks)
+        }
+    }
+    
     /// Load microblock with automatic format detection (backward compatibility)
+    /// Supports both EfficientMicroBlock (new) and MicroBlock (legacy) formats
     pub fn load_microblock_auto_format(&self, height: u64) -> IntegrationResult<Option<qnet_state::MicroBlock>> {
         // Try to load raw microblock data
         let microblock_data = match self.load_microblock(height)? {
@@ -2623,18 +2753,75 @@ impl Storage {
         
         // First, try to deserialize as EfficientMicroBlock (new format)
         if let Ok(efficient_block) = bincode::deserialize::<qnet_state::EfficientMicroBlock>(&microblock_data) {
-            println!("[Storage] 📦 Loading efficient microblock {} (new format)", height);
-            
             // Reconstruct full microblock from efficient format
-            // NOTE: This requires async handling, for now skip efficient blocks
-            println!("[Storage] ⚠️ Efficient block format requires async reconstruction - skipping for now");
-            return Ok(None);
+            // CRITICAL: Load transactions from PERSISTENT RocksDB storage, NOT in-memory pool
+            // This ensures transactions are available even after restart or TTL expiry
+            let mut transactions = Vec::with_capacity(efficient_block.transaction_hashes.len());
+            
+            for tx_hash in &efficient_block.transaction_hashes {
+                let tx_hash_hex = hex::encode(tx_hash);
+                
+                // First try in-memory cache for speed
+                if let Some(tx) = self.transaction_pool.get_transaction(tx_hash) {
+                    transactions.push(tx);
+                    continue;
+                }
+                
+                // Fallback to persistent RocksDB storage
+                // Use blocking approach since this is a sync function
+                let tx_cf = match self.persistent.db.cf_handle("transactions") {
+                    Some(cf) => cf,
+                    None => {
+                        println!("[Storage] ⚠️ transactions CF not found for block {}", height);
+                        continue;
+                    }
+                };
+                
+                let tx_key = format!("tx_{}", tx_hash_hex);
+                match self.persistent.db.get_cf(&tx_cf, tx_key.as_bytes()) {
+                    Ok(Some(data)) => {
+                        // Decompress if Zstd-compressed
+                        let tx_data = if data.len() >= 4 && data[0..4] == [0x28, 0xb5, 0x2f, 0xfd] {
+                            zstd::decode_all(&data[..]).unwrap_or(data.to_vec())
+                        } else {
+                            data.to_vec()
+                        };
+                        
+                        if let Ok(tx) = bincode::deserialize::<qnet_state::Transaction>(&tx_data) {
+                            // Cache for future use
+                            let _ = self.transaction_pool.store_transaction(*tx_hash, tx.clone());
+                            transactions.push(tx);
+                        } else {
+                            println!("[Storage] ⚠️ Failed to deserialize TX {} for block {}", tx_hash_hex, height);
+                        }
+                    }
+                    Ok(None) => {
+                        println!("[Storage] ⚠️ Transaction {} not found in storage for block {}", tx_hash_hex, height);
+                    }
+                    Err(e) => {
+                        println!("[Storage] ⚠️ Error loading TX {}: {}", tx_hash_hex, e);
+                    }
+                }
+            }
+            
+            // Reconstruct full MicroBlock
+            let microblock = qnet_state::MicroBlock {
+                height: efficient_block.height,
+                timestamp: efficient_block.timestamp,
+                transactions,
+                producer: efficient_block.producer,
+                signature: efficient_block.signature,
+                previous_hash: efficient_block.previous_hash,
+                merkle_root: efficient_block.merkle_root,
+                poh_hash: efficient_block.poh_hash,
+                poh_count: efficient_block.poh_count,
+            };
+            
+            return Ok(Some(microblock));
         }
         
         // Fallback: try to deserialize as legacy MicroBlock format
         if let Ok(legacy_block) = bincode::deserialize::<qnet_state::MicroBlock>(&microblock_data) {
-            println!("[Storage] 📦 Loading legacy microblock {} (old format)", height);
-            
             // For backward compatibility, also populate transaction pool with legacy data
             for tx in &legacy_block.transactions {
                 // Convert string hash to [u8; 32]
@@ -4894,6 +5081,27 @@ impl Storage {
         }
     }
     
+    /// Get raw snapshot data for P2P download (v2.19.12)
+    /// Returns compressed binary snapshot data
+    pub fn get_snapshot_data(&self, height: u64) -> IntegrationResult<Option<Vec<u8>>> {
+        let snapshots_cf = self.persistent.db.cf_handle("snapshots")
+            .ok_or_else(|| IntegrationError::StorageError("snapshots column family not found".to_string()))?;
+        
+        let snapshot_key = format!("snapshot_{}", height);
+        
+        match self.persistent.db.get_cf(&snapshots_cf, snapshot_key.as_bytes())? {
+            Some(data) => Ok(Some(data)),
+            None => {
+                // Try state_ prefix as fallback
+                let state_key = format!("state_{}", height);
+                match self.persistent.db.get_cf(&snapshots_cf, state_key.as_bytes())? {
+                    Some(data) => Ok(Some(data)),
+                    None => Ok(None)
+                }
+            }
+        }
+    }
+    
     /// Download snapshot from network for fast bootstrap
     pub async fn download_and_load_snapshot(&self, p2p: &crate::unified_p2p::SimplifiedP2P) -> IntegrationResult<u64> {
         println!("[SNAPSHOT] 🔍 Searching for network snapshots...");
@@ -5044,7 +5252,47 @@ impl Storage {
         let data = serde_json::to_vec(info)
             .map_err(|e| IntegrationError::SerializationError(e.to_string()))?;
         
-        self.persistent.save_raw(&key, &data)
+        self.persistent.save_raw(&key, &data)?;
+        
+        // Also save to contract list for enumeration
+        self.add_contract_to_list(contract_address)?;
+        
+        Ok(())
+    }
+    
+    /// Add contract address to the list of all contracts
+    fn add_contract_to_list(&self, contract_address: &str) -> IntegrationResult<()> {
+        let list_key = "contract:list";
+        
+        // Load existing list
+        let mut contracts: Vec<String> = match self.persistent.load_raw(list_key)? {
+            Some(data) => serde_json::from_slice(&data).unwrap_or_default(),
+            None => Vec::new(),
+        };
+        
+        // Add if not already present
+        if !contracts.contains(&contract_address.to_string()) {
+            contracts.push(contract_address.to_string());
+            let data = serde_json::to_vec(&contracts)
+                .map_err(|e| IntegrationError::SerializationError(e.to_string()))?;
+            self.persistent.save_raw(list_key, &data)?;
+        }
+        
+        Ok(())
+    }
+    
+    /// Get list of all contract addresses
+    pub fn get_all_contract_addresses(&self) -> IntegrationResult<Vec<String>> {
+        let list_key = "contract:list";
+        
+        match self.persistent.load_raw(list_key)? {
+            Some(data) => {
+                let contracts: Vec<String> = serde_json::from_slice(&data)
+                    .unwrap_or_default();
+                Ok(contracts)
+            }
+            None => Ok(Vec::new())
+        }
     }
     
     /// Get contract state value by key

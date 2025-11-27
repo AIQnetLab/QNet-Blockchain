@@ -911,6 +911,25 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(blockchain_filter.clone())
         .and_then(handle_macroblock_by_index);
     
+    // Snapshot endpoints - For P2P Fast Sync (v2.19.12)
+    // GET /api/v1/snapshot/latest - Get latest snapshot info
+    let snapshot_latest = api_v1
+        .and(warp::path("snapshot"))
+        .and(warp::path("latest"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(blockchain_filter.clone())
+        .and_then(handle_snapshot_latest);
+    
+    // GET /api/v1/snapshot/{height} - Download snapshot binary
+    let snapshot_download = api_v1
+        .and(warp::path("snapshot"))
+        .and(warp::path::param::<u64>())
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(blockchain_filter.clone())
+        .and_then(handle_snapshot_download);
+    
     // Transaction endpoints with IP-based rate limiting
     let transaction_submit = api_v1
         .and(warp::path("transaction"))
@@ -1523,6 +1542,47 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(blockchain_filter.clone())
         .and_then(handle_contract_estimate_gas);
     
+    // Deploy QRC-20 Token (simplified endpoint)
+    let token_deploy = api_v1
+        .and(warp::path("token"))
+        .and(warp::path("deploy"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::body::json())
+        .and(warp::addr::remote())
+        .and(blockchain_filter.clone())
+        .and_then(handle_token_deploy);
+    
+    // Get token info
+    let token_info = api_v1
+        .and(warp::path("token"))
+        .and(warp::path::param::<String>())
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(blockchain_filter.clone())
+        .and_then(handle_token_info);
+    
+    // Get token balance for address
+    let token_balance = api_v1
+        .and(warp::path("token"))
+        .and(warp::path::param::<String>())
+        .and(warp::path("balance"))
+        .and(warp::path::param::<String>())
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(blockchain_filter.clone())
+        .and_then(handle_token_balance);
+    
+    // Get all tokens for address
+    let tokens_for_address = api_v1
+        .and(warp::path("account"))
+        .and(warp::path::param::<String>())
+        .and(warp::path("tokens"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(blockchain_filter.clone())
+        .and_then(handle_tokens_for_address);
+    
     // CORS configuration - PRODUCTION SECURITY
     // In development mode (QNET_DEV_MODE=1), allow all origins
     // In production, restrict to whitelisted domains only
@@ -1553,7 +1613,9 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .or(block_latest)
         .or(block_by_height)
         .or(block_by_hash)
-        .or(macroblock_by_index);
+        .or(macroblock_by_index)
+        .or(snapshot_latest)
+        .or(snapshot_download);
         
     let account_routes = account_info
         .or(account_balance)
@@ -1629,7 +1691,11 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .or(contract_call)
         .or(contract_info)
         .or(contract_state)
-        .or(contract_estimate_gas);
+        .or(contract_estimate_gas)
+        .or(token_deploy)
+        .or(token_info)
+        .or(token_balance)
+        .or(tokens_for_address);
     
     // =========================================================================
     // WEBSOCKET: Real-time event subscriptions
@@ -2646,6 +2712,106 @@ async fn handle_macroblock_by_index(
                 "details": e.to_string()
             });
             Ok(warp::reply::json(&error_response))
+        }
+    }
+}
+
+// =========================================================================
+// SNAPSHOT ENDPOINTS - For P2P Fast Sync (v2.19.12)
+// =========================================================================
+
+/// GET /api/v1/snapshot/latest - Get latest available snapshot info
+/// Used by new nodes to find snapshots for fast sync
+async fn handle_snapshot_latest(
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    match blockchain.get_latest_snapshot_height() {
+        Ok(Some(height)) => {
+            // Get IPFS CID if available
+            let ipfs_cid = blockchain.get_snapshot_ipfs_cid(height)
+                .unwrap_or_default()
+                .unwrap_or_default();
+            
+            let response = json!({
+                "height": height,
+                "ipfs_cid": ipfs_cid,
+                "available": true,
+                "node_id": blockchain.get_node_id(),
+                "timestamp": std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+            });
+            Ok(warp::reply::json(&response))
+        }
+        Ok(None) => {
+            let response = json!({
+                "height": 0,
+                "ipfs_cid": "",
+                "available": false,
+                "message": "No snapshots available yet"
+            });
+            Ok(warp::reply::json(&response))
+        }
+        Err(e) => {
+            let error_response = json!({
+                "error": "Failed to get snapshot info",
+                "details": e.to_string()
+            });
+            Ok(warp::reply::json(&error_response))
+        }
+    }
+}
+
+/// GET /api/v1/snapshot/{height} - Download snapshot data
+/// Returns compressed binary snapshot for the specified height
+async fn handle_snapshot_download(
+    height: u64,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    match blockchain.get_snapshot_data(height) {
+        Ok(Some(data)) => {
+            // Return binary data with appropriate headers
+            Ok(warp::reply::with_header(
+                warp::reply::with_header(
+                    data,
+                    "Content-Type",
+                    "application/octet-stream"
+                ),
+                "Content-Disposition",
+                format!("attachment; filename=\"snapshot_{}.bin\"", height)
+            ))
+        }
+        Ok(None) => {
+            // Return 404 as JSON
+            let error_response = json!({
+                "error": "Snapshot not found",
+                "height": height
+            });
+            Ok(warp::reply::with_header(
+                warp::reply::with_header(
+                    serde_json::to_vec(&error_response).unwrap_or_default(),
+                    "Content-Type",
+                    "application/json"
+                ),
+                "Content-Disposition",
+                ""
+            ))
+        }
+        Err(e) => {
+            let error_response = json!({
+                "error": "Failed to get snapshot",
+                "details": e.to_string()
+            });
+            Ok(warp::reply::with_header(
+                warp::reply::with_header(
+                    serde_json::to_vec(&error_response).unwrap_or_default(),
+                    "Content-Type",
+                    "application/json"
+                ),
+                "Content-Disposition",
+                ""
+            ))
         }
     }
 }
@@ -5794,8 +5960,15 @@ async fn handle_get_pending_rewards(
             (0, 0, 0, 0.0)
         };
         
-        // Get last claim time (not implemented yet, using 0)
-        let last_claim = 0u64;
+        // Get last claim time from storage
+        let last_claim = {
+            let storage = blockchain.get_storage();
+            storage.get_contract_state(&format!("rewards:{}", node_id), "last_claim")
+                .ok()
+                .flatten()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0)
+        };
         
         // Determine node type from ID
         let node_type = if node_id.starts_with("light_") {
@@ -7883,19 +8056,63 @@ async fn handle_contract_call(
         })));
     }
     
-    // For view calls, no signature required - execute directly
+    // For view calls, no signature required - execute directly via VM
     if request.is_view {
-        // Simulate contract execution (read-only)
-        let result = json!({
-            "success": true,
-            "is_view": true,
-            "contract_address": request.contract_address,
-            "method": request.method,
-            "result": null, // Would be populated by actual VM execution
-            "gas_used": 0,
-            "message": "View call executed (VM integration pending)"
-        });
-        return Ok(warp::reply::json(&result));
+        // Execute via Contract VM (REAL implementation)
+        let storage = blockchain.get_storage();
+        let vm = crate::contract_vm::ContractVM::new(storage);
+        
+        let args: Vec<serde_json::Value> = request.args.as_array()
+            .cloned()
+            .unwrap_or_default();
+        
+        match vm.execute_contract(&request.contract_address, &request.method, &args, &request.from) {
+            Ok(result) => {
+                // Parse return data based on method
+                let return_value: serde_json::Value = match request.method.as_str() {
+                    "balanceOf" | "balance_of" | "totalSupply" | "total_supply" => {
+                        if result.return_data.len() >= 8 {
+                            let balance = u64::from_le_bytes(result.return_data[..8].try_into().unwrap_or([0u8; 8]));
+                            json!(balance)
+                        } else {
+                            json!(0)
+                        }
+                    }
+                    "name" | "symbol" => {
+                        json!(String::from_utf8_lossy(&result.return_data).to_string())
+                    }
+                    "decimals" => {
+                        json!(result.return_data.first().copied().unwrap_or(18))
+                    }
+                    _ => {
+                        if result.return_data == vec![1] {
+                            json!(true)
+                        } else if result.return_data == vec![0] {
+                            json!(false)
+                        } else {
+                            json!(hex::encode(&result.return_data))
+                        }
+                    }
+                };
+                
+                return Ok(warp::reply::json(&json!({
+                    "success": result.success,
+                    "is_view": true,
+                    "contract_address": request.contract_address,
+                    "method": request.method,
+                    "result": return_value,
+                    "gas_used": result.gas_used,
+                    "error": result.error
+                })));
+            }
+            Err(e) => {
+                return Ok(warp::reply::json(&json!({
+                    "success": false,
+                    "is_view": true,
+                    "error": format!("VM execution failed: {:?}", e)
+                })));
+            }
+        }
     }
     
     // State-changing call requires BOTH signatures (hybrid - like consensus)
@@ -8059,21 +8276,12 @@ async fn handle_contract_info(
             })))
         }
         Ok(None) => {
-            // Contract not found - return placeholder for now
-            // In production, this would query the actual contract state
+            // Contract not found - return error (NOT placeholder!)
             Ok(warp::reply::json(&json!({
-                "success": true,
-                "contract": {
-                    "address": contract_address,
-                    "deployer": "unknown",
-                    "deployed_at": 0,
-                    "code_hash": "not_deployed",
-                    "version": "0.0.0",
-                    "total_gas_used": 0,
-                    "call_count": 0,
-                    "is_active": false
-                },
-                "message": "Contract not found or not yet deployed"
+                "success": false,
+                "error": "Contract not found",
+                "contract_address": contract_address,
+                "message": "No contract deployed at this address"
             })))
         }
         Err(e) => {
@@ -8480,4 +8688,242 @@ async fn handle_ws_connection_with_cleanup(
     WS_RATE_LIMITER.remove_connection(client_ip);
     let (total, unique_ips) = WS_RATE_LIMITER.get_stats();
     println!("[WS] 🔌 Connection closed, cleaned up (total: {}, unique IPs: {})", total, unique_ips);
+}
+
+// ============================================================================
+// QRC-20 TOKEN HANDLERS (v2.19.12)
+// ============================================================================
+
+/// Request to deploy a new QRC-20 token
+#[derive(Debug, Deserialize)]
+struct TokenDeployRequest {
+    /// Creator's EON address
+    from: String,
+    /// Token name
+    name: String,
+    /// Token symbol
+    symbol: String,
+    /// Decimals (default 18)
+    #[serde(default = "default_decimals")]
+    decimals: u8,
+    /// Initial supply
+    initial_supply: u64,
+    /// Ed25519 signature
+    signature: String,
+    /// Ed25519 public key
+    public_key: String,
+    /// Dilithium signature (optional for quantum security)
+    dilithium_signature: Option<String>,
+    /// Dilithium public key
+    dilithium_public_key: Option<String>,
+}
+
+fn default_decimals() -> u8 { 18 }
+
+/// Handle QRC-20 token deployment
+async fn handle_token_deploy(
+    request: TokenDeployRequest,
+    remote_addr: Option<std::net::SocketAddr>,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    // Rate limiting
+    if let Err(rate_limit_response) = check_api_rate_limit(remote_addr, "activation") {
+        return Ok(rate_limit_response);
+    }
+    
+    // Validate creator address
+    if let Err(e) = validate_eon_address_with_error(&request.from) {
+        return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": "Invalid creator address",
+            "details": e
+        })));
+    }
+    
+    // Validate token parameters
+    if request.name.is_empty() || request.name.len() > 64 {
+        return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": "Token name must be 1-64 characters"
+        })));
+    }
+    
+    if request.symbol.is_empty() || request.symbol.len() > 10 {
+        return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": "Token symbol must be 1-10 characters"
+        })));
+    }
+    
+    if request.initial_supply == 0 {
+        return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": "Initial supply must be greater than 0"
+        })));
+    }
+    
+    // Verify Ed25519 signature
+    let message_to_sign = format!("token_deploy:{}:{}:{}:{}", 
+        request.from, request.name, request.symbol, request.initial_supply);
+    
+    let ed25519_valid = verify_ed25519_client_signature(
+        &request.from,
+        &message_to_sign,
+        &request.signature,
+        &request.public_key
+    ).await;
+    
+    if !ed25519_valid {
+        return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": "Ed25519 signature verification failed"
+        })));
+    }
+    
+    // Deploy token via VM
+    let storage = blockchain.get_storage();
+    let vm = crate::contract_vm::ContractVM::new(storage);
+    
+    match vm.deploy_qrc20_token(
+        &request.from,
+        &request.name,
+        &request.symbol,
+        request.decimals,
+        request.initial_supply,
+    ) {
+        Ok(token) => {
+            println!("[TOKEN] 🪙 QRC-20 deployed: {} ({}) by {}", 
+                     token.name, token.symbol, &request.from[..16]);
+            
+            Ok(warp::reply::json(&json!({
+                "success": true,
+                "token": {
+                    "contract_address": token.contract_address,
+                    "name": token.name,
+                    "symbol": token.symbol,
+                    "decimals": token.decimals,
+                    "total_supply": token.total_supply,
+                    "creator": request.from
+                },
+                "message": "QRC-20 token deployed successfully"
+            })))
+        }
+        Err(e) => {
+            Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": "Token deployment failed",
+                "details": format!("{:?}", e)
+            })))
+        }
+    }
+}
+
+/// Handle token info query
+async fn handle_token_info(
+    contract_address: String,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    let storage = blockchain.get_storage();
+    let vm = crate::contract_vm::ContractVM::new(storage);
+    
+    match vm.get_token_info(&contract_address) {
+        Ok(Some(token)) => {
+            Ok(warp::reply::json(&json!({
+                "success": true,
+                "token": {
+                    "contract_address": token.contract_address,
+                    "name": token.name,
+                    "symbol": token.symbol,
+                    "decimals": token.decimals,
+                    "total_supply": token.total_supply
+                }
+            })))
+        }
+        Ok(None) => {
+            Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": "Token not found",
+                "contract_address": contract_address
+            })))
+        }
+        Err(e) => {
+            Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": "Failed to query token",
+                "details": format!("{:?}", e)
+            })))
+        }
+    }
+}
+
+/// Handle token balance query
+async fn handle_token_balance(
+    contract_address: String,
+    holder_address: String,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    let storage = blockchain.get_storage();
+    let vm = crate::contract_vm::ContractVM::new(storage);
+    
+    match vm.balance_of_qrc20(&contract_address, &holder_address) {
+        Ok(balance) => {
+            // Get token info for context
+            let token_info = vm.get_token_info(&contract_address).ok().flatten();
+            
+            Ok(warp::reply::json(&json!({
+                "success": true,
+                "contract_address": contract_address,
+                "holder_address": holder_address,
+                "balance": balance,
+                "token_name": token_info.as_ref().map(|t| &t.name),
+                "token_symbol": token_info.as_ref().map(|t| &t.symbol),
+                "decimals": token_info.as_ref().map(|t| t.decimals).unwrap_or(18)
+            })))
+        }
+        Err(e) => {
+            Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": "Failed to query balance",
+                "details": format!("{:?}", e)
+            })))
+        }
+    }
+}
+
+/// Handle query for all tokens owned by an address
+async fn handle_tokens_for_address(
+    address: String,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    let storage = blockchain.get_storage();
+    let vm = crate::contract_vm::ContractVM::new(storage);
+    
+    match vm.get_tokens_for_address(&address) {
+        Ok(balances) => {
+            let tokens: Vec<serde_json::Value> = balances.iter().map(|b| {
+                let token_info = vm.get_token_info(&b.token_address).ok().flatten();
+                json!({
+                    "contract_address": b.token_address,
+                    "balance": b.balance,
+                    "name": token_info.as_ref().map(|t| &t.name),
+                    "symbol": token_info.as_ref().map(|t| &t.symbol),
+                    "decimals": token_info.as_ref().map(|t| t.decimals).unwrap_or(18)
+                })
+            }).collect();
+            
+            Ok(warp::reply::json(&json!({
+                "success": true,
+                "address": address,
+                "tokens": tokens,
+                "token_count": tokens.len()
+            })))
+        }
+        Err(e) => {
+            Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": "Failed to query tokens",
+                "details": format!("{:?}", e)
+            })))
+        }
+    }
 }

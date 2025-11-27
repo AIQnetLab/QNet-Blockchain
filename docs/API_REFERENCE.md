@@ -1,4 +1,4 @@
-# QNet API Reference v2.19.6
+# QNet API Reference v2.19.12
 
 ## 📡 Base URL
 
@@ -1466,7 +1466,154 @@ ws.onmessage = (event) => {
 
 ---
 
+---
+
+## 🪙 QRC-20 Token Endpoints (NEW v2.19.12)
+
+### Deploy QRC-20 Token
+```http
+POST /api/v1/token/deploy
+```
+
+**Request Body:**
+```json
+{
+  "from": "EON_creator_address...",
+  "name": "MyToken",
+  "symbol": "MTK",
+  "decimals": 18,
+  "initial_supply": 1000000000000000000,
+  "signature": "base64_ed25519_signature",
+  "public_key": "base64_ed25519_pubkey"
+}
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "token": {
+    "contract_address": "EON_contract_abc123...",
+    "name": "MyToken",
+    "symbol": "MTK",
+    "decimals": 18,
+    "total_supply": 1000000000000000000,
+    "creator": "EON_creator_address..."
+  }
+}
+```
+
+---
+
+### Get Token Info
+```http
+GET /api/v1/token/{contract_address}
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "token": {
+    "contract_address": "EON_contract_abc123...",
+    "name": "MyToken",
+    "symbol": "MTK",
+    "decimals": 18,
+    "total_supply": 1000000000000000000
+  }
+}
+```
+
+---
+
+### Get Token Balance
+```http
+GET /api/v1/token/{contract_address}/balance/{holder_address}
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "contract_address": "EON_contract_abc123...",
+  "holder_address": "EON_holder...",
+  "balance": 500000000000000000,
+  "token_name": "MyToken",
+  "token_symbol": "MTK",
+  "decimals": 18
+}
+```
+
+---
+
+### Get All Tokens for Address
+```http
+GET /api/v1/account/{address}/tokens
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "address": "EON_holder...",
+  "tokens": [
+    {
+      "contract_address": "EON_token1...",
+      "balance": 500000000000000000,
+      "name": "MyToken",
+      "symbol": "MTK",
+      "decimals": 18
+    }
+  ],
+  "token_count": 1
+}
+```
+
+---
+
+## 📸 Snapshot Endpoints (NEW v2.19.12)
+
+### Get Latest Snapshot
+```http
+GET /api/v1/snapshot/latest
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "height": 1234500,
+  "ipfs_cid": "Qm...",
+  "state_root": "abc123...",
+  "timestamp": 1732712345
+}
+```
+
+---
+
+### Download Snapshot
+```http
+GET /api/v1/snapshot/{height}
+```
+
+**Response:** Binary snapshot data or redirect to IPFS
+
+---
+
 ## 📝 Changelog
+
+### v2.19.12 (November 2025)
+- **NEW**: QRC-20 Token endpoints:
+  - `POST /api/v1/token/deploy` - Deploy QRC-20 token
+  - `GET /api/v1/token/{address}` - Get token info
+  - `GET /api/v1/token/{address}/balance/{holder}` - Get token balance
+  - `GET /api/v1/account/{address}/tokens` - Get all tokens for address
+- **NEW**: Snapshot endpoints for fast sync:
+  - `GET /api/v1/snapshot/latest` - Latest snapshot info
+  - `GET /api/v1/snapshot/{height}` - Download snapshot
+- **FIX**: Global token registry (persists across requests)
+- **FIX**: Contract info returns error for non-existent contracts
+- **FIX**: Peer validation logic corrected
 
 ### v2.19.5 (November 2025)
 - **NEW**: WebSocket real-time event subscriptions:
