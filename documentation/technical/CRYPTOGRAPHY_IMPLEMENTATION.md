@@ -388,6 +388,43 @@ pub struct MicroBlock {
 }
 ```
 
+### PoH Validation (v2.19.13)
+
+**Separate PoH State Storage:**
+```rust
+// PoH state stored separately for O(1) validation
+pub struct PoHState {
+    pub height: u64,           // Block height
+    pub poh_hash: Vec<u8>,     // SHA3-512 hash (64 bytes)
+    pub poh_count: u64,        // Monotonic counter
+    pub previous_hash: [u8; 32], // Chain linkage
+}
+```
+
+**Validation Flow:**
+```rust
+// 1. Load PoH state from dedicated storage (O(1), no block deserialization)
+let prev_poh = storage.load_poh_state(height - 1)?;
+
+// 2. Check monotonic progression
+if block.poh_count <= prev_poh.poh_count {
+    let regression = prev_poh.poh_count - block.poh_count;
+    if regression > MAX_ACCEPTABLE_REGRESSION {  // 15M hashes (~30 sec)
+        return Err("Severe PoH regression");
+    }
+    // Minor regression acceptable due to network delays
+}
+
+// 3. Auto-save PoH state when saving block
+storage.save_microblock_efficient(block);  // Also saves PoHState
+```
+
+**Security Properties:**
+- ✅ Monotonic counter prevents replay attacks
+- ✅ Chain linkage prevents block reordering
+- ✅ Regression check detects time manipulation
+- ✅ O(1) validation without loading full blocks
+
 ### Why Hybrid SHA3-512 / Blake3?
 
 | Aspect | SHA3-512 Only | Blake3 Only | Hybrid (QNet) |

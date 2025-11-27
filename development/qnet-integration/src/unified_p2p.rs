@@ -2690,13 +2690,13 @@ impl SimplifiedP2P {
              // PRODUCTION: Use existing PERSISTENT reputation system
              
              loop {
-                // CRITICAL: For Genesis phase, check more frequently (5 sec) for Byzantine safety
-                // For normal phase with millions of nodes, check every 30 sec
-                let is_genesis_phase = std::env::var("QNET_BOOTSTRAP_ID")
+                // CRITICAL: Bootstrap nodes check more frequently (5 sec) for Byzantine safety
+                // Regular nodes with millions of peers check every 30 sec for scalability
+                let is_bootstrap_node = std::env::var("QNET_BOOTSTRAP_ID")
                     .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
                     .unwrap_or(false);
                 
-                let check_interval = if is_genesis_phase { 5 } else { 30 };
+                let check_interval = if is_bootstrap_node { 5 } else { 30 };
                 tokio::time::sleep(std::time::Duration::from_secs(check_interval)).await;
                  
                  // PRODUCTION: Apply reputation decay periodically with activity check
@@ -4527,6 +4527,9 @@ impl SimplifiedP2P {
     
     /// CRITICAL: Verify all Genesis nodes are actually connected for bootstrap
     /// This prevents split brain during initial network formation
+    /// 
+    /// ARCHITECTURE (v2.19.13): Uses REAL TCP connectivity checks, not just connected_peers
+    /// This ensures nodes actually wait for each other before starting production
     pub async fn verify_all_genesis_connectivity(&self) -> bool {
         use crate::genesis_constants::GENESIS_NODE_IPS;
         
@@ -4536,9 +4539,10 @@ impl SimplifiedP2P {
             .and_then(|id| id.parse::<usize>().ok())
             .unwrap_or(0);
         
-        let connected_peers = self.connected_peers.read().unwrap();
+        let mut connected_count = 0;
+        let mut total_other_nodes = 0;
         
-        // Check each Genesis node (except self)
+        // Check each Genesis node (except self) with REAL TCP check
         for (ip, id) in GENESIS_NODE_IPS {
             let node_num: usize = id.parse().unwrap_or(0);
             
@@ -4547,22 +4551,32 @@ impl SimplifiedP2P {
                 continue;
             }
             
+            total_other_nodes += 1;
             let peer_addr = format!("{}:8001", ip);
             let node_id = format!("genesis_node_{:03}", node_num);
             
-            // Check if this Genesis node is connected
-            let is_connected = connected_peers.values().any(|peer| {
-                peer.id == node_id || peer.addr == peer_addr
-            });
+            // CRITICAL FIX: Do REAL TCP connectivity check, not just connected_peers lookup
+            // connected_peers may be empty during startup race condition
+            let is_reachable = Self::test_peer_connectivity_static(&peer_addr);
             
-            if !is_connected {
-                println!("[P2P] ❌ Genesis node {} ({}) not connected yet", node_id, ip);
-                return false;
+            if is_reachable {
+                connected_count += 1;
+                println!("[P2P] ✅ Genesis node {} ({}) is reachable", node_id, ip);
+            } else {
+                println!("[P2P] ❌ Genesis node {} ({}) not reachable yet", node_id, ip);
             }
         }
         
-        println!("[P2P] ✅ All Genesis nodes verified as connected");
-        true
+        // All 4 other Genesis nodes must be reachable
+        let all_connected = connected_count == total_other_nodes;
+        
+        if all_connected {
+            println!("[P2P] ✅ All {} Genesis nodes verified as ACTUALLY reachable", total_other_nodes);
+        } else {
+            println!("[P2P] ⏳ Genesis connectivity: {}/{} nodes reachable", connected_count, total_other_nodes);
+        }
+        
+        all_connected
     }
     
     /// PRODUCTION: Check if peer is actually connected (runtime-safe)
@@ -4599,23 +4613,16 @@ impl SimplifiedP2P {
     
     /// PRODUCTION: Get discovery peers for DHT/API (Fast method for millions of nodes)  
     pub fn get_discovery_peers(&self) -> Vec<PeerInfo> {
-        // CRITICAL FIX: During Genesis phase, return ONLY Genesis nodes (not all connected peers)
-        // This prevents exponential peer growth (5→8→16→35 peers)
+        // ARCHITECTURE: Bootstrap nodes use deterministic Genesis peer list for consistent VRF
+        // Regular nodes use dynamic peer discovery from DHT for scalability
+        // This ensures deterministic consensus among Genesis nodes while allowing network growth
         
-        // Check if we're in Genesis phase (network height < 1000)
-        // CRITICAL: Use cached height to avoid recursion
-        let is_genesis_phase = {
-            // Check cached height directly (no network calls)
-            if let Some(cached_data) = CACHE_ACTOR.height_cache.read().unwrap().as_ref() {
-                cached_data.data < 1000
-            } else {
-                // No cached height = assume Genesis phase
-                true
-            }
-        };
+        let is_bootstrap_node = std::env::var("QNET_BOOTSTRAP_ID")
+            .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
+            .unwrap_or(false);
         
-        if is_genesis_phase {
-            // Genesis phase: Return ONLY verified Genesis nodes
+        if is_bootstrap_node {
+            // Bootstrap nodes: Return ONLY verified Genesis nodes for deterministic consensus
             let mut genesis_peers = Vec::new();
             
             // Get Genesis IPs from constants
@@ -7209,42 +7216,34 @@ impl SimplifiedP2P {
                          block_type, height, from_peer, data.len());
                 }
                 
-                // EXISTING: Fast received block validation for millions of nodes scalability  
-                // PERFORMANCE: Use block height for phase detection - NO HTTP calls
-                // Genesis phase determined by block height < 1000 (EXISTING threshold)
-                let is_genesis_phase = height < 1000; // EXISTING: First 1000 blocks = Genesis phase
+                // ARCHITECTURE: Unified block validation for ALL blocks (no special "genesis phase")
+                // - Microblocks: Validated via Dilithium3 signature (quantum-resistant)
+                // - Macroblocks: Require Byzantine consensus (BFT with 4+ nodes)
+                // This ensures consistent security from block 0 to infinity
+                
                 let is_macroblock = block_type == "macro";
                 
-                // EXISTING: Byzantine safety validation ONLY when required (Genesis ALL blocks, Normal ONLY macroblocks)
-                if is_genesis_phase || is_macroblock {
-                    // EXISTING: Use validated peers for Byzantine safety - with sophisticated caching
+                // Byzantine consensus check ONLY for macroblocks (finalization checkpoints)
+                // Microblocks are secured by quantum signatures, not BFT
+                if is_macroblock {
                     let validated_peers = self.get_validated_active_peers();
-                    let network_node_count = std::cmp::min(validated_peers.len() + 1, 5); // EXISTING: Add self, max 5 Genesis
+                    let network_node_count = validated_peers.len() + 1; // +1 for self
                     
                     if network_node_count < 4 {
-                        // GENESIS FIX: Allow syncing blocks during Genesis bootstrap even with limited peers
-                        // This allows nodes to catch up with the network
+                        // Allow sync for bootstrap nodes catching up
                         let is_bootstrap_node = std::env::var("QNET_BOOTSTRAP_ID").is_ok();
-                        let allow_sync = is_bootstrap_node && is_genesis_phase && height > 0;
                         
-                        if allow_sync {
-                            println!("[SECURITY] ⚠️ ACCEPTING block #{} for sync - Genesis bootstrap mode with {} nodes", height, network_node_count);
+                        if is_bootstrap_node && height > 0 {
+                            println!("[SECURITY] ⚠️ ACCEPTING macroblock #{} for sync - bootstrap mode with {} nodes", height, network_node_count);
                             // Continue to process block for synchronization
                         } else {
-                        if is_genesis_phase {
-                            println!("[SECURITY] ⚠️ REJECTING block #{} - Genesis phase requires Byzantine safety: {} nodes < 4", height, network_node_count);
-                        } else {
                             println!("[SECURITY] ⚠️ REJECTING macroblock #{} - Byzantine consensus required: {} nodes < 4", height, network_node_count);
-                        }
-                        println!("[SECURITY] 🔒 Block from {} discarded - network must have 4+ validated nodes", from_peer);
-                        return; // Reject block without processing
+                            println!("[SECURITY] 🔒 Block from {} discarded - network must have 4+ validated nodes", from_peer);
+                            return; // Reject block without processing
                         }
                     }
-                } else {
-                    // EXISTING: Normal phase microblocks - fast acceptance with quantum signature validation only
-                    // PERFORMANCE: Skip expensive Byzantine validation for millions of nodes scalability
-                    // EXISTING: Quantum cryptography validation handled in block processing (CRYSTALS-Dilithium)
                 }
+                // Microblocks: No Byzantine check needed - quantum signature validation in block processing
                 
                 // PRODUCTION: Silent diagnostic check for scalability  
                 let block_tx_guard = self.block_tx.lock().unwrap();

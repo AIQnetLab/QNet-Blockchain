@@ -29,9 +29,11 @@
 | **Tick Duration** | 10ms | 100 ticks per second |
 | **Hashes per Tick** | 5,000 | 500K / 100 = 5,000 |
 | **Hashes per Slot** | 500,000 | 1-second microblock alignment |
-| **Checkpoint Interval** | 1M hashes | ~2 seconds |
+| **Checkpoint Interval** | 10M hashes | ~20 seconds |
 | **Max Drift** | 5% | Auto-warning on clock drift |
 | **Node Types** | Full/Super only | Light nodes excluded (battery saving) |
+| **Storage** | Separate CF | O(1) validation without block loading |
+| **Max Regression** | 15M hashes | ~30 seconds tolerance |
 
 ## 🔄 Progressive Finalization Protocol (PFP)
 

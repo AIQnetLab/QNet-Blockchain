@@ -682,7 +682,7 @@ let entropy_height = ((next_block_height - 1) / 30) * 30;
 let entropy_height = if next_block_height > FINALITY_WINDOW {
     next_block_height - FINALITY_WINDOW  // 10 blocks back
 } else {
-    0  // Genesis phase
+    0  // Initial blocks (use Genesis as entropy)
 };
 ```
 
@@ -991,10 +991,35 @@ for node in eligible_nodes {
 
 | Data Type | Column Family | Retention |
 |-----------|---------------|-----------|
+| Microblocks | `microblocks` | Sliding window (100K) |
+| Macroblocks | `macroblocks` | Full history |
+| Transactions | `transactions` | Pruned after macroblock |
+| **PoH State** | `poh_state` | Full history |
 | Light attestations | `attestations` | 4 hours + 1 window buffer |
 | Full/Super heartbeats | `heartbeats` | 4 hours + 1 window buffer |
 | Pending rewards | `pending_rewards` | Until claimed |
 | Reputation history | `reputation_history` | 30 days |
+
+#### PoH State Storage (v2.19.13)
+
+**Architecture**: PoH state is stored **separately** from blocks for O(1) validation.
+
+```rust
+pub struct PoHState {
+    pub height: u64,           // Block height
+    pub poh_hash: Vec<u8>,     // SHA3-512 hash (64 bytes)
+    pub poh_count: u64,        // Monotonic counter
+    pub previous_hash: [u8; 32], // Chain linkage
+}
+```
+
+**Benefits**:
+- ✅ O(1) PoH validation (no block deserialization)
+- ✅ Format-agnostic (works with MicroBlock, EfficientMicroBlock)
+- ✅ Backward compatible (auto-migration from existing blocks)
+- ✅ Minimal overhead (~112 bytes/block = ~3.5 GB/year)
+
+**Migration**: On node startup, `migrate_all_poh_states()` extracts PoH data from existing blocks.
 
 ### Storage Optimization & Pruning (v2.19.7)
 

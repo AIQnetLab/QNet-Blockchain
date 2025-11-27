@@ -513,6 +513,7 @@ impl PersistentStorage {
             ColumnFamilyDescriptor::new("tx_by_address", Options::default()), // Index: address -> [tx_hashes]
             ColumnFamilyDescriptor::new("attestations", Options::default()), // Light node attestations
             ColumnFamilyDescriptor::new("heartbeats", Options::default()),   // Full/Super node heartbeats
+            ColumnFamilyDescriptor::new("poh_state", Options::default()),    // PoH state for fast validation (v2.19.13)
         ];
         
         let db = match DB::open_cf_descriptors(&opts, path, cfs) {
@@ -1184,6 +1185,63 @@ impl PersistentStorage {
         Ok(())
     }
     
+    // ========================================================================
+    // POH STATE STORAGE (v2.19.13)
+    // ========================================================================
+    // Separate PoH state storage for fast validation without loading full blocks
+    // This is critical for scalability - PoH validation should be O(1) not O(block_size)
+    // ========================================================================
+    
+    /// Save PoH state for a block height
+    /// Called automatically when saving microblocks
+    pub fn save_poh_state(&self, poh_state: &qnet_state::PoHState) -> IntegrationResult<()> {
+        let poh_cf = self.db.cf_handle("poh_state")
+            .ok_or_else(|| IntegrationError::StorageError("poh_state column family not found".to_string()))?;
+        
+        let key = format!("poh_{}", poh_state.height);
+        let data = bincode::serialize(poh_state)
+            .map_err(|e| IntegrationError::SerializationError(e.to_string()))?;
+        
+        self.db.put_cf(&poh_cf, key.as_bytes(), &data)?;
+        Ok(())
+    }
+    
+    /// Load PoH state for a block height
+    /// Returns None if height doesn't exist or PoH data not available
+    pub fn load_poh_state(&self, height: u64) -> IntegrationResult<Option<qnet_state::PoHState>> {
+        let poh_cf = self.db.cf_handle("poh_state")
+            .ok_or_else(|| IntegrationError::StorageError("poh_state column family not found".to_string()))?;
+        
+        let key = format!("poh_{}", height);
+        match self.db.get_cf(&poh_cf, key.as_bytes())? {
+            Some(data) => {
+                let poh_state = bincode::deserialize::<qnet_state::PoHState>(&data)
+                    .map_err(|e| IntegrationError::SerializationError(e.to_string()))?;
+                Ok(Some(poh_state))
+            }
+            None => Ok(None),
+        }
+    }
+    
+    /// Delete PoH state for a block height (for fork resolution)
+    pub fn delete_poh_state(&self, height: u64) -> IntegrationResult<()> {
+        let poh_cf = self.db.cf_handle("poh_state")
+            .ok_or_else(|| IntegrationError::StorageError("poh_state column family not found".to_string()))?;
+        
+        let key = format!("poh_{}", height);
+        self.db.delete_cf(&poh_cf, key.as_bytes())?;
+        Ok(())
+    }
+    
+    /// Get the latest PoH state (for continuing PoH sequence)
+    pub fn get_latest_poh_state(&self) -> IntegrationResult<Option<qnet_state::PoHState>> {
+        let chain_height = self.get_chain_height()?;
+        if chain_height == 0 {
+            return Ok(None);
+        }
+        self.load_poh_state(chain_height)
+    }
+    
     pub fn get_latest_macroblock_hash(&self) -> Result<[u8; 32], IntegrationError> {
         let metadata_cf = self.db.cf_handle("metadata")
             .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
@@ -1367,7 +1425,7 @@ impl PersistentStorage {
         
         Ok(microblocks)
     }
-
+    
     /// Legacy: Get block range for old Block format (only genesis)  
     pub async fn get_blocks_range(&self, from: u64, to: u64) -> IntegrationResult<Vec<qnet_state::Block>> {
         let mut blocks = Vec::new();
@@ -2069,7 +2127,7 @@ impl Storage {
                 
                 // If STILL full after degradation, error out
                 if self.is_storage_critically_full()? && self.get_effective_storage_mode() == StorageMode::Light {
-                    return Err(IntegrationError::StorageError(
+                return Err(IntegrationError::StorageError(
                         "Cannot save microblock: Storage full even after degradation to Light mode. Add disk space!".to_string()
                     ));
                 }
@@ -2116,13 +2174,13 @@ impl Storage {
                 }
                 
                 // Fallback: Apply adaptive compression to raw data
-                let compressed_data = if height > 0 {
-                    self.compress_block_adaptive(data, height)?
-                } else {
-                    data.to_vec()
-                };
-                
-                self.persistent.save_microblock(height, &compressed_data)
+        let compressed_data = if height > 0 {
+            self.compress_block_adaptive(data, height)?
+        } else {
+            data.to_vec()
+        };
+        
+        self.persistent.save_microblock(height, &compressed_data)
             }
         }
     }
@@ -2224,6 +2282,11 @@ impl Storage {
             poh_count: microblock.poh_count,
         };
         
+        // Step 3: Save PoH state separately for fast validation (v2.19.13)
+        // This enables O(1) PoH validation without loading full block
+        let poh_state = qnet_state::PoHState::from_microblock(microblock);
+        self.persistent.save_poh_state(&poh_state)?;
+        
         // Serialize EfficientMicroBlock (much smaller than full MicroBlock)
         let efficient_data = bincode::serialize(&efficient_block)
             .map_err(|e| IntegrationError::SerializationError(e.to_string()))?;
@@ -2256,7 +2319,36 @@ impl Storage {
     /// Delete a microblock at the specified height (for fork resolution)
     pub fn delete_microblock(&self, height: u64) -> IntegrationResult<()> {
         println!("[Storage] 🗑️ Deleting microblock at height {}", height);
+        // Also delete associated PoH state
+        let _ = self.persistent.delete_poh_state(height);
         self.persistent.delete_microblock(height)
+    }
+    
+    // ========================================================================
+    // POH STATE API (v2.19.13)
+    // ========================================================================
+    // Fast PoH validation without loading full blocks
+    // ========================================================================
+    
+    /// Save PoH state for a block
+    pub fn save_poh_state(&self, poh_state: &qnet_state::PoHState) -> IntegrationResult<()> {
+        self.persistent.save_poh_state(poh_state)
+    }
+    
+    /// Load PoH state for a specific height
+    pub fn load_poh_state(&self, height: u64) -> IntegrationResult<Option<qnet_state::PoHState>> {
+        self.persistent.load_poh_state(height)
+    }
+    
+    /// Get the latest PoH state
+    pub fn get_latest_poh_state(&self) -> IntegrationResult<Option<qnet_state::PoHState>> {
+        self.persistent.get_latest_poh_state()
+    }
+    
+    /// Extract and save PoH state from a microblock
+    pub fn save_poh_state_from_microblock(&self, microblock: &qnet_state::MicroBlock) -> IntegrationResult<()> {
+        let poh_state = qnet_state::PoHState::from_microblock(microblock);
+        self.save_poh_state(&poh_state)
     }
     
     pub fn get_latest_macroblock_hash(&self) -> Result<[u8; 32], IntegrationError> {
@@ -2601,7 +2693,7 @@ impl Storage {
         self.persistent.clear_sync_progress()
     }
     
-    /// Get microblocks range for batch sync
+    /// Get microblocks range for batch sync  
     /// CRITICAL: Returns full MicroBlock format for network sync (not EfficientMicroBlock)
     /// This ensures receiving nodes can deserialize blocks with full transaction data
     pub async fn get_microblocks_range(&self, from: u64, to: u64) -> IntegrationResult<Vec<(u64, Vec<u8>)>> {
@@ -2744,11 +2836,21 @@ impl Storage {
     
     /// Load microblock with automatic format detection (backward compatibility)
     /// Supports both EfficientMicroBlock (new) and MicroBlock (legacy) formats
+    /// Handles Zstd compression transparently
     pub fn load_microblock_auto_format(&self, height: u64) -> IntegrationResult<Option<qnet_state::MicroBlock>> {
         // Try to load raw microblock data
-        let microblock_data = match self.load_microblock(height)? {
+        let raw_data = match self.load_microblock(height)? {
             Some(data) => data,
             None => return Ok(None),
+        };
+        
+        // CRITICAL: Decompress if Zstd-compressed (magic bytes: 0x28 0xb5 0x2f 0xfd)
+        // Data is compressed in save_microblock_efficient via compress_block_adaptive
+        let microblock_data = if raw_data.len() >= 4 && raw_data[0..4] == [0x28, 0xb5, 0x2f, 0xfd] {
+            zstd::decode_all(&raw_data[..])
+                .map_err(|e| IntegrationError::Other(format!("Zstd decompression failed: {}", e)))?
+        } else {
+            raw_data
         };
         
         // First, try to deserialize as EfficientMicroBlock (new format)
@@ -2901,6 +3003,90 @@ impl Storage {
         println!("[Storage] 🎉 Batch migration completed: {} microblocks converted to efficient format", migrated_count);
         
         Ok(migrated_count)
+    }
+    
+    // ========================================================================
+    // POH STATE MIGRATION (v2.19.13)
+    // ========================================================================
+    // Migrate existing blocks to have separate PoH state for fast validation
+    // This is a one-time migration that runs on node startup
+    // ========================================================================
+    
+    /// Migrate PoH state for a single block (extract from block and save separately)
+    pub fn migrate_poh_state_for_block(&self, height: u64) -> IntegrationResult<bool> {
+        // Check if PoH state already exists
+        if let Ok(Some(_)) = self.load_poh_state(height) {
+            return Ok(false); // Already migrated
+        }
+        
+        // Load block using auto-format detection
+        let microblock = match self.load_microblock_auto_format(height)? {
+            Some(block) => block,
+            None => return Ok(false), // Block doesn't exist
+        };
+        
+        // Extract and save PoH state
+        let poh_state = qnet_state::PoHState::from_microblock(&microblock);
+        self.save_poh_state(&poh_state)?;
+        
+        Ok(true)
+    }
+    
+    /// Migrate PoH state for all existing blocks (run on startup)
+    /// Returns number of blocks migrated
+    pub fn migrate_all_poh_states(&self) -> IntegrationResult<u64> {
+        let chain_height = self.persistent.get_chain_height()?;
+        if chain_height == 0 {
+            println!("[POH_MIGRATION] ℹ️ No blocks to migrate");
+            return Ok(0);
+        }
+        
+        println!("[POH_MIGRATION] 🚀 Starting PoH state migration for {} blocks", chain_height + 1);
+        
+        let mut migrated = 0u64;
+        let mut skipped = 0u64;
+        let start_time = std::time::Instant::now();
+        
+        for height in 0..=chain_height {
+            match self.migrate_poh_state_for_block(height) {
+                Ok(true) => {
+                    migrated += 1;
+                    if migrated % 1000 == 0 {
+                        let elapsed = start_time.elapsed().as_secs();
+                        let rate = if elapsed > 0 { migrated / elapsed } else { migrated };
+                        println!("[POH_MIGRATION] 📊 Progress: {} migrated, {} skipped ({} blocks/sec)", 
+                                migrated, skipped, rate);
+                    }
+                }
+                Ok(false) => {
+                    skipped += 1;
+                }
+                Err(e) => {
+                    println!("[POH_MIGRATION] ⚠️ Failed to migrate PoH state for block {}: {}", height, e);
+                }
+            }
+        }
+        
+        let elapsed = start_time.elapsed();
+        println!("[POH_MIGRATION] ✅ Migration completed in {:.2}s: {} migrated, {} skipped", 
+                elapsed.as_secs_f64(), migrated, skipped);
+        
+        Ok(migrated)
+    }
+    
+    /// Check if PoH state migration is needed
+    pub fn needs_poh_migration(&self) -> IntegrationResult<bool> {
+        let chain_height = self.persistent.get_chain_height()?;
+        if chain_height == 0 {
+            return Ok(false); // No blocks yet
+        }
+        
+        // Check if PoH state exists for the latest block
+        // If not, migration is needed
+        match self.load_poh_state(chain_height)? {
+            Some(_) => Ok(false), // Already have PoH state
+            None => Ok(true),     // Need to migrate
+        }
     }
     
     /// High-level compression utilities for archive data

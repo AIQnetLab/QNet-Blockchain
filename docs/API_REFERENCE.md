@@ -1481,7 +1481,7 @@ POST /api/v1/token/deploy
   "from": "EON_creator_address...",
   "name": "MyToken",
   "symbol": "MTK",
-  "decimals": 18,
+  "decimals": 9,
   "initial_supply": 1000000000000000000,
   "signature": "base64_ed25519_signature",
   "public_key": "base64_ed25519_pubkey"
@@ -1496,7 +1496,7 @@ POST /api/v1/token/deploy
     "contract_address": "EON_contract_abc123...",
     "name": "MyToken",
     "symbol": "MTK",
-    "decimals": 18,
+    "decimals": 9,
     "total_supply": 1000000000000000000,
     "creator": "EON_creator_address..."
   }
@@ -1518,7 +1518,7 @@ GET /api/v1/token/{contract_address}
     "contract_address": "EON_contract_abc123...",
     "name": "MyToken",
     "symbol": "MTK",
-    "decimals": 18,
+    "decimals": 9,
     "total_supply": 1000000000000000000
   }
 }
@@ -1540,7 +1540,7 @@ GET /api/v1/token/{contract_address}/balance/{holder_address}
   "balance": 500000000000000000,
   "token_name": "MyToken",
   "token_symbol": "MTK",
-  "decimals": 18
+  "decimals": 9
 }
 ```
 
@@ -1562,7 +1562,7 @@ GET /api/v1/account/{address}/tokens
       "balance": 500000000000000000,
       "name": "MyToken",
       "symbol": "MTK",
-      "decimals": 18
+      "decimals": 9
     }
   ],
   "token_count": 1

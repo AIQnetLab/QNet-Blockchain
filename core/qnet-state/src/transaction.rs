@@ -277,7 +277,7 @@ pub struct LocalFinalizationConfig {
 impl Default for LocalFinalizationConfig {
     fn default() -> Self {
         Self {
-            max_instant_amount: 1_000_000, // 1M smallest units
+            max_instant_amount: 100_000_000_000, // 100 QNC (100 * 10^9 nanoQNC)
             max_instant_gas_price: 100,     // Standard gas price
             trusted_senders: HashSet::new(),
             min_confirmations: 6,           // ~90 seconds for macroblock

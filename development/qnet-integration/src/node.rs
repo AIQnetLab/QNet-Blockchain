@@ -1044,6 +1044,30 @@ impl BlockchainNode {
                 std::env::set_var("QNET_STORAGE_PATH", data_dir);
                 println!("[Node] 📁 Storage path set: QNET_STORAGE_PATH={}", data_dir);
                 
+                // POH STATE MIGRATION (v2.19.13): Migrate existing blocks to have separate PoH state
+                // This enables O(1) PoH validation without loading full blocks
+                // Migration is idempotent and only runs once per block
+                match storage_arc.needs_poh_migration() {
+                    Ok(true) => {
+                        println!("[Node] 🔄 PoH state migration needed, starting...");
+                        match storage_arc.migrate_all_poh_states() {
+                            Ok(count) => {
+                                println!("[Node] ✅ PoH state migration completed: {} blocks migrated", count);
+                            }
+                            Err(e) => {
+                                // Non-fatal: PoH validation will fall back to loading blocks
+                                println!("[Node] ⚠️ PoH state migration failed (non-fatal): {}", e);
+                            }
+                        }
+                    }
+                    Ok(false) => {
+                        println!("[Node] ✅ PoH state already migrated or no blocks yet");
+                    }
+                    Err(e) => {
+                        println!("[Node] ⚠️ Could not check PoH migration status: {}", e);
+                    }
+                }
+                
                 storage_arc
             }
             Err(e) => {
@@ -3115,42 +3139,69 @@ impl BlockchainNode {
         
         // 5.5. Verify PoH sequence (if PoH is available and block has PoH data)
         // Only verify for blocks that have valid PoH data (not genesis or pre-PoH blocks)
+        // 
+        // ARCHITECTURE (v2.19.13): Use dedicated PoH state storage for O(1) validation
+        // This avoids loading full blocks which may be in different formats (MicroBlock vs EfficientMicroBlock)
         if microblock.height > 0 && !microblock.poh_hash.is_empty() && microblock.poh_count > 0 {
-            // Get previous block's PoH state for verification
-            if let Ok(Some(prev_data)) = storage.load_microblock(microblock.height - 1) {
-                let prev_block: qnet_state::MicroBlock = bincode::deserialize(&prev_data)
-                    .map_err(|e| format!("Failed to deserialize previous block for PoH check: {}", e))?;
-                
-                // PoH REGRESSION CHECK: Detect attempts to forge block history
-                // Normal network drift is acceptable (nodes may have slightly different PoH speeds)
-                // Byzantine consensus provides primary safety; PoH is an additional time proof layer
-                if microblock.poh_count <= prev_block.poh_count && prev_block.poh_count > 0 {
-                    let regression = prev_block.poh_count - microblock.poh_count;
-                    
-                    // SECURITY: Reject if regression exceeds ~3 minutes of PoH time
-                    // 100M hashes at 500K/sec = 200 seconds = ~3.3 minutes
-                    // This catches serious attacks while tolerating network delays
-                    const MAX_ACCEPTABLE_REGRESSION: u64 = 100_000_000;
-                    
-                    if regression > MAX_ACCEPTABLE_REGRESSION {
-                        println!("[PoH] ❌ SEVERE PoH regression detected! Block #{}: {} <= prev: {} (diff: {})", 
-                                microblock.height, microblock.poh_count, prev_block.poh_count, regression);
-                        return Err(format!(
-                            "Severe PoH regression: block #{} has {} but previous has {} (diff: {})",
-                            microblock.height, microblock.poh_count, prev_block.poh_count, regression
-                        ));
-                    } else {
-                        // Log warning but accept the block - Byzantine consensus will validate
-                        println!("[PoH] ⚠️ Minor PoH regression at block #{}: {} <= prev: {} (acceptable)", 
-                                microblock.height, microblock.poh_count, prev_block.poh_count);
+            // Get previous block's PoH state from dedicated storage (fast, format-agnostic)
+            let prev_poh_state = storage.load_poh_state(microblock.height - 1)
+                .ok()
+                .flatten();
+            
+            // If PoH state not in dedicated storage, try to extract from block (backward compat)
+            let prev_poh_count = if let Some(ref poh_state) = prev_poh_state {
+                poh_state.poh_count
+            } else {
+                // Fallback: try to load from block using auto-format detection
+                match storage.load_microblock_auto_format(microblock.height - 1) {
+                    Ok(Some(prev_block)) => prev_block.poh_count,
+                    Ok(None) if microblock.height == 1 => 0, // Genesis (block #0) has poh_count=0
+                    Ok(None) => {
+                        // SECURITY: Previous block MUST exist for height > 1
+                        // Return error to trigger sync
+                        return Err(format!("MISSING_PREVIOUS:{}", microblock.height - 1));
+                    }
+                    Err(e) => {
+                        // SECURITY: Cannot load previous block - reject
+                        return Err(format!("PoH validation failed: cannot load block #{}: {}", 
+                                          microblock.height - 1, e));
                     }
                 }
+            };
+            
+            // PoH REGRESSION CHECK: Detect attempts to forge block history
+            // Normal network drift is acceptable (nodes may have slightly different PoH speeds)
+            // Byzantine consensus provides primary safety; PoH is an additional time proof layer
+            if microblock.poh_count <= prev_poh_count && prev_poh_count > 0 {
+                let regression = prev_poh_count - microblock.poh_count;
                 
-                // Log PoH progression (reduced frequency to avoid log spam)
-                if microblock.height % 100 == 0 {
-                    println!("[PoH] ✅ PoH verified for block #{}: count={} (prev={})", 
-                            microblock.height, microblock.poh_count, prev_block.poh_count);
+                // SECURITY: Reject if regression exceeds 30 seconds of PoH time
+                // 15M hashes at 500K/sec = 30 seconds
+                // ARCHITECTURE RATIONALE:
+                // - 30 sec < 90 sec macroblock interval (cannot rewrite finalized blocks)
+                // - 30 sec > typical network delay (5-10 sec) for tolerance
+                // - 30 sec = 1/3 of macroblock, prevents serious time manipulation
+                // - Aligned with FINALITY_WINDOW (10 blocks) + safety margin
+                const MAX_ACCEPTABLE_REGRESSION: u64 = 15_000_000;
+                
+                if regression > MAX_ACCEPTABLE_REGRESSION {
+                    println!("[PoH] ❌ SEVERE PoH regression detected! Block #{}: {} <= prev: {} (diff: {})", 
+                            microblock.height, microblock.poh_count, prev_poh_count, regression);
+                    return Err(format!(
+                        "Severe PoH regression: block #{} has {} but previous has {} (diff: {})",
+                        microblock.height, microblock.poh_count, prev_poh_count, regression
+                    ));
+                } else {
+                    // Log warning but accept the block - Byzantine consensus will validate
+                    println!("[PoH] ⚠️ Minor PoH regression at block #{}: {} <= prev: {} (acceptable)", 
+                            microblock.height, microblock.poh_count, prev_poh_count);
                 }
+            }
+            
+            // Log PoH progression (reduced frequency to avoid log spam)
+            if microblock.height % 100 == 0 {
+                println!("[PoH] ✅ PoH verified for block #{}: count={} (prev={})", 
+                        microblock.height, microblock.poh_count, prev_poh_count);
             }
         }
         
@@ -3590,67 +3641,121 @@ impl BlockchainNode {
         // PRODUCTION: Start microblock production ONLY for nodes that can produce blocks
         // Light nodes should NOT enter the production loop - they only sync
         if !matches!(self.node_type, NodeType::Light) {
-            // CRITICAL: Add startup delay for network stabilization and peer discovery
-            // This prevents block #1 creation failures when nodes start simultaneously
-            if self.storage.get_chain_height().unwrap_or(0) == 0 {
-                println!("[Node] ⏳ Genesis phase: Waiting for all 5 Genesis nodes to connect...");
-                println!("[Node] 📡 Byzantine consensus requires minimum 4 nodes");
+            // ========================================================================
+            // NETWORK STARTUP SYNCHRONIZATION (v2.19.13)
+            // ========================================================================
+            // ALL producer nodes (Full/Super) must:
+            // 1. Wait for minimum peers for Byzantine consensus (4 nodes)
+            // 2. Ensure Genesis block exists before starting production
+            // 3. Use REAL TCP connectivity checks, not deterministic lists
+            //
+            // This applies to:
+            // - Bootstrap nodes (genesis_node_001-005) on first start
+            // - Regular Full/Super nodes joining the network
+            // - Nodes restarting after crash
+            // ========================================================================
+            
+            let is_bootstrap_node = std::env::var("QNET_BOOTSTRAP_ID").is_ok();
+            let local_height = self.storage.get_chain_height().unwrap_or(0);
+            
+            println!("[Node] 🔄 Starting network synchronization (local height: {})...", local_height);
+            
+            if let Some(ref p2p) = self.unified_p2p {
+                let mut wait_time = 0u64;
+                const MAX_WAIT_SECS: u64 = 120; // 2 minutes max wait
+                const MIN_PEERS_FOR_CONSENSUS: usize = 4; // Byzantine: 3f+1 where f=1
                 
-                // CRITICAL FIX: Wait until we have enough nodes for Byzantine consensus
-                // ARCHITECTURE: Genesis bootstrap requires ALL 5 nodes for deterministic start
-                // This ensures no split brain and consistent producer selection
-                if let Some(ref p2p) = self.unified_p2p {
-                    let mut wait_time = 0;
-                    let is_genesis_node = std::env::var("QNET_BOOTSTRAP_ID").is_ok();
+                loop {
+                    // STEP 1: Check REAL peer connectivity (TCP check, not config list)
+                    let real_peer_count = if is_bootstrap_node {
+                        // Bootstrap nodes: Use TCP connectivity check to other Genesis nodes
+                        if p2p.verify_all_genesis_connectivity().await {
+                            5 // All 5 Genesis nodes connected
+                        } else {
+                            p2p.get_peer_count() + 1 // Actual connected + self
+                        }
+                    } else {
+                        // Regular nodes: Count real connected peers
+                        p2p.get_peer_count() + 1
+                    };
                     
-                    loop {
-                        let validated_peers = p2p.get_validated_active_peers();
-                        let total_nodes = validated_peers.len() + 1; // +1 for self
-                        
-                        // CRITICAL: Genesis nodes MUST wait for ALL 5 nodes
-                        // Regular nodes need only 4 for Byzantine consensus
-                        let required_nodes = if is_genesis_node { 5 } else { 4 };
-                        
-                        if total_nodes >= required_nodes {
-                            println!("[Node] ✅ Byzantine consensus ready: {} nodes connected", total_nodes);
-                            
-                            // CRITICAL: Genesis nodes verify ALL 5 are actually reachable
-                            if is_genesis_node && total_nodes == 5 {
-                                // Double-check connectivity to prevent false positives
-                                let all_reachable = p2p.verify_all_genesis_connectivity().await;
-                                if !all_reachable {
-                                    println!("[Node] ⚠️ Not all Genesis nodes reachable, retrying...");
-                                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                                    wait_time += 2;
+                    // STEP 2: Check Genesis block exists
+                    let has_genesis = self.storage.load_microblock(0)
+                        .map(|opt| opt.is_some())
+                        .unwrap_or(false);
+                    
+                    // STEP 3: Determine if ready to start
+                    let has_enough_peers = real_peer_count >= MIN_PEERS_FOR_CONSENSUS;
+                    let bootstrap_id = std::env::var("QNET_BOOTSTRAP_ID").unwrap_or_default();
+                    let is_genesis_creator = bootstrap_id == "001";
+                    
+                    // CRITICAL: ALL nodes (except 001) MUST have Genesis block before starting
+                    // Node 001 creates Genesis, all others must receive it
+                    let ready_to_start = has_enough_peers && (has_genesis || is_genesis_creator);
+                    
+                    if ready_to_start {
+                        if !has_genesis {
+                            if is_genesis_creator {
+                                // Node 001: Will create Genesis block after this loop
+                                println!("[Node] 🌍 Node 001: {} peers connected, will create Genesis block", real_peer_count);
+                                println!("[Node] 🚀 Starting production (Genesis creation pending)!");
+                                break;
+                            } else {
+                                // Nodes 002-005 and regular nodes: MUST wait for Genesis
+                                println!("[Node] ⏳ {} peers connected, waiting for Genesis block...", real_peer_count);
+                                
+                                // CRITICAL: Actively request Genesis from network
+                                if let Err(e) = p2p.sync_blocks(0, 0).await {
+                                    println!("[Node] ⚠️ Failed to request Genesis: {}", e);
+                                }
+                                
+                                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                                wait_time += 5;
+                                
+                                // Don't break - continue waiting for Genesis
+                                if wait_time < MAX_WAIT_SECS {
                                     continue;
+                                } else {
+                                    println!("[Node] ❌ CRITICAL: Timeout waiting for Genesis block!");
+                                    println!("[Node] ❌ Cannot start production without Genesis!");
+                                    // Still break but log critical error
+                                    break;
                                 }
                             }
-                            
-                            println!("[Node] 🚀 All required nodes found, starting production!");
-                            break;
-                        }
-                        
-                        println!("[Node] ⏳ Waiting for nodes: {}/{} connected ({}s elapsed)", 
-                                 total_nodes, required_nodes, wait_time);
-                        
-                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                        wait_time += 5;
-                        
-                        // Maximum wait: 120 seconds for Genesis, 60 for regular
-                        let max_wait = if is_genesis_node { 120 } else { 60 };
-                        if wait_time >= max_wait {
-                            println!("[Node] ⚠️ Timeout waiting for nodes, proceeding with {} nodes", total_nodes);
+                        } else {
+                            // Genesis exists - ready to start!
+                            println!("[Node] ✅ Network ready: {} peers connected, Genesis: YES", real_peer_count);
+                            println!("[Node] 🚀 Starting production!");
                             break;
                         }
                     }
                     
-                } else {
-                    // Fallback if no P2P
-                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    // Log progress
+                    println!("[Node] ⏳ Waiting: {} peers (need {}), Genesis: {} ({}s elapsed)", 
+                             real_peer_count, MIN_PEERS_FOR_CONSENSUS,
+                             if has_genesis { "YES" } else { "NO" }, wait_time);
+                    
+                    // Wait and retry
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    wait_time += 5;
+                    
+                    // Timeout check
+                    if wait_time >= MAX_WAIT_SECS {
+                        println!("[Node] ⚠️ Timeout after {}s, proceeding with {} peers", 
+                                wait_time, real_peer_count);
+                        break;
+                    }
                 }
-                
-                println!("[Node] ✅ Network stabilization complete, starting production");
             } else {
+                // No P2P - fallback wait
+                println!("[Node] ⚠️ No P2P available, waiting 30s for network...");
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            }
+            
+            println!("[Node] ✅ Network synchronization complete");
+            
+            // STEP 4: Sync with network if we have data but might be behind
+            if local_height > 0 {
                 // CRITICAL FIX: Sync with network before starting production
                 // This prevents creating blocks at wrong height when restarting
                 println!("[Node] 🔄 Syncing with network before starting production...");
@@ -3925,34 +4030,27 @@ impl BlockchainNode {
             // GENESIS BLOCK CREATION: Create Genesis Block if blockchain is empty
             // CRITICAL FIX: Check if Genesis block EXISTS, not just height == 0
             // This handles cases where storage reports wrong height but Genesis is missing
-            let genesis_check = storage.load_microblock(0);
-            println!("[GENESIS] 🔍 DEBUG: load_microblock(0) result: {:?}", 
-                     genesis_check.as_ref().map(|opt| opt.as_ref().map(|data| data.len())));
+            // 
+            // ARCHITECTURE (v2.19.13): Use load_microblock_auto_format for format-agnostic loading
+            // This handles both legacy MicroBlock and new EfficientMicroBlock formats with Zstd compression
+            let genesis_check = storage.load_microblock_auto_format(0);
+            println!("[GENESIS] 🔍 DEBUG: load_microblock_auto_format(0) result: {:?}", 
+                     genesis_check.as_ref().map(|opt| opt.as_ref().map(|b| b.height)));
             
             let genesis_exists = match genesis_check {
-                Ok(Some(ref data)) => {
-                    println!("[GENESIS] 🔍 DEBUG: Genesis block EXISTS in storage ({} bytes)", data.len());
-                    // Try to deserialize to verify it's valid
-                    match bincode::deserialize::<qnet_state::MicroBlock>(data) {
-                        Ok(block) => {
-                            println!("[GENESIS] 🔍 DEBUG: Genesis block is VALID (height={}, producer={})", 
-                                     block.height, block.producer);
-                            true
-                        }
-                        Err(e) => {
-                            println!("[GENESIS] ⚠️ DEBUG: Genesis block is CORRUPTED: {}", e);
-                            println!("[GENESIS] 🗑️ Deleting corrupted Genesis block...");
-                            let _ = storage.delete_microblock(0);
-                            false
-                        }
-                    }
+                Ok(Some(ref block)) => {
+                    println!("[GENESIS] 🔍 DEBUG: Genesis block EXISTS and VALID (height={}, producer={})", 
+                             block.height, block.producer);
+                    true
                 }
                 Ok(None) => {
                     println!("[GENESIS] 🔍 DEBUG: Genesis block does NOT exist in storage");
                     false
                 }
                 Err(e) => {
-                    println!("[GENESIS] ❌ DEBUG: Error loading Genesis block: {}", e);
+                    println!("[GENESIS] ⚠️ DEBUG: Genesis block exists but corrupted/unreadable: {}", e);
+                    println!("[GENESIS] 🗑️ Deleting corrupted Genesis block...");
+                    let _ = storage.delete_microblock(0);
                     false
                 }
             };
@@ -4348,8 +4446,10 @@ impl BlockchainNode {
                 certificate_cleanup_counter += 1;
                 certificate_broadcast_counter += 1;
                 
-                // PRODUCTION: Certificate management tasks (every 60 seconds)
-                if certificate_cleanup_counter >= 60 {
+                // PRODUCTION: Certificate cache cleanup (every 5 minutes)
+                // Removes expired certificates from cache (TTL: 9 min for verified, 5 min for pending)
+                // Low overhead: O(n) on ~5000 entries = ~50μs per cleanup
+                if certificate_cleanup_counter >= 300 {
                     certificate_cleanup_counter = 0;
                     
                     // Cleanup old certificates from cache
@@ -5621,28 +5721,17 @@ impl BlockchainNode {
                     // PRODUCTION QNet Consensus Integration
                     // QNet uses CommitRevealConsensus + ShardedConsensusManager for Byzantine Fault Tolerance
                     
-                    // EXISTING: QNet Phase-Aware Consensus Architecture for decentralized quantum blockchain
-                    // Genesis phase (height < 1000): ALL blocks require Byzantine safety (network formation)
-                    // Normal phase (height >= 1000): ONLY macroblocks require Byzantine consensus (every 90 blocks)
-                    // Reputation verification handled in select_microblock_producer() for all phases
+                    // ARCHITECTURE: Unified consensus for ALL blocks (no special phases)
+                    // - Microblocks: Quantum signatures (Dilithium3) + VRF producer selection
+                    // - Macroblocks (every 90): Byzantine consensus (BFT) for finalization
+                    // This ensures consistent security from block 0 to infinity
                     
-                    // EXISTING: Skip blocking sync in microblock critical path - handled in background
-                    
-                    // EXISTING: Normal phase microblocks use producer signatures + quantum cryptography
-                    // Byzantine consensus participation required ONLY for macroblock finalization every 90 blocks
-                    
-                    // EXISTING: Scalable architecture - microblocks 1s interval, macroblocks 90s consensus
+                    // SCALABILITY: microblocks 1s interval, macroblocks 90s consensus
                     // CRITICAL FIX: Height increment moved AFTER block creation to fix missing block #1
                     
                     // PRODUCTION: Use validated active peers for accurate count
                     let peer_count = if let Some(p2p) = &unified_p2p {
-                        // For Genesis phase, use validated peers (matches Byzantine safety checks)
-                        if microblock_height < 1000 {
-                            let validated = p2p.get_validated_active_peers();
-                            validated.len()
-                        } else {
                         p2p.get_peer_count()
-                        }
                     } else {
                         0
                     };
@@ -5947,11 +6036,13 @@ impl BlockchainNode {
                         }
                     }
                     
-                    // Apply local finalization for small transactions (< 100 QNT)
+                    // Apply local finalization for small transactions (< 100 QNC)
+                    // 100 QNC = 100 * 10^9 nanoQNC = 100_000_000_000
+                    const LOCAL_FINALITY_THRESHOLD: u64 = 100_000_000_000; // 100 QNC
                     let locally_finalized_count = txs.iter()
                         .filter(|tx| {
                             match &tx.tx_type {
-                                qnet_state::TransactionType::Transfer { amount, .. } => *amount < 100_000_000, // < 100 QNT  
+                                qnet_state::TransactionType::Transfer { amount, .. } => *amount < LOCAL_FINALITY_THRESHOLD,
                                 _ => false,
                             }
                         })
@@ -7783,134 +7874,6 @@ impl BlockchainNode {
                      MAX_VALIDATORS_PER_ROUND, all_qualified.len());
             Self::deterministic_validator_sampling(&all_qualified, MAX_VALIDATORS_PER_ROUND).await
         }
-    }
-    
-    /// DEPRECATED: No longer using phases - always use unified logic
-    #[allow(dead_code)]
-    async fn is_genesis_bootstrap_phase(_p2p: &Arc<SimplifiedP2P>) -> bool {
-        false // Always return false - we don't use phases anymore
-    }
-    
-    /// Legacy function kept for compatibility
-    #[allow(dead_code)]
-    async fn _is_genesis_bootstrap_phase_old(p2p: &Arc<SimplifiedP2P>) -> bool {
-        // PERFORMANCE FIX: Cache phase detection to prevent HTTP spam every microblock
-        // Network phase changes very rarely (only once at height 1000)
-        use std::sync::{Arc as StdArc, Mutex};
-        static CACHED_PHASE_DETECTION: std::sync::OnceLock<Mutex<(bool, u64, std::time::SystemTime)>> = std::sync::OnceLock::new();
-        
-        let phase_cache = CACHED_PHASE_DETECTION.get_or_init(|| Mutex::new((true, 0, std::time::SystemTime::UNIX_EPOCH)));
-        
-        let current_time = std::time::SystemTime::now();
-        
-        // Check cache first (refresh every 30 seconds to reduce HTTP calls)
-        if let Ok(cache) = phase_cache.lock() {
-            let (cached_is_genesis, cached_height, cached_time) = *cache;
-            
-            // Use cache if less than 30 seconds old and we're still in Genesis phase
-            // OR if we're in Normal phase (very unlikely to change back)
-            if let Ok(cache_age) = current_time.duration_since(cached_time) {
-                if cache_age.as_secs() < 30 || !cached_is_genesis {
-                    // EXISTING: Log only when transitioning or first time
-                    if cached_time == std::time::SystemTime::UNIX_EPOCH {
-                        println!("[PHASE] Network height: {} → {} phase (CACHED)", cached_height, 
-                                 if cached_is_genesis { "Genesis" } else { "Normal" });
-                    }
-                    return cached_is_genesis;
-                }
-            }
-        }
-        
-        // API DEADLOCK FIX: Use cached height to avoid blocking during consensus
-        // CRITICAL FIX: Add timeout to prevent deadlock on get_cached_network_height
-        // Try to get cached height first with timeout protection
-        let height_future = async {
-            p2p.get_cached_network_height()
-        };
-        
-        // Use timeout to prevent deadlock - 100ms should be enough for cache read
-        let height_result = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            height_future
-        ).await;
-        
-        if let Ok(Some(network_height)) = height_result {
-                let is_genesis = network_height < 1000; // EXISTING: First 1000 blocks = Genesis phase
-                
-                // Update cache
-                if let Ok(mut cache) = phase_cache.lock() {
-                    *cache = (is_genesis, network_height, current_time);
-                }
-                
-            println!("[PHASE] Network height: {} → {} phase (from cache)", network_height, 
-                         if is_genesis { "Genesis" } else { "Normal" });
-            return is_genesis;
-        } else if height_result.is_err() {
-            println!("[PHASE] ⚠️ Timeout getting cached height - using fallback");
-        }
-        
-        // Check if we're a bootstrap node
-        if std::env::var("QNET_BOOTSTRAP_ID").is_ok() || 
-           std::env::var("QNET_GENESIS_BOOTSTRAP").unwrap_or_default() == "1" {
-            // CRITICAL FIX: Genesis nodes also transition to Normal phase after 1000 blocks!
-            
-            // STEP 1: Try to get height from P2P cache (fastest, no I/O)
-            if let Some(height) = p2p.get_cached_network_height() {
-                let is_genesis = height < 1000;
-                
-                if let Ok(mut cache) = phase_cache.lock() {
-                    *cache = (is_genesis, height, current_time);
-                }
-                
-                if is_genesis {
-                    println!("[PHASE] Bootstrap node at height {} → Genesis phase (from P2P cache)", height);
-                } else {
-                    println!("[PHASE] ✅ Bootstrap node at height {} → Normal phase - using blockchain registry!", height);
-                }
-                
-                return is_genesis;
-            }
-            
-            // STEP 2: Fallback to LOCAL storage (fast, no network calls!)
-            // This handles startup before P2P cache is populated
-            if let Ok(storage_guard) = GLOBAL_STORAGE_INSTANCE.lock() {
-                if let Some(ref storage) = *storage_guard {
-                    if let Ok(local_height) = storage.get_chain_height() {
-                        if local_height > 0 {
-                            let is_genesis = local_height < 1000;
-                            
-                            if let Ok(mut cache) = phase_cache.lock() {
-                                *cache = (is_genesis, local_height, current_time);
-                            }
-                            
-                            if is_genesis {
-                                println!("[PHASE] Bootstrap node at height {} → Genesis phase (from local storage)", local_height);
-                            } else {
-                                println!("[PHASE] ✅ Bootstrap node at height {} → Normal phase - using blockchain registry! (from local storage)", local_height);
-                            }
-                            
-                            return is_genesis;
-                        }
-                    }
-                }
-            }
-            
-            // STEP 3: No data available - safe fallback to Genesis phase
-            // This only happens on FIRST startup with empty storage
-                if let Ok(mut cache) = phase_cache.lock() {
-                    *cache = (true, 0, current_time);
-            }
-            println!("[PHASE] Bootstrap mode - no height data available → Genesis phase (safe fallback)");
-            return true;
-        }
-        
-        // No cache and not bootstrap - assume Genesis phase for safety
-        if let Ok(mut cache) = phase_cache.lock() {
-            *cache = (true, 0, current_time);
-        }
-        
-        println!("[PHASE] No cached height → assuming Genesis phase (SAFE FALLBACK)");
-        true
     }
     
     /// DEPRECATED: Legacy function - use calculate_qualified_candidates() instead
@@ -12990,14 +12953,14 @@ fn verify_genesis_node_certificate(node_id: &str) -> bool {
     use sha3::{Sha3_256, Digest};
     use std::env;
     
-    // GENESIS PERIOD SIMPLIFIED: During network bootstrap, allow genesis nodes without certificates
-    // Check if this is genesis bootstrap period (network height < 1000 blocks)
-    let is_genesis_period = std::env::var("QNET_BOOTSTRAP_ID").is_ok() || 
+    // Bootstrap nodes are trusted during initial network formation
+    // Check if this is a bootstrap node (Genesis nodes 001-005)
+    let is_bootstrap_node = std::env::var("QNET_BOOTSTRAP_ID").is_ok() || 
                            std::env::var("QNET_GENESIS_BOOTSTRAP").unwrap_or_default() == "1";
     
-    if is_genesis_period {
-        println!("[SECURITY] ✅ Genesis bootstrap period: Allowing {} without certificate verification", node_id);
-        return true; // Trust all nodes during genesis bootstrap
+    if is_bootstrap_node {
+        println!("[SECURITY] ✅ Bootstrap node: Allowing {} without certificate verification", node_id);
+        return true; // Trust bootstrap nodes during initial network formation
     }
     
     // SECURITY: Genesis nodes must have cryptographic proof of identity

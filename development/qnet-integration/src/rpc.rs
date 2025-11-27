@@ -7339,7 +7339,7 @@ async fn handle_stats(
             "total_peers": total_peers,
             "active_peers": active_peers,
             "tps": network_tps,
-            "phase": if height < 1000 { "genesis" } else { "production" },
+            "phase": "production", // Unified phase - no special genesis handling
         },
         "node": {
             "id": blockchain.get_node_id(),
@@ -8718,7 +8718,7 @@ struct TokenDeployRequest {
     dilithium_public_key: Option<String>,
 }
 
-fn default_decimals() -> u8 { 18 }
+fn default_decimals() -> u8 { 9 } // QNet standard: 9 decimals (like SOL, QNC)
 
 /// Handle QRC-20 token deployment
 async fn handle_token_deploy(

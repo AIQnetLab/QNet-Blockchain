@@ -113,6 +113,218 @@ pub struct LightMicroBlock {
     pub producer: String,
 }
 
+// ============================================================================
+// VERSIONED STORAGE FORMAT (v2.19.13)
+// ============================================================================
+// This enum provides explicit versioning for stored blocks, eliminating
+// deserialization ambiguity between different block formats.
+// 
+// Architecture principles:
+// 1. First byte indicates version/format
+// 2. All formats can be converted to full MicroBlock when needed
+// 3. PoH state is stored separately for fast validation
+// ============================================================================
+
+/// Storage format version markers
+/// Used as first byte to identify stored block format
+pub mod storage_version {
+    /// Legacy MicroBlock with full transactions (pre-v2.19.8)
+    pub const V1_FULL_MICROBLOCK: u8 = 0x01;
+    /// EfficientMicroBlock with transaction hashes only (v2.19.8+)
+    pub const V2_EFFICIENT_MICROBLOCK: u8 = 0x02;
+    /// LightMicroBlock headers only for Light nodes (v2.19.8+)
+    pub const V3_LIGHT_MICROBLOCK: u8 = 0x03;
+    /// Future: Compressed format with dictionary
+    pub const V4_COMPRESSED: u8 = 0x04;
+}
+
+/// Versioned stored block - wraps different block formats with explicit version tag
+/// This is the PRIMARY format for storing blocks in RocksDB (v2.19.13+)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum StoredMicroBlock {
+    /// Version 1: Full MicroBlock with all transactions (legacy, for backward compat)
+    V1Full(MicroBlock),
+    /// Version 2: Efficient format - transaction hashes only, TX stored separately
+    V2Efficient(EfficientMicroBlock),
+    /// Version 3: Light format - headers only, no transactions or signatures
+    V3Light(LightMicroBlock),
+}
+
+impl StoredMicroBlock {
+    /// Get block height regardless of format
+    pub fn height(&self) -> u64 {
+        match self {
+            StoredMicroBlock::V1Full(b) => b.height,
+            StoredMicroBlock::V2Efficient(b) => b.height,
+            StoredMicroBlock::V3Light(b) => b.height,
+        }
+    }
+    
+    /// Get timestamp regardless of format
+    pub fn timestamp(&self) -> u64 {
+        match self {
+            StoredMicroBlock::V1Full(b) => b.timestamp,
+            StoredMicroBlock::V2Efficient(b) => b.timestamp,
+            StoredMicroBlock::V3Light(b) => b.timestamp,
+        }
+    }
+    
+    /// Get producer regardless of format
+    pub fn producer(&self) -> &str {
+        match self {
+            StoredMicroBlock::V1Full(b) => &b.producer,
+            StoredMicroBlock::V2Efficient(b) => &b.producer,
+            StoredMicroBlock::V3Light(b) => &b.producer,
+        }
+    }
+    
+    /// Get PoH state if available (not available for Light format)
+    pub fn poh_state(&self) -> Option<PoHState> {
+        match self {
+            StoredMicroBlock::V1Full(b) => Some(PoHState {
+                height: b.height,
+                poh_hash: b.poh_hash.clone(),
+                poh_count: b.poh_count,
+                previous_hash: b.previous_hash,
+            }),
+            StoredMicroBlock::V2Efficient(b) => Some(PoHState {
+                height: b.height,
+                poh_hash: b.poh_hash.clone(),
+                poh_count: b.poh_count,
+                previous_hash: b.previous_hash,
+            }),
+            StoredMicroBlock::V3Light(_) => None, // Light nodes don't store PoH
+        }
+    }
+    
+    /// Check if this format can provide full transaction data
+    pub fn has_full_transactions(&self) -> bool {
+        matches!(self, StoredMicroBlock::V1Full(_))
+    }
+    
+    /// Check if this format has transaction hashes
+    pub fn has_transaction_hashes(&self) -> bool {
+        matches!(self, StoredMicroBlock::V1Full(_) | StoredMicroBlock::V2Efficient(_))
+    }
+    
+    /// Get transaction count
+    pub fn tx_count(&self) -> usize {
+        match self {
+            StoredMicroBlock::V1Full(b) => b.transactions.len(),
+            StoredMicroBlock::V2Efficient(b) => b.transaction_hashes.len(),
+            StoredMicroBlock::V3Light(b) => b.tx_count as usize,
+        }
+    }
+    
+    /// Convert to EfficientMicroBlock (for V1Full, extracts hashes)
+    pub fn to_efficient(&self) -> Option<EfficientMicroBlock> {
+        match self {
+            StoredMicroBlock::V1Full(b) => Some(EfficientMicroBlock::from_microblock(b)),
+            StoredMicroBlock::V2Efficient(b) => Some(b.clone()),
+            StoredMicroBlock::V3Light(_) => None,
+        }
+    }
+    
+    /// Get merkle root
+    pub fn merkle_root(&self) -> [u8; 32] {
+        match self {
+            StoredMicroBlock::V1Full(b) => b.merkle_root,
+            StoredMicroBlock::V2Efficient(b) => b.merkle_root,
+            StoredMicroBlock::V3Light(b) => b.merkle_root,
+        }
+    }
+    
+    /// Get previous hash (not available for Light format)
+    pub fn previous_hash(&self) -> Option<[u8; 32]> {
+        match self {
+            StoredMicroBlock::V1Full(b) => Some(b.previous_hash),
+            StoredMicroBlock::V2Efficient(b) => Some(b.previous_hash),
+            StoredMicroBlock::V3Light(_) => None,
+        }
+    }
+}
+
+/// PoH (Proof of History) state for a block
+/// Stored separately for fast validation without loading full block
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PoHState {
+    /// Block height this PoH state belongs to
+    pub height: u64,
+    /// PoH hash at block creation (SHA3-512, 64 bytes)
+    pub poh_hash: Vec<u8>,
+    /// PoH counter at block creation
+    pub poh_count: u64,
+    /// Previous block hash (for chain verification)
+    pub previous_hash: [u8; 32],
+}
+
+impl PoHState {
+    /// Create new PoH state
+    pub fn new(height: u64, poh_hash: Vec<u8>, poh_count: u64, previous_hash: [u8; 32]) -> Self {
+        Self {
+            height,
+            poh_hash,
+            poh_count,
+            previous_hash,
+        }
+    }
+    
+    /// Create from MicroBlock
+    pub fn from_microblock(block: &MicroBlock) -> Self {
+        Self {
+            height: block.height,
+            poh_hash: block.poh_hash.clone(),
+            poh_count: block.poh_count,
+            previous_hash: block.previous_hash,
+        }
+    }
+    
+    /// Create from EfficientMicroBlock
+    pub fn from_efficient(block: &EfficientMicroBlock) -> Self {
+        Self {
+            height: block.height,
+            poh_hash: block.poh_hash.clone(),
+            poh_count: block.poh_count,
+            previous_hash: block.previous_hash,
+        }
+    }
+    
+    /// Validate PoH progression from previous state
+    /// Returns Ok(()) if valid, Err with reason if invalid
+    pub fn validate_progression(&self, prev: &PoHState) -> Result<(), String> {
+        // Height must be exactly one more than previous
+        if self.height != prev.height + 1 {
+            return Err(format!(
+                "Invalid height progression: expected {}, got {}",
+                prev.height + 1, self.height
+            ));
+        }
+        
+        // PoH count must be greater than previous (monotonic increase)
+        // Allow some tolerance for network delays (30 seconds max)
+        // 15M hashes at 500K/sec = 30 seconds < 90 sec macroblock interval
+        const MAX_ACCEPTABLE_REGRESSION: u64 = 15_000_000; // ~30 seconds at 500K/sec
+        
+        if self.poh_count <= prev.poh_count {
+            let regression = prev.poh_count - self.poh_count;
+            if regression > MAX_ACCEPTABLE_REGRESSION {
+                return Err(format!(
+                    "Severe PoH regression: {} <= {} (diff: {})",
+                    self.poh_count, prev.poh_count, regression
+                ));
+            }
+            // Minor regression is acceptable due to network delays
+        }
+        
+        Ok(())
+    }
+    
+    /// Check if PoH data is valid (non-empty)
+    pub fn is_valid(&self) -> bool {
+        !self.poh_hash.is_empty() && self.poh_count > 0
+    }
+}
+
 /// Block in the blockchain
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Block {
