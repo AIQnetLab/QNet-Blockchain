@@ -3710,7 +3710,7 @@ async fn verify_dilithium_signature(node_id: &str, challenge: &str, signature: &
     // Create DilithiumSignature struct from string signature
     let dilithium_sig = crate::quantum_crypto::DilithiumSignature {
         signature: signature.to_string(),
-        algorithm: "CRYSTALS-Dilithium".to_string(),
+        algorithm: "CRYSTALS-Dilithium3".to_string(),  // NIST FIPS 204 standard name
         timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
         strength: "quantum-resistant".to_string(),
     };

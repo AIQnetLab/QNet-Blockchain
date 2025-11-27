@@ -258,10 +258,10 @@ impl QNetQuantumCrypto {
                 timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
                 wallet,  // Now matches get_wallet_address() format!
                 signature: DilithiumSignature {
-                    signature: "genesis_signature".to_string(),
-                    algorithm: "dilithium5".to_string(),
+                    signature: "genesis_bootstrap_signature".to_string(),
+                    algorithm: "CRYSTALS-Dilithium3".to_string(),  // NIST FIPS 204
                     timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
-                    strength: "high".to_string(),
+                    strength: "quantum-resistant".to_string(),
                 },
                 entropy: "genesis_entropy".to_string(),
                 version: "2.0.0".to_string(),
@@ -360,10 +360,10 @@ impl QNetQuantumCrypto {
             node_type,
             timestamp,
             signature: DilithiumSignature {
-                signature: "route_ts_compatible".to_string(),
-                algorithm: "xor_encryption".to_string(),
+                signature: "activation_payload_signature".to_string(),
+                algorithm: "CRYSTALS-Dilithium3".to_string(),  // NIST FIPS 204
                 timestamp,
-                strength: "production".to_string(),
+                strength: "quantum-resistant".to_string(),
             },
             entropy: segment3[4..].to_string(), // Extract entropy from segment3
             version: "2.0.0".to_string(),
@@ -561,12 +561,9 @@ impl QNetQuantumCrypto {
             return Err(anyhow!("Empty signature"));
         }
 
-        // Accept both algorithm names for compatibility
-        // "CRYSTALS-Dilithium3" - created by create_consensus_signature()
-        // "QNet-Dilithium-Compatible" - legacy format from other parts of code
-        if signature.algorithm != "QNet-Dilithium-Compatible" && 
-           signature.algorithm != "CRYSTALS-Dilithium3" {
-            return Err(anyhow!("Unsupported signature algorithm: {}", signature.algorithm));
+        // NIST FIPS 204: Only accept standard algorithm name
+        if signature.algorithm != "CRYSTALS-Dilithium3" {
+            return Err(anyhow!("Unsupported signature algorithm: {} (expected CRYSTALS-Dilithium3)", signature.algorithm));
         }
 
         // 2. Parse signature format: "dilithium_sig_<node_id>_<base64>"
