@@ -79,10 +79,11 @@ export default function ActivatePage() {
     };
 
     // Determine network multiplier based on active nodes
-    let netMultiplier = 0.5;   // 0-100k nodes
-    if (activeNodes >= 10_000_000) netMultiplier = 3.0;      // 10M+ nodes
-    else if (activeNodes >= 1_000_000) netMultiplier = 2.0;  // 1M-10M nodes  
-    else if (activeNodes >= 100_000) netMultiplier = 1.0;    // 100k-1M nodes
+    // CANONICAL VALUES: ≤100K=0.5x, ≤300K=1.0x, ≤1M=2.0x, >1M=3.0x
+    let netMultiplier = 0.5;   // ≤100K nodes
+    if (activeNodes > 1_000_000) netMultiplier = 3.0;       // >1M: Maximum (cap)
+    else if (activeNodes > 300_000) netMultiplier = 2.0;    // ≤1M: High demand
+    else if (activeNodes > 100_000) netMultiplier = 1.0;    // ≤300K: Base price
 
     const basePrice = basePrices[type];
     const currentPrice = Math.round(basePrice * netMultiplier);

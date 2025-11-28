@@ -1,18 +1,6 @@
-pluginManagement {
-    repositories {
-        google()
-        mavenCentral()
-        gradlePluginPortal()
-    }
-}
-
+pluginManagement { includeBuild("../node_modules/@react-native/gradle-plugin") }
+plugins { id("com.facebook.react.settings") }
+extensions.configure(com.facebook.react.ReactSettingsExtension){ ex -> ex.autolinkLibrariesFromCommand() }
 rootProject.name = 'qnet-mobile'
-
-// Include React Native autolinking if available
-def rnAutolink = file("../node_modules/@react-native-community/cli-platform-android/native_modules.gradle")
-if (rnAutolink.exists()) {
-    apply from: rnAutolink
-    applyNativeModulesSettingsGradle(settings)
-}
-
 include ':app'
+includeBuild('../node_modules/@react-native/gradle-plugin')

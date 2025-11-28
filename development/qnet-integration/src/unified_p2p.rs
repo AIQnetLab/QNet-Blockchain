@@ -4639,30 +4639,30 @@ impl SimplifiedP2P {
                 // Skip self and check if working
                 if !self.node_id.contains(&format!("{:03}", id.parse::<usize>().unwrap_or(0) + 1)) {
                     if working_genesis_ips.contains(&ip.to_string()) {
-                    genesis_peers.push(PeerInfo {
-                        id: node_id,
-                        addr: addr.clone(),
-                        node_type: NodeType::Super,
-                        region: get_genesis_region_by_index(id.parse::<usize>().unwrap_or(0).saturating_sub(1)),
-                        last_seen: chrono::Utc::now().timestamp() as u64,
-                        is_stable: true,
-                        latency_ms: 10,
-                        connection_count: 5,
-                        bandwidth_usage: 1000,
-                        node_id_hash: Vec::new(),
-                        bucket_index: 0,
-                        consensus_score: 70.0,  // Genesis nodes start at consensus threshold
-                        network_score: 100.0,   // Optimal network performance
-                        reputation_score: None, // Legacy field (deprecated)
-                        successful_pings: 100,
-                        failed_pings: 0,
-                    });
+                        // PRODUCTION: Get REAL peer data from connected_peers_lockfree
+                        // NO FALLBACK! If peer not found in P2P state, skip it (not really connected)
+                        let peer_data = self.connected_peers_lockfree
+                            .iter()
+                            .find(|entry| entry.value().id == node_id)
+                            .map(|entry| entry.value().clone());
+                        
+                        match peer_data {
+                            Some(real_peer) => {
+                                // PRODUCTION: Use ALL real data from P2P state
+                                genesis_peers.push(real_peer);
+                            }
+                            None => {
+                                // PRODUCTION: Peer not in P2P state = not really connected
+                                // Log but don't add phantom peer with fake data
+                                println!("[P2P] ⚠️ Genesis peer {} not in P2P state - skipping (no fake data)", node_id);
+                            }
+                        }
                     }
                 }
             }
             
-            // PHANTOM PEER FIX: Only report real connected count, not potential Genesis nodes
-            println!("[P2P] 🌱 Genesis mode: returning {} REAL connected peers (not phantom)", 
+            // PRODUCTION: Only return REAL connected peers with REAL reputation
+            println!("[P2P] 🌱 Genesis mode: returning {} REAL connected peers (no phantoms, no fake reputation)", 
                      genesis_peers.len());
             genesis_peers
         } else {
@@ -4986,29 +4986,30 @@ impl SimplifiedP2P {
                 // Example: if self.node_id="genesis_node_005", contains("005") excludes ALL nodes with "005"
                 // This caused certificate broadcast failure for rotated producers!
                 if self.node_id != node_id {  // Exact comparison - only skip if EXACTLY same node
-                    genesis_peers.push(PeerInfo {
-                        id: node_id.clone(),
-                        addr: peer_addr,
-                        node_type: NodeType::Super,
-                        region: get_genesis_region_by_index(i),
-                        last_seen: chrono::Utc::now().timestamp() as u64,
-                        is_stable: true,
-                        latency_ms: 10,
-                        connection_count: 5,
-                        bandwidth_usage: 1000,
-                        node_id_hash: Vec::new(),
-                        bucket_index: 0,
-                        consensus_score: 70.0,  // Universal consensus threshold (ALL node types)
-                        network_score: 100.0,   // Optimal network performance
-                        reputation_score: None, // Legacy (deprecated)
-                        successful_pings: 100,
-                        failed_pings: 0,
-                    });
-                    println!("[P2P]   ├── {}", node_id);
+                    // PRODUCTION: Get REAL reputation from connected_peers_lockfree
+                    // PRODUCTION: Get REAL peer data from connected_peers_lockfree
+                    // NO FALLBACK! If peer not found, skip it (not really connected)
+                    let peer_data = self.connected_peers_lockfree
+                        .iter()
+                        .find(|entry| entry.value().id == node_id)
+                        .map(|entry| entry.value().clone());
+                    
+                    match peer_data {
+                        Some(real_peer) => {
+                            // PRODUCTION: Use ALL real data from P2P state
+                            println!("[P2P]   ├── {} (rep: {:.1}%, latency: {}ms)", 
+                                     real_peer.id, real_peer.consensus_score, real_peer.latency_ms);
+                            genesis_peers.push(real_peer);
+                        }
+                        None => {
+                            // PRODUCTION: Peer not in P2P state = not connected yet
+                            println!("[P2P]   ├── {} (NOT CONNECTED - skipping)", node_id);
+                        }
+                    }
                 }
             }
             
-            println!("[P2P] ✅ Peer list: {} nodes (NO TCP checks - deterministic)", genesis_peers.len());
+            println!("[P2P] ✅ Peer list: {} REAL connected nodes (all data from P2P state)", genesis_peers.len());
             return genesis_peers;
         }
         
@@ -5182,31 +5183,31 @@ impl SimplifiedP2P {
                     let mut genesis_peer_ids = std::collections::HashSet::new();
                     
                     println!("[P2P] 📋 Adding deterministic Genesis peers for consensus (regular node)");
-                    for (i, ip) in genesis_ips.iter().enumerate() {
+                    for (i, _ip) in genesis_ips.iter().enumerate() {
                         let node_id = format!("genesis_node_{:03}", i + 1);
-                        let peer_addr = format!("{}:8001", ip);
                         
-                        // Add all Genesis peers (no self-exclusion for regular nodes)
+                        // Always track Genesis peer IDs for deduplication
                         genesis_peer_ids.insert(node_id.clone());
-                        all_validated_peers.push(PeerInfo {
-                            id: node_id.clone(),
-                            addr: peer_addr,
-                            node_type: NodeType::Super,
-                            region: get_genesis_region_by_index(i),
-                            last_seen: chrono::Utc::now().timestamp() as u64,
-                            is_stable: true,
-                            latency_ms: 10,
-                            connection_count: 5,
-                            bandwidth_usage: 1000,
-                            node_id_hash: Vec::new(),
-                            bucket_index: 0,
-                            consensus_score: 70.0,  // Genesis consensus threshold
-                            network_score: 100.0,   // Optimal performance
-                            reputation_score: None, // Legacy (deprecated)
-                            successful_pings: 100,
-                            failed_pings: 0,
-                        });
-                        println!("[P2P]   ├── {} (deterministic for consensus)", node_id);
+                        
+                        // PRODUCTION: Get REAL peer data from connected_peers_lockfree
+                        // NO FALLBACK! If peer not found, skip it (not really connected)
+                        let peer_data = self.connected_peers_lockfree
+                            .iter()
+                            .find(|entry| entry.value().id == node_id)
+                            .map(|entry| entry.value().clone());
+                        
+                        match peer_data {
+                            Some(real_peer) => {
+                                // PRODUCTION: Use ALL real data from P2P state
+                                println!("[P2P]   ├── {} (rep: {:.1}%, latency: {}ms)", 
+                                         real_peer.id, real_peer.consensus_score, real_peer.latency_ms);
+                                all_validated_peers.push(real_peer);
+                            }
+                            None => {
+                                // PRODUCTION: Peer not in P2P state = not connected yet
+                                println!("[P2P]   ├── {} (NOT CONNECTED - skipping)", node_id);
+                            }
+                        }
                     }
                     
                     // STEP 2: Add DHT-discovered peers (excluding Genesis to avoid duplicates)

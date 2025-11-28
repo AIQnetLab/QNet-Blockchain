@@ -461,6 +461,18 @@ export class SolanaIntegration {
         try {
             const burnPercent = await this.getBurnPercentage();
             
+            // PRODUCTION: Handle null burn data
+            if (burnPercent === null) {
+                return {
+                    nodeType: nodeType,
+                    cost: null,
+                    currency: '1DEV',
+                    phase: 1,
+                    error: 'Burn data unavailable - cannot calculate price',
+                    unavailable: true
+                };
+            }
+            
             // Check if Phase 2 (90% burned or 5 years passed)
             if (burnPercent >= 90) {
                 // Phase 2: QNC activation with dynamic network multiplier
@@ -470,19 +482,20 @@ export class SolanaIntegration {
                     super: 10000  // Base QNC cost
                 };
                 
-                // Get active nodes count (mock for now)
-                const activeNodesCount = 150000; // TODO: Get real count from blockchain
+                // PRODUCTION: Get real active nodes count from QNet API
+                const activeNodesCount = await this.getNetworkSize();
                 
                 // Calculate network size multiplier
+                // CANONICAL VALUES: ≤100K=0.5x, ≤300K=1.0x, ≤1M=2.0x, >1M=3.0x
                 let multiplier = 1.0;
                 if (activeNodesCount <= 100000) {
-                    multiplier = 0.5; // Early network discount
+                    multiplier = 0.5; // ≤100K: Early adopter discount
                 } else if (activeNodesCount <= 300000) {
-                    multiplier = 1.0; // Standard rate
+                    multiplier = 1.0; // ≤300K: Base price
                 } else if (activeNodesCount <= 1000000) {
-                    multiplier = 2.0; // High demand
+                    multiplier = 2.0; // ≤1M: High demand
                 } else {
-                    multiplier = 3.0; // Mature network (1M+)
+                    multiplier = 3.0; // >1M: Maximum (cap)
                 }
                 
                 const baseCost = phase2BaseCosts[nodeType] || phase2BaseCosts.full;
@@ -531,15 +544,18 @@ export class SolanaIntegration {
 
         } catch (error) {
             console.error('Failed to get burn pricing:', error);
-            // Fallback to base price
+            // PRODUCTION: Return error state with max price indicator
+            // Phase 1 max price is 1500 1DEV (at 0% burn)
             return {
                 nodeType: nodeType,
-                cost: 1500, // Phase 1 base price
+                cost: null,
+                baseCost: 1500, // For reference only
                 currency: '1DEV',
                 phase: 1,
                 universalPrice: true,
                 mechanism: 'burn',
-                error: error.message
+                error: 'Burn data unavailable - cannot calculate discount',
+                unavailable: true
             };
         }
     }
@@ -567,8 +583,9 @@ export class SolanaIntegration {
             
         } catch (error) {
             console.error('Failed to get real burn percentage:', error);
-            // Fallback to demo value
-            return 15.7;
+            // PRODUCTION: Return null to indicate unavailable data
+            // Callers must handle null and show error to user
+            return null;
         }
     }
 
@@ -705,7 +722,8 @@ export class SolanaIntegration {
             const networkAge = await this.getNetworkAgeYears();
             
             // Phase 2 conditions: 90% burned OR 5+ years (whichever comes first)
-            if (burnPercent >= 90 || networkAge >= 5) {
+            // Note: burnPercent can be null if API unavailable
+            if ((burnPercent !== null && burnPercent >= 90) || networkAge >= 5) {
                 return 2;
             }
             
@@ -763,15 +781,16 @@ export class SolanaIntegration {
             };
             
             // Network size multipliers
+            // CANONICAL VALUES: ≤100K=0.5x, ≤300K=1.0x, ≤1M=2.0x, >1M=3.0x
             let multiplier = 1.0;
-            if (networkSize < 100000) {
-                multiplier = 0.5; // Early discount
-            } else if (networkSize < 1000000) {
-                multiplier = 1.0; // Standard rate
-            } else if (networkSize < 10000000) {
-                multiplier = 2.0; // High demand
+            if (networkSize <= 100000) {
+                multiplier = 0.5; // ≤100K: Early adopter discount
+            } else if (networkSize <= 300000) {
+                multiplier = 1.0; // ≤300K: Base price
+            } else if (networkSize <= 1000000) {
+                multiplier = 2.0; // ≤1M: High demand
             } else {
-                multiplier = 3.0; // Mature network
+                multiplier = 3.0; // >1M: Maximum (cap)
             }
             
             const baseCost = baseCosts[nodeType] || baseCosts.light;
@@ -790,40 +809,103 @@ export class SolanaIntegration {
 
         } catch (error) {
             console.error('Failed to get QNC activation costs:', error);
-            // Fallback costs
+            // PRODUCTION: Return error state, NOT fake prices
             return {
                 nodeType: nodeType,
-                cost: nodeType === 'super' ? 10000 : nodeType === 'full' ? 7500 : 5000,
+                cost: null,
+                baseCost: null,
+                multiplier: null,
+                networkSize: null,
                 currency: 'QNC',
                 phase: 2,
                 mechanism: 'spend_to_pool3',
-                error: error.message
+                error: 'QNC costs unavailable - network data unreachable',
+                unavailable: true
             };
         }
     }
 
+    // CACHE: Network size (avoid spamming bootstrap nodes)
+    static _networkSizeCache = null;
+    static _networkSizeCacheTime = 0;
+    static NETWORK_SIZE_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+    
     /**
-     * Get current network size
+     * Get current network size from QNet bootstrap nodes
+     * PRODUCTION: Real API call with caching to reduce load
      */
     async getNetworkSize() {
+        // CHECK CACHE FIRST
+        const now = Date.now();
+        if (SolanaIntegration._networkSizeCache !== null && 
+            (now - SolanaIntegration._networkSizeCacheTime) < SolanaIntegration.NETWORK_SIZE_CACHE_TTL) {
+            console.log(`[PRICING] 📦 Using cached network size: ${SolanaIntegration._networkSizeCache}`);
+            return SolanaIntegration._networkSizeCache;
+        }
+        
+        // PRODUCTION: Real Genesis node IPs (from genesis_constants.rs)
+        const bootstrapNodes = [
+            'http://154.38.160.39:8080',   // Genesis #1 - North America
+            'http://62.171.157.44:8080',   // Genesis #2 - Europe
+            'http://161.97.86.81:8080',    // Genesis #3 - Europe
+            'http://5.189.130.160:8080',   // Genesis #4 - Europe
+            'http://162.244.25.114:8080'   // Genesis #5 - Europe
+        ];
+        
         try {
-            // Try background script first
+            // Try background script first (if available)
             if (typeof chrome !== 'undefined' && chrome.runtime) {
-                const response = await chrome.runtime.sendMessage({
-                    type: 'GET_NETWORK_SIZE'
-                });
-                
-                if (response?.success) {
-                    return response.networkSize || 156;
+                try {
+                    const response = await chrome.runtime.sendMessage({
+                        type: 'GET_NETWORK_SIZE'
+                    });
+                    
+                    if (response?.success && response.networkSize > 0) {
+                        // UPDATE CACHE
+                        SolanaIntegration._networkSizeCache = response.networkSize;
+                        SolanaIntegration._networkSizeCacheTime = now;
+                        console.log(`[PRICING] 📊 Network size from background: ${response.networkSize} (cached for 5 min)`);
+                        return response.networkSize;
+                    }
+                } catch (bgError) {
+                    // Background script not available, try direct API
                 }
             }
 
-            // Fallback: Demo network size
-            return 156; // Demo: small network, 0.5x multiplier
+            // Try bootstrap nodes directly
+            for (const apiUrl of bootstrapNodes) {
+                try {
+                    const response = await fetch(`${apiUrl}/api/v1/network/stats`, {
+                        method: 'GET',
+                        headers: { 'Content-Type': 'application/json' },
+                        signal: AbortSignal.timeout(5000)
+                    });
+                    
+                    if (response.ok) {
+                        const stats = await response.json();
+                        const totalNodes = (stats.light_nodes || 0) + 
+                                          (stats.full_nodes || 0) + 
+                                          (stats.super_nodes || 0);
+                        if (totalNodes > 0) {
+                            // UPDATE CACHE
+                            SolanaIntegration._networkSizeCache = totalNodes;
+                            SolanaIntegration._networkSizeCacheTime = now;
+                            console.log(`[PRICING] 📊 Network size fetched: ${totalNodes} (cached for 5 min)`);
+                            return totalNodes;
+                        }
+                    }
+                } catch (nodeError) {
+                    continue; // Try next node
+                }
+            }
+
+            // All failed - throw error, don't use fake data
+            console.error('[PRICING] ❌ Could not reach any bootstrap nodes for network size');
+            throw new Error('Network size unavailable - all bootstrap nodes unreachable');
 
         } catch (error) {
             console.error('Failed to get network size:', error);
-            return 156; // Default small network
+            throw new Error('Network size unavailable: ' + error.message);
         }
     }
 

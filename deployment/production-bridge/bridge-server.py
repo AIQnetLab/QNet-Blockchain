@@ -92,7 +92,8 @@ async def get_current_network_size() -> int:
     except Exception as e:
         print(f"⚠️ Failed to get network size, using safe default: {e}")
         # Safe default: medium network size (1.0x multiplier)
-        return 500000  # 500k nodes = 1.0x multiplier
+        # CANONICAL: ≤100K=0.5x, ≤300K=1.0x, ≤1M=2.0x, >1M=3.0x
+        return 200000  # 200k nodes = 1.0x multiplier (within ≤300K range)
 
 async def get_1dev_burn_state() -> dict:
     """Get current 1DEV burn state for network size estimation"""

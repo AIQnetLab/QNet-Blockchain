@@ -1047,11 +1047,12 @@ async fn get_real_token_supply(rpc_url: &str, token_mint: &str) -> Result<TokenS
 // This function removed - now using real network scanning instead of token burn estimation
 
 fn calculate_network_multiplier(network_size: u64) -> f64 {
+    // CANONICAL VALUES - same across all components
     match network_size {
-        0..=10_000 => 0.5,      // Early network discount
-        10_001..=100_000 => 1.0, // Standard pricing
-        100_001..=1_000_000 => 2.0, // High demand
-        _ => 3.0                 // Mature network premium
+        0..=100_000 => 0.5,          // ≤100K: Early adopter discount
+        100_001..=300_000 => 1.0,    // ≤300K: Base price
+        300_001..=1_000_000 => 2.0,  // ≤1M: High demand
+        _ => 3.0                     // >1M: Maximum (cap)
     }
 }
 

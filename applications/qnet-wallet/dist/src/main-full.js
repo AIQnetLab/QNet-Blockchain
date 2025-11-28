@@ -610,7 +610,10 @@ async function updateNodeCard() {
             </div>
         `;
         
-        const canActivate = walletState.currentPhase === 2 && qncBalance >= 5000;
+        // PRODUCTION: Minimum activation cost is 5000 × 0.5 = 2500 QNC (Light node at early stage)
+        // Show button as enabled if user has at least minimum possible cost
+        const minPossibleCost = 2500; // Light node with 0.5x multiplier
+        const canActivate = walletState.currentPhase === 2 && qncBalance >= minPossibleCost;
         const buttonText = canActivate ? '🚀 Activate Node' : 'Insufficient Balance';
         const buttonClass = canActivate ? 'qnet-button primary gradient' : 'qnet-button primary disabled';
         

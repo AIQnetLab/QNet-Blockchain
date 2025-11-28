@@ -524,8 +524,17 @@ export async function checkServerNodeStatus(activationCode, nodeId = null) {
   try {
     const apiUrl = getRandomBootstrapNode();
     
+    // GENESIS NODE SUPPORT: Convert Genesis activation code to node_id
+    // Genesis codes: QNET-BOOT-000X-STRAP → genesis_node_00X
     let queryParams = '';
-    if (activationCode) {
+    const genesisMatch = activationCode?.match(/^QNET-BOOT-000([1-5])-STRAP$/);
+    
+    if (genesisMatch) {
+      // Genesis node: use node_id format for API query
+      const bootstrapId = genesisMatch[1].padStart(3, '0');
+      const genesisNodeId = `genesis_node_${bootstrapId}`;
+      queryParams = `node_id=${encodeURIComponent(genesisNodeId)}`;
+    } else if (activationCode) {
       queryParams = `activation_code=${encodeURIComponent(activationCode)}`;
     } else if (nodeId) {
       queryParams = `node_id=${encodeURIComponent(nodeId)}`;

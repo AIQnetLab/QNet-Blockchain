@@ -175,6 +175,23 @@ use bincode;
 use flate2;
 use serde::{Serialize, Deserialize};
 
+/// Generate proper EON address from any string identifier
+/// Format: {19 hex}eon{15 hex}{4 hex checksum} = 41 characters
+/// Used for fallback wallet address generation when real address is not available
+fn generate_eon_address_from_id(id: &str) -> String {
+    let hash = blake3::hash(id.as_bytes()).to_hex();
+    let part1 = &hash[..19];
+    let part2 = &hash[19..34];
+    
+    // Generate SHA3-256 checksum (first 4 hex chars)
+    let checksum_input = format!("{}eon{}", part1, part2);
+    let mut hasher = Sha3_256::new();
+    hasher.update(checksum_input.as_bytes());
+    let checksum = hex::encode(&hasher.finalize()[..2]); // 2 bytes = 4 hex chars
+    
+    format!("{}eon{}{}", part1, part2, checksum)
+}
+
 // DYNAMIC NETWORK DETECTION - No timestamp dependency for robust deployment
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -595,10 +612,7 @@ impl BlockchainNode {
                 // Process chunk (can be parallelized with rayon if needed)
                 for (light_node_id, _slot, pinger_id, timestamp) in chunk {
                     let wallet_address = p2p.get_light_node_wallet(&light_node_id)
-                        .unwrap_or_else(|| {
-                            let hash = blake3::hash(light_node_id.as_bytes()).to_hex();
-                            format!("{}eon{}", &hash[..20], &hash[20..40])
-                        });
+                        .unwrap_or_else(|| generate_eon_address_from_id(&light_node_id));
                     
                     chunk_registrations.push((light_node_id.clone(), wallet_address));
                     
@@ -633,10 +647,7 @@ impl BlockchainNode {
             // Small dataset: process sequentially (no overhead)
             for (light_node_id, _slot, pinger_id, timestamp) in &light_attestations {
                 let wallet_address = p2p.get_light_node_wallet(&light_node_id)
-                    .unwrap_or_else(|| {
-                        let hash = blake3::hash(light_node_id.as_bytes()).to_hex();
-                        format!("{}eon{}", &hash[..20], &hash[20..40])
-                    });
+                    .unwrap_or_else(|| generate_eon_address_from_id(&light_node_id));
                 
                 let _ = reward_manager.register_node(
                     light_node_id.clone(), 
@@ -687,10 +698,7 @@ impl BlockchainNode {
                 .ok()
                 .flatten()
                 .map(|(_, wallet, _)| wallet)
-                .unwrap_or_else(|| {
-                    let hash = blake3::hash(node_id.as_bytes()).to_hex();
-                    format!("{}eon{}", &hash[..20], &hash[20..40])
-                });
+                .unwrap_or_else(|| generate_eon_address_from_id(&node_id));
             
             let reward_type = match node_type.as_str() {
                 "super" => RewardNodeType::Super,
@@ -969,8 +977,8 @@ impl BlockchainNode {
                         .flatten()
                         .map(|(_, wallet, _)| wallet)
                         .unwrap_or_else(|| {
-                            let hash = blake3::hash(node_id.as_bytes()).to_hex();
-                            format!("{}eon{}", &hash[..20], &hash[20..40])
+                            // PRODUCTION FORMAT: 19 + 3 + 15 + 4 = 41 characters
+                            generate_eon_address_from_id(&node_id)
                         });
                     
                     let _ = reward_manager.register_node(node_id.clone(), node_type, wallet_address);
@@ -1489,6 +1497,11 @@ impl BlockchainNode {
         let reward_manager = Arc::new(RwLock::new(
             PhaseAwareRewardManager::new(genesis_timestamp)
         ));
+        
+        // CRITICAL: Update global pricing state with Genesis timestamp
+        // This enables dynamic pricing in quantum_crypto.rs
+        crate::update_global_pricing_state(0.0, 5, genesis_timestamp);
+        println!("[PRICING] 📊 Global pricing state initialized with genesis_timestamp: {}", genesis_timestamp);
         
         // CRITICAL: Restore pending rewards from storage (survive restarts)
         {
@@ -2521,9 +2534,12 @@ impl BlockchainNode {
                         println!("[BLOCKS] ✅ Block #{} stored successfully", received_block.height);
                     }
                     
-                    // METRICS: Track successful retry (block was in pending_blocks and now stored)
-                    if pending_blocks.contains_key(&received_block.height) {
+                    // CRITICAL FIX: Remove block from pending_blocks after successful storage
+                    // This prevents infinite retry loops and memory leaks
+                    if pending_blocks.remove(&received_block.height).is_some() {
+                        // METRICS: Track successful retry
                         RETRY_SUCCESS.fetch_add(1, Ordering::Relaxed);
+                        println!("[BLOCKS] ✅ Block #{} removed from pending buffer (retry successful)", received_block.height);
                     }
                     
                     // CRITICAL FIX: Check if we're the producer for next block after rotation boundary
@@ -4457,6 +4473,15 @@ impl BlockchainNode {
                         let mut cert_manager = p2p.certificate_manager.write().unwrap();
                         cert_manager.cleanup();
                         println!("[CERTIFICATE] 🧹 Certificate cache cleaned");
+                        
+                        // CRITICAL: Update global pricing state with REAL network data
+                        // This enables dynamic pricing in quantum_crypto.rs
+                        let active_peers = p2p.get_peer_count() as u64 + 1; // +1 for self
+                        let genesis_ts = crate::GLOBAL_GENESIS_TIMESTAMP.load(std::sync::atomic::Ordering::Relaxed);
+                        // TODO: Get real burn percentage from Solana bridge when available
+                        let burn_pct = crate::GLOBAL_BURN_PERCENTAGE.load(std::sync::atomic::Ordering::Relaxed) as f64 / 100.0;
+                        crate::update_global_pricing_state(burn_pct, active_peers, genesis_ts);
+                        println!("[PRICING] 📊 Global state updated: {} active nodes", active_peers);
                     }
                 }
                 
@@ -5323,6 +5348,115 @@ impl BlockchainNode {
                                 // Liveness: Network must continue even if peers are slow to respond
                                 println!("[CONSENSUS] ⏳ No entropy responses (peers lagging) - continuing with FINALITY_WINDOW safety");
                             }
+                            
+                            // CRITICAL FIX: Check if selected producer is synchronized
+                            // If producer returned entropy=0, they don't have the entropy block → NOT synchronized
+                            // This prevents selecting a lagging node as producer (e.g., node stuck at height 1)
+                            // ARCHITECTURE: A producer MUST have blocks up to (current_height - FINALITY_WINDOW)
+                            // If they don't, they cannot create valid blocks with correct PoH
+                            let producer_is_synchronized = {
+                                let responses = ENTROPY_RESPONSES.lock().unwrap();
+                                // Check if current_producer returned entropy = 0 (not synchronized)
+                                let producer_entropy = responses.get(&(entropy_height, current_producer.clone()));
+                                match producer_entropy {
+                                    Some(entropy) if *entropy == [0u8; 32] => {
+                                        // Producer returned 0 = NOT synchronized (doesn't have entropy block)
+                                        println!("[PRODUCER] ❌ Selected producer {} returned entropy=0 (NOT SYNCHRONIZED)", current_producer);
+                                        println!("[PRODUCER] 📊 Producer is missing block #{} (finality window)", entropy_height);
+                                        false
+                                    }
+                                    Some(_) => {
+                                        // Producer returned valid entropy = synchronized
+                                        true
+                                    }
+                                    None => {
+                                        // No response from producer - could be network issue or lagging
+                                        // Be conservative: assume synchronized if no response (Byzantine resilience)
+                                        // Other nodes will reject invalid blocks anyway
+                                        println!("[PRODUCER] ⚠️ No entropy response from producer {} - assuming synchronized", current_producer);
+                                        true
+                                    }
+                                }
+                            };
+                            
+                            // If producer is NOT synchronized, select next candidate
+                            if !producer_is_synchronized {
+                                println!("[PRODUCER] 🔄 Selecting next synchronized candidate...");
+                                
+                                // Get list of candidates who ARE synchronized (returned valid entropy)
+                                let synchronized_candidates: Vec<String> = {
+                                    let responses = ENTROPY_RESPONSES.lock().unwrap();
+                                    responses.iter()
+                                        .filter(|((height, _), entropy)| {
+                                            *height == entropy_height && 
+                                            **entropy != [0u8; 32] && // Has valid entropy
+                                            **entropy == our_entropy   // Matches consensus
+                                        })
+                                        .map(|((_, node_id), _)| node_id.clone())
+                                        .collect()
+                                };
+                                
+                                if synchronized_candidates.is_empty() {
+                                    println!("[PRODUCER] ⚠️ No synchronized candidates found - waiting for network sync");
+                                    // Skip this round - network needs to synchronize
+                                    tokio::time::sleep(Duration::from_secs(2)).await;
+                                    continue;
+                                }
+                                
+                                // Select from synchronized candidates using SAME quantum-resistant algorithm
+                                // ARCHITECTURE: Identical to primary producer selection (lines 7325-7360)
+                                // - SHA3-512 (NIST approved, post-quantum secure hash)
+                                // - Entropy from Dilithium-signed blocks (quantum-resistant signatures)
+                                // - Deterministic across all nodes for Byzantine consensus
+                                // NIST/Cisco compliant: SHA3-512 is quantum-resistant hash function
+                                use sha3::{Sha3_512, Digest};
+                                let mut selector = Sha3_512::new();
+                                
+                                // CRITICAL: Use same structure as primary selection for consistency
+                                // Domain separator prevents cross-protocol attacks
+                                selector.update(b"QNet_Quantum_Fallback_Producer_Selection_v1");
+                                
+                                // Entropy source: comes from Dilithium-signed blocks (quantum-resistant)
+                                // This is the SAME entropy used in primary selection
+                                selector.update(&our_entropy);
+                                
+                                // Add block height and round for uniqueness
+                                let leadership_round = (next_block_height - 1) / ROTATION_INTERVAL_BLOCKS;
+                                selector.update(&leadership_round.to_le_bytes());
+                                selector.update(&next_block_height.to_le_bytes());
+                                selector.update(&entropy_height.to_le_bytes());
+                                
+                                // Sort candidates for determinism (CRITICAL for Byzantine consensus)
+                                let mut sorted_candidates = synchronized_candidates.clone();
+                                sorted_candidates.sort();
+                                
+                                // Include candidate list in hash for additional entropy
+                                for candidate in &sorted_candidates {
+                                    selector.update(candidate.as_bytes());
+                                }
+                                
+                                // Generate quantum-resistant selection hash
+                                let selection_hash = selector.finalize();
+                                
+                                // Convert to selection index (uniform distribution)
+                                let selection_value = u64::from_le_bytes([
+                                    selection_hash[0], selection_hash[1], selection_hash[2], selection_hash[3],
+                                    selection_hash[4], selection_hash[5], selection_hash[6], selection_hash[7],
+                                ]);
+                                let selection_index = (selection_value % sorted_candidates.len() as u64) as usize;
+                                
+                                let new_producer = sorted_candidates[selection_index].clone();
+                                println!("[PRODUCER] ✅ Fallback producer selected: {} (from {} synchronized candidates)", 
+                                         new_producer, sorted_candidates.len());
+                                
+                                // Update producer for this round
+                                current_producer = new_producer.clone();
+                                is_my_turn_to_produce = current_producer == node_id;
+                                
+                                if is_my_turn_to_produce {
+                                    println!("[PRODUCER] 🎯 WE are the fallback producer for block #{}", next_block_height);
+                                }
+                            }
                         }
                     }
                 }
@@ -5373,11 +5507,13 @@ impl BlockchainNode {
                                             current_round, next_block_height, cert.serial_number);
                                         
                                         // CRITICAL: Use tracked broadcast for producer rotation (Byzantine threshold)
+                                        // NOTE: No artificial delay needed - retry mechanism handles certificate race condition
+                                        // Receiving nodes buffer blocks and retry every 2s until certificate arrives
                                         match p2p.broadcast_certificate_announce_tracked(cert.serial_number.clone(), cert_bytes.clone()).await {
                                             Ok(()) => {
                                                 println!("[CERTIFICATE] ✅ Producer certificate delivered to 2/3+ peers (Byzantine threshold)");
-                                            // Mark this round as broadcasted
-                                            last_certificate_broadcast_round = Some(current_round);
+                                                // Mark this round as broadcasted
+                                                last_certificate_broadcast_round = Some(current_round);
                                             }
                                             Err(e) => {
                                                 println!("[CERTIFICATE] ⚠️ Producer certificate Byzantine threshold NOT reached: {}", e);
@@ -12041,9 +12177,19 @@ impl BlockchainNode {
     /// Get wallet address for this node (for activation verification)
     pub fn get_wallet_address(&self) -> String {
         // PRODUCTION: Extract wallet address from stored activation code
-        // Generate proper EON address format: {20 hex}eon{20 hex}
+        // Generate proper EON address format: {19 hex}eon{15 hex}{4 hex checksum} = 41 chars
         let hash = blake3::hash(self.node_id.as_bytes()).to_hex();
-        format!("{}eon{}", &hash[..20], &hash[20..40])
+        let part1 = &hash[..19];
+        let part2 = &hash[19..34];
+        
+        // Generate SHA3-256 checksum (first 4 hex chars)
+        use sha3::{Sha3_256, Digest};
+        let checksum_input = format!("{}eon{}", part1, part2);
+        let mut hasher = Sha3_256::new();
+        hasher.update(checksum_input.as_bytes());
+        let checksum = hex::encode(&hasher.finalize()[..2]); // 2 bytes = 4 hex chars
+        
+        format!("{}eon{}{}", part1, part2, checksum)
     }
     
     /// Extract wallet address from activation code using quantum decryption

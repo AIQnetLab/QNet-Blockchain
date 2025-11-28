@@ -1,48 +1,54 @@
 /**
  * EON Address Generator for QNet Dual-Network Wallet
- * Generates beautiful EON addresses
- * New Format: 19 chars + "eon" + 15 chars + 4 char checksum = 41 total
+ * PRODUCTION FORMAT: 19 chars + "eon" + 15 chars + 4 char checksum = 41 total
+ * Compatible with mobile app and backend validation
  */
 
 export class EONAddressGenerator {
     constructor() {
-        this.charset = '123456789abcdefghijkmnopqrstuvwxyz'; // Base32-like without confusing chars
+        this.hexCharset = '0123456789abcdef'; // Hex characters only for production
         this.checksumAlgo = 'SHA-256';
     }
 
     /**
      * Generate new EON address
-     * @returns {string} EON address in format: 7a9bk4f2eon8x3m5z1c7
+     * PRODUCTION FORMAT: 19 + 3 + 15 + 4 = 41 characters
+     * @returns {string} EON address in format: xxxxxxxxxxxxxxxxxxx eon xxxxxxxxxxxxxxx xxxx
      */
     async generateEONAddress() {
-        const part1 = this.generateSecureRandom(8);
-        const part2 = this.generateSecureRandom(8);
-        const checksum = await this.calculateChecksum(part1 + part2);
+        // Generate 64 random bytes for entropy
+        const randomBytes = new Uint8Array(64);
+        crypto.getRandomValues(randomBytes);
+        
+        // Convert to hex
+        const hex = Array.from(randomBytes).map(b => b.toString(16).padStart(2, '0')).join('');
+        
+        // PRODUCTION FORMAT: 19 + 3 + 15 + 4 = 41
+        const part1 = hex.substring(0, 19).toLowerCase();
+        const part2 = hex.substring(19, 34).toLowerCase();
+        const checksum = await this.calculateChecksum(part1 + 'eon' + part2);
         
         return `${part1}eon${part2}${checksum}`;
     }
 
     /**
-     * Generate cryptographically secure random string
-     * @param {number} length - Length of random string
-     * @returns {string} Random string using safe charset
+     * Generate cryptographically secure random hex string
+     * @param {number} length - Length of hex string
+     * @returns {string} Random hex string
      */
-    generateSecureRandom(length) {
-        const randomBytes = new Uint8Array(length);
+    generateSecureRandomHex(length) {
+        const bytesNeeded = Math.ceil(length / 2);
+        const randomBytes = new Uint8Array(bytesNeeded);
         crypto.getRandomValues(randomBytes);
         
-        let result = '';
-        for (let i = 0; i < length; i++) {
-            result += this.charset[randomBytes[i] % this.charset.length];
-        }
-        
-        return result;
+        const hex = Array.from(randomBytes).map(b => b.toString(16).padStart(2, '0')).join('');
+        return hex.substring(0, length).toLowerCase();
     }
 
     /**
-     * Calculate checksum for address validation
-     * @param {string} data - Data to calculate checksum for
-     * @returns {string} 4-character checksum
+     * Calculate SHA-256 checksum for address validation
+     * @param {string} data - Data to calculate checksum for (part1 + "eon" + part2)
+     * @returns {string} 4-character hex checksum
      */
     async calculateChecksum(data) {
         const encoder = new TextEncoder();
@@ -51,11 +57,11 @@ export class EONAddressGenerator {
         const hashBuffer = await crypto.subtle.digest('SHA-256', dataBytes);
         const hashArray = new Uint8Array(hashBuffer);
         
-        // Use first 4 bytes for checksum, convert to charset
-        let checksum = '';
-        for (let i = 0; i < 4; i++) {
-            checksum += this.charset[hashArray[i] % this.charset.length];
-        }
+        // Use first 2 bytes = 4 hex chars for checksum
+        const checksum = Array.from(hashArray.slice(0, 2))
+            .map(b => b.toString(16).padStart(2, '0'))
+            .join('')
+            .toLowerCase();
         
         return checksum;
     }

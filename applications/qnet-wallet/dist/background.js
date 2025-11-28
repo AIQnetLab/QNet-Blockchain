@@ -2363,6 +2363,7 @@ class ProductionCrypto {
     }
     
     // Generate QNet address from Solana address (for simple display)
+    // PRODUCTION FORMAT: 19 chars + "eon" + 15 chars + 4 char checksum = 41 total
     static generateQNetAddressFromSolana(solanaAddress) {
         try {
             // Generate deterministic QNet address from Solana address
@@ -2374,20 +2375,21 @@ class ProductionCrypto {
                 const hash = Array.from(new Uint8Array(hashBuffer));
                 const fullHex = hash.map(b => b.toString(16).padStart(2, '0')).join('');
                 
-                // New long format: 19 chars + "eon" + 15 chars + 4 char checksum = 41 total
+                // PRODUCTION FORMAT: 19 + 3 + 15 + 4 = 41 characters (NO underscores!)
                 const part1 = fullHex.substring(0, 19).toLowerCase();
                 const part2 = fullHex.substring(19, 34).toLowerCase();
                 
-                // Generate checksum
-                const checksumData = `qnet_${part1}_eon_${part2}`;
+                // Generate checksum (same algorithm as mobile app)
+                const addressWithoutChecksum = part1 + 'eon' + part2;
                 const checksumEncoder = new TextEncoder();
                 
-                return crypto.subtle.digest('SHA-256', checksumEncoder.encode(checksumData)).then(checksumBuffer => {
+                return crypto.subtle.digest('SHA-256', checksumEncoder.encode(addressWithoutChecksum)).then(checksumBuffer => {
                     const checksumHash = Array.from(new Uint8Array(checksumBuffer));
                     const checksumHex = checksumHash.map(b => b.toString(16).padStart(2, '0')).join('');
-                    const checksum = checksumHex.substring(0, 4);
+                    const checksum = checksumHex.substring(0, 4).toLowerCase();
                     
-                    return `qnet_${part1}_eon_${part2}_${checksum}`;
+                    // PRODUCTION: No underscores, just part1 + eon + part2 + checksum
+                    return `${part1}eon${part2}${checksum}`;
                 });
             });
         } catch (error) {
@@ -3302,6 +3304,67 @@ class SolanaRPC {
         }
     }
     
+    // CACHE: Network size (avoid spamming bootstrap nodes)
+    _networkSizeCache = null;
+    _networkSizeCacheTime = 0;
+    static NETWORK_SIZE_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+    
+    /**
+     * Get active nodes count from QNet bootstrap nodes
+     * PRODUCTION: Real API call with caching to reduce load
+     */
+    async getActiveNodesCount() {
+        // CHECK CACHE FIRST
+        const now = Date.now();
+        if (this._networkSizeCache !== null && 
+            (now - this._networkSizeCacheTime) < SolanaRPC.NETWORK_SIZE_CACHE_TTL) {
+            console.log(`[PRICING] 📦 Using cached network size: ${this._networkSizeCache} (${Math.round((now - this._networkSizeCacheTime) / 1000)}s old)`);
+            return this._networkSizeCache;
+        }
+        
+        // PRODUCTION: Real Genesis node IPs (from genesis_constants.rs)
+        const bootstrapNodes = [
+            'http://154.38.160.39:8080',   // Genesis #1 - North America
+            'http://62.171.157.44:8080',   // Genesis #2 - Europe
+            'http://161.97.86.81:8080',    // Genesis #3 - Europe
+            'http://5.189.130.160:8080',   // Genesis #4 - Europe
+            'http://162.244.25.114:8080'   // Genesis #5 - Europe
+        ];
+        
+        // Try multiple bootstrap nodes for reliability
+        for (const apiUrl of bootstrapNodes) {
+            try {
+                const response = await fetch(`${apiUrl}/api/v1/network/stats`, {
+                    method: 'GET',
+                    headers: { 'Content-Type': 'application/json' },
+                    signal: AbortSignal.timeout(5000) // 5 second timeout
+                });
+                
+                if (response.ok) {
+                    const stats = await response.json();
+                    // Return total active nodes (Light + Full + Super)
+                    const totalNodes = (stats.light_nodes || 0) + 
+                                      (stats.full_nodes || 0) + 
+                                      (stats.super_nodes || 0);
+                    if (totalNodes > 0) {
+                        // UPDATE CACHE
+                        this._networkSizeCache = totalNodes;
+                        this._networkSizeCacheTime = now;
+                        console.log(`[PRICING] 📊 Network size fetched: ${totalNodes} active nodes (cached for 5 min)`);
+                        return totalNodes;
+                    }
+                }
+            } catch (nodeError) {
+                // Try next node
+                continue;
+            }
+        }
+        
+        // All nodes failed - throw error, don't use fake data
+        console.error('[PRICING] ❌ Could not reach any bootstrap nodes for network size');
+        throw new Error('Network size unavailable - all bootstrap nodes unreachable');
+    }
+    
     async getCurrentBurnPricing(nodeType = 'full') {
         try {
             const burnPercent = await this.getBurnProgress();
@@ -3315,19 +3378,20 @@ class SolanaRPC {
                     super: 10000  // Base QNC cost
                 };
                 
-                // Get active nodes count (mock for now)
-                const activeNodesCount = 150000; // TODO: Get real count from blockchain
+                // PRODUCTION: Get real active nodes count from QNet API
+                const activeNodesCount = await this.getActiveNodesCount();
                 
                 // Calculate network size multiplier
+                // CANONICAL VALUES - same across all components
                 let multiplier = 1.0;
                 if (activeNodesCount <= 100000) {
-                    multiplier = 0.5; // Early network discount
+                    multiplier = 0.5;       // ≤100K: Early adopter discount
                 } else if (activeNodesCount <= 300000) {
-                    multiplier = 1.0; // Standard rate
+                    multiplier = 1.0;       // ≤300K: Base price
                 } else if (activeNodesCount <= 1000000) {
-                    multiplier = 2.0; // High demand
+                    multiplier = 2.0;       // ≤1M: High demand
                 } else {
-                    multiplier = 3.0; // Mature network (1M+)
+                    multiplier = 3.0;       // >1M: Maximum (cap)
                 }
                 
                 const baseCost = phase2BaseCosts[nodeType] || phase2BaseCosts.full;
@@ -7260,28 +7324,75 @@ async function getCurrentPhase() {
     }
 }
 
+// CACHE: Global network size cache for getNetworkSize()
+let _globalNetworkSizeCache = null;
+let _globalNetworkSizeCacheTime = 0;
+const GLOBAL_NETWORK_SIZE_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+
 /**
  * Get current network size for QNC pricing
+ * PRODUCTION: Real API call to Genesis nodes with caching
  */
 async function getNetworkSize() {
-    try {
-        // Get current network size from blockchain
-        // For production demo, return small network size
-        const networkSize = 156; // Demo: triggers 0.5x multiplier
-        
+    // CHECK CACHE FIRST
+    const now = Date.now();
+    if (_globalNetworkSizeCache !== null && 
+        (now - _globalNetworkSizeCacheTime) < GLOBAL_NETWORK_SIZE_CACHE_TTL) {
+        console.log(`[PRICING] 📦 Using cached network size: ${_globalNetworkSizeCache}`);
         return { 
             success: true, 
-            networkSize: networkSize,
-            timestamp: Date.now()
-        };
-    } catch (error) {
-        // Error:('Failed to get network size:', error);
-        return { 
-            success: false, 
-            error: error.message,
-            networkSize: 156 // Default small network
+            networkSize: _globalNetworkSizeCache,
+            cached: true,
+            timestamp: _globalNetworkSizeCacheTime
         };
     }
+    
+    // PRODUCTION: Real Genesis node IPs (from genesis_constants.rs)
+    const bootstrapNodes = [
+        'http://154.38.160.39:8080',
+        'http://62.171.157.44:8080',
+        'http://161.97.86.81:8080',
+        'http://5.189.130.160:8080',
+        'http://162.244.25.114:8080'
+    ];
+    
+    for (const apiUrl of bootstrapNodes) {
+        try {
+            const response = await fetch(`${apiUrl}/api/v1/network/stats`, {
+                method: 'GET',
+                headers: { 'Content-Type': 'application/json' },
+                signal: AbortSignal.timeout(5000)
+            });
+            
+            if (response.ok) {
+                const stats = await response.json();
+                const totalNodes = (stats.light_nodes || 0) + 
+                                  (stats.full_nodes || 0) + 
+                                  (stats.super_nodes || 0);
+                if (totalNodes > 0) {
+                    // UPDATE CACHE
+                    _globalNetworkSizeCache = totalNodes;
+                    _globalNetworkSizeCacheTime = now;
+                    console.log(`[PRICING] 📊 Network size fetched: ${totalNodes} (cached for 5 min)`);
+                    return { 
+                        success: true, 
+                        networkSize: totalNodes,
+                        cached: false,
+                        timestamp: now
+                    };
+                }
+            }
+        } catch (e) {
+            continue; // Try next node
+        }
+    }
+    
+    // All nodes failed - return error, NOT fake data
+    return { 
+        success: false, 
+        error: 'All bootstrap nodes unreachable',
+        networkSize: null
+    };
 }
 
 /**

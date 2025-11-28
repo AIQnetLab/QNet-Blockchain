@@ -1079,10 +1079,132 @@ const WalletScreen = () => {
     setNodeActivating(true);
     
     try {
-      // Validate code format (QNET-XXXXXX-XXXXXX-XXXXXX)
+      const code = activationInputCode.trim();
+      
+      // GENESIS NODE SUPPORT: Check if this is a Genesis bootstrap code
+      // Format: QNET-BOOT-000X-STRAP (X = 1-5)
+      const genesisPattern = /^QNET-BOOT-000([1-5])-STRAP$/;
+      const genesisMatch = code.match(genesisPattern);
+      
+      if (genesisMatch) {
+        // GENESIS NODE: Special handling
+        const bootstrapId = genesisMatch[1].padStart(3, '0'); // "001", "002", etc.
+        
+        // SECURITY: Genesis nodes have PREDEFINED wallets
+        // User's wallet MUST match the hardcoded wallet for this Genesis node
+        // PRODUCTION: Genesis wallet addresses (format: 19+3+15+4=41 chars)
+        const GENESIS_WALLETS = {
+          '001': '7bc83500fd08525250feonff5503d0dce4dbdede8',
+          '002': '714a0f700a4dbcc0d88eonf635ace76ed2eb9a186',
+          '003': '357842d58e86cc300cfeon0203e16eef3e7044db1',
+          '004': '4f710f9b3152659c56aeond4c05f2731a1890aedf',
+          '005': '8fa8ebe9e85dee95080eond0a7365096572f03e1c',
+        };
+        
+        const expectedWallet = GENESIS_WALLETS[bootstrapId];
+        
+        // SECURITY: Get user's QNet address for comparison
+        // QNet addresses contain "eon" marker and are 41 characters
+        // Format: 19chars + "eon" + 15chars + 4char_checksum (new)
+        const userQNetAddress = wallet.qnetAddress || wallet.address;
+        
+        if (!userQNetAddress) {
+          throw new Error('Wallet address not found. Please reload your wallet.');
+        }
+        
+        // Normalize both for comparison (lowercase)
+        const normalizedUser = userQNetAddress.toLowerCase();
+        const normalizedExpected = expectedWallet.toLowerCase();
+        
+        // STRICT COMPARISON: Server uses exact match (rpc.rs:5798)
+        // genesis_wallet != claim_request.wallet_address
+        // 
+        // SECURITY CHECK: Verify wallet matches expected Genesis wallet
+        // Genesis wallets in genesis_constants.rs use LEGACY format: {19}eon{19}
+        // Mobile app generates NEW format: {19}eon{15}{4 checksum}
+        // 
+        // IMPORTANT: For Genesis nodes to work, you MUST update genesis_constants.rs
+        // with your actual QNet wallet addresses from the mobile app!
+        if (normalizedUser !== normalizedExpected) {
+          // Check if formats are different but base parts match
+          // Legacy: 7bc83500fd08525250feonff5503d0dce4dbdede8 (19+3+19=41)
+          // New:    7bc83500fd08525250feonff5503d0dce4dbXXXX (19+3+15+4=41)
+          const userPart1 = normalizedUser.substring(0, 19);
+          const userEon = normalizedUser.substring(19, 22);
+          const expectedPart1 = normalizedExpected.substring(0, 19);
+          const expectedEon = normalizedExpected.substring(19, 22);
+          
+          const isFormatMismatch = userPart1 === expectedPart1 && 
+                                   userEon === 'eon' && 
+                                   expectedEon === 'eon';
+          
+          console.log('[GENESIS] Wallet comparison:');
+          console.log('  Expected (legacy):', normalizedExpected);
+          console.log('  User has (new):', normalizedUser);
+          console.log('  Part1 match:', userPart1 === expectedPart1);
+          
+          if (isFormatMismatch) {
+            throw new Error(
+              `Address format mismatch detected!\n\n` +
+              `Genesis constants use LEGACY format.\n` +
+              `Your wallet uses NEW format with checksum.\n\n` +
+              `To fix this:\n` +
+              `1. Update genesis_constants.rs with your actual QNet address:\n` +
+              `   "${normalizedUser}"\n\n` +
+              `2. Rebuild and redeploy all Genesis nodes.`
+            );
+          }
+          
+          throw new Error(
+            `This Genesis code belongs to a different wallet.\n\n` +
+            `Expected: ${expectedWallet}\n` +
+            `Your wallet: ${userQNetAddress}\n\n` +
+            `Genesis nodes are cryptographically bound to specific wallets.\n` +
+            `Only the original wallet owner can access this node.`
+          );
+        }
+        
+        console.log('[GENESIS] ✅ Wallet verification passed for node', bootstrapId);
+        
+        // Genesis node verified - set up as Super node
+        setActivationCode(code);
+        setActivatedNodeType('super'); // Genesis nodes are Super nodes
+        setNodePseudonym(`genesis_node_${bootstrapId}`);
+        
+        // Save to AsyncStorage
+        await AsyncStorage.setItem(`node_pseudonym_${code}`, `genesis_node_${bootstrapId}`);
+        await AsyncStorage.setItem('qnet_last_activated_node', JSON.stringify({
+          nodeType: 'super',
+          code: code,
+          pseudonym: `genesis_node_${bootstrapId}`,
+          isGenesis: true,
+          bootstrapId: bootstrapId,
+          timestamp: Date.now()
+        }));
+        
+        // Load server status immediately
+        loadServerNodeStatus();
+        
+        showAlert(
+          'Genesis Node Connected!',
+          `Successfully connected to Genesis Node #${bootstrapId}.\n\n` +
+          `Node ID: genesis_node_${bootstrapId}\n` +
+          `Type: Super (Bootstrap)\n\n` +
+          `You can now monitor your node and claim rewards.`,
+          [{ text: 'OK', onPress: () => {
+            setShowActivationInput(false);
+            setActivationInputCode('');
+          }}]
+        );
+        
+        setNodeActivating(false);
+        return;
+      }
+      
+      // REGULAR NODE: Validate code format (QNET-XXXXXX-XXXXXX-XXXXXX)
       const codePattern = /^QNET-[A-Z0-9]{6}-[A-Z0-9]{6}-[A-Z0-9]{6}$/;
-      if (!codePattern.test(activationInputCode.trim())) {
-        throw new Error('Invalid activation code format');
+      if (!codePattern.test(code)) {
+        throw new Error('Invalid activation code format. Expected: QNET-XXXXXX-XXXXXX-XXXXXX');
       }
       
       // Register node with backend (system generates pseudonym automatically)
@@ -1095,7 +1217,7 @@ const WalletScreen = () => {
       if (result.success) {
         // Store activation locally
         const nodeType = result.nodeType || 'light';
-        const code = activationInputCode.trim();
+        // Note: 'code' already defined at start of try block
         setActivationCode(code);
         setActivatedNodeType(nodeType);
         setNodePseudonym(result.pseudonym); // Store system-generated pseudonym
@@ -1172,12 +1294,25 @@ const WalletScreen = () => {
     }
   };
   
-  // Get the correct wallet address for claims based on activation phase
-  // Phase 1: Solana address (1DEV burn)
-  // Phase 2: QNet address (QNC transfer)
+  // Get the correct wallet address for claims based on activation phase and node type
+  // SECURITY: Different node types use different wallet address formats
+  // - Genesis nodes: ALWAYS use QNet address (must match genesis_constants.rs)
+  // - Phase 1 nodes (1DEV burn): Use Solana address
+  // - Phase 2 nodes (QNC transfer): Use QNet address
   const getWalletAddressForClaim = async () => {
     try {
-      // Check activation metadata for phase
+      // GENESIS NODES: Always use QNet address (hardcoded in genesis_constants.rs)
+      // Genesis codes format: QNET-BOOT-000X-STRAP
+      if (activationCode && /^QNET-BOOT-000[1-5]-STRAP$/.test(activationCode)) {
+        const qnetAddr = wallet.qnetAddress;
+        if (!qnetAddr) {
+          throw new Error('QNet address required for Genesis node claims');
+        }
+        console.log('[CLAIM] Genesis node using QNet address:', qnetAddr);
+        return qnetAddr;
+      }
+      
+      // REGULAR NODES: Check activation metadata for phase
       const metaStr = await AsyncStorage.getItem(`qnet_activation_meta_${activatedNodeType}`);
       if (metaStr) {
         const meta = JSON.parse(metaStr);
@@ -1193,7 +1328,8 @@ const WalletScreen = () => {
       // Default: Phase 1 uses Solana address
       return wallet.solanaAddress || wallet.address;
     } catch (e) {
-      // Fallback to Solana address
+      console.error('[CLAIM] Error getting wallet address:', e);
+      // Fallback to Solana address for non-Genesis nodes
       return wallet.solanaAddress || wallet.address;
     }
   };

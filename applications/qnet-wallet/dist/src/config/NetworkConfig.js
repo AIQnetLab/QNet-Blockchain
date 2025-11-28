@@ -291,12 +291,14 @@ export class NetworkConfig {
         const baseCosts = config.activationCosts;
         const multipliers = config.networkSizeMultipliers;
 
+        // CANONICAL THRESHOLDS - same across all components
+        // ≤100K → small (0.5x), ≤300K → medium (1.0x), ≤1M → large (2.0x), >1M → massive (3.0x)
         let multiplier;
-        if (networkSize < 100000) {
+        if (networkSize <= 100000) {
             multiplier = multipliers.small;
-        } else if (networkSize < 1000000) {
+        } else if (networkSize <= 300000) {
             multiplier = multipliers.medium;
-        } else if (networkSize < 10000000) {
+        } else if (networkSize <= 1000000) {
             multiplier = multipliers.large;
         } else {
             multiplier = multipliers.massive;

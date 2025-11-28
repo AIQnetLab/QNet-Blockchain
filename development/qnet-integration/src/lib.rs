@@ -53,7 +53,29 @@ pub use validator::BlockValidator;
 pub use node::{BlockchainNode, NodeType, Region};
 pub use unified_p2p::SimplifiedP2P;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+// ============================================================================
+// GLOBAL STATE FOR DYNAMIC PRICING (updated by node sync process)
+// ============================================================================
+
+/// Global 1DEV burn percentage (multiplied by 100 for precision, e.g., 4500 = 45.00%)
+pub static GLOBAL_BURN_PERCENTAGE: AtomicU64 = AtomicU64::new(0);
+
+/// Global total active nodes count (from P2P network)
+pub static GLOBAL_ACTIVE_NODES: AtomicU64 = AtomicU64::new(0);
+
+/// Global Genesis block timestamp (set once from block #0)
+pub static GLOBAL_GENESIS_TIMESTAMP: AtomicU64 = AtomicU64::new(0);
+
+/// Update global pricing state (called by node sync process)
+pub fn update_global_pricing_state(burn_pct: f64, active_nodes: u64, genesis_ts: u64) {
+    GLOBAL_BURN_PERCENTAGE.store((burn_pct * 100.0) as u64, Ordering::Relaxed);
+    GLOBAL_ACTIVE_NODES.store(active_nodes, Ordering::Relaxed);
+    if genesis_ts > 0 && GLOBAL_GENESIS_TIMESTAMP.load(Ordering::Relaxed) == 0 {
+        GLOBAL_GENESIS_TIMESTAMP.store(genesis_ts, Ordering::Relaxed);
+    }
+}
 
 /// Main QNet blockchain instance
 pub struct QNetBlockchain {

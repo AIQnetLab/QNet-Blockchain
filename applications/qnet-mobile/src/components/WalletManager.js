@@ -3044,49 +3044,68 @@ export class WalletManager {
     }
   }
 
+  // CACHE: Network size (avoid spamming bootstrap nodes)
+  _networkSizeCache = null;
+  _networkSizeCacheTime = 0;
+  static NETWORK_SIZE_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+  
   // Get active nodes count from blockchain/API
+  // PRODUCTION: Real API call with caching to reduce load
   async getActiveNodesCount(isTestnet = true) {
-    try {
-      // PRODUCTION: Get real count from QNet bootstrap nodes
-      const bootstrapNodes = [
-        'https://bootstrap1.qnet.network',
-        'https://bootstrap2.qnet.network',
-        'https://bootstrap3.qnet.network',
-        'https://bootstrap4.qnet.network',
-        'https://bootstrap5.qnet.network'
-      ];
-      
-      // Try multiple bootstrap nodes for reliability
-      for (const apiUrl of bootstrapNodes) {
-        try {
-          const response = await fetch(`${apiUrl}/api/v1/network/stats`, {
-            method: 'GET',
-            headers: { 'Content-Type': 'application/json' },
-            timeout: 5000
-          });
-          
-          if (response.ok) {
-            const stats = await response.json();
-            // Return total active nodes (Light + Full + Super)
-            const totalNodes = (stats.light_nodes || 0) + 
-                              (stats.full_nodes || 0) + 
-                              (stats.super_nodes || 0);
-            return totalNodes > 0 ? totalNodes : 150000; // Fallback if 0
-          }
-        } catch (nodeError) {
-          // Try next node
-          continue;
-        }
-      }
-      
-      // All nodes failed, return default
-      return 150000;
-      
-    } catch (error) {
-      // console.error('[getActiveNodesCount] Error:', error);
-      // Default to mid-range if error
-      return 150000;
+    // CHECK CACHE FIRST
+    const now = Date.now();
+    if (this._networkSizeCache !== null && 
+        (now - this._networkSizeCacheTime) < WalletManager.NETWORK_SIZE_CACHE_TTL) {
+      console.log(`[PRICING] 📦 Using cached network size: ${this._networkSizeCache}`);
+      return this._networkSizeCache;
     }
+    
+    // PRODUCTION: Real Genesis node IPs (from genesis_constants.rs)
+    const bootstrapNodes = [
+      'http://154.38.160.39:8080',   // Genesis #1 - North America
+      'http://62.171.157.44:8080',   // Genesis #2 - Europe
+      'http://161.97.86.81:8080',    // Genesis #3 - Europe
+      'http://5.189.130.160:8080',   // Genesis #4 - Europe
+      'http://162.244.25.114:8080'   // Genesis #5 - Europe
+    ];
+    
+    // Try multiple bootstrap nodes for reliability
+    for (const apiUrl of bootstrapNodes) {
+      try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 5000);
+        
+        const response = await fetch(`${apiUrl}/api/v1/network/stats`, {
+          method: 'GET',
+          headers: { 'Content-Type': 'application/json' },
+          signal: controller.signal
+        });
+        
+        clearTimeout(timeoutId);
+        
+        if (response.ok) {
+          const stats = await response.json();
+          // Return total active nodes (Light + Full + Super)
+          const totalNodes = (stats.light_nodes || 0) + 
+                            (stats.full_nodes || 0) + 
+                            (stats.super_nodes || 0);
+          if (totalNodes > 0) {
+            // UPDATE CACHE
+            this._networkSizeCache = totalNodes;
+            this._networkSizeCacheTime = now;
+            console.log(`[PRICING] 📊 Network size fetched: ${totalNodes} (cached for 5 min)`);
+            return totalNodes;
+          }
+        }
+      } catch (nodeError) {
+        // Try next node
+        continue;
+      }
+    }
+    
+    // All nodes failed - throw error, NOT fake data
+    console.error('[PRICING] ❌ Could not reach any bootstrap nodes');
+    throw new Error('Network size unavailable - all bootstrap nodes unreachable');
   }
 
   // Get real burn progress from blockchain
@@ -4501,7 +4520,17 @@ export class WalletManager {
       const apiUrl = this.getRandomBootstrapNode();
       
       // Generate node ID from activation code
-      const nodeId = `${nodeType}_${activationCode}`;
+      // GENESIS NODE SUPPORT: Genesis codes map to genesis_node_XXX format
+      let nodeId;
+      const genesisMatch = activationCode.match(/^QNET-BOOT-000([1-5])-STRAP$/);
+      if (genesisMatch) {
+        // Genesis node: use predefined node ID format
+        const bootstrapId = genesisMatch[1].padStart(3, '0');
+        nodeId = `genesis_node_${bootstrapId}`;
+      } else {
+        // Regular node: use standard format
+        nodeId = `${nodeType}_${activationCode}`;
+      }
       
       // Load wallet for signing
       const walletData = await this.loadWallet(password);

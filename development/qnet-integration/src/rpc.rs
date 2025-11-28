@@ -378,6 +378,29 @@ fn is_origin_allowed(origin: &str) -> bool {
 
 // DYNAMIC NETWORK DETECTION - No timestamp dependency for robust deployment
 
+/// SECURITY: Validate legacy Genesis EON address format (backward compatibility)
+/// Format: {19 hex}eon{19 hex} = 41 characters (NO checksum)
+/// Used ONLY for Genesis nodes in genesis_constants.rs
+fn validate_legacy_eon_address(address: &str) -> bool {
+    // Check length: 19 + 3 + 19 = 41 characters
+    if address.len() != 41 {
+        return false;
+    }
+    
+    // Check "eon" marker at position 19
+    if &address[19..22] != "eon" {
+        return false;
+    }
+    
+    // Check all characters are lowercase hex (except "eon")
+    let part1 = &address[0..19];
+    let part2 = &address[22..41];
+    
+    let is_hex = |s: &str| s.chars().all(|c| c.is_ascii_hexdigit() && !c.is_uppercase());
+    
+    is_hex(part1) && is_hex(part2)
+}
+
 /// SECURITY: Validate QNet EON address format
 /// Format: {19 hex}eon{15 hex}{4 hex checksum} = 41 characters
 /// Example: a1b2c3d4e5f6g7h8i9jeon0k1l2m3n4o5p6q7r8s9a1b2
@@ -4475,8 +4498,15 @@ async fn handle_light_node_ping_response(
         };
         
         let wallet_addr = wallet_address.unwrap_or_else(|| {
+            // Generate proper EON address: {19}eon{15}{4 checksum} = 41 chars
             let hash = blake3::hash(node_id.as_bytes()).to_hex();
-            format!("{}eon{}", &hash[..20], &hash[20..40])
+            let part1 = &hash[..19];
+            let part2 = &hash[19..34];
+            let checksum_input = format!("{}eon{}", part1, part2);
+            let mut hasher = Sha3_256::new();
+            hasher.update(checksum_input.as_bytes());
+            let checksum = hex::encode(&hasher.finalize()[..2]);
+            format!("{}eon{}{}", part1, part2, checksum)
         });
         
         // Register and record ping
@@ -5736,12 +5766,31 @@ async fn handle_claim_rewards(
     }
     
     // SECURITY: Validate EON wallet address format
-    if let Err(e) = validate_eon_address_with_error(&claim_request.wallet_address) {
-        return Ok(warp::reply::json(&json!({
-            "success": false,
-            "error": "Invalid wallet address format",
-            "details": e
-        })));
+    // GENESIS EXCEPTION: Genesis nodes use legacy format {19}eon{19} without checksum
+    // This is for backward compatibility with hardcoded genesis_constants.rs addresses
+    let is_genesis_claim = claim_request.node_id.starts_with("genesis_node_");
+    
+    if is_genesis_claim {
+        // Genesis nodes: Validate legacy format OR new format
+        let is_valid_legacy = validate_legacy_eon_address(&claim_request.wallet_address);
+        let is_valid_new = validate_eon_address(&claim_request.wallet_address);
+        
+        if !is_valid_legacy && !is_valid_new {
+            return Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": "Invalid Genesis wallet address format",
+                "details": "Expected format: {19}eon{19} (legacy) or {19}eon{15}{4 checksum} (new)"
+            })));
+        }
+    } else {
+        // Regular nodes: Strict new format validation
+        if let Err(e) = validate_eon_address_with_error(&claim_request.wallet_address) {
+            return Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": "Invalid wallet address format",
+                "details": e
+            })));
+        }
     }
     
     // PRODUCTION: Verify Ed25519 signature from client (NOT Dilithium - that's for node consensus only)

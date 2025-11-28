@@ -679,21 +679,59 @@ export class PhaseAwareInterface {
     }
 
     /**
-     * Get activation costs
+     * Get activation costs - PRODUCTION: Real dynamic pricing
      */
     async getActivationCosts() {
         try {
-            // This would fetch real data from QNet
+            // PRODUCTION: Get real pricing from background script
+            const response = await chrome.runtime.sendMessage({ 
+                type: 'GET_ACTIVATION_PRICING',
+                nodeType: 'light' // Get all prices
+            });
+            
+            if (response?.success) {
+                if (response.phase === 1) {
+                    // Phase 1: Same price for all node types (1DEV)
+                    return {
+                        light: response.cost,
+                        full: response.cost,
+                        super: response.cost,
+                        currency: '1DEV',
+                        phase: 1
+                    };
+                } else {
+                    // Phase 2: Different prices per node type (QNC)
+                    // Need to get each type's price
+                    const lightResp = await chrome.runtime.sendMessage({ type: 'GET_ACTIVATION_PRICING', nodeType: 'light' });
+                    const fullResp = await chrome.runtime.sendMessage({ type: 'GET_ACTIVATION_PRICING', nodeType: 'full' });
+                    const superResp = await chrome.runtime.sendMessage({ type: 'GET_ACTIVATION_PRICING', nodeType: 'super' });
+                    
+                    return {
+                        light: lightResp?.cost || null,
+                        full: fullResp?.cost || null,
+                        super: superResp?.cost || null,
+                        currency: 'QNC',
+                        phase: 2
+                    };
+                }
+            }
+            
+            // No response - return error state
             return {
-                light: 5000,
-                full: 7500,
-                super: 10000
+                light: null,
+                full: null,
+                super: null,
+                error: 'Pricing data unavailable',
+                unavailable: true
             };
         } catch (error) {
+            console.error('Failed to get activation costs:', error);
             return {
-                light: 5000,
-                full: 7500,
-                super: 10000
+                light: null,
+                full: null,
+                super: null,
+                error: error.message,
+                unavailable: true
             };
         }
     }

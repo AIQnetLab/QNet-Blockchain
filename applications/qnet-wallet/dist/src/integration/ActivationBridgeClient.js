@@ -191,16 +191,17 @@ export class ActivationBridgeClient {
             const stats = await this.getBridgeStats();
             const networkSize = stats?.networkSize || 0;
             
-            // Determine multiplier based on network size
+            // CANONICAL THRESHOLDS - same across all components
+            // ≤100K → 0.5x, ≤300K → 1.0x, ≤1M → 2.0x, >1M → 3.0x
             let multiplier = 1.0;
-            if (networkSize < 100000) {
-                multiplier = this.qncActivationCosts.baseMultipliers['0-100k'];
-            } else if (networkSize < 1000000) {
-                multiplier = this.qncActivationCosts.baseMultipliers['100k-1m'];
-            } else if (networkSize < 10000000) {
-                multiplier = this.qncActivationCosts.baseMultipliers['1m-10m'];
+            if (networkSize <= 100000) {
+                multiplier = 0.5;  // Early adopter discount
+            } else if (networkSize <= 300000) {
+                multiplier = 1.0;  // Base price
+            } else if (networkSize <= 1000000) {
+                multiplier = 2.0;  // High demand
             } else {
-                multiplier = this.qncActivationCosts.baseMultipliers['10m+'];
+                multiplier = 3.0;  // Maximum (cap)
             }
             
             // Calculate final cost
@@ -217,12 +218,14 @@ export class ActivationBridgeClient {
             };
         } catch (error) {
             console.error('Failed to calculate QNC cost:', error);
-            // Return base cost if calculation fails
+            // PRODUCTION: Return error state, NOT fake prices
             return {
                 nodeType,
-                baseCost: this.qncActivationCosts.baseCosts[nodeType] || 5000,
-                multiplier: 1.0,
-                requiredQNC: this.qncActivationCosts.baseCosts[nodeType] || 5000
+                baseCost: null,
+                multiplier: null,
+                requiredQNC: null,
+                error: 'QNC cost calculation failed - network data unavailable',
+                unavailable: true
             };
         }
     }
@@ -561,10 +564,11 @@ export class ActivationBridgeClient {
      * Get network size category for multiplier calculation
      */
     getNetworkSizeCategory(networkSize) {
-        if (networkSize < 100000) return '0-100k';
-        if (networkSize < 1000000) return '100k-1m';
-        if (networkSize < 10000000) return '1m-10m';
-        return '10m+';
+        // CANONICAL THRESHOLDS
+        if (networkSize <= 100000) return '0-100k';
+        if (networkSize <= 300000) return '100k-300k';
+        if (networkSize <= 1000000) return '300k-1m';
+        return '1m+';
     }
 
     /**

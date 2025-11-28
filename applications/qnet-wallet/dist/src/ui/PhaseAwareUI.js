@@ -503,6 +503,18 @@ export class PhaseAwareUI {
             // Update node status
             this.updateNodeStatus(data.nodeInfo);
             
+            // PRODUCTION: Update active nodes count from real API
+            try {
+                const response = await chrome.runtime.sendMessage({ type: 'GET_NETWORK_SIZE' });
+                if (response?.success && response.networkSize > 0) {
+                    this.updateElement('active-nodes', response.networkSize.toLocaleString());
+                } else {
+                    this.updateElement('active-nodes', 'N/A');
+                }
+            } catch (networkError) {
+                this.updateElement('active-nodes', 'N/A');
+            }
+            
         } catch (error) {
             console.error('Failed to load QNet data:', error);
         }
