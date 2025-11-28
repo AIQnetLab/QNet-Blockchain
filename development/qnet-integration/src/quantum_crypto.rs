@@ -240,15 +240,23 @@ impl QNetQuantumCrypto {
         if BOOTSTRAP_WHITELIST.contains(&activation_code) {
             println!("✅ Genesis bootstrap code detected in quantum_crypto.rs: {}", activation_code);
             
-            // Extract bootstrap ID from code: QNET-BOOT-0003-STRAP → "003"
-            let bootstrap_id = activation_code
+            // Extract bootstrap ID from code: QNET-BOOT-0001-STRAP → "001"
+            // Note: split gives "0001" (4 chars), but genesis_constants uses "001" (3 chars)
+            let bootstrap_id_raw = activation_code
                 .split('-')
                 .nth(2)
-                .unwrap_or("000");  // Keep as "003" format
+                .unwrap_or("000");
+            
+            // Convert "0001" → "001", "0002" → "002", etc.
+            let bootstrap_id = bootstrap_id_raw.trim_start_matches('0');
+            let bootstrap_id = if bootstrap_id.is_empty() { "0" } else { bootstrap_id };
+            let bootstrap_id = format!("{:03}", bootstrap_id.parse::<u32>().unwrap_or(0));
+            
+            println!("[GENESIS] Bootstrap ID parsed: '{}' → '{}'", bootstrap_id_raw, bootstrap_id);
             
             // Use predefined wallet from genesis_constants
             // STRICT: No fallback - unknown bootstrap ID is an error
-            let wallet = crate::genesis_constants::get_genesis_wallet_by_id(bootstrap_id)
+            let wallet = crate::genesis_constants::get_genesis_wallet_by_id(&bootstrap_id)
                 .ok_or_else(|| anyhow!("Unknown Genesis bootstrap ID: {} - not in genesis_constants", bootstrap_id))?
                 .to_string();
             

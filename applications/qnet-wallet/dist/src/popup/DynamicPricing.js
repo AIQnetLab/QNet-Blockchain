@@ -53,15 +53,15 @@ class DynamicPricing {
         ];
     }
     
-    // CACHE TTL: 5 minutes
-    static CACHE_TTL = 5 * 60 * 1000;
+    // CACHE TTL: 10 minutes (server caches for 10 min too)
+    static CACHE_TTL = 10 * 60 * 1000;
     
     /**
-     * Update live data from blockchain (call this before pricing calculations)
-     * OPTIMIZED: Uses cache to avoid spamming bootstrap nodes
+     * Update live data from server's cached public stats endpoint
+     * Server caches data for 10 minutes - safe to call frequently
      */
     async updateLiveData() {
-        // CHECK CACHE: Skip if data is fresh (less than 5 min old)
+        // CHECK CACHE: Skip if data is fresh
         const now = Date.now();
         if (this.dataAvailable && this.liveData.lastUpdate && 
             (now - this.liveData.lastUpdate) < DynamicPricing.CACHE_TTL) {
@@ -70,18 +70,10 @@ class DynamicPricing {
         }
         
         try {
-            // Get burn percentage from background script
-            if (typeof chrome !== 'undefined' && chrome.runtime) {
-                const burnResponse = await chrome.runtime.sendMessage({ type: 'GET_BURN_PROGRESS' });
-                if (burnResponse?.success) {
-                    this.liveData.totalBurnedPercent = parseFloat(burnResponse.burnPercent) || 0;
-                }
-            }
-            
-            // Get active nodes from bootstrap nodes
+            // SIMPLE: Get all data from server's cached endpoint
             for (const apiUrl of this.bootstrapNodes) {
                 try {
-                    const response = await fetch(`${apiUrl}/api/v1/network/stats`, {
+                    const response = await fetch(`${apiUrl}/api/v1/public/stats`, {
                         method: 'GET',
                         headers: { 'Content-Type': 'application/json' },
                         signal: AbortSignal.timeout(5000)
@@ -89,31 +81,21 @@ class DynamicPricing {
                     
                     if (response.ok) {
                         const stats = await response.json();
-                        const totalNodes = (stats.light_nodes || 0) + 
-                                          (stats.full_nodes || 0) + 
-                                          (stats.super_nodes || 0);
-                        if (totalNodes > 0) {
-                            this.liveData.activeNodes = totalNodes;
-                            break;
-                        }
+                        this.liveData.activeNodes = stats.active_nodes || 0;
+                        this.liveData.totalBurnedPercent = stats.burn_percentage || 0;
+                        this.liveData.currentPhase = stats.phase === 2 ? 'phase2' : 'phase1';
+                        this.liveData.lastUpdate = now;
+                        this.dataAvailable = true;
+                        console.log('[DynamicPricing] 📊 Server stats:', stats);
+                        return;
                     }
                 } catch (e) {
                     continue;
                 }
             }
             
-            // Determine phase (only if we have burn data)
-            if (this.liveData.totalBurnedPercent !== null) {
-                this.liveData.currentPhase = this.liveData.totalBurnedPercent >= 90 ? 'phase2' : 'phase1';
-            }
-            
-            // Mark data as available only if we have network size
-            if (this.liveData.activeNodes !== null && this.liveData.activeNodes > 0) {
-                this.dataAvailable = true;
-                this.liveData.lastUpdate = now;
-            }
-            
-            console.log('[DynamicPricing] 📊 Live data fetched:', this.liveData, '(cached for 5 min)');
+            console.error('[DynamicPricing] ❌ All bootstrap nodes unreachable');
+            this.dataAvailable = false;
         } catch (error) {
             console.error('[DynamicPricing] ❌ Failed to update live data:', error);
             this.dataAvailable = false;
@@ -191,10 +173,32 @@ class DynamicPricing {
     }
     
     /**
-     * Get activation cost for any node type
+     * Get activation cost directly from server (recommended)
+     * Server calculates price - no client-side manipulation possible
      */
+    async getActivationCostFromServer(nodeType = 'light') {
+        for (const apiUrl of this.bootstrapNodes) {
+            try {
+                const response = await fetch(`${apiUrl}/api/v1/activation/price?type=${nodeType}`, {
+                    method: 'GET',
+                    headers: { 'Content-Type': 'application/json' },
+                    signal: AbortSignal.timeout(5000)
+                });
+                
+                if (response.ok) {
+                    const pricing = await response.json();
+                    console.log('[DynamicPricing] 💰 Server pricing:', pricing);
+                    return pricing;
+                }
+            } catch (e) {
+                continue;
+            }
+        }
+        throw new Error('Unable to get pricing from server');
+    }
+    
     /**
-     * Get activation cost for any node type
+     * Get activation cost for any node type (local calculation - fallback)
      * @throws Error if data not available
      */
     getActivationCost(nodeType = 'light') {

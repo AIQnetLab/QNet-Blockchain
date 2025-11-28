@@ -1,15 +1,17 @@
-# QNet API Reference v2.19.12
+# QNet API Reference v2.19.13
 
 ## 📡 Base URL
 
 ```
-Production: http://{node_ip}:8001/api/v1
+Production API: http://{node_ip}:8080/api/v1
+Production P2P: http://{node_ip}:8001
+
 Genesis Nodes:
-  - 154.38.160.39:8001 (Node 001)
-  - 62.171.157.44:8001 (Node 002)
-  - 161.97.86.81:8001 (Node 003)
-  - 5.189.130.160:8001 (Node 004)
-  - 162.244.25.114:8001 (Node 005)
+  - 154.38.160.39:8080 (Node 001 API) / :8001 (P2P)
+  - 62.171.157.44:8080 (Node 002 API) / :8001 (P2P)
+  - 161.97.86.81:8080 (Node 003 API) / :8001 (P2P)
+  - 5.189.130.160:8080 (Node 004 API) / :8001 (P2P)
+  - 162.244.25.114:8080 (Node 005 API) / :8001 (P2P)
 ```
 
 ## 🔐 Authentication
@@ -840,6 +842,115 @@ GET /api/v1/blocks/stats
 ```http
 GET /api/v1/metrics/performance
 ```
+
+---
+
+## 🌍 Public Endpoints (Cached)
+
+These endpoints are optimized for public consumption (websites, dashboards). Data is cached on the server for 10 minutes to prevent spam and ensure consistent responses.
+
+### Get Public Stats
+```http
+GET /api/v1/public/stats
+```
+
+**Description:** Returns cached network statistics. Safe to call frequently - same data for all clients. Server updates cache every 10 minutes.
+
+**Response:**
+```json
+{
+  "active_nodes": 85000,
+  "light_nodes": 50000,
+  "full_nodes": 30000,
+  "super_nodes": 5000,
+  "height": 1234567,
+  "phase": 1,
+  "burn_percentage": 45.5,
+  "cached_at": "2025-11-28T12:00:00Z",
+  "cache_ttl_seconds": 600
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| active_nodes | u64 | Total active nodes (Light + Full + Super) |
+| light_nodes | u64 | Active Light nodes |
+| full_nodes | u64 | Active Full nodes |
+| super_nodes | u64 | Active Super nodes |
+| height | u64 | Current blockchain height |
+| phase | u8 | Current phase (1 = 1DEV burn, 2 = QNC) |
+| burn_percentage | f64 | Percentage of 1DEV supply burned |
+| cached_at | string | ISO 8601 timestamp of cache update |
+| cache_ttl_seconds | u64 | Cache lifetime in seconds |
+
+---
+
+### Get Activation Price
+```http
+GET /api/v1/activation/price?type={node_type}
+```
+
+**Description:** Returns server-calculated activation price. Server knows burn percentage and network size - client cannot manipulate pricing.
+
+**Query Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| type | string | No | Node type: `light`, `full`, `super`. Default: `light` |
+
+**Phase 1 Response (1DEV Burn):**
+```json
+{
+  "phase": 1,
+  "node_type": "super",
+  "cost": 1050,
+  "currency": "1DEV",
+  "base_cost": 1500,
+  "min_cost": 300,
+  "burn_percentage": 30.0,
+  "savings": 450,
+  "savings_percent": 30,
+  "mechanism": "burn",
+  "universal_price": true
+}
+```
+
+**Phase 2 Response (QNC Transfer):**
+```json
+{
+  "phase": 2,
+  "node_type": "super",
+  "cost": 5000,
+  "currency": "QNC",
+  "base_cost": 10000,
+  "multiplier": 0.5,
+  "mechanism": "transfer_to_pool3",
+  "universal_price": false
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| phase | u8 | Current activation phase |
+| node_type | string | Requested node type |
+| cost | u64 | Final activation cost |
+| currency | string | Token to use (1DEV or QNC) |
+| base_cost | u64 | Base price before discounts |
+| multiplier | f64 | Network size multiplier (Phase 2 only) |
+| mechanism | string | `burn` (Phase 1) or `transfer_to_pool3` (Phase 2) |
+| universal_price | bool | True if same price for all node types |
+
+**Phase 1 Pricing Formula:**
+```
+price = max(1500 - floor(burn% / 10) × 150, 300)
+```
+
+**Phase 2 Network Multipliers:**
+| Network Size | Multiplier |
+|--------------|------------|
+| ≤100K nodes | 0.5x (early adopter discount) |
+| ≤300K nodes | 1.0x (base price) |
+| ≤1M nodes | 2.0x (high demand) |
+| >1M nodes | 3.0x (maximum) |
 
 ---
 

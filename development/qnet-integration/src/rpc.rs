@@ -1381,6 +1381,31 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(blockchain_filter.clone())
         .and_then(handle_sync_status);
     
+    // ============================================================================
+    // PUBLIC ENDPOINTS: Cached, no rate limiting needed (same data for everyone)
+    // ============================================================================
+    
+    // PUBLIC: Network stats for website (cached 10 minutes)
+    // Safe to call frequently - returns same cached data
+    let public_stats = api_v1
+        .and(warp::path("public"))
+        .and(warp::path("stats"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(blockchain_filter.clone())
+        .and_then(handle_public_stats);
+    
+    // PUBLIC: Activation price (server calculates, client just displays)
+    // No network size exposure - server knows everything
+    let activation_price = api_v1
+        .and(warp::path("activation"))
+        .and(warp::path("price"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::query::<HashMap<String, String>>())
+        .and(blockchain_filter.clone())
+        .and_then(handle_activation_price);
+    
     // Network diagnostics endpoint
     let network_diagnostics = api_v1
         .and(warp::path("diagnostics"))
@@ -1677,6 +1702,10 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .or(tower_bft_info)
         .or(performance_metrics)
         .or(reputation_history);
+    
+    // PUBLIC: Cached endpoints for website (no rate limiting needed)
+    let public_routes = public_stats
+        .or(activation_price);
         
     // SECURE: Node information endpoint with activation code (for wallet extensions)
     let node_secure_info = api_v1
@@ -1774,6 +1803,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .or(contract_routes)
         .or(p2p_routes)
         .or(monitoring_routes)
+        .or(public_routes) // PUBLIC: Cached endpoints for website
         .with(cors);
     
     println!("🚀 Starting comprehensive API server on port {}", port);
@@ -7409,6 +7439,143 @@ async fn handle_stats(
     });
     
     Ok(warp::reply::json(&stats))
+}
+
+// ============================================================================
+// PUBLIC CACHED ENDPOINTS
+// ============================================================================
+
+/// Cached public stats - updated every 10 minutes
+/// Safe to call frequently from website - same data for everyone
+static PUBLIC_STATS_CACHE: Lazy<std::sync::RwLock<(serde_json::Value, std::time::Instant)>> = 
+    Lazy::new(|| std::sync::RwLock::new((json!({}), std::time::Instant::now() - std::time::Duration::from_secs(600))));
+
+/// Handle public stats request (cached 10 minutes)
+/// GET /api/v1/public/stats
+async fn handle_public_stats(
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    const CACHE_TTL_SECS: u64 = 600; // 10 minutes
+    
+    // Check cache first
+    {
+        let cache = PUBLIC_STATS_CACHE.read().unwrap();
+        if cache.1.elapsed().as_secs() < CACHE_TTL_SECS {
+            return Ok(warp::reply::json(&cache.0));
+        }
+    }
+    
+    // Cache expired - calculate new stats
+    let height = blockchain.get_height().await;
+    
+    // Get node counts
+    let (light_nodes, full_nodes, super_nodes) = if let Some(p2p) = blockchain.get_unified_p2p() {
+        let peers = p2p.get_validated_active_peers();
+        let light = peers.iter().filter(|p| p.node_type == crate::unified_p2p::NodeType::Light).count();
+        let full = peers.iter().filter(|p| p.node_type == crate::unified_p2p::NodeType::Full).count();
+        let super_n = peers.iter().filter(|p| p.node_type == crate::unified_p2p::NodeType::Super).count();
+        (light, full, super_n + 1) // +1 for self if Super
+    } else {
+        (0, 0, 5) // Default: 5 Genesis nodes
+    };
+    
+    let total_nodes = light_nodes + full_nodes + super_nodes;
+    
+    // Determine current phase
+    let burn_percentage = crate::GLOBAL_BURN_PERCENTAGE.load(std::sync::atomic::Ordering::Relaxed) as f64 / 100.0;
+    let phase = if burn_percentage >= 90.0 { 2 } else { 1 };
+    
+    let stats = json!({
+        "active_nodes": total_nodes,
+        "light_nodes": light_nodes,
+        "full_nodes": full_nodes,
+        "super_nodes": super_nodes,
+        "height": height,
+        "phase": phase,
+        "burn_percentage": burn_percentage,
+        "cached_at": chrono::Utc::now().to_rfc3339(),
+        "cache_ttl_seconds": CACHE_TTL_SECS
+    });
+    
+    // Update cache
+    {
+        let mut cache = PUBLIC_STATS_CACHE.write().unwrap();
+        *cache = (stats.clone(), std::time::Instant::now());
+    }
+    
+    Ok(warp::reply::json(&stats))
+}
+
+/// Handle activation price request (server calculates)
+/// GET /api/v1/activation/price?type=super
+async fn handle_activation_price(
+    params: HashMap<String, String>,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    let node_type = params.get("type").map(|s| s.as_str()).unwrap_or("light");
+    
+    // Get current phase
+    let burn_percentage = crate::GLOBAL_BURN_PERCENTAGE.load(std::sync::atomic::Ordering::Relaxed) as f64 / 100.0;
+    let phase = if burn_percentage >= 90.0 { 2 } else { 1 };
+    
+    if phase == 1 {
+        // Phase 1: 1DEV burn pricing
+        // Price = 1500 - (burn% / 10) * 150, minimum 300
+        let reduction_tiers = (burn_percentage / 10.0).floor() as u64;
+        let total_reduction = reduction_tiers * 150;
+        let price = std::cmp::max(1500u64.saturating_sub(total_reduction), 300);
+        
+        let savings = 1500 - price;
+        let savings_percent = (savings as f64 / 1500.0 * 100.0).round() as u64;
+        
+        return Ok(warp::reply::json(&json!({
+            "phase": 1,
+            "node_type": node_type,
+            "cost": price,
+            "currency": "1DEV",
+            "base_cost": 1500,
+            "min_cost": 300,
+            "burn_percentage": burn_percentage,
+            "savings": savings,
+            "savings_percent": savings_percent,
+            "mechanism": "burn",
+            "universal_price": true // Same for all node types in Phase 1
+        })));
+    }
+    
+    // Phase 2: QNC pricing with network multiplier
+    let active_nodes = crate::GLOBAL_ACTIVE_NODES.load(std::sync::atomic::Ordering::Relaxed);
+    
+    // Base costs
+    let base_cost = match node_type {
+        "super" => 10000u64,
+        "full" => 7500u64,
+        _ => 5000u64, // light
+    };
+    
+    // Network multiplier (canonical thresholds)
+    let multiplier = if active_nodes <= 100_000 {
+        0.5 // ≤100K: Early adopter discount
+    } else if active_nodes <= 300_000 {
+        1.0 // ≤300K: Base price
+    } else if active_nodes <= 1_000_000 {
+        2.0 // ≤1M: High demand
+    } else {
+        3.0 // >1M: Maximum
+    };
+    
+    let final_cost = (base_cost as f64 * multiplier).round() as u64;
+    
+    Ok(warp::reply::json(&json!({
+        "phase": 2,
+        "node_type": node_type,
+        "cost": final_cost,
+        "currency": "QNC",
+        "base_cost": base_cost,
+        "multiplier": multiplier,
+        "mechanism": "transfer_to_pool3",
+        "universal_price": false
+    })))
 }
 
 /// Handle failover history request
