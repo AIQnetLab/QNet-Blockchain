@@ -361,8 +361,13 @@ export class QNetDualWallet {
                 };
             } else {
                 // Phase 2: QNC costs with network size multiplier
+                // PRODUCTION: Must have real network size, no fake fallbacks
                 const networkStats = await this.qnetIntegration.getNetworkStats();
-                const actualNetworkSize = networkSize || networkStats?.totalNodes || 1000;
+                const actualNetworkSize = networkSize || networkStats?.totalNodes;
+                
+                if (!actualNetworkSize || actualNetworkSize <= 0) {
+                    throw new Error('Network size unavailable - cannot calculate Phase 2 costs');
+                }
                 
                 const costs = this.networkConfig.getActivationCosts(actualNetworkSize);
                 
@@ -374,15 +379,29 @@ export class QNetDualWallet {
             }
         } catch (error) {
             console.error('Failed to get activation costs:', error);
-            // Return fallback costs
-            return {
-                light: this.walletData.phase === 1 ? 1500 : 5000,
-                full: this.walletData.phase === 1 ? 1500 : 7500,
-                super: this.walletData.phase === 1 ? 1500 : 10000,
-                currency: this.walletData.phase === 1 ? '1DEV' : 'QNC',
-                phase: this.walletData.phase,
-                error: error.message
-            };
+            // PRODUCTION: Return error state, NOT fake prices
+            // Phase 1 can use base price (1500 1DEV), Phase 2 MUST have network size
+            if (this.walletData.phase === 1) {
+                return {
+                    light: 1500,
+                    full: 1500,
+                    super: 1500,
+                    currency: '1DEV',
+                    phase: 1,
+                    error: error.message
+                };
+            } else {
+                // Phase 2: Cannot calculate without network size
+                return {
+                    light: null,
+                    full: null,
+                    super: null,
+                    currency: 'QNC',
+                    phase: 2,
+                    error: 'Network data unavailable - cannot calculate prices',
+                    unavailable: true
+                };
+            }
         }
     }
 

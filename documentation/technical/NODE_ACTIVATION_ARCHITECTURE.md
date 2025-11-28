@@ -59,24 +59,49 @@ QNet uses quantum-resistant algorithms for all activation code generation and va
 - **Hardware Entropy**: `crypto.randomBytes(32)` for non-deterministic generation
 
 ### **Activation Code Security Features**
-```typescript
-// Quantum-secure code generation
-function generateActivationCode(txHash: string): string {
-  // Hardware entropy for non-deterministic generation
-  const timestamp = Date.now();
-  const hardwareEntropy = crypto.randomBytes(32).toString('hex');
-  
-  // Dynamic salt prevents predictability  
-  const dynamicSalt = `QNET_QUANTUM_V2_${timestamp}_${hardwareEntropy}`;
-  
-  // Multi-layer cryptographic hashing
-  const combinedData = `${txHash}:${hardwareEntropy}:${timestamp}:${dynamicSalt}`;
-  const fullHash = crypto.createHash('sha512').update(combinedData).digest();
-  const quantumHash = crypto.createHash('sha3-256').update(fullHash).digest('hex');
-  
-  // Format: QNET-XXXXXX-XXXXXX-XXXXXX (quantum-resistant, 26 chars)
-  return formatActivationCode(quantumHash);
-}
+
+**Format**: `QNET-XXXXXX-XXXXXX-XXXXXX` (25 characters total)
+
+```
+Segment 1 (6 chars): NodeType marker (L/F/S) + Timestamp (5 hex chars)
+Segment 2 (6 chars): XOR-encrypted wallet address part 1
+Segment 3 (6 chars): XOR-encrypted wallet address part 2 + entropy
+```
+
+```python
+# XOR-encryption based code generation (bridge-server.py / rpc.rs)
+def generate_activation_code(burn_tx_hash: str, wallet_address: str, 
+                              node_type: str, burn_amount: int) -> str:
+    # Step 1: Create encryption key from burn transaction
+    # CRITICAL: burn_amount must match exactly for decryption!
+    key_material = f"{burn_tx_hash}:{node_type}:{burn_amount}"
+    encryption_key = sha256(key_material.encode()).hexdigest()[:32]
+    
+    # Step 2: XOR encrypt wallet address (first 5 bytes → 10 hex chars)
+    encrypted_wallet = xor_encrypt(wallet_address[:5], encryption_key)
+    encrypted_wallet_hex = encrypted_wallet.hex().upper()  # 10 chars
+    
+    # Step 3: Generate entropy for additional security
+    entropy = sha256(f"{burn_tx_hash}:{timestamp}".encode()).hexdigest()[:4]
+    
+    # Step 4: Build segments
+    node_type_marker = {'light': 'L', 'full': 'F', 'super': 'S'}[node_type]
+    timestamp_hex = hex(int(time.time()) % 0x100000)[2:].zfill(5)
+    
+    segment1 = f"{node_type_marker}{timestamp_hex}"[:6].upper()  # 6 chars
+    segment2 = encrypted_wallet_hex[:6]                          # 6 chars
+    segment3 = f"{encrypted_wallet_hex[6:10]}{entropy}"[:6].upper()  # 6 chars
+    
+    # Format: QNET-XXXXXX-XXXXXX-XXXXXX (25 chars)
+    return f"QNET-{segment1}-{segment2}-{segment3}"
+```
+
+**Decryption Process** (quantum_crypto.rs):
+1. Parse segments from activation code
+2. Retrieve `burn_tx_hash` and `burn_amount` from `ActivationRecord` in blockchain registry
+3. Reconstruct `key_material` and derive encryption key
+4. XOR-decrypt wallet prefix from segments 2+3
+5. Verify decrypted prefix matches first 5 chars of registered wallet address
 ```
 
 ### **Cryptographic Wallet Binding**

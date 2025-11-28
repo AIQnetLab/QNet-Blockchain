@@ -101,11 +101,13 @@ export class ProductionCrypto {
     
     /**
      * Generate QNet EON address from seed
+     * PRODUCTION FORMAT: 19 chars + "eon" + 15 chars + 4 char checksum = 41 total
+     * Compatible with mobile app and backend validation
      */
     static generateQNetAddress(seed, accountIndex = 0) {
         try {
-            // Derive QNet-specific seed
-            const qnetSeed = CryptoJS.HmacSHA256(
+            // Derive QNet-specific seed using SHA-512 for more entropy
+            const qnetSeed = CryptoJS.HmacSHA512(
                 `qnet-eon-${accountIndex}`, 
                 CryptoJS.lib.WordArray.create(seed)
             );
@@ -113,10 +115,14 @@ export class ProductionCrypto {
             // Convert to hex and format as EON address
             const hex = qnetSeed.toString(CryptoJS.enc.Hex);
             
-            // Format: 8chars + "eon" + 8chars + 4char checksum
-            const part1 = hex.substring(0, 8);
-            const part2 = hex.substring(8, 16);
-            const checksum = hex.substring(56, 60); // Last 4 chars
+            // PRODUCTION FORMAT: 19 + 3 + 15 + 4 = 41 characters
+            const part1 = hex.substring(0, 19).toLowerCase();
+            const part2 = hex.substring(19, 34).toLowerCase();
+            
+            // Generate SHA-256 checksum (first 4 hex chars)
+            const addressWithoutChecksum = part1 + 'eon' + part2;
+            const checksumHash = CryptoJS.SHA256(addressWithoutChecksum);
+            const checksum = checksumHash.toString(CryptoJS.enc.Hex).substring(0, 4).toLowerCase();
             
             return `${part1}eon${part2}${checksum}`;
         } catch (error) {

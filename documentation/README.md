@@ -153,11 +153,13 @@ curl http://localhost:8545/api/v1/metrics
 
 ### Node Types & Capabilities
 
-| Type | Access Cost | Capabilities | Resources | Performance |
-|------|-------------|--------------|-----------|-------------|
-| **Light** | 1,500-300 $1DEV | Basic validation, mobile-optimized | Minimal | 8,859 TPS mobile |
-| **Full** | 1,500-300 $1DEV | Complete validation, single shard | Moderate | 424,411 TPS blockchain |
-| **Super** | 1,500-300 $1DEV | Priority validation, triple shard | High | 424,411 TPS blockchain |
+| Type | Access Cost | Capabilities | Storage | Performance |
+|------|-------------|--------------|---------|-------------|
+| **Light** | 1,500-300 $1DEV | Basic validation, mobile-optimized | ~100MB (headers only) | 8,859 TPS mobile |
+| **Full** | 1,500-300 $1DEV | Complete validation, 30-day history | ~500GB (pruned) | 424,411 TPS blockchain |
+| **Super** | 1,500-300 $1DEV | Priority validation, full archive | ~2TB (no pruning) | 424,411 TPS blockchain |
+
+> **Note (v2.19.10)**: Sharding is for parallel TX processing, NOT storage partitioning. All nodes receive all blocks; storage differs by tier.
 
 ### Performance Metrics
 - ✅ **424,411 TPS** achieved (verified June 2025) ⚡

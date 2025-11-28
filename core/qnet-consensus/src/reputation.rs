@@ -176,18 +176,11 @@ impl NodeReputation {
         self.reputations.insert(node_id.to_string(), new_reputation);
         self.last_update.insert(node_id.to_string(), Instant::now());
         
-        // STABILITY PROTECTION: Genesis nodes get critical jail instead of ban
+        // THREE STRIKES RULE: All nodes (including Genesis) get jailed
+        // 3rd offense = PERMANENT BAN for everyone
         if new_reputation < self.config.min_reputation {
-            if self.is_genesis_node(node_id) {
-                // Genesis nodes: critical jail (30 days) instead of permanent ban
-                println!("[STABILITY] ⚠️ Genesis {} critical failure - applying 30-day jail instead of ban", node_id);
-                self.jail_node(node_id, MaliciousBehavior::ProtocolViolation);
-                // Set minimum 5% reputation to prevent complete death
-                self.reputations.insert(node_id.to_string(), 5.0);
-            } else {
-                // Regular nodes: normal ban
-                self.ban_node(node_id);
-            }
+            println!("[JAIL] ⚠️ Node {} fell below threshold - applying jail", node_id);
+            self.jail_node(node_id, MaliciousBehavior::ProtocolViolation);
         }
     }
     
@@ -200,16 +193,10 @@ impl NodeReputation {
         self.reputations.insert(node_id.to_string(), new_reputation);
         self.last_update.insert(node_id.to_string(), Instant::now());
         
-        // STABILITY PROTECTION: Same logic as update_reputation
+        // THREE STRIKES RULE: All nodes get jailed equally
         if new_reputation < self.config.min_reputation {
-            if self.is_genesis_node(node_id) {
-                // Genesis nodes: critical jail instead of ban
-                println!("[STABILITY] ⚠️ Genesis {} set below threshold - critical jail", node_id);
-                self.jail_node(node_id, MaliciousBehavior::ProtocolViolation);
-                self.reputations.insert(node_id.to_string(), 5.0);
-            } else {
-                self.ban_node(node_id);
-            }
+            println!("[JAIL] ⚠️ Node {} set below threshold - applying jail", node_id);
+            self.jail_node(node_id, MaliciousBehavior::ProtocolViolation);
         }
     }
     
@@ -414,24 +401,28 @@ impl NodeReputation {
         };
         
         // Calculate jail duration based on offense count - SAME FOR ALL NODES
-        let jail_hours = if is_critical_attack {
-            // CRITICAL ATTACKS: Instant maximum ban (1 year)
-            8760
-        } else {
-            match jail_count {
-                1 => 1,           // First offense: 1 hour
-                2 => 24,          // Second: 24 hours
-                3 => 168,         // Third: 7 days
-                4 => 720,         // Fourth: 30 days
-                5 => 2160,        // Fifth: 3 months
-                _ => 8760,        // 6+ offenses: 1 year max for ALL nodes (full equality)
-            }
-        };
+        // CRITICAL ATTACKS: Instant PERMANENT BAN (no return)
+        // REGULAR OFFENSES: Progressive jail with 6 chances
+        let is_permanent_ban = is_critical_attack;  // Only critical attacks = permanent
         
-        let jailed_until = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs() + (jail_hours * 3600);
+        let jailed_until = if is_permanent_ban {
+            // PERMANENT BAN: Use u64::MAX directly (no overflow)
+            u64::MAX
+        } else {
+            let jail_hours = match jail_count {
+                1 => 1,           // First offense: 1 hour
+                2 => 24,          // Second offense: 24 hours
+                3 => 168,         // Third offense: 7 days
+                4 => 720,         // Fourth offense: 30 days
+                5 => 2160,        // Fifth offense: 3 months
+                _ => 8760,        // 6+ offenses: 1 year (max, but can return)
+            };
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                .saturating_add(jail_hours * 3600)
+        };
         
         let pre_jail_reputation = self.get_reputation(node_id);
         
@@ -466,35 +457,55 @@ impl NodeReputation {
         
         self.reputations.insert(node_id.to_string(), new_reputation);
         
-        println!("[JAIL] ⛓️ Node {} jailed for {} hours (offense #{}) for {:?}", 
-                node_id, jail_hours, jail_count, behavior);
+        if is_permanent_ban {
+            println!("[JAIL] 🚫 Node {} PERMANENTLY BANNED for CRITICAL ATTACK: {:?}", 
+                    node_id, behavior);
+        } else {
+            let jail_hours = match jail_count {
+                1 => 1,
+                2 => 24,
+                3 => 168,
+                4 => 720,
+                5 => 2160,
+                _ => 8760,
+            };
+            println!("[JAIL] ⛓️ Node {} jailed for {} hours (offense #{}) for {:?}", 
+                    node_id, jail_hours, jail_count, behavior);
+        }
     }
     
     /// Release node from jail
+    /// CRITICAL ATTACKS: Never released (permanent ban checked in jail_node)
+    /// REGULAR OFFENSES: Progressive restoration with 6 chances
     fn release_from_jail(&self, node_id: &str) {
         if let Some((_, jail_status)) = self.jailed_nodes.remove(node_id) {
+            // Check if this was a permanent ban (critical attack)
+            if jail_status.jailed_until == u64::MAX {
+                // Re-insert to keep permanently banned
+                self.jailed_nodes.insert(node_id.to_string(), jail_status);
+                println!("[JAIL] 🚫 Node {} is PERMANENTLY BANNED - cannot be released", node_id);
+                return;
+            }
+            
             // Calculate restoration reputation based on jail count
+            // Progressive penalty: more offenses = lower starting point
             let restore_reputation: f64 = match jail_status.jail_count {
-                1 => 30.0,
-                2 => 25.0,
-                3 => 20.0,
-                4 => 15.0,
-                5 => 10.0,
-                _ => 5.0,
+                1 => 30.0,  // First offense: restore to 30%
+                2 => 25.0,  // Second offense: restore to 25%
+                3 => 20.0,  // Third offense: restore to 20%
+                4 => 15.0,  // Fourth offense: restore to 15%
+                5 => 12.0,  // Fifth offense: restore to 12%
+                _ => 10.0,  // 6+ offenses: restore to 10% (minimum for passive recovery)
             };
             
-            // STABILITY: Genesis nodes get minimum 10% after critical jail
-            // This keeps them alive but below consensus threshold (70%)
-            let final_reputation = if self.is_genesis_node(node_id) && restore_reputation < 10.0 {
-                10.0  // Minimum for Genesis to stay in network
-            } else {
-                restore_reputation
-            };
+            // All nodes (including Genesis) get same treatment
+            // Minimum 10% ensures passive recovery is possible
+            let final_reputation = restore_reputation.max(10.0);
             
             self.reputations.insert(node_id.to_string(), final_reputation);
             
-            println!("[JAIL] 🔓 Node {} released from jail - reputation restored to {}%", 
-                    node_id, final_reputation);
+            println!("[JAIL] 🔓 Node {} released from jail (offense #{}) - reputation restored to {}%", 
+                    node_id, jail_status.jail_count, final_reputation);
         }
     }
     
@@ -551,4 +562,35 @@ impl NodeReputation {
     pub fn get_jail_status(&self, node_id: &str) -> Option<JailStatus> {
         self.jailed_nodes.get(node_id).map(|entry| entry.clone())
     }
+    
+    /// PRODUCTION: Apply jail status from network sync
+    /// Used for synchronizing jail across all nodes
+    pub fn apply_jail_sync(&mut self, node_id: &str, jailed_until: u64, jail_count: u32, reason: String) {
+        let jail_status = JailStatus {
+            jailed_until,
+            jail_count,
+            jail_reason: reason,
+            pre_jail_reputation: self.reputations.get(node_id).map(|r| *r).unwrap_or(70.0),
+        };
+        
+        self.jailed_nodes.insert(node_id.to_string(), jail_status);
+        
+        // Set reputation to 0 while jailed
+        if jailed_until == u64::MAX {
+            self.reputations.insert(node_id.to_string(), 0.0);
+        }
+    }
+    
+    /// PRODUCTION: Get all jail statuses for sync broadcast
+    /// Returns Vec of (node_id, jailed_until, jail_count, reason)
+    pub fn get_all_jail_statuses(&self) -> Vec<(String, u64, u32, String)> {
+        self.jailed_nodes
+            .iter()
+            .map(|entry| {
+                let status = entry.value();
+                (entry.key().clone(), status.jailed_until, status.jail_count, status.jail_reason.clone())
+            })
+            .collect()
+    }
+    
 } 

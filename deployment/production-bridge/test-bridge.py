@@ -82,11 +82,12 @@ def test_phase2_pricing():
     
     print("💎 Testing Phase 2 (QNC Pool 3) Dynamic Pricing...")
     
+    # CANONICAL VALUES: ≤100K=0.5x, ≤300K=1.0x, ≤1M=2.0x, >1M=3.0x
     test_cases = [
-        (50000, "0-100k", 0.5),
-        (500000, "100k-1m", 1.0),
-        (5000000, "1m-10m", 2.0),
-        (15000000, "10m+", 3.0)
+        (50000, "≤100k", 0.5),
+        (200000, "≤300k", 1.0),
+        (500000, "≤1M", 2.0),
+        (2000000, ">1M", 3.0)
     ]
     
     for network_size, expected_category, expected_multiplier in test_cases:

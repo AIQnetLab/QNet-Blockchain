@@ -202,14 +202,15 @@ class NodeActivationRouter:
             }
             
             # Apply network size multiplier
-            if total_nodes < 100_000:
-                multiplier = 0.5
-            elif total_nodes < 300_000:
-                multiplier = 1.0
-            elif total_nodes < 1_000_000:
-                multiplier = 2.0
+            # CANONICAL VALUES - same across all components
+            if total_nodes <= 100_000:
+                multiplier = 0.5       # ≤100K: Early adopter discount
+            elif total_nodes <= 300_000:
+                multiplier = 1.0       # ≤300K: Base price
+            elif total_nodes <= 1_000_000:
+                multiplier = 2.0       # ≤1M: High demand
             else:
-                multiplier = 3.0
+                multiplier = 3.0       # >1M: Maximum (cap)
                 
             price = int(base_prices[node_type] * multiplier)
             

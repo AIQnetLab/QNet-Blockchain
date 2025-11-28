@@ -1,4 +1,4 @@
-# QNet v2.19.4 - Quick Reference Guide
+# QNet v2.19.6 - Quick Reference Guide
 
 ## 📚 Key Concepts
 
@@ -29,9 +29,11 @@
 | **Tick Duration** | 10ms | 100 ticks per second |
 | **Hashes per Tick** | 5,000 | 500K / 100 = 5,000 |
 | **Hashes per Slot** | 500,000 | 1-second microblock alignment |
-| **Checkpoint Interval** | 1M hashes | ~2 seconds |
+| **Checkpoint Interval** | 10M hashes | ~20 seconds |
 | **Max Drift** | 5% | Auto-warning on clock drift |
 | **Node Types** | Full/Super only | Light nodes excluded (battery saving) |
+| **Storage** | Separate CF | O(1) validation without block loading |
+| **Max Regression** | 15M hashes | ~30 seconds tolerance |
 
 ## 🔄 Progressive Finalization Protocol (PFP)
 
@@ -146,12 +148,21 @@ Handles out-of-order block arrival in gossip P2P network while preventing memory
 |-----------|-------|-------|
 | **Shards** | 256 | 100K Light nodes per shard |
 | **Max Light Nodes** | 25.6M | 256 × 100K |
-| **Ping Method** | FCM Push | Firebase Cloud Messaging V1 API |
+| **Push Methods** | FCM / UnifiedPush / Polling | Multi-provider support |
 | **Pinger Selection** | Deterministic | Primary + 2 Backups per Light node |
 | **Slot Duration** | 1 minute | 240 slots per 4-hour window |
+| **Slot Randomization** | Per window | Different slot each 4-hour window |
 | **Challenge-Response** | Dilithium signed | Light node signs random challenge |
 | **Attestation** | Dual signature | Light + Pinger signatures |
-| **FCM Rate Limit** | 500/sec | Google API compliance |
+| **Inactive Threshold** | 10 failures | Node marked inactive after 10 missed pings |
+| **Reactivation** | Manual button | "I'm Back" in mobile app |
+
+### Push Provider Priority
+| Provider | Platform | Notes |
+|----------|----------|-------|
+| **FCM** | Google Play | Firebase Cloud Messaging V1 API |
+| **UnifiedPush** | F-Droid | Open-source, decentralized (ntfy.sh, etc.) |
+| **Polling** | Fallback | Smart wake-up ~2 min before calculated slot (once per 4h window) |
 
 ## 💰 Reward System
 
@@ -190,16 +201,25 @@ Handles out-of-order block arrival in gossip P2P network while preventing memory
 
 ```
 CONSENSUS (consensus_score):
-  ValidBlock:             +5.0
+  FullRotationComplete:   +2.0 (for completing all 30 blocks in rotation)
   InvalidBlock:          -20.0
-  ConsensusParticipation: +2.0
+  ConsensusParticipation: +1.0
   MaliciousBehavior:     -50.0
 
-NETWORK (network_score):
-  SuccessfulResponse:     +1.0
+NETWORK (network_score - PENALTIES ONLY):
   TimeoutFailure:         -2.0
   ConnectionFailure:      -5.0
-  FastResponse:           +3.0
+
+PASSIVE RECOVERY (once per 4h, if score [10, 70), NOT jailed):
+  +1.0 reputation
+
+PROGRESSIVE JAIL (6 chances):
+  1st: 1h → 30%    4th: 30d → 15%
+  2nd: 24h → 25%   5th: 3m → 12%
+  3rd: 7d → 20%    6+: 1y → 10% (can return!)
+
+CRITICAL ATTACKS → PERMANENT BAN (no return):
+  DatabaseSubstitution, ChainFork, StorageDeletion
 ```
 
 ### Gossip Protocol
@@ -375,6 +395,7 @@ const GRACE_PERIOD_SECS: u64 = 180;            // 3 minutes
 ## 🔗 Documentation
 
 - **Full Architecture**: `docs/ARCHITECTURE_v2.19.md`
+- **API Reference**: `docs/API_REFERENCE.md` ⬅️ NEW
 - **README**: `README.md`
 - **API Docs**: https://docs.qnet.io (when published)
 

@@ -178,11 +178,8 @@ export class NetworkManager {
                 total_pool: response.total_pool || 0,
                 recent_activations: response.recent_activations || [],
                 next_distribution: response.next_distribution || 'Unknown',
-                activation_costs: response.activation_costs || {
-                    light: 5000,
-                    full: 7500,
-                    super: 10000
-                }
+                // PRODUCTION: No fallback for activation costs - must come from API
+                activation_costs: response.activation_costs || null
             };
         } catch (error) {
             console.error('Error getting Pool 3 info:', error);

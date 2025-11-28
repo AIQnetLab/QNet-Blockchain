@@ -218,6 +218,9 @@ impl DilithiumKeyManager {
     /// 1. Uses Dilithium keypair as entropy source
     /// 2. Uses SHA3-512 which is quantum-resistant
     /// 3. Signature is deterministic and verifiable
+    /// 
+    /// NOTE: Returns only the 2420-byte signature part (legacy compatibility)
+    /// For full SignedMessage format, use sign_full()
     pub fn sign(&self, data: &[u8]) -> Result<Vec<u8>> {
         // OPTIMIZATION: Use cached keypair from get_keypair()
         let (_pk, sk) = self.get_keypair()?;
@@ -233,6 +236,23 @@ impl DilithiumKeyManager {
         
         println!("✅ Generated REAL Dilithium3 quantum-resistant signature ({} bytes)", sig_bytes.len());
         Ok(sig_bytes.to_vec())
+    }
+    
+    /// Sign data and return FULL SignedMessage (signature + message)
+    /// PRODUCTION: Use this for proper Dilithium3 verification with dilithium3::open()
+    /// Format: [signature(2420 bytes)] + [original message]
+    pub fn sign_full(&self, data: &[u8]) -> Result<Vec<u8>> {
+        let (_pk, sk) = self.get_keypair()?;
+        
+        // Sign with REAL Dilithium3 algorithm
+        let signature = dilithium3::sign(data, &sk);
+        
+        // Return the FULL SignedMessage bytes (signature + message)
+        let signed_msg_bytes = SignedMessageTrait::as_bytes(&signature);
+        
+        println!("✅ Generated FULL Dilithium3 SignedMessage ({} bytes = 2420 sig + {} msg)", 
+                 signed_msg_bytes.len(), data.len());
+        Ok(signed_msg_bytes.to_vec())
     }
     
     /// Verify signature with public key
@@ -289,7 +309,144 @@ impl DilithiumKeyManager {
             .map_err(|e| anyhow!("Invalid base64: {}", e))
     }
     
-    /// Save keypair to disk (encrypted)
+    /// Get or create encryption key from file-based secret
+    /// SECURITY: Key is randomly generated once and stored with integrity check
+    /// NOT derived from public data like node_id (NIST SP 800-132 compliant)
+    /// 
+    /// File format: [key(32)] + [sha3_256_hash(8)] = 40 bytes total
+    /// This prevents using corrupted or tampered secrets
+    fn get_encryption_key(&self) -> Result<[u8; 32]> {
+        // 1. Check environment variable first (for advanced users/CI)
+        if let Ok(key_hex) = std::env::var("QNET_KEY_ENCRYPTION_SECRET") {
+            if key_hex.len() == 64 {
+                if let Ok(key_bytes) = hex::decode(&key_hex) {
+                    if key_bytes.len() == 32 {
+                        let mut key = [0u8; 32];
+                        key.copy_from_slice(&key_bytes);
+                        println!("[KEY_MANAGER] 🔐 Using encryption key from QNET_KEY_ENCRYPTION_SECRET");
+                        return Ok(key);
+                    }
+                }
+            }
+            println!("[KEY_MANAGER] ⚠️ Invalid QNET_KEY_ENCRYPTION_SECRET format (need 64 hex chars)");
+        }
+        
+        // 2. File-based secret with integrity check
+        let secret_path = self.key_dir.join(".qnet_encryption_secret");
+        let keypair_path = self.key_dir.join("dilithium_keypair.bin");
+        
+        if secret_path.exists() {
+            // Load existing secret with integrity verification
+            let secret_data = fs::read(&secret_path)
+                .map_err(|e| anyhow!("Failed to read encryption secret: {}", e))?;
+            
+            // Expected format: [key(32)] + [hash(8)]
+            if secret_data.len() == 40 {
+                let key_part = &secret_data[..32];
+                let stored_hash = &secret_data[32..40];
+                
+                // Verify integrity hash
+                let mut hasher = Sha3_256::new();
+                hasher.update(key_part);
+                hasher.update(b"QNET_SECRET_INTEGRITY_V1");
+                let computed_hash = &hasher.finalize()[..8];
+                
+                if stored_hash == computed_hash {
+                    let mut key = [0u8; 32];
+                    key.copy_from_slice(key_part);
+                    return Ok(key);
+                } else {
+                    // CRITICAL: Hash mismatch = tampering or corruption
+                    // If keypair exists, we CANNOT regenerate (would lose identity)
+                    if keypair_path.exists() {
+                        return Err(anyhow!(
+                            "SECURITY ALERT: Encryption secret integrity check failed! \
+                            File may be corrupted or tampered. \
+                            Cannot regenerate without losing node identity. \
+                            Restore from backup or contact support."
+                        ));
+                    }
+                    println!("[KEY_MANAGER] ⚠️ Corrupted encryption secret (no keypair yet), regenerating...");
+                }
+            } else if secret_data.len() == 32 {
+                // Legacy format without hash - upgrade it
+                println!("[KEY_MANAGER] 🔄 Upgrading encryption secret to include integrity hash...");
+                let mut key = [0u8; 32];
+                key.copy_from_slice(&secret_data);
+                
+                // Save with integrity hash
+                self.save_encryption_secret(&key, &secret_path)?;
+                return Ok(key);
+            } else {
+                // Wrong size - corrupted
+                if keypair_path.exists() {
+                    return Err(anyhow!(
+                        "SECURITY ALERT: Encryption secret corrupted (wrong size: {} bytes)! \
+                        Cannot regenerate without losing node identity.",
+                        secret_data.len()
+                    ));
+                }
+                println!("[KEY_MANAGER] ⚠️ Corrupted encryption secret, regenerating...");
+            }
+        }
+        
+        // 3. Generate new random secret (only if no keypair exists!)
+        if keypair_path.exists() {
+            return Err(anyhow!(
+                "CRITICAL: Encryption secret missing but keypair exists! \
+                Cannot decrypt existing keys. Restore .qnet_encryption_secret from backup."
+            ));
+        }
+        
+        println!("[KEY_MANAGER] 🔐 Generating new encryption secret (one-time operation)...");
+        let new_key: [u8; 32] = rand::random();
+        
+        // Save with integrity hash
+        self.save_encryption_secret(&new_key, &secret_path)?;
+        
+        println!("[KEY_MANAGER] ✅ Encryption secret saved to {:?}", secret_path);
+        Ok(new_key)
+    }
+    
+    /// Save encryption secret with integrity hash
+    /// Format: [key(32)] + [sha3_256_hash(8)] = 40 bytes
+    fn save_encryption_secret(&self, key: &[u8; 32], path: &Path) -> Result<()> {
+        // Compute integrity hash
+        let mut hasher = Sha3_256::new();
+        hasher.update(key);
+        hasher.update(b"QNET_SECRET_INTEGRITY_V1");
+        let hash = hasher.finalize();
+        
+        // Combine key + first 8 bytes of hash
+        let mut data = Vec::with_capacity(40);
+        data.extend_from_slice(key);
+        data.extend_from_slice(&hash[..8]);
+        
+        // Write to disk
+        fs::write(path, &data)
+            .map_err(|e| anyhow!("Failed to save encryption secret: {}", e))?;
+        
+        // Set restrictive permissions
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        }
+        
+        #[cfg(windows)]
+        {
+            // Windows: Mark file as hidden and system
+            use std::process::Command;
+            let _ = Command::new("attrib")
+                .args(["+H", "+S", path.to_str().unwrap_or("")])
+                .output();
+        }
+        
+        Ok(())
+    }
+    
+    /// Save keypair to disk (encrypted with file-based secret)
+    /// SECURITY: Uses random encryption key, NOT derived from public node_id
     fn save_keypair_to_disk(&self, pk: &dilithium3::PublicKey, sk: &dilithium3::SecretKey, path: &Path) -> Result<()> {
         use aes_gcm::{aead::{Aead, KeyInit}, Aes256Gcm, Nonce, Key};
         
@@ -304,11 +461,8 @@ impl DilithiumKeyManager {
         combined.extend_from_slice(&(sk_bytes.len() as u32).to_le_bytes());
         combined.extend_from_slice(sk_bytes);
         
-        // Derive encryption key from node_id
-        let mut hasher = Sha3_256::new();
-        hasher.update(self.node_id.as_bytes());
-        hasher.update(b"QNET_KEYPAIR_ENCRYPTION_V1");
-        let key_material = hasher.finalize();
+        // SECURITY FIX: Get encryption key from file-based secret (not from node_id!)
+        let key_material = self.get_encryption_key()?;
         
         // Encrypt with AES-256-GCM
         let key = Key::<Aes256Gcm>::from_slice(&key_material);
@@ -337,7 +491,8 @@ impl DilithiumKeyManager {
         Ok(())
     }
     
-    /// Load keypair from disk (decrypt)
+    /// Load keypair from disk (decrypt with file-based secret)
+    /// SECURITY: Uses random encryption key from file, NOT derived from public node_id
     fn load_keypair_from_disk(&self, path: &Path) -> Result<(dilithium3::PublicKey, dilithium3::SecretKey)> {
         use aes_gcm::{aead::{Aead, KeyInit}, Aes256Gcm, Nonce, Key};
         
@@ -351,11 +506,8 @@ impl DilithiumKeyManager {
         let nonce_bytes = &stored[..12];
         let encrypted = &stored[12..];
         
-        // Derive decryption key
-        let mut hasher = Sha3_256::new();
-        hasher.update(self.node_id.as_bytes());
-        hasher.update(b"QNET_KEYPAIR_ENCRYPTION_V1");
-        let key_material = hasher.finalize();
+        // SECURITY FIX: Get decryption key from file-based secret (not from node_id!)
+        let key_material = self.get_encryption_key()?;
         
         // Decrypt
         let key = Key::<Aes256Gcm>::from_slice(&key_material);
@@ -363,7 +515,7 @@ impl DilithiumKeyManager {
         let nonce = Nonce::from_slice(nonce_bytes);
         
         let decrypted = cipher.decrypt(nonce, encrypted)
-            .map_err(|e| anyhow!("Decryption failed: {}", e))?;
+            .map_err(|e| anyhow!("Decryption failed: {}. If keys were encrypted with old method, delete keys/ folder and restart.", e))?;
         
         // Parse keypair
         if decrypted.len() < 8 {
@@ -411,71 +563,4 @@ impl DilithiumKeyManager {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::TempDir;
-    
-    #[tokio::test]
-    async fn test_key_generation_and_signing() {
-        let temp_dir = TempDir::new().unwrap();
-        let manager = DilithiumKeyManager::new(
-            "test_node".to_string(),
-            temp_dir.path()
-        ).unwrap();
-        
-        // Initialize (generate keys)
-        manager.initialize().await.unwrap();
-        
-        // Test signing
-        let message = b"Test message for quantum-resistant signature";
-        let signature = manager.sign(message).unwrap();
-        assert_eq!(signature.len(), 2420);
-        
-        // Test verification with own public key
-        let public_key = manager.get_public_key().unwrap();
-        let valid = manager.verify(message, &signature, &public_key).unwrap();
-        assert!(valid);
-        
-        // Test invalid signature
-        let mut bad_sig = signature.clone();
-        bad_sig[0] ^= 0xFF;
-        let invalid = manager.verify(message, &bad_sig, &public_key).unwrap();
-        assert!(!invalid);
-    }
-    
-    #[tokio::test]
-    async fn test_key_persistence() {
-        let temp_dir = TempDir::new().unwrap();
-        let node_id = "persistent_test".to_string();
-        
-        // Generate and store seed
-        let manager1 = DilithiumKeyManager::new(
-            node_id.clone(),
-            temp_dir.path()
-        ).unwrap();
-        manager1.initialize().await.unwrap();
-        
-        let message = b"Persistence test";
-        let signature1 = manager1.sign(message).unwrap();
-        let public_key1 = manager1.get_public_key().unwrap();
-        
-        // Load seed in new instance
-        let manager2 = DilithiumKeyManager::new(
-            node_id,
-            temp_dir.path()
-        ).unwrap();
-        manager2.initialize().await.unwrap();
-        
-        let signature2 = manager2.sign(message).unwrap();
-        let public_key2 = manager2.get_public_key().unwrap();
-        
-        // Signatures should be identical (deterministic)
-        assert_eq!(signature1, signature2);
-        
-        // Public keys might differ due to keypair() randomness
-        // But cross-verification should still work with deterministic signatures
-        let valid = manager2.verify(message, &signature1, &public_key1).unwrap();
-        assert!(valid);
-    }
-}
+// Tests moved to quantum_crypto.rs::test_dilithium_sign_and_verify

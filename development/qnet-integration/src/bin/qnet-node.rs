@@ -138,11 +138,11 @@ async fn decode_activation_code_quantum_secure(
 
 // Validate activation code matches expected node type and payment
 fn validate_activation_code_node_type(code: &str, expected_type: NodeType, current_phase: u8, current_pricing: &PricingInfo) -> Result<(), String> {
-    println!("\n🔍 === Activation Code Validation (DEVELOPMENT MODE) ===");
+    println!("\n🔍 === Activation Code Validation ===");
     
-    // Production mode - validate QNET activation codes only
-    if !code.starts_with("QNET-") || code.len() != 17 {
-        return Err("Invalid activation code format. Expected: QNET-XXXX-XXXX-XXXX".to_string());
+    // Production mode - validate QNET activation codes (25 chars: QNET-XXXXXX-XXXXXX-XXXXXX)
+    if !code.starts_with("QNET-") || code.len() != 25 {
+        return Err("Invalid activation code format. Expected: QNET-XXXXXX-XXXXXX-XXXXXX (25 chars)".to_string());
     }
     
     println!("   ✅ QNET activation code format validated");
@@ -1047,11 +1047,12 @@ async fn get_real_token_supply(rpc_url: &str, token_mint: &str) -> Result<TokenS
 // This function removed - now using real network scanning instead of token burn estimation
 
 fn calculate_network_multiplier(network_size: u64) -> f64 {
+    // CANONICAL VALUES - same across all components
     match network_size {
-        0..=10_000 => 0.5,      // Early network discount
-        10_001..=100_000 => 1.0, // Standard pricing
-        100_001..=1_000_000 => 2.0, // High demand
-        _ => 3.0                 // Mature network premium
+        0..=100_000 => 0.5,          // ≤100K: Early adopter discount
+        100_001..=300_000 => 1.0,    // ≤300K: Base price
+        300_001..=1_000_000 => 2.0,  // ≤1M: High demand
+        _ => 3.0                     // >1M: Maximum (cap)
     }
 }
 

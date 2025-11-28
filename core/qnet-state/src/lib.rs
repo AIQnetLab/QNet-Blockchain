@@ -20,7 +20,7 @@ pub mod state;
 mod python_bindings;
 
 pub use account::{Account, AccountState};
-pub use block::{Block, BlockHeader, ConsensusProof, BlockType, MicroBlock, MacroBlock, ConsensusData, LightMicroBlock, BlockHash, EfficientMicroBlock};
+pub use block::{Block, BlockHeader, ConsensusProof, BlockType, MicroBlock, MacroBlock, ConsensusData, LightMicroBlock, BlockHash, EfficientMicroBlock, StoredMicroBlock, PoHState, storage_version};
 pub use transaction::{Transaction, TransactionReceipt, TransactionType, gas_limits, PingSampleData};
 pub use state_db::StateDB;
 pub use state_manager::StateManager;

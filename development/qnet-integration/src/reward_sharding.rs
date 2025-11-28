@@ -215,7 +215,7 @@ impl ShardedRewardManager {
         }
         
         println!("[SHARDING] Processed total rewards: {} QNC across all shards", 
-                 total_rewards as f64 / 1_000_000.0);
+                 total_rewards as f64 / 1_000_000_000.0);
         
         Ok(total_rewards)
     }
@@ -423,7 +423,7 @@ impl ShardedRewardManager {
         println!("[SHARDING] Shard {} completed: {} nodes, {} QNC total", 
                  shard.shard_id, 
                  shard.node_ids.len(),
-                 total_rewards as f64 / 1_000_000.0);
+                 total_rewards as f64 / 1_000_000_000.0);
         
         Ok(total_rewards)
     }

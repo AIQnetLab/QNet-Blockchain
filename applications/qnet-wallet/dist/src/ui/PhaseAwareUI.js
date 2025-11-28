@@ -503,6 +503,29 @@ export class PhaseAwareUI {
             // Update node status
             this.updateNodeStatus(data.nodeInfo);
             
+            // PRODUCTION: Get active nodes from server's cached public stats
+            try {
+                const bootstrapNodes = [
+                    'http://154.38.160.39:8080',
+                    'http://62.171.157.44:8080',
+                    'http://161.97.86.81:8080'
+                ];
+                for (const apiUrl of bootstrapNodes) {
+                    try {
+                        const response = await fetch(`${apiUrl}/api/v1/public/stats`, {
+                            signal: AbortSignal.timeout(5000)
+                        });
+                        if (response.ok) {
+                            const stats = await response.json();
+                            this.updateElement('active-nodes', (stats.active_nodes || 0).toLocaleString());
+                            break;
+                        }
+                    } catch (e) { continue; }
+                }
+            } catch (networkError) {
+                this.updateElement('active-nodes', 'N/A');
+            }
+            
         } catch (error) {
             console.error('Failed to load QNet data:', error);
         }

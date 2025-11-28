@@ -370,8 +370,9 @@ export class SecureCrypto {
     }
 
     /**
-     * Generate QNet address from mnemonic (NEW)
-     * Conforms to the EON address format: 7a9bk4f2eon8x3m5z1c7
+     * Generate QNet address from mnemonic (PRODUCTION)
+     * Format: 19 chars + "eon" + 15 chars + 4 char checksum = 41 total
+     * Compatible with mobile app and backend validation
      */
     async generateQNetAddress(mnemonic, index = 0) {
         try {
@@ -379,39 +380,34 @@ export class SecureCrypto {
             const seedInput = `eon_${mnemonic}_${index}`;
             const hash = await this.hashData(seedInput);
 
-            const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
-            
-            // Generate parts of the address from the hash
-            let part1 = '';
-            for (let i = 0; i < 8; i++) {
-                part1 += chars[parseInt(hash.substr(i * 2, 2), 16) % chars.length];
-            }
+            // PRODUCTION FORMAT: 19 + 3 + 15 + 4 = 41 characters
+            // Extract hex characters from hash
+            const part1 = hash.substring(0, 19).toLowerCase();
+            const part2 = hash.substring(19, 34).toLowerCase();
 
-            let part2 = '';
-            for (let i = 8; i < 16; i++) {
-                part2 += chars[parseInt(hash.substr(i * 2, 2), 16) % chars.length];
-            }
-
-            // A simple checksum for basic validation
-            const checksum_payload = part1 + part2;
-            let checksum = '';
-            for (let i = 0; i < 4; i++) {
-                 const charCode = checksum_payload.charCodeAt(i) + checksum_payload.charCodeAt(i + 8);
-                 checksum += chars[charCode % chars.length];
-            }
+            // Generate SHA-256 checksum (first 4 hex chars)
+            const addressWithoutChecksum = part1 + 'eon' + part2;
+            const checksumHash = await this.hashData(addressWithoutChecksum);
+            const checksum = checksumHash.substring(0, 4).toLowerCase();
 
             return `${part1}eon${part2}${checksum}`;
 
         } catch (error) {
             console.error('Error generating EON address:', error);
-            // Fallback in case of any crypto failure
-            // Use crypto.getRandomValues for secure fallback
-            const randomBytes = new Uint8Array(32);
+            // Fallback: generate secure random address in correct format
+            const randomBytes = new Uint8Array(64);
             crypto.getRandomValues(randomBytes);
-            const fallback_part1 = btoa(String.fromCharCode(...randomBytes.slice(0, 8))).replace(/[+/=]/g, '').substring(0, 8);
-            const fallback_part2 = btoa(String.fromCharCode(...randomBytes.slice(8, 16))).replace(/[+/=]/g, '').substring(0, 8);
-            const fallback_checksum = btoa(String.fromCharCode(...randomBytes.slice(16, 20))).replace(/[+/=]/g, '').substring(0, 6);
-            return `${fallback_part1}eon${fallback_part2}${fallback_checksum}`;
+            const hex = Array.from(randomBytes).map(b => b.toString(16).padStart(2, '0')).join('');
+            const part1 = hex.substring(0, 19).toLowerCase();
+            const part2 = hex.substring(19, 34).toLowerCase();
+            const checksumInput = part1 + 'eon' + part2;
+            // Simple checksum for fallback
+            let checksumNum = 0;
+            for (let i = 0; i < checksumInput.length; i++) {
+                checksumNum = (checksumNum + checksumInput.charCodeAt(i)) % 65536;
+            }
+            const checksum = checksumNum.toString(16).padStart(4, '0');
+            return `${part1}eon${part2}${checksum}`;
         }
     }
 

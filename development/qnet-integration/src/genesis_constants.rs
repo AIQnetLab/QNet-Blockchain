@@ -12,12 +12,13 @@ pub const GENESIS_BOOTSTRAP_CODES: &[&str] = &[
 
 /// Genesis node wallet addresses (PRODUCTION)
 /// These are the predefined wallet addresses for Genesis nodes
+/// Format: 19 hex + "eon" + 15 hex + 4 hex checksum = 41 chars
 pub const GENESIS_WALLETS: &[(&str, &str)] = &[
-    ("001", "b07408bdc5688b92d69eonfd060d05f246f659414"), // Genesis Node #1
-    ("002", "5f7e69d299eb6046af7eonb8e632c67d83a8b96a0"), // Genesis Node #2  
-    ("003", "a3d62ef91e60d66d2a2eon2caa0d87cb2a1976f31"), // Genesis Node #3
-    ("004", "29e11b0a9cc89296490eoncca66139e40d72bd25d"), // Genesis Node #4
-    ("005", "f8c4ed54ad92b0a94f1eonad6cc5623af63b79826"), // Genesis Node #5
+    ("001", "7bc83500fd08525250feonff5503d0dce4dbdede8"), // Genesis Node #1
+    ("002", "714a0f700a4dbcc0d88eonf635ace76ed2eb9a186"), // Genesis Node #2  
+    ("003", "357842d58e86cc300cfeon0203e16eef3e7044db1"), // Genesis Node #3
+    ("004", "4f710f9b3152659c56aeond4c05f2731a1890aedf"), // Genesis Node #4
+    ("005", "8fa8ebe9e85dee95080eond0a7365096572f03e1c"), // Genesis Node #5
 ];
 
 /// Genesis node IP addresses (PRODUCTION)

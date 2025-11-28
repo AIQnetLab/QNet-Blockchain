@@ -47,8 +47,6 @@ pub struct BlockchainActivationRegistry {
     last_sync: RwLock<u64>,
     /// Cache TTL in seconds (5 minutes for production)
     cache_ttl: u64,
-    /// DHT peer network for distributed validation
-    dht_client: Option<DhtClient>,
     /// Load balancer for blockchain RPC endpoints
     rpc_load_balancer: RpcLoadBalancer,
     /// CRITICAL: Shared storage instance to avoid RocksDB lock conflicts
@@ -291,7 +289,27 @@ pub struct NodeInfo {
     pub activated_at: u64,
     pub last_seen: u64,
     pub migration_count: u32,
+    /// CRITICAL: Node ID for linking activation_code to active network node
+    /// Format: "genesis_node_001", "node_154_38_160_39", "full_XXXXX", etc.
+    #[serde(default)]
+    pub node_id: String,
+    /// Burn transaction hash for XOR decryption key derivation
+    /// Phase 1: Solana 1DEV burn tx hash
+    /// Phase 2: QNet Pool 3 transfer tx hash
+    #[serde(default)]
+    pub burn_tx_hash: String,
+    /// Activation phase (1 = 1DEV burn, 2 = QNC transfer)
+    #[serde(default = "default_phase")]
+    pub phase: u8,
+    /// CRITICAL: Exact burn amount used for XOR key derivation
+    /// This MUST match the amount used when generating the activation code
+    /// key_material = f"{burn_tx}:{node_type}:{burn_amount}"
+    #[serde(default = "default_burn_amount")]
+    pub burn_amount: u64,
 }
+
+fn default_phase() -> u8 { 1 }
+fn default_burn_amount() -> u64 { 1500 } // Default Phase 1 base price
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActivationRecord {
@@ -301,7 +319,11 @@ pub struct ActivationRecord {
     pub activated_at: u64,
     pub node_type: String,
     pub phase: u8, // 1 = Phase 1 (1DEV burn), 2 = Phase 2 (QNC to Pool 3)
-    pub activation_amount: u64, // Phase 1: 0 (burned externally), Phase 2: QNC amount transferred
+    /// CRITICAL: The exact amount used for XOR key derivation during code generation
+    /// Phase 1: 1DEV amount (e.g., 1500, 1350, etc. based on burn percentage at generation time)
+    /// Phase 2: QNC amount transferred to Pool 3
+    /// This MUST match the amount used in key_material = f"{burn_tx}:{node_type}:{amount}"
+    pub activation_amount: u64,
     pub blockchain_height: u64,
     pub is_active: bool,
     pub device_migrations: Vec<DeviceMigration>,
@@ -313,12 +335,6 @@ pub struct DeviceMigration {
     pub to_device: String,
     pub migration_timestamp: u64,
     pub wallet_signature: String,
-}
-
-#[derive(Debug)]
-pub struct DhtClient {
-    peer_count: usize,
-    connection_pool: Vec<String>,
 }
 
 impl BlockchainActivationRegistry {
@@ -357,10 +373,6 @@ impl BlockchainActivationRegistry {
             cache_stats: RwLock::new(CacheStats::new()),
             last_sync: RwLock::new(0),
             cache_ttl: 300, // 5 minutes
-            dht_client: Some(DhtClient { 
-                peer_count: 0, 
-                connection_pool: vec![] 
-            }),
             rpc_load_balancer: RpcLoadBalancer::new(rpc_endpoints),
             storage, // CRITICAL: Store shared storage reference
         }
@@ -487,27 +499,8 @@ impl BlockchainActivationRegistry {
             }
         }
         
-        // L4: DHT check (10ms average)
-        if let Some(dht) = &self.dht_client {
-            let mut stats = self.cache_stats.write().await;
-            stats.dht_queries += 1;
-            
-            if self.check_dht_for_code_hash(&code_hash).await? {
-                // Update all caches with hash
-                let mut bloom = self.bloom_filter.write().await;
-                bloom.add(&code_hash);
-                
-                let mut used_codes = self.used_codes.write().await;
-                used_codes.insert(code_hash.clone());
-                
-                let mut l1_cache = self.l1_cache.write().await;
-                l1_cache.put(code_hash.clone(), true);
-                
-                return Ok(true);
-            }
-        }
-        
-        // L5: Blockchain query (100ms average, last resort)
+        // L4: Blockchain query (100ms average, last resort)
+        // NOTE: DHT layer removed - activation validated through blockchain directly
         {
             let mut stats = self.cache_stats.write().await;
             stats.blockchain_queries += 1;
@@ -635,11 +628,11 @@ impl BlockchainActivationRegistry {
         let record = ActivationRecord {
             code_hash: code_hash.clone(),
             wallet_address: node_info.wallet_address.clone(),
-            tx_hash: "".to_string(), // Will be populated from quantum decryption
+            tx_hash: node_info.burn_tx_hash.clone(), // CRITICAL: Store burn_tx for XOR decryption
             activated_at: node_info.activated_at,
             node_type: node_info.node_type.clone(),
-            phase: 1, // Phase 1 (1DEV burn on Solana)
-            activation_amount: 0, // Phase 1: 0 QNC (1DEV burned externally on Solana)
+            phase: node_info.phase, // Use phase from NodeInfo
+            activation_amount: node_info.burn_amount, // CRITICAL: Store exact amount for XOR key derivation
             blockchain_height: self.get_current_blockchain_height().await?,
             is_active: true,
             device_migrations: vec![],
@@ -680,14 +673,7 @@ impl BlockchainActivationRegistry {
             l1_cache.put(code_hash.clone(), true);
         }
 
-        // Propagate to DHT network (use hash for security)
-        if let Some(dht) = &self.dht_client {
-            let code_hash_clone = code_hash.clone();
-            let node_info_clone = node_info.clone();
-            tokio::spawn(async move {
-                let _ = Self::propagate_hash_to_dht(&code_hash_clone, &node_info_clone).await;
-            });
-        }
+        // NOTE: DHT propagation removed - activation syncs through blockchain and ReputationSync
 
         println!("✅ Activation registered on blockchain successfully");
         Ok(())
@@ -947,6 +933,10 @@ impl BlockchainActivationRegistry {
                 activated_at: current_time,
                 last_seen: current_time,
                 migration_count: 0,
+                node_id: format!("genesis_node_{}", bootstrap_id), // CRITICAL: Link to network node
+                burn_tx_hash: format!("genesis_burn_{}", bootstrap_id), // Genesis nodes have special burn_tx
+                phase: 1, // Genesis nodes are Phase 1
+                burn_amount: 0, // Genesis nodes don't use XOR encryption
             };
             
             active_nodes.insert(device_signature.clone(), node_info);
@@ -1120,6 +1110,44 @@ impl BlockchainActivationRegistry {
             Err(IntegrationError::ValidationError("Node not found".to_string()))
         }
     }
+    
+    /// Get node_id by activation_code (for mobile app monitoring)
+    /// Returns the network node_id linked to this activation code
+    pub async fn get_node_id_by_activation_code(&self, code: &str) -> Option<String> {
+        // First check hash-based lookup (activation codes are stored as hashes)
+        let code_hash = self.hash_activation_code_for_blockchain(code).ok()?;
+        
+        // Search in active_nodes
+        let active_nodes = self.active_nodes.read().await;
+        
+        // Try exact match first
+        if let Some(node_info) = active_nodes.values().find(|n| n.activation_code == code_hash || n.activation_code == code) {
+            if !node_info.node_id.is_empty() {
+                return Some(node_info.node_id.clone());
+            }
+        }
+        
+        // Try partial match (code might be prefix of activation_code)
+        if let Some(node_info) = active_nodes.values().find(|n| 
+            n.activation_code.contains(code) || code.contains(&n.activation_code)
+        ) {
+            if !node_info.node_id.is_empty() {
+                return Some(node_info.node_id.clone());
+            }
+        }
+        
+        None
+    }
+    
+    /// Get full node info by activation_code
+    pub async fn get_node_info_by_activation_code(&self, code: &str) -> Option<NodeInfo> {
+        let code_hash = self.hash_activation_code_for_blockchain(code).ok()?;
+        let active_nodes = self.active_nodes.read().await;
+        
+        active_nodes.values()
+            .find(|n| n.activation_code == code_hash || n.activation_code == code)
+            .cloned()
+    }
 
     /// Determine node type from activation code structure
     async fn determine_node_type_from_code(&self, code: &str) -> Result<String, IntegrationError> {
@@ -1188,6 +1216,10 @@ impl BlockchainActivationRegistry {
                             .unwrap()
                             .as_secs(),
                         migration_count: record.device_migrations.len() as u32,
+                        node_id: String::new(), // Will be populated from active network
+                        burn_tx_hash: record.tx_hash.clone(), // Restore burn_tx from record
+                        phase: record.phase,
+                        burn_amount: record.activation_amount, // Restore burn_amount from record
                     };
                     
                     active_nodes.insert(node_info.device_signature.clone(), node_info);
@@ -1384,14 +1416,13 @@ impl BlockchainActivationRegistry {
         // Convert block height to deterministic "time" (1 block = ~1 second)
         let current_time = node.activated_at + current_height;
         
-        // PRODUCTION: All nodes start equal, earn reputation through participation
+        // PRODUCTION: All nodes start equal at consensus threshold
+        // NO uptime bonus! Reputation changes ONLY through:
+        // - Passive recovery: +1 every 4h if score [10, 70)
+        // - Full rotation complete: +2 for 30 blocks
+        // - Consensus participation: +1
+        // - Penalties for failures/attacks
         let mut reputation = 0.70; // Universal consensus threshold for all nodes
-        
-        // EXISTING: Keep sophisticated reputation system for scalability
-        // Boost reputation based on uptime (max +30%)
-        let uptime_days = (current_time - node.activated_at) / 86400; // seconds to days
-        let uptime_bonus = (uptime_days as f64 * 0.01).min(0.30); // 1% per day, max 30%
-        reputation += uptime_bonus;
         
         // Reduce reputation if node was inactive recently
         let days_since_active = (current_time - node.last_seen) / 86400;
@@ -1773,29 +1804,6 @@ impl BlockchainActivationRegistry {
         // Calculate height based on 1-second microblock intervals
         let height = elapsed.as_secs();
         Ok(height)
-    }
-
-    /// Check DHT for activation code
-    async fn check_dht_for_code_hash(&self, code_hash: &str) -> Result<bool, IntegrationError> {
-        // PRODUCTION: Check distributed hash table for activation code hash usage
-        // This prevents double-spending of activation codes across the network
-        
-        // PRODUCTION: Query multiple DHT nodes across the network for activation code hash usage
-        
-        // Check local bloom filter first (fast)
-        if self.bloom_filter.read().await.contains(code_hash) {
-            return Ok(true); // Hash likely used
-        }
-        
-        // Check L1 cache
-        if let Some(_) = self.l1_cache.write().await.get(&code_hash.to_string()) {
-            return Ok(true); // Hash definitely used
-        }
-        
-        // Network DHT check would go here in full production
-        // For now, return false (hash not found in DHT)
-        println!("🌐 DHT hash query: code hash {} not found in network", &code_hash[..8]);
-        Ok(false)
     }
 
     /// FIXED: Register activation or migrate device (automatic old device deactivation)
@@ -2307,29 +2315,20 @@ impl BlockchainActivationRegistry {
         Ok("wallet_signature".to_string())
     }
 
-    /// Propagate to DHT network
-    async fn propagate_hash_to_dht(code_hash: &str, node_info: &NodeInfo) -> Result<(), IntegrationError> {
-        // Mock DHT hash propagation for secure distribution
-        println!("🌐 Propagating activation hash {} to DHT network", &code_hash[..8]);
-        tokio::time::sleep(Duration::from_millis(5)).await;
-        println!("✅ Activation hash propagated to DHT successfully");
-        Ok(())
-    }
-
     /// Get registry statistics
     pub async fn get_registry_stats(&self) -> RegistryStats {
         let used_codes = self.used_codes.read().await;
         let active_nodes = self.active_nodes.read().await;
         let activation_records = self.activation_records.read().await;
         let last_sync = *self.last_sync.read().await;
+        let cache_stats = self.cache_stats.read().await;
         
         RegistryStats {
             total_activations: used_codes.len(),
             active_nodes: active_nodes.len(),
             cached_records: activation_records.len(),
             last_sync_timestamp: last_sync,
-            cache_hit_rate: 95.0, // Mock value
-            dht_peers: self.dht_client.as_ref().map(|d| d.peer_count).unwrap_or(0),
+            cache_hit_rate: cache_stats.hit_rate() * 100.0, // Real cache hit rate percentage
         }
     }
 }
@@ -2355,7 +2354,6 @@ pub struct RegistryStats {
     pub cached_records: usize,
     pub last_sync_timestamp: u64,
     pub cache_hit_rate: f64,
-    pub dht_peers: usize,
 }
 
 /// Legacy compatibility wrapper
@@ -2599,6 +2597,21 @@ impl BlockchainActivationRegistry {
                 Ok(None)
             }
         }
+    }
+    
+    /// Get activation record by code hash (for burn_tx lookup during decryption)
+    pub async fn get_activation_record_by_hash(&self, code_hash: &str) -> Result<Option<ActivationRecord>, IntegrationError> {
+        // Search in local activation records
+        let activation_records = self.activation_records.read().await;
+        
+        if let Some(record) = activation_records.get(code_hash) {
+            println!("✅ Found activation record for hash: {}...", safe_preview(code_hash, 8));
+            return Ok(Some(record.clone()));
+        }
+        
+        // Not found locally - could query blockchain in production
+        println!("⚠️ No activation record found for hash: {}...", safe_preview(code_hash, 8));
+        Ok(None)
     }
     
     /// Query blockchain for wallet activation (production implementation)

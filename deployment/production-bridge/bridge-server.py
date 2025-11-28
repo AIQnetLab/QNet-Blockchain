@@ -92,7 +92,8 @@ async def get_current_network_size() -> int:
     except Exception as e:
         print(f"⚠️ Failed to get network size, using safe default: {e}")
         # Safe default: medium network size (1.0x multiplier)
-        return 500000  # 500k nodes = 1.0x multiplier
+        # CANONICAL: ≤100K=0.5x, ≤300K=1.0x, ≤1M=2.0x, >1M=3.0x
+        return 200000  # 200k nodes = 1.0x multiplier (within ≤300K range)
 
 async def get_1dev_burn_state() -> dict:
     """Get current 1DEV burn state for network size estimation"""
@@ -629,31 +630,56 @@ async def generate_verified_activation_code(wallet_address: str, burn_tx_hash: s
     timestamp = int(datetime.now().timestamp() * 1000)  # JavaScript Date.now() equivalent
     hardware_entropy = secrets.token_hex(4)  # 8 bytes -> 4 hex chars
     
-    # Create encryption key from burn transaction (same as existing)
-    key_material = f"{burn_tx_hash}:{node_type}:1500"  # 1500 is Phase 1 amount
+    # Get current dynamic price based on burn percentage
+    burn_state = await get_current_burn_state_for_pricing()
+    burn_percentage = burn_state.get('burn_percentage', 0)
+    base_cost = 1500
+    reduction_per_10_percent = 150
+    price_reduction = int((burn_percentage // 10) * reduction_per_10_percent)
+    current_price = max(base_cost - price_reduction, 300)  # Minimum 300 1DEV at 80-90%
+    
+    # Create encryption key from burn transaction (MUST use actual price!)
+    # CRITICAL: This price MUST be stored with the activation code for decryption!
+    key_material = f"{burn_tx_hash}:{node_type}:{current_price}"
     encryption_key = hashlib.sha256(key_material.encode()).hexdigest()[:32]
     
-    # XOR encrypt wallet address (same as existing)
-    encrypted_wallet = ""
+    print(f"🔑 XOR key derived with burn_amount={current_price} (burn_percentage={burn_percentage}%)")
+    
+    # XOR encrypt wallet address (same as rpc.rs)
+    encrypted_wallet = bytearray()
     for i, char in enumerate(wallet_address):
-        wallet_char = ord(char)
-        key_char = ord(encryption_key[i % len(encryption_key)])
-        encrypted_wallet += chr(wallet_char ^ key_char)
+        wallet_byte = ord(char)
+        key_byte = ord(encryption_key[i % len(encryption_key)])
+        encrypted_wallet.append(wallet_byte ^ key_byte)
     
-    # Convert to hex
-    encrypted_wallet_hex = encrypted_wallet.encode('latin1').hex()
+    # Convert to hex (uppercase to match rpc.rs)
+    encrypted_wallet_hex = encrypted_wallet.hex().upper()
     
-    # Create structured code (same format as existing)
+    # Create structured code - MUST match rpc.rs format!
+    # Format: QNET-XXXXXX-XXXXXX-XXXXXX (25 chars total)
     node_type_marker = node_type[0].upper()  # L, F, S
-    timestamp_hex = hex(timestamp)[-8:]  # Last 8 hex chars
-    entropy_short = hardware_entropy[:4]  # 4 hex chars
     
-    # Build segments (same as existing)
-    segment1 = (node_type_marker + timestamp_hex)[:4].upper()
-    segment2 = encrypted_wallet_hex[:4].upper()
-    segment3 = (encrypted_wallet_hex[8:12] + entropy_short)[:4].upper()
+    # Timestamp: last 5 hex chars (to match rpc.rs)
+    timestamp_hex = format(timestamp, 'X')
+    timestamp_part = timestamp_hex[-5:] if len(timestamp_hex) >= 5 else timestamp_hex.zfill(5)
     
-    return f"QNET-{segment1}-{segment2}-{segment3}"
+    # segment1: NodeType + Timestamp (6 chars)
+    segment1 = (node_type_marker + timestamp_part).upper()[:6].ljust(6, '0')
+    
+    # segment2: First 6 chars of encrypted wallet hex
+    segment2 = encrypted_wallet_hex[:6] if len(encrypted_wallet_hex) >= 6 else encrypted_wallet_hex.ljust(6, '0')
+    
+    # segment3: More encrypted wallet (chars 6-10) + entropy (4 chars) = 6 chars total
+    wallet_part2 = encrypted_wallet_hex[6:10] if len(encrypted_wallet_hex) >= 10 else encrypted_wallet_hex[6:] if len(encrypted_wallet_hex) > 6 else "0000"
+    segment3 = (wallet_part2 + hardware_entropy[:4])[:6].upper()
+    
+    activation_code = f"QNET-{segment1}-{segment2}-{segment3}"
+    
+    # Validate length (should be 25 chars)
+    if len(activation_code) != 25:
+        print(f"⚠️ Code length: {len(activation_code)} (expected 25)")
+    
+    return activation_code
 
 async def generate_verified_activation_code_phase2(eon_address: str, qnc_transfer_tx: str, node_type: str, qnc_amount: int) -> str:
     """Use existing activation code generation logic for Phase 2 - NO DUPLICATION"""

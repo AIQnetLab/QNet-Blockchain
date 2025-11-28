@@ -44,7 +44,28 @@ This project uses **dual licensing**:
 - **Phase 2 (Future)**: ONLY QNC token activation on QNet blockchain
 - **Transition**: 90% 1DEV burned OR 5 years from genesis block (whichever comes first)
 
-### 🛡️ **LATEST UPDATES (v2.19.3 - November 23, 2025)**
+### 🛡️ **LATEST UPDATES (v2.19.12 - November 27, 2025)**
+- **Full Macroblock Sync**: Complete P2P synchronization for macroblocks (RequestMacroblocks, MacroblocksBatch)
+- **Snapshot API**: New endpoints `/api/v1/snapshot/latest` and `/api/v1/snapshot/{height}` for fast sync
+- **Light Node Support**: Macroblocks synced for state verification, headers rotated to save space
+- **Async Runtime Fixes**: Isolated `block_on` calls prevent "nested runtime" panics
+- **Balance Restoration**: Balances restored from snapshots or block replay during synchronization
+
+### 🛡️ **SECURITY UPDATES (v2.19.11 - November 26, 2025)**
+- **REAL Dilithium3 Signatures**: Full NIST FIPS 204 cryptographic verification with `dilithium3::open()`
+- **Secure Key Storage**: Random encryption keys (NOT derived from public node_id) with SHA3-256 integrity
+- **No Fallback Signatures**: Removed SHA3-256 fallback - operations skip if Dilithium unavailable
+- **Standardized Algorithm**: All signatures use "CRYSTALS-Dilithium3" identifier
+- **WebSocket Rate Limiting**: DDoS protection for real-time connections
+
+### 🛡️ **Previous Updates (v2.19.6 - November 26, 2025)**
+- **WebSocket Real-time Events**: Live updates for blocks, balances, contracts, and transactions
+- **Smart Contract REST API**: Deploy, call, query WASM contracts with hybrid signatures
+- **Smart Polling for Light Nodes**: Battery-efficient polling (~94% fewer wake-ups)
+- **Mandatory Transaction Signatures**: All transfers require Ed25519 verification
+- **Enhanced Rate Limiting**: IP-based DDoS protection for all API endpoints
+
+### 🛡️ **Previous Updates (v2.19.3 - November 23, 2025)**
 - **MEV Protection (Private Bundles)**: Front-running protection for high-value transactions (NEW!)
   - Direct submission to block producer (bypasses public mempool)
   - Dynamic allocation: 0-20% block space for bundles, 80-100% for public TXs
@@ -210,7 +231,7 @@ This project uses **dual licensing**:
 ### **Previous Updates (v2.15.0)**
 - **AES-256-GCM Database Encryption**: Quantum-resistant protection for activation codes
 - **No Encryption Keys in Database**: Keys derived from activation code only
-- **Critical Attack Protection**: Instant 1-year ban for database attacks (substitution, deletion, fork)
+- **Critical Attack Protection**: PERMANENT BAN for critical attacks (DatabaseSubstitution, ChainFork, StorageDeletion)
 - **Privacy-Preserving Pseudonyms**: Enhanced network topology protection (14 log locations)
 - **Genesis Bootstrap Grace**: 15-second timeout for first block (prevents false failover)
 - **Genesis Wallet Synchronization**: Unified wallet format across all modules
@@ -227,10 +248,10 @@ This project uses **dual licensing**:
 - **Atomic Rotation Rewards**: One +30 reward per full 30-block rotation (not 30x +1)
 - **Activity-Based Recovery**: Reputation only recovers if node had recent ping activity
 - **Self-Penalty Fix**: All failovers now apply -20 penalty, even voluntary ones
-- **95% Decentralization**: Minimal Genesis protection for network stability
-- **Jail System**: Progressive suspension with Genesis safeguard (no permanent ban)
+- **Progressive Jail System**: 6 chances for regular offenses (1h → 24h → 7d → 30d → 3m → 1y)
+- **Critical Attack Protection**: PERMANENT BAN for DatabaseSubstitution, ChainFork, StorageDeletion
 - **Double-Sign Detection**: Automatic tracking and evidence collection (-50 reputation + jail)
-- **Critical Failure Protection**: Genesis nodes get 30-day jail instead of ban at <10%
+- **Equal Treatment**: Genesis nodes follow same jail rules as everyone (no special protection)
 - **Anti-DDoS Protection**: Rate limiting and network flooding detection
 
 ### 🖥️ **DEVICE RESTRICTIONS**
@@ -336,15 +357,14 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 #### 🎯 **Storage Features:**
 - **Adaptive Temporal Compression**: Blocks age like wine - stronger compression over time
   - Day 0-1: No compression (hot data)
-  - Day 2-7: Zstd-3 (light compression)
+  - Day 2-7: Zstd-3 (light compression, ~50% reduction)
   - Day 8-30: Zstd-9 (medium compression)
   - Day 31-365: Zstd-15 (heavy compression)
   - Year 1+: Zstd-22 (extreme compression)
-- **Delta Encoding**: Store only differences between blocks (95% space saving)
-- **Pattern Recognition**: Smart compression for common transactions
-  - Simple transfers: 300 → 16 bytes (95% reduction)
-  - Node activations: 500 → 10 bytes (98% reduction)
-  - Rewards: 400 → 13 bytes (97% reduction)
+- **Lossless Compression Only** (v2.19.10): All data fully recoverable
+  - Zstd-3 for new transactions (~50% reduction)
+  - Pattern Recognition removed (was lossy, data could not be reconstructed)
+  - Delta Encoding removed (not needed with EfficientMicroBlock format)
 - **RocksDB Transaction Index**: O(1) transaction lookups with native key-value indexing
 - **Hardware Auto-Tuning**: Automatically optimizes for available resources
   - **CPU Detection**: Uses all available cores (minimum 4 threads)
@@ -353,22 +373,37 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
   - Works on any hardware: 4-core VPS → 64-core server
   - No manual configuration - detects and adapts automatically
 - **Dynamic Shard Auto-Scaling**: Automatically adjusts shard count based on real network size
-  - Genesis (5 nodes): 1 shard
-  - Growth (75k nodes): 2 shards
-  - Scale (150k nodes): 4 shards
-  - Max (19M+ nodes): 256 shards
+  - Genesis (0-1K nodes): 1 shard (~4K TPS)
+  - Growth (1K-10K nodes): 4 shards (~16K TPS)
+  - Medium (10K-50K nodes): 16 shards (~64K TPS)
+  - Large (50K-100K nodes): 64 shards (~256K TPS)
+  - Very Large (100K-500K nodes): 128 shards (~512K TPS)
+  - Massive (500K+ nodes): 256 shards (~1M+ TPS)
   - **Blockchain Registry Integration**: Reads actual activated node count from storage
   - Multi-source detection: Monitoring → Genesis → Blockchain → Default
   - **Recalculation on restart**: Every node startup reads fresh network size
   - No manual configuration - system adapts to network growth automatically
 - **EfficientMicroBlocks**: Store transaction hashes instead of full transactions
 - **Sliding Window Storage**: Full nodes keep only last 100K blocks (~1 day) + snapshots
-- **Smart Pruning**: Automatic deletion of blocks outside retention window
+- **Smart Pruning**: Automatic deletion of blocks AND transactions outside retention window
+  - Block pruning: Removes microblocks and macroblocks
+  - **Transaction pruning**: Removes transactions + tx_index + tx_by_address (v2.19.7)
+  - RocksDB compaction: Forces disk space reclamation after pruning
+  - Batch processing: 1000 items/batch to avoid memory issues
 - **Snapshot-Based Sync**: New nodes bootstrap in minutes, not hours
-- **Node-Specific Storage**:
-  - Light nodes: ~100 MB (headers only)
-  - Full nodes: ~50 GB (100K blocks + snapshots)
-  - Super nodes: 400-500 GB for 100 years of history (with full compression)
+- **State Snapshots**: Periodic full state captures for fast recovery
+  - Auto-cleanup: Keeps only last 5 snapshots
+  - Zstd-15 compression for snapshot data
+  - SHA3-256 integrity verification
+- **Tiered Storage** (v2.19.10 - corrected estimates with Zstd-3 only):
+  - Light nodes: **~100 MB** (headers only, FIFO auto-rotation)
+  - Full nodes: **~500 GB** (30-day pruning window)
+  - Super nodes (archival): **~2 TB** (full history, no pruning)
+  - Storage with Zstd-3 (~50% reduction):
+    - 100 TPS: ~220 GB/year (Super), ~18 GB (Full 30d)
+    - 500 TPS: ~1.1 TB/year (Super), ~90 GB (Full 30d)
+    - 1000 TPS: ~2.2 TB/year (Super), ~180 GB (Full 30d)
+  - Note: Sharding is for parallel TX processing, NOT storage partitioning
 - **Distributed Archival**: Full/Super nodes archive 3-8 chunks each as network obligation
 - **Triple Replication**: Every data chunk replicated across 3+ nodes minimum
 - **Automatic Compliance**: Network enforces archival obligations for fault tolerance
@@ -483,13 +518,17 @@ QNet implements advanced chain reorganization and synchronization mechanisms for
 ### **Light Node Ping System (Sharded)**
 - **Scalability**: 256-shard system supports 25.6M+ Light nodes (100K per shard)
 - **Deterministic Pinger Selection**: Each Light node has Primary + 2 Backup pingers
-- **FCM Push Notifications**: Full/Super nodes send pings via Firebase Cloud Messaging
+- **Multi-Provider Push**: Three delivery methods with automatic fallback:
+  - **FCM** (Google Play): Firebase Cloud Messaging for instant delivery
+  - **UnifiedPush** (F-Droid): Open-source, decentralized (ntfy.sh, Gotify, etc.)
+  - **Smart Polling** (Fallback): Battery-efficient wake-up ~2 min before ping slot (once per 4h)
 - **Challenge-Response**: Light node signs random challenge to prove liveness
 - **Dual Signatures**: Attestation includes both Light node and Pinger Dilithium signatures
 - **Gossip Protocol**: Attestations propagated to all nodes for reward eligibility
 - **Rate Limiting**: 500 FCM requests/sec limit (Google API compliance)
 - **Slot-Based Deduplication**: One attestation per 1-minute slot per Light node
 - **Reward Eligibility**: Light nodes must respond to pings to receive Pool #3 rewards
+- **Battery Optimization**: Smart polling reduces wake-ups from 96/day to 6/day (~94% reduction)
 
 ### **Network Synchronization Metrics**
 - **Sync Speed**: Up to 10,000 blocks/second with parallel processing
@@ -538,29 +577,19 @@ When all nodes fall below 70% reputation threshold:
 
 QNet implements an economic reputation system that incentivizes network participation:
 
-### **Reputation Rewards (Atomic System)**
-| Action | Reward | Frequency |
-|--------|--------|-----------|
-| **Complete Full Rotation** | +30 | Every 30 blocks (one atomic reward) |
-| **Partial Rotation** | Proportional | Based on blocks created before failover |
-| **Lead Macroblock Consensus** | +10 | Every 90 seconds |
-| **Participate in Consensus** | +5 | Every 90 seconds |
-| **Emergency Producer** | +5 | On failover events |
-| **Successful Heartbeat** | +1 | Every 4 hours (Full/Super only) |
-
-### **Reputation System (Atomic Rewards)**
-| Action | Penalty/Reward | Impact |
-|--------|----------------|--------|
-| **Full Rotation (30 blocks)** | +30.0 | Complete producer rotation |
-| **Partial Rotation** | Proportional | e.g., 15 blocks = +15.0 |
+### **Reputation Events (Points)**
+| Action | Rep Points | Impact |
+|--------|------------|--------|
+| **Full Rotation (30 blocks)** | +2.0 | Complete producer rotation (FullRotationComplete) |
+| **Consensus Participation** | +1.0 | Participation in consensus round |
+| **Emergency Producer** | +5.0 | Network service during failover |
 | **Failed Microblock** | -20.0 | Lost producer slot (applies to self) |
-| **Successful Macroblock Leader** | +10.0 | Consensus leadership |
-| **Successful Macroblock Participant** | +5.0 | Consensus participation |
 | **Failed Macroblock** | -30.0 | Consensus failure |
-| **Missed Heartbeat** | -1.0 | Connection issue (Full/Super only) |
-| **Double-Sign** | -50.0 | Byzantine fault |
-| **Emergency Producer** | +5.0 | Network service |
-| **Recovery Rate** | +0.7%/hour | ONLY if active (had heartbeat/attestation) |
+| **Timeout Failure** | -2.0 | P2P timeout (network_score) |
+| **Connection Failure** | -5.0 | Offline/unreachable (network_score) |
+| **Double-Sign** | -50.0 | Byzantine fault + jail |
+| **Malicious Behavior** | -50.0 | Byzantine attack detected |
+| **Passive Recovery** | +1.0/4h | ONLY if reputation [10, 70) and NOT jailed |
 
 ### **Reputation Thresholds**
 - **70+ points**: Eligible for consensus participation AND rewards (70% minimum)
@@ -571,24 +600,27 @@ QNet implements an economic reputation system that incentivizes network particip
 
 ### **Anti-Malicious Protection System**
 
-#### **Jail System (Temporary Suspension)**
-Progressive penalties for repeat offenders:
+#### **Jail System (Progressive with 6 Chances)**
+Fair penalties - equal for ALL nodes (including Genesis):
 
-| Offense Count | Jail Duration | Recovery After Jail |
-|--------------|---------------|---------------------|
-| 1st offense | 1 hour | Restore to 30% |
-| 2nd offense | 24 hours | Restore to 25% |
-| 3rd offense | 7 days | Restore to 20% |
-| 4th offense | 30 days | Restore to 15% |
-| 5th offense | 3 months | Restore to 10% |
-| 6+ offenses | 1 year maximum | Governance review |
+| Offense | Jail Duration | Recovery After Jail |
+|---------|---------------|---------------------|
+| 1st | 1 hour | Restore to 30% |
+| 2nd | 24 hours | Restore to 25% |
+| 3rd | 7 days | Restore to 20% |
+| 4th | 30 days | Restore to 15% |
+| 5th | 3 months | Restore to 12% |
+| 6+ | 1 year | Restore to 10% (can return!) |
 
-**Stability Protection (Minimal):**
-- Genesis nodes: Cannot be permanently banned (network stability)
-- Critical failure (<10%): 30-day jail instead of ban
-- After jail: Restore to 10% (alive but no consensus)
-- Regular nodes: Full ban at <10% (true penalties)
-- Balance: 95% decentralization with 5% stability safeguard
+**Critical Attacks (instant PERMANENT BAN - no return):**
+- DatabaseSubstitution
+- ChainFork  
+- StorageDeletion
+
+**Equal Treatment:**
+- Genesis nodes follow the same rules as everyone
+- Only critical attacks = permanent ban
+- Regular offenses always have a path back
 
 #### **Malicious Behavior Detection**
 
@@ -1506,6 +1538,8 @@ cargo test --test performance --release
 
 ## 📚 API Documentation
 
+> **📖 Full API Reference**: See [`docs/API_REFERENCE.md`](docs/API_REFERENCE.md) for complete endpoint documentation with request/response examples.
+
 ### Multi-Node REST API Architecture
 
 **🌐 Every Full/Super node provides complete API functionality:**
@@ -1531,8 +1565,14 @@ curl http://localhost:8003/api/v1/transactions/{hash}
 
 **Account Management:**
 - `GET /api/v1/account/{address}` - Get account information
-- `GET /api/v1/account/{address}/balance` - Get account balance
+- `GET /api/v1/account/{address}/balance` - Get account balance (QNC)
 - `GET /api/v1/account/{address}/transactions` - Get transaction history
+- `GET /api/v1/account/{address}/tokens` - Get all QRC-20 tokens for address
+
+**QRC-20 Tokens (v2.19.12):**
+- `POST /api/v1/token/deploy` - Deploy new QRC-20 token
+- `GET /api/v1/token/{address}` - Get token info (name, symbol, decimals, supply)
+- `GET /api/v1/token/{address}/balance/{holder}` - Get token balance for holder
 
 **Blockchain Data:**
 - `GET /api/v1/block/latest` - Get latest block
@@ -1846,7 +1886,7 @@ Year 10+:   ~300+ GB    🔧 Increase to 500-1000 GB
 | **Double-Sign Detection** | -50.0 points | Major Byzantine fault - immediate ban if < 10% |
 | **Failed Block Production** | -20.0 points | Microblock production failure |
 | **Failed Consensus Lead** | -30.0 points | Macroblock consensus failure |
-| **Successful Operation** | +1.0 points | Regular successful interaction |
+| **Passive Recovery** | +1.0 points | Once per 4h if score [10,70), NOT jailed |
 | **Emergency Recovery** | +5.0 to +50.0 | Bonus for saving the network |
 | **Ban Threshold** | < 10% | Node removed from network (7-day recovery for regular nodes) |
 | **Consensus Threshold** | ≥ 70% | Minimum to participate in consensus |

@@ -543,6 +543,11 @@ impl PhaseAwareRewardManager {
         self.pending_rewards.get(node_id)
     }
     
+    /// Get the wallet address that owns a node (for claim verification)
+    pub fn get_node_owner(&self, node_id: &str) -> Option<String> {
+        self.node_ownership.get(node_id).cloned()
+    }
+    
     /// Get node's ping history for current window
     pub fn get_ping_history(&self, node_id: &str) -> Option<&NodePingHistory> {
         self.ping_histories.get(node_id)

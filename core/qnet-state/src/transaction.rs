@@ -277,7 +277,7 @@ pub struct LocalFinalizationConfig {
 impl Default for LocalFinalizationConfig {
     fn default() -> Self {
         Self {
-            max_instant_amount: 1_000_000, // 1M smallest units
+            max_instant_amount: 100_000_000_000, // 100 QNC (100 * 10^9 nanoQNC)
             max_instant_gas_price: 100,     // Standard gas price
             trusted_senders: HashSet::new(),
             min_confirmations: 6,           // ~90 seconds for macroblock
@@ -516,6 +516,15 @@ impl Transaction {
                 let sender = accounts.get_mut(from)
                     .ok_or_else(|| StateError::AccountNotFound(from.clone()))?;
                 
+                // CRITICAL SECURITY: Check nonce to prevent replay attacks and double spending
+                // Transaction nonce must be exactly sender.nonce + 1
+                if self.nonce != sender.nonce + 1 {
+                    return Err(StateError::InvalidTransaction(format!(
+                        "Invalid nonce: expected {}, got {} (replay attack prevention)",
+                        sender.nonce + 1, self.nonce
+                    )));
+                }
+                
                 // Check balance
                 let total_amount = amount + self.gas_price * self.gas_limit;
                 if sender.balance < total_amount {
@@ -548,6 +557,14 @@ impl Transaction {
                 let sender = accounts.get_mut(&self.from)
                     .ok_or_else(|| StateError::AccountNotFound(self.from.clone()))?;
 
+                // CRITICAL SECURITY: Check nonce to prevent replay attacks
+                if self.nonce != sender.nonce + 1 {
+                    return Err(StateError::InvalidTransaction(format!(
+                        "Invalid nonce: expected {}, got {} (replay attack prevention)",
+                        sender.nonce + 1, self.nonce
+                    )));
+                }
+
                 // Fee calculation
                 let fee = self.gas_price * self.gas_limit;
                 let total_amount = amount + fee;
@@ -571,6 +588,14 @@ impl Transaction {
                 let sender = accounts.get_mut(&self.from)
                     .ok_or_else(|| StateError::AccountNotFound(self.from.clone()))?;
                 
+                // CRITICAL SECURITY: Check nonce to prevent replay attacks
+                if self.nonce != sender.nonce + 1 {
+                    return Err(StateError::InvalidTransaction(format!(
+                        "Invalid nonce: expected {}, got {} (replay attack prevention)",
+                        sender.nonce + 1, self.nonce
+                    )));
+                }
+                
                 // Check balance for deployment fee
                 let fee = self.gas_price * self.gas_limit;
                 if sender.balance < fee {
@@ -591,6 +616,14 @@ impl Transaction {
                 // Contract interaction
                 let sender = accounts.get_mut(&self.from)
                     .ok_or_else(|| StateError::AccountNotFound(self.from.clone()))?;
+                
+                // CRITICAL SECURITY: Check nonce to prevent replay attacks
+                if self.nonce != sender.nonce + 1 {
+                    return Err(StateError::InvalidTransaction(format!(
+                        "Invalid nonce: expected {}, got {} (replay attack prevention)",
+                        sender.nonce + 1, self.nonce
+                    )));
+                }
                 
                 // Check balance for call fee + value
                 let fee = self.gas_price * self.gas_limit;
@@ -636,6 +669,14 @@ impl Transaction {
                 let sender = accounts.get_mut(&self.from)
                     .ok_or_else(|| StateError::AccountNotFound(self.from.clone()))?;
 
+                // CRITICAL SECURITY: Check nonce to prevent replay attacks
+                if self.nonce != sender.nonce + 1 {
+                    return Err(StateError::InvalidTransaction(format!(
+                        "Invalid nonce: expected {}, got {} (replay attack prevention)",
+                        sender.nonce + 1, self.nonce
+                    )));
+                }
+
                 // Calculate total fee for batch
                 let total_fee = (self.gas_price * self.gas_limit) * node_ids.len() as u64;
 
@@ -658,6 +699,14 @@ impl Transaction {
                 // Batch node activations - single nonce increment for the entire batch
                 let sender = accounts.get_mut(&self.from)
                     .ok_or_else(|| StateError::AccountNotFound(self.from.clone()))?;
+
+                // CRITICAL SECURITY: Check nonce to prevent replay attacks
+                if self.nonce != sender.nonce + 1 {
+                    return Err(StateError::InvalidTransaction(format!(
+                        "Invalid nonce: expected {}, got {} (replay attack prevention)",
+                        sender.nonce + 1, self.nonce
+                    )));
+                }
 
                 // Calculate total activation amount and fees
                 let total_activation_amount: u64 = activation_data.iter().map(|d| d.activation_amount).sum();
@@ -683,6 +732,14 @@ impl Transaction {
                 // Batch transfers - single nonce increment for the entire batch
                 let sender = accounts.get_mut(&self.from)
                     .ok_or_else(|| StateError::AccountNotFound(self.from.clone()))?;
+
+                // CRITICAL SECURITY: Check nonce to prevent replay attacks
+                if self.nonce != sender.nonce + 1 {
+                    return Err(StateError::InvalidTransaction(format!(
+                        "Invalid nonce: expected {}, got {} (replay attack prevention)",
+                        sender.nonce + 1, self.nonce
+                    )));
+                }
 
                 // Calculate total transfer amount and fees
                 let total_transfer_amount: u64 = transfers.iter().map(|t| t.amount).sum();

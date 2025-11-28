@@ -169,14 +169,15 @@ export class QNetIntegration {
 
         } catch (error) {
             console.error('Failed to get activation costs:', error);
-            // Return default costs if API fails
+            // PRODUCTION: Return error state, NOT fake prices
             return {
-                light: 5000,
-                full: 7500,
-                super: 10000,
-                networkSize: 1000,
-                multiplier: 1.0,
-                baseCosts: { light: 5000, full: 7500, super: 10000 }
+                light: null,
+                full: null,
+                super: null,
+                networkSize: null,
+                multiplier: null,
+                error: 'Activation costs unavailable - API unreachable',
+                unavailable: true
             };
         }
     }

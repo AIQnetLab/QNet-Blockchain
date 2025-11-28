@@ -191,16 +191,17 @@ export class ActivationBridgeClient {
             const stats = await this.getBridgeStats();
             const networkSize = stats?.networkSize || 0;
             
-            // Determine multiplier based on network size
+            // CANONICAL THRESHOLDS - same across all components
+            // ≤100K → 0.5x, ≤300K → 1.0x, ≤1M → 2.0x, >1M → 3.0x
             let multiplier = 1.0;
-            if (networkSize < 100000) {
-                multiplier = this.qncActivationCosts.baseMultipliers['0-100k'];
-            } else if (networkSize < 1000000) {
-                multiplier = this.qncActivationCosts.baseMultipliers['100k-1m'];
-            } else if (networkSize < 10000000) {
-                multiplier = this.qncActivationCosts.baseMultipliers['1m-10m'];
+            if (networkSize <= 100000) {
+                multiplier = 0.5;  // Early adopter discount
+            } else if (networkSize <= 300000) {
+                multiplier = 1.0;  // Base price
+            } else if (networkSize <= 1000000) {
+                multiplier = 2.0;  // High demand
             } else {
-                multiplier = this.qncActivationCosts.baseMultipliers['10m+'];
+                multiplier = 3.0;  // Maximum (cap)
             }
             
             // Calculate final cost
@@ -217,12 +218,14 @@ export class ActivationBridgeClient {
             };
         } catch (error) {
             console.error('Failed to calculate QNC cost:', error);
-            // Return base cost if calculation fails
+            // PRODUCTION: Return error state, NOT fake prices
             return {
                 nodeType,
-                baseCost: this.qncActivationCosts.baseCosts[nodeType] || 5000,
-                multiplier: 1.0,
-                requiredQNC: this.qncActivationCosts.baseCosts[nodeType] || 5000
+                baseCost: null,
+                multiplier: null,
+                requiredQNC: null,
+                error: 'QNC cost calculation failed - network data unavailable',
+                unavailable: true
             };
         }
     }
@@ -561,10 +564,11 @@ export class ActivationBridgeClient {
      * Get network size category for multiplier calculation
      */
     getNetworkSizeCategory(networkSize) {
-        if (networkSize < 100000) return '0-100k';
-        if (networkSize < 1000000) return '100k-1m';
-        if (networkSize < 10000000) return '1m-10m';
-        return '10m+';
+        // CANONICAL THRESHOLDS
+        if (networkSize <= 100000) return '0-100k';
+        if (networkSize <= 300000) return '100k-300k';
+        if (networkSize <= 1000000) return '300k-1m';
+        return '1m+';
     }
 
     /**
@@ -660,10 +664,14 @@ export class ActivationBridgeClient {
 
     /**
      * Validate activation code format
+     * Format: QNET-XXXXXX-XXXXXX-XXXXXX (25 chars total)
+     * Segment 1: NodeType marker + Timestamp
+     * Segment 2: Encrypted wallet part 1
+     * Segment 3: Encrypted wallet part 2 + entropy
      */
     validateActivationCode(code) {
-        // QNet activation codes format: QNET-XXXXXX-YYYYYY
-        const pattern = /^QNET-[A-Z0-9]{6}-[A-Z0-9]{6}$/;
+        // QNet activation codes format: QNET-XXXXXX-XXXXXX-XXXXXX (25 chars)
+        const pattern = /^QNET-[A-Z0-9]{6}-[A-Z0-9]{6}-[A-Z0-9]{6}$/;
         return pattern.test(code);
     }
 
@@ -676,10 +684,17 @@ export class ActivationBridgeClient {
         }
 
         const parts = code.split('-');
+        // Extract node type from first char of segment1
+        const nodeTypeMarker = parts[1][0];
+        const nodeTypes = { 'L': 'Light', 'F': 'Full', 'S': 'Super' };
+        
         return {
             prefix: parts[0], // 'QNET'
-            nodeId: parts[1], // 6-character node ID
-            checksum: parts[2] // 6-character checksum
+            segment1: parts[1], // NodeType + Timestamp (6 chars)
+            segment2: parts[2], // Encrypted wallet part 1 (6 chars)
+            segment3: parts[3], // Encrypted wallet part 2 + entropy (6 chars)
+            nodeType: nodeTypes[nodeTypeMarker] || 'Unknown',
+            timestampPart: parts[1].substring(1) // Last 5 chars of segment1
         };
     }
 

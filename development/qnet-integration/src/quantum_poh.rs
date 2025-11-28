@@ -164,8 +164,8 @@ impl QuantumPoH {
         let current_count = self.hash_count.load(Ordering::SeqCst);
         
         // Only skip if checkpoint is VERY old (indicates stale block during resync)
-        // 50M hashes = ~100 seconds at 500K/sec
-        const MAX_ACCEPTABLE_DRIFT: u64 = 50_000_000;
+        // 25M hashes = ~50 seconds at 500K/sec (less than 1 macroblock)
+        const MAX_ACCEPTABLE_DRIFT: u64 = 25_000_000;
         
         if count < current_count && (current_count - count) > MAX_ACCEPTABLE_DRIFT {
             println!("[QuantumPoH] ⚠️ Skipping very old checkpoint: {} (current: {}, drift: {})", 

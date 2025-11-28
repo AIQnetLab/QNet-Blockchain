@@ -541,7 +541,7 @@ impl HybridCrypto {
             
             let dilithium_sig = crate::quantum_crypto::DilithiumSignature {
                 signature: signature.certificate.dilithium_signature.clone(),
-                algorithm: "QNet-Dilithium-Compatible".to_string(),
+                algorithm: "CRYSTALS-Dilithium3".to_string(),
                 timestamp: signature.certificate.issued_at,
                 strength: "quantum-resistant".to_string(),
             };
@@ -594,46 +594,46 @@ impl HybridCrypto {
         // Per NIST/Cisco standards: BOTH signatures must be valid
         // This ensures quantum resistance for EVERY message
         
-        // Skip Dilithium verification only if not provided (backwards compatibility)
-        if !signature.dilithium_message_signature.is_empty() {
-            use crate::node::GLOBAL_QUANTUM_CRYPTO;
-            use crate::quantum_crypto::{QNetQuantumCrypto, DilithiumSignature};
-            
-            let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
-            if crypto_guard.is_none() {
-                let mut crypto = QNetQuantumCrypto::new();
-                crypto.initialize().await?;
-                *crypto_guard = Some(crypto);
-            }
-            let quantum_crypto = crypto_guard.as_ref().unwrap();
-            
-            // Recreate the same message hash used for signing
-            // Use SHA3-256 to match the rest of the system
+        // SECURITY: Dilithium signature is MANDATORY - no backwards compatibility bypass!
+        if signature.dilithium_message_signature.is_empty() {
+            println!("❌ REJECTED: No Dilithium message signature - quantum attack possible!");
+            return Ok(false);
+        }
+        
+        use crate::node::GLOBAL_QUANTUM_CRYPTO;
+        use crate::quantum_crypto::{QNetQuantumCrypto, DilithiumSignature};
+        
+        let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
+        if crypto_guard.is_none() {
+            let mut crypto = QNetQuantumCrypto::new();
+            crypto.initialize().await?;
+            *crypto_guard = Some(crypto);
+        }
+        let quantum_crypto = crypto_guard.as_ref().unwrap();
+        
+        // Recreate the same message hash used for signing
+        // Use SHA3-256 to match the rest of the system
         let mut hasher = Sha3_256::new();
         hasher.update(message);
         let message_hash = hex::encode(hasher.finalize());
-            
-            let dilithium_sig = DilithiumSignature {
-                signature: signature.dilithium_message_signature.clone(),
-                algorithm: "CRYSTALS-Dilithium3".to_string(),
-                timestamp: signature.signed_at,
-                strength: "quantum-resistant".to_string(),
-            };
-            
-            let dilithium_valid = quantum_crypto
-                .verify_dilithium_signature(&message_hash, &dilithium_sig, &signature.certificate.node_id)
-                .await?;
-            
-            if !dilithium_valid {
-                println!("❌ Invalid Dilithium message signature - NOT quantum safe!");
-                return Ok(false);
-            }
-            
-            println!("✅ BOTH signatures verified - truly quantum-resistant");
-        } else {
-            println!("⚠️ WARNING: No Dilithium message signature - NOT quantum safe!");
+        
+        let dilithium_sig = DilithiumSignature {
+            signature: signature.dilithium_message_signature.clone(),
+            algorithm: "CRYSTALS-Dilithium3".to_string(),
+            timestamp: signature.signed_at,
+            strength: "quantum-resistant".to_string(),
+        };
+        
+        let dilithium_valid = quantum_crypto
+            .verify_dilithium_signature(&message_hash, &dilithium_sig, &signature.certificate.node_id)
+            .await?;
+        
+        if !dilithium_valid {
+            println!("❌ Invalid Dilithium message signature - quantum attack detected!");
+            return Ok(false);
         }
         
+        println!("✅ BOTH signatures verified - truly quantum-resistant");
         Ok(true)
     }
     

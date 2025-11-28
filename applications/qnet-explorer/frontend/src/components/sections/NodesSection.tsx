@@ -58,7 +58,8 @@ const NodeActivation = React.memo(function NodeActivation() {
     
         // Phase 2 dynamic QNC pricing - CORRECT implementation
         const basePrices: Record<'light' | 'full' | 'super', number> = { light: 5000, full: 7500, super: 10000 };
-        let netMultiplier = activeNodes >= 10_000_000 ? 3.0 : activeNodes >= 1_000_000 ? 2.0 : activeNodes >= 100_000 ? 1.0 : 0.5;
+        // CANONICAL VALUES: ≤100K=0.5x, ≤300K=1.0x, ≤1M=2.0x, >1M=3.0x
+        let netMultiplier = activeNodes > 1_000_000 ? 3.0 : activeNodes > 300_000 ? 2.0 : activeNodes > 100_000 ? 1.0 : 0.5;
         
         const basePrice = basePrices[type];
         const currentPrice = Math.round(basePrice * netMultiplier);
