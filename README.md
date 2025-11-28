@@ -44,7 +44,15 @@ This project uses **dual licensing**:
 - **Phase 2 (Future)**: ONLY QNC token activation on QNet blockchain
 - **Transition**: 90% 1DEV burned OR 5 years from genesis block (whichever comes first)
 
-### 🛡️ **LATEST UPDATES (v2.19.12 - November 27, 2025)**
+### 🛡️ **LATEST UPDATES (v2.19.14 - November 28, 2025)**
+- **Simplified Fork Resolution**: Three-case approach (network ahead/same height/we're ahead) instead of complex weight calculations
+- **Reputation Manipulation Detection**: Escalating punishment for nodes claiming false reputation (1h → 1d → 1w → 1y ban)
+- **Empty Response Attack Protection**: Detection and penalty for nodes sending empty peer lists
+- **Consensus Security**: Timestamp validation (±5 min) and signature format pre-validation for commits/reveals
+- **Dual Peer Lookup**: Fixed Genesis node peer discovery (check both DashMap and RwLock storage)
+- **Dead Code Removal**: Removed ~250 lines of unused fork recovery code
+
+### 🛡️ **Previous Updates (v2.19.12 - November 27, 2025)**
 - **Full Macroblock Sync**: Complete P2P synchronization for macroblocks (RequestMacroblocks, MacroblocksBatch)
 - **Snapshot API**: New endpoints `/api/v1/snapshot/latest` and `/api/v1/snapshot/{height}` for fast sync
 - **Light Node Support**: Macroblocks synced for state verification, headers rotated to save space
@@ -483,16 +491,18 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 
 QNet implements advanced chain reorganization and synchronization mechanisms for network consistency:
 
-### **Chain Reorganization (Byzantine-Safe)**
-- **Fork Detection**: Automatic detection of competing blockchain forks
-- **Byzantine Weight Calculation**: Reputation-based chain weight with unique validator counting
-- **2/3 Majority Consensus**: Requires 67% Byzantine threshold for reorganization
-- **Deep Reorg Protection**: Maximum 100 blocks reorganization depth (51% attack prevention)
-- **Race Condition Prevention**: Single concurrent reorg with lock-free coordination
+### **Chain Reorganization (Simplified & Reliable)**
+- **Fork Detection**: Automatic detection via SHA3-256 hash comparison (<1ms)
+- **Three-Case Resolution**:
+  - **Network ahead**: Rollback to fork point and sync with longer chain
+  - **Same height**: Resync if ≥3 high-reputation validators (≥70%) connected
+  - **We're ahead**: Keep our chain (we have longer chain)
+- **Validator-Based Decision**: Minimum 3 high-reputation peers required for resync
+- **Deep Reorg Protection**: Maximum 100 blocks sync per request (51% attack prevention)
+- **Race Condition Prevention**: Single concurrent reorg with RwLock flag
 - **DoS Protection**: Rate limiting (1 fork attempt per 60 seconds maximum)
-- **Reputation Capping**: Maximum 95% reputation to prevent single-node dominance
+- **Macroblock Finality**: Ultimate resolution via 67% consensus every 90 blocks
 - **Async Processing**: Non-blocking fork analysis in background tasks
-- **Automatic Rollback**: Full backup and restore on reorganization failure
 
 ### **Advanced Block Synchronization**
 - **Out-of-Order Buffering**: Temporary storage for blocks received before their dependencies

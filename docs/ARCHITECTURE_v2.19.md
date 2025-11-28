@@ -2,7 +2,7 @@
 ## Post-Quantum Decentralized Network - Technical Documentation
 
 **Last Updated**: November 25, 2025  
-**Version**: 2.19.4  
+**Version**: 2.19.14  
 **Status**: Production Ready
 
 ---
@@ -1713,6 +1713,31 @@ QNet v2.19 implements a production-ready, post-quantum secure blockchain with:
 ---
 
 ## Version History
+
+### v2.19.14 (November 28, 2025)
+
+**Fork Resolution Simplification:**
+- Removed complex Byzantine weight calculation (calculate_fork_chain_weight, calculate_our_chain_weight)
+- Removed unused perform_chain_reorganization method (~250 lines of dead code)
+- Simplified fork resolution to three clear cases:
+  - Network ahead: rollback + sync
+  - Same height: resync if ≥3 high-rep validators connected
+  - We're ahead: keep our chain
+- Added MIN_PEERS_FOR_RESYNC = 3 threshold for same-height fork decisions
+
+**Security Enhancements:**
+- Reputation manipulation detection in ActiveNodeAnnouncement handler
+- Escalating punishment for reputation inflation/deflation (1h → 1d → 1w → 1y ban)
+- Empty response attack protection (5 empty responses = -5% reputation)
+- Consensus message timestamp validation (±5 minutes tolerance)
+- Consensus signature format pre-validation
+- Dual peer lookup (DashMap + RwLock fallback) for Genesis nodes
+
+**P2P Improvements:**
+- Fixed Genesis node peer discovery (check both connected_peers_lockfree and connected_peers)
+- Added else branch for empty peers during P2P initialization
+
+---
 
 ### v2.19.4 (November 25, 2025)
 

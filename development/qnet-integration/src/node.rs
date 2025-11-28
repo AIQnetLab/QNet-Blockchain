@@ -1385,12 +1385,15 @@ impl BlockchainNode {
             
             // P2P FIX: Start peer exchange after adding Genesis peers
             // This ensures the exchange protocol has peers to work with
+            // NOTE: Genesis reconnection is handled separately in main loop (every 10 seconds)
             let initial_peers = unified_p2p_instance.get_discovery_peers();
             let peer_count = initial_peers.len();
             
             if !initial_peers.is_empty() {
                 unified_p2p_instance.start_peer_exchange_protocol(initial_peers);
                 println!("[P2P] 🔄 Genesis node: Started peer exchange protocol with {} peers", peer_count);
+            } else {
+                println!("[P2P] ⏳ Genesis node: No peers yet, reconnection will be handled by main loop");
             }
         } else {
             // SCALABILITY: Regular nodes (Full/Light) in production with millions of nodes
@@ -2321,7 +2324,8 @@ impl BlockchainNode {
                                 let parts: Vec<&str> = fork_info.split(':').collect();
                                 if parts.len() == 2 {
                                     if let Ok(fork_height) = parts[0].parse::<u64>() {
-                                        let fork_producer = parts[1];
+                                        // CRITICAL: Clone fork_producer to String for async move
+                                        let fork_producer = parts[1].to_string();
                                         
                                         // CRITICAL: Check if reorg already in progress (prevent race condition)
                                         let is_reorg_active = *reorg_in_progress.read().await;
@@ -2354,6 +2358,7 @@ impl BlockchainNode {
                                         let height_clone = height.clone();
                                         let p2p_clone = unified_p2p.clone();
                                         let reorg_flag = reorg_in_progress.clone();
+                                        let fork_producer_clone = fork_producer.clone();
                                         
                                         tokio::spawn(async move {
                                             // Mark reorg as in progress
@@ -2361,52 +2366,108 @@ impl BlockchainNode {
                                             
                                             // CRITICAL: Query network for consensus on this height
                                             if let Some(p2p) = &p2p_clone {
-                                                // Get all peers' blocks at this height
-                                                let peers = p2p.get_validated_active_peers();
-                                                let mut block_versions: std::collections::HashMap<Vec<u8>, usize> = std::collections::HashMap::new();
-                                                
-                                                for peer in peers.iter().take(10) {  // Sample up to 10 peers
-                                                    // Query peer for their block at fork_height
-                                                    // (This would need a new P2P method to query specific block)
-                                                    // For now, we'll use network height consensus
-                                                }
-                                                
                                                 // Get network consensus height
                                                 if let Ok(network_height) = p2p.sync_blockchain_height() {
                                                     let local_height = *height_clone.read().await;
                                                     
-                                                    // If network is ahead, sync to catch up
+                                                    println!("[REORG] 📊 Comparing chains: local={}, network={}, fork_point={}", 
+                                                             local_height, network_height, fork_height);
+                                                    
+                                                    // CASE 1: Network is ahead - sync to catch up
                                                     if network_height > local_height {
-                                                        println!("[REORG] 📥 Network consensus at height {} - syncing from {}", 
-                                                                 network_height, local_height);
+                                                        println!("[REORG] 📥 Network ahead: {} > {} - syncing", network_height, local_height);
                                                         
-                                                        // Clear our chain from fork point and resync
-                                                        if fork_height < local_height {
-                                                            // Rollback to before fork
+                                                        // Rollback to fork point and resync
+                                                        if fork_height <= local_height {
                                                             println!("[REORG] 🔄 Rolling back from {} to {}", local_height, fork_height - 1);
                                                             
-                                                            // Delete blocks from fork_height onwards
                                                             for h in fork_height..=local_height {
                                                                 if let Err(e) = storage_clone.delete_microblock(h) {
                                                                     println!("[REORG] ⚠️ Failed to delete block {}: {}", h, e);
                                                                 }
                                                             }
                                                             
-                                                            // Update height
                                                             *height_clone.write().await = fork_height - 1;
                                                             storage_clone.set_chain_height(fork_height - 1).ok();
                                                         }
                                                         
-                                                        // Sync missing blocks from network
-                                                        let sync_from = fork_height;
-                                                        let sync_to = std::cmp::min(network_height, fork_height + 100); // Sync in chunks
-                                                        
-                                                        println!("[REORG] 📦 Requesting blocks {}-{} from network", sync_from, sync_to);
-                                                        if let Err(e) = p2p.sync_blocks(sync_from, sync_to).await {
-                                                            println!("[REORG] ❌ Failed to sync blocks: {}", e);
+                                                        // Sync missing blocks
+                                                        let sync_to = std::cmp::min(network_height, fork_height + 100);
+                                                        println!("[REORG] 📦 Requesting blocks {}-{}", fork_height, sync_to);
+                                                        if let Err(e) = p2p.sync_blocks(fork_height, sync_to).await {
+                                                            println!("[REORG] ❌ Failed to sync: {}", e);
                                                         } else {
-                                                            println!("[REORG] ✅ Fork resolved by syncing with network majority");
+                                                            println!("[REORG] ✅ Fork resolved - synced with longer chain");
                                                         }
+                                                    }
+                                                    // CASE 2: Same height - resync from network to resolve
+                                                    // ARCHITECTURE: We can't know which chain is "correct" without querying peers
+                                                    // The safest approach is to resync and let the network decide
+                                                    else if network_height == local_height && fork_height <= local_height {
+                                                        println!("[REORG] ⚖️ Same height {} - fork detected, resyncing from network", local_height);
+                                                        
+                                                        // Get our hash at fork_height for logging
+                                                        let our_hash = if let Ok(Some(our_block)) = storage_clone.load_microblock(fork_height) {
+                                                            use sha3::{Sha3_256, Digest};
+                                                            let mut hasher = Sha3_256::new();
+                                                            hasher.update(&our_block);
+                                                            hex::encode(&hasher.finalize()[0..8])
+                                                        } else {
+                                                            "unknown".to_string()
+                                                        };
+                                                        
+                                                        println!("[REORG] 📊 Our block #{} hash: {}", fork_height, our_hash);
+                                                        println!("[REORG] 📊 Fork from: {}", fork_producer_clone);
+                                                        
+                                                        // SIMPLE AND RELIABLE APPROACH:
+                                                        // 1. Rollback to fork point
+                                                        // 2. Request blocks from highest-reputation peer
+                                                        // 3. The correct chain will be validated and accepted
+                                                        // 4. Macroblock (every 90 blocks) will finalize the correct chain
+                                                        
+                                                        // Count high-rep validators for logging
+                                                        let peers = p2p.get_validated_active_peers();
+                                                        let high_rep_count = peers.iter()
+                                                            .filter(|p| p.consensus_score >= 70.0)
+                                                            .count();
+                                                        
+                                                        println!("[REORG] 📊 Connected to {} high-reputation validators", high_rep_count);
+                                                        
+                                                        // Only resync if we have enough validators to trust
+                                                        // MIN_PEERS_FOR_CONSENSUS = 4 (Byzantine 3f+1 where f=1)
+                                                        const MIN_PEERS_FOR_RESYNC: usize = 3;
+                                                        
+                                                        if high_rep_count >= MIN_PEERS_FOR_RESYNC {
+                                                            println!("[REORG] 🔄 Resyncing from {} validators", high_rep_count);
+                                                            
+                                                            // Rollback to fork point
+                                                            for h in fork_height..=local_height {
+                                                                let _ = storage_clone.delete_microblock(h);
+                                                            }
+                                                            *height_clone.write().await = fork_height - 1;
+                                                            storage_clone.set_chain_height(fork_height - 1).ok();
+                                                            
+                                                            // Request blocks from network
+                                                            // sync_blocks() selects best_peer (highest combined reputation)
+                                                            // Blocks will be validated when received
+                                                            if let Err(e) = p2p.sync_blocks(fork_height, local_height).await {
+                                                                println!("[REORG] ❌ Failed to sync: {}", e);
+                                                            } else {
+                                                                println!("[REORG] ✅ Fork resolved - resynced from network");
+                                                                println!("[REORG] 📋 Macroblock will finalize correct chain within 90 blocks");
+                                                            }
+                                                        } else {
+                                                            // Not enough validators - keep our chain and wait
+                                                            // This prevents switching to a malicious chain from few nodes
+                                                            println!("[REORG] ⚠️ Only {} validators (need {}) - keeping our chain", 
+                                                                     high_rep_count, MIN_PEERS_FOR_RESYNC);
+                                                            println!("[REORG] 📋 Will retry when more validators connect");
+                                                        }
+                                                    }
+                                                    // CASE 3: We're ahead - keep our chain
+                                                    else {
+                                                        println!("[REORG] ✅ We're ahead ({} > {}) - keeping our chain", 
+                                                                 local_height, network_height);
                                                     }
                                                 }
                                             }
@@ -2782,254 +2843,6 @@ impl BlockchainNode {
                              pending_blocks.len(), requested_blocks.len());
                 }
             }
-        }
-    }
-    
-    /// Calculate Byzantine weight of fork chain (considers consensus validators)
-    /// OPTIMIZED: Fast calculation for reorg decisions without blocking
-    async fn calculate_fork_chain_weight(
-        blocks: &[crate::unified_p2p::ReceivedBlock],
-        p2p: &Arc<SimplifiedP2P>,
-        _storage: &Arc<Storage>,
-    ) -> f64 {
-        // PERFORMANCE: Limit blocks analyzed to avoid long computation
-        const MAX_BLOCKS_TO_ANALYZE: usize = 50;
-        let blocks_to_check = if blocks.len() > MAX_BLOCKS_TO_ANALYZE {
-            &blocks[..MAX_BLOCKS_TO_ANALYZE]
-        } else {
-            blocks
-        };
-        
-        // CRITICAL: Byzantine weight calculation for chain reorganization
-        // Weight is based on unique validators with reputation ≥ 70%
-        let mut unique_validators = std::collections::HashSet::new();
-        let mut total_reputation = 0.0;
-        
-        // OPTIMIZATION: Get peers once, not per block
-        let peers = p2p.get_validated_active_peers();
-        
-        for block in blocks_to_check {
-            // Deserialize to get producer (fast operation)
-            if let Ok(microblock) = bincode::deserialize::<qnet_state::MicroBlock>(&block.data) {
-                // Only count each validator once (Byzantine principle)
-                if !unique_validators.contains(&microblock.producer) {
-                    unique_validators.insert(microblock.producer.clone());
-                    
-                    // Get producer reputation from P2P peers
-                    let reputation = if microblock.producer.starts_with("genesis_") {
-                        0.70 // Genesis nodes have fixed 70% reputation
-                    } else {
-                        // OPTIMIZATION: Use pre-fetched peers list
-                        // Use consensus_score (Byzantine-safe) for validator weight
-                        peers.iter()
-                            .find(|p| p.id == microblock.producer)
-                            .map(|p| (p.consensus_score / 100.0).min(0.95)) // Convert to 0-1 scale, cap at 95%
-                            .unwrap_or(0.50) // Default 50% for unknown producers
-                    };
-                    
-                    // Only validators (reputation ≥ 70%) contribute to Byzantine weight
-                    if reputation >= 0.70 {
-                        total_reputation += reputation;
-                    }
-                }
-            }
-        }
-        
-        // Byzantine weight: number of validators * average reputation
-        let validator_count = unique_validators.len() as f64;
-        if validator_count > 0.0 {
-            total_reputation / validator_count * validator_count.sqrt() // Square root for Byzantine scaling
-        } else {
-            0.0
-        }
-    }
-    
-    /// Perform chain reorganization when fork chain has higher weight
-    async fn perform_chain_reorganization(
-        fork_point: u64,
-        fork_blocks: &[crate::unified_p2p::ReceivedBlock],
-        storage: &Arc<Storage>,
-        current_height: &Arc<RwLock<u64>>,
-        p2p: &Option<Arc<SimplifiedP2P>>,
-    ) -> Result<u64, String> {
-        println!("[REORG] 🔄 Starting chain reorganization from height {}", fork_point);
-        
-        // SAFETY: Create backup of current chain before reorg
-        let mut backup_blocks = Vec::new();
-        let current = *current_height.read().await;
-        
-        // Backup blocks that will be replaced
-        for height in fork_point..=current {
-            if let Ok(Some(block_data)) = storage.load_microblock(height) {
-                backup_blocks.push((height, block_data));
-            }
-        }
-        println!("[REORG] 💾 Backed up {} blocks from current chain", backup_blocks.len());
-        
-        // CRITICAL: Validate fork chain integrity before switching
-        let mut prev_hash: [u8; 32] = if fork_point > 0 {
-            // Get the hash of block before fork point
-            if let Ok(Some(prev_data)) = storage.load_microblock(fork_point - 1) {
-                if let Ok(_prev_block) = bincode::deserialize::<qnet_state::MicroBlock>(&prev_data) {
-                    use sha3::{Sha3_256, Digest};
-                    let mut hasher = Sha3_256::new();
-                    hasher.update(&prev_data);
-                    let hash = hasher.finalize();
-                    let mut hash_bytes = [0u8; 32];
-                    hash_bytes.copy_from_slice(&hash);
-                    hash_bytes
-                } else {
-                    return Err("Failed to deserialize previous block".to_string());
-                }
-            } else {
-                return Err(format!("Previous block #{} not found", fork_point - 1));
-            }
-        } else {
-            // Fork at Genesis
-            [0u8; 32]
-        };
-        
-        // Validate each fork block before applying
-        for (idx, fork_block) in fork_blocks.iter().enumerate() {
-            if let Ok(microblock) = bincode::deserialize::<qnet_state::MicroBlock>(&fork_block.data) {
-                // Check previous_hash continuity
-                if microblock.previous_hash != prev_hash {
-                    println!("[REORG] ❌ Fork chain broken at block #{}", microblock.height);
-                    // Restore backup
-                    for (height, data) in backup_blocks {
-                        let _ = storage.save_microblock(height, &data);
-                    }
-                    return Err(format!("Fork chain integrity check failed at height {}", microblock.height));
-                }
-                
-                // Update prev_hash for next iteration
-                use sha3::{Sha3_256, Digest};
-                let mut hasher = Sha3_256::new();
-                hasher.update(&fork_block.data);
-                let hash = hasher.finalize();
-                prev_hash.copy_from_slice(&hash);
-            } else {
-                return Err(format!("Failed to deserialize fork block {}", idx));
-            }
-        }
-        
-        println!("[REORG] ✅ Fork chain validated - {} blocks", fork_blocks.len());
-        
-        // CRITICAL: Apply fork chain (replace our blocks)
-        let mut new_height = fork_point - 1;
-        for fork_block in fork_blocks {
-            if let Ok(microblock) = bincode::deserialize::<qnet_state::MicroBlock>(&fork_block.data) {
-                let height = microblock.height;
-                
-                // CRITICAL: Decompress before saving
-                let decompressed_data = match zstd::decode_all(&fork_block.data[..]) {
-                    Ok(data) => data,
-                    Err(_) => {
-                        // Data might not be compressed
-                        fork_block.data.clone()
-                    }
-                };
-                
-                // Save the new block
-                if let Err(e) = storage.save_microblock(height, &decompressed_data) {
-                    println!("[REORG] ❌ Failed to save fork block #{}: {}", height, e);
-                    // Restore backup on failure
-                    for (backup_height, data) in backup_blocks {
-                        let _ = storage.save_microblock(backup_height, &data);
-                    }
-                    return Err(format!("Failed to save fork block: {}", e));
-                }
-                
-                new_height = height;
-                println!("[REORG] 💾 Applied fork block #{}", height);
-            }
-        }
-        
-        // CRITICAL: Broadcast reorg event to network
-        if let Some(p2p) = p2p {
-            // Notify peers about reorganization via gossip
-            println!("[REORG] 📢 Broadcasting chain reorganization event");
-            
-            // Create reorg notification message
-            let reorg_data = serde_json::json!({
-                "event": "chain_reorg",
-                "old_height": fork_point,
-                "new_height": new_height,
-                "fork_length": new_height.saturating_sub(fork_point),
-                "timestamp": std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
-                "node_id": p2p.node_id.clone()
-            });
-            
-            // Broadcast to all connected peers via gossip
-            p2p.broadcast_system_event("chain_reorg", &reorg_data.to_string());
-            
-            println!("[REORG] ✅ Reorg event broadcasted to {} peers", p2p.get_peer_count());
-        }
-        
-        println!("[REORG] ✅ Chain reorganization complete! New height: {}", new_height);
-        Ok(new_height)
-    }
-    
-    /// Calculate Byzantine weight of our current chain
-    /// OPTIMIZED: Fast calculation with limited block range
-    async fn calculate_our_chain_weight(
-        from_height: u64,
-        to_height: u64,
-        p2p: &Arc<SimplifiedP2P>,
-        storage: &Arc<Storage>,
-    ) -> f64 {
-        // PERFORMANCE: Limit range to avoid long I/O operations
-        const MAX_BLOCKS_TO_ANALYZE: u64 = 50;
-        let actual_to_height = if to_height - from_height > MAX_BLOCKS_TO_ANALYZE {
-            from_height + MAX_BLOCKS_TO_ANALYZE
-        } else {
-            to_height
-        };
-        
-        // CRITICAL: Byzantine weight calculation for current chain
-        let mut unique_validators = std::collections::HashSet::new();
-        let mut total_reputation = 0.0;
-        
-        // OPTIMIZATION: Get peers once, not per block
-        let peers = p2p.get_validated_active_peers();
-        
-        for height in from_height..=actual_to_height {
-            if let Ok(Some(block_data)) = storage.load_microblock(height) {
-                if let Ok(microblock) = bincode::deserialize::<qnet_state::MicroBlock>(&block_data) {
-                    // Only count each validator once (Byzantine principle)
-                    if !unique_validators.contains(&microblock.producer) {
-                        unique_validators.insert(microblock.producer.clone());
-                        
-                        // Get producer reputation
-                        let reputation = if microblock.producer.starts_with("genesis_") {
-                            0.70 // Genesis nodes have fixed 70% reputation
-                        } else {
-                            // OPTIMIZATION: Use pre-fetched peers list
-                            // Use consensus_score (Byzantine-safe) for validator weight
-                            peers.iter()
-                                .find(|p| p.id == microblock.producer)
-                                .map(|p| (p.consensus_score / 100.0).min(0.95)) // Convert to 0-1 scale, cap at 95%
-                                .unwrap_or(0.50) // Default 50% for unknown producers
-                        };
-                        
-                        // Only validators (reputation ≥ 70%) contribute to Byzantine weight
-                        if reputation >= 0.70 {
-                            total_reputation += reputation;
-                        }
-                    }
-                }
-            }
-        }
-        
-        // Byzantine weight: number of validators * average reputation
-        let validator_count = unique_validators.len() as f64;
-        if validator_count > 0.0 {
-            total_reputation / validator_count * validator_count.sqrt() // Square root for Byzantine scaling
-        } else {
-            0.0
         }
     }
     
@@ -3676,6 +3489,15 @@ impl BlockchainNode {
             
             println!("[Node] 🔄 Starting network synchronization (local height: {})...", local_height);
             
+            // CRITICAL FIX: Register in global registry BEFORE waiting for peers
+            // This allows other nodes to discover us via gossip during their sync
+            if let Some(ref p2p) = self.unified_p2p {
+                if !matches!(self.node_type, NodeType::Light) {
+                    println!("[ACTIVE] 📡 Early registration in global registry (pre-sync)...");
+                    p2p.register_as_active_node_async().await;
+                }
+            }
+            
             if let Some(ref p2p) = self.unified_p2p {
                 let mut wait_time = 0u64;
                 const MAX_WAIT_SECS: u64 = 120; // 2 minutes max wait
@@ -3683,16 +3505,14 @@ impl BlockchainNode {
                 
                 loop {
                     // STEP 1: Check REAL peer connectivity (TCP check, not config list)
-                    let real_peer_count = if is_bootstrap_node {
-                        // Bootstrap nodes: Use TCP connectivity check to other Genesis nodes
-                        if p2p.verify_all_genesis_connectivity().await {
-                            5 // All 5 Genesis nodes connected
-                        } else {
-                            p2p.get_peer_count() + 1 // Actual connected + self
-                        }
+                    // CRITICAL: For Genesis nodes, we need EXACTLY 4 other peers (all 5 nodes connected)
+                    let real_peer_count = p2p.get_peer_count(); // Actual connected peers (not including self)
+                    
+                    // For Genesis nodes: verify we have connections to all 4 other Genesis nodes
+                    let genesis_peers_connected = if is_bootstrap_node {
+                        p2p.verify_all_genesis_connectivity().await
                     } else {
-                        // Regular nodes: Count real connected peers
-                        p2p.get_peer_count() + 1
+                        true // Non-Genesis nodes don't need this check
                     };
                     
                     // STEP 2: Check Genesis block exists
@@ -3701,7 +3521,16 @@ impl BlockchainNode {
                         .unwrap_or(false);
                     
                     // STEP 3: Determine if ready to start
-                    let has_enough_peers = real_peer_count >= MIN_PEERS_FOR_CONSENSUS;
+                    // CRITICAL FIX: Genesis nodes MUST have exactly 4 peers (all other Genesis nodes)
+                    // This prevents network split where nodes start with partial connectivity
+                    let has_enough_peers = if is_bootstrap_node {
+                        // Genesis nodes: MUST have 4 peers (all other Genesis nodes connected)
+                        real_peer_count >= 4 && genesis_peers_connected
+                    } else {
+                        // Regular nodes: Need at least 3 peers for Byzantine consensus
+                        real_peer_count >= MIN_PEERS_FOR_CONSENSUS - 1 // -1 because we don't count self
+                    };
+                    
                     let bootstrap_id = std::env::var("QNET_BOOTSTRAP_ID").unwrap_or_default();
                     let is_genesis_creator = bootstrap_id == "001";
                     
@@ -3747,9 +3576,31 @@ impl BlockchainNode {
                     }
                     
                     // Log progress
-                    println!("[Node] ⏳ Waiting: {} peers (need {}), Genesis: {} ({}s elapsed)", 
-                             real_peer_count, MIN_PEERS_FOR_CONSENSUS,
-                             if has_genesis { "YES" } else { "NO" }, wait_time);
+                    if is_bootstrap_node {
+                        println!("[Node] ⏳ Genesis node waiting: {} peers (need 4), all connected: {}, Genesis block: {} ({}s elapsed)", 
+                                 real_peer_count, genesis_peers_connected,
+                                 if has_genesis { "YES" } else { "NO" }, wait_time);
+                    } else {
+                        println!("[Node] ⏳ Waiting: {} peers (need {}), Genesis: {} ({}s elapsed)", 
+                                 real_peer_count, MIN_PEERS_FOR_CONSENSUS - 1,
+                                 if has_genesis { "YES" } else { "NO" }, wait_time);
+                    }
+                    
+                    // CRITICAL FIX: Actively try to connect to Genesis peers during wait
+                    // This fixes race condition where all nodes start simultaneously
+                    if is_bootstrap_node {
+                        use crate::unified_p2p::get_genesis_bootstrap_ips;
+                        let genesis_ips = get_genesis_bootstrap_ips();
+                        let genesis_peers: Vec<String> = genesis_ips.iter()
+                            .map(|ip| format!("{}:8001", ip))
+                            .collect();
+                        
+                        println!("[Node] 🔄 Attempting to connect to Genesis peers...");
+                        p2p.add_discovered_peers(&genesis_peers);
+                        
+                        // Also re-register to propagate our presence
+                        p2p.register_as_active_node_async().await;
+                    }
                     
                     // Wait and retry
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -3757,6 +3608,17 @@ impl BlockchainNode {
                     
                     // Timeout check
                     if wait_time >= MAX_WAIT_SECS {
+                        // CRITICAL FIX: For Genesis nodes, NEVER start without minimum peers
+                        // This prevents network split where each node produces its own chain
+                        if is_bootstrap_node && real_peer_count < MIN_PEERS_FOR_CONSENSUS {
+                            println!("[Node] ❌ CRITICAL: Genesis node timeout with only {} peers!", real_peer_count);
+                            println!("[Node] ❌ Cannot start production - network would split!");
+                            println!("[Node] 🔄 Extending wait time... (Genesis nodes MUST connect)");
+                            // Reset wait time and continue trying
+                            wait_time = 0;
+                            continue;
+                        }
+                        
                         println!("[Node] ⚠️ Timeout after {}s, proceeding with {} peers", 
                                 wait_time, real_peer_count);
                         break;
@@ -3907,10 +3769,11 @@ impl BlockchainNode {
     
     
     /// PRODUCTION: Process consensus messages from other nodes 
+    /// Returns (node_id, success) for reputation tracking
     async fn process_consensus_message(
         consensus_engine: &mut qnet_consensus::CommitRevealConsensus,
         message: ConsensusMessage,
-    ) {
+    ) -> (String, bool, Option<String>) {
         use qnet_consensus::commit_reveal::{Commit, Reveal};
         
         match message {
@@ -3929,9 +3792,12 @@ impl BlockchainNode {
                 match consensus_engine.process_commit(remote_commit).await {
                     Ok(_) => {
                         println!("[CONSENSUS] ✅ Remote commit accepted from: {}", node_id);
+                        (node_id, true, None)
                     }
                     Err(e) => {
-                        println!("[CONSENSUS] ❌ Remote commit rejected from {}: {:?}", node_id, e);
+                        let error_str = format!("{:?}", e);
+                        println!("[CONSENSUS] ❌ Remote commit rejected from {}: {}", node_id, error_str);
+                        (node_id, false, Some(error_str))
                     }
                 }
             }
@@ -3974,9 +3840,12 @@ impl BlockchainNode {
                 match consensus_engine.submit_reveal(remote_reveal) {
                     Ok(_) => {
                         println!("[CONSENSUS] ✅ Remote reveal accepted from: {}", node_id);
+                        (node_id, true, None)
                     }
                     Err(e) => {
-                        println!("[CONSENSUS] ❌ Remote reveal rejected from {}: {:?}", node_id, e);
+                        let error_str = format!("{:?}", e);
+                        println!("[CONSENSUS] ❌ Remote reveal rejected from {}: {}", node_id, error_str);
+                        (node_id, false, Some(error_str))
                     }
                 }
             }
@@ -4428,6 +4297,16 @@ impl BlockchainNode {
             println!("[Microblock] 🚀 Starting production-ready microblock system");
             println!("[Microblock] ⚡ Target: 100k+ TPS with batch processing");
             
+            // CRITICAL: Register as active node immediately at startup
+            // This ensures we're in the global registry for producer selection
+            if node_type != NodeType::Light {
+                if let Some(ref p2p) = unified_p2p {
+                    println!("[ACTIVE] 📡 Registering in global active node registry...");
+                    p2p.register_as_active_node_async().await;
+                    println!("[ACTIVE] ✅ Registered as active {:?} node", node_type);
+                }
+            }
+            
             // CPU MONITORING: Track CPU usage periodically
             let mut cpu_check_counter = 0u64;
             let start_time = std::time::Instant::now();
@@ -4451,6 +4330,7 @@ impl BlockchainNode {
             // PRODUCTION: Track certificate management timing  
             let mut certificate_cleanup_counter = 0u64;
             let mut certificate_broadcast_counter = 0u64;
+            let mut genesis_reconnect_counter = 0u64;  // CRITICAL FIX: Genesis peer reconnection
             let node_start_time = std::time::Instant::now();
             
             // OPTIMIZATION: Track last round when certificate was broadcasted
@@ -4461,6 +4341,7 @@ impl BlockchainNode {
                 cpu_check_counter += 1;
                 certificate_cleanup_counter += 1;
                 certificate_broadcast_counter += 1;
+                genesis_reconnect_counter += 1;
                 
                 // PRODUCTION: Certificate cache cleanup (every 5 minutes)
                 // Removes expired certificates from cache (TTL: 9 min for verified, 5 min for pending)
@@ -4474,6 +4355,11 @@ impl BlockchainNode {
                         cert_manager.cleanup();
                         println!("[CERTIFICATE] 🧹 Certificate cache cleaned");
                         
+                        // CRITICAL: Cleanup stale nodes from active registry
+                        // This prevents selecting offline nodes as producers
+                        // Nodes not seen for >15 minutes are removed
+                        p2p.cleanup_stale_active_nodes();
+                        
                         // CRITICAL: Update global pricing state with REAL network data
                         // This enables dynamic pricing in quantum_crypto.rs
                         let active_peers = p2p.get_peer_count() as u64 + 1; // +1 for self
@@ -4482,6 +4368,64 @@ impl BlockchainNode {
                         let burn_pct = crate::GLOBAL_BURN_PERCENTAGE.load(std::sync::atomic::Ordering::Relaxed) as f64 / 100.0;
                         crate::update_global_pricing_state(burn_pct, active_peers, genesis_ts);
                         println!("[PRICING] 📊 Global state updated: {} active nodes", active_peers);
+                    }
+                }
+                
+                // CRITICAL FIX: Genesis peer reconnection (every 10 seconds)
+                // This fixes the race condition where Genesis nodes start simultaneously
+                // and fail to connect to each other on first attempt
+                let is_genesis_node = std::env::var("QNET_BOOTSTRAP_ID")
+                    .map(|id| ["001", "002", "003", "004", "005"].contains(&id.trim()))
+                    .unwrap_or(false);
+                    
+                if is_genesis_node && genesis_reconnect_counter >= 10 {
+                    genesis_reconnect_counter = 0;
+                    
+                    if let Some(ref p2p) = unified_p2p {
+                        let current_peers = p2p.get_peer_count();
+                        
+                        // If we don't have all 4 other Genesis peers, try to reconnect
+                        if current_peers < 4 {
+                            println!("[P2P] 🔄 GENESIS RECONNECT: Only {} peers, need 4. Attempting reconnection...", current_peers);
+                            
+                            // REUSE: Use existing add_discovered_peers method (no code duplication!)
+                            use crate::unified_p2p::get_genesis_bootstrap_ips;
+                            let genesis_ips = get_genesis_bootstrap_ips();
+                            let genesis_peers: Vec<String> = genesis_ips.iter()
+                                .map(|ip| format!("{}:8001", ip))
+                                .collect();
+                            
+                            // add_discovered_peers handles:
+                            // - TCP connectivity check
+                            // - Self-connection filtering
+                            // - Duplicate detection
+                            // - PeerInfo creation
+                            // - Kademlia fields calculation
+                            p2p.add_discovered_peers(&genesis_peers);
+                            
+                            let new_peer_count = p2p.get_peer_count();
+                            if new_peer_count > current_peers {
+                                println!("[P2P] ✅ GENESIS RECONNECT: Now have {} peers (was {})", new_peer_count, current_peers);
+                            }
+                        }
+                        
+                        // CRITICAL: Re-register as active node to update global registry
+                        // This ensures our node is visible to all other nodes via gossip
+                        p2p.register_as_active_node_async().await;
+                    }
+                }
+                
+                // CRITICAL FIX: Periodic active node registration (every 60 seconds)
+                // This ensures ALL nodes (not just Genesis) are in the global registry
+                // Without this, non-Genesis nodes won't be selected as producers!
+                static ACTIVE_NODE_REGISTRATION_COUNTER: std::sync::atomic::AtomicU64 = 
+                    std::sync::atomic::AtomicU64::new(0);
+                let reg_counter = ACTIVE_NODE_REGISTRATION_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                
+                if reg_counter % 60 == 0 && node_type != NodeType::Light {
+                    if let Some(ref p2p) = unified_p2p {
+                        println!("[ACTIVE] 📡 Periodic registration to global registry...");
+                        p2p.register_as_active_node_async().await;
                     }
                 }
                 
@@ -7942,23 +7886,92 @@ impl BlockchainNode {
         
         println!("[CANDIDATES] 📊 Calculating qualified candidates (UNIFIED decentralized system)");
         
-        // UNIFIED APPROACH: Use P2P connected peers as PRIMARY source
-        // This works for BOTH Genesis (5 nodes) and Production (millions of nodes)
-        // NO artificial phase separation!
+        // ═══════════════════════════════════════════════════════════════════════════
+        // CRITICAL FIX FOR SCALABILITY: Use GLOBAL REGISTRY as PRIMARY source
+        // ═══════════════════════════════════════════════════════════════════════════
+        // 
+        // PROBLEM: Using only connected_peers causes DIFFERENT candidate lists on different nodes:
+        //   - Node A connected to [1,2,3...100] → selects producer X
+        //   - Node B connected to [50,51...150] → selects producer Y
+        //   - RESULT: Network fork!
+        //
+        // SOLUTION: Use active_full_super_nodes (gossip-synced global registry)
+        //   - All nodes receive ActiveNodeAnnouncement via gossip
+        //   - All nodes build SAME global registry
+        //   - All nodes select SAME producer
+        //
+        // ARCHITECTURE: 
+        //   1. PRIMARY: active_full_super_nodes (gossip-synced, eventually consistent)
+        //   2. FALLBACK: connected_peers (only for Genesis bootstrap with <10 nodes)
+        // ═══════════════════════════════════════════════════════════════════════════
         
-        let validated_peers = p2p.get_validated_active_peers();
-        println!("[CANDIDATES] 🌐 Found {} validated P2P peers", validated_peers.len());
+        // STEP 1: Get candidates from GLOBAL REGISTRY (gossip-synced)
+        let global_active_nodes = p2p.get_active_full_super_nodes();
+        println!("[CANDIDATES] 🌍 Global registry: {} active Full/Super nodes", global_active_nodes.len());
         
-        // Add all validated peers with reputation >= 70%
-        for peer in validated_peers {
-            let reputation = Self::get_node_reputation_score(&peer.id, p2p).await;
+        // Use global registry if it has enough nodes (production mode)
+        // Threshold: 5 nodes = Genesis complete, use global registry
+        let use_global_registry = global_active_nodes.len() >= 5;
+        
+        if use_global_registry {
+            println!("[CANDIDATES] ✅ Using GLOBAL REGISTRY (gossip-synced, deterministic)");
             
-            if reputation >= 0.70 {
-                all_qualified.push((peer.id.clone(), reputation));
-                println!("[CANDIDATES]   ├── {} ({:?}, {:.1}%)", peer.id, peer.node_type, reputation * 100.0);
-            } else {
-                println!("[CANDIDATES]   ├── {} ({:?}, {:.1}%) - EXCLUDED (below 70% threshold)", 
-                         peer.id, peer.node_type, reputation * 100.0);
+            // Get full node info with reputation from global registry
+            for (node_id, node_type, _last_seen) in &global_active_nodes {
+                // Only Super and Full nodes participate
+                if node_type != "super" && node_type != "full" {
+                    continue;
+                }
+                
+                let reputation = Self::get_node_reputation_score(node_id, p2p).await;
+                
+                if reputation >= 0.70 {
+                    all_qualified.push((node_id.clone(), reputation));
+                    println!("[CANDIDATES]   ├── {} ({}, {:.1}%) [GLOBAL]", node_id, node_type, reputation * 100.0);
+                } else {
+                    println!("[CANDIDATES]   ├── {} ({}, {:.1}%) - EXCLUDED (below 70%)", 
+                             node_id, node_type, reputation * 100.0);
+                }
+            }
+        } else {
+            // FALLBACK #1: Try connected peers
+            println!("[CANDIDATES] ⚠️ Global registry has {} nodes, trying CONNECTED PEERS...", 
+                     global_active_nodes.len());
+            
+            let validated_peers = p2p.get_validated_active_peers();
+            println!("[CANDIDATES] 🌐 Found {} validated P2P peers", validated_peers.len());
+            
+            for peer in validated_peers {
+                let reputation = Self::get_node_reputation_score(&peer.id, p2p).await;
+                
+                if reputation >= 0.70 {
+                    all_qualified.push((peer.id.clone(), reputation));
+                    println!("[CANDIDATES]   ├── {} ({:?}, {:.1}%) [LOCAL]", peer.id, peer.node_type, reputation * 100.0);
+                } else {
+                    println!("[CANDIDATES]   ├── {} ({:?}, {:.1}%) - EXCLUDED (below 70%)", 
+                             peer.id, peer.node_type, reputation * 100.0);
+                }
+            }
+            
+            // FALLBACK #2: If STILL empty and we're Genesis, use DETERMINISTIC Genesis list
+            // This ensures Genesis nodes can ALWAYS find each other for initial consensus
+            if all_qualified.is_empty() {
+                let is_genesis = std::env::var("QNET_BOOTSTRAP_ID")
+                    .map(|id| ["001", "002", "003", "004", "005"].contains(&id.trim()))
+                    .unwrap_or(false);
+                    
+                if is_genesis {
+                    println!("[CANDIDATES] 🚨 EMERGENCY: Using DETERMINISTIC Genesis list!");
+                    println!("[CANDIDATES] 📋 This ensures Genesis nodes can bootstrap consensus");
+                    
+                    // Add all 5 Genesis nodes with default reputation
+                    for i in 1..=5 {
+                        let genesis_id = format!("genesis_node_{:03}", i);
+                        // Default reputation 70% for Genesis bootstrap
+                        all_qualified.push((genesis_id.clone(), 0.70));
+                        println!("[CANDIDATES]   ├── {} (super, 70.0%) [GENESIS FALLBACK]", genesis_id);
+                    }
+                }
             }
         }
         
@@ -7987,17 +8000,19 @@ impl BlockchainNode {
             all_qualified.push((own_node_id.to_string(), own_reputation));
         }
         
-        // Remove duplicates (maintain insertion order for determinism)
+        // Remove duplicates and SORT for determinism
+        // CRITICAL: Sorting ensures ALL nodes have IDENTICAL candidate order
+        all_qualified.sort_by(|a, b| a.0.cmp(&b.0));
         all_qualified.dedup_by(|a, b| a.0 == b.0);
         
-        println!("[CANDIDATES] 📊 Total qualified: {} nodes (reputation >= 70%)", all_qualified.len());
+        println!("[CANDIDATES] 📊 Total qualified: {} nodes (reputation >= 70%, sorted)", all_qualified.len());
         
-        // CRITICAL: If NO candidates found, this is a P2P connectivity issue
+        // CRITICAL: If NO candidates found, this is a P2P/gossip issue
         if all_qualified.is_empty() {
             println!("[CANDIDATES] ❌ FATAL: No qualified candidates found!");
-            println!("[CANDIDATES] 📋 This indicates P2P connectivity failure");
-            println!("[CANDIDATES] 🔧 Genesis nodes must connect to each other before block production");
-            println!("[CANDIDATES] 💡 Check QNET_GENESIS_NODES environment variable");
+            println!("[CANDIDATES] 📋 This indicates gossip propagation failure");
+            println!("[CANDIDATES] 🔧 Check ActiveNodeAnnouncement gossip is working");
+            println!("[CANDIDATES] 💡 Nodes must register via register_as_active_node()");
         }
         
         // Apply validator sampling for scalability (works for 5 nodes AND millions)
@@ -9071,7 +9086,29 @@ impl BlockchainNode {
                     match consensus_rx_ref.try_recv() {
                         Ok(message) => {
                             println!("[CONSENSUS] 📥 Processing REAL consensus message from P2P channel");
-                            Self::process_consensus_message(consensus_engine, message).await;
+                            let (node_id, success, error) = Self::process_consensus_message(consensus_engine, message).await;
+                            
+                            // SECURITY: Apply reputation based on consensus engine result
+                            if success {
+                                // Valid commit/reveal - reward participation
+                                if let Some(ref p2p) = unified_p2p {
+                                    p2p.update_node_reputation(&node_id, ReputationEvent::ConsensusParticipation);
+                                }
+                            } else if let Some(err) = error {
+                                // Invalid commit/reveal - apply penalty based on error type
+                                if err.contains("InvalidSignature") {
+                                    // CRITICAL: Invalid signature is a serious attack
+                                    println!("[SECURITY] 🚨 Invalid signature from {} - applying -20% penalty", node_id);
+                                    if let Some(ref p2p) = unified_p2p {
+                                        p2p.update_node_reputation(&node_id, ReputationEvent::InvalidBlock);
+                                    }
+                                } else if err.contains("PhaseTimeout") {
+                                    // Late submission - minor issue, no penalty
+                                    println!("[CONSENSUS] ⚠️ Late submission from {} - no penalty", node_id);
+                                }
+                                // Other errors (NoActiveRound, etc.) - no penalty, could be timing issue
+                            }
+                            
                             processed_messages += 1;
                         }
                         Err(_) => {
@@ -9268,9 +9305,24 @@ impl BlockchainNode {
                     match consensus_rx_ref.try_recv() {
                         Ok(message) => {
                             println!("[CONSENSUS] 📥 Processing REAL reveal message from P2P channel");
-                            Self::process_consensus_message(consensus_engine, message).await;
+                            let (node_id, success, error) = Self::process_consensus_message(consensus_engine, message).await;
+                            
+                            // SECURITY: Apply reputation based on consensus engine result
+                            if success {
+                                if let Some(ref p2p) = unified_p2p {
+                                    p2p.update_node_reputation(&node_id, ReputationEvent::ConsensusParticipation);
+                                }
+                                received_reveals += 1; // Only count valid reveals
+                            } else if let Some(err) = error {
+                                if err.contains("InvalidSignature") || err.contains("InvalidReveal") {
+                                    println!("[SECURITY] 🚨 Invalid reveal from {} - applying -20% penalty", node_id);
+                                    if let Some(ref p2p) = unified_p2p {
+                                        p2p.update_node_reputation(&node_id, ReputationEvent::InvalidBlock);
+                                    }
+                                }
+                            }
+                            
                             processed_messages += 1;
-                            received_reveals += 1; // Count real reveals
                         }
                         Err(_) => {
                             // No message available, continue waiting

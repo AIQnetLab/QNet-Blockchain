@@ -218,42 +218,49 @@ Safety ≥90.0%  → safe_for_amounts_under_10000_qnc     (10K QNC)
 
 ## 4. Chain Reorganization & Network Synchronization
 
-### 4.1 Byzantine-Safe Chain Reorganization
+### 4.1 Fork Detection and Resolution
 
-QNet implements advanced chain reorganization mechanism to handle blockchain forks:
+QNet implements a simplified and reliable fork resolution mechanism:
 
-#### **Fork Detection and Resolution**
+#### **Fork Detection**
 ```
-Fork Detected → Validation → Weight Calculation → Byzantine Decision → Execution/Rejection
-     ↓              ↓                ↓                    ↓                    ↓
-  SHA3-256     Deserialize      Reputation Sum      67% Threshold        Atomic Reorg
-  Hash Check      Block          (Unique Nodes)      (2/3 BFT)          with Backup
-```
-
-#### **Byzantine Weight Calculation**
-```rust
-Weight = (Σ unique_validator_reputations) / validator_count * √validator_count
+Block Received → Hash Comparison → Fork Detected → Async Resolution
+      ↓                ↓                 ↓                ↓
+  Deserialize    SHA3-256 check    FORK_DETECTED:H:P   Background task
+                 vs local block                        (non-blocking)
 ```
 
-**Key Properties:**
-- Only validators with reputation ≥70% contribute to weight
-- Each validator counted only once (Byzantine principle)
-- Square root scaling prevents large group dominance
-- Maximum reputation capped at 95% (anti-manipulation)
+#### **Fork Resolution Strategy**
+```
+CASE 1: Network ahead (network_height > local_height)
+  └── Rollback to fork_point → sync_blocks() from network
+
+CASE 2: Same height (network_height == local_height)
+  └── Count high-rep validators (≥70%) → If ≥3: rollback + resync
+  └── If <3 validators: keep chain, wait for more connections
+
+CASE 3: We're ahead (local_height > network_height)
+  └── Keep our chain (we have longer chain)
+```
+
+**Key Design Decisions:**
+- **Simple over complex**: Resync from network majority instead of complex weight calculations
+- **Trust high-reputation validators**: Minimum 3 validators with ≥70% consensus_score required
+- **Macroblock finality**: Ultimate fork resolution via macroblock consensus (every 90 blocks, 67%+ required)
+- **No complex weight calculations**: Removed in favor of simpler, more reliable approach
 
 #### **Security Mechanisms**
-1. **Race Condition Prevention**: Single concurrent reorg with RwLock coordination
-2. **DoS Protection**: Maximum 1 fork attempt per 60 seconds
-3. **Deep Reorg Protection**: Maximum 100 blocks depth (51% attack prevention)
-4. **Validation Before Processing**: Block deserialization check before expensive operations
-5. **Automatic Rollback**: Full chain backup with restore on failure
-6. **Reputation Capping**: 95% maximum to prevent single-node dominance
+1. **Race Condition Prevention**: Single concurrent reorg with RwLock flag
+2. **DoS Protection**: Maximum 1 fork attempt per 60 seconds (rate limiting)
+3. **Deep Reorg Protection**: Maximum 100 blocks sync per request
+4. **Validator Threshold**: Minimum 3 high-reputation peers required for resync decision
+5. **Macroblock Finality**: Forks without 67% consensus cannot create macroblocks
 
 #### **Performance Characteristics**
 - **Fork Detection**: <1ms (SHA3-256 hash comparison)
-- **Weight Calculation**: 10-50ms (max 50 blocks analyzed)
+- **Resolution Decision**: <5ms (peer count + reputation check)
 - **Reorg Execution**: 50-200ms (background processing)
-- **Memory Overhead**: <10MB for tracking and buffering
+- **Memory Overhead**: <5MB (no complex tracking needed)
 - **Network Impact**: Zero blocking (async execution)
 
 ### 4.2 Advanced Block Synchronization
@@ -2177,6 +2184,35 @@ Violation Penalties:
 ├── Consensus Failure: -10.0 reputation
 ├── Extended Offline (24h+): -15.0 reputation
 └── Double Signing: -30.0 reputation
+
+Advanced Security (v2.19.14):
+├── Reputation Manipulation Detection:
+│   ├── Nodes claiming false reputation in ActiveNodeAnnouncement
+│   ├── Detection: Compare claimed vs real reputation (tolerance ±2.0)
+│   ├── Escalating punishment:
+│   │   ├── 1st attempt: -15% + 1 hour ban
+│   │   ├── 2nd attempt: -25% + 1 day ban
+│   │   ├── 3rd attempt: -40% + 1 week ban + network alert
+│   │   └── 4th+ attempt: -50% + 1 year ban + network alert
+│   └── Covers both inflation AND deflation attacks
+│
+├── Empty Response Attack Protection:
+│   ├── Nodes sending empty peer lists to disrupt discovery
+│   ├── Tracking: 5 empty responses in 10 minutes = attack
+│   ├── Penalty: -5% reputation
+│   └── Empty responses ignored (not processed)
+│
+├── Consensus Message Validation:
+│   ├── Timestamp validation: ±5 minutes tolerance
+│   ├── Future timestamps: reject + penalty
+│   ├── Stale timestamps: reject (no penalty)
+│   ├── Signature format pre-validation
+│   └── Invalid format: reject + penalty
+│
+└── Fork Resolution Security:
+    ├── Minimum 3 high-rep validators for resync decision
+    ├── DoS protection: 60s cooldown between fork attempts
+    └── Macroblock finality: 67% consensus every 90 blocks
 ```
 
 **Mobile-Optimized Recovery System:**

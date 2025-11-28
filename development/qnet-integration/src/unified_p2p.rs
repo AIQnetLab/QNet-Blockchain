@@ -4986,13 +4986,24 @@ impl SimplifiedP2P {
                 // Example: if self.node_id="genesis_node_005", contains("005") excludes ALL nodes with "005"
                 // This caused certificate broadcast failure for rotated producers!
                 if self.node_id != node_id {  // Exact comparison - only skip if EXACTLY same node
-                    // PRODUCTION: Get REAL reputation from connected_peers_lockfree
-                    // PRODUCTION: Get REAL peer data from connected_peers_lockfree
-                    // NO FALLBACK! If peer not found, skip it (not really connected)
+                    // PRODUCTION: Get REAL peer data from P2P state
+                    // CRITICAL: Check BOTH storage systems (lockfree DashMap AND legacy RwLock)
+                    // Genesis nodes use legacy storage (should_use_lockfree=false for ≤5 peers)
+                    
+                    // First try lock-free DashMap
                     let peer_data = self.connected_peers_lockfree
                         .iter()
                         .find(|entry| entry.value().id == node_id)
                         .map(|entry| entry.value().clone());
+                    
+                    // If not found in lockfree, try legacy connected_peers (RwLock)
+                    let peer_data = peer_data.or_else(|| {
+                        self.connected_peers.read().ok().and_then(|peers| {
+                            peers.iter()
+                                .find(|(_, p)| p.id == node_id)
+                                .map(|(_, p)| p.clone())
+                        })
+                    });
                     
                     match peer_data {
                         Some(real_peer) => {
@@ -5189,12 +5200,24 @@ impl SimplifiedP2P {
                         // Always track Genesis peer IDs for deduplication
                         genesis_peer_ids.insert(node_id.clone());
                         
-                        // PRODUCTION: Get REAL peer data from connected_peers_lockfree
-                        // NO FALLBACK! If peer not found, skip it (not really connected)
+                        // PRODUCTION: Get REAL peer data from P2P state
+                        // CRITICAL: Check BOTH storage systems (lockfree DashMap AND legacy RwLock)
+                        // Genesis nodes use legacy storage (should_use_lockfree=false for ≤5 peers)
+                        
+                        // First try lock-free DashMap
                         let peer_data = self.connected_peers_lockfree
                             .iter()
                             .find(|entry| entry.value().id == node_id)
                             .map(|entry| entry.value().clone());
+                        
+                        // If not found in lockfree, try legacy connected_peers (RwLock)
+                        let peer_data = peer_data.or_else(|| {
+                            self.connected_peers.read().ok().and_then(|peers| {
+                                peers.iter()
+                                    .find(|(_, p)| p.id == node_id)
+                                    .map(|(_, p)| p.clone())
+                            })
+                        });
                         
                         match peer_data {
                             Some(real_peer) => {
@@ -8284,11 +8307,121 @@ impl SimplifiedP2P {
                     return;
                 }
                 
+                // SECURITY FIX: Use REAL reputation from our local reputation system
+                // Don't trust the reputation value in the announcement - it could be faked!
+                // The announcement reputation is only used as a hint, we verify with our own data
+                let real_reputation = {
+                    let rep_sys = self.reputation_system.lock().unwrap();
+                    rep_sys.get_reputation(&node_id)
+                };
+                
                 // REPUTATION FILTER: Only track nodes with rep >= 70
-                if reputation < 70.0 {
-                    println!("[ACTIVE] ⚠️ Ignoring {} with low reputation {:.1}", node_id, reputation);
+                // Use REAL reputation, not the claimed one from announcement
+                if real_reputation < 70.0 {
+                    // If we don't know this node yet, give them benefit of doubt with default 70
+                    // New nodes start at 70, so this is fair
+                    if real_reputation == 0.0 {
+                        // Unknown node - accept with default reputation
+                        println!("[ACTIVE] 🆕 New node {} - accepting with default reputation 70.0", node_id);
+                    } else {
+                        println!("[ACTIVE] ⚠️ Ignoring {} with low REAL reputation {:.1} (claimed: {:.1})", 
+                                 node_id, real_reputation, reputation);
+                        return;
+                    }
+                }
+                
+                // SECURITY: Detect and punish ANY reputation manipulation attempts
+                // ANY difference between claimed and real reputation is an attack!
+                // Tolerance: ±2.0 for floating point rounding (real systems may have tiny diffs)
+                let reputation_diff = (reputation - real_reputation).abs();
+                let is_manipulation = reputation_diff > 2.0 && real_reputation > 0.0;
+                
+                if is_manipulation {
+                    let manipulation_type = if reputation > real_reputation {
+                        "INFLATION" // Trying to get more producer chances
+                    } else {
+                        "DEFLATION" // Trying to appear weaker (sybil preparation?)
+                    };
+                    
+                    println!("[SECURITY] 🚨 REPUTATION {} ATTACK from {}: claimed {:.1}, real {:.1} (diff: {:.1})", 
+                             manipulation_type, node_id, reputation, real_reputation, reputation_diff);
+                    
+                    // Track inflation attempts for escalating punishment
+                    static INFLATION_ATTEMPTS: Lazy<Arc<DashMap<String, (u32, u64)>>> = 
+                        Lazy::new(|| Arc::new(DashMap::new()));
+                    
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs();
+                    
+                    // Get or create attempt counter
+                    let (attempt_count, first_attempt) = {
+                        let mut entry = INFLATION_ATTEMPTS.entry(node_id.clone()).or_insert((0, now));
+                        entry.0 += 1;
+                        (entry.0, entry.1)
+                    };
+                    
+                    // ESCALATING PUNISHMENT:
+                    // 1st attempt: -15% reputation + 1 hour ban
+                    // 2nd attempt: -25% reputation + 1 day ban
+                    // 3rd attempt: -40% reputation + 1 week ban
+                    // 4th+ attempt: -50% reputation + 1 year ban (essentially permanent)
+                    let (penalty, ban_duration_secs, ban_description) = match attempt_count {
+                        1 => (-15.0, 3600u64, "1 hour"),           // 1 hour
+                        2 => (-25.0, 86400u64, "1 day"),          // 1 day
+                        3 => (-40.0, 604800u64, "1 week"),        // 1 week
+                        _ => (-50.0, 31536000u64, "1 year"),      // 1 year (permanent)
+                    };
+                    
+                    // Apply reputation penalty and jail using existing reputation system
+                    if let Ok(mut rep_sys) = self.reputation_system.lock() {
+                        // Apply penalty
+                        rep_sys.update_reputation(&node_id, penalty);
+                        println!("[SECURITY] ⚠️ Applied {:.1}% penalty to {} for {} (attempt #{}, diff: {:.1})", 
+                                 penalty, node_id, manipulation_type, attempt_count, reputation_diff);
+                        
+                        // Apply jail with escalating duration
+                        let jail_until = now + ban_duration_secs;
+                        let reason = format!("Reputation {} attack (attempt #{}): claimed {:.0}, real {:.0}, diff {:.0}", 
+                                            manipulation_type, attempt_count, reputation, real_reputation, reputation_diff);
+                        
+                        // Use apply_jail_sync for consistent jail handling
+                        rep_sys.apply_jail_sync(&node_id, jail_until, attempt_count, reason.clone());
+                        
+                        println!("[SECURITY] 🔒 BANNED {} for {} (attempt #{}, {}: real {:.1} vs claimed {:.1})", 
+                                 node_id, ban_description, attempt_count, manipulation_type, real_reputation, reputation);
+                        
+                        // Save to persistent storage
+                        self.save_jail_to_storage(&node_id, jail_until, attempt_count, &reason);
+                    }
+                    
+                    // Gossip the ban to network for consensus
+                    if attempt_count >= 3 {
+                        // Critical attack - report to network
+                        println!("[SECURITY] 🚨 CRITICAL: Reporting {} to network for repeated reputation manipulation", node_id);
+                        let _ = self.report_critical_attack(
+                            &node_id, 
+                            MaliciousBehavior::ProtocolViolation, // Reputation manipulation is a protocol violation
+                            0, // No specific block height for reputation attacks
+                            &format!("Repeated reputation {} attacks ({} attempts, diff: {:.0})", 
+                                    manipulation_type, attempt_count, reputation_diff)
+                        );
+                    }
+                    
+                    // Don't accept this announcement
                     return;
                 }
+                
+                // Log minor differences (within tolerance) for monitoring
+                // These are NOT attacks, just floating point differences or slight desync
+                if reputation_diff > 0.5 && reputation_diff <= 2.0 && real_reputation > 0.0 {
+                    println!("[ACTIVE] ℹ️ Minor reputation diff for {} (within tolerance): claimed {:.1}, real {:.1}", 
+                             node_id, reputation, real_reputation);
+                }
+                
+                // Use the HIGHER of real or default (70) for new nodes
+                let effective_reputation = if real_reputation > 0.0 { real_reputation } else { 70.0 };
                 
                 // Update active nodes map
                 {
@@ -8301,11 +8434,11 @@ impl SimplifiedP2P {
                             node_id: node_id.clone(),
                             node_type: node_type.clone(),
                             shard_id,
-                            reputation,
+                            reputation: effective_reputation, // Use REAL reputation!
                             last_seen: timestamp,
                         });
-                        println!("[ACTIVE] ✅ {} ({}) registered/updated, shard {}, rep {:.1}", 
-                                 node_id, node_type, shard_id, reputation);
+                        println!("[ACTIVE] ✅ {} ({}) registered/updated, shard {}, rep {:.1} (real)", 
+                                 node_id, node_type, shard_id, effective_reputation);
                     }
                 }
                 
@@ -8351,12 +8484,49 @@ impl SimplifiedP2P {
                 self.update_peer_last_seen(from_peer);
                 println!("[ACTIVE] 📥 Received {} active nodes from {}", active_nodes.len(), sender_id);
                 
+                // SECURITY: Track nodes that return suspiciously empty lists
+                // This could indicate an attack or node with corrupted state
+                static EMPTY_RESPONSE_TRACKER: Lazy<Arc<DashMap<String, (u32, u64)>>> = 
+                    Lazy::new(|| Arc::new(DashMap::new()));
+                
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
                     .as_secs();
                 
-                // Merge into local map
+                // SECURITY CHECK: Empty response from a node that should have peers
+                if active_nodes.is_empty() {
+                    let (count, first_empty) = {
+                        let mut entry = EMPTY_RESPONSE_TRACKER.entry(sender_id.clone()).or_insert((0, now));
+                        entry.0 += 1;
+                        (entry.0, entry.1)
+                    };
+                    
+                    println!("[SECURITY] ⚠️ Empty active nodes response from {} (count: {}, since: {}s ago)", 
+                             sender_id, count, now - first_empty);
+                    
+                    // After 5 empty responses in 10 minutes, apply reputation penalty
+                    if count >= 5 && (now - first_empty) < 600 {
+                        println!("[SECURITY] 🚨 {} returned 5+ empty responses - possible attack or corrupted state", sender_id);
+                        
+                        // Apply small penalty (not severe - could be legitimate issue)
+                        if let Ok(mut rep_sys) = self.reputation_system.lock() {
+                            rep_sys.update_reputation(&sender_id, -5.0);
+                            println!("[SECURITY] ⚠️ Applied -5% reputation penalty to {} for repeated empty responses", sender_id);
+                        }
+                        
+                        // Reset counter
+                        EMPTY_RESPONSE_TRACKER.remove(&sender_id);
+                    }
+                    
+                    // Don't process empty response further
+                    return;
+                }
+                
+                // Clear empty response counter if we got a valid response
+                EMPTY_RESPONSE_TRACKER.remove(&sender_id);
+                
+                // Merge into local map (ADDITIVE - never replace or delete existing!)
                 let mut added = 0;
                 {
                     let mut nodes = self.active_full_super_nodes.write().unwrap();
@@ -10284,9 +10454,9 @@ impl SimplifiedP2P {
         // Use EXISTING Genesis node detection logic - unified with microblock production
         
         let exchange_interval = if is_genesis_node {
-            // Genesis phase: Less frequent exchange (5 nodes don't change often)
-            // Reduces network spam and improves block production timing
-            std::time::Duration::from_secs(60) // Once per minute for Genesis stability
+            // Genesis phase: Frequent exchange for reconnection during startup race condition
+            // CRITICAL: 10s matches reconnect interval in node.rs main loop
+            std::time::Duration::from_secs(10) // Every 10 seconds for Genesis reconnection
         } else {
             // Normal phase: Slower exchange for millions-scale stability  
             std::time::Duration::from_secs(300) // 5 minutes for scale - EXISTING system value
@@ -11956,8 +12126,35 @@ impl SimplifiedP2P {
         println!("[CONSENSUS] 🏛️ Processing remote commit: round={}, node={}, hash={}", 
                 round_id, node_id, commit_hash);
         
-        // CRITICAL FIX: Reject commits from jailed nodes (reputation < 70%)
-        // This prevents non-deterministic participants lists from causing consensus deadlock
+        // ═══════════════════════════════════════════════════════════════════════════
+        // SECURITY FIX: Timestamp validation (prevents replay attacks)
+        // ═══════════════════════════════════════════════════════════════════════════
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        
+        // Allow ±5 minutes for network delays and clock drift
+        const MAX_TIMESTAMP_DRIFT: u64 = 300; // 5 minutes
+        
+        if timestamp > now + MAX_TIMESTAMP_DRIFT {
+            println!("[CONSENSUS] ❌ Rejecting commit with FUTURE timestamp from {}: {} > {} + {}", 
+                     node_id, timestamp, now, MAX_TIMESTAMP_DRIFT);
+            // Penalty for future timestamps (possible attack attempt)
+            self.update_node_reputation(&node_id, ReputationEvent::InvalidBlock);
+            return;
+        }
+        
+        if timestamp < now.saturating_sub(MAX_TIMESTAMP_DRIFT) {
+            println!("[CONSENSUS] ❌ Rejecting commit with STALE timestamp from {}: {} < {} - {}", 
+                     node_id, timestamp, now, MAX_TIMESTAMP_DRIFT);
+            // No penalty for stale (could be network delay) - just reject
+            return;
+        }
+        
+        // ═══════════════════════════════════════════════════════════════════════════
+        // SECURITY: Reputation check (jailed nodes cannot participate)
+        // ═══════════════════════════════════════════════════════════════════════════
         let reputation_score = {
             let reputation_system = self.reputation_system.lock().unwrap();
             let raw_score = reputation_system.get_reputation(&node_id);
@@ -11971,7 +12168,19 @@ impl SimplifiedP2P {
             return;  // Early return - do NOT process commit
         }
         
-        println!("[CONSENSUS] ✅ Reputation check passed: {} ({:.1}%)", node_id, reputation_score * 100.0);
+        // ═══════════════════════════════════════════════════════════════════════════
+        // SECURITY: Basic signature format validation (full verification in consensus engine)
+        // ═══════════════════════════════════════════════════════════════════════════
+        if signature.is_empty() || signature.len() < 100 {
+            println!("[CONSENSUS] ❌ Rejecting commit with invalid signature format from {}: len={}", 
+                     node_id, signature.len());
+            // Penalty for clearly invalid signatures
+            self.update_node_reputation(&node_id, ReputationEvent::InvalidBlock);
+            return;
+        }
+        
+        println!("[CONSENSUS] ✅ Pre-validation passed: {} (rep: {:.1}%, ts: valid, sig: {}B)", 
+                 node_id, reputation_score * 100.0, signature.len());
         
         // PRODUCTION: Send to consensus engine through channel
         if let Some(ref consensus_tx) = self.consensus_tx {
@@ -11979,7 +12188,7 @@ impl SimplifiedP2P {
                 round_id,
                 node_id: node_id.clone(),
                 commit_hash,
-                signature,  // CONSENSUS FIX: Pass real signature for Byzantine validation
+                signature,  // Full Dilithium verification happens in consensus engine
                 timestamp,
             };
             
@@ -11992,8 +12201,8 @@ impl SimplifiedP2P {
             println!("[CONSENSUS] ⚠️ No consensus channel established - commit not processed");
         }
         
-        // Update peer reputation for participation (valid commit)
-        self.update_node_reputation(&node_id, ReputationEvent::ConsensusParticipation);
+        // Note: +reputation for participation is applied AFTER consensus engine validates
+        // This prevents gaming the system with invalid commits
     }
 
     /// Handle incoming consensus reveal from remote peer
@@ -12001,8 +12210,32 @@ impl SimplifiedP2P {
         println!("[CONSENSUS] 🏛️ Processing remote reveal: round={}, node={}, reveal_length={}, nonce_length={}", 
                 round_id, node_id, reveal_data.len(), nonce.len());
         
-        // CRITICAL FIX: Reject reveals from jailed nodes (reputation < 70%)
-        // Must match commit reputation check for consistency
+        // ═══════════════════════════════════════════════════════════════════════════
+        // SECURITY FIX: Timestamp validation (prevents replay attacks)
+        // ═══════════════════════════════════════════════════════════════════════════
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        
+        const MAX_TIMESTAMP_DRIFT: u64 = 300; // 5 minutes
+        
+        if timestamp > now + MAX_TIMESTAMP_DRIFT {
+            println!("[CONSENSUS] ❌ Rejecting reveal with FUTURE timestamp from {}: {} > {} + {}", 
+                     node_id, timestamp, now, MAX_TIMESTAMP_DRIFT);
+            self.update_node_reputation(&node_id, ReputationEvent::InvalidBlock);
+            return;
+        }
+        
+        if timestamp < now.saturating_sub(MAX_TIMESTAMP_DRIFT) {
+            println!("[CONSENSUS] ❌ Rejecting reveal with STALE timestamp from {}: {} < {} - {}", 
+                     node_id, timestamp, now, MAX_TIMESTAMP_DRIFT);
+            return;
+        }
+        
+        // ═══════════════════════════════════════════════════════════════════════════
+        // SECURITY: Reputation check (jailed nodes cannot participate)
+        // ═══════════════════════════════════════════════════════════════════════════
         let reputation_score = {
             let reputation_system = self.reputation_system.lock().unwrap();
             let raw_score = reputation_system.get_reputation(&node_id);
@@ -12016,7 +12249,26 @@ impl SimplifiedP2P {
             return;  // Early return - do NOT process reveal
         }
         
-        println!("[CONSENSUS] ✅ Reputation check passed: {} ({:.1}%)", node_id, reputation_score * 100.0);
+        // ═══════════════════════════════════════════════════════════════════════════
+        // SECURITY: Basic data format validation
+        // ═══════════════════════════════════════════════════════════════════════════
+        if reveal_data.is_empty() || nonce.is_empty() {
+            println!("[CONSENSUS] ❌ Rejecting reveal with empty data from {}: reveal_len={}, nonce_len={}", 
+                     node_id, reveal_data.len(), nonce.len());
+            self.update_node_reputation(&node_id, ReputationEvent::InvalidBlock);
+            return;
+        }
+        
+        // Nonce should be 32 bytes (64 hex chars)
+        if nonce.len() != 64 {
+            println!("[CONSENSUS] ❌ Rejecting reveal with invalid nonce length from {}: {} (expected 64)", 
+                     node_id, nonce.len());
+            self.update_node_reputation(&node_id, ReputationEvent::InvalidBlock);
+            return;
+        }
+        
+        println!("[CONSENSUS] ✅ Pre-validation passed: {} (rep: {:.1}%, ts: valid, data: {}B)", 
+                 node_id, reputation_score * 100.0, reveal_data.len());
         
         // PRODUCTION: Send to consensus engine through channel
         if let Some(ref consensus_tx) = self.consensus_tx {
@@ -12037,8 +12289,7 @@ impl SimplifiedP2P {
             println!("[CONSENSUS] ⚠️ No consensus channel established - reveal not processed");
         }
         
-        // Update peer reputation for participation (valid reveal)
-        self.update_node_reputation(&node_id, ReputationEvent::ConsensusParticipation);
+        // Note: +reputation for participation is applied AFTER consensus engine validates
     }
     
     /// CRITICAL: Determine if consensus round is for macroblock (every 90 blocks)
