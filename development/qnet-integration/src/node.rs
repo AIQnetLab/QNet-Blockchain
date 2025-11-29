@@ -2107,11 +2107,17 @@ impl BlockchainNode {
         
         loop {
             // Check both channels - prioritize retries
-            let received_block = tokio::select! {
-                Some(block) = retry_rx.recv() => block,
-                Some(block) = block_rx.recv() => block,
+            let (received_block, is_retry) = tokio::select! {
+                Some(block) = retry_rx.recv() => (block, true),
+                Some(block) = block_rx.recv() => (block, false),
                 else => break, // Both channels closed
             };
+            
+            // DIAGNOSTIC: Log retry attempts
+            if is_retry {
+                println!("[BLOCKS] 🔄 RETRY processing block #{} (from pending buffer)", received_block.height);
+            }
+            
             // Check for special ping signal
             if received_block.height == u64::MAX {
                 // Parse ping data: "PING:node_id:success:response_time_ms"
@@ -5424,6 +5430,32 @@ impl BlockchainNode {
                     // PRODUCTION: This node is selected as microblock producer for this round
                     *is_leader.write().await = true;
                     
+                    // CRITICAL FIX v2.19.16: Initialize HybridCrypto BEFORE broadcasting certificate
+                    // This fixes race condition where certificate broadcast fails because
+                    // HybridCrypto instance doesn't exist yet (it was created later during signing)
+                    use crate::hybrid_crypto::{HybridCrypto, GLOBAL_HYBRID_INSTANCES};
+                    
+                    let instances = GLOBAL_HYBRID_INSTANCES.get_or_init(|| async {
+                        Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()))
+                    }).await;
+                    
+                    let normalized_id = Self::normalize_node_id(&node_id);
+                    
+                    // CRITICAL: Ensure HybridCrypto is initialized BEFORE certificate broadcast
+                    {
+                        let mut instances_guard = instances.lock().await;
+                        if !instances_guard.contains_key(&normalized_id) {
+                            println!("[CRYPTO] 🔧 Initializing HybridCrypto for producer {} (pre-broadcast)", normalized_id);
+                            let mut hybrid = HybridCrypto::new(normalized_id.clone());
+                            if let Err(e) = hybrid.initialize().await {
+                                println!("[CRYPTO] ⚠️ Failed to initialize HybridCrypto: {}", e);
+                            } else {
+                                instances_guard.insert(normalized_id.clone(), hybrid);
+                                println!("[CRYPTO] ✅ HybridCrypto initialized for producer");
+                            }
+                        }
+                    }
+                    
                     // CRITICAL FIX: Broadcast certificate IMMEDIATELY when becoming producer
                     // OPTIMIZATION: Only broadcast ONCE per round (not every block)
                     // This prevents "certificate not found" errors during producer rotation
@@ -5435,14 +5467,7 @@ impl BlockchainNode {
                     
                     if should_broadcast {
                         if let Some(ref p2p) = unified_p2p {
-                            use crate::hybrid_crypto::GLOBAL_HYBRID_INSTANCES;
-                            
-                            let instances = GLOBAL_HYBRID_INSTANCES.get_or_init(|| async {
-                                Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()))
-                            }).await;
-                            
                             let instances_guard = instances.lock().await;
-                            let normalized_id = Self::normalize_node_id(&node_id);
                             
                             if let Some(hybrid) = instances_guard.get(&normalized_id) {
                                 if let Some(cert) = hybrid.get_current_certificate() {
