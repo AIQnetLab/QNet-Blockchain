@@ -6707,10 +6707,26 @@ impl BlockchainNode {
                             let is_consensus_period = blocks_since_last_macro >= 61 && blocks_since_last_macro <= 90;
                             let is_rotation_boundary = expected_height_timeout > 1 && ((expected_height_timeout - 1) % 30) == 0;
                             
-                            // CRITICAL FIX: ALWAYS start timeout detection to prevent forks!
-                            // Even if node is behind, it needs to detect failed producers
-                            // Remove the sync check that was preventing failover for lagging nodes
-                            {
+                            // CRITICAL FIX v2.19.18: Prevent multiple failover tasks for same block height
+                            // Without this, each main loop iteration spawns a NEW failover task
+                            // Result: 60+ failover tasks running in parallel → 500%+ CPU usage → network collapse
+                            static FAILOVER_IN_PROGRESS: std::sync::atomic::AtomicBool = 
+                                std::sync::atomic::AtomicBool::new(false);
+                            static FAILOVER_FOR_HEIGHT: std::sync::atomic::AtomicU64 = 
+                                std::sync::atomic::AtomicU64::new(0);
+                            
+                            // Check if failover already running for this height
+                            let current_failover_height = FAILOVER_FOR_HEIGHT.load(Ordering::Relaxed);
+                            let failover_running = FAILOVER_IN_PROGRESS.load(Ordering::Relaxed);
+                            
+                            if failover_running && current_failover_height == expected_height_timeout {
+                                // Failover already in progress for this exact block - skip
+                                // This prevents exponential CPU usage from parallel failover tasks
+                            } else {
+                            // Start new failover task (or replace old one for different height)
+                            FAILOVER_IN_PROGRESS.store(true, Ordering::Relaxed);
+                            FAILOVER_FOR_HEIGHT.store(expected_height_timeout, Ordering::Relaxed);
+                            
                             // EXISTING: Use same async timeout pattern as macroblock failover (line 1205)
                             tokio::spawn(async move {
                                 tokio::time::sleep(actual_timeout).await;
@@ -6783,8 +6799,11 @@ impl BlockchainNode {
                                         }
                                     }
                                 }
+                                
+                                // CRITICAL: Clear failover flag when task completes
+                                FAILOVER_IN_PROGRESS.store(false, Ordering::Relaxed);
                             });
-                            } // End of timeout detection block
+                            } // End of if-else failover guard check
                         }
                     } else {
                         // No P2P available - standalone mode
