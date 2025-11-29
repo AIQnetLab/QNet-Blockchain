@@ -3563,14 +3563,28 @@ impl BlockchainNode {
                                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                                 wait_time += 5;
                                 
-                                // Don't break - continue waiting for Genesis
-                                if wait_time < MAX_WAIT_SECS {
+                                // CRITICAL FIX v2.19.18: Genesis nodes (002-005) MUST wait INDEFINITELY for Genesis block
+                                // Previous code would break after timeout, allowing nodes to start without Genesis
+                                // This caused Node 005 to produce block #1 instead of waiting for Genesis from Node 001
+                                if is_bootstrap_node {
+                                    // Genesis nodes: NEVER start without Genesis block - reset timer and keep waiting
+                                    if wait_time >= MAX_WAIT_SECS {
+                                        println!("[Node] ⚠️ Genesis node {} still waiting for Genesis block after {}s...", 
+                                                 bootstrap_id, wait_time);
+                                        println!("[Node] 🔄 Resetting timer - Genesis nodes MUST have Genesis block!");
+                                        wait_time = 0; // Reset timer - keep waiting indefinitely
+                                    }
                                     continue;
                                 } else {
-                                    println!("[Node] ❌ CRITICAL: Timeout waiting for Genesis block!");
-                                    println!("[Node] ❌ Cannot start production without Genesis!");
-                                    // Still break but log critical error
-                                    break;
+                                    // Regular nodes: Can timeout (they join existing network)
+                                    if wait_time < MAX_WAIT_SECS {
+                                        continue;
+                                    } else {
+                                        println!("[Node] ❌ CRITICAL: Timeout waiting for Genesis block!");
+                                        println!("[Node] ❌ Cannot start production without Genesis!");
+                                        // Regular nodes can fail - they're joining existing network
+                                        break;
+                                    }
                                 }
                             }
                         } else {

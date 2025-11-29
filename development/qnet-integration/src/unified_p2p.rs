@@ -3105,24 +3105,24 @@ impl SimplifiedP2P {
                     // ADAPTIVE TIMEOUT: Base on peer latency + processing buffer
                     // Formula: timeout = max(base_timeout, peer_latency * 3 + processing_buffer)
                     // Why *3: Account for variance (99th percentile ≈ 3× median)
-                    // Why +300ms: Block processing time (decompression + Dilithium verification)
+                    // Why +500ms: Block processing time (decompression + Dilithium verification)
                     // 
-                    // CRITICAL: If latency=0 (not yet measured), use 150ms as assumed latency
-                    // This gives: 150*3 + 300 = 750ms minimum for unmeasured peers
-                    // Safe for international servers while not being too slow
-                    let effective_latency = if peer_latency == 0 { 150 } else { peer_latency };
+                    // CRITICAL FIX v2.19.18: Increased timeouts for international servers
+                    // Previous 2s max was too short for intercontinental P2P at startup
+                    // Now aligned with send_network_message (5s timeout)
+                    let effective_latency = if peer_latency == 0 { 500 } else { peer_latency }; // 500ms for cold peers
                     let adaptive_timeout_ms = std::cmp::max(
-                        500,  // Minimum 500ms (fast local network)
-                        effective_latency.saturating_mul(3).saturating_add(300)  // Adaptive
+                        1000,  // Minimum 1s (was 500ms - too aggressive for international)
+                        effective_latency.saturating_mul(3).saturating_add(500)  // Adaptive with larger buffer
                     );
-                    let adaptive_timeout_ms = std::cmp::min(adaptive_timeout_ms, 2000); // Maximum 2s
+                    let adaptive_timeout_ms = std::cmp::min(adaptive_timeout_ms, 5000); // Maximum 5s (aligned with send_network_message)
                     
                     let peer_ip = peer_addr.split(':').next().unwrap_or(&peer_addr);
                     let url = format!("http://{}:8001/api/v1/p2p/message", peer_ip);
                     
                     let client = reqwest::blocking::Client::builder()
                         .timeout(Duration::from_millis(adaptive_timeout_ms as u64))  // ADAPTIVE!
-                        .connect_timeout(Duration::from_secs(2))  // INCREASED: 2s for international servers
+                        .connect_timeout(Duration::from_secs(3))  // INCREASED: 3s for international servers (aligned with HTTP_CONNECT_TIMEOUT_SECS)
                         .tcp_nodelay(true)  // CRITICAL: No Nagle's algorithm delay
                         .tcp_keepalive(Duration::from_secs(HTTP_TCP_KEEPALIVE_SECS))
                         .pool_max_idle_per_host(HTTP_POOL_MAX_IDLE_PER_HOST)
@@ -3130,12 +3130,33 @@ impl SimplifiedP2P {
                         .build()
                         .map_err(|e| format!("Client failed: {}", e))?;
                     
-                    client.post(&url)
-                        .json(&message_json)
-                        .send()
-                        .map_err(|e| format!("Send to {} failed: {}", peer_ip, e))?;
+                    // PRODUCTION: Retry logic for block delivery (aligned with send_network_message pattern)
+                    // 3 attempts with exponential backoff - critical for network reliability
+                    let mut last_error = String::new();
+                    for attempt in 1..=3 {
+                        match client.post(&url)
+                            .json(&message_json)
+                            .send() {
+                            Ok(response) if response.status().is_success() => {
+                                return Ok(());
+                            }
+                            Ok(response) => {
+                                last_error = format!("HTTP {}", response.status());
+                                if attempt < 3 {
+                                    std::thread::sleep(Duration::from_millis(500 * attempt as u64)); // 500ms, 1s backoff
+                                }
+                            }
+                            Err(e) => {
+                                last_error = e.to_string();
+                                if attempt < 3 {
+                                    // Shorter backoff for blocks (time-sensitive)
+                                    std::thread::sleep(Duration::from_millis(300 * attempt as u64)); // 300ms, 600ms backoff
+                                }
+                            }
+                        }
+                    }
                     
-                    Ok(())
+                    Err(format!("Send to {} failed after 3 attempts: {}", peer_ip, last_error))
                 });
                 
                 handles.push((peer.addr.clone(), handle));
@@ -7536,9 +7557,30 @@ impl SimplifiedP2P {
                             .as_secs(),
                     };
                     
-                    match block_tx.send(received_block) {
+                    match block_tx.send(received_block.clone()) {
                         Ok(_) => {
                             println!("[P2P] ✅ {} block #{} queued for processing", block_type, height);
+                            
+                            // GOSSIP RE-BROADCAST v2.19.18: Forward received blocks to other peers
+                            // This improves block propagation reliability across the network
+                            // Only re-broadcast microblocks (macroblocks have their own consensus)
+                            // Skip re-broadcast for first 5 blocks (Genesis phase - direct broadcast sufficient)
+                            if !is_macroblock && height > 5 {
+                                // Clone data for gossip (received_block already cloned above)
+                                let gossip_msg = NetworkMessage::Block {
+                                    height,
+                                    data: received_block.data.clone(),
+                                    block_type: block_type.clone(),
+                                };
+                                
+                                // Forward to 2 random peers (gossip fanout)
+                                // Low fanout to avoid network spam while ensuring propagation
+                                self.gossip_to_random_peers(gossip_msg, 2);
+                                
+                                if height % 30 == 0 {
+                                    println!("[GOSSIP] 🔄 Re-broadcasted block #{} to 2 random peers", height);
+                                }
+                            }
                         }
                         Err(e) => {
                             println!("[P2P] ❌ Failed to queue {} block #{}: {}", block_type, height, e);
