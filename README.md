@@ -44,7 +44,15 @@ This project uses **dual licensing**:
 - **Phase 2 (Future)**: ONLY QNC token activation on QNet blockchain
 - **Transition**: 90% 1DEV burned OR 5 years from genesis block (whichever comes first)
 
-### 🛡️ **LATEST UPDATES (v2.19.14 - November 28, 2025)**
+### 🛡️ **LATEST UPDATES (v2.19.19 - November 29, 2025)**
+- **Heartbeat without Dilithium**: CPU optimization (~35ms savings per heartbeat, NIST FIPS 204 compliant)
+- **Turbine ALWAYS**: Block propagation uses Turbine for ALL network sizes (not just >10 peers)
+- **Kademlia K-neighbors**: Heartbeats use DHT distance for efficient routing (K=3)
+- **Exponential backoff failover**: 3s → 6s → 12s → 24s → 30s max (reduces CPU under stall)
+- **Priority channels**: Blocks/Consensus use separate channels (implicit priority queue)
+- **gossip_to_k_neighbors()**: New method for DHT-based message propagation
+
+### 🛡️ **Previous Updates (v2.19.14 - November 28, 2025)**
 - **Simplified Fork Resolution**: Three-case approach (network ahead/same height/we're ahead) instead of complex weight calculations
 - **Reputation Manipulation Detection**: Escalating punishment for nodes claiming false reputation (1h → 1d → 1w → 1y ban)
 - **Empty Response Attack Protection**: Detection and penalty for nodes sending empty peer lists

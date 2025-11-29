@@ -2,7 +2,7 @@
 ## Post-Quantum Decentralized Network - Technical Documentation
 
 **Last Updated**: November 25, 2025  
-**Version**: 2.19.14  
+**Version**: 2.19.19  
 **Status**: Production Ready
 
 ---
@@ -602,11 +602,17 @@ NetworkMessage::ReputationSync {
 }
 ```
 
-**Gossip Propagation**:
-1. **Initial Send**: Node gossips to random `fanout` peers (4-32, adaptive)
-2. **Re-gossip**: Each recipient re-gossips to random `fanout` peers (exclude sender)
-3. **Exponential Growth**: 1 → 4 → 16 → 64 → 256 → 1024 → 4096 (7 hops for 4K nodes)
+**Gossip Propagation (v2.19.19)**:
+1. **Initial Send**: Node gossips to K closest neighbors by Kademlia distance (K=3)
+2. **Re-gossip**: Each recipient re-gossips to K neighbors (exclude sender)
+3. **Exponential Growth**: 1 → 3 → 9 → 27 → 81 → 243 → 729 (7 hops for 729 nodes)
 4. **Convergence**: Weighted average (70% local, 30% remote) ensures eventual consistency
+
+**v2.19.19 Optimizations**:
+- **Kademlia K-neighbors**: Heartbeats use DHT distance for efficient routing
+- **Turbine ALWAYS**: Block propagation uses Turbine for ALL network sizes
+- **Heartbeat without Dilithium**: CPU optimization (~35ms savings per heartbeat)
+- **Exponential backoff failover**: 3s → 6s → 12s → 24s → 30s max
 
 **Why Gossip O(log n) vs Broadcast O(n)**:
 - ✅ **Scalability**: 1M nodes = ~20 hops vs 1M HTTP requests

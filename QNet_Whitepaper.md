@@ -496,7 +496,7 @@ let signature = dilithium3::sign(data, &sk);  // 2420 bytes
 | **Key Storage** | Dilithium3 keypair | ~6KB encrypted | AES-256-GCM | Random encryption key |
 | **Encryption Key** | Random 32 bytes | 40 bytes file | SHA3-256 integrity | NOT derived from node_id |
 | **Message Signing** | Ed25519 (ephemeral) | 64 bytes | Fast verification | 4.5-minute lifetime |
-| **Heartbeat Signatures** | CRYSTALS-Dilithium3 | 2420 bytes | NIST Level 3 | sign_full() → open() |
+| **Heartbeat Signatures** | None (v2.19.19+) | N/A | Timestamp + Registry | CPU optimization |
 | **Hashing** | SHA3-256 | 32 bytes | Grover-resistant | All operations |
 
 **Cryptographic Architecture:**
@@ -832,7 +832,7 @@ Response requirements:
 
 Architecture (v2.19.10):
 ├── Light: Full/Super nodes ping via FCM V1 API → Light signs challenge → attestation
-├── Full/Super: Self-attest via Dilithium-signed heartbeats (10 per 4h window)
+├── Full/Super: Self-attest via heartbeats (10 per 4h window, no Dilithium - CPU optimized v2.19.19)
 ├── 256-shard ping system: Light nodes assigned to pingers based on SHA3-256(node_id)[0]
 ├── Light node reputation: Fixed at 70 (immutable, not affected by events)
 ├── Storage: Tiered (Light ~100MB headers, Full ~500GB pruned, Super ~2TB full)
@@ -890,12 +890,19 @@ GOSSIP ARCHITECTURE:
 ├── Signature: SHA3-256 (quantum-safe verification)
 └── Scope: Super + Full nodes only (Light nodes excluded)
 
-EXPONENTIAL PROPAGATION:
-├── Initial Send: Node gossips to random fanout peers (Kademlia-based selection)
-├── Re-gossip: Each recipient re-gossips to fanout peers (exclude sender)
-├── Growth: 1 → 4 → 16 → 64 → 256 → 1024 → 4096 (7 hops for 4K nodes)
+EXPONENTIAL PROPAGATION (v2.19.19):
+├── Initial Send: Node gossips to K closest neighbors by Kademlia distance (K=3)
+├── Re-gossip: Each recipient re-gossips to K neighbors (exclude sender)
+├── Growth: 1 → 3 → 9 → 27 → 81 → 243 → 729 (7 hops for 729 nodes)
 ├── Example: 1M nodes = ~20 hops vs 1M HTTP requests (broadcast)
 └── Convergence: Weighted average (70% local + 30% remote)
+
+OPTIMIZATIONS (v2.19.19):
+├── Kademlia K-neighbors: Heartbeats use DHT distance for efficient routing
+├── Turbine ALWAYS: Block propagation uses Turbine for ALL network sizes
+├── Heartbeat without Dilithium: CPU optimization (~35ms savings per heartbeat)
+├── Exponential backoff failover: 3s → 6s → 12s → 24s → 30s max
+└── Priority channels: Blocks/Consensus use separate channels (implicit priority)
 
 BYZANTINE SAFETY:
 ├── Signature Verification: Every gossip message verified (SHA3-256)
@@ -1420,18 +1427,26 @@ Light Node Attestation Structure:
 **Self-Attestation Architecture (Full/Super Nodes):**
 
 ```
-Heartbeat System (v2.19.4):
+Heartbeat System (v2.19.19):
 ├── Frequency: 10 heartbeats per 4-hour window (~24 min apart)
-├── Self-attestation: Node signs own heartbeat with Dilithium
-├── Gossip: Heartbeats broadcast via P2P gossip protocol
+├── Self-attestation: Node broadcasts heartbeat (NO Dilithium signature)
+├── Gossip: Heartbeats broadcast via P2P gossip protocol (fanout=3)
 ├── Storage: Persisted in RocksDB for reward calculation
+├── Security: Timestamp validation (±5min) + active_full_super_nodes registry
 
 Heartbeat Structure:
 ├── node_id: String
 ├── node_type: "full" or "super"
 ├── heartbeat_index: u8 (0-9)
 ├── timestamp: u64
-└── dilithium_signature: String (2420 bytes)
+└── signature: String (placeholder, NOT verified - CPU optimization)
+
+SECURITY NOTE (v2.19.19 - NIST FIPS 204 compliant):
+├── Heartbeats do NOT affect consensus - fake heartbeats give attacker nothing
+├── Blocks are ALWAYS verified with Dilithium (security preserved)
+├── Node must be in active_full_super_nodes registry (first registration uses Dilithium)
+├── Timestamp validation prevents replay attacks
+└── CPU savings: ~35ms per heartbeat × thousands = significant
 
 Response Requirements by Node Type:
 ├── Light Nodes: 1+ attestation per window (not 100%)

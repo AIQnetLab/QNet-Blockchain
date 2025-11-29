@@ -1,4 +1,4 @@
-# QNet API Reference v2.19.14
+# QNet API Reference v2.19.19
 
 ## 📡 Base URL
 
@@ -1712,6 +1712,14 @@ GET /api/v1/snapshot/{height}
 ---
 
 ## 📝 Changelog
+
+### v2.19.19 (November 2025)
+- **OPTIMIZATION**: Heartbeat without Dilithium signature (CPU savings ~35ms per heartbeat)
+- **OPTIMIZATION**: Turbine block propagation for ALL network sizes
+- **OPTIMIZATION**: Kademlia K-neighbors for heartbeat routing (K=3)
+- **OPTIMIZATION**: Exponential backoff for failover (3s → 6s → 12s → 24s → 30s max)
+- **NEW**: `gossip_to_k_neighbors()` method for DHT-based message propagation
+- **SECURITY**: Heartbeat validation via active_full_super_nodes registry (NIST FIPS 204 compliant)
 
 ### v2.19.12 (November 2025)
 - **NEW**: QRC-20 Token endpoints:

@@ -1124,7 +1124,7 @@ key_material.zeroize();  // Clear derived keys
 
 **File:** `development/qnet-integration/src/key_manager.rs`
 
-**Purpose:** Sign heartbeats, consensus messages, and blocks with **REAL CRYSTALS-Dilithium3** keys
+**Purpose:** Sign consensus messages and blocks with **REAL CRYSTALS-Dilithium3** keys (heartbeats excluded since v2.19.19 for CPU optimization)
 
 **CRITICAL NOTE:** This uses **REAL pqcrypto_dilithium::dilithium3** for cryptographic operations.
 

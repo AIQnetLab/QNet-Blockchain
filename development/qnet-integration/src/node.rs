@@ -6331,16 +6331,18 @@ impl BlockchainNode {
                                                   (height_for_broadcast > 1 && (height_for_broadcast - 1) % 30 == 0) || // Rotation
                                                   (height_for_broadcast % 90 >= 61 && height_for_broadcast % 90 <= 90); // Consensus
                             
+                            // OPTIMIZATION v2.19.19: Use Turbine ALWAYS for non-critical blocks
+                            // Turbine provides Reed-Solomon redundancy and O(log n) complexity
+                            // Even for small networks, Turbine prepares architecture for scaling
                             let result = if is_critical_block {
                                 // CRITICAL: Direct broadcast for immediate delivery (<500ms)
+                                // Used for: emergency blocks, rotation boundaries, consensus phase
                                 println!("[P2P] ⚡ PRIORITY broadcast for critical block #{}", height_for_broadcast);
                                 p2p_clone.broadcast_block(height_for_broadcast, broadcast_data)
-                            } else if peer_count > 10 {
-                                // Turbine protocol: O(log n) complexity for large networks
-                                p2p_clone.broadcast_block_turbine(height_for_broadcast, broadcast_data)
                             } else {
-                                // Direct broadcast: O(n) complexity, works well for ≤10 peers
-                                p2p_clone.broadcast_block(height_for_broadcast, broadcast_data)
+                                // Turbine protocol: O(log n) complexity with Reed-Solomon redundancy
+                                // Works for ANY network size (5 nodes to millions)
+                                p2p_clone.broadcast_block_turbine(height_for_broadcast, broadcast_data)
                             };
                             
                             let broadcast_time = broadcast_start.elapsed();
@@ -6701,12 +6703,6 @@ impl BlockchainNode {
                             // Main loop continues with 1-second timing precision
                             // Failover runs in background and triggers emergency producer if needed
                             
-                            // ARCHITECTURE FIX: Use Tower BFT adaptive timeout for failover detection
-                            // TowerBFT returns optimized timeouts (2-5s) now that crypto is cached
-                            // Old hardcoded values (7-20s) are OBSOLETE and cause nodes to lag
-                            let retry_count = 0; // First attempt
-                            let actual_timeout = tower_bft.get_timeout(next_block_height, retry_count).await;
-                            
                             // CRITICAL: Start ASYNC failover monitoring (does NOT block main loop!)
                             // Failover runs in background, main loop continues immediately
                             let expected_height_timeout = next_block_height;
@@ -6728,10 +6724,27 @@ impl BlockchainNode {
                                 std::sync::atomic::AtomicBool::new(false);
                             static FAILOVER_FOR_HEIGHT: std::sync::atomic::AtomicU64 = 
                                 std::sync::atomic::AtomicU64::new(0);
+                            // OPTIMIZATION v2.19.19: Exponential backoff for failover
+                            // Retry count increases timeout: 3s → 6s → 12s → 24s → 30s max
+                            static FAILOVER_RETRY_COUNT: std::sync::atomic::AtomicU32 = 
+                                std::sync::atomic::AtomicU32::new(0);
                             
                             // Check if failover already running for this height
                             let current_failover_height = FAILOVER_FOR_HEIGHT.load(Ordering::Relaxed);
                             let failover_running = FAILOVER_IN_PROGRESS.load(Ordering::Relaxed);
+                            
+                            // OPTIMIZATION v2.19.19: Track retry count for exponential backoff
+                            let retry_count = if current_failover_height == expected_height_timeout {
+                                // Same block - increment retry
+                                FAILOVER_RETRY_COUNT.fetch_add(1, Ordering::Relaxed).min(4) // Max 4 retries (30s max)
+                            } else {
+                                // New block - reset retry
+                                FAILOVER_RETRY_COUNT.store(0, Ordering::Relaxed);
+                                0
+                            };
+                            
+                            // Get timeout with exponential backoff from Tower BFT
+                            let actual_timeout = tower_bft.get_timeout(next_block_height, retry_count).await;
                             
                             if failover_running && current_failover_height == expected_height_timeout {
                                 // Failover already in progress for this exact block - skip
