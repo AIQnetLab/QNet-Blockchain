@@ -1753,21 +1753,33 @@ impl SimplifiedP2P {
             (NodeType::Full, Region::Europe) // Default for non-Genesis
         };
         
+        // Get real reputation from reputation system if available
+        let real_reputation = self.reputation_system.lock()
+            .ok()
+            .and_then(|rep| {
+                let r = rep.get_reputation(&peer_id);
+                if r > 0.0 { Some(r) } else { None }
+            });
+        
+        // Use real reputation or default (70 for ALL nodes on start)
+        // Reputation increases through consensus participation, not by node type
+        let consensus_score = real_reputation.unwrap_or(70.0);
+        
         let peer_info = PeerInfo {
             id: peer_id.clone(),
             addr: peer_addr.clone(),
             node_type,
             region,
             last_seen: self.current_timestamp(),
-            is_stable: true, // They sent us a message, so they're stable
-            latency_ms: 100, // Default, will be updated
+            is_stable: false, // Will be marked stable after successful pings
+            latency_ms: 0,    // Unknown - will be measured on first ping
             connection_count: 0,
             bandwidth_usage: 0,
-            node_id_hash: Vec::new(),
-            bucket_index: 0,
-            consensus_score: 70.0, // Default consensus threshold
-            network_score: 100.0,
-            reputation_score: None,
+            node_id_hash: Vec::new(),  // Will be calculated in add_peer_safe_static
+            bucket_index: 0,           // Will be calculated in add_peer_safe_static
+            consensus_score,           // Real or default based on node type
+            network_score: 50.0,       // Start at 50%, will increase with successful interactions
+            reputation_score: real_reputation,
             successful_pings: 0,
             failed_pings: 0,
         };
@@ -2375,6 +2387,7 @@ impl SimplifiedP2P {
         let connected_peer_addrs = self.connected_peer_addrs.clone();  // EXISTING: Need for peer management
         let port = self.port;
         let node_type = self.node_type.clone();
+        let reputation_system = self.reputation_system.clone();  // Clone for async block
         
         tokio::spawn(async move {
             println!("[P2P] 🌐 Searching for QNet peers with cryptographic verification...");
@@ -2483,6 +2496,13 @@ impl SimplifiedP2P {
                                 _ => region.clone(), // EXISTING: Use current region as fallback
                             };
                             
+                            // Get real reputation from system (default 70 for ALL nodes)
+                            let real_rep = reputation_system.lock()
+                                .ok()
+                                .map(|r| r.get_reputation(&format!("genesis_{}", target_addr.replace(":", "_"))))
+                                .filter(|&r| r > 0.0)
+                                .unwrap_or(70.0);
+                            
                             let peer_info = PeerInfo {
                                 id: format!("genesis_{}", target_addr.replace(":", "_")),
                                 addr: target_addr.clone(),
@@ -2492,17 +2512,15 @@ impl SimplifiedP2P {
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .unwrap()
                                     .as_secs(),
-                                is_stable: true,
-                                latency_ms: 30,
+                                is_stable: false,  // Will be verified
+                                latency_ms: 0,     // Unknown - will be measured
                                 connection_count: 0,
                                 bandwidth_usage: 0,
-                                // Kademlia DHT fields (will be calculated in add_peer_safe)
-                                node_id_hash: Vec::new(),
-                                bucket_index: 0,
-                                // Split reputation for Byzantine-safe consensus
-                                consensus_score: 70.0,  // Universal consensus threshold (ALL node types)
-                                network_score: 100.0,   // Optimal network performance (ALL node types)
-                                reputation_score: None, // Legacy field (deprecated)
+                                node_id_hash: Vec::new(),  // Calculated in add_peer_safe
+                                bucket_index: 0,           // Calculated in add_peer_safe
+                                consensus_score: real_rep,
+                                network_score: 50.0,  // Start at 50%, increases with interactions
+                                reputation_score: Some(real_rep),
                                 successful_pings: 0,
                                 failed_pings: 0,
                             };
@@ -3088,9 +3106,14 @@ impl SimplifiedP2P {
                     // Formula: timeout = max(base_timeout, peer_latency * 3 + processing_buffer)
                     // Why *3: Account for variance (99th percentile ≈ 3× median)
                     // Why +300ms: Block processing time (decompression + Dilithium verification)
+                    // 
+                    // CRITICAL: If latency=0 (not yet measured), use 150ms as assumed latency
+                    // This gives: 150*3 + 300 = 750ms minimum for unmeasured peers
+                    // Safe for international servers while not being too slow
+                    let effective_latency = if peer_latency == 0 { 150 } else { peer_latency };
                     let adaptive_timeout_ms = std::cmp::max(
                         500,  // Minimum 500ms (fast local network)
-                        peer_latency.saturating_mul(3).saturating_add(300)  // Adaptive
+                        effective_latency.saturating_mul(3).saturating_add(300)  // Adaptive
                     );
                     let adaptive_timeout_ms = std::cmp::min(adaptive_timeout_ms, 2000); // Maximum 2s
                     
@@ -3963,8 +3986,7 @@ impl SimplifiedP2P {
                             println!("[SYNC] 🔧 Genesis peer height query: Node startup grace period (uptime: {}s, grace: 10s) for {}", elapsed, get_privacy_id_for_addr(ip));
                             return Ok(0); // Return 0 during reduced grace period
                         } else {
-                            // PRIVACY: Use pseudonym in logs
-                            println!("[SYNC] ⚠️ Genesis peer {} not responding after 10s grace period (uptime: {}s) - treating as offline", get_privacy_id_for_addr(ip), elapsed);
+                            println!("[SYNC] ⚠️ Genesis peer {} not responding after 10s grace period (uptime: {}s) - treating as offline", ip, elapsed);
                             // After grace period, treat as real error to avoid infinite loops
                         }
                     }
@@ -4651,8 +4673,8 @@ impl SimplifiedP2P {
     /// CRITICAL: Verify all Genesis nodes are actually connected for bootstrap
     /// This prevents split brain during initial network formation
     /// 
-    /// ARCHITECTURE (v2.19.13): Uses REAL TCP connectivity checks, not just connected_peers
-    /// This ensures nodes actually wait for each other before starting production
+    /// ARCHITECTURE (v2.19.17): Check connected_peers first, then active_full_super_nodes
+    /// TCP test is only fallback - if peer sent us a message, they ARE connected!
     pub async fn verify_all_genesis_connectivity(&self) -> bool {
         use crate::genesis_constants::GENESIS_NODE_IPS;
         
@@ -4665,7 +4687,7 @@ impl SimplifiedP2P {
         let mut connected_count = 0;
         let mut total_other_nodes = 0;
         
-        // Check each Genesis node (except self) with REAL TCP check
+        // Check each Genesis node (except self)
         for (ip, id) in GENESIS_NODE_IPS {
             let node_num: usize = id.parse().unwrap_or(0);
             
@@ -4678,25 +4700,47 @@ impl SimplifiedP2P {
             let peer_addr = format!("{}:8001", ip);
             let node_id = format!("genesis_node_{:03}", node_num);
             
-            // CRITICAL FIX: Do REAL TCP connectivity check, not just connected_peers lookup
-            // connected_peers may be empty during startup race condition
-            let is_reachable = Self::test_peer_connectivity_static(&peer_addr);
+            // PRIORITY 1: Check connected_peers (RwLock) - peers added with bootstrap trust
+            let in_connected_peers = self.connected_peers.read()
+                .map(|peers| peers.values().any(|p| p.addr == peer_addr || p.id == node_id))
+                .unwrap_or(false);
             
-            if is_reachable {
+            // PRIORITY 2: Check connected_peers_lockfree (DashMap)
+            let in_lockfree = self.connected_peers_lockfree.contains_key(&peer_addr) ||
+                self.connected_peers_lockfree.iter().any(|e| e.value().id == node_id);
+            
+            // PRIORITY 3: Check active_full_super_nodes registry
+            let in_active_registry = self.active_full_super_nodes.read()
+                .map(|nodes| nodes.contains_key(&node_id))
+                .unwrap_or(false);
+            
+            // If in ANY of these - they are connected (no need for TCP test)
+            let is_connected = in_connected_peers || in_lockfree || in_active_registry;
+            
+            if is_connected {
                 connected_count += 1;
-                println!("[P2P] ✅ Genesis node {} ({}) is reachable", node_id, ip);
+                println!("[P2P] ✅ Genesis {} connected (peers:{}, lockfree:{}, registry:{})", 
+                         node_id, in_connected_peers, in_lockfree, in_active_registry);
             } else {
-                println!("[P2P] ❌ Genesis node {} ({}) not reachable yet", node_id, ip);
+                // FALLBACK: TCP test only if not in any list
+                // This handles the case where peer just started and hasn't sent messages yet
+                let is_reachable = Self::test_peer_connectivity_static(&peer_addr);
+                if is_reachable {
+                    connected_count += 1;
+                    println!("[P2P] ✅ Genesis {} reachable via TCP (not yet in peers list)", node_id);
+                } else {
+                    println!("[P2P] ⏳ Genesis {} not connected yet", node_id);
+                }
             }
         }
         
-        // All 4 other Genesis nodes must be reachable
+        // All 4 other Genesis nodes must be connected
         let all_connected = connected_count == total_other_nodes;
         
         if all_connected {
-            println!("[P2P] ✅ All {} Genesis nodes verified as ACTUALLY reachable", total_other_nodes);
+            println!("[P2P] ✅ All {} Genesis nodes verified connected", total_other_nodes);
         } else {
-            println!("[P2P] ⏳ Genesis connectivity: {}/{} nodes reachable", connected_count, total_other_nodes);
+            println!("[P2P] ⏳ Genesis connectivity: {}/{} nodes", connected_count, total_other_nodes);
         }
         
         all_connected
@@ -5142,22 +5186,37 @@ impl SimplifiedP2P {
                             // ActiveNodeAnnouncement has been received
                             let active_nodes = self.active_full_super_nodes.read().unwrap();
                             if let Some(active_info) = active_nodes.get(&node_id) {
-                                // Create PeerInfo from ActiveNodeInfo
+                                // Create PeerInfo from ActiveNodeInfo - use REAL data!
+                                let node_type = match active_info.node_type.as_str() {
+                                    "super" => NodeType::Super,
+                                    "full" => NodeType::Full,
+                                    _ => NodeType::Super, // Genesis are Super
+                                };
+                                // Region from shard_id
+                                let region = match active_info.shard_id % 6 {
+                                    0 => Region::NorthAmerica,
+                                    1 => Region::Europe,
+                                    2 => Region::Asia,
+                                    3 => Region::SouthAmerica,
+                                    4 => Region::Africa,
+                                    5 => Region::Oceania,
+                                    _ => Region::Europe,
+                                };
                                 let peer_info = PeerInfo {
                                     id: node_id.clone(),
                                     addr: peer_addr.clone(),
-                                    node_type: NodeType::Super,
-                                    region: Region::Europe, // Default for Genesis
+                                    node_type,
+                                    region,
                                     last_seen: active_info.last_seen,
-                                    is_stable: true,
-                                    latency_ms: 100,
+                                    is_stable: false,  // Will be verified
+                                    latency_ms: 0,     // Unknown - will be measured
                                     connection_count: 0,
                                     bandwidth_usage: 0,
-                                    node_id_hash: Vec::new(),
-                                    bucket_index: 0,
+                                    node_id_hash: Vec::new(),  // Calculated later
+                                    bucket_index: 0,           // Calculated later
                                     consensus_score: active_info.reputation,
-                                    network_score: 100.0,
-                                    reputation_score: None,
+                                    network_score: 50.0,  // Start at 50%
+                                    reputation_score: Some(active_info.reputation),
                                     successful_pings: 0,
                                     failed_pings: 0,
                                 };
@@ -5710,8 +5769,10 @@ impl SimplifiedP2P {
             NodeType::Full   // Default for regular nodes
         };
         
-        // Determine reputation based on peer ID and IP
-        // Use EXISTING default values from current system
+        // Static method - default reputation is 70 for ALL nodes
+        // Reputation increases through consensus participation, not by node type
+        let default_rep = 70.0;
+        
         Ok(PeerInfo {
             id: peer_id,
             addr: peer_addr,
@@ -5722,15 +5783,14 @@ impl SimplifiedP2P {
                 .unwrap()
                 .as_secs(),
             is_stable: false,
-            latency_ms: 100, // EXISTING system default
-            connection_count: 0, // EXISTING system default
-            bandwidth_usage: 0, // EXISTING system default
-            // Kademlia DHT fields (will be calculated in add_peer_safe)
-            node_id_hash: Vec::new(),
-            bucket_index: 0,
-            consensus_score: 70.0,  // Universal consensus threshold (ALL node types)
-            network_score: 100.0,   // Optimal network performance (ALL node types)
-            reputation_score: None, // Legacy (deprecated)
+            latency_ms: 0,     // Unknown - will be measured
+            connection_count: 0,
+            bandwidth_usage: 0,
+            node_id_hash: Vec::new(),  // Calculated in add_peer_safe
+            bucket_index: 0,           // Calculated in add_peer_safe
+            consensus_score: default_rep,
+            network_score: 50.0,  // Start at 50%, increases with interactions
+            reputation_score: None,  // Will be populated from reputation system
             successful_pings: 0,
             failed_pings: 0,
         })
