@@ -6156,7 +6156,8 @@ impl SimplifiedP2P {
             })
             .collect();
         
-        region_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        // SECURITY: Use unwrap_or to handle NaN safely (prevents panic)
+        region_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         
         // Select peers from best regions first
         for (region, _score) in region_scores {
@@ -8637,8 +8638,13 @@ impl SimplifiedP2P {
                 // Don't trust the reputation value in the announcement - it could be faked!
                 // The announcement reputation is only used as a hint, we verify with our own data
                 let real_reputation = {
-                    let rep_sys = self.reputation_system.lock().unwrap();
-                    rep_sys.get_reputation(&node_id)
+                    match self.reputation_system.lock() {
+                        Ok(rep_sys) => rep_sys.get_reputation(&node_id),
+                        Err(poisoned) => {
+                            println!("[P2P] ⚠️ Reputation system mutex poisoned, recovering...");
+                            poisoned.into_inner().get_reputation(&node_id)
+                        }
+                    }
                 };
                 
                 // REPUTATION FILTER: Only track nodes with rep >= 70
@@ -9155,7 +9161,13 @@ impl SimplifiedP2P {
             return;
         }
         
-        let mut reputation_sys = self.reputation_system.lock().unwrap();
+        let mut reputation_sys = match self.reputation_system.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                println!("[P2P] ⚠️ Reputation system mutex poisoned, recovering...");
+                poisoned.into_inner()
+            }
+        };
         let current = reputation_sys.get_reputation(node_id);
         let new_rep = (current + delta).clamp(0.0, 100.0);
         reputation_sys.set_reputation(node_id, new_rep);
@@ -9174,7 +9186,13 @@ impl SimplifiedP2P {
             return false;
         }
         
-        let mut reputation_sys = self.reputation_system.lock().unwrap();
+        let mut reputation_sys = match self.reputation_system.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                println!("[P2P] ⚠️ Reputation system mutex poisoned in passive_recovery, recovering...");
+                poisoned.into_inner()
+            }
+        };
         
         // CRITICAL: Jailed nodes do NOT get passive recovery!
         // They must wait for their jail sentence to expire
@@ -9797,8 +9815,13 @@ impl SimplifiedP2P {
         
         // Get current reputation
         let reputation = {
-            let rep_sys = self.reputation_system.lock().unwrap();
-            rep_sys.get_reputation(&self.node_id)
+            match self.reputation_system.lock() {
+                Ok(rep_sys) => rep_sys.get_reputation(&self.node_id),
+                Err(poisoned) => {
+                    println!("[P2P] ⚠️ Reputation system mutex poisoned in register_async, recovering...");
+                    poisoned.into_inner().get_reputation(&self.node_id)
+                }
+            }
         };
         
         // Only register if rep >= 70
@@ -9860,8 +9883,13 @@ impl SimplifiedP2P {
         
         // Get current reputation
         let reputation = {
-            let rep_sys = self.reputation_system.lock().unwrap();
-            rep_sys.get_reputation(&self.node_id)
+            match self.reputation_system.lock() {
+                Ok(rep_sys) => rep_sys.get_reputation(&self.node_id),
+                Err(poisoned) => {
+                    println!("[P2P] ⚠️ Reputation system mutex poisoned in register_sync, recovering...");
+                    poisoned.into_inner().get_reputation(&self.node_id)
+                }
+            }
         };
         
         // Only register if rep >= 70
@@ -9920,8 +9948,13 @@ impl SimplifiedP2P {
     fn update_active_nodes_from_heartbeat(&self, node_id: &str, node_type: &str, timestamp: u64) {
         // Get current reputation
         let reputation = {
-            let rep_sys = self.reputation_system.lock().unwrap();
-            rep_sys.get_reputation(node_id)
+            match self.reputation_system.lock() {
+                Ok(rep_sys) => rep_sys.get_reputation(node_id),
+                Err(poisoned) => {
+                    println!("[P2P] ⚠️ Reputation system mutex poisoned in heartbeat update, recovering...");
+                    poisoned.into_inner().get_reputation(node_id)
+                }
+            }
         };
         
         // Only track nodes with rep >= 70
@@ -9979,8 +10012,13 @@ impl SimplifiedP2P {
     
     /// Get node reputation by ID
     pub fn get_node_reputation(&self, node_id: &str) -> f64 {
-        let rep_sys = self.reputation_system.lock().unwrap();
-        rep_sys.get_reputation(node_id)
+        match self.reputation_system.lock() {
+            Ok(rep_sys) => rep_sys.get_reputation(node_id),
+            Err(poisoned) => {
+                println!("[P2P] ⚠️ Reputation system mutex poisoned in get_reputation, recovering...");
+                poisoned.into_inner().get_reputation(node_id)
+            }
+        }
     }
     
     /// Get delay before pinging based on role (Primary=0, Backup1=30s, Backup2=60s)
@@ -12544,9 +12582,17 @@ impl SimplifiedP2P {
         // SECURITY: Reputation check (jailed nodes cannot participate)
         // ═══════════════════════════════════════════════════════════════════════════
         let reputation_score = {
-            let reputation_system = self.reputation_system.lock().unwrap();
-            let raw_score = reputation_system.get_reputation(&node_id);
-            raw_score / 100.0  // Convert 0-100 to 0-1
+            match self.reputation_system.lock() {
+                Ok(reputation_system) => {
+                    let raw_score = reputation_system.get_reputation(&node_id);
+                    raw_score / 100.0  // Convert 0-100 to 0-1
+                }
+                Err(poisoned) => {
+                    println!("[P2P] ⚠️ Reputation system mutex poisoned in commit handler, recovering...");
+                    let reputation_system = poisoned.into_inner();
+                    reputation_system.get_reputation(&node_id) / 100.0
+                }
+            }
         };
         
         if reputation_score < 0.70 {
@@ -12625,9 +12671,17 @@ impl SimplifiedP2P {
         // SECURITY: Reputation check (jailed nodes cannot participate)
         // ═══════════════════════════════════════════════════════════════════════════
         let reputation_score = {
-            let reputation_system = self.reputation_system.lock().unwrap();
-            let raw_score = reputation_system.get_reputation(&node_id);
-            raw_score / 100.0  // Convert 0-100 to 0-1
+            match self.reputation_system.lock() {
+                Ok(reputation_system) => {
+                    let raw_score = reputation_system.get_reputation(&node_id);
+                    raw_score / 100.0  // Convert 0-100 to 0-1
+                }
+                Err(poisoned) => {
+                    println!("[P2P] ⚠️ Reputation system mutex poisoned in reveal handler, recovering...");
+                    let reputation_system = poisoned.into_inner();
+                    reputation_system.get_reputation(&node_id) / 100.0
+                }
+            }
         };
         
         if reputation_score < 0.70 {
@@ -13220,7 +13274,13 @@ impl SimplifiedP2P {
                     drop(reputation_system);
                     self.save_jail_to_storage(node_id, *jailed_until, *jail_count, reason);
                     // Re-acquire lock for remaining iterations
-                    reputation_system = self.reputation_system.lock().unwrap();
+                    reputation_system = match self.reputation_system.lock() {
+                        Ok(guard) => guard,
+                        Err(poisoned) => {
+                            println!("[P2P] ⚠️ Reputation system mutex poisoned in jail sync, recovering...");
+                            poisoned.into_inner()
+                        }
+                    };
                     
                     let node_display = if node_id.starts_with("genesis_node_") || node_id.starts_with("node_") {
                         node_id.clone()

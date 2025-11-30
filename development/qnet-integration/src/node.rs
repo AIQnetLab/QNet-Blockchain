@@ -1045,8 +1045,17 @@ impl BlockchainNode {
                 
                 // CRITICAL: Set global storage instance to avoid RocksDB lock conflicts
                 // Registry and other components will use this shared instance
-                *GLOBAL_STORAGE_INSTANCE.lock().unwrap() = Some(storage_arc.clone());
-                println!("[Node] 🔐 Global storage instance set (shared across components)");
+                match GLOBAL_STORAGE_INSTANCE.lock() {
+                    Ok(mut guard) => {
+                        *guard = Some(storage_arc.clone());
+                        println!("[Node] 🔐 Global storage instance set (shared across components)");
+                    }
+                    Err(poisoned) => {
+                        // SECURITY: Recover from poisoned lock during initialization
+                        *poisoned.into_inner() = Some(storage_arc.clone());
+                        println!("[Node] ⚠️ Recovered from poisoned lock, storage instance set");
+                    }
+                }
                 
                 // PRODUCTION: Set storage path for registry to read activations
                 std::env::set_var("QNET_STORAGE_PATH", data_dir);
@@ -1121,8 +1130,17 @@ impl BlockchainNode {
         
         // CRITICAL: Set global mempool instance for activation registry
         // This allows Registry to submit transactions without circular dependency
-        *GLOBAL_MEMPOOL_INSTANCE.lock().unwrap() = Some(mempool.clone());
-        println!("[Node] 🔐 Global mempool instance set (shared with activation registry)");
+        match GLOBAL_MEMPOOL_INSTANCE.lock() {
+            Ok(mut guard) => {
+                *guard = Some(mempool.clone());
+                println!("[Node] 🔐 Global mempool instance set (shared with activation registry)");
+            }
+            Err(poisoned) => {
+                // SECURITY: Recover from poisoned lock during initialization
+                *poisoned.into_inner() = Some(mempool.clone());
+                println!("[Node] ⚠️ Recovered from poisoned lock, mempool instance set");
+            }
+        }
         
         // Generate unique node_id for Byzantine consensus
         let node_id = Self::generate_unique_node_id(node_type).await;
@@ -2851,7 +2869,8 @@ impl BlockchainNode {
                                      missing_height, height, retry_count, phase, backoff_secs);
                             
                             // Update request tracking
-                            requested_blocks.insert(missing_height, (std::time::Instant::now(), retry_count as u8 + 1));
+                            // SECURITY: Use saturating_add to prevent overflow at u8::MAX (255)
+                            requested_blocks.insert(missing_height, (std::time::Instant::now(), (retry_count as u8).saturating_add(1)));
                             
                             // Request via P2P
                             if let Some(p2p) = &unified_p2p {
@@ -4469,7 +4488,7 @@ impl BlockchainNode {
                         // This enables dynamic pricing in quantum_crypto.rs
                         let active_peers = p2p.get_peer_count() as u64 + 1; // +1 for self
                         let genesis_ts = crate::GLOBAL_GENESIS_TIMESTAMP.load(std::sync::atomic::Ordering::Relaxed);
-                        // TODO: Get real burn percentage from Solana bridge when available
+                        // PRODUCTION: Burn percentage is updated by bridge-server.py from Solana RPC
                         let burn_pct = crate::GLOBAL_BURN_PERCENTAGE.load(std::sync::atomic::Ordering::Relaxed) as f64 / 100.0;
                         crate::update_global_pricing_state(burn_pct, active_peers, genesis_ts);
                         println!("[PRICING] 📊 Global state updated: {} active nodes", active_peers);
@@ -4718,8 +4737,13 @@ impl BlockchainNode {
                     static LAST_HEIGHT_CHECK: Lazy<Arc<Mutex<u64>>> = Lazy::new(|| Arc::new(Mutex::new(0)));
                     
                     let should_force_update = {
-                        let last_height = *LAST_HEIGHT_CHECK.lock().unwrap();
-                        let time_since_block = LAST_BLOCK_TIME.lock().unwrap().elapsed();
+                        // SECURITY: Handle poisoned locks gracefully to prevent node crash
+                        let last_height = LAST_HEIGHT_CHECK.lock()
+                            .map(|guard| *guard)
+                            .unwrap_or(0);
+                        let time_since_block = LAST_BLOCK_TIME.lock()
+                            .map(|guard| guard.elapsed())
+                            .unwrap_or(Duration::from_secs(0));
                         
                         // Force update ONLY if stuck (no progress for 30 seconds)
                         // Don't force update during normal operation (blocks <=30)
@@ -4732,10 +4756,14 @@ impl BlockchainNode {
                         match p2p.sync_blockchain_height() {
                             Ok(h) => {
                                 println!("[SYNC] 🔄 Forced height update: network={}, local={}", h, microblock_height);
-                                // Update tracking
-                                *LAST_HEIGHT_CHECK.lock().unwrap() = microblock_height;
+                                // Update tracking - handle poisoned locks gracefully
+                                if let Ok(mut guard) = LAST_HEIGHT_CHECK.lock() {
+                                    *guard = microblock_height;
+                                }
                                 if h > microblock_height {
-                                    *LAST_BLOCK_TIME.lock().unwrap() = Instant::now();
+                                    if let Ok(mut guard) = LAST_BLOCK_TIME.lock() {
+                                        *guard = Instant::now();
+                                    }
                                 }
                                 h
                             },
@@ -7681,8 +7709,12 @@ impl BlockchainNode {
                     println!("[EMERGENCY_SELECTION] ✅ Own node {} eligible and SYNCHRONIZED (reputation: {:.1}%)", 
                              own_node_id, own_reputation * 100.0);
                 } else {
+                    // SECURITY: Use safe unwrap_or to prevent panic if storage became None
+                    let stored_height = storage.as_ref()
+                        .map(|s| s.get_chain_height().unwrap_or(0))
+                        .unwrap_or(0);
                     println!("[EMERGENCY_SELECTION] ⚠️ Own node {} eligible but NOT SYNCHRONIZED (height behind: {})", 
-                             own_node_id, current_height - storage.as_ref().unwrap().get_chain_height().unwrap_or(0));
+                             own_node_id, current_height.saturating_sub(stored_height));
                 }
             } else if own_node_id == failed_producer {
                 println!("[EMERGENCY_SELECTION] 💀 Own node {} is the failed producer - excluding", own_node_id);
@@ -7776,7 +7808,8 @@ impl BlockchainNode {
                         // CRITICAL: Sort for deterministic selection when multiple nodes have same reputation
                         let mut sorted_degraded = emergency_candidates.clone();
                         sorted_degraded.sort_by(|a, b| {
-                            match b.1.partial_cmp(&a.1).unwrap() {
+                            // SECURITY: Use unwrap_or to handle NaN safely (prevents panic)
+                            match b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal) {
                                 std::cmp::Ordering::Equal => a.0.cmp(&b.0), // Tie-break by node_id
                                 other => other,
                             }
@@ -7856,7 +7889,8 @@ impl BlockchainNode {
                                 // CRITICAL: Sort for deterministic selection when multiple nodes have same reputation
                                 // Sort by reputation DESC, then by node_id ASC for tie-breaking
                                 eligible.sort_by(|a, b| {
-                                    match b.1.partial_cmp(&a.1).unwrap() {
+                                    // SECURITY: Use unwrap_or to handle NaN safely (prevents panic)
+                                    match b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal) {
                                         std::cmp::Ordering::Equal => a.0.cmp(&b.0), // Tie-break by node_id
                                         other => other,
                                     }
@@ -7977,7 +8011,15 @@ impl BlockchainNode {
         block_height: u64,
     ) -> bool {
         // Check 1: Node reputation must be sufficient
-        let reputation_score = Self::get_node_reputation_score(node_id, unified_p2p.as_ref().unwrap()).await;
+        // SECURITY: Handle None case gracefully - if no P2P, assume not ready
+        let p2p = match unified_p2p.as_ref() {
+            Some(p2p) => p2p,
+            None => {
+                println!("[PRODUCER_READINESS] ❌ P2P not available - cannot validate readiness");
+                return false;
+            }
+        };
+        let reputation_score = Self::get_node_reputation_score(node_id, p2p).await;
         if reputation_score < 0.70 {
             println!("[PRODUCER_READINESS] ❌ Insufficient reputation: {:.1}% (required: ≥70%)", reputation_score * 100.0);
             return false;
@@ -10262,16 +10304,23 @@ impl BlockchainNode {
                             .as_secs();
                         
                         // DDoS PROTECTION: Check if we already requested this certificate recently (5s cooldown)
-                        let should_request = {
-                            let mut requested = REQUESTED_CERTIFICATES.lock().unwrap();
-                            if let Some(&last_request) = requested.get(&compact_sig.cert_serial) {
-                                if now - last_request < 5 {
-                                    false // Too soon, skip request
+                        let should_request = match REQUESTED_CERTIFICATES.lock() {
+                            Ok(mut requested) => {
+                                if let Some(&last_request) = requested.get(&compact_sig.cert_serial) {
+                                    if now - last_request < 5 {
+                                        false // Too soon, skip request
+                                    } else {
+                                        requested.insert(compact_sig.cert_serial.clone(), now);
+                                        true
+                                    }
                                 } else {
                                     requested.insert(compact_sig.cert_serial.clone(), now);
                                     true
                                 }
-                            } else {
+                            }
+                            Err(poisoned) => {
+                                // SECURITY: Recover from poisoned lock to prevent DoS
+                                let mut requested = poisoned.into_inner();
                                 requested.insert(compact_sig.cert_serial.clone(), now);
                                 true
                             }
@@ -11113,14 +11162,23 @@ impl BlockchainNode {
     
     /// Handle incoming EntropyResponse from peer
     pub fn handle_entropy_response(&self, block_height: u64, entropy_hash: [u8; 32], responder_id: String) {
-        // Store the response
-        let mut responses = ENTROPY_RESPONSES.lock().unwrap();
-        responses.insert((block_height, responder_id.clone()), entropy_hash);
-        
-        println!("[CONSENSUS] 🎯 Stored entropy response for block {} from {}: {:x}", 
-                block_height, responder_id,
-                u64::from_le_bytes([entropy_hash[0], entropy_hash[1], entropy_hash[2], entropy_hash[3],
-                                   entropy_hash[4], entropy_hash[5], entropy_hash[6], entropy_hash[7]]));
+        // Store the response - handle poisoned lock gracefully
+        match ENTROPY_RESPONSES.lock() {
+            Ok(mut responses) => {
+                responses.insert((block_height, responder_id.clone()), entropy_hash);
+                
+                println!("[CONSENSUS] 🎯 Stored entropy response for block {} from {}: {:x}", 
+                        block_height, responder_id,
+                        u64::from_le_bytes([entropy_hash[0], entropy_hash[1], entropy_hash[2], entropy_hash[3],
+                                           entropy_hash[4], entropy_hash[5], entropy_hash[6], entropy_hash[7]]));
+            }
+            Err(poisoned) => {
+                // SECURITY: Recover from poisoned lock to prevent consensus deadlock
+                let mut responses = poisoned.into_inner();
+                responses.insert((block_height, responder_id.clone()), entropy_hash);
+                println!("[CONSENSUS] ⚠️ Recovered from poisoned lock, stored entropy response for block {}", block_height);
+            }
+        }
     }
     
     pub fn get_start_time(&self) -> chrono::DateTime<chrono::Utc> {
