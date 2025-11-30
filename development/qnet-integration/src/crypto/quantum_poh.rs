@@ -1,11 +1,16 @@
-// Quantum Proof of History implementation for QNet
+// QNet Verifiable Time Sequence (VTS) - Cryptographic time ordering
 //
-// PoH provides a cryptographic proof of time passage using sequential hashing.
+// VTS provides a cryptographic proof of time passage using sequential hashing,
+// implementing a Verifiable Delay Function (VDF) for temporal ordering.
+// 
 // This implementation is designed for production use with:
-// - 500K hashes/sec for strong VDF property
+// - 500K hashes/sec for strong VDF property (non-parallelizable)
 // - Hybrid SHA3-512/Blake3 for post-quantum security + performance
 // - Thread-safe operation with atomic state updates
 // - Integration with QNet's microblock/macroblock architecture
+//
+// The sequential hash chain creates an unforgeable timeline that proves
+// the ordering of events without relying on trusted timestamps.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -522,3 +527,9 @@ impl QuantumPoH {
         }
     }
 }
+
+// Type aliases for public API (VTS = Verifiable Time Sequence)
+/// Verifiable Time Sequence - cryptographic time ordering
+pub type VerifiableTimeSequence = QuantumPoH;
+/// VTS Entry - checkpoint in the verifiable time chain  
+pub type VTSEntry = PoHEntry;

@@ -1424,14 +1424,14 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(blockchain_filter.clone())
         .and_then(handle_block_statistics);
     
-    // Turbine metrics endpoint
-    let turbine_metrics = api_v1
-        .and(warp::path("turbine"))
+    // Shred Protocol metrics endpoint
+    let shred_protocol_metrics = api_v1
+        .and(warp::path("shred-protocol"))
         .and(warp::path("metrics"))
         .and(warp::path::end())
         .and(warp::get())
         .and(blockchain_filter.clone())
-        .and_then(handle_turbine_metrics);
+        .and_then(handle_shred_protocol_metrics);
     
     // Quantum PoH status endpoint
     let poh_status = api_v1
@@ -1442,14 +1442,14 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(blockchain_filter.clone())
         .and_then(handle_poh_status);
     
-    // Sealevel pipeline metrics endpoint
-    let sealevel_metrics = api_v1
-        .and(warp::path("sealevel"))
+    // Parallel Executor pipeline metrics endpoint
+    let parallel_executor_metrics = api_v1
+        .and(warp::path("parallel-executor"))
         .and(warp::path("metrics"))
         .and(warp::path::end())
         .and(warp::get())
         .and(blockchain_filter.clone())
-        .and_then(handle_sealevel_metrics);
+        .and_then(handle_parallel_executor_metrics);
     
     // Pre-execution cache status endpoint
     let pre_execution_status = api_v1
@@ -1461,13 +1461,13 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and_then(handle_pre_execution_status);
     
     // Tower BFT timeout info endpoint
-    let tower_bft_info = api_v1
-        .and(warp::path("tower-bft"))
+    let adaptive_bft_info = api_v1
+        .and(warp::path("adaptive-bft"))
         .and(warp::path("timeouts"))
         .and(warp::path::end())
         .and(warp::get())
         .and(blockchain_filter.clone())
-        .and_then(handle_tower_bft_timeouts);
+        .and_then(handle_adaptive_bft_timeouts);
     
     // Node performance metrics
     let performance_metrics = api_v1
@@ -1695,11 +1695,11 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .or(sync_status)
         .or(network_diagnostics)
         .or(block_stats)
-        .or(turbine_metrics)
+        .or(shred_protocol_metrics)
         .or(poh_status)
-        .or(sealevel_metrics)
+        .or(parallel_executor_metrics)
         .or(pre_execution_status)
-        .or(tower_bft_info)
+        .or(adaptive_bft_info)
         .or(performance_metrics)
         .or(reputation_history);
     
@@ -4339,11 +4339,11 @@ async fn handle_node_secure_info(
     Ok(warp::reply::json(&response))
 }
 
-// Handler for Turbine metrics
-async fn handle_turbine_metrics(blockchain: Arc<BlockchainNode>) -> Result<impl warp::Reply, warp::Rejection> {
-    // PRODUCTION: Get real-time Turbine metrics from P2P network
+// Handler for Shred Protocol metrics
+async fn handle_shred_protocol_metrics(blockchain: Arc<BlockchainNode>) -> Result<impl warp::Reply, warp::Rejection> {
+    // PRODUCTION: Get real-time Shred Protocol metrics from P2P network
     let (fanout, producers, latency) = if let Some(unified_p2p) = blockchain.get_unified_p2p() {
-        let fanout = unified_p2p.get_turbine_fanout();
+        let fanout = unified_p2p.get_shred_protocol_fanout();
         let producers = unified_p2p.get_qualified_producers_count();
         let latency = unified_p2p.get_average_peer_latency();
         (fanout, producers, latency)
@@ -4393,14 +4393,14 @@ async fn handle_poh_status(blockchain: Arc<BlockchainNode>) -> Result<impl warp:
     Ok(warp::reply::json(&status))
 }
 
-// Handler for Sealevel metrics
-async fn handle_sealevel_metrics(blockchain: Arc<BlockchainNode>) -> Result<impl warp::Reply, warp::Rejection> {
+// Handler for Parallel Executor metrics
+async fn handle_parallel_executor_metrics(blockchain: Arc<BlockchainNode>) -> Result<impl warp::Reply, warp::Rejection> {
     let metrics = json!({
-        "enabled": blockchain.get_hybrid_sealevel().is_some(),
+        "enabled": blockchain.get_parallel_executor().is_some(),
         "pipeline_stages": 5,
         "stages": ["Validation", "DependencyAnalysis", "Execution", "DilithiumSignature", "Commitment"],
         "max_parallel_tx": 10000,
-        "status": if blockchain.get_hybrid_sealevel().is_some() { "active" } else { "disabled" }
+        "status": if blockchain.get_parallel_executor().is_some() { "active" } else { "disabled" }
     });
     
     Ok(warp::reply::json(&metrics))
@@ -4426,12 +4426,12 @@ async fn handle_pre_execution_status(blockchain: Arc<BlockchainNode>) -> Result<
 }
 
 // Handler for Tower BFT timeouts
-async fn handle_tower_bft_timeouts(blockchain: Arc<BlockchainNode>) -> Result<impl warp::Reply, warp::Rejection> {
+async fn handle_adaptive_bft_timeouts(blockchain: Arc<BlockchainNode>) -> Result<impl warp::Reply, warp::Rejection> {
     let current_height = blockchain.get_height().await;
     
-    let timeout_block_1 = blockchain.get_tower_bft().get_timeout(1, 0).await;
-    let timeout_block_10 = blockchain.get_tower_bft().get_timeout(10, 0).await;
-    let timeout_current = blockchain.get_tower_bft().get_timeout(current_height, 0).await;
+    let timeout_block_1 = blockchain.get_adaptive_bft().get_timeout(1, 0).await;
+    let timeout_block_10 = blockchain.get_adaptive_bft().get_timeout(10, 0).await;
+    let timeout_current = blockchain.get_adaptive_bft().get_timeout(current_height, 0).await;
     
     let info = json!({
         "enabled": true,

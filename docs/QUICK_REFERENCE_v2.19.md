@@ -22,7 +22,7 @@
 | **Full** | ⚠️ Partial | Full chain | Medium | Validators | Variable | ✅ Yes |
 | **Super** | ✅ Always | Full + history | High | Producers | Variable | ✅ Yes |
 
-### Proof of History (PoH)
+### Verifiable Time Sequence (PoH)
 | Parameter | Value | Notes |
 |-----------|-------|-------|
 | **Hash Rate** | 500K/sec | SHA3-512 (25%) + Blake3 (75%) |

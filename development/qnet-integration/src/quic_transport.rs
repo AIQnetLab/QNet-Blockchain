@@ -724,7 +724,7 @@ impl QuicTransport {
             NetworkMessage::ConsensusCommit { .. } => 5,
             NetworkMessage::ConsensusReveal { .. } => 6,
             NetworkMessage::EmergencyProducerChange { .. } => 7,
-            NetworkMessage::TurbineChunk { .. } => 8,
+            NetworkMessage::ShredProtocolChunk { .. } => 8,
             NetworkMessage::ReputationSync { .. } => 9,
             _ => 0,
         }

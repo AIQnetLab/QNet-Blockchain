@@ -205,8 +205,8 @@ pub enum MessageType {
     ConsensusReveal = 6,
     /// Emergency producer change
     EmergencyChange = 7,
-    /// Turbine chunk
-    TurbineChunk = 8,
+    /// ShredProtocol chunk
+    ShredProtocolChunk = 8,
     /// Reputation sync
     ReputationSync = 9,
     /// Block request (sync)
@@ -239,7 +239,7 @@ impl MessageType {
             5 => Some(Self::ConsensusCommit),
             6 => Some(Self::ConsensusReveal),
             7 => Some(Self::EmergencyChange),
-            8 => Some(Self::TurbineChunk),
+            8 => Some(Self::ShredProtocolChunk),
             9 => Some(Self::ReputationSync),
             10 => Some(Self::BlockRequest),
             11 => Some(Self::BlockBatch),
@@ -264,7 +264,7 @@ impl MessageType {
             NetworkMessage::ConsensusCommit { .. } => Self::ConsensusCommit,
             NetworkMessage::ConsensusReveal { .. } => Self::ConsensusReveal,
             NetworkMessage::EmergencyProducerChange { .. } => Self::EmergencyChange,
-            NetworkMessage::TurbineChunk { .. } => Self::TurbineChunk,
+            NetworkMessage::ShredProtocolChunk { .. } => Self::ShredProtocolChunk,
             NetworkMessage::ReputationSync { .. } => Self::ReputationSync,
             NetworkMessage::RequestBlocks { .. } => Self::BlockRequest,
             NetworkMessage::BlocksBatch { .. } => Self::BlockBatch,

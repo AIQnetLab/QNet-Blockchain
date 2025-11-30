@@ -579,7 +579,7 @@ keys/
   - Shared across hybrid_crypto.rs for consistency
 
 ### Changed
-- **Tower BFT Timeouts**: Drastically reduced for 1 block/second target
+- **Adaptive BFT Timeouts**: Drastically reduced for 1 block/second target
   - Base timeouts: 2-5 seconds (was 10-25 seconds)
   - Max timeout: 10 seconds (was 60 seconds)
   - Rotation boundaries: 3 seconds (was 12 seconds)

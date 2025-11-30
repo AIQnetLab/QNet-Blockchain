@@ -521,8 +521,8 @@ pub struct SimplifiedP2P {
     /// Sync request channel for requesting blocks from storage
     sync_request_tx: Option<tokio::sync::mpsc::UnboundedSender<(u64, u64, String)>>,
     
-    /// Turbine block assembly states
-    turbine_assemblies: Arc<DashMap<u64, TurbineBlockAssembly>>,
+    /// ShredProtocol block assembly states
+    shred_protocol_assemblies: Arc<DashMap<u64, ShredProtocolBlockAssembly>>,
     
     /// PRODUCTION: Certificate management for compact signatures
     pub certificate_manager: Arc<RwLock<CertificateManager>>,
@@ -974,14 +974,14 @@ const KADEMLIA_K: usize = 20;        // K-bucket size
 const KADEMLIA_ALPHA: usize = 3;     // Concurrent queries
 const KADEMLIA_BITS: usize = 256;    // Hash size in bits
 
-// Turbine block propagation constants
-const TURBINE_CHUNK_SIZE: usize = 1024;      // 1KB chunks (optimal for Dilithium signatures)
-const TURBINE_REDUNDANCY_FACTOR: f32 = 1.5;  // 50% redundancy for Reed-Solomon
-const TURBINE_MAX_CHUNKS: usize = 64;        // Max chunks per block (64KB max block size)
+// ShredProtocol block propagation constants
+const SHRED_PROTOCOL_CHUNK_SIZE: usize = 1024;      // 1KB chunks (optimal for Dilithium signatures)
+const SHRED_PROTOCOL_REDUNDANCY_FACTOR: f32 = 1.5;  // 50% redundancy for Reed-Solomon
+const SHRED_PROTOCOL_MAX_CHUNKS: usize = 64;        // Max chunks per block (64KB max block size)
 
-/// Turbine chunk for block propagation
+/// ShredProtocol chunk for block propagation
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TurbineChunk {
+pub struct ShredProtocolChunk {
     pub block_height: u64,
     pub chunk_index: usize,
     pub total_chunks: usize,
@@ -989,9 +989,9 @@ pub struct TurbineChunk {
     pub is_parity: bool,  // Reed-Solomon parity chunk
 }
 
-/// Turbine block assembly state
+/// ShredProtocol block assembly state
 #[derive(Debug)]
-struct TurbineBlockAssembly {
+struct ShredProtocolBlockAssembly {
     height: u64,
     chunks_received: Vec<Option<Vec<u8>>>,
     parity_chunks: Vec<Option<Vec<u8>>>,
@@ -1112,7 +1112,7 @@ impl SimplifiedP2P {
             consensus_tx: None,
             block_tx: Arc::new(Mutex::new(None)),
             sync_request_tx: None,
-            turbine_assemblies: Arc::new(DashMap::new()),
+            shred_protocol_assemblies: Arc::new(DashMap::new()),
             certificate_manager: Arc::new(RwLock::new(CertificateManager::with_node_type(node_type.clone()))),
             
             // PRODUCTION: Light Node registry for gossip sync
@@ -1224,9 +1224,9 @@ impl SimplifiedP2P {
                         }
                     }
                 }
-                NetworkMessage::TurbineChunk { chunk } => {
-                    // Handle turbine chunk (will be processed by existing handler)
-                    println!("[QUIC] 📦 Received Turbine chunk #{}/{} for block {}", 
+                NetworkMessage::ShredProtocolChunk { chunk } => {
+                    // Handle shred_protocol chunk (will be processed by existing handler)
+                    println!("[QUIC] 📦 Received ShredProtocol chunk #{}/{} for block {}", 
                         chunk.chunk_index, chunk.total_chunks, chunk.block_height);
                 }
                 NetworkMessage::ConsensusCommit { round_id, node_id: sender_id, .. } => {
@@ -3529,15 +3529,15 @@ impl SimplifiedP2P {
         Err("QUIC transport not initialized".into())
     }
     
-    /// PRODUCTION v2.19.21: Broadcast block using Turbine protocol via QUIC
+    /// PRODUCTION v2.19.21: Broadcast block using ShredProtocol protocol via QUIC
     /// Solana-inspired chunking with Reed-Solomon erasure coding
-    pub async fn broadcast_block_turbine(&self, height: u64, block_data: Vec<u8>) -> Result<(), String> {
+    pub async fn broadcast_block_shred_protocol(&self, height: u64, block_data: Vec<u8>) -> Result<(), String> {
         use futures::future::join_all;
         use crate::p2p_transport::P2PTransport;
         
-        // Check if block is too large for Turbine
-        if block_data.len() > TURBINE_MAX_CHUNKS * TURBINE_CHUNK_SIZE {
-            return Err(format!("Block too large for Turbine: {} bytes", block_data.len()));
+        // Check if block is too large for ShredProtocol
+        if block_data.len() > SHRED_PROTOCOL_MAX_CHUNKS * SHRED_PROTOCOL_CHUNK_SIZE {
+            return Err(format!("Block too large for ShredProtocol: {} bytes", block_data.len()));
         }
         
         // Get validated peers using existing method
@@ -3545,7 +3545,7 @@ impl SimplifiedP2P {
         
         if validated_peers.is_empty() {
             if height % 10 == 0 {
-                println!("[TURBINE] ⚠️ No validated peers available - block #{} not broadcasted", height);
+                println!("[SHRED_PROTOCOL] ⚠️ No validated peers available - block #{} not broadcasted", height);
             }
             return Ok(());
         }
@@ -3553,30 +3553,30 @@ impl SimplifiedP2P {
         // Split block into chunks
         let chunks = self.split_into_chunks(&block_data);
         let total_chunks = chunks.len();
-        let parity_count = ((total_chunks as f32) * (TURBINE_REDUNDANCY_FACTOR - 1.0)).ceil() as usize;
+        let parity_count = ((total_chunks as f32) * (SHRED_PROTOCOL_REDUNDANCY_FACTOR - 1.0)).ceil() as usize;
         
         // Generate Reed-Solomon parity chunks
         let parity_chunks = self.generate_parity_chunks(&chunks, parity_count);
         
         // ADAPTIVE FANOUT: Calculate optimal fanout based on network size and latency
-        let turbine_fanout = self.get_turbine_fanout();
+        let shred_protocol_fanout = self.get_shred_protocol_fanout();
         
         if height % 10 == 0 {
             let avg_latency = self.get_average_peer_latency();
             let producers = self.get_qualified_producers_count();
-            println!("[TURBINE/QUIC] 🚀 Broadcasting block #{} as {} chunks + {} parity (fanout={}, producers={}, latency={}ms)", 
-                     height, total_chunks, parity_count, turbine_fanout, producers, avg_latency);
+            println!("[SHRED_PROTOCOL/QUIC] 🚀 Broadcasting block #{} as {} chunks + {} parity (fanout={}, producers={}, latency={}ms)", 
+                     height, total_chunks, parity_count, shred_protocol_fanout, producers, avg_latency);
         }
         
         // Build Kademlia-based routing tree for each chunk
-        let routing_tree = self.build_turbine_routing_tree(&validated_peers);
+        let routing_tree = self.build_shred_protocol_routing_tree(&validated_peers);
         
         // Collect all chunk messages
         let mut chunk_sends: Vec<(PeerInfo, NetworkMessage)> = Vec::new();
         
         // Collect data chunks
         for (chunk_index, chunk_data) in chunks.into_iter().enumerate() {
-            let turbine_chunk = TurbineChunk {
+            let shred_protocol_chunk = ShredProtocolChunk {
                 block_height: height,
                 chunk_index,
                 total_chunks,
@@ -3584,8 +3584,8 @@ impl SimplifiedP2P {
                 is_parity: false,
             };
             
-            let target_peers = self.select_turbine_targets(&routing_tree, chunk_index, turbine_fanout);
-            let msg = NetworkMessage::TurbineChunk { chunk: turbine_chunk };
+            let target_peers = self.select_shred_protocol_targets(&routing_tree, chunk_index, shred_protocol_fanout);
+            let msg = NetworkMessage::ShredProtocolChunk { chunk: shred_protocol_chunk };
             
             for peer in target_peers {
                 chunk_sends.push((peer, msg.clone()));
@@ -3594,7 +3594,7 @@ impl SimplifiedP2P {
         
         // Collect parity chunks
         for (parity_index, parity_data) in parity_chunks.into_iter().enumerate() {
-            let turbine_chunk = TurbineChunk {
+            let shred_protocol_chunk = ShredProtocolChunk {
                 block_height: height,
                 chunk_index: total_chunks + parity_index,
                 total_chunks,
@@ -3602,8 +3602,8 @@ impl SimplifiedP2P {
                 is_parity: true,
             };
             
-            let target_peers = self.select_turbine_targets(&routing_tree, total_chunks + parity_index, turbine_fanout);
-            let msg = NetworkMessage::TurbineChunk { chunk: turbine_chunk };
+            let target_peers = self.select_shred_protocol_targets(&routing_tree, total_chunks + parity_index, shred_protocol_fanout);
+            let msg = NetworkMessage::ShredProtocolChunk { chunk: shred_protocol_chunk };
             
             for peer in target_peers {
                 chunk_sends.push((peer, msg.clone()));
@@ -3646,7 +3646,7 @@ impl SimplifiedP2P {
                 }
                 
                 if height <= 5 || height % 10 == 0 {
-                    println!("[TURBINE/QUIC] ✅ Block #{} chunks delivered: {}/{} (binary protocol)", 
+                    println!("[SHRED_PROTOCOL/QUIC] ✅ Block #{} chunks delivered: {}/{} (binary protocol)", 
                         height, success_count, total_sends);
                 }
                 
@@ -3655,14 +3655,14 @@ impl SimplifiedP2P {
         }
         
         // NO HTTP FALLBACK - QUIC only mode
-        println!("[TURBINE] ❌ QUIC not initialized - block #{} cannot be sent", height);
-        println!("[TURBINE] ℹ️ Ensure init_quic() was called during startup");
+        println!("[SHRED_PROTOCOL] ❌ QUIC not initialized - block #{} cannot be sent", height);
+        println!("[SHRED_PROTOCOL] ℹ️ Ensure init_quic() was called during startup");
         Err("QUIC transport not initialized".into())
     }
     
-    /// Split block data into chunks for Turbine
+    /// Split block data into chunks for ShredProtocol
     fn split_into_chunks(&self, data: &[u8]) -> Vec<Vec<u8>> {
-        data.chunks(TURBINE_CHUNK_SIZE)
+        data.chunks(SHRED_PROTOCOL_CHUNK_SIZE)
             .map(|chunk| chunk.to_vec())
             .collect()
     }
@@ -3676,7 +3676,7 @@ impl SimplifiedP2P {
         let rs = match ReedSolomon::new(data_count, parity_count) {
             Ok(rs) => rs,
             Err(e) => {
-                println!("[TURBINE] ⚠️ Reed-Solomon initialization failed: {:?}, falling back to replication", e);
+                println!("[SHRED_PROTOCOL] ⚠️ Reed-Solomon initialization failed: {:?}, falling back to replication", e);
                 // Fallback: replicate first chunks as parity
                 return data_chunks.iter()
                     .take(parity_count)
@@ -3686,7 +3686,7 @@ impl SimplifiedP2P {
         };
         
         // Ensure all chunks are same size (pad if needed)
-        let chunk_size = data_chunks.iter().map(|c| c.len()).max().unwrap_or(TURBINE_CHUNK_SIZE);
+        let chunk_size = data_chunks.iter().map(|c| c.len()).max().unwrap_or(SHRED_PROTOCOL_CHUNK_SIZE);
         let mut padded_chunks: Vec<Vec<u8>> = data_chunks.iter()
             .map(|chunk| {
                 let mut padded = chunk.clone();
@@ -3707,7 +3707,7 @@ impl SimplifiedP2P {
         
         // Generate parity shards
         if let Err(e) = rs.encode(&mut shards) {
-            println!("[TURBINE] ⚠️ Reed-Solomon encoding failed: {:?}", e);
+            println!("[SHRED_PROTOCOL] ⚠️ Reed-Solomon encoding failed: {:?}", e);
             // Fallback to simple XOR
             let mut parity = vec![vec![0u8; chunk_size]; parity_count];
             for chunk in data_chunks {
@@ -3730,8 +3730,8 @@ impl SimplifiedP2P {
             .collect()
     }
     
-    /// Build Turbine routing tree using Kademlia DHT
-    fn build_turbine_routing_tree(&self, peers: &[PeerInfo]) -> Vec<PeerInfo> {
+    /// Build ShredProtocol routing tree using Kademlia DHT
+    fn build_shred_protocol_routing_tree(&self, peers: &[PeerInfo]) -> Vec<PeerInfo> {
         // Sort peers by Kademlia distance for optimal routing
         let mut sorted_peers = peers.to_vec();
         sorted_peers.sort_by_key(|p| p.bucket_index);
@@ -3739,7 +3739,7 @@ impl SimplifiedP2P {
     }
     
     /// Select target peers for a chunk using Kademlia distance
-    fn select_turbine_targets(&self, routing_tree: &[PeerInfo], chunk_index: usize, fanout: usize) -> Vec<PeerInfo> {
+    fn select_shred_protocol_targets(&self, routing_tree: &[PeerInfo], chunk_index: usize, fanout: usize) -> Vec<PeerInfo> {
         // Deterministic selection based on chunk index
         let start_index = (chunk_index * fanout) % routing_tree.len();
         let mut targets = Vec::new();
@@ -3752,18 +3752,18 @@ impl SimplifiedP2P {
         targets
     }
     
-    /// Handle incoming Turbine chunk
-    fn handle_turbine_chunk(&self, from_peer: &str, chunk: TurbineChunk) {
+    /// Handle incoming ShredProtocol chunk
+    fn handle_shred_protocol_chunk(&self, from_peer: &str, chunk: ShredProtocolChunk) {
         let height = chunk.block_height;
         
         // Update or create assembly state
-        let mut assembly = self.turbine_assemblies.entry(height)
-            .or_insert_with(|| TurbineBlockAssembly {
+        let mut assembly = self.shred_protocol_assemblies.entry(height)
+            .or_insert_with(|| ShredProtocolBlockAssembly {
                 height,
                 chunks_received: vec![None; chunk.total_chunks],
-                parity_chunks: vec![None; ((chunk.total_chunks as f32) * (TURBINE_REDUNDANCY_FACTOR - 1.0)).ceil() as usize],
+                parity_chunks: vec![None; ((chunk.total_chunks as f32) * (SHRED_PROTOCOL_REDUNDANCY_FACTOR - 1.0)).ceil() as usize],
                 total_chunks: chunk.total_chunks,
-                parity_count: ((chunk.total_chunks as f32) * (TURBINE_REDUNDANCY_FACTOR - 1.0)).ceil() as usize,
+                parity_count: ((chunk.total_chunks as f32) * (SHRED_PROTOCOL_REDUNDANCY_FACTOR - 1.0)).ceil() as usize,
                 started_at: Instant::now(),
             });
         
@@ -3779,8 +3779,8 @@ impl SimplifiedP2P {
             }
         }
         
-        // Forward chunk to other peers (Turbine propagation)
-        self.forward_turbine_chunk(from_peer, chunk.clone());
+        // Forward chunk to other peers (ShredProtocol propagation)
+        self.forward_shred_protocol_chunk(from_peer, chunk.clone());
         
         // Check if we can reconstruct the block
         let chunks_count = assembly.chunks_received.iter().filter(|c| c.is_some()).count();
@@ -3788,19 +3788,19 @@ impl SimplifiedP2P {
         
         if chunks_count == assembly.total_chunks {
             // All data chunks received - reconstruct block
-            self.reconstruct_block_from_turbine(height);
+            self.reconstruct_block_from_shred_protocol(height);
         } else if chunks_count + parity_count >= assembly.total_chunks {
             // Enough chunks + parity to reconstruct
             if height % 10 == 0 {
-                println!("[TURBINE] 🔧 Reconstructing block #{} from {} data + {} parity chunks", 
+                println!("[SHRED_PROTOCOL] 🔧 Reconstructing block #{} from {} data + {} parity chunks", 
                          height, chunks_count, parity_count);
             }
             self.reconstruct_block_with_parity(height);
         }
     }
     
-    /// Forward Turbine chunk to other peers via QUIC (async)
-    fn forward_turbine_chunk(&self, original_sender: &str, chunk: TurbineChunk) {
+    /// Forward ShredProtocol chunk to other peers via QUIC (async)
+    fn forward_shred_protocol_chunk(&self, original_sender: &str, chunk: ShredProtocolChunk) {
         // Don't forward if we're the original producer
         if self.node_id == original_sender {
             return;
@@ -3808,12 +3808,12 @@ impl SimplifiedP2P {
         
         // Select adaptive fanout peers to forward to (excluding sender)
         let validated_peers = self.get_validated_active_peers();
-        let routing_tree = self.build_turbine_routing_tree(&validated_peers);
-        let turbine_fanout = self.get_turbine_fanout();
+        let routing_tree = self.build_shred_protocol_routing_tree(&validated_peers);
+        let shred_protocol_fanout = self.get_shred_protocol_fanout();
         
         let forward_targets: Vec<_> = routing_tree.iter()
             .filter(|p| p.addr != original_sender)
-            .take(turbine_fanout)
+            .take(shred_protocol_fanout)
             .cloned()
             .collect();
         
@@ -3828,7 +3828,7 @@ impl SimplifiedP2P {
             
             // PRODUCTION v2.19.22: Use QUIC for chunk forwarding (unidirectional, no response)
             tokio::spawn(async move {
-                let message = NetworkMessage::TurbineChunk { chunk: chunk_clone };
+                let message = NetworkMessage::ShredProtocolChunk { chunk: chunk_clone };
                 
                 // Extract IP and calculate QUIC port
                 let parts: Vec<&str> = peer_addr.split(':').collect();
@@ -3850,8 +3850,8 @@ impl SimplifiedP2P {
     }
     
     /// Reconstruct block from all data chunks
-    fn reconstruct_block_from_turbine(&self, height: u64) {
-        if let Some((_, assembly)) = self.turbine_assemblies.remove(&height) {
+    fn reconstruct_block_from_shred_protocol(&self, height: u64) {
+        if let Some((_, assembly)) = self.shred_protocol_assemblies.remove(&height) {
             let mut block_data = Vec::new();
             
             for chunk_opt in assembly.chunks_received {
@@ -3862,7 +3862,7 @@ impl SimplifiedP2P {
             
             let elapsed = assembly.started_at.elapsed();
             if height % 10 == 0 {
-                println!("[TURBINE] ✅ Block #{} reconstructed from {} chunks in {:?}", 
+                println!("[SHRED_PROTOCOL] ✅ Block #{} reconstructed from {} chunks in {:?}", 
                          height, assembly.total_chunks, elapsed);
             }
             
@@ -3872,7 +3872,7 @@ impl SimplifiedP2P {
                     height,
                     data: block_data,
                     block_type: if height % 90 == 0 { "macro".to_string() } else { "micro".to_string() },
-                    from_peer: "turbine".to_string(),
+                    from_peer: "shred_protocol".to_string(),
                     timestamp: std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
@@ -3887,7 +3887,7 @@ impl SimplifiedP2P {
     /// Reconstruct block using Reed-Solomon parity (PRODUCTION)
     fn reconstruct_block_with_parity(&self, height: u64) {
         // PRODUCTION: Real Reed-Solomon reconstruction
-        if let Some((_, assembly)) = self.turbine_assemblies.remove(&height) {
+        if let Some((_, assembly)) = self.shred_protocol_assemblies.remove(&height) {
             let data_count = assembly.total_chunks;
             let parity_count = assembly.parity_count;
             
@@ -3895,7 +3895,7 @@ impl SimplifiedP2P {
             let rs = match ReedSolomon::new(data_count, parity_count) {
                 Ok(rs) => rs,
                 Err(e) => {
-                    println!("[TURBINE] ❌ Reed-Solomon init failed for reconstruction: {:?}", e);
+                    println!("[SHRED_PROTOCOL] ❌ Reed-Solomon init failed for reconstruction: {:?}", e);
                     return;
                 }
             };
@@ -3906,7 +3906,7 @@ impl SimplifiedP2P {
                 .filter_map(|opt| opt.as_ref())
                 .map(|chunk| chunk.len())
                 .max()
-                .unwrap_or(TURBINE_CHUNK_SIZE);
+                .unwrap_or(SHRED_PROTOCOL_CHUNK_SIZE);
             
             let mut shards: Vec<Option<Box<[u8]>>> = Vec::new();
             
@@ -3935,7 +3935,7 @@ impl SimplifiedP2P {
             // Count available shards
             let available_count = shards.iter().filter(|s| s.is_some()).count();
             if available_count < data_count {
-                println!("[TURBINE] ❌ Not enough shards for reconstruction: {}/{} needed", 
+                println!("[SHRED_PROTOCOL] ❌ Not enough shards for reconstruction: {}/{} needed", 
                          available_count, data_count);
                 return;
             }
@@ -3947,7 +3947,7 @@ impl SimplifiedP2P {
             
             // Reconstruct missing shards
             if let Err(e) = rs.reconstruct(&mut rs_shards) {
-                println!("[TURBINE] ❌ Reed-Solomon reconstruction failed: {:?}", e);
+                println!("[SHRED_PROTOCOL] ❌ Reed-Solomon reconstruction failed: {:?}", e);
                 return;
             }
             
@@ -3968,7 +3968,7 @@ impl SimplifiedP2P {
             }
             
             let elapsed = assembly.started_at.elapsed();
-            println!("[TURBINE] 🔧 Block #{} reconstructed with Reed-Solomon in {:?}", height, elapsed);
+            println!("[SHRED_PROTOCOL] 🔧 Block #{} reconstructed with Reed-Solomon in {:?}", height, elapsed);
             
             // Send reconstructed block through normal block channel
             if let Some(ref block_tx) = &*self.block_tx.lock().unwrap() {
@@ -3976,7 +3976,7 @@ impl SimplifiedP2P {
                     height,
                     data: block_data,
                     block_type: if height % 90 == 0 { "macro".to_string() } else { "micro".to_string() },
-                    from_peer: "turbine-rs".to_string(),
+                    from_peer: "shred_protocol-rs".to_string(),
                     timestamp: std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
@@ -3988,8 +3988,8 @@ impl SimplifiedP2P {
         }
     }
     
-    /// Send a single Turbine chunk to a peer
-    // REMOVED v2.19.21: send_turbine_chunk replaced by async QUIC broadcast in broadcast_block_turbine
+    /// Send a single ShredProtocol chunk to a peer
+    // REMOVED v2.19.21: send_shred_protocol_chunk replaced by async QUIC broadcast in broadcast_block_shred_protocol
     
     /// API DEADLOCK FIX: Get cached network height WITHOUT triggering sync
     /// This method NEVER makes network calls - only reads cache
@@ -5799,7 +5799,7 @@ impl SimplifiedP2P {
     }
     
     /// Get count of qualified producers (consensus_score >= 70%)
-    /// CRITICAL: Used for adaptive Turbine fanout calculation
+    /// CRITICAL: Used for adaptive ShredProtocol fanout calculation
     /// SCALABILITY: Counts only Super and Full nodes (Light nodes excluded)
     pub fn get_qualified_producers_count(&self) -> usize {
         // Count peers that meet Byzantine threshold for consensus
@@ -5809,7 +5809,7 @@ impl SimplifiedP2P {
     }
     
     /// Get average peer latency for network performance estimation
-    /// CRITICAL: Used for adaptive Turbine fanout calculation
+    /// CRITICAL: Used for adaptive ShredProtocol fanout calculation
     /// Returns average latency_ms across all qualified producers
     pub fn get_average_peer_latency(&self) -> u64 {
         let qualified_peers: Vec<u32> = self.connected_peers_lockfree.iter()
@@ -5827,7 +5827,7 @@ impl SimplifiedP2P {
         sum / qualified_peers.len() as u64
     }
     
-    /// Calculate adaptive Turbine fanout based on network size and latency
+    /// Calculate adaptive ShredProtocol fanout based on network size and latency
     /// ARCHITECTURE: Balance between propagation speed and bandwidth usage
     /// CRITICAL: Ensures blocks propagate within 50% of block time (500ms for 1s blocks)
     /// 
@@ -5838,7 +5838,7 @@ impl SimplifiedP2P {
     /// - Medium (201-1000 producers, LAN <50ms): fanout=8 → 4 hops × latency = ~200ms ✅
     /// - Medium (201-1000 producers, WAN >50ms): fanout=16 → 3 hops × latency = ~600ms ✅
     /// - Large (>1000 producers): fanout=32 → 3 hops for 32K nodes
-    pub fn get_turbine_fanout(&self) -> usize {
+    pub fn get_shred_protocol_fanout(&self) -> usize {
         let producers = self.get_qualified_producers_count();
         let latency = self.get_average_peer_latency();
         
@@ -7345,9 +7345,9 @@ pub enum NetworkMessage {
         sender_node_id: Option<String>, // PRODUCTION: Explicit sender identification for Docker/NAT
     },
     
-    /// Turbine chunk for efficient block propagation
-    TurbineChunk {
-        chunk: TurbineChunk,
+    /// ShredProtocol chunk for efficient block propagation
+    ShredProtocolChunk {
+        chunk: ShredProtocolChunk,
     },
     
     /// PRODUCTION: Reputation synchronization for consensus
@@ -7755,9 +7755,9 @@ impl SimplifiedP2P {
                 }
             }
 
-            NetworkMessage::TurbineChunk { chunk } => {
-                // Handle incoming Turbine chunk
-                self.handle_turbine_chunk(from_peer, chunk);
+            NetworkMessage::ShredProtocolChunk { chunk } => {
+                // Handle incoming ShredProtocol chunk
+                self.handle_shred_protocol_chunk(from_peer, chunk);
             }
 
             NetworkMessage::EmergencyProducerChange { failed_producer, new_producer, block_height, change_type, timestamp, sender_node_id } => {
@@ -13675,7 +13675,7 @@ impl SimplifiedP2P {
             }
             
             // ADAPTIVE FANOUT: Use same logic as initial gossip
-            let gossip_fanout = self.get_turbine_fanout(); // Reuse existing method!
+            let gossip_fanout = self.get_shred_protocol_fanout(); // Reuse existing method!
             
             // KADEMLIA RANDOM SELECTION: Select diverse peers
             let mut selection_hasher = Sha3_256::new();
@@ -14416,7 +14416,7 @@ impl SimplifiedP2P {
                     continue;
                 }
                 
-                // ADAPTIVE FANOUT: Use same fanout as Turbine for consistency
+                // ADAPTIVE FANOUT: Use same fanout as ShredProtocol for consistency
                 // PRODUCTION: Fanout=4 (small network) to fanout=32 (large network)
                 let gossip_fanout = {
                     let producers = qualified_peers.len();
@@ -14425,7 +14425,7 @@ impl SimplifiedP2P {
                         .map(|e| e.value().latency_ms as u64)
                         .sum::<u64>() / qualified_peers.len().max(1) as u64;
                     
-                    // Same logic as get_turbine_fanout() (unified_p2p.rs:10715-10731)
+                    // Same logic as get_shred_protocol_fanout() (unified_p2p.rs:10715-10731)
                     match (producers, avg_latency) {
                         (0..=50, _) => 4,
                         (51..=200, 0..=50) => 8,
@@ -14437,7 +14437,7 @@ impl SimplifiedP2P {
                 };
                 
                 // KADEMLIA-BASED RANDOM SELECTION: Use XOR distance for peer diversity
-                // ARCHITECTURE: Same as Turbine routing (no duplication)
+                // ARCHITECTURE: Same as ShredProtocol routing (no duplication)
                 let mut selection_hasher = Sha3_256::new();
                 selection_hasher.update(node_id.as_bytes());
                 selection_hasher.update(&iteration.to_le_bytes());

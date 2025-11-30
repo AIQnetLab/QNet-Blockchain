@@ -506,10 +506,10 @@ pub struct BlockchainNode {
     quantum_poh_receiver: Option<Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<crate::quantum_poh::PoHEntry>>>>,
     
     // Hybrid Sealevel for parallel transaction execution
-    hybrid_sealevel: Option<Arc<crate::hybrid_sealevel::HybridSealevel>>,
+    parallel_executor: Option<Arc<crate::parallel_executor::ParallelExecutor>>,
     
-    // Tower BFT for adaptive timeouts
-    tower_bft: Arc<crate::tower_bft::TowerBft>,
+    // Adaptive BFT for adaptive timeouts
+    adaptive_bft: Arc<crate::adaptive_bft::AdaptiveBft>,
     
     // Pre-execution for speculative transaction processing
     pre_execution: Arc<crate::pre_execution::PreExecutionManager>,
@@ -530,9 +530,9 @@ impl BlockchainNode {
         &self.quantum_poh
     }
     
-    /// Get Hybrid Sealevel reference
-    pub fn get_hybrid_sealevel(&self) -> &Option<Arc<crate::hybrid_sealevel::HybridSealevel>> {
-        &self.hybrid_sealevel
+    /// Get Parallel Executor reference
+    pub fn get_parallel_executor(&self) -> &Option<Arc<crate::parallel_executor::ParallelExecutor>> {
+        &self.parallel_executor
     }
     
     /// Get Pre-execution manager
@@ -540,9 +540,9 @@ impl BlockchainNode {
         self.pre_execution.clone()
     }
     
-    /// Get Tower BFT manager
-    pub fn get_tower_bft(&self) -> Arc<crate::tower_bft::TowerBft> {
-        self.tower_bft.clone()
+    /// Get Adaptive BFT manager
+    pub fn get_adaptive_bft(&self) -> Arc<crate::adaptive_bft::AdaptiveBft> {
+        self.adaptive_bft.clone()
     }
     
     /// Process reward window (called by RPC system every 4 hours)
@@ -1760,29 +1760,29 @@ impl BlockchainNode {
             };
         
         // Initialize Hybrid Sealevel if sharding is enabled
-        let hybrid_sealevel = if let (Some(ref shard_coord), Some(ref parallel_val)) = (&shard_coordinator, &parallel_validator) {
-            let sealevel = Arc::new(crate::hybrid_sealevel::HybridSealevel::new(
+        let parallel_executor = if let (Some(ref shard_coord), Some(ref parallel_val)) = (&shard_coordinator, &parallel_validator) {
+            let sealevel = Arc::new(crate::parallel_executor::ParallelExecutor::new(
                 shard_coord.clone(),
                 parallel_val.clone(),
             ));
-            println!("[HybridSealevel] 🚀 Initialized parallel transaction processor");
+            println!("[ParallelExecutor] 🚀 Initialized parallel transaction processor");
             Some(sealevel)
         } else {
             None
         };
         
-        // Initialize Tower BFT for adaptive timeouts
+        // Initialize Adaptive BFT for adaptive timeouts
         // CRITICAL: Balance between 1 block/sec target and network latency
         // PRODUCTION: Must account for broadcast time (800-900ms) + processing + consensus
-        let tower_bft_config = crate::tower_bft::TowerBftConfig {
+        let adaptive_bft_config = crate::adaptive_bft::AdaptiveBftConfig {
             base_timeout_ms: 3000,      // 3 seconds base (allows 800ms broadcast + 2s processing)
             timeout_multiplier: 1.5,    
             max_timeout_ms: 10000,      // 10 seconds max
             min_timeout_ms: 2000,       // 2 seconds minimum (was 1000)
             latency_window_size: 100,   
         };
-        let tower_bft = Arc::new(crate::tower_bft::TowerBft::new(tower_bft_config));
-        println!("[TowerBFT] 🚀 Initialized adaptive timeout manager");
+        let adaptive_bft = Arc::new(crate::adaptive_bft::AdaptiveBft::new(adaptive_bft_config));
+        println!("[AdaptiveBFT] 🚀 Initialized adaptive timeout manager");
         
         // Initialize Pre-execution manager
         let pre_execution_config = crate::pre_execution::PreExecutionConfig {
@@ -1863,8 +1863,8 @@ impl BlockchainNode {
             reward_manager,
             quantum_poh,  // Already Option - None for Light nodes, Some for Full/Super
             quantum_poh_receiver: poh_receiver,  // Already Option
-            hybrid_sealevel,
-            tower_bft,
+            parallel_executor,
+            adaptive_bft,
             pre_execution,
             block_event_tx,
         };
@@ -4039,8 +4039,8 @@ impl BlockchainNode {
         let perf_config = self.perf_config.clone();
         let rotation_tracker = self.rotation_tracker.clone();
         let quantum_poh_for_spawn = self.quantum_poh.clone();
-        let hybrid_sealevel_for_spawn = self.hybrid_sealevel.clone();
-        let tower_bft_for_spawn = self.tower_bft.clone();
+        let parallel_executor_for_spawn = self.parallel_executor.clone();
+        let adaptive_bft_for_spawn = self.adaptive_bft.clone();
         let pre_execution_for_spawn = self.pre_execution.clone();
         let block_event_tx_for_spawn = self.block_event_tx.clone();
         let reward_manager_for_spawn = self.reward_manager.clone();
@@ -4485,10 +4485,10 @@ impl BlockchainNode {
             let quantum_poh = quantum_poh_for_spawn.clone();
             
             // HYBRID SEALEVEL: Get reference for parallel processing
-            let hybrid_sealevel = hybrid_sealevel_for_spawn.clone();
+            let parallel_executor = parallel_executor_for_spawn.clone();
             
             // TOWER BFT: Get reference for adaptive timeouts
-            let tower_bft = tower_bft_for_spawn.clone();
+            let adaptive_bft = adaptive_bft_for_spawn.clone();
             
             // PRE-EXECUTION: Get reference for speculative execution
             let pre_execution = pre_execution_for_spawn.clone();
@@ -5333,7 +5333,7 @@ impl BlockchainNode {
                             let consensus_start = std::time::Instant::now();
                             
                             // ARCHITECTURE: Adaptive timeout based on network conditions
-                            // Uses same logic as Turbine fanout (unified_p2p.rs:5215-5243)
+                            // Uses same logic as ShredProtocol fanout (unified_p2p.rs:5215-5243)
                             let avg_latency = p2p.get_average_peer_latency();
                             let max_consensus_wait = match (qualified_producers, avg_latency) {
                                 // GENESIS PHASE (5-50 producers):
@@ -5948,15 +5948,15 @@ impl BlockchainNode {
                     }
                     
                     // HYBRID SEALEVEL: Process transactions in parallel if available
-                    if let Some(ref sealevel) = hybrid_sealevel {
+                    if let Some(ref sealevel) = parallel_executor {
                         if !txs.is_empty() {
                             match sealevel.process_transactions(txs.clone()).await {
                                 Ok(processed_txs) => {
-                                    println!("[HybridSealevel] ✅ Processed {} transactions in parallel", processed_txs.len());
+                                    println!("[ParallelExecutor] ✅ Processed {} transactions in parallel", processed_txs.len());
                                     txs = processed_txs;
                                 },
                                 Err(e) => {
-                                    println!("[HybridSealevel] ⚠️ Parallel processing failed: {}, using fallback", e);
+                                    println!("[ParallelExecutor] ⚠️ Parallel processing failed: {}, using fallback", e);
                                     // Continue with original transactions
                                 }
                             }
@@ -6013,8 +6013,8 @@ impl BlockchainNode {
                         0
                     };
                     
-                    // Update Tower BFT with current peer count
-                    tower_bft.update_peer_count(peer_count).await;
+                    // Update Adaptive BFT with current peer count
+                    adaptive_bft.update_peer_count(peer_count).await;
                     
                     // Log only every 10 blocks or when there are transactions
                     if next_block_height % 10 == 0 || !txs.is_empty() {
@@ -6489,18 +6489,18 @@ impl BlockchainNode {
                                                   (height_for_broadcast > 1 && (height_for_broadcast - 1) % 30 == 0) || // Rotation
                                                   (height_for_broadcast % 90 >= 61 && height_for_broadcast % 90 <= 90); // Consensus
                             
-                            // OPTIMIZATION v2.19.19: Use Turbine ALWAYS for non-critical blocks
-                            // Turbine provides Reed-Solomon redundancy and O(log n) complexity
-                            // Even for small networks, Turbine prepares architecture for scaling
+                            // OPTIMIZATION v2.19.19: Use ShredProtocol ALWAYS for non-critical blocks
+                            // ShredProtocol provides Reed-Solomon redundancy and O(log n) complexity
+                            // Even for small networks, ShredProtocol prepares architecture for scaling
                             let result = if is_critical_block {
                                 // CRITICAL: Direct broadcast for immediate delivery (<500ms)
                                 // Used for: emergency blocks, rotation boundaries, consensus phase
                                 println!("[P2P] ⚡ PRIORITY broadcast for critical block #{}", height_for_broadcast);
                                 p2p_clone.broadcast_block(height_for_broadcast, broadcast_data).await
                             } else {
-                                // Turbine protocol: O(log n) complexity with Reed-Solomon redundancy
+                                // ShredProtocol protocol: O(log n) complexity with Reed-Solomon redundancy
                                 // Works for ANY network size (5 nodes to millions)
-                                p2p_clone.broadcast_block_turbine(height_for_broadcast, broadcast_data).await
+                                p2p_clone.broadcast_block_shred_protocol(height_for_broadcast, broadcast_data).await
                             };
                             
                             let broadcast_time = broadcast_start.elapsed();
@@ -6904,8 +6904,8 @@ impl BlockchainNode {
                                 0
                             };
                             
-                            // Get timeout with exponential backoff from Tower BFT
-                            let actual_timeout = tower_bft.get_timeout(next_block_height, retry_count).await;
+                            // Get timeout with exponential backoff from Adaptive BFT
+                            let actual_timeout = adaptive_bft.get_timeout(next_block_height, retry_count).await;
                             
                             if failover_running && current_failover_height == expected_height_timeout {
                                 // Failover already in progress for this exact block - skip
@@ -13653,8 +13653,8 @@ impl Clone for BlockchainNode {
             reward_manager: self.reward_manager.clone(),
             quantum_poh: self.quantum_poh.clone(),
             quantum_poh_receiver: None, // Cannot clone receiver - use None for cloned instances
-            hybrid_sealevel: self.hybrid_sealevel.clone(),
-            tower_bft: self.tower_bft.clone(),
+            parallel_executor: self.parallel_executor.clone(),
+            adaptive_bft: self.adaptive_bft.clone(),
             pre_execution: self.pre_execution.clone(),
             block_event_tx: self.block_event_tx.clone(),
         }

@@ -985,7 +985,7 @@ GET /api/v1/poh/status
 
 ---
 
-### Turbine Metrics
+### Shred Protocol Metrics
 ```http
 GET /api/v1/turbine/metrics
 ```
@@ -1727,7 +1727,7 @@ GET /api/v1/snapshot/{height}
 ## 📝 Changelog
 
 ### v2.19.20 (November 2025)
-- **OPTIMIZATION**: Fire-and-forget Turbine broadcast (1 block/sec production guaranteed)
+- **OPTIMIZATION**: Fire-and-forget Shred Protocol broadcast (1 block/sec production guaranteed)
 - **OPTIMIZATION**: 30-second Genesis startup wait (prevents race conditions)
 - **OPTIMIZATION**: Emergency timeout increased to 10s (was 2s)
 - **RELIABILITY**: Pseudo-infinite retries for blocks (never discard critical data)
@@ -1737,7 +1737,7 @@ GET /api/v1/snapshot/{height}
 
 ### v2.19.19 (November 2025)
 - **OPTIMIZATION**: Heartbeat without Dilithium signature (CPU savings ~35ms per heartbeat)
-- **OPTIMIZATION**: Turbine block propagation for ALL network sizes
+- **OPTIMIZATION**: Shred Protocol block propagation for ALL network sizes
 - **OPTIMIZATION**: Kademlia K-neighbors for heartbeat routing (K=3)
 - **OPTIMIZATION**: Exponential backoff for failover (3s → 6s → 12s → 24s → 30s max)
 - **NEW**: `gossip_to_k_neighbors()` method for DHT-based message propagation
@@ -1781,7 +1781,7 @@ GET /api/v1/snapshot/{height}
 ### v2.19.3 (October 2025)
 - Added MEV bundle endpoints
 - Added PoH status endpoint
-- Added Turbine/Sealevel metrics
+- Added Shred Protocol/Sealevel metrics
 
 ### v2.19.0 (September 2025)
 - Initial API release

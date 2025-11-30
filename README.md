@@ -62,7 +62,7 @@ This project uses **dual licensing**:
 - **Docker Update**: Add `-p 10876:10876/udp` to run commands
 
 ### 🛡️ **Previous Updates (v2.19.20 - November 30, 2025)**
-- **Fire-and-Forget Broadcast**: Turbine block propagation no longer blocks production (1 block/sec guaranteed)
+- **Fire-and-Forget Broadcast**: Shred Protocol block propagation no longer blocks production (1 block/sec guaranteed)
 - **Genesis Startup Wait**: 30-second network stabilization before block production (prevents race conditions)
 - **Emergency Timeout 10s**: Increased from 2s to allow original producer delivery
 - **Pseudo-Infinite Retries**: Blocks are NEVER discarded (like Solana/Ethereum)
@@ -72,7 +72,7 @@ This project uses **dual licensing**:
 
 ### 🛡️ **Previous Updates (v2.19.19 - November 29, 2025)**
 - **Heartbeat without Dilithium**: CPU optimization (~35ms savings per heartbeat, NIST FIPS 204 compliant)
-- **Turbine ALWAYS**: Block propagation uses Turbine for ALL network sizes (not just >10 peers)
+- **Shred Protocol ALWAYS**: Block propagation uses Shred Protocol for ALL network sizes (not just >10 peers)
 - **Kademlia K-neighbors**: Heartbeats use DHT distance for efficient routing (K=3)
 - **Exponential backoff failover**: 3s → 6s → 12s → 24s → 30s max (reduces CPU under stall)
 - **Priority channels**: Blocks/Consensus use separate channels (implicit priority queue)
@@ -126,7 +126,7 @@ This project uses **dual licensing**:
   - Binary+JSON support: flexible storage for different TX types
   - Integrated into block production: automatic priority selection
   - Minimum gas price: 100,000 nano QNC (0.0001 QNC base fee)
-- **Adaptive Turbine Fanout**: Dynamic block propagation scaling (NEW!)
+- **Adaptive Shred Protocol Fanout**: Dynamic block propagation scaling (NEW!)
   - Network-aware: 4-32 fanout based on producer count and latency
   - LAN optimization: higher fanout (16-32) for low latency networks
   - WAN optimization: moderate fanout (8-16) for high latency
@@ -134,7 +134,7 @@ This project uses **dual licensing**:
   - Real-time calculation: adjusts every block based on network state
 - **Real-time Prometheus Metrics**: Live performance monitoring (NEW!)
   - Dynamic mempool size, block height, connected peers
-  - Live Turbine fanout, qualified producers, average latency
+  - Live Shred Protocol fanout, qualified producers, average latency
   - MEV metrics: bundle count, allocation percentage
   - No hardcoded values: all metrics reflect real network state
 - **Split Reputation System**: Byzantine-safe separation of behavior metrics (NEW!)
@@ -170,7 +170,7 @@ This project uses **dual licensing**:
   - Fallback: None (QUIC is mandatory for v2.19.22+)
 - **Gossip Reputation Sync**: Exponential O(log n) propagation for millions of nodes
   - Migrated from O(n) broadcast to O(log n) gossip protocol (99.999% bandwidth savings)
-  - Adaptive fanout (4-32): Same as Turbine block propagation
+  - Adaptive fanout (4-32): Same as Shred Protocol block propagation
   - Kademlia-based peer selection: XOR distance for peer diversity
   - Re-gossip mechanism: Each recipient forwards to fanout peers (exponential growth)
   - Byzantine-safe weighted average: 70% local + 30% remote (convergence)
@@ -232,7 +232,7 @@ This project uses **dual licensing**:
   - Optimized for 4.29B QNC supply with conservative thresholds
   - Zero storage overhead (calculated on-the-fly)
   - Backward compatible (optional fields)
-- **PoH Synchronization**: Synchronized Proof of History for deterministic producer selection
+- **PoH Synchronization**: Synchronized Verifiable Time Sequence for deterministic producer selection
   - PoH state from last confirmed block (all nodes agree)
   - Local PoH generator syncs with received blocks
   - Prevents consensus failures from diverging PoH states
@@ -248,8 +248,8 @@ This project uses **dual licensing**:
 - **Reputation-Based Chain Weight**: Byzantine weight calculation using validator reputation scores
 
 ### **Previous Updates (v2.16.0)**
-- **Turbine Block Propagation**: 85% bandwidth reduction with Reed-Solomon erasure coding
-- **Quantum Proof of History (PoH)**: 500K hashes/sec with hybrid SHA3-512/Blake3 (25%/75%)
+- **Shred Protocol Block Propagation**: 85% bandwidth reduction with Reed-Solomon erasure coding
+- **Quantum Verifiable Time Sequence (PoH)**: 500K hashes/sec with hybrid SHA3-512/Blake3 (25%/75%)
   - Production config: 5,000 hashes per tick × 100 ticks/sec = 500K hashes/sec
   - 100 ticks per second (10ms intervals) for smooth entropy generation
   - 5,000 hashes per tick (optimized for 1-second microblocks)
@@ -260,8 +260,8 @@ This project uses **dual licensing**:
   - 72 bytes overhead per block (poh_hash: 64B + poh_count: 8B) = ~2-3%
   - Hardware: Intel Xeon E5-2680v4 @ 2.4GHz
 - **Quantum-Resistant Producer Selection**: Deterministic selection with finality window, Dilithium + Ed25519 hybrid cryptography for Byzantine-safe leader election
-- **Hybrid Sealevel Execution**: 5-stage pipeline with 10,000 parallel transactions
-- **Tower BFT Adaptive Timeouts**: Dynamic 7s base to 20s max (1.5x multiplier) based on network conditions
+- **Hybrid Parallel Executor Execution**: 5-stage pipeline with 10,000 parallel transactions
+- **Adaptive BFT Adaptive Timeouts**: Dynamic 7s base to 20s max (1.5x multiplier) based on network conditions
 - **Pre-Execution Cache**: Speculative execution with 10,000 transaction cache
 - **Comprehensive Benchmark Harness**: Full performance testing suite for all components
 - **57 API Endpoints**: Complete monitoring and control interface for all features
@@ -354,10 +354,10 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 - **📊 Priority Mempool**: Gas-price-based ordering for spam resistance
 
 #### **Advanced Performance Features**
-- **🌪️ Turbine Protocol**: 85% bandwidth savings with adaptive fanout (4-32) based on network topology
+- **🌪️ Shred Protocol Protocol**: 85% bandwidth savings with adaptive fanout (4-32) based on network topology
 - **⏱️ Quantum PoH**: 500K hashes/sec cryptographic clock for precise timing
-- **⚙️ Hybrid Sealevel**: 10,000 parallel transactions with 5-stage pipeline
-- **🎯 Tower BFT**: Adaptive timeouts (7s base to 20s max, 1.5x multiplier) for optimal consensus
+- **⚙️ Hybrid Parallel Executor**: 10,000 parallel transactions with 5-stage pipeline
+- **🎯 Adaptive BFT**: Adaptive timeouts (7s base to 20s max, 1.5x multiplier) for optimal consensus
 - **🚀 Pre-Execution**: Speculative transaction processing with 10,000 cache size
 - **🔒 MEV Protection**: Private bundle submission with post-quantum signatures
 
@@ -397,7 +397,7 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 **Security Trade-offs:**
 - ✅ **AES-256-GCM**: Grover-resistant (2^128 operations = 10^38 years attack time)
 - ✅ **Nonce Management**: CSPRNG with 2^96 space, 10^-10% collision probability
-- ⚠️ **Architecture Inspiration**: Turbine propagation concept inspired by Solana (original implementation)
+- ⚠️ **Architecture Inspiration**: Shred Protocol propagation concept inspired by Solana (original implementation)
 - ✅ **Sybil Resistance**: Multi-layer (1DEV burn + QNC pool, reputation, time barrier, 67%+ coordination cost)
 
 ### 💾 Ultra-Modern Storage Architecture
@@ -492,19 +492,19 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 │      └── Deadlock prevention with guard pattern            │
 ├─────────────────────────────────────────────────────────────┤
 │  Performance Optimization Layer                   │
-│  ├── Turbine Block Propagation                             │
+│  ├── Shred Protocol Block Propagation                             │
 │  │   ├── 1KB chunks with Reed-Solomon erasure coding       │
 │  │   ├── Adaptive fanout (4-32) based on network size & latency │
 │  │   └── 85% bandwidth reduction                           │
-│  ├── Quantum Proof of History (QPoH)                       │
+│  ├── Quantum Verifiable Time Sequence (QPoH)                       │
 │  │   ├── 500K hashes/sec cryptographic clock               │
 │  │   ├── SHA3-512 + Blake3 hybrid (25%/75%)                │
 │  │   └── Verifiable delay function                         │
-│  ├── Hybrid Sealevel Execution                             │
+│  ├── Hybrid Parallel Executor Execution                             │
 │  │   ├── 5-stage pipeline processing                       │
 │  │   ├── 10,000 parallel transactions                      │
 │  │   └── Dependency graph analysis                         │
-│  ├── Tower BFT Adaptive Timeouts                           │
+│  ├── Adaptive BFT Adaptive Timeouts                           │
 │  │   ├── Dynamic 20s/10s/7s timeouts                       │
 │  │   └── Network condition awareness                       │
 │  └── Pre-Execution Cache                                   │
@@ -557,7 +557,7 @@ QNet implements advanced chain reorganization and synchronization mechanisms for
 - **Genesis Coordination**: Only node_001 creates Genesis block in bootstrap mode
 - **Quantum-Resistant Genesis**: CRYSTALS-Dilithium signature ensures identical Genesis across all nodes
 
-### **Proof of History (PoH) Integration**
+### **Verifiable Time Sequence (PoH) Integration**
 - **Cryptographic Clock**: 500K hashes/sec SHA3-512 + Blake3 hybrid (25%/75%)
 - **Verifiable Delay Function**: Time-stamped block ordering without central authority
 - **Block Time Synchronization**: Sub-second precision across distributed network

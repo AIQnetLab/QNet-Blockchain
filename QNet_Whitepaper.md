@@ -34,7 +34,7 @@ Experimental achievements:
 - ✅ **Mobile-first**: Optimized for smartphones
 - ✅ **Reputation system**: Without staking, only behavioral assessment
 - ✅ **Experimental architecture**: Innovative approach to consensus
-- ✅ **Advanced optimizations**: Turbine, Quantum PoH, Finality Window Selection, Hybrid Sealevel, Tower BFT, Pre-execution
+- ✅ **Advanced optimizations**: Shred Protocol, Quantum PoH, Finality Window Selection, Hybrid Parallel Executor, Adaptive BFT, Pre-execution
 - ✅ **Chain Reorganization**: Byzantine-safe fork resolution with 2/3 majority consensus
 - ✅ **Advanced Synchronization**: Out-of-order block buffering with active missing block requests
 - ✅ **Zero-Downtime Architecture**: Microblocks continue during macroblock consensus
@@ -94,7 +94,7 @@ QNet presents an experimental blockchain platform with unique characteristics:
 │       Wallet, DApps, Mobile Apps, APIs              │
 ├─────────────────────────────────────────────────────┤
 │            Performance Layer                        │
-│  Turbine, Quantum PoH, Sealevel, Tower BFT, Cache  │
+│  Shred Protocol, Quantum PoH, Parallel Executor, Adaptive BFT, Cache  │
 ├─────────────────────────────────────────────────────┤
 │              Network Layer                          │
 │  QUIC Transport, P2P, Sharding, Regional Clustering │
@@ -335,10 +335,10 @@ Genesis Block Signature:
 - **Fast Verification**: SHA3-256 hash comparison
 - **Scalability Ready**: Production nodes only sync, never create
 
-### 3.4 Proof of History (PoH) Integration
+### 3.4 Verifiable Time Sequence (PoH) Integration
 
 #### **Cryptographic Clock**
-QNet integrates Proof of History for verifiable time ordering:
+QNet integrates Verifiable Time Sequence for verifiable time ordering:
 
 ```
 PoH Chain: H₀ → H₁ → H₂ → ... → Hₙ
@@ -680,7 +680,7 @@ loop {
 
 ### 5.2 Architectural Optimizations
 
-**1. Hybrid Sealevel parallel execution:**
+**1. Hybrid Parallel Executor parallel execution:**
 ```rust
 // Process up to 10,000 transactions in parallel
 max_parallel = 10_000;
@@ -688,12 +688,12 @@ dependency_graph = analyze_dependencies(transactions);
 parallel_execute(non_conflicting_transactions);
 ```
 
-**2. Turbine block propagation:**
+**2. Shred Protocol block propagation:**
 - **Chunked transmission**: 1KB chunks with Reed-Solomon encoding
 - **Fanout-4 protocol**: Exponential propagation across network (optimized for Genesis)
 - **85% bandwidth reduction**: Compared to full broadcast
 
-**3. Quantum Proof of History:**
+**3. Quantum Verifiable Time Sequence:**
 - **500K hashes/sec**: Hybrid SHA3-512/Blake3 (25%/75%) for time synchronization
 - **10ms tick duration**: Precise event ordering (100 ticks/sec)
 - **Sequential ordering chain**: SHA3-512 bottleneck limits parallelization (NOT formal VDF)
@@ -705,7 +705,7 @@ parallel_execute(non_conflicting_transactions);
 - **70-90% cache hit rate**: Significant latency reduction
 - **No throughput limit**: Cache optimization, not execution bottleneck
 
-**5. Tower BFT adaptive timeouts:**
+**5. Adaptive BFT adaptive timeouts:**
 - **Dynamic timeouts**: 20s/10s/7s based on network conditions
 - **Exponential backoff**: 1.5x multiplier for retries
 - **Failover protection**: Prevents false positives
@@ -920,7 +920,7 @@ GOSSIP ARCHITECTURE:
 ├── Complexity: O(log n) vs O(n) broadcast (99.999% bandwidth savings)
 ├── Interval: Every 5 minutes (periodic sync)
 ├── Transport: HTTP POST (reliable, NAT-friendly)
-├── Fanout: Adaptive 4-32 (same as Turbine block propagation)
+├── Fanout: Adaptive 4-32 (same as Shred Protocol block propagation)
 ├── Signature: SHA3-256 (quantum-safe verification)
 └── Scope: Super + Full nodes only (Light nodes excluded)
 
@@ -932,14 +932,14 @@ EXPONENTIAL PROPAGATION (v2.19.19):
 └── Convergence: Weighted average (70% local + 30% remote)
 
 OPTIMIZATIONS (v2.19.20):
-├── Fire-and-Forget Broadcast: Turbine doesn't block production (1 block/sec guaranteed)
+├── Fire-and-Forget Broadcast: Shred Protocol doesn't block production (1 block/sec guaranteed)
 ├── Genesis Startup Wait: 30-second network stabilization before production
 ├── Emergency Timeout 10s: Allows original producer delivery (was 2s)
 ├── Pseudo-Infinite Retries: Blocks NEVER discarded (like Solana/Ethereum)
 ├── Exponential Backoff: 10s (0-9) → 30s → 60s → 120s → 240s → 300s max
 ├── Adaptive Buffer: Full/Super 500 blocks (~50MB), Light 100 blocks (~10MB)
 ├── Kademlia K-neighbors: Heartbeats use DHT distance for efficient routing
-├── Turbine ALWAYS: Block propagation uses Turbine for ALL network sizes
+├── Shred Protocol ALWAYS: Block propagation uses Shred Protocol for ALL network sizes
 ├── Heartbeat without Dilithium: CPU optimization (~35ms savings per heartbeat)
 └── Priority channels: Blocks/Consensus use separate channels (implicit priority)
 
@@ -1786,7 +1786,7 @@ pub struct QNetSignature {
 
 QNet implements cutting-edge performance optimization techniques to achieve maximum throughput and minimal latency:
 
-#### 8.4.1 Turbine Block Propagation Protocol
+#### 8.4.1 Shred Protocol Block Propagation Protocol
 
 **Efficient block distribution mechanism:**
 
@@ -1803,7 +1803,7 @@ Block → Chunks (1KB each) → Reed-Solomon Encoding → Fanout Distribution
 
 **Technical implementation:**
 ```rust
-pub struct TurbineChunk {
+pub struct Shred ProtocolChunk {
     block_hash: [u8; 32],
     chunk_index: u32,
     total_chunks: u32,
@@ -1817,11 +1817,11 @@ pub struct TurbineChunk {
 - Propagation time: O(log₃(N)) where N = network size
 - Packet loss tolerance: Up to 33% with full recovery
 
-#### 8.4.2 Quantum Proof of History (QPoH)
+#### 8.4.2 Quantum Verifiable Time Sequence (QPoH)
 
 **Cryptographic clock for precise time synchronization:**
 
-QNet's Quantum Proof of History provides a verifiable, sequential record of events using cryptographic hashing:
+QNet's Quantum Verifiable Time Sequence provides a verifiable, sequential record of events using cryptographic hashing:
 
 **Algorithm:**
 ```rust
@@ -2044,11 +2044,11 @@ async fn select_producer_with_finality_window(
 }
 ```
 
-#### 8.4.4 Hybrid Sealevel Execution Engine
+#### 8.4.4 Hybrid Parallel Executor Execution Engine
 
 **Parallel transaction processing with 5-stage pipeline:**
 
-QNet's Hybrid Sealevel engine enables massive parallelization of transaction execution:
+QNet's Hybrid Parallel Executor engine enables massive parallelization of transaction execution:
 
 **Pipeline stages:**
 1. **Validation Stage**: Transaction format and signature verification
@@ -2075,11 +2075,11 @@ Parallel execution:   424,411 TPS (424x speedup)
 - Smart contract deployment
 - Smart contract calls
 
-#### 8.4.4 Tower BFT Adaptive Timeouts
+#### 8.4.4 Adaptive BFT Adaptive Timeouts
 
 **Dynamic consensus timeouts based on network conditions:**
 
-Tower BFT implements adaptive timeout mechanisms to optimize consensus under varying network conditions:
+Adaptive BFT implements adaptive timeout mechanisms to optimize consensus under varying network conditions:
 
 **Timeout schedule:**
 - **Block #1**: 20 seconds (network bootstrap phase)
@@ -2446,10 +2446,10 @@ ws://node:8001/ws/transactions // Subscribe to transactions
 - ✅ API v1 stabilized
 
 **Q4 2025:**
-- ✅ Turbine block propagation implemented
-- ✅ Quantum Proof of History deployed
-- ✅ Hybrid Sealevel execution engine
-- ✅ Tower BFT adaptive timeouts
+- ✅ Shred Protocol block propagation implemented
+- ✅ Quantum Verifiable Time Sequence deployed
+- ✅ Hybrid Parallel Executor execution engine
+- ✅ Adaptive BFT adaptive timeouts
 - ✅ Pre-execution cache system
 - ✅ 56 API endpoints operational
 
@@ -2648,7 +2648,7 @@ ws://node:8001/ws/transactions // Subscribe to transactions
 - **UDP** for peer discovery messages
 - **HTTP/2** for API endpoints  
 - **WebSocket** for real-time subscription
-- **Turbine** for chunked block propagation
+- **Shred Protocol** for chunked block propagation
 
 **Application Layer:**
 ```rust
@@ -2658,17 +2658,17 @@ QNetProtocol = {
     compression: "Zstd",
     encryption: "TLS 1.3",
     authentication: "CRYSTALS-Dilithium",
-    block_propagation: "Turbine",
+    block_propagation: "Shred Protocol",
     time_sync: "Quantum PoH"
 }
 ```
 
 **Performance Optimizations:**
-- **Turbine Protocol**: Chunked block propagation with Reed-Solomon encoding
+- **Shred Protocol Protocol**: Chunked block propagation with Reed-Solomon encoding
 - **Quantum PoH**: 500K hashes/sec SHA3-512/Blake3 sequential ordering (NOT formal VDF)
 - **Finality Window Selection**: Deterministic SHA3-512 producer selection with 10-block finality for race-free, Byzantine-safe leader election (biasable by 67%+ coalition)
-- **Hybrid Sealevel**: 10,000 parallel transaction execution
-- **Tower BFT**: Adaptive consensus timeouts (7s base, up to 20s max, 1.5x multiplier)
+- **Hybrid Parallel Executor**: 10,000 parallel transaction execution
+- **Adaptive BFT**: Adaptive consensus timeouts (7s base, up to 20s max, 1.5x multiplier)
 - **Comprehensive Benchmarks**: Full performance testing harness for all components
 - **Pre-Execution**: Speculative transaction cache (10,000 TX)
 

@@ -1,4 +1,4 @@
-// Hybrid Sealevel implementation for QNet
+// QNet Parallel Execution Engine
 // Integrates with existing ParallelValidator and ShardCoordinator
 
 use std::sync::Arc;
@@ -35,8 +35,8 @@ pub struct ExecutionContext {
     pub dependencies: Vec<usize>,
 }
 
-/// Hybrid Sealevel processor
-pub struct HybridSealevel {
+/// QNet Parallel Execution Engine
+pub struct ParallelExecutor {
     /// Existing shard coordinator
     shard_coordinator: Arc<ShardCoordinator>,
     /// Existing parallel validator  
@@ -64,8 +64,8 @@ pub struct ExecutionMetrics {
     pub average_tps: f64,
 }
 
-impl HybridSealevel {
-    /// Create new Hybrid Sealevel processor
+impl ParallelExecutor {
+    /// Create new Parallel Execution Engine
     pub fn new(
         shard_coordinator: Arc<ShardCoordinator>,
         parallel_validator: Arc<ParallelValidator>,
@@ -106,7 +106,7 @@ impl HybridSealevel {
         }
     }
     
-    /// Process transactions using Hybrid Sealevel approach
+    /// Process transactions using parallel execution approach
     pub async fn process_transactions(
         &self,
         transactions: Vec<Transaction>,
@@ -176,7 +176,7 @@ impl HybridSealevel {
         let mut metrics = self.metrics.write().await;
         metrics.average_tps = tps;
         
-        println!("[HybridSealevel] ✅ Processed {} transactions in {:.2}s ({:.0} TPS)",
+        println!("[ParallelExecutor] ✅ Processed {} transactions in {:.2}s ({:.0} TPS)",
                 executed_transactions.len(), elapsed.as_secs_f64(), tps);
         
         Ok(executed_transactions)
@@ -370,4 +370,7 @@ impl HybridSealevel {
         Ok(processed)
     }
 }
+
+// Backward compatibility aliases
+pub type HybridSealevel = ParallelExecutor;
 

@@ -60,7 +60,7 @@ pub struct MicroBlock {
     pub merkle_root: Vec<u8>,     // Transaction Merkle tree root
     pub producer: String,         // Producer node ID
     pub signature: Vec<u8>,       // COMPACT hybrid signature (3KB)
-    pub poh_hash: Vec<u8>,        // Proof of History hash (64 bytes)
+    pub poh_hash: Vec<u8>,        // Verifiable Time Sequence hash (64 bytes)
     pub poh_count: u64,           // PoH counter for VDF
     // ... transactions and other fields
 }
@@ -638,7 +638,7 @@ pub fn get_sync_peers_filtered(&self, max_peers: usize) -> Vec<PeerInfo> {
 **Interval**: Every 5 minutes  
 **Signature**: SHA3-256 (quantum-safe)  
 **Scope**: Super + Full nodes only (Light nodes excluded)  
-**Fanout**: Adaptive 4-32 (same as Turbine)
+**Fanout**: Adaptive 4-32 (same as Shred Protocol)
 
 ```rust
 // Reputation sync via QUIC gossip
@@ -658,7 +658,7 @@ NetworkMessage::ReputationSync {
 
 **v2.19.19 Optimizations**:
 - **Kademlia K-neighbors**: Heartbeats use DHT distance for efficient routing
-- **Turbine ALWAYS**: Block propagation uses Turbine for ALL network sizes
+- **Shred Protocol ALWAYS**: Block propagation uses Shred Protocol for ALL network sizes
 - **Heartbeat without Dilithium**: CPU optimization (~35ms savings per heartbeat)
 - **Exponential backoff failover**: 3s → 6s → 12s → 24s → 30s max
 
@@ -1360,7 +1360,7 @@ DELETE /api/v1/bundle/{bundle_id}
 │  3. CRYSTALS-Dilithium signature verification ✅        │
 │  4. Ed25519 format validation ✅                        │
 │  5. Chain continuity checks                             │
-│  6. Proof of History verification                       │
+│  6. Verifiable Time Sequence verification                       │
 │  → ONLY VERIFIED BLOCKS PROCEED TO CONSENSUS            │
 └─────────────────────────────────────────────────────────┘
                          ↓
@@ -1371,7 +1371,7 @@ DELETE /api/v1/bundle/{bundle_id}
 │  1. Structural re-validation (format, sizes)            │
 │  2. Byzantine consensus (2/3+ honest nodes required)    │
 │  3. Commit-Reveal protocol                              │
-│  4. Proof of History entropy                            │
+│  4. Verifiable Time Sequence entropy                            │
 │  → MALICIOUS BLOCKS CANNOT REACH CONSENSUS THRESHOLD    │
 └─────────────────────────────────────────────────────────┘
 ```
@@ -1883,7 +1883,7 @@ Example: 9876 (P2P) → 10876 (QUIC)
 **Messages via QUIC:**
 - Block broadcast (micro/macro)
 - Genesis block distribution
-- Turbine chunks
+- Shred Protocol chunks
 - Certificate announcements
 - Consensus commit/reveal
 
@@ -1907,7 +1907,7 @@ Example: 9876 (P2P) → 10876 (QUIC)
 
 **Certificate Broadcasting Enhancements:**
 - Added tracked broadcast with Byzantine 2/3+ threshold for critical certificate rotations
-- Implemented adaptive timeout (3s/5s/10s) based on network size to avoid Tower BFT conflicts
+- Implemented adaptive timeout (3s/5s/10s) based on network size to avoid Adaptive BFT conflicts
 - Added anti-duplication protection via serial number change detection
 - Updated periodic broadcast to adaptive intervals (10s/30s/120s based on node uptime)
 - Reduced certificate lifetime from 1 hour to 4.5 minutes (optimal quantum protection)
