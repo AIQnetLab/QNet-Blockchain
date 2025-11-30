@@ -44,7 +44,24 @@ This project uses **dual licensing**:
 - **Phase 2 (Future)**: ONLY QNC token activation on QNet blockchain
 - **Transition**: 90% 1DEV burned OR 5 years from genesis block (whichever comes first)
 
-### 🛡️ **LATEST UPDATES (v2.19.20 - November 30, 2025)**
+### 🛡️ **LATEST UPDATES (v2.19.22 - November 30, 2025)**
+
+**🔐 NIST/Cisco Compliant Hybrid Cryptography:**
+- **Ephemeral Keys**: NEW Ed25519 keypair for EACH message (forward secrecy)
+- **Dual Dilithium Signatures**: Signs ephemeral key binding + message hash
+- **Quantum Protection**: Ed25519 broken? Dilithium still protects!
+- **Compliance**: NIST SP 800-208, Cisco Post-Quantum recommendations
+
+**🚀 QUIC Transport Layer:**
+- TLS 1.3 encryption (NIST SP 800-52 compliant)
+- Connection multiplexing: 100+ streams per connection
+- 0-RTT handshake for repeat connections
+- Binary protocol (bincode): ~50% bandwidth reduction vs JSON
+- **HTTP Fallback Removed**: Pure QUIC for Full/Super node P2P
+- **Port Requirement**: UDP 10876 must be open (`sudo ufw allow 10876/udp`)
+- **Docker Update**: Add `-p 10876:10876/udp` to run commands
+
+### 🛡️ **Previous Updates (v2.19.20 - November 30, 2025)**
 - **Fire-and-Forget Broadcast**: Turbine block propagation no longer blocks production (1 block/sec guaranteed)
 - **Genesis Startup Wait**: 30-second network stabilization before block production (prevents race conditions)
 - **Emergency Timeout 10s**: Increased from 2s to allow original producer delivery
@@ -143,14 +160,22 @@ This project uses **dual licensing**:
   - Blacklist filtering: Offline/malicious peers skipped
   - Reputation-based ordering: consensus_score + network_score (latency)
   - Top-20 peer sampling: Avoids stuck sync on single unavailable peer
-- **HTTP Gossip Reputation Sync**: Exponential O(log n) propagation for millions of nodes
+- **QUIC P2P Transport (v2.19.22)**: High-performance UDP-based transport for all P2P communication
+  - Full QUIC protocol with TLS 1.3 encryption (NIST SP 800-52 compliant)
+  - Connection multiplexing: 100+ streams per connection
+  - 0-RTT handshake for repeat connections (ultra-low latency)
+  - Connection pooling with automatic reconnection
+  - Binary protocol (bincode): ~50% bandwidth reduction vs JSON
+  - UDP port 10876 (P2P port + 1000)
+  - Fallback: None (QUIC is mandatory for v2.19.22+)
+- **Gossip Reputation Sync**: Exponential O(log n) propagation for millions of nodes
   - Migrated from O(n) broadcast to O(log n) gossip protocol (99.999% bandwidth savings)
   - Adaptive fanout (4-32): Same as Turbine block propagation
   - Kademlia-based peer selection: XOR distance for peer diversity
   - Re-gossip mechanism: Each recipient forwards to fanout peers (exponential growth)
   - Byzantine-safe weighted average: 70% local + 30% remote (convergence)
   - Prevents fork risk: All nodes converge to same reputation view
-  - Example: 1M nodes = ~20 hops vs 1M HTTP requests (broadcast)
+  - Example: 1M nodes = ~20 hops vs 1M requests (broadcast)
 - **Hybrid Merkle + Sampling**: Scalable on-chain ping commitments
   - 360× on-chain size reduction (100 MB vs 36 GB)
   - Merkle root commitment to ALL pings (blake3 hashing)
@@ -488,12 +513,13 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 │      └── 3-block lookahead                                 │
 ├─────────────────────────────────────────────────────────────┤
 │  Network Layer (Optimized for 10M+ nodes)                  │
+│  ├── QUIC Transport (UDP 10876) - TLS 1.3 encrypted        │
 │  ├── Kademlia DHT with K-bucket management                 │
 │  ├── Lock-Free DashMap for O(1) operations                 │
 │  ├── Dual Indexing (by address & ID)                       │
 │  ├── 256 Shards with Cross-Shard Routing                   │
 │  ├── Auto-Scaling (5→100→10K→1M+ nodes)                    │
-│  ├── Gossip Protocol                                       │
+│  ├── Gossip Protocol (QUIC-based)                          │
 │  ├── Regional Node Clustering                              │
 │  └── Emergency Producer Change Broadcasting                │
 ├─────────────────────────────────────────────────────────────┤
@@ -832,9 +858,21 @@ git pull origin testnet
 # Build production Docker image
 docker build -f development/qnet-integration/Dockerfile.production -t qnet-production .
 
+# REQUIRED: Configure firewall BEFORE running node
+# For UFW (Ubuntu/Debian):
+sudo ufw allow 9876,9877,8001/tcp
+sudo ufw allow 10876/udp
+sudo ufw reload
+
+# For iptables:
+sudo iptables -A INPUT -p tcp --dport 9876 -j ACCEPT
+sudo iptables -A INPUT -p tcp --dport 9877 -j ACCEPT
+sudo iptables -A INPUT -p tcp --dport 8001 -j ACCEPT
+sudo iptables -A INPUT -p udp --dport 10876 -j ACCEPT
+
 # Run interactive production node (ONLY command needed)
 docker run -it --name qnet-node --restart=always \
-  -p 9876:9876 -p 9877:9877 -p 8001:8001 \
+  -p 9876:9876 -p 9877:9877 -p 8001:8001 -p 10876:10876/udp \
   -v $(pwd)/node_data:/app/node_data \
   qnet-production
 
@@ -887,7 +925,7 @@ docker build -f development/qnet-integration/Dockerfile.production -t qnet-produ
 
 # Run interactive production node
 docker run -it --name qnet-node --restart=always \
-  -p 9876:9876 -p 9877:9877 -p 8001:8001 \
+  -p 9876:9876 -p 9877:9877 -p 8001:8001 -p 10876:10876/udp \
   -v $(pwd)/node_data:/app/node_data \
   qnet-production
 ```
@@ -1153,7 +1191,7 @@ docker build -f development/qnet-integration/Dockerfile.production -t qnet-produ
 
 # Run updated container
 docker run -it --name qnet-node --restart=always \
-  -p 9876:9876 -p 9877:9877 -p 8001:8001 \
+  -p 9876:9876 -p 9877:9877 -p 8001:8001 -p 10876:10876/udp \
   -v $(pwd)/node_data:/app/node_data \
   qnet-production
 ```
@@ -1186,7 +1224,7 @@ docker run -it --name qnet-node --restart=always \
 docker run -it --name qnet-node --restart=always \
   -e QNET_PRODUCTION=1 \
   -e QNET_BOOTSTRAP_ID=YOUR_ID \
-  -p 9876:9876 -p 9877:9877 -p 8001:8001 \
+  -p 9876:9876 -p 9877:9877 -p 8001:8001 -p 10876:10876/udp \
   -v $(pwd)/node_data:/app/node_data \
   qnet-production
 
@@ -1296,7 +1334,7 @@ docker run -d --name qnet-genesis-001 --restart=always \
   -e DOCKER_ENV=1 \
   -e QNET_AGGRESSIVE_PRUNING=0 \
   -e QNET_MAX_STORAGE_GB=2000 \
-  -p 9876:9876 -p 9877:9877 -p 8001:8001 \
+  -p 9876:9876 -p 9877:9877 -p 8001:8001 -p 10876:10876/udp \
   -v $(pwd)/genesis_001_data:/app/data \
   qnet-production
 
@@ -1307,7 +1345,7 @@ docker run -d --name qnet-genesis-002 --restart=always \
   -e DOCKER_ENV=1 \
   -e QNET_AGGRESSIVE_PRUNING=0 \
   -e QNET_MAX_STORAGE_GB=2000 \
-  -p 9876:9876 -p 9877:9877 -p 8001:8001 \
+  -p 9876:9876 -p 9877:9877 -p 8001:8001 -p 10876:10876/udp \
   -v $(pwd)/genesis_002_data:/app/data \
   qnet-production
 
@@ -1318,7 +1356,7 @@ docker run -d --name qnet-genesis-003 --restart=always \
   -e DOCKER_ENV=1 \
   -e QNET_AGGRESSIVE_PRUNING=0 \
   -e QNET_MAX_STORAGE_GB=2000 \
-  -p 9876:9876 -p 9877:9877 -p 8001:8001 \
+  -p 9876:9876 -p 9877:9877 -p 8001:8001 -p 10876:10876/udp \
   -v $(pwd)/genesis_003_data:/app/data \
   qnet-production
 
@@ -1329,7 +1367,7 @@ docker run -d --name qnet-genesis-004 --restart=always \
   -e DOCKER_ENV=1 \
   -e QNET_AGGRESSIVE_PRUNING=0 \
   -e QNET_MAX_STORAGE_GB=2000 \
-  -p 9876:9876 -p 9877:9877 -p 8001:8001 \
+  -p 9876:9876 -p 9877:9877 -p 8001:8001 -p 10876:10876/udp \
   -v $(pwd)/genesis_004_data:/app/data \
   qnet-production
 
@@ -1340,7 +1378,7 @@ docker run -d --name qnet-genesis-005 --restart=always \
   -e DOCKER_ENV=1 \
   -e QNET_AGGRESSIVE_PRUNING=0 \
   -e QNET_MAX_STORAGE_GB=2000 \
-  -p 9876:9876 -p 9877:9877 -p 8001:8001 \
+  -p 9876:9876 -p 9877:9877 -p 8001:8001 -p 10876:10876/udp \
   -v $(pwd)/genesis_005_data:/app/data \
   qnet-production
 ```
@@ -1737,6 +1775,15 @@ docker run ... -e QNET_MAX_THREADS=8 ...
 ```
 
 ### 🔐 Quantum-Resistant P2P Network (UPDATED - December 2025)
+
+#### QUIC Transport Layer (v2.19.22)
+- **Full QUIC Protocol**: UDP-based transport with TLS 1.3 encryption
+- **Port**: UDP 10876 (P2P port + 1000)
+- **Connection Multiplexing**: 100+ streams per connection
+- **0-RTT Handshake**: Ultra-low latency for repeat connections
+- **Binary Protocol**: bincode serialization (~50% bandwidth reduction)
+- **Connection Pooling**: Automatic reconnection with idle cleanup
+- **NIST Compliant**: TLS 1.3 per SP 800-52 guidelines
 
 #### Advanced Scalability Features:
 - **Lock-Free Operations**: DashMap for concurrent access without blocking (10M+ nodes)

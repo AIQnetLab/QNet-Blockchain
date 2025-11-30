@@ -25,6 +25,8 @@ pub mod genesis_constants;
 pub mod reward_sharding;
 pub mod p2p_extensions;
 pub mod contract_vm;
+pub mod quic_transport;    // PRODUCTION v2.19.21: QUIC transport layer
+pub mod p2p_transport;     // PRODUCTION v2.19.21: P2P transport abstraction + binary protocol
 
 // ============================================================================
 // CRYPTOGRAPHY MODULE (isolated for external audit)

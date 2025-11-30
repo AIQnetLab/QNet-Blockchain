@@ -59,21 +59,31 @@ Block 270+: PFP Level 4 (critical)
 
 ## 🔐 Security
 
-### Cryptography Stack
-- **Post-Quantum**: CRYSTALS-Dilithium (NIST PQC)
-- **Classical**: Ed25519
-- **Hashing**: SHA3-256
+### Cryptography Stack (NIST/Cisco Compliant v2.19.22)
+- **Post-Quantum**: CRYSTALS-Dilithium3 (NIST FIPS 204)
+- **Classical**: Ed25519 (EPHEMERAL per message!)
+- **Hashing**: SHA3-256 (quantum-resistant)
 - **Consensus**: Byzantine (2/3+ honest nodes)
+
+### Hybrid Signature (Per Message)
+```
+1. Generate NEW ephemeral Ed25519 keypair
+2. Sign message with ephemeral Ed25519
+3. Dilithium signs: ephemeral_pk || hash || timestamp
+4. Dilithium signs: message_hash
+```
+**Why?** Forward secrecy + quantum protection
 
 ### Verification Flow
 ```
 Microblock arrives
     ↓
 P2P Layer (node.rs)
-    ├─► Structure check
+    ├─► Structure check (ephemeral_public_key present?)
     ├─► Certificate lookup
-    ├─► Dilithium verify ✅
-    └─► Ed25519 format ✅
+    ├─► Ed25519 verify with EPHEMERAL key ✅
+    ├─► Dilithium verify key binding ✅
+    └─► Dilithium verify message ✅
     ↓
 Consensus Layer (consensus_crypto.rs)
     ├─► Re-validate structure
@@ -106,7 +116,7 @@ Consensus Layer (consensus_crypto.rs)
 - **Periodic Intervals**: 10s (new) / 60s (medium) / 300s (old certs)
 - **On Rotation**: Immediate tracked broadcast (80% lifetime)
 - **Anti-Duplication**: Serial number change detection
-- **Method**: HTTP POST to `/api/v1/p2p/message`
+- **Transport**: QUIC (UDP 10876) - binary protocol
 
 ### Caching
 - **Capacity**: 100,000 certificates
@@ -226,11 +236,11 @@ CRITICAL ATTACKS → PERMANENT BAN (no return):
 
 ### Gossip Protocol
 
-- **Transport**: HTTP POST (NOT TCP)
+- **Transport**: QUIC (UDP 10876)
+- **Protocol**: Binary (bincode serialization)
 - **Interval**: Every 5 minutes
 - **Scope**: Super + Full nodes only
 - **Signature**: SHA3-256 quantum-safe
-- **URL**: `/api/v1/p2p/message`
 
 ### Byzantine Threshold
 
@@ -340,6 +350,18 @@ docker build -f development/qnet-integration/Dockerfile.production -t qnet-produ
 
 ### Run Genesis Node (Production)
 ```bash
+# REQUIRED: Configure firewall FIRST
+# For UFW (Ubuntu/Debian):
+sudo ufw allow 9876,9877,8001/tcp
+sudo ufw allow 10876/udp
+sudo ufw reload
+
+# For iptables:
+sudo iptables -A INPUT -p tcp --dport 9876 -j ACCEPT
+sudo iptables -A INPUT -p tcp --dport 9877 -j ACCEPT
+sudo iptables -A INPUT -p tcp --dport 8001 -j ACCEPT
+sudo iptables -A INPUT -p udp --dport 10876 -j ACCEPT
+
 # On server with IP matching QNET_BOOTSTRAP_ID (001-005)
 docker run -d --name qnet-genesis-001 --restart=always \
   -e QNET_PRODUCTION=1 \
@@ -347,7 +369,7 @@ docker run -d --name qnet-genesis-001 --restart=always \
   -e DOCKER_ENV=1 \
   -e QNET_AGGRESSIVE_PRUNING=0 \
   -e QNET_MAX_STORAGE_GB=2000 \
-  -p 9876:9876 -p 9877:9877 -p 8001:8001 \
+  -p 9876:9876 -p 9877:9877 -p 8001:8001 -p 10876:10876/udp \
   -v $(pwd)/genesis_001_data:/app/data \
   qnet-production
 ```

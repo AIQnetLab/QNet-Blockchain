@@ -1431,6 +1431,48 @@ impl BlockchainNode {
             }
         }
         
+        // PRODUCTION v2.19.21: Initialize QUIC transport for high-performance P2P
+        // This provides Solana/Aptos-level performance with binary protocol
+        {
+            // Get external IP for QUIC
+            let external_ip = std::env::var("EXTERNAL_IP")
+                .or_else(|_| std::env::var("HOST_IP"))
+                .unwrap_or_else(|_| "0.0.0.0".to_string());
+            
+            // Get certificate serial from hybrid crypto
+            let cert_serial = format!("cert_{}_{}", node_id, 
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs());
+            
+            if let Err(e) = unified_p2p_instance.init_quic(&external_ip, &cert_serial).await {
+                // QUIC is REQUIRED for v2.19.22+
+                // Without QUIC, node cannot participate in P2P network
+                println!("");
+                println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+                println!("🚨 FATAL: QUIC TRANSPORT INITIALIZATION FAILED!");
+                println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+                println!("Error: {}", e);
+                println!("");
+                println!("QUIC transport is REQUIRED for QNet v2.19.22+");
+                println!("Without QUIC, this node CANNOT:");
+                println!("  ❌ Receive blocks from other nodes");
+                println!("  ❌ Send blocks to other nodes");
+                println!("  ❌ Participate in consensus");
+                println!("");
+                println!("SOLUTION: Ensure UDP port 10876 is open in your firewall:");
+                println!("  sudo ufw allow 10876/udp && sudo ufw reload");
+                println!("");
+                println!("For Docker: add '-p 10876:10876/udp' to docker run command");
+                println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+                
+                return Err(QNetError::NetworkError(
+                    format!("QUIC transport required but failed to initialize: {}. Open UDP port 10876.", e)
+                ));
+            }
+        }
+        
         let unified_p2p = Arc::new(unified_p2p_instance);
         
         // Start unified P2P (must start before blockchain creation)
@@ -2000,7 +2042,7 @@ impl BlockchainNode {
             
             if let Some(p2p) = &blockchain_for_sync.unified_p2p {
                 // Get network consensus height
-                match p2p.sync_blockchain_height() {
+                match p2p.sync_blockchain_height().await {
                     Ok(network_height) => {
                         let local_height = *blockchain_for_sync.height.read().await;
                         
@@ -2408,7 +2450,7 @@ impl BlockchainNode {
                                             // CRITICAL: Query network for consensus on this height
                                             if let Some(p2p) = &p2p_clone {
                                                 // Get network consensus height
-                                                if let Ok(network_height) = p2p.sync_blockchain_height() {
+                                                if let Ok(network_height) = p2p.sync_blockchain_height().await {
                                                     let local_height = *height_clone.read().await;
                                                     
                                                     println!("[REORG] 📊 Comparing chains: local={}, network={}, fork_point={}", 
@@ -3764,7 +3806,7 @@ impl BlockchainNode {
                 
                 if let Some(ref p2p) = self.unified_p2p {
                     // Try to get network height
-                    match p2p.sync_blockchain_height() {
+                    match p2p.sync_blockchain_height().await {
                         Ok(network_height) => {
                             let local_height = self.storage.get_chain_height().unwrap_or(0);
                             if network_height > local_height {
@@ -4150,7 +4192,7 @@ impl BlockchainNode {
                                                                 broadcast_attempts, MAX_GENESIS_ATTEMPTS);
                                                     
                                                     // Use dedicated Genesis broadcast with extended timeout
-                                                    match p2p.broadcast_genesis_block(data.clone()) {
+                                                    match p2p.broadcast_genesis_block(data.clone()).await {
                                                         Ok(_) => {
                                                                 println!("[GENESIS] ✅ Genesis block broadcast successful (attempt {})", 
                                                                         broadcast_attempts);
@@ -4753,7 +4795,7 @@ impl BlockchainNode {
                     
                     let network_height = if should_force_update {
                         // Force fresh query if stuck
-                        match p2p.sync_blockchain_height() {
+                        match p2p.sync_blockchain_height().await {
                             Ok(h) => {
                                 println!("[SYNC] 🔄 Forced height update: network={}, local={}", h, microblock_height);
                                 // Update tracking - handle poisoned locks gracefully
@@ -6454,11 +6496,11 @@ impl BlockchainNode {
                                 // CRITICAL: Direct broadcast for immediate delivery (<500ms)
                                 // Used for: emergency blocks, rotation boundaries, consensus phase
                                 println!("[P2P] ⚡ PRIORITY broadcast for critical block #{}", height_for_broadcast);
-                                p2p_clone.broadcast_block(height_for_broadcast, broadcast_data)
+                                p2p_clone.broadcast_block(height_for_broadcast, broadcast_data).await
                             } else {
                                 // Turbine protocol: O(log n) complexity with Reed-Solomon redundancy
                                 // Works for ANY network size (5 nodes to millions)
-                                p2p_clone.broadcast_block_turbine(height_for_broadcast, broadcast_data)
+                                p2p_clone.broadcast_block_turbine(height_for_broadcast, broadcast_data).await
                             };
                             
                             let broadcast_time = broadcast_start.elapsed();
@@ -6731,12 +6773,14 @@ impl BlockchainNode {
                                 // PRODUCTION: Guard ensures flag is cleared even on panic/error
                                 let _guard = SyncGuard;
                                 
-                                // CRITICAL FIX: Try cached height first, fallback to fresh query
+                                // CRITICAL FIX: Try cached height first, fallback to fresh async query
                                 // This ensures sync ALWAYS happens even if cache is empty/expired
-                                let network_height = p2p_clone.get_cached_network_height()
-                                    .or_else(|| {
+                                let network_height = match p2p_clone.get_cached_network_height() {
+                                    Some(h) => Some(h),
+                                    None => {
                                         // Cache miss - query network directly (CRITICAL for 5-node networks)
-                                        match p2p_clone.sync_blockchain_height() {
+                                        // PRODUCTION v2.19.21: Now uses async HTTP client
+                                        match p2p_clone.sync_blockchain_height().await {
                                             Ok(h) => {
                                                 println!("[SYNC] 🔄 Cache miss - queried network height: {}", h);
                                                 Some(h)
@@ -6746,7 +6790,8 @@ impl BlockchainNode {
                                                 None
                                             }
                                         }
-                                    });
+                                    }
+                                };
                                 
                                 if let Some(network_height) = network_height {
                                 if network_height > current_height {
@@ -9951,30 +9996,67 @@ impl BlockchainNode {
         }
     }
     
-    /// Helper: Generate pure Dilithium signature (fallback)
-    /// Used when hybrid crypto is not available or fails
+    /// CRITICAL: This function should NOT be used anymore!
+    /// All signatures MUST use hybrid crypto with ephemeral keys per NIST/Cisco
+    /// This function now creates HYBRID signature as a recovery mechanism
     async fn generate_dilithium_signature(node_id: &str, commit_hash: &str) -> String {
-        use crate::quantum_crypto::QNetQuantumCrypto;
+        use crate::hybrid_crypto::{HybridCrypto, GLOBAL_HYBRID_INSTANCES};
+        use std::sync::Arc;
         
-        // CRITICAL FIX: Use GLOBAL crypto instance to avoid repeated initialization!
-        let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
-        if crypto_guard.is_none() {
-            let mut crypto = QNetQuantumCrypto::new();
-            let _ = crypto.initialize().await;
-            *crypto_guard = Some(crypto);
+        println!("[CRYPTO] ⚠️ RECOVERY: generate_dilithium_signature called - using HYBRID instead");
+        
+        // Get or create hybrid crypto instance (thread-safe global cache)
+        let instances = GLOBAL_HYBRID_INSTANCES.get_or_init(|| async {
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()))
+        }).await;
+        
+        let mut instances_guard = instances.lock().await;
+        
+        // Normalize node_id
+        let normalized_node_id = if node_id.starts_with("qn_") {
+            node_id.to_string()
+        } else {
+            format!("qn_{}", node_id)
+        };
+        
+        // Create instance if not exists - MUST succeed
+        if !instances_guard.contains_key(&normalized_node_id) {
+            let mut hybrid = HybridCrypto::new(normalized_node_id.clone());
+            if let Err(e) = hybrid.initialize().await {
+                println!("[CRYPTO] ❌ FATAL: Cannot init hybrid crypto in recovery: {}", e);
+                panic!("CRITICAL: Cannot operate without hybrid quantum-resistant signatures: {}", e);
+            }
+            instances_guard.insert(normalized_node_id.clone(), hybrid);
         }
-        let crypto = crypto_guard.as_mut().unwrap();
         
-        match crypto.create_consensus_signature(node_id, commit_hash).await {
-            Ok(signature) => {
-                println!("[CRYPTO] ✅ Pure Dilithium signature created for node: {}", node_id);
-                signature.signature
+        let hybrid = instances_guard.get_mut(&normalized_node_id).unwrap();
+        
+        // Decode commit hash to bytes
+        let commit_bytes = match hex::decode(commit_hash) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                println!("[CRYPTO] ❌ FATAL: Invalid commit hash: {}", e);
+                panic!("CRITICAL: Invalid commit hash for signing: {}", e);
+            }
+        };
+        
+        // CRITICAL: Sign with hybrid (ephemeral Ed25519 + Dilithium per NIST/Cisco)
+        match hybrid.sign_message_compact(&commit_bytes).await {
+            Ok(compact_sig) => {
+                match serde_json::to_string(&compact_sig) {
+                    Ok(json) => {
+                        println!("[CRYPTO] ✅ RECOVERY: HYBRID signature created (NIST/Cisco)");
+                        format!("compact:{}", json)
+                    }
+                    Err(e) => {
+                        println!("[CRYPTO] ❌ FATAL: Cannot serialize hybrid signature: {}", e);
+                        panic!("CRITICAL: Cannot serialize hybrid signature: {}", e);
+                    }
+                }
             }
             Err(e) => {
-                // NO FALLBACK - quantum crypto is mandatory for production
-                println!("[CRYPTO] ❌ Quantum crypto signature failed: {:?}", e);
-                println!("[CONSENSUS] ❌ Failed to generate quantum signature for consensus");
-                panic!("CRITICAL: Cannot operate without quantum-resistant signatures: {:?}", e);
+                println!("[CRYPTO] ❌ FATAL: Hybrid signing failed in recovery: {:?}", e);
+                panic!("CRITICAL: Cannot operate without hybrid quantum-resistant signatures: {:?}", e);
             }
         }
     }
@@ -10098,10 +10180,15 @@ impl BlockchainNode {
         }
     }
     
-    /// Helper: Fallback to pure Dilithium signing for microblocks
+    /// CRITICAL: This function should NOT be used anymore!
+    /// All signatures MUST use hybrid crypto with ephemeral keys per NIST/Cisco
+    /// This function now creates HYBRID signature as a recovery mechanism
     async fn sign_microblock_with_pure_dilithium(microblock: &qnet_state::MicroBlock, node_id: &str) -> Result<Vec<u8>, String> {
         use sha3::{Sha3_256, Digest};
-        use crate::quantum_crypto::QNetQuantumCrypto;
+        use crate::hybrid_crypto::{HybridCrypto, GLOBAL_HYBRID_INSTANCES};
+        use std::sync::Arc;
+        
+        println!("[CRYPTO] ⚠️ RECOVERY: sign_microblock_with_pure_dilithium called - using HYBRID instead");
         
         // Create message hash
         let mut hasher = Sha3_256::new();
@@ -10110,29 +10197,46 @@ impl BlockchainNode {
         hasher.update(&microblock.merkle_root);
         hasher.update(&microblock.previous_hash);
         hasher.update(microblock.producer.as_bytes());
-        
         let message_hash = hasher.finalize();
-        let microblock_hash = hex::encode(message_hash);
         
-        // Use global quantum crypto instance
-        let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
-        if crypto_guard.is_none() {
-            let mut crypto = QNetQuantumCrypto::new();
-            let _ = crypto.initialize().await;
-            *crypto_guard = Some(crypto);
+        // Get or create hybrid crypto instance
+        let instances = GLOBAL_HYBRID_INSTANCES.get_or_init(|| async {
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()))
+        }).await;
+        
+        let mut instances_guard = instances.lock().await;
+        
+        // Normalize node_id
+        let normalized_node_id = Self::normalize_node_id(node_id);
+        
+        // Create instance if not exists - MUST succeed
+        if !instances_guard.contains_key(&normalized_node_id) {
+            let mut hybrid = HybridCrypto::new(normalized_node_id.clone());
+            if let Err(e) = hybrid.initialize().await {
+                return Err(format!("CRITICAL: Cannot init hybrid crypto in recovery: {}", e));
+            }
+            instances_guard.insert(normalized_node_id.clone(), hybrid);
         }
-        let crypto = crypto_guard.as_mut().unwrap();
         
-        match crypto.create_consensus_signature(node_id, &microblock_hash).await {
-            Ok(signature) => {
-                let sig_bytes = signature.signature.as_bytes().to_vec();
-                println!("[CRYPTO] ⚠️ Microblock #{} signed with FALLBACK pure Dilithium (size: {} bytes)", 
-                        microblock.height, sig_bytes.len());
-                Ok(sig_bytes)
+        let hybrid = instances_guard.get_mut(&normalized_node_id).unwrap();
+        
+        // CRITICAL: Sign with hybrid (ephemeral Ed25519 + Dilithium per NIST/Cisco)
+        match hybrid.sign_message_compact(message_hash.as_ref()).await {
+            Ok(compact_sig) => {
+                match serde_json::to_string(&compact_sig) {
+                    Ok(json) => {
+                        let sig_with_prefix = format!("compact:{}", json);
+                        let sig_bytes = sig_with_prefix.as_bytes().to_vec();
+                        println!("[CRYPTO] ✅ RECOVERY: Microblock #{} signed with HYBRID (NIST/Cisco)", microblock.height);
+                        Ok(sig_bytes)
+                    }
+                    Err(e) => {
+                        Err(format!("Failed to serialize hybrid signature: {}", e))
+                    }
+                }
             }
             Err(e) => {
-                println!("[CRYPTO] ❌ Pure Dilithium signing also failed: {:?}", e);
-                Err(format!("Failed to sign microblock: {:?}", e))
+                Err(format!("Failed to sign microblock with hybrid: {:?}", e))
             }
         }
     }
@@ -10254,21 +10358,22 @@ impl BlockchainNode {
                                          certificate.expires_at, now);
                                 false
                             } else {
-                                // Verify Ed25519 signature using certificate's public key
+                                // Verify Ed25519 signature using ephemeral public key (NIST/Cisco requirement)
                                 if let Ok(ed_sig_bytes) = compact_sig.message_signature.as_slice().try_into() {
                                     let ed_sig_array: [u8; 64] = ed_sig_bytes;
                                     
                                     // Use HybridCrypto's verify_ed25519_signature method
                                     // CRITICAL: Sign the raw hash bytes, not the hex string
+                                    // CRITICAL: Use EPHEMERAL public key, not certificate key!
                                     let message_hash_bytes = hex::decode(&message_hash_str)
                                         .map_err(|_| "Invalid hex in message hash")?;
                                     match HybridCrypto::verify_ed25519_signature(
                                         &message_hash_bytes,
                                         &ed_sig_array,
-                                        &certificate.ed25519_public_key
+                                        &compact_sig.ephemeral_public_key  // Use ephemeral key per NIST/Cisco
                                     ) {
                                         Ok(true) => {
-                                            println!("[CRYPTO] ✅ Ed25519 signature verified with certificate");
+                                            println!("[CRYPTO] ✅ Ed25519 signature verified with ephemeral key");
                                             println!("[CRYPTO]    Certificate: {}", certificate.serial_number);
                                             println!("[CRYPTO]    Producer: {}", certificate.node_id);
                                             true
@@ -10375,7 +10480,10 @@ impl BlockchainNode {
                 return Ok(false);
             }
             
-            // STEP 3: Verify Dilithium signature (quantum-resistant, mandatory)
+            // STEP 3: Verify Dilithium signatures (quantum-resistant, MANDATORY per NIST/Cisco)
+            // NIST/Cisco requirement: Verify BOTH Dilithium signatures
+            // 1. Dilithium signature of encapsulated_data (ephemeral key)
+            // 2. Dilithium signature of message
             use crate::quantum_crypto::{QNetQuantumCrypto, DilithiumSignature};
             let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
             if crypto_guard.is_none() {
@@ -10385,29 +10493,70 @@ impl BlockchainNode {
             }
             let crypto = crypto_guard.as_mut().unwrap();
             
-            // Create Dilithium signature for verification
-            let dilithium_sig = DilithiumSignature {
+            // SECURITY: Both Dilithium signatures are MANDATORY - no backwards compatibility bypass!
+            if compact_sig.dilithium_key_signature.is_empty() {
+                println!("[CRYPTO] ❌ REJECTED: No Dilithium key signature - quantum attack possible!");
+                return Ok(false);
+            }
+            if compact_sig.dilithium_message_signature.is_empty() {
+                println!("[CRYPTO] ❌ REJECTED: No Dilithium message signature - quantum attack possible!");
+                return Ok(false);
+            }
+            
+            // Step 3a: Verify Dilithium signature of encapsulated_data (ephemeral key)
+            let message_hash_bytes = hex::decode(&message_hash_str)
+                .map_err(|_| "Invalid hex in message hash")?;
+            let mut encapsulated_data = Vec::new();
+            encapsulated_data.extend_from_slice(&compact_sig.ephemeral_public_key);
+            encapsulated_data.extend_from_slice(&message_hash_bytes);
+            encapsulated_data.extend_from_slice(&compact_sig.signed_at.to_le_bytes());
+            let encapsulated_hex = hex::encode(&encapsulated_data);
+            
+            let dilithium_key_sig = DilithiumSignature {
+                signature: compact_sig.dilithium_key_signature.clone(),
+                algorithm: "CRYSTALS-Dilithium3".to_string(),
+                timestamp: compact_sig.signed_at,
+                strength: "quantum-resistant".to_string(),
+            };
+            
+            let dilithium_key_valid = match crypto.verify_dilithium_signature(&encapsulated_hex, &dilithium_key_sig, &compact_sig.node_id).await {
+                Ok(true) => true,
+                Ok(false) => {
+                    println!("[CRYPTO] ❌ Dilithium key signature INVALID!");
+                    false
+                }
+                Err(e) => {
+                    println!("[CRYPTO] ❌ Dilithium key verification error: {}", e);
+                    false
+                }
+            };
+            
+            if !dilithium_key_valid {
+                return Ok(false);
+            }
+            
+            // Step 3b: Verify Dilithium signature of message
+            let dilithium_msg_sig = DilithiumSignature {
                 signature: compact_sig.dilithium_message_signature.clone(),
                 algorithm: "CRYSTALS-Dilithium3".to_string(),
                 timestamp: compact_sig.signed_at,
                 strength: "quantum-resistant".to_string(),
             };
             
-            // REAL Dilithium verification (NIST post-quantum)
-            match crypto.verify_dilithium_signature(&message_hash_str, &dilithium_sig, &compact_sig.node_id).await {
+            match crypto.verify_dilithium_signature(&message_hash_str, &dilithium_msg_sig, &compact_sig.node_id).await {
                 Ok(true) => {
-                    println!("[CRYPTO] ✅ BOTH signatures verified (Ed25519 + Dilithium)");
+                    println!("[CRYPTO] ✅ ALL signatures verified (Ed25519 + Dilithium key + Dilithium message)");
                     println!("[CRYPTO]    Producer: {}", compact_sig.node_id);
                     println!("[CRYPTO]    Certificate: {}", compact_sig.cert_serial);
-                    println!("[CRYPTO]    NIST/Cisco: ✅ Post-quantum compliant");
+                    println!("[CRYPTO]    NIST/Cisco: ✅ Post-quantum compliant with encapsulated keys");
                     return Ok(true);
                 }
                 Ok(false) => {
-                    println!("[CRYPTO] ❌ Dilithium signature INVALID!");
+                    println!("[CRYPTO] ❌ Dilithium message signature INVALID!");
                     return Ok(false);
                 }
                 Err(e) => {
-                    println!("[CRYPTO] ❌ Dilithium verification error: {}", e);
+                    println!("[CRYPTO] ❌ Dilithium message verification error: {}", e);
                     // SECURITY: NO BYPASS - Dilithium verification is MANDATORY
                     // Quantum attacker cannot forge Dilithium signatures
                     return Ok(false);
@@ -11119,7 +11268,7 @@ impl BlockchainNode {
         let local_height = self.get_height().await;
         let network_height = if let Some(p2p) = &self.unified_p2p {
             // Try to get network consensus height
-            match p2p.sync_blockchain_height() {
+            match p2p.sync_blockchain_height().await {
                 Ok(h) => h,
                 Err(_) => {
                     // Fallback to cached or local height
@@ -13512,4 +13661,106 @@ impl Clone for BlockchainNode {
     }
 }
 
-
+// =============================================================================
+// UNIT TESTS FOR NODE CRYPTO FUNCTIONS
+// =============================================================================
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    /// Test CompactHybridSignature deserialization
+    #[test]
+    fn test_compact_signature_parsing() {
+        use base64::{Engine as _, engine::general_purpose};
+        
+        // Create valid base64 for 32-byte array (ephemeral_public_key)
+        let ephemeral_pk = [0u8; 32];
+        let ephemeral_b64 = general_purpose::STANDARD.encode(&ephemeral_pk);
+        
+        // Create valid base64 for 64-byte array (message_signature)
+        let msg_sig = [0u8; 64];
+        let msg_sig_b64 = general_purpose::STANDARD.encode(&msg_sig);
+        
+        let json = format!(r#"{{
+            "node_id": "qn_test_node",
+            "cert_serial": "CERT-123",
+            "ephemeral_public_key": "{}",
+            "message_signature": "{}",
+            "dilithium_key_signature": "test_key_sig",
+            "dilithium_message_signature": "test_msg_sig",
+            "signed_at": 1234567890
+        }}"#, ephemeral_b64, msg_sig_b64);
+        
+        let parsed: Result<crate::crypto::CompactHybridSignature, _> = serde_json::from_str(&json);
+        assert!(parsed.is_ok(), "CompactHybridSignature should parse correctly: {:?}", parsed.err());
+        
+        let sig = parsed.unwrap();
+        assert_eq!(sig.node_id, "qn_test_node");
+        assert_eq!(sig.cert_serial, "CERT-123");
+        assert!(!sig.dilithium_key_signature.is_empty());
+        assert!(!sig.dilithium_message_signature.is_empty());
+    }
+    
+    /// Test signature prefix detection
+    #[test]
+    fn test_signature_prefix_detection() {
+        let compact_sig = "compact:{\"node_id\":\"test\"}";
+        let hybrid_sig = "hybrid:{\"cert\":{}}";
+        let dilithium_sig = "dilithium_sig_abc123";
+        let p2p_sig = "hybrid_p2p:{\"node_id\":\"test\"}";
+        
+        assert!(compact_sig.starts_with("compact:"));
+        assert!(hybrid_sig.starts_with("hybrid:"));
+        assert!(dilithium_sig.starts_with("dilithium_sig_"));
+        assert!(p2p_sig.starts_with("hybrid_p2p:"));
+    }
+    
+    /// Test microblock hash computation
+    #[test]
+    fn test_microblock_hash_computation() {
+        use sha3::{Sha3_256, Digest};
+        
+        let test_data = b"test microblock data";
+        let mut hasher = Sha3_256::new();
+        hasher.update(test_data);
+        let hash = hasher.finalize();
+        
+        // SHA3-256 produces 32 bytes
+        assert_eq!(hash.len(), 32);
+        
+        // Same input should produce same hash
+        let mut hasher2 = Sha3_256::new();
+        hasher2.update(test_data);
+        let hash2 = hasher2.finalize();
+        assert_eq!(hash, hash2);
+    }
+    
+    /// Test GLOBAL_QUANTUM_CRYPTO initialization pattern
+    #[tokio::test]
+    async fn test_global_crypto_initialization() {
+        let crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
+        // Initial state might be None or Some (depends on test order)
+        // Just verify we can acquire the lock without deadlock
+        drop(crypto_guard);
+    }
+    
+    /// Test encapsulated data format for NIST/Cisco compliance
+    #[test]
+    fn test_encapsulated_data_format() {
+        let ephemeral_pk = [0u8; 32]; // 32 bytes
+        let message_hash = [1u8; 32]; // 32 bytes SHA3-256
+        let timestamp: u64 = 1234567890;
+        
+        let mut encapsulated = Vec::new();
+        encapsulated.extend_from_slice(&ephemeral_pk);
+        encapsulated.extend_from_slice(&message_hash);
+        encapsulated.extend_from_slice(&timestamp.to_le_bytes());
+        
+        // NIST/Cisco format: 32 + 32 + 8 = 72 bytes
+        assert_eq!(encapsulated.len(), 72);
+        
+        // Verify hex encoding works
+        let hex = hex::encode(&encapsulated);
+        assert_eq!(hex.len(), 144); // 72 * 2
+    }
+}

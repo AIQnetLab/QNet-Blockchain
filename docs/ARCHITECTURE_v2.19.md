@@ -1,9 +1,9 @@
 # QNet Blockchain Architecture v2.19
 ## Post-Quantum Decentralized Network - Technical Documentation
 
-**Last Updated**: November 25, 2025  
-**Version**: 2.19.19  
-**Status**: Production Ready
+**Last Updated**: November 30, 2025  
+**Version**: 2.19.22  
+**Status**: Production Ready (QUIC Transport)
 
 ---
 
@@ -90,6 +90,28 @@ pub struct MacroBlock {
 
 ## Signature System
 
+### NIST/Cisco Compliant Hybrid Signatures (v2.19.22)
+
+**Critical Security**: Per NIST SP 800-208 and Cisco recommendations, every message uses a **NEW ephemeral Ed25519 key** signed by the persistent Dilithium key.
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│ HYBRID SIGNATURE ARCHITECTURE (NIST/Cisco Compliant)               │
+├─────────────────────────────────────────────────────────────────────┤
+│ For EACH message:                                                   │
+│   1. Generate NEW ephemeral Ed25519 keypair                        │
+│   2. Sign message with ephemeral Ed25519 → message_signature       │
+│   3. Create encapsulated_data = ephemeral_pk || hash || timestamp  │
+│   4. Sign encapsulated_data with Dilithium → dilithium_key_sig     │
+│   5. Sign message_hash with Dilithium → dilithium_message_sig      │
+├─────────────────────────────────────────────────────────────────────┤
+│ Quantum Attack Protection:                                          │
+│   - Attacker breaks Ed25519? → Dilithium still protects!           │
+│   - Attacker breaks one message? → Other messages use NEW keys!    │
+│   - Forward secrecy via ephemeral keys                             │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
 ### Compact Signatures (Microblocks)
 
 **Format**: `compact:<json>`
@@ -98,15 +120,18 @@ pub struct MacroBlock {
 {
   "node_id": "genesis_node_001",
   "cert_serial": "cert_2024_11_16_12345",
-  "message_signature": [64, 32, ...],        // Ed25519 (64 bytes)
-  "dilithium_message_signature": "base64...", // Dilithium (~2420 bytes)
+  "ephemeral_public_key": [32 bytes],         // NEW Ed25519 key for THIS message
+  "message_signature": [64 bytes],            // Ed25519 with ephemeral key
+  "dilithium_key_signature": "base64...",     // Dilithium signs ephemeral+hash+ts
+  "dilithium_message_signature": "base64...", // Dilithium signs message hash
   "signed_at": 1700140800
 }
 ```
 
 **Size**: ~3KB (3,000 bytes)  
 **Bandwidth Savings**: 75% vs full signatures  
-**Certificate**: Referenced by serial, cached at P2P layer
+**Certificate**: Referenced by serial, cached at P2P layer  
+**Ephemeral Keys**: NEW key generated for EACH message (NIST/Cisco requirement)
 
 #### Verification Flow
 
@@ -114,14 +139,16 @@ pub struct MacroBlock {
 1. Microblock arrives at node
    ↓
 2. P2P Layer (node.rs::verify_microblock_signature)
-   ├─► Structural validation
+   ├─► Structural validation (ephemeral_public_key present?)
    ├─► Certificate lookup (cache or request)
-   ├─► Dilithium signature verification ✅ (NIST post-quantum)
-   ├─► Ed25519 format validation ✅
-   └─► Result: Accept or Reject
+   ├─► Ed25519 verify with EPHEMERAL key ✅
+   ├─► Recreate encapsulated_data = ephemeral_pk || hash || timestamp
+   ├─► Dilithium verify encapsulated_data (key binding) ✅
+   ├─► Dilithium verify message_hash ✅
+   └─► Result: Accept (all pass) or Reject (any fail)
    ↓
 3. Consensus Layer (consensus_crypto.rs::verify_compact_hybrid_signature)
-   ├─► Structural re-validation (format, sizes)
+   ├─► Structural re-validation (all fields present)
    ├─► Byzantine consensus (2/3+ honest nodes)
    └─► Only pre-verified blocks participate
 ```
@@ -132,12 +159,15 @@ pub struct MacroBlock {
 
 ```json
 {
-  "message_signature": "base64...",     // Ed25519
-  "dilithium_signature": "base64...",   // Dilithium
+  "ephemeral_public_key": [32 bytes],       // NEW Ed25519 key for THIS message
+  "message_signature": "base64...",          // Ed25519 with ephemeral key
+  "dilithium_key_signature": "base64...",    // Dilithium signs ephemeral+hash+ts
+  "dilithium_message_signature": "base64...",// Dilithium signs message hash
+  "signed_at": 1700140800,
   "certificate": {
-    "ed25519_public_key": "...",
+    "ed25519_public_key": "...",             // Certificate's persistent Ed25519
     "dilithium_public_key": "...",
-    "dilithium_signature_of_ed25519": "...",
+    "dilithium_signature_of_ed25519": "...", // Certificate binding
     "serial_number": "...",
     "valid_from": 1700140800,
     "valid_until": 1700227200
@@ -147,7 +177,8 @@ pub struct MacroBlock {
 
 **Size**: ~12KB (12,000 bytes)  
 **Use Case**: Macroblocks (no certificate lookup delay)  
-**Verification**: Immediate (certificate embedded)
+**Verification**: Immediate (certificate embedded)  
+**Ephemeral Keys**: Same NIST/Cisco requirement as compact signatures
 
 ### Certificate Management
 
@@ -216,7 +247,7 @@ if serial_changed {
 **Broadcast Methods**:
 - **Tracked**: Waits for 2/3+ Byzantine confirmation (3-10s adaptive timeout)
 - **Async**: Fire-and-forget for gossip propagation
-- **Transport**: HTTP POST to `/api/v1/p2p/message`
+- **Transport**: QUIC (UDP 10876) - binary protocol
 
 **Cache**: 100,000 certificates (LRU eviction)  
 **Scalability**: Handles millions of nodes (max 1000 active validators)
@@ -600,17 +631,17 @@ pub fn get_sync_peers_filtered(&self, max_peers: usize) -> Vec<PeerInfo> {
 }
 ```
 
-### Reputation Gossip Protocol (v2.19.3)
+### Reputation Gossip Protocol (v2.19.22)
 
 **Complexity**: O(log n) exponential propagation (NOT O(n) broadcast!)  
-**Transport**: HTTP POST (NOT TCP)  
+**Transport**: QUIC (UDP 10876) - binary protocol  
 **Interval**: Every 5 minutes  
 **Signature**: SHA3-256 (quantum-safe)  
 **Scope**: Super + Full nodes only (Light nodes excluded)  
 **Fanout**: Adaptive 4-32 (same as Turbine)
 
 ```rust
-// Reputation sync via HTTP gossip
+// Reputation sync via QUIC gossip
 NetworkMessage::ReputationSync {
     node_id: String,
     reputation_updates: Vec<(String, f64)>,
@@ -632,16 +663,17 @@ NetworkMessage::ReputationSync {
 - **Exponential backoff failover**: 3s → 6s → 12s → 24s → 30s max
 
 **Why Gossip O(log n) vs Broadcast O(n)**:
-- ✅ **Scalability**: 1M nodes = ~20 hops vs 1M HTTP requests
+- ✅ **Scalability**: 1M nodes = ~20 hops vs 1M requests
 - ✅ **Bandwidth**: 99.999% reduction for millions of nodes
 - ✅ **Fork Prevention**: All nodes converge to same reputation view
 - ✅ **Byzantine Safety**: Signature verification at each hop
 
-**Why HTTP over TCP**:
-- ✅ More reliable in WAN/Docker environments
-- ✅ Connection pooling for millions of nodes
-- ✅ Consistent error handling
-- ✅ NAT/firewall friendly
+**Why QUIC over HTTP (v2.19.22)**:
+- ✅ No Head-of-Line Blocking (independent streams)
+- ✅ 0-RTT handshake for repeat connections
+- ✅ Connection multiplexing (100+ streams/connection)
+- ✅ Built-in TLS 1.3 encryption
+- ✅ Binary protocol (~50% bandwidth reduction)
 
 ### Byzantine Threshold Check
 
@@ -1344,24 +1376,44 @@ DELETE /api/v1/bundle/{bundle_id}
 └─────────────────────────────────────────────────────────┘
 ```
 
-### NIST/Cisco Compliance
+### NIST/Cisco Compliance (v2.19.22)
+
+#### Hybrid Signature Architecture (CRITICAL)
+
+Per **NIST SP 800-208** and **Cisco Post-Quantum Recommendations**:
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│ EVERY MESSAGE uses:                                                 │
+│   1. NEW ephemeral Ed25519 key (generated per message)             │
+│   2. Dilithium signs: ephemeral_key || message_hash || timestamp   │
+│   3. Dilithium signs: message_hash (independent verification)      │
+├─────────────────────────────────────────────────────────────────────┤
+│ WHY EPHEMERAL KEYS?                                                 │
+│   • Forward secrecy: compromise one message ≠ compromise all       │
+│   • Key binding: Dilithium cryptographically binds ephemeral key   │
+│   • Quantum resistance: Ed25519 broken? Dilithium still protects!  │
+└─────────────────────────────────────────────────────────────────────┘
+```
 
 #### Post-Quantum Cryptography
-- **Algorithm**: CRYSTALS-Dilithium (NIST PQC standard)
+- **Algorithm**: CRYSTALS-Dilithium (NIST FIPS 204 / ML-DSA)
 - **Security Level**: Dilithium3 (Level 3)
 - **Key Size**: 1952 bytes (public), 4000 bytes (private)
 - **Signature Size**: ~2420 bytes
 - **Security**: Resistant to Shor's algorithm (quantum attacks)
+- **Usage**: Signs BOTH ephemeral key binding AND message hash
 
-#### Classical Cryptography
+#### Classical Cryptography  
 - **Algorithm**: Ed25519 (Curve25519)
 - **Security Level**: 128-bit security
 - **Key Size**: 32 bytes (public), 64 bytes (private)
 - **Signature Size**: 64 bytes
-- **Purpose**: Legacy compatibility, fast verification
+- **Purpose**: Fast verification, EPHEMERAL keys per message
+- **CRITICAL**: Ed25519 keys are NOT reused between messages!
 
 #### Hashing
-- **Algorithm**: SHA3-256 (NIST FIPS 202)
+- **Algorithm**: SHA3-256 (NIST FIPS 202) - quantum-resistant
 - **Output**: 256 bits (32 bytes)
 - **Usage**: Block hashes, message digests, signature preparation
 - **Alternative**: Blake3 (for non-cryptographic identifiers only)
@@ -1799,6 +1851,48 @@ QNet v2.19 implements a production-ready, post-quantum secure blockchain with:
 - FCM message handling for ping challenges
 - Ping response with Ed25519 signature
 - Token refresh and registration
+
+---
+
+## Network Ports
+
+### Required Ports
+
+| Port | Protocol | Purpose | Firewall |
+|------|----------|---------|----------|
+| **9876** | TCP | P2P network (peer discovery, legacy) | REQUIRED |
+| **9877** | TCP | P2P gossip (reputation sync) | REQUIRED |
+| **8001** | TCP | REST API (JSON-RPC, monitoring) | REQUIRED |
+| **10876** | UDP/QUIC | QUIC transport (blocks, consensus) | **REQUIRED v2.19.22+** |
+
+### QUIC Transport (v2.19.22+)
+
+QNet uses QUIC for high-performance P2P communication:
+
+```
+QUIC Port = P2P Port + 1000
+Example: 9876 (P2P) → 10876 (QUIC)
+```
+
+**Features:**
+- TLS 1.3 encryption (NIST SP 800-52 compliant)
+- Binary protocol (bincode) - 50% less bandwidth than JSON
+- Connection multiplexing (100 streams per connection)
+- Keep-alive: 30s, Idle timeout: 90s
+
+**Messages via QUIC:**
+- Block broadcast (micro/macro)
+- Genesis block distribution
+- Turbine chunks
+- Certificate announcements
+- Consensus commit/reveal
+
+**Messages via HTTP (REST API):**
+- Security alerts
+- Audit storage
+- External client queries
+
+---
 
 **Fixes:**
 - Light node reputation fixed at 70 (immutable by design)

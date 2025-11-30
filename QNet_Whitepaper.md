@@ -3,8 +3,8 @@
 
 **⚠️ EXPERIMENTAL BLOCKCHAIN RESEARCH ⚠️**
 
-**Version**: 2.19.11-experimental  
-**Date**: November 26, 2025  
+**Version**: 2.19.22-experimental  
+**Date**: November 30, 2025  
 **Authors**: QNet Research Team  
 **Status**: Experimental Research Project  
 **Goal**: To prove that one person without multi-million investments can create an advanced blockchain
@@ -24,10 +24,12 @@
 QNet is an experimental post-quantum blockchain created to prove: **one person-operator without technical knowledge, multi-million investments, and funds is capable of building an advanced blockchain**.
 
 Experimental achievements:
-- ✅ **Post-quantum cryptography**: CRYSTALS-Dilithium3 (2420-byte signatures) + Ed25519 hybrid  
+- ✅ **Post-quantum cryptography**: CRYSTALS-Dilithium3 (NIST FIPS 204) + Ed25519 hybrid  
+- ✅ **NIST/Cisco Compliant**: Ephemeral Ed25519 keys per message + Dilithium key binding
 - ✅ **Compact Signatures**: 3KB vs 12KB (75% bandwidth reduction) with certificate caching
 - ✅ **Progressive Finalization Protocol**: Self-healing consensus recovery (80% → 1% degradation)
 - ✅ **424,411 TPS**: Proven performance in tests
+- ✅ **QUIC Transport**: Binary protocol (bincode), TLS 1.3, 100+ streams/connection
 - ✅ **Two-phase activation**: 1DEV burn → QNC Pool #3
 - ✅ **Mobile-first**: Optimized for smartphones
 - ✅ **Reputation system**: Without staking, only behavioral assessment
@@ -72,8 +74,9 @@ These characteristics make QNet suitable for mass mobile usage with exchange-gra
 
 QNet presents an experimental blockchain platform with unique characteristics:
 
-1. **Post-quantum cryptography**: CRYSTALS-Dilithium3 (NIST PQC, 2420-byte signatures) with hybrid Ed25519
-2. **Compact signatures**: 75% bandwidth reduction (3KB vs 12KB) via certificate caching
+1. **Post-quantum cryptography**: CRYSTALS-Dilithium3 (NIST FIPS 204) + Ephemeral Ed25519 (per message)
+2. **NIST/Cisco Compliant**: Dilithium signs ephemeral key binding + message hash (forward secrecy)
+3. **Compact signatures**: 75% bandwidth reduction (3KB vs 12KB) via certificate caching
 3. **Progressive Finalization Protocol**: Self-healing consensus with zero-downtime
 4. **High performance**: 424,411+ TPS achieved in experiments
 5. **Innovative economy**: Reputation system without staking
@@ -94,7 +97,7 @@ QNet presents an experimental blockchain platform with unique characteristics:
 │  Turbine, Quantum PoH, Sealevel, Tower BFT, Cache  │
 ├─────────────────────────────────────────────────────┤
 │              Network Layer                          │
-│      P2P, Sharding, Regional Clustering             │
+│  QUIC Transport, P2P, Sharding, Regional Clustering │
 ├─────────────────────────────────────────────────────┤  
 │             Consensus Layer                         │
 │     Commit-Reveal BFT, Producer rotation            │
@@ -103,7 +106,7 @@ QNet presents an experimental blockchain platform with unique characteristics:
 │       Microblocks (1s) + Macroblocks                │
 ├─────────────────────────────────────────────────────┤
 │           Cryptography Layer                        │
-│        CRYSTALS-Dilithium, Post-Quantum             │
+│  CRYSTALS-Dilithium3 + Ephemeral Ed25519 (NIST)     │
 └─────────────────────────────────────────────────────┘
 ```
 
@@ -721,7 +724,37 @@ parallel_execute(non_conflicting_transactions);
 
 ## 6. Network Architecture
 
-### 6.1 P2P System
+### 6.1 QUIC Transport Layer (v2.19.22)
+
+**High-Performance P2P Transport:**
+
+QNet uses the QUIC protocol for all P2P communication, providing:
+
+| Feature | Description |
+|---------|-------------|
+| **Protocol** | QUIC over UDP (port 10876) |
+| **Encryption** | TLS 1.3 (NIST SP 800-52 compliant) |
+| **Multiplexing** | 100+ streams per connection |
+| **Handshake** | 0-RTT for repeat connections |
+| **Serialization** | Binary (bincode) - 50% bandwidth reduction |
+| **Connection Pool** | Automatic reconnection with idle cleanup |
+
+**Transport Constants:**
+```rust
+CONNECT_TIMEOUT: 3 seconds    // Quick connection establishment
+IDLE_TIMEOUT: 90 seconds      // Connection reuse window
+KEEP_ALIVE: 30 seconds        // Connection heartbeat
+MAX_MESSAGE_SIZE: 10 MB       // Supports full macroblocks (~3MB)
+```
+
+**Why QUIC over HTTP:**
+- **No Head-of-Line Blocking**: Independent streams prevent delays
+- **Lower Latency**: 0-RTT handshake for repeat connections
+- **Better Multiplexing**: Multiple messages on single connection
+- **Built-in Encryption**: TLS 1.3 integrated into protocol
+- **Connection Migration**: Survives IP address changes
+
+### 6.2 P2P System
 
 **Regional clustering:**
 - **North America**: Nodes grouped by geography
@@ -735,7 +768,7 @@ parallel_execute(non_conflicting_transactions);
 - 1001-100000 nodes: 100 peers per region
 - 100k+ nodes: 500 peers per region
 
-### 6.2 Node Discovery
+### 6.3 Node Discovery
 
 **Multi-level discovery:**
 
@@ -744,7 +777,7 @@ parallel_execute(non_conflicting_transactions);
 3. **Peer exchange**: Node list exchange every 30 seconds
 4. **Registry integration**: Blockchain-based node registration
 
-### 6.3 Synchronization & Snapshots
+### 6.4 Synchronization & Snapshots
 
 **Advanced sync mechanisms:**
 
@@ -772,7 +805,7 @@ parallel_execute(non_conflicting_transactions);
    - **Health monitor**: Periodic flag checking
    - **Force reset**: Clear stuck sync flags after timeout
 
-### 6.4 Reputation System
+### 6.5 Reputation System
 
 **Byzantine-Safe Split Reputation (v2.19.2):**
 

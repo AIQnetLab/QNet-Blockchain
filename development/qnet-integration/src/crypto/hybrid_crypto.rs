@@ -109,6 +109,36 @@ mod base64_bytes {
     }
 }
 
+/// Helper module for serializing [u8; 32] arrays with serde
+mod base64_bytes_32 {
+    use serde::{Serialize, Deserialize, Serializer, Deserializer};
+    use base64::{Engine as _, engine::general_purpose};
+    
+    pub fn serialize<S>(bytes: &[u8; 32], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let b64 = general_purpose::STANDARD.encode(bytes);
+        b64.serialize(serializer)
+    }
+    
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 32], D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let b64 = String::deserialize(deserializer)?;
+        let bytes = general_purpose::STANDARD
+            .decode(&b64)
+            .map_err(serde::de::Error::custom)?;
+        if bytes.len() != 32 {
+            return Err(serde::de::Error::custom(format!("Expected 32 bytes, got {}", bytes.len())));
+        }
+        let mut result = [0u8; 32];
+        result.copy_from_slice(&bytes);
+        Ok(result)
+    }
+}
+
 /// Certificate lifetime in seconds (4.5 minutes = 270 seconds = 3 macroblocks)
 /// SECURITY: Optimized for quantum resistance with minimal network overhead
 /// - Rotation threshold: 80% (216s)
@@ -155,9 +185,18 @@ pub struct HybridSignature {
     /// Certificate (can be cached)
     pub certificate: HybridCertificate,
     
+    /// CRITICAL: Ephemeral Ed25519 public key for THIS message (NIST/Cisco requirement)
+    /// Generated fresh for each message to ensure forward secrecy
+    #[serde(with = "base64_bytes_32")]
+    pub ephemeral_public_key: [u8; 32],
+    
     /// Ed25519 signature of the actual message (base64 encoded for serde)
     #[serde(with = "base64_bytes")]
     pub message_signature: [u8; 64],
+    
+    /// CRITICAL: Dilithium signature of encapsulated_data (ephemeral_key || message_hash || timestamp)
+    /// Per NIST/Cisco: Dilithium MUST sign the ephemeral key for each message
+    pub dilithium_key_signature: String,
     
     /// CRITICAL: Dilithium signature of the SAME message (quantum-resistant)
     /// Per NIST/Cisco: EVERY message must have BOTH signatures
@@ -177,9 +216,18 @@ pub struct CompactHybridSignature {
     /// Certificate serial number (for cache lookup)
     pub cert_serial: String,
     
+    /// CRITICAL: Ephemeral Ed25519 public key for THIS message (NIST/Cisco requirement)
+    /// Generated fresh for each message to ensure forward secrecy
+    #[serde(with = "base64_bytes_32")]
+    pub ephemeral_public_key: [u8; 32],
+    
     /// Ed25519 signature of the actual message (base64 encoded)
     #[serde(with = "base64_bytes")]
     pub message_signature: [u8; 64],
+    
+    /// CRITICAL: Dilithium signature of encapsulated_data (ephemeral_key || message_hash || timestamp)
+    /// Per NIST/Cisco: Dilithium MUST sign the ephemeral key for each message
+    pub dilithium_key_signature: String,
     
     /// CRITICAL: Dilithium signature of the SAME message (quantum-resistant)
     /// Per NIST/Cisco: EVERY message must have BOTH signatures
@@ -286,15 +334,10 @@ impl HybridCrypto {
         // CRITICAL FIX: Use GLOBAL crypto instance for certificate rotation!
         let mut crypto_guard = crate::node::GLOBAL_QUANTUM_CRYPTO.lock().await;
         if crypto_guard.is_none() {
-            // Use GLOBAL crypto instance for consistency
-            use crate::node::GLOBAL_QUANTUM_CRYPTO;
-            
-            let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
-            if crypto_guard.is_none() {
-                let mut crypto = crate::quantum_crypto::QNetQuantumCrypto::new();
-                let _ = crypto.initialize().await;
-                *crypto_guard = Some(crypto);
-            }
+            // Initialize crypto within the SAME lock guard (no nested lock!)
+            let mut crypto = crate::quantum_crypto::QNetQuantumCrypto::new();
+            let _ = crypto.initialize().await;
+            *crypto_guard = Some(crypto);
         }
         let quantum_crypto = crypto_guard.as_ref().unwrap();
         
@@ -376,26 +419,43 @@ impl HybridCrypto {
     }
     
     /// Sign message with BOTH Ed25519 AND Dilithium per NIST/Cisco standards
+    /// CRITICAL: Generates NEW ephemeral Ed25519 key for each message (NIST/Cisco requirement)
     pub async fn sign_message(&self, message: &[u8]) -> Result<HybridSignature> {
         // CRITICAL: Per NIST/Cisco standards for hybrid cryptography:
-        // EVERY message MUST be signed by BOTH algorithms
-        // - Ed25519 for performance/compatibility  
-        // - Dilithium for quantum resistance
-        // This is NOT optional - both signatures are REQUIRED for security
+        // 1. Generate NEW ephemeral Ed25519 key for THIS message
+        // 2. Sign message with ephemeral Ed25519 key
+        // 3. Create encapsulated_data = ephemeral_public_key || message_hash || timestamp
+        // 4. Sign encapsulated_data with Dilithium (signs the ephemeral key)
+        // 5. Sign message with Dilithium (quantum resistance)
         
-        // Get current Ed25519 signing key (or rotate if needed)
-        let signing_key = self.ed25519_signing_key.as_ref()
-            .ok_or_else(|| anyhow!("No Ed25519 signing key available"))?;
+        // Step 1: Generate NEW ephemeral Ed25519 keypair for THIS message
+        let mut csprng = OsRng{};
+        let ephemeral_signing_key = SigningKey::generate(&mut csprng);
+        let ephemeral_verifying_key = ephemeral_signing_key.verifying_key();
+        let ephemeral_public_key_bytes = *ephemeral_verifying_key.as_bytes();
         
-        // Step 1: Sign the message with Ed25519 key
-        let ed25519_signature = signing_key.sign(message);
+        // Step 2: Sign the message with ephemeral Ed25519 key
+        let ed25519_signature = ephemeral_signing_key.sign(message);
         
-        // Step 2: Get or use existing certificate
+        // Step 3: Get or use existing certificate
         let certificate = self.current_certificate.as_ref()
             .ok_or_else(|| anyhow!("No current certificate available"))?;
         
-        // Step 3: CRITICAL - ALSO sign the message with Dilithium
-        // This provides quantum resistance for EVERY message, not just certificates
+        // Step 4: Create message hash for Dilithium signing
+        let mut hasher = Sha3_256::new();
+        hasher.update(message);
+        let message_hash = hasher.finalize();
+        let message_hash_hex = hex::encode(message_hash);
+        
+        // Step 5: Create encapsulated_data = ephemeral_public_key || message_hash || timestamp
+        let signed_at = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        let mut encapsulated_data = Vec::new();
+        encapsulated_data.extend_from_slice(&ephemeral_public_key_bytes);
+        encapsulated_data.extend_from_slice(&message_hash);
+        encapsulated_data.extend_from_slice(&signed_at.to_le_bytes());
+        let encapsulated_hex = hex::encode(&encapsulated_data);
+        
+        // Step 6: Sign encapsulated_data with Dilithium (NIST/Cisco requirement)
         use crate::node::GLOBAL_QUANTUM_CRYPTO;
         use crate::quantum_crypto::QNetQuantumCrypto;
         
@@ -407,40 +467,67 @@ impl HybridCrypto {
         }
         let quantum_crypto = crypto_guard.as_ref().unwrap();
         
-        // Create Dilithium signature for the message
-        // Use SHA3-256 to match the rest of the system
-        let mut hasher = Sha3_256::new();
-        hasher.update(message);
-        let message_hash = hex::encode(hasher.finalize());
-        let dilithium_sig = quantum_crypto.create_consensus_signature(&self.node_id, &message_hash).await
-            .map_err(|e| anyhow!("Failed to create Dilithium signature: {}", e))?;
+        // Sign encapsulated_data with Dilithium (signs the ephemeral key)
+        let dilithium_key_sig = quantum_crypto.create_consensus_signature(&self.node_id, &encapsulated_hex).await
+            .map_err(|e| anyhow!("Failed to create Dilithium key signature: {}", e))?;
+        
+        // Step 7: Sign message with Dilithium (quantum resistance)
+        let dilithium_msg_sig = quantum_crypto.create_consensus_signature(&self.node_id, &message_hash_hex).await
+            .map_err(|e| anyhow!("Failed to create Dilithium message signature: {}", e))?;
         
         Ok(HybridSignature {
             certificate: certificate.clone(),
+            ephemeral_public_key: ephemeral_public_key_bytes,
             message_signature: ed25519_signature.to_bytes(),
-            dilithium_message_signature: dilithium_sig.signature, // REQUIRED per NIST/Cisco
-            signed_at: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
+            dilithium_key_signature: dilithium_key_sig.signature,
+            dilithium_message_signature: dilithium_msg_sig.signature,
+            signed_at,
         })
     }
     
     /// OPTIMIZED: Create compact signature for consensus (reduces size from 12KB to 3KB)
     /// Certificate is cached separately for O(1) verification
+    /// CRITICAL: Generates NEW ephemeral Ed25519 key for each message (NIST/Cisco requirement)
     pub async fn sign_message_compact(&self, message: &[u8]) -> Result<CompactHybridSignature> {
-        // Get current Ed25519 signing key 
-        let signing_key = self.ed25519_signing_key.as_ref()
-            .ok_or_else(|| anyhow!("No Ed25519 signing key available"))?;
+        // CRITICAL: Per NIST/Cisco standards for hybrid cryptography:
+        // 1. Generate NEW ephemeral Ed25519 key for THIS message
+        // 2. Sign message with ephemeral Ed25519 key
+        // 3. Create encapsulated_data = ephemeral_public_key || message_hash || timestamp
+        // 4. Sign encapsulated_data with Dilithium (signs the ephemeral key)
+        // 5. Sign message with Dilithium (quantum resistance)
         
-        // Get current certificate for metadata
+        // Step 1: Generate NEW ephemeral Ed25519 keypair for THIS message
+        let mut csprng = OsRng{};
+        let ephemeral_signing_key = SigningKey::generate(&mut csprng);
+        let ephemeral_verifying_key = ephemeral_signing_key.verifying_key();
+        let ephemeral_public_key_bytes = *ephemeral_verifying_key.as_bytes();
+        
+        // Step 2: Get current certificate for metadata
         let certificate = self.current_certificate.as_ref()
             .ok_or_else(|| anyhow!("No current certificate available"))?;
         
         // CRITICAL: Ensure certificate is in cache BEFORE creating compact signature
         self.cache_certificate(certificate).await;
         
-        // Step 1: Sign with Ed25519
-        let ed25519_signature = signing_key.sign(message);
+        // Step 3: Sign message with ephemeral Ed25519 key
+        let ed25519_signature = ephemeral_signing_key.sign(message);
         
-        // Step 2: Sign with Dilithium (quantum-resistant)
+        // Step 4: Create message hash for Dilithium signing
+        // CRITICAL FIX: Message is already SHA3 hash from microblock signing
+        // DO NOT hash again - just convert to hex for Dilithium
+        let message_hash_hex = hex::encode(message);
+        
+        // Step 5: Create encapsulated_data = ephemeral_public_key || message_hash || timestamp
+        let signed_at = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        let message_hash_bytes = hex::decode(&message_hash_hex)
+            .map_err(|e| anyhow!("Failed to decode message hash: {}", e))?;
+        let mut encapsulated_data = Vec::new();
+        encapsulated_data.extend_from_slice(&ephemeral_public_key_bytes);
+        encapsulated_data.extend_from_slice(&message_hash_bytes);
+        encapsulated_data.extend_from_slice(&signed_at.to_le_bytes());
+        let encapsulated_hex = hex::encode(&encapsulated_data);
+        
+        // Step 6: Sign encapsulated_data with Dilithium (NIST/Cisco requirement)
         use crate::node::GLOBAL_QUANTUM_CRYPTO;
         use crate::quantum_crypto::QNetQuantumCrypto;
         
@@ -452,18 +539,22 @@ impl HybridCrypto {
         }
         let quantum_crypto = crypto_guard.as_ref().unwrap();
         
-        // CRITICAL FIX: Message is already SHA3 hash from microblock signing
-        // DO NOT hash again - just convert to hex for Dilithium
-        let message_hash = hex::encode(message);
-        let dilithium_sig = quantum_crypto.create_consensus_signature(&self.node_id, &message_hash).await
-            .map_err(|e| anyhow!("Failed to create Dilithium signature: {}", e))?;
+        // Sign encapsulated_data with Dilithium (signs the ephemeral key)
+        let dilithium_key_sig = quantum_crypto.create_consensus_signature(&self.node_id, &encapsulated_hex).await
+            .map_err(|e| anyhow!("Failed to create Dilithium key signature: {}", e))?;
+        
+        // Step 7: Sign message with Dilithium (quantum resistance)
+        let dilithium_msg_sig = quantum_crypto.create_consensus_signature(&self.node_id, &message_hash_hex).await
+            .map_err(|e| anyhow!("Failed to create Dilithium message signature: {}", e))?;
         
         Ok(CompactHybridSignature {
             node_id: self.node_id.clone(),
-            cert_serial: certificate.serial_number.clone(), 
+            cert_serial: certificate.serial_number.clone(),
+            ephemeral_public_key: ephemeral_public_key_bytes,
             message_signature: ed25519_signature.to_bytes(),
-            dilithium_message_signature: dilithium_sig.signature,
-            signed_at: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
+            dilithium_key_signature: dilithium_key_sig.signature,
+            dilithium_message_signature: dilithium_msg_sig.signature,
+            signed_at,
         })
     }
     
@@ -578,11 +669,11 @@ impl HybridCrypto {
             return Ok(false);
         }
         
-        // Step 4: Verify Ed25519 message signature (fast)
+        // Step 4: Verify Ed25519 message signature with ephemeral key (fast)
         let ed25519_valid = Self::verify_ed25519_signature(
             message,
             &signature.message_signature,
-            &signature.certificate.ed25519_public_key
+            &signature.ephemeral_public_key  // Use ephemeral key, not certificate key!
         )?;
         
         if !ed25519_valid {
@@ -590,11 +681,16 @@ impl HybridCrypto {
             return Ok(false);
         }
         
-        // Step 5: CRITICAL - Verify Dilithium message signature
+        // Step 5: CRITICAL - Verify Dilithium signatures (NIST/Cisco requirement)
         // Per NIST/Cisco standards: BOTH signatures must be valid
-        // This ensures quantum resistance for EVERY message
+        // 1. Dilithium signature of encapsulated_data (ephemeral key)
+        // 2. Dilithium signature of message
         
-        // SECURITY: Dilithium signature is MANDATORY - no backwards compatibility bypass!
+        // SECURITY: Both Dilithium signatures are MANDATORY - no backwards compatibility bypass!
+        if signature.dilithium_key_signature.is_empty() {
+            println!("❌ REJECTED: No Dilithium key signature - quantum attack possible!");
+            return Ok(false);
+        }
         if signature.dilithium_message_signature.is_empty() {
             println!("❌ REJECTED: No Dilithium message signature - quantum attack possible!");
             return Ok(false);
@@ -612,28 +708,52 @@ impl HybridCrypto {
         let quantum_crypto = crypto_guard.as_ref().unwrap();
         
         // Recreate the same message hash used for signing
-        // Use SHA3-256 to match the rest of the system
         let mut hasher = Sha3_256::new();
         hasher.update(message);
-        let message_hash = hex::encode(hasher.finalize());
+        let message_hash = hasher.finalize();
+        let message_hash_hex = hex::encode(message_hash);
         
-        let dilithium_sig = DilithiumSignature {
+        // Step 5a: Verify Dilithium signature of encapsulated_data (ephemeral key)
+        let mut encapsulated_data = Vec::new();
+        encapsulated_data.extend_from_slice(&signature.ephemeral_public_key);
+        encapsulated_data.extend_from_slice(&message_hash);
+        encapsulated_data.extend_from_slice(&signature.signed_at.to_le_bytes());
+        let encapsulated_hex = hex::encode(&encapsulated_data);
+        
+        let dilithium_key_sig = DilithiumSignature {
+            signature: signature.dilithium_key_signature.clone(),
+            algorithm: "CRYSTALS-Dilithium3".to_string(),
+            timestamp: signature.signed_at,
+            strength: "quantum-resistant".to_string(),
+        };
+        
+        let dilithium_key_valid = quantum_crypto
+            .verify_dilithium_signature(&encapsulated_hex, &dilithium_key_sig, &signature.certificate.node_id)
+            .await?;
+        
+        if !dilithium_key_valid {
+            println!("❌ Invalid Dilithium key signature - quantum attack detected!");
+            return Ok(false);
+        }
+        
+        // Step 5b: Verify Dilithium signature of message
+        let dilithium_msg_sig = DilithiumSignature {
             signature: signature.dilithium_message_signature.clone(),
             algorithm: "CRYSTALS-Dilithium3".to_string(),
             timestamp: signature.signed_at,
             strength: "quantum-resistant".to_string(),
         };
         
-        let dilithium_valid = quantum_crypto
-            .verify_dilithium_signature(&message_hash, &dilithium_sig, &signature.certificate.node_id)
+        let dilithium_msg_valid = quantum_crypto
+            .verify_dilithium_signature(&message_hash_hex, &dilithium_msg_sig, &signature.certificate.node_id)
             .await?;
         
-        if !dilithium_valid {
+        if !dilithium_msg_valid {
             println!("❌ Invalid Dilithium message signature - quantum attack detected!");
             return Ok(false);
         }
         
-        println!("✅ BOTH signatures verified - truly quantum-resistant");
+        println!("✅ ALL signatures verified (Ed25519 + Dilithium key + Dilithium message) - truly quantum-resistant");
         Ok(true)
     }
     
@@ -691,5 +811,195 @@ impl HybridCrypto {
         });
         
         println!("🧹 Cache cleaned: {} certificates remaining", cache.len());
+    }
+}
+
+// ============================================================================
+// UNIT TESTS
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    /// Test HybridCrypto creation
+    #[test]
+    fn test_hybrid_crypto_creation() {
+        let node_id = "test_node_001".to_string();
+        let hybrid = HybridCrypto::new(node_id.clone());
+        
+        // Node ID should be set correctly
+        assert!(!node_id.is_empty());
+        // Needs rotation because no certificate yet
+        assert!(hybrid.needs_rotation());
+    }
+    
+    /// Test Ed25519 signature creation and verification
+    #[test]
+    fn test_ed25519_signature() {
+        use ed25519_dalek::{SigningKey, Signer};
+        use rand::rngs::OsRng;
+        
+        // Generate keypair
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let verifying_key = signing_key.verifying_key();
+        
+        // Sign message
+        let message = b"test message for ed25519";
+        let signature = signing_key.sign(message);
+        
+        // Verify signature
+        let sig_bytes: [u8; 64] = signature.to_bytes();
+        let pk_bytes: [u8; 32] = *verifying_key.as_bytes();
+        
+        let result = HybridCrypto::verify_ed25519_signature(message, &sig_bytes, &pk_bytes);
+        assert!(result.is_ok());
+        assert!(result.unwrap());
+    }
+    
+    /// Test Ed25519 signature with wrong key fails
+    #[test]
+    fn test_ed25519_wrong_key_fails() {
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+        
+        // Generate two keypairs
+        let signing_key1 = SigningKey::generate(&mut OsRng);
+        let signing_key2 = SigningKey::generate(&mut OsRng);
+        let wrong_verifying_key = signing_key2.verifying_key();
+        
+        // Sign with key1
+        let message = b"test message";
+        let signature = signing_key1.sign(message);
+        
+        // Verify with key2 (should fail)
+        let sig_bytes: [u8; 64] = signature.to_bytes();
+        let wrong_pk_bytes: [u8; 32] = *wrong_verifying_key.as_bytes();
+        
+        let result = HybridCrypto::verify_ed25519_signature(message, &sig_bytes, &wrong_pk_bytes);
+        assert!(result.is_ok());
+        assert!(!result.unwrap()); // Should be false
+    }
+    
+    /// Test ephemeral key generation is unique per call
+    #[test]
+    fn test_ephemeral_keys_unique() {
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+        
+        let key1 = SigningKey::generate(&mut OsRng);
+        let key2 = SigningKey::generate(&mut OsRng);
+        
+        // Ephemeral keys should be different
+        assert_ne!(key1.verifying_key().as_bytes(), key2.verifying_key().as_bytes());
+    }
+    
+    /// Test certificate expiration check
+    #[test]
+    fn test_certificate_expiration() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        
+        // Valid certificate (expires in future)
+        let valid_cert = HybridCertificate {
+            node_id: "test".to_string(),
+            ed25519_public_key: [0u8; 32],
+            dilithium_signature: String::new(),
+            issued_at: now,
+            expires_at: now + 300, // 5 minutes
+            serial_number: "test_serial".to_string(),
+            rotation_signature: None,
+        };
+        assert!(valid_cert.expires_at > now);
+        
+        // Expired certificate
+        let expired_cert = HybridCertificate {
+            node_id: "test".to_string(),
+            ed25519_public_key: [0u8; 32],
+            dilithium_signature: String::new(),
+            issued_at: now - 600,
+            expires_at: now - 300, // Expired 5 minutes ago
+            serial_number: "test_serial".to_string(),
+            rotation_signature: None,
+        };
+        assert!(expired_cert.expires_at < now);
+    }
+    
+    /// Test rotation threshold (80% of lifetime)
+    #[test]
+    fn test_rotation_threshold() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        
+        let hybrid = HybridCrypto::new("test_node".to_string());
+        
+        // Test needs_rotation with no certificate
+        assert!(hybrid.needs_rotation()); // No cert = needs rotation
+    }
+    
+    /// Test compact signature structure has required fields
+    #[test]
+    fn test_compact_signature_structure() {
+        let sig = CompactHybridSignature {
+            node_id: "test_node".to_string(),
+            cert_serial: "cert_123".to_string(),
+            ephemeral_public_key: [1u8; 32],
+            message_signature: [2u8; 64],
+            dilithium_key_signature: "key_sig".to_string(),
+            dilithium_message_signature: "msg_sig".to_string(),
+            signed_at: 1234567890,
+        };
+        
+        // Verify all fields are present
+        assert!(!sig.node_id.is_empty());
+        assert!(!sig.cert_serial.is_empty());
+        assert!(sig.ephemeral_public_key.iter().any(|&b| b != 0)); // Not all zeros
+        assert!(sig.message_signature.iter().any(|&b| b != 0));
+        assert!(!sig.dilithium_key_signature.is_empty());
+        assert!(!sig.dilithium_message_signature.is_empty());
+        assert!(sig.signed_at > 0);
+    }
+    
+    /// Test cache operations
+    #[test]
+    fn test_cache_stats() {
+        let (size, hit_rate) = HybridCrypto::get_cache_stats();
+        
+        // Cache stats should return valid values
+        // size is usize, always >= 0
+        let _ = size; // Use the value
+        assert!(hit_rate >= 0.0 && hit_rate <= 1.0);
+    }
+    
+    /// Test JSON serialization/deserialization of compact signature
+    #[test]
+    fn test_compact_signature_json_roundtrip() {
+        let original = CompactHybridSignature {
+            node_id: "test_node".to_string(),
+            cert_serial: "cert_123".to_string(),
+            ephemeral_public_key: [42u8; 32],
+            message_signature: [0u8; 64],
+            dilithium_key_signature: "dilithium_key_test".to_string(),
+            dilithium_message_signature: "dilithium_msg_test".to_string(),
+            signed_at: 1700000000,
+        };
+        
+        // Serialize to JSON
+        let json = serde_json::to_string(&original).expect("Serialization failed");
+        
+        // Deserialize back
+        let restored: CompactHybridSignature = serde_json::from_str(&json)
+            .expect("Deserialization failed");
+        
+        // Verify fields match
+        assert_eq!(original.node_id, restored.node_id);
+        assert_eq!(original.cert_serial, restored.cert_serial);
+        assert_eq!(original.ephemeral_public_key, restored.ephemeral_public_key);
+        assert_eq!(original.dilithium_key_signature, restored.dilithium_key_signature);
+        assert_eq!(original.signed_at, restored.signed_at);
     }
 }

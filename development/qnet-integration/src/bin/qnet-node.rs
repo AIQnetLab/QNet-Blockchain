@@ -653,12 +653,20 @@ async fn interactive_node_setup() -> Result<(NodeType, String), Box<dyn std::err
 
     // Beautiful quantum node startup banner
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!("🔮 QNET QUANTUM BLOCKCHAIN NODE INITIALIZED");
+    println!("🔮 QNET QUANTUM BLOCKCHAIN NODE v2.19.22");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("🚀 Node Type: {:?} | 🔐 Post-Quantum Security: ACTIVE", node_type);
     println!("🛡️  Quantum Algorithms: CRYSTALS-Dilithium + CRYSTALS-Kyber");
     println!("⚡ Performance Target: 100,000+ TPS | ⏱️  Block Time: 1s microblocks");
     println!("🌐 Network: Production Ready | 💎 Consensus: Byzantine-BFT");
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("🔌 REQUIRED PORTS (open in firewall!):");
+    println!("   TCP 9876  - P2P Network");
+    println!("   TCP 9877  - Gossip Protocol");  
+    println!("   TCP 8001  - REST API");
+    println!("   UDP 10876 - QUIC Transport ⚡ (REQUIRED for v2.19.22+)");
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("⚠️  FIREWALL: sudo ufw allow 9876,9877,8001/tcp && sudo ufw allow 10876/udp");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("✅ Quantum Node Ready - Blockchain Operations Starting...");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");

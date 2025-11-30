@@ -1,17 +1,19 @@
-# QNet API Reference v2.19.19
+# QNet API Reference v2.19.22
 
 ## 📡 Base URL
 
 ```
-Production API: http://{node_ip}:8080/api/v1
-Production P2P: http://{node_ip}:8001
+REST API:     http://{node_ip}:8001/api/v1  (for Light nodes & external clients)
+P2P (QUIC):   quic://{node_ip}:10876        (for Full/Super nodes - internal)
 
 Genesis Nodes:
-  - 154.38.160.39:8080 (Node 001 API) / :8001 (P2P)
-  - 62.171.157.44:8080 (Node 002 API) / :8001 (P2P)
-  - 161.97.86.81:8080 (Node 003 API) / :8001 (P2P)
-  - 5.189.130.160:8080 (Node 004 API) / :8001 (P2P)
-  - 162.244.25.114:8080 (Node 005 API) / :8001 (P2P)
+  - 154.38.160.39:8001 (REST API) / :10876/udp (QUIC P2P)
+  - 62.171.157.44:8001 (REST API) / :10876/udp (QUIC P2P)
+  - 161.97.86.81:8001 (REST API) / :10876/udp (QUIC P2P)
+  - 5.189.130.160:8001 (REST API) / :10876/udp (QUIC P2P)
+  - 162.244.25.114:8001 (REST API) / :10876/udp (QUIC P2P)
+
+Note: Light nodes use REST API (HTTP). Full/Super nodes use QUIC for P2P.
 ```
 
 ## 🔐 Authentication
@@ -21,6 +23,14 @@ Most endpoints are public. Protected endpoints require:
 - Ed25519 signature verification
 
 > **📚 Cryptography Details**: See [CRYPTOGRAPHY_IMPLEMENTATION.md](../documentation/technical/CRYPTOGRAPHY_IMPLEMENTATION.md) for full cryptographic specifications.
+
+### Signature Types
+
+| Context | Algorithm | Notes |
+|---------|-----------|-------|
+| **User Transactions** | Ed25519 | Standard wallet signatures |
+| **Node-to-Node (P2P)** | Hybrid (Ed25519 + Dilithium) | NIST/Cisco compliant, ephemeral keys per message |
+| **Block Signatures** | Hybrid (Ed25519 + Dilithium) | Quantum-resistant, FIPS 204 |
 
 ---
 
@@ -1348,7 +1358,10 @@ Content-Type: application/json
 
 ## 🔗 P2P Endpoints
 
-### P2P Message
+> **Note (v2.19.22)**: Full/Super nodes use QUIC (UDP 10876) for P2P communication.
+> These HTTP endpoints are for Light nodes and legacy compatibility only.
+
+### P2P Message (Light Nodes Only)
 ```http
 POST /api/v1/p2p/message
 Content-Type: application/json

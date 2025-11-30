@@ -56,6 +56,23 @@ RUN mkdir -p /app/data /app/logs \
 RUN echo '#!/bin/bash\n\
 set -e\n\
 DATA_DIR="${QNET_DATA_DIR:-/app/data}"\n\
+\n\
+# ════════════════════════════════════════════════════════════════════════════\n\
+# QNET v2.19.22+ REQUIRED PORTS - MUST BE OPEN IN HOST FIREWALL!\n\
+# ════════════════════════════════════════════════════════════════════════════\n\
+echo ""\n\
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"\n\
+echo "🔌 QNET v2.19.22 - REQUIRED PORTS (must be open on HOST firewall!)"\n\
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"\n\
+echo "   TCP 9876  - P2P Network"\n\
+echo "   TCP 9877  - Gossip Protocol"\n\
+echo "   TCP 8001  - REST API"\n\
+echo "   UDP 10876 - QUIC Transport ⚡ (NEW! Required for v2.19.22+)"\n\
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"\n\
+echo "⚠️  RUN ON HOST: sudo ufw allow 9876,9877,8001/tcp && sudo ufw allow 10876/udp"\n\
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"\n\
+echo ""\n\
+\n\
 if [ "$(id -u)" = "0" ]; then\n\
   echo "Checking data directory: $DATA_DIR"\n\
   \n\
@@ -103,7 +120,11 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:8001/api/v1/node/health || exit 1
 
 # Expose required ports (QNet specific)
-EXPOSE 9876 9877 8001
+# 9876 - P2P HTTP
+# 9877 - P2P gossip
+# 8001 - REST API
+# 10876 - QUIC transport (9876 + 1000)
+EXPOSE 9876 9877 8001 10876
 
 # Production startup command with automatic permission fixing
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

@@ -128,10 +128,13 @@ async fn verify_compact_hybrid_signature(
     // - This function only handles microblock verification
     
     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_data) {
-        // Verify structure has required fields
+        // Verify structure has required fields (NIST/Cisco compliance)
+        // CRITICAL: Must have ephemeral_public_key and dilithium_key_signature
         if parsed.get("node_id").is_some() && 
            parsed.get("cert_serial").is_some() &&
-           parsed.get("message_signature").is_some() && 
+           parsed.get("ephemeral_public_key").is_some() &&  // NIST/Cisco: ephemeral key per message
+           parsed.get("message_signature").is_some() &&
+           parsed.get("dilithium_key_signature").is_some() &&  // NIST/Cisco: Dilithium signs ephemeral key
            parsed.get("dilithium_message_signature").is_some() {
             
             // Extract fields from compact signature
@@ -168,15 +171,25 @@ async fn verify_compact_hybrid_signature(
                         Some(bytes)
                     });
                 
-                let dilithium_sig = parsed.get("dilithium_message_signature")
+                let dilithium_key_sig = parsed.get("dilithium_key_signature")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let dilithium_msg_sig = parsed.get("dilithium_message_signature")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
                 
-                // Verify both signatures are present
-                if ed25519_sig_bytes.is_none() || dilithium_sig.is_empty() {
+                // Extract ephemeral public key
+                let ephemeral_pk = parsed.get("ephemeral_public_key")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                
+                // Verify ALL signatures are present (NIST/Cisco requirement)
+                if ed25519_sig_bytes.is_none() || dilithium_key_sig.is_empty() || dilithium_msg_sig.is_empty() || ephemeral_pk.is_empty() {
                     println!("[CONSENSUS] ❌ Compact signature missing components!");
                     println!("[CONSENSUS]    Ed25519: {}", if ed25519_sig_bytes.is_some() {"✅"} else {"❌"});
-                    println!("[CONSENSUS]    Dilithium: {}", if !dilithium_sig.is_empty() {"✅"} else {"❌"});
+                    println!("[CONSENSUS]    Ephemeral PK: {}", if !ephemeral_pk.is_empty() {"✅"} else {"❌"});
+                    println!("[CONSENSUS]    Dilithium key: {}", if !dilithium_key_sig.is_empty() {"✅"} else {"❌"});
+                    println!("[CONSENSUS]    Dilithium message: {}", if !dilithium_msg_sig.is_empty() {"✅"} else {"❌"});
                     return false;
                 }
                 
@@ -209,9 +222,13 @@ async fn verify_compact_hybrid_signature(
                     return false;
                 }
                 
-                // Validate Dilithium signature component
-                if dilithium_sig.len() < 100 {
-                    println!("[CONSENSUS] ❌ Invalid Dilithium signature size: {} (too small)", dilithium_sig.len());
+                // Validate Dilithium signature components (both key and message signatures)
+                if dilithium_key_sig.len() < 100 {
+                    println!("[CONSENSUS] ❌ Invalid Dilithium key signature size: {} (too small)", dilithium_key_sig.len());
+                    return false;
+                }
+                if dilithium_msg_sig.len() < 100 {
+                    println!("[CONSENSUS] ❌ Invalid Dilithium message signature size: {} (too small)", dilithium_msg_sig.len());
                     return false;
                 }
                 
@@ -231,20 +248,28 @@ async fn verify_compact_hybrid_signature(
                     }
                 }
                 
-                // Verify Dilithium signature is base64-encoded (basic check)
-                if dilithium_sig.chars().any(|c| {
+                // Verify Dilithium signatures are base64-encoded (basic check)
+                if dilithium_key_sig.chars().any(|c| {
                     !c.is_ascii_alphanumeric() && c != '+' && c != '/' && c != '='
                 }) {
-                    println!("[CONSENSUS] ❌ Dilithium signature not valid base64!");
+                    println!("[CONSENSUS] ❌ Dilithium key signature not valid base64!");
+                    return false;
+                }
+                if dilithium_msg_sig.chars().any(|c| {
+                    !c.is_ascii_alphanumeric() && c != '+' && c != '/' && c != '='
+                }) {
+                    println!("[CONSENSUS] ❌ Dilithium message signature not valid base64!");
                     return false;
                 }
                 
                 // Message hash validation - ensures consistency
-                println!("[CONSENSUS] ✅ Compact signature structurally valid");
+                println!("[CONSENSUS] ✅ Compact signature structurally valid (NIST/Cisco compliant)");
                 println!("[CONSENSUS]    Node: {}", node_id);
                 println!("[CONSENSUS]    Certificate: {}", cert_serial);
+                println!("[CONSENSUS]    Ephemeral PK: ✅ present");
                 println!("[CONSENSUS]    Ed25519: ✅ {} bytes", ed25519_sig_len);
-                println!("[CONSENSUS]    Dilithium: ✅ {} bytes", dilithium_sig.len());
+                println!("[CONSENSUS]    Dilithium key: ✅ {} bytes", dilithium_key_sig.len());
+                println!("[CONSENSUS]    Dilithium message: ✅ {} bytes", dilithium_msg_sig.len());
                 println!("[CONSENSUS]    Message hash (SHA3-256): {}", message_hash_str);
                 println!("[CONSENSUS]    ℹ️  Full crypto verification performed at P2P level");
                 

@@ -1,0 +1,832 @@
+//! # QNet QUIC Transport Layer
+//!
+//! High-performance QUIC transport for QNet P2P network.
+//! Replaces HTTP for all P2P communication.
+//!
+//! ## Architecture
+//!
+//! ```
+//! ┌─────────────────────────────────────────────────────────────────┐
+//! │                    QUIC Transport Stack                         │
+//! ├─────────────────────────────────────────────────────────────────┤
+//! │ Server: Accept incoming connections                             │
+//! │   - endpoint.accept() loop in background task                  │
+//! │   - Handle incoming streams                                     │
+//! │   - Route messages to handler callback                         │
+//! ├─────────────────────────────────────────────────────────────────┤
+//! │ Client: Connect to peers                                        │
+//! │   - Persistent connection pool                                  │
+//! │   - Automatic reconnection                                      │
+//! │   - Binary protocol (bincode)                                   │
+//! └─────────────────────────────────────────────────────────────────┘
+//! ```
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+
+use dashmap::DashMap;
+use quinn::{Endpoint, ServerConfig, ClientConfig, Connection, VarInt, RecvStream, SendStream};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use tokio::sync::{RwLock, mpsc};
+use serde::{Serialize, Deserialize};
+
+use crate::p2p_transport::*;
+use crate::unified_p2p::{NetworkMessage, PeerInfo};
+
+// ============================================================================
+// CONSTANTS - ALIGNED WITH HTTP VALUES
+// ============================================================================
+
+/// Connection timeout (same as HTTP: 3s)
+pub const CONNECT_TIMEOUT_SECS: u64 = 3;
+
+/// Send/receive timeout (same as HTTP: 5s for messages)
+pub const MESSAGE_TIMEOUT_SECS: u64 = 5;
+
+/// Keep-alive interval (same as HTTP TCP keepalive: 30s)
+pub const KEEP_ALIVE_SECS: u64 = 30;
+
+/// Idle connection timeout (same as HTTP pool: 90s)
+pub const IDLE_TIMEOUT_SECS: u64 = 90;
+
+/// Maximum concurrent streams per connection
+pub const MAX_STREAMS_PER_CONN: u32 = 100;
+
+/// QUIC port offset from P2P port (9876 -> 10876)
+pub const QUIC_PORT_OFFSET: u16 = 1000;
+
+/// Maximum message size (10 MB - for macroblocks)
+pub const MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024;
+
+/// Protocol version
+pub const PROTOCOL_VERSION: u8 = 1;
+
+// ============================================================================
+// NODE HANDSHAKE
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeHandshake {
+    pub node_id: String,
+    pub cert_serial: String,
+    pub protocol_version: u8,
+    pub node_type: String,
+    pub timestamp: u64,
+}
+
+// ============================================================================
+// QUIC CONNECTION
+// ============================================================================
+
+pub struct QuicConnection {
+    pub connection: Connection,
+    pub remote_node_id: Option<String>,
+    pub remote_cert_serial: Option<String>,
+    pub connected_at: Instant,
+    pub last_activity: Instant,
+    pub messages_sent: AtomicU64,
+    pub messages_received: AtomicU64,
+    pub bytes_sent: AtomicU64,
+    pub bytes_received: AtomicU64,
+}
+
+// ============================================================================
+// TRANSPORT STATISTICS
+// ============================================================================
+
+#[derive(Debug, Clone, Default)]
+pub struct QuicStats {
+    pub connections_established: u64,
+    pub connections_failed: u64,
+    pub active_connections: usize,
+    pub messages_sent: u64,
+    pub messages_received: u64,
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
+    pub avg_rtt_ms: u64,
+}
+
+// ============================================================================
+// MESSAGE HANDLER TYPE
+// ============================================================================
+
+/// Callback type for handling received messages
+pub type MessageHandler = Arc<dyn Fn(SocketAddr, NetworkMessage) + Send + Sync>;
+
+// ============================================================================
+// QUIC TRANSPORT
+// ============================================================================
+
+pub struct QuicTransport {
+    /// QUIC endpoint
+    endpoint: Option<Endpoint>,
+    /// Our node ID
+    node_id: String,
+    /// Our certificate serial
+    cert_serial: String,
+    /// Node type string
+    node_type: String,
+    /// QUIC port
+    quic_port: u16,
+    /// Active connections (peer_addr -> connection)
+    connections: Arc<DashMap<SocketAddr, Arc<QuicConnection>>>,
+    /// Server running flag
+    server_running: Arc<AtomicBool>,
+    /// Message handler callback
+    message_handler: Option<MessageHandler>,
+    /// Statistics
+    stats: Arc<RwLock<QuicStats>>,
+}
+
+impl QuicTransport {
+    pub fn new(node_id: String, node_type: String, quic_port: u16) -> Self {
+        Self {
+            endpoint: None,
+            node_id,
+            cert_serial: String::new(),
+            node_type,
+            quic_port,
+            connections: Arc::new(DashMap::new()),
+            server_running: Arc::new(AtomicBool::new(false)),
+            message_handler: None,
+            stats: Arc::new(RwLock::new(QuicStats::default())),
+        }
+    }
+    
+    /// Set message handler callback
+    pub fn set_message_handler(&mut self, handler: MessageHandler) {
+        self.message_handler = Some(handler);
+    }
+    
+    /// Generate self-signed TLS certificate
+    fn generate_tls_cert(node_id: &str) -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>), String> {
+        let cert = rcgen::generate_simple_self_signed(vec![format!("qnet-{}", node_id)])
+            .map_err(|e| format!("Certificate generation failed: {}", e))?;
+        
+        let cert_der = cert.serialize_der()
+            .map_err(|e| format!("Certificate serialization failed: {}", e))?;
+        let key_der = cert.get_key_pair().serialize_der();
+        
+        Ok((CertificateDer::from(cert_der), PrivateKeyDer::Pkcs8(key_der.into())))
+    }
+    
+    /// Initialize QUIC transport (creates endpoint)
+    pub async fn init(&mut self, bind_addr: SocketAddr, cert_serial: &str) -> Result<(), String> {
+        self.cert_serial = cert_serial.to_string();
+        
+        // Generate TLS certificate
+        let (cert, key) = Self::generate_tls_cert(&self.node_id)?;
+        
+        // Server config
+        let mut server_crypto = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.clone()], key.clone_key())
+            .map_err(|e| format!("Server config failed: {}", e))?;
+        
+        server_crypto.alpn_protocols = vec![b"qnet-p2p-v1".to_vec()];
+        
+        let mut server_config = ServerConfig::with_crypto(Arc::new(
+            quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)
+                .map_err(|e| format!("QUIC server config failed: {}", e))?
+        ));
+        
+        // Transport config - ALIGNED WITH HTTP
+        let mut transport = quinn::TransportConfig::default();
+        transport.max_concurrent_bidi_streams(VarInt::from_u32(MAX_STREAMS_PER_CONN));
+        transport.max_concurrent_uni_streams(VarInt::from_u32(MAX_STREAMS_PER_CONN));
+        transport.max_idle_timeout(Some(Duration::from_secs(IDLE_TIMEOUT_SECS).try_into().unwrap()));
+        transport.keep_alive_interval(Some(Duration::from_secs(KEEP_ALIVE_SECS)));
+        server_config.transport_config(Arc::new(transport));
+        
+        // Create endpoint
+        let endpoint = Endpoint::server(server_config, bind_addr)
+            .map_err(|e| format!("Endpoint creation failed: {}", e))?;
+        
+        self.endpoint = Some(endpoint);
+        
+        println!("[QUIC] ✅ Transport initialized on {}", bind_addr);
+        println!("[QUIC] 📊 Timeouts: connect={}s, idle={}s, keepalive={}s", 
+            CONNECT_TIMEOUT_SECS, IDLE_TIMEOUT_SECS, KEEP_ALIVE_SECS);
+        
+        Ok(())
+    }
+    
+    /// Start QUIC server (accept incoming connections)
+    pub async fn start_server(&self) -> Result<(), String> {
+        let endpoint = self.endpoint.clone()
+            .ok_or("Endpoint not initialized")?;
+        
+        if self.server_running.load(Ordering::Relaxed) {
+            return Ok(()); // Already running
+        }
+        
+        self.server_running.store(true, Ordering::SeqCst);
+        
+        let connections = self.connections.clone();
+        let server_running = self.server_running.clone();
+        let message_handler = self.message_handler.clone();
+        let stats = self.stats.clone();
+        let node_id = self.node_id.clone();
+        let cert_serial = self.cert_serial.clone();
+        let node_type = self.node_type.clone();
+        
+        // Spawn server task
+        tokio::spawn(async move {
+            println!("[QUIC] 🚀 Server started, accepting connections...");
+            
+            while server_running.load(Ordering::Relaxed) {
+                // Accept incoming connection
+                let incoming = match endpoint.accept().await {
+                    Some(conn) => conn,
+                    None => {
+                        println!("[QUIC] ⚠️ Endpoint closed");
+                        break;
+                    }
+                };
+                
+                let peer_addr = incoming.remote_address();
+                
+                // Handle connection in separate task
+                let connections_clone = connections.clone();
+                let handler_clone = message_handler.clone();
+                let stats_clone = stats.clone();
+                let node_id_clone = node_id.clone();
+                let cert_serial_clone = cert_serial.clone();
+                let node_type_clone = node_type.clone();
+                
+                tokio::spawn(async move {
+                    match incoming.await {
+                        Ok(connection) => {
+                            println!("[QUIC] 📥 Incoming connection from {}", peer_addr);
+                            
+                            // Perform handshake
+                            let handshake_result = Self::handle_server_handshake(
+                                &connection, 
+                                &node_id_clone, 
+                                &cert_serial_clone,
+                                &node_type_clone
+                            ).await;
+                            
+                            let (remote_node_id, remote_cert_serial) = match handshake_result {
+                                Ok(h) => h,
+                                Err(e) => {
+                                    println!("[QUIC] ❌ Handshake failed from {}: {}", peer_addr, e);
+                                    return;
+                                }
+                            };
+                            
+                            println!("[QUIC] ✅ Accepted connection from {} (node: {})", peer_addr, remote_node_id);
+                            
+                            // Store connection
+                            let quic_conn = Arc::new(QuicConnection {
+                                connection: connection.clone(),
+                                remote_node_id: Some(remote_node_id),
+                                remote_cert_serial: Some(remote_cert_serial),
+                                connected_at: Instant::now(),
+                                last_activity: Instant::now(),
+                                messages_sent: AtomicU64::new(0),
+                                messages_received: AtomicU64::new(0),
+                                bytes_sent: AtomicU64::new(0),
+                                bytes_received: AtomicU64::new(0),
+                            });
+                            
+                            connections_clone.insert(peer_addr, quic_conn.clone());
+                            
+                            // Update stats
+                            {
+                                let mut s = stats_clone.write().await;
+                                s.connections_established += 1;
+                                s.active_connections = connections_clone.len();
+                            }
+                            
+                            // Handle incoming streams
+                            Self::handle_incoming_streams(connection, peer_addr, handler_clone, quic_conn).await;
+                        }
+                        Err(e) => {
+                            println!("[QUIC] ❌ Connection failed from {}: {}", peer_addr, e);
+                            let mut s = stats_clone.write().await;
+                            s.connections_failed += 1;
+                        }
+                    }
+                });
+            }
+            
+            println!("[QUIC] 🛑 Server stopped");
+        });
+        
+        Ok(())
+    }
+    
+    /// Handle server-side handshake
+    async fn handle_server_handshake(
+        conn: &Connection,
+        our_node_id: &str,
+        our_cert_serial: &str,
+        our_node_type: &str,
+    ) -> Result<(String, String), String> {
+        // Accept bidirectional stream for handshake
+        let (mut send, mut recv) = conn.accept_bi().await
+            .map_err(|e| format!("Accept stream failed: {}", e))?;
+        
+        // Receive peer's handshake
+        let mut len_buf = [0u8; 4];
+        recv.read_exact(&mut len_buf).await.map_err(|e| format!("Read len failed: {}", e))?;
+        let len = u32::from_be_bytes(len_buf) as usize;
+        
+        if len > MAX_MESSAGE_SIZE {
+            return Err(format!("Handshake too large: {}", len));
+        }
+        
+        let mut data = vec![0u8; len];
+        recv.read_exact(&mut data).await.map_err(|e| format!("Read data failed: {}", e))?;
+        
+        let peer_handshake: NodeHandshake = bincode::deserialize(&data)
+            .map_err(|e| format!("Handshake deserialize failed: {}", e))?;
+        
+        // Send our handshake
+        let our_handshake = NodeHandshake {
+            node_id: our_node_id.to_string(),
+            cert_serial: our_cert_serial.to_string(),
+            protocol_version: PROTOCOL_VERSION,
+            node_type: our_node_type.to_string(),
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        };
+        
+        let handshake_bytes = bincode::serialize(&our_handshake)
+            .map_err(|e| format!("Handshake serialize failed: {}", e))?;
+        
+        let len_bytes = (handshake_bytes.len() as u32).to_be_bytes();
+        send.write_all(&len_bytes).await.map_err(|e| format!("Write len failed: {}", e))?;
+        send.write_all(&handshake_bytes).await.map_err(|e| format!("Write data failed: {}", e))?;
+        send.finish().map_err(|e| format!("Finish failed: {}", e))?;
+        
+        Ok((peer_handshake.node_id, peer_handshake.cert_serial))
+    }
+    
+    /// Handle incoming streams from a connection
+    async fn handle_incoming_streams(
+        conn: Connection,
+        peer_addr: SocketAddr,
+        handler: Option<MessageHandler>,
+        quic_conn: Arc<QuicConnection>,
+    ) {
+        loop {
+            // Accept bidirectional or unidirectional streams
+            tokio::select! {
+                // Bidirectional stream (request-response)
+                result = conn.accept_bi() => {
+                    match result {
+                        Ok((send, recv)) => {
+                            let handler_clone = handler.clone();
+                            let conn_clone = quic_conn.clone();
+                            tokio::spawn(async move {
+                                Self::handle_bidi_stream(peer_addr, send, recv, handler_clone, conn_clone).await;
+                            });
+                        }
+                        Err(e) => {
+                            println!("[QUIC] 🔌 Connection closed from {}: {}", peer_addr, e);
+                            break;
+                        }
+                    }
+                }
+                // Unidirectional stream (broadcast, no response)
+                result = conn.accept_uni() => {
+                    match result {
+                        Ok(recv) => {
+                            let handler_clone = handler.clone();
+                            let conn_clone = quic_conn.clone();
+                            tokio::spawn(async move {
+                                Self::handle_uni_stream(peer_addr, recv, handler_clone, conn_clone).await;
+                            });
+                        }
+                        Err(e) => {
+                            println!("[QUIC] 🔌 Connection closed from {}: {}", peer_addr, e);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    /// Handle bidirectional stream
+    async fn handle_bidi_stream(
+        peer_addr: SocketAddr,
+        mut send: SendStream,
+        mut recv: RecvStream,
+        handler: Option<MessageHandler>,
+        conn: Arc<QuicConnection>,
+    ) {
+        // Read message
+        let data = match tokio::time::timeout(
+            Duration::from_secs(MESSAGE_TIMEOUT_SECS),
+            recv.read_to_end(MAX_MESSAGE_SIZE)
+        ).await {
+            Ok(Ok(d)) => d,
+            Ok(Err(e)) => {
+                println!("[QUIC] ⚠️ Read failed from {}: {}", peer_addr, e);
+                return;
+            }
+            Err(_) => {
+                println!("[QUIC] ⚠️ Read timeout from {}", peer_addr);
+                return;
+            }
+        };
+        
+        conn.bytes_received.fetch_add(data.len() as u64, Ordering::Relaxed);
+        conn.messages_received.fetch_add(1, Ordering::Relaxed);
+        
+        // Parse message
+        let msg = match Self::parse_message(&data) {
+            Ok(m) => m,
+            Err(e) => {
+                println!("[QUIC] ⚠️ Parse failed from {}: {}", peer_addr, e);
+                return;
+            }
+        };
+        
+        // Call handler
+        if let Some(ref h) = handler {
+            h(peer_addr, msg);
+        }
+        
+        // Send empty response (acknowledgment)
+        let _ = send.finish();
+    }
+    
+    /// Handle unidirectional stream (broadcast)
+    async fn handle_uni_stream(
+        peer_addr: SocketAddr,
+        mut recv: RecvStream,
+        handler: Option<MessageHandler>,
+        conn: Arc<QuicConnection>,
+    ) {
+        // Read message
+        let data = match tokio::time::timeout(
+            Duration::from_secs(MESSAGE_TIMEOUT_SECS),
+            recv.read_to_end(MAX_MESSAGE_SIZE)
+        ).await {
+            Ok(Ok(d)) => d,
+            Ok(Err(e)) => {
+                println!("[QUIC] ⚠️ Uni read failed from {}: {}", peer_addr, e);
+                return;
+            }
+            Err(_) => {
+                println!("[QUIC] ⚠️ Uni read timeout from {}", peer_addr);
+                return;
+            }
+        };
+        
+        conn.bytes_received.fetch_add(data.len() as u64, Ordering::Relaxed);
+        conn.messages_received.fetch_add(1, Ordering::Relaxed);
+        
+        // Parse message
+        let msg = match Self::parse_message(&data) {
+            Ok(m) => m,
+            Err(e) => {
+                println!("[QUIC] ⚠️ Uni parse failed from {}: {}", peer_addr, e);
+                return;
+            }
+        };
+        
+        // Call handler
+        if let Some(ref h) = handler {
+            h(peer_addr, msg);
+        }
+    }
+    
+    /// Parse binary message
+    fn parse_message(data: &[u8]) -> Result<NetworkMessage, String> {
+        if data.len() < 6 {
+            return Err("Message too short".into());
+        }
+        
+        // Check header
+        let version = data[0];
+        if version != PROTOCOL_VERSION {
+            return Err(format!("Protocol version mismatch: {}", version));
+        }
+        
+        let payload_len = u32::from_be_bytes([data[2], data[3], data[4], data[5]]) as usize;
+        
+        if data.len() < 6 + payload_len {
+            return Err("Incomplete message".into());
+        }
+        
+        // Deserialize payload
+        bincode::deserialize(&data[6..6+payload_len])
+            .map_err(|e| format!("Deserialize failed: {}", e))
+    }
+    
+    /// Connect to a peer (client mode)
+    pub async fn connect(&self, peer_addr: SocketAddr) -> Result<Arc<QuicConnection>, String> {
+        // Check existing connection
+        if let Some(conn) = self.connections.get(&peer_addr) {
+            return Ok(conn.clone());
+        }
+        
+        let endpoint = self.endpoint.as_ref()
+            .ok_or("Endpoint not initialized")?;
+        
+        // Client config
+        let client_crypto = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
+            .with_no_client_auth();
+        
+        let mut client_config = ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)
+                .map_err(|e| format!("Client config failed: {}", e))?
+        ));
+        
+        // Transport config - ALIGNED WITH HTTP
+        let mut transport = quinn::TransportConfig::default();
+        transport.max_concurrent_bidi_streams(VarInt::from_u32(MAX_STREAMS_PER_CONN));
+        transport.max_idle_timeout(Some(Duration::from_secs(IDLE_TIMEOUT_SECS).try_into().unwrap()));
+        transport.keep_alive_interval(Some(Duration::from_secs(KEEP_ALIVE_SECS)));
+        client_config.transport_config(Arc::new(transport));
+        
+        // Connect with timeout
+        let connecting = endpoint.connect_with(client_config, peer_addr, "qnet-node")
+            .map_err(|e| format!("Connect failed: {}", e))?;
+        
+        let connection = tokio::time::timeout(
+            Duration::from_secs(CONNECT_TIMEOUT_SECS),
+            connecting
+        )
+            .await
+            .map_err(|_| "Connection timeout")?
+            .map_err(|e| format!("Connection failed: {}", e))?;
+        
+        // Perform client handshake
+        let (remote_node_id, remote_cert_serial) = self.perform_client_handshake(&connection).await?;
+        
+        println!("[QUIC] ✅ Connected to {} (node: {})", peer_addr, remote_node_id);
+        
+        // Store connection
+        let quic_conn = Arc::new(QuicConnection {
+            connection,
+            remote_node_id: Some(remote_node_id),
+            remote_cert_serial: Some(remote_cert_serial),
+            connected_at: Instant::now(),
+            last_activity: Instant::now(),
+            messages_sent: AtomicU64::new(0),
+            messages_received: AtomicU64::new(0),
+            bytes_sent: AtomicU64::new(0),
+            bytes_received: AtomicU64::new(0),
+        });
+        
+        self.connections.insert(peer_addr, quic_conn.clone());
+        
+        // Update stats
+        {
+            let mut stats = self.stats.write().await;
+            stats.connections_established += 1;
+            stats.active_connections = self.connections.len();
+        }
+        
+        Ok(quic_conn)
+    }
+    
+    /// Perform client-side handshake
+    async fn perform_client_handshake(&self, conn: &Connection) -> Result<(String, String), String> {
+        // Our handshake
+        let our_handshake = NodeHandshake {
+            node_id: self.node_id.clone(),
+            cert_serial: self.cert_serial.clone(),
+            protocol_version: PROTOCOL_VERSION,
+            node_type: self.node_type.clone(),
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        };
+        
+        let handshake_bytes = bincode::serialize(&our_handshake)
+            .map_err(|e| format!("Serialize failed: {}", e))?;
+        
+        // Open stream
+        let (mut send, mut recv) = conn.open_bi().await
+            .map_err(|e| format!("Open stream failed: {}", e))?;
+        
+        // Send our handshake
+        let len_bytes = (handshake_bytes.len() as u32).to_be_bytes();
+        send.write_all(&len_bytes).await.map_err(|e| format!("Write len failed: {}", e))?;
+        send.write_all(&handshake_bytes).await.map_err(|e| format!("Write data failed: {}", e))?;
+        send.finish().map_err(|e| format!("Finish failed: {}", e))?;
+        
+        // Receive peer's handshake
+        let mut len_buf = [0u8; 4];
+        recv.read_exact(&mut len_buf).await.map_err(|e| format!("Read len failed: {}", e))?;
+        let len = u32::from_be_bytes(len_buf) as usize;
+        
+        if len > MAX_MESSAGE_SIZE {
+            return Err(format!("Handshake too large: {}", len));
+        }
+        
+        let mut data = vec![0u8; len];
+        recv.read_exact(&mut data).await.map_err(|e| format!("Read data failed: {}", e))?;
+        
+        let peer_handshake: NodeHandshake = bincode::deserialize(&data)
+            .map_err(|e| format!("Deserialize failed: {}", e))?;
+        
+        Ok((peer_handshake.node_id, peer_handshake.cert_serial))
+    }
+    
+    /// Send message to peer (request-response)
+    pub async fn send_message(&self, peer_addr: SocketAddr, msg: &NetworkMessage) -> Result<(), String> {
+        let conn = self.connect(peer_addr).await?;
+        
+        // Serialize message
+        let wire_data = Self::serialize_message(msg)?;
+        
+        // Open bidirectional stream
+        let (mut send, _recv) = conn.connection.open_bi().await
+            .map_err(|e| format!("Open stream failed: {}", e))?;
+        
+        // Send with timeout
+        tokio::time::timeout(
+            Duration::from_secs(MESSAGE_TIMEOUT_SECS),
+            send.write_all(&wire_data)
+        )
+            .await
+            .map_err(|_| "Send timeout")?
+            .map_err(|e| format!("Write failed: {}", e))?;
+        
+        send.finish().map_err(|e| format!("Finish failed: {}", e))?;
+        
+        conn.bytes_sent.fetch_add(wire_data.len() as u64, Ordering::Relaxed);
+        conn.messages_sent.fetch_add(1, Ordering::Relaxed);
+        
+        // Update stats
+        {
+            let mut stats = self.stats.write().await;
+            stats.messages_sent += 1;
+            stats.bytes_sent += wire_data.len() as u64;
+        }
+        
+        Ok(())
+    }
+    
+    /// Broadcast message (unidirectional, no response)
+    pub async fn broadcast_to(&self, peer_addr: SocketAddr, msg: &NetworkMessage) -> Result<(), String> {
+        let conn = self.connect(peer_addr).await?;
+        
+        // Serialize message
+        let wire_data = Self::serialize_message(msg)?;
+        
+        // Open unidirectional stream
+        let mut send = conn.connection.open_uni().await
+            .map_err(|e| format!("Open uni stream failed: {}", e))?;
+        
+        // Send
+        send.write_all(&wire_data).await
+            .map_err(|e| format!("Write failed: {}", e))?;
+        send.finish().map_err(|e| format!("Finish failed: {}", e))?;
+        
+        conn.bytes_sent.fetch_add(wire_data.len() as u64, Ordering::Relaxed);
+        conn.messages_sent.fetch_add(1, Ordering::Relaxed);
+        
+        Ok(())
+    }
+    
+    /// Serialize message to wire format
+    fn serialize_message(msg: &NetworkMessage) -> Result<Vec<u8>, String> {
+        let payload = bincode::serialize(msg)
+            .map_err(|e| format!("Serialize failed: {}", e))?;
+        
+        if payload.len() > MAX_MESSAGE_SIZE {
+            return Err(format!("Message too large: {}", payload.len()));
+        }
+        
+        // Build wire format: version (1) + type (1) + length (4) + payload
+        let mut wire_data = Vec::with_capacity(6 + payload.len());
+        wire_data.push(PROTOCOL_VERSION);
+        wire_data.push(Self::get_message_type(msg));
+        wire_data.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        wire_data.extend_from_slice(&payload);
+        
+        Ok(wire_data)
+    }
+    
+    /// Get message type byte
+    fn get_message_type(msg: &NetworkMessage) -> u8 {
+        match msg {
+            NetworkMessage::Block { .. } => 1,
+            NetworkMessage::Transaction { .. } => 2,
+            NetworkMessage::PeerDiscovery { .. } => 3,
+            NetworkMessage::HealthPing { .. } => 4,
+            NetworkMessage::ConsensusCommit { .. } => 5,
+            NetworkMessage::ConsensusReveal { .. } => 6,
+            NetworkMessage::EmergencyProducerChange { .. } => 7,
+            NetworkMessage::TurbineChunk { .. } => 8,
+            NetworkMessage::ReputationSync { .. } => 9,
+            _ => 0,
+        }
+    }
+    
+    /// Get statistics
+    pub async fn get_stats(&self) -> QuicStats {
+        let mut stats = self.stats.read().await.clone();
+        stats.active_connections = self.connections.len();
+        
+        // Calculate average RTT
+        let total_rtt: u64 = self.connections.iter()
+            .map(|c| c.connection.rtt().as_millis() as u64)
+            .sum();
+        
+        if !self.connections.is_empty() {
+            stats.avg_rtt_ms = total_rtt / self.connections.len() as u64;
+        }
+        
+        stats
+    }
+    
+    /// Disconnect from peer
+    pub fn disconnect(&self, peer_addr: &SocketAddr) {
+        if let Some((_, conn)) = self.connections.remove(peer_addr) {
+            conn.connection.close(VarInt::from_u32(0), b"disconnect");
+        }
+    }
+    
+    /// Cleanup idle connections
+    pub fn cleanup_idle(&self) {
+        let now = Instant::now();
+        let mut to_remove = Vec::new();
+        
+        for entry in self.connections.iter() {
+            if now.duration_since(entry.last_activity) > Duration::from_secs(IDLE_TIMEOUT_SECS) {
+                to_remove.push(*entry.key());
+            }
+        }
+        
+        for addr in to_remove {
+            self.disconnect(&addr);
+        }
+    }
+    
+    /// Check if connected
+    pub fn is_connected(&self, peer_addr: &SocketAddr) -> bool {
+        self.connections.contains_key(peer_addr)
+    }
+    
+    /// Get connection count
+    pub fn connection_count(&self) -> usize {
+        self.connections.len()
+    }
+    
+    /// Stop server
+    pub fn stop(&self) {
+        self.server_running.store(false, Ordering::SeqCst);
+    }
+}
+
+// ============================================================================
+// SKIP SERVER VERIFICATION
+// ============================================================================
+
+#[derive(Debug)]
+struct SkipServerVerification;
+
+impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![
+            rustls::SignatureScheme::ED25519,
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+        ]
+    }
+}

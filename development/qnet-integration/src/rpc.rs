@@ -3958,35 +3958,67 @@ pub fn generate_quantum_challenge() -> String {
     hex::encode(challenge_bytes)
 }
 
-// PRODUCTION: Sign with CRYSTALS-Dilithium using QNet quantum crypto system
+// PRODUCTION: Sign with HYBRID cryptography (Ed25519 + CRYSTALS-Dilithium) per NIST/Cisco
+// CRITICAL: Generates NEW ephemeral Ed25519 key for each challenge - NO FALLBACK!
 async fn sign_with_dilithium(node_id: &str, challenge: &str) -> String {
-    // Use existing QNet quantum crypto system for real Dilithium signing
-    use crate::quantum_crypto::QNetQuantumCrypto;
-    use crate::node::GLOBAL_QUANTUM_CRYPTO;
+    use crate::hybrid_crypto::{HybridCrypto, GLOBAL_HYBRID_INSTANCES};
+    use std::sync::Arc;
     
-    // OPTIMIZATION: Use GLOBAL crypto instance to avoid repeated initialization
-    let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
-    if crypto_guard.is_none() {
-        let mut crypto = QNetQuantumCrypto::new();
-        let _ = crypto.initialize().await;
-        *crypto_guard = Some(crypto);
+    // Get or create hybrid crypto instance (thread-safe global cache)
+    let instances = GLOBAL_HYBRID_INSTANCES.get_or_init(|| async {
+        Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()))
+    }).await;
+    
+    let mut instances_guard = instances.lock().await;
+    
+    // Normalize node_id
+    let normalized_node_id = if node_id.starts_with("qn_") {
+        node_id.to_string()
+    } else {
+        format!("qn_{}", node_id)
+    };
+    
+    // Create instance if not exists
+    if !instances_guard.contains_key(&normalized_node_id) {
+        let mut hybrid = HybridCrypto::new(normalized_node_id.clone());
+        if let Err(e) = hybrid.initialize().await {
+            println!("[CRYPTO] ❌ CRITICAL: Hybrid crypto init failed for {}: {}", node_id, e);
+            // NO FALLBACK - return error signature that will be rejected
+            return format!("ERROR_NO_HYBRID_CRYPTO_{}", node_id);
+        }
+        instances_guard.insert(normalized_node_id.clone(), hybrid);
     }
-    let crypto = crypto_guard.as_mut().unwrap();
     
-    match crypto.create_consensus_signature(node_id, challenge).await {
-        Ok(dilithium_sig) => {
-            println!("[CRYPTO] ✅ Dilithium signature created for node {}", node_id);
-            dilithium_sig.signature
+    let hybrid = instances_guard.get_mut(&normalized_node_id).unwrap();
+    
+    // Check certificate rotation
+    if hybrid.needs_rotation() {
+        if let Err(e) = hybrid.rotate_certificate().await {
+            println!("[CRYPTO] ⚠️ Certificate rotation failed: {}", e);
+        }
+    }
+    
+    // CRITICAL: Sign with hybrid (ephemeral Ed25519 + Dilithium per NIST/Cisco)
+    match hybrid.sign_message_compact(challenge.as_bytes()).await {
+        Ok(compact_sig) => {
+            match serde_json::to_string(&compact_sig) {
+                Ok(json) => {
+                    println!("[CRYPTO] ✅ HYBRID signature created for node {} (NIST/Cisco compliant)", node_id);
+                    println!("[CRYPTO]    Ephemeral key: ✅ (new for this challenge)");
+                    println!("[CRYPTO]    Dilithium key sig: ✅");
+                    println!("[CRYPTO]    Dilithium msg sig: ✅");
+                    format!("hybrid_rpc:{}", json)
+                }
+                Err(e) => {
+                    println!("[CRYPTO] ❌ Failed to serialize hybrid signature: {}", e);
+                    format!("ERROR_SERIALIZE_FAILED_{}", node_id)
+                }
+            }
         }
         Err(e) => {
-            println!("[CRYPTO] ❌ Dilithium signing failed for node {}: {}", node_id, e);
-            // Fallback signature for stability (not secure, but prevents crashes)
-            use sha3::{Sha3_256, Digest};
-            let mut hasher = Sha3_256::new();
-            hasher.update(node_id.as_bytes());
-            hasher.update(challenge.as_bytes());
-            hasher.update(b"QNET_FALLBACK_SIG");
-            format!("fallback_{}", hex::encode(&hasher.finalize()[..32]))
+            println!("[CRYPTO] ❌ Hybrid signing failed for node {}: {}", node_id, e);
+            // NO FALLBACK - unsigned/weak signatures are security vulnerabilities!
+            format!("ERROR_HYBRID_SIGN_FAILED_{}", node_id)
         }
     }
 }
@@ -4466,30 +4498,67 @@ async fn handle_light_node_ping_response(
         let attestation_data = format!("attestation:{}:{}:{}:{}", 
             node_id, current_slot, now, challenge);
         
+        // CRITICAL: Sign with HYBRID cryptography per NIST/Cisco
         let pinger_signature = {
-            use crate::quantum_crypto::QNetQuantumCrypto;
-            use sha3::{Sha3_256, Digest};
+            use crate::hybrid_crypto::{HybridCrypto, GLOBAL_HYBRID_INSTANCES};
+            use std::sync::Arc;
             
-            let mut hasher = Sha3_256::new();
-            hasher.update(attestation_data.as_bytes());
-            let hash = hex::encode(hasher.finalize());
+            // Get or create hybrid crypto instance
+            let instances = GLOBAL_HYBRID_INSTANCES.get_or_init(|| async {
+                Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()))
+            }).await;
             
-            let mut crypto = QNetQuantumCrypto::new();
-            if crypto.initialize().await.is_err() {
-                println!("[LIGHT] ❌ Failed to init quantum crypto for attestation");
-                return Ok(warp::reply::json(&json!({
-                    "success": false,
-                    "error": "Quantum crypto initialization failed"
-                })));
+            let mut instances_guard = instances.lock().await;
+            
+            // Normalize node_id
+            let normalized_node_id = if our_node_id.starts_with("qn_") {
+                our_node_id.clone()
+            } else {
+                format!("qn_{}", our_node_id)
+            };
+            
+            // Create instance if not exists
+            if !instances_guard.contains_key(&normalized_node_id) {
+                let mut hybrid = HybridCrypto::new(normalized_node_id.clone());
+                if let Err(e) = hybrid.initialize().await {
+                    println!("[LIGHT] ❌ Failed to init hybrid crypto: {}", e);
+                    return Ok(warp::reply::json(&json!({
+                        "success": false,
+                        "error": "Hybrid crypto initialization failed"
+                    })));
+                }
+                instances_guard.insert(normalized_node_id.clone(), hybrid);
             }
             
-            match crypto.create_consensus_signature(&our_node_id, &hash).await {
-                Ok(sig) => sig.signature,
+            let hybrid = instances_guard.get_mut(&normalized_node_id).unwrap();
+            
+            // Check rotation
+            if hybrid.needs_rotation() {
+                let _ = hybrid.rotate_certificate().await;
+            }
+            
+            // CRITICAL: Sign with hybrid (ephemeral Ed25519 + Dilithium)
+            match hybrid.sign_message_compact(attestation_data.as_bytes()).await {
+                Ok(compact_sig) => {
+                    match serde_json::to_string(&compact_sig) {
+                        Ok(json) => {
+                            println!("[LIGHT] ✅ HYBRID attestation signature (NIST/Cisco compliant)");
+                            format!("hybrid_attest:{}", json)
+                        }
+                        Err(e) => {
+                            println!("[LIGHT] ❌ Failed to serialize hybrid signature: {}", e);
+                            return Ok(warp::reply::json(&json!({
+                                "success": false,
+                                "error": "Failed to serialize attestation signature"
+                            })));
+                        }
+                    }
+                }
                 Err(e) => {
                     println!("[LIGHT] ❌ Failed to sign attestation: {:?}", e);
                     return Ok(warp::reply::json(&json!({
                         "success": false,
-                        "error": "Failed to sign attestation"
+                        "error": "Failed to sign attestation with hybrid crypto"
                     })));
                 }
             }
@@ -7127,30 +7196,64 @@ fn generate_light_node_pseudonym(wallet_address: &str) -> String {
             &pseudonym_hash.to_hex()[..8])
 }
 
-/// PRODUCTION: Generate quantum-secure signature using EXISTING QNetQuantumCrypto
+/// PRODUCTION: Generate HYBRID signature per NIST/Cisco standards
+/// CRITICAL: Generates NEW ephemeral Ed25519 key for EACH signature
 async fn generate_quantum_signature(node_id: &str, data: &str) -> String {
-    // Use EXISTING QNetQuantumCrypto instead of duplicating functionality
-    use crate::quantum_crypto::QNetQuantumCrypto;
-    use crate::node::GLOBAL_QUANTUM_CRYPTO;
+    use crate::hybrid_crypto::{HybridCrypto, GLOBAL_HYBRID_INSTANCES};
+    use std::sync::Arc;
     
-    // OPTIMIZATION: Use GLOBAL crypto instance to avoid repeated initialization
-    let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
-    if crypto_guard.is_none() {
-        let mut crypto = QNetQuantumCrypto::new();
-        let _ = crypto.initialize().await;
-        *crypto_guard = Some(crypto);
+    // Get or create hybrid crypto instance (thread-safe global cache)
+    let instances = GLOBAL_HYBRID_INSTANCES.get_or_init(|| async {
+        Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()))
+    }).await;
+    
+    let mut instances_guard = instances.lock().await;
+    
+    // Normalize node_id
+    let normalized_node_id = if node_id.starts_with("qn_") {
+        node_id.to_string()
+    } else {
+        format!("qn_{}", node_id)
+    };
+    
+    // Create instance if not exists
+    if !instances_guard.contains_key(&normalized_node_id) {
+        let mut hybrid = HybridCrypto::new(normalized_node_id.clone());
+        if let Err(e) = hybrid.initialize().await {
+            // NO FALLBACK - hybrid crypto is mandatory
+            println!("[CRYPTO] ❌ FATAL: Hybrid crypto init failed: {}", e);
+            panic!("[FATAL] Cannot operate without hybrid quantum-resistant signatures!");
+        }
+        instances_guard.insert(normalized_node_id.clone(), hybrid);
     }
-    let crypto = crypto_guard.as_mut().unwrap();
     
-    match crypto.create_consensus_signature(node_id, data).await {
-        Ok(signature) => {
-            println!("[CRYPTO] ✅ RPC signature created with existing QNetQuantumCrypto");
-            signature.signature
+    let hybrid = instances_guard.get_mut(&normalized_node_id).unwrap();
+    
+    // Check certificate rotation
+    if hybrid.needs_rotation() {
+        if let Err(e) = hybrid.rotate_certificate().await {
+            println!("[CRYPTO] ⚠️ Certificate rotation failed: {}", e);
+        }
+    }
+    
+    // CRITICAL: Sign with hybrid (ephemeral Ed25519 + Dilithium per NIST/Cisco)
+    match hybrid.sign_message_compact(data.as_bytes()).await {
+        Ok(compact_sig) => {
+            match serde_json::to_string(&compact_sig) {
+                Ok(json) => {
+                    println!("[CRYPTO] ✅ HYBRID RPC signature created (NIST/Cisco compliant)");
+                    format!("hybrid_rpc:{}", json)
+                }
+                Err(e) => {
+                    println!("[CRYPTO] ❌ FATAL: Failed to serialize hybrid signature: {}", e);
+                    panic!("[FATAL] Cannot serialize hybrid signature!");
+                }
+            }
         }
         Err(e) => {
-            // NO FALLBACK - quantum crypto is mandatory
-            println!("[CRYPTO] ❌ RPC quantum crypto signature failed: {:?}", e);
-            panic!("[FATAL] Cannot operate without quantum-resistant signatures!");
+            // NO FALLBACK - hybrid crypto is mandatory
+            println!("[CRYPTO] ❌ FATAL: Hybrid signing failed: {:?}", e);
+            panic!("[FATAL] Cannot operate without hybrid quantum-resistant signatures!");
         }
     }
 }
@@ -7767,14 +7870,16 @@ async fn handle_sync_status(
     Ok(warp::reply::json(&status))
 }
 
-/// Handle network diagnostics request
+/// Handle network diagnostics request (includes QUIC metrics)
 async fn handle_network_diagnostics(
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
-    let peers = if let Some(p2p) = blockchain.get_unified_p2p() {
-        p2p.get_peer_count()
+    let (peers, quic_stats) = if let Some(p2p) = blockchain.get_unified_p2p() {
+        let peers = p2p.get_peer_count();
+        let stats = p2p.get_quic_stats().await;
+        (peers, stats)
     } else {
-        0
+        (0, None)
     };
     
     let height = blockchain.get_height().await;
@@ -7783,6 +7888,27 @@ async fn handle_network_diagnostics(
     let uptime_seconds = {
         let start_time = blockchain.get_start_time().timestamp();
         chrono::Utc::now().timestamp() - start_time
+    };
+    
+    // PRODUCTION v2.19.21: Include QUIC transport statistics
+    let quic_metrics = if let Some(stats) = quic_stats {
+        json!({
+            "enabled": true,
+            "active_connections": stats.active_connections,
+            "connections_established": stats.connections_established,
+            "connections_failed": stats.connections_failed,
+            "active_connections": stats.active_connections,
+            "messages_sent": stats.messages_sent,
+            "messages_received": stats.messages_received,
+            "bytes_sent": stats.bytes_sent,
+            "bytes_received": stats.bytes_received,
+            "avg_rtt_ms": stats.avg_rtt_ms
+        })
+    } else {
+        json!({
+            "enabled": false,
+            "reason": "QUIC transport not initialized"
+        })
     };
     
     let diagnostics = json!({
@@ -7794,7 +7920,13 @@ async fn handle_network_diagnostics(
         "node_type": format!("{:?}", node_type),
         "consensus_participation": node_type != crate::node::NodeType::Light,
         "uptime_seconds": uptime_seconds,
-        "last_block_time": chrono::Utc::now().timestamp() - 1
+        "last_block_time": chrono::Utc::now().timestamp() - 1,
+        "transport": {
+            "protocol": "QUIC v1 + TLS 1.3",
+            "serialization": "bincode (binary)",
+            "pki": "HybridCertificate (Ed25519 + Dilithium)",
+            "quic": quic_metrics
+        }
     });
     
     Ok(warp::reply::json(&diagnostics))
