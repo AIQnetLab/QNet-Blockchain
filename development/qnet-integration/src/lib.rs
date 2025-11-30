@@ -16,9 +16,6 @@ pub mod rpc;
 pub mod genesis;
 pub mod blockchain;
 pub mod activation_validation;
-pub mod quantum_crypto;
-pub mod hybrid_crypto;
-pub mod quantum_poh;
 pub mod hybrid_sealevel;
 pub mod tower_bft;
 pub mod pre_execution;
@@ -27,10 +24,22 @@ pub mod archive_manager;
 pub mod genesis_constants;
 pub mod reward_sharding;
 pub mod p2p_extensions;
-pub mod vrf;
-pub mod vrf_hybrid;
-pub mod key_manager;
 pub mod contract_vm;
+
+// ============================================================================
+// CRYPTOGRAPHY MODULE (isolated for external audit)
+// ============================================================================
+/// All cryptographic operations: Dilithium, Ed25519, VRF, PoH, Key Management
+/// See: src/crypto/mod.rs for full documentation
+pub mod crypto;
+
+// Backwards compatibility re-exports (so existing imports still work)
+pub use crypto::hybrid_crypto;
+pub use crypto::quantum_crypto;
+pub use crypto::quantum_poh;
+pub use crypto::vrf;
+pub use crypto::vrf_hybrid;
+pub use crypto::key_manager;
 
 use std::sync::Arc;
 use tokio::sync::RwLock;

@@ -4114,7 +4114,10 @@ async fn handle_light_node_register(
     
     // Register Light node or add device to existing node using pseudonym
     let registration_result = {
-        let mut registry = LIGHT_NODE_REGISTRY.lock().unwrap();
+        let mut registry = match LIGHT_NODE_REGISTRY.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         
         if let Some(existing_node) = registry.get_mut(&light_node_pseudonym) {
             // Check device limit (max 3 devices per Light node)
@@ -4188,7 +4191,10 @@ async fn handle_light_node_register(
         
         // Get device token hash from local registry
         let device_token_hash = {
-            let registry = LIGHT_NODE_REGISTRY.lock().unwrap();
+            let registry = match LIGHT_NODE_REGISTRY.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
             registry.get(&light_node_pseudonym)
                 .and_then(|n| n.devices.first())
                 .map(|d| d.device_token_hash.clone())
@@ -4519,7 +4525,10 @@ async fn handle_light_node_ping_response(
         
         // Get wallet address from registry
         let wallet_address = {
-            let registry = LIGHT_NODE_REGISTRY.lock().unwrap();
+            let registry = match LIGHT_NODE_REGISTRY.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
             if let Some(light_node) = registry.get(&node_id) {
                 light_node.devices.first().map(|d| d.wallet_address.clone())
             } else {
@@ -4555,8 +4564,9 @@ async fn handle_light_node_ping_response(
     
     // Clear pending challenge if exists (for polling nodes)
     {
-        let mut challenges = PENDING_CHALLENGES.lock().unwrap();
-        challenges.remove(&node_id);
+        if let Ok(mut challenges) = PENDING_CHALLENGES.lock() {
+            challenges.remove(&node_id);
+        }
     }
     
     Ok(warp::reply::json(&json!({
@@ -4651,7 +4661,10 @@ async fn handle_light_node_pending_challenge(
     
     // Check for pending challenge
     let pending = {
-        let mut challenges = PENDING_CHALLENGES.lock().unwrap();
+        let mut challenges = match PENDING_CHALLENGES.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         
         // Clean up expired challenges
         challenges.retain(|_, c| c.expires_at > now);
@@ -4695,12 +4708,13 @@ async fn handle_light_node_pending_challenge(
                 
                 // Store pending challenge
                 {
-                    let mut challenges = PENDING_CHALLENGES.lock().unwrap();
-                    challenges.insert(node_id.clone(), PendingChallenge {
-                        challenge: challenge.clone(),
-                        created_at: now,
-                        expires_at,
-                    });
+                    if let Ok(mut challenges) = PENDING_CHALLENGES.lock() {
+                        challenges.insert(node_id.clone(), PendingChallenge {
+                            challenge: challenge.clone(),
+                            created_at: now,
+                            expires_at,
+                        });
+                    }
                 }
                 
                 println!("[POLLING] 🎯 Generated challenge for {} (polling mode)", node_id);
@@ -5568,12 +5582,13 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
                                         .as_secs();
                                     
                                     {
-                                        let mut challenges = PENDING_CHALLENGES.lock().unwrap();
-                                        challenges.insert(light_node.node_id.clone(), PendingChallenge {
-                                            challenge: challenge.clone(),
-                                            created_at: now,
-                                            expires_at: now + 180, // 3 minute expiry
-                                        });
+                                        if let Ok(mut challenges) = PENDING_CHALLENGES.lock() {
+                                            challenges.insert(light_node.node_id.clone(), PendingChallenge {
+                                                challenge: challenge.clone(),
+                                                created_at: now,
+                                                expires_at: now + 180, // 3 minute expiry
+                                            });
+                                        }
                                     }
                                     
                                     println!("[LIGHT] 📥 {} stored challenge for {} slot {} (polling mode)", 
@@ -5629,12 +5644,13 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
                             .unwrap()
                             .as_secs();
                         
-                        let mut challenges = PENDING_CHALLENGES.lock().unwrap();
-                        challenges.insert(node.node_id.clone(), PendingChallenge {
-                            challenge,
-                            created_at: now,
-                            expires_at: now + 300, // 5 minute expiry for probes
-                        });
+                        if let Ok(mut challenges) = PENDING_CHALLENGES.lock() {
+                            challenges.insert(node.node_id.clone(), PendingChallenge {
+                                challenge,
+                                created_at: now,
+                                expires_at: now + 300, // 5 minute expiry for probes
+                            });
+                        }
                     }
                 }
             }
@@ -5730,7 +5746,10 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
             
             // Clean up inactive devices from all Light nodes
             {
-                let mut registry = LIGHT_NODE_REGISTRY.lock().unwrap();
+                let mut registry = match LIGHT_NODE_REGISTRY.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
                 
                 for (node_id, light_node) in registry.iter_mut() {
                     let devices_before = light_node.devices.len();
@@ -6144,7 +6163,10 @@ async fn handle_register_node(
         
     if node_type == "light" {
         // Light node: store locally and gossip
-        let mut registry = LIGHT_NODE_REGISTRY.lock().unwrap();
+        let mut registry = match LIGHT_NODE_REGISTRY.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         let light_node = LightNodeInfo {
             node_id: node_id.clone(),
             devices: vec![LightNodeDevice {

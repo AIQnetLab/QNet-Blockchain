@@ -1542,7 +1542,11 @@ impl SimplifiedP2P {
         // QUANTUM ROUTING: Try lock-free first if should use it
         if self.should_use_lockfree() {
             // AUTO-MIGRATE if needed
-            if self.connected_peers_lockfree.is_empty() && !self.connected_peers.read().unwrap().is_empty() {
+            let legacy_has_peers = match self.connected_peers.read() {
+                Ok(peers) => !peers.is_empty(),
+                Err(poisoned) => !poisoned.into_inner().is_empty(),
+            };
+            if self.connected_peers_lockfree.is_empty() && legacy_has_peers {
                 self.migrate_to_lockfree();
             }
             
@@ -1596,7 +1600,13 @@ impl SimplifiedP2P {
         }
         
         // Fallback to legacy
-        let mut peers = self.connected_peers.write().unwrap();
+        let mut peers = match self.connected_peers.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                println!("[P2P] ⚠️ Connected peers mutex poisoned in reputation update, recovering...");
+                poisoned.into_inner()
+            }
+        };
         if let Some(peer) = peers.get_mut(peer_addr) {
             // Migrate legacy reputation if needed
             peer.migrate_legacy_reputation();
@@ -1662,7 +1672,10 @@ impl SimplifiedP2P {
         }
         
         // Check connected peers (legacy)
-        let connected = self.connected_peers.read().unwrap();
+        let connected = match self.connected_peers.read() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         if let Some(peer) = connected.get(node_id) {
             return Some(peer.addr.clone());
         }
@@ -1869,7 +1882,7 @@ impl SimplifiedP2P {
         if bucket_peers.len() >= KADEMLIA_K {
             // Find peer with lowest combined reputation in this bucket
             if let Some((worst_addr, worst_rep)) = bucket_peers.iter()
-                .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap()) {
+                .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)) {
                 
                 if peer_info.combined_reputation() > *worst_rep {
                     // Remove worst peer to make room
@@ -1904,7 +1917,7 @@ impl SimplifiedP2P {
                 // Find and remove worst peer from legacy too
                 if let Some(worst_addr) = peers.iter()
                     .filter(|(_, p)| p.bucket_index == peer_info.bucket_index)
-                    .min_by(|a, b| a.1.reputation_score.partial_cmp(&b.1.reputation_score).unwrap())
+                    .min_by(|a, b| a.1.reputation_score.partial_cmp(&b.1.reputation_score).unwrap_or(std::cmp::Ordering::Equal))
                     .map(|(addr, _)| addr.clone()) {
                     
                     peers.remove(&worst_addr);
@@ -2013,8 +2026,14 @@ impl SimplifiedP2P {
         
         // Add to both collections atomically
         {
-            let mut peer_addrs = connected_peer_addrs.write().unwrap();
-            let mut connected_peers = connected_peers.write().unwrap();
+            let mut peer_addrs = match connected_peer_addrs.write() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let mut connected_peers = match connected_peers.write() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
             
             // Double-check in write lock (prevent race condition)
             if peer_addrs.contains(&peer_info.addr) {
@@ -2120,7 +2139,10 @@ impl SimplifiedP2P {
                 
                 // Check if not already connected (or if Genesis peer - always re-verify)
                 let already_connected = {
-                    let connected = self.connected_peers.read().unwrap();
+                    let connected = match self.connected_peers.read() {
+                        Ok(guard) => guard,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
                     // SCALABILITY: O(1) HashMap lookup
                     connected.contains_key(&peer_info.addr)
                 };
@@ -2605,7 +2627,11 @@ impl SimplifiedP2P {
             }
             
             // If no peers found, still ready to accept new connections
-            if connected_peers.read().unwrap().is_empty() {
+            let peers_empty = match connected_peers.read() {
+                Ok(peers) => peers.is_empty(),
+                Err(poisoned) => poisoned.into_inner().is_empty(),
+            };
+            if peers_empty {
                 println!("[P2P] 🌐 Running in genesis mode - accepting new peer connections");
                 println!("[P2P] 💡 Node ready to bootstrap other QNet nodes joining the network");
                 println!("[P2P] 💡 Other nodes will discover this node through bootstrap or peer exchange");
@@ -2647,7 +2673,10 @@ impl SimplifiedP2P {
                 
                 // CRITICAL FIX: Actually update network height cache periodically
                 // Query peers for their current height
-                let peers = connected_peers.read().unwrap().clone();
+                let peers = match connected_peers.read() {
+                    Ok(guard) => guard.clone(),
+                    Err(poisoned) => poisoned.into_inner().clone(),
+                };
                 let mut peer_heights = Vec::new();
                 
                 for peer in peers.values().take(5) {  // Query up to 5 peers
@@ -2718,8 +2747,9 @@ impl SimplifiedP2P {
                         });
                         
                         // Also update old cache for backward compatibility
-                        let mut cache = CACHED_BLOCKCHAIN_HEIGHT.lock().unwrap();
-                        *cache = (consensus_height, Instant::now());
+                        if let Ok(mut cache) = CACHED_BLOCKCHAIN_HEIGHT.lock() {
+                            *cache = (consensus_height, Instant::now());
+                        }
                     }
                 } else {
                     println!("[SYNC] ⚠️ Background: No peer responses - cache not updated");
@@ -3795,7 +3825,10 @@ impl SimplifiedP2P {
         }
         
         // Fallback to old cache
-        let cache = CACHED_BLOCKCHAIN_HEIGHT.lock().unwrap();
+        let cache = match CACHED_BLOCKCHAIN_HEIGHT.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         let age = Instant::now().duration_since(cache.1);
         // CRITICAL: Same 1 second TTL for consistency
         if age.as_secs() < 1 && cache.0 > 0 {
@@ -3828,7 +3861,10 @@ impl SimplifiedP2P {
             }
             
             // Fallback to old cache
-            let cache = CACHED_BLOCKCHAIN_HEIGHT.lock().unwrap();
+            let cache = match CACHED_BLOCKCHAIN_HEIGHT.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
             let age = Instant::now().duration_since(cache.1);
             // QUANTUM: Same minimal cache for old system
             let cache_duration = if cache.0 == 0 { 1 } else { 0 };
@@ -3902,8 +3938,9 @@ impl SimplifiedP2P {
             });
             
             // Also update old cache for backward compatibility
-            let mut cache = CACHED_BLOCKCHAIN_HEIGHT.lock().unwrap();
-            *cache = (consensus_height, Instant::now());
+            if let Ok(mut cache) = CACHED_BLOCKCHAIN_HEIGHT.lock() {
+                *cache = (consensus_height, Instant::now());
+            }
         }
         
         Ok(consensus_height)
@@ -4463,7 +4500,10 @@ impl SimplifiedP2P {
         // COMPATIBILITY: Function name kept for existing code
         // In production: This would return current round's primary validator
         
-        let connected = self.connected_peers.read().unwrap();
+        let connected = match self.connected_peers.read() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         
         // Return primary consensus participant from connected peers
         // Genesis nodes are determined by BOOTSTRAP_ID, not hardcoded IPs
@@ -5273,7 +5313,10 @@ impl SimplifiedP2P {
         
         // CRITICAL FIX: Cache with topology-aware key to prevent stale cache on topology changes
         let (peer_count, cache_key, peer_addrs) = {
-            let connected_peers = self.connected_peers.read().unwrap();
+            let connected_peers = match self.connected_peers.read() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
             // SCALABILITY: O(n) but optimized for HashMap keys
             let mut peer_addrs: Vec<String> = connected_peers.keys()
                 .cloned()
@@ -6141,8 +6184,14 @@ impl SimplifiedP2P {
     
     /// Intelligent peer selection with load balancing
     pub fn select_optimal_peers(&self, required_count: usize) -> Vec<PeerInfo> {
-        let regional_peers = self.regional_peers.lock().unwrap();
-        let metrics = self.regional_metrics.lock().unwrap();
+        let regional_peers = match self.regional_peers.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let metrics = match self.regional_metrics.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         let mut selected_peers = Vec::new();
         
         // Get regions sorted by capacity (best first)
@@ -6178,7 +6227,7 @@ impl SimplifiedP2P {
                 region_peers.sort_by(|a, b| {
                     let score_a = self.calculate_peer_score(a);
                     let score_b = self.calculate_peer_score(b);
-                    score_b.partial_cmp(&score_a).unwrap()
+                    score_b.partial_cmp(&score_a).unwrap_or(std::cmp::Ordering::Equal)
                 });
                 
                 // Take up to max_peers_per_region from this region
@@ -6237,8 +6286,14 @@ impl SimplifiedP2P {
     
     /// Update regional load balancing metrics
     fn update_regional_metrics(&self) {
-        let connected = self.connected_peers.read().unwrap();
-        let mut metrics = self.regional_metrics.lock().unwrap();
+        let connected = match self.connected_peers.read() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let mut metrics = match self.regional_metrics.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         
         for region in &[Region::NorthAmerica, Region::Europe, Region::Asia, Region::SouthAmerica, Region::Africa, Region::Oceania] {
             let region_peers: Vec<&PeerInfo> = connected
@@ -6280,7 +6335,10 @@ impl SimplifiedP2P {
         println!("[P2P] 🔄 Starting connection rebalancing");
         
         // Get current load metrics
-        let metrics = self.regional_metrics.lock().unwrap();
+        let metrics = match self.regional_metrics.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         let overloaded_regions: Vec<Region> = metrics
             .iter()
             .filter(|(_, metric)| {
@@ -6295,7 +6353,10 @@ impl SimplifiedP2P {
         }
         
         // Drop connections from overloaded regions
-        let mut connected = self.connected_peers.write().unwrap();
+        let mut connected = match self.connected_peers.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         let initial_count = connected.len();
         
         // SCALABILITY: Collect addresses to remove (can't modify HashMap while iterating)
@@ -6322,7 +6383,10 @@ impl SimplifiedP2P {
         if dropped_count > 0 {
             // Reconnect to better peers
             let optimal_peers = self.select_optimal_peers(dropped_count);
-            let mut connected = self.connected_peers.write().unwrap();
+            let mut connected = match self.connected_peers.write() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
             
             for peer in optimal_peers {
                 println!("[P2P] 🔺 Connecting to optimal peer {} from {:?} (Latency: {}ms)", 
@@ -6353,7 +6417,10 @@ impl SimplifiedP2P {
                 
                 // PRODUCTION: Collect real metrics from connected peers via HTTP
                 {
-                    let mut connected = connected_peers.write().unwrap();
+                    let mut connected = match connected_peers.write() {
+                        Ok(guard) => guard,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
                     // SCALABILITY: Iterate over HashMap values for O(n)
                     for peer in connected.values_mut() {
                         // PRODUCTION: Query peer's /api/v1/node/health endpoint for real metrics
@@ -6394,8 +6461,14 @@ impl SimplifiedP2P {
     
     /// Get load balancing statistics
     pub fn get_load_balancing_stats(&self) -> HashMap<String, serde_json::Value> {
-        let connected = self.connected_peers.read().unwrap();
-        let metrics = self.regional_metrics.lock().unwrap();
+        let connected = match self.connected_peers.read() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let metrics = match self.regional_metrics.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         
         let mut stats = HashMap::new();
         
@@ -6577,7 +6650,10 @@ impl SimplifiedP2P {
                 let mut regional_counts = std::collections::HashMap::new();
                 
                 {
-                    let connected = connected_peers.read().unwrap();
+                    let connected = match connected_peers.read() {
+                        Ok(guard) => guard,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
                     for (_addr, peer) in connected.iter() {
                         *regional_counts.entry(peer.region.clone()).or_insert(0) += 1;
                     }
@@ -10514,7 +10590,7 @@ impl SimplifiedP2P {
         
         // Select best peer for sync (highest combined reputation)
         let best_peer = eligible_peers.iter()
-            .max_by(|a, b| a.combined_reputation().partial_cmp(&b.combined_reputation()).unwrap())
+            .max_by(|a, b| a.combined_reputation().partial_cmp(&b.combined_reputation()).unwrap_or(std::cmp::Ordering::Equal))
             .ok_or("No valid peer for macroblock sync")?;
         
         println!("[MACROBLOCK-SYNC] 📡 Requesting macroblocks from peer {} (consensus: {:.1}%, network: {:.1}%)", 
@@ -10542,7 +10618,7 @@ impl SimplifiedP2P {
             // Use reputation as proxy for reliable height reporting
             let max_height_peer = peers.values()
                 .filter(|p| p.consensus_score >= 50.0)  // Only trust peers with decent reputation
-                .max_by(|a, b| a.consensus_score.partial_cmp(&b.consensus_score).unwrap());
+                .max_by(|a, b| a.consensus_score.partial_cmp(&b.consensus_score).unwrap_or(std::cmp::Ordering::Equal));
             
             // If we have reliable peers, estimate from network consensus
             // Otherwise return 0 (will sync from scratch)
@@ -10660,7 +10736,7 @@ impl SimplifiedP2P {
         
         // Select best peer for sync (highest combined reputation)
         let best_peer = peers.iter()
-            .max_by(|a, b| a.combined_reputation().partial_cmp(&b.combined_reputation()).unwrap())
+            .max_by(|a, b| a.combined_reputation().partial_cmp(&b.combined_reputation()).unwrap_or(std::cmp::Ordering::Equal))
             .ok_or("No valid peer for sync")?;
         
         println!("[SYNC] 📡 Requesting blocks from peer {} (consensus: {:.1}%, network: {:.1}%)", 
@@ -10713,7 +10789,7 @@ impl SimplifiedP2P {
         
         // Select peer with highest consensus score (Byzantine safety)
         let best_peer = peers.iter()
-            .max_by(|a, b| a.consensus_score.partial_cmp(&b.consensus_score).unwrap())
+            .max_by(|a, b| a.consensus_score.partial_cmp(&b.consensus_score).unwrap_or(std::cmp::Ordering::Equal))
             .ok_or("No valid peer for consensus sync")?;
         
         println!("[CONSENSUS] 📡 Requesting from peer {} (consensus: {:.1}%, network: {:.1}%)", 
@@ -11697,7 +11773,10 @@ impl SimplifiedP2P {
         
         // SCALABILITY: Only notify Super nodes and random sample of peers
         // For millions of nodes, broadcasting to all would cause network storm
-        let peers = self.connected_peers.read().unwrap();
+        let peers = match self.connected_peers.read() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         let mut broadcasted = 0;
         
         // Collect Super nodes and sample of other peers
@@ -11994,7 +12073,10 @@ impl SimplifiedP2P {
     /// Broadcast audit entry to network for distributed verification
     fn broadcast_audit_entry(&self, audit_block: serde_json::Value) {
         // Send to at least 3 random peers for redundancy
-        let peers = self.connected_peers.read().unwrap();
+        let peers = match self.connected_peers.read() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         let peer_list: Vec<_> = peers.keys().cloned().collect();
         
         let selected_peers = if peer_list.len() <= 3 {
@@ -12359,7 +12441,10 @@ impl SimplifiedP2P {
         
         // ADAPTIVE TIMEOUT: For synchronous P2P messages
         let peer_latency = {
-            let connected = self.connected_peers.read().unwrap();
+            let connected = match self.connected_peers.read() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
             connected.values()
                 .find(|p| p.addr == peer_addr)
                 .map(|p| p.latency_ms)
@@ -14300,12 +14385,12 @@ impl SimplifiedP2P {
         // Sort by priority: 1) network_score (latency), 2) consensus_score (reliability)
         eligible_peers.sort_by(|a, b| {
             // Primary: network_score (higher = better latency)
-            let network_cmp = b.network_score.partial_cmp(&a.network_score).unwrap();
+            let network_cmp = b.network_score.partial_cmp(&a.network_score).unwrap_or(std::cmp::Ordering::Equal);
             if network_cmp != std::cmp::Ordering::Equal {
                 return network_cmp;
             }
             // Secondary: consensus_score (higher = more reliable)
-            b.consensus_score.partial_cmp(&a.consensus_score).unwrap()
+            b.consensus_score.partial_cmp(&a.consensus_score).unwrap_or(std::cmp::Ordering::Equal)
         });
         
         // Return top-N peers
