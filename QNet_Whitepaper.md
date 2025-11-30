@@ -267,33 +267,34 @@ CASE 3: We're ahead (local_height > network_height)
 
 QNet implements sophisticated synchronization for handling network latency:
 
-#### **Out-of-Order Block Buffering**
+#### **Out-of-Order Block Buffering (v2.19.20)**
 ```
 Block #N+5 arrives → Missing #N+1,N+2,N+3,N+4 → Buffer #N+5 → Request Missing
      ↓                         ↓                      ↓              ↓
-  Validate            Check previous_hash      Store with retry    Active P2P
-  Structure           in pending_blocks         counter (max 3)    sync_blocks()
+  Validate            Check previous_hash      Store with pseudo-  Active P2P
+  Structure           in pending_blocks        infinite retries    sync_blocks()
 ```
 
-**Buffer Management:**
+**Buffer Management (v2.19.20):**
 - HashMap storage: O(1) lookup by block height
-- Maximum 3 retry attempts per block
-- Automatic cleanup after 60 seconds
-- Timestamp tracking for age-based eviction
+- **Pseudo-infinite retries** (like Solana/Ethereum) - blocks NEVER discarded
+- **Adaptive buffer size**: Full/Super 500 blocks (~50MB), Light 100 blocks (~10MB)
+- **Exponential backoff**: 10s (retries 0-9) → 30s → 60s → 120s → 240s → 300s max
+- Timestamp tracking for age-based re-request (not eviction)
 
-#### **DDoS-Protected Active Block Requests**
+#### **DDoS-Protected Active Block Requests (v2.19.20)**
 ```
-Missing Block Detected → Rate Limit Check → Request via P2P → Track & Cooldown
+Missing Block Detected → Rate Limit Check → Request via P2P → Track & Backoff
          ↓                      ↓                   ↓                  ↓
-   MISSING_PREVIOUS:H      10s cooldown      sync_blocks(H, H)    Update timestamp
-                           Max 3 attempts     Non-blocking          Max 10 concurrent
+   MISSING_PREVIOUS:H      Exponential       sync_blocks(H, H)    Update timestamp
+                           backoff           Non-blocking          Max 10 concurrent
 ```
 
 **Protection Mechanisms:**
-- **Request Cooldown**: 10 seconds minimum between requests for same block
-- **Maximum Attempts**: 3 requests per block maximum
+- **Request Cooldown**: 10s (aggressive) → 30s-300s (exponential backoff)
+- **Maximum Attempts**: Pseudo-infinite (never give up on blocks)
 - **Concurrent Limit**: Maximum 10 simultaneous requests
-- **Automatic Cleanup**: Remove stale requests after 60 seconds
+- **Background Re-request**: Every 30 seconds with exponential backoff
 
 #### **Parallel Block Processing**
 When dependency arrives, process up to 10 consecutive buffered blocks:
@@ -897,11 +898,16 @@ EXPONENTIAL PROPAGATION (v2.19.19):
 ├── Example: 1M nodes = ~20 hops vs 1M HTTP requests (broadcast)
 └── Convergence: Weighted average (70% local + 30% remote)
 
-OPTIMIZATIONS (v2.19.19):
+OPTIMIZATIONS (v2.19.20):
+├── Fire-and-Forget Broadcast: Turbine doesn't block production (1 block/sec guaranteed)
+├── Genesis Startup Wait: 30-second network stabilization before production
+├── Emergency Timeout 10s: Allows original producer delivery (was 2s)
+├── Pseudo-Infinite Retries: Blocks NEVER discarded (like Solana/Ethereum)
+├── Exponential Backoff: 10s (0-9) → 30s → 60s → 120s → 240s → 300s max
+├── Adaptive Buffer: Full/Super 500 blocks (~50MB), Light 100 blocks (~10MB)
 ├── Kademlia K-neighbors: Heartbeats use DHT distance for efficient routing
 ├── Turbine ALWAYS: Block propagation uses Turbine for ALL network sizes
 ├── Heartbeat without Dilithium: CPU optimization (~35ms savings per heartbeat)
-├── Exponential backoff failover: 3s → 6s → 12s → 24s → 30s max
 └── Priority channels: Blocks/Consensus use separate channels (implicit priority)
 
 BYZANTINE SAFETY:

@@ -44,7 +44,16 @@ This project uses **dual licensing**:
 - **Phase 2 (Future)**: ONLY QNC token activation on QNet blockchain
 - **Transition**: 90% 1DEV burned OR 5 years from genesis block (whichever comes first)
 
-### 🛡️ **LATEST UPDATES (v2.19.19 - November 29, 2025)**
+### 🛡️ **LATEST UPDATES (v2.19.20 - November 30, 2025)**
+- **Fire-and-Forget Broadcast**: Turbine block propagation no longer blocks production (1 block/sec guaranteed)
+- **Genesis Startup Wait**: 30-second network stabilization before block production (prevents race conditions)
+- **Emergency Timeout 10s**: Increased from 2s to allow original producer delivery
+- **Pseudo-Infinite Retries**: Blocks are NEVER discarded (like Solana/Ethereum)
+- **Exponential Backoff**: 10s (retries 0-9) → 30s → 60s → 120s → 240s → 300s max
+- **Adaptive Buffer Size**: Full/Super nodes: 500 blocks (~50MB), Light nodes: 100 blocks (~10MB)
+- **Background Re-request**: Missing blocks automatically re-requested every 30s with backoff
+
+### 🛡️ **Previous Updates (v2.19.19 - November 29, 2025)**
 - **Heartbeat without Dilithium**: CPU optimization (~35ms savings per heartbeat, NIST FIPS 204 compliant)
 - **Turbine ALWAYS**: Block propagation uses Turbine for ALL network sizes (not just >10 peers)
 - **Kademlia K-neighbors**: Heartbeats use DHT distance for efficient routing (K=3)

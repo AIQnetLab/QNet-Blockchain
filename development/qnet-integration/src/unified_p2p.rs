@@ -3407,23 +3407,33 @@ impl SimplifiedP2P {
             }
         }
         
-        // Wait for all chunk sends to complete
-        let mut success_count = 0;
+        // OPTIMIZATION v2.19.20: Fire-and-forget - don't wait for chunk delivery
+        // This allows 1 block/second production without broadcast blocking
+        // Chunks are sent in parallel threads, we return immediately
+        // Reed-Solomon redundancy ensures blocks are reconstructed even if some chunks fail
         let total_sends = handles.len();
         
-        for handle in handles {
-            if let Ok(Ok(())) = handle.join() {
-                success_count += 1;
-            }
-        }
-        
-        if success_count > 0 {
+        if total_sends > 0 {
+            // Spawn monitoring task in background (non-blocking)
+            let height_copy = height;
+            std::thread::spawn(move || {
+                let mut success_count = 0;
+                for handle in handles {
+                    if let Ok(Ok(())) = handle.join() {
+                        success_count += 1;
+                    }
+                }
+                
+                // Log only for early blocks or every 10th block
+                if height_copy <= 5 || height_copy % 10 == 0 {
+                    println!("[TURBINE] ✅ Block #{} chunks delivered: {}/{}", height_copy, success_count, total_sends);
+                }
+            });
+            
             if height <= 5 || height % 10 == 0 {
-                println!("[TURBINE] ✅ Block #{} chunks sent: {}/{} successful", height, success_count, total_sends);
+                println!("[TURBINE] 🚀 Block #{} chunks dispatched: {} sends (fire-and-forget)", height, total_sends);
             }
             Ok(())
-        } else if total_sends > 0 {
-            Err(format!("Failed to send any chunks for block #{}", height))
         } else {
             Ok(())
         }

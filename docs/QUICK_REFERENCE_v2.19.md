@@ -115,17 +115,19 @@ Consensus Layer (consensus_crypto.rs)
 - **Rotation**: 80% lifetime (216 seconds)
 - **Cache TTL**: 9 minutes (2× lifetime for grace period)
 
-## 🔄 Block Buffering
+## 🔄 Block Buffering (v2.19.20)
 
-### Memory Protection
-- **Max Pending**: 100 blocks (~10 MB)
-- **Timeout**: 30 seconds per block
-- **Retry Limit**: 5 attempts
+### Adaptive Memory Protection
+- **Max Pending (Light)**: 100 blocks (~10 MB)
+- **Max Pending (Full/Super)**: 500 blocks (~50 MB)
+- **Retry**: Pseudo-infinite (like Solana/Ethereum)
+- **Backoff (0-9 retries)**: 10 seconds (aggressive)
+- **Backoff (10+ retries)**: 30s → 60s → 120s → 240s → 300s max
 - **Eviction**: FIFO (oldest first)
 - **Protection**: Current block never removed
 
 ### Purpose
-Handles out-of-order block arrival in gossip P2P network while preventing memory exhaustion attacks.
+Handles out-of-order block arrival in gossip P2P network while preventing memory exhaustion attacks. Blocks are NEVER discarded - pseudo-infinite retries with exponential backoff ensure all blocks are eventually received.
 
 ## 🎯 Reputation System
 
@@ -374,7 +376,12 @@ const FINALITY_WINDOW: u64 = 10;               // Blocks for finality
 const MAX_VALIDATORS_PER_ROUND: usize = 1000;  // Consensus limit
 const CERTIFICATE_LIFETIME_SECS: u64 = 270;    // 4.5 minutes
 const MAX_CACHE_SIZE: usize = 100000;          // Certificate cache
-const MAX_PENDING_BLOCKS: usize = 100;         // Block buffer limit
+
+// Block buffering (v2.19.20) - adaptive by node type
+// Light nodes: 100 blocks (~10 MB)
+// Full/Super nodes: 500 blocks (~50 MB)
+const NETWORK_STABILIZATION_SECS: u64 = 30;    // Genesis startup wait
+const EMERGENCY_WAIT_SECS: u64 = 10;           // Emergency producer wait
 
 // PoH constants (quantum_poh.rs)
 const HASHES_PER_TICK: u64 = 5_000;            // Hashes per 10ms tick

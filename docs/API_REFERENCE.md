@@ -1713,6 +1713,15 @@ GET /api/v1/snapshot/{height}
 
 ## 📝 Changelog
 
+### v2.19.20 (November 2025)
+- **OPTIMIZATION**: Fire-and-forget Turbine broadcast (1 block/sec production guaranteed)
+- **OPTIMIZATION**: 30-second Genesis startup wait (prevents race conditions)
+- **OPTIMIZATION**: Emergency timeout increased to 10s (was 2s)
+- **RELIABILITY**: Pseudo-infinite retries for blocks (never discard critical data)
+- **RELIABILITY**: Exponential backoff: 10s (0-9) → 30s → 60s → 120s → 240s → 300s max
+- **MEMORY**: Adaptive buffer: Full/Super 500 blocks (~50MB), Light 100 blocks (~10MB)
+- **SYNC**: Background re-request every 30s with exponential backoff
+
 ### v2.19.19 (November 2025)
 - **OPTIMIZATION**: Heartbeat without Dilithium signature (CPU savings ~35ms per heartbeat)
 - **OPTIMIZATION**: Turbine block propagation for ALL network sizes

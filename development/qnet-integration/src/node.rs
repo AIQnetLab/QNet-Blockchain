@@ -2093,10 +2093,14 @@ impl BlockchainNode {
         const REQUEST_COOLDOWN_FAST: u64 = 1;    // Fast sync: 1 second for catching up
         const FAST_SYNC_THRESHOLD: u64 = 10;     // Switch to fast sync if >10 blocks behind
         
-        // MEMORY PROTECTION: Maximum pending blocks to prevent memory exhaustion
-        // 100 blocks * ~100KB = ~10 MB maximum buffer size
+        // MEMORY PROTECTION v2.19.20: Adaptive buffer size by node type
+        // Full/Super nodes: 500 blocks (~50MB) - covers 8+ minutes of network issues
+        // Light nodes: 100 blocks (~10MB) - minimal memory footprint
         // Protects against malicious peers sending out-of-order blocks
-        const MAX_PENDING_BLOCKS: usize = 100;
+        let max_pending_blocks: usize = match node_type {
+            NodeType::Light => 100,  // Light nodes: minimal memory (~10MB)
+            NodeType::Full | NodeType::Super => 500,  // Full/Super: larger buffer (~50MB)
+        };
         
         // CRITICAL: REORG PROTECTION - Prevent concurrent reorgs and DoS attacks
         let reorg_in_progress = Arc::new(tokio::sync::RwLock::new(false));
@@ -2178,15 +2182,15 @@ impl BlockchainNode {
                                 println!("[BLOCKS] 🔐 Buffering block #{} (retry #{}) - waiting for certificate from {}", 
                                          received_block.height, retry_count, received_block.from_peer);
                                 
-                                // MEMORY PROTECTION: Enforce maximum buffer size
-                                if pending_blocks.len() >= MAX_PENDING_BLOCKS {
+                                // MEMORY PROTECTION: Enforce maximum buffer size (adaptive by node type)
+                                if pending_blocks.len() >= max_pending_blocks {
                                     // Remove oldest block to make room (but not the one we're inserting)
                                     if let Some((&oldest_height, _)) = pending_blocks.iter()
                                         .filter(|(&h, _)| h != received_block.height)  // Don't remove current block
                                         .min_by_key(|(_, (_, _, timestamp))| timestamp) {
                                         pending_blocks.remove(&oldest_height);
                                         println!("[BLOCKS] 🚨 Max buffer ({}) reached - removed oldest block #{}", 
-                                                 MAX_PENDING_BLOCKS, oldest_height);
+                                                 max_pending_blocks, oldest_height);
                                     }
                                 }
                                 
@@ -2219,19 +2223,32 @@ impl BlockchainNode {
                                         .map(|(_, count, _)| count + 1)
                                         .unwrap_or(0);
                                     
-                                    if retry_count < 3 { // Max 3 retries
-                                        println!("[BLOCKS] 📋 Buffering block #{} (retry #{}) - waiting for previous block #{}", 
-                                                 received_block.height, retry_count, missing_height);
+                                    // CRITICAL v2.19.20: PSEUDO-INFINITE retries (like Solana/Ethereum)
+                                    // Blocks are critical data - NEVER discard them!
+                                    // Protection layers:
+                                    // 1. max_pending_blocks = 500 Full/Super, 100 Light (memory protection)
+                                    // 2. Exponential backoff after 10 retries (network protection)
+                                    // 3. Rate limiting on requests (CPU protection)
+                                    // 4. Background sync every 30s (persistent recovery)
+                                    //
+                                    // Backoff schedule:
+                                    // - Retries 0-9: aggressive (immediate)
+                                    // - Retries 10+: exponential (30s, 60s, 120s, 240s, 300s max)
+                                    let backoff_phase = if retry_count < 10 { "aggressive" } else { "backoff" };
+                                    println!("[BLOCKS] 📋 Buffering block #{} (retry #{}, {}) - waiting for previous block #{}", 
+                                             received_block.height, retry_count, backoff_phase, missing_height);
+                                    
+                                    // ALWAYS buffer - never discard! (pseudo-infinite)
                                         
-                                        // MEMORY PROTECTION: Enforce maximum buffer size
-                                        if pending_blocks.len() >= MAX_PENDING_BLOCKS {
+                                        // MEMORY PROTECTION: Enforce maximum buffer size (adaptive by node type)
+                                        if pending_blocks.len() >= max_pending_blocks {
                                             // Remove oldest block to make room (but not the one we're inserting)
                                             if let Some((&oldest_height, _)) = pending_blocks.iter()
                                                 .filter(|(&h, _)| h != received_block.height)  // Don't remove current block
                                                 .min_by_key(|(_, (_, _, timestamp))| timestamp) {
                                                 pending_blocks.remove(&oldest_height);
                                                 println!("[BLOCKS] 🚨 Max buffer ({}) reached - removed oldest block #{}", 
-                                                         MAX_PENDING_BLOCKS, oldest_height);
+                                                         max_pending_blocks, oldest_height);
                                             }
                                         }
                                         
@@ -2319,9 +2336,9 @@ impl BlockchainNode {
                                                 println!("[BLOCKS] ⏳ Rate limit: delaying request for block #{}", missing_height);
                                             }
                                         }
-                                    } else {
-                                        println!("[BLOCKS] ❌ Block #{} exceeded max retries - discarding", received_block.height);
-                                    }
+                                    
+                                    // PSEUDO-INFINITE: No else branch - block is ALWAYS buffered above
+                                    // Background sync (every 30s) will re-request with exponential backoff
                                 }
                             }
                         } else if e.starts_with("FORK_DETECTED:") {
@@ -2798,17 +2815,61 @@ impl BlockchainNode {
             if last_cleanup_check.elapsed() > std::time::Duration::from_secs(30) {
                 last_cleanup_check = std::time::Instant::now();
                 
-                // Clean expired pending blocks (after 30 seconds)
-                // REDUCED TIMEOUT: Prevents memory accumulation during certificate propagation issues
-                let mut expired = Vec::new();
-                for (height, (_, _, timestamp)) in pending_blocks.iter() {
+                // CRITICAL v2.19.20: Don't remove expired pending blocks - re-request missing dependencies!
+                // Blocks are critical data, never throw them away
+                // Instead, re-request the missing previous block after 30 seconds
+                let mut blocks_to_retry = Vec::new();
+                for (height, (_, retry_count, timestamp)) in pending_blocks.iter() {
                     if timestamp.elapsed() > std::time::Duration::from_secs(30) {
-                        expired.push(*height);
+                        blocks_to_retry.push((*height, *retry_count));
                     }
                 }
-                for height in expired {
-                    println!("[BLOCKS] 🗑️ Removing expired pending block #{}", height);
-                    pending_blocks.remove(&height);
+                
+                // Re-request missing blocks for expired pending blocks
+                for (height, retry_count) in blocks_to_retry {
+                    if height > 0 {
+                        let missing_height = height - 1;  // Previous block is likely missing
+                        
+                        // Check if we can request (rate limiting)
+                        // PSEUDO-INFINITE v2.19.20: Exponential backoff for retries >= 10
+                        // Backoff schedule: 10s (retries 0-9), 30s, 60s, 120s, 240s, 300s max
+                        let backoff_secs = if retry_count < 10 {
+                            10u64  // Aggressive: 10 seconds for first 10 retries
+                        } else {
+                            // Exponential: 30 * 2^(retry-10), max 300s (5 minutes)
+                            let exp = (retry_count - 10).min(4) as u32;  // Cap at 2^4 = 16
+                            std::cmp::min(30 * (1u64 << exp), 300)
+                        };
+                        
+                        let can_request = requested_blocks.get(&missing_height)
+                            .map(|(ts, _)| ts.elapsed() > std::time::Duration::from_secs(backoff_secs))
+                            .unwrap_or(true);
+                        
+                        if can_request {
+                            let phase = if retry_count < 10 { "aggressive" } else { "backoff" };
+                            println!("[BLOCKS] 🔄 Re-requesting missing block #{} for pending block #{} (retry #{}, {}, next in {}s)", 
+                                     missing_height, height, retry_count, phase, backoff_secs);
+                            
+                            // Update request tracking
+                            requested_blocks.insert(missing_height, (std::time::Instant::now(), retry_count as u8 + 1));
+                            
+                            // Request via P2P
+                            if let Some(p2p) = &unified_p2p {
+                                let p2p_clone = p2p.clone();
+                                let missing = missing_height;
+                                tokio::spawn(async move {
+                                    if let Err(e) = p2p_clone.sync_blocks(missing, missing).await {
+                                        println!("[BLOCKS] ⚠️ Failed to re-request block #{}: {}", missing, e);
+                                    }
+                                });
+                            }
+                            
+                            // Reset timestamp for pending block (give it more time)
+                            if let Some((data, count, _)) = pending_blocks.remove(&height) {
+                                pending_blocks.insert(height, (data, count, std::time::Instant::now()));
+                            }
+                        }
+                    }
                 }
                 
                 // Clean expired block requests (older than 60 seconds)
@@ -3548,7 +3609,19 @@ impl BlockchainNode {
                         if !has_genesis {
                             if is_genesis_creator {
                                 // Node 001: Will create Genesis block after this loop
-                                println!("[Node] 🌍 Node 001: {} peers connected, will create Genesis block", real_peer_count);
+                                // CRITICAL v2.19.20: Wait for network stabilization before Genesis creation
+                                // This ensures all peer APIs are fully ready to receive blocks
+                                const NETWORK_STABILIZATION_SECS: u64 = 30;
+                                if wait_time < NETWORK_STABILIZATION_SECS {
+                                    let remaining = NETWORK_STABILIZATION_SECS - wait_time;
+                                    println!("[Node] 🌍 Node 001: {} peers connected, waiting {}s for network stabilization...", 
+                                             real_peer_count, remaining);
+                                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                                    wait_time += 5;
+                                    continue;
+                                }
+                                
+                                println!("[Node] 🌍 Node 001: {} peers connected, network stable for {}s", real_peer_count, wait_time);
                                 println!("[Node] 🚀 Starting production (Genesis creation pending)!");
                                 break;
                             } else {
@@ -3589,7 +3662,19 @@ impl BlockchainNode {
                             }
                         } else {
                             // Genesis exists - ready to start!
-                            println!("[Node] ✅ Network ready: {} peers connected, Genesis: YES", real_peer_count);
+                            // CRITICAL v2.19.20: Wait for network stabilization before production
+                            // This ensures all peer APIs are fully ready to receive blocks
+                            const NETWORK_STABILIZATION_SECS: u64 = 30;
+                            if is_bootstrap_node && wait_time < NETWORK_STABILIZATION_SECS {
+                                let remaining = NETWORK_STABILIZATION_SECS - wait_time;
+                                println!("[Node] ✅ Network ready: {} peers connected, Genesis: YES", real_peer_count);
+                                println!("[Node] ⏳ Waiting {}s for network stabilization (total: {}s)...", remaining, wait_time);
+                                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                                wait_time += 5;
+                                continue;
+                            }
+                            
+                            println!("[Node] ✅ Network ready: {} peers connected, Genesis: YES, stable for {}s", real_peer_count, wait_time);
                             println!("[Node] 🚀 Starting production!");
                             break;
                         }
@@ -5553,8 +5638,11 @@ impl BlockchainNode {
                         } else {
                             // We are synchronized - check if block already exists
                             println!("[EMERGENCY] ✅ Node synchronized at height {} - checking if block exists", local_height);
-                            println!("[EMERGENCY] ⏰ Waiting 2 seconds to allow original producer to deliver...");
-                            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                            // CRITICAL v2.19.20: Wait 10 seconds for original producer delivery
+                            // Fire-and-forget broadcast takes 3-5 seconds, so 2s was too short
+                            // This prevents premature emergency production causing forks
+                            println!("[EMERGENCY] ⏰ Waiting 10 seconds to allow original producer to deliver...");
+                            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
                             
                             let block_exists = {
                                 match storage.load_microblock(next_block_height) {

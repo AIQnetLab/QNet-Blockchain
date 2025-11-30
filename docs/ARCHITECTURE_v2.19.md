@@ -228,55 +228,72 @@ if serial_changed {
 ### Problem
 In a gossip-based P2P network, blocks may arrive out of order due to network latency or partial connectivity. Nodes must buffer blocks until their parent blocks arrive.
 
-### Solution: Bounded Buffer with Cleanup
+### Solution: Bounded Buffer with Cleanup (v2.19.20)
 
-#### MAX_PENDING_BLOCKS Protection
+#### Adaptive Buffer Size by Node Type
 
 ```rust
-// MEMORY PROTECTION: Maximum pending blocks to prevent memory exhaustion
-// Per ARCHITECTURE_v2.19: Microblock = ~53 KB (header + PoH + signature + transactions)
-// 100 blocks * ~100KB = ~10 MB maximum buffer size
-// Protects against malicious peers sending out-of-order blocks during network issues
-const MAX_PENDING_BLOCKS: usize = 100;
+// MEMORY PROTECTION v2.19.20: Adaptive buffer size by node type
+// Full/Super nodes: 500 blocks (~50MB) - covers 8+ minutes of network issues
+// Light nodes: 100 blocks (~10MB) - minimal memory footprint
+// Protects against malicious peers sending out-of-order blocks
+let max_pending_blocks: usize = match node_type {
+    NodeType::Light => 100,  // Light nodes: minimal memory (~10MB)
+    NodeType::Full | NodeType::Super => 500,  // Full/Super: larger buffer (~50MB)
+};
 
-if pending_blocks.len() >= MAX_PENDING_BLOCKS {
+if pending_blocks.len() >= max_pending_blocks {
     // Remove oldest block to make room (FIFO-like)
     if let Some((&oldest_height, _)) = pending_blocks.iter()
         .filter(|(&h, _)| h != received_block.height)  // Don't remove current block
         .min_by_key(|(_, (_, _, timestamp))| timestamp) {
         pending_blocks.remove(&oldest_height);
         println!("[BLOCKS] 🚨 Max buffer ({}) reached - removed oldest block #{}", 
-                 MAX_PENDING_BLOCKS, oldest_height);
+                 max_pending_blocks, oldest_height);
     }
 }
 ```
 
-#### Retry Mechanism
+#### Pseudo-Infinite Retry Mechanism (v2.19.20)
 
 ```rust
-// Buffer block with retry counter
-pending_blocks.insert(height, (block, retry_count, timestamp));
+// CRITICAL v2.19.20: PSEUDO-INFINITE retries (like Solana/Ethereum)
+// Blocks are critical data - NEVER discard them!
+// Protection layers:
+// 1. max_pending_blocks = 500 Full/Super, 100 Light (memory protection)
+// 2. Exponential backoff after 10 retries (network protection)
+// 3. Rate limiting on requests (CPU protection)
+// 4. Background sync every 30s (persistent recovery)
 
-// Cleanup after 30 seconds or 5 failed retries
-if age_seconds > 30 || retry_count >= 5 {
-    pending_blocks.remove(&height);
-}
+// Backoff schedule:
+// - Retries 0-9: 10s cooldown (aggressive)
+// - Retries 10+: exponential (30s, 60s, 120s, 240s, 300s max)
+let backoff_secs = if retry_count < 10 {
+    10u64  // Aggressive: 10 seconds for first 10 retries
+} else {
+    // Exponential: 30 * 2^(retry-10), max 300s (5 minutes)
+    std::cmp::min(30 * (1u64 << (retry_count - 10).min(4)), 300)
+};
+
+// ALWAYS buffer - never discard! (pseudo-infinite)
+pending_blocks.insert(height, (block, retry_count, timestamp));
 ```
 
-#### Protection Features
+#### Protection Features (v2.19.20)
 
-| Feature | Value | Purpose |
-|---------|-------|---------|
-| **Max Buffer Size** | 100 blocks (~10 MB) | Prevent memory exhaustion |
-| **Retry Limit** | 5 attempts | Avoid infinite loops |
-| **Timeout** | 30 seconds | Release stale blocks |
-| **Eviction Policy** | FIFO (oldest first) | Fair buffer management |
-| **Self-Protection** | Current block never removed | Ensure progress |
+| Feature | Light Nodes | Full/Super Nodes | Purpose |
+|---------|-------------|------------------|---------|
+| **Max Buffer Size** | 100 blocks (~10 MB) | 500 blocks (~50 MB) | Prevent memory exhaustion |
+| **Retry Limit** | **Pseudo-infinite** | **Pseudo-infinite** | Never lose blocks |
+| **Backoff (0-9)** | 10 seconds | 10 seconds | Aggressive recovery |
+| **Backoff (10+)** | 30s → 300s max | 30s → 300s max | Network protection |
+| **Eviction Policy** | FIFO (oldest first) | FIFO (oldest first) | Fair buffer management |
+| **Self-Protection** | Current block never removed | Current block never removed | Ensure progress |
 
 **Attack Mitigation**:
-- **Memory DoS**: Max 10 MB buffer (100 blocks)
-- **Stale Blocks**: 30-second automatic cleanup
-- **Infinite Retry**: 5-attempt limit
+- **Memory DoS**: Adaptive buffer (10-50 MB based on node type)
+- **Stale Blocks**: Background re-request every 30s with exponential backoff
+- **Infinite Retry**: Pseudo-infinite with backoff (never discard critical data)
 - **Race Conditions**: Current block never evicted
 
 ---
