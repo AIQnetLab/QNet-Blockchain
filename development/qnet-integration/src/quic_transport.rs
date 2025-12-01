@@ -284,10 +284,19 @@ impl QuicTransport {
                             
                             println!("[QUIC] ✅ Accepted connection from {} (node: {})", peer_addr, remote_node_id);
                             
+                            // Check if we already have a connection to this peer
+                            // This prevents race condition when both nodes connect simultaneously
+                            if connections_clone.contains_key(&peer_addr) {
+                                println!("[QUIC] ⚠️ Already have connection to {}, reusing existing", peer_addr);
+                                // Reuse existing connection, close this one
+                                connection.close(quinn::VarInt::from_u32(0), b"duplicate");
+                                return;
+                            }
+                            
                             // Store connection
                             let quic_conn = Arc::new(QuicConnection {
                                 connection: connection.clone(),
-                                remote_node_id: Some(remote_node_id),
+                                remote_node_id: Some(remote_node_id.clone()),
                                 remote_cert_serial: Some(remote_cert_serial),
                                 connected_at: Instant::now(),
                                 last_activity: Instant::now(),
@@ -298,6 +307,7 @@ impl QuicTransport {
                             });
                             
                             connections_clone.insert(peer_addr, quic_conn.clone());
+                            println!("[QUIC] 📦 Connection stored for {} (node: {})", peer_addr, remote_node_id);
                             
                             // Update stats
                             {

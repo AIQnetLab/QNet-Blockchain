@@ -1358,6 +1358,10 @@ impl BlockchainNode {
         let (macroblock_tx, mut macroblock_rx) = tokio::sync::mpsc::unbounded_channel();
         let (macroblock_sync_tx, mut macroblock_sync_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, u64, String)>();
         
+        // PRODUCTION v2.19.22: Create QUIC message channel for full message processing
+        // All QUIC messages are routed through this to use same handle_message() logic
+        let (quic_message_tx, mut quic_message_rx) = tokio::sync::mpsc::unbounded_channel::<(String, crate::unified_p2p::NetworkMessage)>();
+        
         println!("[UnifiedP2P] 🔍 DEBUG: Creating SimplifiedP2P instance...");
         let mut unified_p2p_instance = SimplifiedP2P::new(
             node_id.clone(),
@@ -1376,6 +1380,9 @@ impl BlockchainNode {
         // PRODUCTION v2.19.12: Set macroblock sync channels
         unified_p2p_instance.set_macroblock_channel(macroblock_tx);
         unified_p2p_instance.set_macroblock_sync_channel(macroblock_sync_tx);
+        
+        // PRODUCTION v2.19.22: Set QUIC message channel for full message processing
+        unified_p2p_instance.set_quic_message_channel(quic_message_tx);
         
         // CRITICAL: Initialize all Genesis node reputations deterministically at startup
         // This prevents race conditions where different nodes see different candidate lists
@@ -2028,6 +2035,18 @@ impl BlockchainNode {
                 // Process received macroblock
                 if let Err(e) = blockchain_for_macroblocks.process_received_macroblock(received_macroblock).await {
                     println!("[MACROBLOCK-SYNC] ❌ Failed to process macroblock: {}", e);
+                }
+            }
+        });
+        
+        // PRODUCTION v2.19.22: Start QUIC message handler
+        // Routes ALL QUIC messages through handle_message() for full processing
+        let blockchain_for_quic = blockchain.clone();
+        tokio::spawn(async move {
+            while let Some((from_peer, message)) = quic_message_rx.recv().await {
+                // Use same handle_message() logic as HTTP
+                if let Some(ref p2p) = blockchain_for_quic.unified_p2p {
+                    p2p.handle_message(&from_peer, message);
                 }
             }
         });

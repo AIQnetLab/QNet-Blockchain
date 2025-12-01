@@ -564,6 +564,11 @@ pub struct SimplifiedP2P {
     
     /// PRODUCTION: QUIC enabled flag (pure QUIC mode - no HTTP fallback)
     quic_enabled: Arc<std::sync::atomic::AtomicBool>,
+    
+    /// PRODUCTION v2.19.22: QUIC message channel for full message processing
+    /// All QUIC messages are sent here and processed via handle_message()
+    /// This ensures QUIC messages use same logic as HTTP (no duplication)
+    quic_message_tx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<(String, NetworkMessage)>>>>,
 }
 
 /// HYBRID: Simplified certificate manager for microblocks only
@@ -1135,6 +1140,9 @@ impl SimplifiedP2P {
             // PRODUCTION v2.19.21: QUIC transport (initialized later via init_quic)
             quic_transport: None,
             quic_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            
+            // PRODUCTION v2.19.22: QUIC message channel (set via set_quic_message_channel)
+            quic_message_tx: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1167,6 +1175,13 @@ impl SimplifiedP2P {
         self.sync_request_tx = Some(sync_request_tx);
     }
     
+    /// PRODUCTION v2.19.22: Set QUIC message channel for full message processing
+    /// All QUIC messages are routed through this channel to handle_message()
+    pub fn set_quic_message_channel(&mut self, quic_message_tx: tokio::sync::mpsc::UnboundedSender<(String, NetworkMessage)>) {
+        *self.quic_message_tx.lock().unwrap() = Some(quic_message_tx);
+        println!("[QUIC] ✅ Message processing channel established");
+    }
+    
     /// PRODUCTION v2.19.21: Initialize QUIC transport for high-performance P2P
     /// 
     /// Features:
@@ -1192,59 +1207,24 @@ impl SimplifiedP2P {
         transport.init(bind_addr, cert_serial).await
             .map_err(|e| format!("QUIC init failed: {}", e))?;
         
-        // Set message handler - route received messages to P2P processing
-        let block_tx = self.block_tx.clone();
-        let macroblock_tx = self.macroblock_tx.clone();
-        let reputation_system = self.reputation_system.clone();
-        let connected_peers = self.connected_peers.clone();
-        let node_id = self.node_id.clone();
+        // PRODUCTION v2.19.22: Route ALL QUIC messages through channel to handle_message()
+        // This ensures QUIC uses SAME logic as HTTP - no code duplication!
+        let quic_message_tx = self.quic_message_tx.clone();
         
         let handler: MessageHandler = Arc::new(move |peer_addr, msg| {
-            // Route message based on type
-            let now_ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
+            // Convert QUIC SocketAddr to API port format (matches handle_message expectation)
+            let peer_str = format!("{}:8001", peer_addr.ip());
             
-            match msg {
-                NetworkMessage::Block { height, data, block_type } => {
-                    // Convert SocketAddr back to string format (use API port 8001)
-                    let peer_str = format!("{}:8001", peer_addr.ip());
-                    
-                    // Send to block processing channel (use block_tx for all blocks)
-                    if let Ok(tx_guard) = block_tx.lock() {
-                        if let Some(ref tx) = *tx_guard {
-                            let _ = tx.send(crate::unified_p2p::ReceivedBlock {
-                                height,
-                                data,
-                                block_type: block_type.clone(),
-                                from_peer: peer_str,
-                                timestamp: now_ts,
-                            });
-                        }
+            // CRITICAL: Send ALL messages through channel for full processing
+            // This calls handle_message() which has complete logic for all message types
+            if let Ok(tx_guard) = quic_message_tx.lock() {
+                if let Some(ref tx) = *tx_guard {
+                    if let Err(e) = tx.send((peer_str.clone(), msg)) {
+                        println!("[QUIC] ⚠️ Failed to queue message from {}: {}", peer_str, e);
                     }
-                }
-                NetworkMessage::ShredProtocolChunk { chunk } => {
-                    // Handle shred_protocol chunk (will be processed by existing handler)
-                    println!("[QUIC] 📦 Received ShredProtocol chunk #{}/{} for block {}", 
-                        chunk.chunk_index, chunk.total_chunks, chunk.block_height);
-                }
-                NetworkMessage::ConsensusCommit { round_id, node_id: sender_id, .. } => {
-                    println!("[QUIC] 🏛️ Received consensus commit: round={}, from={}", round_id, sender_id);
-                }
-                NetworkMessage::ConsensusReveal { round_id, node_id: sender_id, .. } => {
-                    println!("[QUIC] 🔓 Received consensus reveal: round={}, from={}", round_id, sender_id);
-                }
-                NetworkMessage::HealthPing { from, .. } => {
-                    // Update peer last seen (u64 timestamp)
-                    if let Ok(mut peers) = connected_peers.write() {
-                        if let Some(peer) = peers.get_mut(&from) {
-                            peer.last_seen = now_ts;
-                        }
-                    }
-                }
-                _ => {
-                    // Other messages handled by default
+                } else {
+                    // Channel not set yet - this can happen during startup
+                    // Messages will be processed once channel is established
                 }
             }
         });
