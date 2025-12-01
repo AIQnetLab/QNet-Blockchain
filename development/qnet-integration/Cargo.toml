@@ -96,7 +96,7 @@ rand = "0.8.5"
 dirs = "5.0"
 url = "2.5"
 
-# Reed-Solomon erasure coding for Turbine
+# Reed-Solomon erasure coding for Shred Protocol
 reed-solomon-erasure = "6.0"
 
 # HTTP client

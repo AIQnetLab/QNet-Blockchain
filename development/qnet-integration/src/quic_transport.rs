@@ -54,8 +54,13 @@ pub const IDLE_TIMEOUT_SECS: u64 = 90;
 /// Maximum concurrent streams per connection
 pub const MAX_STREAMS_PER_CONN: u32 = 100;
 
-/// QUIC port offset from P2P port (9876 -> 10876)
-pub const QUIC_PORT_OFFSET: u16 = 1000;
+/// Fixed QUIC port - always use this port for QUIC connections
+/// Docker maps this port: -p 10876:10876/udp
+pub const QUIC_PORT: u16 = 10876;
+
+/// QUIC port offset from API port (8001 -> 10876)
+/// NOTE: peer.addr contains API port (8001), so offset = 10876 - 8001 = 2875
+pub const QUIC_PORT_OFFSET: u16 = 2875;
 
 /// Maximum message size (10 MB - for macroblocks)
 pub const MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024;

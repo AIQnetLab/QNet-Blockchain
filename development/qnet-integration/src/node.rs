@@ -501,11 +501,11 @@ pub struct BlockchainNode {
     // Reward manager for lazy rewards system
     reward_manager: Arc<RwLock<PhaseAwareRewardManager>>,
     
-    // Quantum Proof of History for time synchronization
+    // Verifiable Time Sequence (VTS) for time synchronization
     quantum_poh: Option<Arc<crate::quantum_poh::QuantumPoH>>,
     quantum_poh_receiver: Option<Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<crate::quantum_poh::PoHEntry>>>>,
     
-    // Hybrid Sealevel for parallel transaction execution
+    // Parallel Executor for parallel transaction execution
     parallel_executor: Option<Arc<crate::parallel_executor::ParallelExecutor>>,
     
     // Adaptive BFT for adaptive timeouts
@@ -525,7 +525,7 @@ impl BlockchainNode {
         self.reward_manager.clone()
     }
     
-    /// Get Quantum PoH reference
+    /// Get Quantum VTS reference
     pub fn get_quantum_poh(&self) -> &Option<Arc<crate::quantum_poh::QuantumPoH>> {
         &self.quantum_poh
     }
@@ -1638,8 +1638,8 @@ impl BlockchainNode {
         println!("[Node] 🔍 DEBUG: Creating BlockchainNode struct...");
         
         // =========================================================================
-        // QUANTUM PoH INITIALIZATION
-        // CRITICAL: PoH only runs on Full and Super nodes (block producers)
+        // QUANTUM VTS INITIALIZATION
+        // CRITICAL: VTS only runs on Full and Super nodes (block producers)
         // Light nodes do NOT run PoH - they are mobile devices with limited resources
         // =========================================================================
         let (quantum_poh, poh_receiver): (Option<Arc<crate::quantum_poh::QuantumPoH>>, Option<Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<crate::quantum_poh::PoHEntry>>>>) = 
@@ -1759,14 +1759,14 @@ impl BlockchainNode {
                 (None, None)
             };
         
-        // Initialize Hybrid Sealevel if sharding is enabled
+        // Initialize Parallel Executor if sharding is enabled
         let parallel_executor = if let (Some(ref shard_coord), Some(ref parallel_val)) = (&shard_coordinator, &parallel_validator) {
-            let sealevel = Arc::new(crate::parallel_executor::ParallelExecutor::new(
+            let executor = Arc::new(crate::parallel_executor::ParallelExecutor::new(
                 shard_coord.clone(),
                 parallel_val.clone(),
             ));
             println!("[ParallelExecutor] 🚀 Initialized parallel transaction processor");
-            Some(sealevel)
+            Some(executor)
         } else {
             None
         };
@@ -4481,13 +4481,13 @@ impl BlockchainNode {
             let mut last_production_time = std::time::Instant::now();
             let mut last_production_height = 0u64;
             
-            // QUANTUM PoH: Get reference for microblock production
+            // QUANTUM VTS: Get reference for microblock production
             let quantum_poh = quantum_poh_for_spawn.clone();
             
-            // HYBRID SEALEVEL: Get reference for parallel processing
+            // PARALLEL EXECUTOR: Get reference for parallel processing
             let parallel_executor = parallel_executor_for_spawn.clone();
             
-            // TOWER BFT: Get reference for adaptive timeouts
+            // ADAPTIVE BFT: Get reference for adaptive timeouts
             let adaptive_bft = adaptive_bft_for_spawn.clone();
             
             // PRE-EXECUTION: Get reference for speculative execution
@@ -5947,10 +5947,10 @@ impl BlockchainNode {
                         }
                     }
                     
-                    // HYBRID SEALEVEL: Process transactions in parallel if available
-                    if let Some(ref sealevel) = parallel_executor {
+                    // PARALLEL EXECUTOR: Process transactions in parallel if available
+                    if let Some(ref executor) = parallel_executor {
                         if !txs.is_empty() {
-                            match sealevel.process_transactions(txs.clone()).await {
+                            match executor.process_transactions(txs.clone()).await {
                                 Ok(processed_txs) => {
                                     println!("[ParallelExecutor] ✅ Processed {} transactions in parallel", processed_txs.len());
                                     txs = processed_txs;
@@ -6220,7 +6220,7 @@ impl BlockchainNode {
                         poh_count, // Add PoH counter to block
                     };
                     
-                    // QUANTUM PoH: Mix microblock into PoH chain for cryptographic time proof
+                    // QUANTUM VTS: Mix microblock into VTS chain for cryptographic time proof
                     if let Some(ref poh) = quantum_poh {
                         let block_data = bincode::serialize(&microblock).unwrap_or_default();
                         match poh.create_microblock_proof(&block_data).await {

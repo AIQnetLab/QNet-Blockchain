@@ -35,7 +35,7 @@ QNet uses a two-phase activation system transitioning from 1DEV burn on Solana t
 - **Parallel Validation**: Concurrent processing of multiple activation requests
 - **Memory Efficiency**: Optimized data structures for high-throughput scenarios
 
-**Proof of History (PoH) Integration:**
+**Verifiable Time Sequence (VTS) Integration:**
 - **Hybrid Hashing**: SHA3-512/Blake3 (25%/75%) for optimal security/performance
 - **Performance**: 2.39M hashes/sec verified on Intel Xeon E5-2680v4 @ 2.4GHz
 - **Test Results**: 7.2M hashes in 3.01 seconds, 187 entries generated (October 31, 2025)

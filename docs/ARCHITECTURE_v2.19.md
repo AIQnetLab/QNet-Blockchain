@@ -61,7 +61,7 @@ pub struct MicroBlock {
     pub producer: String,         // Producer node ID
     pub signature: Vec<u8>,       // COMPACT hybrid signature (3KB)
     pub poh_hash: Vec<u8>,        // Verifiable Time Sequence hash (64 bytes)
-    pub poh_count: u64,           // PoH counter for VDF
+    pub poh_count: u64,           // VTS counter for time ordering
     // ... transactions and other fields
 }
 ```
@@ -1049,18 +1049,18 @@ for node in eligible_nodes {
 | Microblocks | `microblocks` | Sliding window (100K) |
 | Macroblocks | `macroblocks` | Full history |
 | Transactions | `transactions` | Pruned after macroblock |
-| **PoH State** | `poh_state` | Full history |
+| **VTS State** | `poh_state` | Full history |
 | Light attestations | `attestations` | 4 hours + 1 window buffer |
 | Full/Super heartbeats | `heartbeats` | 4 hours + 1 window buffer |
 | Pending rewards | `pending_rewards` | Until claimed |
 | Reputation history | `reputation_history` | 30 days |
 
-#### PoH State Storage (v2.19.13)
+#### VTS State Storage (v2.19.13)
 
-**Architecture**: PoH state is stored **separately** from blocks for O(1) validation.
+**Architecture**: VTS state is stored **separately** from blocks for O(1) validation.
 
 ```rust
-pub struct PoHState {
+pub struct VTSState {
     pub height: u64,           // Block height
     pub poh_hash: Vec<u8>,     // SHA3-512 hash (64 bytes)
     pub poh_count: u64,        // Monotonic counter
@@ -1069,12 +1069,12 @@ pub struct PoHState {
 ```
 
 **Benefits**:
-- ✅ O(1) PoH validation (no block deserialization)
+- ✅ O(1) VTS validation (no block deserialization)
 - ✅ Format-agnostic (works with MicroBlock, EfficientMicroBlock)
 - ✅ Backward compatible (auto-migration from existing blocks)
 - ✅ Minimal overhead (~112 bytes/block = ~3.5 GB/year)
 
-**Migration**: On node startup, `migrate_all_poh_states()` extracts PoH data from existing blocks.
+**Migration**: On node startup, `migrate_all_poh_states()` extracts VTS data from existing blocks.
 
 ### Storage Optimization & Pruning (v2.19.7)
 
@@ -1597,7 +1597,7 @@ Conclusion: Certificate memory remains ~7.5 MB regardless of network size
 | Component | Size | Frequency |
 |-----------|------|-----------|
 | **Block Header** | ~256 bytes | Every block |
-| **PoH (hash + count)** | 72 bytes | Every block |
+| **VTS (hash + count)** | 72 bytes | Every block |
 | **Compact Signature** | ~3 KB | Every block |
 | **Transactions** | ~50 KB | Every block (1000 tx × 50 bytes avg) |
 | **Total per Microblock** | ~53 KB | Every second |

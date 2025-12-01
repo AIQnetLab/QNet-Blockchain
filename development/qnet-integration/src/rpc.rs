@@ -1433,7 +1433,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(blockchain_filter.clone())
         .and_then(handle_shred_protocol_metrics);
     
-    // Quantum PoH status endpoint
+    // Quantum VTS status endpoint
     let poh_status = api_v1
         .and(warp::path("poh"))
         .and(warp::path("status"))
@@ -1460,7 +1460,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(blockchain_filter.clone())
         .and_then(handle_pre_execution_status);
     
-    // Tower BFT timeout info endpoint
+    // Adaptive BFT timeout info endpoint
     let adaptive_bft_info = api_v1
         .and(warp::path("adaptive-bft"))
         .and(warp::path("timeouts"))
@@ -4366,7 +4366,7 @@ async fn handle_shred_protocol_metrics(blockchain: Arc<BlockchainNode>) -> Resul
     Ok(warp::reply::json(&metrics))
 }
 
-// Handler for Quantum PoH status
+// Handler for Quantum VTS status
 async fn handle_poh_status(blockchain: Arc<BlockchainNode>) -> Result<impl warp::Reply, warp::Rejection> {
     // CRITICAL FIX: Get real hash rate from PoH instance
     let (enabled, hash_rate_str, status) = if let Some(poh) = blockchain.get_quantum_poh() {
@@ -4425,7 +4425,7 @@ async fn handle_pre_execution_status(blockchain: Arc<BlockchainNode>) -> Result<
     Ok(warp::reply::json(&status))
 }
 
-// Handler for Tower BFT timeouts
+// Handler for Adaptive BFT timeouts
 async fn handle_adaptive_bft_timeouts(blockchain: Arc<BlockchainNode>) -> Result<impl warp::Reply, warp::Rejection> {
     let current_height = blockchain.get_height().await;
     

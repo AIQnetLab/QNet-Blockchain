@@ -16,13 +16,13 @@
 | **Full** | 12KB | Macroblocks (low frequency) | Embedded |
 
 ### Node Types
-| Type | Consensus | Storage | Bandwidth | Target | Reputation | PoH |
+| Type | Consensus | Storage | Bandwidth | Target | Reputation | VTS |
 |------|-----------|---------|-----------|--------|------------|-----|
 | **Light** | ❌ No | Minimal | Low | Mobile, IoT | Fixed 70 | ❌ No |
 | **Full** | ⚠️ Partial | Full chain | Medium | Validators | Variable | ✅ Yes |
 | **Super** | ✅ Always | Full + history | High | Producers | Variable | ✅ Yes |
 
-### Verifiable Time Sequence (PoH)
+### Verifiable Time Sequence (VTS)
 | Parameter | Value | Notes |
 |-----------|-------|-------|
 | **Hash Rate** | 500K/sec | SHA3-512 (25%) + Blake3 (75%) |
@@ -405,7 +405,7 @@ const MAX_CACHE_SIZE: usize = 100000;          // Certificate cache
 const NETWORK_STABILIZATION_SECS: u64 = 30;    // Genesis startup wait
 const EMERGENCY_WAIT_SECS: u64 = 10;           // Emergency producer wait
 
-// PoH constants (quantum_poh.rs)
+// VTS constants (quantum_poh.rs)
 const HASHES_PER_TICK: u64 = 5_000;            // Hashes per 10ms tick
 const TICK_DURATION_US: u64 = 10_000;          // 10ms = 10,000 microseconds
 const HASHES_PER_SLOT: u64 = 500_000;          // 500K hashes = 1 second

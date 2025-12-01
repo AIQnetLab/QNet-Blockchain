@@ -232,12 +232,12 @@ This project uses **dual licensing**:
   - Optimized for 4.29B QNC supply with conservative thresholds
   - Zero storage overhead (calculated on-the-fly)
   - Backward compatible (optional fields)
-- **PoH Synchronization**: Synchronized Verifiable Time Sequence for deterministic producer selection
-  - PoH state from last confirmed block (all nodes agree)
-  - Local PoH generator syncs with received blocks
-  - Prevents consensus failures from diverging PoH states
-  - Macroblock PoH sourced from last microblock in range
-- **Fork Detection & Resolution**: PoH counter regression checks prevent malicious forks
+- **VTS Synchronization**: Synchronized Verifiable Time Sequence for deterministic producer selection
+  - VTS state from last confirmed block (all nodes agree)
+  - Local VTS generator syncs with received blocks
+  - Prevents consensus failures from diverging VTS states
+  - Macroblock VTS sourced from last microblock in range
+- **Fork Detection & Resolution**: VTS counter regression checks prevent malicious forks
 
 ### **Previous Updates (v2.17.0)**
 - **Chain Reorganization (Chain Reorg)**: Byzantine-safe fork resolution with 2/3 majority consensus
@@ -249,7 +249,7 @@ This project uses **dual licensing**:
 
 ### **Previous Updates (v2.16.0)**
 - **Shred Protocol Block Propagation**: 85% bandwidth reduction with Reed-Solomon erasure coding
-- **Quantum Verifiable Time Sequence (PoH)**: 500K hashes/sec with hybrid SHA3-512/Blake3 (25%/75%)
+- **Quantum Verifiable Time Sequence (VTS)**: 500K hashes/sec with hybrid SHA3-512/Blake3 (25%/75%)
   - Production config: 5,000 hashes per tick × 100 ticks/sec = 500K hashes/sec
   - 100 ticks per second (10ms intervals) for smooth entropy generation
   - 5,000 hashes per tick (optimized for 1-second microblocks)
@@ -355,7 +355,7 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 
 #### **Advanced Performance Features**
 - **🌪️ Shred Protocol Protocol**: 85% bandwidth savings with adaptive fanout (4-32) based on network topology
-- **⏱️ Quantum PoH**: 500K hashes/sec cryptographic clock for precise timing
+- **⏱️ Quantum VTS**: 500K hashes/sec cryptographic clock for precise timing
 - **⚙️ Hybrid Parallel Executor**: 10,000 parallel transactions with 5-stage pipeline
 - **🎯 Adaptive BFT**: Adaptive timeouts (7s base to 20s max, 1.5x multiplier) for optimal consensus
 - **🚀 Pre-Execution**: Speculative transaction processing with 10,000 cache size
@@ -378,7 +378,7 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 
 **Hardware & Benchmarks:**
 - **Test Environment**: Intel Xeon E5-2680v4 @ 2.4GHz (14 cores, 28 threads), 32GB DDR4-2400
-- **PoH Performance**: 500K hashes/sec (hybrid SHA3-512/Blake3, sequential ordering chain)
+- **VTS Performance**: 500K hashes/sec (hybrid SHA3-512/Blake3, sequential ordering chain)
 - **Signature Verification**: Dilithium3 ~2ms, Ed25519 ~20μs per signature
 - **Network**: WAN-optimized with adaptive timeouts (7s-20s)
 
@@ -496,7 +496,7 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 │  │   ├── 1KB chunks with Reed-Solomon erasure coding       │
 │  │   ├── Adaptive fanout (4-32) based on network size & latency │
 │  │   └── 85% bandwidth reduction                           │
-│  ├── Quantum Verifiable Time Sequence (QPoH)                       │
+│  ├── Quantum Verifiable Time Sequence (QVTS)                       │
 │  │   ├── 500K hashes/sec cryptographic clock               │
 │  │   ├── SHA3-512 + Blake3 hybrid (25%/75%)                │
 │  │   └── Verifiable delay function                         │
@@ -557,14 +557,14 @@ QNet implements advanced chain reorganization and synchronization mechanisms for
 - **Genesis Coordination**: Only node_001 creates Genesis block in bootstrap mode
 - **Quantum-Resistant Genesis**: CRYSTALS-Dilithium signature ensures identical Genesis across all nodes
 
-### **Verifiable Time Sequence (PoH) Integration**
+### **Verifiable Time Sequence (VTS) Integration**
 - **Cryptographic Clock**: 500K hashes/sec SHA3-512 + Blake3 hybrid (25%/75%)
 - **Verifiable Delay Function**: Time-stamped block ordering without central authority
 - **Block Time Synchronization**: Sub-second precision across distributed network
 - **Historical Proof**: Cryptographic evidence of event ordering and timing
-- **Fork Prevention**: PoH creates immutable timeline making forks computationally expensive
-- **Node Type Optimization**: PoH runs ONLY on Full/Super nodes (Light nodes excluded to save mobile battery/CPU)
-- **Network Synchronization**: Local PoH syncs with network consensus on block receipt
+- **Fork Prevention**: VTS creates immutable timeline making forks computationally expensive
+- **Node Type Optimization**: VTS runs ONLY on Full/Super nodes (Light nodes excluded to save mobile battery/CPU)
+- **Network Synchronization**: Local VTS syncs with network consensus on block receipt
 - **Checkpointing**: Automatic checkpoints every 1M hashes for fast node restart
 - **Drift Detection**: Automatic clock drift monitoring with 5% tolerance threshold
 
@@ -1390,7 +1390,7 @@ docker run -d --name qnet-genesis-005 --restart=always \
 - ✅ Batch size: 10,000 transactions
 - ✅ Mempool: 2M transactions capacity
 - ✅ High frequency mode: enabled
-- ✅ PoH: 500K hashes/sec (Full/Super nodes only)
+- ✅ VTS: 500K hashes/sec (Full/Super nodes only)
 
 **Genesis Node Requirements:**
 - Set `QNET_BOOTSTRAP_ID` to 001-005 for genesis nodes

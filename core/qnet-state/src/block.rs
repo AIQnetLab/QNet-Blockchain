@@ -40,9 +40,9 @@ pub struct MicroBlock {
     pub previous_hash: [u8; 32],
     /// Merkle root of transactions
     pub merkle_root: [u8; 32],
-    /// Proof of History hash at block creation
+    /// Verifiable Time Sequence hash at block creation
     pub poh_hash: Vec<u8>,  // SHA3-512 produces 64 bytes
-    /// Proof of History counter at block creation
+    /// Verifiable Time Sequence counter at block creation
     pub poh_count: u64,
 }
 
@@ -61,9 +61,9 @@ pub struct MacroBlock {
     pub consensus_data: ConsensusData,
     /// Previous macroblock hash
     pub previous_hash: [u8; 32],
-    /// Proof of History hash at macroblock finalization
+    /// Verifiable Time Sequence hash at macroblock finalization
     pub poh_hash: Vec<u8>,  // SHA3-512 produces 64 bytes
-    /// Proof of History counter at macroblock finalization
+    /// Verifiable Time Sequence counter at macroblock finalization
     pub poh_count: u64,
 }
 
@@ -96,9 +96,9 @@ pub struct EfficientMicroBlock {
     pub previous_hash: [u8; 32],
     /// Merkle root of transaction hashes
     pub merkle_root: [u8; 32],
-    /// Proof of History hash at block creation (SHA3-512 produces 64 bytes)
+    /// Verifiable Time Sequence hash at block creation (SHA3-512 produces 64 bytes)
     pub poh_hash: Vec<u8>,
-    /// Proof of History counter at block creation
+    /// Verifiable Time Sequence counter at block creation
     pub poh_count: u64,
 }
 
@@ -244,7 +244,7 @@ impl StoredMicroBlock {
     }
 }
 
-/// PoH (Proof of History) state for a block
+/// VTS (Verifiable Time Sequence) state for a block
 /// Stored separately for fast validation without loading full block
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PoHState {

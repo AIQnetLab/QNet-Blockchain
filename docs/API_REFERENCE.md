@@ -966,7 +966,7 @@ price = max(1500 - floor(burn% / 10) × 150, 300)
 
 ## ⚙️ Advanced Endpoints
 
-### PoH Status
+### VTS Status
 ```http
 GET /api/v1/poh/status
 ```
@@ -987,14 +987,14 @@ GET /api/v1/poh/status
 
 ### Shred Protocol Metrics
 ```http
-GET /api/v1/turbine/metrics
+GET /api/v1/shred-protocol/metrics
 ```
 
 ---
 
-### Sealevel Metrics
+### Parallel Executor Metrics
 ```http
-GET /api/v1/sealevel/metrics
+GET /api/v1/parallel-executor/metrics
 ```
 
 ---
@@ -1006,9 +1006,9 @@ GET /api/v1/pre-execution/status
 
 ---
 
-### Tower BFT Timeouts
+### Adaptive BFT Timeouts
 ```http
-GET /api/v1/tower-bft/timeouts
+GET /api/v1/adaptive-bft/timeouts
 ```
 
 ---
@@ -1780,8 +1780,8 @@ GET /api/v1/snapshot/{height}
 
 ### v2.19.3 (October 2025)
 - Added MEV bundle endpoints
-- Added PoH status endpoint
-- Added Shred Protocol/Sealevel metrics
+- Added VTS status endpoint
+- Added Shred Protocol/Parallel Executor metrics
 
 ### v2.19.0 (September 2025)
 - Initial API release

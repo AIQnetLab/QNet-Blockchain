@@ -16,7 +16,7 @@
 //! ├── mod.rs              - This file (public exports)
 //! ├── hybrid_crypto.rs    - Dilithium + Ed25519 hybrid signatures
 //! ├── quantum_crypto.rs   - Quantum-resistant cryptography core
-//! ├── quantum_poh.rs      - Quantum Proof of History
+//! ├── quantum_poh.rs      - Verifiable Time Sequence (VTS)
 //! ├── vrf.rs              - Verifiable Random Function
 //! ├── vrf_hybrid.rs       - Hybrid VRF (quantum + classical)
 //! ├── key_manager.rs      - Key generation and management
@@ -47,7 +47,7 @@ pub mod hybrid_crypto;
 /// Node activation, phase management, pricing calculations
 pub mod quantum_crypto;
 
-/// Quantum Proof of History
+/// Verifiable Time Sequence (VTS)
 /// Time-based consensus with quantum-resistant hashing
 pub mod quantum_poh;
 
@@ -91,7 +91,7 @@ pub use quantum_crypto::{
     SimpleNodeRecord,
 };
 
-// Quantum PoH types
+// Quantum VTS types
 pub use quantum_poh::{
     QuantumPoH,
     PoHEntry,

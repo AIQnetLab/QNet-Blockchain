@@ -25,7 +25,7 @@ QNet implements **NIST/Cisco recommended post-quantum cryptography** with:
 
 1. [Architecture Overview](#architecture-overview)
    - 1.1 [Client Transaction Cryptography](#11-client-transaction-cryptography-mobile--browser)
-   - 1.2 [Quantum Proof-of-History (PoH)](#12-quantum-proof-of-history-poh)
+   - 1.2 [Verifiable Time Sequence (VTS)](#12-verifiable-time-sequence-vts---sequential-hash-chain)
    - 1.3 [Ping Commitment Cryptography](#13-ping-commitment-cryptography-v2190)
    - 1.4 [MEV Bundle Cryptography](#14-mev-bundle-cryptography-v2193)
 2. [Signature Systems (v2.19)](#signature-systems-v219)
@@ -255,17 +255,17 @@ When quantum computers become a threat:
 
 ---
 
-## 1.2 Proof-of-History (PoH) - Sequential Hash Chain
+## 1.2 Verifiable Time Sequence (VTS) - Sequential Hash Chain
 
 ### Overview
 
-QNet implements **Hybrid SHA3-512 / Blake3 Proof-of-History** as a sequential hash chain for verifiable time ordering and event sequencing. This provides cryptographic time ordering for 1-second microblocks without requiring a formal VDF (Verifiable Delay Function) with mathematical delay proofs.
+QNet implements **Hybrid SHA3-512 / Blake3 Verifiable Time Sequence** as a sequential hash chain for verifiable time ordering and event sequencing. This provides cryptographic time ordering for 1-second microblocks without requiring a formal VDF (Verifiable Delay Function) with mathematical delay proofs.
 
 ### Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│  QUANTUM POH CHAIN                                      │
+│  VERIFIABLE TIME SEQUENCE (VTS) CHAIN                   │
 ├─────────────────────────────────────────────────────────┤
 │                                                          │
 │  Genesis Hash (SHA3-256)                                │
@@ -287,7 +287,7 @@ QNet implements **Hybrid SHA3-512 / Blake3 Proof-of-History** as a sequential ha
 │  ... (100 ticks = 1 slot = 1 second)                   │
 │         ↓                                                │
 │  ┌──────────────────────────────────────────────────┐  │
-│  │  Microblock #N (includes PoH hash + count)       │  │
+│  │  Microblock #N (includes VTS hash + count)       │  │
 │  └──────────────────────────────────────────────────┘  │
 │                                                          │
 └─────────────────────────────────────────────────────────┘
@@ -346,7 +346,7 @@ else {
    - ✅ No need for external time source
 
 3. **Consensus Integration:**
-   - ✅ PoH hash mixed into block signatures
+   - ✅ VTS hash mixed into block signatures
    - ✅ Prevents block reordering attacks
    - ✅ Provides time ordering for blocks
    - ✅ Synchronizes network time
@@ -364,12 +364,12 @@ let genesis_hash = hasher.finalize();
 
 **Checkpoint Synchronization:**
 ```rust
-// Nodes sync PoH state from blocks
+// Nodes sync VTS state from blocks
 pub async fn sync_from_checkpoint(&self, hash: &[u8], count: u64) {
     // CRITICAL: Only sync forward, never backward
     let current_count = *self.hash_count.read().await;
     if count < current_count {
-        return; // Prevent PoH regression
+        return; // Prevent VTS regression
     }
     *self.current_hash.write().await = hash.to_vec();
     *self.hash_count.write().await = count;
@@ -378,22 +378,22 @@ pub async fn sync_from_checkpoint(&self, hash: &[u8], count: u64) {
 
 **Block Integration:**
 ```rust
-// Each microblock includes PoH state
+// Each microblock includes VTS state
 pub struct MicroBlock {
     pub height: u64,
-    pub poh_hash: Vec<u8>,    // Current PoH hash (64 bytes)
+    pub poh_hash: Vec<u8>,    // Current VTS hash (64 bytes)
     pub poh_count: u64,       // Total hashes computed
     pub timestamp: u64,       // Wall clock time
     ...
 }
 ```
 
-### PoH Validation (v2.19.13)
+### VTS Validation (v2.19.13)
 
-**Separate PoH State Storage:**
+**Separate VTS State Storage:**
 ```rust
-// PoH state stored separately for O(1) validation
-pub struct PoHState {
+// VTS state stored separately for O(1) validation
+pub struct VTSState {
     pub height: u64,           // Block height
     pub poh_hash: Vec<u8>,     // SHA3-512 hash (64 bytes)
     pub poh_count: u64,        // Monotonic counter
@@ -403,20 +403,20 @@ pub struct PoHState {
 
 **Validation Flow:**
 ```rust
-// 1. Load PoH state from dedicated storage (O(1), no block deserialization)
+// 1. Load VTS state from dedicated storage (O(1), no block deserialization)
 let prev_poh = storage.load_poh_state(height - 1)?;
 
 // 2. Check monotonic progression
 if block.poh_count <= prev_poh.poh_count {
     let regression = prev_poh.poh_count - block.poh_count;
     if regression > MAX_ACCEPTABLE_REGRESSION {  // 15M hashes (~30 sec)
-        return Err("Severe PoH regression");
+        return Err("Severe VTS regression");
     }
     // Minor regression acceptable due to network delays
 }
 
-// 3. Auto-save PoH state when saving block
-storage.save_microblock_efficient(block);  // Also saves PoHState
+// 3. Auto-save VTS state when saving block
+storage.save_microblock_efficient(block);  // Also saves VTSState
 ```
 
 **Security Properties:**
@@ -454,7 +454,7 @@ let actual_duration = start_time.elapsed().as_micros();
 let drift = (actual_duration - expected_duration) as f64 / expected_duration as f64;
 
 if drift.abs() > MAX_DRIFT_PERCENT {
-    println!("[QuantumPoH] ⚠️ Drift detected: {:.2}%", drift * 100.0);
+    println!("[VTS] ⚠️ Drift detected: {:.2}%", drift * 100.0);
 }
 ```
 
@@ -472,10 +472,10 @@ if drift.abs() > MAX_DRIFT_PERCENT {
 - Slot duration: 1 second (100 ticks)
 - Drift: <1% (well within 5% limit)
 
-### Comparison with Solana PoH
+### Comparison: Sequential Hash Chain Approaches
 
-| Aspect | Solana PoH | QNet PoH |
-|--------|------------|----------|
+| Aspect | Other Blockchains | QNet VTS |
+|--------|-------------------|----------|
 | **Algorithm** | SHA-256 | Hybrid SHA3-512 / Blake3 |
 | **Hash Rate** | ~1M hashes/sec | ~500K hashes/sec |
 | **VDF Property** | 100% | 25% (sufficient) |
@@ -483,7 +483,7 @@ if drift.abs() > MAX_DRIFT_PERCENT {
 | **Quantum Resistant** | ❌ No | ✅ Yes (SHA3-512) |
 | **NIST Approved** | ⚠️ SHA-256 | ✅ SHA3-512 |
 
-**QNet Advantages:**
+**QNet VTS Advantages:**
 - ✅ Quantum-resistant (SHA3-512)
 - ✅ NIST FIPS 202 compliant
 - ✅ Hybrid approach (security + speed)

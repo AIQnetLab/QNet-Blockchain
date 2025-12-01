@@ -1176,11 +1176,11 @@ impl SimplifiedP2P {
     /// - Server accepts incoming connections
     /// - NO HTTP fallback (pure QUIC)
     pub async fn init_quic(&mut self, external_ip: &str, cert_serial: &str) -> Result<(), String> {
-        use crate::quic_transport::{QuicTransport, QUIC_PORT_OFFSET, MessageHandler};
+        use crate::quic_transport::{QuicTransport, QUIC_PORT, MessageHandler};
         use std::net::SocketAddr;
         
-        // QUIC port is P2P port + 1000 (e.g., 9876 -> 10876)
-        let quic_port = self.port.saturating_add(QUIC_PORT_OFFSET);
+        // QUIC always uses fixed port 10876 (Docker: -p 10876:10876/udp)
+        let quic_port = QUIC_PORT;
         let bind_addr: SocketAddr = format!("0.0.0.0:{}", quic_port)
             .parse()
             .map_err(|e| format!("Invalid QUIC bind address: {}", e))?;
@@ -1208,8 +1208,8 @@ impl SimplifiedP2P {
             
             match msg {
                 NetworkMessage::Block { height, data, block_type } => {
-                    // Convert SocketAddr back to string format
-                    let peer_str = format!("{}:{}", peer_addr.ip(), peer_addr.port().saturating_sub(QUIC_PORT_OFFSET));
+                    // Convert SocketAddr back to string format (use API port 8001)
+                    let peer_str = format!("{}:8001", peer_addr.ip());
                     
                     // Send to block processing channel (use block_tx for all blocks)
                     if let Ok(tx_guard) = block_tx.lock() {
@@ -5297,7 +5297,7 @@ impl SimplifiedP2P {
         // Medium networks (<=100): 5s for moderate WAN latency
         // Large networks (>100): 10s for global distribution
         let timeout_secs = if total_peers <= 10 {
-            3  // 3s for small networks (doesn't conflict with Tower BFT 4s timeout)
+            3  // 3s for small networks (doesn't conflict with Adaptive BFT 4s timeout)
         } else if total_peers <= 100 {
             5  // 5s for medium networks
         } else {

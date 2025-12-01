@@ -108,7 +108,7 @@ pub struct QuantumPoH {
 }
 
 impl QuantumPoH {
-    /// Create new Quantum PoH instance from genesis hash
+    /// Create new Quantum VTS instance from genesis hash
     pub fn new(genesis_hash: Vec<u8>) -> (Self, mpsc::UnboundedReceiver<PoHEntry>) {
         let (entry_sender, entry_receiver) = mpsc::unbounded_channel();
         
@@ -129,7 +129,7 @@ impl QuantumPoH {
         (poh, entry_receiver)
     }
     
-    /// Create new Quantum PoH instance from a checkpoint
+    /// Create new Quantum VTS instance from a checkpoint
     pub fn new_from_checkpoint(hash: Vec<u8>, count: u64) -> (Self, mpsc::UnboundedReceiver<PoHEntry>) {
         let (entry_sender, entry_receiver) = mpsc::unbounded_channel();
         
@@ -214,7 +214,7 @@ impl QuantumPoH {
             return;
         }
         
-        println!("[QuantumPoH] 🚀 Starting Quantum PoH generator (500K hashes/sec)");
+        println!("[QuantumPoH] 🚀 Starting Quantum VTS generator (500K hashes/sec)");
         
         // Clone Arc references for the spawned task
         let current_hash = self.current_hash.clone();
