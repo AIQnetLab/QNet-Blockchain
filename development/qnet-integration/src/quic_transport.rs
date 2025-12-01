@@ -538,11 +538,14 @@ impl QuicTransport {
         let endpoint = self.endpoint.as_ref()
             .ok_or("Endpoint not initialized")?;
         
-        // Client config
-        let client_crypto = rustls::ClientConfig::builder()
+        // Client config with ALPN (must match server)
+        let mut client_crypto = rustls::ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
             .with_no_client_auth();
+        
+        // CRITICAL: Set ALPN protocol to match server
+        client_crypto.alpn_protocols = vec![b"qnet-p2p-v1".to_vec()];
         
         let mut client_config = ClientConfig::new(Arc::new(
             quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)
