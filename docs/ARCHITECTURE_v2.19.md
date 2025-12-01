@@ -1870,9 +1870,11 @@ QNet v2.19 implements a production-ready, post-quantum secure blockchain with:
 QNet uses QUIC for high-performance P2P communication:
 
 ```
-QUIC Port = P2P Port + 1000
-Example: 9876 (P2P) → 10876 (QUIC)
+QUIC Port = 10876 (fixed for all nodes)
+Docker: -p 10876:10876/udp
 ```
+
+**Note:** Internal offset calculation: API port (8001) + 2875 = 10876
 
 **Features:**
 - TLS 1.3 encryption (NIST SP 800-52 compliant)
