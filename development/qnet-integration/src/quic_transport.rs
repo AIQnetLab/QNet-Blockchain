@@ -33,7 +33,17 @@ use tokio::sync::{RwLock, mpsc};
 use serde::{Serialize, Deserialize};
 
 use crate::p2p_transport::*;
-use crate::unified_p2p::{NetworkMessage, PeerInfo};
+use crate::unified_p2p::{NetworkMessage, PeerInfo, get_privacy_id_for_addr};
+
+// ============================================================================
+// RETRY CONSTANTS
+// ============================================================================
+
+/// Number of connection retry attempts
+const CONNECT_RETRY_ATTEMPTS: u32 = 3;
+
+/// Delay between retry attempts (exponential backoff base)
+const RETRY_DELAY_MS: u64 = 100;
 
 // ============================================================================
 // CONSTANTS - ALIGNED WITH HTTP VALUES
@@ -211,6 +221,7 @@ impl QuicTransport {
         
         self.endpoint = Some(endpoint);
         
+        // PRIVACY: bind_addr is local, OK to show
         println!("[QUIC] ✅ Transport initialized on {}", bind_addr);
         println!("[QUIC] 📊 Timeouts: connect={}s, idle={}s, keepalive={}s", 
             CONNECT_TIMEOUT_SECS, IDLE_TIMEOUT_SECS, KEEP_ALIVE_SECS);
@@ -264,7 +275,8 @@ impl QuicTransport {
                 tokio::spawn(async move {
                     match incoming.await {
                         Ok(connection) => {
-                            println!("[QUIC] 📥 Incoming connection from {}", peer_addr);
+                            // PRIVACY: Hide real IP in logs
+                            println!("[QUIC] 📥 Incoming connection from {}", get_privacy_id_for_addr(&peer_addr.to_string()));
                             
                             // Perform handshake
                             let handshake_result = Self::handle_server_handshake(
@@ -277,20 +289,27 @@ impl QuicTransport {
                             let (remote_node_id, remote_cert_serial) = match handshake_result {
                                 Ok(h) => h,
                                 Err(e) => {
-                                    println!("[QUIC] ❌ Handshake failed from {}: {}", peer_addr, e);
+                                    println!("[QUIC] ❌ Handshake failed from {}: {}", get_privacy_id_for_addr(&peer_addr.to_string()), e);
                                     return;
                                 }
                             };
                             
-                            println!("[QUIC] ✅ Accepted connection from {} (node: {})", peer_addr, remote_node_id);
+                            println!("[QUIC] ✅ Accepted connection from {} (node: {})", get_privacy_id_for_addr(&peer_addr.to_string()), remote_node_id);
                             
                             // Check if we already have a connection to this peer
-                            // This prevents race condition when both nodes connect simultaneously
-                            if connections_clone.contains_key(&peer_addr) {
-                                println!("[QUIC] ⚠️ Already have connection to {}, reusing existing", peer_addr);
-                                // Reuse existing connection, close this one
-                                connection.close(quinn::VarInt::from_u32(0), b"duplicate");
-                                return;
+                            // CRITICAL FIX: Only reuse if existing connection is ALIVE
+                            if let Some(existing) = connections_clone.get(&peer_addr) {
+                                // Check if existing connection is still alive
+                                if existing.connection.close_reason().is_none() {
+                                    println!("[QUIC] ⚠️ Already have LIVE connection to {}, reusing existing", get_privacy_id_for_addr(&peer_addr.to_string()));
+                                    // Reuse existing connection, close this one
+                                    connection.close(quinn::VarInt::from_u32(0), b"duplicate");
+                                    return;
+                                } else {
+                                    // Existing connection is dead - remove it and use new one
+                                    println!("[QUIC] 🔄 Existing connection to {} is DEAD, replacing with new", get_privacy_id_for_addr(&peer_addr.to_string()));
+                                    connections_clone.remove(&peer_addr);
+                                }
                             }
                             
                             // Store connection
@@ -307,7 +326,7 @@ impl QuicTransport {
                             });
                             
                             connections_clone.insert(peer_addr, quic_conn.clone());
-                            println!("[QUIC] 📦 Connection stored for {} (node: {})", peer_addr, remote_node_id);
+                            println!("[QUIC] 📦 Connection stored for {} (node: {})", get_privacy_id_for_addr(&peer_addr.to_string()), remote_node_id);
                             
                             // Update stats
                             {
@@ -320,7 +339,7 @@ impl QuicTransport {
                             Self::handle_incoming_streams(connection, peer_addr, handler_clone, quic_conn).await;
                         }
                         Err(e) => {
-                            println!("[QUIC] ❌ Connection failed from {}: {}", peer_addr, e);
+                            println!("[QUIC] ❌ Connection failed from {}: {}", get_privacy_id_for_addr(&peer_addr.to_string()), e);
                             let mut s = stats_clone.write().await;
                             s.connections_failed += 1;
                         }
@@ -404,7 +423,7 @@ impl QuicTransport {
                             });
                         }
                         Err(e) => {
-                            println!("[QUIC] 🔌 Connection closed from {}: {}", peer_addr, e);
+                            println!("[QUIC] 🔌 Connection closed from {}: {}", get_privacy_id_for_addr(&peer_addr.to_string()), e);
                             break;
                         }
                     }
@@ -420,7 +439,7 @@ impl QuicTransport {
                             });
                         }
                         Err(e) => {
-                            println!("[QUIC] 🔌 Connection closed from {}: {}", peer_addr, e);
+                            println!("[QUIC] 🔌 Uni stream closed from {}: {}", get_privacy_id_for_addr(&peer_addr.to_string()), e);
                             break;
                         }
                     }
@@ -444,11 +463,11 @@ impl QuicTransport {
         ).await {
             Ok(Ok(d)) => d,
             Ok(Err(e)) => {
-                println!("[QUIC] ⚠️ Read failed from {}: {}", peer_addr, e);
+                println!("[QUIC] ⚠️ Read failed from {}: {}", get_privacy_id_for_addr(&peer_addr.to_string()), e);
                 return;
             }
             Err(_) => {
-                println!("[QUIC] ⚠️ Read timeout from {}", peer_addr);
+                println!("[QUIC] ⚠️ Read timeout from {}", get_privacy_id_for_addr(&peer_addr.to_string()));
                 return;
             }
         };
@@ -460,7 +479,7 @@ impl QuicTransport {
         let msg = match Self::parse_message(&data) {
             Ok(m) => m,
             Err(e) => {
-                println!("[QUIC] ⚠️ Parse failed from {}: {}", peer_addr, e);
+                println!("[QUIC] ⚠️ Parse failed from {}: {}", get_privacy_id_for_addr(&peer_addr.to_string()), e);
                 return;
             }
         };
@@ -488,11 +507,11 @@ impl QuicTransport {
         ).await {
             Ok(Ok(d)) => d,
             Ok(Err(e)) => {
-                println!("[QUIC] ⚠️ Uni read failed from {}: {}", peer_addr, e);
+                println!("[QUIC] ⚠️ Uni read failed from {}: {}", get_privacy_id_for_addr(&peer_addr.to_string()), e);
                 return;
             }
             Err(_) => {
-                println!("[QUIC] ⚠️ Uni read timeout from {}", peer_addr);
+                println!("[QUIC] ⚠️ Uni read timeout from {}", get_privacy_id_for_addr(&peer_addr.to_string()));
                 return;
             }
         };
@@ -504,7 +523,7 @@ impl QuicTransport {
         let msg = match Self::parse_message(&data) {
             Ok(m) => m,
             Err(e) => {
-                println!("[QUIC] ⚠️ Uni parse failed from {}: {}", peer_addr, e);
+                println!("[QUIC] ⚠️ Uni parse failed from {}: {}", get_privacy_id_for_addr(&peer_addr.to_string()), e);
                 return;
             }
         };
@@ -538,15 +557,47 @@ impl QuicTransport {
             .map_err(|e| format!("Deserialize failed: {}", e))
     }
     
-    /// Connect to a peer (client mode)
+    /// Connect to a peer (client mode) with auto-retry
     pub async fn connect(&self, peer_addr: SocketAddr) -> Result<Arc<QuicConnection>, String> {
-        // Check existing connection
+        // Check existing connection - but only if it's ALIVE
         if let Some(conn) = self.connections.get(&peer_addr) {
-            return Ok(conn.clone());
+            if conn.connection.close_reason().is_none() {
+                // Connection is alive - reuse it
+                return Ok(conn.clone());
+            } else {
+                // Connection is dead - remove it and create new one
+                println!("[QUIC] 🔄 Removing dead connection to {}", get_privacy_id_for_addr(&peer_addr.to_string()));
+                self.connections.remove(&peer_addr);
+            }
         }
         
         let endpoint = self.endpoint.as_ref()
             .ok_or("Endpoint not initialized")?;
+        
+        // Retry loop for connection attempts
+        let mut last_error = String::new();
+        for attempt in 1..=CONNECT_RETRY_ATTEMPTS {
+            match self.try_connect_once(endpoint, peer_addr).await {
+                Ok(conn) => return Ok(conn),
+                Err(e) => {
+                    last_error = e;
+                    if attempt < CONNECT_RETRY_ATTEMPTS {
+                        let delay = Duration::from_millis(RETRY_DELAY_MS * (1 << (attempt - 1))); // Exponential backoff
+                        println!("[QUIC] ⚠️ Connection attempt {}/{} to {} failed, retrying in {:?}...",
+                            attempt, CONNECT_RETRY_ATTEMPTS,
+                            get_privacy_id_for_addr(&peer_addr.to_string()),
+                            delay);
+                        tokio::time::sleep(delay).await;
+                    }
+                }
+            }
+        }
+        
+        Err(format!("Failed to connect after {} attempts: {}", CONNECT_RETRY_ATTEMPTS, last_error))
+    }
+    
+    /// Single connection attempt (internal helper)
+    async fn try_connect_once(&self, endpoint: &Endpoint, peer_addr: SocketAddr) -> Result<Arc<QuicConnection>, String> {
         
         // Client config with ALPN (must match server)
         let mut client_crypto = rustls::ClientConfig::builder()
@@ -584,7 +635,7 @@ impl QuicTransport {
         // Perform client handshake
         let (remote_node_id, remote_cert_serial) = self.perform_client_handshake(&connection).await?;
         
-        println!("[QUIC] ✅ Connected to {} (node: {})", peer_addr, remote_node_id);
+        println!("[QUIC] ✅ Connected to {} (node: {})", get_privacy_id_for_addr(&peer_addr.to_string()), remote_node_id);
         
         // Store connection
         let quic_conn = Arc::new(QuicConnection {
@@ -607,6 +658,15 @@ impl QuicTransport {
             stats.connections_established += 1;
             stats.active_connections = self.connections.len();
         }
+        
+        // CRITICAL FIX: Start listening for incoming streams on CLIENT connections too!
+        // Without this, we can send but not receive on client-initiated connections
+        let handler = self.message_handler.clone();
+        let quic_conn_for_listener = quic_conn.clone();
+        let connection_for_listener = quic_conn.connection.clone();
+        tokio::spawn(async move {
+            Self::handle_incoming_streams(connection_for_listener, peer_addr, handler, quic_conn_for_listener).await;
+        });
         
         Ok(quic_conn)
     }
@@ -656,12 +716,40 @@ impl QuicTransport {
         Ok((peer_handshake.node_id, peer_handshake.cert_serial))
     }
     
-    /// Send message to peer (request-response)
+    /// Send message to peer (request-response) with retry
     pub async fn send_message(&self, peer_addr: SocketAddr, msg: &NetworkMessage) -> Result<(), String> {
-        let conn = self.connect(peer_addr).await?;
-        
-        // Serialize message
+        // Serialize message once
         let wire_data = Self::serialize_message(msg)?;
+        
+        // Retry loop for send attempts
+        let mut last_error = String::new();
+        for attempt in 1..=CONNECT_RETRY_ATTEMPTS {
+            match self.try_send_once(peer_addr, &wire_data).await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    last_error = e;
+                    // Cleanup dead connection on error
+                    if let Some(conn) = self.connections.get(&peer_addr) {
+                        if conn.connection.close_reason().is_some() {
+                            self.connections.remove(&peer_addr);
+                            println!("[QUIC] 🧹 Removed dead connection to {} after send error",
+                                get_privacy_id_for_addr(&peer_addr.to_string()));
+                        }
+                    }
+                    if attempt < CONNECT_RETRY_ATTEMPTS {
+                        let delay = Duration::from_millis(RETRY_DELAY_MS * (1 << (attempt - 1)));
+                        tokio::time::sleep(delay).await;
+                    }
+                }
+            }
+        }
+        
+        Err(format!("Send failed after {} attempts: {}", CONNECT_RETRY_ATTEMPTS, last_error))
+    }
+    
+    /// Single send attempt (internal helper)
+    async fn try_send_once(&self, peer_addr: SocketAddr, wire_data: &[u8]) -> Result<(), String> {
+        let conn = self.connect(peer_addr).await?;
         
         // Open bidirectional stream
         let (mut send, _recv) = conn.connection.open_bi().await
@@ -670,7 +758,7 @@ impl QuicTransport {
         // Send with timeout
         tokio::time::timeout(
             Duration::from_secs(MESSAGE_TIMEOUT_SECS),
-            send.write_all(&wire_data)
+            send.write_all(wire_data)
         )
             .await
             .map_err(|_| "Send timeout")?
@@ -691,19 +779,47 @@ impl QuicTransport {
         Ok(())
     }
     
-    /// Broadcast message (unidirectional, no response)
+    /// Broadcast message (unidirectional, no response) with retry
     pub async fn broadcast_to(&self, peer_addr: SocketAddr, msg: &NetworkMessage) -> Result<(), String> {
-        let conn = self.connect(peer_addr).await?;
-        
-        // Serialize message
+        // Serialize message once
         let wire_data = Self::serialize_message(msg)?;
+        
+        // Retry loop for broadcast attempts
+        let mut last_error = String::new();
+        for attempt in 1..=CONNECT_RETRY_ATTEMPTS {
+            match self.try_broadcast_once(peer_addr, &wire_data).await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    last_error = e;
+                    // Cleanup dead connection on error
+                    if let Some(conn) = self.connections.get(&peer_addr) {
+                        if conn.connection.close_reason().is_some() {
+                            self.connections.remove(&peer_addr);
+                            println!("[QUIC] 🧹 Removed dead connection to {} after broadcast error",
+                                get_privacy_id_for_addr(&peer_addr.to_string()));
+                        }
+                    }
+                    if attempt < CONNECT_RETRY_ATTEMPTS {
+                        let delay = Duration::from_millis(RETRY_DELAY_MS * (1 << (attempt - 1)));
+                        tokio::time::sleep(delay).await;
+                    }
+                }
+            }
+        }
+        
+        Err(format!("Broadcast failed after {} attempts: {}", CONNECT_RETRY_ATTEMPTS, last_error))
+    }
+    
+    /// Single broadcast attempt (internal helper)
+    async fn try_broadcast_once(&self, peer_addr: SocketAddr, wire_data: &[u8]) -> Result<(), String> {
+        let conn = self.connect(peer_addr).await?;
         
         // Open unidirectional stream
         let mut send = conn.connection.open_uni().await
             .map_err(|e| format!("Open uni stream failed: {}", e))?;
         
         // Send
-        send.write_all(&wire_data).await
+        send.write_all(wire_data).await
             .map_err(|e| format!("Write failed: {}", e))?;
         send.finish().map_err(|e| format!("Finish failed: {}", e))?;
         

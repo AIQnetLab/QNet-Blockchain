@@ -140,9 +140,11 @@ pub async fn select_producer_with_hybrid_vrf(
     vrf_input.extend_from_slice(entropy);
     
     // Include all candidates to ensure consistency
-    for (candidate_id, reputation) in candidates {
+    // CRITICAL: Use ONLY node_id, NOT reputation!
+    // Reputation changes dynamically → different entropy → different producer → FORK!
+    for (candidate_id, _reputation) in candidates {
         vrf_input.extend_from_slice(candidate_id.as_bytes());
-        vrf_input.extend_from_slice(&reputation.to_le_bytes());
+        // DO NOT use reputation in entropy - it changes during runtime!
     }
     
     // Generate VRF output with quantum-resistant proof
@@ -165,26 +167,29 @@ pub async fn select_producer_with_hybrid_vrf(
     Ok((selected_producer, vrf_output))
 }
 
-/// Fallback to original VRF if hybrid not available
-pub async fn select_producer_with_vrf_fallback(
+/// PRODUCTION: Hybrid VRF only - NO FALLBACK to legacy Ed25519 VRF
+/// Per NIST/Cisco: All consensus operations MUST use quantum-resistant cryptography
+/// Legacy Ed25519-only VRF is NOT acceptable for consensus - would allow quantum attack
+pub async fn select_producer_with_vrf_no_fallback(
     round: u64,
     candidates: &[(String, f64)],
     node_id: &str,
     entropy: &[u8],
 ) -> Result<String> {
-    // Try hybrid VRF first
+    // CRITICAL: Only Hybrid VRF is acceptable for consensus
+    // NO FALLBACK to Ed25519-only VRF (quantum vulnerable!)
     match select_producer_with_hybrid_vrf(round, candidates, node_id, entropy).await {
         Ok((producer, _)) => {
-            println!("[VRF] ✅ Using quantum-resistant hybrid VRF");
+            println!("[VRF] ✅ Quantum-resistant Hybrid VRF (Dilithium + Ed25519)");
             Ok(producer)
         }
         Err(e) => {
-            println!("[VRF] ⚠️ Hybrid VRF failed: {}, using legacy VRF", e);
-            // Fallback to legacy VRF
-            match crate::vrf::select_producer_with_vrf(round, candidates, node_id, entropy).await {
-                Ok((producer, _)) => Ok(producer),
-                Err(e) => Err(anyhow!("Both hybrid and legacy VRF failed: {}", e))
-            }
+            // CRITICAL: Do NOT fall back to legacy VRF - it's quantum vulnerable!
+            // If Hybrid VRF fails, the network should halt rather than become insecure
+            println!("[VRF] ❌ CRITICAL: Hybrid VRF failed: {}", e);
+            println!("[VRF] ❌ NO FALLBACK to legacy Ed25519 VRF (quantum vulnerable)");
+            println!("[VRF] ❌ Network security requires Hybrid VRF - check Dilithium initialization");
+            Err(anyhow!("Hybrid VRF failed and fallback disabled for quantum security: {}", e))
         }
     }
 }

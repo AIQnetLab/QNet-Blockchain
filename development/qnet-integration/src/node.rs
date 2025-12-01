@@ -1032,6 +1032,51 @@ impl BlockchainNode {
         node_type: NodeType,
         region: Region,
     ) -> Result<Self, QNetError> {
+        // =========================================================================
+        // PHASE 0: PRE-FLIGHT CHECKS (v2.19.22)
+        // CRITICAL: Validate ports and connectivity BEFORE anything else
+        // This prevents "ghost nodes" that appear online but can't sync blocks
+        // =========================================================================
+        
+        // Get external IP for connectivity checks
+        let external_ip = std::env::var("EXTERNAL_IP")
+            .or_else(|_| std::env::var("HOST_IP"))
+            .ok();
+        
+        // Run pre-flight checks unless explicitly disabled (for testing only)
+        if std::env::var("QNET_SKIP_PREFLIGHT").is_err() {
+            match crate::preflight_checks::run_preflight_checks(external_ip.as_deref()).await {
+                Ok(result) => {
+                    if !result.critical_failures.is_empty() {
+                        // Should not happen - run_preflight_checks returns Err on critical failures
+                        return Err(QNetError::NetworkError(
+                            format!("Pre-flight checks failed: {:?}", result.critical_failures)
+                        ));
+                    }
+                    println!("[Node] ✅ Pre-flight checks passed - node can participate in network");
+                }
+                Err(e) => {
+                    // CRITICAL: Pre-flight checks failed - do NOT start the node
+                    eprintln!("");
+                    eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+                    eprintln!("🚨 FATAL: PRE-FLIGHT CHECKS FAILED!");
+                    eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+                    eprintln!("{}", e);
+                    eprintln!("");
+                    eprintln!("Node cannot start until these issues are fixed.");
+                    eprintln!("This prevents 'ghost nodes' that appear online but cannot sync.");
+                    eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+                    eprintln!("");
+                    
+                    return Err(QNetError::NetworkError(
+                        format!("Pre-flight checks failed: {}", e)
+                    ));
+                }
+            }
+        } else {
+            println!("[Node] ⚠️ QNET_SKIP_PREFLIGHT set - skipping pre-flight checks (NOT FOR PRODUCTION!)");
+        }
+        
         // NOTE: Light node server blocking is already implemented in bin/qnet-node.rs (lines 78-83, 173-184)
         // No need to duplicate the check here
         
@@ -7550,49 +7595,58 @@ impl BlockchainNode {
             // 3. Round number and candidate list
             // This provides quantum resistance WITHOUT requiring per-node VRF keys
             
-            // OPTIMIZATION: For small candidate sets (< 100), direct computation is fine
-            // For large sets, we'd use sampling (not needed for 1000 validators)
+            // PRODUCTION: Use TRUE Hybrid VRF for quantum-resistant producer selection
+            // Hybrid VRF = Dilithium certificate + Ed25519 ephemeral keys per NIST/Cisco
+            // This provides VERIFIABLE randomness with cryptographic proof!
             
             let selected_producer = if candidates.len() == 1 {
-                // Optimization: Single candidate
+                // Optimization: Single candidate - no VRF needed
                 println!("[PRODUCER] ✅ Single candidate: {}", candidates[0].0);
                 candidates[0].0.clone()
-                    } else {
-                // QUANTUM-RESISTANT SELECTION using SHA3-512 (NIST approved)
-                // CRITICAL FIX: Use ONLY vrf_entropy for selection (candidates already included in vrf_entropy)
-                // This ensures ROTATION works even when candidates list is static (Genesis bootstrap)
-                use sha3::{Sha3_512, Digest};
+            } else {
+                // QUANTUM-RESISTANT VRF SELECTION using Hybrid VRF (Dilithium + Ed25519)
+                // CRITICAL: This is TRUE VRF with cryptographic proof, not just a hash!
+                use crate::crypto::vrf_hybrid::select_producer_with_hybrid_vrf;
                 
-                // Create deterministic seed from quantum-signed entropy
-                let mut selector = Sha3_512::new();
-                selector.update(b"QNet_Quantum_Producer_Selection_v4"); // v4: Fixed rotation!
-                selector.update(&vrf_entropy); // Contains: round + candidates + entropy_source
-                selector.update(&leadership_round.to_le_bytes());
-                selector.update(&current_height.to_le_bytes()); // Add height for extra entropy
-                
-                // REMOVED: candidate list from hash (already in vrf_entropy)
-                // This prevents static candidate lists from causing rotation failure
-                // For small networks (5 Genesis nodes): entropy source CHANGES each round → rotation works
-                // For large networks (millions): candidate sampling CHANGES each round → rotation works
-                
-                // Generate quantum-resistant selection
-                let selection_hash = selector.finalize();
-                
-                // Convert to selection index (uniform distribution)
-                let selection_value = u64::from_le_bytes([
-                selection_hash[0], selection_hash[1], selection_hash[2], selection_hash[3],
-                selection_hash[4], selection_hash[5], selection_hash[6], selection_hash[7],
-            ]);
-            
-                let selection_index = (selection_value as usize) % candidates.len();
-                let winner = &candidates[selection_index];
-                
-                println!("[PRODUCER] 🏆 Selected: {} (index {}/{})", 
-                         winner.0, selection_index + 1, candidates.len());
-                println!("[PRODUCER] 🔐 Quantum-resistant via Dilithium-signed entropy");
-                println!("[PRODUCER] 🔄 VRF recalculates each block → unpredictable rotation");
-                
-                winner.0.clone()
+                match select_producer_with_hybrid_vrf(
+                    leadership_round,
+                    &candidates,
+                    own_node_id,
+                    &vrf_entropy,
+                ).await {
+                    Ok((producer, vrf_output)) => {
+                        // SUCCESS: Hybrid VRF with Dilithium proof
+                        println!("[HYBRID-VRF] 🎲 Producer selected: {} (round {})", producer, leadership_round);
+                        println!("[HYBRID-VRF] 🔐 Certificate: {}", vrf_output.proof.certificate.serial_number);
+                        println!("[HYBRID-VRF] ✅ Dilithium-signed ephemeral proof (NIST FIPS 204)");
+                        producer
+                    }
+                    Err(e) => {
+                        // FALLBACK: Use deterministic SHA3 if VRF fails (should not happen in production)
+                        println!("[HYBRID-VRF] ⚠️ Hybrid VRF failed: {}, using deterministic fallback", e);
+                        
+                        use sha3::{Sha3_512, Digest};
+                        let mut selector = Sha3_512::new();
+                        selector.update(b"QNet_Quantum_Producer_Selection_v5_Fallback");
+                        selector.update(&vrf_entropy);
+                        selector.update(&leadership_round.to_le_bytes());
+                        selector.update(&current_height.to_le_bytes());
+                        
+                        let selection_hash = selector.finalize();
+                        let selection_value = u64::from_le_bytes([
+                            selection_hash[0], selection_hash[1], selection_hash[2], selection_hash[3],
+                            selection_hash[4], selection_hash[5], selection_hash[6], selection_hash[7],
+                        ]);
+                        
+                        let selection_index = (selection_value as usize) % candidates.len();
+                        let winner = &candidates[selection_index];
+                        
+                        println!("[PRODUCER] 🏆 Fallback selected: {} (index {}/{})", 
+                                 winner.0, selection_index + 1, candidates.len());
+                        
+                        winner.0.clone()
+                    }
+                }
             };
             
             
@@ -7993,19 +8047,6 @@ impl BlockchainNode {
             
             let candidates = valid_candidates;
             
-            // CRITICAL: Deterministic emergency selection to prevent race conditions
-            // Uses ONLY data available to ALL nodes regardless of sync status
-            // This ensures 100% determinism even when some nodes are behind
-            // NOTE: We do NOT use PoH, timestamps, or block hashes - only height and failed_producer
-            use sha3::{Sha3_256, Digest};
-            let mut emergency_hasher = Sha3_256::new();
-            
-            // Use the recalculated correct_producer (calculated above) for deterministic hash
-            println!("[EMERGENCY] 🔐 Using deterministic entropy for block #{}", current_height);
-            emergency_hasher.update(b"EMERGENCY_DETERMINISTIC_V5_NORMALIZED");  // V5: use recalculated producer
-            emergency_hasher.update(&current_height.to_le_bytes());
-            emergency_hasher.update(correct_producer.as_bytes());  // Use recalculated value, not stale failed_producer
-            
             // CRITICAL: Apply MAX_VALIDATORS limit BEFORE sorting (for scalability)
             // Same limit as normal consensus to prevent O(n log n) on millions of nodes
             const MAX_EMERGENCY_VALIDATORS: usize = 1000; // Same as MAX_VALIDATORS_PER_ROUND
@@ -8014,7 +8055,6 @@ impl BlockchainNode {
                 candidates.clone()
             } else {
                 // PRODUCTION: Deterministic sampling for large networks
-                // Take first N candidates by reputation (already sorted by reputation in candidates)
                 println!("[EMERGENCY] 📊 Limiting {} candidates to {} for scalability", 
                         candidates.len(), MAX_EMERGENCY_VALIDATORS);
                 candidates.iter()
@@ -8024,26 +8064,67 @@ impl BlockchainNode {
             };
             
             // CRITICAL: Sort candidates to ensure deterministic ordering across all nodes
-            // Different nodes may receive peers in different order from p2p.get_validated_active_peers()
             let mut sorted_candidates = limited_candidates;
             sorted_candidates.sort_by(|a, b| a.0.cmp(&b.0));  // Sort by node_id alphabetically
             
-            for (node_id, _) in &sorted_candidates {
-                emergency_hasher.update(node_id.as_bytes());
-            }
+            // PRODUCTION: Use TRUE Hybrid VRF for quantum-resistant emergency producer selection
+            // Same cryptographic guarantees as normal producer selection (NIST FIPS 204)
+            println!("[EMERGENCY] 🔐 Using Hybrid VRF for emergency selection at block #{}", current_height);
             
-            let emergency_hash = emergency_hasher.finalize();
-            let emergency_number = u64::from_le_bytes([
-                emergency_hash[0], emergency_hash[1], emergency_hash[2], emergency_hash[3],
-                emergency_hash[4], emergency_hash[5], emergency_hash[6], emergency_hash[7],
-            ]);
+            // Create deterministic entropy for emergency VRF
+            let emergency_entropy = {
+                use sha3::{Sha3_256, Digest};
+                let mut hasher = Sha3_256::new();
+                hasher.update(b"EMERGENCY_VRF_ENTROPY_V6");
+                hasher.update(&current_height.to_le_bytes());
+                hasher.update(correct_producer.as_bytes());
+                for (node_id, _) in &sorted_candidates {
+                    hasher.update(node_id.as_bytes());
+                }
+                let result = hasher.finalize();
+                let mut entropy = [0u8; 32];
+                entropy.copy_from_slice(&result);
+                entropy
+            };
             
-            // Deterministic selection - all nodes will calculate same result
-            let selection_index = (emergency_number as usize) % sorted_candidates.len();
-            let emergency_producer = sorted_candidates[selection_index].0.clone();
+            // Use Hybrid VRF for quantum-resistant selection
+            use crate::crypto::vrf_hybrid::select_producer_with_hybrid_vrf;
             
-            println!("[FAILOVER] 🆘 Deterministic emergency producer: {} (reputation: {:.1}%, index: {}/{})", 
-                     emergency_producer, sorted_candidates[selection_index].1 * 100.0, selection_index, sorted_candidates.len());
+            let emergency_producer = match select_producer_with_hybrid_vrf(
+                current_height,  // Use height as round for emergency
+                &sorted_candidates,
+                own_node_id,
+                &emergency_entropy,
+            ).await {
+                Ok((producer, vrf_output)) => {
+                    // SUCCESS: Hybrid VRF with Dilithium proof
+                    println!("[EMERGENCY-VRF] 🎲 Emergency producer selected: {}", producer);
+                    println!("[EMERGENCY-VRF] 🔐 Certificate: {}", vrf_output.proof.certificate.serial_number);
+                    println!("[EMERGENCY-VRF] ✅ Dilithium-signed proof (NIST FIPS 204)");
+                    producer
+                }
+                Err(e) => {
+                    // FALLBACK: Use deterministic SHA3 if VRF fails
+                    println!("[EMERGENCY-VRF] ⚠️ Hybrid VRF failed: {}, using deterministic fallback", e);
+                    
+                    use sha3::{Sha3_512, Digest};
+                    let mut selector = Sha3_512::new();
+                    selector.update(b"EMERGENCY_FALLBACK_V6");
+                    selector.update(&emergency_entropy);
+                    selector.update(&current_height.to_le_bytes());
+                    
+                    let selection_hash = selector.finalize();
+                    let selection_value = u64::from_le_bytes([
+                        selection_hash[0], selection_hash[1], selection_hash[2], selection_hash[3],
+                        selection_hash[4], selection_hash[5], selection_hash[6], selection_hash[7],
+                    ]);
+                    
+                    let selection_index = (selection_value as usize) % sorted_candidates.len();
+                    sorted_candidates[selection_index].0.clone()
+                }
+            };
+            
+            println!("[FAILOVER] 🆘 Emergency producer: {} (Hybrid VRF selection)", emergency_producer);
             
             // Save failover event to storage for monitoring
             if let Some(ref storage) = storage {

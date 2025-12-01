@@ -3620,7 +3620,9 @@ impl SimplifiedP2P {
                     };
                     
                     let quic_addr = std::net::SocketAddr::new(ip, port.saturating_add(crate::p2p_transport::QUIC_PORT_OFFSET));
-                    if transport.send_message(quic_addr, msg).await.is_ok() {
+                    // CRITICAL FIX: Use broadcast_to (uni stream) not send_message (bi stream)
+                    // Message handler only listens on uni streams via accept_uni()
+                    if transport.broadcast_to(quic_addr, msg).await.is_ok() {
                         success_count += 1;
                     }
                 }

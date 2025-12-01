@@ -175,9 +175,11 @@ pub async fn select_producer_with_vrf(
     vrf_input.extend_from_slice(entropy);
     
     // Include all candidates to ensure consistency
-    for (candidate_id, reputation) in candidates {
+    // CRITICAL: Use ONLY node_id, NOT reputation!
+    // Reputation changes dynamically → different entropy → different producer → FORK!
+    for (candidate_id, _reputation) in candidates {
         vrf_input.extend_from_slice(candidate_id.as_bytes());
-        vrf_input.extend_from_slice(&reputation.to_le_bytes());
+        // DO NOT use reputation in entropy - it changes during runtime!
     }
     
     // Generate VRF output
