@@ -66,7 +66,7 @@ async fn decode_activation_code_quantum_secure(
             .map_err(|e| format!("Failed to initialize quantum crypto: {}", e))?;
         *crypto_guard = Some(crypto);
     }
-    let quantum_crypto = crypto_guard.as_ref().unwrap();
+    let quantum_crypto = crypto_guard.as_ref().expect("Crypto initialized above");
 
     // 1. Decrypt activation code using quantum-resistant decryption
     println!("🔓 Decrypting quantum-secure activation code...");
@@ -653,20 +653,12 @@ async fn interactive_node_setup() -> Result<(NodeType, String), Box<dyn std::err
 
     // Beautiful quantum node startup banner
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!("🔮 QNET QUANTUM BLOCKCHAIN NODE v2.19.22");
+    println!("🔮 QNET QUANTUM BLOCKCHAIN NODE INITIALIZED");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("🚀 Node Type: {:?} | 🔐 Post-Quantum Security: ACTIVE", node_type);
     println!("🛡️  Quantum Algorithms: CRYSTALS-Dilithium + CRYSTALS-Kyber");
     println!("⚡ Performance Target: 100,000+ TPS | ⏱️  Block Time: 1s microblocks");
     println!("🌐 Network: Production Ready | 💎 Consensus: Byzantine-BFT");
-    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!("🔌 REQUIRED PORTS (open in firewall!):");
-    println!("   TCP 9876  - P2P Network");
-    println!("   TCP 9877  - Gossip Protocol");  
-    println!("   TCP 8001  - REST API");
-    println!("   UDP 10876 - QUIC Transport ⚡ (REQUIRED for v2.19.22+)");
-    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!("⚠️  FIREWALL: sudo ufw allow 9876,9877,8001/tcp && sudo ufw allow 10876/udp");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("✅ Quantum Node Ready - Blockchain Operations Starting...");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
@@ -2594,7 +2586,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             crypto.initialize().await?;
             *crypto_guard = Some(crypto);
         }
-        let quantum_crypto = crypto_guard.as_ref().unwrap();
+        let quantum_crypto = crypto_guard.as_ref().expect("Crypto initialized above");
         
         // Decrypt activation code to get payload
         let payload = quantum_crypto.decrypt_activation_code(&activation_code).await?;
@@ -3617,7 +3609,7 @@ async fn start_metrics_server(port: u16) {
                      qnet_transactions_total 0\n",
                     std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
+                        .unwrap_or_default()
                         .as_secs()
                 )
             });
@@ -4397,7 +4389,7 @@ async fn get_activation_with_auto_genesis() -> Result<(NodeType, String), Box<dy
             println!("[SUCCESS] Found valid activation code with cryptographic binding");
             println!("   [CODE] Code: {}", mask_code(&code));
             println!("   [TYPE] Node Type: {:?}", node_type);
-            let current_time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+            let current_time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
             println!("   [TIME] Activated: {} days ago", (current_time - timestamp) / (24 * 60 * 60));
             println!("   [UNIVERSAL] Works on VPS, VDS, PC, laptop, server");
             println!("   [RESUMING] Resuming node with existing activation...\n");

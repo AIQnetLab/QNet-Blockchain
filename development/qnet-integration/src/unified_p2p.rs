@@ -76,7 +76,10 @@ impl CacheActor {
     }
     
     fn increment_epoch(&self) -> u64 {
-        let mut epoch = self.epoch_counter.write().unwrap();
+        let mut epoch = match self.epoch_counter.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner()
+        };
         *epoch += 1;
         *epoch
     }
@@ -1154,13 +1157,21 @@ impl SimplifiedP2P {
     
     /// PRODUCTION: Set block processing channel for storage integration
     pub fn set_block_channel(&mut self, block_tx: tokio::sync::mpsc::UnboundedSender<ReceivedBlock>) {
-        *self.block_tx.lock().unwrap() = Some(block_tx);
+        let mut guard = match self.block_tx.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner()
+        };
+        *guard = Some(block_tx);
         println!("[P2P] ✅ Block processing channel established");
     }
     
     /// PRODUCTION: Set macroblock processing channel for storage integration (v2.19.12)
     pub fn set_macroblock_channel(&mut self, macroblock_tx: tokio::sync::mpsc::UnboundedSender<ReceivedBlock>) {
-        *self.macroblock_tx.lock().unwrap() = Some(macroblock_tx);
+        let mut guard = match self.macroblock_tx.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner()
+        };
+        *guard = Some(macroblock_tx);
         println!("[P2P] ✅ Macroblock processing channel established");
     }
     
@@ -1178,7 +1189,11 @@ impl SimplifiedP2P {
     /// PRODUCTION v2.19.22: Set QUIC message channel for full message processing
     /// All QUIC messages are routed through this channel to handle_message()
     pub fn set_quic_message_channel(&mut self, quic_message_tx: tokio::sync::mpsc::UnboundedSender<(String, NetworkMessage)>) {
-        *self.quic_message_tx.lock().unwrap() = Some(quic_message_tx);
+        let mut guard = match self.quic_message_tx.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner()
+        };
+        *guard = Some(quic_message_tx);
         println!("[QUIC] ✅ Message processing channel established");
     }
     
@@ -1362,6 +1377,44 @@ impl SimplifiedP2P {
         }
     }
     
+    /// PRODUCTION: Get QUIC connection count for monitoring
+    pub async fn get_quic_connection_count(&self) -> usize {
+        if let Some(ref quic_transport) = self.quic_transport {
+            let transport = quic_transport.read().await;
+            transport.connection_count()
+        } else {
+            0
+        }
+    }
+    
+    /// PRODUCTION: Check if QUIC is connected to specific peer
+    pub async fn is_quic_connected_to(&self, peer_addr: &str) -> bool {
+        use crate::quic_transport::QUIC_PORT_OFFSET;
+        
+        if let Some(ref quic_transport) = self.quic_transport {
+            let parts: Vec<&str> = peer_addr.split(':').collect();
+            if parts.len() == 2 {
+                if let (Ok(ip), Ok(port)) = (parts[0].parse::<std::net::IpAddr>(), parts[1].parse::<u16>()) {
+                    let quic_port = port.saturating_add(QUIC_PORT_OFFSET);
+                    let quic_addr = std::net::SocketAddr::new(ip, quic_port);
+                    
+                    let transport = quic_transport.read().await;
+                    return transport.is_connected(&quic_addr);
+                }
+            }
+        }
+        false
+    }
+    
+    /// PRODUCTION: Graceful QUIC shutdown
+    pub async fn stop_quic(&self) {
+        if let Some(ref quic_transport) = self.quic_transport {
+            let transport = quic_transport.read().await;
+            transport.stop();
+            println!("[QUIC] 🛑 QUIC transport stopped gracefully");
+        }
+    }
+    
     /// PRODUCTION: Load jail statuses from persistent storage on startup
     /// This ensures jail survives node restart
     pub fn load_jail_statuses_on_startup(&self) {
@@ -1413,7 +1466,11 @@ impl SimplifiedP2P {
             Some(_) => {},
             None => {},
         }
-        match &*self.block_tx.lock().unwrap() {
+        let block_tx_guard = match self.block_tx.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner()
+        };
+        match &*block_tx_guard {
             Some(_) => println!("[DIAGNOSTIC] ✅ Block channel: AVAILABLE"),
             None => println!("[DIAGNOSTIC] ❌ Block channel: MISSING - blocks will be discarded!"),
         }
@@ -1726,7 +1783,11 @@ impl SimplifiedP2P {
                 if !self.connected_peers_lockfree.contains_key(addr) {
                     // CRITICAL: Check for self-connection before migration
                     let peer_ip = addr.split(':').next().unwrap_or("");
-                    let is_self_by_ip = if let Some(ref our_ip) = *self.external_ip.read().unwrap() {
+                    let external_ip_guard = match self.external_ip.read() {
+                        Ok(g) => g,
+                        Err(p) => p.into_inner()
+                    };
+                    let is_self_by_ip = if let Some(ref our_ip) = *external_ip_guard {
                         peer_ip == our_ip
                     } else {
                         false
@@ -2074,7 +2135,11 @@ impl SimplifiedP2P {
     pub fn add_peer_lockfree(&self, mut peer_info: PeerInfo) -> bool {
         // CRITICAL: Prevent self-connection at the earliest stage
         let peer_ip = peer_info.addr.split(':').next().unwrap_or("");
-        let is_self_by_ip = if let Some(ref our_ip) = *self.external_ip.read().unwrap() {
+        let external_ip_guard = match self.external_ip.read() {
+            Ok(g) => g,
+            Err(p) => p.into_inner()
+        };
+        let is_self_by_ip = if let Some(ref our_ip) = *external_ip_guard {
             peer_ip == our_ip
         } else {
             false
@@ -2227,7 +2292,10 @@ impl SimplifiedP2P {
     ) -> bool {
         // First check if peer address already exists
         {
-            let peer_addrs = connected_peer_addrs.read().unwrap();
+            let peer_addrs = match connected_peer_addrs.read() {
+                Ok(g) => g,
+                Err(p) => p.into_inner()
+            };
             if peer_addrs.contains(&peer_info.addr) {
                 return false; // Peer already exists
             }
@@ -2561,7 +2629,11 @@ impl SimplifiedP2P {
             let external_ip = match Self::get_our_ip_address().await {
                 Ok(ip) => {
                     // Store our external IP to prevent self-connection
-                    *external_ip_store.write().unwrap() = Some(ip.clone());
+                    let mut guard = match external_ip_store.write() {
+                        Ok(g) => g,
+                        Err(p) => p.into_inner()
+                    };
+                    *guard = Some(ip.clone());
                     ip
                 },
                 Err(e) => {
@@ -2612,7 +2684,7 @@ impl SimplifiedP2P {
                 "region": format!("{:?}", region),
                 "announced_at": std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
+                    .unwrap_or_default()
                     .as_secs(),
                 "node_type": "QNet",
                 "version": "1.0.0"
@@ -2757,7 +2829,7 @@ impl SimplifiedP2P {
                                 region: peer_region,
                                 last_seen: std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap()
+                                    .unwrap_or_default()
                                     .as_secs(),
                                 is_stable: false,  // Will be verified
                                 latency_ms: 0,     // Unknown - will be measured
@@ -2806,7 +2878,10 @@ impl SimplifiedP2P {
             
             // Add validated peers to regional map
             {
-                let mut regional_peers = regional_peers.lock().unwrap();
+                let mut regional_peers = match regional_peers.lock() {
+                    Ok(g) => g,
+                    Err(p) => p.into_inner()
+                };
                 for peer in validated_peers.iter() {
                     regional_peers
                         .entry(peer.region.clone())
@@ -2822,7 +2897,10 @@ impl SimplifiedP2P {
                     if Self::test_peer_connectivity_static(&peer.addr) {
                         // First check if peer already exists
                         let already_exists = {
-                            let peer_addrs = connected_peer_addrs.read().unwrap();
+                            let peer_addrs = match connected_peer_addrs.read() {
+                                Ok(g) => g,
+                                Err(p) => p.into_inner()
+                            };
                             peer_addrs.contains(&peer.addr)
                         };
                         
@@ -2964,7 +3042,11 @@ impl SimplifiedP2P {
                         
                         // Update new cache actor
                         let epoch = CACHE_ACTOR.increment_epoch();
-                        *CACHE_ACTOR.height_cache.write().unwrap() = Some(CachedData {
+                        let mut height_cache_guard = match CACHE_ACTOR.height_cache.write() {
+                            Ok(g) => g,
+                            Err(p) => p.into_inner()
+                        };
+                        *height_cache_guard = Some(CachedData {
                             data: consensus_height,
                             epoch,
                             timestamp: Instant::now(),
@@ -2993,6 +3075,7 @@ impl SimplifiedP2P {
         let connected_peer_addrs = self.connected_peer_addrs.clone();
         let peer_id_to_addr = self.peer_id_to_addr.clone();
         let peer_shards = self.peer_shards.clone();
+        let quic_transport = self.quic_transport.clone();
         
         tokio::spawn(async move {
             println!("[P2P] 🧹 Starting periodic peer cleanup task (every 5 minutes)...");
@@ -3058,6 +3141,13 @@ impl SimplifiedP2P {
                     }
                     
                     println!("[P2P] ✅ Cleaned up {} inactive peers", peers_to_remove.len());
+                }
+                
+                // CRITICAL: Also cleanup idle QUIC connections
+                if let Some(ref quic_transport) = quic_transport {
+                    let transport = quic_transport.read().await;
+                    transport.cleanup_idle();
+                    println!("[QUIC] 🧹 Cleaned up idle QUIC connections (timeout: 90s)");
                 }
             }
         });
@@ -3849,7 +3939,11 @@ impl SimplifiedP2P {
             }
             
             // Send reconstructed block through normal block channel
-            if let Some(ref block_tx) = &*self.block_tx.lock().unwrap() {
+            let block_tx_guard = match self.block_tx.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner()
+            };
+            if let Some(ref block_tx) = &*block_tx_guard {
                 let received_block = ReceivedBlock {
                     height,
                     data: block_data,
@@ -3953,7 +4047,11 @@ impl SimplifiedP2P {
             println!("[SHRED_PROTOCOL] 🔧 Block #{} reconstructed with Reed-Solomon in {:?}", height, elapsed);
             
             // Send reconstructed block through normal block channel
-            if let Some(ref block_tx) = &*self.block_tx.lock().unwrap() {
+            let block_tx_guard = match self.block_tx.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner()
+            };
+            if let Some(ref block_tx) = &*block_tx_guard {
                 let received_block = ReceivedBlock {
                     height,
                     data: block_data,
@@ -3977,7 +4075,11 @@ impl SimplifiedP2P {
     /// This method NEVER makes network calls - only reads cache
     pub fn get_cached_network_height(&self) -> Option<u64> {
         // Check cache actor first
-        if let Some(cached_data) = CACHE_ACTOR.height_cache.read().unwrap().as_ref() {
+        let height_cache_guard = match CACHE_ACTOR.height_cache.read() {
+            Ok(g) => g,
+            Err(p) => p.into_inner()
+        };
+        if let Some(cached_data) = height_cache_guard.as_ref() {
             let age = Instant::now().duration_since(cached_data.timestamp);
             // CRITICAL: Cache TTL reduced to 1 second for 1 block/sec target
             // 5 seconds was too long and caused producer selection mismatches
@@ -4007,7 +4109,7 @@ impl SimplifiedP2P {
         // IMPROVED: Check both cache systems for compatibility
         {
             // Try new cache actor first
-            if let Some(cached_data) = CACHE_ACTOR.height_cache.read().unwrap().as_ref() {
+            if let Some(cached_data) = match CACHE_ACTOR.height_cache.read() { Ok(g) => g, Err(p) => p.into_inner() }.as_ref() {
                 let age = Instant::now().duration_since(cached_data.timestamp);
                 // QUANTUM: Minimal cache for decentralized quantum blockchain
                 let cache_duration = if cached_data.data == 0 {
@@ -4100,7 +4202,7 @@ impl SimplifiedP2P {
         {
             // Update new cache actor
             let epoch = CACHE_ACTOR.increment_epoch();
-            *CACHE_ACTOR.height_cache.write().unwrap() = Some(CachedData {
+            *match CACHE_ACTOR.height_cache.write() { Ok(g) => g, Err(p) => p.into_inner() } = Some(CachedData {
                 data: consensus_height,
                 epoch,
                 timestamp: Instant::now(),
@@ -4304,7 +4406,7 @@ impl SimplifiedP2P {
         // Send challenge with timeout
         let challenge_payload = serde_json::json!({
             "challenge": hex::encode(&challenge),
-            "timestamp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+            "timestamp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
             "protocol_version": "qnet-v1.0"
         });
         
@@ -4385,7 +4487,7 @@ impl SimplifiedP2P {
             let _ = crypto.initialize().await;
             *crypto_guard = Some(crypto);
         }
-        let crypto = crypto_guard.as_ref().unwrap();
+        let crypto = crypto_guard.as_ref().expect("Crypto initialized above");
             
             // Use centralized quantum crypto verification
             use crate::quantum_crypto::DilithiumSignature;
@@ -4396,7 +4498,7 @@ impl SimplifiedP2P {
                 algorithm: "CRYSTALS-Dilithium3".to_string(),
                 timestamp: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
+                    .unwrap_or_default()
                     .as_secs(),
                 strength: "5".to_string(),
             };
@@ -5081,7 +5183,7 @@ impl SimplifiedP2P {
         
         // Store our own certificate first
         {
-            let mut cert_manager = self.certificate_manager.write().unwrap();
+            let mut cert_manager = match self.certificate_manager.write() { Ok(g) => g, Err(p) => p.into_inner() };
             cert_manager.set_local_certificate(cert_serial.clone(), certificate);
         }
         
@@ -5188,7 +5290,7 @@ impl SimplifiedP2P {
         
         // Store locally first (immediate availability)
         {
-            let mut cert_manager = self.certificate_manager.write().unwrap();
+            let mut cert_manager = match self.certificate_manager.write() { Ok(g) => g, Err(p) => p.into_inner() };
             cert_manager.set_local_certificate(cert_serial.clone(), certificate.clone());
         }
         
@@ -5383,7 +5485,7 @@ impl SimplifiedP2P {
                             // CRITICAL FIX v2.19.15: Fallback to active_full_super_nodes registry
                             // This fixes Genesis startup where connected_peers is empty but
                             // ActiveNodeAnnouncement has been received
-                            let active_nodes = self.active_full_super_nodes.read().unwrap();
+                            let active_nodes = match self.active_full_super_nodes.read() { Ok(g) => g, Err(p) => p.into_inner() };
                             if let Some(active_info) = active_nodes.get(&node_id) {
                                 // Create PeerInfo from ActiveNodeInfo - use REAL data!
                                 let node_type = match active_info.node_type.as_str() {
@@ -5465,7 +5567,7 @@ impl SimplifiedP2P {
         // IMPROVED: Check new cache actor first, then old cache
         let should_refresh = {
             // Try new cache actor first
-            if let Some(cached_data) = CACHE_ACTOR.peers_cache.read().unwrap().as_ref() {
+            if let Some(cached_data) = match CACHE_ACTOR.peers_cache.read() { Ok(g) => g, Err(p) => p.into_inner() }.as_ref() {
             let now = Instant::now();
                 let age = now.duration_since(cached_data.timestamp);
                 
@@ -5511,7 +5613,7 @@ impl SimplifiedP2P {
                 // Update new cache actor
                 let epoch = CACHE_ACTOR.increment_epoch();
                 let topology_hash = CacheActor::get_topology_hash(&fresh_peers.iter().map(|p| p.addr.clone()).collect::<Vec<_>>());
-                *CACHE_ACTOR.peers_cache.write().unwrap() = Some(CachedData {
+                *match CACHE_ACTOR.peers_cache.write() { Ok(g) => g, Err(p) => p.into_inner() } = Some(CachedData {
                     data: fresh_peers.clone(),
                     epoch,
                     timestamp: Instant::now(),
@@ -5982,7 +6084,7 @@ impl SimplifiedP2P {
             region: correct_region,
             last_seen: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_secs(),
             is_stable: false,
             latency_ms: 0,     // Unknown - will be measured
@@ -6372,7 +6474,7 @@ impl SimplifiedP2P {
     
     /// Rebalance connections based on load
     pub fn rebalance_connections(&self) -> bool {
-        let mut last_rebalance = self.last_rebalance.lock().unwrap();
+        let mut last_rebalance = match self.last_rebalance.lock() { Ok(g) => g, Err(p) => p.into_inner() };
         let now = Instant::now();
         
         // Check if enough time has passed since last rebalance
@@ -6461,10 +6563,10 @@ impl SimplifiedP2P {
         let regional_metrics = self.regional_metrics.clone();
         
         thread::spawn(move || {
-            while *is_running.lock().unwrap() {
+            while *match is_running.lock() { Ok(g) => g, Err(p) => p.into_inner() } {
                 thread::sleep(Duration::from_secs(30)); // Check every 30 seconds
                 
-                *last_check.lock().unwrap() = Instant::now();
+                *match last_check.lock() { Ok(g) => g, Err(p) => p.into_inner() } = Instant::now();
                 
                 // PRODUCTION: Collect real metrics from connected peers via HTTP
                 {
@@ -6501,7 +6603,7 @@ impl SimplifiedP2P {
         let node_id = self.node_id.clone();
         
         thread::spawn(move || {
-            while *is_running.lock().unwrap() {
+            while *match is_running.lock() { Ok(g) => g, Err(p) => p.into_inner() } {
                 thread::sleep(Duration::from_secs(60)); // Rebalance every minute
                 
                 // In production: call self.rebalance_connections() (silently)
@@ -6525,8 +6627,8 @@ impl SimplifiedP2P {
         
         // Overall statistics
         stats.insert("total_peers".to_string(), serde_json::Value::Number(connected.len().into()));
-        stats.insert("total_bytes_sent".to_string(), serde_json::Value::Number((*self.total_bytes_sent.lock().unwrap()).into()));
-        stats.insert("total_bytes_received".to_string(), serde_json::Value::Number((*self.total_bytes_received.lock().unwrap()).into()));
+        stats.insert("total_bytes_sent".to_string(), serde_json::Value::Number((*match self.total_bytes_sent.lock() { Ok(g) => g, Err(p) => p.into_inner() }).into()));
+        stats.insert("total_bytes_received".to_string(), serde_json::Value::Number((*match self.total_bytes_received.lock() { Ok(g) => g, Err(p) => p.into_inner() }).into()));
         
         // Regional breakdown
         let mut regional_stats = serde_json::Map::new();
@@ -6631,7 +6733,7 @@ impl SimplifiedP2P {
     fn current_timestamp(&self) -> u64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs()
     }
     
@@ -6647,7 +6749,7 @@ impl SimplifiedP2P {
             println!("[P2P] 🌍 Starting regional clustering for region: {:?}", region);
             
             // Regional clustering logic
-            while *is_running.lock().unwrap() {
+            while *match is_running.lock() { Ok(g) => g, Err(p) => p.into_inner() } {
                 tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                 
                 // Rebalance regional connections
@@ -6973,8 +7075,8 @@ impl SimplifiedP2P {
             let chunk_end = std::cmp::min(i + chunk_size_blocks as usize, missing_blocks.len());
             let chunk_blocks: Vec<u64> = missing_blocks[i..chunk_end].to_vec();
             if !chunk_blocks.is_empty() {
-                let start = *chunk_blocks.first().unwrap();
-                let end = *chunk_blocks.last().unwrap();
+                let start = match chunk_blocks.first() { Some(s) => *s, None => continue };
+                let end = match chunk_blocks.last() { Some(e) => *e, None => continue };
                 chunks.push((start, end));
             }
             i = chunk_end;
@@ -7005,7 +7107,10 @@ impl SimplifiedP2P {
             let peers_clone = peers.clone();
             
             let task = tokio::spawn(async move {
-                let _permit = sem_clone.acquire().await.unwrap();
+                let _permit = match sem_clone.acquire().await {
+                    Ok(p) => p,
+                    Err(_) => { println!("[SYNC] ⚠️ Semaphore closed"); return; }
+                };
                 
                 println!("[SYNC] 🔄 Worker started for blocks {}-{}", chunk_start, chunk_end);
                 let start_time = std::time::Instant::now();
@@ -7629,7 +7734,10 @@ impl SimplifiedP2P {
                 // Microblocks: No Byzantine check needed - quantum signature validation in block processing
                 
                 // PRODUCTION: Silent diagnostic check for scalability  
-                let block_tx_guard = self.block_tx.lock().unwrap();
+                let block_tx_guard = match self.block_tx.lock() {
+                    Ok(g) => g,
+                    Err(p) => p.into_inner()
+                };
                 match &*block_tx_guard {
                     Some(_) => {}, // Silent success
                     None => println!("[DIAGNOSTIC] ❌ Block channel is MISSING - this explains discarded blocks"),
@@ -8039,7 +8147,7 @@ impl SimplifiedP2P {
                 // OPTIMISTIC: Save certificate to pending cache IMMEDIATELY
                 // This prevents race conditions where blocks arrive before verification completes
                 {
-                    let mut cert_manager = self.certificate_manager.write().unwrap();
+                    let mut cert_manager = match self.certificate_manager.write() { Ok(g) => g, Err(p) => p.into_inner() };
                     let now = self.current_timestamp();
                     
                     // Check if already in pending or verified
@@ -8094,7 +8202,7 @@ impl SimplifiedP2P {
                         let _ = crypto.initialize().await;
                         *crypto_guard = Some(crypto);
                     }
-                    let quantum_crypto = crypto_guard.as_ref().unwrap();
+                    let quantum_crypto = crypto_guard.as_ref().expect("Crypto initialized above");
                     
                     let dilithium_sig = crate::quantum_crypto::DilithiumSignature {
                         signature: cert.dilithium_signature.clone(),
@@ -8109,7 +8217,7 @@ impl SimplifiedP2P {
                             println!("[P2P] ✅ Certificate {} cryptographically verified", cert_serial_clone);
                             
                             // COMPATIBILITY: Check certificate history to ensure smooth rotation
-                            let mut cert_manager = cert_manager_clone.write().unwrap();
+                            let mut cert_manager = match cert_manager_clone.write() { Ok(g) => g, Err(p) => p.into_inner() };
                             
                             // Check if we have history for this node
                             let is_compatible = if let Some(history) = cert_manager.certificate_history.get(&cert.node_id) {
@@ -8218,7 +8326,7 @@ impl SimplifiedP2P {
                             println!("[P2P] 🚨 SECURITY: Potential attack - invalid certificate rejected");
                             
                             // CRITICAL: Remove invalid certificate from pending cache
-                            let mut cert_manager = cert_manager_clone.write().unwrap();
+                            let mut cert_manager = match cert_manager_clone.write() { Ok(g) => g, Err(p) => p.into_inner() };
                             cert_manager.pending_certificates.remove(&cert_serial_clone);
                             println!("[P2P] 🗑️ Removed invalid certificate from pending cache");
                             
@@ -8231,14 +8339,14 @@ impl SimplifiedP2P {
                             println!("[P2P] ❌ Certificate verification error: {}", e);
                             
                             // Remove failed certificate from pending cache
-                            let mut cert_manager = cert_manager_clone.write().unwrap();
+                            let mut cert_manager = match cert_manager_clone.write() { Ok(g) => g, Err(p) => p.into_inner() };
                             cert_manager.pending_certificates.remove(&cert_serial_clone);
                             println!("[P2P] 🗑️ Removed failed certificate from pending cache");
                         }
                     }
                     
                     // CLEANUP: Clean expired pending certificates periodically
-                    let mut cert_manager = cert_manager_clone.write().unwrap();
+                    let mut cert_manager = match cert_manager_clone.write() { Ok(g) => g, Err(p) => p.into_inner() };
                     if cert_manager.pending_certificates.len() > 50 {
                         let now = SystemTime::now()
                             .duration_since(UNIX_EPOCH)
@@ -8258,7 +8366,7 @@ impl SimplifiedP2P {
                 
                 // Check if we have the certificate and send response
                 // MUST use write lock to track usage_count for proper LRU
-                let mut cert_manager = self.certificate_manager.write().unwrap();
+                let mut cert_manager = match self.certificate_manager.write() { Ok(g) => g, Err(p) => p.into_inner() };
                 if let Some(certificate) = cert_manager.get_and_mark_used(&cert_serial) {
                     drop(cert_manager); // Release lock before network operations
                     
@@ -8315,7 +8423,7 @@ impl SimplifiedP2P {
                 println!("[P2P] 📥 Certificate response from {} (serial: {})", node_id, cert_serial);
                 
                 // Store received certificate
-                let mut cert_manager = self.certificate_manager.write().unwrap();
+                let mut cert_manager = match self.certificate_manager.write() { Ok(g) => g, Err(p) => p.into_inner() };
                 cert_manager.store_remote_certificate(cert_serial.clone(), certificate);
                 println!("[P2P] ✅ Received certificate {} cached", cert_serial);
             }
@@ -8336,7 +8444,7 @@ impl SimplifiedP2P {
                 
                 // DEDUPE: Check if already in registry
                 {
-                    let registry = self.light_node_registry.read().unwrap();
+                    let registry = match self.light_node_registry.read() { Ok(g) => g, Err(p) => p.into_inner() };
                     if let Some(existing) = registry.get(&node_id) {
                         // Already have this registration
                         // SECURITY: Only accept updates with newer timestamp
@@ -8365,7 +8473,7 @@ impl SimplifiedP2P {
                 
                 // Store in local registry with LRU eviction
                 {
-                    let mut registry = self.light_node_registry.write().unwrap();
+                    let mut registry = match self.light_node_registry.write() { Ok(g) => g, Err(p) => p.into_inner() };
                     
                     // LRU eviction: Remove oldest entries if at capacity
                     if registry.len() >= MAX_LIGHT_NODE_REGISTRY_SIZE {
@@ -8431,7 +8539,7 @@ impl SimplifiedP2P {
                 // TIMESTAMP VALIDATION: Must be within ±5 minutes
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
+                    .unwrap_or_default()
                     .as_secs();
                 if timestamp > now + 300 || timestamp < now.saturating_sub(300) {
                     println!("[HEARTBEAT] ❌ Invalid timestamp for {} (drift: {}s)", node_id, 
@@ -8442,7 +8550,7 @@ impl SimplifiedP2P {
                 // DEDUPE: Check if already received this heartbeat
                 let heartbeat_key = format!("{}:{}", node_id, heartbeat_index);
                 {
-                    let heartbeats = self.heartbeat_history.read().unwrap();
+                    let heartbeats = match self.heartbeat_history.read() { Ok(g) => g, Err(p) => p.into_inner() };
                     if let Some(existing) = heartbeats.get(&heartbeat_key) {
                         // Same 4h window? Skip
                         let current_4h_window = now - (now % (4 * 60 * 60));
@@ -8468,7 +8576,7 @@ impl SimplifiedP2P {
                 
                 // VERIFY: Node must be registered (first registration uses Dilithium)
                 let is_known_node = {
-                    let active_nodes = self.active_full_super_nodes.read().unwrap();
+                    let active_nodes = match self.active_full_super_nodes.read() { Ok(g) => g, Err(p) => p.into_inner() };
                     active_nodes.contains_key(&node_id)
                 };
                 
@@ -8485,7 +8593,7 @@ impl SimplifiedP2P {
                 
                 // Store heartbeat in RAM
                 {
-                    let mut heartbeats = self.heartbeat_history.write().unwrap();
+                    let mut heartbeats = match self.heartbeat_history.write() { Ok(g) => g, Err(p) => p.into_inner() };
                     heartbeats.insert(heartbeat_key, HeartbeatRecord {
                         node_id: node_id.clone(),
                         timestamp,
@@ -8527,7 +8635,7 @@ impl SimplifiedP2P {
                 
                 // Collect registrations newer than last_sync_timestamp
                 let registrations: Vec<LightNodeRegistrationData> = {
-                    let registry = self.light_node_registry.read().unwrap();
+                    let registry = match self.light_node_registry.read() { Ok(g) => g, Err(p) => p.into_inner() };
                     registry.values()
                         .filter(|r| r.registered_at > last_sync_timestamp)
                         .cloned()
@@ -8535,7 +8643,7 @@ impl SimplifiedP2P {
                 };
                 
                 let total_count = {
-                    let registry = self.light_node_registry.read().unwrap();
+                    let registry = match self.light_node_registry.read() { Ok(g) => g, Err(p) => p.into_inner() };
                     registry.len() as u64
                 };
                 
@@ -8560,7 +8668,7 @@ impl SimplifiedP2P {
                 // Merge into local registry
                 let mut added = 0;
                 {
-                    let mut registry = self.light_node_registry.write().unwrap();
+                    let mut registry = match self.light_node_registry.write() { Ok(g) => g, Err(p) => p.into_inner() };
                     for reg in registrations {
                         if !registry.contains_key(&reg.node_id) {
                             registry.insert(reg.node_id.clone(), reg);
@@ -8587,7 +8695,7 @@ impl SimplifiedP2P {
                 // DEDUPE: Check if we already have attestation for this slot
                 let attestation_key = format!("{}:{}", light_node_id, slot);
                 {
-                    let attestations = self.light_node_attestations.read().unwrap();
+                    let attestations = match self.light_node_attestations.read() { Ok(g) => g, Err(p) => p.into_inner() };
                     if attestations.contains_key(&attestation_key) {
                         // Already have attestation for this Light node in this slot
                         return;
@@ -8597,7 +8705,7 @@ impl SimplifiedP2P {
                 // TIMESTAMP VALIDATION: Must be within ±5 minutes
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
+                    .unwrap_or_default()
                     .as_secs();
                 if timestamp > now + 300 || timestamp < now.saturating_sub(300) {
                     println!("[ATTESTATION] ❌ Invalid timestamp for {} (drift: {}s)", 
@@ -8607,7 +8715,7 @@ impl SimplifiedP2P {
                 
                 // VERIFY: Pinger must be in active Full/Super nodes list
                 {
-                    let active_nodes = self.active_full_super_nodes.read().unwrap();
+                    let active_nodes = match self.active_full_super_nodes.read() { Ok(g) => g, Err(p) => p.into_inner() };
                     if !active_nodes.contains_key(&pinger_id) && !pinger_id.starts_with("genesis_node_") {
                         println!("[ATTESTATION] ❌ Unknown pinger {} for Light node {}", pinger_id, light_node_id);
                         return;
@@ -8616,7 +8724,7 @@ impl SimplifiedP2P {
                 
                 // VERIFY: Light node must be in registry
                 {
-                    let registry = self.light_node_registry.read().unwrap();
+                    let registry = match self.light_node_registry.read() { Ok(g) => g, Err(p) => p.into_inner() };
                     if !registry.contains_key(&light_node_id) {
                         println!("[ATTESTATION] ❌ Unknown Light node {}", light_node_id);
                         return;
@@ -8633,7 +8741,7 @@ impl SimplifiedP2P {
                 
                 // Store attestation with capacity check
                 {
-                    let mut attestations = self.light_node_attestations.write().unwrap();
+                    let mut attestations = match self.light_node_attestations.write() { Ok(g) => g, Err(p) => p.into_inner() };
                     
                     // Capacity check: cleanup oldest if at limit
                     if attestations.len() >= MAX_ATTESTATIONS_SIZE {
@@ -8691,7 +8799,7 @@ impl SimplifiedP2P {
                 // TIMESTAMP VALIDATION: Must be within ±5 minutes
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
+                    .unwrap_or_default()
                     .as_secs();
                 if timestamp > now + 300 || timestamp < now.saturating_sub(300) {
                     return;
@@ -8758,7 +8866,7 @@ impl SimplifiedP2P {
                     
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
+                        .unwrap_or_default()
                         .as_secs();
                     
                     // Get or create attempt counter
@@ -8831,7 +8939,7 @@ impl SimplifiedP2P {
                 
                 // Update active nodes map
                 {
-                    let mut active_nodes = self.active_full_super_nodes.write().unwrap();
+                    let mut active_nodes = match self.active_full_super_nodes.write() { Ok(g) => g, Err(p) => p.into_inner() };
                     let existing = active_nodes.get(&node_id);
                     
                     // Only update if newer timestamp
@@ -8867,7 +8975,7 @@ impl SimplifiedP2P {
                 
                 // Collect active nodes with rep >= 70
                 let active_nodes: Vec<ActiveNodeInfo> = {
-                    let nodes = self.active_full_super_nodes.read().unwrap();
+                    let nodes = match self.active_full_super_nodes.read() { Ok(g) => g, Err(p) => p.into_inner() };
                     nodes.values()
                         .filter(|n| n.reputation >= 70.0)
                         .cloned()
@@ -8897,7 +9005,7 @@ impl SimplifiedP2P {
                 
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
+                    .unwrap_or_default()
                     .as_secs();
                 
                 // SECURITY CHECK: Empty response from a node that should have peers
@@ -8935,7 +9043,7 @@ impl SimplifiedP2P {
                 // Merge into local map (ADDITIVE - never replace or delete existing!)
                 let mut added = 0;
                 {
-                    let mut nodes = self.active_full_super_nodes.write().unwrap();
+                    let mut nodes = match self.active_full_super_nodes.write() { Ok(g) => g, Err(p) => p.into_inner() };
                     for node in active_nodes {
                         // Only add if rep >= 70 and not stale (< 15 min old)
                         if node.reputation >= 70.0 && node.last_seen > now.saturating_sub(15 * 60) {
@@ -9114,7 +9222,7 @@ impl SimplifiedP2P {
             *crypto_guard = Some(crypto);
         }
         
-        let crypto = crypto_guard.as_ref().unwrap();
+        let crypto = crypto_guard.as_ref().expect("Crypto initialized above");
         
         // Create DilithiumSignature struct
         let dilithium_sig = DilithiumSignature {
@@ -9122,7 +9230,7 @@ impl SimplifiedP2P {
             algorithm: "CRYSTALS-Dilithium3".to_string(),
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_secs(),
             strength: "quantum-resistant".to_string(),
         };
@@ -9216,7 +9324,7 @@ impl SimplifiedP2P {
             let _ = crypto.initialize().await;
             *crypto_guard = Some(crypto);
         }
-        let crypto = crypto_guard.as_ref().unwrap();
+        let crypto = crypto_guard.as_ref().expect("Crypto initialized above");
         
         // Verify Dilithium key signature (encapsulated_data)
         let mut encapsulated_data = Vec::new();
@@ -9316,14 +9424,14 @@ impl SimplifiedP2P {
                             *crypto_guard = Some(crypto);
                         }
                         
-                        let crypto = crypto_guard.as_ref().unwrap();
+                        let crypto = crypto_guard.as_ref().expect("Crypto initialized above");
                         
                         let dilithium_sig = DilithiumSignature {
                             signature: signature.clone(),
                             algorithm: "CRYSTALS-Dilithium3".to_string(),
                             timestamp: std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
+                                .unwrap_or_default()
                                 .as_secs(),
                             strength: "quantum-resistant".to_string(),
                         };
@@ -9425,7 +9533,7 @@ impl SimplifiedP2P {
                             let _ = crypto.initialize().await;
                             *crypto_guard = Some(crypto);
                         }
-                        let crypto = crypto_guard.as_ref().unwrap();
+                        let crypto = crypto_guard.as_ref().expect("Crypto initialized above");
                         
                         // Verify Dilithium key signature
                         let mut encapsulated_data = Vec::new();
@@ -9572,7 +9680,7 @@ impl SimplifiedP2P {
             loop {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
+                    .unwrap_or_default()
                     .as_secs();
                 
                 // Calculate deterministic heartbeat times for this node
@@ -9584,7 +9692,7 @@ impl SimplifiedP2P {
                         // Check if we already sent this heartbeat
                         let heartbeat_key = format!("{}:{}", node_id, index);
                         let already_sent = {
-                            let history = p2p.heartbeat_history.read().unwrap();
+                            let history = match p2p.heartbeat_history.read() { Ok(g) => g, Err(p) => p.into_inner() };
                             if let Some(record) = history.get(&heartbeat_key) {
                                 let current_4h = now - (now % (4 * 60 * 60));
                                 let record_4h = record.timestamp - (record.timestamp % (4 * 60 * 60));
@@ -9622,7 +9730,7 @@ impl SimplifiedP2P {
                             
                             // Record locally
                             {
-                                let mut history = p2p.heartbeat_history.write().unwrap();
+                                let mut history = match p2p.heartbeat_history.write() { Ok(g) => g, Err(p) => p.into_inner() };
                                 history.insert(heartbeat_key, HeartbeatRecord {
                                     node_id: node_id.clone(),
                                     timestamp: now,
@@ -9679,7 +9787,7 @@ impl SimplifiedP2P {
             instances_guard.insert(normalized_node_id.clone(), hybrid);
         }
         
-        let hybrid = instances_guard.get_mut(&normalized_node_id).unwrap();
+        let hybrid = instances_guard.get_mut(&normalized_node_id).expect("Inserted above");
         
         // Check certificate rotation
         if hybrid.needs_rotation() {
@@ -9754,7 +9862,7 @@ impl SimplifiedP2P {
                         instances_guard.insert(normalized_node_id.clone(), hybrid);
                     }
                     
-                    let hybrid = instances_guard.get_mut(&normalized_node_id).unwrap();
+                    let hybrid = instances_guard.get_mut(&normalized_node_id).expect("Inserted above");
                     
                     // Check certificate rotation
                     if hybrid.needs_rotation() {
@@ -9792,12 +9900,12 @@ impl SimplifiedP2P {
     pub fn cleanup_old_heartbeats(&self) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
         
         // Only cleanup once per hour
         {
-            let mut last_cleanup = self.last_heartbeat_cleanup.lock().unwrap();
+            let mut last_cleanup = match self.last_heartbeat_cleanup.lock() { Ok(g) => g, Err(p) => p.into_inner() };
             if now - *last_cleanup < 3600 {
                 return;
             }
@@ -9808,7 +9916,7 @@ impl SimplifiedP2P {
         let mut removed = 0;
         
         {
-            let mut history = self.heartbeat_history.write().unwrap();
+            let mut history = match self.heartbeat_history.write() { Ok(g) => g, Err(p) => p.into_inner() };
             history.retain(|_, record| {
                 if record.timestamp < cutoff {
                     removed += 1;
@@ -9826,14 +9934,14 @@ impl SimplifiedP2P {
     
     /// Get Light Node registry (for ping service)
     pub fn get_light_node_registry(&self) -> HashMap<String, LightNodeRegistrationData> {
-        self.light_node_registry.read().unwrap().clone()
+        match self.light_node_registry.read() { Ok(g) => g, Err(p) => p.into_inner() }.clone()
     }
     
     /// Register Light node locally and gossip to network
     pub fn register_light_node(&self, registration: LightNodeRegistrationData) {
         // Store locally
         {
-            let mut registry = self.light_node_registry.write().unwrap();
+            let mut registry = match self.light_node_registry.write() { Ok(g) => g, Err(p) => p.into_inner() };
             registry.insert(registration.node_id.clone(), registration.clone());
         }
         
@@ -9861,12 +9969,12 @@ impl SimplifiedP2P {
     pub fn request_light_node_registry_sync(&self) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
         
         // Get oldest registration timestamp we have
         let last_sync = {
-            let registry = self.light_node_registry.read().unwrap();
+            let registry = match self.light_node_registry.read() { Ok(g) => g, Err(p) => p.into_inner() };
             registry.values()
                 .map(|r| r.registered_at)
                 .max()
@@ -9888,7 +9996,7 @@ impl SimplifiedP2P {
     pub fn check_heartbeat_eligibility(&self, node_id: &str, node_type: &str) -> (u8, u8, bool) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
         
         let current_4h_window = now - (now % (4 * 60 * 60));
@@ -9896,7 +10004,7 @@ impl SimplifiedP2P {
         // Count successful heartbeats in current 4h window
         let mut count = 0u8;
         {
-            let history = self.heartbeat_history.read().unwrap();
+            let history = match self.heartbeat_history.read() { Ok(g) => g, Err(p) => p.into_inner() };
             for i in 0..10 {
                 let key = format!("{}:{}", node_id, i);
                 if let Some(record) = history.get(&key) {
@@ -9935,7 +10043,7 @@ impl SimplifiedP2P {
     pub fn get_current_slot() -> u64 {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
         let current_4h_window = now - (now % (4 * 60 * 60));
         let seconds_in_window = now - current_4h_window;
@@ -9946,7 +10054,7 @@ impl SimplifiedP2P {
     pub fn get_current_window_number() -> u64 {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
         now / (4 * 60 * 60)  // Window number since epoch
     }
@@ -9969,7 +10077,7 @@ impl SimplifiedP2P {
     pub fn get_next_ping_time(light_node_id: &str) -> (u64, u64) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
         
         let current_window = Self::get_current_window_number();
@@ -10032,7 +10140,7 @@ impl SimplifiedP2P {
         
         // Get sorted active Full/Super node IDs (only rep >= 70)
         let active_node_ids: Vec<String> = {
-            let nodes = self.active_full_super_nodes.read().unwrap();
+            let nodes = match self.active_full_super_nodes.read() { Ok(g) => g, Err(p) => p.into_inner() };
             let mut sorted: Vec<_> = nodes.values()
                 .filter(|n| n.reputation >= 70.0)
                 .map(|n| n.node_id.clone())
@@ -10073,14 +10181,14 @@ impl SimplifiedP2P {
     /// Check if attestation already exists for Light node in current slot
     pub fn has_attestation(&self, light_node_id: &str, slot: u64) -> bool {
         let key = format!("{}:{}", light_node_id, slot);
-        let attestations = self.light_node_attestations.read().unwrap();
+        let attestations = match self.light_node_attestations.read() { Ok(g) => g, Err(p) => p.into_inner() };
         attestations.contains_key(&key)
     }
     
     /// Get Light nodes in our shard (for this Full/Super node to ping)
     pub fn get_light_nodes_in_shard(&self) -> Vec<LightNodeRegistrationData> {
         let our_shard = self.shard_id;
-        let registry = self.light_node_registry.read().unwrap();
+        let registry = match self.light_node_registry.read() { Ok(g) => g, Err(p) => p.into_inner() };
         
         registry.values()
             .filter(|node| Self::calculate_light_node_shard(&node.node_id) == our_shard)
@@ -10097,7 +10205,7 @@ impl SimplifiedP2P {
         let mut result = Vec::new();
         
         // SCALABILITY: Only check Light nodes in our shard (1/256 of total)
-        let registry = self.light_node_registry.read().unwrap();
+        let registry = match self.light_node_registry.read() { Ok(g) => g, Err(p) => p.into_inner() };
         
         for node in registry.values() {
             // SHARD FILTER: Only process Light nodes in our shard
@@ -10134,7 +10242,7 @@ impl SimplifiedP2P {
     /// Mark Light node as failed (no response to ping)
     /// After 5 consecutive failures, node is marked inactive
     pub fn mark_light_node_ping_failed(&self, node_id: &str) {
-        let mut registry = self.light_node_registry.write().unwrap();
+        let mut registry = match self.light_node_registry.write() { Ok(g) => g, Err(p) => p.into_inner() };
         if let Some(node) = registry.get_mut(node_id) {
             node.consecutive_failures = node.consecutive_failures.saturating_add(1);
             
@@ -10151,10 +10259,10 @@ impl SimplifiedP2P {
     pub fn mark_light_node_ping_success(&self, node_id: &str) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
             
-        let mut registry = self.light_node_registry.write().unwrap();
+        let mut registry = match self.light_node_registry.write() { Ok(g) => g, Err(p) => p.into_inner() };
         if let Some(node) = registry.get_mut(node_id) {
             let was_inactive = !node.is_active;
             
@@ -10174,7 +10282,7 @@ impl SimplifiedP2P {
         let our_shard = self.shard_id;
         let current_window = Self::get_current_window_number();
         
-        let registry = self.light_node_registry.read().unwrap();
+        let registry = match self.light_node_registry.read() { Ok(g) => g, Err(p) => p.into_inner() };
         
         registry.values()
             .filter(|node| {
@@ -10205,7 +10313,7 @@ impl SimplifiedP2P {
         // Store locally first
         let key = format!("{}:{}", attestation.light_node_id, attestation.slot);
         {
-            let mut attestations = self.light_node_attestations.write().unwrap();
+            let mut attestations = match self.light_node_attestations.write() { Ok(g) => g, Err(p) => p.into_inner() };
             attestations.insert(key, attestation);
         }
         
@@ -10219,7 +10327,7 @@ impl SimplifiedP2P {
     pub async fn register_as_active_node_async(&self) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
         
         let node_type_str = match self.node_type {
@@ -10247,7 +10355,7 @@ impl SimplifiedP2P {
         
         // Register locally
         {
-            let mut nodes = self.active_full_super_nodes.write().unwrap();
+            let mut nodes = match self.active_full_super_nodes.write() { Ok(g) => g, Err(p) => p.into_inner() };
             nodes.insert(self.node_id.clone(), ActiveNodeInfo {
                 node_id: self.node_id.clone(),
                 node_type: node_type_str.to_string(),
@@ -10287,7 +10395,7 @@ impl SimplifiedP2P {
     pub fn register_as_active_node(&self) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
         
         let node_type_str = match self.node_type {
@@ -10315,7 +10423,7 @@ impl SimplifiedP2P {
         
         // Register locally
         {
-            let mut nodes = self.active_full_super_nodes.write().unwrap();
+            let mut nodes = match self.active_full_super_nodes.write() { Ok(g) => g, Err(p) => p.into_inner() };
             nodes.insert(self.node_id.clone(), ActiveNodeInfo {
                 node_id: self.node_id.clone(),
                 node_type: node_type_str.to_string(),
@@ -10381,7 +10489,7 @@ impl SimplifiedP2P {
         let shard_id = Self::calculate_light_node_shard(node_id);
         
         // Update active nodes map
-        let mut nodes = self.active_full_super_nodes.write().unwrap();
+        let mut nodes = match self.active_full_super_nodes.write() { Ok(g) => g, Err(p) => p.into_inner() };
         nodes.insert(node_id.to_string(), ActiveNodeInfo {
             node_id: node_id.to_string(),
             node_type: node_type.to_string(),
@@ -10395,12 +10503,12 @@ impl SimplifiedP2P {
     pub fn cleanup_stale_active_nodes(&self) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
         
         let cutoff = now - (15 * 60);  // 15 minutes ago
         
-        let mut nodes = self.active_full_super_nodes.write().unwrap();
+        let mut nodes = match self.active_full_super_nodes.write() { Ok(g) => g, Err(p) => p.into_inner() };
         let before = nodes.len();
         nodes.retain(|_, v| v.last_seen > cutoff);
         let removed = before - nodes.len();
@@ -10412,14 +10520,14 @@ impl SimplifiedP2P {
     
     /// Get count of active Full/Super nodes
     pub fn get_active_node_count(&self) -> usize {
-        let nodes = self.active_full_super_nodes.read().unwrap();
+        let nodes = match self.active_full_super_nodes.read() { Ok(g) => g, Err(p) => p.into_inner() };
         nodes.len()
     }
     
     /// Get list of active Full/Super nodes with their status
     /// Returns Vec<(node_id, node_type, last_seen)>
     pub fn get_active_full_super_nodes(&self) -> Vec<(String, String, u64)> {
-        let nodes = self.active_full_super_nodes.read().unwrap();
+        let nodes = match self.active_full_super_nodes.read() { Ok(g) => g, Err(p) => p.into_inner() };
         nodes.values()
             .map(|n| (n.node_id.clone(), n.node_type.clone(), n.last_seen))
             .collect()
@@ -10450,12 +10558,12 @@ impl SimplifiedP2P {
     pub fn cleanup_old_attestations(&self) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
         
         let cutoff = now - (24 * 60 * 60);  // 24 hours ago
         
-        let mut attestations = self.light_node_attestations.write().unwrap();
+        let mut attestations = match self.light_node_attestations.write() { Ok(g) => g, Err(p) => p.into_inner() };
         let before = attestations.len();
         attestations.retain(|_, v| v.timestamp > cutoff);
         let removed = before - attestations.len();
@@ -10469,7 +10577,7 @@ impl SimplifiedP2P {
     pub fn check_light_node_eligibility(&self, light_node_id: &str) -> (u8, u8, bool) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
         
         let current_4h_window = now - (now % (4 * 60 * 60));
@@ -10479,7 +10587,7 @@ impl SimplifiedP2P {
         // Count attestations in current 4h window
         let mut count = 0u8;
         {
-            let attestations = self.light_node_attestations.read().unwrap();
+            let attestations = match self.light_node_attestations.read() { Ok(g) => g, Err(p) => p.into_inner() };
             for slot in window_start_slot..=window_end_slot {
                 let key = format!("{}:{}", light_node_id, slot);
                 if attestations.contains_key(&key) {
@@ -10501,7 +10609,7 @@ impl SimplifiedP2P {
     pub fn get_attestations_for_window(&self, window_start_timestamp: u64) -> Vec<(String, u64, String, u64)> {
         let window_end = window_start_timestamp + (4 * 60 * 60);
         
-        let attestations = self.light_node_attestations.read().unwrap();
+        let attestations = match self.light_node_attestations.read() { Ok(g) => g, Err(p) => p.into_inner() };
         attestations.values()
             .filter(|a| a.timestamp >= window_start_timestamp && a.timestamp < window_end)
             .map(|a| (a.light_node_id.clone(), a.slot, a.pinger_id.clone(), a.timestamp))
@@ -10513,7 +10621,7 @@ impl SimplifiedP2P {
     pub fn get_heartbeats_for_window(&self, window_start_timestamp: u64) -> Vec<(String, u8, u64)> {
         let window_end = window_start_timestamp + (4 * 60 * 60);
         
-        let heartbeats = self.heartbeat_history.read().unwrap();
+        let heartbeats = match self.heartbeat_history.read() { Ok(g) => g, Err(p) => p.into_inner() };
         heartbeats.values()
             .filter(|h| h.timestamp >= window_start_timestamp && h.timestamp < window_end)
             .map(|h| (h.node_id.clone(), h.heartbeat_index, h.timestamp))
@@ -10524,7 +10632,7 @@ impl SimplifiedP2P {
     /// Returns Vec<(node_id, wallet_address)> for nodes with at least 1 attestation
     pub fn get_eligible_light_nodes(&self, window_start_timestamp: u64) -> Vec<(String, String)> {
         let attestations = self.get_attestations_for_window(window_start_timestamp);
-        let registry = self.light_node_registry.read().unwrap();
+        let registry = match self.light_node_registry.read() { Ok(g) => g, Err(p) => p.into_inner() };
         
         // Dedupe by node_id (only need 1 attestation per Light node)
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -10555,7 +10663,7 @@ impl SimplifiedP2P {
         }
         
         // Get node types from active_full_super_nodes
-        let active_nodes = self.active_full_super_nodes.read().unwrap();
+        let active_nodes = match self.active_full_super_nodes.read() { Ok(g) => g, Err(p) => p.into_inner() };
         
         counts.into_iter()
             .map(|(node_id, (_, count))| {
@@ -10588,7 +10696,7 @@ impl SimplifiedP2P {
     
     /// Get Light node wallet address from registry
     pub fn get_light_node_wallet(&self, node_id: &str) -> Option<String> {
-        let registry = self.light_node_registry.read().unwrap();
+        let registry = match self.light_node_registry.read() { Ok(g) => g, Err(p) => p.into_inner() };
         registry.get(node_id).map(|r| r.wallet_address.clone())
     }
 }
@@ -10600,7 +10708,7 @@ fn calculate_heartbeat_times_for_node(node_id: &str) -> Vec<u64> {
     
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_secs();
     
     let current_4h_window = now - (now % (4 * 60 * 60));
@@ -10751,7 +10859,7 @@ impl SimplifiedP2P {
         self.update_peer_last_seen_with_height(&sender_id, Some(to_height));
         
         // CRITICAL: Send blocks to block receiver for processing
-        if let Some(ref block_tx) = &*self.block_tx.lock().unwrap() {
+        if let Some(ref block_tx) = &*match self.block_tx.lock() { Ok(g) => g, Err(p) => p.into_inner() } {
             for (height, data) in blocks {
                 // Create ReceivedBlock for processing
                 let received_block = ReceivedBlock {
@@ -10882,7 +10990,7 @@ impl SimplifiedP2P {
         self.update_peer_last_seen(&sender_id);
         
         // CRITICAL: Send macroblocks to macroblock receiver for processing
-        if let Some(ref macroblock_tx) = &*self.macroblock_tx.lock().unwrap() {
+        if let Some(ref macroblock_tx) = &*match self.macroblock_tx.lock() { Ok(g) => g, Err(p) => p.into_inner() } {
             let macroblock_count = macroblocks.len();
             for (index, data) in macroblocks {
                 // Create ReceivedBlock for macroblock processing
@@ -11325,7 +11433,7 @@ impl SimplifiedP2P {
                         for mut new_peer in new_peers {
                             // EXISTING: Same duplicate check as add_peer_safe
                             let already_exists = {
-                                let peer_addrs = connected_peer_addrs.read().unwrap();
+                                let peer_addrs = match connected_peer_addrs.read() { Ok(g) => g, Err(p) => p.into_inner() };
                                 peer_addrs.contains(&new_peer.addr)
                             };
                             
@@ -12356,7 +12464,7 @@ impl SimplifiedP2P {
             instances_guard.insert(normalized_node_id.clone(), hybrid);
         }
         
-        let hybrid = instances_guard.get_mut(&normalized_node_id).unwrap();
+        let hybrid = instances_guard.get_mut(&normalized_node_id).expect("Inserted above");
         
         // Check certificate rotation
         if hybrid.needs_rotation() {
@@ -12420,7 +12528,7 @@ impl SimplifiedP2P {
                             instances_guard.insert(normalized_node_id.clone(), hybrid);
                         }
                         
-                        let hybrid = instances_guard.get_mut(&normalized_node_id).unwrap();
+                        let hybrid = instances_guard.get_mut(&normalized_node_id).expect("Inserted above");
                         
                         // Check certificate rotation
                         if hybrid.needs_rotation() {
@@ -12894,7 +13002,7 @@ impl SimplifiedP2P {
         // ═══════════════════════════════════════════════════════════════════════════
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
         
         // Allow ±5 minutes for network delays and clock drift
@@ -12986,7 +13094,7 @@ impl SimplifiedP2P {
         // ═══════════════════════════════════════════════════════════════════════════
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
         
         const MAX_TIMESTAMP_DRIFT: u64 = 300; // 5 minutes
@@ -13596,7 +13704,7 @@ impl SimplifiedP2P {
                     // No current jail - apply if jailed_until is in the future
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
+                        .unwrap_or_default()
                         .as_secs();
                     *jailed_until > now
                 };
@@ -13799,7 +13907,7 @@ impl SimplifiedP2P {
             *crypto_guard = Some(crypto);
         }
         
-        let crypto = crypto_guard.as_ref().unwrap();
+        let crypto = crypto_guard.as_ref().expect("Crypto initialized above");
         match crypto.verify_dilithium_signature(&message, &dilithium_sig, node_id).await {
             Ok(valid) => {
                 if valid {
@@ -13860,7 +13968,7 @@ impl SimplifiedP2P {
             let _ = crypto.initialize().await;
             *crypto_guard = Some(crypto);
         }
-        let crypto = crypto_guard.as_ref().unwrap();
+        let crypto = crypto_guard.as_ref().expect("Crypto initialized above");
         
         // Verify Dilithium key signature
         let mut encapsulated_data = Vec::new();
@@ -13967,7 +14075,7 @@ impl SimplifiedP2P {
                                         let _ = crypto.initialize().await;
                                         *crypto_guard = Some(crypto);
                                     }
-                                    let crypto = crypto_guard.as_ref().unwrap();
+                                    let crypto = crypto_guard.as_ref().expect("Crypto initialized above");
                                     
                                     // Verify Dilithium key signature
                                     let mut encapsulated_data = Vec::new();
@@ -14022,7 +14130,7 @@ impl SimplifiedP2P {
                             let _ = crypto.initialize().await;
                             *crypto_guard = Some(crypto);
                         }
-                        let crypto = crypto_guard.as_ref().unwrap();
+                        let crypto = crypto_guard.as_ref().expect("Crypto initialized above");
                         
                         match crypto.verify_dilithium_signature(&message_clone, &dilithium_sig, &node_id_clone).await {
                             Ok(valid) => valid,
@@ -14073,7 +14181,7 @@ impl SimplifiedP2P {
         
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
         
         // Create message from reputation updates
@@ -14107,7 +14215,7 @@ impl SimplifiedP2P {
             instances_guard.insert(normalized_node_id.clone(), hybrid);
         }
         
-        let hybrid = instances_guard.get_mut(&normalized_node_id).unwrap();
+        let hybrid = instances_guard.get_mut(&normalized_node_id).expect("Inserted above");
         
         // Check certificate rotation
         if hybrid.needs_rotation() {
@@ -14187,7 +14295,7 @@ impl SimplifiedP2P {
         
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
         
         // Create message from reputation updates
@@ -14226,7 +14334,7 @@ impl SimplifiedP2P {
                         instances_guard.insert(normalized_node_id.clone(), hybrid);
                     }
                     
-                    let hybrid = instances_guard.get_mut(&normalized_node_id).unwrap();
+                    let hybrid = instances_guard.get_mut(&normalized_node_id).expect("Inserted above");
                     
                     // Check certificate rotation
                     if hybrid.needs_rotation() {
@@ -14333,7 +14441,7 @@ impl SimplifiedP2P {
                 // Create signature for updates
                 let timestamp = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
+                    .unwrap_or_default()
                     .as_secs();
                 
                 // PRODUCTION: Create quantum-resistant signature using SHA3-256
@@ -14737,7 +14845,7 @@ impl SimplifiedP2P {
         
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
         
         let mut successful_broadcasts = 0;

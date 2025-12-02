@@ -290,7 +290,7 @@ impl QuantumPoH {
                     data: None,
                     timestamp: SystemTime::now()
                         .duration_since(UNIX_EPOCH)
-                        .unwrap()
+                        .unwrap_or_default()
                         .as_micros() as u64,
                 };
                 
@@ -391,7 +391,7 @@ impl QuantumPoH {
             data: Some(tx_data),
             timestamp: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_micros() as u64,
         };
         
@@ -455,7 +455,7 @@ impl QuantumPoH {
                     // Last hash with data: use SHA3-512 with data mixed in
                     let mut hasher = Sha3_512::new();
                     hasher.update(&hash_bytes);
-                    hasher.update(entry.data.as_ref().unwrap());
+                    hasher.update(entry.data.as_ref().expect("Checked is_some above"));
                     hasher.update(&counter_value.to_le_bytes());
                     let result = hasher.finalize();
                     hash_bytes.copy_from_slice(&result);
@@ -522,7 +522,7 @@ impl QuantumPoH {
             data: Some(format!("MACROBLOCK_CHECKPOINT_SLOT_{}", slot).into_bytes()),
             timestamp: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_micros() as u64,
         }
     }

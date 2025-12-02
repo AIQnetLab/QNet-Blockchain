@@ -45,7 +45,7 @@ impl DilithiumKeyManager {
     fn ensure_writable_directory(preferred: &Path) -> Result<PathBuf> {
         // Check cache first to avoid repeated filesystem operations
         {
-            let cache = CACHED_KEY_DIR.read().unwrap();
+            let cache = match CACHED_KEY_DIR.read() { Ok(g) => g, Err(p) => p.into_inner() };
             if let Some(cached_dir) = &*cache {
                 // Verify cached directory still exists and is writable
                 if cached_dir.exists() && cached_dir.is_dir() {
@@ -86,7 +86,7 @@ impl DilithiumKeyManager {
                             println!("[KEY_MANAGER] ✅ Selected writable directory: {:?}", path);
                             
                             // Cache the successful directory for future use
-                            let mut cache = CACHED_KEY_DIR.write().unwrap();
+                            let mut cache = match CACHED_KEY_DIR.write() { Ok(g) => g, Err(p) => p.into_inner() };
                             *cache = Some(path.clone());
                             
                             return Ok(path.clone());
@@ -165,7 +165,7 @@ impl DilithiumKeyManager {
     fn get_keypair(&self) -> Result<(dilithium3::PublicKey, dilithium3::SecretKey)> {
         // Check cache first
         {
-            let cache_guard = self.cached_keypair.read().unwrap();
+            let cache_guard = match self.cached_keypair.read() { Ok(g) => g, Err(p) => p.into_inner() };
             if let Some((pk, sk)) = cache_guard.as_ref() {
                 return Ok((pk.clone(), sk.clone()));
             }
@@ -179,7 +179,7 @@ impl DilithiumKeyManager {
             let (pk, sk) = self.load_keypair_from_disk(&key_path)?;
             
             // Cache the loaded keypair
-            let mut cache_guard = self.cached_keypair.write().unwrap();
+            let mut cache_guard = match self.cached_keypair.write() { Ok(g) => g, Err(p) => p.into_inner() };
             *cache_guard = Some((pk.clone(), sk.clone()));
             return Ok((pk, sk));
         }
@@ -198,7 +198,7 @@ impl DilithiumKeyManager {
         
         // Cache the keypair
         {
-            let mut cache_guard = self.cached_keypair.write().unwrap();
+            let mut cache_guard = match self.cached_keypair.write() { Ok(g) => g, Err(p) => p.into_inner() };
             *cache_guard = Some((pk.clone(), sk.clone()));
         }
         

@@ -296,20 +296,34 @@ impl QuicTransport {
                             
                             println!("[QUIC] ✅ Accepted connection from {} (node: {})", get_privacy_id_for_addr(&peer_addr.to_string()), remote_node_id);
                             
-                            // Check if we already have a connection to this peer
-                            // CRITICAL FIX: Only reuse if existing connection is ALIVE
-                            if let Some(existing) = connections_clone.get(&peer_addr) {
-                                // Check if existing connection is still alive
-                                if existing.connection.close_reason().is_none() {
-                                    println!("[QUIC] ⚠️ Already have LIVE connection to {}, reusing existing", get_privacy_id_for_addr(&peer_addr.to_string()));
-                                    // Reuse existing connection, close this one
-                                    connection.close(quinn::VarInt::from_u32(0), b"duplicate");
-                                    return;
-                                } else {
-                                    // Existing connection is dead - remove it and use new one
-                                    println!("[QUIC] 🔄 Existing connection to {} is DEAD, replacing with new", get_privacy_id_for_addr(&peer_addr.to_string()));
-                                    connections_clone.remove(&peer_addr);
+                            // CRITICAL: Prevent self-connect on server side too
+                            if remote_node_id == node_id_clone {
+                                println!("[QUIC] ⚠️ Self-connect detected on server side, closing");
+                                connection.close(quinn::VarInt::from_u32(0), b"self-connect");
+                                return;
+                            }
+                            
+                            // Check if we already have a connection to this node (by node_id, not just addr)
+                            // CRITICAL: Incoming connections have random source ports, so check by node_id!
+                            let mut existing_addr: Option<std::net::SocketAddr> = None;
+                            for entry in connections_clone.iter() {
+                                if let Some(ref existing_node_id) = entry.value().remote_node_id {
+                                    if existing_node_id == &remote_node_id {
+                                        if entry.value().connection.close_reason().is_none() {
+                                            println!("[QUIC] ⚠️ Already have LIVE connection to node {}, reusing existing", remote_node_id);
+                                            connection.close(quinn::VarInt::from_u32(0), b"duplicate");
+                                            return;
+                                        } else {
+                                            existing_addr = Some(*entry.key());
+                                        }
+                                        break;
+                                    }
                                 }
+                            }
+                            // Remove dead connection if found
+                            if let Some(addr) = existing_addr {
+                                println!("[QUIC] 🔄 Removing DEAD connection to node {} (addr: {})", remote_node_id, get_privacy_id_for_addr(&addr.to_string()));
+                                connections_clone.remove(&addr);
                             }
                             
                             // Store connection
@@ -387,7 +401,7 @@ impl QuicTransport {
             node_type: our_node_type.to_string(),
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_secs(),
         };
         
@@ -517,7 +531,13 @@ impl QuicTransport {
         };
         
         conn.bytes_received.fetch_add(data.len() as u64, Ordering::Relaxed);
-        conn.messages_received.fetch_add(1, Ordering::Relaxed);
+        let msg_count = conn.messages_received.fetch_add(1, Ordering::Relaxed) + 1;
+        
+        // Log every 100th message or first 5 for debugging
+        if msg_count <= 5 || msg_count % 100 == 0 {
+            println!("[QUIC] 📨 Received uni message #{} from {} ({} bytes)", 
+                msg_count, get_privacy_id_for_addr(&peer_addr.to_string()), data.len());
+        }
         
         // Parse message
         let msg = match Self::parse_message(&data) {
@@ -614,8 +634,10 @@ impl QuicTransport {
         ));
         
         // Transport config - ALIGNED WITH HTTP
+        // CRITICAL FIX: Must include uni_streams for receiving broadcasts!
         let mut transport = quinn::TransportConfig::default();
         transport.max_concurrent_bidi_streams(VarInt::from_u32(MAX_STREAMS_PER_CONN));
+        transport.max_concurrent_uni_streams(VarInt::from_u32(MAX_STREAMS_PER_CONN)); // CRITICAL: Allow incoming uni streams!
         transport.max_idle_timeout(Some(Duration::from_secs(IDLE_TIMEOUT_SECS).try_into().unwrap()));
         transport.keep_alive_interval(Some(Duration::from_secs(KEEP_ALIVE_SECS)));
         client_config.transport_config(Arc::new(transport));
@@ -634,6 +656,13 @@ impl QuicTransport {
         
         // Perform client handshake
         let (remote_node_id, remote_cert_serial) = self.perform_client_handshake(&connection).await?;
+        
+        // CRITICAL: Prevent self-connect
+        if remote_node_id == self.node_id {
+            println!("[QUIC] ⚠️ Self-connect detected, closing connection");
+            connection.close(quinn::VarInt::from_u32(0), b"self-connect");
+            return Err("Self-connect not allowed".to_string());
+        }
         
         println!("[QUIC] ✅ Connected to {} (node: {})", get_privacy_id_for_addr(&peer_addr.to_string()), remote_node_id);
         
@@ -681,7 +710,7 @@ impl QuicTransport {
             node_type: self.node_type.clone(),
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_secs(),
         };
         

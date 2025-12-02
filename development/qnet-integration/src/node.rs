@@ -150,6 +150,17 @@ lazy_static::lazy_static! {
     static ref ENTROPY_RESPONSES: Mutex<std::collections::HashMap<(u64, String), [u8; 32]>> = Mutex::new(std::collections::HashMap::new());
 }
 
+/// Helper: Safe lock for ENTROPY_RESPONSES with poisoned lock recovery
+fn entropy_responses_lock() -> std::sync::MutexGuard<'static, std::collections::HashMap<(u64, String), [u8; 32]>> {
+    match ENTROPY_RESPONSES.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            println!("[CONSENSUS] ⚠️ ENTROPY_RESPONSES mutex poisoned, recovering...");
+            poisoned.into_inner()
+        }
+    }
+}
+
 // CRITICAL: Global quantum crypto instance to avoid repeated initialization
 lazy_static::lazy_static! {
     pub static ref GLOBAL_QUANTUM_CRYPTO: tokio::sync::Mutex<Option<crate::quantum_crypto::QNetQuantumCrypto>> = 
@@ -379,7 +390,7 @@ impl SignedBlockTracker {
     /// Detect invalid blocks
     pub fn detect_invalid_block(&self, block: &MicroBlock) -> Option<Evidence> {
         // Check timestamp is not too far in future (>5 seconds)
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         if block.timestamp > now + 5 {
             println!("[SECURITY] ⚠️ TIME MANIPULATION: Block from future by {}s", block.timestamp - now);
             return Some(Evidence {
@@ -555,7 +566,7 @@ impl BlockchainNode {
         // This approach scales to millions of nodes while maintaining Byzantine security
         let current_time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
         let window_start = current_time - (current_time % (4 * 60 * 60)); // Start of current 4-hour window
         let current_height = self.get_height().await;
@@ -627,7 +638,13 @@ impl BlockchainNode {
                 
                 // Batch update reward manager (single lock acquisition)
                 {
-                    let mut rm = reward_manager_mutex.lock().unwrap();
+                    let mut rm = match reward_manager_mutex.lock() {
+                        Ok(guard) => guard,
+                        Err(poisoned) => {
+                            println!("[REWARDS] ⚠️ Reward manager mutex poisoned, recovering...");
+                            poisoned.into_inner()
+                        }
+                    };
                     for (node_id, wallet) in chunk_registrations {
                         let _ = rm.register_node(node_id.clone(), RewardNodeType::Light, wallet);
                         let _ = rm.record_ping_attempt(&node_id, true, 0);
@@ -636,7 +653,13 @@ impl BlockchainNode {
                 
                 // Batch add pings
                 {
-                    let mut pings = all_pings_mutex.lock().unwrap();
+                    let mut pings = match all_pings_mutex.lock() {
+                        Ok(guard) => guard,
+                        Err(poisoned) => {
+                            println!("[PINGS] ⚠️ Pings mutex poisoned, recovering...");
+                            poisoned.into_inner()
+                        }
+                    };
                     pings.extend(chunk_pings);
                 }
             }
@@ -1495,7 +1518,7 @@ impl BlockchainNode {
             let cert_serial = format!("cert_{}_{}", node_id, 
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
+                    .unwrap_or_default()
                     .as_secs());
             
             if let Err(e) = unified_p2p_instance.init_quic(&external_ip, &cert_serial).await {
@@ -1958,7 +1981,7 @@ impl BlockchainNode {
                     
                     let current_time = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
-                        .unwrap()
+                        .unwrap_or_default()
                         .as_secs();
                     
                     let removed = mev_pool_for_cleanup.cleanup_expired_bundles(current_time);
@@ -2003,7 +2026,13 @@ impl BlockchainNode {
             // CRITICAL FIX: Register Genesis node in BlockchainActivationRegistry
             // This ensures ALL nodes see Genesis in Registry for deterministic consensus
             {
-                let storage_ref = GLOBAL_STORAGE_INSTANCE.lock().unwrap().clone();
+                let storage_ref = match GLOBAL_STORAGE_INSTANCE.lock() {
+                    Ok(guard) => guard.clone(),
+                    Err(poisoned) => {
+                        println!("[STORAGE] ⚠️ Global storage mutex poisoned, recovering...");
+                        poisoned.into_inner().clone()
+                    }
+                };
                 let registry = crate::activation_validation::BlockchainActivationRegistry::new_with_storage(
                     None, // Use default RPC
                     storage_ref
@@ -2016,7 +2045,7 @@ impl BlockchainNode {
                 
                 let current_time = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
+                    .unwrap_or_default()
                     .as_secs();
                 
                 let genesis_node_id = format!("genesis_node_{}", bootstrap_id);
@@ -4581,7 +4610,13 @@ impl BlockchainNode {
                     
                     // Cleanup old certificates from cache
                     if let Some(ref p2p) = unified_p2p {
-                        let mut cert_manager = p2p.certificate_manager.write().unwrap();
+                        let mut cert_manager = match p2p.certificate_manager.write() {
+                            Ok(guard) => guard,
+                            Err(poisoned) => {
+                                println!("[CERTIFICATE] ⚠️ Certificate manager mutex poisoned, recovering...");
+                                poisoned.into_inner()
+                            }
+                        };
                         cert_manager.cleanup();
                         println!("[CERTIFICATE] 🧹 Certificate cache cleaned");
                         
@@ -5330,7 +5365,7 @@ impl BlockchainNode {
                         
                         // CRITICAL FIX: Check if we already have enough responses before sending new requests
                         let already_have_responses = {
-                            let responses = ENTROPY_RESPONSES.lock().unwrap();
+                            let responses = entropy_responses_lock();
                             responses.iter()
                                 .filter(|((h, _), _)| *h == entropy_height)
                                 .count()
@@ -5340,7 +5375,7 @@ impl BlockchainNode {
                         if already_have_responses < sample_size {
                             // Clear old responses for this height only if they're stale (>10 seconds)
                             {
-                                let mut responses = ENTROPY_RESPONSES.lock().unwrap();
+                                let mut responses = entropy_responses_lock();
                                 // Keep recent responses, only clear if we're starting fresh
                                 if already_have_responses == 0 {
                                     responses.retain(|(h, _), _| *h != entropy_height);
@@ -5351,7 +5386,7 @@ impl BlockchainNode {
                             for peer in peers.iter().take(sample_size - already_have_responses) {
                                 // Check if we already have response from this peer
                                 let peer_already_responded = {
-                                    let responses = ENTROPY_RESPONSES.lock().unwrap();
+                                    let responses = entropy_responses_lock();
                                     responses.contains_key(&(entropy_height, peer.id.clone()))
                                 };
                                 
@@ -5437,7 +5472,7 @@ impl BlockchainNode {
                                 mismatches = 0;
                                 
                                 {
-                                    let responses = ENTROPY_RESPONSES.lock().unwrap();
+                                    let responses = entropy_responses_lock();
                                     for ((height, responder), peer_entropy) in responses.iter() {
                                         if *height == entropy_height {
                                             // CRITICAL FIX: Ignore peer_entropy == 0 (peer doesn't have block yet)
@@ -5482,7 +5517,7 @@ impl BlockchainNode {
                             
                             // Log final results with responder details
                             if consensus_reached || matches > 0 {
-                                let responses = ENTROPY_RESPONSES.lock().unwrap();
+                                let responses = entropy_responses_lock();
                                 for ((height, responder), peer_entropy) in responses.iter() {
                                     if *height == entropy_height && *peer_entropy != [0u8; 32] {
                                         if *peer_entropy == our_entropy {
@@ -5538,7 +5573,7 @@ impl BlockchainNode {
                             // ARCHITECTURE: A producer MUST have blocks up to (current_height - FINALITY_WINDOW)
                             // If they don't, they cannot create valid blocks with correct PoH
                             let producer_is_synchronized = {
-                                let responses = ENTROPY_RESPONSES.lock().unwrap();
+                                let responses = entropy_responses_lock();
                                 // Check if current_producer returned entropy = 0 (not synchronized)
                                 let producer_entropy = responses.get(&(entropy_height, current_producer.clone()));
                                 match producer_entropy {
@@ -5568,7 +5603,7 @@ impl BlockchainNode {
                                 
                                 // Get list of candidates who ARE synchronized (returned valid entropy)
                                 let synchronized_candidates: Vec<String> = {
-                                    let responses = ENTROPY_RESPONSES.lock().unwrap();
+                                    let responses = entropy_responses_lock();
                                     responses.iter()
                                         .filter(|((height, _), entropy)| {
                                             *height == entropy_height && 
@@ -5928,7 +5963,7 @@ impl BlockchainNode {
                     // NOTE: If emission block, mempool contains emission transaction as FIRST tx
                     let tx_jsons = if let Some(ref mev_pool) = mev_mempool {
                         // MEV-AWARE BLOCK BUILDING
-                        let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                        let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
                         let mut block_txs = Vec::new();
                         
                         // STEP 1: BUNDLE TXS (dynamic 0-20% allocation)
@@ -8516,8 +8551,14 @@ impl BlockchainNode {
             .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
             
         // CRITICAL: Get shared storage reference to avoid RocksDB lock conflicts
-        let storage_ref = if let Ok(storage_path) = std::env::var("QNET_STORAGE_PATH") {
-            GLOBAL_STORAGE_INSTANCE.lock().unwrap().clone()
+        let storage_ref = if let Ok(_storage_path) = std::env::var("QNET_STORAGE_PATH") {
+            match GLOBAL_STORAGE_INSTANCE.lock() {
+                Ok(guard) => guard.clone(),
+                Err(poisoned) => {
+                    println!("[STORAGE] ⚠️ Global storage mutex poisoned, recovering...");
+                    poisoned.into_inner().clone()
+                }
+            }
         } else {
             None
         };
@@ -8669,8 +8710,9 @@ impl BlockchainNode {
                 
                 if i < 5 || i >= max_count - 5 {
                     // Log first 5 and last 5 selections for debugging
-                    println!("  │     Validator {}: {} (reputation: {:.1}%)", 
-                             i + 1, selected.last().unwrap().0, selected.last().unwrap().1 * 100.0);
+                    if let Some((id, rep)) = selected.last() {
+                        println!("  │     Validator {}: {} (reputation: {:.1}%)", i + 1, id, rep * 100.0);
+                    }
                 } else if i == 5 {
                     println!("  │     ... (sampling {} more validators) ...", max_count - 10);
                 }
@@ -9323,7 +9365,7 @@ impl BlockchainNode {
                 commit_hash: commit_hash.clone(),
                 timestamp: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
+                    .unwrap_or_default()
                     .as_secs(),
                 signature,
             };
@@ -9561,7 +9603,7 @@ impl BlockchainNode {
                 nonce,
                 timestamp: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
+                    .unwrap_or_default()
                     .as_secs(),
             };
             
@@ -9974,7 +10016,7 @@ impl BlockchainNode {
             instances_guard.insert(normalized_node_id.clone(), hybrid);
         }
         
-        let hybrid = instances_guard.get_mut(&normalized_node_id).unwrap();
+        let hybrid = instances_guard.get_mut(&normalized_node_id).expect("Inserted above");
         
         // Check if certificate needs rotation
         if hybrid.needs_rotation() {
@@ -10126,7 +10168,7 @@ impl BlockchainNode {
             instances_guard.insert(normalized_node_id.clone(), hybrid);
         }
         
-        let hybrid = instances_guard.get_mut(&normalized_node_id).unwrap();
+        let hybrid = instances_guard.get_mut(&normalized_node_id).expect("Inserted above");
         
         // Decode commit hash to bytes
         let commit_bytes = match hex::decode(commit_hash) {
@@ -10214,7 +10256,7 @@ impl BlockchainNode {
             instances_guard.insert(normalized_node_id.clone(), hybrid);
         }
         
-        let hybrid = instances_guard.get_mut(&normalized_node_id).unwrap();
+        let hybrid = instances_guard.get_mut(&normalized_node_id).expect("Inserted above");
         
         // Check if certificate needs rotation
         if hybrid.needs_rotation() {
@@ -10315,7 +10357,7 @@ impl BlockchainNode {
             instances_guard.insert(normalized_node_id.clone(), hybrid);
         }
         
-        let hybrid = instances_guard.get_mut(&normalized_node_id).unwrap();
+        let hybrid = instances_guard.get_mut(&normalized_node_id).expect("Inserted above");
         
         // CRITICAL: Sign with hybrid (ephemeral Ed25519 + Dilithium per NIST/Cisco)
         match hybrid.sign_message_compact(message_hash.as_ref()).await {
@@ -10429,7 +10471,13 @@ impl BlockchainNode {
             let ed25519_verified = if let Some(p2p_ref) = p2p {
                 // Get certificate from P2P certificate manager
                 // MUST use write lock to properly track usage_count for LRU
-                let mut cert_manager = p2p_ref.certificate_manager.write().unwrap();
+                let mut cert_manager = match p2p_ref.certificate_manager.write() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => {
+                        println!("[CRYPTO] ⚠️ Certificate manager mutex poisoned, recovering...");
+                        poisoned.into_inner()
+                    }
+                };
                 if let Some(cert_data) = cert_manager.get_and_mark_used(&compact_sig.cert_serial) {
                     drop(cert_manager); // Release lock early
                     
@@ -10448,7 +10496,7 @@ impl BlockchainNode {
                             // Check certificate expiration
                             let now = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
+                                .unwrap_or_default()
                                 .as_secs();
                             if now > certificate.expires_at {
                                 println!("[CRYPTO] ❌ Certificate expired at {}, now is {}", 
@@ -10588,7 +10636,7 @@ impl BlockchainNode {
                 let _ = crypto.initialize().await;
                 *crypto_guard = Some(crypto);
             }
-            let crypto = crypto_guard.as_mut().unwrap();
+            let crypto = crypto_guard.as_mut().expect("Crypto initialized above");
             
             // SECURITY: Both Dilithium signatures are MANDATORY - no backwards compatibility bypass!
             if compact_sig.dilithium_key_signature.is_empty() {
@@ -10683,7 +10731,7 @@ impl BlockchainNode {
             let _ = crypto.initialize().await;
             *crypto_guard = Some(crypto);
         }
-        let crypto = crypto_guard.as_mut().unwrap();
+        let crypto = crypto_guard.as_mut().expect("Crypto initialized above");
         
         // Create DilithiumSignature from microblock signature
         // Convert back to string directly, no hex decoding needed
@@ -10828,7 +10876,7 @@ impl BlockchainNode {
         }
         
         // Validate timestamp is not too far in future
-        let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         if microblock.timestamp > current_time + 30 {
             return Err("Timestamp too far in future".to_string());
         }
@@ -11683,7 +11731,16 @@ impl BlockchainNode {
             
             // Check balance
             let sender_balance = state.get_balance(&tx.from);
-            let required_balance = tx.amount + (tx.gas_price * tx.gas_limit);
+            
+            // SECURITY: Use checked arithmetic to prevent overflow attacks
+            let gas_cost = tx.gas_price.checked_mul(tx.gas_limit)
+                .ok_or_else(|| QNetError::ValidationError(
+                    format!("Gas calculation overflow: {} * {}", tx.gas_price, tx.gas_limit)
+                ))?;
+            let required_balance = tx.amount.checked_add(gas_cost)
+                .ok_or_else(|| QNetError::ValidationError(
+                    format!("Balance calculation overflow: {} + {}", tx.amount, gas_cost)
+                ))?;
             
             if sender_balance < required_balance {
                 return Err(QNetError::ValidationError(format!(
@@ -11699,7 +11756,7 @@ impl BlockchainNode {
         
         {
             let mut mempool = self.mempool.write().await;
-            let tx_json = serde_json::to_string(&tx).unwrap();
+            let tx_json = serde_json::to_string(&tx).unwrap_or_else(|_| "{}".to_string());
             let tx_hash = format!("{:x}", sha3::Sha3_256::digest(tx_json.as_bytes()));
             // PRODUCTION: Add with gas_price for priority ordering (anti-spam protection)
             mempool.add_raw_transaction(tx_json, tx_hash, tx.gas_price);
@@ -12379,7 +12436,7 @@ impl BlockchainNode {
         
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
         
         // Validate activation code format
@@ -12596,7 +12653,7 @@ impl BlockchainNode {
         
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
         
         // Update activation record for device migration
@@ -12656,7 +12713,7 @@ impl BlockchainNode {
         // Current timestamp (rounded to hour for stability)
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
         let rounded_timestamp = (timestamp / 3600) * 3600; // Round to hour
         signature_components.push(rounded_timestamp.to_string());
@@ -12723,7 +12780,7 @@ impl BlockchainNode {
             let _ = crypto.initialize().await;
             *crypto_guard = Some(crypto);
         }
-        let quantum_crypto = crypto_guard.as_ref().unwrap();
+        let quantum_crypto = crypto_guard.as_ref().expect("Crypto initialized above");
             
         // SECURITY: NO FALLBACK ALLOWED - quantum decryption MUST work
         match quantum_crypto.decrypt_activation_code(code).await {
@@ -12791,6 +12848,12 @@ impl BlockchainNode {
         // Finish processing current transactions
         println!("   ⏳ Finishing current transaction processing");
         
+        // Stop QUIC transport gracefully
+        if let Some(ref p2p) = self.unified_p2p {
+            p2p.stop_quic().await;
+            println!("   🔌 QUIC transport stopped");
+        }
+        
         // Clear local activation (so it doesn't restart automatically)
         self.clear_activation_code().await?;
         println!("   🗑️  Cleared local activation code");
@@ -12844,7 +12907,7 @@ impl BlockchainNode {
     pub async fn get_connected_peers(&self) -> Result<Vec<PeerInfo>, QNetError> {
         let current_time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
         // EXISTING: Get connected peers for RPC API (fast method for API responses)
         // PERFORMANCE: Use fast discovery peers instead of expensive validation for API

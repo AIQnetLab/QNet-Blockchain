@@ -263,11 +263,11 @@ impl ApiRateLimiter {
     fn check_rate_limit(&self, ip: IpAddr, endpoint_type: &str) -> (bool, u64) {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
         
         let config = self.configs.get(endpoint_type)
-            .unwrap_or_else(|| self.configs.get("general").unwrap());
+            .unwrap_or_else(|| self.configs.get("general").expect("General config must exist"));
         
         // Get or create IP entry
         let ip_endpoints = self.ip_states.entry(ip).or_insert_with(DashMap::new);
@@ -304,13 +304,13 @@ impl ApiRateLimiter {
     /// Get remaining requests for an IP/endpoint
     fn get_remaining(&self, ip: IpAddr, endpoint_type: &str) -> u32 {
         let config = self.configs.get(endpoint_type)
-            .unwrap_or_else(|| self.configs.get("general").unwrap());
+            .unwrap_or_else(|| self.configs.get("general").expect("General config must exist"));
         
         if let Some(ip_endpoints) = self.ip_states.get(&ip) {
             if let Some(state) = ip_endpoints.get(endpoint_type) {
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
-                    .unwrap()
+                    .unwrap_or_default()
                     .as_secs();
                 let window_start = now.saturating_sub(config.window_seconds);
                 let recent_requests = state.requests.iter()
@@ -1062,7 +1062,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
             // API FIX: Filter out invalid peers and calculate correct last_seen
             let current_time = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_secs();
             
             let mut peer_list: Vec<serde_json::Value> = peers.iter()
@@ -3123,7 +3123,7 @@ async fn handle_bundle_submit(
     };
     
     let min_timestamp = bundle_request["min_timestamp"].as_u64().unwrap_or_else(|| {
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
     });
     
     let max_timestamp = bundle_request["max_timestamp"].as_u64().unwrap_or_else(|| {
@@ -3195,7 +3195,7 @@ async fn handle_bundle_submit(
     };
     
     // Get current time
-    let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     
     // Add bundle to MEV mempool
     match mev_mempool.add_bundle(bundle, submitter_reputation, current_time).await {
@@ -3240,7 +3240,7 @@ async fn handle_bundle_status(
     // Get bundle
     match mev_mempool.get_bundle(&bundle_id) {
         Some(bundle) => {
-            let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+            let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
             let status = if current_time < bundle.min_timestamp {
                 "pending"
             } else if current_time > bundle.max_timestamp {
@@ -3370,7 +3370,7 @@ async fn handle_batch_claim_rewards(
                 // Create RewardDistribution transaction for actual payout
                 let current_time = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
-                    .unwrap()
+                    .unwrap_or_default()
                     .as_secs();
                 
                 // DECENTRALIZED: Reward claim transaction without signature
@@ -3492,7 +3492,7 @@ async fn handle_batch_transfer(
     // Get current nonce from state (use timestamp-based nonce for batch transfers)
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_secs();
     let nonce = timestamp; // Use timestamp as nonce for batch transfers
     
@@ -3533,7 +3533,7 @@ async fn handle_batch_transfer(
         nonce,
         100_000, // Base gas price
         request.transfers.len() as u64 * 10_000, // Gas per transfer (optimized)
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
         None, // block_hash
         qnet_state::TransactionType::BatchTransfers { 
             transfers: request.transfers.iter().map(|t| BatchTransferData {
@@ -3779,7 +3779,7 @@ async fn handle_network_ping(
     use std::time::{SystemTime, UNIX_EPOCH};
     
     let start_time = SystemTime::now();
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     
     // Extract challenge from ping request
     let challenge = ping_request.get("challenge")
@@ -3867,7 +3867,14 @@ async fn verify_ed25519_client_signature(
         }
     };
     
-    let verifying_key = match VerifyingKey::from_bytes(pubkey_bytes.as_slice().try_into().unwrap()) {
+    let pubkey_array: [u8; 32] = match pubkey_bytes.as_slice().try_into() {
+        Ok(arr) => arr,
+        Err(_) => {
+            println!("[CRYPTO] ❌ Invalid public key length: expected 32 bytes, got {}", pubkey_bytes.len());
+            return false;
+        }
+    };
+    let verifying_key = match VerifyingKey::from_bytes(&pubkey_array) {
         Ok(key) => key,
         Err(e) => {
             println!("[CRYPTO] ❌ Invalid Ed25519 public key: {}", e);
@@ -3884,7 +3891,14 @@ async fn verify_ed25519_client_signature(
         }
     };
     
-    let signature = Signature::from_bytes(sig_bytes.as_slice().try_into().unwrap());
+    let sig_array: [u8; 64] = match sig_bytes.as_slice().try_into() {
+        Ok(arr) => arr,
+        Err(_) => {
+            println!("[CRYPTO] ❌ Invalid signature length: expected 64 bytes, got {}", sig_bytes.len());
+            return false;
+        }
+    };
+    let signature = Signature::from_bytes(&sig_array);
     
     // CRITICAL FIX: Use the PASSED message directly, don't construct internally!
     // The caller knows what message format was signed by the client
@@ -3924,13 +3938,13 @@ async fn verify_dilithium_signature(node_id: &str, challenge: &str, signature: &
         let _ = crypto.initialize().await;
         *crypto_guard = Some(crypto);
     }
-    let crypto = crypto_guard.as_mut().unwrap();
+    let crypto = crypto_guard.as_mut().expect("Crypto initialized above");
     
     // Create DilithiumSignature struct from string signature
     let dilithium_sig = crate::quantum_crypto::DilithiumSignature {
         signature: signature.to_string(),
         algorithm: "CRYSTALS-Dilithium3".to_string(),  // NIST FIPS 204 standard name
-        timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+        timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
         strength: "quantum-resistant".to_string(),
     };
     
@@ -3989,7 +4003,7 @@ async fn sign_with_dilithium(node_id: &str, challenge: &str) -> String {
         instances_guard.insert(normalized_node_id.clone(), hybrid);
     }
     
-    let hybrid = instances_guard.get_mut(&normalized_node_id).unwrap();
+    let hybrid = instances_guard.get_mut(&normalized_node_id).expect("Inserted above");
     
     // Check certificate rotation
     if hybrid.needs_rotation() {
@@ -4134,7 +4148,7 @@ async fn handle_light_node_register(
         format!("fcm_{:016x}", hasher.finish())
     };
     
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     
     let new_device = LightNodeDevice {
         wallet_address: register_request.wallet_address.clone(),
@@ -4475,7 +4489,7 @@ async fn handle_light_node_ping_response(
         })));
     }
     
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     let current_slot = SimplifiedP2P::get_current_slot();
     let our_node_id = blockchain.get_node_id();
     
@@ -4530,7 +4544,7 @@ async fn handle_light_node_ping_response(
                 instances_guard.insert(normalized_node_id.clone(), hybrid);
             }
             
-            let hybrid = instances_guard.get_mut(&normalized_node_id).unwrap();
+            let hybrid = instances_guard.get_mut(&normalized_node_id).expect("Inserted above");
             
             // Check rotation
             if hybrid.needs_rotation() {
@@ -4726,7 +4740,7 @@ async fn handle_light_node_pending_challenge(
         }
     }
     
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     
     // Check for pending challenge
     let pending = {
@@ -4875,7 +4889,7 @@ async fn handle_light_node_reactivate(
 ) -> Result<impl Reply, Rejection> {
     use std::time::{SystemTime, UNIX_EPOCH};
     
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     
     // Timestamp must be within 5 minutes
     if now.abs_diff(request.timestamp) > 300 {
@@ -5008,7 +5022,7 @@ async fn handle_server_node_status(
         })));
     }
     
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     let current_window = now - (now % (4 * 60 * 60)); // Current 4h window
     
     if let Some(p2p) = blockchain.get_unified_p2p() {
@@ -5148,7 +5162,7 @@ impl FcmRateLimiter {
     fn try_acquire(&self) -> bool {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
         
         let current = self.current_second.load(AtomicOrdering::Relaxed);
@@ -5231,7 +5245,7 @@ impl FCMPushService {
         // Create JWT for OAuth2
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
         
         let jwt_header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
@@ -5330,7 +5344,7 @@ impl FCMPushService {
                     "node_id": node_id,
                     "challenge": challenge,
                     "quantum_secure": "true",
-                    "timestamp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs().to_string()
+                    "timestamp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs().to_string()
                 },
                 "notification": {
                     "title": "QNet Node Ping",
@@ -5403,7 +5417,7 @@ fn calculate_ping_slot(node_id: &str) -> u32 {
 fn calculate_next_ping_time(node_id: &str) -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     let current_4h_window = now - (now % (4 * 60 * 60)); // Start of current 4h window
     let slot = calculate_ping_slot(node_id);
     let slot_offset = (node_id.len() % 60) as u64; // 0-59 seconds within slot
@@ -5422,7 +5436,7 @@ fn calculate_next_ping_time(node_id: &str) -> u64 {
 fn calculate_full_super_ping_times(node_id: &str) -> Vec<u64> {
     use std::time::{SystemTime, UNIX_EPOCH};
     
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     let current_4h_window = now - (now % (4 * 60 * 60)); // Start of current 4h window
     let base_slot = calculate_ping_slot(node_id); // Base randomization from node_id
     let slot_offset = (node_id.len() % 60) as u64; // 0-59 seconds within slot
@@ -5513,7 +5527,7 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
             
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_secs();
             
             let current_slot = SimplifiedP2P::get_current_slot();
@@ -5574,7 +5588,10 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
                             }
                             
                             // Acquire semaphore permit
-                            let _permit = semaphore.acquire().await.unwrap();
+                            let _permit = match semaphore.acquire().await {
+                                Ok(p) => p,
+                                Err(_) => { println!("[RPC] ⚠️ Semaphore closed"); return; }
+                            };
                             
                             let role_str = match role {
                                 PingerRole::Primary => "PRIMARY",
@@ -5615,7 +5632,7 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
                                             "challenge": challenge,
                                             "timestamp": std::time::SystemTime::now()
                                                 .duration_since(std::time::UNIX_EPOCH)
-                                                .unwrap()
+                                                .unwrap_or_default()
                                                 .as_secs()
                                         });
                                         
@@ -5647,7 +5664,7 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
                                     // Polling mode - store challenge for device to fetch
                                     let now = std::time::SystemTime::now()
                                         .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap()
+                                        .unwrap_or_default()
                                         .as_secs();
                                     
                                     {
@@ -5710,7 +5727,7 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
                         let challenge = generate_quantum_challenge();
                         let now = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap()
+                            .unwrap_or_default()
                             .as_secs();
                         
                         if let Ok(mut challenges) = PENDING_CHALLENGES.lock() {
@@ -5807,7 +5824,7 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
             
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_secs();
             
             let mut total_cleaned = 0;
@@ -6435,7 +6452,7 @@ async fn handle_graceful_shutdown(
         std::process::exit(0);
     });
 
-    let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
 
     println!("✅ Graceful shutdown initiated - node will terminate in {} seconds", timeout_seconds);
 
@@ -6738,7 +6755,7 @@ async fn handle_consensus_commit(
         let commit = Commit {
             node_id: commit_request.node_id.clone(),
             commit_hash: commit_request.commit_hash.clone(), // String format
-            timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+            timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
             signature: generate_quantum_signature(&commit_request.node_id, &commit_request.commit_hash).await,
         };
 
@@ -6761,7 +6778,7 @@ async fn handle_consensus_commit(
             "round": commit_request.round,
             "node_id": blockchain.get_node_id(),
             "message": "Commit processed by consensus engine",
-            "timestamp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+            "timestamp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()
         })
     } else {
         json!({
@@ -6810,7 +6827,7 @@ async fn handle_consensus_reveal(
             node_id: reveal_request.node_id.clone(),
             reveal_data: hex::decode(&reveal_request.reveal_hash).unwrap_or_default(),
             nonce: [0u8; 32], // PRODUCTION: Use proper nonce
-            timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+            timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
         };
 
         // Process reveal through consensus engine
@@ -6832,7 +6849,7 @@ async fn handle_consensus_reveal(
             "round": reveal_request.round,
             "node_id": blockchain.get_node_id(),
             "message": "Reveal processed by consensus engine",
-            "timestamp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+            "timestamp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()
         })
     } else {
         json!({
@@ -6889,7 +6906,7 @@ async fn handle_consensus_round_status(
                     "reveals_received": 0,
                     "leader": "unknown",
                     "macroblock_height": blockchain.get_height().await,
-                    "timestamp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+                    "timestamp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
                     "node_id": blockchain.get_node_id()
                 })
             }
@@ -6982,7 +6999,7 @@ async fn handle_consensus_sync(
         "current_phase": current_round_state.as_ref().map(|s| format!("{:?}", s.phase)).unwrap_or_else(|| "unknown".to_string()),
         "rounds": consensus_rounds,
         "node_id": blockchain.get_node_id(),
-        "timestamp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+        "timestamp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()
     });
     
     Ok(warp::reply::json(&response))
@@ -7227,7 +7244,7 @@ async fn generate_quantum_signature(node_id: &str, data: &str) -> String {
         instances_guard.insert(normalized_node_id.clone(), hybrid);
     }
     
-    let hybrid = instances_guard.get_mut(&normalized_node_id).unwrap();
+    let hybrid = instances_guard.get_mut(&normalized_node_id).expect("Inserted above");
     
     // Check certificate rotation
     if hybrid.needs_rotation() {
@@ -7584,7 +7601,7 @@ async fn handle_public_stats(
     
     // Check cache first
     {
-        let cache = PUBLIC_STATS_CACHE.read().unwrap();
+        let cache = match PUBLIC_STATS_CACHE.read() { Ok(g) => g, Err(p) => p.into_inner() };
         if cache.1.elapsed().as_secs() < CACHE_TTL_SECS {
             return Ok(warp::reply::json(&cache.0));
         }
@@ -7624,7 +7641,7 @@ async fn handle_public_stats(
     
     // Update cache
     {
-        let mut cache = PUBLIC_STATS_CACHE.write().unwrap();
+        let mut cache = match PUBLIC_STATS_CACHE.write() { Ok(g) => g, Err(p) => p.into_inner() };
         *cache = (stats.clone(), std::time::Instant::now());
     }
     
@@ -8505,10 +8522,14 @@ async fn handle_contract_call(
     // NIST/CISCO COMPLIANT HYBRID SIGNATURE VERIFICATION (MANDATORY)
     // =========================================================================
     
-    let signature = request.signature.as_ref().unwrap();
-    let public_key = request.public_key.as_ref().unwrap();
-    let dilithium_sig = request.dilithium_signature.as_ref().unwrap();
-    let dilithium_pk = request.dilithium_public_key.as_ref().unwrap();
+    let signature = request.signature.as_ref()
+        .ok_or_else(|| warp::reject::reject())?;
+    let public_key = request.public_key.as_ref()
+        .ok_or_else(|| warp::reject::reject())?;
+    let dilithium_sig = request.dilithium_signature.as_ref()
+        .ok_or_else(|| warp::reject::reject())?;
+    let dilithium_pk = request.dilithium_public_key.as_ref()
+        .ok_or_else(|| warp::reject::reject())?;
     
     // Build message to verify
     let message_to_sign = format!("contract_call:{}:{}:{}:{}", 
@@ -8877,7 +8898,7 @@ async fn handle_ws_connection(
         "type": "connected",
         "message": "WebSocket connected to QNet node",
         "subscribed_channels": channels.len(),
-        "timestamp": SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+        "timestamp": SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
     });
     
     if let Ok(welcome_str) = serde_json::to_string(&welcome) {
@@ -8982,7 +9003,7 @@ async fn handle_ws_connection_with_cleanup(
         "type": "connected",
         "message": "WebSocket connected to QNet node",
         "subscribed_channels": channels.len(),
-        "timestamp": SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+        "timestamp": SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
         "node_id": blockchain.get_public_display_name(),
         "rate_limit": {
             "max_per_ip": 5,

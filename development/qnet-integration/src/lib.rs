@@ -283,7 +283,7 @@ impl QNetBlockchain {
             transactions: vec![],
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_secs(),
             merkle_root: [0u8; 32],
             producer: "node1".to_string(),

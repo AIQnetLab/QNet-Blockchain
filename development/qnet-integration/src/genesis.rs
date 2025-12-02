@@ -26,7 +26,7 @@ impl Default for GenesisConfig {
                 // Other nodes will receive this timestamp via P2P
                 let real_time = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
+                    .unwrap_or_default()
                     .as_secs();
                 println!("[GENESIS] ⏰ Using real-time timestamp for Genesis: {}", real_time);
                 real_time

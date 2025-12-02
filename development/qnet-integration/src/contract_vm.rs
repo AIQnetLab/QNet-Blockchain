@@ -162,7 +162,7 @@ impl ContractVM {
             creation_height: 0, // Will be set by caller
             creation_timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_secs(),
             balance: 0,
         };
@@ -180,7 +180,7 @@ impl ContractVM {
         
         // Add to registry
         {
-            let mut registry = self.token_registry().write().unwrap();
+            let mut registry = match self.token_registry().write() { Ok(g) => g, Err(p) => p.into_inner() };
             registry.insert(contract_address.clone(), token.clone());
         }
         
@@ -224,7 +224,12 @@ impl ContractVM {
         let to_balance = self.storage.get_contract_state(contract_address, &to_balance_key)?
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(0);
-        let new_to_balance = to_balance + amount;
+        
+        // SECURITY: Use checked arithmetic to prevent overflow
+        let new_to_balance = to_balance.checked_add(amount)
+            .ok_or_else(|| IntegrationError::ValidationError(
+                format!("Balance overflow: {} + {} exceeds u64::MAX", to_balance, amount)
+            ))?;
         self.storage.save_contract_state(contract_address, &to_balance_key, &new_to_balance.to_string())?;
         
         gas_used += 5000; // Storage write cost
@@ -354,7 +359,7 @@ impl ContractVM {
     pub fn get_token_info(&self, contract_address: &str) -> IntegrationResult<Option<QRC20Token>> {
         // Check cache first
         {
-            let registry = self.token_registry().read().unwrap();
+            let registry = match self.token_registry().read() { Ok(g) => g, Err(p) => p.into_inner() };
             if let Some(token) = registry.get(contract_address) {
                 return Ok(Some(token.clone()));
             }
@@ -385,7 +390,7 @@ impl ContractVM {
         
         // Cache it
         {
-            let mut registry = self.token_registry().write().unwrap();
+            let mut registry = match self.token_registry().write() { Ok(g) => g, Err(p) => p.into_inner() };
             registry.insert(contract_address.to_string(), token.clone());
         }
         
@@ -528,7 +533,7 @@ impl ContractVM {
         hasher.update(symbol.as_bytes());
         hasher.update(&std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_nanos()
             .to_le_bytes());
         
@@ -587,17 +592,17 @@ impl TokenRegistry {
     }
     
     pub fn register_token(&self, token: QRC20Token) {
-        let mut tokens = self.tokens.write().unwrap();
+        let mut tokens = match self.tokens.write() { Ok(g) => g, Err(p) => p.into_inner() };
         tokens.insert(token.contract_address.clone(), token);
     }
     
     pub fn get_token(&self, address: &str) -> Option<QRC20Token> {
-        let tokens = self.tokens.read().unwrap();
+        let tokens = match self.tokens.read() { Ok(g) => g, Err(p) => p.into_inner() };
         tokens.get(address).cloned()
     }
     
     pub fn get_all_tokens(&self) -> Vec<QRC20Token> {
-        let tokens = self.tokens.read().unwrap();
+        let tokens = match self.tokens.read() { Ok(g) => g, Err(p) => p.into_inner() };
         tokens.values().cloned().collect()
     }
 }

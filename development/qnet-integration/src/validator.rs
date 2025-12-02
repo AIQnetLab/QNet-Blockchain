@@ -133,7 +133,7 @@ impl BlockValidator {
             return Err(IntegrationError::ValidationError("Invalid Ed25519 public key length (expected 32 bytes)".to_string()));
         }
         
-        let verifying_key = VerifyingKey::from_bytes(&pubkey_bytes.try_into().unwrap())
+        let verifying_key = VerifyingKey::from_bytes(&pubkey_bytes.try_into().expect("Length checked above"))
             .map_err(|e| IntegrationError::ValidationError(format!("Invalid Ed25519 public key: {}", e)))?;
         
         // Decode signature (64 bytes)
@@ -144,7 +144,7 @@ impl BlockValidator {
             return Err(IntegrationError::ValidationError("Invalid Ed25519 signature length (expected 64 bytes)".to_string()));
         }
         
-        let signature = Signature::from_bytes(&sig_bytes.try_into().unwrap());
+        let signature = Signature::from_bytes(&sig_bytes.try_into().expect("Length checked above"));
         
         // PRODUCTION: Create CLIENT signing message (without nonce/timestamp - client doesn't know them yet)
         // Client signs: "transfer:from:to:amount:gas_price:gas_limit"
@@ -235,7 +235,7 @@ impl BlockValidator {
                 }
                 *crypto_guard = Some(crypto);
             }
-            let crypto = crypto_guard.as_ref().unwrap();
+            let crypto = crypto_guard.as_ref().expect("Crypto initialized above");
             crypto.verify_dilithium_signature(&message_str, &dilithium_sig, &tx.from).await
         });
         

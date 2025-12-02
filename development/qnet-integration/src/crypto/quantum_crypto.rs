@@ -264,12 +264,12 @@ impl QNetQuantumCrypto {
             return Ok(ActivationPayload {
                 burn_tx: "genesis_bootstrap".to_string(),
                 node_type: "super".to_string(),
-                timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+                timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
                 wallet,  // Now matches get_wallet_address() format!
                 signature: DilithiumSignature {
                     signature: "genesis_bootstrap_signature".to_string(),
                     algorithm: "CRYSTALS-Dilithium3".to_string(),  // NIST FIPS 204
-                    timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+                    timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
                     strength: "quantum-resistant".to_string(),
                 },
                 entropy: "genesis_entropy".to_string(),
@@ -408,7 +408,7 @@ impl QNetQuantumCrypto {
         {
             let cache = SIGNATURE_CACHE.read().await;
             if let Some(cached_sig) = cache.get(&cache_key) {
-                let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
                 if current_time - cached_sig.cached_at < self.cache_ttl_seconds {
                     self.increment_zero_copy_ops();
                     return Ok(cached_sig.is_valid);
@@ -424,7 +424,7 @@ impl QNetQuantumCrypto {
             let mut cache = SIGNATURE_CACHE.write().await;
             cache.insert(cache_key, CachedSignature {
                 is_valid,
-                cached_at: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+                cached_at: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
                 signature_hash: signature.signature[..16].to_string(),
             });
         }
@@ -436,7 +436,7 @@ impl QNetQuantumCrypto {
     async fn get_from_cache(&self, activation_code: &str) -> Option<CachedActivationData> {
         let cache = CRYPTO_CACHE.read().await;
         if let Some(cached) = cache.get(activation_code) {
-            let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+            let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
             if current_time - cached.created_at < self.cache_ttl_seconds {
                 return Some(cached.clone());
             }
@@ -451,13 +451,13 @@ impl QNetQuantumCrypto {
         // Implement LRU eviction if cache is full
         if cache.len() >= self.max_cache_size {
             // Remove oldest entries
-            let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+            let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
             cache.retain(|_, v| current_time - v.created_at < self.cache_ttl_seconds / 2);
         }
         
         cache.insert(activation_code.to_string(), CachedActivationData {
             payload: payload.clone(),
-            created_at: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            created_at: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
             access_count: 1,
         });
     }
@@ -500,7 +500,7 @@ impl QNetQuantumCrypto {
 
     /// Get performance status (removed code verification - system always generates correct codes)
     pub fn get_status(&self) -> QuantumCryptoStatus {
-        let stats = self.performance_stats.read().unwrap();
+        let stats = match self.performance_stats.read() { Ok(g) => g, Err(p) => p.into_inner() };
         let zero_copy_ops = self.zero_copy_counter.load(std::sync::atomic::Ordering::Relaxed);
         
         let cache_hit_rate = if stats.total_operations > 0 {
@@ -882,7 +882,7 @@ impl QNetQuantumCrypto {
         use std::sync::Arc;
         
         // Check cache first (using existing TTL pattern)
-        let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         let cache_key = node_id.to_string();
         
         // Get or create cached key manager
@@ -987,7 +987,7 @@ impl QNetQuantumCrypto {
         Ok(DilithiumSignature {
             signature: consensus_signature,
             algorithm: "CRYSTALS-Dilithium3".to_string(),  // REAL algorithm name
-            timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
             strength: "quantum-resistant".to_string(),
         })
     }
@@ -1040,7 +1040,7 @@ impl QNetQuantumCrypto {
         // Route.ts compatible validation - less strict than old quantum payload
         let current_time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
 
         // Allow wider timestamp range for route.ts compatibility
@@ -1179,7 +1179,9 @@ impl QNetQuantumCrypto {
         }
 
         // First character is node type marker (L/F/S)
-        let node_type_char = segment1.chars().next().unwrap().to_uppercase().next().unwrap();
+        // SAFE: segment1 is checked for empty above
+        let first_char = segment1.chars().next().expect("Checked non-empty above");
+        let node_type_char = first_char.to_ascii_uppercase();
         
         let node_type = match node_type_char {
             'L' => "light",
@@ -1320,7 +1322,7 @@ impl QNetQuantumCrypto {
     async fn get_blockchain_phase_state(&self) -> Result<BlockchainPhaseState> {
         let current_timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
         
         // PRODUCTION: Get REAL data from global state (set by node sync process)

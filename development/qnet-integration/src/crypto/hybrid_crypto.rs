@@ -339,7 +339,7 @@ impl HybridCrypto {
             let _ = crypto.initialize().await;
             *crypto_guard = Some(crypto);
         }
-        let quantum_crypto = crypto_guard.as_ref().unwrap();
+        let quantum_crypto = crypto_guard.as_ref().expect("Crypto initialized above");
         
         let dilithium_sig = quantum_crypto
             .create_consensus_signature(&self.node_id, &encapsulated_hex)
@@ -465,7 +465,7 @@ impl HybridCrypto {
             crypto.initialize().await?;
             *crypto_guard = Some(crypto);
         }
-        let quantum_crypto = crypto_guard.as_ref().unwrap();
+        let quantum_crypto = crypto_guard.as_ref().expect("Crypto initialized above");
         
         // Sign encapsulated_data with Dilithium (signs the ephemeral key)
         let dilithium_key_sig = quantum_crypto.create_consensus_signature(&self.node_id, &encapsulated_hex).await
@@ -537,7 +537,7 @@ impl HybridCrypto {
             crypto.initialize().await?;
             *crypto_guard = Some(crypto);
         }
-        let quantum_crypto = crypto_guard.as_ref().unwrap();
+        let quantum_crypto = crypto_guard.as_ref().expect("Crypto initialized above");
         
         // Sign encapsulated_data with Dilithium (signs the ephemeral key)
         let dilithium_key_sig = quantum_crypto.create_consensus_signature(&self.node_id, &encapsulated_hex).await
@@ -574,8 +574,8 @@ impl HybridCrypto {
         };
         
         // Only update global cache (local cache references same instance)
-        CERTIFICATE_CACHE.write().unwrap().insert(cache_key.clone(), cached.clone());
-        self.certificate_cache.write().unwrap().insert(cache_key, cached);
+        match CERTIFICATE_CACHE.write() { Ok(g) => g, Err(p) => p.into_inner() }.insert(cache_key.clone(), cached.clone());
+        match self.certificate_cache.write() { Ok(g) => g, Err(p) => p.into_inner() }.insert(cache_key, cached);
     }
     
     /// Verify hybrid signature per NIST/Cisco ENCAPSULATED KEYS standard
@@ -598,7 +598,7 @@ impl HybridCrypto {
             signature.certificate.serial_number);
         
         // Try to get from cache
-        let cert_is_valid = if let Some(cached) = self.certificate_cache.read().unwrap().get(&cache_key) {
+        let cert_is_valid = if let Some(cached) = match self.certificate_cache.read() { Ok(g) => g, Err(p) => p.into_inner() }.get(&cache_key) {
             if cached.is_valid && now <= signature.certificate.expires_at {
                 println!("✅ Certificate verified from cache (O(1) performance)");
                 true // Certificate is valid from cache
@@ -628,7 +628,7 @@ impl HybridCrypto {
                 let _ = crypto.initialize().await;
                 *crypto_guard = Some(crypto);
             }
-            let quantum_crypto = crypto_guard.as_ref().unwrap();
+            let quantum_crypto = crypto_guard.as_ref().expect("Crypto initialized above");
             
             let dilithium_sig = crate::quantum_crypto::DilithiumSignature {
                 signature: signature.certificate.dilithium_signature.clone(),
@@ -644,7 +644,7 @@ impl HybridCrypto {
             if !cert_valid {
                 println!("❌ Invalid Dilithium signature on certificate");
                 // Cache negative result
-                self.certificate_cache.write().unwrap().insert(cache_key.clone(), CachedCertificate {
+                match self.certificate_cache.write() { Ok(g) => g, Err(p) => p.into_inner() }.insert(cache_key.clone(), CachedCertificate {
                     certificate: signature.certificate.clone(),
                     verified_at: now,
                     verification_count: 1,
@@ -655,7 +655,7 @@ impl HybridCrypto {
             
             // OPTIMIZATION: Cache valid certificate for O(1) future verifications
             println!("✅ Certificate verified and cached");
-            self.certificate_cache.write().unwrap().insert(cache_key, CachedCertificate {
+            match self.certificate_cache.write() { Ok(g) => g, Err(p) => p.into_inner() }.insert(cache_key, CachedCertificate {
                 certificate: signature.certificate.clone(),
                 verified_at: now,
                 verification_count: 1,
@@ -705,7 +705,7 @@ impl HybridCrypto {
             crypto.initialize().await?;
             *crypto_guard = Some(crypto);
         }
-        let quantum_crypto = crypto_guard.as_ref().unwrap();
+        let quantum_crypto = crypto_guard.as_ref().expect("Crypto initialized above");
         
         // Recreate the same message hash used for signing
         let mut hasher = Sha3_256::new();
@@ -782,7 +782,7 @@ impl HybridCrypto {
     
     /// Get cache statistics
     pub fn get_cache_stats() -> (usize, f64) {
-        let cache = CERTIFICATE_CACHE.read().unwrap();
+        let cache = match CERTIFICATE_CACHE.read() { Ok(g) => g, Err(p) => p.into_inner() };
         let size = cache.len();
         
         let total_verifications: u64 = cache.values()
@@ -805,7 +805,7 @@ impl HybridCrypto {
             .unwrap_or(Duration::from_secs(0))
             .as_secs();
         
-        let mut cache = CERTIFICATE_CACHE.write().unwrap();
+        let mut cache = match CERTIFICATE_CACHE.write() { Ok(g) => g, Err(p) => p.into_inner() };
         cache.retain(|_, cached| {
             cached.certificate.expires_at > now
         });
@@ -899,7 +899,7 @@ mod tests {
     fn test_certificate_expiration() {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
         
         // Valid certificate (expires in future)
@@ -932,7 +932,7 @@ mod tests {
     fn test_rotation_threshold() {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
         
         let hybrid = HybridCrypto::new("test_node".to_string());

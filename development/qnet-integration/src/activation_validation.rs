@@ -417,7 +417,7 @@ impl BlockchainActivationRegistry {
                 .map_err(|e| IntegrationError::CryptoError(format!("Quantum crypto init failed: {}", e)))?;
             *crypto_guard = Some(crypto);
         }
-        let quantum_crypto = crypto_guard.as_ref().unwrap();
+        let quantum_crypto = crypto_guard.as_ref().expect("Crypto initialized above");
             
         // SECURITY: NO FALLBACK ALLOWED - quantum decryption MUST work for security
         match quantum_crypto.decrypt_activation_code(code).await {
@@ -729,7 +729,7 @@ impl BlockchainActivationRegistry {
                     to_device: new_device_signature.to_string(),
                     migration_timestamp: SystemTime::now()
                         .duration_since(UNIX_EPOCH)
-                        .unwrap()
+                        .unwrap_or_default()
                         .as_secs(),
                     wallet_signature: self.generate_wallet_signature(wallet_address, code).await?,
                 };
@@ -775,7 +775,7 @@ impl BlockchainActivationRegistry {
         println!("🔍 Checking server migration rate from QNet blockchain...");
         
         // DECENTRALIZED: Use blockchain instead of local database
-        let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         let twenty_four_hours_ago = current_time - (24 * 60 * 60);
         
         // 1. Query QNet blockchain for migration history
@@ -1177,7 +1177,7 @@ impl BlockchainActivationRegistry {
         let last_sync = *self.last_sync.read().await;
         let current_time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
         
         current_time - last_sync > self.cache_ttl
@@ -1213,7 +1213,7 @@ impl BlockchainActivationRegistry {
                         activated_at: record.activated_at,
                         last_seen: SystemTime::now()
                             .duration_since(UNIX_EPOCH)
-                            .unwrap()
+                            .unwrap_or_default()
                             .as_secs(),
                         migration_count: record.device_migrations.len() as u32,
                         node_id: String::new(), // Will be populated from active network
@@ -1232,7 +1232,7 @@ impl BlockchainActivationRegistry {
             let mut last_sync = self.last_sync.write().await;
             *last_sync = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_secs();
         }
 
@@ -1708,7 +1708,7 @@ impl BlockchainActivationRegistry {
         // SECURITY: Unique nonce to prevent collision and replay attacks
         let nonce_data = format!("{}:{}:{}", record.wallet_address, record.activated_at, record.code_hash);
         let nonce_hash = blake3::hash(nonce_data.as_bytes());
-        let nonce = u64::from_le_bytes(nonce_hash.as_bytes()[0..8].try_into().unwrap());
+        let nonce = u64::from_le_bytes(nonce_hash.as_bytes()[0..8].try_into().expect("Blake3 hash is 32 bytes"));
         
         let transaction = Transaction {
             hash: tx_hash.clone(),
@@ -2005,7 +2005,7 @@ impl BlockchainActivationRegistry {
                 .map_err(|e| IntegrationError::CryptoError(format!("Quantum crypto init failed: {}", e)))?;
             *crypto_guard = Some(crypto);
         }
-        let quantum_crypto = crypto_guard.as_ref().unwrap();
+        let quantum_crypto = crypto_guard.as_ref().expect("Crypto initialized above");
         
         // Decrypt activation code to get payload with signature
         let payload = quantum_crypto.decrypt_activation_code(activation_code).await
@@ -2267,7 +2267,7 @@ impl BlockchainActivationRegistry {
                 .map_err(|e| IntegrationError::CryptoError(format!("Quantum crypto init failed: {}", e)))?;
             *crypto_guard = Some(crypto);
         }
-        let quantum_crypto = crypto_guard.as_ref().unwrap();
+        let quantum_crypto = crypto_guard.as_ref().expect("Crypto initialized above");
         
         // Decrypt payload to get wallet address
         let payload = quantum_crypto.decrypt_activation_code(activation_code).await
@@ -2297,7 +2297,7 @@ impl BlockchainActivationRegistry {
                 .map_err(|e| IntegrationError::CryptoError(format!("Quantum crypto init failed: {}", e)))?;
             *crypto_guard = Some(crypto);
         }
-        let quantum_crypto = crypto_guard.as_ref().unwrap();
+        let quantum_crypto = crypto_guard.as_ref().expect("Crypto initialized above");
         
         let payload = quantum_crypto.decrypt_activation_code(activation_code).await
             .map_err(|e| IntegrationError::CryptoError(format!("Decryption failed: {}", e)))?;

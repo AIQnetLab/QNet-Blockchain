@@ -150,7 +150,7 @@ impl ParallelExecutor {
                         amount: tx.amount,
                         timestamp: std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap()
+                            .unwrap_or_default()
                             .as_secs(),
                     };
                     self.shard_coordinator.process_cross_shard_tx(cross_tx).await

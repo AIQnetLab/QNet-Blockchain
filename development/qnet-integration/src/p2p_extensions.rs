@@ -31,7 +31,7 @@ impl super::unified_p2p::SimplifiedP2P {
             finalization_type: "emergency".to_string(),
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_secs(),
         };
         
@@ -64,7 +64,7 @@ impl super::unified_p2p::SimplifiedP2P {
             message: format!("CRITICAL: Single-node finalization at height {}", height),
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_secs(),
         };
         
