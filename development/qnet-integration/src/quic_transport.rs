@@ -303,27 +303,55 @@ impl QuicTransport {
                                 return;
                             }
                             
-                            // Check if we already have a connection to this node (by node_id, not just addr)
-                            // CRITICAL: Incoming connections have random source ports, so check by node_id!
-                            let mut existing_addr: Option<std::net::SocketAddr> = None;
+                            // CRITICAL FIX v2.19.24: Smart connection management
+                            // 
+                            // Architecture: Each node pair needs connections for BOTH directions:
+                            // - CLIENT conn (we initiated): we send, they receive via accept
+                            // - SERVER conn (they initiated): they send, we receive via accept
+                            // 
+                            // Rules:
+                            // 1. Accept incoming if we don't have SERVER conn from this node
+                            // 2. Replace SERVER conn if it's DEAD
+                            // 3. Keep our CLIENT conn separate (different peer_addr anyway)
+                            //
+                            // This prevents:
+                            // - Duplicate SERVER connections from same node
+                            // - Closing connections needed for receiving
+                            // - Memory leaks from dead connections
+                            
+                            let mut existing_server_addr: Option<std::net::SocketAddr> = None;
+                            let mut existing_server_alive = false;
+                            
                             for entry in connections_clone.iter() {
                                 if let Some(ref existing_node_id) = entry.value().remote_node_id {
                                     if existing_node_id == &remote_node_id {
-                                        if entry.value().connection.close_reason().is_none() {
-                                            println!("[QUIC] ⚠️ Already have LIVE connection to node {}, reusing existing", remote_node_id);
-                                            connection.close(quinn::VarInt::from_u32(0), b"duplicate");
-                                            return;
-                                        } else {
-                                            existing_addr = Some(*entry.key());
+                                        // Check if this is a SERVER connection (incoming)
+                                        // SERVER connections have random source port from client
+                                        // Our CLIENT connections use the known QUIC port
+                                        let entry_port = entry.key().port();
+                                        let is_server_conn = entry_port != crate::quic_transport::QUIC_PORT;
+                                        
+                                        if is_server_conn {
+                                            existing_server_addr = Some(*entry.key());
+                                            existing_server_alive = entry.value().connection.close_reason().is_none();
+                                            break;
                                         }
-                                        break;
                                     }
                                 }
                             }
-                            // Remove dead connection if found
-                            if let Some(addr) = existing_addr {
-                                println!("[QUIC] 🔄 Removing DEAD connection to node {} (addr: {})", remote_node_id, get_privacy_id_for_addr(&addr.to_string()));
-                                connections_clone.remove(&addr);
+                            
+                            // Handle existing SERVER connection
+                            if let Some(addr) = existing_server_addr {
+                                if existing_server_alive {
+                                    // Already have LIVE server connection - close this duplicate
+                                    println!("[QUIC] ⚠️ Already have LIVE SERVER connection from node {}, closing duplicate", remote_node_id);
+                                    connection.close(quinn::VarInt::from_u32(0), b"duplicate-server");
+                                    return;
+                                } else {
+                                    // Remove DEAD server connection
+                                    println!("[QUIC] 🔄 Replacing DEAD SERVER connection from node {}", remote_node_id);
+                                    connections_clone.remove(&addr);
+                                }
                             }
                             
                             // Store connection

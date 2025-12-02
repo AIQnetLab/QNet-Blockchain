@@ -3085,6 +3085,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "proptest-derive"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9cf16337405ca084e9c78985114633b6827711d22b9e6ef6c6c0d665eb3f0b6e"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 1.0.109",
+]
+
+[[package]]
 name = "protobuf"
 version = "2.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3305,6 +3316,8 @@ dependencies = [
  "pqcrypto-dilithium",
  "pqcrypto-traits",
  "prometheus",
+ "proptest",
+ "proptest-derive",
  "qnet-consensus",
  "qnet-core",
  "qnet-mempool",
