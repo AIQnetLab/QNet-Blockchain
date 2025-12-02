@@ -99,6 +99,7 @@ pub struct QuicConnection {
     pub connection: Connection,
     pub remote_node_id: Option<String>,
     pub remote_cert_serial: Option<String>,
+    pub remote_node_type: Option<String>,  // "super", "full", or "light" (lowercase)
     pub connected_at: Instant,
     pub last_activity: Instant,
     pub messages_sent: AtomicU64,
@@ -286,7 +287,7 @@ impl QuicTransport {
                                 &node_type_clone
                             ).await;
                             
-                            let (remote_node_id, remote_cert_serial) = match handshake_result {
+                            let (remote_node_id, remote_cert_serial, remote_node_type) = match handshake_result {
                                 Ok(h) => h,
                                 Err(e) => {
                                     println!("[QUIC] ❌ Handshake failed from {}: {}", get_privacy_id_for_addr(&peer_addr.to_string()), e);
@@ -359,6 +360,7 @@ impl QuicTransport {
                                 connection: connection.clone(),
                                 remote_node_id: Some(remote_node_id.clone()),
                                 remote_cert_serial: Some(remote_cert_serial),
+                                remote_node_type: Some(remote_node_type.clone()),
                                 connected_at: Instant::now(),
                                 last_activity: Instant::now(),
                                 messages_sent: AtomicU64::new(0),
@@ -368,7 +370,7 @@ impl QuicTransport {
                             });
                             
                             connections_clone.insert(peer_addr, quic_conn.clone());
-                            println!("[QUIC] 📦 Connection stored for {} (node: {})", get_privacy_id_for_addr(&peer_addr.to_string()), remote_node_id);
+                            println!("[QUIC] 📦 Connection stored for {} (node: {}, type: {})", get_privacy_id_for_addr(&peer_addr.to_string()), remote_node_id, remote_node_type);
                             
                             // Update stats
                             {
@@ -401,7 +403,7 @@ impl QuicTransport {
         our_node_id: &str,
         our_cert_serial: &str,
         our_node_type: &str,
-    ) -> Result<(String, String), String> {
+    ) -> Result<(String, String, String), String> {
         // Accept bidirectional stream for handshake
         let (mut send, mut recv) = conn.accept_bi().await
             .map_err(|e| format!("Accept stream failed: {}", e))?;
@@ -441,7 +443,7 @@ impl QuicTransport {
         send.write_all(&handshake_bytes).await.map_err(|e| format!("Write data failed: {}", e))?;
         send.finish().map_err(|e| format!("Finish failed: {}", e))?;
         
-        Ok((peer_handshake.node_id, peer_handshake.cert_serial))
+        Ok((peer_handshake.node_id, peer_handshake.cert_serial, peer_handshake.node_type))
     }
     
     /// Handle incoming streams from a connection
@@ -579,6 +581,8 @@ impl QuicTransport {
         // Call handler
         if let Some(ref h) = handler {
             h(peer_addr, msg);
+        } else {
+            println!("[QUIC] ❌ CRITICAL: handler is None! Message from {} lost!", get_privacy_id_for_addr(&peer_addr.to_string()));
         }
     }
     
@@ -683,7 +687,7 @@ impl QuicTransport {
             .map_err(|e| format!("Connection failed: {}", e))?;
         
         // Perform client handshake
-        let (remote_node_id, remote_cert_serial) = self.perform_client_handshake(&connection).await?;
+        let (remote_node_id, remote_cert_serial, remote_node_type) = self.perform_client_handshake(&connection).await?;
         
         // CRITICAL: Prevent self-connect
         if remote_node_id == self.node_id {
@@ -692,13 +696,14 @@ impl QuicTransport {
             return Err("Self-connect not allowed".to_string());
         }
         
-        println!("[QUIC] ✅ Connected to {} (node: {})", get_privacy_id_for_addr(&peer_addr.to_string()), remote_node_id);
+        println!("[QUIC] ✅ Connected to {} (node: {}, type: {})", get_privacy_id_for_addr(&peer_addr.to_string()), remote_node_id, remote_node_type);
         
         // Store connection
         let quic_conn = Arc::new(QuicConnection {
             connection,
             remote_node_id: Some(remote_node_id),
             remote_cert_serial: Some(remote_cert_serial),
+            remote_node_type: Some(remote_node_type),
             connected_at: Instant::now(),
             last_activity: Instant::now(),
             messages_sent: AtomicU64::new(0),
@@ -729,7 +734,7 @@ impl QuicTransport {
     }
     
     /// Perform client-side handshake
-    async fn perform_client_handshake(&self, conn: &Connection) -> Result<(String, String), String> {
+    async fn perform_client_handshake(&self, conn: &Connection) -> Result<(String, String, String), String> {
         // Our handshake
         let our_handshake = NodeHandshake {
             node_id: self.node_id.clone(),
@@ -770,7 +775,7 @@ impl QuicTransport {
         let peer_handshake: NodeHandshake = bincode::deserialize(&data)
             .map_err(|e| format!("Deserialize failed: {}", e))?;
         
-        Ok((peer_handshake.node_id, peer_handshake.cert_serial))
+        Ok((peer_handshake.node_id, peer_handshake.cert_serial, peer_handshake.node_type))
     }
     
     /// Send message to peer (request-response) with retry
@@ -926,14 +931,30 @@ impl QuicTransport {
         let mut stats = self.stats.read().await.clone();
         stats.active_connections = self.connections.len();
         
-        // Calculate average RTT
-        let total_rtt: u64 = self.connections.iter()
-            .map(|c| c.connection.rtt().as_millis() as u64)
-            .sum();
+        // Calculate average RTT and sum per-connection stats
+        let mut total_rtt: u64 = 0;
+        let mut total_sent: u64 = 0;
+        let mut total_recv: u64 = 0;
+        let mut total_bytes_sent: u64 = 0;
+        let mut total_bytes_recv: u64 = 0;
+        
+        for conn in self.connections.iter() {
+            total_rtt += conn.connection.rtt().as_millis() as u64;
+            total_sent += conn.messages_sent.load(Ordering::Relaxed);
+            total_recv += conn.messages_received.load(Ordering::Relaxed);
+            total_bytes_sent += conn.bytes_sent.load(Ordering::Relaxed);
+            total_bytes_recv += conn.bytes_received.load(Ordering::Relaxed);
+        }
         
         if !self.connections.is_empty() {
             stats.avg_rtt_ms = total_rtt / self.connections.len() as u64;
         }
+        
+        // Override with per-connection totals (global stats may be stale)
+        stats.messages_sent = total_sent;
+        stats.messages_received = total_recv;
+        stats.bytes_sent = total_bytes_sent;
+        stats.bytes_received = total_bytes_recv;
         
         stats
     }
@@ -969,6 +990,25 @@ impl QuicTransport {
     /// Get connection count
     pub fn connection_count(&self) -> usize {
         self.connections.len()
+    }
+    
+    /// Get list of connected peers (addr, node_id, node_type)
+    /// Returns ALL connected peers with their real node_type from QUIC handshake
+    pub fn get_connected_peers(&self) -> Vec<(SocketAddr, String, String)> {
+        self.connections.iter()
+            .filter_map(|entry| {
+                let addr = *entry.key();
+                if let Some(ref node_id) = entry.value().remote_node_id {
+                    // Use real node_type from handshake, fallback to "full" for safety
+                    // (Full nodes don't have Super privileges, safer default)
+                    let node_type = entry.value().remote_node_type.clone()
+                        .unwrap_or_else(|| "full".to_string());
+                    Some((addr, node_id.clone(), node_type))
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
     
     /// Stop server

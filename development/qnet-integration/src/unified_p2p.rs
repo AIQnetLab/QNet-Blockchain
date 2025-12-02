@@ -1215,8 +1215,13 @@ impl SimplifiedP2P {
             .parse()
             .map_err(|e| format!("Invalid QUIC bind address: {}", e))?;
         
-        let node_type_str = format!("{:?}", self.node_type);
-        let mut transport = QuicTransport::new(self.node_id.clone(), node_type_str, quic_port);
+        // UNIFIED: Use lowercase format consistent with ActiveNodeAnnouncement
+        let node_type_str = match self.node_type {
+            NodeType::Super => "super",
+            NodeType::Full => "full",
+            NodeType::Light => "light",
+        };
+        let mut transport = QuicTransport::new(self.node_id.clone(), node_type_str.to_string(), quic_port);
         
         // Initialize endpoint
         transport.init(bind_addr, cert_serial).await
@@ -5059,6 +5064,86 @@ impl SimplifiedP2P {
         }
     }
     
+    /// CRITICAL FIX v2.19.25: Create PeerInfo from QUIC connection when P2P registry not updated yet
+    /// Returns Some(PeerInfo) if peer is connected via QUIC, None otherwise
+    fn try_create_peer_from_quic(&self, node_id: &str, peer_addr: &str) -> Option<PeerInfo> {
+        if !self.quic_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
+        
+        let quic_transport = self.quic_transport.as_ref()?;
+        let transport = quic_transport.try_read().ok()?;
+        let quic_peers = transport.get_connected_peers();
+        
+        // Find peer and get their node_type from QUIC handshake
+        let quic_node_type = quic_peers.iter()
+            .find(|(_, id, _)| id == node_id)
+            .map(|(_, _, node_type)| node_type.clone())?;
+        
+        // Peer connected via QUIC! Get real values from config
+        let ip = peer_addr.split(':').next().unwrap_or("");
+        
+        use crate::genesis_constants::get_genesis_region_by_ip;
+        let region_str = get_genesis_region_by_ip(ip).unwrap_or("Europe");
+        let region = match region_str {
+            "NorthAmerica" => Region::NorthAmerica,
+            "Europe" => Region::Europe,
+            "Asia" => Region::Asia,
+            "SouthAmerica" => Region::SouthAmerica,
+            "Africa" => Region::Africa,
+            "Oceania" => Region::Oceania,
+            _ => Region::Europe,
+        };
+        
+        let reputation = self.get_node_reputation(node_id);
+        
+        // Use node_type from QUIC handshake (real value from remote node)
+        // UNIFIED: All node_type strings are lowercase ("super", "full", "light")
+        let node_type = match quic_node_type.as_str() {
+            "super" => NodeType::Super,
+            "full" => NodeType::Full,
+            "light" => NodeType::Light, // Light nodes won't be here, but handle for completeness
+            _ => {
+                // Fallback for legacy/unknown formats - try lowercase
+                match quic_node_type.to_lowercase().as_str() {
+                    "super" => NodeType::Super,
+                    "full" => NodeType::Full,
+                    "light" => NodeType::Light,
+                    _ => {
+                        // Genesis nodes are always Super
+                        if node_id.starts_with("genesis_node_") {
+                            NodeType::Super
+                        } else {
+                            NodeType::Full // Default for unknown types
+                        }
+                    }
+                }
+            }
+        };
+        
+        Some(PeerInfo {
+            id: node_id.to_string(),
+            addr: peer_addr.to_string(),
+            node_type,
+            region,
+            last_seen: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            is_stable: true,
+            latency_ms: 0,
+            connection_count: 1,
+            bandwidth_usage: 0,
+            node_id_hash: Vec::new(),
+            bucket_index: 0,
+            consensus_score: reputation,
+            network_score: 50.0,
+            reputation_score: Some(reputation),
+            successful_pings: 0,
+            failed_pings: 0,
+        })
+    }
+    
     /// CRITICAL: Verify all Genesis nodes are actually connected for bootstrap
     /// This prevents split brain during initial network formation
     /// 
@@ -5614,8 +5699,13 @@ impl SimplifiedP2P {
                                          node_id, active_info.reputation);
                                 genesis_peers.push(peer_info);
                             } else {
-                                // PRODUCTION: Peer not in P2P state = not connected yet
-                                println!("[P2P]   ├── {} (NOT CONNECTED - skipping)", node_id);
+                                // CRITICAL FIX v2.19.25: Check QUIC connections as last resort
+                                if let Some(peer_info) = self.try_create_peer_from_quic(&node_id, &peer_addr) {
+                                    println!("[P2P]   ├── {} (from QUIC, rep: {:.1}%)", node_id, peer_info.consensus_score);
+                                    genesis_peers.push(peer_info);
+                                } else {
+                                    println!("[P2P]   ├── {} (NOT CONNECTED - skipping)", node_id);
+                                }
                             }
                         }
                     }
@@ -5801,8 +5891,9 @@ impl SimplifiedP2P {
                     let mut genesis_peer_ids = std::collections::HashSet::new();
                     
                     println!("[P2P] 📋 Adding deterministic Genesis peers for consensus (regular node)");
-                    for (i, _ip) in genesis_ips.iter().enumerate() {
+                    for (i, ip) in genesis_ips.iter().enumerate() {
                         let node_id = format!("genesis_node_{:03}", i + 1);
+                        let peer_addr = format!("{}:8001", ip);
                         
                         // Always track Genesis peer IDs for deduplication
                         genesis_peer_ids.insert(node_id.clone());
@@ -5834,8 +5925,13 @@ impl SimplifiedP2P {
                                 all_validated_peers.push(real_peer);
                             }
                             None => {
-                                // PRODUCTION: Peer not in P2P state = not connected yet
-                                println!("[P2P]   ├── {} (NOT CONNECTED - skipping)", node_id);
+                                // CRITICAL FIX v2.19.25: Check QUIC connections as last resort
+                                if let Some(peer_info) = self.try_create_peer_from_quic(&node_id, &peer_addr) {
+                                    println!("[P2P]   ├── {} (from QUIC, rep: {:.1}%)", node_id, peer_info.consensus_score);
+                                    all_validated_peers.push(peer_info);
+                                } else {
+                                    println!("[P2P]   ├── {} (NOT CONNECTED - skipping)", node_id);
+                                }
                             }
                         }
                     }
