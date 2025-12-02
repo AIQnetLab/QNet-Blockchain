@@ -403,7 +403,7 @@ impl KademliaDht {
         let request_id = format!("{}:{}", node.addr, node.port);
         
         {
-            let mut pending = self.pending_requests.lock().unwrap();
+            let mut pending = match self.pending_requests.lock() { Ok(g) => g, Err(p) => p.into_inner() };
             pending.insert(request_id.clone(), tx);
         }
         
@@ -420,7 +420,7 @@ impl KademliaDht {
             Ok(Ok(KademliaRpc::FindNodeResponse { nodes, .. })) => Ok(nodes),
             _ => {
                 // Remove from pending requests on timeout/error
-                let mut pending = self.pending_requests.lock().unwrap();
+                let mut pending = match self.pending_requests.lock() { Ok(g) => g, Err(p) => p.into_inner() };
                 pending.remove(&request_id);
                 Err("Request timeout or error".into())
             }
@@ -461,7 +461,7 @@ impl KademliaDht {
         let request_id = format!("{}:{}", node.addr, node.port);
         
         {
-            let mut pending = self.pending_requests.lock().unwrap();
+            let mut pending = match self.pending_requests.lock() { Ok(g) => g, Err(p) => p.into_inner() };
             pending.insert(request_id.clone(), tx);
         }
         
@@ -477,7 +477,7 @@ impl KademliaDht {
         match response {
             Ok(Ok(KademliaRpc::StoreResponse { success: true, .. })) => Ok(()),
             _ => {
-                let mut pending = self.pending_requests.lock().unwrap();
+                let mut pending = match self.pending_requests.lock() { Ok(g) => g, Err(p) => p.into_inner() };
                 pending.remove(&request_id);
                 Err("Store request failed".into())
             }
@@ -537,7 +537,7 @@ impl KademliaDht {
         let request_id = format!("{}:{}", node.addr, node.port);
         
         {
-            let mut pending = self.pending_requests.lock().unwrap();
+            let mut pending = match self.pending_requests.lock() { Ok(g) => g, Err(p) => p.into_inner() };
             pending.insert(request_id.clone(), tx);
         }
         
@@ -553,7 +553,7 @@ impl KademliaDht {
             Ok(Ok(KademliaRpc::FindValueResponse { value: Some(data), .. })) => Ok(Some(data)),
             Ok(Ok(KademliaRpc::FindValueResponse { value: None, .. })) => Ok(None),
             _ => {
-                let mut pending = self.pending_requests.lock().unwrap();
+                let mut pending = match self.pending_requests.lock() { Ok(g) => g, Err(p) => p.into_inner() };
                 pending.remove(&request_id);
                 Err("Find value request failed".into())
             }
@@ -626,7 +626,7 @@ impl KademliaDht {
     
     /// Remove pending request
     async fn remove_pending_request(&self, request_id: &str) -> Option<tokio::sync::oneshot::Sender<KademliaRpc>> {
-        let mut pending = self.pending_requests.lock().unwrap();
+        let mut pending = match self.pending_requests.lock() { Ok(g) => g, Err(p) => p.into_inner() };
         pending.remove(request_id)
     }
     
@@ -809,6 +809,6 @@ impl TokenBucket {
 fn current_timestamp() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_millis() as u64
 } 

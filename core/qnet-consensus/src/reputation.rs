@@ -142,7 +142,7 @@ impl NodeReputation {
         if let Some(jail_status) = self.jailed_nodes.get(node_id) {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_secs();
             
             if now < jail_status.jailed_until {
@@ -380,7 +380,7 @@ impl NodeReputation {
         self.violation_history
             .entry(node_id.to_string())
             .or_insert_with(Vec::new)
-            .push((behavior.clone(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()));
+            .push((behavior.clone(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()));
         
         // CRITICAL: Check for instant max ban offenses
         let is_critical_attack = matches!(behavior, 
@@ -419,7 +419,7 @@ impl NodeReputation {
             };
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_secs()
                 .saturating_add(jail_hours * 3600)
         };
@@ -549,7 +549,7 @@ impl NodeReputation {
         if let Some(jail_status) = self.jailed_nodes.get(node_id) {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_secs();
             
             now < jail_status.jailed_until

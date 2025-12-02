@@ -240,7 +240,7 @@ impl SecureStorageEngine {
     ) -> Result<(), SecurityError> {
         let start_time = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
         
         // 1. Validate access permissions
@@ -292,7 +292,7 @@ impl SecureStorageEngine {
     ) -> Result<Option<Vec<u8>>, SecurityError> {
         let start_time = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
         
         // 1. Validate access permissions
@@ -379,7 +379,7 @@ impl SecureStorageEngine {
         
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
         
         DataChecksum {

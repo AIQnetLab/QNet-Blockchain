@@ -119,7 +119,7 @@ impl ShardCoordinator {
         // Calculate default shard with dynamic total (lock-free read)
         let total = self.total_shards.load(Ordering::Relaxed);
         let hash = blake3::hash(address.as_bytes());
-        let shard = u32::from_le_bytes(hash.as_bytes()[0..4].try_into().unwrap());
+        let shard = u32::from_le_bytes(hash.as_bytes()[0..4].try_into().expect("Blake3 hash is 32 bytes"));
         shard % total
     }
     
@@ -245,7 +245,7 @@ impl ShardCoordinator {
     pub fn track_account_activity(&self, address: &str, tx_size: u64) {
         let current_time = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
         
         let mut hot_account = self.hot_accounts.entry(address.to_string()).or_insert_with(|| {
@@ -304,7 +304,7 @@ impl ParallelValidator {
         let thread_pool = rayon::ThreadPoolBuilder::new()
             .num_threads(num_threads)
             .build()
-            .unwrap();
+            .expect("Failed to create thread pool");
             
         Self { thread_pool }
     }

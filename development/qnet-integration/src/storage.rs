@@ -4649,7 +4649,7 @@ impl Storage {
         
         // Verify hash
         let stored_hash = &snapshot_data[..32];
-        let size = u64::from_le_bytes(snapshot_data[32..40].try_into().unwrap()) as usize;
+        let size = u64::from_le_bytes(snapshot_data[32..40].try_into().expect("Snapshot size field must be 8 bytes")) as usize;
         let compressed_data = &snapshot_data[40..];
         
         use sha3::{Sha3_256, Digest};
@@ -4669,7 +4669,7 @@ impl Storage {
         let mut cursor = 0;
         
         // Check protocol version
-        let version = u32::from_le_bytes(decompressed[0..4].try_into().unwrap());
+        let version = u32::from_le_bytes(decompressed[0..4].try_into().expect("Version field must be 4 bytes"));
         cursor += 4;
         
         if version != crate::node::PROTOCOL_VERSION {
@@ -4688,12 +4688,12 @@ impl Storage {
         let mut account_count = 0;
         
         while cursor < decompressed.len() {
-            let key_len = u32::from_le_bytes(decompressed[cursor..cursor+4].try_into().unwrap()) as usize;
+            let key_len = u32::from_le_bytes(decompressed[cursor..cursor+4].try_into().expect("Key length field must be 4 bytes")) as usize;
             cursor += 4;
             let key = &decompressed[cursor..cursor+key_len];
             cursor += key_len;
             
-            let value_len = u32::from_le_bytes(decompressed[cursor..cursor+4].try_into().unwrap()) as usize;
+            let value_len = u32::from_le_bytes(decompressed[cursor..cursor+4].try_into().expect("Value length field must be 4 bytes")) as usize;
             cursor += 4;
             let value = &decompressed[cursor..cursor+value_len];
             cursor += value_len;

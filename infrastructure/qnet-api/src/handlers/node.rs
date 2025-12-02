@@ -88,7 +88,7 @@ pub async fn get_peers(
             peer_id: peer_id.clone(),
             address: format!("{}:9876", peer_id), // Default port, real address in P2P system
             version: "1.0.0".to_string(),
-            last_seen: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+            last_seen: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
             latency_ms: 50, // Estimated latency
         }
     }).collect();

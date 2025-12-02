@@ -27,25 +27,25 @@ lazy_static! {
     static ref POH_HASH_COUNT: Counter = register_counter!(
         "qnet_poh_hash_count_total",
         "Total number of PoH hashes computed"
-    ).unwrap();
+    ).expect("Failed to create POH_HASH_COUNT metric");
     
     /// PoH hashes per second
     static ref POH_HASH_RATE: Gauge = register_gauge!(
         "qnet_poh_hash_rate",
         "Current PoH hash rate per second"
-    ).unwrap();
+    ).expect("Failed to create POH_HASH_RATE metric");
     
     /// Current PoH slot
     static ref POH_CURRENT_SLOT: Gauge = register_gauge!(
         "qnet_poh_current_slot",
         "Current PoH slot number"
-    ).unwrap();
+    ).expect("Failed to create POH_CURRENT_SLOT metric");
     
     /// PoH checkpoint count
     static ref POH_CHECKPOINT_COUNT: Counter = register_counter!(
         "qnet_poh_checkpoint_count_total",
         "Total number of PoH checkpoints saved"
-    ).unwrap();
+    ).expect("Failed to create POH_CHECKPOINT_COUNT metric");
 }
 
 // ============================================================================

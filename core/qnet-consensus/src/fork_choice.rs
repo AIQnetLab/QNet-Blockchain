@@ -175,7 +175,7 @@ impl ForkChoice {
         // Time penalty for old blocks (reduced impact for tests)
         let current_time = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
         let age_penalty = if block.timestamp > 0 && current_time > block.timestamp {
             ((current_time - block.timestamp) as f64 / 3600.0).min(1.0) // Max 1.0 penalty, 1 hour scale

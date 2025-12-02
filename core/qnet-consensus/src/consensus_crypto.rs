@@ -193,7 +193,7 @@ async fn verify_compact_hybrid_signature(
                     return false;
                 }
                 
-                let ed25519_sig = ed25519_sig_bytes.unwrap();
+                let ed25519_sig = ed25519_sig_bytes.expect("Checked is_none above");
                 let ed25519_sig_len = ed25519_sig.len();  // Save length before ownership transfer
                 
                 // PRODUCTION: Real cryptographic verification with certificates
@@ -365,7 +365,7 @@ async fn verify_dilithium_signature(
         return false;
     }
     
-    let separator_pos = last_underscore_pos.unwrap();
+    let separator_pos = last_underscore_pos.expect("Checked is_none above");
     let extracted_node_id = &signature_part[..separator_pos];
     let signature_base64 = &signature_part[separator_pos + 1..];
     

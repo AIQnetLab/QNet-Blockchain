@@ -605,7 +605,7 @@ async fn interactive_node_setup() -> Result<(NodeType, String), Box<dyn std::err
     use std::io::Write;
     let activation_code = loop {
         print!("\n🔐 Activation Code: ");
-        std::io::stdout().flush().unwrap();
+        std::io::stdout().flush().expect("Failed to flush stdout");
         
         let mut input = String::new();
         match io::stdin().read_line(&mut input) {

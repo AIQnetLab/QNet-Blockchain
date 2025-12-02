@@ -31,7 +31,7 @@ fn bench_mempool_operations(c: &mut Criterion) {
                     10_000, // QNet TRANSFER gas limit
                     SystemTime::now()
                         .duration_since(UNIX_EPOCH)
-                        .unwrap()
+                        .unwrap_or_default()
                         .as_secs(),
                 );
                 

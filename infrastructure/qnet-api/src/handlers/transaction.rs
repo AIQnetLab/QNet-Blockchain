@@ -140,7 +140,7 @@ pub async fn submit_transaction(
         req.gas_limit,
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs(),
         Some(req.signature.clone()),
         tx_type,
@@ -207,7 +207,7 @@ pub async fn get_transaction(
             gas_price: tx.gas_price,
             gas_limit: tx.gas_limit,
             timestamp: tx.timestamp,
-            tx_type: serde_json::to_value(&tx.tx_type).unwrap(),
+            tx_type: serde_json::to_value(&tx.tx_type).expect("TxType must be serializable"),
         };
         return Ok(HttpResponse::Ok().json(response));
     }
@@ -222,7 +222,7 @@ pub async fn get_transaction(
                 gas_price: tx.gas_price,
                 gas_limit: tx.gas_limit,
                 timestamp: tx.timestamp,
-                tx_type: serde_json::to_value(&tx.tx_type).unwrap(),
+                tx_type: serde_json::to_value(&tx.tx_type).expect("TxType must be serializable"),
             };
             Ok(HttpResponse::Ok().json(response))
         },

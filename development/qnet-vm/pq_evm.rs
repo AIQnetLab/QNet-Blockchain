@@ -204,7 +204,10 @@ impl PostQuantumEVM {
             return Err("Invalid post-quantum signature".to_string());
         }
 
-        let mut state = self.state.lock().unwrap();
+        let mut state = match self.state.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
         
         // Check account nonce
         let sender_account = state.get_account(&tx.from);
@@ -283,7 +286,10 @@ impl PostQuantumEVM {
         let message = self.create_transaction_hash(tx);
         
         // Get sender's post-quantum public key
-        let state = self.state.lock().unwrap();
+        let state = match self.state.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
         let account = state.get_account(&tx.from);
         
         let pq_pk = account.pq_public_key.as_ref()

@@ -1238,9 +1238,13 @@ impl SimplifiedP2P {
                         println!("[QUIC] ⚠️ Failed to queue message from {}: {}", peer_str, e);
                     }
                 } else {
-                    // Channel not set yet - this can happen during startup
-                    // Messages will be processed once channel is established
+                    // Channel not set yet - this is a CRITICAL startup race condition!
+                    // Log this as it means messages are being lost
+                    println!("[QUIC] ⚠️ Message from {} dropped - channel not initialized yet!", peer_str);
                 }
+            } else {
+                // Mutex poisoned - log error
+                println!("[QUIC] ❌ Failed to acquire quic_message_tx lock - message dropped!");
             }
         });
         
@@ -2290,6 +2294,12 @@ impl SimplifiedP2P {
         connected_peers: Arc<RwLock<HashMap<String, PeerInfo>>>,
         connected_peer_addrs: Arc<RwLock<HashSet<String>>>
     ) -> bool {
+        // CRITICAL: Prevent self-connection
+        if peer_info.id == node_id {
+            println!("[P2P] 🚫 add_peer_safe_static: Rejecting self-connection by node_id {}", node_id);
+            return false;
+        }
+        
         // First check if peer address already exists
         {
             let peer_addrs = match connected_peer_addrs.read() {
@@ -2378,16 +2388,38 @@ impl SimplifiedP2P {
             return;
         }
         
-        println!("[P2P] Connecting to {} bootstrap peers", peers.len());
+        // CRITICAL FIX: Get our own IP to filter out self-connections
+        let our_ip = match self.external_ip.read() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        
+        println!("[P2P] Connecting to {} bootstrap peers (filtering self: {:?})", peers.len(), our_ip);
         
         let mut successful_parses = 0;
+        let mut skipped_self = 0;
         for peer_addr in peers {
-            println!("[P2P] 🔍 DEBUG: Parsing peer address: {}", peer_addr);
+            // CRITICAL: Skip our own address to prevent self-connect loops
+            let peer_ip = peer_addr.split(':').next().unwrap_or("");
+            if let Some(ref own_ip) = our_ip {
+                if peer_ip == own_ip {
+                    println!("[P2P] 🚫 Skipping self-address: {}", get_privacy_id_for_addr(peer_addr));
+                    skipped_self += 1;
+                    continue;
+                }
+            }
+            
             match self.parse_peer_address(peer_addr) {
                 Ok(peer_info) => {
+                    // Also check by node_id
+                    if peer_info.id == self.node_id {
+                        println!("[P2P] 🚫 Skipping self by node_id: {}", peer_info.id);
+                        skipped_self += 1;
+                        continue;
+                    }
                     // PRIVACY: Use pseudonym in logs
                     println!("[P2P] ✅ Successfully parsed peer: {} ({})", get_privacy_id_for_addr(peer_addr), region_string(&peer_info.region));
-                self.add_peer_to_region(peer_info);
+                    self.add_peer_to_region(peer_info);
                     successful_parses += 1;
                 }
                 Err(e) => {
@@ -2397,7 +2429,8 @@ impl SimplifiedP2P {
             }
         }
         
-        println!("[P2P] 📊 Successfully parsed {}/{} bootstrap peers", successful_parses, peers.len());
+        println!("[P2P] 📊 Successfully parsed {}/{} bootstrap peers (skipped {} self)", 
+                 successful_parses, peers.len(), skipped_self);
         
         // STARTUP FIX: Establish connections asynchronously to prevent blocking startup
         self.start_regional_connection_establishment();
@@ -3435,11 +3468,29 @@ impl SimplifiedP2P {
                     .cloned()
                     .collect();
                 
+                // CRITICAL: Get our IP to skip self-broadcasts
+                let our_ip = match self.external_ip.read() {
+                    Ok(guard) => guard.clone(),
+                    Err(p) => p.into_inner().clone(),
+                };
+                
                 // Broadcast via QUIC to each peer (parallel, binary)
                 let mut results: Vec<crate::p2p_transport::BroadcastResult> = Vec::new();
                 for peer in &filtered_peers {
+                    // Skip self
+                    if peer.id == self.node_id {
+                        continue;
+                    }
+                    
                     let parts: Vec<&str> = peer.addr.split(':').collect();
                     if parts.len() != 2 { continue; }
+                    
+                    // Skip our own IP
+                    if let Some(ref own_ip) = our_ip {
+                        if parts[0] == own_ip {
+                            continue;
+                        }
+                    }
                     
                     if let (Ok(ip), Ok(port)) = (parts[0].parse::<std::net::IpAddr>(), parts[1].parse::<u16>()) {
                         let quic_port = port.saturating_add(QUIC_PORT_OFFSET);
@@ -3699,7 +3750,13 @@ impl SimplifiedP2P {
                 let mut success_count = 0;
                 let transport = quic_transport.read().await;
                 
+                let mut fail_count = 0;
                 for (peer, msg) in peers_for_broadcast.iter().zip(messages.iter()) {
+                    // CRITICAL: Skip self to prevent self-broadcast loops
+                    if peer.id == self.node_id {
+                        continue;
+                    }
+                    
                     let ip: std::net::IpAddr = match peer.addr.split(':').next().and_then(|s| s.parse().ok()) {
                         Some(ip) => ip,
                         None => continue,
@@ -3712,8 +3769,16 @@ impl SimplifiedP2P {
                     let quic_addr = std::net::SocketAddr::new(ip, port.saturating_add(crate::p2p_transport::QUIC_PORT_OFFSET));
                     // CRITICAL FIX: Use broadcast_to (uni stream) not send_message (bi stream)
                     // Message handler only listens on uni streams via accept_uni()
-                    if transport.broadcast_to(quic_addr, msg).await.is_ok() {
-                        success_count += 1;
+                    match transport.broadcast_to(quic_addr, msg).await {
+                        Ok(_) => success_count += 1,
+                        Err(e) => {
+                            fail_count += 1;
+                            // Log first 3 failures for debugging
+                            if fail_count <= 3 {
+                                println!("[SHRED_PROTOCOL] ⚠️ Broadcast failed to {}: {}", 
+                                    get_privacy_id_for_addr(&peer.addr), e);
+                            }
+                        }
                     }
                 }
                 
@@ -3883,8 +3948,32 @@ impl SimplifiedP2P {
         let routing_tree = self.build_shred_protocol_routing_tree(&validated_peers);
         let shred_protocol_fanout = self.get_shred_protocol_fanout();
         
+        // Get our external IP for additional self-check
+        let our_ip = match self.external_ip.read() {
+            Ok(guard) => guard.clone(),
+            Err(p) => p.into_inner().clone(),
+        };
+        let our_node_id = self.node_id.clone();
+        
         let forward_targets: Vec<_> = routing_tree.iter()
-            .filter(|p| p.addr != original_sender)
+            .filter(|p| {
+                // Exclude original sender
+                if p.addr == original_sender {
+                    return false;
+                }
+                // CRITICAL: Exclude self by node_id (primary check)
+                if p.id == our_node_id {
+                    return false;
+                }
+                // CRITICAL: Exclude self by IP (secondary check)
+                if let Some(ref own_ip) = our_ip {
+                    let peer_ip = p.addr.split(':').next().unwrap_or("");
+                    if peer_ip == own_ip {
+                        return false;
+                    }
+                }
+                true
+            })
             .take(shred_protocol_fanout)
             .cloned()
             .collect();

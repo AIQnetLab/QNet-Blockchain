@@ -13,35 +13,35 @@ lazy_static! {
         "qnet_consensus_rounds_total",
         "Total number of consensus rounds",
         &["status"]
-    ).unwrap();
+    ).expect("Failed to create CONSENSUS_ROUNDS metric");
     
     /// Counter for commits
     pub static ref CONSENSUS_COMMITS: CounterVec = register_counter_vec!(
         "qnet_consensus_commits_total",
         "Total number of commits received",
         &["result"]
-    ).unwrap();
+    ).expect("Failed to create CONSENSUS_COMMITS metric");
     
     /// Counter for reveals
     pub static ref CONSENSUS_REVEALS: CounterVec = register_counter_vec!(
         "qnet_consensus_reveals_total",
         "Total number of reveals received",
         &["result"]
-    ).unwrap();
+    ).expect("Failed to create CONSENSUS_REVEALS metric");
     
     /// Gauge for current difficulty
     pub static ref CONSENSUS_DIFFICULTY: GaugeVec = register_gauge_vec!(
         "qnet_consensus_difficulty",
         "Current consensus difficulty",
         &["type"]
-    ).unwrap();
+    ).expect("Failed to create CONSENSUS_DIFFICULTY metric");
     
     /// Gauge for active participants
     pub static ref CONSENSUS_PARTICIPANTS: GaugeVec = register_gauge_vec!(
         "qnet_consensus_participants",
         "Number of active participants",
         &["phase"]
-    ).unwrap();
+    ).expect("Failed to create CONSENSUS_PARTICIPANTS metric");
     
     /// Histogram for round duration
     pub static ref CONSENSUS_ROUND_DURATION: HistogramVec = register_histogram_vec!(
@@ -49,7 +49,7 @@ lazy_static! {
         "Duration of consensus rounds",
         &["phase"],
         vec![10.0, 20.0, 30.0, 45.0, 60.0, 90.0, 120.0, 180.0]
-    ).unwrap();
+    ).expect("Failed to create CONSENSUS_ROUND_DURATION metric");
     
     /// Histogram for reputation scores
     pub static ref NODE_REPUTATION_SCORE: HistogramVec = register_histogram_vec!(
@@ -57,14 +57,14 @@ lazy_static! {
         "Distribution of node reputation scores",
         &["category"],
         vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
-    ).unwrap();
+    ).expect("Failed to create NODE_REPUTATION_SCORE metric");
     
     /// Counter for reputation updates
     pub static ref REPUTATION_UPDATES: CounterVec = register_counter_vec!(
         "qnet_reputation_updates_total",
         "Total number of reputation updates",
         &["type"]
-    ).unwrap();
+    ).expect("Failed to create REPUTATION_UPDATES metric");
 }
 
 /// Metrics data

@@ -284,7 +284,7 @@ impl MevProtectedMempool {
         
         println!("[MEV] ✅ Bundle accepted: {} ({} TXs, {:.1}% reputation, {} gas)", 
                  bundle_id, 
-                 self.bundles.get(&bundle_id).unwrap().transactions.len(),
+                 self.bundles.get(&bundle_id).expect("Just inserted above").transactions.len(),
                  submitter_reputation,
                  total_gas);
         

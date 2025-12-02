@@ -211,7 +211,7 @@ impl QuicTransport {
         let mut transport = quinn::TransportConfig::default();
         transport.max_concurrent_bidi_streams(VarInt::from_u32(MAX_STREAMS_PER_CONN));
         transport.max_concurrent_uni_streams(VarInt::from_u32(MAX_STREAMS_PER_CONN));
-        transport.max_idle_timeout(Some(Duration::from_secs(IDLE_TIMEOUT_SECS).try_into().unwrap()));
+        transport.max_idle_timeout(Some(Duration::from_secs(IDLE_TIMEOUT_SECS).try_into().expect("Idle timeout must fit in IdleTimeout")));
         transport.keep_alive_interval(Some(Duration::from_secs(KEEP_ALIVE_SECS)));
         server_config.transport_config(Arc::new(transport));
         
@@ -638,7 +638,7 @@ impl QuicTransport {
         let mut transport = quinn::TransportConfig::default();
         transport.max_concurrent_bidi_streams(VarInt::from_u32(MAX_STREAMS_PER_CONN));
         transport.max_concurrent_uni_streams(VarInt::from_u32(MAX_STREAMS_PER_CONN)); // CRITICAL: Allow incoming uni streams!
-        transport.max_idle_timeout(Some(Duration::from_secs(IDLE_TIMEOUT_SECS).try_into().unwrap()));
+        transport.max_idle_timeout(Some(Duration::from_secs(IDLE_TIMEOUT_SECS).try_into().expect("Idle timeout must fit in IdleTimeout")));
         transport.keep_alive_interval(Some(Duration::from_secs(KEEP_ALIVE_SECS)));
         client_config.transport_config(Arc::new(transport));
         

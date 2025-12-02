@@ -26,7 +26,7 @@ pub struct TxPriority {
 impl TxPriority {
     /// Create new priority info
     pub fn new(tx: &Transaction, is_priority: bool) -> Self {
-        let size = bincode::serialize(tx).unwrap().len();
+        let size = bincode::serialize(tx).expect("Transaction must be serializable").len();
         let mut priority = Self {
             gas_price: tx.gas_price,
             timestamp: Instant::now(),
