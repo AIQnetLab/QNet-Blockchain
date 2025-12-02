@@ -939,14 +939,15 @@ QNet uses **TWO DIFFERENT** cryptographic systems for different purposes:
 | **Macroblock Signatures** | Key Manager (persistent) | Macroblock finalization | Dilithium-seeded SHA3-512 |
 | **MEV Bundle Signatures** | Real Dilithium3 | Private bundle authentication | Node's persistent Dilithium key |
 | **Client Transactions** | Ed25519-only | User transactions (wallet) | User's Ed25519 key |
-| **Producer Selection** | Finality Window | Deterministic selection | SHA3-512 hash (no keys) |
+| **Producer Selection** | Deterministic SHA3-512 | Quantum-resistant leader election | Hash of finality block + round |
+| **Emergency Producer** | Deterministic SHA3-512 | Failover leader election | Hash of entropy + height |
 
 **Critical distinction:**
-- **Ephemeral keys (hybrid_crypto.rs)**: Only for Byzantine consensus messages (commit/reveal)
+- **Ephemeral keys (hybrid_crypto.rs)**: For Byzantine consensus messages (commit/reveal)
 - **Persistent keys (key_manager.rs)**: For all block signatures (micro + macro)
 - **MEV bundles (mev_protection.rs)**: Signed with node's persistent Dilithium key (80%+ reputation required)
 - **Client transactions**: Ed25519-only for fast mobile/browser operations
-- **No VRF keys**: Producer selection uses Finality Window (deterministic SHA3-512)
+- **Deterministic Selection**: Producer selection uses SHA3-512 for identical results on all nodes (no forks)
 
 ---
 
@@ -1579,13 +1580,15 @@ development/qnet-integration/src/
 ├── hybrid_crypto.rs          # Consensus commit/reveal signatures (NIST/Cisco ephemeral)
 ├── key_manager.rs            # Persistent block signatures (SHA3-512 + Dilithium)
 ├── quantum_crypto.rs         # Core crypto operations & Dilithium management
-└── vrf_hybrid.rs             # VRF utilities (not used for producer selection)
+├── vrf_hybrid.rs             # Hybrid VRF (used for block signing proof, NOT selection)
+└── vrf.rs                    # Legacy VRF (deprecated)
 
 core/qnet-consensus/src/
 └── consensus_crypto.rs       # Signature verification for consensus messages
 
-Note: Producer selection now uses Finality Window with deterministic SHA3-512 hashing,
-      not VRF. Entropy comes from Dilithium-signed finalized blocks.
+Note: Producer SELECTION uses DETERMINISTIC SHA3-512 (identical on all nodes, no forks).
+      This provides verifiable selection: SHA3(finality_block + round + sorted_candidates).
+      Block SIGNATURES use Hybrid crypto (Dilithium signs ephemeral Ed25519 per NIST/Cisco).
 ```
 
 ### 6.2 Dependencies

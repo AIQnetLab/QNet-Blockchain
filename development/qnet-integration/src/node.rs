@@ -7595,58 +7595,64 @@ impl BlockchainNode {
             // 3. Round number and candidate list
             // This provides quantum resistance WITHOUT requiring per-node VRF keys
             
-            // PRODUCTION: Use TRUE Hybrid VRF for quantum-resistant producer selection
-            // Hybrid VRF = Dilithium certificate + Ed25519 ephemeral keys per NIST/Cisco
-            // This provides VERIFIABLE randomness with cryptographic proof!
+            // ═══════════════════════════════════════════════════════════════════════════
+            // PRODUCTION: DETERMINISTIC SHA3 PRODUCER SELECTION (NIST/Cisco Compliant)
+            // ═══════════════════════════════════════════════════════════════════════════
+            // 
+            // ARCHITECTURE (Ian Smith approved):
+            //   1. SELECTION: Deterministic SHA3-512 (quantum-resistant, identical for all nodes)
+            //   2. BLOCK SIGNING: Hybrid signature (Dilithium signs ephemeral Ed25519 per message)
+            //   3. VERIFICATION: Any node can verify selection via: SHA3(entropy + round + candidates)
+            //
+            // WHY NOT VRF FOR SELECTION:
+            //   - VRF requires per-node secret key → different outputs → FORKS!
+            //   - Deterministic hash gives SAME result on ALL nodes → NO FORKS
+            //   - Quantum resistance via SHA3-512 (2^128 quantum security)
+            //
+            // QUANTUM SAFETY:
+            //   - SHA3-512: NIST approved, Grover's algorithm gives 2^128 security
+            //   - Block signatures: Dilithium3 (NIST FIPS 204, Level 3)
+            //   - Ephemeral keys: New Ed25519 keypair for EACH message (per NIST/Cisco)
+            // ═══════════════════════════════════════════════════════════════════════════
             
             let selected_producer = if candidates.len() == 1 {
-                // Optimization: Single candidate - no VRF needed
+                // Optimization: Single candidate - no selection needed
                 println!("[PRODUCER] ✅ Single candidate: {}", candidates[0].0);
                 candidates[0].0.clone()
             } else {
-                // QUANTUM-RESISTANT VRF SELECTION using Hybrid VRF (Dilithium + Ed25519)
-                // CRITICAL: This is TRUE VRF with cryptographic proof, not just a hash!
-                use crate::crypto::vrf_hybrid::select_producer_with_hybrid_vrf;
+                // DETERMINISTIC QUANTUM-RESISTANT SELECTION using SHA3-512
+                // All nodes compute IDENTICAL result → consensus without forks
+                use sha3::{Sha3_512, Digest};
+                let mut selector = Sha3_512::new();
                 
-                match select_producer_with_hybrid_vrf(
-                    leadership_round,
-                    &candidates,
-                    own_node_id,
-                    &vrf_entropy,
-                ).await {
-                    Ok((producer, vrf_output)) => {
-                        // SUCCESS: Hybrid VRF with Dilithium proof
-                        println!("[HYBRID-VRF] 🎲 Producer selected: {} (round {})", producer, leadership_round);
-                        println!("[HYBRID-VRF] 🔐 Certificate: {}", vrf_output.proof.certificate.serial_number);
-                        println!("[HYBRID-VRF] ✅ Dilithium-signed ephemeral proof (NIST FIPS 204)");
-                        producer
-                    }
-                    Err(e) => {
-                        // FALLBACK: Use deterministic SHA3 if VRF fails (should not happen in production)
-                        println!("[HYBRID-VRF] ⚠️ Hybrid VRF failed: {}, using deterministic fallback", e);
-                        
-                        use sha3::{Sha3_512, Digest};
-                        let mut selector = Sha3_512::new();
-                        selector.update(b"QNet_Quantum_Producer_Selection_v5_Fallback");
-                        selector.update(&vrf_entropy);
-                        selector.update(&leadership_round.to_le_bytes());
-                        selector.update(&current_height.to_le_bytes());
-                        
-                        let selection_hash = selector.finalize();
-                        let selection_value = u64::from_le_bytes([
-                            selection_hash[0], selection_hash[1], selection_hash[2], selection_hash[3],
-                            selection_hash[4], selection_hash[5], selection_hash[6], selection_hash[7],
-                        ]);
-                        
-                        let selection_index = (selection_value as usize) % candidates.len();
-                        let winner = &candidates[selection_index];
-                        
-                        println!("[PRODUCER] 🏆 Fallback selected: {} (index {}/{})", 
-                                 winner.0, selection_index + 1, candidates.len());
-                        
-                        winner.0.clone()
-                    }
+                // Entropy components (ALL deterministic across nodes):
+                selector.update(b"QNet_Deterministic_Producer_Selection_v6");
+                selector.update(&vrf_entropy);  // From finality window block (Dilithium-signed!)
+                selector.update(&leadership_round.to_le_bytes());
+                
+                // Include sorted candidate list for additional entropy
+                for (candidate_id, _) in &candidates {
+                    selector.update(candidate_id.as_bytes());
                 }
+                
+                let selection_hash = selector.finalize();
+                let selection_value = u64::from_le_bytes([
+                    selection_hash[0], selection_hash[1], selection_hash[2], selection_hash[3],
+                    selection_hash[4], selection_hash[5], selection_hash[6], selection_hash[7],
+                ]);
+                
+                let selection_index = (selection_value as usize) % candidates.len();
+                let winner = &candidates[selection_index];
+                
+                // Log at rotation boundaries only (performance)
+                if current_height > 0 && ((current_height - 1) % 30 == 0 || current_height == 1) {
+                    println!("[PRODUCER] 🎲 Deterministic selection: {} (round {}, index {}/{})", 
+                             winner.0, leadership_round, selection_index + 1, candidates.len());
+                    println!("[PRODUCER] 🔐 Entropy source: Dilithium-signed finality block");
+                    println!("[PRODUCER] ✅ SHA3-512 quantum-resistant (2^128 security)");
+                }
+                
+                winner.0.clone()
             };
             
             
@@ -8087,44 +8093,35 @@ impl BlockchainNode {
                 entropy
             };
             
-            // Use Hybrid VRF for quantum-resistant selection
-            use crate::crypto::vrf_hybrid::select_producer_with_hybrid_vrf;
+            // ═══════════════════════════════════════════════════════════════════════════
+            // EMERGENCY: DETERMINISTIC SHA3 SELECTION (Same as normal selection)
+            // ═══════════════════════════════════════════════════════════════════════════
+            // All nodes compute IDENTICAL result → no forks during emergency
+            // Quantum-resistant via SHA3-512 (2^128 security)
+            // ═══════════════════════════════════════════════════════════════════════════
             
-            let emergency_producer = match select_producer_with_hybrid_vrf(
-                current_height,  // Use height as round for emergency
-                &sorted_candidates,
-                own_node_id,
-                &emergency_entropy,
-            ).await {
-                Ok((producer, vrf_output)) => {
-                    // SUCCESS: Hybrid VRF with Dilithium proof
-                    println!("[EMERGENCY-VRF] 🎲 Emergency producer selected: {}", producer);
-                    println!("[EMERGENCY-VRF] 🔐 Certificate: {}", vrf_output.proof.certificate.serial_number);
-                    println!("[EMERGENCY-VRF] ✅ Dilithium-signed proof (NIST FIPS 204)");
-                    producer
-                }
-                Err(e) => {
-                    // FALLBACK: Use deterministic SHA3 if VRF fails
-                    println!("[EMERGENCY-VRF] ⚠️ Hybrid VRF failed: {}, using deterministic fallback", e);
-                    
-                    use sha3::{Sha3_512, Digest};
-                    let mut selector = Sha3_512::new();
-                    selector.update(b"EMERGENCY_FALLBACK_V6");
-                    selector.update(&emergency_entropy);
-                    selector.update(&current_height.to_le_bytes());
-                    
-                    let selection_hash = selector.finalize();
-                    let selection_value = u64::from_le_bytes([
-                        selection_hash[0], selection_hash[1], selection_hash[2], selection_hash[3],
-                        selection_hash[4], selection_hash[5], selection_hash[6], selection_hash[7],
-                    ]);
-                    
-                    let selection_index = (selection_value as usize) % sorted_candidates.len();
-                    sorted_candidates[selection_index].0.clone()
-                }
-            };
+            use sha3::{Sha3_512, Digest};
+            let mut selector = Sha3_512::new();
+            selector.update(b"QNet_Emergency_Producer_Selection_v6");
+            selector.update(&emergency_entropy);
+            selector.update(&current_height.to_le_bytes());
             
-            println!("[FAILOVER] 🆘 Emergency producer: {} (Hybrid VRF selection)", emergency_producer);
+            // Include sorted candidate list for determinism
+            for (candidate_id, _) in &sorted_candidates {
+                selector.update(candidate_id.as_bytes());
+            }
+            
+            let selection_hash = selector.finalize();
+            let selection_value = u64::from_le_bytes([
+                selection_hash[0], selection_hash[1], selection_hash[2], selection_hash[3],
+                selection_hash[4], selection_hash[5], selection_hash[6], selection_hash[7],
+            ]);
+            
+            let selection_index = (selection_value as usize) % sorted_candidates.len();
+            let emergency_producer = sorted_candidates[selection_index].0.clone();
+            
+            println!("[FAILOVER] 🆘 Emergency producer: {} (deterministic SHA3)", emergency_producer);
+            println!("[FAILOVER] 🔐 Quantum-resistant selection (SHA3-512)");
             
             // Save failover event to storage for monitoring
             if let Some(ref storage) = storage {
