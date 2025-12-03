@@ -3756,19 +3756,44 @@ impl BlockchainNode {
                     let bootstrap_id = std::env::var("QNET_BOOTSTRAP_ID").unwrap_or_default();
                     let is_genesis_creator = bootstrap_id == "001";
                     
+                    // CRITICAL: Track when ALL peers connected for stabilization timing
+                    // stabilization_time counts from when peers connected, NOT from startup
+                    static PEERS_CONNECTED: std::sync::atomic::AtomicBool = 
+                        std::sync::atomic::AtomicBool::new(false);
+                    static STABILIZATION_START: std::sync::atomic::AtomicU64 = 
+                        std::sync::atomic::AtomicU64::new(0);
+                    
+                    // CRITICAL: Mark when peers first connected (for stabilization timing)
+                    // This should happen when has_enough_peers is true, BEFORE checking Genesis
+                    if has_enough_peers && !PEERS_CONNECTED.load(std::sync::atomic::Ordering::Relaxed) {
+                        PEERS_CONNECTED.store(true, std::sync::atomic::Ordering::Relaxed);
+                        STABILIZATION_START.store(wait_time, std::sync::atomic::Ordering::Relaxed);
+                        println!("[Node] ✅ All {} peers connected at {}s - starting stabilization timer", 
+                                 real_peer_count, wait_time);
+                    }
+                    
+                    // Calculate stabilization time from when peers connected
+                    let stabilization_start = STABILIZATION_START.load(std::sync::atomic::Ordering::Relaxed);
+                    let stabilization_time = if PEERS_CONNECTED.load(std::sync::atomic::Ordering::Relaxed) {
+                        wait_time.saturating_sub(stabilization_start)
+                    } else {
+                        0 // Peers not connected yet
+                    };
+                    
                     // CRITICAL: ALL nodes (except 001) MUST have Genesis block before starting
                     // Node 001 creates Genesis, all others must receive it
                     let ready_to_start = has_enough_peers && (has_genesis || is_genesis_creator);
                     
                     if ready_to_start {
+                        
                         if !has_genesis {
                             if is_genesis_creator {
                                 // Node 001: Will create Genesis block after this loop
                                 // CRITICAL v2.19.20: Wait for network stabilization before Genesis creation
                                 // This ensures all peer APIs are fully ready to receive blocks
-                                const NETWORK_STABILIZATION_SECS: u64 = 30;
-                                if wait_time < NETWORK_STABILIZATION_SECS {
-                                    let remaining = NETWORK_STABILIZATION_SECS - wait_time;
+                                const NETWORK_STABILIZATION_SECS: u64 = 60;
+                                if stabilization_time < NETWORK_STABILIZATION_SECS {
+                                    let remaining = NETWORK_STABILIZATION_SECS - stabilization_time;
                                     println!("[Node] 🌍 Node 001: {} peers connected, waiting {}s for network stabilization...", 
                                              real_peer_count, remaining);
                                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -3776,7 +3801,7 @@ impl BlockchainNode {
                                     continue;
                                 }
                                 
-                                println!("[Node] 🌍 Node 001: {} peers connected, network stable for {}s", real_peer_count, wait_time);
+                                println!("[Node] 🌍 Node 001: {} peers connected, network stable for {}s", real_peer_count, stabilization_time);
                                 println!("[Node] 🚀 Starting production (Genesis creation pending)!");
                                 break;
                             } else {
@@ -3819,17 +3844,17 @@ impl BlockchainNode {
                             // Genesis exists - ready to start!
                             // CRITICAL v2.19.20: Wait for network stabilization before production
                             // This ensures all peer APIs are fully ready to receive blocks
-                            const NETWORK_STABILIZATION_SECS: u64 = 30;
-                            if is_bootstrap_node && wait_time < NETWORK_STABILIZATION_SECS {
-                                let remaining = NETWORK_STABILIZATION_SECS - wait_time;
+                            const NETWORK_STABILIZATION_SECS: u64 = 60;
+                            if is_bootstrap_node && stabilization_time < NETWORK_STABILIZATION_SECS {
+                                let remaining = NETWORK_STABILIZATION_SECS - stabilization_time;
                                 println!("[Node] ✅ Network ready: {} peers connected, Genesis: YES", real_peer_count);
-                                println!("[Node] ⏳ Waiting {}s for network stabilization (total: {}s)...", remaining, wait_time);
+                                println!("[Node] ⏳ Waiting {}s for network stabilization (stabilized: {}s)...", remaining, stabilization_time);
                                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                                 wait_time += 5;
                                 continue;
                             }
                             
-                            println!("[Node] ✅ Network ready: {} peers connected, Genesis: YES, stable for {}s", real_peer_count, wait_time);
+                            println!("[Node] ✅ Network ready: {} peers connected, Genesis: YES, stable for {}s", real_peer_count, stabilization_time);
                             println!("[Node] 🚀 Starting production!");
                             break;
                         }
@@ -5269,6 +5294,34 @@ impl BlockchainNode {
                         }
                     }
                 }
+                
+                // CRITICAL: For Genesis nodes, wait until global registry has all 5 nodes
+                // This ensures ALL nodes have SAME candidate list for deterministic producer selection
+                // Uses static flag to check only ONCE at startup, not every block
+                static REGISTRY_CONFIRMED: std::sync::atomic::AtomicBool = 
+                    std::sync::atomic::AtomicBool::new(false);
+                
+                let is_genesis_node = std::env::var("QNET_BOOTSTRAP_ID")
+                    .map(|id| ["001", "002", "003", "004", "005"].contains(&id.trim()))
+                    .unwrap_or(false);
+                
+                // Only check registry once at startup for Genesis nodes
+                if is_genesis_node && !REGISTRY_CONFIRMED.load(std::sync::atomic::Ordering::Relaxed) {
+                    if let Some(ref p2p) = unified_p2p {
+                        let registry_count = p2p.get_active_full_super_nodes().len();
+                        if registry_count < 5 {
+                            println!("[REGISTRY] ⏳ Waiting for global registry: {}/5 nodes registered", registry_count);
+                            println!("[REGISTRY] 🔄 Re-registering to propagate our presence...");
+                            p2p.register_as_active_node_async().await;
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                            continue; // Skip this iteration until registry is full
+                        }
+                        // Registry is full - set flag and never check again
+                        REGISTRY_CONFIRMED.store(true, std::sync::atomic::Ordering::Relaxed);
+                        println!("[REGISTRY] ✅ Global registry complete: {}/5 nodes - starting production!", registry_count);
+                    }
+                }
+                
                 let mut current_producer = Self::select_microblock_producer(
                     next_block_height,  // Use NEXT height for producer selection
                     &unified_p2p, 
@@ -8253,91 +8306,49 @@ impl BlockchainNode {
         println!("[CANDIDATES] 📊 Calculating qualified candidates (UNIFIED decentralized system)");
         
         // ═══════════════════════════════════════════════════════════════════════════
-        // CRITICAL FIX FOR SCALABILITY: Use GLOBAL REGISTRY as PRIMARY source
+        // CRITICAL: Use GLOBAL REGISTRY as ONLY source - NO FALLBACKS!
         // ═══════════════════════════════════════════════════════════════════════════
         // 
-        // PROBLEM: Using only connected_peers causes DIFFERENT candidate lists on different nodes:
+        // PROBLEM: Using connected_peers causes DIFFERENT candidate lists on different nodes:
         //   - Node A connected to [1,2,3...100] → selects producer X
         //   - Node B connected to [50,51...150] → selects producer Y
         //   - RESULT: Network fork!
         //
-        // SOLUTION: Use active_full_super_nodes (gossip-synced global registry)
+        // SOLUTION: Use ONLY active_full_super_nodes (gossip-synced global registry)
         //   - All nodes receive ActiveNodeAnnouncement via gossip
         //   - All nodes build SAME global registry
         //   - All nodes select SAME producer
+        //   - NO FALLBACK to connected_peers - wait until registry is populated!
         //
         // ARCHITECTURE: 
-        //   1. PRIMARY: active_full_super_nodes (gossip-synced, eventually consistent)
-        //   2. FALLBACK: connected_peers (only for Genesis bootstrap with <10 nodes)
+        //   - ALWAYS use active_full_super_nodes (gossip-synced, deterministic)
+        //   - If empty: return empty list → producer selection waits
         // ═══════════════════════════════════════════════════════════════════════════
         
         // STEP 1: Get candidates from GLOBAL REGISTRY (gossip-synced)
+        // CRITICAL: ALWAYS use global registry - NO fallback to connected_peers!
+        // This ensures ALL nodes use the SAME candidate list for deterministic producer selection
         let global_active_nodes = p2p.get_active_full_super_nodes();
         println!("[CANDIDATES] 🌍 Global registry: {} active Full/Super nodes", global_active_nodes.len());
         
-        // Use global registry if it has enough nodes (production mode)
-        // Threshold: 5 nodes = Genesis complete, use global registry
-        let use_global_registry = global_active_nodes.len() >= 5;
+        // ALWAYS use global registry - deterministic source for ALL nodes
+        println!("[CANDIDATES] ✅ Using GLOBAL REGISTRY (gossip-synced, deterministic)");
         
-        if use_global_registry {
-            println!("[CANDIDATES] ✅ Using GLOBAL REGISTRY (gossip-synced, deterministic)");
-            
-            // Get full node info with reputation from global registry
-            for (node_id, node_type, _last_seen) in &global_active_nodes {
-                // Only Super and Full nodes participate
-                if node_type != "super" && node_type != "full" {
-                    continue;
-                }
-                
-                let reputation = Self::get_node_reputation_score(node_id, p2p).await;
-                
-                if reputation >= 0.70 {
-                    all_qualified.push((node_id.clone(), reputation));
-                    println!("[CANDIDATES]   ├── {} ({}, {:.1}%) [GLOBAL]", node_id, node_type, reputation * 100.0);
-                } else {
-                    println!("[CANDIDATES]   ├── {} ({}, {:.1}%) - EXCLUDED (below 70%)", 
-                             node_id, node_type, reputation * 100.0);
-                }
-            }
-        } else {
-            // FALLBACK #1: Try connected peers
-            println!("[CANDIDATES] ⚠️ Global registry has {} nodes, trying CONNECTED PEERS...", 
-                     global_active_nodes.len());
-            
-            let validated_peers = p2p.get_validated_active_peers();
-            println!("[CANDIDATES] 🌐 Found {} validated P2P peers", validated_peers.len());
-            
-            for peer in validated_peers {
-                let reputation = Self::get_node_reputation_score(&peer.id, p2p).await;
-                
-                if reputation >= 0.70 {
-                    all_qualified.push((peer.id.clone(), reputation));
-                    println!("[CANDIDATES]   ├── {} ({:?}, {:.1}%) [LOCAL]", peer.id, peer.node_type, reputation * 100.0);
-                } else {
-                    println!("[CANDIDATES]   ├── {} ({:?}, {:.1}%) - EXCLUDED (below 70%)", 
-                             peer.id, peer.node_type, reputation * 100.0);
-                }
+        // Get full node info with reputation from global registry
+        for (node_id, node_type, _last_seen) in &global_active_nodes {
+            // Only Super and Full nodes participate
+            if node_type != "super" && node_type != "full" {
+                continue;
             }
             
-            // FALLBACK #2: If STILL empty and we're Genesis, use DETERMINISTIC Genesis list
-            // This ensures Genesis nodes can ALWAYS find each other for initial consensus
-            if all_qualified.is_empty() {
-                let is_genesis = std::env::var("QNET_BOOTSTRAP_ID")
-                    .map(|id| ["001", "002", "003", "004", "005"].contains(&id.trim()))
-                    .unwrap_or(false);
-                    
-                if is_genesis {
-                    println!("[CANDIDATES] 🚨 EMERGENCY: Using DETERMINISTIC Genesis list!");
-                    println!("[CANDIDATES] 📋 This ensures Genesis nodes can bootstrap consensus");
-                    
-                    // Add all 5 Genesis nodes with default reputation
-                    for i in 1..=5 {
-                        let genesis_id = format!("genesis_node_{:03}", i);
-                        // Default reputation 70% for Genesis bootstrap
-                        all_qualified.push((genesis_id.clone(), 0.70));
-                        println!("[CANDIDATES]   ├── {} (super, 70.0%) [GENESIS FALLBACK]", genesis_id);
-                    }
-                }
+            let reputation = Self::get_node_reputation_score(node_id, p2p).await;
+            
+            if reputation >= 0.70 {
+                all_qualified.push((node_id.clone(), reputation));
+                println!("[CANDIDATES]   ├── {} ({}, {:.1}%) [GLOBAL]", node_id, node_type, reputation * 100.0);
+            } else {
+                println!("[CANDIDATES]   ├── {} ({}, {:.1}%) - EXCLUDED (below 70%)", 
+                         node_id, node_type, reputation * 100.0);
             }
         }
         
