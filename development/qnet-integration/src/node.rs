@@ -6584,23 +6584,18 @@ impl BlockchainNode {
                             // TIMING: Measure broadcast time
                             let broadcast_start = std::time::Instant::now();
                             
-                            // OPTIMIZATION: Use direct broadcast for critical blocks (emergency, rotation, consensus)
-                            let is_critical_block = is_emergency_producer || 
-                                                  (height_for_broadcast > 1 && (height_for_broadcast - 1) % 30 == 0) || // Rotation
-                                                  (height_for_broadcast % 90 >= 61 && height_for_broadcast % 90 <= 90); // Consensus
+                            // CRITICAL FIX v2.19.23: Use direct broadcast for small networks
+                            // ShredProtocol has issues with channel routing - use simple broadcast
+                            // ShredProtocol will be enabled when network > 100 nodes
+                            let use_shred_protocol = peer_count > 100;
                             
-                            // OPTIMIZATION v2.19.19: Use ShredProtocol ALWAYS for non-critical blocks
-                            // ShredProtocol provides Reed-Solomon redundancy and O(log n) complexity
-                            // Even for small networks, ShredProtocol prepares architecture for scaling
-                            let result = if is_critical_block {
-                                // CRITICAL: Direct broadcast for immediate delivery (<500ms)
-                                // Used for: emergency blocks, rotation boundaries, consensus phase
-                                println!("[P2P] ⚡ PRIORITY broadcast for critical block #{}", height_for_broadcast);
-                                p2p_clone.broadcast_block(height_for_broadcast, broadcast_data).await
-                            } else {
-                                // ShredProtocol protocol: O(log n) complexity with Reed-Solomon redundancy
-                                // Works for ANY network size (5 nodes to millions)
+                            let result = if use_shred_protocol {
+                                // Large network: ShredProtocol with Reed-Solomon for O(log n) complexity
                                 p2p_clone.broadcast_block_shred_protocol(height_for_broadcast, broadcast_data).await
+                            } else {
+                                // Small network (<= 100 nodes): Direct broadcast like Genesis
+                                // This is reliable and fast for bootstrap/testnet
+                                p2p_clone.broadcast_block(height_for_broadcast, broadcast_data).await
                             };
                             
                             let broadcast_time = broadcast_start.elapsed();

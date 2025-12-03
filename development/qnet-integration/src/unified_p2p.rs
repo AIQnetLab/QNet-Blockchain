@@ -3898,40 +3898,64 @@ impl SimplifiedP2P {
     fn handle_shred_protocol_chunk(&self, from_peer: &str, chunk: ShredProtocolChunk) {
         let height = chunk.block_height;
         
-        // Update or create assembly state
-        let mut assembly = self.shred_protocol_assemblies.entry(height)
-            .or_insert_with(|| ShredProtocolBlockAssembly {
-                height,
-                chunks_received: vec![None; chunk.total_chunks],
-                parity_chunks: vec![None; ((chunk.total_chunks as f32) * (SHRED_PROTOCOL_REDUNDANCY_FACTOR - 1.0)).ceil() as usize],
-                total_chunks: chunk.total_chunks,
-                parity_count: ((chunk.total_chunks as f32) * (SHRED_PROTOCOL_REDUNDANCY_FACTOR - 1.0)).ceil() as usize,
-                started_at: Instant::now(),
-            });
-        
-        // Store chunk
-        if chunk.is_parity {
-            let parity_index = chunk.chunk_index - chunk.total_chunks;
-            if parity_index < assembly.parity_chunks.len() {
-                assembly.parity_chunks[parity_index] = Some(chunk.data.clone());
-            }
-        } else {
-            if chunk.chunk_index < assembly.chunks_received.len() {
-                assembly.chunks_received[chunk.chunk_index] = Some(chunk.data.clone());
-            }
+        // DEBUG: Log chunk reception for first 5 blocks or every 10th
+        if height <= 5 || height % 10 == 0 {
+            println!("[SHRED_PROTOCOL] 📥 Chunk {}/{} for block #{} from {} (parity: {})", 
+                chunk.chunk_index + 1, chunk.total_chunks, height, 
+                get_privacy_id_for_addr(from_peer), chunk.is_parity);
         }
+        
+        // CRITICAL FIX: Track state OUTSIDE DashMap lock to prevent deadlock
+        // DashMap entry() holds a lock that would block remove() in reconstruct functions
+        let (should_reconstruct_all, should_reconstruct_parity, total_chunks, chunks_count, parity_count);
+        
+        {
+            // Scoped block to release DashMap lock before calling reconstruct
+            let mut assembly = self.shred_protocol_assemblies.entry(height)
+                .or_insert_with(|| ShredProtocolBlockAssembly {
+                    height,
+                    chunks_received: vec![None; chunk.total_chunks],
+                    parity_chunks: vec![None; ((chunk.total_chunks as f32) * (SHRED_PROTOCOL_REDUNDANCY_FACTOR - 1.0)).ceil() as usize],
+                    total_chunks: chunk.total_chunks,
+                    parity_count: ((chunk.total_chunks as f32) * (SHRED_PROTOCOL_REDUNDANCY_FACTOR - 1.0)).ceil() as usize,
+                    started_at: Instant::now(),
+                });
+            
+            // Store chunk
+            if chunk.is_parity {
+                let parity_index = chunk.chunk_index - chunk.total_chunks;
+                if parity_index < assembly.parity_chunks.len() {
+                    assembly.parity_chunks[parity_index] = Some(chunk.data.clone());
+                }
+            } else {
+                if chunk.chunk_index < assembly.chunks_received.len() {
+                    assembly.chunks_received[chunk.chunk_index] = Some(chunk.data.clone());
+                }
+            }
+            
+            // Check if we can reconstruct the block
+            chunks_count = assembly.chunks_received.iter().filter(|c| c.is_some()).count();
+            parity_count = assembly.parity_chunks.iter().filter(|c| c.is_some()).count();
+            total_chunks = assembly.total_chunks;
+            
+            should_reconstruct_all = chunks_count == total_chunks;
+            should_reconstruct_parity = !should_reconstruct_all && (chunks_count + parity_count >= total_chunks);
+            
+            // DEBUG: Log assembly progress for first 5 blocks
+            if height <= 5 {
+                println!("[SHRED_PROTOCOL] 📊 Block #{}: {}/{} data + {}/{} parity chunks received", 
+                    height, chunks_count, total_chunks, parity_count, assembly.parity_count);
+            }
+        } // DashMap lock released here!
         
         // Forward chunk to other peers (ShredProtocol propagation)
         self.forward_shred_protocol_chunk(from_peer, chunk.clone());
         
-        // Check if we can reconstruct the block
-        let chunks_count = assembly.chunks_received.iter().filter(|c| c.is_some()).count();
-        let parity_count = assembly.parity_chunks.iter().filter(|c| c.is_some()).count();
-        
-        if chunks_count == assembly.total_chunks {
+        // Now safe to call reconstruct functions (they need remove() which needs DashMap lock)
+        if should_reconstruct_all {
             // All data chunks received - reconstruct block
             self.reconstruct_block_from_shred_protocol(height);
-        } else if chunks_count + parity_count >= assembly.total_chunks {
+        } else if should_reconstruct_parity {
             // Enough chunks + parity to reconstruct
             if height % 10 == 0 {
                 println!("[SHRED_PROTOCOL] 🔧 Reconstructing block #{} from {} data + {} parity chunks", 
