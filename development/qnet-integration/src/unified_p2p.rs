@@ -527,6 +527,10 @@ pub struct SimplifiedP2P {
     /// ShredProtocol block assembly states
     shred_protocol_assemblies: Arc<DashMap<u64, ShredProtocolBlockAssembly>>,
     
+    /// CRITICAL: Track already processed blocks to prevent infinite loop
+    /// When a block is reconstructed, its height is added here to skip duplicate chunks
+    processed_shred_blocks: Arc<DashSet<u64>>,
+    
     /// PRODUCTION: Certificate management for compact signatures
     pub certificate_manager: Arc<RwLock<CertificateManager>>,
     
@@ -1121,6 +1125,7 @@ impl SimplifiedP2P {
             block_tx: Arc::new(Mutex::new(None)),
             sync_request_tx: None,
             shred_protocol_assemblies: Arc::new(DashMap::new()),
+            processed_shred_blocks: Arc::new(DashSet::new()),
             certificate_manager: Arc::new(RwLock::new(CertificateManager::with_node_type(node_type.clone()))),
             
             // PRODUCTION: Light Node registry for gossip sync
@@ -3910,6 +3915,21 @@ impl SimplifiedP2P {
     fn handle_shred_protocol_chunk(&self, from_peer: &str, chunk: ShredProtocolChunk) {
         let height = chunk.block_height;
         
+        // CRITICAL: Skip chunks for blocks already in blockchain
+        // This handles node restart case where processed_shred_blocks is empty
+        let local_height = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+        if height <= local_height {
+            // Block already in blockchain, ignore stale chunks
+            return;
+        }
+        
+        // CRITICAL FIX v2.19.24: Skip chunks for already processed blocks
+        // This prevents infinite loop where chunks keep being forwarded and reconstructed
+        if self.processed_shred_blocks.contains(&height) {
+            // Block already reconstructed, ignore duplicate chunks
+            return;
+        }
+        
         // DEBUG: Log chunk reception for first 500 blocks or every 10th
         // CRITICAL: Extended logging for initial network debugging
         if height <= 500 || height % 10 == 0 {
@@ -3961,8 +3981,17 @@ impl SimplifiedP2P {
             }
         } // DashMap lock released here!
         
+        // CRITICAL: Mark block as processed BEFORE forwarding if we have enough chunks
+        // This prevents forward loop where chunks keep circulating after block is ready
+        if should_reconstruct_all || should_reconstruct_parity {
+            self.processed_shred_blocks.insert(height);
+        }
+        
         // Forward chunk to other peers (ShredProtocol propagation)
-        self.forward_shred_protocol_chunk(from_peer, chunk.clone());
+        // Only forward if block is NOT yet ready for reconstruction
+        if !should_reconstruct_all && !should_reconstruct_parity {
+            self.forward_shred_protocol_chunk(from_peer, chunk.clone());
+        }
         
         // Now safe to call reconstruct functions (they need remove() which needs DashMap lock)
         if should_reconstruct_all {
@@ -3976,12 +4005,30 @@ impl SimplifiedP2P {
             }
             self.reconstruct_block_with_parity(height);
         }
+        
+        // MEMORY CLEANUP: Remove old entries to prevent memory leak
+        // Keep only last 1000 blocks in processed set
+        if height > 1000 && height % 100 == 0 {
+            let cleanup_threshold = height - 1000;
+            self.processed_shred_blocks.retain(|&h| h > cleanup_threshold);
+            
+            // CRITICAL: Also cleanup stale assemblies (incomplete block reconstructions)
+            // Remove assemblies older than 60 seconds to prevent memory leak
+            self.shred_protocol_assemblies.retain(|_, assembly| {
+                assembly.started_at.elapsed().as_secs() < 60
+            });
+        }
     }
     
     /// Forward ShredProtocol chunk to other peers via QUIC (async)
     fn forward_shred_protocol_chunk(&self, original_sender: &str, chunk: ShredProtocolChunk) {
         // Don't forward if we're the original producer
         if self.node_id == original_sender {
+            return;
+        }
+        
+        // CRITICAL: Don't forward chunks for already processed blocks (prevents infinite loop)
+        if self.processed_shred_blocks.contains(&chunk.block_height) {
             return;
         }
         
@@ -4054,45 +4101,59 @@ impl SimplifiedP2P {
     
     /// Reconstruct block from all data chunks
     fn reconstruct_block_from_shred_protocol(&self, height: u64) {
-        if let Some((_, assembly)) = self.shred_protocol_assemblies.remove(&height) {
-            let mut block_data = Vec::new();
-            
-            for chunk_opt in assembly.chunks_received {
-                if let Some(chunk) = chunk_opt {
-                    block_data.extend(chunk);
-                }
+        // Block already marked as processed in handle_shred_protocol_chunk
+        let assembly = match self.shred_protocol_assemblies.remove(&height) {
+            Some((_, asm)) => asm,
+            None => {
+                // Assembly already removed (race condition) - remove from processed for retry
+                self.processed_shred_blocks.remove(&height);
+                return;
             }
-            
-            let elapsed = assembly.started_at.elapsed();
-            if height % 10 == 0 {
-                println!("[SHRED_PROTOCOL] ✅ Block #{} reconstructed from {} chunks in {:?}", 
-                         height, assembly.total_chunks, elapsed);
+        };
+        
+        let mut block_data = Vec::new();
+        
+        for chunk_opt in assembly.chunks_received {
+            if let Some(chunk) = chunk_opt {
+                block_data.extend(chunk);
             }
-            
-            // Send reconstructed block through normal block channel
-            let block_tx_guard = match self.block_tx.lock() {
-                Ok(g) => g,
-                Err(p) => p.into_inner()
+        }
+        
+        let elapsed = assembly.started_at.elapsed();
+        if height % 10 == 0 {
+            println!("[SHRED_PROTOCOL] ✅ Block #{} reconstructed from {} chunks in {:?}", 
+                     height, assembly.total_chunks, elapsed);
+        }
+        
+        // Send reconstructed block through normal block channel
+        let block_tx_guard = match self.block_tx.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner()
+        };
+        
+        if let Some(ref block_tx) = &*block_tx_guard {
+            let received_block = ReceivedBlock {
+                height,
+                data: block_data,
+                block_type: if height % 90 == 0 { "macro".to_string() } else { "micro".to_string() },
+                from_peer: "shred_protocol".to_string(),
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
             };
-            if let Some(ref block_tx) = &*block_tx_guard {
-                let received_block = ReceivedBlock {
-                    height,
-                    data: block_data,
-                    block_type: if height % 90 == 0 { "macro".to_string() } else { "micro".to_string() },
-                    from_peer: "shred_protocol".to_string(),
-                    timestamp: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs(),
-                };
-                
-                let _ = block_tx.send(received_block);
-            }
+            
+            let _ = block_tx.send(received_block);
+        } else {
+            // block_tx not initialized - remove from processed for retry
+            println!("[SHRED_PROTOCOL] ⚠️ Block #{} reconstructed but block_tx not ready, will retry", height);
+            self.processed_shred_blocks.remove(&height);
         }
     }
     
     /// Reconstruct block using Reed-Solomon parity (PRODUCTION)
     fn reconstruct_block_with_parity(&self, height: u64) {
+        // Block already marked as processed in handle_shred_protocol_chunk
         // PRODUCTION: Real Reed-Solomon reconstruction
         if let Some((_, assembly)) = self.shred_protocol_assemblies.remove(&height) {
             let data_count = assembly.total_chunks;
@@ -4103,6 +4164,8 @@ impl SimplifiedP2P {
                 Ok(rs) => rs,
                 Err(e) => {
                     println!("[SHRED_PROTOCOL] ❌ Reed-Solomon init failed for reconstruction: {:?}", e);
+                    // CRITICAL: Remove from processed so new chunks can retry
+                    self.processed_shred_blocks.remove(&height);
                     return;
                 }
             };
@@ -4144,6 +4207,8 @@ impl SimplifiedP2P {
             if available_count < data_count {
                 println!("[SHRED_PROTOCOL] ❌ Not enough shards for reconstruction: {}/{} needed", 
                          available_count, data_count);
+                // CRITICAL: Remove from processed so new chunks can retry
+                self.processed_shred_blocks.remove(&height);
                 return;
             }
             
@@ -4155,6 +4220,8 @@ impl SimplifiedP2P {
             // Reconstruct missing shards
             if let Err(e) = rs.reconstruct(&mut rs_shards) {
                 println!("[SHRED_PROTOCOL] ❌ Reed-Solomon reconstruction failed: {:?}", e);
+                // CRITICAL: Remove from processed so new chunks can retry
+                self.processed_shred_blocks.remove(&height);
                 return;
             }
             
@@ -14952,6 +15019,14 @@ impl SimplifiedP2P {
             let now = Instant::now();
             INVALID_BLOCKS_TRACKER.retain(|_, (_, first_seen)| {
                 now.duration_since(*first_seen) < Duration::from_secs(300)
+            });
+        }
+        
+        // MEMORY CLEANUP: Also cleanup FALSE_EMERGENCY_TRACKER (peer-based, limited growth)
+        if FALSE_EMERGENCY_TRACKER.len() > 500 {
+            let now = Instant::now();
+            FALSE_EMERGENCY_TRACKER.retain(|_, (_, first_seen)| {
+                now.duration_since(*first_seen) < Duration::from_secs(600) // 10 min TTL
             });
         }
     }
