@@ -194,9 +194,10 @@ fn generate_eon_address_from_id(id: &str) -> String {
     let part1 = &hash[..19];
     let part2 = &hash[19..34];
     
-    // Generate SHA3-256 checksum (first 4 hex chars)
+    // Generate SHA-256 checksum (first 4 hex chars) - for wallet compatibility
     let checksum_input = format!("{}eon{}", part1, part2);
-    let mut hasher = Sha3_256::new();
+    use sha2::{Sha256, Digest as Sha2Digest};
+    let mut hasher = Sha256::new();
     hasher.update(checksum_input.as_bytes());
     let checksum = hex::encode(&hasher.finalize()[..2]); // 2 bytes = 4 hex chars
     
@@ -12754,10 +12755,10 @@ impl BlockchainNode {
         let part1 = &hash[..19];
         let part2 = &hash[19..34];
         
-        // Generate SHA3-256 checksum (first 4 hex chars)
-        use sha3::{Sha3_256, Digest};
+        // Generate SHA-256 checksum (first 4 hex chars) - for wallet compatibility
+        use sha2::{Sha256, Digest as Sha2Digest};
         let checksum_input = format!("{}eon{}", part1, part2);
-        let mut hasher = Sha3_256::new();
+        let mut hasher = Sha256::new();
         hasher.update(checksum_input.as_bytes());
         let checksum = hex::encode(&hasher.finalize()[..2]); // 2 bytes = 4 hex chars
         

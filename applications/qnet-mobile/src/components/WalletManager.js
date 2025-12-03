@@ -2093,12 +2093,12 @@ export class WalletManager {
       const part1 = fullHash.substring(0, 19).toLowerCase();
       const part2 = fullHash.substring(19, 34).toLowerCase();
       
-      // Generate checksum
-      const checksumData = `qnet_${part1}_eon_${part2}`;
-      const checksumHash = CryptoJS.SHA256(checksumData);
-      const checksum = checksumHash.toString(CryptoJS.enc.Hex).substring(0, 4);
+      // Generate SHA-256 checksum (MUST match server!)
+      const addressWithoutChecksum = part1 + 'eon' + part2;
+      const checksumHash = CryptoJS.SHA256(addressWithoutChecksum);
+      const checksum = checksumHash.toString(CryptoJS.enc.Hex).substring(0, 4).toLowerCase();
       
-      return `qnet_${part1}_eon_${part2}_${checksum}`;
+      return `${part1}eon${part2}${checksum}`;
     } catch (error) {
       // console.error('Error generating QNet address from Solana:', error);
       return null;
@@ -2248,7 +2248,7 @@ export class WalletManager {
       const part1 = fullHash.substring(0, 19).toLowerCase();
       const part2 = fullHash.substring(19, 34).toLowerCase();
       
-      // Generate checksum
+      // Generate SHA-256 checksum (MUST match server!)
       const addressWithoutChecksum = part1 + 'eon' + part2;
       const checksumData = CryptoJS.SHA256(addressWithoutChecksum);
       const checksum = checksumData.toString(CryptoJS.enc.Hex).substring(0, 4).toLowerCase();

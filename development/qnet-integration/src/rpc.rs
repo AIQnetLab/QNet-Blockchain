@@ -426,10 +426,11 @@ fn validate_eon_address(address: &str) -> bool {
         return false;
     }
     
-    // Verify checksum
+    // Verify SHA-256 checksum (for wallet compatibility)
     let address_without_checksum = format!("{}eon{}", part1, part2);
     let computed_checksum = {
-        let mut hasher = Sha3_256::new();
+        use sha2::{Sha256, Digest as Sha2Digest};
+        let mut hasher = Sha256::new();
         hasher.update(address_without_checksum.as_bytes());
         let hash = hasher.finalize();
         hex::encode(&hash[..2]) // First 2 bytes = 4 hex chars
@@ -464,10 +465,11 @@ fn validate_eon_address_with_error(address: &str) -> Result<(), String> {
         return Err("Invalid address: checksum contains non-hex characters".to_string());
     }
     
-    // Verify checksum
+    // Verify SHA-256 checksum (for wallet compatibility)
     let address_without_checksum = format!("{}eon{}", part1, part2);
     let computed_checksum = {
-        let mut hasher = Sha3_256::new();
+        use sha2::{Sha256, Digest as Sha2Digest};
+        let mut hasher = Sha256::new();
         hasher.update(address_without_checksum.as_bytes());
         let hash = hasher.finalize();
         hex::encode(&hash[..2])
@@ -4012,8 +4014,8 @@ async fn sign_with_dilithium(node_id: &str, challenge: &str) -> String {
         }
     }
     
-    // CRITICAL: Sign with hybrid (ephemeral Ed25519 + Dilithium per NIST/Cisco)
-    match hybrid.sign_message_compact(challenge.as_bytes()).await {
+    // CRITICAL: Sign RAW challenge with hybrid (hashes before signing)
+    match hybrid.sign_raw_message_compact(challenge.as_bytes()).await {
         Ok(compact_sig) => {
             match serde_json::to_string(&compact_sig) {
                 Ok(json) => {
@@ -4551,8 +4553,8 @@ async fn handle_light_node_ping_response(
                 let _ = hybrid.rotate_certificate().await;
             }
             
-            // CRITICAL: Sign with hybrid (ephemeral Ed25519 + Dilithium)
-            match hybrid.sign_message_compact(attestation_data.as_bytes()).await {
+            // CRITICAL: Sign RAW attestation with hybrid (hashes before signing)
+            match hybrid.sign_raw_message_compact(attestation_data.as_bytes()).await {
                 Ok(compact_sig) => {
                     match serde_json::to_string(&compact_sig) {
                         Ok(json) => {
@@ -7253,8 +7255,8 @@ async fn generate_quantum_signature(node_id: &str, data: &str) -> String {
         }
     }
     
-    // CRITICAL: Sign with hybrid (ephemeral Ed25519 + Dilithium per NIST/Cisco)
-    match hybrid.sign_message_compact(data.as_bytes()).await {
+    // CRITICAL: Sign RAW data with hybrid (hashes before signing)
+    match hybrid.sign_raw_message_compact(data.as_bytes()).await {
         Ok(compact_sig) => {
             match serde_json::to_string(&compact_sig) {
                 Ok(json) => {
@@ -8059,15 +8061,14 @@ async fn handle_reputation_history(
 async fn generate_quantum_activation_code(
     request: &GenerateActivationCodeRequest,
 ) -> Result<String, String> {
-    use sha2::{Sha256, Digest as Sha2Digest};
-    use sha3::{Sha3_256, Digest as Sha3Digest};
+    use sha3::{Sha3_256, Digest};
     
     println!("🔐 Generating quantum-secure activation code with XOR encryption...");
     println!("   Wallet: {}...", &request.wallet_address[..8.min(request.wallet_address.len())]);
     println!("   Burn TX: {}...", &request.burn_tx_hash[..8.min(request.burn_tx_hash.len())]);
     println!("   Node Type: {}", request.node_type);
     
-    // Step 1: Create encryption key from burn transaction (MUST match bridge-server.py)
+    // Step 1: Create encryption key from burn transaction (SHA3-256 for consistency)
     // key_material = f"{burn_tx_hash}:{node_type}:{burn_amount}"
     let key_material = format!("{}:{}:{}", 
         request.burn_tx_hash, 
@@ -8075,7 +8076,7 @@ async fn generate_quantum_activation_code(
         request.burn_amount
     );
     
-    let mut key_hasher = Sha256::new();
+    let mut key_hasher = Sha3_256::new();
     key_hasher.update(key_material.as_bytes());
     let encryption_key_full = hex::encode(key_hasher.finalize());
     let encryption_key = &encryption_key_full[..32]; // First 32 chars
@@ -8280,8 +8281,10 @@ async fn handle_contract_deploy(
         // Format as EON address
         let part1 = &hash[0..19];
         let part2 = &hash[19..34];
+        // Generate SHA-256 checksum for wallet compatibility
         let checksum_input = format!("{}eon{}", part1, part2);
-        let mut checksum_hasher = Sha3_256::new();
+        use sha2::{Sha256, Digest as Sha2Digest};
+        let mut checksum_hasher = Sha256::new();
         checksum_hasher.update(checksum_input.as_bytes());
         let checksum = hex::encode(&checksum_hasher.finalize()[..2]);
         format!("{}eon{}{}", part1, part2, checksum)

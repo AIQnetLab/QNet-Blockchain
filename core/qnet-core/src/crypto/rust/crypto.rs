@@ -1,5 +1,5 @@
 // crypto.rs - Production-grade cryptographic functions for QNet
-use sha2::{Sha256, Sha512, Digest};
+use sha3::{Sha3_256, Sha3_512, Digest};
 use rand::{rngs::OsRng, RngCore};
 use std::error::Error;
 use std::fmt;
@@ -149,7 +149,7 @@ impl Sig {
         };
         
         // 2. Create secure message hash with domain separation
-        let mut hasher = Sha512::new();
+        let mut hasher = Sha3_512::new();
         let mut rng = OsRng;
         let mut salt = vec![0u8; 64];
         rng.fill_bytes(&mut salt);
@@ -172,7 +172,7 @@ impl Sig {
         let mut poly_data = vec![0u8; remaining_size];
         
         // Use SHAKE256-based deterministic expansion (production approach)
-        let mut seed_hasher = Sha512::new();
+        let mut seed_hasher = Sha3_512::new();
         seed_hasher.update(secret_key.as_bytes());
         seed_hasher.update(&message_hash);
         seed_hasher.update(b"QNet-Lattice-Expansion");
@@ -185,7 +185,7 @@ impl Sig {
             let end = ((i + 1) * chunk_size).min(remaining_size);
             
             if start < poly_data.len() && end <= poly_data.len() {
-                let mut poly_hasher = Sha512::new();
+                let mut poly_hasher = Sha3_512::new();
                 poly_hasher.update(&seed);
                 poly_hasher.update(&[i as u8]);
                 poly_hasher.update(&message_hash);
@@ -223,7 +223,7 @@ impl Sig {
         let poly_data = &sig_bytes[128..];
         
         // Recompute message hash
-        let mut hasher = Sha512::new();
+        let mut hasher = Sha3_512::new();
         hasher.update(b"QNet-Dilithium-Sign-v1.0");
         hasher.update(&[level]);
         hasher.update(salt);
@@ -236,14 +236,14 @@ impl Sig {
         }
         
         // Verify polynomial structure (simplified but secure approach)
-        let mut seed_hasher = Sha512::new();
+        let mut seed_hasher = Sha3_512::new();
         seed_hasher.update(public_key.as_bytes());
         seed_hasher.update(&computed_hash);
         seed_hasher.update(b"QNet-Lattice-Verify");
         let verification_seed = seed_hasher.finalize();
         
         // Check polynomial consistency
-        let mut verification_hasher = Sha512::new();
+        let mut verification_hasher = Sha3_512::new();
         verification_hasher.update(&verification_seed);
         verification_hasher.update(poly_data);
         verification_hasher.update(&computed_hash);
@@ -265,7 +265,7 @@ impl Sig {
         };
         
         // Enhanced Falcon signature with NTRU-based approach
-        let mut hasher = Sha512::new();
+        let mut hasher = Sha3_512::new();
         let mut rng = OsRng;
         let mut nonce = vec![0u8; 40];
         rng.fill_bytes(&mut nonce);
@@ -287,7 +287,7 @@ impl Sig {
         
         // Deterministic NTRU coefficient generation
         for (i, chunk) in ntru_data.chunks_mut(64).enumerate() {
-            let mut chunk_hasher = Sha512::new();
+            let mut chunk_hasher = Sha3_512::new();
             chunk_hasher.update(&message_hash);
             chunk_hasher.update(&[i as u8]);
             chunk_hasher.update(secret_key.as_bytes());
@@ -315,7 +315,7 @@ impl Sig {
         let stored_hash = &sig_bytes[40..104];
         
         // Recompute and verify hash
-        let mut hasher = Sha512::new();
+        let mut hasher = Sha3_512::new();
         hasher.update(b"QNet-Falcon-Sign-v1.0");
         hasher.update(&size.to_be_bytes());
         hasher.update(nonce);
@@ -329,7 +329,7 @@ impl Sig {
 
 // Enhanced helper functions
 pub fn hash_message(message: &[u8]) -> Vec<u8> {
-    let mut hasher = Sha256::new();
+    let mut hasher = Sha3_256::new();
     hasher.update(b"QNet-Message-Hash-v1.0");
     hasher.update(message);
     hasher.finalize().to_vec()
@@ -364,7 +364,7 @@ fn generate_dilithium_keypair(level: u8, rng: &mut OsRng) -> Result<(PublicKey, 
     rng.fill_bytes(&mut secret_bytes);
     
     // Derive public key using secure hash-based approach
-    let mut hasher = Sha512::new();
+    let mut hasher = Sha3_512::new();
     hasher.update(b"QNet-Dilithium-Keygen-v1.0");
     hasher.update(&[level]);
     hasher.update(&secret_bytes);
@@ -374,7 +374,7 @@ fn generate_dilithium_keypair(level: u8, rng: &mut OsRng) -> Result<(PublicKey, 
     
     // Generate structured public key
     for (i, chunk) in public_bytes.chunks_mut(64).enumerate() {
-        let mut chunk_hasher = Sha512::new();
+        let mut chunk_hasher = Sha3_512::new();
         chunk_hasher.update(&seed);
         chunk_hasher.update(&[i as u8]);
         let chunk_result = chunk_hasher.finalize();
@@ -399,7 +399,7 @@ fn generate_falcon_keypair(size: u16, rng: &mut OsRng) -> Result<(PublicKey, Sec
     rng.fill_bytes(&mut secret_bytes);
     
     // Derive public key for Falcon
-    let mut hasher = Sha512::new();
+    let mut hasher = Sha3_512::new();
     hasher.update(b"QNet-Falcon-Keygen-v1.0");
     hasher.update(&size.to_be_bytes());
     hasher.update(&secret_bytes);
@@ -408,7 +408,7 @@ fn generate_falcon_keypair(size: u16, rng: &mut OsRng) -> Result<(PublicKey, Sec
     let mut seed = hasher.finalize();
     
     for (i, chunk) in public_bytes.chunks_mut(64).enumerate() {
-        let mut chunk_hasher = Sha512::new();
+        let mut chunk_hasher = Sha3_512::new();
         chunk_hasher.update(&seed);
         chunk_hasher.update(&[i as u8]);
         let chunk_result = chunk_hasher.finalize();

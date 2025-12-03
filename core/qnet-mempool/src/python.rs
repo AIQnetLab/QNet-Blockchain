@@ -62,9 +62,9 @@ impl PyMempool {
         // Extract gas_price from transaction (default to 1 if missing)
         let gas_price = tx["gas_price"].as_u64().unwrap_or(1);
         
-        // Generate a simple hash
-        use sha2::{Sha256, Digest};
-        let mut hasher = Sha256::new();
+        // Generate a simple hash (SHA3-256 for NIST compliance)
+        use sha3::{Sha3_256, Digest};
+        let mut hasher = Sha3_256::new();
         hasher.update(tx_json.as_bytes());
         let hash = hex::encode(hasher.finalize());
         

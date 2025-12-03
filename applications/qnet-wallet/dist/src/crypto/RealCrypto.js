@@ -119,7 +119,7 @@ export class ProductionCrypto {
             const part1 = hex.substring(0, 19).toLowerCase();
             const part2 = hex.substring(19, 34).toLowerCase();
             
-            // Generate SHA-256 checksum (first 4 hex chars)
+            // Generate SHA-256 checksum (first 4 hex chars) - MUST match server!
             const addressWithoutChecksum = part1 + 'eon' + part2;
             const checksumHash = CryptoJS.SHA256(addressWithoutChecksum);
             const checksum = checksumHash.toString(CryptoJS.enc.Hex).substring(0, 4).toLowerCase();

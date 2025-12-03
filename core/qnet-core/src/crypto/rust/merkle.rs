@@ -1,7 +1,7 @@
 //! Advanced Merkle tree implementation for QNet
 //! Provides efficient transaction verification with optimized memory usage
 
-use sha2::{Sha256, Digest};
+use sha3::{Sha3_256, Digest};
 use std::error::Error;
 use std::collections::HashMap;
 use std::cmp::min;
@@ -18,7 +18,7 @@ use std::cmp::min;
 pub fn compute_merkle_root(transaction_hashes: &[String]) -> Result<String, Box<dyn Error>> {
     if transaction_hashes.is_empty() {
         // Return hash of empty string for empty tree
-        let hasher = Sha256::new();
+        let hasher = Sha3_256::new();
         let result = hasher.finalize();
         return Ok(hex::encode(result));
     }
@@ -48,7 +48,7 @@ fn build_tree_level(hashes: &[String]) -> Result<String, Box<dyn Error>> {
         
         // Combine hashes and compute parent
         let combined = format!("{}{}", left, right);
-        let mut hasher = Sha256::new();
+        let mut hasher = Sha3_256::new();
         hasher.update(combined);
         let result = hasher.finalize();
         next_level.push(hex::encode(result));
@@ -108,7 +108,7 @@ pub fn generate_merkle_proof(
             };
             
             let combined = format!("{}{}", left, right);
-            let mut hasher = Sha256::new();
+            let mut hasher = Sha3_256::new();
             hasher.update(combined);
             let result = hasher.finalize();
             next_level.push(hex::encode(result));
@@ -150,7 +150,7 @@ pub fn verify_merkle_proof(
         };
         
         // Hash the combined value
-        let mut hasher = Sha256::new();
+        let mut hasher = Sha3_256::new();
         hasher.update(&combined);
         let result = hasher.finalize();
         current_hash = hex::encode(result);
@@ -201,7 +201,7 @@ pub fn compute_incremental_merkle_root(
 ) -> Result<String, Box<dyn Error>> {
     if transaction_hashes.is_empty() {
         // Return hash of empty string for empty tree
-        let hasher = Sha256::new();
+        let hasher = Sha3_256::new();
         let result = hasher.finalize();
         return Ok(hex::encode(result));
     }
@@ -229,7 +229,7 @@ pub fn compute_incremental_merkle_root(
                 };
                 
                 let combined = format!("{}{}", left, right);
-                let mut hasher = Sha256::new();
+                let mut hasher = Sha3_256::new();
                 hasher.update(combined);
                 let result = hasher.finalize();
                 next_level.push(hex::encode(result));

@@ -485,9 +485,12 @@ impl HybridCrypto {
         })
     }
     
-    /// OPTIMIZED: Create compact signature for consensus (reduces size from 12KB to 3KB)
+    /// OPTIMIZED: Create compact signature for PREHASHED data (reduces size from 12KB to 3KB)
     /// Certificate is cached separately for O(1) verification
     /// CRITICAL: Generates NEW ephemeral Ed25519 key for each message (NIST/Cisco requirement)
+    /// 
+    /// USE THIS FOR: Microblock signing where message is already SHA3-256 hash bytes
+    /// USE sign_raw_message_compact() FOR: heartbeats, announcements, RPC (raw strings)
     pub async fn sign_message_compact(&self, message: &[u8]) -> Result<CompactHybridSignature> {
         // CRITICAL: Per NIST/Cisco standards for hybrid cryptography:
         // 1. Generate NEW ephemeral Ed25519 key for THIS message
@@ -544,6 +547,84 @@ impl HybridCrypto {
             .map_err(|e| anyhow!("Failed to create Dilithium key signature: {}", e))?;
         
         // Step 7: Sign message with Dilithium (quantum resistance)
+        let dilithium_msg_sig = quantum_crypto.create_consensus_signature(&self.node_id, &message_hash_hex).await
+            .map_err(|e| anyhow!("Failed to create Dilithium message signature: {}", e))?;
+        
+        Ok(CompactHybridSignature {
+            node_id: self.node_id.clone(),
+            cert_serial: certificate.serial_number.clone(),
+            ephemeral_public_key: ephemeral_public_key_bytes,
+            message_signature: ed25519_signature.to_bytes(),
+            dilithium_key_signature: dilithium_key_sig.signature,
+            dilithium_message_signature: dilithium_msg_sig.signature,
+            signed_at,
+        })
+    }
+    
+    /// Sign RAW message (not prehashed) with hybrid cryptography
+    /// CRITICAL: This function HASHES the message before signing (NIST SP 800-186 compliant)
+    /// Use this for: heartbeats, ActiveNodeAnnouncement, reputation updates
+    /// Use sign_message_compact() for: microblocks (already hashed)
+    /// 
+    /// Per NIST/Cisco hybrid crypto standards:
+    /// 1. Generate NEW ephemeral Ed25519 key for THIS message
+    /// 2. Hash message with SHA3-256
+    /// 3. Sign hash with ephemeral Ed25519
+    /// 4. Create encapsulated_data = ephemeral_key || message_hash || timestamp
+    /// 5. Sign encapsulated_data with Dilithium (binds ephemeral key to message)
+    /// 6. Sign message_hash with Dilithium (quantum resistance)
+    pub async fn sign_raw_message_compact(&self, message: &[u8]) -> Result<CompactHybridSignature> {
+        // Step 1: Generate NEW ephemeral Ed25519 keypair for THIS message
+        let mut csprng = OsRng{};
+        let ephemeral_signing_key = SigningKey::generate(&mut csprng);
+        let ephemeral_verifying_key = ephemeral_signing_key.verifying_key();
+        let ephemeral_public_key_bytes = *ephemeral_verifying_key.as_bytes();
+        
+        // Step 2: Get current certificate for metadata
+        let certificate = self.current_certificate.as_ref()
+            .ok_or_else(|| anyhow!("No current certificate available"))?;
+        
+        // CRITICAL: Ensure certificate is in cache BEFORE creating compact signature
+        self.cache_certificate(certificate).await;
+        
+        // Step 3: HASH the message with SHA3-256 (NIST SP 800-186)
+        // This ensures consistency between signing and verification
+        let mut hasher = Sha3_256::new();
+        hasher.update(message);
+        let message_hash = hasher.finalize();
+        let message_hash_bytes: [u8; 32] = message_hash.into();
+        
+        // Step 4: Sign MESSAGE HASH with ephemeral Ed25519 key
+        // CRITICAL: We sign the hash, not raw message - matches verification!
+        let ed25519_signature = ephemeral_signing_key.sign(&message_hash_bytes);
+        
+        // Step 5: Create encapsulated_data = ephemeral_public_key || message_hash || timestamp
+        let signed_at = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        let mut encapsulated_data = Vec::new();
+        encapsulated_data.extend_from_slice(&ephemeral_public_key_bytes);
+        encapsulated_data.extend_from_slice(&message_hash_bytes);
+        encapsulated_data.extend_from_slice(&signed_at.to_le_bytes());
+        let encapsulated_hex = hex::encode(&encapsulated_data);
+        
+        // Step 6: Sign encapsulated_data with Dilithium (NIST/Cisco requirement)
+        // This cryptographically binds the ephemeral Ed25519 key to this specific message
+        use crate::node::GLOBAL_QUANTUM_CRYPTO;
+        use crate::quantum_crypto::QNetQuantumCrypto;
+        
+        let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
+        if crypto_guard.is_none() {
+            let mut crypto = QNetQuantumCrypto::new();
+            crypto.initialize().await?;
+            *crypto_guard = Some(crypto);
+        }
+        let quantum_crypto = crypto_guard.as_ref().expect("Crypto initialized above");
+        
+        // Sign encapsulated_data with Dilithium (signs the ephemeral key)
+        let dilithium_key_sig = quantum_crypto.create_consensus_signature(&self.node_id, &encapsulated_hex).await
+            .map_err(|e| anyhow!("Failed to create Dilithium key signature: {}", e))?;
+        
+        // Step 7: Sign message_hash with Dilithium (quantum resistance)
+        let message_hash_hex = hex::encode(&message_hash_bytes);
         let dilithium_msg_sig = quantum_crypto.create_consensus_signature(&self.node_id, &message_hash_hex).await
             .map_err(|e| anyhow!("Failed to create Dilithium message signature: {}", e))?;
         

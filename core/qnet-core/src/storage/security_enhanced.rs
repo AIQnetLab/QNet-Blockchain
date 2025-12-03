@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use sha2::{Sha256, Digest};
+use sha3::{Sha3_256, Digest};
 use aes_gcm::{Aes256Gcm, Key, Nonce, NewAead};
 use aes_gcm::aead::{Aead, generic_array::GenericArray};
 use std::collections::HashMap;
@@ -370,7 +370,7 @@ impl SecureStorageEngine {
     
     /// Calculate SHA-256 checksum
     fn calculate_checksum(&self, data: &[u8]) -> DataChecksum {
-        let mut hasher = Sha256::new();
+        let mut hasher = Sha3_256::new();
         hasher.update(data);
         let hash_bytes = hasher.finalize();
         
@@ -529,7 +529,7 @@ impl IntegrityChecker {
     async fn validate_data(&self, key: &[u8], data: &[u8]) -> Result<(), SecurityError> {
         let checksums = self.checksums.read().await;
         if let Some(stored_checksum) = checksums.get(key) {
-            let mut hasher = Sha256::new();
+            let mut hasher = Sha3_256::new();
             hasher.update(data);
             let current_hash = hasher.finalize();
             

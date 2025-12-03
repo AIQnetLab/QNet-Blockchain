@@ -5,7 +5,7 @@
 //! queryable through APIs, but files are protected from physical disk access.
 
 use std::fmt;
-use sha2::{Sha256, Digest};
+use sha3::{Sha3_256, Digest};
 use serde::{Serialize, Deserialize};
 use rand::RngCore;
 
@@ -113,7 +113,7 @@ impl FileEncryption {
         let mut master_key = vec![0u8; 32];
         if enabled {
             // Derive key from node ID and random salt for uniqueness
-            let mut hasher = Sha256::new();
+            let mut hasher = Sha3_256::new();
             hasher.update(node_id.as_bytes());
             hasher.update(&salt);
             hasher.update(b"qnet_lsm_encryption_key");
@@ -177,7 +177,7 @@ impl FileEncryption {
         let encrypted_data = self.encrypt_with_chacha20_poly1305(data, &nonce)?;
         
         // Calculate file integrity checksum
-        let mut hasher = Sha256::new();
+        let mut hasher = Sha3_256::new();
         hasher.update(&encrypted_data);
         hasher.update(&nonce);
         hasher.update(&self.salt);
@@ -235,7 +235,7 @@ impl FileEncryption {
         let encrypted_content = &encrypted_data[55..];
         
         // Verify integrity checksum
-        let mut hasher = Sha256::new();
+        let mut hasher = Sha3_256::new();
         hasher.update(encrypted_content);
         hasher.update(&nonce);
         hasher.update(&self.salt);
@@ -320,7 +320,7 @@ impl FileEncryption {
         rand::thread_rng().fill_bytes(&mut self.salt);
         
         // Derive new key
-        let mut hasher = Sha256::new();
+        let mut hasher = Sha3_256::new();
         hasher.update(self.node_id.as_bytes());
         hasher.update(&self.salt);
         hasher.update(b"qnet_lsm_encryption_key_rotated");

@@ -409,8 +409,8 @@ impl CryptoService {
     
     // Helper methods
     fn hash_message(&self, message: &[u8]) -> [u8; 32] {
-        use sha2::{Sha256, Digest};
-        let mut hasher = Sha256::new();
+        use sha3::{Sha3_256, Digest};
+        let mut hasher = Sha3_256::new();
         hasher.update(message);
         hasher.finalize().into()
     }

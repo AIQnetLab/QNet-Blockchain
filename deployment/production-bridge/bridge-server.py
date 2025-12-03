@@ -640,8 +640,9 @@ async def generate_verified_activation_code(wallet_address: str, burn_tx_hash: s
     
     # Create encryption key from burn transaction (MUST use actual price!)
     # CRITICAL: This price MUST be stored with the activation code for decryption!
+    # Using SHA3-256 for consistency with Rust nodes (NIST SP 800-186)
     key_material = f"{burn_tx_hash}:{node_type}:{current_price}"
-    encryption_key = hashlib.sha256(key_material.encode()).hexdigest()[:32]
+    encryption_key = hashlib.sha3_256(key_material.encode()).hexdigest()[:32]
     
     print(f"🔑 XOR key derived with burn_amount={current_price} (burn_percentage={burn_percentage}%)")
     
@@ -694,10 +695,10 @@ async def record_activation_in_solana_contract(wallet_address: str, node_type: s
     # For now, return the PDA address that would be created
     contract_address = "D7g7mkL8o1YEex6ZgETJEQyyHV7uuUMvV3Fy3u83igJ7"
     
-    # Calculate PDA address for this activation
+    # Calculate PDA address for this activation (SHA3-256 for consistency)
     import base58
     seed = f"node_activation_{wallet_address}"
-    pda_address = f"PDA_{base58.b58encode(hashlib.sha256(seed.encode()).digest()[:20]).decode()}"
+    pda_address = f"PDA_{base58.b58encode(hashlib.sha3_256(seed.encode()).digest()[:20]).decode()}"
     
     print(f"📝 Recording activation in Solana contract: {contract_address}")
     print(f"   Wallet: {wallet_address}")

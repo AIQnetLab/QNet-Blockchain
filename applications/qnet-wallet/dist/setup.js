@@ -1906,7 +1906,7 @@ async function generateEONAddress(seedPhrase) {
         const part1 = fullHex.substring(0, 19).toLowerCase();
         const part2 = fullHex.substring(19, 34).toLowerCase();
         
-        // Generate checksum
+        // Generate SHA-256 checksum
         const addressWithoutChecksum = part1 + 'eon' + part2;
         const encoder = new TextEncoder();
         const checksumBuffer = await crypto.subtle.digest('SHA-256', encoder.encode(addressWithoutChecksum));

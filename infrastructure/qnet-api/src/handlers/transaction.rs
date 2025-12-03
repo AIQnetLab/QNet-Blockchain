@@ -7,7 +7,7 @@ use crate::{error::{ApiError, ApiResult}, state::AppState};
 use qnet_state::transaction::{Transaction, TransactionType};
 use qnet_state::account::{NodeType, ActivationPhase};
 use std::time::{SystemTime, UNIX_EPOCH};
-use sha2::{Sha256, Digest};
+use sha3::{Sha3_256, Digest};
 
 /// Submit transaction request
 #[derive(Debug, Deserialize, Validate)]
@@ -264,9 +264,9 @@ fn verify_transaction_signature(req: &SubmitTransactionRequest, tx: &Transaction
     !req.signature.is_empty()
 }
 
-/// Create transaction message for signing/verification
+/// Create transaction message for signing/verification (SHA3-256 for NIST compliance)
 fn create_transaction_message(req: &SubmitTransactionRequest, tx: &Transaction) -> Vec<u8> {
-    let mut hasher = Sha256::new();
+    let mut hasher = Sha3_256::new();
     
     // Hash transaction components
     hasher.update(req.from.as_bytes());

@@ -9981,8 +9981,10 @@ impl SimplifiedP2P {
             }
         }
         
-        // CRITICAL: Sign with hybrid (ephemeral Ed25519 + Dilithium per NIST/Cisco)
-        match hybrid.sign_message_compact(message.as_bytes()).await {
+        // CRITICAL: Sign RAW message with hybrid (ephemeral Ed25519 + Dilithium per NIST/Cisco)
+        // Using sign_raw_message_compact which hashes the message before signing
+        // This ensures consistency with verification which also hashes
+        match hybrid.sign_raw_message_compact(message.as_bytes()).await {
             Ok(compact_sig) => {
                 // Serialize to JSON with prefix
                 match serde_json::to_string(&compact_sig) {
@@ -10054,8 +10056,8 @@ impl SimplifiedP2P {
                         let _ = hybrid.rotate_certificate().await;
                     }
                     
-                    // CRITICAL: Sign with hybrid (ephemeral Ed25519 + Dilithium per NIST/Cisco)
-                    hybrid.sign_message_compact(message_owned.as_bytes()).await
+                    // CRITICAL: Sign RAW message with hybrid (hashes before signing)
+                    hybrid.sign_raw_message_compact(message_owned.as_bytes()).await
                 });
                 
                 match result {
@@ -12656,8 +12658,8 @@ impl SimplifiedP2P {
             let _ = hybrid.rotate_certificate().await;
         }
         
-        // CRITICAL: Sign with hybrid (ephemeral Ed25519 + Dilithium per NIST/Cisco)
-        match hybrid.sign_message_compact(entry_hash.as_bytes()).await {
+        // CRITICAL: Sign RAW message with hybrid (hashes before signing)
+        match hybrid.sign_raw_message_compact(entry_hash.as_bytes()).await {
             Ok(compact_sig) => {
                 match serde_json::to_string(&compact_sig) {
                     Ok(json) => {
@@ -12720,8 +12722,8 @@ impl SimplifiedP2P {
                             let _ = hybrid.rotate_certificate().await;
                         }
                         
-                        // Sign with hybrid (ephemeral Ed25519 + Dilithium)
-                        hybrid.sign_message_compact(entry_hash.as_bytes()).await
+                        // Sign RAW message with hybrid (hashes before signing)
+                        hybrid.sign_raw_message_compact(entry_hash.as_bytes()).await
                     });
                     
                     match result {
@@ -14407,8 +14409,8 @@ impl SimplifiedP2P {
             let _ = hybrid.rotate_certificate().await;
         }
         
-        // CRITICAL: Sign with hybrid (ephemeral Ed25519 + Dilithium per NIST/Cisco)
-        let signature = match hybrid.sign_message_compact(message.as_bytes()).await {
+        // CRITICAL: Sign RAW message with hybrid (hashes before signing)
+        let signature = match hybrid.sign_raw_message_compact(message.as_bytes()).await {
             Ok(compact_sig) => {
                 match serde_json::to_string(&compact_sig) {
                     Ok(json) => {
@@ -14526,8 +14528,8 @@ impl SimplifiedP2P {
                         let _ = hybrid.rotate_certificate().await;
                     }
                     
-                    // Sign with hybrid (ephemeral Ed25519 + Dilithium)
-                    hybrid.sign_message_compact(message_for_sign.as_bytes()).await
+                    // Sign RAW message with hybrid (hashes before signing)
+                    hybrid.sign_raw_message_compact(message_for_sign.as_bytes()).await
                 });
                 
                 match result {

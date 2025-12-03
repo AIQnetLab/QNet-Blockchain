@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use serde::{Serialize, Deserialize};
-use sha2::{Sha256, Digest};
+use sha3::{Sha3_256, Digest};
 use aes_gcm::{Aes256Gcm, Key, Nonce, aead::{Aead, KeyInit, OsRng}};
 use rand::RngCore;
 
@@ -560,7 +560,7 @@ impl BloomFilter {
     
     /// Calculate hash for key with salt
     fn hash(&self, key: &[u8], salt: usize) -> u64 {
-        let mut hasher = Sha256::new();
+        let mut hasher = Sha3_256::new();
         hasher.update(key);
         hasher.update(&salt.to_le_bytes());
         let hash = hasher.finalize();
@@ -602,7 +602,7 @@ impl ShardingConfig {
     pub fn get_shard(&self, key: &[u8]) -> usize {
         match self.shard_function {
             ShardFunction::Hash => {
-                let mut hasher = Sha256::new();
+                let mut hasher = Sha3_256::new();
                 hasher.update(key);
                 let hash = hasher.finalize();
                 let hash_val = u64::from_le_bytes([
@@ -620,7 +620,7 @@ impl ShardingConfig {
             ShardFunction::Consistent => {
                 // Consistent hashing implementation
                 // In production, would use proper consistent hash ring
-                let mut hasher = Sha256::new();
+                let mut hasher = Sha3_256::new();
                 hasher.update(key);
                 hasher.update(b"consistent");
                 let hash = hasher.finalize();
@@ -1086,7 +1086,7 @@ impl FileEncryption {
         encrypted.extend_from_slice(&encrypted_data);
         
         // Add integrity checksum
-        let mut hasher = Sha256::new();
+        let mut hasher = Sha3_256::new();
         hasher.update(&encrypted_data);
         let checksum = hasher.finalize();
         encrypted.extend_from_slice(&checksum[..8]); // 64-bit checksum
@@ -1121,7 +1121,7 @@ impl FileEncryption {
         }
         
         // Verify integrity checksum
-        let mut hasher = Sha256::new();
+        let mut hasher = Sha3_256::new();
         hasher.update(&encrypted_content);
         let expected_checksum = hasher.finalize();
         let stored_checksum = &encrypted_data[data_end..];

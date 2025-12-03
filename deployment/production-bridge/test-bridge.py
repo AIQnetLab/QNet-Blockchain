@@ -115,9 +115,9 @@ def test_node_code_generation():
     
     for eon_address in test_eon_addresses:
         for node_type in NodeType:
-            # Generate node code
+            # Generate node code (SHA3-256 for consistency)
             data = f"{eon_address}_{node_type.value}_{int(time.time())}"
-            hash_obj = hashlib.sha256(data.encode())
+            hash_obj = hashlib.sha3_256(data.encode())
             node_code = f"{node_type.value.upper()}{hash_obj.hexdigest()[:8].upper()}"
             
             print(f"  🏷️  EON: {eon_address} + {node_type.value} → {node_code}")

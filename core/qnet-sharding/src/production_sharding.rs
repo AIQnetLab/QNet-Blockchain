@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock, Mutex};
-use sha2::{Sha256, Digest};
+use sha3::{Sha3_256, Digest};
 use serde::{Serialize, Deserialize};
 
 /// Shard configuration for production deployment
@@ -131,7 +131,7 @@ impl ProductionShardManager {
     
     /// Calculate shard assignment deterministically
     fn calculate_shard(&self, address: &str) -> u32 {
-        let mut hasher = Sha256::new();
+        let mut hasher = Sha3_256::new();
         hasher.update(address.as_bytes());
         let hash = hasher.finalize();
         
@@ -424,7 +424,7 @@ impl ProductionShardManager {
     }
     
     fn generate_tx_id(&self, from: &str, to: &str, nonce: u64) -> String {
-        let mut hasher = Sha256::new();
+        let mut hasher = Sha3_256::new();
         hasher.update(from.as_bytes());
         hasher.update(to.as_bytes());
         hasher.update(&nonce.to_le_bytes());
@@ -440,7 +440,7 @@ impl ProductionShardManager {
     }
     
     fn calculate_state_root(&self, state: &ShardState) -> [u8; 32] {
-        let mut hasher = Sha256::new();
+        let mut hasher = Sha3_256::new();
         
         // Hash all accounts in deterministic order
         let mut addresses: Vec<_> = state.accounts.keys().collect();
@@ -580,7 +580,7 @@ pub fn create_production_config(region: &str, node_id: &str) -> ShardConfig {
     };
     
     // Shard ID based on node ID hash
-    let mut hasher = Sha256::new();
+    let mut hasher = Sha3_256::new();
     hasher.update(node_id.as_bytes());
     let hash = hasher.finalize();
     let shard_id = u32::from_le_bytes([hash[0], hash[1], hash[2], hash[3]]) % total_shards;

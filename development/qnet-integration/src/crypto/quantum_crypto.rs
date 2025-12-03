@@ -2,8 +2,7 @@
 //! Production implementation using CRYSTALS-Kyber and Dilithium algorithms
 //! Server-side activation code decryption and validation
 
-use sha2::{Sha256, Digest};
-use sha3::Sha3_256;
+use sha3::{Sha3_256, Digest};
 // Crystals-Dilithium will be used through key_manager
 use aes_gcm::{Aes256Gcm, Key, Nonce, KeyInit};
 use aes_gcm::aead::{Aead, AeadCore, OsRng};
@@ -314,7 +313,7 @@ impl QNetQuantumCrypto {
         // 6. Create decryption key (same as route.ts logic)
         // key_material = f"{burn_tx}:{node_type}:{burn_amount}"
         let key_material = format!("{}:{}:{}", burn_tx, node_type, burn_amount);
-        let encryption_key = self.sha256_hash(&key_material)[..32].to_string();
+        let encryption_key = self.sha3_hash(&key_material)[..32].to_string();
         
         println!("🔑 Decryption key derived from:");
         println!("   burn_tx: {}...", safe_preview(&burn_tx, 8));
@@ -397,8 +396,8 @@ impl QNetQuantumCrypto {
 
     /// Fast signature verification with aggressive caching
     pub async fn verify_dilithium_signature_cached(&self, data: &str, signature: &DilithiumSignature, wallet_address: &str) -> Result<bool> {
-        // Create cache key for signature
-        let mut hasher = Sha256::new();
+        // Create cache key for signature (SHA3-256 for consistency)
+        let mut hasher = Sha3_256::new();
         hasher.update(data.as_bytes());
         hasher.update(signature.signature.as_bytes());
         hasher.update(wallet_address.as_bytes());
@@ -765,12 +764,12 @@ impl QNetQuantumCrypto {
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| {
                     // Fallback: Generate proper EON address format: {19}eon{15}{4 checksum} = 41 chars
-                    use sha3::{Sha3_256, Digest};
+                    use sha2::{Sha256, Digest as Sha2Digest};
                     let hash = blake3::hash(genesis_node_id.as_bytes()).to_hex();
                     let part1 = &hash[..19];
                     let part2 = &hash[19..34];
                     let checksum_input = format!("{}eon{}", part1, part2);
-                    let mut hasher = Sha3_256::new();
+                    let mut hasher = Sha256::new();
                     hasher.update(checksum_input.as_bytes());
                     let checksum = hex::encode(&hasher.finalize()[..2]);
                     format!("{}eon{}{}", part1, part2, checksum)
@@ -805,8 +804,8 @@ impl QNetQuantumCrypto {
             "F" | "f" | "4" | "5" | "6" | "D" | "E" => NodeType::Full, 
             "S" | "s" | "7" | "8" | "9" => NodeType::Super,
             _ => {
-                // Fallback logic
-                let mut hasher = Sha256::new();
+                // Fallback logic (SHA3-256 for consistency)
+                let mut hasher = Sha3_256::new();
                 hasher.update(encoded_data.as_bytes());
                 let hash = hasher.finalize();
                 match hash[0] % 3 {
@@ -831,15 +830,17 @@ impl QNetQuantumCrypto {
         // Generate wallet address from activation code
         // PRODUCTION FORMAT: 19 + 3 + 15 + 4 = 41 characters
         let wallet_hash = {
-            let mut hasher = Sha256::new();
+            let mut hasher = Sha3_256::new();
             hasher.update(code.as_bytes());
             hasher.finalize()
         };
         let full_hex = hex::encode(&wallet_hash);
         let part1 = &full_hex[..19];
         let part2 = &full_hex[19..34];
+        // Generate SHA-256 checksum for wallet compatibility
         let checksum_input = format!("{}eon{}", part1, part2);
-        let mut checksum_hasher = Sha3_256::new();
+        use sha2::{Sha256, Digest as Sha2Digest};
+        let mut checksum_hasher = Sha256::new();
         checksum_hasher.update(checksum_input.as_bytes());
         let checksum = hex::encode(&checksum_hasher.finalize()[..2]); // 4 hex chars
         let wallet_address = format!("{}eon{}{}", part1, part2, checksum);
@@ -1008,8 +1009,8 @@ impl QNetQuantumCrypto {
             "4" | "5" | "6" | "7" | "D" | "E" | "F" => Ok("full".to_string()),
             "8" | "9" => Ok("super".to_string()),
             _ => {
-                // Fallback: hash-based determination
-                let mut hasher = Sha256::new();
+                // Fallback: hash-based determination (SHA3-256 for consistency)
+                let mut hasher = Sha3_256::new();
                 hasher.update(code_segments.as_bytes());
                 let hash = hasher.finalize();
                 
@@ -1384,10 +1385,9 @@ impl QNetQuantumCrypto {
         }
     }
 
-    /// SHA256 hash function (route.ts compatible)
-    fn sha256_hash(&self, data: &str) -> String {
-        use sha2::{Sha256, Digest};
-        let mut hasher = Sha256::new();
+    /// SHA3-256 hash function (NIST SP 800-186 compliant)
+    fn sha3_hash(&self, data: &str) -> String {
+        let mut hasher = Sha3_256::new();
         hasher.update(data.as_bytes());
         hex::encode(hasher.finalize())
     }
