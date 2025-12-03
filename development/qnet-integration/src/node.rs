@@ -6584,19 +6584,11 @@ impl BlockchainNode {
                             // TIMING: Measure broadcast time
                             let broadcast_start = std::time::Instant::now();
                             
-                            // CRITICAL FIX v2.19.23: Use direct broadcast for small networks
-                            // ShredProtocol has issues with channel routing - use simple broadcast
-                            // ShredProtocol will be enabled when network > 100 nodes
-                            let use_shred_protocol = peer_count > 100;
-                            
-                            let result = if use_shred_protocol {
-                                // Large network: ShredProtocol with Reed-Solomon for O(log n) complexity
-                                p2p_clone.broadcast_block_shred_protocol(height_for_broadcast, broadcast_data).await
-                            } else {
-                                // Small network (<= 100 nodes): Direct broadcast like Genesis
-                                // This is reliable and fast for bootstrap/testnet
-                                p2p_clone.broadcast_block(height_for_broadcast, broadcast_data).await
-                            };
+                            // PRODUCTION: Use ShredProtocol for ALL block broadcasts
+                            // ShredProtocol provides Reed-Solomon redundancy and O(log n) complexity
+                            // Works for ANY network size (5 nodes to millions)
+                            // Deadlock fix in unified_p2p.rs handle_shred_protocol_chunk() makes this safe
+                            let result = p2p_clone.broadcast_block_shred_protocol(height_for_broadcast, broadcast_data).await;
                             
                             let broadcast_time = broadcast_start.elapsed();
                             
