@@ -3687,11 +3687,12 @@ impl SimplifiedP2P {
         // ADAPTIVE FANOUT: Calculate optimal fanout based on network size and latency
         let shred_protocol_fanout = self.get_shred_protocol_fanout();
         
-        if height % 10 == 0 {
+        // CRITICAL: Log first 500 blocks and every 10th for debugging
+        if height <= 500 || height % 10 == 0 {
             let avg_latency = self.get_average_peer_latency();
             let producers = self.get_qualified_producers_count();
-            println!("[SHRED_PROTOCOL/QUIC] 🚀 Broadcasting block #{} as {} chunks + {} parity (fanout={}, producers={}, latency={}ms)", 
-                     height, total_chunks, parity_count, shred_protocol_fanout, producers, avg_latency);
+            println!("[SHRED_PROTOCOL/QUIC] 🚀 Broadcasting block #{} as {} chunks + {} parity to {} peers (fanout={}, producers={}, latency={}ms)", 
+                     height, total_chunks, parity_count, validated_peers.len(), shred_protocol_fanout, producers, avg_latency);
         }
         
         // Build Kademlia-based routing tree for each chunk
@@ -3751,14 +3752,17 @@ impl SimplifiedP2P {
                     .map(|(_, msg)| msg.clone())
                     .collect();
                 
-                // Send chunks in parallel using tokio::spawn
-                let mut success_count = 0;
-                let transport = quic_transport.read().await;
+
+                let transport_arc = quic_transport.clone();
+                let node_id_clone = self.node_id.clone();
+                let height_for_log = height;
                 
-                let mut fail_count = 0;
+                // Build list of (quic_addr, msg) tuples
+                let mut send_tasks = Vec::with_capacity(total_sends);
+                
                 for (peer, msg) in peers_for_broadcast.iter().zip(messages.iter()) {
                     // CRITICAL: Skip self to prevent self-broadcast loops
-                    if peer.id == self.node_id {
+                    if peer.id == node_id_clone {
                         continue;
                     }
                     
@@ -3772,24 +3776,32 @@ impl SimplifiedP2P {
                     };
                     
                     let quic_addr = std::net::SocketAddr::new(ip, port.saturating_add(crate::p2p_transport::QUIC_PORT_OFFSET));
-                    // CRITICAL FIX: Use broadcast_to (uni stream) not send_message (bi stream)
-                    // Message handler only listens on uni streams via accept_uni()
-                    match transport.broadcast_to(quic_addr, msg).await {
-                        Ok(_) => success_count += 1,
-                        Err(e) => {
-                            fail_count += 1;
-                            // Log first 3 failures for debugging
-                            if fail_count <= 3 {
-                                println!("[SHRED_PROTOCOL] ⚠️ Broadcast failed to {}: {}", 
-                                    get_privacy_id_for_addr(&peer.addr), e);
-                            }
-                        }
-                    }
+                    let transport_clone = transport_arc.clone();
+                    let msg_clone = msg.clone();
+                    
+                    // Spawn parallel task for each chunk
+                    send_tasks.push(tokio::spawn(async move {
+                        let transport = transport_clone.read().await;
+                        transport.broadcast_to(quic_addr, &msg_clone).await
+                    }));
                 }
                 
-                if height <= 5 || height % 10 == 0 {
-                    println!("[SHRED_PROTOCOL/QUIC] ✅ Block #{} chunks delivered: {}/{} (binary protocol)", 
-                        height, success_count, total_sends);
+                // Wait for all sends to complete in parallel
+                let results = futures::future::join_all(send_tasks).await;
+                let success_count = results.iter()
+                    .filter(|r| matches!(r, Ok(Ok(_))))
+                    .count();
+                let fail_count = results.len() - success_count;
+                
+                // Log failures for debugging
+                if fail_count > 0 && (height_for_log <= 500 || height_for_log % 10 == 0) {
+                    println!("[SHRED_PROTOCOL] ⚠️ Block #{}: {}/{} chunks failed to send", 
+                        height_for_log, fail_count, results.len());
+                }
+                
+                if height_for_log <= 500 || height_for_log % 10 == 0 {
+                    println!("[SHRED_PROTOCOL/QUIC] ✅ Block #{} chunks delivered: {}/{} (PARALLEL binary protocol)", 
+                        height_for_log, success_count, total_sends);
                 }
                 
                 return Ok(());
@@ -3898,8 +3910,9 @@ impl SimplifiedP2P {
     fn handle_shred_protocol_chunk(&self, from_peer: &str, chunk: ShredProtocolChunk) {
         let height = chunk.block_height;
         
-        // DEBUG: Log chunk reception for first 5 blocks or every 10th
-        if height <= 5 || height % 10 == 0 {
+        // DEBUG: Log chunk reception for first 500 blocks or every 10th
+        // CRITICAL: Extended logging for initial network debugging
+        if height <= 500 || height % 10 == 0 {
             println!("[SHRED_PROTOCOL] 📥 Chunk {}/{} for block #{} from {} (parity: {})", 
                 chunk.chunk_index + 1, chunk.total_chunks, height, 
                 get_privacy_id_for_addr(from_peer), chunk.is_parity);

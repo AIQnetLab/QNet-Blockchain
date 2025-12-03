@@ -1851,10 +1851,10 @@ impl BlockchainNode {
         // CRITICAL: Balance between 1 block/sec target and network latency
         // PRODUCTION: Must account for broadcast time (800-900ms) + processing + consensus
         let adaptive_bft_config = crate::adaptive_bft::AdaptiveBftConfig {
-            base_timeout_ms: 3000,      // 3 seconds base (allows 800ms broadcast + 2s processing)
+            base_timeout_ms: 5000,      // 5 seconds base - parallel broadcast is fast now
             timeout_multiplier: 1.5,    
-            max_timeout_ms: 10000,      // 10 seconds max
-            min_timeout_ms: 2000,       // 2 seconds minimum (was 1000)
+            max_timeout_ms: 15000,      // 15 seconds max
+            min_timeout_ms: 3000,       // 3 seconds minimum
             latency_window_size: 100,   
         };
         let adaptive_bft = Arc::new(crate::adaptive_bft::AdaptiveBft::new(adaptive_bft_config));
@@ -10492,14 +10492,18 @@ impl BlockchainNode {
                                      certificate.node_id, microblock.producer);
                             false
                         } else {
-                            // Check certificate expiration
+                            // Check certificate expiration with GRACE PERIOD
+                            // CRITICAL: Allow 60 second grace period for network propagation delays
+                            // Blocks signed just before certificate expiry should still be valid
+                            const CERTIFICATE_VERIFICATION_GRACE_SECS: u64 = 60;
                             let now = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
                                 .as_secs();
-                            if now > certificate.expires_at {
-                                println!("[CRYPTO] ❌ Certificate expired at {}, now is {}", 
-                                         certificate.expires_at, now);
+                            let expires_with_grace = certificate.expires_at + CERTIFICATE_VERIFICATION_GRACE_SECS;
+                            if now > expires_with_grace {
+                                println!("[CRYPTO] ❌ Certificate expired at {} (with 60s grace), now is {}", 
+                                         expires_with_grace, now);
                                 false
                             } else {
                                 // Verify Ed25519 signature using ephemeral public key (NIST/Cisco requirement)

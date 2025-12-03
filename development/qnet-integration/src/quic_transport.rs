@@ -610,8 +610,9 @@ impl QuicTransport {
     }
     
     /// Connect to a peer (client mode) with auto-retry
+    /// CRITICAL: Thread-safe with double-check to prevent race conditions
     pub async fn connect(&self, peer_addr: SocketAddr) -> Result<Arc<QuicConnection>, String> {
-        // Check existing connection - but only if it's ALIVE
+        // FIRST CHECK: Existing connection - but only if it's ALIVE
         if let Some(conn) = self.connections.get(&peer_addr) {
             if conn.connection.close_reason().is_none() {
                 // Connection is alive - reuse it
@@ -629,6 +630,14 @@ impl QuicTransport {
         // Retry loop for connection attempts
         let mut last_error = String::new();
         for attempt in 1..=CONNECT_RETRY_ATTEMPTS {
+            // CRITICAL FIX: Double-check before creating connection (race condition protection)
+            // Another task may have created connection while we were waiting
+            if let Some(conn) = self.connections.get(&peer_addr) {
+                if conn.connection.close_reason().is_none() {
+                    return Ok(conn.clone());
+                }
+            }
+            
             match self.try_connect_once(endpoint, peer_addr).await {
                 Ok(conn) => return Ok(conn),
                 Err(e) => {

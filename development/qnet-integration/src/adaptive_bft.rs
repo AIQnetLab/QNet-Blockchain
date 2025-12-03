@@ -95,22 +95,22 @@ impl AdaptiveBft {
         }
         
         // Calculate adaptive timeout based on QNet's existing logic
-        // Balanced timeouts for 1 block/second target
+        // With PARALLEL chunk broadcast, propagation is fast (~100-500ms)
+        // Timeouts are for FAILOVER, not production delays
         let base_timeout = if height == 0 || height == 1 {
-            // First blocks need more time for network bootstrap
-            5000  // 5 seconds for first blocks
+            // First blocks need time for certificate sync
+            10000  // 10 seconds for first blocks
         } else if height <= 10 {
-            // Early blocks still forming network
-            3000  // 3 seconds for early blocks
+            // Early blocks - network stabilizing
+            5000  // 5 seconds for early blocks
         } else if height >= 61 && ((height - 1) % 90) >= 60 {
             // Consensus period (blocks 61-90, 151-180, 241-270, etc.)
-            // During these 30 blocks, macroblock consensus runs in background
             5000  // 5 seconds for consensus period
         } else if height > 1 && ((height - 1) % 30) == 0 {
-            // Rotation boundaries need slightly more time for producer switch
-            4000  // 4 seconds for rotation boundaries
+            // Rotation boundaries
+            5000  // 5 seconds for rotation boundaries
         } else {
-            // Normal operation - target 1 second blocks with reasonable timeout
+            // Normal operation - parallel broadcast is fast
             4000  // 4 seconds timeout for normal blocks
         };
         
