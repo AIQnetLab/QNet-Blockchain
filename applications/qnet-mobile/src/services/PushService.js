@@ -580,6 +580,43 @@ export async function checkServerNodeStatus(activationCode, nodeId = null) {
 // For now, server nodes don't need polling - user can pull-to-refresh
 // Server handles heartbeats automatically, rewards calculated at end of 4h window
 
+/**
+ * Get ALL nodes owned by a wallet address (Light, Full, Super, Genesis)
+ * Returns unified list for display in mobile app
+ * @param {string} walletAddress - EON wallet address
+ */
+export async function getAllNodesByWallet(walletAddress) {
+  try {
+    const apiUrl = getRandomBootstrapNode();
+    
+    // NEW: Call without node_type to get ALL nodes
+    const response = await fetch(
+      `${apiUrl}/api/v1/activations/by-wallet?wallet_address=${encodeURIComponent(walletAddress)}`,
+      { method: 'GET' }
+    );
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+
+    const result = await response.json();
+    
+    if (result.success && result.nodes) {
+      console.log(`[Nodes] Found ${result.nodes.length} nodes for wallet`);
+      return {
+        success: true,
+        nodes: result.nodes,
+        totalNodes: result.total_nodes || result.nodes.length
+      };
+    }
+    
+    return { success: true, nodes: [], totalNodes: 0 };
+  } catch (error) {
+    console.error('[Nodes] ❌ Failed to get nodes by wallet:', error);
+    return { success: false, error: error.message, nodes: [] };
+  }
+}
+
 export default {
   // Push provider detection
   PushType,
@@ -600,5 +637,8 @@ export default {
   
   // Server node status (Full/Super/Genesis - single API call)
   checkServerNodeStatus,
+  
+  // Get all nodes by wallet (unified view)
+  getAllNodesByWallet,
 };
 

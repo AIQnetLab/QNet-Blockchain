@@ -12,10 +12,10 @@
 //! - **Hybrid**: Both required for validity
 //!
 //! ### Certificate Management
-//! - **Lifetime**: 1 hour (3600 seconds)
-//! - **Rotation**: Automatic before expiration (5 min advance)
+//! - **Lifetime**: 4.5 minutes (270 seconds) - frequent rotation for security
+//! - **Rotation**: Automatic at 80% lifetime (216 sec), grace period 54 sec
 //! - **Storage**: LRU cache (100K certificates)
-//! - **Distribution**: P2P broadcast every 5 minutes
+//! - **Distribution**: P2P broadcast on rotation
 //!
 //! ## Signature Formats
 //!

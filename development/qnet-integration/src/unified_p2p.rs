@@ -576,6 +576,11 @@ pub struct SimplifiedP2P {
     /// All QUIC messages are sent here and processed via handle_message()
     /// This ensures QUIC messages use same logic as HTTP (no duplication)
     quic_message_tx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<(String, NetworkMessage)>>>>,
+    
+    /// PRODUCTION v2.19.25: Transaction processing channel
+    /// Received transactions from P2P are sent here for validation and mempool
+    /// This enables full transaction propagation across the network
+    transaction_tx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<ReceivedTransaction>>>>,
 }
 
 /// HYBRID: Simplified certificate manager for microblocks only
@@ -989,7 +994,8 @@ const KADEMLIA_BITS: usize = 256;    // Hash size in bits
 // ShredProtocol block propagation constants
 const SHRED_PROTOCOL_CHUNK_SIZE: usize = 1024;      // 1KB chunks (optimal for Dilithium signatures)
 const SHRED_PROTOCOL_REDUNDANCY_FACTOR: f32 = 1.5;  // 50% redundancy for Reed-Solomon
-const SHRED_PROTOCOL_MAX_CHUNKS: usize = 64;        // Max chunks per block (64KB max block size)
+const SHRED_PROTOCOL_MAX_CHUNKS: usize = 2048;      // Max chunks per block (2MB max for 50K TX support)
+                                                     // ADAPTIVE: Empty block ~1KB, full 50K TX block ~1.6MB
 
 /// ShredProtocol chunk for block propagation
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1155,6 +1161,9 @@ impl SimplifiedP2P {
             
             // PRODUCTION v2.19.22: QUIC message channel (set via set_quic_message_channel)
             quic_message_tx: Arc::new(Mutex::new(None)),
+            
+            // PRODUCTION v2.19.25: Transaction channel (set via set_transaction_channel)
+            transaction_tx: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1182,6 +1191,17 @@ impl SimplifiedP2P {
         };
         *guard = Some(macroblock_tx);
         println!("[P2P] ✅ Macroblock processing channel established");
+    }
+    
+    /// PRODUCTION v2.19.25: Set transaction processing channel for mempool integration
+    /// Enables full transaction propagation across the network
+    pub fn set_transaction_channel(&mut self, tx_channel: tokio::sync::mpsc::UnboundedSender<ReceivedTransaction>) {
+        let mut guard = match self.transaction_tx.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner()
+        };
+        *guard = Some(tx_channel);
+        println!("[P2P] ✅ Transaction processing channel established");
     }
     
     /// PRODUCTION: Set macroblock sync request channel (v2.19.12)
@@ -7994,6 +8014,15 @@ pub struct ReceivedBlock {
     pub timestamp: u64,
 }
 
+/// Transaction received from P2P network for mempool processing
+#[derive(Debug, Clone)]
+pub struct ReceivedTransaction {
+    pub tx_hash: String,
+    pub tx_data: Vec<u8>,
+    pub from_peer: String,
+    pub timestamp: u64,
+}
+
 impl SimplifiedP2P {
     /// Handle incoming network message
     pub fn handle_message(&self, from_peer: &str, message: NetworkMessage) {
@@ -8116,8 +8145,48 @@ impl SimplifiedP2P {
             NetworkMessage::Transaction { data } => {
                 // Update last_seen for the peer who sent the transaction
                 self.update_peer_last_seen(from_peer);
-                println!("[P2P] ← Received transaction from {} ({} bytes)", 
-                         from_peer, data.len());
+                
+                // PRODUCTION v2.19.25: Full transaction processing
+                // Deserialize, validate basic structure, and send to mempool via channel
+                let tx_guard = match self.transaction_tx.lock() {
+                    Ok(g) => g,
+                    Err(p) => p.into_inner()
+                };
+                
+                if let Some(ref tx_sender) = *tx_guard {
+                    // Calculate transaction hash for deduplication
+                    let tx_hash = format!("{:x}", sha3::Sha3_256::digest(&data));
+                    
+                    // Create received transaction for processing
+                    let received_tx = ReceivedTransaction {
+                        tx_hash: tx_hash.clone(),
+                        tx_data: data.clone(),
+                        from_peer: from_peer.to_string(),
+                        timestamp: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
+                    };
+                    
+                    // Send to node for validation and mempool addition
+                    match tx_sender.send(received_tx) {
+                        Ok(_) => {
+                            println!("[P2P] ← Transaction {} from {} queued for processing", 
+                                     &tx_hash[..16], from_peer);
+                        }
+                        Err(e) => {
+                            println!("[P2P] ❌ Failed to queue transaction: {}", e);
+                        }
+                    }
+                } else {
+                    println!("[P2P] ⚠️ Transaction channel not available - tx from {} discarded", from_peer);
+                }
+                drop(tx_guard);
+                
+                // GOSSIP: Forward transaction to other peers (low fanout to avoid spam)
+                // OPTIMIZATION: Moved OUTSIDE lock to prevent holding mutex during network ops
+                let gossip_msg = NetworkMessage::Transaction { data };
+                self.gossip_to_random_peers(gossip_msg, 2);
             }
             
             NetworkMessage::PeerDiscovery { requesting_node } => {
@@ -8909,8 +8978,54 @@ impl SimplifiedP2P {
                     return;
                 }
                 
-                // Signature is stored but NOT verified for heartbeats (optimization)
-                let _ = signature; // Suppress unused warning
+                // SECURITY v2.20.1: Verify Ed25519 ephemeral signature
+                // Parse JSON signature: {"ephemeral_pubkey":"...", "signature":"...", "message":"..."}
+                let signature_valid = {
+                    use ed25519_dalek::{VerifyingKey, Signature, Verifier};
+                    
+                    // Try to parse as JSON with ephemeral signature
+                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&signature) {
+                        if let (Some(pubkey_b64), Some(sig_b64), Some(msg)) = (
+                            parsed["ephemeral_pubkey"].as_str(),
+                            parsed["signature"].as_str(),
+                            parsed["message"].as_str()
+                        ) {
+                            // Decode base64
+                            let pubkey_bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, pubkey_b64);
+                            let sig_bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, sig_b64);
+                            
+                            if let (Ok(pk), Ok(sb)) = (pubkey_bytes, sig_bytes) {
+                                if pk.len() == 32 && sb.len() == 64 {
+                                    let mut pk_arr = [0u8; 32];
+                                    let mut sig_arr = [0u8; 64];
+                                    pk_arr.copy_from_slice(&pk);
+                                    sig_arr.copy_from_slice(&sb);
+                                    
+                                    if let Ok(verifying_key) = VerifyingKey::from_bytes(&pk_arr) {
+                                        let sig = Signature::from_bytes(&sig_arr);
+                                        
+                                        // Verify: message must match node_id:timestamp:height:index
+                                        let expected_msg = format!("{}:{}:{}:{}", node_id, timestamp, block_height, heartbeat_index);
+                                        if msg == expected_msg {
+                                            verifying_key.verify(msg.as_bytes(), &sig).is_ok()
+                                        } else {
+                                            false // Message mismatch
+                                        }
+                                    } else { false }
+                                } else { false }
+                            } else { false }
+                        } else { false }
+                    } else {
+                        // v2.20.1: No legacy support - all heartbeats must have ephemeral signature
+                        println!("[HEARTBEAT] ❌ Invalid signature format (expected JSON with ephemeral_pubkey)");
+                        false
+                    }
+                };
+                
+                if !signature_valid {
+                    println!("[HEARTBEAT] ❌ Invalid signature for {} heartbeat #{}", node_id, heartbeat_index);
+                    return;
+                }
                 
                 // Store heartbeat in RAM
                 {
@@ -9165,93 +9280,35 @@ impl SimplifiedP2P {
                     }
                 }
                 
-                // SECURITY: Detect and punish INFLATION manipulation attempts
-                // CRITICAL FIX: Only INFLATION is an attack (claiming higher reputation to become producer)
-                // DEFLATION is NOT an attack - node may have received legitimate penalty
-                // Tolerance: 10% for network delays and sync timing (was 2% - too strict)
-                let reputation_diff = reputation - real_reputation; // Positive = INFLATION
-                let is_inflation_attack = reputation_diff > 10.0 && real_reputation > 0.0;
+                // ARCHITECTURE FIX v2.19.25: REMOVED INFLATION CHECK
+                // ═══════════════════════════════════════════════════════════════════════════
+                // WHY REMOVED:
+                // 1. Reputation is now synchronized via BLOCKS (not gossip)
+                //    - When node receives block at rotation boundary (every 30 blocks)
+                //    - ALL nodes update producer's reputation locally (+2%)
+                //    - This guarantees 100% consistency without extra traffic
+                //
+                // 2. INFLATION check caused FALSE POSITIVES:
+                //    - ReputationSync runs every 5 minutes
+                //    - Reputation changes every 30 seconds (rotation)
+                //    - Diff accumulated → honest nodes BANNED!
+                //
+                // 3. Producer selection uses LOCAL reputation (not announced):
+                //    - Even if node lies about reputation in announcement
+                //    - Other nodes use THEIR OWN local reputation for selection
+                //    - Lying provides NO advantage
+                //
+                // 4. Real attacks are detected via blocks:
+                //    - Invalid block → -20% penalty (consensus confirmed)
+                //    - Malicious behavior → -50% penalty
+                //    - Jail status synced via ReputationSync
+                // ═══════════════════════════════════════════════════════════════════════════
                 
-                if is_inflation_attack {
-                    let manipulation_type = "INFLATION"; // Only inflation is an attack
-                    
-                    println!("[SECURITY] 🚨 REPUTATION {} ATTACK from {}: claimed {:.1}, real {:.1} (diff: {:.1})", 
-                             manipulation_type, node_id, reputation, real_reputation, reputation_diff);
-                    
-                    // Track inflation attempts for escalating punishment
-                    static INFLATION_ATTEMPTS: Lazy<Arc<DashMap<String, (u32, u64)>>> = 
-                        Lazy::new(|| Arc::new(DashMap::new()));
-                    
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-                    
-                    // Get or create attempt counter
-                    let (attempt_count, first_attempt) = {
-                        let mut entry = INFLATION_ATTEMPTS.entry(node_id.clone()).or_insert((0, now));
-                        entry.0 += 1;
-                        (entry.0, entry.1)
-                    };
-                    
-                    // ESCALATING PUNISHMENT:
-                    // 1st attempt: -15% reputation + 1 hour ban
-                    // 2nd attempt: -25% reputation + 1 day ban
-                    // 3rd attempt: -40% reputation + 1 week ban
-                    // 4th+ attempt: -50% reputation + 1 year ban (essentially permanent)
-                    let (penalty, ban_duration_secs, ban_description) = match attempt_count {
-                        1 => (-15.0, 3600u64, "1 hour"),           // 1 hour
-                        2 => (-25.0, 86400u64, "1 day"),          // 1 day
-                        3 => (-40.0, 604800u64, "1 week"),        // 1 week
-                        _ => (-50.0, 31536000u64, "1 year"),      // 1 year (permanent)
-                    };
-                    
-                    // Apply reputation penalty and jail using existing reputation system
-                    if let Ok(mut rep_sys) = self.reputation_system.lock() {
-                        // Apply penalty
-                        rep_sys.update_reputation(&node_id, penalty);
-                        println!("[SECURITY] ⚠️ Applied {:.1}% penalty to {} for {} (attempt #{}, diff: {:.1})", 
-                                 penalty, node_id, manipulation_type, attempt_count, reputation_diff);
-                        
-                        // Apply jail with escalating duration
-                        let jail_until = now + ban_duration_secs;
-                        let reason = format!("Reputation {} attack (attempt #{}): claimed {:.0}, real {:.0}, diff {:.0}", 
-                                            manipulation_type, attempt_count, reputation, real_reputation, reputation_diff);
-                        
-                        // Use apply_jail_sync for consistent jail handling
-                        rep_sys.apply_jail_sync(&node_id, jail_until, attempt_count, reason.clone());
-                        
-                        println!("[SECURITY] 🔒 BANNED {} for {} (attempt #{}, {}: real {:.1} vs claimed {:.1})", 
-                                 node_id, ban_description, attempt_count, manipulation_type, real_reputation, reputation);
-                        
-                        // Save to persistent storage
-                        self.save_jail_to_storage(&node_id, jail_until, attempt_count, &reason);
-                    }
-                    
-                    // Gossip the ban to network for consensus
-                    if attempt_count >= 3 {
-                        // Critical attack - report to network
-                        println!("[SECURITY] 🚨 CRITICAL: Reporting {} to network for repeated reputation manipulation", node_id);
-                        let _ = self.report_critical_attack(
-                            &node_id, 
-                            MaliciousBehavior::ProtocolViolation, // Reputation manipulation is a protocol violation
-                            0, // No specific block height for reputation attacks
-                            &format!("Repeated reputation {} attacks ({} attempts, diff: {:.0})", 
-                                    manipulation_type, attempt_count, reputation_diff)
-                        );
-                    }
-                    
-                    // Don't accept this announcement
-                    return;
-                }
-                
-                // Log minor differences (within tolerance) for monitoring
-                // These are NOT attacks, just floating point/network sync differences
-                // Use abs() for logging since we only care about magnitude for monitoring
-                let abs_diff = reputation_diff.abs();
-                if abs_diff > 0.5 && abs_diff <= 10.0 && real_reputation > 0.0 {
-                    println!("[ACTIVE] ℹ️ Minor reputation diff for {} (within tolerance): claimed {:.1}, real {:.1}", 
-                             node_id, reputation, real_reputation);
+                // MONITORING ONLY: Log significant differences for debugging
+                let reputation_diff = (reputation - real_reputation).abs();
+                if reputation_diff > 5.0 && real_reputation > 0.0 {
+                    println!("[ACTIVE] ℹ️ Reputation diff for {} (monitoring): claimed {:.1}, local {:.1}, diff {:.1}", 
+                             node_id, reputation, real_reputation, reputation_diff);
                 }
                 
                 // Use the HIGHER of real or default (70) for new nodes
@@ -10025,11 +10082,35 @@ impl SimplifiedP2P {
                         if !already_sent {
                             let block_height = blockchain_height_fn();
                             
-                            // OPTIMIZATION v2.19.19: No Dilithium signature for heartbeats
-                            // RATIONALE: Heartbeats don't affect consensus, CPU savings significant
-                            // Security ensured by: timestamp validation, active node registry, dedupe
-                            // Blocks are ALWAYS verified with Dilithium (security preserved)
-                            let signature = format!("heartbeat_v2_{}_{}", node_id, now);
+                            // SECURITY v2.20.1: Ed25519 ephemeral signature for heartbeats
+                            // Per NIST/Cisco: NEW ephemeral key for EACH heartbeat (1 key = 1 message)
+                            // - Generate fresh Ed25519 keypair
+                            // - Sign: node_id || timestamp || block_height || heartbeat_index
+                            // - Include ephemeral pubkey + signature in JSON format
+                            // - Key is discarded after signing (ephemeral)
+                            let signature = {
+                                use ed25519_dalek::{SigningKey, Signer};
+                                use rand::rngs::OsRng;
+                                
+                                // Step 1: Generate NEW ephemeral Ed25519 keypair
+                                let mut csprng = OsRng{};
+                                let ephemeral_signing_key = SigningKey::generate(&mut csprng);
+                                let ephemeral_verifying_key = ephemeral_signing_key.verifying_key();
+                                
+                                // Step 2: Create message to sign
+                                let message = format!("{}:{}:{}:{}", node_id, now, block_height, index);
+                                
+                                // Step 3: Sign with ephemeral key
+                                let sig = ephemeral_signing_key.sign(message.as_bytes());
+                                
+                                // Step 4: Encode as JSON (pubkey + signature in base64)
+                                // Ephemeral key is now DISCARDED (out of scope)
+                                format!(r#"{{"ephemeral_pubkey":"{}","signature":"{}","message":"{}"}}"#,
+                                    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, ephemeral_verifying_key.as_bytes()),
+                                    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, sig.to_bytes()),
+                                    message
+                                )
+                            };
                             
                             // Broadcast heartbeat
                             let heartbeat_msg = NetworkMessage::NodeHeartbeat {

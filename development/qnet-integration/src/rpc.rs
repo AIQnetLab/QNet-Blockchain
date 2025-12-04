@@ -590,7 +590,13 @@ struct BatchTransferRequest {
 
 #[derive(Debug, Deserialize)]
 struct GenerateActivationCodeRequest {
+    /// Phase 1: Solana address (for burn verification)
+    /// Phase 2: QNet EON address (for both burn and rewards)
     wallet_address: String,
+    /// QNet EON address for rewards (REQUIRED for Phase 1, optional for Phase 2)
+    /// Format: {19 hex}eon{15 hex}{4 checksum} = 41 chars
+    #[serde(default)]
+    qnet_reward_wallet: Option<String>,
     burn_tx_hash: String,
     node_type: String,
     burn_amount: u64,
@@ -1633,6 +1639,50 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(blockchain_filter.clone())
         .and_then(handle_tokens_for_address);
     
+    // ============================================================================
+    // BENCHMARK ENDPOINTS - Real Transaction Load Testing
+    // ============================================================================
+    
+    // POST /api/v1/benchmark/start - Start benchmark with config
+    let benchmark_start = api_v1
+        .and(warp::path("benchmark"))
+        .and(warp::path("start"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::body::json())
+        .and(blockchain_filter.clone())
+        .and_then(handle_benchmark_start);
+    
+    // GET /api/v1/benchmark/status - Get current benchmark status
+    let benchmark_status = api_v1
+        .and(warp::path("benchmark"))
+        .and(warp::path("status"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and_then(handle_benchmark_status);
+    
+    // GET /api/v1/benchmark/results - Get benchmark results
+    let benchmark_results = api_v1
+        .and(warp::path("benchmark"))
+        .and(warp::path("results"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and_then(handle_benchmark_results);
+    
+    // POST /api/v1/benchmark/stop - Stop benchmark
+    let benchmark_stop = api_v1
+        .and(warp::path("benchmark"))
+        .and(warp::path("stop"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and_then(handle_benchmark_stop);
+    
+    // Combine benchmark routes
+    let benchmark_routes = benchmark_start
+        .or(benchmark_status)
+        .or(benchmark_results)
+        .or(benchmark_stop);
+    
     // CORS configuration - PRODUCTION SECURITY
     // In development mode (QNET_DEV_MODE=1), allow all origins
     // In production, restrict to whitelisted domains only
@@ -1806,6 +1856,7 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .or(p2p_routes)
         .or(monitoring_routes)
         .or(public_routes) // PUBLIC: Cached endpoints for website
+        .or(benchmark_routes) // BENCHMARK: Real transaction load testing
         .with(cors);
     
     println!("🚀 Starting comprehensive API server on port {}", port);
@@ -1822,6 +1873,18 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
     if !matches!(node_type, crate::node::NodeType::Light) {
         start_light_node_ping_service(blockchain.clone());
         println!("🕐 Light node randomized ping service started");
+        
+        // CRITICAL: Start heartbeat service for Full/Super nodes (required for rewards!)
+        // Full nodes need 8/10 heartbeats, Super nodes need 9/10 per 4h window
+        if let Some(p2p) = blockchain.get_unified_p2p() {
+            let blockchain_for_heartbeat = blockchain.clone();
+            p2p.start_heartbeat_service(move || {
+                // This closure provides current blockchain height
+                tokio::runtime::Handle::current()
+                    .block_on(async { blockchain_for_heartbeat.get_height().await })
+            });
+            println!("💓 Heartbeat service started (10 heartbeats per 4h window for rewards)");
+        }
     }
     
     warp::serve(routes).run(([0, 0, 0, 0], port)).await;
@@ -3065,7 +3128,7 @@ async fn handle_mempool_status(
     let mempool_size = blockchain.get_mempool_size().await.unwrap_or(0);
     let response = json!({
         "size": mempool_size,
-        "max_size": 500_000,
+        "max_size": 5_000_000, // 5M TX mempool for 50K TX/block support
         "status": "healthy",
         "node_id": blockchain.get_public_display_name(),
         "timestamp": chrono::Utc::now().timestamp()
@@ -4124,6 +4187,17 @@ async fn handle_light_node_register(
         return Ok(rate_limit_response);
     }
     
+    // SECURITY: Validate QNet EON wallet address format
+    // Rewards MUST go to valid EON address - prevents loss of funds!
+    if let Err(e) = validate_eon_address_with_error(&register_request.wallet_address) {
+        return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": "Invalid QNet EON wallet address",
+            "details": e,
+            "hint": "Wallet address must be in EON format: {19 hex}eon{15 hex}{4 checksum} = 41 chars"
+        })));
+    }
+    
     // PRIVACY: Generate quantum-secure pseudonym for Light node (mobile privacy protection)
     let light_node_pseudonym = generate_light_node_pseudonym(&register_request.wallet_address);
     
@@ -4374,8 +4448,8 @@ async fn handle_shred_protocol_metrics(blockchain: Arc<BlockchainNode>) -> Resul
         "qualified_producers": producers,  // REAL-TIME: Producers with reputation >= 70%
         "average_latency_ms": latency,  // REAL-TIME: Network performance
         "redundancy_factor": 1.5,
-        "max_chunks": 64,
-        "max_block_size": 65536,
+        "max_chunks": 2048,
+        "max_block_size": 2097152, // 2 MB for 50K TX support
         "status": "active"
     });
     
@@ -4429,8 +4503,8 @@ async fn handle_pre_execution_status(blockchain: Arc<BlockchainNode>) -> Result<
     let status = json!({
         "enabled": true,
         "lookahead_blocks": 3,
-        "max_tx_per_block": 1000,
-        "cache_size": 10000,
+        "max_tx_per_block": 50000, // 50K TX/block max
+        "cache_size": 50000, // Match max TX per block
         "total_pre_executed": metrics.total_pre_executed,
         "cache_hits": metrics.cache_hits,
         "cache_misses": metrics.cache_misses,
@@ -6410,11 +6484,35 @@ async fn handle_auth_challenge(
 }
 
 /// Handle graceful shutdown request for node replacement
+/// SECURITY: Only allowed from localhost or with QNET_ADMIN_SECRET
 async fn handle_graceful_shutdown(
     shutdown_request: Value,
     blockchain: Arc<BlockchainNode>,
 ) -> Result<impl Reply, Rejection> {
     use std::time::{SystemTime, UNIX_EPOCH};
+    
+    // SECURITY: Check admin secret if provided
+    let admin_secret = std::env::var("QNET_ADMIN_SECRET").ok();
+    let request_secret = shutdown_request.get("admin_secret")
+        .and_then(|v| v.as_str());
+    
+    // Only allow if:
+    // 1. No admin secret is set (dev mode), OR
+    // 2. Request provides correct admin secret
+    if let Some(secret) = &admin_secret {
+        match request_secret {
+            Some(req_secret) if req_secret == secret => {
+                // OK - correct secret provided
+            }
+            _ => {
+                println!("⚠️  SHUTDOWN REJECTED: Invalid or missing admin_secret");
+                return Ok(warp::reply::json(&json!({
+                    "success": false,
+                    "error": "Unauthorized: admin_secret required"
+                })));
+            }
+        }
+    }
 
     let reason = shutdown_request.get("reason")
         .and_then(|v| v.as_str())
@@ -6426,7 +6524,7 @@ async fn handle_graceful_shutdown(
         .and_then(|v| v.as_u64())
         .unwrap_or(10);
 
-    println!("🛑 GRACEFUL SHUTDOWN REQUESTED");
+    println!("🛑 GRACEFUL SHUTDOWN AUTHORIZED");
     println!("   Reason: {}", reason);
     println!("   Message: {}", message);
     println!("   Timeout: {} seconds", timeout_seconds);
@@ -6469,6 +6567,7 @@ async fn handle_graceful_shutdown(
 }
 
 /// Handle activation codes query by wallet address for bridge-server
+/// EXTENDED: node_type is now OPTIONAL - returns ALL nodes for wallet if omitted
 async fn handle_activations_by_wallet(
     params: HashMap<String, String>,
     blockchain: Arc<BlockchainNode>,
@@ -6477,7 +6576,7 @@ async fn handle_activations_by_wallet(
     
     // Extract parameters from query string
     let wallet_address = match params.get("wallet_address") {
-        Some(addr) if !addr.is_empty() => addr,
+        Some(addr) if !addr.is_empty() => addr.clone(),
         _ => {
             let error_response = json!({
                 "exists": false,
@@ -6488,28 +6587,84 @@ async fn handle_activations_by_wallet(
     };
     
     let phase = params.get("phase").and_then(|p| p.parse::<u8>().ok()).unwrap_or(1);
-    let node_type = params.get("node_type").map_or("", |v| v).to_string();
+    let node_type = params.get("node_type").map(|v| v.to_string());
     
-    if node_type.is_empty() {
-        let error_response = json!({
-            "exists": false,
-            "error": "Missing node_type parameter"
+    // NEW: If node_type is NOT specified, return ALL nodes for this wallet
+    if node_type.is_none() || node_type.as_ref().map(|s| s.is_empty()).unwrap_or(true) {
+        // Query RewardManager for all nodes owned by this wallet
+        let reward_manager_arc = blockchain.get_reward_manager();
+        let reward_manager = reward_manager_arc.read().await;
+        let nodes = reward_manager.get_nodes_by_wallet(&wallet_address);
+        
+        if nodes.is_empty() {
+            // No nodes in reward manager - check activation registry for pending activations
+            let registry = &*GLOBAL_ACTIVATION_REGISTRY;
+            match registry.check_wallet_has_any_node(&wallet_address).await {
+                Ok(Some((existing_type, code_or_id))) => {
+                    let response = json!({
+                        "success": true,
+                        "wallet_address": wallet_address,
+                        "nodes": [{
+                            "node_type": existing_type,
+                            "activation_code": code_or_id,
+                            "node_id": null,
+                            "pending_rewards": 0,
+                            "status": "pending_activation"
+                        }]
+                    });
+                    return Ok(warp::reply::json(&response));
+                }
+                _ => {
+                    let response = json!({
+                        "success": true,
+                        "wallet_address": wallet_address,
+                        "nodes": [],
+                        "message": "No nodes found for this wallet"
+                    });
+                    return Ok(warp::reply::json(&response));
+                }
+            }
+        }
+        
+        // Build nodes array with full info
+        let nodes_json: Vec<serde_json::Value> = nodes.iter().map(|(node_id, node_type, pending)| {
+            let type_str = match node_type {
+                qnet_consensus::lazy_rewards::NodeType::Light => "light",
+                qnet_consensus::lazy_rewards::NodeType::Full => "full",
+                qnet_consensus::lazy_rewards::NodeType::Super => "super",
+            };
+            json!({
+                "node_id": node_id,
+                "node_type": type_str,
+                "pending_rewards": pending,
+                "status": "active"
+            })
+        }).collect();
+        
+        let response = json!({
+            "success": true,
+            "wallet_address": wallet_address,
+            "nodes": nodes_json,
+            "total_nodes": nodes.len()
         });
-        return Ok(warp::reply::json(&error_response));
+        return Ok(warp::reply::json(&response));
     }
+    
+    // LEGACY: If node_type IS specified, use old behavior for backward compatibility
+    let node_type_str = node_type.unwrap();
     
     // Initialize activation registry for blockchain query
     let registry = &*GLOBAL_ACTIVATION_REGISTRY;
     
     // Query blockchain for existing activation record
-    match registry.query_activation_by_wallet_and_type(wallet_address, phase, &node_type).await {
+    match registry.query_activation_by_wallet_and_type(&wallet_address, phase, &node_type_str).await {
         Ok(Some(activation_code)) => {
             let response = json!({
                 "exists": true,
                 "activation_code": activation_code,
                 "wallet_address": wallet_address,
                 "phase": phase,
-                "node_type": node_type,
+                "node_type": node_type_str,
                 "reusable": true,
                 "message": "Existing activation code found for this wallet and node type"
             });
@@ -6520,7 +6675,7 @@ async fn handle_activations_by_wallet(
                 "exists": false,
                 "wallet_address": wallet_address,
                 "phase": phase,
-                "node_type": node_type,
+                "node_type": node_type_str,
                 "message": "No existing activation found for this wallet and node type"
             });
             Ok(warp::reply::json(&response))
@@ -6532,7 +6687,7 @@ async fn handle_activations_by_wallet(
                 "error": format!("Blockchain query failed: {}", e),
                 "wallet_address": wallet_address,
                 "phase": phase,
-                "node_type": node_type
+                "node_type": node_type_str
             });
             Ok(warp::reply::json(&error_response))
         }
@@ -6550,8 +6705,15 @@ async fn handle_generate_activation_code(
         return Ok(rate_limit_response);
     }
     
-    // SECURITY: Validate wallet address format (Phase 2 uses EON, Phase 1 uses Solana base58)
+    // SECURITY: Validate wallet addresses
+    // Phase 1: wallet_address = Solana (burn), qnet_reward_wallet = EON (rewards) - REQUIRED
+    // Phase 2: wallet_address = EON (burn + rewards)
+    
+    // Determine the QNet EON address for rewards (used for "1 wallet = 1 node" check)
+    let qnet_wallet_for_rewards: String;
+    
     if request.phase == 2 {
+        // Phase 2: wallet_address is EON, used for everything
         if let Err(e) = validate_eon_address_with_error(&request.wallet_address) {
             return Ok(warp::reply::json(&json!({
                 "success": false,
@@ -6559,17 +6721,44 @@ async fn handle_generate_activation_code(
                 "details": e
             })));
         }
+        qnet_wallet_for_rewards = request.wallet_address.clone();
     } else {
-        // Phase 1: Solana base58 address validation (32-44 chars, alphanumeric except 0OIl)
+        // Phase 1: wallet_address is Solana (for burn), qnet_reward_wallet is EON (for rewards)
+        
+        // Validate Solana address (for burn verification)
         let is_valid_solana = request.wallet_address.len() >= 32 
             && request.wallet_address.len() <= 44
             && request.wallet_address.chars().all(|c| c.is_alphanumeric() && c != '0' && c != 'O' && c != 'I' && c != 'l');
         if !is_valid_solana {
             return Ok(warp::reply::json(&json!({
                 "success": false,
-                "error": "Invalid Solana wallet address format"
+                "error": "Invalid Solana wallet address format for burn verification"
             })));
         }
+        
+        // REQUIRED: QNet EON address for rewards
+        match &request.qnet_reward_wallet {
+            Some(qnet_addr) => {
+                if let Err(e) = validate_eon_address_with_error(qnet_addr) {
+                    return Ok(warp::reply::json(&json!({
+                        "success": false,
+                        "error": "Invalid QNet EON reward wallet address",
+                        "details": e,
+                        "hint": "Phase 1 requires both Solana address (for burn) and QNet EON address (for rewards)"
+                    })));
+                }
+                qnet_wallet_for_rewards = qnet_addr.clone();
+            }
+            None => {
+                return Ok(warp::reply::json(&json!({
+                    "success": false,
+                    "error": "Missing qnet_reward_wallet for Phase 1",
+                    "hint": "Phase 1 requires 'qnet_reward_wallet' field with QNet EON address for rewards"
+                })));
+            }
+        }
+        
+        println!("   QNet Reward Wallet: {}...", &qnet_wallet_for_rewards[..8.min(qnet_wallet_for_rewards.len())]);
     }
     
     // Validate node type
@@ -6614,9 +6803,36 @@ async fn handle_generate_activation_code(
         }
     }
     
-    // Check if activation code already exists for this wallet+node_type+phase
-    // System allows multiple codes per burn (one per node type), but enforces 1 wallet = 1 active node of each type
+    // SECURITY: 1 wallet = 1 node rule (regardless of node type!)
+    // A wallet can only have ONE node - Light, Full, OR Super, not multiple
+    // Check is ALWAYS by QNet EON address (the reward wallet)
     let registry = &*GLOBAL_ACTIVATION_REGISTRY;
+    
+    // First check: Does QNet wallet already have ANY node?
+    match registry.check_wallet_has_any_node(&qnet_wallet_for_rewards).await {
+        Ok(Some((existing_type, existing_code))) => {
+            println!("🚫 [SECURITY] QNet wallet already has {} node - rejecting new {} activation", 
+                     existing_type, request.node_type);
+            let response = json!({
+                "success": false,
+                "error": "QNet wallet already has an active node",
+                "existing_node_type": existing_type,
+                "qnet_wallet": qnet_wallet_for_rewards,
+                "requested_node_type": request.node_type,
+                "message": "1 wallet = 1 node rule: Each QNet wallet can only activate ONE node (Light, Full, or Super)"
+            });
+            return Ok(warp::reply::json(&response));
+        }
+        Ok(None) => {
+            // Wallet has no nodes - eligible for activation
+            println!("✅ Wallet has no existing nodes - proceeding with activation");
+        }
+        Err(e) => {
+            println!("⚠️ Registry query error: {} - proceeding with generation", e);
+        }
+    }
+    
+    // Legacy check for same type (backward compatibility for existing codes)
     match registry.query_activation_by_wallet_and_type(&request.wallet_address, request.phase, &request.node_type).await {
         Ok(Some(existing_code)) => {
             println!("✅ Existing activation code found - returning cached code");
@@ -6627,7 +6843,7 @@ async fn handle_generate_activation_code(
                 "node_type": request.node_type,
                 "phase": request.phase,
                 "cached": true,
-                "message": "Existing activation code found for this wallet and node type"
+                "message": "Existing activation code found for this wallet"
             });
             return Ok(warp::reply::json(&response));
         }
@@ -6652,7 +6868,7 @@ async fn handle_generate_activation_code(
             
             let node_info = crate::activation_validation::NodeInfo {
                 activation_code: code_hash.clone(), // Use hash for secure blockchain storage
-                wallet_address: request.wallet_address.clone(),
+                wallet_address: qnet_wallet_for_rewards.clone(), // ALWAYS QNet EON address for rewards!
                 device_signature: format!("generated_{}", chrono::Utc::now().timestamp()),
                 node_type: request.node_type.clone(),
                 activated_at: chrono::Utc::now().timestamp() as u64,
@@ -7572,7 +7788,7 @@ async fn handle_stats(
         },
         "mempool": {
             "size": mempool_size,
-            "max_size": 500000,
+            "max_size": 5_000_000, // 5M TX mempool
         },
         "blockchain": {
             "microblock_interval": 1,
@@ -8001,7 +8217,7 @@ async fn handle_performance_metrics(
     
     let metrics = json!({
         "mempool_size": mempool_size,  // REAL-TIME
-        "mempool_capacity": 500000,
+        "mempool_capacity": 5_000_000, // 5M TX mempool
         "current_height": current_height,  // REAL-TIME
         "peers_connected": peer_count,  // REAL-TIME
         "tps_current": tps_current,
@@ -9320,4 +9536,223 @@ async fn handle_tokens_for_address(
             })))
         }
     }
+}
+
+// ============================================================================
+// BENCHMARK HANDLERS - Real Transaction Load Testing
+// ============================================================================
+
+/// Request body for benchmark start
+#[derive(Debug, Clone, serde::Deserialize)]
+struct BenchmarkStartRequest {
+    /// Total number of transactions to generate
+    #[serde(default = "default_total_transactions")]
+    total: u64,
+    /// Target TPS
+    #[serde(default = "default_target_tps")]
+    target_tps: u64,
+    /// Number of test accounts
+    #[serde(default = "default_num_accounts")]
+    num_accounts: usize,
+}
+
+fn default_total_transactions() -> u64 { 100_000 }
+fn default_target_tps() -> u64 { 50_000 }
+fn default_num_accounts() -> usize { 100 }
+
+/// Handle POST /api/v1/benchmark/start
+/// SECURITY: Only Genesis/Bootstrap nodes can run benchmarks
+async fn handle_benchmark_start(
+    request: BenchmarkStartRequest,
+    blockchain: Arc<BlockchainNode>,
+) -> Result<impl Reply, Rejection> {
+    use crate::benchmark::{BENCHMARK_MANAGER, BenchmarkConfig};
+    
+    // SECURITY: Only allow benchmark on Genesis/Bootstrap nodes
+    let is_genesis_node = std::env::var("QNET_BOOTSTRAP_ID").is_ok();
+    let benchmark_secret = std::env::var("QNET_BENCHMARK_SECRET").ok();
+    
+    if !is_genesis_node && benchmark_secret.is_none() {
+        return Ok(warp::reply::json(&json!({
+            "success": false,
+            "error": "Benchmark only available on Genesis nodes or with QNET_BENCHMARK_SECRET"
+        })));
+    }
+    
+    // Genesis nodes have no limits, others are restricted
+    let config = BenchmarkConfig {
+        total_transactions: request.total,
+        target_tps: request.target_tps,
+        num_accounts: request.num_accounts,
+        initial_balance: 1_000_000 * crate::benchmark::ONE_QNC, // 1M QNC (decimals=9)
+    };
+    
+    println!("[BENCHMARK] 🔐 Genesis node authorized. Starting benchmark...");
+    
+    // Start benchmark
+    match BENCHMARK_MANAGER.start(config.clone()).await {
+        Ok(_) => {
+            // Spawn transaction generator task
+            let blockchain_clone = blockchain.clone();
+            let total = config.total_transactions;
+            let target_tps = config.target_tps;
+            
+            tokio::spawn(async move {
+                run_benchmark_generator(blockchain_clone, total, target_tps).await;
+            });
+            
+            Ok(warp::reply::json(&json!({
+                "success": true,
+                "message": "Benchmark started",
+                "config": {
+                    "total_transactions": config.total_transactions,
+                    "target_tps": config.target_tps,
+                    "num_accounts": config.num_accounts
+                }
+            })))
+        }
+        Err(e) => {
+            Ok(warp::reply::json(&json!({
+                "success": false,
+                "error": e
+            })))
+        }
+    }
+}
+
+/// Run benchmark transaction generator
+async fn run_benchmark_generator(
+    blockchain: Arc<BlockchainNode>,
+    total_transactions: u64,
+    target_tps: u64,
+) {
+    use crate::benchmark::BENCHMARK_MANAGER;
+    use std::time::{Duration, Instant};
+    
+    println!("[BENCHMARK] 🚀 Starting transaction generator: {} tx at {} TPS", total_transactions, target_tps);
+    
+    let delay_per_tx = if target_tps > 0 {
+        Duration::from_nanos(1_000_000_000 / target_tps)
+    } else {
+        Duration::from_millis(1)
+    };
+    
+    let batch_size = 1000usize; // Send in batches for efficiency
+    let mut sent = 0u64;
+    let start = Instant::now();
+    
+    while sent < total_transactions && BENCHMARK_MANAGER.is_running() {
+        let batch_start = Instant::now();
+        
+        // Generate and send batch
+        for _ in 0..batch_size {
+            if sent >= total_transactions || !BENCHMARK_MANAGER.is_running() {
+                break;
+            }
+            
+            // Generate transaction
+            if let Some(tx) = BENCHMARK_MANAGER.generate_transaction().await {
+                let tx_start = Instant::now();
+                
+                // Submit to blockchain (will broadcast to network)
+                match blockchain.submit_benchmark_transaction(tx).await {
+                    Ok(_) => {
+                        BENCHMARK_MANAGER.record_sent();
+                        BENCHMARK_MANAGER.record_confirmed();
+                        let latency = tx_start.elapsed().as_secs_f64() * 1000.0;
+                        BENCHMARK_MANAGER.record_latency(latency).await;
+                    }
+                    Err(_) => {
+                        BENCHMARK_MANAGER.record_error();
+                    }
+                }
+                
+                sent += 1;
+            }
+        }
+        
+        // Log progress every 10k transactions
+        if sent % 10_000 == 0 {
+            let elapsed = start.elapsed().as_secs_f64();
+            let current_tps = sent as f64 / elapsed;
+            println!("[BENCHMARK] 📊 Progress: {}/{} ({:.0} TPS)", sent, total_transactions, current_tps);
+        }
+        
+        // Throttle if needed
+        let batch_elapsed = batch_start.elapsed();
+        let expected_batch_time = delay_per_tx * batch_size as u32;
+        if batch_elapsed < expected_batch_time {
+            tokio::time::sleep(expected_batch_time - batch_elapsed).await;
+        }
+    }
+    
+    // Stop benchmark
+    BENCHMARK_MANAGER.stop().await;
+    
+    let elapsed = start.elapsed().as_secs_f64();
+    let final_tps = sent as f64 / elapsed;
+    println!("[BENCHMARK] 🏁 Completed: {} transactions in {:.2}s ({:.0} TPS)", sent, elapsed, final_tps);
+}
+
+/// Handle GET /api/v1/benchmark/status
+async fn handle_benchmark_status() -> Result<impl Reply, Rejection> {
+    use crate::benchmark::BENCHMARK_MANAGER;
+    
+    let status = BENCHMARK_MANAGER.get_status().await;
+    
+    Ok(warp::reply::json(&json!({
+        "success": true,
+        "status": {
+            "is_running": status.is_running,
+            "transactions_sent": status.transactions_sent,
+            "transactions_confirmed": status.transactions_confirmed,
+            "current_tps": status.current_tps,
+            "peak_tps": status.peak_tps,
+            "elapsed_seconds": status.elapsed_seconds,
+            "errors": status.errors
+        }
+    })))
+}
+
+/// Handle GET /api/v1/benchmark/results
+async fn handle_benchmark_results() -> Result<impl Reply, Rejection> {
+    use crate::benchmark::BENCHMARK_MANAGER;
+    
+    let results = BENCHMARK_MANAGER.get_results().await;
+    
+    Ok(warp::reply::json(&json!({
+        "success": true,
+        "results": {
+            "total_transactions": results.total_transactions,
+            "confirmed_transactions": results.confirmed_transactions,
+            "duration_seconds": results.duration_seconds,
+            "average_tps": results.average_tps,
+            "peak_tps": results.peak_tps,
+            "min_latency_ms": results.min_latency_ms,
+            "max_latency_ms": results.max_latency_ms,
+            "avg_latency_ms": results.avg_latency_ms,
+            "p99_latency_ms": results.p99_latency_ms,
+            "errors": results.errors,
+            "success_rate": results.success_rate
+        }
+    })))
+}
+
+/// Handle POST /api/v1/benchmark/stop
+async fn handle_benchmark_stop() -> Result<impl Reply, Rejection> {
+    use crate::benchmark::BENCHMARK_MANAGER;
+    
+    BENCHMARK_MANAGER.stop().await;
+    let results = BENCHMARK_MANAGER.get_results().await;
+    
+    Ok(warp::reply::json(&json!({
+        "success": true,
+        "message": "Benchmark stopped",
+        "results": {
+            "total_transactions": results.total_transactions,
+            "peak_tps": results.peak_tps,
+            "average_tps": results.average_tps,
+            "duration_seconds": results.duration_seconds
+        }
+    })))
 }

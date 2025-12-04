@@ -98,7 +98,7 @@ struct CachedKeyManager {
     access_count: Arc<std::sync::atomic::AtomicU64>,
 }
 
-/// Simple node replacement: 1 wallet = 1 active node per type
+/// Simple node replacement: 1 wallet = 1 active node (regardless of type)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SimpleNodeRecord {
     pub wallet_address: String,
@@ -108,9 +108,13 @@ pub struct SimpleNodeRecord {
 }
 
 /// Activation payload structure (decrypted from quantum-secure code)
+/// IMPORTANT: `wallet` is ALWAYS QNet EON address (for rewards)
+/// Phase 1: Solana address used only for burn verification, rewards go to QNet wallet
+/// Phase 2: Same QNet EON address used for burn and rewards
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActivationPayload {
     pub burn_tx: String,
+    /// QNet EON address for rewards (ALWAYS EON format: {19}eon{15}{4checksum})
     pub wallet: String,
     pub node_type: String,
     pub signature: DilithiumSignature,

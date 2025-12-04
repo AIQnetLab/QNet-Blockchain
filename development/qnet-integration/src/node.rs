@@ -84,7 +84,7 @@ use qnet_mempool::{SimpleMempool, SimpleMempoolConfig};
 use qnet_consensus::{ConsensusEngine, ConsensusConfig, NodeId, CommitRevealConsensus, ConsensusError};
 use qnet_consensus::lazy_rewards::{PhaseAwareRewardManager, NodeType as RewardNodeType};
 use qnet_consensus::reputation::{Evidence, MaliciousBehavior};
-use qnet_sharding::{ShardCoordinator, ParallelValidator};
+use qnet_sharding::{ShardCoordinator, ParallelValidator, MAX_SHARDS};
 use crate::quantum_poh::QuantumPoH;
 use std::sync::Arc;
 use std::collections::HashMap;
@@ -318,17 +318,22 @@ impl Default for PerformanceConfig {
         
         Self {
             enable_sharding: env::var("QNET_ENABLE_SHARDING").unwrap_or_default() == "1",
-            // PRODUCTION: 256 shards for 400k+ TPS (parallel processing)
-            // NOTE: Shards are for TX processing parallelism, NOT storage partitioning
-            shard_count: env::var("QNET_SHARD_COUNT").unwrap_or_default().parse().unwrap_or(256),
+            // PRODUCTION: Shards for TX processing parallelism (NOT storage partitioning)
+            // NOTE: Actual shard count is determined by network size via ShardCoordinator
+            // Manual override only affects LOCAL parallel processing, not network consensus
+            shard_count: env::var("QNET_SHARD_COUNT")
+                .unwrap_or_default()
+                .parse()
+                .unwrap_or(256)
+                .min(MAX_SHARDS as usize)  // Cap at MAX_SHARDS (256)
+                .max(1),                    // Minimum 1 shard
             
             parallel_validation: auto_parallel_validation,
             // AUTO-TUNE: Use all available CPU cores for maximum throughput
             parallel_threads: auto_parallel_threads,
             
             p2p_compression: env::var("QNET_P2P_COMPRESSION").unwrap_or_default() == "1",
-            // PRODUCTION: 10k batch for optimal throughput (tested in local benchmarks)
-            batch_size: env::var("QNET_BATCH_SIZE").unwrap_or_default().parse().unwrap_or(10000),
+            batch_size: env::var("QNET_BATCH_SIZE").unwrap_or_default().parse().unwrap_or(50000),
             
             high_throughput: env::var("QNET_HIGH_THROUGHPUT").unwrap_or_default() == "1",
             high_frequency: env::var("QNET_HIGH_FREQUENCY").unwrap_or_default() == "1",
@@ -1431,6 +1436,10 @@ impl BlockchainNode {
         // All QUIC messages are routed through this to use same handle_message() logic
         let (quic_message_tx, mut quic_message_rx) = tokio::sync::mpsc::unbounded_channel::<(String, crate::unified_p2p::NetworkMessage)>();
         
+        // PRODUCTION v2.19.25: Create transaction processing channel
+        // Enables full transaction propagation from P2P to mempool
+        let (transaction_tx, mut transaction_rx) = tokio::sync::mpsc::unbounded_channel::<crate::unified_p2p::ReceivedTransaction>();
+        
         println!("[UnifiedP2P] 🔍 DEBUG: Creating SimplifiedP2P instance...");
         let mut unified_p2p_instance = SimplifiedP2P::new(
             node_id.clone(),
@@ -1452,6 +1461,9 @@ impl BlockchainNode {
         
         // PRODUCTION v2.19.22: Set QUIC message channel for full message processing
         unified_p2p_instance.set_quic_message_channel(quic_message_tx);
+        
+        // PRODUCTION v2.19.25: Set transaction channel for mempool integration
+        unified_p2p_instance.set_transaction_channel(transaction_tx);
         
         // CRITICAL: Initialize all Genesis node reputations deterministically at startup
         // This prevents race conditions where different nodes see different candidate lists
@@ -1561,14 +1573,14 @@ impl BlockchainNode {
                 return true;
             }
             
-            // AUTO-DETECTION based on peer count
-            let peer_count = unified_p2p.get_peer_count();
+            // AUTO-DETECTION based on GLOBAL active Full/Super nodes (NOT local peers!)
+            // Light nodes are NOT counted - only consensus-participating nodes
+            let active_nodes = unified_p2p.get_active_full_super_nodes();
+            let network_size = active_nodes.len();
             
-            if peer_count >= 10000 {
-                println!("[SHARDING] ⚡ AUTO-ENABLED for {} peers (threshold: 10000)", peer_count);
-                return true;
-            } else if peer_count >= 5000 && node_type == NodeType::Super {
-                println!("[SHARDING] ⚡ AUTO-ENABLED for Super node with {} peers", peer_count);
+            // Auto-enable when network grows (same threshold for all node types)
+            if network_size >= 1000 {
+                println!("[SHARDING] ⚡ AUTO-ENABLED: {} active Full/Super nodes (threshold: 1000)", network_size);
                 return true;
             }
             
@@ -1863,8 +1875,8 @@ impl BlockchainNode {
         // Initialize Pre-execution manager
         let pre_execution_config = crate::pre_execution::PreExecutionConfig {
             lookahead_blocks: 3,      // Pre-execute 3 blocks ahead
-            max_tx_per_block: 1000,   // From existing constants
-            cache_size: 10000,        // Cache 10k pre-executed transactions
+            max_tx_per_block: 50000,  // 50K TX/block max
+            cache_size: 150000,       // Cache 3 blocks × 50K TX
             timeout_ms: 500,          // 500ms timeout
         };
         let pre_execution = Arc::new(crate::pre_execution::PreExecutionManager::new(pre_execution_config));
@@ -2126,6 +2138,63 @@ impl BlockchainNode {
             }
         });
         
+        // PRODUCTION v2.19.25: Start transaction receiver handler
+        // Processes transactions received from P2P network and adds to mempool
+        let blockchain_for_transactions = blockchain.clone();
+        tokio::spawn(async move {
+            // Track processed transactions to avoid duplicates (deduplication cache)
+            let mut processed_txs: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut last_cleanup = std::time::Instant::now();
+            const MAX_CACHE_SIZE: usize = 100_000; // 100K transactions
+            const CLEANUP_INTERVAL_SECS: u64 = 300; // 5 minutes
+            
+            while let Some(received_tx) = transaction_rx.recv().await {
+                // DEDUPLICATION: Skip already processed transactions
+                if processed_txs.contains(&received_tx.tx_hash) {
+                    continue;
+                }
+                
+                // Deserialize transaction
+                match serde_json::from_slice::<qnet_state::Transaction>(&received_tx.tx_data) {
+                    Ok(tx) => {
+                        // PRODUCTION VALIDATION: Full validation before adding to mempool
+                        // Check signature, nonce, balance, etc.
+                        match blockchain_for_transactions.validate_and_add_network_transaction(tx).await {
+                            Ok(hash) => {
+                                // Add to deduplication cache
+                                processed_txs.insert(received_tx.tx_hash.clone());
+                                println!("[TX-SYNC] ✅ Transaction {} from {} added to mempool", 
+                                         &hash[..16], received_tx.from_peer);
+                            }
+                            Err(e) => {
+                                // Don't spam logs for common rejections (duplicates, etc.)
+                                if !e.to_string().contains("duplicate") && !e.to_string().contains("already") {
+                                    println!("[TX-SYNC] ⚠️ Transaction rejected: {}", e);
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        println!("[TX-SYNC] ❌ Failed to deserialize transaction from {}: {}", 
+                                 received_tx.from_peer, e);
+                    }
+                }
+                
+                // MEMORY MANAGEMENT: Periodic cleanup of deduplication cache
+                if last_cleanup.elapsed().as_secs() > CLEANUP_INTERVAL_SECS || processed_txs.len() > MAX_CACHE_SIZE {
+                    // Keep only most recent transactions (simple strategy: clear half)
+                    if processed_txs.len() > MAX_CACHE_SIZE / 2 {
+                        let to_remove: Vec<_> = processed_txs.iter().take(processed_txs.len() / 2).cloned().collect();
+                        for key in to_remove {
+                            processed_txs.remove(&key);
+                        }
+                        println!("[TX-SYNC] 🧹 Cleaned up deduplication cache: {} entries remaining", processed_txs.len());
+                    }
+                    last_cleanup = std::time::Instant::now();
+                }
+            }
+        });
+        
         // CRITICAL FIX: Perform initial sync with network on startup
         // This prevents nodes from getting stuck on old blocks
         println!("[SYNC] 🔄 Performing initial network sync...");
@@ -2320,6 +2389,9 @@ impl BlockchainNode {
             }
             
             // PRODUCTION: Validate and store received block
+            // REPUTATION FIX: Track producer_id for reputation sync across all nodes
+            let mut block_producer_id: Option<String> = None;
+            
             let store_result = match received_block.block_type.as_str() {
                 "micro" => {
                     // Validate microblock signature and structure
@@ -2681,6 +2753,8 @@ impl BlockchainNode {
                     // This ensures state consistency across all nodes
                     match bincode::deserialize::<qnet_state::MicroBlock>(&decompressed_data) {
                         Ok(microblock) => {
+                            // CRITICAL: Save producer_id for reputation update after storage
+                            block_producer_id = Some(microblock.producer.clone());
                             // Apply ALL transactions from block to state
                             for tx in &microblock.transactions {
                                 // SPECIAL HANDLING: RewardDistribution transactions
@@ -2750,6 +2824,29 @@ impl BlockchainNode {
                     // Deserialize decompressed macroblock struct
                     match bincode::deserialize::<qnet_state::MacroBlock>(&decompressed_data) {
                         Ok(macroblock) => {
+                            // CRITICAL REPUTATION FIX: Update reputation for ALL consensus participants
+                            // This ensures reputation is synchronized across ALL nodes (not just leader)
+                            // Without this, only macroblock creator updates reputation → desync!
+                            if let Some(ref p2p) = unified_p2p {
+                                // Reward all commit participants (they started consensus)
+                                for (participant_id, _) in &macroblock.consensus_data.commits {
+                                    p2p.update_node_reputation(participant_id, ReputationEvent::ConsensusParticipation);
+                                }
+                                
+                                // Reward reveal participants who completed consensus  
+                                // (reveals are more important - they finalize the macroblock)
+                                for (participant_id, _) in &macroblock.consensus_data.reveals {
+                                    // Extra reward for completing reveal (total +2 for full participation)
+                                    p2p.update_node_reputation(participant_id, ReputationEvent::ConsensusParticipation);
+                                }
+                                
+                                // Reward next leader selection
+                                if !macroblock.consensus_data.next_leader.is_empty() {
+                                    println!("[MACROBLOCK] ✅ Reputation updated for {} consensus participants", 
+                                             macroblock.consensus_data.reveals.len());
+                                }
+                            }
+                            
                             // save_macroblock IS async
                             storage.save_macroblock(macroblock.height, &macroblock).await
                                 .map_err(|e| format!("Storage error: {:?}", e))
@@ -2785,6 +2882,19 @@ impl BlockchainNode {
                     if received_block.height > 0 && received_block.height % 30 == 0 {
                         // Just received last block of a round (30, 60, 90...)
                         println!("[ROTATION] 🔄 Received rotation boundary block #{} - checking producer for next round", received_block.height);
+                        
+                        // CRITICAL REPUTATION FIX: Update producer's reputation on ALL nodes
+                        // This ensures reputation is synchronized across the network through blocks
+                        // Without this, only the producer updates its own reputation → desync!
+                        if received_block.block_type == "micro" {
+                            if let Some(ref producer_id) = block_producer_id {
+                                if let Some(ref p2p) = unified_p2p {
+                                    p2p.update_node_reputation(producer_id, ReputationEvent::FullRotationComplete);
+                                    println!("[REPUTATION] ✅ Rotation #{} complete - {} reputation +2% (synced via block)", 
+                                             received_block.height / 30, producer_id);
+                                }
+                            }
+                        }
                         
                         // Update global height immediately to ensure proper producer calculation
                         {
@@ -2867,7 +2977,7 @@ impl BlockchainNode {
                             // This ensures ALL nodes see the macroblock boundary banner
                             if received_block.height % 90 == 0 && received_block.height > 0 {
                                 let shard_count = 256; // From perf_config
-                                let avg_tx_per_block = 10000; // From perf_config
+                                let avg_tx_per_block = 50000; // 50K TX/block max
                                 let blocks_per_second = 1.0;
                                 let theoretical_tps = blocks_per_second * avg_tx_per_block as f64 * shard_count as f64;
                                 
@@ -11802,6 +11912,117 @@ impl BlockchainNode {
         
         println!("[Transaction] ✅ Validated and submitted: {} (amount: {}, gas: {})", 
                  hash, tx.amount, tx.gas_price * tx.gas_limit);
+        
+        Ok(hash)
+    }
+    
+    /// PRODUCTION v2.19.25: Validate and add transaction received from P2P network
+    /// Unlike submit_transaction(), this does NOT broadcast to avoid infinite loops
+    pub async fn validate_and_add_network_transaction(&self, tx: qnet_state::Transaction) -> Result<String, QNetError> {
+        // PRODUCTION VALIDATION - same as submit_transaction
+        if let Err(validation_error) = tx.validate() {
+            return Err(QNetError::ValidationError(format!("Transaction validation failed: {}", validation_error)));
+        }
+        
+        // Signature validation
+        if matches!(tx.tx_type, qnet_state::TransactionType::RewardDistribution) {
+            if tx.from != "system_emission" {
+                if tx.signature.as_ref().map_or(true, |s| s.is_empty()) {
+                    return Err(QNetError::ValidationError("Reward claim must be signed".to_string()));
+                }
+            }
+        } else {
+            if tx.signature.as_ref().map_or(true, |s| s.is_empty()) {
+                return Err(QNetError::ValidationError("Transaction signature is empty".to_string()));
+            }
+        }
+        
+        if tx.amount == 0 && matches!(tx.tx_type, qnet_state::TransactionType::Transfer { .. }) {
+            return Err(QNetError::ValidationError("Transfer amount cannot be zero".to_string()));
+        }
+        
+        // Nonce validation
+        {
+            let state = self.state.read().await;
+            if let Some(account) = state.get_account(&tx.from) {
+                let expected_nonce = account.nonce + 1;
+                if tx.nonce != expected_nonce {
+                    return Err(QNetError::ValidationError(format!(
+                        "Invalid nonce: expected {}, got {}",
+                        expected_nonce, tx.nonce
+                    )));
+                }
+            } else if tx.nonce != 1 {
+                return Err(QNetError::ValidationError("New account nonce must be 1".to_string()));
+            }
+        }
+        
+        // Balance validation for transfers
+        if let qnet_state::TransactionType::Transfer { .. } = &tx.tx_type {
+            let state = self.state.read().await;
+            let balance = state.get_balance(&tx.from);
+            let total_cost = tx.amount + (tx.gas_price * tx.gas_limit);
+            
+            if balance < total_cost {
+                return Err(QNetError::ValidationError(format!(
+                    "Insufficient balance: {} < {} (need {} + gas)",
+                    balance, total_cost, tx.amount
+                )));
+            }
+        }
+        
+        let hash = hex::encode(&tx.hash);
+        
+        // Add to mempool (NO BROADCAST - already received from network)
+        {
+            let mut mempool = self.mempool.write().await;
+            let tx_json = serde_json::to_string(&tx).unwrap_or_else(|_| "{}".to_string());
+            let tx_hash = format!("{:x}", sha3::Sha3_256::digest(tx_json.as_bytes()));
+            
+            if !mempool.add_raw_transaction(tx_json, tx_hash, tx.gas_price) {
+                return Err(QNetError::ValidationError("Transaction already in mempool or mempool full".to_string()));
+            }
+        }
+        
+        Ok(hash)
+    }
+    
+    /// BENCHMARK: Submit transaction for load testing
+    /// Skips balance validation for benchmark accounts (EON1benchmark*)
+    /// Full signature validation and P2P broadcast still applied
+    pub async fn submit_benchmark_transaction(&self, tx: qnet_state::Transaction) -> Result<String, QNetError> {
+        use crate::benchmark::BenchmarkManager;
+        
+        // Only allow benchmark accounts
+        if !BenchmarkManager::is_benchmark_account(&tx.from) {
+            return Err(QNetError::ValidationError("Only benchmark accounts allowed".to_string()));
+        }
+        
+        // Basic structure validation (skip balance check for benchmark)
+        if let Err(validation_error) = tx.validate() {
+            return Err(QNetError::ValidationError(format!("Transaction validation failed: {}", validation_error)));
+        }
+        
+        // Signature validation
+        if tx.signature.as_ref().map_or(true, |s| s.is_empty()) {
+            return Err(QNetError::ValidationError("Transaction signature is empty".to_string()));
+        }
+        
+        let hash = hex::encode(&tx.hash);
+        
+        // Add to mempool
+        {
+            let mut mempool = self.mempool.write().await;
+            let tx_json = serde_json::to_string(&tx).unwrap_or_else(|_| "{}".to_string());
+            let tx_hash = format!("{:x}", sha3::Sha3_256::digest(tx_json.as_bytes()));
+            mempool.add_raw_transaction(tx_json, tx_hash, tx.gas_price);
+        }
+        
+        // Broadcast to network
+        if let Some(unified_p2p) = &self.unified_p2p {
+            let tx_data = serde_json::to_vec(&tx).unwrap_or_default();
+            let _ = unified_p2p.broadcast_transaction(tx_data);
+        }
         
         Ok(hash)
     }

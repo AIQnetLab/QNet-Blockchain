@@ -2808,22 +2808,21 @@ fn configure_production_mode() {
     std::env::set_var("QNET_IS_LEADER", "1");
     std::env::set_var("QNET_MICROBLOCK_PRODUCER", "1");
     
-    // PRODUCTION: 400k+ TPS with advanced optimizations
     std::env::set_var("QNET_HIGH_FREQUENCY", "1");
-    std::env::set_var("QNET_MAX_TPS", "500000"); // 500k TPS capacity
-    std::env::set_var("QNET_MEMPOOL_SIZE", "2000000"); // 2M transactions in mempool
-    std::env::set_var("QNET_BATCH_SIZE", "10000"); // Optimal batch size
+    std::env::set_var("QNET_MAX_TPS", "12800000");
+    std::env::set_var("QNET_MEMPOOL_SIZE", "5000000");
+    std::env::set_var("QNET_BATCH_SIZE", "50000");
     std::env::set_var("QNET_PARALLEL_VALIDATION", "1");
     std::env::set_var("QNET_PARALLEL_THREADS", "16");
     std::env::set_var("QNET_COMPRESSION", "1");
     
-    // PRODUCTION: Enable sharding for 400k+ TPS (256 shards default)
+    
     std::env::set_var("QNET_ENABLE_SHARDING", "1");
     std::env::set_var("QNET_SHARD_COUNT", "256");
     std::env::set_var("QNET_USE_LOCKFREE", "1"); // DashMap for lock-free operations
     
-    println!("⚡ ULTRA HIGH-PERFORMANCE: 400k+ TPS with 256 shards enabled");
-    println!("🚀 Quantum blockchain optimizations: Lock-free + Sharding + Parallel");
+    println!("⚡ ULTRA HIGH-PERFORMANCE: 12.8M TPS theoretical max (50K × 256 shards)");
+    println!("🚀 Quantum blockchain optimizations: Lock-free + Sharding + Parallel + 2MB blocks");
         
     // Default server configuration (user will choose during setup)
     std::env::set_var("QNET_FULL_SYNC", "1");

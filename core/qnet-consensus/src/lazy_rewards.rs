@@ -633,6 +633,23 @@ impl PhaseAwareRewardManager {
             .collect()
     }
     
+    /// Get all nodes owned by a specific wallet address
+    /// Returns Vec of (node_id, node_type, pending_reward)
+    /// Used by mobile apps to find user's nodes by wallet
+    pub fn get_nodes_by_wallet(&self, wallet_address: &str) -> Vec<(String, NodeType, u64)> {
+        self.node_ownership.iter()
+            .filter(|(_, wallet)| *wallet == wallet_address)
+            .filter_map(|(node_id, _)| {
+                self.ping_histories.get(node_id).map(|history| {
+                    let pending = self.pending_rewards.get(node_id)
+                        .map(|r| r.total_reward)
+                        .unwrap_or(0);
+                    (node_id.clone(), history.node_type.clone(), pending)
+                })
+            })
+            .collect()
+    }
+    
     /// Restore pending reward from storage (for node restart recovery)
     pub fn restore_pending_reward(&mut self, node_id: String, reward: PhaseAwareReward) {
         self.pending_rewards.insert(node_id, reward);

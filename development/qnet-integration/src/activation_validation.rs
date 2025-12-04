@@ -2543,7 +2543,42 @@ impl BlockchainActivationRegistry {
         Ok(())
     }
     
+    /// SECURITY: Check if wallet already has ANY node (1 wallet = 1 node rule)
+    /// Returns existing node info if found, regardless of node type
+    pub async fn check_wallet_has_any_node(&self, wallet_address: &str) -> Result<Option<(String, String)>, IntegrationError> {
+        println!("🔍 [SECURITY] Checking if wallet {} already has a node (1 wallet = 1 node rule)", 
+                 safe_preview(wallet_address, 8));
+        
+        // Search in local activation records (any node type)
+        {
+            let activation_records = self.activation_records.read().await;
+            for (code_hash, record) in activation_records.iter() {
+                if record.wallet_address == wallet_address {
+                    println!("🚫 [SECURITY] Wallet already has {} node: {}", 
+                             record.node_type, safe_preview(code_hash, 8));
+                    return Ok(Some((record.node_type.clone(), format!("HASH:{}", code_hash))));
+                }
+            }
+        }
+        
+        // Search in active nodes registry (any node type)
+        {
+            let active_nodes = self.active_nodes.read().await;
+            for (_device_sig, node_info) in active_nodes.iter() {
+                if node_info.wallet_address == wallet_address {
+                    println!("🚫 [SECURITY] Wallet already has active {} node", node_info.node_type);
+                    return Ok(Some((node_info.node_type.clone(), node_info.activation_code.clone())));
+                }
+            }
+        }
+        
+        println!("✅ [SECURITY] Wallet {} has no existing nodes - eligible for activation", 
+                 safe_preview(wallet_address, 8));
+        Ok(None)
+    }
+    
     /// Query activation code by wallet address and node type for bridge-server
+    /// DEPRECATED: Use check_wallet_has_any_node() for security checks
     pub async fn query_activation_by_wallet_and_type(
         &self, 
         wallet_address: &str, 

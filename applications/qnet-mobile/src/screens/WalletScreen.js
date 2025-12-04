@@ -26,7 +26,8 @@ import QRCode from 'react-native-qrcode-svg';
 import { 
   checkNodeStatus, 
   reactivateNode, 
-  checkServerNodeStatus
+  checkServerNodeStatus,
+  getAllNodesByWallet
 } from '../services/PushService';
 
 // 1DEV Burn Tracker Contract (same as browser extension)
@@ -775,6 +776,8 @@ const WalletScreen = () => {
   const [activationInputCode, setActivationInputCode] = useState(''); // Input activation code
   const [lightNodeStatus, setLightNodeStatus] = useState(null); // Light node network status
   const [serverNodeStatus, setServerNodeStatus] = useState(null); // Full/Super node network status
+  const [allUserNodes, setAllUserNodes] = useState([]); // All nodes owned by this wallet (unified view)
+  const [loadingAllNodes, setLoadingAllNodes] = useState(false); // Loading state for all nodes
   const [reactivatingNode, setReactivatingNode] = useState(false); // Reactivation in progress
   const [nodeActivating, setNodeActivating] = useState(false); // Node activation in progress
   const [unlockError, setUnlockError] = useState(''); // Error message for unlock screen
@@ -896,38 +899,44 @@ const WalletScreen = () => {
   // ARCHITECTURE:
   // - Light nodes: App is the node, needs local rewards tracking + network ping status
   // - Full/Super/Genesis: Server is the node, app just monitors via single API call
+  // - NEW: Load ALL nodes owned by this wallet for unified display
   useEffect(() => {
-    if (activeTab === 'node' && activatedNodeType && activationCode) {
+    if (activeTab === 'node' && wallet && wallet.publicKey) {
+      // UNIFIED: Load ALL nodes for this wallet (Light + Full + Super + Genesis)
+      loadAllUserNodes();
       
-      if (activatedNodeType === 'light') {
-        // LIGHT NODES: App IS the node
-        // - Load rewards (local tracking)
-        // - Check ping status from network
-        // - Start ping interval for responding to challenges
-        loadNodeRewards();
-        loadLightNodeStatus();
-        
-        // Start ping interval if not already running (for responding to challenges)
-        if (!global.nodePingInterval) {
-          startNodePingInterval();
+      // Also load specific node data if activated
+      if (activatedNodeType && activationCode) {
+        if (activatedNodeType === 'light') {
+          // LIGHT NODES: App IS the node
+          // - Load rewards (local tracking)
+          // - Check ping status from network
+          // - Start ping interval for responding to challenges
+          loadNodeRewards();
+          loadLightNodeStatus();
+          
+          // Start ping interval if not already running (for responding to challenges)
+          if (!global.nodePingInterval) {
+            startNodePingInterval();
+          }
+          
+          // NO POLLING - user can pull-to-refresh
+          // Light nodes get push notifications for pings anyway
+          
+        } else {
+          // FULL/SUPER/GENESIS NODES: Server IS the node
+          // - Single API call gets ALL info (status, heartbeats, rewards)
+          // - Server handles heartbeats automatically every 24 min
+          // - Rewards calculated at end of 4h window on server
+          loadServerNodeStatus();
+          
+          // NO POLLING - server nodes don't need real-time updates from app
+          // User can pull-to-refresh when they want to check
+          // This saves battery significantly!
         }
-        
-        // NO POLLING - user can pull-to-refresh
-        // Light nodes get push notifications for pings anyway
-        
-      } else {
-        // FULL/SUPER/GENESIS NODES: Server IS the node
-        // - Single API call gets ALL info (status, heartbeats, rewards)
-        // - Server handles heartbeats automatically every 24 min
-        // - Rewards calculated at end of 4h window on server
-        loadServerNodeStatus();
-        
-        // NO POLLING - server nodes don't need real-time updates from app
-        // User can pull-to-refresh when they want to check
-        // This saves battery significantly!
       }
-      }
-  }, [activeTab, activatedNodeType, activationCode, nodePseudonym]); // Load when tab opens
+    }
+  }, [activeTab, activatedNodeType, activationCode, nodePseudonym, wallet]); // Load when tab opens
   
   // Load dynamic pricing when on activate tab
   useEffect(() => {
@@ -993,6 +1002,31 @@ const WalletScreen = () => {
       }
     } catch (error) {
       console.error('Failed to load server node status:', error);
+    }
+  };
+  
+  // Load ALL nodes owned by this wallet (unified view for Light + Full + Super + Genesis)
+  const loadAllUserNodes = async () => {
+    if (!wallet || !wallet.publicKey || loadingAllNodes) return;
+    
+    setLoadingAllNodes(true);
+    try {
+      const result = await getAllNodesByWallet(wallet.publicKey);
+      
+      if (result.success) {
+        setAllUserNodes(result.nodes || []);
+        console.log(`[Nodes] Loaded ${result.nodes?.length || 0} nodes for wallet`);
+        
+        // If we found server nodes that aren't activated locally, show them
+        const serverNodes = (result.nodes || []).filter(n => n.node_type !== 'light' && n.status === 'active');
+        if (serverNodes.length > 0 && !activatedNodeType) {
+          console.log('[Nodes] Found active server nodes - auto-linking...');
+        }
+      }
+    } catch (error) {
+      console.error('Failed to load all user nodes:', error);
+    } finally {
+      setLoadingAllNodes(false);
     }
   };
   
@@ -3819,6 +3853,97 @@ const WalletScreen = () => {
             scrollEventThrottle={500}
           >
             <Text style={styles.tabTitle}>Node Monitoring</Text>
+            
+            {/* Show server node found via wallet lookup (1 wallet = 1 node rule) */}
+            {/* This shows when user has a Full/Super node on server linked to this wallet */}
+            {allUserNodes.length > 0 && allUserNodes[0] && !activatedNodeType && (
+              <View style={[styles.nodeMonitoringCard, {marginBottom: 16}]}>
+                <View style={{
+                  flexDirection: 'row',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                }}>
+                  <View style={{flex: 1}}>
+                    <Text style={styles.nodeMonitoringValue}>
+                      {allUserNodes[0].node_type?.charAt(0).toUpperCase() + allUserNodes[0].node_type?.slice(1)} Node
+                    </Text>
+                    <Text style={[styles.nodeMonitoringLabel, {fontSize: 11, marginTop: 4}]}>
+                      {allUserNodes[0].node_id || 'Pending activation'}
+                    </Text>
+                  </View>
+                  <View style={{alignItems: 'flex-end'}}>
+                    <Text style={[styles.statusBadgeText, {
+                      color: allUserNodes[0].status === 'active' ? '#34c759' : '#ff9500'
+                    }]}>
+                      {allUserNodes[0].status === 'active' ? 'ONLINE' : 'PENDING'}
+                    </Text>
+                    {allUserNodes[0].pending_rewards > 0 && (
+                      <Text style={[styles.nodeMonitoringLabel, {color: '#ffd700', fontSize: 11, marginTop: 4}]}>
+                        {(allUserNodes[0].pending_rewards / 1e9).toFixed(2)} QNC pending
+                      </Text>
+                    )}
+                  </View>
+                </View>
+                
+                {/* Auto-link button for server nodes */}
+                {allUserNodes[0].node_type !== 'light' && allUserNodes[0].status === 'active' && (
+                  <TouchableOpacity 
+                    style={[styles.button, styles.primaryButton, {marginTop: 16}]}
+                    onPress={async () => {
+                      // Auto-link this server node to the app
+                      const node = allUserNodes[0];
+                      setActivatedNodeType(node.node_type);
+                      setNodePseudonym(node.node_id);
+                      // Load full status
+                      loadServerNodeStatus();
+                      showAlert('Node Linked', `Your ${node.node_type} node is now linked to this app.`);
+                    }}
+                  >
+                    <Text style={styles.buttonText}>Link This Node</Text>
+                  </TouchableOpacity>
+                )}
+              </View>
+            )}
+            
+            {/* Loading indicator */}
+            {loadingAllNodes && !activatedNodeType && (
+              <View style={{padding: 20, alignItems: 'center'}}>
+                <Text style={styles.nodeMonitoringLabel}>Checking for linked nodes...</Text>
+              </View>
+            )}
+            
+            {/* No node yet - show how to activate */}
+            {!loadingAllNodes && allUserNodes.length === 0 && !activatedNodeType && (
+              <View style={[styles.nodeMonitoringCard, {marginBottom: 16}]}>
+                <Text style={[styles.nodeMonitoringLabel, {marginBottom: 8}]}>
+                  No Node Active
+                </Text>
+                <Text style={[styles.nodeMonitoringLabel, {fontSize: 12, color: '#888', marginBottom: 12}]}>
+                  Activate a Light node here, or use your EON address when setting up a Full/Super node on a server.
+                </Text>
+                
+                {/* Copy EON address for server activation */}
+                <View style={{padding: 10, backgroundColor: '#1a1a2e', borderRadius: 8}}>
+                  <Text style={[styles.nodeMonitoringLabel, {fontSize: 11, color: '#888'}]}>
+                    Your EON Address (for server node activation):
+                  </Text>
+                  <TouchableOpacity 
+                    onPress={() => {
+                      if (wallet?.publicKey) {
+                        Clipboard.setString(wallet.publicKey);
+                        setCopiedAddress(wallet.publicKey);
+                        setTimeout(() => setCopiedAddress(''), 2000);
+                      }
+                    }}
+                    style={{marginTop: 6}}
+                  >
+                    <Text style={[styles.nodeMonitoringLabel, {fontSize: 11, color: '#007AFF'}]}>
+                      {copiedAddress === wallet?.publicKey ? 'Copied!' : `Copy: ${wallet?.publicKey?.substring(0, 20)}...`}
+                    </Text>
+                  </TouchableOpacity>
+                </View>
+              </View>
+            )}
             
             {activatedNodeType ? (
               <View>

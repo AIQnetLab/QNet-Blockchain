@@ -535,8 +535,9 @@ impl MicroBlock {
             return Err(StateError::InvalidBlock("Invalid timestamp".to_string()));
         }
         
-        // Check transaction count (max 10,000)
-        if self.transactions.len() > 10_000 {
+        // Check transaction count (max 50,000 for high-throughput mode)
+        // PRODUCTION: 50K TX/block × 256 shards = 12.8M TPS theoretical max
+        if self.transactions.len() > 50_000 {
             return Err(StateError::InvalidBlock("Too many transactions in microblock".to_string()));
         }
         
@@ -685,7 +686,8 @@ impl EfficientMicroBlock {
         }
         
         // Check transaction count (same limit as regular microblock)
-        if self.transaction_hashes.len() > 10_000 {
+        // PRODUCTION: 50K TX/block × 256 shards = 12.8M TPS theoretical max
+        if self.transaction_hashes.len() > 50_000 {
             return Err(StateError::InvalidBlock("Too many transactions in microblock".to_string()));
         }
         
