@@ -10,7 +10,18 @@
 //! - Block inclusion
 //! 
 //! Usage:
-//! POST /api/v1/benchmark/start { "total": 500000, "target_tps": 100000 }
+//! ## Presets (use "preset" field):
+//! - "single_shard"  : 1 shard,   50K TPS,   50K TX
+//! - "small_scale"   : 8 shards,  400K TPS,  400K TX
+//! - "medium_scale"  : 32 shards, 1.6M TPS,  1.6M TX
+//! - "large_scale"   : 64 shards, 3.2M TPS,  3.2M TX
+//! - "extra_large"   : 128 shards, 6.4M TPS, 6.4M TX
+//! - "full_scale"    : 256 shards, 12.8M TPS, 12.8M TX (MAX)
+//! 
+//! ## API Examples:
+//! POST /api/v1/benchmark/start { "preset": "single_shard" }
+//! POST /api/v1/benchmark/start { "preset": "full_scale" }
+//! POST /api/v1/benchmark/start { "shards": 64, "total": 5000000, "target_tps": 3200000 }
 //! GET /api/v1/benchmark/status
 //! GET /api/v1/benchmark/results
 
@@ -29,9 +40,41 @@ pub const QNC_DECIMALS: u32 = 9;
 /// 1 QNC in smallest units
 pub const ONE_QNC: u64 = 1_000_000_000;
 
+/// Benchmark preset types
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum BenchmarkPreset {
+    /// Single shard test: 50K TPS
+    SingleShard,
+    /// 8 shards test: 400K TPS
+    SmallScale,
+    /// 32 shards test: 1.6M TPS  
+    MediumScale,
+    /// 64 shards test: 3.2M TPS
+    LargeScale,
+    /// 128 shards test: 6.4M TPS
+    ExtraLarge,
+    /// Full 256 shards: 12.8M TPS (MAXIMUM)
+    FullScale,
+    /// Custom configuration
+    Custom,
+}
+
+impl Default for BenchmarkPreset {
+    fn default() -> Self {
+        BenchmarkPreset::FullScale
+    }
+}
+
 /// Benchmark configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BenchmarkConfig {
+    /// Preset type for quick configuration
+    #[serde(default)]
+    pub preset: BenchmarkPreset,
+    /// Number of shards to simulate (1-256)
+    #[serde(default = "default_shards")]
+    pub shards: usize,
     /// Total number of transactions to generate
     pub total_transactions: u64,
     /// Target TPS (transactions per second)
@@ -42,14 +85,43 @@ pub struct BenchmarkConfig {
     pub initial_balance: u64,
 }
 
+fn default_shards() -> usize { 256 }
+
+impl BenchmarkConfig {
+    /// Create config from preset
+    pub fn from_preset(preset: BenchmarkPreset) -> Self {
+        let (shards, total, tps, accounts) = match preset {
+            BenchmarkPreset::SingleShard => (1, 50_000, 50_000, 100),
+            BenchmarkPreset::SmallScale => (8, 400_000, 400_000, 500),
+            BenchmarkPreset::MediumScale => (32, 1_600_000, 1_600_000, 2_000),
+            BenchmarkPreset::LargeScale => (64, 3_200_000, 3_200_000, 4_000),
+            BenchmarkPreset::ExtraLarge => (128, 6_400_000, 6_400_000, 8_000),
+            BenchmarkPreset::FullScale => (256, 12_800_000, 12_800_000, 10_000),
+            BenchmarkPreset::Custom => (256, 12_800_000, 12_800_000, 10_000),
+        };
+        
+        Self {
+            preset,
+            shards,
+            total_transactions: total,
+            target_tps: tps,
+            num_accounts: accounts,
+            initial_balance: 1_000_000 * ONE_QNC,
+        }
+    }
+    
+    /// Quick presets
+    pub fn single_shard() -> Self { Self::from_preset(BenchmarkPreset::SingleShard) }
+    pub fn small_scale() -> Self { Self::from_preset(BenchmarkPreset::SmallScale) }
+    pub fn medium_scale() -> Self { Self::from_preset(BenchmarkPreset::MediumScale) }
+    pub fn large_scale() -> Self { Self::from_preset(BenchmarkPreset::LargeScale) }
+    pub fn extra_large() -> Self { Self::from_preset(BenchmarkPreset::ExtraLarge) }
+    pub fn full_scale() -> Self { Self::from_preset(BenchmarkPreset::FullScale) }
+}
+
 impl Default for BenchmarkConfig {
     fn default() -> Self {
-        Self {
-            total_transactions: 100_000,
-            target_tps: 50_000,
-            num_accounts: 100,
-            initial_balance: 1_000_000 * ONE_QNC, // 1M QNC per account (1M × 10^9 nanoQNC)
-        }
+        Self::from_preset(BenchmarkPreset::FullScale)
     }
 }
 
@@ -204,10 +276,11 @@ impl BenchmarkManager {
         self.is_running.store(true, Ordering::SeqCst);
         
         println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-        println!("🚀 QNET BENCHMARK STARTED");
+        println!("🚀 QNET BENCHMARK STARTED - {:?}", config.preset);
         println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-        println!("📊 Target: {} transactions", config.total_transactions);
-        println!("⚡ Target TPS: {}", config.target_tps);
+        println!("🧩 Shards: {} × 50K TPS each", config.shards);
+        println!("📊 Target: {} transactions ({:.1}M)", config.total_transactions, config.total_transactions as f64 / 1_000_000.0);
+        println!("⚡ Target TPS: {} ({:.1}M TPS)", config.target_tps, config.target_tps as f64 / 1_000_000.0);
         println!("👥 Test accounts: {}", config.num_accounts);
         println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
         
@@ -455,8 +528,8 @@ mod tests {
         
         let manager = BenchmarkManager::new();
         
-        // Initialize test accounts
-        let num_accounts = 100;
+        // Initialize test accounts for 256-shard full scale test
+        let num_accounts = 10_000;  // 10K accounts for realistic load distribution
         println!("🔑 Generating {} Ed25519 keypairs...", num_accounts);
         let key_start = Instant::now();
         manager.initialize(num_accounts).await;
@@ -465,8 +538,8 @@ mod tests {
                  key_time.as_secs_f64() * 1000.0,
                  num_accounts as f64 / key_time.as_secs_f64());
         
-        // Generate transactions
-        let num_transactions = 10_000;
+        // Generate transactions - 256 shards × 50K TPS = 12.8M TPS target
+        let num_transactions = 1_000_000;  // 1M TX for generation speed test
         println!("\n📝 Generating {} signed transactions...", num_transactions);
         
         let tx_start = Instant::now();

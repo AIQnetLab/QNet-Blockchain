@@ -1677,11 +1677,20 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         .and(warp::post())
         .and_then(handle_benchmark_stop);
     
+    // GET /api/v1/benchmark/presets - Get available presets
+    let benchmark_presets = api_v1
+        .and(warp::path("benchmark"))
+        .and(warp::path("presets"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and_then(handle_benchmark_presets);
+    
     // Combine benchmark routes
     let benchmark_routes = benchmark_start
         .or(benchmark_status)
         .or(benchmark_results)
-        .or(benchmark_stop);
+        .or(benchmark_stop)
+        .or(benchmark_presets);
     
     // CORS configuration - PRODUCTION SECURITY
     // In development mode (QNET_DEV_MODE=1), allow all origins
@@ -9545,20 +9554,22 @@ async fn handle_tokens_for_address(
 /// Request body for benchmark start
 #[derive(Debug, Clone, serde::Deserialize)]
 struct BenchmarkStartRequest {
+    /// Preset configuration (single_shard, small_scale, medium_scale, large_scale, extra_large, full_scale)
+    #[serde(default)]
+    preset: Option<crate::benchmark::BenchmarkPreset>,
+    /// Number of shards to simulate (1-256)
+    #[serde(default)]
+    shards: Option<usize>,
     /// Total number of transactions to generate
-    #[serde(default = "default_total_transactions")]
-    total: u64,
+    #[serde(default)]
+    total: Option<u64>,
     /// Target TPS
-    #[serde(default = "default_target_tps")]
-    target_tps: u64,
+    #[serde(default)]
+    target_tps: Option<u64>,
     /// Number of test accounts
-    #[serde(default = "default_num_accounts")]
-    num_accounts: usize,
+    #[serde(default)]
+    num_accounts: Option<usize>,
 }
-
-fn default_total_transactions() -> u64 { 100_000 }
-fn default_target_tps() -> u64 { 50_000 }
-fn default_num_accounts() -> usize { 100 }
 
 /// Handle POST /api/v1/benchmark/start
 /// SECURITY: Only Genesis/Bootstrap nodes can run benchmarks
@@ -9579,15 +9590,34 @@ async fn handle_benchmark_start(
         })));
     }
     
-    // Genesis nodes have no limits, others are restricted
-    let config = BenchmarkConfig {
-        total_transactions: request.total,
-        target_tps: request.target_tps,
-        num_accounts: request.num_accounts,
-        initial_balance: 1_000_000 * crate::benchmark::ONE_QNC, // 1M QNC (decimals=9)
+    // Build config from preset or custom values
+    let config = if let Some(preset) = request.preset {
+        // Use preset configuration
+        let mut cfg = BenchmarkConfig::from_preset(preset);
+        // Override with any custom values provided
+        if let Some(shards) = request.shards { cfg.shards = shards.min(256).max(1); }
+        if let Some(total) = request.total { cfg.total_transactions = total; }
+        if let Some(tps) = request.target_tps { cfg.target_tps = tps; }
+        if let Some(accounts) = request.num_accounts { cfg.num_accounts = accounts; }
+        cfg
+    } else if request.shards.is_some() || request.total.is_some() || request.target_tps.is_some() {
+        // Custom configuration
+        let shards = request.shards.unwrap_or(256).min(256).max(1);
+        let tps_per_shard = 50_000u64;
+        BenchmarkConfig {
+            preset: crate::benchmark::BenchmarkPreset::Custom,
+            shards,
+            total_transactions: request.total.unwrap_or(shards as u64 * tps_per_shard),
+            target_tps: request.target_tps.unwrap_or(shards as u64 * tps_per_shard),
+            num_accounts: request.num_accounts.unwrap_or(shards * 40),
+            initial_balance: 1_000_000 * crate::benchmark::ONE_QNC,
+        }
+    } else {
+        // Default: Full scale (256 shards, 12.8M TPS)
+        BenchmarkConfig::default()
     };
     
-    println!("[BENCHMARK] 🔐 Genesis node authorized. Starting benchmark...");
+    println!("[BENCHMARK] 🔐 Genesis node authorized. Starting {:?} benchmark...", config.preset);
     
     // Start benchmark
     match BENCHMARK_MANAGER.start(config.clone()).await {
@@ -9754,5 +9784,58 @@ async fn handle_benchmark_stop() -> Result<impl Reply, Rejection> {
             "average_tps": results.average_tps,
             "duration_seconds": results.duration_seconds
         }
+    })))
+}
+
+/// Handle GET /api/v1/benchmark/presets
+async fn handle_benchmark_presets() -> Result<impl Reply, Rejection> {
+    Ok(warp::reply::json(&json!({
+        "success": true,
+        "presets": [
+            {
+                "name": "single_shard",
+                "description": "Single shard test",
+                "shards": 1,
+                "target_tps": 50_000,
+                "total_transactions": 50_000
+            },
+            {
+                "name": "small_scale",
+                "description": "8 shards test",
+                "shards": 8,
+                "target_tps": 400_000,
+                "total_transactions": 400_000
+            },
+            {
+                "name": "medium_scale",
+                "description": "32 shards test",
+                "shards": 32,
+                "target_tps": 1_600_000,
+                "total_transactions": 1_600_000
+            },
+            {
+                "name": "large_scale",
+                "description": "64 shards test",
+                "shards": 64,
+                "target_tps": 3_200_000,
+                "total_transactions": 3_200_000
+            },
+            {
+                "name": "extra_large",
+                "description": "128 shards test",
+                "shards": 128,
+                "target_tps": 6_400_000,
+                "total_transactions": 6_400_000
+            },
+            {
+                "name": "full_scale",
+                "description": "MAXIMUM: 256 shards test",
+                "shards": 256,
+                "target_tps": 12_800_000,
+                "total_transactions": 12_800_000
+            }
+        ],
+        "formula": "TPS = shards × 50,000",
+        "max_theoretical": "12.8M TPS (256 shards × 50K)"
     })))
 }
