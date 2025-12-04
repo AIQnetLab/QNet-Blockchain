@@ -1000,6 +1000,7 @@ pub struct ShredProtocolChunk {
     pub data: Vec<u8>,
     pub is_parity: bool,  // Reed-Solomon parity chunk
     pub original_block_size: usize,  // CRITICAL: Original block size for correct reconstruction
+    pub is_macroblock: bool,  // PRODUCTION: Distinguish macro/micro for correct deserialization
 }
 
 /// ShredProtocol block assembly state
@@ -1011,6 +1012,7 @@ struct ShredProtocolBlockAssembly {
     total_chunks: usize,
     parity_count: usize,
     original_block_size: usize,  // CRITICAL: Store original size for reconstruction
+    is_macroblock: bool,  // PRODUCTION: Track block type for correct deserialization
     started_at: Instant,
 }
 
@@ -3664,7 +3666,14 @@ impl SimplifiedP2P {
     
     /// PRODUCTION v2.19.21: Broadcast block using ShredProtocol protocol via QUIC
     /// Solana-inspired chunking with Reed-Solomon erasure coding
+    /// For microblocks only (default) - use broadcast_block_shred_protocol_typed for macroblocks
     pub async fn broadcast_block_shred_protocol(&self, height: u64, block_data: Vec<u8>) -> Result<(), String> {
+        self.broadcast_block_shred_protocol_typed(height, block_data, false).await
+    }
+    
+    /// PRODUCTION: Broadcast block (micro or macro) using ShredProtocol protocol via QUIC
+    /// Supports both microblocks and macroblocks with correct type tagging
+    pub async fn broadcast_block_shred_protocol_typed(&self, height: u64, block_data: Vec<u8>, is_macroblock: bool) -> Result<(), String> {
         use futures::future::join_all;
         use crate::p2p_transport::P2PTransport;
         
@@ -3685,7 +3694,7 @@ impl SimplifiedP2P {
         
         // CRITICAL: Store original block size BEFORE splitting
         let original_block_size = block_data.len();
-        
+
         // Split block into chunks
         let chunks = self.split_into_chunks(&block_data);
         let total_chunks = chunks.len();
@@ -3720,6 +3729,7 @@ impl SimplifiedP2P {
                 data: chunk_data,
                 is_parity: false,
                 original_block_size,  // CRITICAL: Include original size
+                is_macroblock,  // PRODUCTION: Tag block type
             };
             
             let target_peers = self.select_shred_protocol_targets(&routing_tree, chunk_index, shred_protocol_fanout);
@@ -3739,6 +3749,7 @@ impl SimplifiedP2P {
                 data: parity_data,
                 is_parity: true,
                 original_block_size,  // CRITICAL: Include original size
+                is_macroblock,  // PRODUCTION: Tag block type
             };
             
             let target_peers = self.select_shred_protocol_targets(&routing_tree, total_chunks + parity_index, shred_protocol_fanout);
@@ -3959,6 +3970,7 @@ impl SimplifiedP2P {
                     total_chunks: chunk.total_chunks,
                     parity_count: ((chunk.total_chunks as f32) * (SHRED_PROTOCOL_REDUNDANCY_FACTOR - 1.0)).ceil() as usize,
                     original_block_size: chunk.original_block_size,  // CRITICAL: Store for reconstruction
+                    is_macroblock: chunk.is_macroblock,  // PRODUCTION: Track block type
                     started_at: Instant::now(),
                 });
             
@@ -4139,11 +4151,15 @@ impl SimplifiedP2P {
             Err(p) => p.into_inner()
         };
         
+        // PRODUCTION: Use correct block_type based on chunk metadata
+        let block_type = if assembly.is_macroblock { "macro".to_string() } else { "micro".to_string() };
+        
         if let Some(ref block_tx) = &*block_tx_guard {
             let received_block = ReceivedBlock {
                 height,
                 data: block_data,
-                block_type: if height % 90 == 0 { "macro".to_string() } else { "micro".to_string() },
+                // PRODUCTION: Use block type from chunk metadata (supports both micro and macro)
+                block_type,
                 from_peer: "shred_protocol".to_string(),
                 timestamp: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -4256,6 +4272,9 @@ impl SimplifiedP2P {
             let elapsed = assembly.started_at.elapsed();
             println!("[SHRED_PROTOCOL] 🔧 Block #{} reconstructed with Reed-Solomon in {:?}", height, elapsed);
             
+            // PRODUCTION: Use correct block_type based on chunk metadata
+            let block_type = if assembly.is_macroblock { "macro".to_string() } else { "micro".to_string() };
+            
             // Send reconstructed block through normal block channel
             let block_tx_guard = match self.block_tx.lock() {
                 Ok(g) => g,
@@ -4265,7 +4284,8 @@ impl SimplifiedP2P {
                 let received_block = ReceivedBlock {
                     height,
                     data: block_data,
-                    block_type: if height % 90 == 0 { "macro".to_string() } else { "micro".to_string() },
+                    // PRODUCTION: Use block type from chunk metadata (supports both micro and macro)
+                    block_type,
                     from_peer: "shred_protocol-rs".to_string(),
                     timestamp: std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)

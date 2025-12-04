@@ -11307,8 +11307,33 @@ impl BlockchainNode {
                 println!("[REPUTATION] 💰 Distributed reputation rewards to {} consensus participants", 
                          consensus_data.participants.len());
                 
-                // Consensus already cleaned immediately after finalization (see above)
-                // No need to broadcast completion - all participants already know through commit/reveal
+                // PRODUCTION: Broadcast macroblock to ALL nodes via ShredProtocol
+                // This ensures non-consensus participants (new nodes, light nodes) receive macroblock
+                // Uses same infrastructure as microblocks for scalability to millions of nodes
+                {
+                    let macroblock_data = bincode::serialize(&macroblock)
+                        .map_err(|e| format!("Failed to serialize macroblock: {}", e))?;
+                    
+                    // Compress for efficient transmission
+                    let compressed_data = zstd::encode_all(&macroblock_data[..], 3)
+                        .unwrap_or_else(|_| macroblock_data.clone());
+                    
+                    // Use macroblock index as height for ShredProtocol
+                    let macroblock_height = macroblock.height;
+                    
+                    println!("[MACROBLOCK] 📡 Broadcasting macroblock #{} via ShredProtocol ({} bytes compressed)", 
+                             macroblock_height, compressed_data.len());
+                    
+                    match p2p.broadcast_block_shred_protocol_typed(macroblock_height, compressed_data, true).await {
+                        Ok(_) => {
+                            println!("[MACROBLOCK] ✅ Macroblock #{} broadcast to network via ShredProtocol", macroblock_height);
+                        },
+                        Err(e) => {
+                            // Non-fatal: consensus participants already have the block
+                            println!("[MACROBLOCK] ⚠️ Macroblock #{} broadcast failed: {} (consensus participants already have it)", macroblock_height, e);
+                        }
+                    }
+                }
                 
                 Ok(())
             },
