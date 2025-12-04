@@ -70,6 +70,12 @@ This project uses **dual licensing**:
 - **Adaptive Buffer Size**: Full/Super nodes: 500 blocks (~50MB), Light nodes: 100 blocks (~10MB)
 - **Background Re-request**: Missing blocks automatically re-requested every 30s with backoff
 
+### 🛡️ **Latest Update (v2.20.0 - December 4, 2025)**
+- **Reputation System Fix**: Only INFLATION is an attack (DEFLATION is legitimate after penalties)
+- **Tolerance Increased**: 2% → 10% for network delays and sync timing
+- **Deterministic Producer Selection**: Round 0 uses Genesis + leadership_round as entropy
+- **Cascade Prevention**: Prevents false accusations from network desync
+
 ### 🛡️ **Previous Updates (v2.19.19 - November 29, 2025)**
 - **Heartbeat without Dilithium**: CPU optimization (~35ms savings per heartbeat, NIST FIPS 204 compliant)
 - **Shred Protocol ALWAYS**: Block propagation uses Shred Protocol for ALL network sizes (not just >10 peers)
@@ -80,7 +86,7 @@ This project uses **dual licensing**:
 
 ### 🛡️ **Previous Updates (v2.19.14 - November 28, 2025)**
 - **Simplified Fork Resolution**: Three-case approach (network ahead/same height/we're ahead) instead of complex weight calculations
-- **Reputation Manipulation Detection**: Escalating punishment for nodes claiming false reputation (1h → 1d → 1w → 1y ban)
+- **Reputation Manipulation Detection**: Escalating punishment for INFLATION attacks (1h → 1d → 1w → 1y ban)
 - **Empty Response Attack Protection**: Detection and penalty for nodes sending empty peer lists
 - **Consensus Security**: Timestamp validation (±5 min) and signature format pre-validation for commits/reveals
 - **Dual Peer Lookup**: Fixed Genesis node peer discovery (check both DashMap and RwLock storage)

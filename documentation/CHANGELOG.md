@@ -5,6 +5,42 @@ All notable changes to the QNet project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.20.0] - December 4, 2025 "Reputation System Fix + Deterministic Producer Selection"
+
+### 🔐 CRITICAL - Reputation Manipulation Detection Fix
+
+**Problem**: False DEFLATION accusations caused cascade jailing of legitimate nodes
+**Root Cause**: 
+- Tolerance was 2% (too strict for network delays)
+- DEFLATION was treated as attack (wrong - it's legitimate after penalty)
+
+**Solution**:
+- Increased tolerance to 10% for network delays and sync timing
+- Only INFLATION is now an attack (node claiming higher reputation)
+- DEFLATION (claiming lower) is NOT an attack - legitimate after penalties
+
+#### Changes
+- **Tolerance**: 2% → 10% for reputation sync differences
+- **INFLATION Only**: Only punish nodes claiming HIGHER reputation than actual
+- **DEFLATION OK**: Nodes can claim lower reputation (after receiving penalties)
+- **Cascade Prevention**: Prevents false accusations from desync
+
+### 🎯 Deterministic Producer Selection Fix
+
+**Problem**: Nodes selected different producers due to varying entropy sources
+**Root Cause**: Finality blocks (height-10) not available during initial sync
+
+**Solution**: 
+- Round 0 (blocks 1-30): Use Genesis + leadership_round as entropy
+- All nodes have Genesis → identical entropy → same producer selected
+
+#### Files Modified
+- `unified_p2p.rs` - Reputation manipulation detection logic
+- `node.rs` - Producer selection entropy calculation
+- `MICROBLOCK_ARCHITECTURE_PLAN.md` - Updated documentation
+
+---
+
 ## [2.19.22] - November 30, 2025 "QUIC Transport Layer + NIST/Cisco Hybrid Crypto"
 
 ### 🔐 CRITICAL - NIST/Cisco Compliant Hybrid Signatures

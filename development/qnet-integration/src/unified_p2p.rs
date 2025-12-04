@@ -9133,18 +9133,15 @@ impl SimplifiedP2P {
                     }
                 }
                 
-                // SECURITY: Detect and punish ANY reputation manipulation attempts
-                // ANY difference between claimed and real reputation is an attack!
-                // Tolerance: ±2.0 for floating point rounding (real systems may have tiny diffs)
-                let reputation_diff = (reputation - real_reputation).abs();
-                let is_manipulation = reputation_diff > 2.0 && real_reputation > 0.0;
+                // SECURITY: Detect and punish INFLATION manipulation attempts
+                // CRITICAL FIX: Only INFLATION is an attack (claiming higher reputation to become producer)
+                // DEFLATION is NOT an attack - node may have received legitimate penalty
+                // Tolerance: 10% for network delays and sync timing (was 2% - too strict)
+                let reputation_diff = reputation - real_reputation; // Positive = INFLATION
+                let is_inflation_attack = reputation_diff > 10.0 && real_reputation > 0.0;
                 
-                if is_manipulation {
-                    let manipulation_type = if reputation > real_reputation {
-                        "INFLATION" // Trying to get more producer chances
-                    } else {
-                        "DEFLATION" // Trying to appear weaker (sybil preparation?)
-                    };
+                if is_inflation_attack {
+                    let manipulation_type = "INFLATION"; // Only inflation is an attack
                     
                     println!("[SECURITY] 🚨 REPUTATION {} ATTACK from {}: claimed {:.1}, real {:.1} (diff: {:.1})", 
                              manipulation_type, node_id, reputation, real_reputation, reputation_diff);
@@ -9217,8 +9214,10 @@ impl SimplifiedP2P {
                 }
                 
                 // Log minor differences (within tolerance) for monitoring
-                // These are NOT attacks, just floating point differences or slight desync
-                if reputation_diff > 0.5 && reputation_diff <= 2.0 && real_reputation > 0.0 {
+                // These are NOT attacks, just floating point/network sync differences
+                // Use abs() for logging since we only care about magnitude for monitoring
+                let abs_diff = reputation_diff.abs();
+                if abs_diff > 0.5 && abs_diff <= 10.0 && real_reputation > 0.0 {
                     println!("[ACTIVE] ℹ️ Minor reputation diff for {} (within tolerance): claimed {:.1}, real {:.1}", 
                              node_id, reputation, real_reputation);
                 }

@@ -2239,16 +2239,18 @@ Violation Penalties:
 ├── Extended Offline (24h+): -15.0 reputation
 └── Double Signing: -30.0 reputation
 
-Advanced Security (v2.19.14):
+Advanced Security (v2.20.0):
 ├── Reputation Manipulation Detection:
 │   ├── Nodes claiming false reputation in ActiveNodeAnnouncement
-│   ├── Detection: Compare claimed vs real reputation (tolerance ±2.0)
+│   ├── Detection: Compare claimed vs real reputation (tolerance ±10%)
+│   ├── Only INFLATION is an attack (claiming higher reputation)
+│   ├── DEFLATION is NOT an attack (legitimate after penalties)
 │   ├── Escalating punishment:
 │   │   ├── 1st attempt: -15% + 1 hour ban
 │   │   ├── 2nd attempt: -25% + 1 day ban
 │   │   ├── 3rd attempt: -40% + 1 week ban + network alert
 │   │   └── 4th+ attempt: -50% + 1 year ban + network alert
-│   └── Covers both inflation AND deflation attacks
+│   └── Prevents cascade false accusations from network desync
 │
 ├── Empty Response Attack Protection:
 │   ├── Nodes sending empty peer lists to disrupt discovery
