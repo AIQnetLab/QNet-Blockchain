@@ -999,6 +999,7 @@ pub struct ShredProtocolChunk {
     pub total_chunks: usize,
     pub data: Vec<u8>,
     pub is_parity: bool,  // Reed-Solomon parity chunk
+    pub original_block_size: usize,  // CRITICAL: Original block size for correct reconstruction
 }
 
 /// ShredProtocol block assembly state
@@ -1009,6 +1010,7 @@ struct ShredProtocolBlockAssembly {
     parity_chunks: Vec<Option<Vec<u8>>>,
     total_chunks: usize,
     parity_count: usize,
+    original_block_size: usize,  // CRITICAL: Store original size for reconstruction
     started_at: Instant,
 }
 
@@ -3681,6 +3683,9 @@ impl SimplifiedP2P {
             return Ok(());
         }
         
+        // CRITICAL: Store original block size BEFORE splitting
+        let original_block_size = block_data.len();
+        
         // Split block into chunks
         let chunks = self.split_into_chunks(&block_data);
         let total_chunks = chunks.len();
@@ -3714,6 +3719,7 @@ impl SimplifiedP2P {
                 total_chunks,
                 data: chunk_data,
                 is_parity: false,
+                original_block_size,  // CRITICAL: Include original size
             };
             
             let target_peers = self.select_shred_protocol_targets(&routing_tree, chunk_index, shred_protocol_fanout);
@@ -3732,6 +3738,7 @@ impl SimplifiedP2P {
                 total_chunks,
                 data: parity_data,
                 is_parity: true,
+                original_block_size,  // CRITICAL: Include original size
             };
             
             let target_peers = self.select_shred_protocol_targets(&routing_tree, total_chunks + parity_index, shred_protocol_fanout);
@@ -3951,6 +3958,7 @@ impl SimplifiedP2P {
                     parity_chunks: vec![None; ((chunk.total_chunks as f32) * (SHRED_PROTOCOL_REDUNDANCY_FACTOR - 1.0)).ceil() as usize],
                     total_chunks: chunk.total_chunks,
                     parity_count: ((chunk.total_chunks as f32) * (SHRED_PROTOCOL_REDUNDANCY_FACTOR - 1.0)).ceil() as usize,
+                    original_block_size: chunk.original_block_size,  // CRITICAL: Store for reconstruction
                     started_at: Instant::now(),
                 });
             
@@ -4231,15 +4239,19 @@ impl SimplifiedP2P {
                 .collect();
             
             // Assemble reconstructed block from data shards
-            let mut block_data = Vec::new();
+            // CRITICAL FIX: Use original_block_size instead of rposition
+            // rposition incorrectly removes trailing zeros which corrupts bincode data!
+            let original_size = assembly.original_block_size;
+            let mut block_data = Vec::with_capacity(original_size);
+            
             for shard_opt in shards.iter().take(data_count) {
                 if let Some(shard) = shard_opt {
-                    // Remove padding (find actual data length)
-                    let data = shard.as_ref();
-                    let actual_len = data.iter().rposition(|&b| b != 0).map(|i| i + 1).unwrap_or(0);
-                    block_data.extend_from_slice(&data[..actual_len]);
+                    block_data.extend_from_slice(shard.as_ref());
                 }
             }
+            
+            // Truncate to original size (remove padding)
+            block_data.truncate(original_size);
             
             let elapsed = assembly.started_at.elapsed();
             println!("[SHRED_PROTOCOL] 🔧 Block #{} reconstructed with Reed-Solomon in {:?}", height, elapsed);
