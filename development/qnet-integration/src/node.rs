@@ -7583,17 +7583,19 @@ impl BlockchainNode {
                 // Using global constant for consistent behavior across all selection logic
                 
                 let prev_hash = if current_height <= FINALITY_WINDOW {
-                    // INITIAL PHASE (blocks 1-10): Use Genesis + height for variation
-                    // All nodes have Genesis, so this is deterministic
-                    println!("[FINALITY] 🎲 Block #{}: Initial phase - using Genesis + height as entropy", current_height);
+                    // INITIAL PHASE (blocks 1-10): Use Genesis + leadership_round
+                    // CRITICAL FIX: Use leadership_round NOT current_height!
+                    // current_height varies by node state, leadership_round is deterministic
+                    println!("[FINALITY] 🎲 Block #{}: Initial phase - using Genesis + round {} as entropy", current_height, leadership_round);
                     
                     match store.load_microblock(0) {
                         Ok(Some(genesis_data)) => {
-                            // Mix Genesis hash with current height for variation
+                            // Mix Genesis hash with leadership_round for deterministic selection
+                            // CRITICAL: All nodes in same round get SAME entropy regardless of local height
                             use sha3::{Sha3_256, Digest};
                             let mut hasher = Sha3_256::new();
                             hasher.update(&genesis_data);
-                            hasher.update(&current_height.to_le_bytes()); // Add height for variation
+                            hasher.update(&leadership_round.to_le_bytes()); // Same for entire round!
                             let result = hasher.finalize();
                             let mut hash = [0u8; 32];
                             hash.copy_from_slice(&result);
