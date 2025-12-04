@@ -7582,11 +7582,13 @@ impl BlockchainNode {
                 // FINALITY WINDOW IMPLEMENTATION for Byzantine safety
                 // Using global constant for consistent behavior across all selection logic
                 
-                let prev_hash = if current_height <= FINALITY_WINDOW {
-                    // INITIAL PHASE (blocks 1-10): Use Genesis + leadership_round
-                    // CRITICAL FIX: Use leadership_round NOT current_height!
-                    // current_height varies by node state, leadership_round is deterministic
-                    println!("[FINALITY] 🎲 Block #{}: Initial phase - using Genesis + round {} as entropy", current_height, leadership_round);
+                // CRITICAL FIX: For ENTIRE round 0 (blocks 1-30), use Genesis + leadership_round
+                // This ensures ALL nodes have same entropy even if they haven't synced all blocks yet
+                // Finality blocks (block height-10) may not exist on all nodes during round 0!
+                let prev_hash = if leadership_round == 0 {
+                    // ROUND 0 (blocks 1-30): Use Genesis + leadership_round
+                    // All nodes have Genesis, so this is always deterministic
+                    println!("[FINALITY] 🎲 Block #{}: Round 0 - using Genesis + round {} as entropy (all nodes synced)", current_height, leadership_round);
                     
                     match store.load_microblock(0) {
                         Ok(Some(genesis_data)) => {
