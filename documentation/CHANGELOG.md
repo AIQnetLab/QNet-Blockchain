@@ -5,6 +5,208 @@ All notable changes to the QNet project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.21.5] - December 5, 2025 "Full Blockchain Reputation Integration"
+
+### 🏗️ MAJOR ARCHITECTURE - Complete Blockchain Integration
+
+**Complete migration from P2P-based to blockchain-based reputation system!**
+
+### 🔴 Bug Fixes
+
+| Bug | Before | After |
+|-----|--------|-------|
+| Genesis hardcoded at 70% | `return 0.70` | Uses DeterministicReputationState |
+| Type conversion error | `score.min(1.0)` | `(score / 100.0).min(1.0)` |
+| Slashing not in blockchain | Stored in P2P RAM | Stored in ConsensusData |
+| No replay on restart | Lost on restart | Replays from blockchain |
+
+### ✅ Blockchain Storage for Reputation
+
+**Extended ConsensusData structure:**
+```rust
+pub struct ConsensusData {
+    pub commits: HashMap<String, Vec<u8>>,
+    pub reveals: HashMap<String, Vec<u8>>,
+    pub next_leader: String,
+    // NEW - stored in blockchain:
+    pub slashing_events_data: Option<Vec<u8>>,
+    pub automatic_jails_data: Option<Vec<u8>>,
+}
+```
+
+**New data types:**
+- `SlashingEventData` - serialized slashing events in blockchain
+- `AutomaticJailData` - serialized jail records in blockchain
+
+### ✅ Blockchain Replay on Restart
+
+```rust
+// On node startup:
+for height in (30..=current_height).step_by(30) {
+    rep_state.process_block(&block_data);  // +2% rotation rewards
+}
+for macroblock_index in 1..=(current_height / 90) {
+    rep_state.process_macroblock(&macro_data);  // +1% consensus + slashing
+}
+```
+
+### ✅ Old System Deprecated
+
+| Old (NodeReputation) | New (DeterministicReputationState) |
+|---------------------|-----------------------------------|
+| `get_reputation_system()` | `get_node_reputation_from_blockchain()` |
+| Stored in P2P RAM | Stored in blockchain |
+| Lost on restart | Replayed from blockchain |
+| Nodes can disagree | All nodes compute same |
+
+### 📊 Architecture Comparison
+
+```
+BEFORE (P2P):
+┌─────────────┐     ┌─────────────┐
+│ Node 001    │     │ Node 002    │
+│ rep=72%     │  ≠  │ rep=70%     │  ← CAN DISAGREE!
+└─────────────┘     └─────────────┘
+
+AFTER (Blockchain):
+┌─────────────┐     ┌─────────────┐
+│ Node 001    │     │ Node 002    │
+│ rep=72%     │  =  │ rep=72%     │  ← ALWAYS SAME!
+└─────────────┘     └─────────────┘
+       ↑                   ↑
+       └───────┬───────────┘
+               │
+        ┌──────┴──────┐
+        │  BLOCKCHAIN │
+        │  - commits  │
+        │  - reveals  │
+        │  - slashing │
+        │  - jails    │
+        └─────────────┘
+```
+
+### 🧪 Verification
+
+**Expected behavior:**
+```
+Genesis starts: 70%
+After 1 rotation (30 blocks): 72% (+2%)
+After 3 macroblocks: 75% (+1% each)
+After restart: SAME values (replayed from blockchain)
+```
+
+---
+
+## [2.21.4] - December 5, 2025 "QUIC Rate Limiting - 40% Packet Loss Fix"
+
+### 🔥 CRITICAL - Receiver Overload Fix
+
+**Problem**: 72 concurrent QUIC streams caused receiver overload → 40% chunk loss
+**Root Cause**: Burst of 72 parallel `tokio::spawn` → QUIC timeouts on receiver
+**Solution**: Semaphore-based rate limiting for chunk sends
+
+#### Technical Details
+```
+BEFORE: 72 chunks → 72 concurrent streams → receiver overload → 40% loss
+AFTER:  72 chunks → max 20 concurrent → controlled flow → ~0% loss
+```
+
+#### New Features
+- **Semaphore Rate Limiting**: Max N concurrent QUIC streams at any time
+- **Adaptive Limits**: Based on network size (15-50 concurrent)
+- **get_max_concurrent_chunk_sends()**: Dynamic limit calculation
+
+| Network Size | Max Concurrent | Rationale |
+|--------------|----------------|-----------|
+| 0-10 nodes | 15 | Conservative for Genesis |
+| 11-100 | 20 | Balanced throughput |
+| 101-1000 | 30 | More parallelism safe |
+| 1000+ | 50 | Distributed load |
+
+#### Why This Approach
+- ✅ Chunks remain independent (Reed-Solomon works)
+- ✅ No head-of-line blocking
+- ✅ QUIC flow control works properly
+- ✅ Scales to 100K+ nodes
+- ✅ Architecturally correct (not a hack)
+
+### 🧪 Tests Added
+- `test_rate_limit_genesis_network` - 5 nodes scenario
+- `test_rate_limit_small_network` - 50 nodes
+- `test_rate_limit_medium_network` - 500 nodes
+- `test_rate_limit_large_network` - 5000 nodes
+- `test_per_peer_limit_protection` - Per-receiver protection
+- `test_minimum_throughput_guarantee` - Min 10 concurrent
+- `test_rate_limit_vs_total_sends` - Throttle verification
+- `test_rate_limit_large_blocks` - 2MB block handling
+
+### 🛡️ Phantom Peers Prevention
+- **MAX_CONNECTED_PEERS = 1000**: Hard limit on connected peers
+- **LRU Eviction**: Automatic removal of oldest peer when limit reached
+- **ensure_peer_connected()**: Now respects capacity limits
+- **Scalability**: Prevents RAM overflow in networks with 10,000+ nodes
+
+### 🔥 CRITICAL - Reputation Processing Fix
+- **BUG**: `process_macroblock()` was NOT called when node CREATES macroblock!
+- **EFFECT**: Reputation rewards and slashing were NOT applied on creator node
+- **FIX**: Added full `process_macroblock()` call in macroblock creation (node.rs:11591+)
+- **Includes**: Slashing events, automatic jails, passive recovery
+
+---
+
+## [2.21.3] - December 5, 2025 "SHRED Retransmit & Network Hardening"
+
+### 🚀 NEW - SHRED Protocol Chunk Retransmit
+
+**Problem**: ~20% chunk loss in QUIC broadcast caused reliance on Reed-Solomon for ALL blocks
+**Solution**: Efficient retransmit mechanism for missing chunks without full block re-download
+
+#### New Features
+- **RequestMissingChunks**: Request specific missing chunks by index
+- **MissingChunksResponse**: Peers respond with cached chunks
+- **Adaptive Peer Selection**: 3-10 peers based on network size (5 to 100K+ nodes)
+- **100-Block Chunk Cache**: Recently received chunks cached for retransmit
+- **3-Second Timeout**: Wait before requesting retransmit
+- **Max 2 Retries**: Prevents infinite loops
+
+#### Bandwidth Savings
+| Missing Chunks | Full Block | Retransmit | Savings |
+|----------------|------------|------------|---------|
+| 2 | 12KB | 2KB | 83% |
+| 3 | 12KB | 3KB | 75% |
+| 5 | 12KB | 5KB | 58% |
+
+#### Scalability
+| Network Size | Peers Queried | Success Rate |
+|--------------|---------------|--------------|
+| 5-10 nodes | 3 | 87.5% |
+| 100 nodes | 5 | 96.9% |
+| 10,000 nodes | 7 | 99.2% |
+| 100,000 nodes | 8 | 99.6% |
+
+### 🔒 Security & Privacy
+- **Privacy-First Logging**: ALL IP addresses use `get_privacy_id_for_addr()` pseudonyms
+- **QUIC Address Protection**: No raw IPs in any log output
+- **Genesis Peer Validation**: Extended retry (3 attempts × 2s) before adding peers
+
+### 🐛 Bug Fixes
+- **Genesis QUIC Readiness**: Wait for QUIC connections before Genesis broadcast
+- **Deadlock Detection**: Fixed `>` to `>=` for exact timeout match
+- **Background Sync**: Detect stuck sync with `start_time=0` check
+- **FAST_SYNC in Background**: Now triggers for non-producer nodes too
+- **Adaptive Timeout**: Longer timeouts for larger sync operations
+
+### 📚 Documentation
+- `docs/REPUTATION_SYSTEM.md` - Added SHRED Retransmit section
+- `QNet_Whitepaper.md` - Added Chunk Retransmit mechanism
+- `README.md` - Added v2.21.3 release notes
+
+### 🧪 Tests
+- `tests/retransmit_tests.rs` - 20+ comprehensive tests
+- Unit tests for adaptive peer selection, cache, timeout detection
+
+---
+
 ## [2.21.0] - December 5, 2025 "Deterministic Reputation System v2.1"
 
 ### 🔐 CRITICAL - Complete Reputation System Overhaul

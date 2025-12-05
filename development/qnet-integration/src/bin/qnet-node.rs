@@ -18,6 +18,7 @@
 
 use qnet_integration::node::{BlockchainNode, NodeType, Region};
 use qnet_integration::quantum_crypto::{QNetQuantumCrypto, ActivationPayload};
+use qnet_integration::unified_p2p::get_privacy_id_for_addr;
 // No clap - fully automatic configuration
 use std::path::PathBuf;
 use std::time::Duration;
@@ -2620,6 +2621,79 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // CRITICAL FIX v2.21.3: Genesis nodes MUST wait for other Genesis nodes before starting
+    // This prevents fork caused by nodes starting before others are ready
+    let is_genesis = std::env::var("QNET_BOOTSTRAP_ID")
+        .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
+        .unwrap_or(false);
+    
+    if is_genesis {
+        println!("[GENESIS SYNC] ⏳ Waiting for other Genesis nodes to be ready...");
+        let genesis_ips = vec![
+            "154.38.160.39",
+            "62.171.157.44",
+            "161.97.86.81",
+            "5.189.130.160",
+            "162.244.25.114",
+        ];
+        
+        // CRITICAL FIX: Get our IP for self-skip in Genesis sync
+        let our_ip = get_physical_ip().await.unwrap_or_else(|_| "127.0.0.1".to_string());
+        let mut ready_count = 0;
+        let mut attempts = 0;
+        const MAX_ATTEMPTS: u32 = 60; // 60 * 2s = 120 seconds max wait
+        const REQUIRED_PEERS: usize = 3; // Need at least 3 other Genesis nodes ready
+        
+        while ready_count < REQUIRED_PEERS && attempts < MAX_ATTEMPTS {
+            attempts += 1;
+            ready_count = 0;
+            
+            for ip in &genesis_ips {
+                // Skip self
+                if *ip == our_ip {
+                    continue;
+                }
+                
+                // Check if node API is responding
+                let check_url = format!("http://{}:8001/health", ip);
+                let is_ready = match reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(2))
+                    .build()
+                {
+                    Ok(client) => {
+                        match client.get(&check_url).send().await {
+                            Ok(resp) => resp.status().is_success(),
+                            Err(_) => false,
+                        }
+                    }
+                    Err(_) => false,
+                };
+                
+                if is_ready {
+                    ready_count += 1;
+                }
+            }
+            
+            if ready_count >= REQUIRED_PEERS {
+                println!("[GENESIS SYNC] ✅ {} Genesis nodes ready, proceeding with startup", ready_count);
+                break;
+            }
+            
+            println!("[GENESIS SYNC] ⏳ {}/{} Genesis nodes ready (attempt {}/{}), waiting 2s...", 
+                     ready_count, REQUIRED_PEERS, attempts, MAX_ATTEMPTS);
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+        
+        if ready_count < REQUIRED_PEERS {
+            println!("[GENESIS SYNC] ⚠️ Only {} Genesis nodes ready after {} attempts, starting anyway", 
+                     ready_count, attempts);
+        }
+        
+        // Extra wait for QUIC connections to stabilize
+        println!("[GENESIS SYNC] ⏳ Waiting 5s for QUIC connections to stabilize...");
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    }
+
     println!("🔍 DEBUG: About to create BlockchainNode...");
     let mut node = match BlockchainNode::new_with_config(
         &config.data_dir.to_string_lossy(),
@@ -3933,7 +4007,8 @@ async fn scan_active_qnet_nodes() -> (RealNodeCounts, Vec<String>) {
                 _ => {}
             }
             counts.total += 1;
-            println!("   🔄 Discovered {} node at {}", node_info.node_type, peer_addr);
+            // PRIVACY: Use pseudonym for peer address
+            println!("   🔄 Discovered {} node at {}", node_info.node_type, get_privacy_id_for_addr(&peer_addr));
         }
     }
     
@@ -4161,7 +4236,8 @@ async fn perform_broadcast_discovery() -> Result<Vec<String>, String> {
                     if parts.len() >= 3 {
                         let peer_addr = format!("{}:{}", parts[1], parts[2]);
                         if !discovered_peers.contains(&peer_addr) {
-                            println!("[BROADCAST] 📡 Discovered local peer: {}", peer_addr);
+                            // PRIVACY: Use pseudonym for peer address
+                            println!("[BROADCAST] 📡 Discovered local peer: {}", get_privacy_id_for_addr(&peer_addr));
                             discovered_peers.push(peer_addr);
                         }
                     }
@@ -4169,7 +4245,8 @@ async fn perform_broadcast_discovery() -> Result<Vec<String>, String> {
                     // Simple acknowledgment from a QNet node
                     let peer_addr = format!("{}:9876", sender.ip());
                     if !discovered_peers.contains(&peer_addr) {
-                        println!("[BROADCAST] 📡 Discovered peer via ACK: {}", peer_addr);
+                        // PRIVACY: Use pseudonym for peer address
+                        println!("[BROADCAST] 📡 Discovered peer via ACK: {}", get_privacy_id_for_addr(&peer_addr));
                         discovered_peers.push(peer_addr);
                     }
                 }

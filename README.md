@@ -251,6 +251,25 @@ This project uses **dual licensing**:
 - **Parallel Block Processing**: High-performance consecutive block processing (up to 10 blocks)
 - **Reputation-Based Chain Weight**: Byzantine weight calculation using validator reputation scores
 
+### **Latest Updates (v2.21.4)**
+- **QUIC Rate Limiting**: Semaphore-based adaptive rate limiting for chunk sends
+  - Prevents receiver overload from burst of 72+ concurrent streams
+  - Fixed ~40% packet loss issue discovered in production testing
+  - Adaptive limits: 20-200 concurrent based on network size
+  - Per-peer limit: max 5 concurrent streams per receiver
+  - Scales from 5 to 100K+ nodes
+
+### **Previous Updates (v2.21.3)**
+- **SHRED Chunk Retransmit**: Efficient recovery of missing chunks without full block download
+  - 3-second timeout before requesting missing chunks
+  - Adaptive peer selection (3-10 peers based on network size)
+  - 100-block chunk cache for fast retransmit responses
+  - 83% bandwidth savings vs full block re-download
+  - Works for both microblocks and macroblocks
+- **Privacy-First Logging**: All IP addresses use pseudonyms via `get_privacy_id_for_addr()`
+- **Genesis QUIC Readiness**: Retry mechanism ensures QUIC connections established before broadcast
+- **Deadlock Detection Fixes**: Improved sync flag management with `>=` timeout checks
+
 ### **Previous Updates (v2.16.0)**
 - **Shred Protocol Block Propagation**: 85% bandwidth reduction with Reed-Solomon erasure coding
 - **Quantum Verifiable Time Sequence (VTS)**: 500K hashes/sec with hybrid SHA3-512/Blake3 (25%/75%)

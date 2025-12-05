@@ -682,5 +682,107 @@ Run audit: `python tests/reputation_audit.py`
 | Deterministic Consistency | ✅ |
 | Memory Efficiency | ✅ |
 | Light Nodes | ✅ |
+| **SHRED Protocol Retransmit** | ✅ |
+
+---
+
+## SHRED Protocol Retransmit (v2.21.3)
+
+### Overview
+
+The SHRED Protocol Retransmit mechanism enables efficient recovery of missing block chunks
+without downloading entire blocks. This significantly reduces bandwidth usage and improves
+block propagation reliability.
+
+### Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    SHRED RETRANSMIT FLOW                                │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  1. Node receives chunks for block #100                                 │
+│     └── Got: 9/12 data chunks + 3/6 parity                              │
+│     └── Missing: chunks 3, 7, 11                                        │
+│                                                                         │
+│  2. After 3 seconds timeout:                                            │
+│     └── RequestMissingChunks { block: 100, indices: [3, 7, 11] }        │
+│     └── Sent to 3-10 peers (adaptive based on network size)             │
+│                                                                         │
+│  3. Peers with cached chunks respond:                                   │
+│     └── MissingChunksResponse { block: 100, chunks: [...] }             │
+│                                                                         │
+│  4. Node reconstructs block:                                            │
+│     └── Reed-Solomon if needed                                          │
+│     └── Block saved to storage                                          │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Constants
+
+```rust
+SHRED_CHUNK_TIMEOUT_SECS = 3    // Timeout before requesting missing chunks
+SHRED_CHUNK_CACHE_SIZE = 100   // Cache last 100 blocks' chunks for retransmit
+SHRED_CHUNK_MAX_RETRIES = 2    // Maximum retransmit attempts per block
+```
+
+### Adaptive Peer Selection
+
+The number of peers to request chunks from scales with network size:
+
+| Network Size | Request Peers | Success Probability* |
+|--------------|---------------|---------------------|
+| 5-10 nodes | 3 | 87.5% |
+| 11-100 nodes | 5 | 96.9% |
+| 101-1,000 nodes | 6 | 98.4% |
+| 1,001-10,000 nodes | 7 | 99.2% |
+| 10,001-100,000 nodes | 8 | 99.6% |
+| >100,000 nodes | 10 | 99.9% |
+
+*Assuming 50% of peers have the chunk cached
+
+### Bandwidth Savings
+
+| Scenario | Full Block Download | Retransmit | Savings |
+|----------|---------------------|------------|---------|
+| 2 missing chunks | 12KB | 2KB | 83% |
+| 3 missing chunks | 12KB | 3KB | 75% |
+| 5 missing chunks | 12KB | 5KB | 58% |
+
+### NetworkMessage Types
+
+```rust
+// Request missing chunks
+RequestMissingChunks {
+    block_height: u64,
+    missing_indices: Vec<usize>,
+    requester_id: String,
+    timestamp: u64,
+}
+
+// Response with chunks
+MissingChunksResponse {
+    block_height: u64,
+    chunks: Vec<(usize, Vec<u8>, bool)>,  // (index, data, is_parity)
+    original_block_size: usize,
+    is_macroblock: bool,
+    sender_id: String,
+}
+```
+
+### Macroblock Support
+
+✅ Retransmit works for both microblocks and macroblocks:
+- `is_macroblock` flag preserved in cache and responses
+- Larger macroblock chunks handled correctly
+- Reed-Solomon parity works for both block types
+
+### Privacy
+
+All peer addresses in logs use pseudonyms via `get_privacy_id_for_addr()`:
+- Real IPs are never logged
+- Pseudonyms generated from hash of IP address
+- Genesis node IDs preserved for identification
 
 

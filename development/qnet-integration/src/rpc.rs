@@ -5157,8 +5157,8 @@ async fn handle_server_node_status(
                 // Calculate if eligible for rewards
                 let is_reward_eligible = heartbeat_count >= required_heartbeats;
                 
-                // Get reputation
-                let reputation = p2p.get_node_reputation(found_id);
+                // Get reputation from blockchain (v2.21.5)
+                let reputation = p2p.get_node_reputation_from_blockchain(found_id);
                 
                 // Get block height if available
                 let block_height = blockchain.get_height().await;

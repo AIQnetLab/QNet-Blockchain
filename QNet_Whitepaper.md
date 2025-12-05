@@ -1827,6 +1827,51 @@ pub struct Shred ProtocolChunk {
 - Propagation time: O(log₃(N)) where N = network size
 - Packet loss tolerance: Up to 33% with full recovery
 
+**Chunk Retransmit Mechanism (v2.21.3):**
+
+When chunks are lost during propagation, the retransmit mechanism enables efficient recovery without downloading entire blocks:
+
+```
+1. Node detects missing chunks after 3-second timeout
+2. Sends RequestMissingChunks to 3-10 peers (adaptive based on network size)
+3. Peers respond with cached chunks from last 100 blocks
+4. Node reconstructs block with recovered chunks + Reed-Solomon
+```
+
+| Network Size | Peers Queried | Success Rate* |
+|--------------|---------------|---------------|
+| 5-100 nodes | 3-5 | 87-97% |
+| 100-10K nodes | 5-7 | 97-99% |
+| 10K-100K nodes | 7-8 | 99%+ |
+
+*Assuming 50% cache hit rate
+
+**Bandwidth savings:**
+- Request 2 missing chunks: 2KB vs 12KB full block = **83% savings**
+- Request 5 missing chunks: 5KB vs 12KB full block = **58% savings**
+
+**QUIC Rate Limiting (v2.21.4):**
+
+Without rate limiting, burst of 72+ concurrent QUIC streams causes receiver overload and ~40% packet loss. Solution: Semaphore-based adaptive rate limiting.
+
+```rust
+// Adaptive limit based on network size and per-peer capacity
+let max_concurrent = min(network_limit, peer_count * 5);
+```
+
+| Network Size | Network Limit | Per-Peer (×5) | Effective |
+|--------------|---------------|---------------|-----------|
+| 5 nodes | 20 | 25 | 20 |
+| 50 nodes | 50 | 250 | 50 |
+| 500 nodes | 100 | 2500 | 100 |
+| 5000 nodes | 200 | 25000 | 200 |
+
+**Benefits:**
+- ✅ Chunks remain independent (Reed-Solomon compatible)
+- ✅ No head-of-line blocking
+- ✅ QUIC flow control works correctly
+- ✅ Scales to 100K+ nodes
+
 #### 8.4.2 Quantum Verifiable Time Sequence (QVTS)
 
 **Cryptographic clock for precise time synchronization:**

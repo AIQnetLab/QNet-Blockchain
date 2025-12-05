@@ -76,6 +76,53 @@ pub struct ConsensusData {
     pub reveals: HashMap<String, Vec<u8>>,
     /// Selected leader for next round
     pub next_leader: String,
+    
+    // ═══════════════════════════════════════════════════════════════════
+    // DETERMINISTIC REPUTATION DATA (v2.21.5)
+    // Stored in blockchain for all nodes to compute identical reputation
+    // ═══════════════════════════════════════════════════════════════════
+    
+    /// Serialized slashing events with cryptographic proof
+    /// Format: bincode serialized Vec<SlashingEventData>
+    #[serde(default)]
+    pub slashing_events_data: Option<Vec<u8>>,
+    
+    /// Serialized automatic jails (computed deterministically)
+    /// Format: bincode serialized Vec<AutomaticJailData>
+    #[serde(default)]
+    pub automatic_jails_data: Option<Vec<u8>>,
+}
+
+/// Slashing event data for blockchain storage (simplified for serialization)
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SlashingEventData {
+    /// Node being slashed
+    pub offender: String,
+    /// Penalty amount (reputation points)
+    pub penalty: f64,
+    /// Block height when detected
+    pub detected_at_height: u64,
+    /// Reporter node
+    pub reporter: String,
+    /// Offense type code (0=DoubleSign, 1=InvalidBlock, 2=ChainFork, 3=MissedBlocks)
+    pub offense_type: u8,
+    /// SHA3 hash of evidence
+    pub evidence_hash: [u8; 32],
+    /// Is permanent ban
+    pub is_permanent_ban: bool,
+}
+
+/// Automatic jail data for blockchain storage
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AutomaticJailData {
+    /// Node being jailed
+    pub node_id: String,
+    /// Jail duration in seconds
+    pub jail_duration: u64,
+    /// Offense count (for progressive jail)
+    pub offense_count: u32,
+    /// Reason code
+    pub reason: String,
 }
 
 /// Efficient microblock structure - stores only transaction hashes instead of full transactions
