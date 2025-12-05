@@ -4521,11 +4521,42 @@ impl BlockchainNode {
                                             Ok(_) => {
                                                 println!("[GENESIS] ✅ Genesis Block created and saved at height 0");
                                                 
-                                                // CRITICAL FIX: Wait 5 seconds before broadcasting Genesis
-                                                // This gives ALL nodes time to fully initialize P2P listeners
-                                                // Without this delay, fast-starting nodes might miss Genesis broadcast
-                                                println!("[GENESIS] ⏳ Waiting 5 seconds for all nodes to initialize...");
-                                                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                                                // CRITICAL FIX v2.21.2: Wait for QUIC connections to be FULLY established
+                                                // Root cause: Node 001 was broadcasting Genesis before Node 005's QUIC listener
+                                                // had fully processed the incoming connection, causing Genesis to be lost
+                                                
+                                                // Step 1: Wait 10 seconds for all nodes to initialize
+                                                println!("[GENESIS] ⏳ Waiting 10 seconds for all nodes to initialize QUIC...");
+                                                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                                                
+                                                // Step 2: Verify QUIC connections are established with Genesis peers
+                                                if let Some(ref p2p_check) = unified_p2p {
+                                                    let mut quic_ready_attempts = 0;
+                                                    const MAX_QUIC_READY_ATTEMPTS: u32 = 12; // 12 * 5s = 60 seconds max
+                                                    
+                                                    loop {
+                                                        quic_ready_attempts += 1;
+                                                        let peers = p2p_check.get_validated_active_peers();
+                                                        let connected_genesis = peers.iter()
+                                                            .filter(|p| p.id.starts_with("genesis_node_"))
+                                                            .count();
+                                                        
+                                                        if connected_genesis >= 3 {
+                                                            println!("[GENESIS] ✅ QUIC ready: {}/4 Genesis peers connected", connected_genesis);
+                                                            break;
+                                                        }
+                                                        
+                                                        if quic_ready_attempts >= MAX_QUIC_READY_ATTEMPTS {
+                                                            println!("[GENESIS] ⚠️ Timeout waiting for QUIC ({} peers connected), proceeding anyway", connected_genesis);
+                                                            break;
+                                                        }
+                                                        
+                                                        println!("[GENESIS] ⏳ Waiting for QUIC: {}/3 Genesis peers ready (attempt {}/{})",
+                                                                 connected_genesis, quic_ready_attempts, MAX_QUIC_READY_ATTEMPTS);
+                                                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                                                    }
+                                                }
+                                                
                                                 println!("[GENESIS] ✅ All nodes ready, proceeding with Genesis broadcast");
                                                 
                                                 // CRITICAL: Broadcast Genesis block WITH RETRY for guaranteed delivery
@@ -4547,8 +4578,9 @@ impl BlockchainNode {
                                                                 println!("[GENESIS] ✅ Genesis block broadcast successful (attempt {})", 
                                                                         broadcast_attempts);
                                                                 
-                                                                // CRITICAL: Wait and verify peers received Genesis
-                                                                tokio::time::sleep(Duration::from_secs(2)).await;
+                                                                // CRITICAL v2.21.2: Increased wait time for Genesis propagation
+                                                                // 2s was insufficient - some nodes missed Genesis due to network latency
+                                                                tokio::time::sleep(Duration::from_secs(5)).await;
                                                                 
                                                                 // Check if at least 3 out of 5 Genesis nodes are connected
                                                                 let peers = p2p.get_validated_active_peers();
