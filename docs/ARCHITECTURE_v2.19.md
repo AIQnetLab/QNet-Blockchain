@@ -5,6 +5,10 @@
 **Version**: 2.19.22  
 **Status**: Production Ready (QUIC Transport)
 
+> ⚠️ **REPUTATION SYSTEM UPDATED in v2.21.0**  
+> The reputation section in this document describes the OLD P2P gossip-based system.  
+> See [docs/REPUTATION_SYSTEM.md](REPUTATION_SYSTEM.md) for the current deterministic blockchain-based system.
+
 ---
 
 ## Table of Contents

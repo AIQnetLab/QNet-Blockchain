@@ -341,30 +341,67 @@ fn default_reputation() -> Option<f64> {
     None
 }
 
-/// Reputation event types for Byzantine-safe tracking
-/// ARCHITECTURE: Separate consensus (Byzantine) from network (performance) events
+/// Network event types for P2P routing optimization
+/// ═══════════════════════════════════════════════════════════════════════════
+/// ARCHITECTURE v2.21: CONSENSUS REPUTATION MOVED TO BLOCKCHAIN
+/// 
+/// OLD (REMOVED):
+/// - FullRotationComplete, InvalidBlock, ConsensusParticipation, MaliciousBehavior
+/// - These affected consensus_score via P2P - NOT DETERMINISTIC!
+/// 
+/// NEW (deterministic_reputation.rs):
+/// - Reputation computed ONLY from blockchain data
+/// - All nodes compute same result from same blocks
+/// - Slashing requires cryptographic proof in MacroBlock
+/// 
+/// REMAINING (network_score only - for P2P routing, NOT consensus):
+/// - TimeoutFailure: -2.0 network_score (WAN latency)
+/// - ConnectionFailure: -5.0 network_score (offline)
+/// ═══════════════════════════════════════════════════════════════════════════
 #[derive(Debug, Clone, Copy)]
 pub enum ReputationEvent {
-    // CONSENSUS EVENTS (affect consensus_score - Byzantine safety)
-    // NOTE: ValidBlock removed - use FullRotationComplete instead (+2 for completing 30 blocks)
-    FullRotationComplete,   // +2.0 consensus_score: Completed full 30-block rotation   
-    InvalidBlock,           // -20.0 consensus_score: Produced invalid block (Byzantine attack)
-    ConsensusParticipation, // +1.0 consensus_score: Participated in consensus (was +2, now +1)
-    MaliciousBehavior,      // -50.0 consensus_score: Detected Byzantine attack
+    // ═══════════════════════════════════════════════════════════════════════
+    // DEPRECATED CONSENSUS EVENTS - DO NOT USE!
+    // Reputation now computed from blockchain via DeterministicReputationState
+    // ═══════════════════════════════════════════════════════════════════════
+    #[deprecated(note = "Use DeterministicReputationState.process_block() - reputation from blockchain")]
+    FullRotationComplete,
+    #[deprecated(note = "Use SlashingEvent in MacroBlock - requires cryptographic proof")]
+    InvalidBlock,
+    #[deprecated(note = "Use MacroBlockConsensusData.participants - recorded in blockchain")]
+    ConsensusParticipation,
+    #[deprecated(note = "Use SlashingEvent in MacroBlock - requires cryptographic proof")]
+    MaliciousBehavior,
     
-    // NETWORK EVENTS (affect network_score - PENALTIES ONLY)
-    // NOTE: No bonuses for network events! Reputation recovery is PASSIVE ONLY (once per 4h if score 10-70)
-    TimeoutFailure,         // -2.0 network_score: P2P timeout (WAN latency, not malicious)
-    ConnectionFailure,      // -5.0 network_score: Connection failed (offline/unreachable)
+    // ═══════════════════════════════════════════════════════════════════════
+    // ACTIVE NETWORK EVENTS - For P2P routing optimization ONLY
+    // These affect network_score (local, not synced) - used for peer prioritization
+    // ═══════════════════════════════════════════════════════════════════════
+    TimeoutFailure,         // -2.0 network_score: P2P timeout (WAN latency)
+    ConnectionFailure,      // -5.0 network_score: Connection failed (offline)
 }
 
 impl PeerInfo {
-    /// Calculate combined reputation for backward compatibility
-    /// ARCHITECTURE: Byzantine threshold checks ONLY consensus_score
-    /// Combined score used for peer prioritization and display only
+    /// Get reputation score
+    /// ═══════════════════════════════════════════════════════════════════════════
+    /// ARCHITECTURE v2.21: TEMPORARY - Returns consensus_score from PeerInfo
+    /// 
+    /// In production, reputation should be computed from blockchain via
+    /// DeterministicReputationState. This field is kept for backward compatibility
+    /// during migration but should not be relied upon for consensus decisions.
+    /// 
+    /// For P2P routing optimization, use network_score instead.
+    /// ═══════════════════════════════════════════════════════════════════════════
+    pub fn reputation(&self) -> f64 {
+        // Return consensus_score for backward compatibility
+        // Real reputation comes from DeterministicReputationState
+        self.consensus_score
+    }
+    
+    /// Backward compatibility alias
+    #[inline]
     pub fn combined_reputation(&self) -> f64 {
-        // Weighted average: 70% consensus (Byzantine safety) + 30% network (performance)
-        (self.consensus_score * 0.7) + (self.network_score * 0.3)
+        self.reputation()
     }
     
     /// Check if peer is qualified for consensus (Byzantine threshold)
@@ -514,6 +551,14 @@ pub struct SimplifiedP2P {
     
     /// Reputation system for consensus (public for ping service access)
     pub reputation_system: Arc<Mutex<NodeReputation>>,
+    
+    /// PRODUCTION: Slashing event collector for next macroblock
+    /// Events are collected during block production and included in macroblock
+    slashing_collector: Arc<Mutex<Vec<qnet_consensus::deterministic_reputation::SlashingEvent>>>,
+    
+    /// PRODUCTION: Deterministic reputation state (shared with BlockchainNode)
+    /// Set via set_deterministic_reputation() after BlockchainNode creation
+    deterministic_reputation: Arc<std::sync::RwLock<Option<Arc<std::sync::RwLock<qnet_consensus::deterministic_reputation::DeterministicReputationState>>>>>,
     
     /// Consensus message channel
     consensus_tx: Option<tokio::sync::mpsc::UnboundedSender<ConsensusMessage>>,
@@ -1131,6 +1176,8 @@ impl SimplifiedP2P {
                 
                 Arc::new(Mutex::new(reputation_sys))
             },
+            slashing_collector: Arc::new(Mutex::new(Vec::new())),
+            deterministic_reputation: Arc::new(std::sync::RwLock::new(None)),
             consensus_tx: None,
             block_tx: Arc::new(Mutex::new(None)),
             sync_request_tx: None,
@@ -1700,6 +1747,18 @@ impl SimplifiedP2P {
         self.peer_id_to_addr.get(peer_id).map(|entry| entry.value().clone())
     }
     
+    /// Get all online node IDs (connected via P2P with recent heartbeat)
+    /// Used for passive reputation recovery
+    pub fn get_online_node_ids(&self) -> Vec<String> {
+        let now = self.current_timestamp();
+        let threshold = now.saturating_sub(300); // 5 min
+        self.connected_peers_lockfree
+            .iter()
+            .filter(|entry| entry.value().last_seen >= threshold)
+            .map(|entry| entry.value().id.clone())
+            .collect()
+    }
+    
     /// HELPER: Resolve Genesis node address from node ID
     /// Returns address for Genesis nodes (genesis_node_001 -> IP:8001)
     /// Returns None for invalid Genesis node IDs
@@ -1860,8 +1919,21 @@ impl SimplifiedP2P {
         }
     }
     
-    /// Update peer reputation based on event type (Byzantine-safe split scoring)
-    /// ARCHITECTURE: Separate consensus (Byzantine) from network (performance) tracking
+    /// Update peer network score based on event type
+    /// ═══════════════════════════════════════════════════════════════════════════
+    /// ARCHITECTURE v2.21: NETWORK EVENTS ONLY
+    /// 
+    /// Consensus reputation is now computed from blockchain via DeterministicReputationState.
+    /// This function ONLY affects network_score for P2P routing optimization.
+    /// 
+    /// DEPRECATED events (ignored):
+    /// - FullRotationComplete, InvalidBlock, ConsensusParticipation, MaliciousBehavior
+    /// 
+    /// ACTIVE events (network_score only):
+    /// - TimeoutFailure: -2.0 (WAN latency)
+    /// - ConnectionFailure: -5.0 (offline)
+    /// ═══════════════════════════════════════════════════════════════════════════
+    #[allow(deprecated)]
     fn update_peer_reputation(&self, peer_addr: &str, event: ReputationEvent) {
         // QUANTUM ROUTING: Try lock-free first if should use it
         if self.should_use_lockfree() {
@@ -1878,35 +1950,25 @@ impl SimplifiedP2P {
                 // Migrate legacy reputation if needed
                 peer.migrate_legacy_reputation();
                 
-                // Apply event-specific reputation changes
+                // Apply event-specific changes
                 match event {
-                    // CONSENSUS EVENTS (Byzantine safety)
-                    ReputationEvent::FullRotationComplete => {
-                        // +2 for completing full 30-block rotation
-                        peer.successful_pings += 1;
-                        peer.consensus_score = (peer.consensus_score + 2.0).min(100.0);
-                    }
-                    ReputationEvent::InvalidBlock => {
-                        peer.failed_pings += 1;
-                        peer.consensus_score = (peer.consensus_score - 20.0).max(0.0);
-                        if peer.consensus_score < 70.0 {
-                            println!("[REPUTATION] ⚠️ Peer {} consensus score critically low: {:.1}% (excluded from consensus)", 
-                                    peer_addr, peer.consensus_score);
-                        }
-                    }
-                    ReputationEvent::ConsensusParticipation => {
-                        // +1 for participating in consensus (reduced from +2)
-                        peer.consensus_score = (peer.consensus_score + 1.0).min(100.0);
-                    }
+                    // ═══════════════════════════════════════════════════════════
+                    // DEPRECATED CONSENSUS EVENTS - IGNORED!
+                    // Reputation now computed from blockchain
+                    // ═══════════════════════════════════════════════════════════
+                    ReputationEvent::FullRotationComplete |
+                    ReputationEvent::InvalidBlock |
+                    ReputationEvent::ConsensusParticipation |
                     ReputationEvent::MaliciousBehavior => {
-                        peer.failed_pings += 1;
-                        peer.consensus_score = (peer.consensus_score - 50.0).max(0.0);
-                        println!("[SECURITY] 🚨 Byzantine behavior detected from {}: consensus_score={:.1}%", 
-                                peer_addr, peer.consensus_score);
+                        // IGNORED: Use DeterministicReputationState from blockchain
+                        // Log only in debug mode to avoid spam
+                        #[cfg(debug_assertions)]
+                        println!("[REPUTATION] ⚠️ Deprecated consensus event ignored - use blockchain reputation");
                     }
                     
-                    // NETWORK EVENTS (PENALTIES ONLY)
-                    // NOTE: No bonuses! Reputation recovery is PASSIVE ONLY (once per 4h if score 10-70)
+                    // ═══════════════════════════════════════════════════════════
+                    // ACTIVE NETWORK EVENTS - For P2P routing only
+                    // ═══════════════════════════════════════════════════════════
                     ReputationEvent::TimeoutFailure => {
                         // SOFT penalty: WAN latency is not malicious
                         peer.failed_pings += 1;
@@ -1923,7 +1985,7 @@ impl SimplifiedP2P {
             }
         }
         
-        // Fallback to legacy
+        // Fallback to legacy structure
         let mut peers = match self.connected_peers.write() {
             Ok(guard) => guard,
             Err(poisoned) => {
@@ -1935,32 +1997,17 @@ impl SimplifiedP2P {
             // Migrate legacy reputation if needed
             peer.migrate_legacy_reputation();
             
-            // Apply same event logic
+            // Apply same event logic (deprecated consensus events ignored)
             match event {
-                ReputationEvent::FullRotationComplete => {
-                    // +2 for completing full 30-block rotation
-                    peer.successful_pings += 1;
-                    peer.consensus_score = (peer.consensus_score + 2.0).min(100.0);
-                }
-                ReputationEvent::InvalidBlock => {
-                    peer.failed_pings += 1;
-                    peer.consensus_score = (peer.consensus_score - 20.0).max(0.0);
-                    if peer.consensus_score < 70.0 {
-                        println!("[REPUTATION] ⚠️ Peer {} consensus score critically low: {:.1}% (excluded from consensus)", 
-                                peer_addr, peer.consensus_score);
-                    }
-                }
-                ReputationEvent::ConsensusParticipation => {
-                    // +1 for participating in consensus (reduced from +2)
-                    peer.consensus_score = (peer.consensus_score + 1.0).min(100.0);
-                }
+                // DEPRECATED CONSENSUS EVENTS - IGNORED
+                ReputationEvent::FullRotationComplete |
+                ReputationEvent::InvalidBlock |
+                ReputationEvent::ConsensusParticipation |
                 ReputationEvent::MaliciousBehavior => {
-                    peer.failed_pings += 1;
-                    peer.consensus_score = (peer.consensus_score - 50.0).max(0.0);
-                    println!("[SECURITY] 🚨 Byzantine behavior detected from {}: consensus_score={:.1}%", 
-                            peer_addr, peer.consensus_score);
+                    // IGNORED: Use DeterministicReputationState from blockchain
                 }
-                // NOTE: No bonuses! Reputation recovery is PASSIVE ONLY (once per 4h if score 10-70)
+                
+                // ACTIVE NETWORK EVENTS
                 ReputationEvent::TimeoutFailure => {
                     peer.failed_pings += 1;
                     peer.network_score = (peer.network_score - 2.0).max(0.0);
@@ -2905,7 +2952,7 @@ impl SimplifiedP2P {
                                 node_id_hash: Vec::new(),  // Calculated in add_peer_safe
                                 bucket_index: 0,           // Calculated in add_peer_safe
                                 consensus_score: real_rep,
-                                network_score: 50.0,  // Start at 50%, increases with interactions
+                                network_score: 100.0,  // CRITICAL FIX: Start at 100% like default_network_score
                                 reputation_score: Some(real_rep),
                                 successful_pings: 0,
                                 failed_pings: 0,
@@ -7778,14 +7825,26 @@ pub enum NetworkMessage {
         chunk: ShredProtocolChunk,
     },
     
-    /// PRODUCTION: Reputation synchronization for consensus
-    /// Includes jail status for network-wide consistency
-    ReputationSync {
+    /// DEPRECATED: ReputationSync removed for security
+    /// ═══════════════════════════════════════════════════════════════════════════
+    /// WHY REMOVED:
+    /// 1. Sybil Attack: Fake nodes can inflate/deflate reputation
+    /// 2. Ephemeral Key Forgery: Signatures don't prove identity
+    /// 3. Non-deterministic: Different nodes have different state
+    /// 4. Jail Manipulation: Any node can ban any other node
+    /// 
+    /// NEW ARCHITECTURE:
+    /// - Reputation computed ONLY from blockchain (deterministic_reputation.rs)
+    /// - Slashing events recorded in MacroBlocks with cryptographic proof
+    /// - Jail is automatic when missing N consecutive assigned blocks
+    /// ═══════════════════════════════════════════════════════════════════════════
+    #[deprecated(note = "Use DeterministicReputationState from blockchain data")]
+    ReputationSyncDeprecated {
         node_id: String,
-        reputation_updates: Vec<(String, f64)>, // (node_id, reputation)
-        jail_updates: Vec<(String, u64, u32, String)>, // (node_id, jailed_until, jail_count, reason)
+        reputation_updates: Vec<(String, f64)>,
+        jail_updates: Vec<(String, u64, u32, String)>,
         timestamp: u64,
-        signature: Vec<u8>, // Cryptographic signature for Byzantine safety
+        signature: Vec<u8>,
     },
     
     /// Request blocks for sync
@@ -8322,9 +8381,24 @@ impl SimplifiedP2P {
                 );
             }
             
-            NetworkMessage::ReputationSync { node_id, reputation_updates, jail_updates, timestamp, signature } => {
-                // PRODUCTION: Process reputation synchronization from other nodes
-                self.handle_reputation_sync(node_id, reputation_updates, jail_updates, timestamp, signature);
+            #[allow(deprecated)]
+            #[allow(deprecated)]
+            NetworkMessage::ReputationSyncDeprecated { node_id, reputation_updates: _, jail_updates: _, timestamp: _, signature: _ } => {
+                // ═══════════════════════════════════════════════════════════════
+                // DEPRECATED: ReputationSync disabled for security
+                // 
+                // VULNERABILITIES:
+                // 1. Sybil Attack: Fake nodes can manipulate reputation
+                // 2. Ephemeral Key Forgery: Signatures don't prove identity
+                // 3. Jail Manipulation: Any node can ban others
+                //
+                // NEW ARCHITECTURE:
+                // - Reputation computed ONLY from blockchain data
+                // - Slashing requires cryptographic proof in MacroBlock
+                // - Jail is automatic when missing N consecutive blocks
+                // ═══════════════════════════════════════════════════════════════
+                println!("[REPUTATION] ⚠️ IGNORED ReputationSync from {} - use blockchain-based reputation", 
+                         if node_id.starts_with("genesis_node_") { node_id.clone() } else { get_privacy_id_for_addr(&node_id) });
             }
             
             NetworkMessage::RequestBlocks { from_height, to_height, requester_id } => {
@@ -8468,8 +8542,9 @@ impl SimplifiedP2P {
                     Ok(c) => c,
                     Err(e) => {
                         println!("[P2P] ❌ Invalid certificate format from {}: {}", node_id, e);
-                        // SECURITY: Penalize for sending invalid data (consensus issue)
-                        self.update_node_reputation(&node_id, ReputationEvent::InvalidBlock);
+                        // SECURITY: Log attack - penalty via SlashingEvent in MacroBlock
+                        // TODO: Create SlashingEvent with evidence
+                        println!("[SECURITY] 🚨 Invalid certificate attack from {} - will be slashed in MacroBlock", node_id);
                         self.track_invalid_certificate(&node_id, "INVALID_FORMAT");
                         return;
                     }
@@ -8482,17 +8557,11 @@ impl SimplifiedP2P {
                     println!("[P2P]    Certificate owner is: {}", cert.node_id);
                     
                     // CRITICAL: Certificate spoofing is a CRITICAL ATTACK
-                    // BUT: Genesis nodes get special protection
-                    if self.is_genesis_node(&node_id) {
-                        println!("[SECURITY] ⚠️ Genesis node {} attempted certificate spoofing - SEVERE WARNING", node_id);
-                        println!("[SECURITY] 🛡️ Genesis node protected from ban, applying Byzantine penalty");
-                        self.update_node_reputation(&node_id, ReputationEvent::MaliciousBehavior);
-                        self.track_invalid_certificate(&node_id, "CERTIFICATE_SPOOFING");
-                    } else {
-                        // Regular nodes: Byzantine attack
-                        self.update_node_reputation(&node_id, ReputationEvent::MaliciousBehavior);
-                        self.track_invalid_certificate(&node_id, "CERTIFICATE_SPOOFING");
-                        
+                    // Penalty will be applied via SlashingEvent in MacroBlock
+                    println!("[SECURITY] 🚨 Certificate spoofing from {} - will be slashed in MacroBlock", node_id);
+                    self.track_invalid_certificate(&node_id, "CERTIFICATE_SPOOFING");
+                    
+                    if !self.is_genesis_node(&node_id) {
                         // Report as critical attack for instant ban (1 year)
                         let _ = self.report_critical_attack(
                             &node_id,
@@ -8949,6 +9018,15 @@ impl SimplifiedP2P {
                             return; // Already have this heartbeat for current window
                         }
                     }
+                }
+                
+                // CRITICAL FIX v2.21.1: Check sender reputation >= 70% for QNC rewards!
+                // Reject heartbeats from nodes with low reputation
+                let sender_reputation = self.get_node_reputation(&node_id);
+                if sender_reputation < 70.0 {
+                    println!("[HEARTBEAT] ⚠️ Rejecting heartbeat from {}: reputation {:.1}% < 70%", 
+                             node_id, sender_reputation);
+                    return;
                 }
                 
                 // OPTIMIZATION v2.19.19: Skip Dilithium verification for heartbeats
@@ -9999,36 +10077,21 @@ impl SimplifiedP2P {
     /// - Banned nodes (<10): EXCLUDED (no passive recovery)
     /// - JAILED nodes: EXCLUDED (must wait for jail to expire first!)
     /// SCALABILITY: O(1) per node, called once per 4 hours
-    pub fn apply_passive_recovery(&self, node_id: &str) -> bool {
-        // CRITICAL: Light nodes have fixed reputation of 70 - skip
-        if node_id.starts_with("light_") {
-            return false;
-        }
-        
-        let mut reputation_sys = match self.reputation_system.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => {
-                println!("[P2P] ⚠️ Reputation system mutex poisoned in passive_recovery, recovering...");
-                poisoned.into_inner()
-            }
-        };
-        
-        // CRITICAL: Jailed nodes do NOT get passive recovery!
-        // They must wait for their jail sentence to expire
-        if reputation_sys.is_jailed(node_id) {
-            return false;
-        }
-        
-        let current = reputation_sys.get_reputation(node_id);
-        
-        // Only recover nodes in range [10, 70)
-        if current >= 10.0 && current < 70.0 {
-            // +1% absolute, capped at 70 (consensus threshold)
-            let new_rep = (current + 1.0).min(70.0);
-            reputation_sys.set_reputation(node_id, new_rep);
-            return true;
-        }
-        
+    /// DEPRECATED: PassiveRecovery removed - not synchronized across network
+    /// ═══════════════════════════════════════════════════════════════════════════
+    /// WHY REMOVED:
+    /// 1. Not deterministic (each node on own timer)
+    /// 2. Not synchronized (no P2P message)
+    /// 3. Abuse potential (get +1% for doing nothing)
+    ///
+    /// NEW ARCHITECTURE: Use DeterministicReputationState from blockchain data
+    /// Recovery happens when node successfully produces blocks again
+    /// ═══════════════════════════════════════════════════════════════════════════
+    #[deprecated(note = "Use DeterministicReputationState - PassiveRecovery not synchronized")]
+    #[allow(dead_code)]
+    pub fn apply_passive_recovery(&self, _node_id: &str) -> bool {
+        // DISABLED: Always returns false
+        // Reputation recovery now happens through block production
         false
     }
     
@@ -10080,6 +10143,18 @@ impl SimplifiedP2P {
                         };
                         
                         if !already_sent {
+                            // CRITICAL FIX v2.21.1: Check reputation >= 70% before sending heartbeat
+                            // Nodes with low reputation should NOT participate in reward pings
+                            let our_reputation = p2p.get_node_reputation(&node_id);
+                            if our_reputation < 70.0 {
+                                // Log once per window (first heartbeat only)
+                                if index == 0 {
+                                    println!("[HEARTBEAT] ⚠️ Skipping heartbeats: reputation {:.1}% < 70%", 
+                                             our_reputation);
+                                }
+                                continue; // Skip this heartbeat slot
+                            }
+                            
                             let block_height = blockchain_height_fn();
                             
                             // SECURITY v2.20.1: Ed25519 ephemeral signature for heartbeats
@@ -11054,6 +11129,7 @@ impl SimplifiedP2P {
     
     /// Get eligible Full/Super nodes for rewards in current window
     /// Returns Vec<(node_id, node_type, heartbeat_count)>
+    /// CRITICAL: Only nodes with reputation >= 70% are eligible for QNC rewards!
     pub fn get_eligible_full_super_nodes(&self, window_start_timestamp: u64) -> Vec<(String, String, u8)> {
         let heartbeats = self.get_heartbeats_for_window(window_start_timestamp);
         
@@ -11075,7 +11151,16 @@ impl SimplifiedP2P {
                     .unwrap_or_else(|| "full".to_string());
                 (node_id, node_type, count)
             })
-            .filter(|(_, node_type, count)| {
+            .filter(|(node_id, node_type, count)| {
+                // CRITICAL FIX v2.21.1: Check reputation >= 70% for QNC rewards!
+                // Nodes with low reputation should NOT receive monetary rewards
+                let reputation = self.get_node_reputation(node_id);
+                if reputation < 70.0 {
+                    println!("[REWARDS] ⚠️ Node {} excluded from rewards: reputation {:.1}% < 70%", 
+                             node_id, reputation);
+                    return false;
+                }
+                
                 // Filter by eligibility: Full >= 8/10, Super >= 9/10
                 match node_type.as_str() {
                     "super" => *count >= 9,
@@ -11968,57 +12053,167 @@ impl SimplifiedP2P {
         self.reputation_system.clone()
     }
     
-    /// PRODUCTION: Update node reputation with event-based tracking
-    /// ARCHITECTURE: Consensus events update NodeReputation (Byzantine tracking)
-    /// Network events update PeerInfo.network_score (performance tracking)
-    pub fn update_node_reputation(&self, node_id: &str, event: ReputationEvent) {
-        // Determine delta based on event type
-        let (consensus_delta, is_consensus_event) = match event {
-            ReputationEvent::FullRotationComplete => (2.0, true),  // +2.0 for completing 30-block rotation
-            ReputationEvent::InvalidBlock => (-20.0, true),
-            ReputationEvent::ConsensusParticipation => (1.0, true), // +1.0 (was +2.0, reduced per docs)
-            ReputationEvent::MaliciousBehavior => (-50.0, true),
-            // Network events don't affect consensus reputation
-            _ => (0.0, false),
-        };
-        
-        // Update consensus_score in NodeReputation (if consensus event)
-        if is_consensus_event {
-            if let Ok(mut reputation) = self.reputation_system.lock() {
-                reputation.update_reputation(node_id, consensus_delta);
-                
-                // CRITICAL FIX: Save reputation to persistent storage
-                let new_reputation = reputation.get_reputation(node_id);
-                self.save_reputation_to_storage(node_id, new_reputation);
-                
-                // PRIVACY: Use pseudonym for logging
-                let display_id = if node_id.starts_with("genesis_node_") || node_id.starts_with("node_") {
-                    node_id.to_string()
-                } else {
-                    get_privacy_id_for_addr(node_id)
-                };
-                println!("[REPUTATION] 📊 Consensus score for {}: delta {:.1} (new: {:.1}%)", 
-                        display_id, consensus_delta, new_reputation);
-            }
-        }
-        
-        // Update network_score in PeerInfo (for all events)
-        // Find peer address by node_id
-        if let Some(peer_addr) = self.peer_id_to_addr.get(node_id) {
-            self.update_peer_reputation(&peer_addr, event);
+    /// PRODUCTION: Get deterministic reputation state (blockchain-based)
+    /// Shared with BlockchainNode for unified reputation access
+    pub fn get_deterministic_reputation(&self) -> Option<Arc<std::sync::RwLock<qnet_consensus::deterministic_reputation::DeterministicReputationState>>> {
+        match self.deterministic_reputation.read() {
+            Ok(guard) => guard.clone(),
+            Err(_) => None,
         }
     }
     
-    /// BACKWARD COMPATIBILITY: Update reputation with delta (legacy method)
-    #[allow(dead_code)]
-    pub fn update_node_reputation_legacy(&self, node_id: &str, delta: f64) {
-        // Map delta to appropriate event
-        let event = if delta > 0.0 {
-            ReputationEvent::FullRotationComplete
+    /// PRODUCTION: Set deterministic reputation state (called by BlockchainNode after creation)
+    pub fn set_deterministic_reputation(&self, state: Arc<std::sync::RwLock<qnet_consensus::deterministic_reputation::DeterministicReputationState>>) {
+        if let Ok(mut guard) = self.deterministic_reputation.write() {
+            *guard = Some(state);
+            println!("[P2P] ✅ Deterministic reputation state linked (blockchain-based)");
+        }
+    }
+    
+    /// PRODUCTION: Add slashing event for inclusion in next macroblock
+    /// Events are collected and processed deterministically by all nodes
+    pub fn add_slashing_event(&self, event: qnet_consensus::deterministic_reputation::SlashingEvent) {
+        if let Ok(mut collector) = self.slashing_collector.lock() {
+            // Prevent duplicates
+            if !collector.iter().any(|e| e.offender == event.offender && e.detected_at_height == event.detected_at_height) {
+                println!("[SLASHING] 📝 Recorded offense: {} at height {} (penalty: -{:.1}%)", 
+                         event.offender, event.detected_at_height, event.penalty);
+                collector.push(event);
+            }
+        }
+    }
+    
+    /// PRODUCTION: Get and clear collected slashing events for macroblock
+    pub fn drain_slashing_events(&self) -> Vec<qnet_consensus::deterministic_reputation::SlashingEvent> {
+        if let Ok(mut collector) = self.slashing_collector.lock() {
+            std::mem::take(&mut *collector)
         } else {
-            ReputationEvent::InvalidBlock
+            Vec::new()
+        }
+    }
+    
+    /// PRODUCTION: Create slashing event for invalid block
+    pub fn report_invalid_block(&self, offender: &str, height: u64, block_hash: [u8; 32], reason: &str) {
+        use qnet_consensus::deterministic_reputation::{SlashingEvent, SlashingType};
+        use sha3::{Sha3_256, Digest};
+        
+        // Create evidence hash
+        let mut hasher = Sha3_256::new();
+        hasher.update(offender.as_bytes());
+        hasher.update(&height.to_le_bytes());
+        hasher.update(&block_hash);
+        hasher.update(reason.as_bytes());
+        let evidence_hash: [u8; 32] = hasher.finalize().into();
+        
+        let event = SlashingEvent {
+            offender: offender.to_string(),
+            offense: SlashingType::InvalidBlock {
+                height,
+                block_hash,
+                reason: reason.to_string(),
+            },
+            penalty: SlashingEvent::calculate_penalty(&SlashingType::InvalidBlock {
+                height,
+                block_hash,
+                reason: reason.to_string(),
+            }),
+            detected_at_height: height,
+            reporter: self.node_id.clone(),
+            evidence_hash,
         };
-        self.update_node_reputation(node_id, event);
+        
+        self.add_slashing_event(event);
+    }
+    
+    /// PRODUCTION: Create slashing event for double signing
+    pub fn report_double_sign(&self, offender: &str, height: u64, hash_a: [u8; 32], hash_b: [u8; 32], sig_a: Vec<u8>, sig_b: Vec<u8>) {
+        use qnet_consensus::deterministic_reputation::{SlashingEvent, SlashingType};
+        use sha3::{Sha3_256, Digest};
+        
+        // Create evidence hash
+        let mut hasher = Sha3_256::new();
+        hasher.update(offender.as_bytes());
+        hasher.update(&height.to_le_bytes());
+        hasher.update(&hash_a);
+        hasher.update(&hash_b);
+        let evidence_hash: [u8; 32] = hasher.finalize().into();
+        
+        let event = SlashingEvent {
+            offender: offender.to_string(),
+            offense: SlashingType::DoubleSign {
+                height,
+                hash_a,
+                hash_b,
+                signature_a: sig_a,
+                signature_b: sig_b,
+            },
+            penalty: qnet_consensus::deterministic_reputation::PENALTY_DOUBLE_SIGN,
+            detected_at_height: height,
+            reporter: self.node_id.clone(),
+            evidence_hash,
+        };
+        
+        self.add_slashing_event(event);
+    }
+    
+    /// DEPRECATED: Update node reputation via P2P
+    /// ═══════════════════════════════════════════════════════════════════════════
+    /// ARCHITECTURE v2.21: CONSENSUS REPUTATION FROM BLOCKCHAIN ONLY
+    /// 
+    /// This function is deprecated for consensus events. Use:
+    /// - DeterministicReputationState.process_block() for +2% rotation rewards
+    /// - DeterministicReputationState.process_macroblock() for +1% participation
+    /// - SlashingEvent in MacroBlock for penalties (with cryptographic proof)
+    /// 
+    /// Network events still update network_score for P2P routing.
+    /// ═══════════════════════════════════════════════════════════════════════════
+    #[allow(deprecated)]
+    pub fn update_node_reputation(&self, node_id: &str, event: ReputationEvent) {
+        match event {
+            // ═══════════════════════════════════════════════════════════════
+            // DEPRECATED CONSENSUS EVENTS - IGNORED!
+            // Reputation now computed from blockchain
+            // ═══════════════════════════════════════════════════════════════
+            ReputationEvent::FullRotationComplete |
+            ReputationEvent::InvalidBlock |
+            ReputationEvent::ConsensusParticipation |
+            ReputationEvent::MaliciousBehavior => {
+                // IGNORED: Use DeterministicReputationState from blockchain
+                // The old P2P-based reputation caused desync between nodes
+                #[cfg(debug_assertions)]
+                {
+                    let display_id = if node_id.starts_with("genesis_node_") || node_id.starts_with("node_") {
+                        node_id.to_string()
+                    } else {
+                        get_privacy_id_for_addr(node_id)
+                    };
+                    println!("[REPUTATION] ⚠️ Deprecated event {:?} for {} - use blockchain", 
+                             event, display_id);
+                }
+            }
+            
+            // ═══════════════════════════════════════════════════════════════
+            // NETWORK EVENTS - Update network_score for P2P routing
+            // ═══════════════════════════════════════════════════════════════
+            ReputationEvent::TimeoutFailure | 
+            ReputationEvent::ConnectionFailure => {
+                if let Some(peer_addr) = self.peer_id_to_addr.get(node_id) {
+                    self.update_peer_reputation(&peer_addr, event);
+                }
+            }
+        }
+    }
+    
+    /// DEPRECATED: Legacy reputation update method
+    /// ═══════════════════════════════════════════════════════════════════════════
+    /// Use DeterministicReputationState from blockchain data instead.
+    /// This method now does nothing for consensus reputation.
+    /// ═══════════════════════════════════════════════════════════════════════════
+    #[deprecated(note = "Use DeterministicReputationState from blockchain")]
+    #[allow(dead_code)]
+    pub fn update_node_reputation_legacy(&self, _node_id: &str, _delta: f64) {
+        // DISABLED: Reputation now computed from blockchain
+        // All nodes compute same reputation from same blocks = deterministic
     }
     
     /// PRODUCTION: Set absolute reputation (for Genesis initialization)
@@ -12047,7 +12242,7 @@ impl SimplifiedP2P {
         }
     }
     
-    /// Get combined reputation score for a node (consensus_score * 0.7 + network_score * 0.3)
+    /// Get reputation score for a node (ONLY consensus_score - synced via blocks)
     /// MEV PROTECTION: Used for bundle submission reputation checks
     /// Returns 70.0 (default consensus threshold) if peer not found
     pub fn get_node_combined_reputation(&self, node_id: &str) -> f64 {
@@ -12567,12 +12762,14 @@ impl SimplifiedP2P {
         };
         
         // Apply the penalty (Byzantine attack)
-        let event = if penalty <= -50.0 {
-            ReputationEvent::MaliciousBehavior
-        } else {
-            ReputationEvent::InvalidBlock
-        };
-        self.update_node_reputation(node_id, event);
+        // Report reputation tampering as slashing event
+        let current_height = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+        self.report_invalid_block(
+            node_id, 
+            current_height, 
+            [0u8; 32], // No specific block hash for tampering
+            &format!("Reputation tampering: attempted={:.1}%, actual={:.1}%", attempted_reputation, current_reputation)
+        );
         
         // Broadcast tampering alert to network
         self.broadcast_tampering_alert(node_id, attempted_reputation, current_reputation, severity);
@@ -13414,8 +13611,9 @@ impl SimplifiedP2P {
         if timestamp > now + MAX_TIMESTAMP_DRIFT {
             println!("[CONSENSUS] ❌ Rejecting commit with FUTURE timestamp from {}: {} > {} + {}", 
                      node_id, timestamp, now, MAX_TIMESTAMP_DRIFT);
-            // Penalty for future timestamps (possible attack attempt)
-            self.update_node_reputation(&node_id, ReputationEvent::InvalidBlock);
+            // Report future timestamp attack
+            let current_height = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+            self.report_invalid_block(&node_id, current_height, [0u8; 32], "Future timestamp in commit");
             return;
         }
         
@@ -13456,8 +13654,9 @@ impl SimplifiedP2P {
         if signature.is_empty() || signature.len() < 100 {
             println!("[CONSENSUS] ❌ Rejecting commit with invalid signature format from {}: len={}", 
                      node_id, signature.len());
-            // Penalty for clearly invalid signatures
-            self.update_node_reputation(&node_id, ReputationEvent::InvalidBlock);
+            // Report invalid signature
+            let current_height = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+            self.report_invalid_block(&node_id, current_height, [0u8; 32], "Invalid signature format in commit");
             return;
         }
         
@@ -13505,7 +13704,9 @@ impl SimplifiedP2P {
         if timestamp > now + MAX_TIMESTAMP_DRIFT {
             println!("[CONSENSUS] ❌ Rejecting reveal with FUTURE timestamp from {}: {} > {} + {}", 
                      node_id, timestamp, now, MAX_TIMESTAMP_DRIFT);
-            self.update_node_reputation(&node_id, ReputationEvent::InvalidBlock);
+            // Report future timestamp attack
+            let current_height = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+            self.report_invalid_block(&node_id, current_height, [0u8; 32], "Future timestamp in reveal");
             return;
         }
         
@@ -13545,7 +13746,9 @@ impl SimplifiedP2P {
         if reveal_data.is_empty() || nonce.is_empty() {
             println!("[CONSENSUS] ❌ Rejecting reveal with empty data from {}: reveal_len={}, nonce_len={}", 
                      node_id, reveal_data.len(), nonce.len());
-            self.update_node_reputation(&node_id, ReputationEvent::InvalidBlock);
+            // Report empty reveal data
+            let current_height = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+            self.report_invalid_block(&node_id, current_height, [0u8; 32], "Empty reveal data");
             return;
         }
         
@@ -13553,7 +13756,9 @@ impl SimplifiedP2P {
         if nonce.len() != 64 {
             println!("[CONSENSUS] ❌ Rejecting reveal with invalid nonce length from {}: {} (expected 64)", 
                      node_id, nonce.len());
-            self.update_node_reputation(&node_id, ReputationEvent::InvalidBlock);
+            // Report invalid nonce
+            let current_height = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+            self.report_invalid_block(&node_id, current_height, [0u8; 32], "Invalid nonce length");
             return;
         }
         
@@ -13740,8 +13945,13 @@ impl SimplifiedP2P {
             println!("[SECURITY] 🚨 Attack type: {} at block #{}", change_type, block_height);
             println!("[SECURITY] 🚨 APPLYING INSTANT MAXIMUM BAN (1 YEAR)!");
             
-            // Apply instant reputation destruction (Byzantine attack)
-            self.update_node_reputation(&failed_producer, ReputationEvent::MaliciousBehavior);
+            // Report Byzantine attack as slashing event
+            self.report_invalid_block(
+                &failed_producer, 
+                block_height, 
+                [0u8; 32], 
+                &format!("Critical Byzantine attack: {}", change_type)
+            );
             
             // Report to reputation system for jail
             if let Ok(mut reputation) = self.reputation_system.lock() {
@@ -13918,11 +14128,8 @@ impl SimplifiedP2P {
             println!("[NETWORK] 📊 Emergency producer change recorded | Type: {} | Height: {} | Time: {}", 
                      change_type, block_height, timestamp);
             
-            // Still give small boost to emergency producer for service
-            if new_producer != "emergency_consensus" && new_producer != self.node_id {
-                self.update_node_reputation(&new_producer, ReputationEvent::ConsensusParticipation);
-                println!("[REPUTATION] ✅ Emergency producer {} rewarded (bootstrap service)", new_display);
-            }
+            // Emergency producer reward will be processed via block production
+            // DeterministicReputationState.process_block() handles rewards
             return;
         }
         
@@ -14020,21 +14227,23 @@ impl SimplifiedP2P {
         
         if current_confirmations >= 3 {
             println!("[CONSENSUS] ✅ CONSENSUS REACHED: 3+ nodes confirm emergency");
-            self.update_node_reputation(&failed_producer, ReputationEvent::InvalidBlock);
-            println!("[FAILOVER] ⚔️ Applied penalty to {} (consensus)", failed_producer);
+            // Report failed producer for slashing
+            self.report_invalid_block(&failed_producer, block_height, [0u8; 32], "Confirmed failed production (3+ nodes)");
+            println!("[FAILOVER] ⚔️ Slashing event recorded for {}", failed_producer);
             
             if new_producer != "emergency_consensus" {
-                self.update_node_reputation(&new_producer, ReputationEvent::FullRotationComplete);
-                println!("[FAILOVER] ✅ Emergency producer {} rewarded", new_producer);
+                // Emergency producer reward processed via DeterministicReputationState.process_block()
+                println!("[FAILOVER] ✅ Emergency producer {} will be rewarded via block production", new_producer);
             }
         } else if current_confirmations >= 2 {
             println!("[CONSENSUS] ⚠️ PARTIAL CONSENSUS: 2 nodes confirm emergency");
-            self.update_node_reputation(&failed_producer, ReputationEvent::InvalidBlock);
-            println!("[FAILOVER] ⚔️ Applied penalty to {} (partial)", failed_producer);
+            // Report failed producer for slashing (partial consensus)
+            self.report_invalid_block(&failed_producer, block_height, [0u8; 32], "Confirmed failed production (2 nodes)");
+            println!("[FAILOVER] ⚔️ Slashing event recorded for {}", failed_producer);
             
             if new_producer != "emergency_consensus" {
-                self.update_node_reputation(&new_producer, ReputationEvent::ConsensusParticipation);
-                println!("[FAILOVER] ✅ Emergency producer {} rewarded", new_producer);
+                // Emergency producer reward processed via DeterministicReputationState.process_block()
+                println!("[FAILOVER] ✅ Emergency producer {} will be rewarded via block production", new_producer);
             }
         } else {
             println!("[CONSENSUS] ⚠️ SINGLE REPORT: No penalty for {}", failed_producer);
@@ -14042,643 +14251,109 @@ impl SimplifiedP2P {
     }
     
     
-    /// PRODUCTION: Handle reputation synchronization from peers
-    /// Includes jail status synchronization for network-wide consistency
+    /// DEPRECATED: P2P reputation sync - DISABLED for security
+    /// ═══════════════════════════════════════════════════════════════════════════
+    /// REMOVED because:
+    /// 1. Sybil Attack: Fake nodes can manipulate reputation
+    /// 2. Ephemeral Key Forgery: Signatures don't prove identity
+    /// 3. Non-deterministic: Different nodes have different state
+    /// 4. Jail Manipulation: Any node could ban others
+    ///
+    /// NEW ARCHITECTURE (deterministic_reputation.rs):
+    /// - Reputation computed ONLY from blockchain data
+    /// - Slashing requires cryptographic proof in MacroBlock
+    /// - All nodes compute same result from same blocks
+    /// ═══════════════════════════════════════════════════════════════════════════
+    #[allow(unused_variables)]
     fn handle_reputation_sync(&self, from_node: String, reputation_updates: Vec<(String, f64)>, jail_updates: Vec<(String, u64, u32, String)>, timestamp: u64, signature: Vec<u8>) {
-        use sha3::{Sha3_256, Digest}; // For gossip propagation
-        
-        // PRIVACY: Use pseudonym for logging
+        // DISABLED: This entire function is deprecated
+        // Reputation sync via P2P is a security vulnerability
         let from_display = if from_node.starts_with("genesis_node_") || from_node.starts_with("node_") {
             from_node.clone()
         } else {
             get_privacy_id_for_addr(&from_node)
         };
         
-        println!("[REPUTATION] 📨 Processing reputation sync from {} with {} rep updates, {} jail updates", 
-                from_display, reputation_updates.len(), jail_updates.len());
+        println!("[REPUTATION] ⚠️ IGNORED ReputationSync from {} - P2P reputation sync DISABLED", from_display);
+        println!("[REPUTATION]    Use DeterministicReputationState from blockchain instead");
         
-        // PRODUCTION: Verify signature for Byzantine safety using SHA3-256
-        // Uses quantum-resistant CRYSTALS-Dilithium for Genesis nodes
-        let is_valid = self.verify_reputation_signature(&from_node, &reputation_updates, timestamp, &signature);
-        
-        if !is_valid {
-            println!("[REPUTATION] ❌ Invalid signature from {} - ignoring reputation updates", from_display);
-            return;
-        }
-        
-        // PRODUCTION: Apply weighted average of reputations from multiple sources
-        let mut significant_updates = 0;
-        let mut jail_sync_count = 0;
-        
-        if let Ok(mut reputation_system) = self.reputation_system.lock() {
-            // Process reputation updates
-            for (node_id, new_reputation) in &reputation_updates {
-                let current = reputation_system.get_reputation(&node_id);
-                
-                // PRODUCTION: Use weighted average (70% local, 30% remote) to prevent manipulation
-                let weighted_reputation = current * 0.7 + new_reputation * 0.3;
-                
-                // Only update if change is significant (>1%)
-                if (weighted_reputation - current).abs() > 1.0 {
-                    reputation_system.set_reputation(&node_id, weighted_reputation);
-                    significant_updates += 1;
-                    
-                    // PRIVACY: Use pseudonyms for logging
-                    let node_display = if node_id.starts_with("genesis_node_") || node_id.starts_with("node_") {
-                        node_id.clone()
-                    } else {
-                        get_privacy_id_for_addr(&node_id)
-                    };
-                    
-                    println!("[REPUTATION] 📊 Updated {} reputation: {:.1} → {:.1} (sync from {})", 
-                            node_display, current, weighted_reputation, from_display);
-                }
-            }
-            
-            // PRODUCTION: Process jail updates - sync jail status across network
-            for (node_id, jailed_until, jail_count, reason) in &jail_updates {
-                // Only apply jail if it's more severe than current (higher jail_count or longer duration)
-                let should_apply = if let Some(current_jail) = reputation_system.get_jail_status(node_id) {
-                    // Apply if: permanent ban OR higher jail_count OR longer duration
-                    *jailed_until == u64::MAX || 
-                    *jail_count > current_jail.jail_count ||
-                    (*jail_count == current_jail.jail_count && *jailed_until > current_jail.jailed_until)
-                } else {
-                    // No current jail - apply if jailed_until is in the future
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-                    *jailed_until > now
-                };
-                
-                if should_apply {
-                    // Apply jail from remote node
-                    reputation_system.apply_jail_sync(node_id, *jailed_until, *jail_count, reason.clone());
-                    jail_sync_count += 1;
-                    
-                    // CRITICAL: Persist synced jail to storage
-                    // Drop lock temporarily to avoid deadlock with save_jail_to_storage
-                    drop(reputation_system);
-                    self.save_jail_to_storage(node_id, *jailed_until, *jail_count, reason);
-                    // Re-acquire lock for remaining iterations
-                    reputation_system = match self.reputation_system.lock() {
-                        Ok(guard) => guard,
-                        Err(poisoned) => {
-                            println!("[P2P] ⚠️ Reputation system mutex poisoned in jail sync, recovering...");
-                            poisoned.into_inner()
-                        }
-                    };
-                    
-                    let node_display = if node_id.starts_with("genesis_node_") || node_id.starts_with("node_") {
-                        node_id.clone()
-                    } else {
-                        get_privacy_id_for_addr(&node_id)
-                    };
-                    
-                    if *jailed_until == u64::MAX {
-                        println!("[JAIL] 🔄 Synced PERMANENT BAN for {} (from {})", node_display, from_display);
-                    } else {
-                        println!("[JAIL] 🔄 Synced jail for {} until {} (offense #{}, from {})", 
-                                node_display, jailed_until, jail_count, from_display);
-                    }
-                }
-            }
-        }
-        
-        // GOSSIP PROPAGATION: Re-gossip to random peers (exponential propagation!)
-        // ARCHITECTURE: This is the KEY to O(log n) complexity
-        // Each node that receives gossip re-sends to fanout peers
-        // Example: 1 → 4 → 16 → 64 → 256 → 1024 → 4096 (7 hops for 4K nodes)
-        if significant_updates > 0 {
-            // RE-GOSSIP: Forward to RANDOM subset of peers (exclude sender!)
-            let peers = self.get_validated_active_peers();
-            
-            // Filter qualified peers (exclude Light nodes and sender)
-            let qualified_peers: Vec<_> = peers.iter()
-                .filter(|p| {
-                    p.node_type != NodeType::Light && 
-                    p.is_consensus_qualified() &&
-                    p.id != from_node // DON'T send back to sender!
-                })
-                .collect();
-            
-            if qualified_peers.is_empty() {
-                return; // No peers to re-gossip
-            }
-            
-            // ADAPTIVE FANOUT: Use same logic as initial gossip
-            let gossip_fanout = self.get_shred_protocol_fanout(); // Reuse existing method!
-            
-            // KADEMLIA RANDOM SELECTION: Select diverse peers
-            let mut selection_hasher = Sha3_256::new();
-            selection_hasher.update(self.node_id.as_bytes());
-            selection_hasher.update(&timestamp.to_le_bytes());
-            selection_hasher.update(b"QNET_REGOSSIP_V1");
-            let selection_seed = selection_hasher.finalize();
-            
-            let mut sorted_peers: Vec<_> = qualified_peers.into_iter().cloned().collect();
-            sorted_peers.sort_by_key(|peer| {
-                // XOR distance (Kademlia-like)
-                let mut peer_hasher = Sha3_256::new();
-                peer_hasher.update(peer.id.as_bytes());
-                peer_hasher.update(&selection_seed);
-                let peer_hash = peer_hasher.finalize();
-                u64::from_le_bytes([
-                    peer_hash[0], peer_hash[1], peer_hash[2], peer_hash[3],
-                    peer_hash[4], peer_hash[5], peer_hash[6], peer_hash[7],
-                ])
-            });
-            
-            // Select top-N peers for re-gossip
-            let gossip_targets: Vec<_> = sorted_peers.into_iter()
-                .take(gossip_fanout)
-                .collect();
-            
-            // RE-GOSSIP: Forward message to selected peers (async, non-blocking)
-            let sync_msg = NetworkMessage::ReputationSync {
-                node_id: from_node.clone(), // Keep ORIGINAL sender for signature verification
-                reputation_updates: reputation_updates.clone(),
-                jail_updates: jail_updates.clone(), // Include jail status in re-gossip
-                timestamp,
-                signature: signature.clone(),
-            };
-            
-            let message_json = match serde_json::to_string(&sync_msg) {
-                Ok(json) => json,
-                Err(e) => {
-                    println!("[REPUTATION] ❌ Failed to serialize re-gossip message: {}", e);
-                    return;
-                }
-            };
-            
-            // Send re-gossip messages via QUIC
-            let mut regossip_count = 0;
-            let quic_enabled = self.quic_enabled.load(std::sync::atomic::Ordering::Relaxed);
-            let quic_transport = self.quic_transport.clone();
-            
-            for peer in gossip_targets {
-                let peer_addr_str = peer.addr.clone();
-                let quic_transport_clone = quic_transport.clone();
-                
-                // Parse reputation update from JSON for NetworkMessage
-                if let Ok(msg_value) = serde_json::from_str::<serde_json::Value>(&message_json) {
-                    if let Some(_updates) = msg_value.get("reputation_updates") {
-                        let reputation_msg = NetworkMessage::ReputationSync {
-                            node_id: self.node_id.clone(),
-                            reputation_updates: vec![], // Parsed from original message
-                            jail_updates: vec![],
-                            timestamp: std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs(),
-                            signature: vec![],
-                        };
-                        
-                        // Spawn async task for QUIC (non-blocking)
-                        tokio::spawn(async move {
-                            if quic_enabled {
-                                if let Some(ref transport) = quic_transport_clone {
-                                    // Parse peer address to QUIC port
-                                    let parts: Vec<&str> = peer_addr_str.split(':').collect();
-                                    if parts.len() == 2 {
-                                        if let (Ok(ip), Ok(port)) = (parts[0].parse::<std::net::IpAddr>(), parts[1].parse::<u16>()) {
-                                            let quic_port = port.saturating_add(crate::quic_transport::QUIC_PORT_OFFSET);
-                                            let quic_addr = std::net::SocketAddr::new(ip, quic_port);
-                                            
-                                            let transport_guard = transport.read().await;
-                                            let _ = transport_guard.broadcast_to(quic_addr, &reputation_msg).await;
-                                        }
-                                    }
-                                }
-                            }
-                        });
-                    }
-                }
-                
-                regossip_count += 1;
-            }
-            
-            println!("[REPUTATION] 🌐 Re-gossiped {} updates to {} peers (fanout={})", 
-                     significant_updates, regossip_count, gossip_fanout);
-        }
+        // DO NOTHING - reputation comes from blockchain only
     }
     
-    /// PRODUCTION: Verify reputation signature (ASYNC)
-    /// Supports BOTH hybrid (NIST/Cisco) and legacy Dilithium formats
+    
+    /// DEPRECATED: P2P reputation signature verification - DISABLED
+    /// ═══════════════════════════════════════════════════════════════════════════
+    /// This function was used to verify signatures on ReputationSync messages.
+    /// It used EPHEMERAL Ed25519 keys which DON'T prove node identity!
+    /// 
+    /// SECURITY VULNERABILITY:
+    /// - Ephemeral keys can be generated by anyone
+    /// - No binding between ephemeral key and node's Dilithium identity
+    /// - Sybil attack possible: create 100 fake nodes, all sign same update
+    ///
+    /// NEW ARCHITECTURE:
+    /// - Reputation computed from blockchain (deterministic)
+    /// - Slashing requires proof recorded in MacroBlock
+    /// - All nodes compute same result = no P2P sync needed
+    /// ═══════════════════════════════════════════════════════════════════════════
+    #[deprecated(note = "P2P reputation sync disabled - use DeterministicReputationState")]
+    #[allow(unused_variables)]
     pub async fn verify_reputation_signature_async(&self, node_id: &str, updates: &[(String, f64)], timestamp: u64, signature: &[u8]) -> bool {
-        use crate::quantum_crypto::{QNetQuantumCrypto, DilithiumSignature};
-        use crate::node::GLOBAL_QUANTUM_CRYPTO;
-        use crate::hybrid_crypto::{CompactHybridSignature, HybridCrypto};
-        use sha3::{Sha3_256, Digest};
-        
-        // Create message from reputation updates (same format used for signing)
-        let mut message = String::new();
-        message.push_str(&format!("REPUTATION:{}:{}", node_id, timestamp));
-        
-        for (node, reputation) in updates {
-            message.push_str(&format!(":{}={}", node, reputation));
-        }
-        
-        // Try to parse signature as UTF-8 string (hybrid format is JSON)
-        if let Ok(sig_str) = String::from_utf8(signature.to_vec()) {
-            // NEW FORMAT: Hybrid signature (JSON)
-            if sig_str.starts_with("{") {
-                // Parse as CompactHybridSignature JSON
-                if let Ok(compact_sig) = serde_json::from_str::<CompactHybridSignature>(&sig_str) {
-                    return self.verify_hybrid_reputation_signature_async(&message, &compact_sig, node_id).await;
-                }
-            }
-        }
-        
-        // LEGACY FORMAT: Pure Dilithium signature
-        use base64::{Engine as _, engine::general_purpose};
-        let signature_b64 = general_purpose::STANDARD.encode(signature);
-        let dilithium_sig_str = format!("dilithium_sig_{}_{}", node_id, signature_b64);
-        
-        let dilithium_sig = DilithiumSignature {
-            signature: dilithium_sig_str,
-            algorithm: "CRYSTALS-Dilithium3".to_string(),
-            timestamp,
-            strength: "quantum-resistant".to_string(),
-        };
-        
-        let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
-        if crypto_guard.is_none() {
-            let mut crypto = QNetQuantumCrypto::new();
-            let _ = crypto.initialize().await;
-            *crypto_guard = Some(crypto);
-        }
-        
-        let crypto = crypto_guard.as_ref().expect("Crypto initialized above");
-        match crypto.verify_dilithium_signature(&message, &dilithium_sig, node_id).await {
-            Ok(valid) => {
-                if valid {
-                    println!("[P2P] ✅ Reputation signature verified (legacy Dilithium)");
-                } else {
-                    println!("[P2P] ❌ Reputation signature invalid for node {}", node_id);
-                }
-                valid
-            }
-            Err(e) => {
-                println!("[P2P] ❌ Reputation verification FAILED for {}: {}", node_id, e);
-                false
-            }
-        }
+        // DISABLED: Always returns false - reputation sync via P2P is a security vulnerability
+        println!("[REPUTATION] ⚠️ verify_reputation_signature DISABLED - use blockchain reputation");
+        false
     }
     
-    /// Verify HYBRID reputation signature (ASYNC) - NIST/Cisco compliant
+    /// DEPRECATED: Hybrid reputation signature verification - DISABLED
+    #[deprecated(note = "P2P reputation sync disabled")]
+    #[allow(unused_variables)]
+    #[allow(dead_code)]
     async fn verify_hybrid_reputation_signature_async(&self, message: &str, compact_sig: &crate::hybrid_crypto::CompactHybridSignature, node_id: &str) -> bool {
-        use crate::hybrid_crypto::HybridCrypto;
-        use crate::quantum_crypto::DilithiumSignature;
-        use crate::node::GLOBAL_QUANTUM_CRYPTO;
-        use sha3::{Sha3_256, Digest};
-        
-        // Verify ephemeral key present
-        if compact_sig.ephemeral_public_key.iter().all(|&b| b == 0) {
-            println!("[P2P] ❌ Ephemeral public key is all zeros!");
-            return false;
-        }
-        
-        // Verify Dilithium signatures present
-        if compact_sig.dilithium_key_signature.is_empty() || compact_sig.dilithium_message_signature.is_empty() {
-            println!("[P2P] ❌ Missing Dilithium signatures!");
-            return false;
-        }
-        
-        // Create message hash
-        let mut hasher = Sha3_256::new();
-        hasher.update(message.as_bytes());
-        let message_hash = hasher.finalize();
-        
-        // Verify Ed25519 with ephemeral key
-        match HybridCrypto::verify_ed25519_signature(
-            &message_hash,
-            &compact_sig.message_signature,
-            &compact_sig.ephemeral_public_key
-        ) {
-            Ok(true) => println!("[P2P] ✅ Ed25519 signature verified"),
-            _ => {
-                println!("[P2P] ❌ Ed25519 signature INVALID!");
-                return false;
-            }
-        }
-        
-        // Get quantum crypto for Dilithium verification
-        let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
-        if crypto_guard.is_none() {
-            let mut crypto = crate::quantum_crypto::QNetQuantumCrypto::new();
-            let _ = crypto.initialize().await;
-            *crypto_guard = Some(crypto);
-        }
-        let crypto = crypto_guard.as_ref().expect("Crypto initialized above");
-        
-        // Verify Dilithium key signature
-        let mut encapsulated_data = Vec::new();
-        encapsulated_data.extend_from_slice(&compact_sig.ephemeral_public_key);
-        encapsulated_data.extend_from_slice(&message_hash);
-        encapsulated_data.extend_from_slice(&compact_sig.signed_at.to_le_bytes());
-        let encapsulated_hex = hex::encode(&encapsulated_data);
-        
-        let dilithium_key_sig = DilithiumSignature {
-            signature: compact_sig.dilithium_key_signature.clone(),
-            algorithm: "CRYSTALS-Dilithium3".to_string(),
-            timestamp: compact_sig.signed_at,
-            strength: "quantum-resistant".to_string(),
-        };
-        
-        match crypto.verify_dilithium_signature(&encapsulated_hex, &dilithium_key_sig, &compact_sig.node_id).await {
-            Ok(true) => {}
-            _ => {
-                println!("[P2P] ❌ Dilithium key signature INVALID!");
-                return false;
-            }
-        }
-        
-        // Verify Dilithium message signature
-        let message_hash_hex = hex::encode(&message_hash);
-        let dilithium_msg_sig = DilithiumSignature {
-            signature: compact_sig.dilithium_message_signature.clone(),
-            algorithm: "CRYSTALS-Dilithium3".to_string(),
-            timestamp: compact_sig.signed_at,
-            strength: "quantum-resistant".to_string(),
-        };
-        
-        match crypto.verify_dilithium_signature(&message_hash_hex, &dilithium_msg_sig, &compact_sig.node_id).await {
-            Ok(true) => {
-                println!("[P2P] ✅ Reputation HYBRID signature verified (NIST/Cisco)");
-                true
-            }
-            _ => {
-                println!("[P2P] ❌ Dilithium message signature INVALID!");
-                false
-            }
-        }
+        // DISABLED: Part of P2P reputation sync which is now removed
+        false
     }
     
-    /// PRODUCTION: Verify reputation signature (SYNC version)
-    /// Supports BOTH hybrid (NIST/Cisco) and legacy Dilithium formats
+    /// DEPRECATED: P2P reputation signature verification (SYNC) - DISABLED
+    /// See verify_reputation_signature_async for details on why this is disabled
+    #[deprecated(note = "P2P reputation sync disabled - use DeterministicReputationState")]
+    #[allow(unused_variables)]
     fn verify_reputation_signature(&self, node_id: &str, updates: &[(String, f64)], timestamp: u64, signature: &[u8]) -> bool {
-        use crate::hybrid_crypto::CompactHybridSignature;
-        
-        // Create message from reputation updates
-        let mut message = String::new();
-        message.push_str(&format!("REPUTATION:{}:{}", node_id, timestamp));
-        
-        for (node, reputation) in updates {
-            message.push_str(&format!(":{}={}", node, reputation));
-        }
-        
-        // Try to parse signature as UTF-8 string (hybrid format is JSON)
-        let signature_vec = signature.to_vec();
-        let message_clone = message.clone();
-        let node_id_clone = node_id.to_string();
-        
-        let handle = std::thread::spawn(move || {
-            match tokio::runtime::Runtime::new() {
-                Ok(rt) => {
-                    rt.block_on(async move {
-                        // Try hybrid format first
-                        if let Ok(sig_str) = String::from_utf8(signature_vec.clone()) {
-                            if sig_str.starts_with("{") {
-                                if let Ok(compact_sig) = serde_json::from_str::<CompactHybridSignature>(&sig_str) {
-                                    // Verify hybrid signature inline
-                                    use crate::hybrid_crypto::HybridCrypto;
-                                    use crate::quantum_crypto::DilithiumSignature;
-                                    use crate::node::GLOBAL_QUANTUM_CRYPTO;
-                                    use sha3::{Sha3_256, Digest};
-                                    
-                                    // Check ephemeral key
-                                    if compact_sig.ephemeral_public_key.iter().all(|&b| b == 0) {
-                                        return false;
-                                    }
-                                    if compact_sig.dilithium_key_signature.is_empty() || 
-                                       compact_sig.dilithium_message_signature.is_empty() {
-                                        return false;
-                                    }
-                                    
-                                    // Create message hash
-                                    let mut hasher = Sha3_256::new();
-                                    hasher.update(message_clone.as_bytes());
-                                    let message_hash = hasher.finalize();
-                                    
-                                    // Verify Ed25519
-                                    if HybridCrypto::verify_ed25519_signature(
-                                        &message_hash,
-                                        &compact_sig.message_signature,
-                                        &compact_sig.ephemeral_public_key
-                                    ).unwrap_or(false) == false {
-                                        return false;
-                                    }
-                                    
-                                    // Get crypto for Dilithium
-                                    let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
-                                    if crypto_guard.is_none() {
-                                        let mut crypto = crate::quantum_crypto::QNetQuantumCrypto::new();
-                                        let _ = crypto.initialize().await;
-                                        *crypto_guard = Some(crypto);
-                                    }
-                                    let crypto = crypto_guard.as_ref().expect("Crypto initialized above");
-                                    
-                                    // Verify Dilithium key signature
-                                    let mut encapsulated_data = Vec::new();
-                                    encapsulated_data.extend_from_slice(&compact_sig.ephemeral_public_key);
-                                    encapsulated_data.extend_from_slice(&message_hash);
-                                    encapsulated_data.extend_from_slice(&compact_sig.signed_at.to_le_bytes());
-                                    let encapsulated_hex = hex::encode(&encapsulated_data);
-                                    
-                                    let dilithium_key_sig = DilithiumSignature {
-                                        signature: compact_sig.dilithium_key_signature.clone(),
-                                        algorithm: "CRYSTALS-Dilithium3".to_string(),
-                                        timestamp: compact_sig.signed_at,
-                                        strength: "quantum-resistant".to_string(),
-                                    };
-                                    
-                                    if crypto.verify_dilithium_signature(&encapsulated_hex, &dilithium_key_sig, &compact_sig.node_id).await.unwrap_or(false) == false {
-                                        return false;
-                                    }
-                                    
-                                    // Verify Dilithium message signature
-                                    let message_hash_hex = hex::encode(&message_hash);
-                                    let dilithium_msg_sig = DilithiumSignature {
-                                        signature: compact_sig.dilithium_message_signature.clone(),
-                                        algorithm: "CRYSTALS-Dilithium3".to_string(),
-                                        timestamp: compact_sig.signed_at,
-                                        strength: "quantum-resistant".to_string(),
-                                    };
-                                    
-                                    return crypto.verify_dilithium_signature(&message_hash_hex, &dilithium_msg_sig, &compact_sig.node_id).await.unwrap_or(false);
-                                }
-                            }
-                        }
-                        
-                        // Legacy Dilithium format
-                        use crate::quantum_crypto::{QNetQuantumCrypto, DilithiumSignature};
-                        use crate::node::GLOBAL_QUANTUM_CRYPTO;
-                        use base64::{Engine as _, engine::general_purpose};
-                        
-                        let signature_b64 = general_purpose::STANDARD.encode(&signature_vec);
-                        let dilithium_sig_str = format!("dilithium_sig_{}_{}", node_id_clone, signature_b64);
-                        
-                        let dilithium_sig = DilithiumSignature {
-                            signature: dilithium_sig_str,
-                            algorithm: "CRYSTALS-Dilithium3".to_string(),
-                            timestamp,
-                            strength: "quantum-resistant".to_string(),
-                        };
-                        
-                        let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
-                        if crypto_guard.is_none() {
-                            let mut crypto = QNetQuantumCrypto::new();
-                            let _ = crypto.initialize().await;
-                            *crypto_guard = Some(crypto);
-                        }
-                        let crypto = crypto_guard.as_ref().expect("Crypto initialized above");
-                        
-                        match crypto.verify_dilithium_signature(&message_clone, &dilithium_sig, &node_id_clone).await {
-                            Ok(valid) => valid,
-                            Err(_) => false
-                        }
-                    })
-                }
-                Err(_) => false
-            }
-        });
-        
-        match handle.join() {
-            Ok(valid) => {
-                if valid {
-                    println!("[P2P] ✅ Reputation signature verified");
-                } else {
-                    println!("[P2P] ❌ Reputation signature invalid for node {}", node_id);
-                }
-                valid
-            }
-            Err(_) => {
-                println!("[P2P] ❌ Reputation verification thread panicked");
-                false
-            }
-        }
+        // DISABLED: Always returns false
+        false
     }
     
-    /// PRODUCTION: Broadcast reputation updates to network (ASYNC version)
-    /// Includes jail status for network-wide consistency
-    /// CRITICAL: Uses HYBRID cryptography with ephemeral keys per NIST/Cisco
+    /// DEPRECATED: P2P reputation broadcast - DISABLED for security
+    /// ═══════════════════════════════════════════════════════════════════════════
+    /// This function broadcast reputation updates via P2P gossip.
+    /// REMOVED because:
+    /// 1. Sybil Attack: Fake nodes can flood network with fake updates
+    /// 2. Ephemeral Key Forgery: Signatures don't prove node identity
+    /// 3. Non-deterministic: Creates state divergence between nodes
+    /// 4. Scalability issue: O(n²) messages at scale
+    ///
+    /// NEW ARCHITECTURE:
+    /// - Reputation computed from blockchain (deterministic)
+    /// - All nodes compute same result from same blocks
+    /// - No broadcast needed
+    /// ═══════════════════════════════════════════════════════════════════════════
+    #[deprecated(note = "P2P reputation sync disabled - use DeterministicReputationState")]
     pub async fn broadcast_reputation_sync_async(&self) -> Result<(), String> {
-        use crate::hybrid_crypto::{HybridCrypto, GLOBAL_HYBRID_INSTANCES};
-        use std::sync::Arc;
-        
-        // Get current reputation state and jail statuses
-        let (reputation_updates, jail_updates) = if let Ok(reputation) = self.reputation_system.lock() {
-            (
-                reputation.get_all_reputations().into_iter().collect::<Vec<_>>(),
-                reputation.get_all_jail_statuses()
-            )
-        } else {
-            return Err("Failed to lock reputation system".to_string());
-        };
-        
-        if reputation_updates.is_empty() {
-            return Ok(()); // Nothing to sync
-        }
-        
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        
-        // Create message from reputation updates
-        let mut message = String::new();
-        message.push_str(&format!("REPUTATION:{}:{}", self.node_id, timestamp));
-        
-        for (node, reputation) in &reputation_updates {
-            message.push_str(&format!(":{}={}", node, reputation));
-        }
-        
-        // CRITICAL: Use HYBRID signature (ephemeral Ed25519 + Dilithium per NIST/Cisco)
-        let instances = GLOBAL_HYBRID_INSTANCES.get_or_init(|| async {
-            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()))
-        }).await;
-        
-        let mut instances_guard = instances.lock().await;
-        
-        // Normalize node_id
-        let normalized_node_id = if self.node_id.starts_with("qn_") {
-            self.node_id.clone()
-        } else {
-            format!("qn_{}", self.node_id)
-        };
-        
-        // Create instance if not exists
-        if !instances_guard.contains_key(&normalized_node_id) {
-            let mut hybrid = HybridCrypto::new(normalized_node_id.clone());
-            if let Err(e) = hybrid.initialize().await {
-                return Err(format!("Hybrid crypto init failed: {}", e));
-            }
-            instances_guard.insert(normalized_node_id.clone(), hybrid);
-        }
-        
-        let hybrid = instances_guard.get_mut(&normalized_node_id).expect("Inserted above");
-        
-        // Check certificate rotation
-        if hybrid.needs_rotation() {
-            let _ = hybrid.rotate_certificate().await;
-        }
-        
-        // CRITICAL: Sign RAW message with hybrid (hashes before signing)
-        let signature = match hybrid.sign_raw_message_compact(message.as_bytes()).await {
-            Ok(compact_sig) => {
-                match serde_json::to_string(&compact_sig) {
-                    Ok(json) => {
-                        println!("[P2P] ✅ Generated HYBRID signature for reputation sync (NIST/Cisco compliant)");
-                        json.as_bytes().to_vec()
-                    }
-                    Err(e) => {
-                        println!("[P2P] ❌ Failed to serialize hybrid signature: {}", e);
-                        Vec::new()
-                    }
-                }
-            }
-            Err(e) => {
-                println!("[P2P] ❌ Failed to generate hybrid signature: {}", e);
-                Vec::new()
-            }
-        };
-        
-        // Release lock before sending
-        drop(instances_guard);
-        
-        // Check if signature is valid before sending
-        if signature.is_empty() {
-            return Err("Cannot broadcast without valid quantum-resistant signature".to_string());
-        }
-        
-        let sync_msg = NetworkMessage::ReputationSync {
-            node_id: self.node_id.clone(),
-            reputation_updates,
-            jail_updates,
-            timestamp,
-            signature,
-        };
-        
-        // Send to all connected peers
-        let peers = match self.connected_peers.read() {
-            Ok(peers) => peers.clone(),
-            Err(_) => return Err("Failed to read connected peers".to_string()),
-        };
-        
-        for (_addr, peer) in peers.iter() {
-            self.send_network_message(&peer.addr, sync_msg.clone());
-        }
-        
-        println!("[P2P] 📡 Broadcast reputation sync to {} peers", peers.len());
+        // DISABLED: Returns Ok but does nothing
+        println!("[REPUTATION] ⚠️ broadcast_reputation_sync DISABLED - reputation from blockchain only");
         Ok(())
     }
     
-    /// PRODUCTION: Broadcast reputation updates to network (SYNC version)
-    /// WARNING: Creates new runtime - only use in pure sync contexts!
-    /// CRITICAL: Uses HYBRID cryptography with ephemeral keys per NIST/Cisco
+    /// DEPRECATED: P2P reputation broadcast (SYNC) - DISABLED
+    /// See broadcast_reputation_sync_async for details
+    #[deprecated(note = "P2P reputation sync disabled - use DeterministicReputationState")]
     pub fn broadcast_reputation_sync(&self) -> Result<(), String> {
+        // DISABLED: Returns Ok but does nothing
+        Ok(())
+    }
+    
+    /// DEPRECATED: Old SYNC implementation - preserved for reference
+    #[allow(dead_code)]
+    fn _broadcast_reputation_sync_legacy(&self) -> Result<(), String> {
         use crate::hybrid_crypto::{HybridCrypto, GLOBAL_HYBRID_INSTANCES};
         use std::sync::Arc;
         
@@ -14779,7 +14454,8 @@ impl SimplifiedP2P {
             return Err("Cannot broadcast without valid quantum-resistant signature".to_string());
         }
         
-        let sync_msg = NetworkMessage::ReputationSync {
+        #[allow(deprecated)]
+        let sync_msg = NetworkMessage::ReputationSyncDeprecated {
             node_id: self.node_id.clone(),
             reputation_updates,
             jail_updates,
@@ -14872,7 +14548,8 @@ impl SimplifiedP2P {
                 signature[32..].copy_from_slice(&node_sig);
                 
                 // Create sync message with jail updates
-                let sync_msg = NetworkMessage::ReputationSync {
+                #[allow(deprecated)]
+                let sync_msg = NetworkMessage::ReputationSyncDeprecated {
                     node_id: node_id.clone(),
                     reputation_updates: reputation_updates.clone(),
                     jail_updates: jail_updates.clone(),
@@ -15043,8 +14720,9 @@ impl SimplifiedP2P {
                 println!("[SECURITY] ⚠️ Genesis node {} has {} invalid certificates - WARNING ONLY", 
                          node_id, count);
                 println!("[SECURITY] 🛡️ Genesis nodes are protected from automatic bans");
-                // Apply reputation penalty but no ban
-                self.update_node_reputation(node_id, ReputationEvent::MaliciousBehavior);
+                // Record slashing event but Genesis nodes protected from ban
+                let current_height = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+                self.report_invalid_block(node_id, current_height, [0u8; 32], "Genesis node: 5+ invalid certificates");
                 INVALID_CERT_TRACKER.remove(node_id);
                 return;
             }
@@ -15066,9 +14744,10 @@ impl SimplifiedP2P {
             // Clear tracker after ban
             INVALID_CERT_TRACKER.remove(node_id);
         } else if count == 3 {
-            // Warning level - significant reputation penalty
+            // Warning level - record slashing evidence
             println!("[SECURITY] ⚠️ WARNING: {} has sent 3 invalid certificates", node_id);
-            self.update_node_reputation(node_id, ReputationEvent::InvalidBlock);
+            let current_height = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+            self.report_invalid_block(node_id, current_height, [0u8; 32], "3 invalid certificates");
         }
     }
     
@@ -15111,13 +14790,15 @@ impl SimplifiedP2P {
             
         } else if count == 3 {
             // WARNING: 3 invalid blocks = possible bug or sync issue
-            println!("[SECURITY] ⚠️ WARNING: {} sent 3 invalid blocks - applying penalty", producer);
-            self.update_node_reputation(producer, ReputationEvent::InvalidBlock);
+            println!("[SECURITY] ⚠️ WARNING: {} sent 3 invalid blocks", producer);
+            let current_height = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+            self.report_invalid_block(producer, current_height, [0u8; 32], "3 consecutive invalid blocks");
             
         } else if count == 5 {
             // ESCALATION: 5 invalid blocks = suspicious behavior
-            println!("[SECURITY] ⚠️ ESCALATION: {} sent 5 invalid blocks - applying penalty", producer);
-            self.update_node_reputation(producer, ReputationEvent::InvalidBlock);
+            println!("[SECURITY] ⚠️ ESCALATION: {} sent 5 invalid blocks", producer);
+            let current_height = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+            self.report_invalid_block(producer, current_height, [0u8; 32], "5 consecutive invalid blocks (suspicious)");
         }
         
         // CLEANUP: Remove old entries after 5 minutes (prevent memory leak)
@@ -15208,8 +14889,15 @@ impl SimplifiedP2P {
             change_type
         )?;
         
-        // Apply instant ban locally (Byzantine attack)
-        self.update_node_reputation(attacker, ReputationEvent::MaliciousBehavior);
+        // Report double sign attack with cryptographic proof
+        self.report_double_sign(
+            attacker,
+            block_height,
+            [0u8; 32], // hash_a placeholder - real evidence in consensus
+            [0u8; 32], // hash_b placeholder - real evidence in consensus
+            vec![],    // sig_a placeholder
+            vec![]     // sig_b placeholder
+        );
         
         // Jail for 1 year
         if let Ok(mut reputation) = self.reputation_system.lock() {

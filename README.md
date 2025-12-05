@@ -174,14 +174,12 @@ This project uses **dual licensing**:
   - Binary protocol (bincode): ~50% bandwidth reduction vs JSON
   - UDP port 10876 (P2P port + 1000)
   - Fallback: None (QUIC is mandatory for v2.19.22+)
-- **Gossip Reputation Sync**: Exponential O(log n) propagation for millions of nodes
-  - Migrated from O(n) broadcast to O(log n) gossip protocol (99.999% bandwidth savings)
-  - Adaptive fanout (4-32): Same as Shred Protocol block propagation
-  - Kademlia-based peer selection: XOR distance for peer diversity
-  - Re-gossip mechanism: Each recipient forwards to fanout peers (exponential growth)
-  - Byzantine-safe weighted average: 70% local + 30% remote (convergence)
-  - Prevents fork risk: All nodes converge to same reputation view
-  - Example: 1M nodes = ~20 hops vs 1M requests (broadcast)
+- **Deterministic Reputation (v2.1)**: No P2P gossip - reputation from blockchain only
+  - REMOVED: Gossip-based reputation sync (Sybil attack vulnerable)
+  - All reputation computed from on-chain data (blocks, macroblocks)
+  - SlashingEvents with cryptographic proof in macroblocks
+  - Finality Checkpoints: After 2 macroblocks = irreversible
+  - Scalable: Chunked processing for 100,000+ nodes
 - **Hybrid Merkle + Sampling**: Scalable on-chain ping commitments
   - 360× on-chain size reduction (100 MB vs 36 GB)
   - Merkle root commitment to ALL pings (blake3 hashing)
@@ -632,30 +630,33 @@ When all nodes fall below 70% reputation threshold:
 - **Progressive Penalties**: Escalating reputation penalties prevent repeated failures
 - **Network Transparency**: All failover events logged and broadcast to peers
 
-## 💎 Reputation System
+## 💎 Reputation System (v2.1 - Deterministic)
 
-QNet implements an economic reputation system that incentivizes network participation:
+**ARCHITECTURE v2.1:** Reputation computed ONLY from blockchain data (no P2P gossip)
+- All nodes compute identical reputation from on-chain data
+- Sybil-resistant: Cannot fake reputation via gossip
+- Deterministic: Verifiable by replaying blockchain from genesis
 
-### **Reputation Events (Points)**
-| Action | Rep Points | Impact |
+See full documentation: [docs/REPUTATION_SYSTEM.md](docs/REPUTATION_SYSTEM.md)
+
+### **Reputation Events (Blockchain-Based)**
+| Action | Rep Points | Source |
 |--------|------------|--------|
-| **Full Rotation (30 blocks)** | +2.0 | Complete producer rotation (FullRotationComplete) |
-| **Consensus Participation** | +1.0 | Participation in consensus round |
-| **Emergency Producer** | +5.0 | Network service during failover |
-| **Failed Microblock** | -20.0 | Lost producer slot (applies to self) |
-| **Failed Macroblock** | -30.0 | Consensus failure |
-| **Timeout Failure** | -2.0 | P2P timeout (network_score) |
-| **Connection Failure** | -5.0 | Offline/unreachable (network_score) |
-| **Double-Sign** | -50.0 | Byzantine fault + jail |
-| **Malicious Behavior** | -50.0 | Byzantine attack detected |
-| **Passive Recovery** | +1.0/4h | ONLY if reputation [10, 70) and NOT jailed |
+| **Full Rotation (30 blocks)** | +2.0 | Recorded in block producer field |
+| **Consensus Participation** | +1.0 | Recorded in macroblock (commit+reveal) |
+| **Invalid Block** | -20.0 | SlashingEvent in macroblock |
+| **Double-Sign** | -50.0 + BAN | SlashingEvent with cryptographic proof |
+| **Chain Fork** | PERMANENT BAN | SlashingEvent with evidence |
+| **Passive Recovery** | +1.0/4h | For online nodes with rep 10-69% |
+| **Timeout Failure** | -2.0 | network_score only (P2P routing) |
+| **Connection Failure** | -5.0 | network_score only (P2P routing) |
 
 ### **Reputation Thresholds**
-- **70+ points**: Eligible for consensus participation AND rewards (70% minimum)
-- **10-69 points**: Network access only, no new rewards (can claim old accumulated rewards)
-- **<10 points**: Network ban (7-day recovery period, can still claim old rewards)
-- **Maximum**: 100 points (hard cap)
-- **Light nodes**: Fixed at 70 (immutable, always eligible for rewards)
+- **70-100%**: Eligible for consensus participation
+- **10-69%**: Passive recovery (+1% per 4h if online)
+- **<10%**: Cannot recover (too low)
+- **0%**: Jailed or permanently banned
+- **Light nodes**: Fixed at 70% (excluded by NodeType, not reputation)
 
 ### **Anti-Malicious Protection System**
 

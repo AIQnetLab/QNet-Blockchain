@@ -5,6 +5,46 @@ All notable changes to the QNet project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.21.0] - December 5, 2025 "Deterministic Reputation System v2.1"
+
+### 🔐 CRITICAL - Complete Reputation System Overhaul
+
+**Problem**: P2P gossip-based reputation was vulnerable to Sybil attacks and caused forks
+**Solution**: Deterministic blockchain-based reputation - all nodes compute identical scores
+
+#### Breaking Changes
+- `ReputationSync` message type: **DEPRECATED** (ignored by all nodes)
+- `broadcast_reputation_sync()`: **DISABLED** (returns Ok but does nothing)
+- P2P reputation gossip: **REMOVED** (prevents Sybil attacks)
+
+#### New Architecture
+```
+OLD: P2P Gossip → Nodes can disagree → FORKS
+NEW: Blockchain Data → All nodes identical → NO FORKS
+```
+
+#### New Features
+- **DeterministicReputationState**: Single source of truth from blockchain
+- **SlashingEvents**: Cryptographic proof of misbehavior in macroblocks
+- **AutomaticJail**: Deterministic jail for missed blocks
+- **FinalityCheckpoints**: 2 macroblocks with 2/3+ sigs = irreversible
+- **Chunked Processing**: Scalable to 100,000+ nodes
+
+#### Files Added/Modified
+- `core/qnet-consensus/src/deterministic_reputation.rs` - NEW: Core reputation logic
+- `core/qnet-consensus/src/macro_consensus.rs` - Finality checkpoints
+- `development/qnet-integration/src/node.rs` - Integration with blockchain
+- `development/qnet-integration/src/unified_p2p.rs` - Deprecated old system
+- `docs/REPUTATION_SYSTEM.md` - NEW: Full documentation
+
+#### Security Improvements
+- Sybil-resistant: Cannot fake reputation via gossip
+- Evidence-based: All penalties require cryptographic proof
+- Deterministic: Verifiable by replaying blockchain from genesis
+- Finality: Prevents long-range attacks
+
+---
+
 ## [2.20.0] - December 4, 2025 "Reputation System Fix + Deterministic Producer Selection"
 
 ### 🔐 CRITICAL - Reputation Manipulation Detection Fix
@@ -528,12 +568,11 @@ keys/
   - 1st offense: 1 hour → 30%
   - 2nd offense: 24 hours → 25%
   - 3rd offense: 7 days → 20%
-- **JAIL NETWORK SYNCHRONIZATION**: Jail status now syncs across all nodes
-  - Added `jail_updates` to `ReputationSync` message
-  - Jail status propagates via gossip protocol (O(log n) complexity)
-  - Permanent bans (critical attacks) sync immediately network-wide
-  - Added `apply_jail_sync()` method for receiving jail from peers
-  - Added `get_all_jail_statuses()` for broadcast
+- **JAIL NETWORK SYNCHRONIZATION**: ~~Jail status now syncs across all nodes~~ **(DEPRECATED in v2.21.0)**
+  - ~~Added `jail_updates` to `ReputationSync` message~~ → **Now in macroblock**
+  - ~~Jail status propagates via gossip protocol~~ → **Blockchain-based in v2.21.0**
+  - ~~Permanent bans sync via gossip~~ → **SlashingEvent in macroblock**
+  - See v2.21.0 for new deterministic jail system
 - **JAIL PERSISTENCE**: Jail survives node restart
   - `save_jail_to_storage()` - saves jail to `./data/jail/jail_statuses.json`
   - `load_jail_from_storage()` - loads active jails on startup

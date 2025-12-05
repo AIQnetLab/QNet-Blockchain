@@ -266,7 +266,8 @@ impl MessageType {
             NetworkMessage::ConsensusReveal { .. } => Self::ConsensusReveal,
             NetworkMessage::EmergencyProducerChange { .. } => Self::EmergencyChange,
             NetworkMessage::ShredProtocolChunk { .. } => Self::ShredProtocolChunk,
-            NetworkMessage::ReputationSync { .. } => Self::ReputationSync,
+            #[allow(deprecated)]
+            NetworkMessage::ReputationSyncDeprecated { .. } => Self::ReputationSync,
             NetworkMessage::RequestBlocks { .. } => Self::BlockRequest,
             NetworkMessage::BlocksBatch { .. } => Self::BlockBatch,
             NetworkMessage::CertificateAnnounce { .. } => Self::CertificateAnnounce,

@@ -3260,7 +3260,7 @@ async fn handle_bundle_submit(
     
     // Get REAL reputation for bundle submitter
     // SECURITY: This is used for MEV bundle reputation check (min 80% required)
-    // ARCHITECTURE: Combined reputation = consensus_score * 0.7 + network_score * 0.3
+    // ARCHITECTURE: Reputation = consensus_score ONLY (synced via blocks)
     let submitter_node_id = hex::encode(&bundle.submitter_pubkey);
     let submitter_reputation = if let Some(p2p) = blockchain.get_p2p() {
         p2p.get_node_combined_reputation(&submitter_node_id)
@@ -5848,55 +5848,29 @@ pub fn start_light_node_ping_service(blockchain: Arc<BlockchainNode>) {
     // Emission now happens as part of block production (every 14,400 blocks = 4 hours)
     // See node.rs block production logic for emission integration
     
-    // PASSIVE RECOVERY: Restore reputation for Full/Super nodes BELOW consensus threshold
-    // RULE: +1% every 4 hours for nodes with reputation 10-69 (not banned, below threshold)
-    // Light nodes: EXCLUDED (fixed reputation of 70)
-    // Nodes >= 70: EXCLUDED (already at/above threshold, no recovery needed)
-    // Nodes < 10: EXCLUDED (banned, must appeal or wait for manual review)
-    let blockchain_for_reputation = blockchain.clone();
-    tokio::spawn(async move {
-        // Wait for network initialization
-        tokio::time::sleep(tokio::time::Duration::from_secs(5 * 60)).await;
-        
-        let mut reputation_interval = tokio::time::interval(tokio::time::Duration::from_secs(4 * 60 * 60)); // 4 hours
-        
-        loop {
-            reputation_interval.tick().await;
-            
-            println!("[REPUTATION] 🔄 Processing passive recovery (every 4 hours)");
-            
-            // PASSIVE RECOVERY: +1% reputation for Full/Super nodes with 10 <= rep < 70
-            // This allows gradual recovery to consensus threshold (70%)
-            // Recovery time from 10% to 70%: 60 × 4h = 240 hours = 10 days
-            if let Some(p2p) = blockchain_for_reputation.get_unified_p2p() {
-                let online_peers = p2p.get_validated_active_peers();
-                let total_peers = online_peers.len();
-                let mut recovered_count = 0;
-                
-                // SCALABILITY: Process in batches for large networks
-                // O(n) where n = online peers, but each operation is O(1)
-                for peer in &online_peers {
-                    // apply_passive_recovery handles all checks:
-                    // - Skips Light nodes (fixed at 70)
-                    // - Only recovers nodes in [10, 70) range
-                    // - Caps at 70 (consensus threshold)
-                    if p2p.apply_passive_recovery(&peer.id) {
-                        recovered_count += 1;
-                        println!("[REPUTATION] 🔄 Passive recovery: {} ({:.1}% → {:.1}%)", 
-                                 peer.id, peer.consensus_score, (peer.consensus_score + 1.0).min(70.0));
-                    }
-                }
-                
-                if recovered_count > 0 {
-                    println!("[REPUTATION] ✅ Passive recovery +1% applied to {} Full/Super nodes (10-69% range)", 
-                             recovered_count);
-                } else {
-                    println!("[REPUTATION] ℹ️ No nodes in recovery range (10-69%) - {} online peers checked", 
-                             total_peers);
-                }
-            }
-        }
-    });
+    // ═══════════════════════════════════════════════════════════════════════════
+    // REMOVED: PassiveRecovery - Not synchronized across network
+    // ═══════════════════════════════════════════════════════════════════════════
+    // 
+    // WHY REMOVED:
+    // 1. NOT DETERMINISTIC: Each node runs on its own timer
+    //    - Node A: gives +1% to node X at 10:00
+    //    - Node B: gives +1% to node X at 10:03
+    //    - Result: Different reputation on different nodes!
+    //
+    // 2. NOT SYNCHRONIZED: No P2P message to announce recovery
+    //    - New nodes don't know about past recovery events
+    //    - Offline nodes miss recovery and fall behind
+    //
+    // 3. ABUSE POTENTIAL: Nodes can stay online without participating
+    //    - Get +1% every 4 hours for doing nothing
+    //    - Recover from 10% to 70% in 10 days without contributing
+    //
+    // NEW ARCHITECTURE (deterministic_reputation.rs):
+    // - Reputation computed ONLY from blockchain data
+    // - Recovery happens when node successfully produces blocks again
+    // - All nodes compute same reputation from same blocks
+    // ═══════════════════════════════════════════════════════════════════════════
     
     // Separate task for device cleanup (every 24 hours)
     tokio::spawn(async {

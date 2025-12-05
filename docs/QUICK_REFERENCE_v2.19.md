@@ -1,5 +1,8 @@
 # QNet v2.19.6 - Quick Reference Guide
 
+> ⚠️ **REPUTATION SYSTEM UPDATED in v2.21.0**  
+> See [docs/REPUTATION_SYSTEM.md](REPUTATION_SYSTEM.md) for current deterministic blockchain-based reputation.
+
 ## 📚 Key Concepts
 
 ### Block Structure

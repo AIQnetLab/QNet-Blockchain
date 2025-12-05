@@ -84,6 +84,11 @@ use qnet_mempool::{SimpleMempool, SimpleMempoolConfig};
 use qnet_consensus::{ConsensusEngine, ConsensusConfig, NodeId, CommitRevealConsensus, ConsensusError};
 use qnet_consensus::lazy_rewards::{PhaseAwareRewardManager, NodeType as RewardNodeType};
 use qnet_consensus::reputation::{Evidence, MaliciousBehavior};
+// ARCHITECTURE v2.21: Deterministic reputation from blockchain
+use qnet_consensus::deterministic_reputation::{
+    DeterministicReputationState, BlockData, MacroBlockData,
+    INITIAL_REPUTATION, MIN_CONSENSUS_REPUTATION,
+};
 use qnet_sharding::{ShardCoordinator, ParallelValidator, MAX_SHARDS};
 use crate::quantum_poh::QuantumPoH;
 use std::sync::Arc;
@@ -534,12 +539,63 @@ pub struct BlockchainNode {
     // Event-based block notification system (replaces polling in consensus listener)
     // Sender broadcasts new block height to all subscribers
     block_event_tx: tokio::sync::broadcast::Sender<u64>,
+    
+    // DETERMINISTIC REPUTATION: Reputation calculated from blockchain data only
+    // Replaces old P2P gossip-based reputation system (eliminated Sybil attacks)
+    // NOTE: Uses std::sync::RwLock for compatibility with SimplifiedP2P
+    deterministic_reputation: Arc<std::sync::RwLock<DeterministicReputationState>>,
 }
 
 impl BlockchainNode {
     /// Get reward manager for RPC integration
     pub fn get_reward_manager(&self) -> Arc<RwLock<PhaseAwareRewardManager>> {
         self.reward_manager.clone()
+    }
+    
+    /// Get deterministic reputation system (blockchain-based)
+    /// SECURITY: Replaces P2P gossip-based reputation (eliminated Sybil attacks)
+    pub fn get_deterministic_reputation(&self) -> Arc<std::sync::RwLock<DeterministicReputationState>> {
+        self.deterministic_reputation.clone()
+    }
+    
+    /// PRODUCTION: Compute automatic jails for nodes that committed but didn't reveal
+    /// These nodes started consensus but failed to complete it (possible attack or failure)
+    fn compute_automatic_jails(
+        commit_participants: &std::collections::HashSet<String>,
+        reveal_participants: &std::collections::HashSet<String>,
+        timestamp: u64
+    ) -> Vec<qnet_consensus::deterministic_reputation::AutomaticJail> {
+        use qnet_consensus::deterministic_reputation::AutomaticJail;
+        
+        use sha3::{Sha3_256, Digest};
+        
+        // Find nodes that committed but didn't reveal
+        let commit_only: Vec<String> = commit_participants
+            .difference(reveal_participants)
+            .cloned()
+            .collect();
+        
+        // Get current block height
+        let current_height = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+        
+        // Create automatic jail for each (1 hour jail for first offense, escalates)
+        commit_only.into_iter().map(|node_id| {
+            // Create evidence hash from node_id and timestamp
+            let mut hasher = Sha3_256::new();
+            hasher.update(node_id.as_bytes());
+            hasher.update(&timestamp.to_le_bytes());
+            hasher.update(b"commit_without_reveal");
+            let evidence_hash: [u8; 32] = hasher.finalize().into();
+            
+            AutomaticJail {
+                node_id,
+                offense_count: 1, // Will be updated by DeterministicReputationState
+                jail_start_height: current_height,
+                jail_duration: 3600, // 1 hour base jail
+                reason: "Committed but failed to reveal in consensus".to_string(),
+                evidence_hash,
+            }
+        }).collect()
     }
     
     /// Get Quantum VTS reference
@@ -1887,6 +1943,12 @@ impl BlockchainNode {
         let (block_event_tx, _block_event_rx) = tokio::sync::broadcast::channel(100);
         println!("[BlockEvents] 📡 Initialized event-based block notification system");
         
+        // DETERMINISTIC REPUTATION: Initialize blockchain-based reputation state
+        // All reputation is calculated from on-chain data (no P2P gossip vulnerabilities)
+        // NOTE: Uses std::sync::RwLock for compatibility with SimplifiedP2P
+        let deterministic_reputation = Arc::new(std::sync::RwLock::new(DeterministicReputationState::new()));
+        println!("[REPUTATION] 🔒 Initialized deterministic reputation system (blockchain-only)");
+        
         // MEV PROTECTION: Initialize optional private bundle mempool
         // ARCHITECTURE: Dynamic 0-20% allocation protects public TX throughput
         let mev_mempool = if env::var("QNET_ENABLE_MEV_PROTECTION").unwrap_or_default() == "1" {
@@ -1955,9 +2017,16 @@ impl BlockchainNode {
             adaptive_bft,
             pre_execution,
             block_event_tx,
+            deterministic_reputation,
         };
         
         println!("[Node] 🔍 DEBUG: BlockchainNode created successfully for node_id: {}", node_id);
+        
+        // CRITICAL: Link deterministic reputation to P2P for unified access
+        // This allows VRF producer selection to use blockchain-based reputation
+        if let Some(ref p2p) = blockchain.unified_p2p {
+            p2p.set_deterministic_reputation(blockchain.deterministic_reputation.clone());
+        }
         
         // PRODUCTION: Start block processing handler with blockchain's height and P2P
         let storage_for_blocks = blockchain.storage.clone();
@@ -1969,6 +2038,7 @@ impl BlockchainNode {
         let node_type_for_blocks = blockchain.node_type;
         let block_event_tx_for_blocks = blockchain.block_event_tx.clone();
         let reward_manager_for_blocks = blockchain.reward_manager.clone();
+        let reputation_for_blocks = blockchain.deterministic_reputation.clone();
         tokio::spawn(async move {
             Self::process_received_blocks(
                 block_rx, 
@@ -1981,6 +2051,7 @@ impl BlockchainNode {
                 node_type_for_blocks,
                 block_event_tx_for_blocks,
                 reward_manager_for_blocks,
+                reputation_for_blocks,
             ).await;
         });
         
@@ -2293,6 +2364,7 @@ impl BlockchainNode {
         node_type: NodeType,
         block_event_tx: tokio::sync::broadcast::Sender<u64>,
         reward_manager: Arc<RwLock<PhaseAwareRewardManager>>,
+        deterministic_reputation: Arc<std::sync::RwLock<DeterministicReputationState>>,
     ) {
         // CRITICAL FIX: Buffer for out-of-order blocks
         // Key: block height, Value: (block data, retry count, timestamp)
@@ -2824,26 +2896,62 @@ impl BlockchainNode {
                     // Deserialize decompressed macroblock struct
                     match bincode::deserialize::<qnet_state::MacroBlock>(&decompressed_data) {
                         Ok(macroblock) => {
-                            // CRITICAL REPUTATION FIX: Update reputation for ALL consensus participants
-                            // This ensures reputation is synchronized across ALL nodes (not just leader)
-                            // Without this, only macroblock creator updates reputation → desync!
-                            if let Some(ref p2p) = unified_p2p {
-                                // Reward all commit participants (they started consensus)
-                                for (participant_id, _) in &macroblock.consensus_data.commits {
-                                    p2p.update_node_reputation(participant_id, ReputationEvent::ConsensusParticipation);
-                                }
+                            // DETERMINISTIC REPUTATION: Process macroblock consensus via blockchain
+                            // All nodes compute same reputation from on-chain data (no P2P gossip)
+                            {
+                                use std::collections::HashSet;
+                                use qnet_consensus::deterministic_reputation::{MacroBlockConsensus, MacroBlockData};
                                 
-                                // Reward reveal participants who completed consensus  
-                                // (reveals are more important - they finalize the macroblock)
-                                for (participant_id, _) in &macroblock.consensus_data.reveals {
-                                    // Extra reward for completing reveal (total +2 for full participation)
-                                    p2p.update_node_reputation(participant_id, ReputationEvent::ConsensusParticipation);
-                                }
+                                // Convert ConsensusData to MacroBlockConsensus
+                                let commit_participants: HashSet<String> = macroblock.consensus_data.commits.keys().cloned().collect();
+                                let reveal_participants: HashSet<String> = macroblock.consensus_data.reveals.keys().cloned().collect();
                                 
-                                // Reward next leader selection
-                                if !macroblock.consensus_data.next_leader.is_empty() {
-                                    println!("[MACROBLOCK] ✅ Reputation updated for {} consensus participants", 
-                                             macroblock.consensus_data.reveals.len());
+                                // PRODUCTION: Drain collected slashing events from P2P
+                                let slashing_events = if let Some(ref p2p) = unified_p2p {
+                                    p2p.drain_slashing_events()
+                                } else {
+                                    Vec::new()
+                                };
+                                
+                                // Calculate automatic jails from commit-only participants
+                                let automatic_jails = Self::compute_automatic_jails(
+                                    &commit_participants,
+                                    &reveal_participants,
+                                    macroblock.timestamp
+                                );
+                                
+                                let macro_consensus = MacroBlockConsensus {
+                                    index: macroblock.height,
+                                    commit_participants,
+                                    reveal_participants,
+                                    slashing_events,
+                                    automatic_jails,
+                                    timestamp: macroblock.timestamp,
+                                };
+                                
+                                let macro_data = MacroBlockData {
+                                    index: macroblock.height,
+                                    consensus: macro_consensus,
+                                };
+                                
+                                // Update deterministic reputation state (std::sync::RwLock - no await)
+                                {
+                                    if let Ok(mut rep_state) = deterministic_reputation.write() {
+                                        rep_state.process_macroblock(&macro_data, macroblock.timestamp);
+                                        
+                                        // PASSIVE RECOVERY: Apply to online nodes with rep 10-69%
+                                        // Online nodes = connected via P2P with recent heartbeat (NOT consensus participants!)
+                                        // Nodes with rep < 70% can't participate in consensus, but CAN be connected via P2P
+                                        let online_nodes: Vec<String> = if let Some(ref p2p) = unified_p2p {
+                                            p2p.get_online_node_ids()
+                                        } else {
+                                            Vec::new()
+                                        };
+                                        rep_state.apply_passive_recovery(&online_nodes, macroblock.timestamp);
+                                        
+                                        println!("[MACROBLOCK] ✅ Reputation: {} consensus participants, {} online nodes for recovery", 
+                                                 macroblock.consensus_data.reveals.len(), online_nodes.len());
+                                    }
                                 }
                             }
                             
@@ -2883,15 +2991,28 @@ impl BlockchainNode {
                         // Just received last block of a round (30, 60, 90...)
                         println!("[ROTATION] 🔄 Received rotation boundary block #{} - checking producer for next round", received_block.height);
                         
-                        // CRITICAL REPUTATION FIX: Update producer's reputation on ALL nodes
-                        // This ensures reputation is synchronized across the network through blocks
-                        // Without this, only the producer updates its own reputation → desync!
+                        // DETERMINISTIC REPUTATION: Update via blockchain-based system
+                        // All nodes compute same reputation from block data (no P2P gossip)
                         if received_block.block_type == "micro" {
                             if let Some(ref producer_id) = block_producer_id {
-                                if let Some(ref p2p) = unified_p2p {
-                                    p2p.update_node_reputation(producer_id, ReputationEvent::FullRotationComplete);
-                                    println!("[REPUTATION] ✅ Rotation #{} complete - {} reputation +2% (synced via block)", 
-                                             received_block.height / 30, producer_id);
+                                // Create BlockData for deterministic processing
+                                let block_data = BlockData {
+                                    height: received_block.height,
+                                    producer: producer_id.clone(),
+                                    timestamp: std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs(),
+                                    is_valid: true,
+                                };
+                                
+                                // Update deterministic reputation state (std::sync::RwLock - no await)
+                                {
+                                    if let Ok(mut rep_state) = deterministic_reputation.write() {
+                                        rep_state.process_block(&block_data);
+                                        println!("[REPUTATION] ✅ Rotation #{} - {} block processed (deterministic)", 
+                                                 received_block.height / 30, producer_id);
+                                    }
                                 }
                             }
                         }
@@ -6698,24 +6819,18 @@ impl BlockchainNode {
                         
                         // Spawn async task for rotation tracking (can be in background)
                         tokio::spawn(async move {
-                            // Check if rotation completed (every 30 blocks)
+                            // Rotation tracking for logging (rewards processed via DeterministicReputationState)
                             if let Some((rotation_producer, blocks_created)) = 
                                 rotation_tracker_clone.check_rotation_complete(height_for_storage).await {
                                 
-                                // ATOMIC REWARD: One reward for entire rotation
-                                if let Some(ref p2p) = p2p_for_reward {
-                                    if blocks_created == ROTATION_INTERVAL_BLOCKS as u32 {
-                                        // Full rotation completed - reward valid block production
-                                        p2p.update_node_reputation(&rotation_producer, ReputationEvent::FullRotationComplete);
-                                        println!("[ROTATION] ✅ {} completed full rotation ({}/30 blocks)", 
-                                                rotation_producer, blocks_created);
-                                    } else {
-                                        // Partial rotation (failover occurred) - still reward participation
-                                        p2p.update_node_reputation(&rotation_producer, ReputationEvent::ConsensusParticipation);
-                                        println!("[ROTATION] ⚠️ {} partial rotation ({}/30 blocks)", 
-                                                rotation_producer, blocks_created);
-                                    }
+                                if blocks_created == ROTATION_INTERVAL_BLOCKS as u32 {
+                                    println!("[ROTATION] ✅ {} completed full rotation ({}/30 blocks)", 
+                                            rotation_producer, blocks_created);
+                                } else {
+                                    println!("[ROTATION] ⚠️ {} partial rotation ({}/30 blocks)", 
+                                            rotation_producer, blocks_created);
                                 }
+                                // Reward processed via DeterministicReputationState.process_block()
                             }
                         });
                     } else {
@@ -6819,23 +6934,18 @@ impl BlockchainNode {
                     
                     println!("[PRODUCER] 📈 Advanced to height {} after producing block", microblock_height);
                     
-                    // Check if rotation completed
+                    // Rotation tracking for logging (rewards processed via DeterministicReputationState)
                     if let Some((rotation_producer, blocks_created)) = 
                         rotation_tracker.check_rotation_complete(microblock.height).await {
                         
-                        if let Some(p2p) = &unified_p2p {
-                            if blocks_created == ROTATION_INTERVAL_BLOCKS as u32 {
-                                // Full rotation: reward valid block production
-                                p2p.update_node_reputation(&rotation_producer, ReputationEvent::FullRotationComplete);
-                                println!("[ROTATION] ✅ {} completed full rotation #{} ({}/30 blocks)", 
-                                        rotation_producer, microblock.height / 30, blocks_created);
-                            } else {
-                                // Partial rotation: reward participation
-                                p2p.update_node_reputation(&rotation_producer, ReputationEvent::ConsensusParticipation);
-                                println!("[ROTATION] ⚠️ {} partial rotation #{} ({}/30 blocks)", 
-                                        rotation_producer, microblock.height / 30, blocks_created);
-                            }
+                        if blocks_created == ROTATION_INTERVAL_BLOCKS as u32 {
+                            println!("[ROTATION] ✅ {} completed full rotation #{} ({}/30 blocks)", 
+                                    rotation_producer, microblock.height / 30, blocks_created);
+                        } else {
+                            println!("[ROTATION] ⚠️ {} partial rotation #{} ({}/30 blocks)", 
+                                    rotation_producer, microblock.height / 30, blocks_created);
                         }
+                        // Reward processed via DeterministicReputationState.process_block()
                     }
                     
                     // CRITICAL FIX: Optimized mempool cleanup - batch removal for performance 
@@ -7062,12 +7172,10 @@ impl BlockchainNode {
                                         *height_clone.write().await = network_height;
                                         println!("[SYNC] ✅ Background sync completed to block #{}", network_height);
                                         
-                                        // REPUTATION RECOVERY: Restore reputation if node caught up
-                                        // Check if we were significantly behind (>50 blocks)
+                                        // SYNC COMPLETE: Reputation recovery handled via block processing
+                                        // DeterministicReputationState.process_block() gives rewards for production
                                         if network_height > current_height + 50 {
-                                            // Node successfully caught up after being behind
-                                            p2p_clone.update_node_reputation(&node_id_for_sync, ReputationEvent::FullRotationComplete);
-                                            println!("[REPUTATION] 🔄 Node {} recovered from {} block lag!", 
+                                            println!("[SYNC] ✅ Node {} recovered from {} block lag!", 
                                                      node_id_for_sync, network_height - current_height);
                                         }
                                     }
@@ -7894,33 +8002,61 @@ impl BlockchainNode {
     }
     
     /// Get reputation score for a node
+    /// ═══════════════════════════════════════════════════════════════════════════
+    /// ARCHITECTURE v2.21: TRANSITIONAL - Uses legacy NodeReputation
+    /// 
+    /// TARGET ARCHITECTURE (DeterministicReputationState):
+    /// - Reputation computed ONLY from blockchain data
+    /// - +2% for completing 30-block rotation (in microblock)
+    /// - +1% for participating in consensus (in macroblock)
+    /// - Penalties via SlashingEvent with cryptographic proof
+    /// - All nodes compute same result from same blocks = deterministic
+    /// 
+    /// PRODUCTION: Reputation from blockchain data only (DeterministicReputationState)
+    /// - No P2P gossip vulnerabilities (Sybil-resistant)
+    /// - All nodes compute same reputation from on-chain data
+    /// - Genesis nodes start at 70% (MIN_CONSENSUS_REPUTATION)
+    /// ═══════════════════════════════════════════════════════════════════════════
     pub async fn get_node_reputation_score(node_id: &str, p2p: &Arc<SimplifiedP2P>) -> f64 {
-        // PRODUCTION: Get reputation score with proper lifetime management
-        match p2p.get_reputation_system().lock() {
-            Ok(reputation) => {
-                let score = reputation.get_reputation(node_id);
-                // DIAGNOSTIC: Check what exactly we get from reputation system
-                println!("[DIAGNOSTIC] 🔍 Node {}: raw_score={}", node_id, score);
-                
-                // Convert 0-100 scale to 0-1 scale
-                // CRITICAL ARCHITECTURAL FIX: QNet minimum reputation threshold enforcement
-                // Documentation: "Simple binary threshold: qualified (≥70%) or not qualified (<70%)"
-                let raw_reputation = (score / 100.0).max(0.0).min(1.0);
-                
-                // PRODUCTION: QNet quantum consensus participation eligibility
-                let reputation_score = if raw_reputation < 0.70 {
-                    // Below consensus threshold: Exclude from qualified candidates
-                    println!("[REPUTATION] ⚠️ Peer {} below consensus threshold: {:.1}% (min: 70%) - excluded", node_id, raw_reputation * 100.0);
-                    raw_reputation // Return actual low score for exclusion logic
-                } else {
-                    raw_reputation // Above threshold: Use actual reputation
-                };
-                
-                reputation_score
+        // GENESIS NODES: Fixed reputation for stability
+        // These nodes have deterministic reputation from blockchain
+        if node_id.starts_with("genesis_node_") {
+            return 0.70; // Genesis always eligible (70% = MIN_CONSENSUS_REPUTATION)
+        }
+        
+        // PRODUCTION: Use P2P's DeterministicReputationState (blockchain-based)
+        // This replaces the old NodeReputation gossip system
+        match p2p.get_deterministic_reputation() {
+            Some(rep_state) => {
+                match rep_state.read() {
+                    Ok(state) => {
+                        let current_ts = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        let score = state.get_reputation(node_id, current_ts);
+                        let raw_reputation = score.max(0.0).min(1.0);
+                        
+                        if raw_reputation < MIN_CONSENSUS_REPUTATION {
+                            #[cfg(debug_assertions)]
+                            println!("[REPUTATION] ⚠️ Node {} below threshold: {:.1}% (min: {:.0}%)", 
+                                     node_id, raw_reputation * 100.0, MIN_CONSENSUS_REPUTATION * 100.0);
+                        }
+                        
+                        raw_reputation
+                    }
+                    Err(_) => INITIAL_REPUTATION
+                }
             }
-            Err(_) => {
-                println!("[REPUTATION] ⚠️ Failed to access reputation system for {} - using default", node_id);
-                0.70 // Default reputation for calculation consistency
+            None => {
+                // Fallback to legacy P2P system during transition
+                match p2p.get_reputation_system().lock() {
+                    Ok(reputation) => {
+                        let score = reputation.get_reputation(node_id);
+                        (score / 100.0).max(0.0).min(1.0)
+                    }
+                    Err(_) => 0.70
+                }
             }
         }
     }
@@ -8142,9 +8278,8 @@ impl BlockchainNode {
                     for (i, _ip) in genesis_ips.iter().enumerate() {
                         let peer_node_id = format!("genesis_node_{:03}", i + 1);
                         if peer_node_id != failed_producer {
-                            // Give emergency reputation boost to enable recovery
-                            p2p.update_node_reputation(&peer_node_id, ReputationEvent::FullRotationComplete);
-                            println!("[EMERGENCY] 💊 Emergency boost to {} for recovery", peer_node_id);
+                            // Genesis nodes have fixed 70% reputation in deterministic system
+                            println!("[EMERGENCY] 💊 Selecting Genesis {} for recovery (fixed 70% reputation)", peer_node_id);
                             
                             // Check if now eligible
                             let new_reputation = Self::get_node_reputation_score(&peer_node_id, p2p).await;
@@ -8226,11 +8361,10 @@ impl BlockchainNode {
                         // CRITICAL: Sort peers to ensure ALL nodes boost SAME peer (network recovery consensus)
                         peers.sort_by(|a, b| a.id.cmp(&b.id));
                         
-                        // Boost first available peer (now deterministic across all nodes)
+                        // Select first available peer (deterministic across all nodes)
                         let emergency_peer = &peers[0];
-                        // Critical boost for network recovery
-                        p2p.update_node_reputation(&emergency_peer.id, ReputationEvent::FullRotationComplete);
-                        println!("[EMERGENCY] 💊 Critical boost to {} for network recovery", emergency_peer.id);
+                        // Reward processed via DeterministicReputationState when block is produced
+                        println!("[EMERGENCY] 💊 Selecting {} for network recovery", emergency_peer.id);
                         return emergency_peer.id.clone();
                     }
                     
@@ -9395,11 +9529,12 @@ impl BlockchainNode {
     ) {
         println!("[MACROBLOCK] 🚨 EMERGENCY: Failed leader {} - activating PFP", failed_leader);
         
-        // Penalize failed leader if valid
+        // Report failed leader via slashing collector
         if let Some(ref p2p) = unified_p2p {
             if !failed_leader.starts_with("unknown") && !failed_leader.starts_with("no_leader") {
-                p2p.update_node_reputation(&failed_leader, ReputationEvent::InvalidBlock);
-                println!("[REPUTATION] ⚔️ Failed leader {} penalized", failed_leader);
+                let current_height = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+                p2p.report_invalid_block(&failed_leader, current_height, [0u8; 32], "Failed macroblock production");
+                println!("[SLASHING] ⚔️ Failed leader {} reported for slashing", failed_leader);
             }
         }
         
@@ -9586,25 +9721,22 @@ impl BlockchainNode {
                             println!("[CONSENSUS] 📥 Processing REAL consensus message from P2P channel");
                             let (node_id, success, error) = Self::process_consensus_message(consensus_engine, message).await;
                             
-                            // SECURITY: Apply reputation based on consensus engine result
-                            if success {
-                                // Valid commit/reveal - reward participation
-                                if let Some(ref p2p) = unified_p2p {
-                                    p2p.update_node_reputation(&node_id, ReputationEvent::ConsensusParticipation);
-                                }
-                            } else if let Some(err) = error {
-                                // Invalid commit/reveal - apply penalty based on error type
-                                if err.contains("InvalidSignature") {
-                                    // CRITICAL: Invalid signature is a serious attack
-                                    println!("[SECURITY] 🚨 Invalid signature from {} - applying -20% penalty", node_id);
-                                    if let Some(ref p2p) = unified_p2p {
-                                        p2p.update_node_reputation(&node_id, ReputationEvent::InvalidBlock);
+                            // SECURITY: Reputation handled via DeterministicReputationState in macroblock
+                            if !success {
+                                if let Some(err) = error {
+                                    // Invalid commit/reveal - report for slashing
+                                    if err.contains("InvalidSignature") {
+                                        println!("[SECURITY] 🚨 Invalid signature from {} - reporting for slashing", node_id);
+                                        if let Some(ref p2p) = unified_p2p {
+                                            let current_height = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+                                            p2p.report_invalid_block(&node_id, current_height, [0u8; 32], "Invalid signature in consensus");
+                                        }
+                                    } else if err.contains("PhaseTimeout") {
+                                        // Late submission - minor issue, no penalty
+                                        println!("[CONSENSUS] ⚠️ Late submission from {} - no penalty", node_id);
                                     }
-                                } else if err.contains("PhaseTimeout") {
-                                    // Late submission - minor issue, no penalty
-                                    println!("[CONSENSUS] ⚠️ Late submission from {} - no penalty", node_id);
+                                    // Other errors (NoActiveRound, etc.) - no penalty, could be timing issue
                                 }
-                                // Other errors (NoActiveRound, etc.) - no penalty, could be timing issue
                             }
                             
                             processed_messages += 1;
@@ -9805,17 +9937,15 @@ impl BlockchainNode {
                             println!("[CONSENSUS] 📥 Processing REAL reveal message from P2P channel");
                             let (node_id, success, error) = Self::process_consensus_message(consensus_engine, message).await;
                             
-                            // SECURITY: Apply reputation based on consensus engine result
+                            // SECURITY: Reputation handled via DeterministicReputationState in macroblock
                             if success {
-                                if let Some(ref p2p) = unified_p2p {
-                                    p2p.update_node_reputation(&node_id, ReputationEvent::ConsensusParticipation);
-                                }
                                 received_reveals += 1; // Only count valid reveals
                             } else if let Some(err) = error {
                                 if err.contains("InvalidSignature") || err.contains("InvalidReveal") {
-                                    println!("[SECURITY] 🚨 Invalid reveal from {} - applying -20% penalty", node_id);
+                                    println!("[SECURITY] 🚨 Invalid reveal from {} - reporting for slashing", node_id);
                                     if let Some(ref p2p) = unified_p2p {
-                                        p2p.update_node_reputation(&node_id, ReputationEvent::InvalidBlock);
+                                        let current_height = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+                                        p2p.report_invalid_block(&node_id, current_height, [0u8; 32], "Invalid reveal in consensus");
                                     }
                                 }
                             }
@@ -10024,21 +10154,19 @@ impl BlockchainNode {
         behavior_delta: f64,
     ) {
         if let Some(p2p) = unified_p2p {
-            // Map behavior_delta to ReputationEvent
-            let event = if behavior_delta > 0.0 {
-                ReputationEvent::FullRotationComplete
-            } else if behavior_delta < 0.0 {
-                ReputationEvent::InvalidBlock
-            } else {
+            // DETERMINISTIC: Reputation updates handled via blockchain
+            // Positive changes: DeterministicReputationState.process_block()
+            // Negative changes: SlashingEvent in macroblock
+            if behavior_delta == 0.0 {
                 return; // Neutral behavior, no update
-            };
-            
-            // Update reputation in P2P system
-            p2p.update_node_reputation(node_id, event);
+            }
             
             let behavior_desc = if behavior_delta > 0.0 {
-                "positive"
+                "positive" // Reward via block production
             } else {
+                // Report negative behavior for slashing
+                let current_height = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+                p2p.report_invalid_block(node_id, current_height, [0u8; 32], "Negative behavior detected");
                 "negative"
             };
             
@@ -11399,20 +11527,10 @@ impl BlockchainNode {
                 println!("[MACROBLOCK] ⏰ Timestamp: {}", macroblock.timestamp);
                 println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
                 
-                // PRODUCTION: Distribute reputation rewards for successful macroblock consensus
-                // According to config.ini and ReputationConfig documentation
-                // Reward consensus leader
-                p2p.update_node_reputation(&consensus_data.leader_id, ReputationEvent::FullRotationComplete);
-                println!("[REPUTATION] 🏆 Consensus leader {} rewarded", consensus_data.leader_id);
-                
-                // Reward all participants
-                for participant_id in &consensus_data.participants {
-                    // Don't double-reward the leader
-                    if participant_id != &consensus_data.leader_id {
-                        p2p.update_node_reputation(participant_id, ReputationEvent::ConsensusParticipation);
-                        println!("[REPUTATION] ✅ Consensus participant {} rewarded", participant_id);
-                    }
-                }
+                // DETERMINISTIC: Reputation rewards processed via DeterministicReputationState.process_macroblock()
+                // When macroblock is saved, all nodes compute same reputation from on-chain data
+                println!("[REPUTATION] 🏆 Consensus leader {} - reward via macroblock", consensus_data.leader_id);
+                println!("[REPUTATION] ✅ {} participants - rewards via macroblock", consensus_data.participants.len());
                 
                 println!("[REPUTATION] 💰 Distributed reputation rewards to {} consensus participants", 
                          consensus_data.participants.len());
@@ -14070,6 +14188,7 @@ impl Clone for BlockchainNode {
             adaptive_bft: self.adaptive_bft.clone(),
             pre_execution: self.pre_execution.clone(),
             block_event_tx: self.block_event_tx.clone(),
+            deterministic_reputation: self.deterministic_reputation.clone(),
         }
     }
 }

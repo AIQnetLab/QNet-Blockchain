@@ -17,6 +17,8 @@ pub mod dynamic_timing;
 pub mod errors;
 pub mod reputation;
 pub mod kademlia;
+pub mod deterministic_reputation;
+pub mod macro_consensus;
 
 // Re-export main types for public API
 pub use lazy_rewards::{PhaseAwareRewardManager, PhaseAwareReward, RewardClaimResult};
@@ -29,6 +31,19 @@ pub use commit_reveal::{CommitRevealConsensus, ConsensusConfig};
 pub use errors::ConsensusError;
 pub use reputation::{NodeReputation, ReputationConfig, MaliciousBehavior};
 pub use kademlia::{KademliaDht, KademliaNode, generate_node_id};
+pub use deterministic_reputation::{
+    DeterministicReputationState, SlashingEvent, SlashingType, 
+    AutomaticJail, MacroBlockConsensus, BlockData, MacroBlockData,
+    ReputationStats,
+    INITIAL_REPUTATION, MAX_REPUTATION, MIN_CONSENSUS_REPUTATION,
+    REWARD_FULL_ROTATION, REWARD_CONSENSUS_PARTICIPATION,
+    PENALTY_INVALID_BLOCK, PENALTY_DOUBLE_SIGN, PENALTY_MISSED_BLOCK,
+    PROCESSING_CHUNK_SIZE, MAX_SLASHING_EVENTS_PER_MACROBLOCK, MAX_AUTO_JAILS_PER_MACROBLOCK,
+};
+pub use macro_consensus::{
+    MacroBlockConsensusData, MissedBlockTracker, MacroConsensusResult,
+    FinalityCheckpoint, FinalityManager, FINALITY_DEPTH, FINALITY_THRESHOLD,
+};
 
 // Common types used across modules
 pub use lazy_rewards::{NodeType, QNetPhase};

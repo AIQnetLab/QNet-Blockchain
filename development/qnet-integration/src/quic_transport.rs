@@ -930,7 +930,8 @@ impl QuicTransport {
             NetworkMessage::ConsensusReveal { .. } => 6,
             NetworkMessage::EmergencyProducerChange { .. } => 7,
             NetworkMessage::ShredProtocolChunk { .. } => 8,
-            NetworkMessage::ReputationSync { .. } => 9,
+            #[allow(deprecated)]
+            NetworkMessage::ReputationSyncDeprecated { .. } => 9,
             _ => 0,
         }
     }

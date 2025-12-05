@@ -807,53 +807,63 @@ MAX_MESSAGE_SIZE: 10 MB       // Supports full macroblocks (~3MB)
 
 ### 6.5 Reputation System
 
-**Byzantine-Safe Split Reputation (v2.19.2):**
+**Deterministic Blockchain-Based Reputation (v2.1):**
 
-QNet implements a **two-dimensional reputation model** that separates Byzantine attacks from network performance issues:
+> **ARCHITECTURE v2.1:** Reputation computed ONLY from blockchain data (no P2P gossip).
+> All nodes compute identical reputation from on-chain data - Sybil-resistant and deterministic.
+> See [docs/REPUTATION_SYSTEM.md](docs/REPUTATION_SYSTEM.md) for full documentation.
 
 ```rust
-pub struct PeerInfo {
-    consensus_score: f64,  // 0-100: Byzantine behavior (invalid blocks, attacks)
-    network_score: f64,    // 0-100: Network performance (timeouts, latency)
+pub struct DeterministicReputationState {
+    reputations: HashMap<String, f64>,      // node_id -> reputation (0-100)
+    active_jails: HashMap<String, (u64, u32)>, // node_id -> (end_ts, offense_count)
+    permanent_bans: HashSet<String>,        // Permanently banned nodes
+    offense_counts: HashMap<String, u32>,   // Progressive jail tracking
 }
 ```
 
-**Why Split Reputation?**
+**Why Deterministic (not P2P Gossip)?**
 
-| Issue | Single Reputation | Split Reputation |
-|-------|------------------|------------------|
-| **WAN Latency** | Good node penalized → excluded from consensus | Only network_score affected → still eligible |
-| **Invalid Blocks** | Same penalty as timeout → unfair | consensus_score penalty → proper isolation |
-| **Peer Selection** | Can't distinguish malicious from slow | Prioritize by network_score, filter by consensus_score |
-| **Byzantine Safety** | Network issues affect consensus threshold | Only Byzantine behavior affects consensus eligibility |
+| Issue | OLD (P2P Gossip) | NEW (Deterministic) |
+|-------|------------------|---------------------|
+| **Sybil Attack** | Vulnerable - fake reputation via gossip | Resistant - only blockchain data |
+| **Node Agreement** | Nodes can disagree | All nodes compute same result |
+| **Evidence** | Ephemeral keys (forgeable) | Cryptographic proof in blocks |
+| **Jail Sync** | Gossip lag → manipulation | Recorded in macroblock |
 
-**Reputation Components:**
+**Reputation Events (Blockchain-Based):**
 
 ```
-CONSENSUS SCORE (Byzantine Safety):
-  ├── FullRotationComplete: +2.0 (for completing all 30 blocks)
-  ├── InvalidBlock: -20.0
-  ├── MaliciousBehavior: -50.0
-  ├── ConsensusParticipation: +1.0
-  └── Threshold: ≥70% for consensus participation
+REWARDS (from blockchain data):
+  ├── Full Rotation (30 blocks): +2.0 (block producer field)
+  ├── Consensus Participation: +1.0 (macroblock commit+reveal)
+  └── Passive Recovery: +1.0/4h (online nodes with rep 10-69%)
 
-NETWORK SCORE (Peer Performance - PENALTIES ONLY):
-  ├── TimeoutFailure: -2.0
-  ├── ConnectionFailure: -5.0
-  └── No threshold (used for prioritization only)
+PENALTIES (SlashingEvent with cryptographic proof):
+  ├── Invalid Block: -20.0 (proof: the invalid block itself)
+  ├── Double Sign: -50.0 + PERMANENT BAN (proof: both signed blocks)
+  ├── Chain Fork: PERMANENT BAN (proof: conflicting chains)
+  └── Missed Blocks: -2.0 per block (AutomaticJail in macroblock)
 
-PASSIVE RECOVERY (once per 4h, if score [10, 70), NOT jailed):
-  └── +1.0 reputation
+NETWORK SCORE (P2P routing only, NOT consensus):
+  ├── TimeoutFailure: -2.0 (local network_score)
+  ├── ConnectionFailure: -5.0 (local network_score)
+  └── Used for peer prioritization, not consensus eligibility
 
-PROGRESSIVE JAIL (6 chances for regular offenses):
+PROGRESSIVE JAIL (6 chances, recorded in macroblock):
   ├── 1st: 1h → 30%    4th: 30d → 15%
   ├── 2nd: 24h → 25%   5th: 3m → 12%
   ├── 3rd: 7d → 20%    6+: 1y → 10% (can return!)
   └── CRITICAL ATTACKS → PERMANENT BAN (no return):
-      DatabaseSubstitution, ChainFork, StorageDeletion
+      DoubleSign, ChainFork
+```
 
-COMBINED REPUTATION (Peer Selection):
-  └── 70% consensus_score + 30% network_score
+**Finality Checkpoints (v2.1):**
+```
+After 2 macroblocks with 2/3+ validator signatures = FINAL
+├── Prevents long-range attacks
+├── Cannot rewrite finalized history
+└── ~3 minutes to finality (2 × 90 seconds)
 ```
 
 **Ping/Heartbeat-based participation (every 4 hours) - v2.19.4:**
