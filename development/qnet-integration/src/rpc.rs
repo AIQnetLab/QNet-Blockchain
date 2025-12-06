@@ -1887,10 +1887,12 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
         // Full nodes need 8/10 heartbeats, Super nodes need 9/10 per 4h window
         if let Some(p2p) = blockchain.get_unified_p2p() {
             let blockchain_for_heartbeat = blockchain.clone();
+            // CRITICAL FIX: Get runtime handle BEFORE spawning std::thread
+            // Otherwise Handle::current() panics in non-tokio thread
+            let runtime_handle = tokio::runtime::Handle::current();
             p2p.start_heartbeat_service(move || {
-                // This closure provides current blockchain height
-                tokio::runtime::Handle::current()
-                    .block_on(async { blockchain_for_heartbeat.get_height().await })
+                // Use pre-captured handle instead of Handle::current()
+                runtime_handle.block_on(async { blockchain_for_heartbeat.get_height().await })
             });
             println!("💓 Heartbeat service started (10 heartbeats per 4h window for rewards)");
         }

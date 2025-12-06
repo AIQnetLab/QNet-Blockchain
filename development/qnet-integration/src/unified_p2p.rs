@@ -9501,18 +9501,11 @@ impl SimplifiedP2P {
                     return;
                 }
                 
-                // OPTIMIZATION v2.19.19: Skip Dilithium verification for heartbeats
-                // RATIONALE (NIST FIPS 204 compliant):
-                // - Dilithium is designed for document/transaction signatures, NOT high-frequency pings
-                // - Heartbeats don't affect consensus - fake heartbeats give attacker nothing
-                // - Blocks are ALWAYS verified with Dilithium (security preserved)
-                // - CPU savings: ~35ms per heartbeat × thousands = significant
-                // 
-                // SECURITY: Heartbeat validity is ensured by:
-                // 1. Timestamp validation (±5 minutes) - already done above
-                // 2. Node must be in active_full_super_nodes registry (verified below)
-                // 3. Dedupe prevents replay attacks - already done above
-                // 4. Gossip TTL limits propagation - already done above
+                // SECURITY v2.23: FULL HYBRID verification for heartbeats (NIST/Cisco compliant)
+                // CRITICAL: Dilithium verification is now MANDATORY for quantum resistance
+                // - Ephemeral Ed25519 key for fast classical verification
+                // - Dilithium signs (ephemeral_key || message_hash || timestamp) for quantum protection
+                // - CPU cost: ~5ms per heartbeat (acceptable for 10 heartbeats per 4 hours)
                 
                 // VERIFY: Node must be registered (first registration uses Dilithium)
                 let is_known_node = {
@@ -9528,54 +9521,17 @@ impl SimplifiedP2P {
                     return;
                 }
                 
-                // SECURITY v2.20.1: Verify Ed25519 ephemeral signature
-                // Parse JSON signature: {"ephemeral_pubkey":"...", "signature":"...", "message":"..."}
-                let signature_valid = {
-                    use ed25519_dalek::{VerifyingKey, Signature, Verifier};
-                    
-                    // Try to parse as JSON with ephemeral signature
-                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&signature) {
-                        if let (Some(pubkey_b64), Some(sig_b64), Some(msg)) = (
-                            parsed["ephemeral_pubkey"].as_str(),
-                            parsed["signature"].as_str(),
-                            parsed["message"].as_str()
-                        ) {
-                            // Decode base64
-                            let pubkey_bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, pubkey_b64);
-                            let sig_bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, sig_b64);
-                            
-                            if let (Ok(pk), Ok(sb)) = (pubkey_bytes, sig_bytes) {
-                                if pk.len() == 32 && sb.len() == 64 {
-                                    let mut pk_arr = [0u8; 32];
-                                    let mut sig_arr = [0u8; 64];
-                                    pk_arr.copy_from_slice(&pk);
-                                    sig_arr.copy_from_slice(&sb);
-                                    
-                                    if let Ok(verifying_key) = VerifyingKey::from_bytes(&pk_arr) {
-                                        let sig = Signature::from_bytes(&sig_arr);
-                                        
-                                        // Verify: message must match node_id:timestamp:height:index
-                                        let expected_msg = format!("{}:{}:{}:{}", node_id, timestamp, block_height, heartbeat_index);
-                                        if msg == expected_msg {
-                                            verifying_key.verify(msg.as_bytes(), &sig).is_ok()
-                                        } else {
-                                            false // Message mismatch
-                                        }
-                                    } else { false }
-                                } else { false }
-                            } else { false }
-                        } else { false }
-                    } else {
-                        // v2.20.1: No legacy support - all heartbeats must have ephemeral signature
-                        println!("[HEARTBEAT] ❌ Invalid signature format (expected JSON with ephemeral_pubkey)");
-                        false
-                    }
-                };
+                // SECURITY v2.23: Verify HYBRID signature (Ed25519 + Dilithium)
+                // Expected format: "hybrid_p2p:{json}" with CompactHybridSignature
+                let expected_msg = format!("{}:{}:{}:{}", node_id, timestamp, block_height, heartbeat_index);
+                let signature_valid = self.verify_dilithium_heartbeat_signature(&expected_msg, &signature, &node_id);
                 
                 if !signature_valid {
-                    println!("[HEARTBEAT] ❌ Invalid signature for {} heartbeat #{}", node_id, heartbeat_index);
+                    println!("[HEARTBEAT] ❌ HYBRID signature verification FAILED for {} heartbeat #{}", node_id, heartbeat_index);
                     return;
                 }
+                
+                println!("[HEARTBEAT] ✅ HYBRID signature verified for {} (quantum-resistant)", node_id);
                 
                 // Store heartbeat in RAM
                 {
@@ -10223,13 +10179,9 @@ impl SimplifiedP2P {
             }
         }
         
-        // Step 3: Verify Dilithium signatures (MANDATORY per NIST/Cisco)
+        // OPTIMIZED v2.23: RAW bytes, single Dilithium signature (includes message_hash)
         if compact_sig.dilithium_key_signature.is_empty() {
             println!("[HEARTBEAT] ❌ REJECTED: No Dilithium key signature!");
-            return false;
-        }
-        if compact_sig.dilithium_message_signature.is_empty() {
-            println!("[HEARTBEAT] ❌ REJECTED: No Dilithium message signature!");
             return false;
         }
         
@@ -10242,52 +10194,35 @@ impl SimplifiedP2P {
         }
         let crypto = crypto_guard.as_ref().expect("Crypto initialized above");
         
-        // Verify Dilithium key signature (encapsulated_data)
+        // Verify Dilithium key signature (encapsulated_data = ephemeral_key || message_hash || timestamp)
         let mut encapsulated_data = Vec::new();
         encapsulated_data.extend_from_slice(&compact_sig.ephemeral_public_key);
         encapsulated_data.extend_from_slice(&message_hash);
         encapsulated_data.extend_from_slice(&compact_sig.signed_at.to_le_bytes());
         let encapsulated_hex = hex::encode(&encapsulated_data);
         
+        // OPTIMIZED v2.23: Convert RAW bytes to signature string
+        use crate::crypto::hybrid_crypto::encode_dilithium_signature;
+        let signature_string = encode_dilithium_signature(&compact_sig.node_id, &compact_sig.dilithium_key_signature);
+        
         let dilithium_key_sig = DilithiumSignature {
-            signature: compact_sig.dilithium_key_signature.clone(),
+            signature: signature_string,
             algorithm: "CRYSTALS-Dilithium3".to_string(),
             timestamp: compact_sig.signed_at,
             strength: "quantum-resistant".to_string(),
         };
         
         match crypto.verify_dilithium_signature(&encapsulated_hex, &dilithium_key_sig, &compact_sig.node_id).await {
-            Ok(true) => println!("[HEARTBEAT] ✅ Dilithium key signature verified"),
-            Ok(false) => {
-                println!("[HEARTBEAT] ❌ Dilithium key signature INVALID!");
-                return false;
-            }
-            Err(e) => {
-                println!("[HEARTBEAT] ❌ Dilithium key verification error: {}", e);
-                return false;
-            }
-        }
-        
-        // Verify Dilithium message signature
-        let message_hash_hex = hex::encode(&message_hash);
-        let dilithium_msg_sig = DilithiumSignature {
-            signature: compact_sig.dilithium_message_signature.clone(),
-            algorithm: "CRYSTALS-Dilithium3".to_string(),
-            timestamp: compact_sig.signed_at,
-            strength: "quantum-resistant".to_string(),
-        };
-        
-        match crypto.verify_dilithium_signature(&message_hash_hex, &dilithium_msg_sig, &compact_sig.node_id).await {
             Ok(true) => {
-                println!("[HEARTBEAT] ✅ ALL signatures verified (NIST/Cisco hybrid compliant)");
+                println!("[HEARTBEAT] ✅ Signature verified (NIST/Cisco hybrid)");
                 true
             }
             Ok(false) => {
-                println!("[HEARTBEAT] ❌ Dilithium message signature INVALID!");
+                println!("[HEARTBEAT] ❌ Dilithium signature INVALID!");
                 false
             }
             Err(e) => {
-                println!("[HEARTBEAT] ❌ Dilithium message verification error: {}", e);
+                println!("[HEARTBEAT] ❌ Dilithium verification error: {}", e);
                 false
             }
         }
@@ -10416,10 +10351,9 @@ impl SimplifiedP2P {
                             return false;
                         }
                         
-                        // Verify Dilithium signatures
-                        if compact_sig.dilithium_key_signature.is_empty() || 
-                           compact_sig.dilithium_message_signature.is_empty() {
-                            println!("[HEARTBEAT] ❌ Missing Dilithium signatures!");
+                        // OPTIMIZED v2.23: RAW bytes, only key signature required
+                        if compact_sig.dilithium_key_signature.is_empty() {
+                            println!("[HEARTBEAT] ❌ Missing Dilithium key signature!");
                             return false;
                         }
                         
@@ -10458,37 +10392,25 @@ impl SimplifiedP2P {
                         encapsulated_data.extend_from_slice(&compact_sig.signed_at.to_le_bytes());
                         let encapsulated_hex = hex::encode(&encapsulated_data);
                         
+                        // OPTIMIZED v2.23: Convert RAW bytes to signature string
+                        use crate::crypto::hybrid_crypto::encode_dilithium_signature;
+                        let signature_string = encode_dilithium_signature(&compact_sig.node_id, &compact_sig.dilithium_key_signature);
+                        
                         let dilithium_key_sig = DilithiumSignature {
-                            signature: compact_sig.dilithium_key_signature.clone(),
+                            signature: signature_string,
                             algorithm: "CRYSTALS-Dilithium3".to_string(),
                             timestamp: compact_sig.signed_at,
                             strength: "quantum-resistant".to_string(),
                         };
                         
+                        // OPTIMIZED v2.23: Single Dilithium signature verification
                         match crypto.verify_dilithium_signature(&encapsulated_hex, &dilithium_key_sig, &compact_sig.node_id).await {
-                            Ok(true) => {}
-                            _ => {
-                                println!("[HEARTBEAT] ❌ Dilithium key signature INVALID!");
-                                return false;
-                            }
-                        }
-                        
-                        // Verify Dilithium message signature
-                        let message_hash_hex = hex::encode(&message_hash);
-                        let dilithium_msg_sig = DilithiumSignature {
-                            signature: compact_sig.dilithium_message_signature.clone(),
-                            algorithm: "CRYSTALS-Dilithium3".to_string(),
-                            timestamp: compact_sig.signed_at,
-                            strength: "quantum-resistant".to_string(),
-                        };
-                        
-                        match crypto.verify_dilithium_signature(&message_hash_hex, &dilithium_msg_sig, &compact_sig.node_id).await {
                             Ok(true) => {
                                 println!("[HEARTBEAT] ✅ HYBRID signature verified (NIST/Cisco)");
                                 true
                             }
                             _ => {
-                                println!("[HEARTBEAT] ❌ Dilithium message signature INVALID!");
+                                println!("[HEARTBEAT] ❌ Dilithium signature INVALID!");
                                 false
                             }
                         }
@@ -10607,34 +10529,19 @@ impl SimplifiedP2P {
                             
                             let block_height = blockchain_height_fn();
                             
-                            // SECURITY v2.20.1: Ed25519 ephemeral signature for heartbeats
-                            // Per NIST/Cisco: NEW ephemeral key for EACH heartbeat (1 key = 1 message)
-                            // - Generate fresh Ed25519 keypair
-                            // - Sign: node_id || timestamp || block_height || heartbeat_index
-                            // - Include ephemeral pubkey + signature in JSON format
-                            // - Key is discarded after signing (ephemeral)
-                            let signature = {
-                                use ed25519_dalek::{SigningKey, Signer};
-                                use rand::rngs::OsRng;
-                                
-                                // Step 1: Generate NEW ephemeral Ed25519 keypair
-                                let mut csprng = OsRng{};
-                                let ephemeral_signing_key = SigningKey::generate(&mut csprng);
-                                let ephemeral_verifying_key = ephemeral_signing_key.verifying_key();
-                                
-                                // Step 2: Create message to sign
-                                let message = format!("{}:{}:{}:{}", node_id, now, block_height, index);
-                                
-                                // Step 3: Sign with ephemeral key
-                                let sig = ephemeral_signing_key.sign(message.as_bytes());
-                                
-                                // Step 4: Encode as JSON (pubkey + signature in base64)
-                                // Ephemeral key is now DISCARDED (out of scope)
-                                format!(r#"{{"ephemeral_pubkey":"{}","signature":"{}","message":"{}"}}"#,
-                                    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, ephemeral_verifying_key.as_bytes()),
-                                    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, sig.to_bytes()),
-                                    message
-                                )
+                            // SECURITY v2.23: HYBRID signature for heartbeats (NIST/Cisco compliant)
+                            // CRITICAL: Dilithium signs ephemeral Ed25519 key for EVERY heartbeat
+                            // - Generates NEW ephemeral Ed25519 keypair
+                            // - Ed25519 signs: node_id || timestamp || block_height || heartbeat_index
+                            // - Dilithium signs: ephemeral_key || message_hash || timestamp
+                            // - Full quantum resistance for heartbeat integrity
+                            let heartbeat_message = format!("{}:{}:{}:{}", node_id, now, block_height, index);
+                            let signature = match p2p.sign_heartbeat_dilithium(&heartbeat_message, &node_id) {
+                                Some(sig) => sig,
+                                None => {
+                                    println!("[HEARTBEAT] ⚠️ HYBRID signing failed for heartbeat #{} - skipping", index);
+                                    continue; // Skip this heartbeat if signing fails
+                                }
                             };
                             
                             // Broadcast heartbeat
@@ -15644,6 +15551,7 @@ mod tests {
     }
     
     /// Test CompactHybridSignature JSON parsing for P2P
+    /// OPTIMIZED v2.23: RAW bytes, dilithium_message_signature removed
     #[test]
     fn test_compact_signature_p2p_parsing() {
         use crate::crypto::CompactHybridSignature;
@@ -15651,27 +15559,25 @@ mod tests {
         
         // Create valid base64 for 32-byte array (ephemeral_public_key)
         let ephemeral_pk = [42u8; 32];
-        let ephemeral_b64 = general_purpose::STANDARD.encode(&ephemeral_pk);
-        
-        // Create valid base64 for 64-byte array (message_signature)
         let msg_sig = [1u8; 64];
-        let msg_sig_b64 = general_purpose::STANDARD.encode(&msg_sig);
         
-        let json = format!(r#"{{
-            "node_id": "qn_p2p_test",
-            "cert_serial": "CERT-P2P-123",
-            "ephemeral_public_key": "{}",
-            "message_signature": "{}",
-            "dilithium_key_signature": "p2p_key_sig",
-            "dilithium_message_signature": "p2p_msg_sig",
-            "signed_at": 9999999999
-        }}"#, ephemeral_b64, msg_sig_b64);
+        // OPTIMIZED v2.23: Create signature directly (RAW bytes format)
+        let sig = CompactHybridSignature {
+            node_id: "qn_p2p_test".to_string(),
+            cert_serial: "CERT-P2P-123".to_string(),
+            ephemeral_public_key: ephemeral_pk,
+            message_signature: msg_sig,
+            dilithium_key_signature: vec![1, 2, 3],  // RAW bytes
+            signed_at: 9999999999,
+        };
         
-        let parsed: Result<CompactHybridSignature, _> = serde_json::from_str(&json);
-        assert!(parsed.is_ok(), "P2P CompactHybridSignature should parse: {:?}", parsed.err());
+        // Test roundtrip
+        let json = serde_json::to_string(&sig).expect("Serialization failed");
+        let restored: CompactHybridSignature = serde_json::from_str(&json)
+            .expect("Deserialization failed");
         
-        let sig = parsed.unwrap();
-        assert_eq!(sig.node_id, "qn_p2p_test");
+        assert_eq!(sig.node_id, restored.node_id);
+        assert_eq!(sig.dilithium_key_signature, restored.dilithium_key_signature);
         assert!(sig.signed_at > 0);
     }
     

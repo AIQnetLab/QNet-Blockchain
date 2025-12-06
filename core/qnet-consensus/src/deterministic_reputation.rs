@@ -13,6 +13,29 @@ use serde::{Deserialize, Serialize};
 use sha3::{Sha3_256, Digest};
 
 // ============================================================================
+// FULL REPUTATION SNAPSHOT (v2.24.0)
+// Contains ALL state needed for perfect synchronization across nodes
+// ============================================================================
+
+/// Complete reputation snapshot for blockchain storage
+/// Includes all state: reputations, jails, bans, offense counts
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FullReputationSnapshot {
+    /// Node reputations (0-100%)
+    pub reputations: HashMap<String, f64>,
+    /// Active jails: node_id -> (end_timestamp, offense_count)
+    pub active_jails: HashMap<String, (u64, u32)>,
+    /// Permanently banned nodes
+    pub permanent_bans: HashSet<String>,
+    /// Offense counts for progressive jail
+    pub offense_counts: HashMap<String, u32>,
+    /// Last passive recovery timestamp per node
+    pub last_passive_recovery: HashMap<String, u64>,
+    /// Processed rotation numbers (prevents double-counting)
+    pub processed_rotations: HashSet<u64>,
+}
+
+// ============================================================================
 // CONSTANTS - Same as Ethereum/Cosmos approach
 // ============================================================================
 
@@ -351,11 +374,16 @@ impl MacroBlockConsensus {
 // ============================================================================
 
 /// Block data needed for reputation calculation
+/// Block data for reputation calculation
+#[derive(Debug, Clone, Default)]
 pub struct BlockData {
     pub height: u64,
     pub producer: String,
     pub timestamp: u64,
     pub is_valid: bool,
+    /// Number of blocks this producer created in current rotation (1-30)
+    /// CRITICAL: Only producers with 30/30 blocks get reward!
+    pub blocks_in_rotation: u32,
 }
 
 /// Macroblock data for reputation calculation  
@@ -459,14 +487,22 @@ impl DeterministicReputationState {
             return;
         }
         
-        // Reward producer for completing rotation
-        if block.is_valid {
+        // Reward producer ONLY if completed FULL rotation (30/30 blocks)
+        // Partial rotation (failover) = NO reward!
+        let full_rotation = block.blocks_in_rotation >= BLOCKS_PER_ROTATION as u32;
+        
+        if block.is_valid && full_rotation {
             let current = self.reputations.get(&block.producer).unwrap_or(&INITIAL_REPUTATION);
             let new_rep = (current + REWARD_FULL_ROTATION).min(MAX_REPUTATION);
             self.reputations.insert(block.producer.clone(), new_rep);
             self.processed_rotations.insert(rotation_number);
-            println!("[REPUTATION] ✅ Producer {} completed rotation #{} → {:.1}%", 
+            println!("[REPUTATION] ✅ Producer {} completed FULL rotation #{} (30/30) → {:.1}%", 
                      block.producer, rotation_number, new_rep);
+        } else if block.is_valid && !full_rotation {
+            // Partial rotation - record but no reward
+            self.processed_rotations.insert(rotation_number);
+            println!("[REPUTATION] ⚠️ Producer {} partial rotation #{} ({}/30) → NO REWARD", 
+                     block.producer, rotation_number, block.blocks_in_rotation);
         }
         
         // Update last_height to highest seen
@@ -624,6 +660,80 @@ impl DeterministicReputationState {
                 (id.clone(), effective_rep)
             })
             .collect()
+    }
+    
+    // =========================================================================
+    // REPUTATION SNAPSHOT (v2.24.0) - Ethereum 2.0 style
+    // Ensures all nodes have IDENTICAL reputation after macroblock
+    // =========================================================================
+    
+    /// Create FULL reputation snapshot for inclusion in macroblock
+    /// Includes: reputations, jails, bans, offense counts
+    /// Returns bincode-serialized FullReputationSnapshot
+    pub fn create_snapshot(&self) -> Vec<u8> {
+        let snapshot = FullReputationSnapshot {
+            reputations: self.reputations.clone(),
+            active_jails: self.active_jails.clone(),
+            permanent_bans: self.permanent_bans.clone(),
+            offense_counts: self.offense_counts.clone(),
+            last_passive_recovery: self.last_passive_recovery.clone(),
+            processed_rotations: self.processed_rotations.clone(),
+        };
+        bincode::serialize(&snapshot).unwrap_or_default()
+    }
+    
+    /// Apply FULL reputation snapshot from macroblock (AUTHORITATIVE)
+    /// This OVERWRITES ALL local state with blockchain-verified values
+    /// Ensures ALL nodes have IDENTICAL reputation state
+    pub fn apply_snapshot(&mut self, snapshot_data: &[u8]) -> Result<usize, String> {
+        if snapshot_data.is_empty() {
+            return Err("Empty snapshot data".to_string());
+        }
+        
+        // Try new full format first
+        if let Ok(full_snapshot) = bincode::deserialize::<FullReputationSnapshot>(snapshot_data) {
+            let count = full_snapshot.reputations.len();
+            
+            // Apply ALL state
+            self.reputations = full_snapshot.reputations;
+            self.active_jails = full_snapshot.active_jails;
+            self.permanent_bans = full_snapshot.permanent_bans;
+            self.offense_counts = full_snapshot.offense_counts;
+            self.last_passive_recovery = full_snapshot.last_passive_recovery;
+            self.processed_rotations = full_snapshot.processed_rotations;
+            
+            println!("[REPUTATION] 📸 Applied FULL snapshot: {} nodes, {} jailed, {} banned", 
+                     count, self.active_jails.len(), self.permanent_bans.len());
+            
+            return Ok(count);
+        }
+        
+        // Fallback: Legacy format (just reputations)
+        let snapshot: HashMap<String, f64> = bincode::deserialize(snapshot_data)
+            .map_err(|e| format!("Failed to deserialize snapshot: {}", e))?;
+        
+        let count = snapshot.len();
+        
+        // CRITICAL: Replace ALL reputations with snapshot values
+        // This is the Ethereum 2.0 approach - blockchain is authoritative
+        for (node_id, reputation) in snapshot {
+            self.reputations.insert(node_id, reputation);
+        }
+        
+        println!("[REPUTATION] 📸 Applied snapshot: {} nodes synced from macroblock", count);
+        
+        Ok(count)
+    }
+    
+    /// Force set reputation for a specific node (used by snapshot application)
+    pub fn set_reputation(&mut self, node_id: &str, reputation: f64) {
+        let clamped = reputation.clamp(0.0, MAX_REPUTATION);
+        self.reputations.insert(node_id.to_string(), clamped);
+    }
+    
+    /// Get raw reputation map for snapshot creation
+    pub fn get_reputations_raw(&self) -> &HashMap<String, f64> {
+        &self.reputations
     }
     
     /// Get consensus-eligible nodes (reputation >= 70%)

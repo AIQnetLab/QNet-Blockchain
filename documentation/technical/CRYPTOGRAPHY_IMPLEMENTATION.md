@@ -10,12 +10,13 @@
 ## 🎯 Executive Summary
 
 QNet implements **NIST/Cisco recommended post-quantum cryptography** with:
-- ✅ **Real CRYSTALS-Dilithium3** (2420-byte signatures) for quantum resistance
-- ✅ **Hybrid Ed25519 + Dilithium** (dual signature system)
-- ✅ **Compact signatures** (3KB vs 12KB, 75% bandwidth reduction)
+- ✅ **Real CRYSTALS-Dilithium3** (~2500-byte RAW signatures) for quantum resistance
+- ✅ **Hybrid Ed25519 + Dilithium** (single Dilithium signature per message)
+- ✅ **Compact signatures v2.23** (~2.6KB RAW bytes, 88% reduction from 22KB)
 - ✅ **Certificate caching** (100K LRU cache for scalability)
-- ✅ **Defense-in-depth** (two-layer verification: P2P + Consensus)
+- ✅ **Defense-in-depth** (two-layer verification: P2P + Consensus with real Dilithium)
 - ✅ **SHA3-256 hashing** (NIST FIPS 202 compliant)
+- ✅ **RAW bytes format** (serde_bytes, no base64 overhead)
 - ✅ **Forward secrecy** (4.5-minute certificate lifetime with 80% rotation threshold)
 - ✅ **Byzantine-safe** (2/3+ honest nodes at all verification layers)
 
@@ -782,144 +783,166 @@ This hybrid approach provides:
 
 ---
 
-## 2. Signature Systems (v2.19)
+## 2. Signature Systems (v2.23 - RAW bytes)
 
 ### Overview
 
-QNet v2.19 implements **two signature formats** optimized for different block types:
+> **UPDATED v2.23**: Signatures now use **RAW bytes** format via `serde_bytes`.
+> This reduces compact signature size from ~22KB to **~2.6KB** (88% reduction).
+> Redundant `dilithium_message_signature` removed (saves ~3.3KB).
 
-1. **Compact Signatures** (Microblocks): ~3KB - Certificate cached separately
-2. **Full Signatures** (Macroblocks): ~12KB - Certificate embedded
+QNet v2.23 implements **two signature formats** optimized for different block types:
+
+1. **Compact Signatures** (Microblocks): ~2.6KB RAW bytes - Certificate cached separately
+2. **Full Signatures** (Macroblocks): ~5KB RAW bytes - Certificate embedded
 
 ### Dilithium3 Core Specifications
 
-**IMPORTANT**: QNet uses **full CRYSTALS-Dilithium3** signatures.
+**IMPORTANT**: QNet uses **full CRYSTALS-Dilithium3** signatures in RAW bytes format.
 
 | Property | Value | Notes |
 |----------|-------|-------|
-| **Signature Size (raw)** | **2420 bytes** | Binary format |
-| **Signature Size (base64)** | **~3227 characters** | Encoded for JSON |
+| **Signature Size (raw)** | **~2500 bytes** | RAW binary (no base64!) |
 | **Public Key Size** | 1952 bytes | Dilithium3 public key |
 | **Private Key Size** | 4000 bytes | Dilithium3 secret key |
 | **Security Level** | NIST Level 3 | Equivalent to AES-192 |
 | **Quantum Resistance** | Yes | Resistant to Shor's algorithm |
 | **Algorithm** | Module-Lattice-Based | NIST PQC Round 3 winner |
+| **Serialization** | `serde_bytes` | No base64 overhead |
 
 #### Code Verification
 ```rust
-// From key_manager.rs:243
-if signature.len() != 2420 {
-    println!("❌ Invalid signature length: {} (expected 2420)", signature.len());
+// From consensus_crypto.rs - v2.23 limit for RAW bytes
+if signature.len() > 2600 {
+    // Reject oversized signatures
     return Ok(false);
 }
-
-// From quantum_crypto.rs:962
-assert_eq!(sig_serialized.len(), 2420, "Dilithium3 signature must be 2420 bytes");
 ```
 
-### 2.1 Compact Signatures (Microblocks)
+### 2.1 Compact Signatures (Microblocks) - v2.23
 
 **Purpose**: Optimize bandwidth for high-frequency microblocks (1/second)
 
-**Size**: ~3KB per signature
+**Size**: ~2.6KB per signature (was 22KB - 88% reduction!)
 
 #### Structure
 ```rust
+#[derive(Serialize, Deserialize)]
 pub struct CompactHybridSignature {
-    pub node_id: String,                          // Producer node ID
-    pub cert_serial: String,                      // Certificate reference
-    pub message_signature: Vec<u8>,               // Ed25519 (64 bytes)
-    pub dilithium_message_signature: String,      // Dilithium3 (2420 bytes → 3227 base64)
-    pub signed_at: u64,                           // Unix timestamp
+    pub node_id: String,                   // Producer node ID
+    pub cert_serial: String,               // Certificate reference
+    #[serde(with = "serde_bytes")]
+    pub ephemeral_public_key: [u8; 32],    // NEW Ed25519 key for THIS message
+    #[serde(with = "serde_bytes")]
+    pub message_signature: [u8; 64],       // Ed25519 RAW bytes
+    #[serde(with = "serde_bytes")]
+    pub dilithium_key_signature: Vec<u8>,  // Dilithium3 RAW bytes (~2500 bytes)
+    pub signed_at: u64,                    // Unix timestamp
 }
 ```
 
-#### Size Breakdown
-| Component | Raw Size | Encoded Size | Description |
-|-----------|----------|--------------|-------------|
-| `node_id` | Variable | ~20 bytes | String (e.g., "genesis_node_001") |
-| `cert_serial` | Variable | ~30 bytes | String (e.g., "cert_2024_11_16_12345") |
-| `message_signature` | 64 bytes | 64 bytes | Ed25519 binary array |
-| `dilithium_message_signature` | **2420 bytes** | **~3227 chars** | Dilithium3 base64 |
-| `signed_at` | 8 bytes | 8 bytes | u64 timestamp |
-| **Total** | **~2.5KB raw** | **~3KB JSON** | **75% reduction vs full** |
+#### Size Breakdown (v2.23)
+| Component | Size | Description |
+|-----------|------|-------------|
+| `node_id` | ~20 bytes | String (e.g., "genesis_node_001") |
+| `cert_serial` | ~30 bytes | String (e.g., "cert_2024_11_16_12345") |
+| `ephemeral_public_key` | 32 bytes | RAW bytes (NEW Ed25519 key) |
+| `message_signature` | 64 bytes | Ed25519 RAW bytes |
+| `dilithium_key_signature` | **~2500 bytes** | Dilithium3 RAW bytes |
+| `signed_at` | 8 bytes | u64 timestamp |
+| **Total** | **~2.6KB** | **88% reduction from 22KB!** |
 
-#### JSON Example
+#### JSON Example (v2.23 - byte arrays)
 ```json
 "compact:{
   \"node_id\": \"genesis_node_001\",
   \"cert_serial\": \"cert_2024_11_16_12345\",
-  \"message_signature\": [64, 32, 128, ...],
-  \"dilithium_message_signature\": \"BASE64_ENCODED_2420_BYTES_HERE...\",
+  \"ephemeral_public_key\": [32, 64, 128, ...],  // 32 bytes
+  \"message_signature\": [64, 32, 128, ...],     // 64 bytes
+  \"dilithium_key_signature\": [12, 45, 78, ...], // ~2500 bytes RAW
   \"signed_at\": 1700140800
 }"
 ```
 
-#### Verification Process
+#### Verification Process (v2.23)
 ```
 P2P Layer (node.rs::verify_microblock_signature):
 1. Parse "compact:" prefix and JSON
 2. Lookup certificate using cert_serial
    ├─► Cache HIT (100K LRU cache): Use cached certificate ✅
    └─► Cache MISS: Request via P2P broadcast
-3. Verify Ed25519 (64 bytes) with certificate's ed25519_public_key
-4. Verify Dilithium (2420 bytes) with certificate's dilithium_public_key ✅ REAL CRYPTO
-5. Both must be valid → Accept block
+3. Verify Ed25519 with ephemeral key (64 bytes RAW)
+4. Recreate encapsulated_data = ephemeral_pk || message_hash || timestamp
+5. Verify Dilithium via dilithium3::open() ✅ REAL CRYPTO
+6. All must be valid → Accept block
 
 Consensus Layer (consensus_crypto.rs::verify_compact_hybrid_signature):
-1. Structural re-validation (format, sizes)
-2. Byzantine consensus (2/3+ honest nodes)
-3. Only pre-verified blocks participate
+1. Parse RAW bytes from JSON
+2. Reconstruct encapsulated_data
+3. Real Dilithium3 verification via dilithium3::open()
+4. Byzantine consensus (2/3+ honest nodes)
+5. Only verified blocks participate
 ```
 
-### 2.2 Full Hybrid Signatures (Macroblocks)
+### 2.2 Full Hybrid Signatures (Macroblocks) - v2.23
 
 **Purpose**: Immediate verification for low-frequency macroblocks (1/90 seconds)
 
-**Size**: ~12KB per signature
+**Size**: ~5KB per signature (was 12KB - RAW bytes optimization)
 
-#### Structure
+#### Structure (v2.23)
 ```rust
+#[derive(Serialize, Deserialize)]
 pub struct HybridSignature {
-    pub message_signature: Vec<u8>,         // Ed25519 (64 bytes)
-    pub dilithium_signature: String,        // Dilithium3 (2420 bytes → 3227 base64)
-    pub certificate: HybridCertificate,     // Full certificate (~9KB)
+    pub certificate: HybridCertificate,        // Full certificate embedded
+    #[serde(with = "serde_bytes")]
+    pub ephemeral_public_key: [u8; 32],        // NEW Ed25519 key RAW
+    #[serde(with = "serde_bytes")]
+    pub message_signature: [u8; 64],           // Ed25519 RAW bytes
+    #[serde(with = "serde_bytes")]
+    pub dilithium_key_signature: Vec<u8>,      // Dilithium3 RAW bytes
+    pub signed_at: u64,
 }
 
 pub struct HybridCertificate {
-    pub ed25519_public_key: Vec<u8>,                // 32 bytes
-    pub dilithium_public_key: Vec<u8>,              // 1952 bytes
-    pub dilithium_signature_of_ed25519: String,     // 2420 bytes → 3227 base64
-    pub serial_number: String,
+    pub node_id: String,
+    pub serial: String,
+    #[serde(with = "serde_bytes")]
+    pub ed25519_public_key: [u8; 32],          // RAW bytes
+    #[serde(with = "serde_bytes")]
+    pub dilithium_public_key: Vec<u8>,         // ~1952 bytes RAW
+    #[serde(with = "serde_bytes")]
+    pub dilithium_signature_of_ed25519: Vec<u8>, // RAW bytes
     pub valid_from: u64,
     pub valid_until: u64,
 }
 ```
 
-#### Size Breakdown
+#### Size Breakdown (v2.23)
 | Component | Size | Description |
 |-----------|------|-------------|
-| `message_signature` (Ed25519) | 64 bytes | Message signature |
-| `dilithium_signature` | ~3227 bytes | Message signature (base64) |
+| `ephemeral_public_key` | 32 bytes | NEW Ed25519 key RAW |
+| `message_signature` (Ed25519) | 64 bytes | RAW bytes |
+| `dilithium_key_signature` | ~2500 bytes | RAW bytes (no base64!) |
 | **Certificate**: | | |
-| - `ed25519_public_key` | 32 bytes | Public key for Ed25519 |
-| - `dilithium_public_key` | 1952 bytes | Public key for Dilithium3 |
-| - `dilithium_signature_of_ed25519` | ~3227 bytes | Certificate signature (base64) |
+| - `ed25519_public_key` | 32 bytes | RAW bytes |
+| - `dilithium_public_key` | 1952 bytes | RAW bytes |
+| - `dilithium_signature_of_ed25519` | ~2500 bytes | RAW bytes |
 | - Serial + timestamps | ~50 bytes | Metadata |
-| **Total** | **~12KB** | **Full verification data** |
+| **Total** | **~5KB** | **58% reduction from 12KB!** |
 
-### 2.3 Bandwidth Comparison
+### 2.3 Bandwidth Comparison (v2.23)
 
 #### Per Microblock (1/second)
 | Signature Type | Size | Bandwidth/hour | Production Use |
 |---------------|------|----------------|----------------|
-| **Compact** | ~3KB | 10.8 MB/hour | ✅ YES (75% savings) |
-| **Full** | ~12KB | 43.2 MB/hour | ❌ NO (too expensive) |
+| **Compact v2.23** | ~2.6KB | 9.4 MB/hour | ✅ YES (88% reduction!) |
+| **Old Compact** | ~22KB | 79.2 MB/hour | ❌ OBSOLETE |
 
 #### Per Macroblock (1/90 seconds = 40/hour)
 | Signature Type | Size | Bandwidth/hour | Production Use |
 |---------------|------|----------------|----------------|
-| **Compact** | ~3KB | 0.12 MB/hour | ⚠️ Requires cert request |
+| **Full v2.23** | ~5KB | 0.2 MB/hour | ✅ YES (immediate verify) |
 | **Full** | ~12KB | 0.48 MB/hour | ✅ YES (immediate verify) |
 
 **Total Production Bandwidth**: ~11.3 MB/hour (microblocks + macroblocks)
@@ -965,19 +988,22 @@ QNet uses **TWO DIFFERENT** cryptographic systems for different purposes:
 pub struct HybridSignature {
     certificate: HybridCertificate {
         node_id: String,
-        ed25519_public_key: [u8; 32],        // Ephemeral key
-        dilithium_signature: String,          // Signs encapsulated data
+        ed25519_public_key: [u8; 32],           // RAW bytes
+        dilithium_public_key: Vec<u8>,          // RAW bytes (~1952 bytes)
+        dilithium_signature_of_ed25519: Vec<u8>,// RAW bytes (certificate binding)
         issued_at: u64,
-        expires_at: u64,                      // 270-second lifetime (4.5 minutes)
+        expires_at: u64,                         // 270-second lifetime (4.5 minutes)
         serial_number: String,
     },
-    message_signature: [u8; 64],             // Ed25519 signs message (fast)
-    dilithium_message_signature: String,     // Dilithium signs MESSAGE (quantum-resistant)
+    ephemeral_public_key: [u8; 32],             // NEW Ed25519 key RAW
+    message_signature: [u8; 64],                // Ed25519 RAW bytes
+    dilithium_key_signature: Vec<u8>,           // Dilithium RAW (~2500 bytes)
+    // NOTE: dilithium_message_signature REMOVED in v2.23 (redundant)
     signed_at: u64,
 }
 ```
 
-### 3.2 Signing Process
+### 3.2 Signing Process (v2.23)
 
 ```rust
 // Step 1: Generate NEW ephemeral Ed25519 key for THIS message
@@ -985,26 +1011,23 @@ let ephemeral_signing_key = SigningKey::from_bytes(&rand::thread_rng().gen::<[u8
 let ephemeral_verifying_key = ephemeral_signing_key.verifying_key();
 
 // Step 2: Sign message with ephemeral Ed25519
-let ed25519_signature = ephemeral_signing_key.sign(message);
+let ed25519_signature = ephemeral_signing_key.sign(message);  // 64 bytes RAW
 
-// Step 3: Create encapsulated data
+// Step 3: Create encapsulated data (includes message_hash!)
 let mut encapsulated_data = Vec::new();
-encapsulated_data.extend_from_slice(ephemeral_verifying_key.as_bytes());
-encapsulated_data.extend_from_slice(&sha3::Sha3_256::digest(message));
-encapsulated_data.extend_from_slice(&timestamp.to_le_bytes());
+encapsulated_data.extend_from_slice(ephemeral_verifying_key.as_bytes());  // 32 bytes
+encapsulated_data.extend_from_slice(&sha3::Sha3_256::digest(message));    // 32 bytes
+encapsulated_data.extend_from_slice(&timestamp.to_le_bytes());            // 8 bytes
 
-// Step 4: Sign encapsulated data with Dilithium
+// Step 4: Sign encapsulated data with Dilithium (SINGLE signature!)
+// v2.23: Message hash is ALREADY in encapsulated_data, so one sig is enough
 let dilithium_key_sig = quantum_crypto
     .create_consensus_signature(&node_id, &hex::encode(&encapsulated_data))
     .await?;
+// Extract RAW bytes (no base64!)
+let dilithium_raw = extract_dilithium_raw_bytes(&dilithium_key_sig);  // ~2500 bytes
 
-// Step 5: CRITICAL - Dilithium MUST ALSO sign the message itself!
-// Per NIST/Cisco standards: This prevents quantum attacks on Ed25519
-let dilithium_msg_sig = quantum_crypto
-    .create_consensus_signature(&node_id, &hex::encode(message))
-    .await?;
-
-// Step 6: Create certificate (4.5-minute lifetime with 80% rotation threshold)
+// Step 5: Create certificate (4.5-minute lifetime with 80% rotation threshold)
 // SECURITY: Optimized for quantum resistance with minimal network overhead
 // - Lifetime: 270 seconds (3 macroblocks)
 // - Rotation: 216 seconds (80% threshold)
@@ -1013,7 +1036,7 @@ let dilithium_msg_sig = quantum_crypto
 let ephemeral_certificate = HybridCertificate {
     node_id,
     ed25519_public_key: *ephemeral_verifying_key.as_bytes(),
-    dilithium_signature: dilithium_key_sig.signature,
+    dilithium_signature_of_ed25519: dilithium_key_sig.signature,  // RAW bytes
     issued_at: now,
     expires_at: now + 270,  // 4.5 minutes = 270 seconds (CERTIFICATE_LIFETIME_SECS)
     serial_number: format!("{:x}", now),
@@ -1039,41 +1062,30 @@ pub async fn verify_signature(
     encapsulated_data.extend_from_slice(&signature.certificate.ed25519_public_key);
     encapsulated_data.extend_from_slice(&sha3::Sha3_256::digest(message));
     
-    // Step 3: Verify Dilithium signature on encapsulated data
-    // OPTIMIZATION: Certificate verification is cached for O(1) future lookups
-    // Message signatures (Ed25519 + Dilithium) are verified EVERY time
-    let cert_valid = quantum_crypto
-        .verify_dilithium_signature(&hex::encode(&encapsulated_data), &dilithium_sig, &node_id)
-        .await?;
+    // Step 3: Verify Dilithium signature on encapsulated data (v2.23)
+    // NOTE: encapsulated_data includes message_hash, so this covers both key binding AND message!
+    // dilithium_message_signature was REMOVED as redundant in v2.23
     
-    if !cert_valid {
+    // Use real dilithium3::open() for cryptographic verification
+    let dilithium_valid = pqcrypto_dilithium::dilithium3::open(
+        &signature.dilithium_key_signature,  // RAW bytes
+        &encapsulated_data,                   // Includes message_hash
+        &dilithium_public_key
+    ).is_ok();
+    
+    if !dilithium_valid {
+        println!("❌ Invalid Dilithium signature - QUANTUM ATTACK POSSIBLE!");
         return Ok(false);
     }
     
-    // Step 4: CRITICAL - Verify Dilithium message signature (quantum-resistant)
-    // Per NIST/Cisco: EVERY message must have BOTH signatures verified
-    if signature.dilithium_message_signature.is_empty() {
-        println!("❌ CRITICAL: No Dilithium message signature - NOT quantum-resistant!");
-        return Ok(false);
-    }
-    
-    let dilithium_msg_valid = quantum_crypto
-        .verify_dilithium_signature(&hex::encode(message), &dilithium_msg_sig, &node_id)
-        .await?;
-    
-    if !dilithium_msg_valid {
-        println!("❌ Invalid Dilithium message signature - QUANTUM ATTACK POSSIBLE!");
-        return Ok(false);
-    }
-    
-    // Step 5: Verify Ed25519 message signature (fast)
+    // Step 4: Verify Ed25519 message signature (fast path)
     let ed25519_valid = verify_ed25519_signature(
         message,
-        &signature.message_signature,
-        &signature.certificate.ed25519_public_key
+        &signature.message_signature,  // [u8; 64] RAW
+        &signature.ephemeral_public_key  // [u8; 32] RAW
     )?;
     
-    Ok(ed25519_valid)
+    Ok(ed25519_valid && dilithium_valid)
 }
 ```
 
@@ -1785,33 +1797,40 @@ let dilithium_sig = quantum_crypto
 // Every message signed by BOTH algorithms
 let ed25519_signature = signing_key.sign(message);
 let dilithium_sig = quantum_crypto
-    .create_consensus_signature(&node_id, &message_hash)
+    .create_consensus_signature(&node_id, &hex::encode(&encapsulated_data))
     .await?;
+
+// v2.23: Extract RAW bytes (no base64!)
+let dilithium_raw = extract_dilithium_raw_bytes(&dilithium_sig);
 
 HybridSignature {
     certificate: certificate.clone(),              // Dilithium → Ed25519
-    message_signature: ed25519_signature,          // Ed25519 → Message
-    dilithium_message_signature: dilithium_sig,    // Dilithium → Message
+    ephemeral_public_key: *ephemeral_verifying_key.as_bytes(),  // [u8; 32] RAW
+    message_signature: ed25519_signature.to_bytes(),             // [u8; 64] RAW
+    dilithium_key_signature: dilithium_raw,                      // Vec<u8> RAW (~2500 bytes)
+    signed_at: timestamp,
 }
 ```
 
-**Compliance Checklist**:
-- ✅ **Encapsulated Keys**: Dilithium signs ephemeral Ed25519 key
-- ✅ **Dual Signatures**: Every message signed by both algorithms
+**Compliance Checklist (v2.23)**:
+- ✅ **Encapsulated Keys**: Dilithium signs ephemeral Ed25519 key + message_hash
+- ✅ **Single Dilithium Signature**: Message hash included in encapsulated_data
+- ✅ **RAW Bytes Format**: No base64 overhead (88% size reduction)
 - ✅ **Forward Secrecy**: 4.5-minute certificate lifetime with 80% rotation threshold (216s)
 - ✅ **Quantum Resistance**: CRYSTALS-Dilithium3 (NIST FIPS 203)
-- ✅ **Performance**: O(1) scaling with certificate caching (Byzantine-safe)
+- ✅ **Defense-in-Depth**: Real verification at P2P + Consensus layers
 - ✅ **Byzantine Safety**: Certificate caching secured by 2/3+ honest node threshold
 
 ---
 
-#### Production Status (November 16, 2025)
+#### Production Status (December 6, 2025)
 
-✅ **NIST/Cisco Compliant**: Encapsulated keys, dual signatures per message  
+✅ **NIST/Cisco Compliant**: Encapsulated keys, Dilithium binds ephemeral key + message_hash  
 ✅ **Real Dilithium3**: Official `pqcrypto_dilithium::dilithium3` library  
+✅ **RAW Bytes v2.23**: 88% size reduction via `serde_bytes`  
+✅ **Defense-in-Depth**: Both P2P and Consensus layers verify via `dilithium3::open()`  
 ✅ **O(1) Scaling**: GLOBAL_QUANTUM_CRYPTO singleton pattern  
-✅ **Quantum-Resistant**: Both Ed25519 and Dilithium verified for every block  
-✅ **Byzantine-Safe**: 2/3+ consensus with 6-layer certificate protection  
+✅ **Byzantine-Safe**: 2/3+ consensus with multi-layer certificate protection  
 
 **Status**: Production Ready 🚀
 

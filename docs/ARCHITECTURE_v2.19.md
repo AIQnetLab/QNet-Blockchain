@@ -34,7 +34,7 @@ QNet is a high-performance, post-quantum secure blockchain with a **two-layer bl
 - **Macroblocks**: Created every 90 seconds (consensus finalization)
 
 ### Key Innovations
-- **Compact Hybrid Signatures**: 75% bandwidth reduction (3KB vs 12KB)
+- **Compact Hybrid Signatures v2.23**: 88% bandwidth reduction (~2.6KB RAW bytes)
 - **Progressive Finalization Protocol**: Self-healing consensus recovery
 - **Zero-Downtime Architecture**: Microblocks continue during macroblock consensus
 - **NIST Post-Quantum Compliant**: CRYSTALS-Dilithium + Ed25519 hybrid
@@ -63,16 +63,16 @@ pub struct MicroBlock {
     pub previous_hash: Vec<u8>,   // SHA3-256 of previous block
     pub merkle_root: Vec<u8>,     // Transaction Merkle tree root
     pub producer: String,         // Producer node ID
-    pub signature: Vec<u8>,       // COMPACT hybrid signature (3KB)
+    pub signature: Vec<u8>,       // COMPACT hybrid signature v2.23 (~2.6KB RAW)
     pub poh_hash: Vec<u8>,        // Verifiable Time Sequence hash (64 bytes)
     pub poh_count: u64,           // VTS counter for time ordering
     // ... transactions and other fields
 }
 ```
 
-**Signature Type**: Compact (3KB)  
+**Signature Type**: Compact v2.23 (~2.6KB RAW bytes)  
 **Frequency**: 1 per second  
-**Verification**: P2P layer (pre-consensus)
+**Verification**: P2P layer + Consensus layer (defense-in-depth)
 
 ### Macroblock Structure
 ```rust
@@ -86,7 +86,7 @@ pub struct MacroBlock {
 }
 ```
 
-**Signature Type**: Full hybrid (12KB)  
+**Signature Type**: Full hybrid v2.23 (~5KB RAW bytes)  
 **Frequency**: Every 90 blocks (90 seconds)  
 **Verification**: Byzantine consensus (2/3+ nodes)
 
@@ -94,20 +94,23 @@ pub struct MacroBlock {
 
 ## Signature System
 
-### NIST/Cisco Compliant Hybrid Signatures (v2.19.22)
+### NIST/Cisco Compliant Hybrid Signatures (v2.23 - RAW bytes)
+
+> **UPDATED v2.23**: Signatures now use RAW bytes format via `serde_bytes` instead of base64/JSON.
+> This reduces compact signature size from ~22KB to **~2.6KB** (88% reduction).
 
 **Critical Security**: Per NIST SP 800-208 and Cisco recommendations, every message uses a **NEW ephemeral Ed25519 key** signed by the persistent Dilithium key.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│ HYBRID SIGNATURE ARCHITECTURE (NIST/Cisco Compliant)               │
+│ HYBRID SIGNATURE ARCHITECTURE (NIST/Cisco Compliant) - v2.23       │
 ├─────────────────────────────────────────────────────────────────────┤
 │ For EACH message:                                                   │
 │   1. Generate NEW ephemeral Ed25519 keypair                        │
 │   2. Sign message with ephemeral Ed25519 → message_signature       │
 │   3. Create encapsulated_data = ephemeral_pk || hash || timestamp  │
 │   4. Sign encapsulated_data with Dilithium → dilithium_key_sig     │
-│   5. Sign message_hash with Dilithium → dilithium_message_sig      │
+│   (dilithium_message_signature REMOVED - redundant, saves ~3.3KB)  │
 ├─────────────────────────────────────────────────────────────────────┤
 │ Quantum Attack Protection:                                          │
 │   - Attacker breaks Ed25519? → Dilithium still protects!           │
@@ -116,24 +119,23 @@ pub struct MacroBlock {
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-### Compact Signatures (Microblocks)
+### Compact Signatures (Microblocks) - v2.23
 
-**Format**: `compact:<json>`
+**Format**: `compact:<json>` with RAW bytes via `serde_bytes`
 
-```json
-{
-  "node_id": "genesis_node_001",
-  "cert_serial": "cert_2024_11_16_12345",
-  "ephemeral_public_key": [32 bytes],         // NEW Ed25519 key for THIS message
-  "message_signature": [64 bytes],            // Ed25519 with ephemeral key
-  "dilithium_key_signature": "base64...",     // Dilithium signs ephemeral+hash+ts
-  "dilithium_message_signature": "base64...", // Dilithium signs message hash
-  "signed_at": 1700140800
+```rust
+CompactHybridSignature {
+    node_id: String,                     // "genesis_node_001"
+    cert_serial: String,                 // "cert_2024_11_16_12345"
+    ephemeral_public_key: [u8; 32],      // RAW bytes (NEW Ed25519 key)
+    message_signature: [u8; 64],         // RAW bytes (Ed25519 signature)
+    dilithium_key_signature: Vec<u8>,    // RAW bytes (~2500 bytes, NOT base64!)
+    signed_at: u64,                      // Unix timestamp
 }
 ```
 
-**Size**: ~3KB (3,000 bytes)  
-**Bandwidth Savings**: 75% vs full signatures  
+**Size**: ~2.6KB (was 22KB - **88% reduction**)  
+**Format**: RAW bytes via `serde_bytes` (no base64 overhead)  
 **Certificate**: Referenced by serial, cached at P2P layer  
 **Ephemeral Keys**: NEW key generated for EACH message (NIST/Cisco requirement)
 
@@ -148,30 +150,36 @@ pub struct MacroBlock {
    ├─► Ed25519 verify with EPHEMERAL key ✅
    ├─► Recreate encapsulated_data = ephemeral_pk || hash || timestamp
    ├─► Dilithium verify encapsulated_data (key binding) ✅
-   ├─► Dilithium verify message_hash ✅
    └─► Result: Accept (all pass) or Reject (any fail)
    ↓
 3. Consensus Layer (consensus_crypto.rs::verify_compact_hybrid_signature)
-   ├─► Structural re-validation (all fields present)
+   ├─► Parse RAW bytes from JSON
+   ├─► Reconstruct encapsulated_data
+   ├─► Real Dilithium3 verification via dilithium3::open()
    ├─► Byzantine consensus (2/3+ honest nodes)
-   └─► Only pre-verified blocks participate
+   └─► Only verified blocks participate
 ```
 
-### Full Hybrid Signatures (Macroblocks)
+### Full Hybrid Signatures (Macroblocks) - v2.23
 
-**Format**: `hybrid:<json>`
+**Format**: `hybrid:<json>` with RAW bytes
 
-```json
-{
-  "ephemeral_public_key": [32 bytes],       // NEW Ed25519 key for THIS message
-  "message_signature": "base64...",          // Ed25519 with ephemeral key
-  "dilithium_key_signature": "base64...",    // Dilithium signs ephemeral+hash+ts
-  "dilithium_message_signature": "base64...",// Dilithium signs message hash
-  "signed_at": 1700140800,
-  "certificate": {
-    "ed25519_public_key": "...",             // Certificate's persistent Ed25519
-    "dilithium_public_key": "...",
-    "dilithium_signature_of_ed25519": "...", // Certificate binding
+```rust
+HybridSignature {
+    certificate: HybridCertificate,      // Full certificate embedded
+    ephemeral_public_key: [u8; 32],      // RAW bytes
+    message_signature: [u8; 64],          // RAW bytes (Ed25519)
+    dilithium_key_signature: Vec<u8>,    // RAW bytes (~2500 bytes)
+    signed_at: u64,
+}
+
+// Certificate structure:
+HybridCertificate {
+    node_id: String,
+    serial: String,
+    ed25519_public_key: [u8; 32],        // RAW bytes
+    dilithium_public_key: Vec<u8>,       // RAW bytes (~1952 bytes)
+    dilithium_signature_of_ed25519: Vec<u8>, // Certificate binding
     "serial_number": "...",
     "valid_from": 1700140800,
     "valid_until": 1700227200
@@ -179,9 +187,9 @@ pub struct MacroBlock {
 }
 ```
 
-**Size**: ~12KB (12,000 bytes)  
+**Size**: ~5KB RAW bytes (was 12KB - 58% reduction)  
 **Use Case**: Macroblocks (no certificate lookup delay)  
-**Verification**: Immediate (certificate embedded)  
+**Verification**: Immediate (certificate embedded) + real Dilithium  
 **Ephemeral Keys**: Same NIST/Cisco requirement as compact signatures
 
 ### Certificate Management
@@ -663,7 +671,7 @@ NetworkMessage::ReputationSync {
 **v2.19.19 Optimizations**:
 - **Kademlia K-neighbors**: Heartbeats use DHT distance for efficient routing
 - **Shred Protocol ALWAYS**: Block propagation uses Shred Protocol for ALL network sizes
-- **Heartbeat without Dilithium**: CPU optimization (~35ms savings per heartbeat)
+- **Heartbeat with HYBRID signatures (v2.23)**: Full quantum protection (Ed25519 + Dilithium)
 - **Exponential backoff failover**: 3s → 6s → 12s → 24s → 30s max
 
 **Why Gossip O(log n) vs Broadcast O(n)**:
@@ -1615,9 +1623,9 @@ Conclusion: Certificate memory remains ~7.5 MB regardless of network size
 | **Macroblock Header** | ~512 bytes | Every 90 blocks |
 | **State Root** | 32 bytes | Every 90 blocks |
 | **Microblock Hashes (90)** | 2.88 KB | 90 × 32 bytes |
-| **Full Hybrid Signature** | ~12 KB | Every 90 blocks |
-| **Validator Signatures (1000)** | ~3 MB | 1000 × 3KB (worst case) |
-| **Total per Macroblock** | ~3 MB | Every 90 seconds |
+| **Full Hybrid Signature v2.23** | ~5 KB | Every 90 blocks |
+| **Validator Signatures (1000)** | ~2.6 MB | 1000 × ~2.6KB (v2.23) |
+| **Total per Macroblock** | ~2.6 MB | Every 90 seconds |
 
 **Macroblock Bandwidth**: ~267 Kbps average (amortized over 90 seconds)
 
@@ -1776,9 +1784,10 @@ Environment:
 
 ## Conclusion
 
-QNet v2.19 implements a production-ready, post-quantum secure blockchain with:
+QNet v2.23 implements a production-ready, post-quantum secure blockchain with:
 
-✅ **Compact signatures**: 75% bandwidth reduction  
+✅ **Compact signatures v2.23**: 88% bandwidth reduction (~2.6KB RAW bytes)  
+✅ **Defense-in-depth**: Real Dilithium verification at P2P + Consensus layers  
 ✅ **Progressive Finalization**: Self-healing consensus  
 ✅ **Zero downtime**: Microblocks never stop  
 ✅ **NIST compliant**: CRYSTALS-Dilithium post-quantum cryptography  

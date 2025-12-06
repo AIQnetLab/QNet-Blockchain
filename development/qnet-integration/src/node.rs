@@ -2063,11 +2063,25 @@ impl BlockchainNode {
                     for height in (30..=current_height).step_by(30) {
                         if let Ok(Some(block_data)) = blockchain.storage.load_microblock(height) {
                             if let Ok(microblock) = bincode::deserialize::<qnet_state::MicroBlock>(&block_data) {
+                                // Count blocks by this producer in this rotation
+                                let rotation_start = height.saturating_sub(29);
+                                let mut blocks_by_producer = 0u32;
+                                for h in rotation_start..=height {
+                                    if let Ok(Some(b)) = blockchain.storage.load_microblock(h) {
+                                        if let Ok(mb) = bincode::deserialize::<qnet_state::MicroBlock>(&b) {
+                                            if mb.producer == microblock.producer {
+                                                blocks_by_producer += 1;
+                                            }
+                                        }
+                                    }
+                                }
+                                
                                 let block_data = BlockData {
                                     height,
                                     producer: microblock.producer.clone(),
                                     timestamp: microblock.timestamp,
                                     is_valid: true,
+                                    blocks_in_rotation: blocks_by_producer,
                                 };
                                 rep_state.process_block(&block_data);
                                 blocks_processed += 1;
@@ -2130,11 +2144,23 @@ impl BlockchainNode {
                                 consensus: macro_consensus,
                             };
                             
-                            rep_state.process_macroblock(&macro_data, macroblock.timestamp);
+                            // v2.24: Apply reputation snapshot if present (Ethereum 2.0 style)
+                            if let Some(ref snapshot_data) = macroblock.consensus_data.reputation_snapshot {
+                                if !snapshot_data.is_empty() {
+                                    if let Ok(count) = rep_state.apply_snapshot(snapshot_data) {
+                                        println!("[REPUTATION-REPLAY] 📸 Applied snapshot from macroblock #{}: {} nodes", 
+                                                 macroblock_index, count);
+                                    }
+                                } else {
+                                    rep_state.process_macroblock(&macro_data, macroblock.timestamp);
+                                }
+                            } else {
+                                rep_state.process_macroblock(&macro_data, macroblock.timestamp);
+                            }
                             macroblocks_processed += 1;
                         }
                     }
-                    
+
                     let elapsed = start_time.elapsed();
                     println!("[REPUTATION] ✅ Replay complete: {} rotation blocks, {} macroblocks in {:?}",
                              blocks_processed, macroblocks_processed, elapsed);
@@ -3083,7 +3109,28 @@ impl BlockchainNode {
                                 // 4. Update deterministic reputation state (in-memory)
                                 {
                                     if let Ok(mut rep_state) = deterministic_reputation.write() {
-                                        rep_state.process_macroblock(&macro_data, macroblock.timestamp);
+                                        // v2.24: Apply reputation snapshot if present (Ethereum 2.0 style)
+                                        // This is AUTHORITATIVE - blockchain is source of truth!
+                                        if let Some(ref snapshot_data) = macroblock.consensus_data.reputation_snapshot {
+                                            if !snapshot_data.is_empty() {
+                                                match rep_state.apply_snapshot(snapshot_data) {
+                                                    Ok(count) => {
+                                                        println!("[REPUTATION] 📸 Applied snapshot from macroblock #{}: {} nodes synced", 
+                                                                 macroblock.height, count);
+                                                    }
+                                                    Err(e) => {
+                                                        println!("[REPUTATION] ⚠️ Snapshot apply failed: {}, falling back to process_macroblock", e);
+                                                        rep_state.process_macroblock(&macro_data, macroblock.timestamp);
+                                                    }
+                                                }
+                                            } else {
+                                                // No snapshot - use traditional method
+                                                rep_state.process_macroblock(&macro_data, macroblock.timestamp);
+                                            }
+                                        } else {
+                                            // Legacy macroblock without snapshot
+                                            rep_state.process_macroblock(&macro_data, macroblock.timestamp);
+                                        }
                                         
                                         // PASSIVE RECOVERY: Apply to online nodes with rep 10-69%
                                         let online_nodes: Vec<String> = if let Some(ref p2p) = unified_p2p {
@@ -3140,6 +3187,19 @@ impl BlockchainNode {
                         // All nodes compute same reputation from block data (no P2P gossip)
                         if received_block.block_type == "micro" {
                             if let Some(ref producer_id) = block_producer_id {
+                                // Count blocks by this producer in this rotation
+                                let rotation_start = received_block.height.saturating_sub(29);
+                                let mut blocks_by_producer = 0u32;
+                                for h in rotation_start..=received_block.height {
+                                    if let Ok(Some(b)) = storage.load_microblock(h) {
+                                        if let Ok(mb) = bincode::deserialize::<qnet_state::MicroBlock>(&b) {
+                                            if mb.producer == *producer_id {
+                                                blocks_by_producer += 1;
+                                            }
+                                        }
+                                    }
+                                }
+                                
                                 // Create BlockData for deterministic processing
                                 let block_data = BlockData {
                                     height: received_block.height,
@@ -3149,8 +3209,9 @@ impl BlockchainNode {
                                         .unwrap_or_default()
                                         .as_secs(),
                                     is_valid: true,
+                                    blocks_in_rotation: blocks_by_producer,
                                 };
-                                
+
                                 // Update deterministic reputation state (std::sync::RwLock - no await)
                                 // ARCHITECTURE: State is in-memory, can be rebuilt from blockchain
                                 // No P2P Storage sync needed - reputation is deterministic!
@@ -7008,9 +7069,54 @@ impl BlockchainNode {
                         // Don't wait for P2P round-trip - local block is ready for consensus check
                         let _ = block_event_tx_for_spawn.send(height_for_storage);
                         
-                        // Spawn async task for rotation tracking (can be in background)
+                        // v2.24: CRITICAL - Call process_block for OWN blocks immediately!
+                        // This ensures producer's reputation is updated at rotation boundary
+                        if height_for_storage % 30 == 0 && height_for_storage > 0 {
+                            if let Some(ref p2p) = p2p_for_reward {
+                                if let Some(rep_arc) = p2p.get_deterministic_reputation() {
+                                    if let Ok(mut rep_state) = rep_arc.write() {
+                                        use qnet_consensus::deterministic_reputation::BlockData;
+                                        let producer_id = microblock.producer.clone();
+                                        
+                                        // Count OWN blocks in this rotation
+                                        let rotation_start = height_for_storage.saturating_sub(29);
+                                        let mut blocks_by_producer = 0u32;
+                                        for h in rotation_start..=height_for_storage {
+                                            if let Ok(Some(b)) = storage_clone.load_microblock(h) {
+                                                if let Ok(mb) = bincode::deserialize::<qnet_state::MicroBlock>(&b) {
+                                                    if mb.producer == producer_id {
+                                                        blocks_by_producer += 1;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        
+                                        let block_data = BlockData {
+                                            height: height_for_storage,
+                                            producer: producer_id.clone(),
+                                            timestamp: std::time::SystemTime::now()
+                                                .duration_since(std::time::UNIX_EPOCH)
+                                                .unwrap_or_default()
+                                                .as_secs(),
+                                            is_valid: true,
+                                            blocks_in_rotation: blocks_by_producer,
+                                        };
+                                        rep_state.process_block(&block_data);
+
+                                        let new_rep = rep_state.get_reputation(&producer_id,
+                                            std::time::SystemTime::now()
+                                                .duration_since(std::time::UNIX_EPOCH)
+                                                .unwrap_or_default()
+                                                .as_secs());
+                                        println!("[REPUTATION] ✅ Own rotation #{} → {:.1}%", 
+                                                 height_for_storage / 30, new_rep);
+                                    }
+                                }
+                            }
+                        }
+                        
+                        // Spawn async task for rotation tracking (logging only)
                         tokio::spawn(async move {
-                            // Rotation tracking for logging (rewards processed via DeterministicReputationState)
                             if let Some((rotation_producer, blocks_created)) = 
                                 rotation_tracker_clone.check_rotation_complete(height_for_storage).await {
                                 
@@ -7021,7 +7127,6 @@ impl BlockchainNode {
                                     println!("[ROTATION] ⚠️ {} partial rotation ({}/30 blocks)", 
                                             rotation_producer, blocks_created);
                                 }
-                                // Reward processed via DeterministicReputationState.process_block()
                             }
                         });
                     } else {
@@ -7125,7 +7230,46 @@ impl BlockchainNode {
                     
                     println!("[PRODUCER] 📈 Advanced to height {} after producing block", microblock_height);
                     
-                    // Rotation tracking for logging (rewards processed via DeterministicReputationState)
+                    // v2.24: CRITICAL - Producer MUST call process_block for OWN blocks!
+                    // This ensures producer's reputation is updated immediately
+                    // Previously this was only done when RECEIVING blocks from P2P
+                    if microblock.height % 30 == 0 && microblock.height > 0 {
+                        if let Some(ref p2p) = unified_p2p {
+                            if let Some(rep_arc) = p2p.get_deterministic_reputation() {
+                                if let Ok(mut rep_state) = rep_arc.write() {
+                                    use qnet_consensus::deterministic_reputation::BlockData;
+                                    
+                                    // Count OWN blocks in this rotation
+                                    let rotation_start = microblock.height.saturating_sub(29);
+                                    let mut blocks_by_producer = 0u32;
+                                    for h in rotation_start..=microblock.height {
+                                        if let Ok(Some(b)) = storage.load_microblock(h) {
+                                            if let Ok(mb) = bincode::deserialize::<qnet_state::MicroBlock>(&b) {
+                                                if mb.producer == microblock.producer {
+                                                    blocks_by_producer += 1;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    
+                                    let block_data = BlockData {
+                                        height: microblock.height,
+                                        producer: microblock.producer.clone(),
+                                        timestamp: microblock.timestamp,
+                                        is_valid: true,
+                                        blocks_in_rotation: blocks_by_producer,
+                                    };
+                                    rep_state.process_block(&block_data);
+
+                                    let new_rep = rep_state.get_reputation(&microblock.producer, microblock.timestamp);
+                                    println!("[REPUTATION] ✅ Producer {} rotation #{} ({}/30) → {:.1}%", 
+                                             microblock.producer, microblock.height / 30, blocks_by_producer, new_rep);
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Rotation tracking for logging
                     if let Some((rotation_producer, blocks_created)) = 
                         rotation_tracker.check_rotation_complete(microblock.height).await {
                         
@@ -7136,7 +7280,6 @@ impl BlockchainNode {
                             println!("[ROTATION] ⚠️ {} partial rotation #{} ({}/30 blocks)", 
                                     rotation_producer, microblock.height / 30, blocks_created);
                         }
-                        // Reward processed via DeterministicReputationState.process_block()
                     }
                     
                     // CRITICAL FIX: Optimized mempool cleanup - batch removal for performance 
@@ -8112,7 +8255,7 @@ impl BlockchainNode {
             // PRODUCTION: DETERMINISTIC SHA3 PRODUCER SELECTION (NIST/Cisco Compliant)
             // ═══════════════════════════════════════════════════════════════════════════
             // 
-            // ARCHITECTURE (Ian Smith approved):
+            // ARCHITECTURE:
             //   1. SELECTION: Deterministic SHA3-512 (quantum-resistant, identical for all nodes)
             //   2. BLOCK SIGNING: Hybrid signature (Dilithium signs ephemeral Ed25519 per message)
             //   3. VERIFICATION: Any node can verify selection via: SHA3(entropy + round + candidates)
@@ -9677,6 +9820,8 @@ impl BlockchainNode {
             // Emergency macroblocks don't include slashing (created during recovery)
             slashing_events_data: None,
             automatic_jails_data: None,
+            // v2.24: No reputation snapshot in emergency mode (preserve current state)
+            reputation_snapshot: None,
         };
         
         // Count microblocks before moving
@@ -10878,10 +11023,8 @@ impl BlockchainNode {
                 return Ok(false);
             }
             
-            if compact_sig.dilithium_message_signature.len() < 100 {
-                println!("[CRYPTO] ❌ Invalid Dilithium signature size: {}", compact_sig.dilithium_message_signature.len());
-                return Ok(false);
-            }
+            // OPTIMIZED v2.23: RAW bytes format with single Dilithium signature
+            // dilithium_message_signature removed (redundant - message_hash is in encapsulated_data)
             
             // STEP 1: Get certificate from P2P cache for Ed25519 verification
             println!("[CRYPTO] 🔐 Verifying compact signature for block #{}", microblock.height);
@@ -11066,17 +11209,18 @@ impl BlockchainNode {
             }
             let crypto = crypto_guard.as_mut().expect("Crypto initialized above");
             
-            // SECURITY: Both Dilithium signatures are MANDATORY - no backwards compatibility bypass!
+            // SECURITY: Dilithium key signature is MANDATORY - no bypass!
+            // OPTIMIZED v2.23: RAW bytes format
             if compact_sig.dilithium_key_signature.is_empty() {
                 println!("[CRYPTO] ❌ REJECTED: No Dilithium key signature - quantum attack possible!");
                 return Ok(false);
             }
-            if compact_sig.dilithium_message_signature.is_empty() {
-                println!("[CRYPTO] ❌ REJECTED: No Dilithium message signature - quantum attack possible!");
-                return Ok(false);
-            }
             
-            // Step 3a: Verify Dilithium signature of encapsulated_data (ephemeral key)
+            // Verify Dilithium signature of encapsulated_data (ephemeral_key || message_hash || timestamp)
+            // This single signature proves:
+            // 1. Ephemeral key binding (key is bound to this message)
+            // 2. Message integrity (message_hash is inside)
+            // 3. Freshness (timestamp is inside)
             let message_hash_bytes = hex::decode(&message_hash_str)
                 .map_err(|_| "Invalid hex in message hash")?;
             let mut encapsulated_data = Vec::new();
@@ -11085,53 +11229,32 @@ impl BlockchainNode {
             encapsulated_data.extend_from_slice(&compact_sig.signed_at.to_le_bytes());
             let encapsulated_hex = hex::encode(&encapsulated_data);
             
+            // OPTIMIZED v2.23: Convert RAW bytes to signature string
+            use crate::crypto::hybrid_crypto::encode_dilithium_signature;
+            let signature_string = encode_dilithium_signature(&compact_sig.node_id, &compact_sig.dilithium_key_signature);
+            
             let dilithium_key_sig = DilithiumSignature {
-                signature: compact_sig.dilithium_key_signature.clone(),
+                signature: signature_string,
                 algorithm: "CRYSTALS-Dilithium3".to_string(),
                 timestamp: compact_sig.signed_at,
                 strength: "quantum-resistant".to_string(),
             };
             
-            let dilithium_key_valid = match crypto.verify_dilithium_signature(&encapsulated_hex, &dilithium_key_sig, &compact_sig.node_id).await {
-                Ok(true) => true,
-                Ok(false) => {
-                    println!("[CRYPTO] ❌ Dilithium key signature INVALID!");
-                    false
-                }
-                Err(e) => {
-                    println!("[CRYPTO] ❌ Dilithium key verification error: {}", e);
-                    false
-                }
-            };
-            
-            if !dilithium_key_valid {
-                return Ok(false);
-            }
-            
-            // Step 3b: Verify Dilithium signature of message
-            let dilithium_msg_sig = DilithiumSignature {
-                signature: compact_sig.dilithium_message_signature.clone(),
-                algorithm: "CRYSTALS-Dilithium3".to_string(),
-                timestamp: compact_sig.signed_at,
-                strength: "quantum-resistant".to_string(),
-            };
-            
-            match crypto.verify_dilithium_signature(&message_hash_str, &dilithium_msg_sig, &compact_sig.node_id).await {
+            match crypto.verify_dilithium_signature(&encapsulated_hex, &dilithium_key_sig, &compact_sig.node_id).await {
                 Ok(true) => {
-                    println!("[CRYPTO] ✅ ALL signatures verified (Ed25519 + Dilithium key + Dilithium message)");
+                    println!("[CRYPTO] ✅ Signatures verified (Ed25519 + Dilithium key)");
                     println!("[CRYPTO]    Producer: {}", compact_sig.node_id);
                     println!("[CRYPTO]    Certificate: {}", compact_sig.cert_serial);
-                    println!("[CRYPTO]    NIST/Cisco: ✅ Post-quantum compliant with encapsulated keys");
+                    println!("[CRYPTO]    NIST/Cisco: ✅ Post-quantum compliant");
                     return Ok(true);
                 }
                 Ok(false) => {
-                    println!("[CRYPTO] ❌ Dilithium message signature INVALID!");
+                    println!("[CRYPTO] ❌ Dilithium key signature INVALID!");
                     return Ok(false);
                 }
                 Err(e) => {
-                    println!("[CRYPTO] ❌ Dilithium message verification error: {}", e);
+                    println!("[CRYPTO] ❌ Dilithium verification error: {}", e);
                     // SECURITY: NO BYPASS - Dilithium verification is MANDATORY
-                    // Quantum attacker cannot forge Dilithium signatures
                     return Ok(false);
                 }
             }
@@ -11753,6 +11876,19 @@ impl BlockchainNode {
                 // BLOCKCHAIN STORAGE for deterministic reputation:
                 slashing_events_data,
                 automatic_jails_data,
+                // v2.24: REPUTATION SNAPSHOT - Ethereum 2.0 style
+                // All nodes MUST have IDENTICAL reputation after applying macroblock
+                reputation_snapshot: {
+                    if let Some(rep_arc) = p2p.get_deterministic_reputation() {
+                        if let Ok(rep_state) = rep_arc.read() {
+                            Some(rep_state.create_snapshot())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                },
             },
             previous_hash: previous_macroblock_hash,
             poh_hash: poh_hash.to_vec(),
@@ -12757,6 +12893,27 @@ impl BlockchainNode {
         
         // Save macroblock to storage
         self.storage.save_macroblock(index, &macroblock).await?;
+        
+        // v2.24: Apply reputation snapshot from macroblock (Ethereum 2.0 style)
+        // This ensures ALL nodes have IDENTICAL reputation after syncing
+        if let Some(ref snapshot_data) = macroblock.consensus_data.reputation_snapshot {
+            if !snapshot_data.is_empty() {
+                if let Some(ref p2p) = self.unified_p2p {
+                    if let Some(rep_arc) = p2p.get_deterministic_reputation() {
+                        if let Ok(mut rep_state) = rep_arc.write() {
+                            match rep_state.apply_snapshot(snapshot_data) {
+                                Ok(count) => {
+                                    println!("[MACROBLOCK-SYNC] 📸 Applied reputation snapshot: {} nodes synced", count);
+                                }
+                                Err(e) => {
+                                    println!("[MACROBLOCK-SYNC] ⚠️ Failed to apply reputation snapshot: {}", e);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
         
         println!("[MACROBLOCK-SYNC] ✅ Macroblock #{} saved successfully ({} microblock hashes)", 
                  index, macroblock.micro_blocks.len());
@@ -14478,6 +14635,7 @@ mod tests {
     use super::*;
     
     /// Test CompactHybridSignature deserialization
+    /// OPTIMIZED v2.23: RAW bytes format, dilithium_message_signature removed
     #[test]
     fn test_compact_signature_parsing() {
         use base64::{Engine as _, engine::general_purpose};
@@ -14488,26 +14646,29 @@ mod tests {
         
         // Create valid base64 for 64-byte array (message_signature)
         let msg_sig = [0u8; 64];
-        let msg_sig_b64 = general_purpose::STANDARD.encode(&msg_sig);
+        let _msg_sig_b64 = general_purpose::STANDARD.encode(&msg_sig);
         
-        let json = format!(r#"{{
-            "node_id": "qn_test_node",
-            "cert_serial": "CERT-123",
-            "ephemeral_public_key": "{}",
-            "message_signature": "{}",
-            "dilithium_key_signature": "test_key_sig",
-            "dilithium_message_signature": "test_msg_sig",
-            "signed_at": 1234567890
-        }}"#, ephemeral_b64, msg_sig_b64);
+        // OPTIMIZED v2.23: Create signature directly (JSON with byte arrays is complex)
+        let sig = crate::crypto::CompactHybridSignature {
+            node_id: "qn_test_node".to_string(),
+            cert_serial: "CERT-123".to_string(),
+            ephemeral_public_key: ephemeral_pk,
+            message_signature: msg_sig,
+            dilithium_key_signature: vec![1, 2, 3, 4, 5],  // RAW bytes
+            signed_at: 1234567890,
+        };
         
-        let parsed: Result<crate::crypto::CompactHybridSignature, _> = serde_json::from_str(&json);
-        assert!(parsed.is_ok(), "CompactHybridSignature should parse correctly: {:?}", parsed.err());
-        
-        let sig = parsed.unwrap();
+        // Verify fields
         assert_eq!(sig.node_id, "qn_test_node");
         assert_eq!(sig.cert_serial, "CERT-123");
         assert!(!sig.dilithium_key_signature.is_empty());
-        assert!(!sig.dilithium_message_signature.is_empty());
+        
+        // Test roundtrip
+        let json = serde_json::to_string(&sig).expect("Serialization failed");
+        let restored: crate::crypto::CompactHybridSignature = serde_json::from_str(&json)
+            .expect("Deserialization failed");
+        assert_eq!(sig.node_id, restored.node_id);
+        assert_eq!(sig.dilithium_key_signature, restored.dilithium_key_signature);
     }
     
     /// Test signature prefix detection

@@ -5,6 +5,165 @@ All notable changes to the QNet project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.24.0] - December 6, 2025 "Ethereum 2.0 Style Reputation Snapshots"
+
+### 🔐 CRITICAL - Complete Reputation System Overhaul
+
+**Problems fixed:**
+1. Nodes could have different reputation values due to out-of-order block processing
+2. Reward given for partial rotation (failover) - should be 30/30 only!
+3. Snapshot only stored reputations, not jails/bans/offense counts
+
+**Solution**: Full Ethereum 2.0 style reputation snapshots + strict 30/30 rule!
+
+### ✅ Changes
+
+| Component | Before | After |
+|-----------|--------|-------|
+| **Snapshot content** | Only reputations | ALL state (jails, bans, offense counts) |
+| **Rotation reward** | Any block at height 30/60/90 | Only 30/30 full rotation |
+| **Sync method** | Each node computes independently | Blockchain is authoritative |
+| **Consistency** | Possible drift between nodes | 100% identical after macroblock |
+
+### 🔧 Technical Changes
+
+**NEW: FullReputationSnapshot struct:**
+```rust
+pub struct FullReputationSnapshot {
+    pub reputations: HashMap<String, f64>,          // Node reputations
+    pub active_jails: HashMap<String, (u64, u32)>,  // Jail end + offense count
+    pub permanent_bans: HashSet<String>,            // Permanently banned
+    pub offense_counts: HashMap<String, u32>,       // Progressive jail counter
+    pub last_passive_recovery: HashMap<String, u64>, // Recovery timers
+    pub processed_rotations: HashSet<u64>,          // Duplicate protection
+}
+```
+
+**NEW: BlockData.blocks_in_rotation field:**
+```rust
+pub struct BlockData {
+    pub height: u64,
+    pub producer: String,
+    pub timestamp: u64,
+    pub is_valid: bool,
+    pub blocks_in_rotation: u32,  // MUST be 30 for reward!
+}
+```
+
+**CRITICAL: Partial rotation = NO REWARD:**
+```rust
+// OLD (wrong):
+if block.is_valid {
+    new_rep = current + REWARD_FULL_ROTATION;  // Always rewarded!
+}
+
+// NEW (correct):
+if block.is_valid && block.blocks_in_rotation >= 30 {
+    new_rep = current + REWARD_FULL_ROTATION;  // Only 30/30!
+} else {
+    println!("[REPUTATION] ⚠️ Partial rotation ({}/30) → NO REWARD");
+}
+```
+
+### 📦 Affected Files
+
+- `core/qnet-state/src/block.rs` - Added `reputation_snapshot` to ConsensusData
+- `core/qnet-consensus/src/deterministic_reputation.rs`:
+  - Added `FullReputationSnapshot` struct
+  - Added `blocks_in_rotation` to `BlockData`
+  - Updated `create_snapshot()` to include ALL state
+  - Updated `apply_snapshot()` to restore ALL state
+  - Updated `process_block()` to check 30/30 requirement
+- `development/qnet-integration/src/node.rs`:
+  - Snapshot creation in macroblock
+  - Snapshot application at 4 points (receive, sync, replay, own blocks)
+  - Count blocks_in_rotation before rewarding
+
+### 🛡️ Security
+
+| Attack | Protection |
+|--------|------------|
+| Fake jail removal | Jails stored in snapshot, signed by 2/3+ validators |
+| Inflate offense count | offense_counts in snapshot are authoritative |
+| Skip permanent ban | permanent_bans in snapshot cannot be removed |
+| Partial rotation farming | 30/30 check prevents failover reward abuse |
+
+### 📊 What Gets Stored
+
+| Field | Description | Storage |
+|-------|-------------|---------|
+| `reputations` | Node reputation 0-100% | HashMap<String, f64> |
+| `active_jails` | Jail end time + offense count | HashMap<String, (u64, u32)> |
+| `permanent_bans` | Permanently banned nodes | HashSet<String> |
+| `offense_counts` | Progressive jail counter | HashMap<String, u32> |
+| `last_passive_recovery` | Recovery timers | HashMap<String, u64> |
+| `processed_rotations` | Duplicate protection | HashSet<u64> |
+
+---
+
+## [2.23.0] - December 6, 2025 "RAW Bytes Signature Optimization + Full Quantum Heartbeat"
+
+### 🔐 CRITICAL - Signature Format Overhaul
+
+**Complete signature format optimization with 88% size reduction!**
+
+### ✅ Changes
+
+| Component | Before | After | Reduction |
+|-----------|--------|-------|-----------|
+| **Compact signature** | ~22KB (base64 JSON) | ~2.6KB (RAW bytes) | 88% |
+| **Full signature** | ~12KB | ~5KB | 58% |
+| **Dilithium format** | base64 String | Vec<u8> RAW | No overhead |
+| **Ed25519 fields** | Vec<u8> | [u8; 32/64] + serde_bytes | Type-safe |
+
+### 🔧 Technical Changes
+
+**New signature structure (v2.23):**
+```rust
+pub struct CompactHybridSignature {
+    pub node_id: String,
+    pub cert_serial: String,
+    #[serde(with = "serde_bytes")]
+    pub ephemeral_public_key: [u8; 32],    // RAW bytes
+    #[serde(with = "serde_bytes")]
+    pub message_signature: [u8; 64],        // Ed25519 RAW
+    #[serde(with = "serde_bytes")]
+    pub dilithium_key_signature: Vec<u8>,   // Dilithium RAW (~2500 bytes)
+    pub signed_at: u64,
+}
+```
+
+**Removed:**
+- `dilithium_message_signature` (redundant - message_hash already in encapsulated_data)
+
+**Added:**
+- `serde_bytes` dependency for efficient byte array serialization
+- Helper functions: `extract_dilithium_raw_bytes()`, `encode_dilithium_signature()`
+
+### 🛡️ Security
+
+- **Defense-in-depth**: Both P2P and Consensus layers perform real `dilithium3::open()` verification
+- **Consensus layer fix**: Now reconstructs `encapsulated_data` for correct verification
+- **Signature limit**: Reduced from 18KB to 2.6KB in `consensus_crypto.rs`
+
+### 💓 Heartbeat Quantum Protection (NEW!)
+
+**CRITICAL FIX**: Heartbeat now uses FULL HYBRID signatures (NIST/Cisco compliant)!
+
+| Before | After |
+|--------|-------|
+| Ed25519 only (quantum vulnerable) | HYBRID (Ed25519 + Dilithium) |
+| No Dilithium verification | Full `dilithium3::open()` verification |
+| Quantum attacker could fake heartbeats | Quantum-resistant heartbeat integrity |
+
+**Changes:**
+- `unified_p2p.rs`: Heartbeat creation uses `sign_heartbeat_dilithium()` 
+- `unified_p2p.rs`: Heartbeat verification uses `verify_dilithium_heartbeat_signature()`
+- Format: `hybrid_p2p:{CompactHybridSignature JSON}`
+- CPU cost: ~5ms per heartbeat (10 per 4h = 50ms total, negligible)
+
+---
+
 ## [2.21.5] - December 5, 2025 "Full Blockchain Reputation Integration"
 
 ### 🏗️ MAJOR ARCHITECTURE - Complete Blockchain Integration

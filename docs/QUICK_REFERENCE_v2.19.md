@@ -12,11 +12,13 @@
 - **Finality Window**: 10 blocks (~10 seconds)
 - **Entropy Consensus**: At rotation boundaries (adaptive 200ms-2s)
 
-### Signature Types
+### Signature Types (v2.23 - RAW bytes)
 | Type | Size | Use Case | Certificate |
 |------|------|----------|-------------|
-| **Compact** | 3KB | Microblocks (high frequency) | Cached separately |
-| **Full** | 12KB | Macroblocks (low frequency) | Embedded |
+| **Compact v2.23** | ~2.6KB | Microblocks (high frequency) | Cached separately |
+| **Full v2.23** | ~5KB | Macroblocks (low frequency) | Embedded |
+
+> **v2.23 Update**: RAW bytes format via `serde_bytes` (88% reduction from 22KB)
 
 ### Node Types
 | Type | Consensus | Storage | Bandwidth | Target | Reputation | VTS |

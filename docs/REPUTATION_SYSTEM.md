@@ -1,9 +1,11 @@
-# QNET Deterministic Reputation System v2.1
+# QNET Deterministic Reputation System v2.24
 
 ## Overview
 
 QNET uses a **deterministic blockchain-based reputation system** that eliminates P2P gossip vulnerabilities.
 All nodes compute identical reputation scores from on-chain data.
+
+**NEW in v2.24:** Ethereum 2.0 style reputation snapshots ensure 100% synchronization across all nodes!
 
 **Architecture Comparison:**
 | Feature | OLD (P2P Gossip) | NEW (Deterministic) |
@@ -45,7 +47,8 @@ MAX_REPUTATION = 100.0          // Maximum cap
 JAIL_THRESHOLD = 10.0           // Below = cannot recover
 
 // Rewards  
-REWARD_FULL_ROTATION = +2.0     // Completing 30-block rotation as producer
+REWARD_FULL_ROTATION = +2.0     // Completing FULL 30/30 block rotation as producer
+                                // ⚠️ Partial rotation = NO REWARD!
 REWARD_CONSENSUS_PARTICIPATION = +1.0  // Participating in macroblock (commit+reveal)
 
 // Penalties
@@ -195,7 +198,9 @@ for node_id in online_nodes {
 ### 2. Active Recovery (70%+ → 100%)
 
 Once at 70%, nodes can grow reputation through:
-- **Block Production:** +2% per 30-block rotation
+- **Block Production:** +2% per FULL 30/30 block rotation
+  - ⚠️ **CRITICAL:** Partial rotation (failover) = NO REWARD!
+  - Producer must complete ALL 30 blocks without failover
 - **Consensus Participation:** +1% per macroblock (commit + reveal)
 
 **Time to 100%:**
@@ -587,6 +592,70 @@ let is_final = finality_manager.is_height_finalized(block_height);
 // Get last finalized height
 let final_height = finality_manager.last_finalized_height();
 ```
+
+---
+
+## Full Reputation Snapshot (v2.24)
+
+### Problem: Reputation Drift
+
+Before v2.24, nodes could have different reputation values due to:
+- Out-of-order block processing
+- Failed deserialization of some blocks
+- Different blockchain heights
+
+### Solution: Ethereum 2.0 Style Snapshots
+
+Every macroblock now contains a **FULL reputation snapshot** stored in blockchain:
+
+```rust
+/// Complete reputation snapshot (stored in ConsensusData)
+pub struct FullReputationSnapshot {
+    pub reputations: HashMap<String, f64>,       // Node reputations (0-100%)
+    pub active_jails: HashMap<String, (u64, u32)>, // Jail end time + offense count
+    pub permanent_bans: HashSet<String>,          // Permanently banned nodes
+    pub offense_counts: HashMap<String, u32>,     // Progressive jail counter
+    pub last_passive_recovery: HashMap<String, u64>, // Recovery timers
+    pub processed_rotations: HashSet<u64>,        // Duplicate protection
+}
+```
+
+### How It Works
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    SNAPSHOT FLOW                                     │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  Producer creates macroblock:                                        │
+│    → rep_state.create_snapshot()                                    │
+│    → Serialize ALL reputation state to bincode                       │
+│    → Store in ConsensusData.reputation_snapshot                     │
+│                                                                      │
+│  All nodes receive macroblock:                                       │
+│    → rep_state.apply_snapshot(snapshot_data)                        │
+│    → OVERWRITE local state with blockchain values                   │
+│    → All nodes now have IDENTICAL reputation!                        │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### Security: Cannot Forge Reputation
+
+| Attack Vector | Protection |
+|--------------|------------|
+| Modify snapshot | Macroblock signed by 2/3+ validators |
+| Fake jails | Evidence verified in SlashingEvent |
+| Skip bans | permanent_bans in snapshot are authoritative |
+| Inflate reputation | Snapshot overwrites any local manipulation |
+
+### Storage Impact
+
+| Nodes | Snapshot Size | Per Macroblock |
+|-------|--------------|----------------|
+| 100 | ~15 KB | Negligible |
+| 1,000 | ~150 KB | 0.1% overhead |
+| 10,000 | ~1.5 MB | 1% overhead |
 
 ---
 

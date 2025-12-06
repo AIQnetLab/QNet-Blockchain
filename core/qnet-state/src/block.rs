@@ -91,6 +91,18 @@ pub struct ConsensusData {
     /// Format: bincode serialized Vec<AutomaticJailData>
     #[serde(default)]
     pub automatic_jails_data: Option<Vec<u8>>,
+    
+    // ═══════════════════════════════════════════════════════════════════
+    // REPUTATION SNAPSHOT (v2.24.0)
+    // Ethereum 2.0 style: snapshot stored in macroblock for consistency
+    // All nodes MUST have identical reputation after applying macroblock
+    // ═══════════════════════════════════════════════════════════════════
+    
+    /// Reputation snapshot at macroblock finalization
+    /// Format: bincode serialized HashMap<String, f64>
+    /// This ensures ALL nodes have IDENTICAL reputation (no drift!)
+    #[serde(default)]
+    pub reputation_snapshot: Option<Vec<u8>>,
 }
 
 /// Slashing event data for blockchain storage (simplified for serialization)

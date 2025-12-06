@@ -76,9 +76,10 @@ This project uses **dual licensing**:
 - **Deterministic Producer Selection**: Round 0 uses Genesis + leadership_round as entropy
 - **Cascade Prevention**: Prevents false accusations from network desync
 
-### 🛡️ **Previous Updates (v2.19.19 - November 29, 2025)**
-- **Heartbeat without Dilithium**: CPU optimization (~35ms savings per heartbeat, NIST FIPS 204 compliant)
-- **Shred Protocol ALWAYS**: Block propagation uses Shred Protocol for ALL network sizes (not just >10 peers)
+### 🛡️ **Previous Updates (v2.23 - December 6, 2025)**
+- **Heartbeat with HYBRID signatures**: Full quantum protection (Ed25519 + Dilithium per heartbeat)
+- **RAW bytes signatures**: 88% size reduction (~2.6KB vs 22KB)
+- **Shred Protocol ALWAYS**: Block propagation uses Shred Protocol for ALL network sizes
 - **Kademlia K-neighbors**: Heartbeats use DHT distance for efficient routing (K=3)
 - **Exponential backoff failover**: 3s → 6s → 12s → 24s → 30s max (reduces CPU under stall)
 - **Priority channels**: Blocks/Consensus use separate channels (implicit priority queue)
@@ -194,10 +195,10 @@ This project uses **dual licensing**:
   - Conservative estimates for Pool 2 & Pool 3
   - Partial determinism by design (±1-5% acceptable)
   - Byzantine consensus ensures security
-- **Compact Hybrid Signatures**: Optimized microblock signatures (3KB vs 12KB)
+- **Compact Hybrid Signatures v2.23**: Optimized microblock signatures (~2.6KB RAW bytes)
   - Ed25519 + CRYSTALS-Dilithium hybrid cryptography
-  - Certificate caching for 4x bandwidth reduction
-  - Separate verification: structural (consensus) + cryptographic (P2P)
+  - RAW bytes format via `serde_bytes` (88% reduction from 22KB)
+  - Defense-in-depth: real Dilithium verification at P2P + Consensus layers
   - NIST/Cisco post-quantum compliance
 - **Progressive Finalization Protocol (PFP)**: Self-healing macroblock recovery
   - Degradation levels: 80% → 60% → 40% → 1% node requirements
@@ -649,26 +650,40 @@ When all nodes fall below 70% reputation threshold:
 - **Progressive Penalties**: Escalating reputation penalties prevent repeated failures
 - **Network Transparency**: All failover events logged and broadcast to peers
 
-## 💎 Reputation System (v2.1 - Deterministic)
+## 💎 Reputation System (v2.24 - Ethereum 2.0 Style Snapshots)
 
-**ARCHITECTURE v2.1:** Reputation computed ONLY from blockchain data (no P2P gossip)
+**ARCHITECTURE v2.24:** Blockchain-based reputation with full state snapshots
 - All nodes compute identical reputation from on-chain data
 - Sybil-resistant: Cannot fake reputation via gossip
 - Deterministic: Verifiable by replaying blockchain from genesis
+- **NEW:** Full reputation snapshot in every macroblock (Ethereum 2.0 style)
+- **NEW:** Strict 30/30 rule - only FULL rotation gets reward!
 
 See full documentation: [docs/REPUTATION_SYSTEM.md](docs/REPUTATION_SYSTEM.md)
 
+### **Full Reputation Snapshot (v2.24)**
+
+Every macroblock stores complete reputation state:
+```rust
+pub struct FullReputationSnapshot {
+    pub reputations: HashMap<String, f64>,          // 0-100%
+    pub active_jails: HashMap<String, (u64, u32)>,  // end_time + offense_count
+    pub permanent_bans: HashSet<String>,            // Forever banned
+    pub offense_counts: HashMap<String, u32>,       // Progressive jail counter
+    pub last_passive_recovery: HashMap<String, u64>, // Recovery timers
+}
+```
+
 ### **Reputation Events (Blockchain-Based)**
-| Action | Rep Points | Source |
-|--------|------------|--------|
-| **Full Rotation (30 blocks)** | +2.0 | Recorded in block producer field |
-| **Consensus Participation** | +1.0 | Recorded in macroblock (commit+reveal) |
-| **Invalid Block** | -20.0 | SlashingEvent in macroblock |
-| **Double-Sign** | -50.0 + BAN | SlashingEvent with cryptographic proof |
-| **Chain Fork** | PERMANENT BAN | SlashingEvent with evidence |
-| **Passive Recovery** | +1.0/4h | For online nodes with rep 10-69% |
-| **Timeout Failure** | -2.0 | network_score only (P2P routing) |
-| **Connection Failure** | -5.0 | network_score only (P2P routing) |
+| Action | Rep Points | Source | Requirement |
+|--------|------------|--------|-------------|
+| **Full Rotation** | +2.0 | block producer | **30/30 blocks only!** |
+| **Consensus Participation** | +1.0 | macroblock commit+reveal | Full participation |
+| **Invalid Block** | -20.0 | SlashingEvent in macroblock | Cryptographic proof |
+| **Double-Sign** | -50.0 + BAN | SlashingEvent | Both blocks as evidence |
+| **Chain Fork** | PERMANENT BAN | SlashingEvent | Fork evidence |
+| **Passive Recovery** | +1.0/4h | online nodes 10-69% | Not jailed |
+| **Partial Rotation** | 0 | — | NO REWARD if <30 blocks! |
 
 ### **Reputation Thresholds**
 - **70-100%**: Eligible for consensus participation

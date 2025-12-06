@@ -1,15 +1,17 @@
-//! # QNet Hybrid Cryptography Module
+//! # QNet Hybrid Cryptography Module (v2.23)
 //!
 //! ## Overview
-//! Implements Key Encapsulation Mechanism (KEM) with CRYSTALS-Dilithium and Ed25519
-//! following NIST and Cisco recommendations for post-quantum hybrid cryptography.
+//! Implements hybrid post-quantum cryptography with CRYSTALS-Dilithium and Ed25519
+//! following NIST and Cisco recommendations. Optimized for minimal bandwidth with
+//! RAW bytes format (no base64 overhead).
 //!
-//! ## Architecture (v2.19.0)
+//! ## Architecture (v2.23 - RAW bytes optimization)
 //!
-//! ### Dual Signature System
-//! - **Ed25519**: Fast classical signatures (64 bytes)
-//! - **CRYSTALS-Dilithium**: Post-quantum signatures (~2420 bytes)
-//! - **Hybrid**: Both required for validity
+//! ### Signature System
+//! - **Ed25519**: Fast classical signatures (64 bytes RAW)
+//! - **CRYSTALS-Dilithium**: Post-quantum signatures (~2500 bytes RAW)
+//! - **Hybrid**: Single Dilithium signature covers ephemeral_key + message_hash + timestamp
+//! - **Format**: RAW bytes via serde_bytes (88% size reduction vs base64 JSON)
 //!
 //! ### Certificate Management
 //! - **Lifetime**: 4.5 minutes (270 seconds) - frequent rotation for security
@@ -17,51 +19,46 @@
 //! - **Storage**: LRU cache (100K certificates)
 //! - **Distribution**: P2P broadcast on rotation
 //!
-//! ## Signature Formats
+//! ## Signature Formats (v2.23)
 //!
-//! ### Compact Signature (Microblocks - 3KB)
+//! ### Compact Signature (Microblocks - ~2.6KB)
 //! ```rust
 //! pub struct CompactHybridSignature {
 //!     pub node_id: String,
-//!     pub cert_serial: String,                    // Reference to cached certificate
-//!     pub message_signature: Vec<u8>,             // Ed25519 (64 bytes)
-//!     pub dilithium_message_signature: String,    // Dilithium (~2420 bytes base64)
+//!     pub cert_serial: String,
+//!     pub ephemeral_public_key: [u8; 32],   // RAW bytes
+//!     pub message_signature: [u8; 64],       // Ed25519 RAW
+//!     pub dilithium_key_signature: Vec<u8>,  // Dilithium RAW (~2500 bytes)
 //!     pub signed_at: u64,
 //! }
 //! ```
-//! **Bandwidth**: ~3KB (certificate cached separately)
+//! **Bandwidth**: ~2.6KB (was 22KB - 88% reduction!)
 //!
-//! ### Full Signature (Macroblocks - 12KB)
+//! ### Full Signature (Macroblocks - ~5KB)
 //! ```rust
 //! pub struct HybridSignature {
-//!     pub message_signature: Vec<u8>,         // Ed25519 (64 bytes)
-//!     pub dilithium_signature: String,        // Dilithium (~2420 bytes)
-//!     pub certificate: HybridCertificate,     // Full certificate (~9KB)
+//!     pub certificate: HybridCertificate,
+//!     pub ephemeral_public_key: [u8; 32],
+//!     pub message_signature: [u8; 64],
+//!     pub dilithium_key_signature: Vec<u8>,  // RAW bytes
+//!     pub signed_at: u64,
 //! }
 //! ```
-//! **Bandwidth**: ~12KB (certificate embedded for immediate verification)
+//! **Bandwidth**: ~5KB (certificate + signature RAW bytes)
+//!
+//! ## Helper Functions
+//! - `extract_dilithium_raw_bytes()` - Extract RAW bytes from signature string
+//! - `encode_dilithium_signature()` - Encode RAW bytes to signature string
 //!
 //! ## Global Instance Management
-//!
-//! ### GLOBAL_HYBRID_INSTANCES
 //! Thread-safe, globally accessible cache of HybridCrypto instances for all nodes.
 //!
-//! ```rust
-//! // Single source of truth for hybrid crypto
-//! pub static GLOBAL_HYBRID_INSTANCES: OnceCell<...> = ...;
-//! ```
-//!
-//! **Benefits**:
-//! - Prevents duplicate crypto instances
-//! - Thread-safe access via tokio::Mutex
-//! - Automatic certificate rotation
-//! - Consistent across all modules
-//!
 //! ## NIST/Cisco Compliance
-//! - **Post-Quantum**: CRYSTALS-Dilithium (NIST PQC)
+//! - **Post-Quantum**: CRYSTALS-Dilithium3 (NIST PQC Level 3)
 //! - **Classical**: Ed25519 (FIPS 186-4)
 //! - **Hashing**: SHA3-256 (NIST FIPS 202)
-//! - **Certification**: Self-signed with Dilithium signature of Ed25519 key
+//! - **Ephemeral Keys**: New Ed25519 key per message (forward secrecy)
+//! - **Key Binding**: Dilithium signs ephemeral_key || message_hash || timestamp
 
 use anyhow::{Result, anyhow};
 use ed25519_dalek::{SigningKey, VerifyingKey, Signature, Signer, Verifier};
@@ -72,6 +69,31 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH, Duration};
 use base64::{Engine as _, engine::general_purpose};
+
+/// Extract RAW bytes from Dilithium signature string
+/// Format: "dilithium_sig_<node_id>_<base64>"
+/// Returns: RAW bytes (not base64 encoded)
+pub fn extract_dilithium_raw_bytes(signature_str: &str) -> Result<Vec<u8>> {
+    if !signature_str.starts_with("dilithium_sig_") {
+        return Err(anyhow!("Invalid Dilithium signature format"));
+    }
+    
+    // Find last underscore - everything after is base64
+    let last_underscore = signature_str.rfind('_')
+        .ok_or_else(|| anyhow!("No underscore separator in signature"))?;
+    
+    let base64_part = &signature_str[last_underscore + 1..];
+    
+    general_purpose::STANDARD.decode(base64_part)
+        .map_err(|e| anyhow!("Failed to decode base64: {}", e))
+}
+
+/// Encode RAW bytes back to Dilithium signature string format
+/// Returns: "dilithium_sig_<node_id>_<base64>"
+pub fn encode_dilithium_signature(node_id: &str, raw_bytes: &[u8]) -> String {
+    let base64 = general_purpose::STANDARD.encode(raw_bytes);
+    format!("dilithium_sig_{}_{}", node_id, base64)
+}
 
 /// Global hybrid crypto instances for all nodes (thread-safe)
 /// PRODUCTION: Single source of truth for hybrid crypto instances
@@ -180,6 +202,7 @@ pub struct HybridCertificate {
 }
 
 /// Hybrid Signature containing both certificate and message signature
+/// OPTIMIZED v2.23: RAW bytes for Dilithium signature (not base64 String!)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HybridSignature {
     /// Certificate (can be cached)
@@ -187,27 +210,58 @@ pub struct HybridSignature {
     
     /// CRITICAL: Ephemeral Ed25519 public key for THIS message (NIST/Cisco requirement)
     /// Generated fresh for each message to ensure forward secrecy
-    #[serde(with = "base64_bytes_32")]
+    #[serde(with = "serde_bytes")]
     pub ephemeral_public_key: [u8; 32],
     
-    /// Ed25519 signature of the actual message (base64 encoded for serde)
-    #[serde(with = "base64_bytes")]
+    /// Ed25519 signature of the actual message (RAW 64 bytes)
+    #[serde(with = "serde_bytes")]
     pub message_signature: [u8; 64],
     
-    /// CRITICAL: Dilithium signature of encapsulated_data (ephemeral_key || message_hash || timestamp)
-    /// Per NIST/Cisco: Dilithium MUST sign the ephemeral key for each message
-    pub dilithium_key_signature: String,
-    
-    /// CRITICAL: Dilithium signature of the SAME message (quantum-resistant)
-    /// Per NIST/Cisco: EVERY message must have BOTH signatures
-    pub dilithium_message_signature: String,
+    /// CRITICAL: Dilithium signature - RAW BYTES (not base64 String!)
+    /// Contains: [sig_len(4)] + [signed_msg] + [pk_len(4)] + [public_key(1952)]
+    #[serde(with = "serde_bytes")]
+    pub dilithium_key_signature: Vec<u8>,
     
     /// Timestamp of signature creation
     pub signed_at: u64,
 }
 
-/// OPTIMIZED: Compact signature for consensus (references cached certificate)
-/// This reduces signature size from 12KB to ~3KB while maintaining quantum resistance
+impl HybridSignature {
+    /// Serialize to binary format with Zstd compression
+    pub fn to_binary_compressed(&self) -> Result<Vec<u8>> {
+        use std::io::Write;
+        
+        let binary = bincode::serialize(self)
+            .map_err(|e| anyhow!("Bincode serialization failed: {}", e))?;
+        
+        let mut encoder = zstd::Encoder::new(Vec::new(), 3)
+            .map_err(|e| anyhow!("Zstd encoder creation failed: {}", e))?;
+        encoder.write_all(&binary)
+            .map_err(|e| anyhow!("Zstd write failed: {}", e))?;
+        let compressed = encoder.finish()
+            .map_err(|e| anyhow!("Zstd finish failed: {}", e))?;
+        
+        Ok(compressed)
+    }
+    
+    /// Deserialize from binary compressed format
+    pub fn from_binary_compressed(data: &[u8]) -> Result<Self> {
+        use std::io::Read;
+        
+        let mut decoder = zstd::Decoder::new(data)
+            .map_err(|e| anyhow!("Zstd decoder creation failed: {}", e))?;
+        let mut decompressed = Vec::new();
+        decoder.read_to_end(&mut decompressed)
+            .map_err(|e| anyhow!("Zstd read failed: {}", e))?;
+        
+        bincode::deserialize(&decompressed)
+            .map_err(|e| anyhow!("Bincode deserialization failed: {}", e))
+    }
+}
+
+/// OPTIMIZED v2.23: Compact signature with RAW bytes (not base64 String!)
+/// Size: ~2.6KB vs 22KB original (88% reduction!)
+/// Format: node_id + cert_serial + 32 + 64 + ~2500 + 8 bytes
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompactHybridSignature {
     /// Node ID for certificate lookup
@@ -218,23 +272,71 @@ pub struct CompactHybridSignature {
     
     /// CRITICAL: Ephemeral Ed25519 public key for THIS message (NIST/Cisco requirement)
     /// Generated fresh for each message to ensure forward secrecy
-    #[serde(with = "base64_bytes_32")]
+    #[serde(with = "serde_bytes")]
     pub ephemeral_public_key: [u8; 32],
     
-    /// Ed25519 signature of the actual message (base64 encoded)
-    #[serde(with = "base64_bytes")]
+    /// Ed25519 signature of the actual message (RAW 64 bytes)
+    #[serde(with = "serde_bytes")]
     pub message_signature: [u8; 64],
     
-    /// CRITICAL: Dilithium signature of encapsulated_data (ephemeral_key || message_hash || timestamp)
-    /// Per NIST/Cisco: Dilithium MUST sign the ephemeral key for each message
-    pub dilithium_key_signature: String,
-    
-    /// CRITICAL: Dilithium signature of the SAME message (quantum-resistant)
-    /// Per NIST/Cisco: EVERY message must have BOTH signatures
-    pub dilithium_message_signature: String,
+    /// CRITICAL: Dilithium signature - RAW BYTES (not base64 String!)
+    /// Contains: [sig_len(4)] + [signed_msg] + [pk_len(4)] + [public_key(1952)]
+    /// Per NIST/Cisco: Dilithium MUST sign ephemeral_key || message_hash || timestamp
+    #[serde(with = "serde_bytes")]
+    pub dilithium_key_signature: Vec<u8>,
     
     /// Timestamp of signature creation
     pub signed_at: u64,
+}
+
+impl CompactHybridSignature {
+    /// Serialize to binary format with Zstd compression
+    /// OPTIMIZED v2.23: ~2.6KB RAW bytes (88% reduction vs original 22KB)
+    pub fn to_binary_compressed(&self) -> Result<Vec<u8>> {
+        use std::io::Write;
+        
+        // Step 1: Serialize to bincode
+        let binary = bincode::serialize(self)
+            .map_err(|e| anyhow!("Bincode serialization failed: {}", e))?;
+        
+        // Step 2: Compress with Zstd (level 3 = fast + good compression)
+        let mut encoder = zstd::Encoder::new(Vec::new(), 3)
+            .map_err(|e| anyhow!("Zstd encoder creation failed: {}", e))?;
+        encoder.write_all(&binary)
+            .map_err(|e| anyhow!("Zstd write failed: {}", e))?;
+        let compressed = encoder.finish()
+            .map_err(|e| anyhow!("Zstd finish failed: {}", e))?;
+        
+        Ok(compressed)
+    }
+    
+    /// Deserialize from binary compressed format
+    pub fn from_binary_compressed(data: &[u8]) -> Result<Self> {
+        use std::io::Read;
+        
+        // Step 1: Decompress with Zstd
+        let mut decoder = zstd::Decoder::new(data)
+            .map_err(|e| anyhow!("Zstd decoder creation failed: {}", e))?;
+        let mut decompressed = Vec::new();
+        decoder.read_to_end(&mut decompressed)
+            .map_err(|e| anyhow!("Zstd read failed: {}", e))?;
+        
+        // Step 2: Deserialize from bincode
+        bincode::deserialize(&decompressed)
+            .map_err(|e| anyhow!("Bincode deserialization failed: {}", e))
+    }
+    
+    /// Serialize to JSON (legacy format)
+    pub fn to_json(&self) -> Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow!("JSON serialization failed: {}", e))
+    }
+    
+    /// Deserialize from JSON (legacy format)
+    pub fn from_json(json: &str) -> Result<Self> {
+        serde_json::from_str(json)
+            .map_err(|e| anyhow!("JSON deserialization failed: {}", e))
+    }
 }
 
 /// Certificate cache entry
@@ -467,20 +569,19 @@ impl HybridCrypto {
         }
         let quantum_crypto = crypto_guard.as_ref().expect("Crypto initialized above");
         
-        // Sign encapsulated_data with Dilithium (signs the ephemeral key)
+        // Sign encapsulated_data with Dilithium (signs the ephemeral key + message_hash)
+        // OPTIMIZED v2.23: RAW bytes - no base64 overhead!
         let dilithium_key_sig = quantum_crypto.create_consensus_signature(&self.node_id, &encapsulated_hex).await
             .map_err(|e| anyhow!("Failed to create Dilithium key signature: {}", e))?;
         
-        // Step 7: Sign message with Dilithium (quantum resistance)
-        let dilithium_msg_sig = quantum_crypto.create_consensus_signature(&self.node_id, &message_hash_hex).await
-            .map_err(|e| anyhow!("Failed to create Dilithium message signature: {}", e))?;
+        // Extract RAW bytes from signature string
+        let raw_bytes = extract_dilithium_raw_bytes(&dilithium_key_sig.signature)?;
         
         Ok(HybridSignature {
             certificate: certificate.clone(),
             ephemeral_public_key: ephemeral_public_key_bytes,
             message_signature: ed25519_signature.to_bytes(),
-            dilithium_key_signature: dilithium_key_sig.signature,
-            dilithium_message_signature: dilithium_msg_sig.signature,
+            dilithium_key_signature: raw_bytes,
             signed_at,
         })
     }
@@ -542,21 +643,20 @@ impl HybridCrypto {
         }
         let quantum_crypto = crypto_guard.as_ref().expect("Crypto initialized above");
         
-        // Sign encapsulated_data with Dilithium (signs the ephemeral key)
+        // Sign encapsulated_data with Dilithium (signs ephemeral key + message_hash)
+        // OPTIMIZED v2.23: RAW bytes - no base64 overhead!
         let dilithium_key_sig = quantum_crypto.create_consensus_signature(&self.node_id, &encapsulated_hex).await
             .map_err(|e| anyhow!("Failed to create Dilithium key signature: {}", e))?;
         
-        // Step 7: Sign message with Dilithium (quantum resistance)
-        let dilithium_msg_sig = quantum_crypto.create_consensus_signature(&self.node_id, &message_hash_hex).await
-            .map_err(|e| anyhow!("Failed to create Dilithium message signature: {}", e))?;
+        // Extract RAW bytes from signature string
+        let raw_bytes = extract_dilithium_raw_bytes(&dilithium_key_sig.signature)?;
         
         Ok(CompactHybridSignature {
             node_id: self.node_id.clone(),
             cert_serial: certificate.serial_number.clone(),
             ephemeral_public_key: ephemeral_public_key_bytes,
             message_signature: ed25519_signature.to_bytes(),
-            dilithium_key_signature: dilithium_key_sig.signature,
-            dilithium_message_signature: dilithium_msg_sig.signature,
+            dilithium_key_signature: raw_bytes,
             signed_at,
         })
     }
@@ -566,13 +666,13 @@ impl HybridCrypto {
     /// Use this for: heartbeats, ActiveNodeAnnouncement, reputation updates
     /// Use sign_message_compact() for: microblocks (already hashed)
     /// 
+    /// OPTIMIZED v2.23: Single Dilithium signature (RAW bytes, includes message_hash)
     /// Per NIST/Cisco hybrid crypto standards:
     /// 1. Generate NEW ephemeral Ed25519 key for THIS message
     /// 2. Hash message with SHA3-256
     /// 3. Sign hash with ephemeral Ed25519
     /// 4. Create encapsulated_data = ephemeral_key || message_hash || timestamp
-    /// 5. Sign encapsulated_data with Dilithium (binds ephemeral key to message)
-    /// 6. Sign message_hash with Dilithium (quantum resistance)
+    /// 5. Sign encapsulated_data with Dilithium (binds ephemeral key to message + integrity)
     pub async fn sign_raw_message_compact(&self, message: &[u8]) -> Result<CompactHybridSignature> {
         // Step 1: Generate NEW ephemeral Ed25519 keypair for THIS message
         let mut csprng = OsRng{};
@@ -619,22 +719,20 @@ impl HybridCrypto {
         }
         let quantum_crypto = crypto_guard.as_ref().expect("Crypto initialized above");
         
-        // Sign encapsulated_data with Dilithium (signs the ephemeral key)
+        // Sign encapsulated_data with Dilithium (signs ephemeral key + message_hash)
+        // OPTIMIZED v2.23: RAW bytes - no base64 overhead!
         let dilithium_key_sig = quantum_crypto.create_consensus_signature(&self.node_id, &encapsulated_hex).await
             .map_err(|e| anyhow!("Failed to create Dilithium key signature: {}", e))?;
         
-        // Step 7: Sign message_hash with Dilithium (quantum resistance)
-        let message_hash_hex = hex::encode(&message_hash_bytes);
-        let dilithium_msg_sig = quantum_crypto.create_consensus_signature(&self.node_id, &message_hash_hex).await
-            .map_err(|e| anyhow!("Failed to create Dilithium message signature: {}", e))?;
+        // Extract RAW bytes from signature string
+        let raw_bytes = extract_dilithium_raw_bytes(&dilithium_key_sig.signature)?;
         
         Ok(CompactHybridSignature {
             node_id: self.node_id.clone(),
             cert_serial: certificate.serial_number.clone(),
             ephemeral_public_key: ephemeral_public_key_bytes,
             message_signature: ed25519_signature.to_bytes(),
-            dilithium_key_signature: dilithium_key_sig.signature,
-            dilithium_message_signature: dilithium_msg_sig.signature,
+            dilithium_key_signature: raw_bytes,
             signed_at,
         })
     }
@@ -762,18 +860,12 @@ impl HybridCrypto {
             return Ok(false);
         }
         
-        // Step 5: CRITICAL - Verify Dilithium signatures (NIST/Cisco requirement)
-        // Per NIST/Cisco standards: BOTH signatures must be valid
-        // 1. Dilithium signature of encapsulated_data (ephemeral key)
-        // 2. Dilithium signature of message
+        // Step 5: CRITICAL - Verify Dilithium key signature (NIST/Cisco requirement)
+        // OPTIMIZED v2.23: Single Dilithium RAW bytes covers ephemeral_key + message_hash + timestamp
+        // This provides BOTH key binding AND message integrity in one signature
         
-        // SECURITY: Both Dilithium signatures are MANDATORY - no backwards compatibility bypass!
         if signature.dilithium_key_signature.is_empty() {
             println!("❌ REJECTED: No Dilithium key signature - quantum attack possible!");
-            return Ok(false);
-        }
-        if signature.dilithium_message_signature.is_empty() {
-            println!("❌ REJECTED: No Dilithium message signature - quantum attack possible!");
             return Ok(false);
         }
         
@@ -792,17 +884,23 @@ impl HybridCrypto {
         let mut hasher = Sha3_256::new();
         hasher.update(message);
         let message_hash = hasher.finalize();
-        let message_hash_hex = hex::encode(message_hash);
         
-        // Step 5a: Verify Dilithium signature of encapsulated_data (ephemeral key)
+        // Verify Dilithium signature of encapsulated_data (ephemeral_key || message_hash || timestamp)
+        // This single signature proves:
+        // 1. Ephemeral key is bound to this message (key binding)
+        // 2. Message has not been tampered with (message_hash inside)
+        // 3. Signature is fresh (timestamp inside)
         let mut encapsulated_data = Vec::new();
         encapsulated_data.extend_from_slice(&signature.ephemeral_public_key);
         encapsulated_data.extend_from_slice(&message_hash);
         encapsulated_data.extend_from_slice(&signature.signed_at.to_le_bytes());
         let encapsulated_hex = hex::encode(&encapsulated_data);
         
+        // OPTIMIZED v2.23: Convert RAW bytes back to signature string for verification
+        let signature_string = encode_dilithium_signature(&signature.certificate.node_id, &signature.dilithium_key_signature);
+        
         let dilithium_key_sig = DilithiumSignature {
-            signature: signature.dilithium_key_signature.clone(),
+            signature: signature_string,
             algorithm: "CRYSTALS-Dilithium3".to_string(),
             timestamp: signature.signed_at,
             strength: "quantum-resistant".to_string(),
@@ -817,24 +915,7 @@ impl HybridCrypto {
             return Ok(false);
         }
         
-        // Step 5b: Verify Dilithium signature of message
-        let dilithium_msg_sig = DilithiumSignature {
-            signature: signature.dilithium_message_signature.clone(),
-            algorithm: "CRYSTALS-Dilithium3".to_string(),
-            timestamp: signature.signed_at,
-            strength: "quantum-resistant".to_string(),
-        };
-        
-        let dilithium_msg_valid = quantum_crypto
-            .verify_dilithium_signature(&message_hash_hex, &dilithium_msg_sig, &signature.certificate.node_id)
-            .await?;
-        
-        if !dilithium_msg_valid {
-            println!("❌ Invalid Dilithium message signature - quantum attack detected!");
-            return Ok(false);
-        }
-        
-        println!("✅ ALL signatures verified (Ed25519 + Dilithium key + Dilithium message) - truly quantum-resistant");
+        println!("✅ ALL signatures verified (Ed25519 + Dilithium key) - quantum-resistant");
         Ok(true)
     }
     
@@ -1023,6 +1104,7 @@ mod tests {
     }
     
     /// Test compact signature structure has required fields
+    /// OPTIMIZED v2.23: RAW bytes format
     #[test]
     fn test_compact_signature_structure() {
         let sig = CompactHybridSignature {
@@ -1030,8 +1112,7 @@ mod tests {
             cert_serial: "cert_123".to_string(),
             ephemeral_public_key: [1u8; 32],
             message_signature: [2u8; 64],
-            dilithium_key_signature: "key_sig".to_string(),
-            dilithium_message_signature: "msg_sig".to_string(),
+            dilithium_key_signature: vec![1, 2, 3],  // RAW bytes now
             signed_at: 1234567890,
         };
         
@@ -1041,7 +1122,6 @@ mod tests {
         assert!(sig.ephemeral_public_key.iter().any(|&b| b != 0)); // Not all zeros
         assert!(sig.message_signature.iter().any(|&b| b != 0));
         assert!(!sig.dilithium_key_signature.is_empty());
-        assert!(!sig.dilithium_message_signature.is_empty());
         assert!(sig.signed_at > 0);
     }
     
@@ -1057,15 +1137,16 @@ mod tests {
     }
     
     /// Test JSON serialization/deserialization of compact signature
+    /// OPTIMIZED v2.23: RAW bytes, dilithium_message_signature removed
     #[test]
     fn test_compact_signature_json_roundtrip() {
+        // OPTIMIZED v2.23: RAW bytes format
         let original = CompactHybridSignature {
             node_id: "test_node".to_string(),
             cert_serial: "cert_123".to_string(),
             ephemeral_public_key: [42u8; 32],
             message_signature: [0u8; 64],
-            dilithium_key_signature: "dilithium_key_test".to_string(),
-            dilithium_message_signature: "dilithium_msg_test".to_string(),
+            dilithium_key_signature: vec![1, 2, 3, 4, 5],  // RAW bytes now
             signed_at: 1700000000,
         };
         

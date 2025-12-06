@@ -26,7 +26,7 @@ QNet is an experimental post-quantum blockchain created to prove: **one person-o
 Experimental achievements:
 - ✅ **Post-quantum cryptography**: CRYSTALS-Dilithium3 (NIST FIPS 204) + Ed25519 hybrid  
 - ✅ **NIST/Cisco Compliant**: Ephemeral Ed25519 keys per message + Dilithium key binding
-- ✅ **Compact Signatures**: 3KB vs 12KB (75% bandwidth reduction) with certificate caching
+- ✅ **Compact Signatures v2.23**: ~2.6KB RAW bytes (88% reduction) with certificate caching
 - ✅ **Progressive Finalization Protocol**: Self-healing consensus recovery (80% → 1% degradation)
 - ✅ **424,411 TPS**: Proven performance in tests
 - ✅ **QUIC Transport**: Binary protocol (bincode), TLS 1.3, 100+ streams/connection
@@ -76,7 +76,7 @@ QNet presents an experimental blockchain platform with unique characteristics:
 
 1. **Post-quantum cryptography**: CRYSTALS-Dilithium3 (NIST FIPS 204) + Ephemeral Ed25519 (per message)
 2. **NIST/Cisco Compliant**: Dilithium signs ephemeral key binding + message hash (forward secrecy)
-3. **Compact signatures**: 75% bandwidth reduction (3KB vs 12KB) via certificate caching
+3. **Compact signatures v2.23**: 88% bandwidth reduction (~2.6KB RAW bytes) via certificate caching
 3. **Progressive Finalization Protocol**: Self-healing consensus with zero-downtime
 4. **High performance**: 424,411+ TPS achieved in experiments
 5. **Innovative economy**: Reputation system without staking
@@ -413,34 +413,42 @@ MicroBlock {
 **QNet implements NIST/Cisco recommended encapsulated key approach:**
 
 ```rust
-// CRITICAL: NEW ephemeral Ed25519 key for EVERY message
+// CRITICAL: NEW ephemeral Ed25519 key for EVERY message (v2.23 RAW bytes)
 struct HybridSignature {
     certificate: HybridCertificate {
         node_id: String,
-        ed25519_public_key: [u8; 32],        // Ephemeral key
-        dilithium_signature: String,          // Signs encapsulated data
+        ed25519_public_key: [u8; 32],           // RAW bytes
+        dilithium_public_key: Vec<u8>,          // RAW bytes (~1952 bytes)
+        dilithium_signature_of_ed25519: Vec<u8>,// RAW bytes (certificate binding)
         issued_at: u64,
-        expires_at: u64,                      // 4.5 minute lifetime (270s)
+        expires_at: u64,                         // 4.5 minute lifetime (270s)
         serial_number: String,
     },
-    message_signature: [u8; 64],             // Ed25519 signs message
-    dilithium_message_signature: String,     // Not used (Dilithium signs KEY)
+    ephemeral_public_key: [u8; 32],             // NEW Ed25519 key RAW
+    message_signature: [u8; 64],                // Ed25519 signs message RAW
+    dilithium_key_signature: Vec<u8>,           // RAW bytes (~2500 bytes)
     signed_at: u64,
 }
 
-// Signing Process:
+// Signing Process (v2.23):
 // 1. Generate NEW ephemeral Ed25519 key
-// 2. Sign message with ephemeral key
-// 3. Create encapsulated_data = ephemeral_key || node_id || timestamp
-// 4. Sign encapsulated_data with Dilithium (NOT the message!)
+// 2. Sign message with ephemeral key → message_signature
+// 3. Create encapsulated_data = ephemeral_pk || message_hash || timestamp
+// 4. Sign encapsulated_data with Dilithium → dilithium_key_signature (SINGLE sig!)
 // 5. Certificate expires in 270 seconds (4.5 minutes)
 
-// Verification Process (Certificate caching OK):
+// Verification Process (Defense-in-Depth):
+// P2P Layer (node.rs):
 // 1. Check certificate expiration
-// 2. Recreate encapsulated_data
-// 3. Verify Dilithium signature on encapsulated_data
-// 4. Verify Ed25519 signature on message
-// 5. Both MUST pass - no optimization allowed per NIST/Cisco
+// 2. Verify Ed25519 signature with ephemeral key
+// 3. Recreate encapsulated_data
+// 4. Verify Dilithium via dilithium3::open() ✅ REAL CRYPTO
+//
+// Consensus Layer (consensus_crypto.rs):
+// 1. Parse RAW bytes from JSON
+// 2. Reconstruct encapsulated_data
+// 3. Real Dilithium3 verification via dilithium3::open() ✅
+// 4. Byzantine consensus (2/3+ honest nodes)
 ```
 
 **Key Features:**
@@ -500,7 +508,7 @@ let signature = dilithium3::sign(data, &sk);  // 2420 bytes
 | **Key Storage** | Dilithium3 keypair | ~6KB encrypted | AES-256-GCM | Random encryption key |
 | **Encryption Key** | Random 32 bytes | 40 bytes file | SHA3-256 integrity | NOT derived from node_id |
 | **Message Signing** | Ed25519 (ephemeral) | 64 bytes | Fast verification | 4.5-minute lifetime |
-| **Heartbeat Signatures** | None (v2.19.19+) | N/A | Timestamp + Registry | CPU optimization |
+| **Heartbeat Signatures** | HYBRID (v2.23+) | ~2.6KB RAW | Quantum-resistant | Ed25519 + Dilithium |
 | **Hashing** | SHA3-256 | 32 bytes | Grover-resistant | All operations |
 
 **Cryptographic Architecture:**
@@ -807,35 +815,39 @@ MAX_MESSAGE_SIZE: 10 MB       // Supports full macroblocks (~3MB)
 
 ### 6.5 Reputation System
 
-**Deterministic Blockchain-Based Reputation (v2.1):**
+**Deterministic Blockchain-Based Reputation (v2.24 - Ethereum 2.0 Style):**
 
-> **ARCHITECTURE v2.1:** Reputation computed ONLY from blockchain data (no P2P gossip).
-> All nodes compute identical reputation from on-chain data - Sybil-resistant and deterministic.
+> **ARCHITECTURE v2.24:** Reputation computed from blockchain data + FULL snapshots in macroblocks.
+> All nodes have IDENTICAL reputation state after every macroblock - 100% synchronized.
 > See [docs/REPUTATION_SYSTEM.md](docs/REPUTATION_SYSTEM.md) for full documentation.
 
 ```rust
-pub struct DeterministicReputationState {
-    reputations: HashMap<String, f64>,      // node_id -> reputation (0-100)
-    active_jails: HashMap<String, (u64, u32)>, // node_id -> (end_ts, offense_count)
-    permanent_bans: HashSet<String>,        // Permanently banned nodes
-    offense_counts: HashMap<String, u32>,   // Progressive jail tracking
+/// FULL reputation snapshot stored in every macroblock (v2.24)
+pub struct FullReputationSnapshot {
+    pub reputations: HashMap<String, f64>,          // node_id -> reputation (0-100)
+    pub active_jails: HashMap<String, (u64, u32)>,  // node_id -> (end_ts, offense_count)
+    pub permanent_bans: HashSet<String>,            // Permanently banned nodes
+    pub offense_counts: HashMap<String, u32>,       // Progressive jail tracking
+    pub last_passive_recovery: HashMap<String, u64>, // Recovery timers
+    pub processed_rotations: HashSet<u64>,          // Duplicate protection
 }
 ```
 
-**Why Deterministic (not P2P Gossip)?**
+**Why Snapshots (not just Computation)?**
 
-| Issue | OLD (P2P Gossip) | NEW (Deterministic) |
-|-------|------------------|---------------------|
-| **Sybil Attack** | Vulnerable - fake reputation via gossip | Resistant - only blockchain data |
-| **Node Agreement** | Nodes can disagree | All nodes compute same result |
-| **Evidence** | Ephemeral keys (forgeable) | Cryptographic proof in blocks |
-| **Jail Sync** | Gossip lag → manipulation | Recorded in macroblock |
+| Issue | v2.1 (Computed Only) | v2.24 (Snapshots) |
+|-------|---------------------|-------------------|
+| **Out-of-order blocks** | Reputation drift | Snapshot authoritative |
+| **Jail persistence** | In-memory only | Stored in blockchain |
+| **Ban persistence** | In-memory only | Stored in blockchain |
+| **Offense counts** | In-memory only | Stored in blockchain |
+| **Node sync** | May disagree | 100% identical after macroblock |
 
 **Reputation Events (Blockchain-Based):**
 
 ```
 REWARDS (from blockchain data):
-  ├── Full Rotation (30 blocks): +2.0 (block producer field)
+  ├── Full Rotation: +2.0 (ONLY if 30/30 blocks! Partial = NO reward!)
   ├── Consensus Participation: +1.0 (macroblock commit+reveal)
   └── Passive Recovery: +1.0/4h (online nodes with rep 10-69%)
 
@@ -845,12 +857,14 @@ PENALTIES (SlashingEvent with cryptographic proof):
   ├── Chain Fork: PERMANENT BAN (proof: conflicting chains)
   └── Missed Blocks: -2.0 per block (AutomaticJail in macroblock)
 
-NETWORK SCORE (P2P routing only, NOT consensus):
-  ├── TimeoutFailure: -2.0 (local network_score)
-  ├── ConnectionFailure: -5.0 (local network_score)
-  └── Used for peer prioritization, not consensus eligibility
+SNAPSHOT STORAGE (every 90 blocks in macroblock):
+  ├── All reputations (HashMap<String, f64>)
+  ├── Active jails (node_id → end_time + offense_count)
+  ├── Permanent bans (HashSet<String>)
+  ├── Offense counts (for progressive jail)
+  └── Recovery timers (for passive recovery)
 
-PROGRESSIVE JAIL (6 chances, recorded in macroblock):
+PROGRESSIVE JAIL (6 chances, stored in snapshot):
   ├── 1st: 1h → 30%    4th: 30d → 15%
   ├── 2nd: 24h → 25%   5th: 3m → 12%
   ├── 3rd: 7d → 20%    6+: 1y → 10% (can return!)
@@ -874,9 +888,9 @@ Response requirements:
 ├── Full Nodes: 80% (8+ out of 10 heartbeats in current window)
 └── Super Nodes: 90% (9+ out of 10 heartbeats in current window)
 
-Architecture (v2.19.10):
+Architecture (v2.23):
 ├── Light: Full/Super nodes ping via FCM V1 API → Light signs challenge → attestation
-├── Full/Super: Self-attest via heartbeats (10 per 4h window, no Dilithium - CPU optimized v2.19.19)
+├── Full/Super: Self-attest via heartbeats (10 per 4h window, HYBRID signature - quantum-resistant)
 ├── 256-shard ping system: Light nodes assigned to pingers based on SHA3-256(node_id)[0]
 ├── Light node reputation: Fixed at 70 (immutable, not affected by events)
 ├── Storage: Tiered (Light ~100MB headers, Full ~500GB pruned, Super ~2TB full)
@@ -950,7 +964,7 @@ OPTIMIZATIONS (v2.19.20):
 ├── Adaptive Buffer: Full/Super 500 blocks (~50MB), Light 100 blocks (~10MB)
 ├── Kademlia K-neighbors: Heartbeats use DHT distance for efficient routing
 ├── Shred Protocol ALWAYS: Block propagation uses Shred Protocol for ALL network sizes
-├── Heartbeat without Dilithium: CPU optimization (~35ms savings per heartbeat)
+├── Heartbeat with HYBRID (v2.23): Full quantum protection (Ed25519 + Dilithium per message)
 └── Priority channels: Blocks/Consensus use separate channels (implicit priority)
 
 BYZANTINE SAFETY:
@@ -1476,11 +1490,12 @@ Light Node Attestation Structure:
 **Self-Attestation Architecture (Full/Super Nodes):**
 
 ```
-Heartbeat System (v2.19.19):
+Heartbeat System (v2.23 - Quantum Protected):
 ├── Frequency: 10 heartbeats per 4-hour window (~24 min apart)
-├── Self-attestation: Node broadcasts heartbeat (NO Dilithium signature)
-├── Gossip: Heartbeats broadcast via P2P gossip protocol (fanout=3)
+├── Self-attestation: Node broadcasts heartbeat with HYBRID signature (Ed25519 + Dilithium)
+├── Gossip: Heartbeats broadcast via Kademlia K-neighbors (K=3, DHT routing)
 ├── Storage: Persisted in RocksDB for reward calculation
+├── Security: Quantum-resistant - Dilithium signs (ephemeral_key || message_hash || timestamp)
 ├── Security: Timestamp validation (±5min) + active_full_super_nodes registry
 
 Heartbeat Structure:

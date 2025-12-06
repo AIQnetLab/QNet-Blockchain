@@ -1735,8 +1735,9 @@ GET /api/v1/snapshot/{height}
 - **MEMORY**: Adaptive buffer: Full/Super 500 blocks (~50MB), Light 100 blocks (~10MB)
 - **SYNC**: Background re-request every 30s with exponential backoff
 
-### v2.19.19 (November 2025)
-- **OPTIMIZATION**: Heartbeat without Dilithium signature (CPU savings ~35ms per heartbeat)
+### v2.23 (December 2025)
+- **SECURITY**: Heartbeat with HYBRID signature (Ed25519 + Dilithium, quantum-resistant)
+- **OPTIMIZATION**: RAW bytes signatures (88% size reduction)
 - **OPTIMIZATION**: Shred Protocol block propagation for ALL network sizes
 - **OPTIMIZATION**: Kademlia K-neighbors for heartbeat routing (K=3)
 - **OPTIMIZATION**: Exponential backoff for failover (3s → 6s → 12s → 24s → 30s max)
