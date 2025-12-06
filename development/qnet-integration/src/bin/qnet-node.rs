@@ -2628,6 +2628,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(false);
     
     if is_genesis {
+        // CRITICAL FIX v2.21.6: Start signal listener BEFORE waiting for other nodes
+        // This allows other nodes to detect us while we wait for them
+        let signal_listener = tokio::net::TcpListener::bind("0.0.0.0:9876").await
+            .expect("Failed to bind signal port 9876");
+        println!("[GENESIS SYNC] 📡 Signal listener started on port 9876");
+        
+        // Spawn background task to accept connections (just for signaling readiness)
+        tokio::spawn(async move {
+            loop {
+                if let Ok((socket, _)) = signal_listener.accept().await {
+                    // Just accept and drop - this signals we're alive
+                    drop(socket);
+                }
+            }
+        });
+        
         println!("[GENESIS SYNC] ⏳ Waiting for other Genesis nodes to be ready...");
         let genesis_ips = vec![
             "154.38.160.39",
@@ -2654,8 +2670,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     continue;
                 }
                 
-                // Check if node P2P port is responding (TCP 9876 opens before HTTP API)
-                // This prevents deadlock where all nodes wait for each other's HTTP API
+                // Check if node signal port is responding (TCP 9876)
                 let is_ready = match tokio::time::timeout(
                     std::time::Duration::from_secs(2),
                     tokio::net::TcpStream::connect(format!("{}:9876", ip))
