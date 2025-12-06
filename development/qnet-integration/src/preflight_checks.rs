@@ -30,10 +30,9 @@ pub struct CheckResult {
 }
 
 /// Required ports for QNet node
+/// NOTE: 9876/9877 removed - not actually used, P2P works via QUIC (10876) and HTTP API (8001)
 pub const REQUIRED_PORTS: &[(u16, &str, &str)] = &[
     (8001, "TCP", "REST API"),
-    (9876, "TCP", "P2P Network"),
-    (9877, "TCP", "Gossip Protocol"),
     (10876, "UDP", "QUIC Transport"),
 ];
 
@@ -126,7 +125,7 @@ pub async fn run_preflight_checks(external_ip: Option<&str>) -> Result<Preflight
     println!("   ℹ️ This verifies ports are open from outside");
     
     // Start temporary listeners for external check
-    let tcp_ports = vec![8001u16, 9876, 9877];
+    let tcp_ports = vec![8001u16];
     let mut listeners = Vec::new();
     
     for port in &tcp_ports {
@@ -235,12 +234,10 @@ pub async fn run_preflight_checks(external_ip: Option<&str>) -> Result<Preflight
         println!("🔧 FIX THESE ISSUES BEFORE STARTING NODE:");
         println!("   1. Open required ports in firewall:");
         println!("      sudo iptables -A INPUT -p tcp --dport 8001 -j ACCEPT");
-        println!("      sudo iptables -A INPUT -p tcp --dport 9876 -j ACCEPT");
-        println!("      sudo iptables -A INPUT -p tcp --dport 9877 -j ACCEPT");
         println!("      sudo iptables -A INPUT -p udp --dport 10876 -j ACCEPT");
         println!("");
         println!("   2. For Docker, ensure port mapping:");
-        println!("      -p 8001:8001 -p 9876:9876 -p 9877:9877 -p 10876:10876/udp");
+        println!("      -p 8001:8001 -p 10876:10876/udp");
         println!("");
         
         Err(format!("Pre-flight failed: {}", critical_failures.join("; ")))

@@ -2621,30 +2621,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // CRITICAL FIX v2.21.3: Genesis nodes MUST wait for other Genesis nodes before starting
+    // CRITICAL FIX v2.21.7: Genesis nodes MUST wait for other Genesis nodes before starting
     // This prevents fork caused by nodes starting before others are ready
     let is_genesis = std::env::var("QNET_BOOTSTRAP_ID")
         .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
         .unwrap_or(false);
     
     if is_genesis {
-        // CRITICAL FIX v2.21.6: Start signal listener BEFORE waiting for other nodes
-        // This allows other nodes to detect us while we wait for them
-        let signal_listener = tokio::net::TcpListener::bind("0.0.0.0:9876").await
-            .expect("Failed to bind signal port 9876");
-        println!("[GENESIS SYNC] 📡 Signal listener started on port 9876");
+        // Start TCP listener on port 8001 BEFORE waiting for other nodes
+        // This allows other Genesis nodes to detect us
+        // CRITICAL: Keep listener in main thread so we can properly drop it
+        println!("[GENESIS SYNC] 📡 Starting signal listener on port 8001...");
         
-        // Spawn background task to accept connections (just for signaling readiness)
-        tokio::spawn(async move {
-            loop {
-                if let Ok((socket, _)) = signal_listener.accept().await {
-                    // Just accept and drop - this signals we're alive
-                    drop(socket);
-                }
-            }
-        });
+        let signal_listener = tokio::net::TcpListener::bind("0.0.0.0:8001").await
+            .expect("Failed to bind port 8001 for Genesis sync");
         
+        println!("[GENESIS SYNC] ✅ Signal listener ready on port 8001");
         println!("[GENESIS SYNC] ⏳ Waiting for other Genesis nodes to be ready...");
+        
         let genesis_ips = vec![
             "154.38.160.39",
             "62.171.157.44",
@@ -2653,7 +2647,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "162.244.25.114",
         ];
         
-        // CRITICAL FIX: Get our IP for self-skip in Genesis sync
+        // Get our IP for self-skip
         let our_ip = get_physical_ip().await.unwrap_or_else(|_| "127.0.0.1".to_string());
         let mut ready_count = 0;
         let mut attempts = 0;
@@ -2664,19 +2658,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             attempts += 1;
             ready_count = 0;
             
+            // Accept any incoming connections (non-blocking) to signal we're alive
+            // Use short timeout so we don't block the check loop
+            loop {
+                match tokio::time::timeout(
+                    std::time::Duration::from_millis(10),
+                    signal_listener.accept()
+                ).await {
+                    Ok(Ok((socket, _))) => {
+                        drop(socket); // Accept and drop - just signals we're alive
+                    }
+                    _ => break, // No more pending connections
+                }
+            }
+            
+            // Check other Genesis nodes
             for ip in &genesis_ips {
                 // Skip self
                 if *ip == our_ip {
                     continue;
                 }
                 
-                // Check if node signal port is responding (TCP 9876)
+                // Check if node API port is responding (TCP 8001)
                 let is_ready = match tokio::time::timeout(
-                    std::time::Duration::from_secs(2),
-                    tokio::net::TcpStream::connect(format!("{}:9876", ip))
+                    std::time::Duration::from_secs(1),
+                    tokio::net::TcpStream::connect(format!("{}:8001", ip))
                 ).await {
-                    Ok(Ok(_)) => true,  // TCP connection successful
-                    _ => false,         // Timeout or connection refused
+                    Ok(Ok(_)) => true,
+                    _ => false,
                 };
                 
                 if is_ready {
@@ -2699,9 +2708,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                      ready_count, attempts);
         }
         
-        // Extra wait for QUIC connections to stabilize
-        println!("[GENESIS SYNC] ⏳ Waiting 5s for QUIC connections to stabilize...");
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        // CRITICAL: Drop listener to immediately release port 8001 for RPC server
+        println!("[GENESIS SYNC] 🔌 Releasing port 8001 for RPC server...");
+        drop(signal_listener);
+        
+        // Brief wait for OS to fully release socket
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        
+        // Wait for connections to stabilize
+        println!("[GENESIS SYNC] ⏳ Waiting 2s for connections to stabilize...");
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
 
     println!("🔍 DEBUG: About to create BlockchainNode...");
