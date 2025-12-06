@@ -387,6 +387,10 @@ pub struct DeterministicReputationState {
     /// PASSIVE RECOVERY: Last recovery timestamp per node
     /// Nodes with reputation 10-69% get +1% every 4 hours if they were online (in ping_participants)
     last_passive_recovery: HashMap<String, u64>,
+    
+    /// Processed rotation numbers (to handle out-of-order blocks)
+    /// Prevents double-counting reputation for same rotation
+    processed_rotations: HashSet<u64>,
 }
 
 impl DeterministicReputationState {
@@ -400,6 +404,7 @@ impl DeterministicReputationState {
             last_height: 0,
             last_macroblock: 0,
             last_passive_recovery: HashMap::new(),
+            processed_rotations: HashSet::new(),
         }
     }
     
@@ -435,23 +440,39 @@ impl DeterministicReputationState {
     }
     
     /// Process a block and update reputation
+    /// NOTE: Blocks may arrive out-of-order due to shred protocol parallelism
+    /// We only care about rotation boundaries (every 30 blocks) for reputation updates
     pub fn process_block(&mut self, block: &BlockData) {
-        // Ensure in order
-        if block.height != self.last_height + 1 && self.last_height > 0 {
-            return; // Skip out-of-order blocks
-        }
-        
-        // Reward producer
-        if block.is_valid {
-            // Check for rotation complete (every 30 blocks)
-            if block.height % BLOCKS_PER_ROTATION == 0 && block.height > 0 {
-                let current = self.reputations.get(&block.producer).unwrap_or(&INITIAL_REPUTATION);
-                let new_rep = (current + REWARD_FULL_ROTATION).min(MAX_REPUTATION);
-                self.reputations.insert(block.producer.clone(), new_rep);
+        // Only process rotation boundary blocks (30, 60, 90...)
+        // Other blocks don't affect reputation
+        if block.height % BLOCKS_PER_ROTATION != 0 || block.height == 0 {
+            // Update last_height tracking even for non-rotation blocks
+            if block.height > self.last_height {
+                self.last_height = block.height;
             }
+            return;
         }
         
-        self.last_height = block.height;
+        // Check if this rotation was already processed (duplicate protection)
+        let rotation_number = block.height / BLOCKS_PER_ROTATION;
+        if self.processed_rotations.contains(&rotation_number) {
+            return;
+        }
+        
+        // Reward producer for completing rotation
+        if block.is_valid {
+            let current = self.reputations.get(&block.producer).unwrap_or(&INITIAL_REPUTATION);
+            let new_rep = (current + REWARD_FULL_ROTATION).min(MAX_REPUTATION);
+            self.reputations.insert(block.producer.clone(), new_rep);
+            self.processed_rotations.insert(rotation_number);
+            println!("[REPUTATION] ✅ Producer {} completed rotation #{} → {:.1}%", 
+                     block.producer, rotation_number, new_rep);
+        }
+        
+        // Update last_height to highest seen
+        if block.height > self.last_height {
+            self.last_height = block.height;
+        }
     }
     
     /// Process macroblock consensus data

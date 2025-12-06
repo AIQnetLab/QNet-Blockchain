@@ -2654,19 +2654,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     continue;
                 }
                 
-                // Check if node API is responding
-                let check_url = format!("http://{}:8001/health", ip);
-                let is_ready = match reqwest::Client::builder()
-                    .timeout(std::time::Duration::from_secs(2))
-                    .build()
-                {
-                    Ok(client) => {
-                        match client.get(&check_url).send().await {
-                            Ok(resp) => resp.status().is_success(),
-                            Err(_) => false,
-                        }
-                    }
-                    Err(_) => false,
+                // Check if node P2P port is responding (TCP 9876 opens before HTTP API)
+                // This prevents deadlock where all nodes wait for each other's HTTP API
+                let is_ready = match tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    tokio::net::TcpStream::connect(format!("{}:9876", ip))
+                ).await {
+                    Ok(Ok(_)) => true,  // TCP connection successful
+                    _ => false,         // Timeout or connection refused
                 };
                 
                 if is_ready {

@@ -2946,6 +2946,7 @@ impl BlockchainNode {
                         Ok(microblock) => {
                             // CRITICAL: Save producer_id for reputation update after storage
                             block_producer_id = Some(microblock.producer.clone());
+                            println!("[REPUTATION] 🔍 Block #{} producer extracted: {}", received_block.height, microblock.producer);
                             // Apply ALL transactions from block to state
                             for tx in &microblock.transactions {
                                 // SPECIAL HANDLING: RewardDistribution transactions
@@ -3131,6 +3132,7 @@ impl BlockchainNode {
                     if received_block.height > 0 && received_block.height % 30 == 0 {
                         // Just received last block of a round (30, 60, 90...)
                         println!("[ROTATION] 🔄 Received rotation boundary block #{} - checking producer for next round", received_block.height);
+                        println!("[ROTATION] 🔍 DEBUG: block_type='{}', producer_id={:?}", received_block.block_type, block_producer_id);
                         
                         // DETERMINISTIC REPUTATION: Update via blockchain-based system
                         // All nodes compute same reputation from block data (no P2P gossip)
