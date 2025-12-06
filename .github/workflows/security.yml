@@ -65,8 +65,7 @@ jobs:
       continue-on-error: true
     
     - name: Run cargo audit
-      run: cargo audit --json > audit-results.json || echo "Audit completed with warnings"
-      continue-on-error: true
+      run: cargo audit --json > audit-results.json
     
     - name: Upload audit results
       uses: actions/upload-artifact@v3

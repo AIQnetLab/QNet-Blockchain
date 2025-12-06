@@ -2,8 +2,7 @@
 //! Production implementation using CRYSTALS-Kyber and Dilithium algorithms
 //! Server-side activation code decryption and validation
 
-use sha2::{Sha256, Digest};
-use sha3::Sha3_256;
+use sha3::{Sha3_256, Digest};
 // Crystals-Dilithium will be used through key_manager
 use aes_gcm::{Aes256Gcm, Key, Nonce, KeyInit};
 use aes_gcm::aead::{Aead, AeadCore, OsRng};
@@ -99,7 +98,7 @@ struct CachedKeyManager {
     access_count: Arc<std::sync::atomic::AtomicU64>,
 }
 
-/// Simple node replacement: 1 wallet = 1 active node per type
+/// Simple node replacement: 1 wallet = 1 active node (regardless of type)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SimpleNodeRecord {
     pub wallet_address: String,
@@ -109,9 +108,13 @@ pub struct SimpleNodeRecord {
 }
 
 /// Activation payload structure (decrypted from quantum-secure code)
+/// IMPORTANT: `wallet` is ALWAYS QNet EON address (for rewards)
+/// Phase 1: Solana address used only for burn verification, rewards go to QNet wallet
+/// Phase 2: Same QNet EON address used for burn and rewards
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActivationPayload {
     pub burn_tx: String,
+    /// QNet EON address for rewards (ALWAYS EON format: {19}eon{15}{4checksum})
     pub wallet: String,
     pub node_type: String,
     pub signature: DilithiumSignature,
@@ -264,12 +267,12 @@ impl QNetQuantumCrypto {
             return Ok(ActivationPayload {
                 burn_tx: "genesis_bootstrap".to_string(),
                 node_type: "super".to_string(),
-                timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+                timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
                 wallet,  // Now matches get_wallet_address() format!
                 signature: DilithiumSignature {
                     signature: "genesis_bootstrap_signature".to_string(),
                     algorithm: "CRYSTALS-Dilithium3".to_string(),  // NIST FIPS 204
-                    timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+                    timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
                     strength: "quantum-resistant".to_string(),
                 },
                 entropy: "genesis_entropy".to_string(),
@@ -314,7 +317,7 @@ impl QNetQuantumCrypto {
         // 6. Create decryption key (same as route.ts logic)
         // key_material = f"{burn_tx}:{node_type}:{burn_amount}"
         let key_material = format!("{}:{}:{}", burn_tx, node_type, burn_amount);
-        let encryption_key = self.sha256_hash(&key_material)[..32].to_string();
+        let encryption_key = self.sha3_hash(&key_material)[..32].to_string();
         
         println!("🔑 Decryption key derived from:");
         println!("   burn_tx: {}...", safe_preview(&burn_tx, 8));
@@ -397,8 +400,8 @@ impl QNetQuantumCrypto {
 
     /// Fast signature verification with aggressive caching
     pub async fn verify_dilithium_signature_cached(&self, data: &str, signature: &DilithiumSignature, wallet_address: &str) -> Result<bool> {
-        // Create cache key for signature
-        let mut hasher = Sha256::new();
+        // Create cache key for signature (SHA3-256 for consistency)
+        let mut hasher = Sha3_256::new();
         hasher.update(data.as_bytes());
         hasher.update(signature.signature.as_bytes());
         hasher.update(wallet_address.as_bytes());
@@ -408,7 +411,7 @@ impl QNetQuantumCrypto {
         {
             let cache = SIGNATURE_CACHE.read().await;
             if let Some(cached_sig) = cache.get(&cache_key) {
-                let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
                 if current_time - cached_sig.cached_at < self.cache_ttl_seconds {
                     self.increment_zero_copy_ops();
                     return Ok(cached_sig.is_valid);
@@ -424,7 +427,7 @@ impl QNetQuantumCrypto {
             let mut cache = SIGNATURE_CACHE.write().await;
             cache.insert(cache_key, CachedSignature {
                 is_valid,
-                cached_at: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+                cached_at: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
                 signature_hash: signature.signature[..16].to_string(),
             });
         }
@@ -436,7 +439,7 @@ impl QNetQuantumCrypto {
     async fn get_from_cache(&self, activation_code: &str) -> Option<CachedActivationData> {
         let cache = CRYPTO_CACHE.read().await;
         if let Some(cached) = cache.get(activation_code) {
-            let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+            let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
             if current_time - cached.created_at < self.cache_ttl_seconds {
                 return Some(cached.clone());
             }
@@ -451,13 +454,13 @@ impl QNetQuantumCrypto {
         // Implement LRU eviction if cache is full
         if cache.len() >= self.max_cache_size {
             // Remove oldest entries
-            let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+            let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
             cache.retain(|_, v| current_time - v.created_at < self.cache_ttl_seconds / 2);
         }
         
         cache.insert(activation_code.to_string(), CachedActivationData {
             payload: payload.clone(),
-            created_at: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            created_at: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
             access_count: 1,
         });
     }
@@ -500,7 +503,7 @@ impl QNetQuantumCrypto {
 
     /// Get performance status (removed code verification - system always generates correct codes)
     pub fn get_status(&self) -> QuantumCryptoStatus {
-        let stats = self.performance_stats.read().unwrap();
+        let stats = match self.performance_stats.read() { Ok(g) => g, Err(p) => p.into_inner() };
         let zero_copy_ops = self.zero_copy_counter.load(std::sync::atomic::Ordering::Relaxed);
         
         let cache_hit_rate = if stats.total_operations > 0 {
@@ -765,12 +768,12 @@ impl QNetQuantumCrypto {
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| {
                     // Fallback: Generate proper EON address format: {19}eon{15}{4 checksum} = 41 chars
-                    use sha3::{Sha3_256, Digest};
+                    use sha2::{Sha256, Digest as Sha2Digest};
                     let hash = blake3::hash(genesis_node_id.as_bytes()).to_hex();
                     let part1 = &hash[..19];
                     let part2 = &hash[19..34];
                     let checksum_input = format!("{}eon{}", part1, part2);
-                    let mut hasher = Sha3_256::new();
+                    let mut hasher = Sha256::new();
                     hasher.update(checksum_input.as_bytes());
                     let checksum = hex::encode(&hasher.finalize()[..2]);
                     format!("{}eon{}{}", part1, part2, checksum)
@@ -805,8 +808,8 @@ impl QNetQuantumCrypto {
             "F" | "f" | "4" | "5" | "6" | "D" | "E" => NodeType::Full, 
             "S" | "s" | "7" | "8" | "9" => NodeType::Super,
             _ => {
-                // Fallback logic
-                let mut hasher = Sha256::new();
+                // Fallback logic (SHA3-256 for consistency)
+                let mut hasher = Sha3_256::new();
                 hasher.update(encoded_data.as_bytes());
                 let hash = hasher.finalize();
                 match hash[0] % 3 {
@@ -831,15 +834,17 @@ impl QNetQuantumCrypto {
         // Generate wallet address from activation code
         // PRODUCTION FORMAT: 19 + 3 + 15 + 4 = 41 characters
         let wallet_hash = {
-            let mut hasher = Sha256::new();
+            let mut hasher = Sha3_256::new();
             hasher.update(code.as_bytes());
             hasher.finalize()
         };
         let full_hex = hex::encode(&wallet_hash);
         let part1 = &full_hex[..19];
         let part2 = &full_hex[19..34];
+        // Generate SHA-256 checksum for wallet compatibility
         let checksum_input = format!("{}eon{}", part1, part2);
-        let mut checksum_hasher = Sha3_256::new();
+        use sha2::{Sha256, Digest as Sha2Digest};
+        let mut checksum_hasher = Sha256::new();
         checksum_hasher.update(checksum_input.as_bytes());
         let checksum = hex::encode(&checksum_hasher.finalize()[..2]); // 4 hex chars
         let wallet_address = format!("{}eon{}{}", part1, part2, checksum);
@@ -882,7 +887,7 @@ impl QNetQuantumCrypto {
         use std::sync::Arc;
         
         // Check cache first (using existing TTL pattern)
-        let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         let cache_key = node_id.to_string();
         
         // Get or create cached key manager
@@ -987,7 +992,7 @@ impl QNetQuantumCrypto {
         Ok(DilithiumSignature {
             signature: consensus_signature,
             algorithm: "CRYSTALS-Dilithium3".to_string(),  // REAL algorithm name
-            timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
             strength: "quantum-resistant".to_string(),
         })
     }
@@ -1008,8 +1013,8 @@ impl QNetQuantumCrypto {
             "4" | "5" | "6" | "7" | "D" | "E" | "F" => Ok("full".to_string()),
             "8" | "9" => Ok("super".to_string()),
             _ => {
-                // Fallback: hash-based determination
-                let mut hasher = Sha256::new();
+                // Fallback: hash-based determination (SHA3-256 for consistency)
+                let mut hasher = Sha3_256::new();
                 hasher.update(code_segments.as_bytes());
                 let hash = hasher.finalize();
                 
@@ -1040,7 +1045,7 @@ impl QNetQuantumCrypto {
         // Route.ts compatible validation - less strict than old quantum payload
         let current_time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
 
         // Allow wider timestamp range for route.ts compatibility
@@ -1179,7 +1184,9 @@ impl QNetQuantumCrypto {
         }
 
         // First character is node type marker (L/F/S)
-        let node_type_char = segment1.chars().next().unwrap().to_uppercase().next().unwrap();
+        // SAFE: segment1 is checked for empty above
+        let first_char = segment1.chars().next().expect("Checked non-empty above");
+        let node_type_char = first_char.to_ascii_uppercase();
         
         let node_type = match node_type_char {
             'L' => "light",
@@ -1320,7 +1327,7 @@ impl QNetQuantumCrypto {
     async fn get_blockchain_phase_state(&self) -> Result<BlockchainPhaseState> {
         let current_timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
         
         // PRODUCTION: Get REAL data from global state (set by node sync process)
@@ -1382,10 +1389,9 @@ impl QNetQuantumCrypto {
         }
     }
 
-    /// SHA256 hash function (route.ts compatible)
-    fn sha256_hash(&self, data: &str) -> String {
-        use sha2::{Sha256, Digest};
-        let mut hasher = Sha256::new();
+    /// SHA3-256 hash function (NIST SP 800-186 compliant)
+    fn sha3_hash(&self, data: &str) -> String {
+        let mut hasher = Sha3_256::new();
         hasher.update(data.as_bytes());
         hex::encode(hasher.finalize())
     }

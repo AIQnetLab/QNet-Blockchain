@@ -1,5 +1,8 @@
 # QNet v2.19.6 - Quick Reference Guide
 
+> ⚠️ **REPUTATION SYSTEM UPDATED in v2.21.0**  
+> See [docs/REPUTATION_SYSTEM.md](REPUTATION_SYSTEM.md) for current deterministic blockchain-based reputation.
+
 ## 📚 Key Concepts
 
 ### Block Structure
@@ -9,20 +12,22 @@
 - **Finality Window**: 10 blocks (~10 seconds)
 - **Entropy Consensus**: At rotation boundaries (adaptive 200ms-2s)
 
-### Signature Types
+### Signature Types (v2.23 - RAW bytes)
 | Type | Size | Use Case | Certificate |
 |------|------|----------|-------------|
-| **Compact** | 3KB | Microblocks (high frequency) | Cached separately |
-| **Full** | 12KB | Macroblocks (low frequency) | Embedded |
+| **Compact v2.23** | ~2.6KB | Microblocks (high frequency) | Cached separately |
+| **Full v2.23** | ~5KB | Macroblocks (low frequency) | Embedded |
+
+> **v2.23 Update**: RAW bytes format via `serde_bytes` (88% reduction from 22KB)
 
 ### Node Types
-| Type | Consensus | Storage | Bandwidth | Target | Reputation | PoH |
+| Type | Consensus | Storage | Bandwidth | Target | Reputation | VTS |
 |------|-----------|---------|-----------|--------|------------|-----|
 | **Light** | ❌ No | Minimal | Low | Mobile, IoT | Fixed 70 | ❌ No |
 | **Full** | ⚠️ Partial | Full chain | Medium | Validators | Variable | ✅ Yes |
 | **Super** | ✅ Always | Full + history | High | Producers | Variable | ✅ Yes |
 
-### Proof of History (PoH)
+### Verifiable Time Sequence (VTS)
 | Parameter | Value | Notes |
 |-----------|-------|-------|
 | **Hash Rate** | 500K/sec | SHA3-512 (25%) + Blake3 (75%) |
@@ -59,21 +64,31 @@ Block 270+: PFP Level 4 (critical)
 
 ## 🔐 Security
 
-### Cryptography Stack
-- **Post-Quantum**: CRYSTALS-Dilithium (NIST PQC)
-- **Classical**: Ed25519
-- **Hashing**: SHA3-256
+### Cryptography Stack (NIST/Cisco Compliant v2.19.22)
+- **Post-Quantum**: CRYSTALS-Dilithium3 (NIST FIPS 204)
+- **Classical**: Ed25519 (EPHEMERAL per message!)
+- **Hashing**: SHA3-256 (quantum-resistant)
 - **Consensus**: Byzantine (2/3+ honest nodes)
+
+### Hybrid Signature (Per Message)
+```
+1. Generate NEW ephemeral Ed25519 keypair
+2. Sign message with ephemeral Ed25519
+3. Dilithium signs: ephemeral_pk || hash || timestamp
+4. Dilithium signs: message_hash
+```
+**Why?** Forward secrecy + quantum protection
 
 ### Verification Flow
 ```
 Microblock arrives
     ↓
 P2P Layer (node.rs)
-    ├─► Structure check
+    ├─► Structure check (ephemeral_public_key present?)
     ├─► Certificate lookup
-    ├─► Dilithium verify ✅
-    └─► Ed25519 format ✅
+    ├─► Ed25519 verify with EPHEMERAL key ✅
+    ├─► Dilithium verify key binding ✅
+    └─► Dilithium verify message ✅
     ↓
 Consensus Layer (consensus_crypto.rs)
     ├─► Re-validate structure
@@ -106,7 +121,7 @@ Consensus Layer (consensus_crypto.rs)
 - **Periodic Intervals**: 10s (new) / 60s (medium) / 300s (old certs)
 - **On Rotation**: Immediate tracked broadcast (80% lifetime)
 - **Anti-Duplication**: Serial number change detection
-- **Method**: HTTP POST to `/api/v1/p2p/message`
+- **Transport**: QUIC (UDP 10876) - binary protocol
 
 ### Caching
 - **Capacity**: 100,000 certificates
@@ -115,17 +130,19 @@ Consensus Layer (consensus_crypto.rs)
 - **Rotation**: 80% lifetime (216 seconds)
 - **Cache TTL**: 9 minutes (2× lifetime for grace period)
 
-## 🔄 Block Buffering
+## 🔄 Block Buffering (v2.19.20)
 
-### Memory Protection
-- **Max Pending**: 100 blocks (~10 MB)
-- **Timeout**: 30 seconds per block
-- **Retry Limit**: 5 attempts
+### Adaptive Memory Protection
+- **Max Pending (Light)**: 100 blocks (~10 MB)
+- **Max Pending (Full/Super)**: 500 blocks (~50 MB)
+- **Retry**: Pseudo-infinite (like Solana/Ethereum)
+- **Backoff (0-9 retries)**: 10 seconds (aggressive)
+- **Backoff (10+ retries)**: 30s → 60s → 120s → 240s → 300s max
 - **Eviction**: FIFO (oldest first)
 - **Protection**: Current block never removed
 
 ### Purpose
-Handles out-of-order block arrival in gossip P2P network while preventing memory exhaustion attacks.
+Handles out-of-order block arrival in gossip P2P network while preventing memory exhaustion attacks. Blocks are NEVER discarded - pseudo-infinite retries with exponential backoff ensure all blocks are eventually received.
 
 ## 🎯 Reputation System
 
@@ -224,11 +241,11 @@ CRITICAL ATTACKS → PERMANENT BAN (no return):
 
 ### Gossip Protocol
 
-- **Transport**: HTTP POST (NOT TCP)
+- **Transport**: QUIC (UDP 10876)
+- **Protocol**: Binary (bincode serialization)
 - **Interval**: Every 5 minutes
 - **Scope**: Super + Full nodes only
 - **Signature**: SHA3-256 quantum-safe
-- **URL**: `/api/v1/p2p/message`
 
 ### Byzantine Threshold
 
@@ -338,6 +355,18 @@ docker build -f development/qnet-integration/Dockerfile.production -t qnet-produ
 
 ### Run Genesis Node (Production)
 ```bash
+# REQUIRED: Configure firewall FIRST
+# For UFW (Ubuntu/Debian):
+sudo ufw allow 9876,9877,8001/tcp
+sudo ufw allow 10876/udp
+sudo ufw reload
+
+# For iptables:
+sudo iptables -A INPUT -p tcp --dport 9876 -j ACCEPT
+sudo iptables -A INPUT -p tcp --dport 9877 -j ACCEPT
+sudo iptables -A INPUT -p tcp --dport 8001 -j ACCEPT
+sudo iptables -A INPUT -p udp --dport 10876 -j ACCEPT
+
 # On server with IP matching QNET_BOOTSTRAP_ID (001-005)
 docker run -d --name qnet-genesis-001 --restart=always \
   -e QNET_PRODUCTION=1 \
@@ -345,7 +374,7 @@ docker run -d --name qnet-genesis-001 --restart=always \
   -e DOCKER_ENV=1 \
   -e QNET_AGGRESSIVE_PRUNING=0 \
   -e QNET_MAX_STORAGE_GB=2000 \
-  -p 9876:9876 -p 9877:9877 -p 8001:8001 \
+  -p 9876:9876 -p 9877:9877 -p 8001:8001 -p 10876:10876/udp \
   -v $(pwd)/genesis_001_data:/app/data \
   qnet-production
 ```
@@ -374,9 +403,14 @@ const FINALITY_WINDOW: u64 = 10;               // Blocks for finality
 const MAX_VALIDATORS_PER_ROUND: usize = 1000;  // Consensus limit
 const CERTIFICATE_LIFETIME_SECS: u64 = 270;    // 4.5 minutes
 const MAX_CACHE_SIZE: usize = 100000;          // Certificate cache
-const MAX_PENDING_BLOCKS: usize = 100;         // Block buffer limit
 
-// PoH constants (quantum_poh.rs)
+// Block buffering (v2.19.20) - adaptive by node type
+// Light nodes: 100 blocks (~10 MB)
+// Full/Super nodes: 500 blocks (~50 MB)
+const NETWORK_STABILIZATION_SECS: u64 = 30;    // Genesis startup wait
+const EMERGENCY_WAIT_SECS: u64 = 10;           // Emergency producer wait
+
+// VTS constants (quantum_poh.rs)
 const HASHES_PER_TICK: u64 = 5_000;            // Hashes per 10ms tick
 const TICK_DURATION_US: u64 = 10_000;          // 10ms = 10,000 microseconds
 const HASHES_PER_SLOT: u64 = 500_000;          // 500K hashes = 1 second

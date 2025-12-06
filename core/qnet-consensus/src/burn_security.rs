@@ -212,7 +212,7 @@ impl BurnSecurityValidator {
             activation_amount: burned_amount,
             activated_at: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_secs(),
             node_type,
             reputation: 100.0, // Start with max reputation
@@ -239,7 +239,7 @@ impl BurnSecurityValidator {
             activation_amount: transferred_amount,
             activated_at: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_secs(),
             node_type,
             reputation: 100.0, // Start with max reputation

@@ -44,7 +44,56 @@ This project uses **dual licensing**:
 - **Phase 2 (Future)**: ONLY QNC token activation on QNet blockchain
 - **Transition**: 90% 1DEV burned OR 5 years from genesis block (whichever comes first)
 
-### 🛡️ **LATEST UPDATES (v2.19.12 - November 27, 2025)**
+### 🛡️ **LATEST UPDATES (v2.19.22 - November 30, 2025)**
+
+**🔐 NIST/Cisco Compliant Hybrid Cryptography:**
+- **Ephemeral Keys**: NEW Ed25519 keypair for EACH message (forward secrecy)
+- **Dual Dilithium Signatures**: Signs ephemeral key binding + message hash
+- **Quantum Protection**: Ed25519 broken? Dilithium still protects!
+- **Compliance**: NIST SP 800-208, Cisco Post-Quantum recommendations
+
+**🚀 QUIC Transport Layer:**
+- TLS 1.3 encryption (NIST SP 800-52 compliant)
+- Connection multiplexing: 100+ streams per connection
+- 0-RTT handshake for repeat connections
+- Binary protocol (bincode): ~50% bandwidth reduction vs JSON
+- **HTTP Fallback Removed**: Pure QUIC for Full/Super node P2P
+- **Port Requirement**: UDP 10876 must be open (`sudo ufw allow 10876/udp`)
+- **Docker Update**: Add `-p 10876:10876/udp` to run commands
+
+### 🛡️ **Previous Updates (v2.19.20 - November 30, 2025)**
+- **Fire-and-Forget Broadcast**: Shred Protocol block propagation no longer blocks production (1 block/sec guaranteed)
+- **Genesis Startup Wait**: 30-second network stabilization before block production (prevents race conditions)
+- **Emergency Timeout 10s**: Increased from 2s to allow original producer delivery
+- **Pseudo-Infinite Retries**: Blocks are NEVER discarded (like Solana/Ethereum)
+- **Exponential Backoff**: 10s (retries 0-9) → 30s → 60s → 120s → 240s → 300s max
+- **Adaptive Buffer Size**: Full/Super nodes: 500 blocks (~50MB), Light nodes: 100 blocks (~10MB)
+- **Background Re-request**: Missing blocks automatically re-requested every 30s with backoff
+
+### 🛡️ **Latest Update (v2.20.0 - December 4, 2025)**
+- **Reputation System Fix**: Only INFLATION is an attack (DEFLATION is legitimate after penalties)
+- **Tolerance Increased**: 2% → 10% for network delays and sync timing
+- **Deterministic Producer Selection**: Round 0 uses Genesis + leadership_round as entropy
+- **Cascade Prevention**: Prevents false accusations from network desync
+
+### 🛡️ **Previous Updates (v2.23 - December 6, 2025)**
+- **Heartbeat with HYBRID signatures**: Full quantum protection (Ed25519 + Dilithium per heartbeat)
+- **RAW bytes signatures**: 88% size reduction (~2.6KB vs 22KB)
+- **Shred Protocol ALWAYS**: Block propagation uses Shred Protocol for ALL network sizes
+- **Kademlia K-neighbors**: Heartbeats use DHT distance for efficient routing (K=3)
+- **Exponential backoff failover**: 3s → 6s → 12s → 24s → 30s max (reduces CPU under stall)
+- **Priority channels**: Blocks/Consensus use separate channels (implicit priority queue)
+- **gossip_to_k_neighbors()**: New method for DHT-based message propagation
+
+### 🛡️ **Previous Updates (v2.19.14 - November 28, 2025)**
+- **Simplified Fork Resolution**: Three-case approach (network ahead/same height/we're ahead) instead of complex weight calculations
+- **Reputation Manipulation Detection**: Escalating punishment for INFLATION attacks (1h → 1d → 1w → 1y ban)
+- **Empty Response Attack Protection**: Detection and penalty for nodes sending empty peer lists
+- **Consensus Security**: Timestamp validation (±5 min) and signature format pre-validation for commits/reveals
+- **Dual Peer Lookup**: Fixed Genesis node peer discovery (check both DashMap and RwLock storage)
+- **Dead Code Removal**: Removed ~250 lines of unused fork recovery code
+
+### 🛡️ **Previous Updates (v2.19.12 - November 27, 2025)**
 - **Full Macroblock Sync**: Complete P2P synchronization for macroblocks (RequestMacroblocks, MacroblocksBatch)
 - **Snapshot API**: New endpoints `/api/v1/snapshot/latest` and `/api/v1/snapshot/{height}` for fast sync
 - **Light Node Support**: Macroblocks synced for state verification, headers rotated to save space
@@ -84,7 +133,7 @@ This project uses **dual licensing**:
   - Binary+JSON support: flexible storage for different TX types
   - Integrated into block production: automatic priority selection
   - Minimum gas price: 100,000 nano QNC (0.0001 QNC base fee)
-- **Adaptive Turbine Fanout**: Dynamic block propagation scaling (NEW!)
+- **Adaptive Shred Protocol Fanout**: Dynamic block propagation scaling (NEW!)
   - Network-aware: 4-32 fanout based on producer count and latency
   - LAN optimization: higher fanout (16-32) for low latency networks
   - WAN optimization: moderate fanout (8-16) for high latency
@@ -92,7 +141,7 @@ This project uses **dual licensing**:
   - Real-time calculation: adjusts every block based on network state
 - **Real-time Prometheus Metrics**: Live performance monitoring (NEW!)
   - Dynamic mempool size, block height, connected peers
-  - Live Turbine fanout, qualified producers, average latency
+  - Live Shred Protocol fanout, qualified producers, average latency
   - MEV metrics: bundle count, allocation percentage
   - No hardcoded values: all metrics reflect real network state
 - **Split Reputation System**: Byzantine-safe separation of behavior metrics (NEW!)
@@ -118,14 +167,20 @@ This project uses **dual licensing**:
   - Blacklist filtering: Offline/malicious peers skipped
   - Reputation-based ordering: consensus_score + network_score (latency)
   - Top-20 peer sampling: Avoids stuck sync on single unavailable peer
-- **HTTP Gossip Reputation Sync**: Exponential O(log n) propagation for millions of nodes
-  - Migrated from O(n) broadcast to O(log n) gossip protocol (99.999% bandwidth savings)
-  - Adaptive fanout (4-32): Same as Turbine block propagation
-  - Kademlia-based peer selection: XOR distance for peer diversity
-  - Re-gossip mechanism: Each recipient forwards to fanout peers (exponential growth)
-  - Byzantine-safe weighted average: 70% local + 30% remote (convergence)
-  - Prevents fork risk: All nodes converge to same reputation view
-  - Example: 1M nodes = ~20 hops vs 1M HTTP requests (broadcast)
+- **QUIC P2P Transport (v2.19.22)**: High-performance UDP-based transport for all P2P communication
+  - Full QUIC protocol with TLS 1.3 encryption (NIST SP 800-52 compliant)
+  - Connection multiplexing: 100+ streams per connection
+  - 0-RTT handshake for repeat connections (ultra-low latency)
+  - Connection pooling with automatic reconnection
+  - Binary protocol (bincode): ~50% bandwidth reduction vs JSON
+  - UDP port 10876 (P2P port + 1000)
+  - Fallback: None (QUIC is mandatory for v2.19.22+)
+- **Deterministic Reputation (v2.1)**: No P2P gossip - reputation from blockchain only
+  - REMOVED: Gossip-based reputation sync (Sybil attack vulnerable)
+  - All reputation computed from on-chain data (blocks, macroblocks)
+  - SlashingEvents with cryptographic proof in macroblocks
+  - Finality Checkpoints: After 2 macroblocks = irreversible
+  - Scalable: Chunked processing for 100,000+ nodes
 - **Hybrid Merkle + Sampling**: Scalable on-chain ping commitments
   - 360× on-chain size reduction (100 MB vs 36 GB)
   - Merkle root commitment to ALL pings (blake3 hashing)
@@ -140,10 +195,10 @@ This project uses **dual licensing**:
   - Conservative estimates for Pool 2 & Pool 3
   - Partial determinism by design (±1-5% acceptable)
   - Byzantine consensus ensures security
-- **Compact Hybrid Signatures**: Optimized microblock signatures (3KB vs 12KB)
+- **Compact Hybrid Signatures v2.23**: Optimized microblock signatures (~2.6KB RAW bytes)
   - Ed25519 + CRYSTALS-Dilithium hybrid cryptography
-  - Certificate caching for 4x bandwidth reduction
-  - Separate verification: structural (consensus) + cryptographic (P2P)
+  - RAW bytes format via `serde_bytes` (88% reduction from 22KB)
+  - Defense-in-depth: real Dilithium verification at P2P + Consensus layers
   - NIST/Cisco post-quantum compliance
 - **Progressive Finalization Protocol (PFP)**: Self-healing macroblock recovery
   - Degradation levels: 80% → 60% → 40% → 1% node requirements
@@ -182,12 +237,12 @@ This project uses **dual licensing**:
   - Optimized for 4.29B QNC supply with conservative thresholds
   - Zero storage overhead (calculated on-the-fly)
   - Backward compatible (optional fields)
-- **PoH Synchronization**: Synchronized Proof of History for deterministic producer selection
-  - PoH state from last confirmed block (all nodes agree)
-  - Local PoH generator syncs with received blocks
-  - Prevents consensus failures from diverging PoH states
-  - Macroblock PoH sourced from last microblock in range
-- **Fork Detection & Resolution**: PoH counter regression checks prevent malicious forks
+- **VTS Synchronization**: Synchronized Verifiable Time Sequence for deterministic producer selection
+  - VTS state from last confirmed block (all nodes agree)
+  - Local VTS generator syncs with received blocks
+  - Prevents consensus failures from diverging VTS states
+  - Macroblock VTS sourced from last microblock in range
+- **Fork Detection & Resolution**: VTS counter regression checks prevent malicious forks
 
 ### **Previous Updates (v2.17.0)**
 - **Chain Reorganization (Chain Reorg)**: Byzantine-safe fork resolution with 2/3 majority consensus
@@ -197,9 +252,28 @@ This project uses **dual licensing**:
 - **Parallel Block Processing**: High-performance consecutive block processing (up to 10 blocks)
 - **Reputation-Based Chain Weight**: Byzantine weight calculation using validator reputation scores
 
+### **Latest Updates (v2.21.4)**
+- **QUIC Rate Limiting**: Semaphore-based adaptive rate limiting for chunk sends
+  - Prevents receiver overload from burst of 72+ concurrent streams
+  - Fixed ~40% packet loss issue discovered in production testing
+  - Adaptive limits: 20-200 concurrent based on network size
+  - Per-peer limit: max 5 concurrent streams per receiver
+  - Scales from 5 to 100K+ nodes
+
+### **Previous Updates (v2.21.3)**
+- **SHRED Chunk Retransmit**: Efficient recovery of missing chunks without full block download
+  - 3-second timeout before requesting missing chunks
+  - Adaptive peer selection (3-10 peers based on network size)
+  - 100-block chunk cache for fast retransmit responses
+  - 83% bandwidth savings vs full block re-download
+  - Works for both microblocks and macroblocks
+- **Privacy-First Logging**: All IP addresses use pseudonyms via `get_privacy_id_for_addr()`
+- **Genesis QUIC Readiness**: Retry mechanism ensures QUIC connections established before broadcast
+- **Deadlock Detection Fixes**: Improved sync flag management with `>=` timeout checks
+
 ### **Previous Updates (v2.16.0)**
-- **Turbine Block Propagation**: 85% bandwidth reduction with Reed-Solomon erasure coding
-- **Quantum Proof of History (PoH)**: 500K hashes/sec with hybrid SHA3-512/Blake3 (25%/75%)
+- **Shred Protocol Block Propagation**: 85% bandwidth reduction with Reed-Solomon erasure coding
+- **Quantum Verifiable Time Sequence (VTS)**: 500K hashes/sec with hybrid SHA3-512/Blake3 (25%/75%)
   - Production config: 5,000 hashes per tick × 100 ticks/sec = 500K hashes/sec
   - 100 ticks per second (10ms intervals) for smooth entropy generation
   - 5,000 hashes per tick (optimized for 1-second microblocks)
@@ -210,8 +284,8 @@ This project uses **dual licensing**:
   - 72 bytes overhead per block (poh_hash: 64B + poh_count: 8B) = ~2-3%
   - Hardware: Intel Xeon E5-2680v4 @ 2.4GHz
 - **Quantum-Resistant Producer Selection**: Deterministic selection with finality window, Dilithium + Ed25519 hybrid cryptography for Byzantine-safe leader election
-- **Hybrid Sealevel Execution**: 5-stage pipeline with 10,000 parallel transactions
-- **Tower BFT Adaptive Timeouts**: Dynamic 7s base to 20s max (1.5x multiplier) based on network conditions
+- **Hybrid Parallel Executor Execution**: 5-stage pipeline with 10,000 parallel transactions
+- **Adaptive BFT Adaptive Timeouts**: Dynamic 7s base to 20s max (1.5x multiplier) based on network conditions
 - **Pre-Execution Cache**: Speculative execution with 10,000 transaction cache
 - **Comprehensive Benchmark Harness**: Full performance testing suite for all components
 - **57 API Endpoints**: Complete monitoring and control interface for all features
@@ -304,10 +378,10 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 - **📊 Priority Mempool**: Gas-price-based ordering for spam resistance
 
 #### **Advanced Performance Features**
-- **🌪️ Turbine Protocol**: 85% bandwidth savings with adaptive fanout (4-32) based on network topology
-- **⏱️ Quantum PoH**: 500K hashes/sec cryptographic clock for precise timing
-- **⚙️ Hybrid Sealevel**: 10,000 parallel transactions with 5-stage pipeline
-- **🎯 Tower BFT**: Adaptive timeouts (7s base to 20s max, 1.5x multiplier) for optimal consensus
+- **🌪️ Shred Protocol Protocol**: 85% bandwidth savings with adaptive fanout (4-32) based on network topology
+- **⏱️ Quantum VTS**: 500K hashes/sec cryptographic clock for precise timing
+- **⚙️ Hybrid Parallel Executor**: 10,000 parallel transactions with 5-stage pipeline
+- **🎯 Adaptive BFT**: Adaptive timeouts (7s base to 20s max, 1.5x multiplier) for optimal consensus
 - **🚀 Pre-Execution**: Speculative transaction processing with 10,000 cache size
 - **🔒 MEV Protection**: Private bundle submission with post-quantum signatures
 
@@ -328,7 +402,7 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 
 **Hardware & Benchmarks:**
 - **Test Environment**: Intel Xeon E5-2680v4 @ 2.4GHz (14 cores, 28 threads), 32GB DDR4-2400
-- **PoH Performance**: 500K hashes/sec (hybrid SHA3-512/Blake3, sequential ordering chain)
+- **VTS Performance**: 500K hashes/sec (hybrid SHA3-512/Blake3, sequential ordering chain)
 - **Signature Verification**: Dilithium3 ~2ms, Ed25519 ~20μs per signature
 - **Network**: WAN-optimized with adaptive timeouts (7s-20s)
 
@@ -347,7 +421,7 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 **Security Trade-offs:**
 - ✅ **AES-256-GCM**: Grover-resistant (2^128 operations = 10^38 years attack time)
 - ✅ **Nonce Management**: CSPRNG with 2^96 space, 10^-10% collision probability
-- ⚠️ **Architecture Inspiration**: Turbine propagation concept inspired by Solana (original implementation)
+- ⚠️ **Architecture Inspiration**: Shred Protocol propagation concept inspired by Solana (original implementation)
 - ✅ **Sybil Resistance**: Multi-layer (1DEV burn + QNC pool, reputation, time barrier, 67%+ coordination cost)
 
 ### 💾 Ultra-Modern Storage Architecture
@@ -442,19 +516,19 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 │      └── Deadlock prevention with guard pattern            │
 ├─────────────────────────────────────────────────────────────┤
 │  Performance Optimization Layer                   │
-│  ├── Turbine Block Propagation                             │
+│  ├── Shred Protocol Block Propagation                             │
 │  │   ├── 1KB chunks with Reed-Solomon erasure coding       │
 │  │   ├── Adaptive fanout (4-32) based on network size & latency │
 │  │   └── 85% bandwidth reduction                           │
-│  ├── Quantum Proof of History (QPoH)                       │
+│  ├── Quantum Verifiable Time Sequence (QVTS)                       │
 │  │   ├── 500K hashes/sec cryptographic clock               │
 │  │   ├── SHA3-512 + Blake3 hybrid (25%/75%)                │
 │  │   └── Verifiable delay function                         │
-│  ├── Hybrid Sealevel Execution                             │
+│  ├── Hybrid Parallel Executor Execution                             │
 │  │   ├── 5-stage pipeline processing                       │
 │  │   ├── 10,000 parallel transactions                      │
 │  │   └── Dependency graph analysis                         │
-│  ├── Tower BFT Adaptive Timeouts                           │
+│  ├── Adaptive BFT Adaptive Timeouts                           │
 │  │   ├── Dynamic 20s/10s/7s timeouts                       │
 │  │   └── Network condition awareness                       │
 │  └── Pre-Execution Cache                                   │
@@ -463,12 +537,13 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 │      └── 3-block lookahead                                 │
 ├─────────────────────────────────────────────────────────────┤
 │  Network Layer (Optimized for 10M+ nodes)                  │
+│  ├── QUIC Transport (UDP 10876) - TLS 1.3 encrypted        │
 │  ├── Kademlia DHT with K-bucket management                 │
 │  ├── Lock-Free DashMap for O(1) operations                 │
 │  ├── Dual Indexing (by address & ID)                       │
 │  ├── 256 Shards with Cross-Shard Routing                   │
 │  ├── Auto-Scaling (5→100→10K→1M+ nodes)                    │
-│  ├── Gossip Protocol                                       │
+│  ├── Gossip Protocol (QUIC-based)                          │
 │  ├── Regional Node Clustering                              │
 │  └── Emergency Producer Change Broadcasting                │
 ├─────────────────────────────────────────────────────────────┤
@@ -483,16 +558,18 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 
 QNet implements advanced chain reorganization and synchronization mechanisms for network consistency:
 
-### **Chain Reorganization (Byzantine-Safe)**
-- **Fork Detection**: Automatic detection of competing blockchain forks
-- **Byzantine Weight Calculation**: Reputation-based chain weight with unique validator counting
-- **2/3 Majority Consensus**: Requires 67% Byzantine threshold for reorganization
-- **Deep Reorg Protection**: Maximum 100 blocks reorganization depth (51% attack prevention)
-- **Race Condition Prevention**: Single concurrent reorg with lock-free coordination
+### **Chain Reorganization (Simplified & Reliable)**
+- **Fork Detection**: Automatic detection via SHA3-256 hash comparison (<1ms)
+- **Three-Case Resolution**:
+  - **Network ahead**: Rollback to fork point and sync with longer chain
+  - **Same height**: Resync if ≥3 high-reputation validators (≥70%) connected
+  - **We're ahead**: Keep our chain (we have longer chain)
+- **Validator-Based Decision**: Minimum 3 high-reputation peers required for resync
+- **Deep Reorg Protection**: Maximum 100 blocks sync per request (51% attack prevention)
+- **Race Condition Prevention**: Single concurrent reorg with RwLock flag
 - **DoS Protection**: Rate limiting (1 fork attempt per 60 seconds maximum)
-- **Reputation Capping**: Maximum 95% reputation to prevent single-node dominance
+- **Macroblock Finality**: Ultimate resolution via 67% consensus every 90 blocks
 - **Async Processing**: Non-blocking fork analysis in background tasks
-- **Automatic Rollback**: Full backup and restore on reorganization failure
 
 ### **Advanced Block Synchronization**
 - **Out-of-Order Buffering**: Temporary storage for blocks received before their dependencies
@@ -504,14 +581,14 @@ QNet implements advanced chain reorganization and synchronization mechanisms for
 - **Genesis Coordination**: Only node_001 creates Genesis block in bootstrap mode
 - **Quantum-Resistant Genesis**: CRYSTALS-Dilithium signature ensures identical Genesis across all nodes
 
-### **Proof of History (PoH) Integration**
+### **Verifiable Time Sequence (VTS) Integration**
 - **Cryptographic Clock**: 500K hashes/sec SHA3-512 + Blake3 hybrid (25%/75%)
 - **Verifiable Delay Function**: Time-stamped block ordering without central authority
 - **Block Time Synchronization**: Sub-second precision across distributed network
 - **Historical Proof**: Cryptographic evidence of event ordering and timing
-- **Fork Prevention**: PoH creates immutable timeline making forks computationally expensive
-- **Node Type Optimization**: PoH runs ONLY on Full/Super nodes (Light nodes excluded to save mobile battery/CPU)
-- **Network Synchronization**: Local PoH syncs with network consensus on block receipt
+- **Fork Prevention**: VTS creates immutable timeline making forks computationally expensive
+- **Node Type Optimization**: VTS runs ONLY on Full/Super nodes (Light nodes excluded to save mobile battery/CPU)
+- **Network Synchronization**: Local VTS syncs with network consensus on block receipt
 - **Checkpointing**: Automatic checkpoints every 1M hashes for fast node restart
 - **Drift Detection**: Automatic clock drift monitoring with 5% tolerance threshold
 
@@ -573,30 +650,47 @@ When all nodes fall below 70% reputation threshold:
 - **Progressive Penalties**: Escalating reputation penalties prevent repeated failures
 - **Network Transparency**: All failover events logged and broadcast to peers
 
-## 💎 Reputation System
+## 💎 Reputation System (v2.24 - Ethereum 2.0 Style Snapshots)
 
-QNet implements an economic reputation system that incentivizes network participation:
+**ARCHITECTURE v2.24:** Blockchain-based reputation with full state snapshots
+- All nodes compute identical reputation from on-chain data
+- Sybil-resistant: Cannot fake reputation via gossip
+- Deterministic: Verifiable by replaying blockchain from genesis
+- **NEW:** Full reputation snapshot in every macroblock (Ethereum 2.0 style)
+- **NEW:** Strict 30/30 rule - only FULL rotation gets reward!
 
-### **Reputation Events (Points)**
-| Action | Rep Points | Impact |
-|--------|------------|--------|
-| **Full Rotation (30 blocks)** | +2.0 | Complete producer rotation (FullRotationComplete) |
-| **Consensus Participation** | +1.0 | Participation in consensus round |
-| **Emergency Producer** | +5.0 | Network service during failover |
-| **Failed Microblock** | -20.0 | Lost producer slot (applies to self) |
-| **Failed Macroblock** | -30.0 | Consensus failure |
-| **Timeout Failure** | -2.0 | P2P timeout (network_score) |
-| **Connection Failure** | -5.0 | Offline/unreachable (network_score) |
-| **Double-Sign** | -50.0 | Byzantine fault + jail |
-| **Malicious Behavior** | -50.0 | Byzantine attack detected |
-| **Passive Recovery** | +1.0/4h | ONLY if reputation [10, 70) and NOT jailed |
+See full documentation: [docs/REPUTATION_SYSTEM.md](docs/REPUTATION_SYSTEM.md)
+
+### **Full Reputation Snapshot (v2.24)**
+
+Every macroblock stores complete reputation state:
+```rust
+pub struct FullReputationSnapshot {
+    pub reputations: HashMap<String, f64>,          // 0-100%
+    pub active_jails: HashMap<String, (u64, u32)>,  // end_time + offense_count
+    pub permanent_bans: HashSet<String>,            // Forever banned
+    pub offense_counts: HashMap<String, u32>,       // Progressive jail counter
+    pub last_passive_recovery: HashMap<String, u64>, // Recovery timers
+}
+```
+
+### **Reputation Events (Blockchain-Based)**
+| Action | Rep Points | Source | Requirement |
+|--------|------------|--------|-------------|
+| **Full Rotation** | +2.0 | block producer | **30/30 blocks only!** |
+| **Consensus Participation** | +1.0 | macroblock commit+reveal | Full participation |
+| **Invalid Block** | -20.0 | SlashingEvent in macroblock | Cryptographic proof |
+| **Double-Sign** | -50.0 + BAN | SlashingEvent | Both blocks as evidence |
+| **Chain Fork** | PERMANENT BAN | SlashingEvent | Fork evidence |
+| **Passive Recovery** | +1.0/4h | online nodes 10-69% | Not jailed |
+| **Partial Rotation** | 0 | — | NO REWARD if <30 blocks! |
 
 ### **Reputation Thresholds**
-- **70+ points**: Eligible for consensus participation AND rewards (70% minimum)
-- **10-69 points**: Network access only, no new rewards (can claim old accumulated rewards)
-- **<10 points**: Network ban (7-day recovery period, can still claim old rewards)
-- **Maximum**: 100 points (hard cap)
-- **Light nodes**: Fixed at 70 (immutable, always eligible for rewards)
+- **70-100%**: Eligible for consensus participation
+- **10-69%**: Passive recovery (+1% per 4h if online)
+- **<10%**: Cannot recover (too low)
+- **0%**: Jailed or permanently banned
+- **Light nodes**: Fixed at 70% (excluded by NodeType, not reputation)
 
 ### **Anti-Malicious Protection System**
 
@@ -805,9 +899,21 @@ git pull origin testnet
 # Build production Docker image
 docker build -f development/qnet-integration/Dockerfile.production -t qnet-production .
 
+# REQUIRED: Configure firewall BEFORE running node
+# For UFW (Ubuntu/Debian):
+sudo ufw allow 9876,9877,8001/tcp
+sudo ufw allow 10876/udp
+sudo ufw reload
+
+# For iptables:
+sudo iptables -A INPUT -p tcp --dport 9876 -j ACCEPT
+sudo iptables -A INPUT -p tcp --dport 9877 -j ACCEPT
+sudo iptables -A INPUT -p tcp --dport 8001 -j ACCEPT
+sudo iptables -A INPUT -p udp --dport 10876 -j ACCEPT
+
 # Run interactive production node (ONLY command needed)
 docker run -it --name qnet-node --restart=always \
-  -p 9876:9876 -p 9877:9877 -p 8001:8001 \
+  -p 9876:9876 -p 9877:9877 -p 8001:8001 -p 10876:10876/udp \
   -v $(pwd)/node_data:/app/node_data \
   qnet-production
 
@@ -860,7 +966,7 @@ docker build -f development/qnet-integration/Dockerfile.production -t qnet-produ
 
 # Run interactive production node
 docker run -it --name qnet-node --restart=always \
-  -p 9876:9876 -p 9877:9877 -p 8001:8001 \
+  -p 9876:9876 -p 9877:9877 -p 8001:8001 -p 10876:10876/udp \
   -v $(pwd)/node_data:/app/node_data \
   qnet-production
 ```
@@ -1126,7 +1232,7 @@ docker build -f development/qnet-integration/Dockerfile.production -t qnet-produ
 
 # Run updated container
 docker run -it --name qnet-node --restart=always \
-  -p 9876:9876 -p 9877:9877 -p 8001:8001 \
+  -p 9876:9876 -p 9877:9877 -p 8001:8001 -p 10876:10876/udp \
   -v $(pwd)/node_data:/app/node_data \
   qnet-production
 ```
@@ -1159,7 +1265,7 @@ docker run -it --name qnet-node --restart=always \
 docker run -it --name qnet-node --restart=always \
   -e QNET_PRODUCTION=1 \
   -e QNET_BOOTSTRAP_ID=YOUR_ID \
-  -p 9876:9876 -p 9877:9877 -p 8001:8001 \
+  -p 9876:9876 -p 9877:9877 -p 8001:8001 -p 10876:10876/udp \
   -v $(pwd)/node_data:/app/node_data \
   qnet-production
 
@@ -1269,7 +1375,7 @@ docker run -d --name qnet-genesis-001 --restart=always \
   -e DOCKER_ENV=1 \
   -e QNET_AGGRESSIVE_PRUNING=0 \
   -e QNET_MAX_STORAGE_GB=2000 \
-  -p 9876:9876 -p 9877:9877 -p 8001:8001 \
+  -p 9876:9876 -p 9877:9877 -p 8001:8001 -p 10876:10876/udp \
   -v $(pwd)/genesis_001_data:/app/data \
   qnet-production
 
@@ -1280,7 +1386,7 @@ docker run -d --name qnet-genesis-002 --restart=always \
   -e DOCKER_ENV=1 \
   -e QNET_AGGRESSIVE_PRUNING=0 \
   -e QNET_MAX_STORAGE_GB=2000 \
-  -p 9876:9876 -p 9877:9877 -p 8001:8001 \
+  -p 9876:9876 -p 9877:9877 -p 8001:8001 -p 10876:10876/udp \
   -v $(pwd)/genesis_002_data:/app/data \
   qnet-production
 
@@ -1291,7 +1397,7 @@ docker run -d --name qnet-genesis-003 --restart=always \
   -e DOCKER_ENV=1 \
   -e QNET_AGGRESSIVE_PRUNING=0 \
   -e QNET_MAX_STORAGE_GB=2000 \
-  -p 9876:9876 -p 9877:9877 -p 8001:8001 \
+  -p 9876:9876 -p 9877:9877 -p 8001:8001 -p 10876:10876/udp \
   -v $(pwd)/genesis_003_data:/app/data \
   qnet-production
 
@@ -1302,7 +1408,7 @@ docker run -d --name qnet-genesis-004 --restart=always \
   -e DOCKER_ENV=1 \
   -e QNET_AGGRESSIVE_PRUNING=0 \
   -e QNET_MAX_STORAGE_GB=2000 \
-  -p 9876:9876 -p 9877:9877 -p 8001:8001 \
+  -p 9876:9876 -p 9877:9877 -p 8001:8001 -p 10876:10876/udp \
   -v $(pwd)/genesis_004_data:/app/data \
   qnet-production
 
@@ -1313,7 +1419,7 @@ docker run -d --name qnet-genesis-005 --restart=always \
   -e DOCKER_ENV=1 \
   -e QNET_AGGRESSIVE_PRUNING=0 \
   -e QNET_MAX_STORAGE_GB=2000 \
-  -p 9876:9876 -p 9877:9877 -p 8001:8001 \
+  -p 9876:9876 -p 9877:9877 -p 8001:8001 -p 10876:10876/udp \
   -v $(pwd)/genesis_005_data:/app/data \
   qnet-production
 ```
@@ -1325,7 +1431,7 @@ docker run -d --name qnet-genesis-005 --restart=always \
 - ✅ Batch size: 10,000 transactions
 - ✅ Mempool: 2M transactions capacity
 - ✅ High frequency mode: enabled
-- ✅ PoH: 500K hashes/sec (Full/Super nodes only)
+- ✅ VTS: 500K hashes/sec (Full/Super nodes only)
 
 **Genesis Node Requirements:**
 - Set `QNET_BOOTSTRAP_ID` to 001-005 for genesis nodes
@@ -1710,6 +1816,15 @@ docker run ... -e QNET_MAX_THREADS=8 ...
 ```
 
 ### 🔐 Quantum-Resistant P2P Network (UPDATED - December 2025)
+
+#### QUIC Transport Layer (v2.19.22)
+- **Full QUIC Protocol**: UDP-based transport with TLS 1.3 encryption
+- **Port**: UDP 10876 (P2P port + 1000)
+- **Connection Multiplexing**: 100+ streams per connection
+- **0-RTT Handshake**: Ultra-low latency for repeat connections
+- **Binary Protocol**: bincode serialization (~50% bandwidth reduction)
+- **Connection Pooling**: Automatic reconnection with idle cleanup
+- **NIST Compliant**: TLS 1.3 per SP 800-52 guidelines
 
 #### Advanced Scalability Features:
 - **Lock-Free Operations**: DashMap for concurrent access without blocking (10M+ nodes)

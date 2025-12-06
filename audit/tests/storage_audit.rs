@@ -41,7 +41,7 @@ fn create_test_transaction(id: u64, size: usize) -> Transaction {
         nonce: id,
         gas_price: 1,      // Minimal gas price in QNet
         gas_limit: 21000,  // Standard transaction gas limit
-        timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+        timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
         signature: Some(format!("sig_{:064x}", id)),
         tx_type: TransactionType::Transfer {
             from: format!("qnet_{:040x}", id),
@@ -60,7 +60,7 @@ fn create_test_microblock(height: u64, tx_count: usize) -> MicroBlock {
     
     MicroBlock {
         height,
-        timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+        timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
         transactions,
         producer: format!("genesis_node_{:03}", (height % 5) + 1), // Real QNet producer format
         signature: vec![0u8; 64],  // Dilithium signature size

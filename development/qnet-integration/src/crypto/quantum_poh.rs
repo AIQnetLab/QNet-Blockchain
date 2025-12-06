@@ -1,11 +1,16 @@
-// Quantum Proof of History implementation for QNet
+// QNet Verifiable Time Sequence (VTS) - Cryptographic time ordering
 //
-// PoH provides a cryptographic proof of time passage using sequential hashing.
+// VTS provides a cryptographic proof of time passage using sequential hashing,
+// implementing a Verifiable Delay Function (VDF) for temporal ordering.
+// 
 // This implementation is designed for production use with:
-// - 500K hashes/sec for strong VDF property
+// - 500K hashes/sec for strong VDF property (non-parallelizable)
 // - Hybrid SHA3-512/Blake3 for post-quantum security + performance
 // - Thread-safe operation with atomic state updates
 // - Integration with QNet's microblock/macroblock architecture
+//
+// The sequential hash chain creates an unforgeable timeline that proves
+// the ordering of events without relying on trusted timestamps.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -22,25 +27,25 @@ lazy_static! {
     static ref POH_HASH_COUNT: Counter = register_counter!(
         "qnet_poh_hash_count_total",
         "Total number of PoH hashes computed"
-    ).unwrap();
+    ).expect("Failed to create POH_HASH_COUNT metric");
     
     /// PoH hashes per second
     static ref POH_HASH_RATE: Gauge = register_gauge!(
         "qnet_poh_hash_rate",
         "Current PoH hash rate per second"
-    ).unwrap();
+    ).expect("Failed to create POH_HASH_RATE metric");
     
     /// Current PoH slot
     static ref POH_CURRENT_SLOT: Gauge = register_gauge!(
         "qnet_poh_current_slot",
         "Current PoH slot number"
-    ).unwrap();
+    ).expect("Failed to create POH_CURRENT_SLOT metric");
     
     /// PoH checkpoint count
     static ref POH_CHECKPOINT_COUNT: Counter = register_counter!(
         "qnet_poh_checkpoint_count_total",
         "Total number of PoH checkpoints saved"
-    ).unwrap();
+    ).expect("Failed to create POH_CHECKPOINT_COUNT metric");
 }
 
 // ============================================================================
@@ -103,7 +108,7 @@ pub struct QuantumPoH {
 }
 
 impl QuantumPoH {
-    /// Create new Quantum PoH instance from genesis hash
+    /// Create new Quantum VTS instance from genesis hash
     pub fn new(genesis_hash: Vec<u8>) -> (Self, mpsc::UnboundedReceiver<PoHEntry>) {
         let (entry_sender, entry_receiver) = mpsc::unbounded_channel();
         
@@ -124,7 +129,7 @@ impl QuantumPoH {
         (poh, entry_receiver)
     }
     
-    /// Create new Quantum PoH instance from a checkpoint
+    /// Create new Quantum VTS instance from a checkpoint
     pub fn new_from_checkpoint(hash: Vec<u8>, count: u64) -> (Self, mpsc::UnboundedReceiver<PoHEntry>) {
         let (entry_sender, entry_receiver) = mpsc::unbounded_channel();
         
@@ -209,7 +214,7 @@ impl QuantumPoH {
             return;
         }
         
-        println!("[QuantumPoH] 🚀 Starting Quantum PoH generator (500K hashes/sec)");
+        println!("[QuantumPoH] 🚀 Starting Quantum VTS generator (500K hashes/sec)");
         
         // Clone Arc references for the spawned task
         let current_hash = self.current_hash.clone();
@@ -285,7 +290,7 @@ impl QuantumPoH {
                     data: None,
                     timestamp: SystemTime::now()
                         .duration_since(UNIX_EPOCH)
-                        .unwrap()
+                        .unwrap_or_default()
                         .as_micros() as u64,
                 };
                 
@@ -386,7 +391,7 @@ impl QuantumPoH {
             data: Some(tx_data),
             timestamp: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_micros() as u64,
         };
         
@@ -450,7 +455,7 @@ impl QuantumPoH {
                     // Last hash with data: use SHA3-512 with data mixed in
                     let mut hasher = Sha3_512::new();
                     hasher.update(&hash_bytes);
-                    hasher.update(entry.data.as_ref().unwrap());
+                    hasher.update(entry.data.as_ref().expect("Checked is_some above"));
                     hasher.update(&counter_value.to_le_bytes());
                     let result = hasher.finalize();
                     hash_bytes.copy_from_slice(&result);
@@ -517,8 +522,14 @@ impl QuantumPoH {
             data: Some(format!("MACROBLOCK_CHECKPOINT_SLOT_{}", slot).into_bytes()),
             timestamp: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_micros() as u64,
         }
     }
 }
+
+// Type aliases for public API (VTS = Verifiable Time Sequence)
+/// Verifiable Time Sequence - cryptographic time ordering
+pub type VerifiableTimeSequence = QuantumPoH;
+/// VTS Entry - checkpoint in the verifiable time chain  
+pub type VTSEntry = PoHEntry;

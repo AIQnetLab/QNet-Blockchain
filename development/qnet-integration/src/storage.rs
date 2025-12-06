@@ -3923,7 +3923,7 @@ impl Storage {
             let (key, value) = item?;
             if let Ok(key_str) = std::str::from_utf8(&key) {
                 if key_str.starts_with("reward_") {
-                    let node_id = key_str.strip_prefix("reward_").unwrap().to_string();
+                    let node_id = key_str.strip_prefix("reward_").expect("Checked starts_with above").to_string();
                     let reward: qnet_consensus::lazy_rewards::PhaseAwareReward = bincode::deserialize(&value)
                         .map_err(|e| IntegrationError::DeserializationError(e.to_string()))?;
                     rewards.push((node_id, reward));
@@ -3948,7 +3948,7 @@ impl Storage {
             "node_type": node_type,
             "wallet": wallet,
             "reputation": reputation,
-            "timestamp": SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+            "timestamp": SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
         });
         
         self.persistent.db.put_cf(&registry_cf, key.as_bytes(), data.to_string().as_bytes())?;
@@ -4076,7 +4076,7 @@ impl Storage {
         
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
         
         // Key: rep_history_{node_id}_{timestamp} for chronological ordering
@@ -4649,7 +4649,7 @@ impl Storage {
         
         // Verify hash
         let stored_hash = &snapshot_data[..32];
-        let size = u64::from_le_bytes(snapshot_data[32..40].try_into().unwrap()) as usize;
+        let size = u64::from_le_bytes(snapshot_data[32..40].try_into().expect("Snapshot size field must be 8 bytes")) as usize;
         let compressed_data = &snapshot_data[40..];
         
         use sha3::{Sha3_256, Digest};
@@ -4669,7 +4669,7 @@ impl Storage {
         let mut cursor = 0;
         
         // Check protocol version
-        let version = u32::from_le_bytes(decompressed[0..4].try_into().unwrap());
+        let version = u32::from_le_bytes(decompressed[0..4].try_into().expect("Version field must be 4 bytes"));
         cursor += 4;
         
         if version != crate::node::PROTOCOL_VERSION {
@@ -4688,12 +4688,12 @@ impl Storage {
         let mut account_count = 0;
         
         while cursor < decompressed.len() {
-            let key_len = u32::from_le_bytes(decompressed[cursor..cursor+4].try_into().unwrap()) as usize;
+            let key_len = u32::from_le_bytes(decompressed[cursor..cursor+4].try_into().expect("Key length field must be 4 bytes")) as usize;
             cursor += 4;
             let key = &decompressed[cursor..cursor+key_len];
             cursor += key_len;
             
-            let value_len = u32::from_le_bytes(decompressed[cursor..cursor+4].try_into().unwrap()) as usize;
+            let value_len = u32::from_le_bytes(decompressed[cursor..cursor+4].try_into().expect("Value length field must be 4 bytes")) as usize;
             cursor += 4;
             let value = &decompressed[cursor..cursor+value_len];
             cursor += value_len;

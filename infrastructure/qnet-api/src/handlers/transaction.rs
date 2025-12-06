@@ -7,7 +7,7 @@ use crate::{error::{ApiError, ApiResult}, state::AppState};
 use qnet_state::transaction::{Transaction, TransactionType};
 use qnet_state::account::{NodeType, ActivationPhase};
 use std::time::{SystemTime, UNIX_EPOCH};
-use sha2::{Sha256, Digest};
+use sha3::{Sha3_256, Digest};
 
 /// Submit transaction request
 #[derive(Debug, Deserialize, Validate)]
@@ -140,7 +140,7 @@ pub async fn submit_transaction(
         req.gas_limit,
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs(),
         Some(req.signature.clone()),
         tx_type,
@@ -207,7 +207,7 @@ pub async fn get_transaction(
             gas_price: tx.gas_price,
             gas_limit: tx.gas_limit,
             timestamp: tx.timestamp,
-            tx_type: serde_json::to_value(&tx.tx_type).unwrap(),
+            tx_type: serde_json::to_value(&tx.tx_type).expect("TxType must be serializable"),
         };
         return Ok(HttpResponse::Ok().json(response));
     }
@@ -222,7 +222,7 @@ pub async fn get_transaction(
                 gas_price: tx.gas_price,
                 gas_limit: tx.gas_limit,
                 timestamp: tx.timestamp,
-                tx_type: serde_json::to_value(&tx.tx_type).unwrap(),
+                tx_type: serde_json::to_value(&tx.tx_type).expect("TxType must be serializable"),
             };
             Ok(HttpResponse::Ok().json(response))
         },
@@ -264,9 +264,9 @@ fn verify_transaction_signature(req: &SubmitTransactionRequest, tx: &Transaction
     !req.signature.is_empty()
 }
 
-/// Create transaction message for signing/verification
+/// Create transaction message for signing/verification (SHA3-256 for NIST compliance)
 fn create_transaction_message(req: &SubmitTransactionRequest, tx: &Transaction) -> Vec<u8> {
-    let mut hasher = Sha256::new();
+    let mut hasher = Sha3_256::new();
     
     // Hash transaction components
     hasher.update(req.from.as_bytes());

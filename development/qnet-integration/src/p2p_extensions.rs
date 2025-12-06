@@ -7,7 +7,8 @@ impl super::unified_p2p::SimplifiedP2P {
     }
     
     /// Broadcast emergency finalization to network (Progressive Finalization Protocol)
-    pub fn broadcast_emergency_finalization(
+    /// PRODUCTION v2.19.21: Now async for QUIC compatibility
+    pub async fn broadcast_emergency_finalization(
         &self,
         height: u64,
         participants: Vec<String>,
@@ -30,21 +31,22 @@ impl super::unified_p2p::SimplifiedP2P {
             finalization_type: "emergency".to_string(),
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_secs(),
         };
         
         let serialized = bincode::serialize(&emergency_data)
             .map_err(|e| format!("Failed to serialize emergency finalization: {}", e))?;
         
-        // Broadcast as special block type
-        self.broadcast_block(height, serialized)?;
+        // Broadcast as special block type via QUIC
+        self.broadcast_block(height, serialized).await?;
         
         Ok(())
     }
     
     /// Broadcast critical alert when network is in degraded state
-    pub fn broadcast_critical_alert(&self, height: u64) -> Result<(), String> {
+    /// PRODUCTION v2.19.21: Now async for QUIC compatibility
+    pub async fn broadcast_critical_alert(&self, height: u64) -> Result<(), String> {
         println!("🚨 CRITICAL ALERT: Network forcing single-node finalization at height {}", height);
         
         // Create critical alert data
@@ -62,15 +64,15 @@ impl super::unified_p2p::SimplifiedP2P {
             message: format!("CRITICAL: Single-node finalization at height {}", height),
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_secs(),
         };
         
         let serialized = bincode::serialize(&alert)
             .map_err(|e| format!("Failed to serialize critical alert: {}", e))?;
         
-        // Broadcast as special block type
-        self.broadcast_block(height, serialized)?;
+        // Broadcast as special block type via QUIC
+        self.broadcast_block(height, serialized).await?;
         
         // Log critical state
         println!("[P2P] ⚠️ CRITICAL STATE: Network degraded to single-node consensus");

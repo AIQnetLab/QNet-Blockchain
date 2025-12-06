@@ -88,7 +88,7 @@ impl NodePingHistory {
     pub fn add_ping_attempt(&mut self, success: bool, response_time_ms: u32) {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
             
         self.attempts.push(PingAttempt {
@@ -212,7 +212,7 @@ impl PhaseAwareRewardManager {
     fn get_current_window_start() -> u64 {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
             
         // Round down to nearest 4-hour boundary
@@ -223,7 +223,7 @@ impl PhaseAwareRewardManager {
     fn calculate_years_since_genesis(&self) -> u64 {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
             
         if now > self.genesis_timestamp {
@@ -460,7 +460,7 @@ impl PhaseAwareRewardManager {
     pub fn claim_rewards(&mut self, node_id: &str, claimant_wallet: &str) -> RewardClaimResult {
         let current_time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
         
         // CRITICAL: Verify wallet ownership FIRST
@@ -515,7 +515,7 @@ impl PhaseAwareRewardManager {
                     };
                 }
                 // Remove only after validation passed
-                self.pending_rewards.remove(node_id).unwrap()
+                self.pending_rewards.remove(node_id).expect("Reward exists from match above")
             },
             None => {
                 return RewardClaimResult {
@@ -630,6 +630,23 @@ impl PhaseAwareRewardManager {
     pub fn get_all_registered_nodes(&self) -> Vec<(String, NodeType)> {
         self.ping_histories.iter()
             .map(|(node_id, history)| (node_id.clone(), history.node_type.clone()))
+            .collect()
+    }
+    
+    /// Get all nodes owned by a specific wallet address
+    /// Returns Vec of (node_id, node_type, pending_reward)
+    /// Used by mobile apps to find user's nodes by wallet
+    pub fn get_nodes_by_wallet(&self, wallet_address: &str) -> Vec<(String, NodeType, u64)> {
+        self.node_ownership.iter()
+            .filter(|(_, wallet)| *wallet == wallet_address)
+            .filter_map(|(node_id, _)| {
+                self.ping_histories.get(node_id).map(|history| {
+                    let pending = self.pending_rewards.get(node_id)
+                        .map(|r| r.total_reward)
+                        .unwrap_or(0);
+                    (node_id.clone(), history.node_type.clone(), pending)
+                })
+            })
             .collect()
     }
     

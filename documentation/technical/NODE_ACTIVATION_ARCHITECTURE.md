@@ -35,7 +35,7 @@ QNet uses a two-phase activation system transitioning from 1DEV burn on Solana t
 - **Parallel Validation**: Concurrent processing of multiple activation requests
 - **Memory Efficiency**: Optimized data structures for high-throughput scenarios
 
-**Proof of History (PoH) Integration:**
+**Verifiable Time Sequence (VTS) Integration:**
 - **Hybrid Hashing**: SHA3-512/Blake3 (25%/75%) for optimal security/performance
 - **Performance**: 2.39M hashes/sec verified on Intel Xeon E5-2680v4 @ 2.4GHz
 - **Test Results**: 7.2M hashes in 3.01 seconds, 187 entries generated (October 31, 2025)
@@ -74,15 +74,16 @@ def generate_activation_code(burn_tx_hash: str, wallet_address: str,
                               node_type: str, burn_amount: int) -> str:
     # Step 1: Create encryption key from burn transaction
     # CRITICAL: burn_amount must match exactly for decryption!
+    # Using SHA3-256 for NIST SP 800-186 compliance
     key_material = f"{burn_tx_hash}:{node_type}:{burn_amount}"
-    encryption_key = sha256(key_material.encode()).hexdigest()[:32]
+    encryption_key = sha3_256(key_material.encode()).hexdigest()[:32]
     
     # Step 2: XOR encrypt wallet address (first 5 bytes → 10 hex chars)
     encrypted_wallet = xor_encrypt(wallet_address[:5], encryption_key)
     encrypted_wallet_hex = encrypted_wallet.hex().upper()  # 10 chars
     
     # Step 3: Generate entropy for additional security
-    entropy = sha256(f"{burn_tx_hash}:{timestamp}".encode()).hexdigest()[:4]
+    entropy = sha3_256(f"{burn_tx_hash}:{timestamp}".encode()).hexdigest()[:4]
     
     # Step 4: Build segments
     node_type_marker = {'light': 'L', 'full': 'F', 'super': 'S'}[node_type]

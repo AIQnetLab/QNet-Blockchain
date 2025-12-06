@@ -16,21 +16,35 @@ pub mod rpc;
 pub mod genesis;
 pub mod blockchain;
 pub mod activation_validation;
-pub mod quantum_crypto;
-pub mod hybrid_crypto;
-pub mod quantum_poh;
-pub mod hybrid_sealevel;
-pub mod tower_bft;
+pub mod parallel_executor;
+pub mod adaptive_bft;
 pub mod pre_execution;
 pub mod network_config;
 pub mod archive_manager;
 pub mod genesis_constants;
 pub mod reward_sharding;
 pub mod p2p_extensions;
-pub mod vrf;
-pub mod vrf_hybrid;
-pub mod key_manager;
 pub mod contract_vm;
+pub mod quic_transport;    // PRODUCTION v2.19.21: QUIC transport layer
+pub mod p2p_transport;     // PRODUCTION v2.19.21: P2P transport abstraction + binary protocol
+pub mod preflight_checks;  // PRODUCTION v2.19.22: Pre-flight port/connectivity validation
+pub mod benchmark;         // PRODUCTION v2.19.25: Real transaction benchmark system
+pub mod tests;             // PRODUCTION v2.19.25: Complete test suite (API, Stress, Network, Chaos)
+
+// ============================================================================
+// CRYPTOGRAPHY MODULE (isolated for external audit)
+// ============================================================================
+/// All cryptographic operations: Dilithium, Ed25519, VRF, PoH, Key Management
+/// See: src/crypto/mod.rs for full documentation
+pub mod crypto;
+
+// Backwards compatibility re-exports (so existing imports still work)
+pub use crypto::hybrid_crypto;
+pub use crypto::quantum_crypto;
+pub use crypto::quantum_poh;
+pub use crypto::vrf;
+pub use crypto::vrf_hybrid;
+pub use crypto::key_manager;
 
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -271,7 +285,7 @@ impl QNetBlockchain {
             transactions: vec![],
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_secs(),
             merkle_root: [0u8; 32],
             producer: "node1".to_string(),

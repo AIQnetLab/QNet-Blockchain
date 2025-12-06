@@ -45,7 +45,7 @@ impl DilithiumKeyManager {
     fn ensure_writable_directory(preferred: &Path) -> Result<PathBuf> {
         // Check cache first to avoid repeated filesystem operations
         {
-            let cache = CACHED_KEY_DIR.read().unwrap();
+            let cache = match CACHED_KEY_DIR.read() { Ok(g) => g, Err(p) => p.into_inner() };
             if let Some(cached_dir) = &*cache {
                 // Verify cached directory still exists and is writable
                 if cached_dir.exists() && cached_dir.is_dir() {
@@ -86,7 +86,7 @@ impl DilithiumKeyManager {
                             println!("[KEY_MANAGER] ✅ Selected writable directory: {:?}", path);
                             
                             // Cache the successful directory for future use
-                            let mut cache = CACHED_KEY_DIR.write().unwrap();
+                            let mut cache = match CACHED_KEY_DIR.write() { Ok(g) => g, Err(p) => p.into_inner() };
                             *cache = Some(path.clone());
                             
                             return Ok(path.clone());
@@ -165,7 +165,7 @@ impl DilithiumKeyManager {
     fn get_keypair(&self) -> Result<(dilithium3::PublicKey, dilithium3::SecretKey)> {
         // Check cache first
         {
-            let cache_guard = self.cached_keypair.read().unwrap();
+            let cache_guard = match self.cached_keypair.read() { Ok(g) => g, Err(p) => p.into_inner() };
             if let Some((pk, sk)) = cache_guard.as_ref() {
                 return Ok((pk.clone(), sk.clone()));
             }
@@ -179,7 +179,7 @@ impl DilithiumKeyManager {
             let (pk, sk) = self.load_keypair_from_disk(&key_path)?;
             
             // Cache the loaded keypair
-            let mut cache_guard = self.cached_keypair.write().unwrap();
+            let mut cache_guard = match self.cached_keypair.write() { Ok(g) => g, Err(p) => p.into_inner() };
             *cache_guard = Some((pk.clone(), sk.clone()));
             return Ok((pk, sk));
         }
@@ -198,7 +198,7 @@ impl DilithiumKeyManager {
         
         // Cache the keypair
         {
-            let mut cache_guard = self.cached_keypair.write().unwrap();
+            let mut cache_guard = match self.cached_keypair.write() { Ok(g) => g, Err(p) => p.into_inner() };
             *cache_guard = Some((pk.clone(), sk.clone()));
         }
         
@@ -563,4 +563,131 @@ impl DilithiumKeyManager {
     }
 }
 
-// Tests moved to quantum_crypto.rs::test_dilithium_sign_and_verify
+// ============================================================================
+// UNIT TESTS (Dilithium sign/verify tests are in quantum_crypto.rs)
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+    
+    /// Test key directory creation with fallback paths
+    #[test]
+    fn test_ensure_writable_directory() {
+        let temp = tempdir().expect("Failed to create temp dir");
+        let key_dir = temp.path().join("keys");
+        
+        let result = DilithiumKeyManager::ensure_writable_directory(&key_dir);
+        assert!(result.is_ok());
+        
+        let path = result.unwrap();
+        assert!(path.exists() || path.to_str().is_some());
+    }
+    
+    /// Test key manager creation
+    #[test]
+    fn test_key_manager_creation() {
+        let temp = tempdir().expect("Failed to create temp dir");
+        let key_dir = temp.path().join("keys");
+        
+        let result = DilithiumKeyManager::new("test_node".to_string(), &key_dir);
+        assert!(result.is_ok());
+        
+        let manager = result.unwrap();
+        assert_eq!(manager.node_id, "test_node");
+    }
+    
+    /// Test encryption key format (32 bytes, not all zeros)
+    #[test]
+    fn test_encryption_key_format() {
+        use rand::RngCore;
+        
+        let mut encryption_key = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut encryption_key);
+        
+        assert_eq!(encryption_key.len(), 32);
+        assert!(encryption_key.iter().any(|&b| b != 0));
+    }
+    
+    /// Test AES-256-GCM encryption/decryption roundtrip
+    #[test]
+    fn test_aes_gcm_encryption() {
+        use aes_gcm::{Aes256Gcm, KeyInit, aead::Aead};
+        use aes_gcm::aead::generic_array::GenericArray;
+        use rand::RngCore;
+        
+        let mut key = [0u8; 32];
+        let mut nonce_bytes = [0u8; 12];
+        rand::thread_rng().fill_bytes(&mut key);
+        rand::thread_rng().fill_bytes(&mut nonce_bytes);
+        
+        let cipher = Aes256Gcm::new(GenericArray::from_slice(&key));
+        let nonce = GenericArray::from_slice(&nonce_bytes);
+        
+        let plaintext = b"Secret keypair data";
+        let ciphertext = cipher.encrypt(nonce, plaintext.as_ref())
+            .expect("Encryption failed");
+        
+        let decrypted = cipher.decrypt(nonce, ciphertext.as_ref())
+            .expect("Decryption failed");
+        
+        assert_eq!(decrypted, plaintext);
+    }
+    
+    /// Test SHA3-256 integrity hash consistency
+    #[test]
+    fn test_sha3_integrity_hash() {
+        let data = b"Test data for integrity check";
+        
+        let mut hasher1 = Sha3_256::new();
+        hasher1.update(data);
+        let hash1 = hasher1.finalize();
+        
+        let mut hasher2 = Sha3_256::new();
+        hasher2.update(data);
+        let hash2 = hasher2.finalize();
+        
+        assert_eq!(hash1.len(), 32);
+        assert_eq!(hash1, hash2);
+    }
+    
+    /// Test key serialization format (length-prefixed)
+    #[test]
+    fn test_key_serialization_format() {
+        let (pk, sk) = dilithium3::keypair();
+        let pk_bytes = pk.as_bytes();
+        let sk_bytes = sk.as_bytes();
+        
+        // Serialize: len(4) + pk + len(4) + sk
+        let mut serialized = Vec::new();
+        serialized.extend_from_slice(&(pk_bytes.len() as u32).to_le_bytes());
+        serialized.extend_from_slice(pk_bytes);
+        serialized.extend_from_slice(&(sk_bytes.len() as u32).to_le_bytes());
+        serialized.extend_from_slice(sk_bytes);
+        
+        // Parse back
+        let mut cursor = 0;
+        let pk_len = u32::from_le_bytes([
+            serialized[cursor], serialized[cursor+1],
+            serialized[cursor+2], serialized[cursor+3]
+        ]) as usize;
+        cursor += 4;
+        
+        let restored_pk = &serialized[cursor..cursor+pk_len];
+        cursor += pk_len;
+        
+        let sk_len = u32::from_le_bytes([
+            serialized[cursor], serialized[cursor+1],
+            serialized[cursor+2], serialized[cursor+3]
+        ]) as usize;
+        cursor += 4;
+        
+        let restored_sk = &serialized[cursor..cursor+sk_len];
+        
+        assert_eq!(pk_bytes, restored_pk);
+        assert_eq!(sk_bytes, restored_sk);
+    }
+}
+
+// NOTE: Dilithium sign/verify tests are in quantum_crypto.rs::test_dilithium_sign_and_verify

@@ -1,4 +1,4 @@
-// Tower BFT adaptive timeouts for QNet
+// QNet Adaptive BFT - Adaptive timeout management for Byzantine consensus
 // Integrates with existing consensus mechanisms
 
 use std::sync::Arc;
@@ -6,9 +6,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use std::collections::HashMap;
 
-/// Tower BFT timeout configuration
+/// Adaptive BFT timeout configuration
 #[derive(Debug, Clone)]
-pub struct TowerBftConfig {
+pub struct AdaptiveBftConfig {
     /// Base timeout for first block (milliseconds)
     pub base_timeout_ms: u64,
     /// Timeout multiplier for exponential backoff
@@ -21,7 +21,7 @@ pub struct TowerBftConfig {
     pub latency_window_size: usize,
 }
 
-impl Default for TowerBftConfig {
+impl Default for AdaptiveBftConfig {
     fn default() -> Self {
         Self {
             base_timeout_ms: 7000,      // 7 seconds base - network must be optimized to meet this
@@ -33,10 +33,10 @@ impl Default for TowerBftConfig {
     }
 }
 
-/// Tower BFT adaptive timeout manager
-pub struct TowerBft {
+/// QNet Adaptive BFT timeout manager
+pub struct AdaptiveBft {
     /// Configuration
-    config: TowerBftConfig,
+    config: AdaptiveBftConfig,
     /// Vote timeouts by height
     vote_timeouts: Arc<RwLock<HashMap<u64, Duration>>>,
     /// Network latency measurements
@@ -69,9 +69,9 @@ impl Default for NetworkState {
     }
 }
 
-impl TowerBft {
-    /// Create new Tower BFT manager
-    pub fn new(config: TowerBftConfig) -> Self {
+impl AdaptiveBft {
+    /// Create new Adaptive BFT manager
+    pub fn new(config: AdaptiveBftConfig) -> Self {
         Self {
             config,
             vote_timeouts: Arc::new(RwLock::new(HashMap::new())),
@@ -84,7 +84,7 @@ impl TowerBft {
     pub async fn get_timeout(&self, height: u64, retry_count: u32) -> Duration {
         // Check cached timeout
         if let Some(timeout) = self.vote_timeouts.read().await.get(&height) {
-            // CRITICAL FIX: Apply exponential backoff even for cached values on retry
+            // Apply exponential backoff even for cached values on retry
             if retry_count > 0 {
                 let multiplier = self.config.timeout_multiplier.powi(retry_count as i32);
                 let adjusted_ms = (timeout.as_millis() as f64 * multiplier) as u64;
@@ -95,46 +95,34 @@ impl TowerBft {
         }
         
         // Calculate adaptive timeout based on QNet's existing logic
-        // CRITICAL FIX: Balanced timeouts for 1 block/second target
-        // Now that crypto initialization is cached, we can use MUCH smaller timeouts
+        // With PARALLEL chunk broadcast, propagation is fast (~100-500ms)
+        // Timeouts are for FAILOVER, not production delays
         let base_timeout = if height == 0 || height == 1 {
-            // First blocks need more time for network bootstrap (but crypto is now cached!)
-            5000  // 5 seconds for first blocks (was 25000!)
+            // First blocks need time for certificate sync
+            10000  // 10 seconds for first blocks
         } else if height <= 10 {
-            // Early blocks still forming network
-            3000  // 3 seconds for early blocks (was 15000!)
+            // Early blocks - network stabilizing
+            5000  // 5 seconds for early blocks
         } else if height >= 61 && ((height - 1) % 90) >= 60 {
-            // CRITICAL: Consensus period (blocks 61-90, 151-180, 241-270, etc.)
-            // During these 30 blocks, macroblock consensus runs in background
-            // CPU/Network contention from Dilithium signatures + commit/reveal phases
-            // Producer needs extra buffer to avoid emergency failover
-            5000  // 5 seconds for consensus period (balances safety vs. speed)
+            // Consensus period (blocks 61-90, 151-180, 241-270, etc.)
+            5000  // 5 seconds for consensus period
         } else if height > 1 && ((height - 1) % 30) == 0 {
-            // CRITICAL: Rotation boundaries need slightly more time for producer switch
-            // CRITICAL FIX: Increased from 3s to 4s to match normal block timeout
-            // Rotation is when producer changes - needs same buffer as regular blocks
-            4000  // 4 seconds for rotation boundaries (was 3000!)
+            // Rotation boundaries
+            5000  // 5 seconds for rotation boundaries
         } else {
-            // Normal operation - target 1 second blocks with reasonable timeout
-            // CRITICAL FIX: Increased from 2s to 4s to account for:
-            // - 500ms broadcast timeout per peer (unified_p2p.rs:2144)
-            // - 500ms network latency (WAN conditions)
-            // - 3000ms buffer for async broadcast + race conditions
-            // Real-world testing showed 2-3s was too aggressive for async broadcast architecture
-            4000  // 4 seconds timeout for normal blocks (was 2000!)
+            // Normal operation - parallel broadcast is fast
+            4000  // 4 seconds timeout for normal blocks
         };
         
-        // Apply exponential backoff for retries (Solana-style)
+        // Apply exponential backoff for retries
         let timeout_ms = if retry_count > 0 {
-            // CRITICAL FIX: Much smaller backoff for 1 block/sec target!
-            // Exponential backoff: 2s -> 3s -> 5s -> 10s (max)
             let multiplier = match retry_count {
                 1 => 1.5,   // Second attempt: +50%
                 2 => 2.5,   // Third attempt: 2.5x
                 _ => 5.0,   // Fourth+ attempt: 5x (capped)
             };
             let adjusted = (base_timeout as f64 * multiplier) as u64;
-            adjusted.min(10000).max(self.config.min_timeout_ms) // Max 10 seconds (was 60!)
+            adjusted.min(10000).max(self.config.min_timeout_ms)
         } else {
             base_timeout
         };
@@ -199,8 +187,8 @@ impl TowerBft {
     /// Get timeout for Byzantine consensus phases
     pub fn get_consensus_timeout(&self, phase: ConsensusPhase) -> Duration {
         match phase {
-            ConsensusPhase::Commit => Duration::from_secs(15), // From existing code
-            ConsensusPhase::Reveal => Duration::from_secs(15), // From existing code
+            ConsensusPhase::Commit => Duration::from_secs(15),
+            ConsensusPhase::Reveal => Duration::from_secs(15),
             ConsensusPhase::Finalize => Duration::from_secs(5),
         }
     }
@@ -224,7 +212,6 @@ impl TowerBft {
         }
         
         // Weight timeout based on stake distribution
-        // More distributed stake = longer timeout
         let stake_variance = self.calculate_stake_variance(validator_stakes, total_stake);
         
         // High variance means uneven distribution - need more time
@@ -261,7 +248,7 @@ pub enum ConsensusPhase {
     Finalize,
 }
 
-/// Vote state for Tower BFT
+/// Vote state for Adaptive BFT
 #[derive(Debug, Clone)]
 pub struct VoteState {
     pub height: u64,
@@ -291,4 +278,8 @@ impl VoteState {
         self.last_vote_time = Instant::now();
     }
 }
+
+// Backward compatibility aliases
+pub type TowerBftConfig = AdaptiveBftConfig;
+pub type TowerBft = AdaptiveBft;
 

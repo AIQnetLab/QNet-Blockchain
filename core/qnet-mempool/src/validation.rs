@@ -186,7 +186,7 @@ impl TxValidator for DefaultValidator {
         }
         
         // Check transaction size
-        let tx_size = bincode::serialize(tx).unwrap().len();
+        let tx_size = bincode::serialize(tx).expect("Transaction must be serializable").len();
         if tx_size > self.max_tx_size {
             result.add_error(format!(
                 "Transaction too large: {} bytes > {} bytes",
@@ -197,7 +197,7 @@ impl TxValidator for DefaultValidator {
         // Check timestamp
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
         
         if tx.timestamp > now + 300 {

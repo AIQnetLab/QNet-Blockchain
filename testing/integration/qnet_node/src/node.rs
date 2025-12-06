@@ -59,7 +59,8 @@ impl Node {
         } else {
             info!("Generating new keypair");
             let keypair = Keypair::generate_ed25519();
-            std::fs::write(&keypair_path, keypair.to_protobuf_encoding().unwrap())?;
+            std::fs::write(&keypair_path, keypair.to_protobuf_encoding()
+                .expect("Ed25519 keypair should always encode to protobuf"))?;
             keypair
         };
         

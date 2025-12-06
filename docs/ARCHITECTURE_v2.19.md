@@ -1,9 +1,13 @@
 # QNet Blockchain Architecture v2.19
 ## Post-Quantum Decentralized Network - Technical Documentation
 
-**Last Updated**: November 25, 2025  
-**Version**: 2.19.4  
-**Status**: Production Ready
+**Last Updated**: November 30, 2025  
+**Version**: 2.19.22  
+**Status**: Production Ready (QUIC Transport)
+
+> ⚠️ **REPUTATION SYSTEM UPDATED in v2.21.0**  
+> The reputation section in this document describes the OLD P2P gossip-based system.  
+> See [docs/REPUTATION_SYSTEM.md](REPUTATION_SYSTEM.md) for the current deterministic blockchain-based system.
 
 ---
 
@@ -30,7 +34,7 @@ QNet is a high-performance, post-quantum secure blockchain with a **two-layer bl
 - **Macroblocks**: Created every 90 seconds (consensus finalization)
 
 ### Key Innovations
-- **Compact Hybrid Signatures**: 75% bandwidth reduction (3KB vs 12KB)
+- **Compact Hybrid Signatures v2.23**: 88% bandwidth reduction (~2.6KB RAW bytes)
 - **Progressive Finalization Protocol**: Self-healing consensus recovery
 - **Zero-Downtime Architecture**: Microblocks continue during macroblock consensus
 - **NIST Post-Quantum Compliant**: CRYSTALS-Dilithium + Ed25519 hybrid
@@ -59,16 +63,16 @@ pub struct MicroBlock {
     pub previous_hash: Vec<u8>,   // SHA3-256 of previous block
     pub merkle_root: Vec<u8>,     // Transaction Merkle tree root
     pub producer: String,         // Producer node ID
-    pub signature: Vec<u8>,       // COMPACT hybrid signature (3KB)
-    pub poh_hash: Vec<u8>,        // Proof of History hash (64 bytes)
-    pub poh_count: u64,           // PoH counter for VDF
+    pub signature: Vec<u8>,       // COMPACT hybrid signature v2.23 (~2.6KB RAW)
+    pub poh_hash: Vec<u8>,        // Verifiable Time Sequence hash (64 bytes)
+    pub poh_count: u64,           // VTS counter for time ordering
     // ... transactions and other fields
 }
 ```
 
-**Signature Type**: Compact (3KB)  
+**Signature Type**: Compact v2.23 (~2.6KB RAW bytes)  
 **Frequency**: 1 per second  
-**Verification**: P2P layer (pre-consensus)
+**Verification**: P2P layer + Consensus layer (defense-in-depth)
 
 ### Macroblock Structure
 ```rust
@@ -82,7 +86,7 @@ pub struct MacroBlock {
 }
 ```
 
-**Signature Type**: Full hybrid (12KB)  
+**Signature Type**: Full hybrid v2.23 (~5KB RAW bytes)  
 **Frequency**: Every 90 blocks (90 seconds)  
 **Verification**: Byzantine consensus (2/3+ nodes)
 
@@ -90,23 +94,50 @@ pub struct MacroBlock {
 
 ## Signature System
 
-### Compact Signatures (Microblocks)
+### NIST/Cisco Compliant Hybrid Signatures (v2.23 - RAW bytes)
 
-**Format**: `compact:<json>`
+> **UPDATED v2.23**: Signatures now use RAW bytes format via `serde_bytes` instead of base64/JSON.
+> This reduces compact signature size from ~22KB to **~2.6KB** (88% reduction).
 
-```json
-{
-  "node_id": "genesis_node_001",
-  "cert_serial": "cert_2024_11_16_12345",
-  "message_signature": [64, 32, ...],        // Ed25519 (64 bytes)
-  "dilithium_message_signature": "base64...", // Dilithium (~2420 bytes)
-  "signed_at": 1700140800
+**Critical Security**: Per NIST SP 800-208 and Cisco recommendations, every message uses a **NEW ephemeral Ed25519 key** signed by the persistent Dilithium key.
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│ HYBRID SIGNATURE ARCHITECTURE (NIST/Cisco Compliant) - v2.23       │
+├─────────────────────────────────────────────────────────────────────┤
+│ For EACH message:                                                   │
+│   1. Generate NEW ephemeral Ed25519 keypair                        │
+│   2. Sign message with ephemeral Ed25519 → message_signature       │
+│   3. Create encapsulated_data = ephemeral_pk || hash || timestamp  │
+│   4. Sign encapsulated_data with Dilithium → dilithium_key_sig     │
+│   (dilithium_message_signature REMOVED - redundant, saves ~3.3KB)  │
+├─────────────────────────────────────────────────────────────────────┤
+│ Quantum Attack Protection:                                          │
+│   - Attacker breaks Ed25519? → Dilithium still protects!           │
+│   - Attacker breaks one message? → Other messages use NEW keys!    │
+│   - Forward secrecy via ephemeral keys                             │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### Compact Signatures (Microblocks) - v2.23
+
+**Format**: `compact:<json>` with RAW bytes via `serde_bytes`
+
+```rust
+CompactHybridSignature {
+    node_id: String,                     // "genesis_node_001"
+    cert_serial: String,                 // "cert_2024_11_16_12345"
+    ephemeral_public_key: [u8; 32],      // RAW bytes (NEW Ed25519 key)
+    message_signature: [u8; 64],         // RAW bytes (Ed25519 signature)
+    dilithium_key_signature: Vec<u8>,    // RAW bytes (~2500 bytes, NOT base64!)
+    signed_at: u64,                      // Unix timestamp
 }
 ```
 
-**Size**: ~3KB (3,000 bytes)  
-**Bandwidth Savings**: 75% vs full signatures  
-**Certificate**: Referenced by serial, cached at P2P layer
+**Size**: ~2.6KB (was 22KB - **88% reduction**)  
+**Format**: RAW bytes via `serde_bytes` (no base64 overhead)  
+**Certificate**: Referenced by serial, cached at P2P layer  
+**Ephemeral Keys**: NEW key generated for EACH message (NIST/Cisco requirement)
 
 #### Verification Flow
 
@@ -114,30 +145,41 @@ pub struct MacroBlock {
 1. Microblock arrives at node
    ↓
 2. P2P Layer (node.rs::verify_microblock_signature)
-   ├─► Structural validation
+   ├─► Structural validation (ephemeral_public_key present?)
    ├─► Certificate lookup (cache or request)
-   ├─► Dilithium signature verification ✅ (NIST post-quantum)
-   ├─► Ed25519 format validation ✅
-   └─► Result: Accept or Reject
+   ├─► Ed25519 verify with EPHEMERAL key ✅
+   ├─► Recreate encapsulated_data = ephemeral_pk || hash || timestamp
+   ├─► Dilithium verify encapsulated_data (key binding) ✅
+   └─► Result: Accept (all pass) or Reject (any fail)
    ↓
 3. Consensus Layer (consensus_crypto.rs::verify_compact_hybrid_signature)
-   ├─► Structural re-validation (format, sizes)
+   ├─► Parse RAW bytes from JSON
+   ├─► Reconstruct encapsulated_data
+   ├─► Real Dilithium3 verification via dilithium3::open()
    ├─► Byzantine consensus (2/3+ honest nodes)
-   └─► Only pre-verified blocks participate
+   └─► Only verified blocks participate
 ```
 
-### Full Hybrid Signatures (Macroblocks)
+### Full Hybrid Signatures (Macroblocks) - v2.23
 
-**Format**: `hybrid:<json>`
+**Format**: `hybrid:<json>` with RAW bytes
 
-```json
-{
-  "message_signature": "base64...",     // Ed25519
-  "dilithium_signature": "base64...",   // Dilithium
-  "certificate": {
-    "ed25519_public_key": "...",
-    "dilithium_public_key": "...",
-    "dilithium_signature_of_ed25519": "...",
+```rust
+HybridSignature {
+    certificate: HybridCertificate,      // Full certificate embedded
+    ephemeral_public_key: [u8; 32],      // RAW bytes
+    message_signature: [u8; 64],          // RAW bytes (Ed25519)
+    dilithium_key_signature: Vec<u8>,    // RAW bytes (~2500 bytes)
+    signed_at: u64,
+}
+
+// Certificate structure:
+HybridCertificate {
+    node_id: String,
+    serial: String,
+    ed25519_public_key: [u8; 32],        // RAW bytes
+    dilithium_public_key: Vec<u8>,       // RAW bytes (~1952 bytes)
+    dilithium_signature_of_ed25519: Vec<u8>, // Certificate binding
     "serial_number": "...",
     "valid_from": 1700140800,
     "valid_until": 1700227200
@@ -145,9 +187,10 @@ pub struct MacroBlock {
 }
 ```
 
-**Size**: ~12KB (12,000 bytes)  
+**Size**: ~5KB RAW bytes (was 12KB - 58% reduction)  
 **Use Case**: Macroblocks (no certificate lookup delay)  
-**Verification**: Immediate (certificate embedded)
+**Verification**: Immediate (certificate embedded) + real Dilithium  
+**Ephemeral Keys**: Same NIST/Cisco requirement as compact signatures
 
 ### Certificate Management
 
@@ -216,7 +259,7 @@ if serial_changed {
 **Broadcast Methods**:
 - **Tracked**: Waits for 2/3+ Byzantine confirmation (3-10s adaptive timeout)
 - **Async**: Fire-and-forget for gossip propagation
-- **Transport**: HTTP POST to `/api/v1/p2p/message`
+- **Transport**: QUIC (UDP 10876) - binary protocol
 
 **Cache**: 100,000 certificates (LRU eviction)  
 **Scalability**: Handles millions of nodes (max 1000 active validators)
@@ -228,55 +271,72 @@ if serial_changed {
 ### Problem
 In a gossip-based P2P network, blocks may arrive out of order due to network latency or partial connectivity. Nodes must buffer blocks until their parent blocks arrive.
 
-### Solution: Bounded Buffer with Cleanup
+### Solution: Bounded Buffer with Cleanup (v2.19.20)
 
-#### MAX_PENDING_BLOCKS Protection
+#### Adaptive Buffer Size by Node Type
 
 ```rust
-// MEMORY PROTECTION: Maximum pending blocks to prevent memory exhaustion
-// Per ARCHITECTURE_v2.19: Microblock = ~53 KB (header + PoH + signature + transactions)
-// 100 blocks * ~100KB = ~10 MB maximum buffer size
-// Protects against malicious peers sending out-of-order blocks during network issues
-const MAX_PENDING_BLOCKS: usize = 100;
+// MEMORY PROTECTION v2.19.20: Adaptive buffer size by node type
+// Full/Super nodes: 500 blocks (~50MB) - covers 8+ minutes of network issues
+// Light nodes: 100 blocks (~10MB) - minimal memory footprint
+// Protects against malicious peers sending out-of-order blocks
+let max_pending_blocks: usize = match node_type {
+    NodeType::Light => 100,  // Light nodes: minimal memory (~10MB)
+    NodeType::Full | NodeType::Super => 500,  // Full/Super: larger buffer (~50MB)
+};
 
-if pending_blocks.len() >= MAX_PENDING_BLOCKS {
+if pending_blocks.len() >= max_pending_blocks {
     // Remove oldest block to make room (FIFO-like)
     if let Some((&oldest_height, _)) = pending_blocks.iter()
         .filter(|(&h, _)| h != received_block.height)  // Don't remove current block
         .min_by_key(|(_, (_, _, timestamp))| timestamp) {
         pending_blocks.remove(&oldest_height);
         println!("[BLOCKS] 🚨 Max buffer ({}) reached - removed oldest block #{}", 
-                 MAX_PENDING_BLOCKS, oldest_height);
+                 max_pending_blocks, oldest_height);
     }
 }
 ```
 
-#### Retry Mechanism
+#### Pseudo-Infinite Retry Mechanism (v2.19.20)
 
 ```rust
-// Buffer block with retry counter
-pending_blocks.insert(height, (block, retry_count, timestamp));
+// CRITICAL v2.19.20: PSEUDO-INFINITE retries (like Solana/Ethereum)
+// Blocks are critical data - NEVER discard them!
+// Protection layers:
+// 1. max_pending_blocks = 500 Full/Super, 100 Light (memory protection)
+// 2. Exponential backoff after 10 retries (network protection)
+// 3. Rate limiting on requests (CPU protection)
+// 4. Background sync every 30s (persistent recovery)
 
-// Cleanup after 30 seconds or 5 failed retries
-if age_seconds > 30 || retry_count >= 5 {
-    pending_blocks.remove(&height);
-}
+// Backoff schedule:
+// - Retries 0-9: 10s cooldown (aggressive)
+// - Retries 10+: exponential (30s, 60s, 120s, 240s, 300s max)
+let backoff_secs = if retry_count < 10 {
+    10u64  // Aggressive: 10 seconds for first 10 retries
+} else {
+    // Exponential: 30 * 2^(retry-10), max 300s (5 minutes)
+    std::cmp::min(30 * (1u64 << (retry_count - 10).min(4)), 300)
+};
+
+// ALWAYS buffer - never discard! (pseudo-infinite)
+pending_blocks.insert(height, (block, retry_count, timestamp));
 ```
 
-#### Protection Features
+#### Protection Features (v2.19.20)
 
-| Feature | Value | Purpose |
-|---------|-------|---------|
-| **Max Buffer Size** | 100 blocks (~10 MB) | Prevent memory exhaustion |
-| **Retry Limit** | 5 attempts | Avoid infinite loops |
-| **Timeout** | 30 seconds | Release stale blocks |
-| **Eviction Policy** | FIFO (oldest first) | Fair buffer management |
-| **Self-Protection** | Current block never removed | Ensure progress |
+| Feature | Light Nodes | Full/Super Nodes | Purpose |
+|---------|-------------|------------------|---------|
+| **Max Buffer Size** | 100 blocks (~10 MB) | 500 blocks (~50 MB) | Prevent memory exhaustion |
+| **Retry Limit** | **Pseudo-infinite** | **Pseudo-infinite** | Never lose blocks |
+| **Backoff (0-9)** | 10 seconds | 10 seconds | Aggressive recovery |
+| **Backoff (10+)** | 30s → 300s max | 30s → 300s max | Network protection |
+| **Eviction Policy** | FIFO (oldest first) | FIFO (oldest first) | Fair buffer management |
+| **Self-Protection** | Current block never removed | Current block never removed | Ensure progress |
 
 **Attack Mitigation**:
-- **Memory DoS**: Max 10 MB buffer (100 blocks)
-- **Stale Blocks**: 30-second automatic cleanup
-- **Infinite Retry**: 5-attempt limit
+- **Memory DoS**: Adaptive buffer (10-50 MB based on node type)
+- **Stale Blocks**: Background re-request every 30s with exponential backoff
+- **Infinite Retry**: Pseudo-infinite with backoff (never discard critical data)
 - **Race Conditions**: Current block never evicted
 
 ---
@@ -583,17 +643,17 @@ pub fn get_sync_peers_filtered(&self, max_peers: usize) -> Vec<PeerInfo> {
 }
 ```
 
-### Reputation Gossip Protocol (v2.19.3)
+### Reputation Gossip Protocol (v2.19.22)
 
 **Complexity**: O(log n) exponential propagation (NOT O(n) broadcast!)  
-**Transport**: HTTP POST (NOT TCP)  
+**Transport**: QUIC (UDP 10876) - binary protocol  
 **Interval**: Every 5 minutes  
 **Signature**: SHA3-256 (quantum-safe)  
 **Scope**: Super + Full nodes only (Light nodes excluded)  
-**Fanout**: Adaptive 4-32 (same as Turbine)
+**Fanout**: Adaptive 4-32 (same as Shred Protocol)
 
 ```rust
-// Reputation sync via HTTP gossip
+// Reputation sync via QUIC gossip
 NetworkMessage::ReputationSync {
     node_id: String,
     reputation_updates: Vec<(String, f64)>,
@@ -602,23 +662,30 @@ NetworkMessage::ReputationSync {
 }
 ```
 
-**Gossip Propagation**:
-1. **Initial Send**: Node gossips to random `fanout` peers (4-32, adaptive)
-2. **Re-gossip**: Each recipient re-gossips to random `fanout` peers (exclude sender)
-3. **Exponential Growth**: 1 → 4 → 16 → 64 → 256 → 1024 → 4096 (7 hops for 4K nodes)
+**Gossip Propagation (v2.19.19)**:
+1. **Initial Send**: Node gossips to K closest neighbors by Kademlia distance (K=3)
+2. **Re-gossip**: Each recipient re-gossips to K neighbors (exclude sender)
+3. **Exponential Growth**: 1 → 3 → 9 → 27 → 81 → 243 → 729 (7 hops for 729 nodes)
 4. **Convergence**: Weighted average (70% local, 30% remote) ensures eventual consistency
 
+**v2.19.19 Optimizations**:
+- **Kademlia K-neighbors**: Heartbeats use DHT distance for efficient routing
+- **Shred Protocol ALWAYS**: Block propagation uses Shred Protocol for ALL network sizes
+- **Heartbeat with HYBRID signatures (v2.23)**: Full quantum protection (Ed25519 + Dilithium)
+- **Exponential backoff failover**: 3s → 6s → 12s → 24s → 30s max
+
 **Why Gossip O(log n) vs Broadcast O(n)**:
-- ✅ **Scalability**: 1M nodes = ~20 hops vs 1M HTTP requests
+- ✅ **Scalability**: 1M nodes = ~20 hops vs 1M requests
 - ✅ **Bandwidth**: 99.999% reduction for millions of nodes
 - ✅ **Fork Prevention**: All nodes converge to same reputation view
 - ✅ **Byzantine Safety**: Signature verification at each hop
 
-**Why HTTP over TCP**:
-- ✅ More reliable in WAN/Docker environments
-- ✅ Connection pooling for millions of nodes
-- ✅ Consistent error handling
-- ✅ NAT/firewall friendly
+**Why QUIC over HTTP (v2.19.22)**:
+- ✅ No Head-of-Line Blocking (independent streams)
+- ✅ 0-RTT handshake for repeat connections
+- ✅ Connection multiplexing (100+ streams/connection)
+- ✅ Built-in TLS 1.3 encryption
+- ✅ Binary protocol (~50% bandwidth reduction)
 
 ### Byzantine Threshold Check
 
@@ -994,18 +1061,18 @@ for node in eligible_nodes {
 | Microblocks | `microblocks` | Sliding window (100K) |
 | Macroblocks | `macroblocks` | Full history |
 | Transactions | `transactions` | Pruned after macroblock |
-| **PoH State** | `poh_state` | Full history |
+| **VTS State** | `poh_state` | Full history |
 | Light attestations | `attestations` | 4 hours + 1 window buffer |
 | Full/Super heartbeats | `heartbeats` | 4 hours + 1 window buffer |
 | Pending rewards | `pending_rewards` | Until claimed |
 | Reputation history | `reputation_history` | 30 days |
 
-#### PoH State Storage (v2.19.13)
+#### VTS State Storage (v2.19.13)
 
-**Architecture**: PoH state is stored **separately** from blocks for O(1) validation.
+**Architecture**: VTS state is stored **separately** from blocks for O(1) validation.
 
 ```rust
-pub struct PoHState {
+pub struct VTSState {
     pub height: u64,           // Block height
     pub poh_hash: Vec<u8>,     // SHA3-512 hash (64 bytes)
     pub poh_count: u64,        // Monotonic counter
@@ -1014,12 +1081,12 @@ pub struct PoHState {
 ```
 
 **Benefits**:
-- ✅ O(1) PoH validation (no block deserialization)
+- ✅ O(1) VTS validation (no block deserialization)
 - ✅ Format-agnostic (works with MicroBlock, EfficientMicroBlock)
 - ✅ Backward compatible (auto-migration from existing blocks)
 - ✅ Minimal overhead (~112 bytes/block = ~3.5 GB/year)
 
-**Migration**: On node startup, `migrate_all_poh_states()` extracts PoH data from existing blocks.
+**Migration**: On node startup, `migrate_all_poh_states()` extracts VTS data from existing blocks.
 
 ### Storage Optimization & Pruning (v2.19.7)
 
@@ -1305,7 +1372,7 @@ DELETE /api/v1/bundle/{bundle_id}
 │  3. CRYSTALS-Dilithium signature verification ✅        │
 │  4. Ed25519 format validation ✅                        │
 │  5. Chain continuity checks                             │
-│  6. Proof of History verification                       │
+│  6. Verifiable Time Sequence verification                       │
 │  → ONLY VERIFIED BLOCKS PROCEED TO CONSENSUS            │
 └─────────────────────────────────────────────────────────┘
                          ↓
@@ -1316,29 +1383,49 @@ DELETE /api/v1/bundle/{bundle_id}
 │  1. Structural re-validation (format, sizes)            │
 │  2. Byzantine consensus (2/3+ honest nodes required)    │
 │  3. Commit-Reveal protocol                              │
-│  4. Proof of History entropy                            │
+│  4. Verifiable Time Sequence entropy                            │
 │  → MALICIOUS BLOCKS CANNOT REACH CONSENSUS THRESHOLD    │
 └─────────────────────────────────────────────────────────┘
 ```
 
-### NIST/Cisco Compliance
+### NIST/Cisco Compliance (v2.19.22)
+
+#### Hybrid Signature Architecture (CRITICAL)
+
+Per **NIST SP 800-208** and **Cisco Post-Quantum Recommendations**:
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│ EVERY MESSAGE uses:                                                 │
+│   1. NEW ephemeral Ed25519 key (generated per message)             │
+│   2. Dilithium signs: ephemeral_key || message_hash || timestamp   │
+│   3. Dilithium signs: message_hash (independent verification)      │
+├─────────────────────────────────────────────────────────────────────┤
+│ WHY EPHEMERAL KEYS?                                                 │
+│   • Forward secrecy: compromise one message ≠ compromise all       │
+│   • Key binding: Dilithium cryptographically binds ephemeral key   │
+│   • Quantum resistance: Ed25519 broken? Dilithium still protects!  │
+└─────────────────────────────────────────────────────────────────────┘
+```
 
 #### Post-Quantum Cryptography
-- **Algorithm**: CRYSTALS-Dilithium (NIST PQC standard)
+- **Algorithm**: CRYSTALS-Dilithium (NIST FIPS 204 / ML-DSA)
 - **Security Level**: Dilithium3 (Level 3)
 - **Key Size**: 1952 bytes (public), 4000 bytes (private)
 - **Signature Size**: ~2420 bytes
 - **Security**: Resistant to Shor's algorithm (quantum attacks)
+- **Usage**: Signs BOTH ephemeral key binding AND message hash
 
-#### Classical Cryptography
+#### Classical Cryptography  
 - **Algorithm**: Ed25519 (Curve25519)
 - **Security Level**: 128-bit security
 - **Key Size**: 32 bytes (public), 64 bytes (private)
 - **Signature Size**: 64 bytes
-- **Purpose**: Legacy compatibility, fast verification
+- **Purpose**: Fast verification, EPHEMERAL keys per message
+- **CRITICAL**: Ed25519 keys are NOT reused between messages!
 
 #### Hashing
-- **Algorithm**: SHA3-256 (NIST FIPS 202)
+- **Algorithm**: SHA3-256 (NIST FIPS 202) - quantum-resistant
 - **Output**: 256 bits (32 bytes)
 - **Usage**: Block hashes, message digests, signature preparation
 - **Alternative**: Blake3 (for non-cryptographic identifiers only)
@@ -1522,7 +1609,7 @@ Conclusion: Certificate memory remains ~7.5 MB regardless of network size
 | Component | Size | Frequency |
 |-----------|------|-----------|
 | **Block Header** | ~256 bytes | Every block |
-| **PoH (hash + count)** | 72 bytes | Every block |
+| **VTS (hash + count)** | 72 bytes | Every block |
 | **Compact Signature** | ~3 KB | Every block |
 | **Transactions** | ~50 KB | Every block (1000 tx × 50 bytes avg) |
 | **Total per Microblock** | ~53 KB | Every second |
@@ -1536,9 +1623,9 @@ Conclusion: Certificate memory remains ~7.5 MB regardless of network size
 | **Macroblock Header** | ~512 bytes | Every 90 blocks |
 | **State Root** | 32 bytes | Every 90 blocks |
 | **Microblock Hashes (90)** | 2.88 KB | 90 × 32 bytes |
-| **Full Hybrid Signature** | ~12 KB | Every 90 blocks |
-| **Validator Signatures (1000)** | ~3 MB | 1000 × 3KB (worst case) |
-| **Total per Macroblock** | ~3 MB | Every 90 seconds |
+| **Full Hybrid Signature v2.23** | ~5 KB | Every 90 blocks |
+| **Validator Signatures (1000)** | ~2.6 MB | 1000 × ~2.6KB (v2.23) |
+| **Total per Macroblock** | ~2.6 MB | Every 90 seconds |
 
 **Macroblock Bandwidth**: ~267 Kbps average (amortized over 90 seconds)
 
@@ -1697,9 +1784,10 @@ Environment:
 
 ## Conclusion
 
-QNet v2.19 implements a production-ready, post-quantum secure blockchain with:
+QNet v2.23 implements a production-ready, post-quantum secure blockchain with:
 
-✅ **Compact signatures**: 75% bandwidth reduction  
+✅ **Compact signatures v2.23**: 88% bandwidth reduction (~2.6KB RAW bytes)  
+✅ **Defense-in-depth**: Real Dilithium verification at P2P + Consensus layers  
 ✅ **Progressive Finalization**: Self-healing consensus  
 ✅ **Zero downtime**: Microblocks never stop  
 ✅ **NIST compliant**: CRYSTALS-Dilithium post-quantum cryptography  
@@ -1713,6 +1801,31 @@ QNet v2.19 implements a production-ready, post-quantum secure blockchain with:
 ---
 
 ## Version History
+
+### v2.19.14 (November 28, 2025)
+
+**Fork Resolution Simplification:**
+- Removed complex Byzantine weight calculation (calculate_fork_chain_weight, calculate_our_chain_weight)
+- Removed unused perform_chain_reorganization method (~250 lines of dead code)
+- Simplified fork resolution to three clear cases:
+  - Network ahead: rollback + sync
+  - Same height: resync if ≥3 high-rep validators connected
+  - We're ahead: keep our chain
+- Added MIN_PEERS_FOR_RESYNC = 3 threshold for same-height fork decisions
+
+**Security Enhancements:**
+- Reputation manipulation detection in ActiveNodeAnnouncement handler
+- Escalating punishment for reputation inflation/deflation (1h → 1d → 1w → 1y ban)
+- Empty response attack protection (5 empty responses = -5% reputation)
+- Consensus message timestamp validation (±5 minutes tolerance)
+- Consensus signature format pre-validation
+- Dual peer lookup (DashMap + RwLock fallback) for Genesis nodes
+
+**P2P Improvements:**
+- Fixed Genesis node peer discovery (check both connected_peers_lockfree and connected_peers)
+- Added else branch for empty peers during P2P initialization
+
+---
 
 ### v2.19.4 (November 25, 2025)
 
@@ -1752,6 +1865,50 @@ QNet v2.19 implements a production-ready, post-quantum secure blockchain with:
 - Ping response with Ed25519 signature
 - Token refresh and registration
 
+---
+
+## Network Ports
+
+### Required Ports
+
+| Port | Protocol | Purpose | Firewall |
+|------|----------|---------|----------|
+| **9876** | TCP | P2P network (peer discovery, legacy) | REQUIRED |
+| **9877** | TCP | P2P gossip (reputation sync) | REQUIRED |
+| **8001** | TCP | REST API (JSON-RPC, monitoring) | REQUIRED |
+| **10876** | UDP/QUIC | QUIC transport (blocks, consensus) | **REQUIRED v2.19.22+** |
+
+### QUIC Transport (v2.19.22+)
+
+QNet uses QUIC for high-performance P2P communication:
+
+```
+QUIC Port = 10876 (fixed for all nodes)
+Docker: -p 10876:10876/udp
+```
+
+**Note:** Internal offset calculation: API port (8001) + 2875 = 10876
+
+**Features:**
+- TLS 1.3 encryption (NIST SP 800-52 compliant)
+- Binary protocol (bincode) - 50% less bandwidth than JSON
+- Connection multiplexing (100 streams per connection)
+- Keep-alive: 30s, Idle timeout: 90s
+
+**Messages via QUIC:**
+- Block broadcast (micro/macro)
+- Genesis block distribution
+- Shred Protocol chunks
+- Certificate announcements
+- Consensus commit/reveal
+
+**Messages via HTTP (REST API):**
+- Security alerts
+- Audit storage
+- External client queries
+
+---
+
 **Fixes:**
 - Light node reputation fixed at 70 (immutable by design)
 - Removed all TODO/placeholder comments
@@ -1765,7 +1922,7 @@ QNet v2.19 implements a production-ready, post-quantum secure blockchain with:
 
 **Certificate Broadcasting Enhancements:**
 - Added tracked broadcast with Byzantine 2/3+ threshold for critical certificate rotations
-- Implemented adaptive timeout (3s/5s/10s) based on network size to avoid Tower BFT conflicts
+- Implemented adaptive timeout (3s/5s/10s) based on network size to avoid Adaptive BFT conflicts
 - Added anti-duplication protection via serial number change detection
 - Updated periodic broadcast to adaptive intervals (10s/30s/120s based on node uptime)
 - Reduced certificate lifetime from 1 hour to 4.5 minutes (optimal quantum protection)

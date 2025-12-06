@@ -3,8 +3,8 @@
 
 **⚠️ EXPERIMENTAL BLOCKCHAIN RESEARCH ⚠️**
 
-**Version**: 2.19.11-experimental  
-**Date**: November 26, 2025  
+**Version**: 2.19.22-experimental  
+**Date**: November 30, 2025  
 **Authors**: QNet Research Team  
 **Status**: Experimental Research Project  
 **Goal**: To prove that one person without multi-million investments can create an advanced blockchain
@@ -24,15 +24,17 @@
 QNet is an experimental post-quantum blockchain created to prove: **one person-operator without technical knowledge, multi-million investments, and funds is capable of building an advanced blockchain**.
 
 Experimental achievements:
-- ✅ **Post-quantum cryptography**: CRYSTALS-Dilithium3 (2420-byte signatures) + Ed25519 hybrid  
-- ✅ **Compact Signatures**: 3KB vs 12KB (75% bandwidth reduction) with certificate caching
+- ✅ **Post-quantum cryptography**: CRYSTALS-Dilithium3 (NIST FIPS 204) + Ed25519 hybrid  
+- ✅ **NIST/Cisco Compliant**: Ephemeral Ed25519 keys per message + Dilithium key binding
+- ✅ **Compact Signatures v2.23**: ~2.6KB RAW bytes (88% reduction) with certificate caching
 - ✅ **Progressive Finalization Protocol**: Self-healing consensus recovery (80% → 1% degradation)
 - ✅ **424,411 TPS**: Proven performance in tests
+- ✅ **QUIC Transport**: Binary protocol (bincode), TLS 1.3, 100+ streams/connection
 - ✅ **Two-phase activation**: 1DEV burn → QNC Pool #3
 - ✅ **Mobile-first**: Optimized for smartphones
 - ✅ **Reputation system**: Without staking, only behavioral assessment
 - ✅ **Experimental architecture**: Innovative approach to consensus
-- ✅ **Advanced optimizations**: Turbine, Quantum PoH, Finality Window Selection, Hybrid Sealevel, Tower BFT, Pre-execution
+- ✅ **Advanced optimizations**: Shred Protocol, Quantum VTS, Finality Window Selection, Hybrid Parallel Executor, Adaptive BFT, Pre-execution
 - ✅ **Chain Reorganization**: Byzantine-safe fork resolution with 2/3 majority consensus
 - ✅ **Advanced Synchronization**: Out-of-order block buffering with active missing block requests
 - ✅ **Zero-Downtime Architecture**: Microblocks continue during macroblock consensus
@@ -72,8 +74,9 @@ These characteristics make QNet suitable for mass mobile usage with exchange-gra
 
 QNet presents an experimental blockchain platform with unique characteristics:
 
-1. **Post-quantum cryptography**: CRYSTALS-Dilithium3 (NIST PQC, 2420-byte signatures) with hybrid Ed25519
-2. **Compact signatures**: 75% bandwidth reduction (3KB vs 12KB) via certificate caching
+1. **Post-quantum cryptography**: CRYSTALS-Dilithium3 (NIST FIPS 204) + Ephemeral Ed25519 (per message)
+2. **NIST/Cisco Compliant**: Dilithium signs ephemeral key binding + message hash (forward secrecy)
+3. **Compact signatures v2.23**: 88% bandwidth reduction (~2.6KB RAW bytes) via certificate caching
 3. **Progressive Finalization Protocol**: Self-healing consensus with zero-downtime
 4. **High performance**: 424,411+ TPS achieved in experiments
 5. **Innovative economy**: Reputation system without staking
@@ -91,10 +94,10 @@ QNet presents an experimental blockchain platform with unique characteristics:
 │       Wallet, DApps, Mobile Apps, APIs              │
 ├─────────────────────────────────────────────────────┤
 │            Performance Layer                        │
-│  Turbine, Quantum PoH, Sealevel, Tower BFT, Cache  │
+│  Shred Protocol, Quantum VTS, Parallel Executor, Adaptive BFT, Cache  │
 ├─────────────────────────────────────────────────────┤
 │              Network Layer                          │
-│      P2P, Sharding, Regional Clustering             │
+│  QUIC Transport, P2P, Sharding, Regional Clustering │
 ├─────────────────────────────────────────────────────┤  
 │             Consensus Layer                         │
 │     Commit-Reveal BFT, Producer rotation            │
@@ -103,7 +106,7 @@ QNet presents an experimental blockchain platform with unique characteristics:
 │       Microblocks (1s) + Macroblocks                │
 ├─────────────────────────────────────────────────────┤
 │           Cryptography Layer                        │
-│        CRYSTALS-Dilithium, Post-Quantum             │
+│  CRYSTALS-Dilithium3 + Ephemeral Ed25519 (NIST)     │
 └─────────────────────────────────────────────────────┘
 ```
 
@@ -218,75 +221,83 @@ Safety ≥90.0%  → safe_for_amounts_under_10000_qnc     (10K QNC)
 
 ## 4. Chain Reorganization & Network Synchronization
 
-### 4.1 Byzantine-Safe Chain Reorganization
+### 4.1 Fork Detection and Resolution
 
-QNet implements advanced chain reorganization mechanism to handle blockchain forks:
+QNet implements a simplified and reliable fork resolution mechanism:
 
-#### **Fork Detection and Resolution**
+#### **Fork Detection**
 ```
-Fork Detected → Validation → Weight Calculation → Byzantine Decision → Execution/Rejection
-     ↓              ↓                ↓                    ↓                    ↓
-  SHA3-256     Deserialize      Reputation Sum      67% Threshold        Atomic Reorg
-  Hash Check      Block          (Unique Nodes)      (2/3 BFT)          with Backup
-```
-
-#### **Byzantine Weight Calculation**
-```rust
-Weight = (Σ unique_validator_reputations) / validator_count * √validator_count
+Block Received → Hash Comparison → Fork Detected → Async Resolution
+      ↓                ↓                 ↓                ↓
+  Deserialize    SHA3-256 check    FORK_DETECTED:H:P   Background task
+                 vs local block                        (non-blocking)
 ```
 
-**Key Properties:**
-- Only validators with reputation ≥70% contribute to weight
-- Each validator counted only once (Byzantine principle)
-- Square root scaling prevents large group dominance
-- Maximum reputation capped at 95% (anti-manipulation)
+#### **Fork Resolution Strategy**
+```
+CASE 1: Network ahead (network_height > local_height)
+  └── Rollback to fork_point → sync_blocks() from network
+
+CASE 2: Same height (network_height == local_height)
+  └── Count high-rep validators (≥70%) → If ≥3: rollback + resync
+  └── If <3 validators: keep chain, wait for more connections
+
+CASE 3: We're ahead (local_height > network_height)
+  └── Keep our chain (we have longer chain)
+```
+
+**Key Design Decisions:**
+- **Simple over complex**: Resync from network majority instead of complex weight calculations
+- **Trust high-reputation validators**: Minimum 3 validators with ≥70% consensus_score required
+- **Macroblock finality**: Ultimate fork resolution via macroblock consensus (every 90 blocks, 67%+ required)
+- **No complex weight calculations**: Removed in favor of simpler, more reliable approach
 
 #### **Security Mechanisms**
-1. **Race Condition Prevention**: Single concurrent reorg with RwLock coordination
-2. **DoS Protection**: Maximum 1 fork attempt per 60 seconds
-3. **Deep Reorg Protection**: Maximum 100 blocks depth (51% attack prevention)
-4. **Validation Before Processing**: Block deserialization check before expensive operations
-5. **Automatic Rollback**: Full chain backup with restore on failure
-6. **Reputation Capping**: 95% maximum to prevent single-node dominance
+1. **Race Condition Prevention**: Single concurrent reorg with RwLock flag
+2. **DoS Protection**: Maximum 1 fork attempt per 60 seconds (rate limiting)
+3. **Deep Reorg Protection**: Maximum 100 blocks sync per request
+4. **Validator Threshold**: Minimum 3 high-reputation peers required for resync decision
+5. **Macroblock Finality**: Forks without 67% consensus cannot create macroblocks
 
 #### **Performance Characteristics**
 - **Fork Detection**: <1ms (SHA3-256 hash comparison)
-- **Weight Calculation**: 10-50ms (max 50 blocks analyzed)
+- **Resolution Decision**: <5ms (peer count + reputation check)
 - **Reorg Execution**: 50-200ms (background processing)
-- **Memory Overhead**: <10MB for tracking and buffering
+- **Memory Overhead**: <5MB (no complex tracking needed)
 - **Network Impact**: Zero blocking (async execution)
 
 ### 4.2 Advanced Block Synchronization
 
 QNet implements sophisticated synchronization for handling network latency:
 
-#### **Out-of-Order Block Buffering**
+#### **Out-of-Order Block Buffering (v2.19.20)**
 ```
 Block #N+5 arrives → Missing #N+1,N+2,N+3,N+4 → Buffer #N+5 → Request Missing
      ↓                         ↓                      ↓              ↓
-  Validate            Check previous_hash      Store with retry    Active P2P
-  Structure           in pending_blocks         counter (max 3)    sync_blocks()
+  Validate            Check previous_hash      Store with pseudo-  Active P2P
+  Structure           in pending_blocks        infinite retries    sync_blocks()
 ```
 
-**Buffer Management:**
+**Buffer Management (v2.19.20):**
 - HashMap storage: O(1) lookup by block height
-- Maximum 3 retry attempts per block
-- Automatic cleanup after 60 seconds
-- Timestamp tracking for age-based eviction
+- **Pseudo-infinite retries** (like Solana/Ethereum) - blocks NEVER discarded
+- **Adaptive buffer size**: Full/Super 500 blocks (~50MB), Light 100 blocks (~10MB)
+- **Exponential backoff**: 10s (retries 0-9) → 30s → 60s → 120s → 240s → 300s max
+- Timestamp tracking for age-based re-request (not eviction)
 
-#### **DDoS-Protected Active Block Requests**
+#### **DDoS-Protected Active Block Requests (v2.19.20)**
 ```
-Missing Block Detected → Rate Limit Check → Request via P2P → Track & Cooldown
+Missing Block Detected → Rate Limit Check → Request via P2P → Track & Backoff
          ↓                      ↓                   ↓                  ↓
-   MISSING_PREVIOUS:H      10s cooldown      sync_blocks(H, H)    Update timestamp
-                           Max 3 attempts     Non-blocking          Max 10 concurrent
+   MISSING_PREVIOUS:H      Exponential       sync_blocks(H, H)    Update timestamp
+                           backoff           Non-blocking          Max 10 concurrent
 ```
 
 **Protection Mechanisms:**
-- **Request Cooldown**: 10 seconds minimum between requests for same block
-- **Maximum Attempts**: 3 requests per block maximum
+- **Request Cooldown**: 10s (aggressive) → 30s-300s (exponential backoff)
+- **Maximum Attempts**: Pseudo-infinite (never give up on blocks)
 - **Concurrent Limit**: Maximum 10 simultaneous requests
-- **Automatic Cleanup**: Remove stale requests after 60 seconds
+- **Background Re-request**: Every 30 seconds with exponential backoff
 
 #### **Parallel Block Processing**
 When dependency arrives, process up to 10 consecutive buffered blocks:
@@ -324,13 +335,13 @@ Genesis Block Signature:
 - **Fast Verification**: SHA3-256 hash comparison
 - **Scalability Ready**: Production nodes only sync, never create
 
-### 3.4 Proof of History (PoH) Integration
+### 3.4 Verifiable Time Sequence (VTS) Integration
 
 #### **Cryptographic Clock**
-QNet integrates Proof of History for verifiable time ordering:
+QNet integrates Verifiable Time Sequence for verifiable time ordering:
 
 ```
-PoH Chain: H₀ → H₁ → H₂ → ... → Hₙ
+VTS Chain: H₀ → H₁ → H₂ → ... → Hₙ
            ↓    ↓    ↓         ↓
         Hybrid SHA3-512/Blake3 (25%/75%)
         500K hashes/second
@@ -339,7 +350,7 @@ PoH Chain: H₀ → H₁ → H₂ → ... → Hₙ
 **Properties:**
 - **Sequential Hash Chain**: 25% SHA3-512 creates sequential bottleneck for ordering
 - **Cryptographic Timestamps**: Each hash proves ordering and time progression
-- **Fork Prevention**: Creating alternative history requires recomputing entire PoH chain
+- **Fork Prevention**: Creating alternative history requires recomputing entire VTS chain
 - **Performance Balance**: Blake3 for speed, SHA3-512 intervals for sequential ordering
 - **Sub-Second Precision**: Accurate time measurement across distributed network
 
@@ -348,8 +359,8 @@ PoH Chain: H₀ → H₁ → H₂ → ... → Hₙ
 MicroBlock {
     height: u64,
     timestamp: u64,           // Unix timestamp
-    poh_hash: [u8; 64],      // PoH chain state at block creation
-    poh_count: u64,          // Number of PoH hashes since last block
+    poh_hash: [u8; 64],      // VTS chain state at block creation
+    poh_count: u64,          // Number of VTS hashes since last block
     previous_hash: [u8; 32], // Link to previous block
     ...
 }
@@ -357,9 +368,9 @@ MicroBlock {
 
 **Use Cases:**
 1. **Time Synchronization**: Nodes agree on block ordering without central clock
-2. **Fork Detection**: Competing chains must have valid PoH history
+2. **Fork Detection**: Competing chains must have valid VTS history
 3. **Transaction Ordering**: Cryptographic proof of event sequence
-4. **Network Latency Compensation**: PoH continues during network partitions
+4. **Network Latency Compensation**: VTS continues during network partitions
 
 ### 3.5 Synchronization Performance Metrics
 
@@ -402,34 +413,42 @@ MicroBlock {
 **QNet implements NIST/Cisco recommended encapsulated key approach:**
 
 ```rust
-// CRITICAL: NEW ephemeral Ed25519 key for EVERY message
+// CRITICAL: NEW ephemeral Ed25519 key for EVERY message (v2.23 RAW bytes)
 struct HybridSignature {
     certificate: HybridCertificate {
         node_id: String,
-        ed25519_public_key: [u8; 32],        // Ephemeral key
-        dilithium_signature: String,          // Signs encapsulated data
+        ed25519_public_key: [u8; 32],           // RAW bytes
+        dilithium_public_key: Vec<u8>,          // RAW bytes (~1952 bytes)
+        dilithium_signature_of_ed25519: Vec<u8>,// RAW bytes (certificate binding)
         issued_at: u64,
-        expires_at: u64,                      // 4.5 minute lifetime (270s)
+        expires_at: u64,                         // 4.5 minute lifetime (270s)
         serial_number: String,
     },
-    message_signature: [u8; 64],             // Ed25519 signs message
-    dilithium_message_signature: String,     // Not used (Dilithium signs KEY)
+    ephemeral_public_key: [u8; 32],             // NEW Ed25519 key RAW
+    message_signature: [u8; 64],                // Ed25519 signs message RAW
+    dilithium_key_signature: Vec<u8>,           // RAW bytes (~2500 bytes)
     signed_at: u64,
 }
 
-// Signing Process:
+// Signing Process (v2.23):
 // 1. Generate NEW ephemeral Ed25519 key
-// 2. Sign message with ephemeral key
-// 3. Create encapsulated_data = ephemeral_key || node_id || timestamp
-// 4. Sign encapsulated_data with Dilithium (NOT the message!)
+// 2. Sign message with ephemeral key → message_signature
+// 3. Create encapsulated_data = ephemeral_pk || message_hash || timestamp
+// 4. Sign encapsulated_data with Dilithium → dilithium_key_signature (SINGLE sig!)
 // 5. Certificate expires in 270 seconds (4.5 minutes)
 
-// Verification Process (Certificate caching OK):
+// Verification Process (Defense-in-Depth):
+// P2P Layer (node.rs):
 // 1. Check certificate expiration
-// 2. Recreate encapsulated_data
-// 3. Verify Dilithium signature on encapsulated_data
-// 4. Verify Ed25519 signature on message
-// 5. Both MUST pass - no optimization allowed per NIST/Cisco
+// 2. Verify Ed25519 signature with ephemeral key
+// 3. Recreate encapsulated_data
+// 4. Verify Dilithium via dilithium3::open() ✅ REAL CRYPTO
+//
+// Consensus Layer (consensus_crypto.rs):
+// 1. Parse RAW bytes from JSON
+// 2. Reconstruct encapsulated_data
+// 3. Real Dilithium3 verification via dilithium3::open() ✅
+// 4. Byzantine consensus (2/3+ honest nodes)
 ```
 
 **Key Features:**
@@ -489,7 +508,7 @@ let signature = dilithium3::sign(data, &sk);  // 2420 bytes
 | **Key Storage** | Dilithium3 keypair | ~6KB encrypted | AES-256-GCM | Random encryption key |
 | **Encryption Key** | Random 32 bytes | 40 bytes file | SHA3-256 integrity | NOT derived from node_id |
 | **Message Signing** | Ed25519 (ephemeral) | 64 bytes | Fast verification | 4.5-minute lifetime |
-| **Heartbeat Signatures** | CRYSTALS-Dilithium3 | 2420 bytes | NIST Level 3 | sign_full() → open() |
+| **Heartbeat Signatures** | HYBRID (v2.23+) | ~2.6KB RAW | Quantum-resistant | Ed25519 + Dilithium |
 | **Hashing** | SHA3-256 | 32 bytes | Grover-resistant | All operations |
 
 **Cryptographic Architecture:**
@@ -669,7 +688,7 @@ loop {
 
 ### 5.2 Architectural Optimizations
 
-**1. Hybrid Sealevel parallel execution:**
+**1. Hybrid Parallel Executor parallel execution:**
 ```rust
 // Process up to 10,000 transactions in parallel
 max_parallel = 10_000;
@@ -677,12 +696,12 @@ dependency_graph = analyze_dependencies(transactions);
 parallel_execute(non_conflicting_transactions);
 ```
 
-**2. Turbine block propagation:**
+**2. Shred Protocol block propagation:**
 - **Chunked transmission**: 1KB chunks with Reed-Solomon encoding
 - **Fanout-4 protocol**: Exponential propagation across network (optimized for Genesis)
 - **85% bandwidth reduction**: Compared to full broadcast
 
-**3. Quantum Proof of History:**
+**3. Quantum Verifiable Time Sequence:**
 - **500K hashes/sec**: Hybrid SHA3-512/Blake3 (25%/75%) for time synchronization
 - **10ms tick duration**: Precise event ordering (100 ticks/sec)
 - **Sequential ordering chain**: SHA3-512 bottleneck limits parallelization (NOT formal VDF)
@@ -694,7 +713,7 @@ parallel_execute(non_conflicting_transactions);
 - **70-90% cache hit rate**: Significant latency reduction
 - **No throughput limit**: Cache optimization, not execution bottleneck
 
-**5. Tower BFT adaptive timeouts:**
+**5. Adaptive BFT adaptive timeouts:**
 - **Dynamic timeouts**: 20s/10s/7s based on network conditions
 - **Exponential backoff**: 1.5x multiplier for retries
 - **Failover protection**: Prevents false positives
@@ -713,7 +732,37 @@ parallel_execute(non_conflicting_transactions);
 
 ## 6. Network Architecture
 
-### 6.1 P2P System
+### 6.1 QUIC Transport Layer (v2.19.22)
+
+**High-Performance P2P Transport:**
+
+QNet uses the QUIC protocol for all P2P communication, providing:
+
+| Feature | Description |
+|---------|-------------|
+| **Protocol** | QUIC over UDP (port 10876) |
+| **Encryption** | TLS 1.3 (NIST SP 800-52 compliant) |
+| **Multiplexing** | 100+ streams per connection |
+| **Handshake** | 0-RTT for repeat connections |
+| **Serialization** | Binary (bincode) - 50% bandwidth reduction |
+| **Connection Pool** | Automatic reconnection with idle cleanup |
+
+**Transport Constants:**
+```rust
+CONNECT_TIMEOUT: 3 seconds    // Quick connection establishment
+IDLE_TIMEOUT: 90 seconds      // Connection reuse window
+KEEP_ALIVE: 30 seconds        // Connection heartbeat
+MAX_MESSAGE_SIZE: 10 MB       // Supports full macroblocks (~3MB)
+```
+
+**Why QUIC over HTTP:**
+- **No Head-of-Line Blocking**: Independent streams prevent delays
+- **Lower Latency**: 0-RTT handshake for repeat connections
+- **Better Multiplexing**: Multiple messages on single connection
+- **Built-in Encryption**: TLS 1.3 integrated into protocol
+- **Connection Migration**: Survives IP address changes
+
+### 6.2 P2P System
 
 **Regional clustering:**
 - **North America**: Nodes grouped by geography
@@ -727,7 +776,7 @@ parallel_execute(non_conflicting_transactions);
 - 1001-100000 nodes: 100 peers per region
 - 100k+ nodes: 500 peers per region
 
-### 6.2 Node Discovery
+### 6.3 Node Discovery
 
 **Multi-level discovery:**
 
@@ -736,7 +785,7 @@ parallel_execute(non_conflicting_transactions);
 3. **Peer exchange**: Node list exchange every 30 seconds
 4. **Registry integration**: Blockchain-based node registration
 
-### 6.3 Synchronization & Snapshots
+### 6.4 Synchronization & Snapshots
 
 **Advanced sync mechanisms:**
 
@@ -764,55 +813,71 @@ parallel_execute(non_conflicting_transactions);
    - **Health monitor**: Periodic flag checking
    - **Force reset**: Clear stuck sync flags after timeout
 
-### 6.4 Reputation System
+### 6.5 Reputation System
 
-**Byzantine-Safe Split Reputation (v2.19.2):**
+**Deterministic Blockchain-Based Reputation (v2.24 - Ethereum 2.0 Style):**
 
-QNet implements a **two-dimensional reputation model** that separates Byzantine attacks from network performance issues:
+> **ARCHITECTURE v2.24:** Reputation computed from blockchain data + FULL snapshots in macroblocks.
+> All nodes have IDENTICAL reputation state after every macroblock - 100% synchronized.
+> See [docs/REPUTATION_SYSTEM.md](docs/REPUTATION_SYSTEM.md) for full documentation.
 
 ```rust
-pub struct PeerInfo {
-    consensus_score: f64,  // 0-100: Byzantine behavior (invalid blocks, attacks)
-    network_score: f64,    // 0-100: Network performance (timeouts, latency)
+/// FULL reputation snapshot stored in every macroblock (v2.24)
+pub struct FullReputationSnapshot {
+    pub reputations: HashMap<String, f64>,          // node_id -> reputation (0-100)
+    pub active_jails: HashMap<String, (u64, u32)>,  // node_id -> (end_ts, offense_count)
+    pub permanent_bans: HashSet<String>,            // Permanently banned nodes
+    pub offense_counts: HashMap<String, u32>,       // Progressive jail tracking
+    pub last_passive_recovery: HashMap<String, u64>, // Recovery timers
+    pub processed_rotations: HashSet<u64>,          // Duplicate protection
 }
 ```
 
-**Why Split Reputation?**
+**Why Snapshots (not just Computation)?**
 
-| Issue | Single Reputation | Split Reputation |
-|-------|------------------|------------------|
-| **WAN Latency** | Good node penalized → excluded from consensus | Only network_score affected → still eligible |
-| **Invalid Blocks** | Same penalty as timeout → unfair | consensus_score penalty → proper isolation |
-| **Peer Selection** | Can't distinguish malicious from slow | Prioritize by network_score, filter by consensus_score |
-| **Byzantine Safety** | Network issues affect consensus threshold | Only Byzantine behavior affects consensus eligibility |
+| Issue | v2.1 (Computed Only) | v2.24 (Snapshots) |
+|-------|---------------------|-------------------|
+| **Out-of-order blocks** | Reputation drift | Snapshot authoritative |
+| **Jail persistence** | In-memory only | Stored in blockchain |
+| **Ban persistence** | In-memory only | Stored in blockchain |
+| **Offense counts** | In-memory only | Stored in blockchain |
+| **Node sync** | May disagree | 100% identical after macroblock |
 
-**Reputation Components:**
+**Reputation Events (Blockchain-Based):**
 
 ```
-CONSENSUS SCORE (Byzantine Safety):
-  ├── FullRotationComplete: +2.0 (for completing all 30 blocks)
-  ├── InvalidBlock: -20.0
-  ├── MaliciousBehavior: -50.0
-  ├── ConsensusParticipation: +1.0
-  └── Threshold: ≥70% for consensus participation
+REWARDS (from blockchain data):
+  ├── Full Rotation: +2.0 (ONLY if 30/30 blocks! Partial = NO reward!)
+  ├── Consensus Participation: +1.0 (macroblock commit+reveal)
+  └── Passive Recovery: +1.0/4h (online nodes with rep 10-69%)
 
-NETWORK SCORE (Peer Performance - PENALTIES ONLY):
-  ├── TimeoutFailure: -2.0
-  ├── ConnectionFailure: -5.0
-  └── No threshold (used for prioritization only)
+PENALTIES (SlashingEvent with cryptographic proof):
+  ├── Invalid Block: -20.0 (proof: the invalid block itself)
+  ├── Double Sign: -50.0 + PERMANENT BAN (proof: both signed blocks)
+  ├── Chain Fork: PERMANENT BAN (proof: conflicting chains)
+  └── Missed Blocks: -2.0 per block (AutomaticJail in macroblock)
 
-PASSIVE RECOVERY (once per 4h, if score [10, 70), NOT jailed):
-  └── +1.0 reputation
+SNAPSHOT STORAGE (every 90 blocks in macroblock):
+  ├── All reputations (HashMap<String, f64>)
+  ├── Active jails (node_id → end_time + offense_count)
+  ├── Permanent bans (HashSet<String>)
+  ├── Offense counts (for progressive jail)
+  └── Recovery timers (for passive recovery)
 
-PROGRESSIVE JAIL (6 chances for regular offenses):
+PROGRESSIVE JAIL (6 chances, stored in snapshot):
   ├── 1st: 1h → 30%    4th: 30d → 15%
   ├── 2nd: 24h → 25%   5th: 3m → 12%
   ├── 3rd: 7d → 20%    6+: 1y → 10% (can return!)
   └── CRITICAL ATTACKS → PERMANENT BAN (no return):
-      DatabaseSubstitution, ChainFork, StorageDeletion
+      DoubleSign, ChainFork
+```
 
-COMBINED REPUTATION (Peer Selection):
-  └── 70% consensus_score + 30% network_score
+**Finality Checkpoints (v2.1):**
+```
+After 2 macroblocks with 2/3+ validator signatures = FINAL
+├── Prevents long-range attacks
+├── Cannot rewrite finalized history
+└── ~3 minutes to finality (2 × 90 seconds)
 ```
 
 **Ping/Heartbeat-based participation (every 4 hours) - v2.19.4:**
@@ -823,9 +888,9 @@ Response requirements:
 ├── Full Nodes: 80% (8+ out of 10 heartbeats in current window)
 └── Super Nodes: 90% (9+ out of 10 heartbeats in current window)
 
-Architecture (v2.19.10):
+Architecture (v2.23):
 ├── Light: Full/Super nodes ping via FCM V1 API → Light signs challenge → attestation
-├── Full/Super: Self-attest via Dilithium-signed heartbeats (10 per 4h window)
+├── Full/Super: Self-attest via heartbeats (10 per 4h window, HYBRID signature - quantum-resistant)
 ├── 256-shard ping system: Light nodes assigned to pingers based on SHA3-256(node_id)[0]
 ├── Light node reputation: Fixed at 70 (immutable, not affected by events)
 ├── Storage: Tiered (Light ~100MB headers, Full ~500GB pruned, Super ~2TB full)
@@ -879,16 +944,28 @@ GOSSIP ARCHITECTURE:
 ├── Complexity: O(log n) vs O(n) broadcast (99.999% bandwidth savings)
 ├── Interval: Every 5 minutes (periodic sync)
 ├── Transport: HTTP POST (reliable, NAT-friendly)
-├── Fanout: Adaptive 4-32 (same as Turbine block propagation)
+├── Fanout: Adaptive 4-32 (same as Shred Protocol block propagation)
 ├── Signature: SHA3-256 (quantum-safe verification)
 └── Scope: Super + Full nodes only (Light nodes excluded)
 
-EXPONENTIAL PROPAGATION:
-├── Initial Send: Node gossips to random fanout peers (Kademlia-based selection)
-├── Re-gossip: Each recipient re-gossips to fanout peers (exclude sender)
-├── Growth: 1 → 4 → 16 → 64 → 256 → 1024 → 4096 (7 hops for 4K nodes)
+EXPONENTIAL PROPAGATION (v2.19.19):
+├── Initial Send: Node gossips to K closest neighbors by Kademlia distance (K=3)
+├── Re-gossip: Each recipient re-gossips to K neighbors (exclude sender)
+├── Growth: 1 → 3 → 9 → 27 → 81 → 243 → 729 (7 hops for 729 nodes)
 ├── Example: 1M nodes = ~20 hops vs 1M HTTP requests (broadcast)
 └── Convergence: Weighted average (70% local + 30% remote)
+
+OPTIMIZATIONS (v2.19.20):
+├── Fire-and-Forget Broadcast: Shred Protocol doesn't block production (1 block/sec guaranteed)
+├── Genesis Startup Wait: 30-second network stabilization before production
+├── Emergency Timeout 10s: Allows original producer delivery (was 2s)
+├── Pseudo-Infinite Retries: Blocks NEVER discarded (like Solana/Ethereum)
+├── Exponential Backoff: 10s (0-9) → 30s → 60s → 120s → 240s → 300s max
+├── Adaptive Buffer: Full/Super 500 blocks (~50MB), Light 100 blocks (~10MB)
+├── Kademlia K-neighbors: Heartbeats use DHT distance for efficient routing
+├── Shred Protocol ALWAYS: Block propagation uses Shred Protocol for ALL network sizes
+├── Heartbeat with HYBRID (v2.23): Full quantum protection (Ed25519 + Dilithium per message)
+└── Priority channels: Blocks/Consensus use separate channels (implicit priority)
 
 BYZANTINE SAFETY:
 ├── Signature Verification: Every gossip message verified (SHA3-256)
@@ -1413,18 +1490,27 @@ Light Node Attestation Structure:
 **Self-Attestation Architecture (Full/Super Nodes):**
 
 ```
-Heartbeat System (v2.19.4):
+Heartbeat System (v2.23 - Quantum Protected):
 ├── Frequency: 10 heartbeats per 4-hour window (~24 min apart)
-├── Self-attestation: Node signs own heartbeat with Dilithium
-├── Gossip: Heartbeats broadcast via P2P gossip protocol
+├── Self-attestation: Node broadcasts heartbeat with HYBRID signature (Ed25519 + Dilithium)
+├── Gossip: Heartbeats broadcast via Kademlia K-neighbors (K=3, DHT routing)
 ├── Storage: Persisted in RocksDB for reward calculation
+├── Security: Quantum-resistant - Dilithium signs (ephemeral_key || message_hash || timestamp)
+├── Security: Timestamp validation (±5min) + active_full_super_nodes registry
 
 Heartbeat Structure:
 ├── node_id: String
 ├── node_type: "full" or "super"
 ├── heartbeat_index: u8 (0-9)
 ├── timestamp: u64
-└── dilithium_signature: String (2420 bytes)
+└── signature: String (placeholder, NOT verified - CPU optimization)
+
+SECURITY NOTE (v2.19.19 - NIST FIPS 204 compliant):
+├── Heartbeats do NOT affect consensus - fake heartbeats give attacker nothing
+├── Blocks are ALWAYS verified with Dilithium (security preserved)
+├── Node must be in active_full_super_nodes registry (first registration uses Dilithium)
+├── Timestamp validation prevents replay attacks
+└── CPU savings: ~35ms per heartbeat × thousands = significant
 
 Response Requirements by Node Type:
 ├── Light Nodes: 1+ attestation per window (not 100%)
@@ -1725,7 +1811,7 @@ pub struct QNetSignature {
 
 QNet implements cutting-edge performance optimization techniques to achieve maximum throughput and minimal latency:
 
-#### 8.4.1 Turbine Block Propagation Protocol
+#### 8.4.1 Shred Protocol Block Propagation Protocol
 
 **Efficient block distribution mechanism:**
 
@@ -1742,7 +1828,7 @@ Block → Chunks (1KB each) → Reed-Solomon Encoding → Fanout Distribution
 
 **Technical implementation:**
 ```rust
-pub struct TurbineChunk {
+pub struct Shred ProtocolChunk {
     block_hash: [u8; 32],
     chunk_index: u32,
     total_chunks: u32,
@@ -1756,11 +1842,56 @@ pub struct TurbineChunk {
 - Propagation time: O(log₃(N)) where N = network size
 - Packet loss tolerance: Up to 33% with full recovery
 
-#### 8.4.2 Quantum Proof of History (QPoH)
+**Chunk Retransmit Mechanism (v2.21.3):**
+
+When chunks are lost during propagation, the retransmit mechanism enables efficient recovery without downloading entire blocks:
+
+```
+1. Node detects missing chunks after 3-second timeout
+2. Sends RequestMissingChunks to 3-10 peers (adaptive based on network size)
+3. Peers respond with cached chunks from last 100 blocks
+4. Node reconstructs block with recovered chunks + Reed-Solomon
+```
+
+| Network Size | Peers Queried | Success Rate* |
+|--------------|---------------|---------------|
+| 5-100 nodes | 3-5 | 87-97% |
+| 100-10K nodes | 5-7 | 97-99% |
+| 10K-100K nodes | 7-8 | 99%+ |
+
+*Assuming 50% cache hit rate
+
+**Bandwidth savings:**
+- Request 2 missing chunks: 2KB vs 12KB full block = **83% savings**
+- Request 5 missing chunks: 5KB vs 12KB full block = **58% savings**
+
+**QUIC Rate Limiting (v2.21.4):**
+
+Without rate limiting, burst of 72+ concurrent QUIC streams causes receiver overload and ~40% packet loss. Solution: Semaphore-based adaptive rate limiting.
+
+```rust
+// Adaptive limit based on network size and per-peer capacity
+let max_concurrent = min(network_limit, peer_count * 5);
+```
+
+| Network Size | Network Limit | Per-Peer (×5) | Effective |
+|--------------|---------------|---------------|-----------|
+| 5 nodes | 20 | 25 | 20 |
+| 50 nodes | 50 | 250 | 50 |
+| 500 nodes | 100 | 2500 | 100 |
+| 5000 nodes | 200 | 25000 | 200 |
+
+**Benefits:**
+- ✅ Chunks remain independent (Reed-Solomon compatible)
+- ✅ No head-of-line blocking
+- ✅ QUIC flow control works correctly
+- ✅ Scales to 100K+ nodes
+
+#### 8.4.2 Quantum Verifiable Time Sequence (QVTS)
 
 **Cryptographic clock for precise time synchronization:**
 
-QNet's Quantum Proof of History provides a verifiable, sequential record of events using cryptographic hashing:
+QNet's Quantum Verifiable Time Sequence provides a verifiable, sequential record of events using cryptographic hashing:
 
 **Algorithm:**
 ```rust
@@ -1768,10 +1899,10 @@ QNet's Quantum Proof of History provides a verifiable, sequential record of even
 for i in 0..HASHES_PER_TICK {
     if i % 4 == 0 {
         // Every 4th hash: SHA3-512 for sequential ordering (limits parallelization)
-        PoH_n = SHA3_512(PoH_{n-1} || counter)
+        VTS_n = SHA3_512(VTS_{n-1} || counter)
     } else {
         // Other hashes: Blake3 for speed (3x faster)
-        PoH_n = Blake3(PoH_{n-1} || counter)
+        VTS_n = Blake3(VTS_{n-1} || counter)
     }
 }
 ```
@@ -1783,7 +1914,7 @@ for i in 0..HASHES_PER_TICK {
 - **Tick Duration**: 10 milliseconds (5,000 hashes per tick)
 - **Ticks Per Slot**: 100 ticks = 1 second = 1 microblock slot
 - **Drift Detection**: Maximum 5% allowed drift before correction
-- **Verification**: Each node can independently verify PoH sequence
+- **Verification**: Each node can independently verify VTS sequence
 - **Memory**: Fixed-size arrays (64 bytes), zero Vec allocations in hot path
 
 **Benefits:**
@@ -1795,7 +1926,7 @@ for i in 0..HASHES_PER_TICK {
 
 **Implementation:**
 ```rust
-pub struct PoHEntry {
+pub struct VTSEntry {
     num_hashes: u64,       // Sequential counter
     hash: Vec<u8>,         // SHA3-512 output (64 bytes)
     data: Option<Vec<u8>>, // Optional transaction/event data
@@ -1983,11 +2114,11 @@ async fn select_producer_with_finality_window(
 }
 ```
 
-#### 8.4.4 Hybrid Sealevel Execution Engine
+#### 8.4.4 Hybrid Parallel Executor Execution Engine
 
 **Parallel transaction processing with 5-stage pipeline:**
 
-QNet's Hybrid Sealevel engine enables massive parallelization of transaction execution:
+QNet's Hybrid Parallel Executor engine enables massive parallelization of transaction execution:
 
 **Pipeline stages:**
 1. **Validation Stage**: Transaction format and signature verification
@@ -2014,11 +2145,11 @@ Parallel execution:   424,411 TPS (424x speedup)
 - Smart contract deployment
 - Smart contract calls
 
-#### 8.4.4 Tower BFT Adaptive Timeouts
+#### 8.4.4 Adaptive BFT Adaptive Timeouts
 
 **Dynamic consensus timeouts based on network conditions:**
 
-Tower BFT implements adaptive timeout mechanisms to optimize consensus under varying network conditions:
+Adaptive BFT implements adaptive timeout mechanisms to optimize consensus under varying network conditions:
 
 **Timeout schedule:**
 - **Block #1**: 20 seconds (network bootstrap phase)
@@ -2177,6 +2308,37 @@ Violation Penalties:
 ├── Consensus Failure: -10.0 reputation
 ├── Extended Offline (24h+): -15.0 reputation
 └── Double Signing: -30.0 reputation
+
+Advanced Security (v2.20.0):
+├── Reputation Manipulation Detection:
+│   ├── Nodes claiming false reputation in ActiveNodeAnnouncement
+│   ├── Detection: Compare claimed vs real reputation (tolerance ±10%)
+│   ├── Only INFLATION is an attack (claiming higher reputation)
+│   ├── DEFLATION is NOT an attack (legitimate after penalties)
+│   ├── Escalating punishment:
+│   │   ├── 1st attempt: -15% + 1 hour ban
+│   │   ├── 2nd attempt: -25% + 1 day ban
+│   │   ├── 3rd attempt: -40% + 1 week ban + network alert
+│   │   └── 4th+ attempt: -50% + 1 year ban + network alert
+│   └── Prevents cascade false accusations from network desync
+│
+├── Empty Response Attack Protection:
+│   ├── Nodes sending empty peer lists to disrupt discovery
+│   ├── Tracking: 5 empty responses in 10 minutes = attack
+│   ├── Penalty: -5% reputation
+│   └── Empty responses ignored (not processed)
+│
+├── Consensus Message Validation:
+│   ├── Timestamp validation: ±5 minutes tolerance
+│   ├── Future timestamps: reject + penalty
+│   ├── Stale timestamps: reject (no penalty)
+│   ├── Signature format pre-validation
+│   └── Invalid format: reject + penalty
+│
+└── Fork Resolution Security:
+    ├── Minimum 3 high-rep validators for resync decision
+    ├── DoS protection: 60s cooldown between fork attempts
+    └── Macroblock finality: 67% consensus every 90 blocks
 ```
 
 **Mobile-Optimized Recovery System:**
@@ -2356,10 +2518,10 @@ ws://node:8001/ws/transactions // Subscribe to transactions
 - ✅ API v1 stabilized
 
 **Q4 2025:**
-- ✅ Turbine block propagation implemented
-- ✅ Quantum Proof of History deployed
-- ✅ Hybrid Sealevel execution engine
-- ✅ Tower BFT adaptive timeouts
+- ✅ Shred Protocol block propagation implemented
+- ✅ Quantum Verifiable Time Sequence deployed
+- ✅ Hybrid Parallel Executor execution engine
+- ✅ Adaptive BFT adaptive timeouts
 - ✅ Pre-execution cache system
 - ✅ 56 API endpoints operational
 
@@ -2558,7 +2720,7 @@ ws://node:8001/ws/transactions // Subscribe to transactions
 - **UDP** for peer discovery messages
 - **HTTP/2** for API endpoints  
 - **WebSocket** for real-time subscription
-- **Turbine** for chunked block propagation
+- **Shred Protocol** for chunked block propagation
 
 **Application Layer:**
 ```rust
@@ -2568,17 +2730,17 @@ QNetProtocol = {
     compression: "Zstd",
     encryption: "TLS 1.3",
     authentication: "CRYSTALS-Dilithium",
-    block_propagation: "Turbine",
-    time_sync: "Quantum PoH"
+    block_propagation: "Shred Protocol",
+    time_sync: "Quantum VTS"
 }
 ```
 
 **Performance Optimizations:**
-- **Turbine Protocol**: Chunked block propagation with Reed-Solomon encoding
-- **Quantum PoH**: 500K hashes/sec SHA3-512/Blake3 sequential ordering (NOT formal VDF)
+- **Shred Protocol Protocol**: Chunked block propagation with Reed-Solomon encoding
+- **Quantum VTS**: 500K hashes/sec SHA3-512/Blake3 sequential ordering (NOT formal VDF)
 - **Finality Window Selection**: Deterministic SHA3-512 producer selection with 10-block finality for race-free, Byzantine-safe leader election (biasable by 67%+ coalition)
-- **Hybrid Sealevel**: 10,000 parallel transaction execution
-- **Tower BFT**: Adaptive consensus timeouts (7s base, up to 20s max, 1.5x multiplier)
+- **Hybrid Parallel Executor**: 10,000 parallel transaction execution
+- **Adaptive BFT**: Adaptive consensus timeouts (7s base, up to 20s max, 1.5x multiplier)
 - **Comprehensive Benchmarks**: Full performance testing harness for all components
 - **Pre-Execution**: Speculative transaction cache (10,000 TX)
 

@@ -451,7 +451,7 @@ impl Mempool {
             let mut priorities: Vec<_> = queue.iter()
                 .map(|(hash, priority)| (hash.clone(), priority.score))
                 .collect();
-            priorities.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+            priorities.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
             
             for (hash, _) in priorities.into_iter().take(count - to_remove.len()) {
                 to_remove.push(hash);
@@ -533,7 +533,7 @@ impl Mempool {
             gas_limit: 10_000, // QNet TRANSFER gas limit
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_secs(),
             signature: None,
             public_key: None, // Not needed for placeholder transaction
@@ -693,7 +693,7 @@ impl Mempool {
             capacity_utilization: (total_txs as f64 / self.config.max_size as f64) * 100.0,
             last_updated: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_secs(),
         }
     }

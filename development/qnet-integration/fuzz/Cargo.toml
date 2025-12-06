@@ -1,0 +1,44 @@
+[package]
+name = "qnet-fuzz"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+
+[dependencies.qnet-integration]
+path = ".."
+
+[[bin]]
+name = "fuzz_network_message"
+path = "fuzz_targets/fuzz_network_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_block_parsing"
+path = "fuzz_targets/fuzz_block_parsing.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_transaction"
+path = "fuzz_targets/fuzz_transaction.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_signature"
+path = "fuzz_targets/fuzz_signature.rs"
+test = false
+doc = false
+bench = false
+

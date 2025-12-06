@@ -80,20 +80,17 @@ jobs:
     - name: Build workspace
       run: |
         echo "Building Rust workspace..."
-        cargo build --workspace --verbose || echo "⚠️ Build completed with warnings"
-      continue-on-error: true
+        cargo build --workspace --verbose
     
     - name: Run library tests
       run: |
         echo "Running Rust tests..."
-        cargo test --workspace --lib --verbose || echo "⚠️ Some tests failed"
-      continue-on-error: true
+        cargo test --workspace --lib --verbose
     
     - name: Build release
       run: |
         echo "Building release version..."
-        cargo build --workspace --release || echo "⚠️ Release build completed with warnings"
-      continue-on-error: true
+        cargo build --workspace --release
 
   frontend-build:
     name: Frontend Build & Test

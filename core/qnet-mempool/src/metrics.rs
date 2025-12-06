@@ -12,14 +12,14 @@ lazy_static! {
         "qnet_mempool_tx_operations_total",
         "Total number of transaction operations",
         &["operation", "result"]
-    ).unwrap();
+    ).expect("Failed to create MEMPOOL_OPERATIONS metric");
     
     /// Current mempool size
     pub static ref MEMPOOL_SIZE: GaugeVec = register_gauge_vec!(
         "qnet_mempool_size",
         "Current mempool size",
         &["type"]
-    ).unwrap();
+    ).expect("Failed to create metric");
     
     /// Gas price distribution
     pub static ref GAS_PRICE_HISTOGRAM: HistogramVec = register_histogram_vec!(
@@ -27,7 +27,7 @@ lazy_static! {
         "Gas price distribution in mempool",
         &["type"],
         vec![1.0, 5.0, 10.0, 50.0, 100.0, 500.0, 1000.0]
-    ).unwrap();
+    ).expect("Failed to create TRANSACTION_GAS_PRICE metric");
     
     /// Transaction age
     pub static ref TX_AGE: HistogramVec = register_histogram_vec!(
@@ -35,14 +35,14 @@ lazy_static! {
         "Transaction age in mempool",
         &["status"],
         vec![10.0, 60.0, 300.0, 600.0, 1800.0, 3600.0]
-    ).unwrap();
+    ).expect("Failed to create TRANSACTION_AGE metric");
     
     /// Eviction counter
     pub static ref EVICTIONS: CounterVec = register_counter_vec!(
         "qnet_mempool_evictions_total",
         "Total number of evictions",
         &["reason"]
-    ).unwrap();
+    ).expect("Failed to create EVICTION_REASONS metric");
 }
 
 /// Record transaction operation

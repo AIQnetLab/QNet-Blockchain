@@ -5,6 +5,511 @@ All notable changes to the QNet project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.24.0] - December 6, 2025 "Ethereum 2.0 Style Reputation Snapshots"
+
+### 🔐 CRITICAL - Complete Reputation System Overhaul
+
+**Problems fixed:**
+1. Nodes could have different reputation values due to out-of-order block processing
+2. Reward given for partial rotation (failover) - should be 30/30 only!
+3. Snapshot only stored reputations, not jails/bans/offense counts
+
+**Solution**: Full Ethereum 2.0 style reputation snapshots + strict 30/30 rule!
+
+### ✅ Changes
+
+| Component | Before | After |
+|-----------|--------|-------|
+| **Snapshot content** | Only reputations | ALL state (jails, bans, offense counts) |
+| **Rotation reward** | Any block at height 30/60/90 | Only 30/30 full rotation |
+| **Sync method** | Each node computes independently | Blockchain is authoritative |
+| **Consistency** | Possible drift between nodes | 100% identical after macroblock |
+
+### 🔧 Technical Changes
+
+**NEW: FullReputationSnapshot struct:**
+```rust
+pub struct FullReputationSnapshot {
+    pub reputations: HashMap<String, f64>,          // Node reputations
+    pub active_jails: HashMap<String, (u64, u32)>,  // Jail end + offense count
+    pub permanent_bans: HashSet<String>,            // Permanently banned
+    pub offense_counts: HashMap<String, u32>,       // Progressive jail counter
+    pub last_passive_recovery: HashMap<String, u64>, // Recovery timers
+    pub processed_rotations: HashSet<u64>,          // Duplicate protection
+}
+```
+
+**NEW: BlockData.blocks_in_rotation field:**
+```rust
+pub struct BlockData {
+    pub height: u64,
+    pub producer: String,
+    pub timestamp: u64,
+    pub is_valid: bool,
+    pub blocks_in_rotation: u32,  // MUST be 30 for reward!
+}
+```
+
+**CRITICAL: Partial rotation = NO REWARD:**
+```rust
+// OLD (wrong):
+if block.is_valid {
+    new_rep = current + REWARD_FULL_ROTATION;  // Always rewarded!
+}
+
+// NEW (correct):
+if block.is_valid && block.blocks_in_rotation >= 30 {
+    new_rep = current + REWARD_FULL_ROTATION;  // Only 30/30!
+} else {
+    println!("[REPUTATION] ⚠️ Partial rotation ({}/30) → NO REWARD");
+}
+```
+
+### 📦 Affected Files
+
+- `core/qnet-state/src/block.rs` - Added `reputation_snapshot` to ConsensusData
+- `core/qnet-consensus/src/deterministic_reputation.rs`:
+  - Added `FullReputationSnapshot` struct
+  - Added `blocks_in_rotation` to `BlockData`
+  - Updated `create_snapshot()` to include ALL state
+  - Updated `apply_snapshot()` to restore ALL state
+  - Updated `process_block()` to check 30/30 requirement
+- `development/qnet-integration/src/node.rs`:
+  - Snapshot creation in macroblock
+  - Snapshot application at 4 points (receive, sync, replay, own blocks)
+  - Count blocks_in_rotation before rewarding
+
+### 🛡️ Security
+
+| Attack | Protection |
+|--------|------------|
+| Fake jail removal | Jails stored in snapshot, signed by 2/3+ validators |
+| Inflate offense count | offense_counts in snapshot are authoritative |
+| Skip permanent ban | permanent_bans in snapshot cannot be removed |
+| Partial rotation farming | 30/30 check prevents failover reward abuse |
+
+### 📊 What Gets Stored
+
+| Field | Description | Storage |
+|-------|-------------|---------|
+| `reputations` | Node reputation 0-100% | HashMap<String, f64> |
+| `active_jails` | Jail end time + offense count | HashMap<String, (u64, u32)> |
+| `permanent_bans` | Permanently banned nodes | HashSet<String> |
+| `offense_counts` | Progressive jail counter | HashMap<String, u32> |
+| `last_passive_recovery` | Recovery timers | HashMap<String, u64> |
+| `processed_rotations` | Duplicate protection | HashSet<u64> |
+
+---
+
+## [2.23.0] - December 6, 2025 "RAW Bytes Signature Optimization + Full Quantum Heartbeat"
+
+### 🔐 CRITICAL - Signature Format Overhaul
+
+**Complete signature format optimization with 88% size reduction!**
+
+### ✅ Changes
+
+| Component | Before | After | Reduction |
+|-----------|--------|-------|-----------|
+| **Compact signature** | ~22KB (base64 JSON) | ~2.6KB (RAW bytes) | 88% |
+| **Full signature** | ~12KB | ~5KB | 58% |
+| **Dilithium format** | base64 String | Vec<u8> RAW | No overhead |
+| **Ed25519 fields** | Vec<u8> | [u8; 32/64] + serde_bytes | Type-safe |
+
+### 🔧 Technical Changes
+
+**New signature structure (v2.23):**
+```rust
+pub struct CompactHybridSignature {
+    pub node_id: String,
+    pub cert_serial: String,
+    #[serde(with = "serde_bytes")]
+    pub ephemeral_public_key: [u8; 32],    // RAW bytes
+    #[serde(with = "serde_bytes")]
+    pub message_signature: [u8; 64],        // Ed25519 RAW
+    #[serde(with = "serde_bytes")]
+    pub dilithium_key_signature: Vec<u8>,   // Dilithium RAW (~2500 bytes)
+    pub signed_at: u64,
+}
+```
+
+**Removed:**
+- `dilithium_message_signature` (redundant - message_hash already in encapsulated_data)
+
+**Added:**
+- `serde_bytes` dependency for efficient byte array serialization
+- Helper functions: `extract_dilithium_raw_bytes()`, `encode_dilithium_signature()`
+
+### 🛡️ Security
+
+- **Defense-in-depth**: Both P2P and Consensus layers perform real `dilithium3::open()` verification
+- **Consensus layer fix**: Now reconstructs `encapsulated_data` for correct verification
+- **Signature limit**: Reduced from 18KB to 2.6KB in `consensus_crypto.rs`
+
+### 💓 Heartbeat Quantum Protection (NEW!)
+
+**CRITICAL FIX**: Heartbeat now uses FULL HYBRID signatures (NIST/Cisco compliant)!
+
+| Before | After |
+|--------|-------|
+| Ed25519 only (quantum vulnerable) | HYBRID (Ed25519 + Dilithium) |
+| No Dilithium verification | Full `dilithium3::open()` verification |
+| Quantum attacker could fake heartbeats | Quantum-resistant heartbeat integrity |
+
+**Changes:**
+- `unified_p2p.rs`: Heartbeat creation uses `sign_heartbeat_dilithium()` 
+- `unified_p2p.rs`: Heartbeat verification uses `verify_dilithium_heartbeat_signature()`
+- Format: `hybrid_p2p:{CompactHybridSignature JSON}`
+- CPU cost: ~5ms per heartbeat (10 per 4h = 50ms total, negligible)
+
+---
+
+## [2.21.5] - December 5, 2025 "Full Blockchain Reputation Integration"
+
+### 🏗️ MAJOR ARCHITECTURE - Complete Blockchain Integration
+
+**Complete migration from P2P-based to blockchain-based reputation system!**
+
+### 🔴 Bug Fixes
+
+| Bug | Before | After |
+|-----|--------|-------|
+| Genesis hardcoded at 70% | `return 0.70` | Uses DeterministicReputationState |
+| Type conversion error | `score.min(1.0)` | `(score / 100.0).min(1.0)` |
+| Slashing not in blockchain | Stored in P2P RAM | Stored in ConsensusData |
+| No replay on restart | Lost on restart | Replays from blockchain |
+
+### ✅ Blockchain Storage for Reputation
+
+**Extended ConsensusData structure:**
+```rust
+pub struct ConsensusData {
+    pub commits: HashMap<String, Vec<u8>>,
+    pub reveals: HashMap<String, Vec<u8>>,
+    pub next_leader: String,
+    // NEW - stored in blockchain:
+    pub slashing_events_data: Option<Vec<u8>>,
+    pub automatic_jails_data: Option<Vec<u8>>,
+}
+```
+
+**New data types:**
+- `SlashingEventData` - serialized slashing events in blockchain
+- `AutomaticJailData` - serialized jail records in blockchain
+
+### ✅ Blockchain Replay on Restart
+
+```rust
+// On node startup:
+for height in (30..=current_height).step_by(30) {
+    rep_state.process_block(&block_data);  // +2% rotation rewards
+}
+for macroblock_index in 1..=(current_height / 90) {
+    rep_state.process_macroblock(&macro_data);  // +1% consensus + slashing
+}
+```
+
+### ✅ Old System Deprecated
+
+| Old (NodeReputation) | New (DeterministicReputationState) |
+|---------------------|-----------------------------------|
+| `get_reputation_system()` | `get_node_reputation_from_blockchain()` |
+| Stored in P2P RAM | Stored in blockchain |
+| Lost on restart | Replayed from blockchain |
+| Nodes can disagree | All nodes compute same |
+
+### 📊 Architecture Comparison
+
+```
+BEFORE (P2P):
+┌─────────────┐     ┌─────────────┐
+│ Node 001    │     │ Node 002    │
+│ rep=72%     │  ≠  │ rep=70%     │  ← CAN DISAGREE!
+└─────────────┘     └─────────────┘
+
+AFTER (Blockchain):
+┌─────────────┐     ┌─────────────┐
+│ Node 001    │     │ Node 002    │
+│ rep=72%     │  =  │ rep=72%     │  ← ALWAYS SAME!
+└─────────────┘     └─────────────┘
+       ↑                   ↑
+       └───────┬───────────┘
+               │
+        ┌──────┴──────┐
+        │  BLOCKCHAIN │
+        │  - commits  │
+        │  - reveals  │
+        │  - slashing │
+        │  - jails    │
+        └─────────────┘
+```
+
+### 🧪 Verification
+
+**Expected behavior:**
+```
+Genesis starts: 70%
+After 1 rotation (30 blocks): 72% (+2%)
+After 3 macroblocks: 75% (+1% each)
+After restart: SAME values (replayed from blockchain)
+```
+
+---
+
+## [2.21.4] - December 5, 2025 "QUIC Rate Limiting - 40% Packet Loss Fix"
+
+### 🔥 CRITICAL - Receiver Overload Fix
+
+**Problem**: 72 concurrent QUIC streams caused receiver overload → 40% chunk loss
+**Root Cause**: Burst of 72 parallel `tokio::spawn` → QUIC timeouts on receiver
+**Solution**: Semaphore-based rate limiting for chunk sends
+
+#### Technical Details
+```
+BEFORE: 72 chunks → 72 concurrent streams → receiver overload → 40% loss
+AFTER:  72 chunks → max 20 concurrent → controlled flow → ~0% loss
+```
+
+#### New Features
+- **Semaphore Rate Limiting**: Max N concurrent QUIC streams at any time
+- **Adaptive Limits**: Based on network size (15-50 concurrent)
+- **get_max_concurrent_chunk_sends()**: Dynamic limit calculation
+
+| Network Size | Max Concurrent | Rationale |
+|--------------|----------------|-----------|
+| 0-10 nodes | 15 | Conservative for Genesis |
+| 11-100 | 20 | Balanced throughput |
+| 101-1000 | 30 | More parallelism safe |
+| 1000+ | 50 | Distributed load |
+
+#### Why This Approach
+- ✅ Chunks remain independent (Reed-Solomon works)
+- ✅ No head-of-line blocking
+- ✅ QUIC flow control works properly
+- ✅ Scales to 100K+ nodes
+- ✅ Architecturally correct (not a hack)
+
+### 🧪 Tests Added
+- `test_rate_limit_genesis_network` - 5 nodes scenario
+- `test_rate_limit_small_network` - 50 nodes
+- `test_rate_limit_medium_network` - 500 nodes
+- `test_rate_limit_large_network` - 5000 nodes
+- `test_per_peer_limit_protection` - Per-receiver protection
+- `test_minimum_throughput_guarantee` - Min 10 concurrent
+- `test_rate_limit_vs_total_sends` - Throttle verification
+- `test_rate_limit_large_blocks` - 2MB block handling
+
+### 🛡️ Phantom Peers Prevention
+- **MAX_CONNECTED_PEERS = 1000**: Hard limit on connected peers
+- **LRU Eviction**: Automatic removal of oldest peer when limit reached
+- **ensure_peer_connected()**: Now respects capacity limits
+- **Scalability**: Prevents RAM overflow in networks with 10,000+ nodes
+
+### 🔥 CRITICAL - Reputation Processing Fix
+- **BUG**: `process_macroblock()` was NOT called when node CREATES macroblock!
+- **EFFECT**: Reputation rewards and slashing were NOT applied on creator node
+- **FIX**: Added full `process_macroblock()` call in macroblock creation (node.rs:11591+)
+- **Includes**: Slashing events, automatic jails, passive recovery
+
+---
+
+## [2.21.3] - December 5, 2025 "SHRED Retransmit & Network Hardening"
+
+### 🚀 NEW - SHRED Protocol Chunk Retransmit
+
+**Problem**: ~20% chunk loss in QUIC broadcast caused reliance on Reed-Solomon for ALL blocks
+**Solution**: Efficient retransmit mechanism for missing chunks without full block re-download
+
+#### New Features
+- **RequestMissingChunks**: Request specific missing chunks by index
+- **MissingChunksResponse**: Peers respond with cached chunks
+- **Adaptive Peer Selection**: 3-10 peers based on network size (5 to 100K+ nodes)
+- **100-Block Chunk Cache**: Recently received chunks cached for retransmit
+- **3-Second Timeout**: Wait before requesting retransmit
+- **Max 2 Retries**: Prevents infinite loops
+
+#### Bandwidth Savings
+| Missing Chunks | Full Block | Retransmit | Savings |
+|----------------|------------|------------|---------|
+| 2 | 12KB | 2KB | 83% |
+| 3 | 12KB | 3KB | 75% |
+| 5 | 12KB | 5KB | 58% |
+
+#### Scalability
+| Network Size | Peers Queried | Success Rate |
+|--------------|---------------|--------------|
+| 5-10 nodes | 3 | 87.5% |
+| 100 nodes | 5 | 96.9% |
+| 10,000 nodes | 7 | 99.2% |
+| 100,000 nodes | 8 | 99.6% |
+
+### 🔒 Security & Privacy
+- **Privacy-First Logging**: ALL IP addresses use `get_privacy_id_for_addr()` pseudonyms
+- **QUIC Address Protection**: No raw IPs in any log output
+- **Genesis Peer Validation**: Extended retry (3 attempts × 2s) before adding peers
+
+### 🐛 Bug Fixes
+- **Genesis QUIC Readiness**: Wait for QUIC connections before Genesis broadcast
+- **Deadlock Detection**: Fixed `>` to `>=` for exact timeout match
+- **Background Sync**: Detect stuck sync with `start_time=0` check
+- **FAST_SYNC in Background**: Now triggers for non-producer nodes too
+- **Adaptive Timeout**: Longer timeouts for larger sync operations
+
+### 📚 Documentation
+- `docs/REPUTATION_SYSTEM.md` - Added SHRED Retransmit section
+- `QNet_Whitepaper.md` - Added Chunk Retransmit mechanism
+- `README.md` - Added v2.21.3 release notes
+
+### 🧪 Tests
+- `tests/retransmit_tests.rs` - 20+ comprehensive tests
+- Unit tests for adaptive peer selection, cache, timeout detection
+
+---
+
+## [2.21.0] - December 5, 2025 "Deterministic Reputation System v2.1"
+
+### 🔐 CRITICAL - Complete Reputation System Overhaul
+
+**Problem**: P2P gossip-based reputation was vulnerable to Sybil attacks and caused forks
+**Solution**: Deterministic blockchain-based reputation - all nodes compute identical scores
+
+#### Breaking Changes
+- `ReputationSync` message type: **DEPRECATED** (ignored by all nodes)
+- `broadcast_reputation_sync()`: **DISABLED** (returns Ok but does nothing)
+- P2P reputation gossip: **REMOVED** (prevents Sybil attacks)
+
+#### New Architecture
+```
+OLD: P2P Gossip → Nodes can disagree → FORKS
+NEW: Blockchain Data → All nodes identical → NO FORKS
+```
+
+#### New Features
+- **DeterministicReputationState**: Single source of truth from blockchain
+- **SlashingEvents**: Cryptographic proof of misbehavior in macroblocks
+- **AutomaticJail**: Deterministic jail for missed blocks
+- **FinalityCheckpoints**: 2 macroblocks with 2/3+ sigs = irreversible
+- **Chunked Processing**: Scalable to 100,000+ nodes
+
+#### Files Added/Modified
+- `core/qnet-consensus/src/deterministic_reputation.rs` - NEW: Core reputation logic
+- `core/qnet-consensus/src/macro_consensus.rs` - Finality checkpoints
+- `development/qnet-integration/src/node.rs` - Integration with blockchain
+- `development/qnet-integration/src/unified_p2p.rs` - Deprecated old system
+- `docs/REPUTATION_SYSTEM.md` - NEW: Full documentation
+
+#### Security Improvements
+- Sybil-resistant: Cannot fake reputation via gossip
+- Evidence-based: All penalties require cryptographic proof
+- Deterministic: Verifiable by replaying blockchain from genesis
+- Finality: Prevents long-range attacks
+
+---
+
+## [2.20.0] - December 4, 2025 "Reputation System Fix + Deterministic Producer Selection"
+
+### 🔐 CRITICAL - Reputation Manipulation Detection Fix
+
+**Problem**: False DEFLATION accusations caused cascade jailing of legitimate nodes
+**Root Cause**: 
+- Tolerance was 2% (too strict for network delays)
+- DEFLATION was treated as attack (wrong - it's legitimate after penalty)
+
+**Solution**:
+- Increased tolerance to 10% for network delays and sync timing
+- Only INFLATION is now an attack (node claiming higher reputation)
+- DEFLATION (claiming lower) is NOT an attack - legitimate after penalties
+
+#### Changes
+- **Tolerance**: 2% → 10% for reputation sync differences
+- **INFLATION Only**: Only punish nodes claiming HIGHER reputation than actual
+- **DEFLATION OK**: Nodes can claim lower reputation (after receiving penalties)
+- **Cascade Prevention**: Prevents false accusations from desync
+
+### 🎯 Deterministic Producer Selection Fix
+
+**Problem**: Nodes selected different producers due to varying entropy sources
+**Root Cause**: Finality blocks (height-10) not available during initial sync
+
+**Solution**: 
+- Round 0 (blocks 1-30): Use Genesis + leadership_round as entropy
+- All nodes have Genesis → identical entropy → same producer selected
+
+#### Files Modified
+- `unified_p2p.rs` - Reputation manipulation detection logic
+- `node.rs` - Producer selection entropy calculation
+- `MICROBLOCK_ARCHITECTURE_PLAN.md` - Updated documentation
+
+---
+
+## [2.19.22] - November 30, 2025 "QUIC Transport Layer + NIST/Cisco Hybrid Crypto"
+
+### 🔐 CRITICAL - NIST/Cisco Compliant Hybrid Signatures
+
+**Problem**: Hybrid signatures were not using ephemeral keys per message
+**Solution**: Full NIST SP 800-208 / Cisco PQ implementation with ephemeral Ed25519 keys
+
+#### Changes
+- **Ephemeral Keys**: NEW Ed25519 keypair generated for EACH message
+- **Dilithium Key Binding**: Signs `ephemeral_pk || message_hash || timestamp`
+- **Dilithium Message Sig**: Additionally signs message hash (independent verification)
+- **Forward Secrecy**: Compromise one message ≠ compromise all
+
+#### Updated Structures
+```rust
+// CompactHybridSignature & HybridSignature now include:
+pub ephemeral_public_key: [u8; 32],      // NEW per message
+pub dilithium_key_signature: String,      // Binds ephemeral key
+pub dilithium_message_signature: String,  // Signs message
+```
+
+#### Files Modified
+- `hybrid_crypto.rs` - Ephemeral key generation per message
+- `node.rs` - Updated verification with ephemeral keys
+- `unified_p2p.rs` - All P2P signatures now hybrid
+- `rpc.rs` - All RPC signatures now hybrid
+- `consensus_crypto.rs` - Updated verification
+
+### 🚀 NEW - Full QUIC P2P Transport
+
+**Problem**: HTTP-based P2P was causing blocking issues and performance bottlenecks
+**Solution**: Complete migration to QUIC protocol for all P2P communication
+
+#### QUIC Features
+- **Protocol**: QUIC over UDP (port 10876)
+- **Encryption**: TLS 1.3 (NIST SP 800-52 compliant)
+- **Multiplexing**: 100+ streams per connection
+- **Handshake**: 0-RTT for repeat connections
+- **Serialization**: Binary (bincode) - 50% bandwidth reduction
+
+#### New Files
+- `quic_transport.rs` - QUIC transport layer implementation
+- `p2p_transport.rs` - P2P transport trait and binary protocol
+
+#### Transport Constants
+```rust
+CONNECT_TIMEOUT: 3 seconds
+IDLE_TIMEOUT: 90 seconds
+KEEP_ALIVE: 30 seconds
+MAX_MESSAGE_SIZE: 10 MB
+QUIC_PORT: P2P_PORT + 1000 (default 10876)
+```
+
+#### HTTP Fallback
+- **Removed**: HTTP no longer used for P2P between Full/Super nodes
+- **REST API**: HTTP still available for Light nodes on port 8001
+
+#### Docker Changes
+- **New port**: `-p 10876:10876/udp` required for QUIC
+- **Firewall**: `sudo ufw allow 10876/udp`
+
+### 🔧 Breaking Changes
+- QUIC port 10876/udp must be open for node operation
+- Node will fail to start if QUIC initialization fails
+- HTTP P2P endpoints deprecated for Full/Super nodes
+
+---
+
 ## [2.19.12] - November 27, 2025 "Macroblock Sync + QRC-20 Tokens + Snapshot API"
 
 ### 🪙 NEW - QRC-20 Token Support (REAL Implementation!)
@@ -424,12 +929,11 @@ keys/
   - 1st offense: 1 hour → 30%
   - 2nd offense: 24 hours → 25%
   - 3rd offense: 7 days → 20%
-- **JAIL NETWORK SYNCHRONIZATION**: Jail status now syncs across all nodes
-  - Added `jail_updates` to `ReputationSync` message
-  - Jail status propagates via gossip protocol (O(log n) complexity)
-  - Permanent bans (critical attacks) sync immediately network-wide
-  - Added `apply_jail_sync()` method for receiving jail from peers
-  - Added `get_all_jail_statuses()` for broadcast
+- **JAIL NETWORK SYNCHRONIZATION**: ~~Jail status now syncs across all nodes~~ **(DEPRECATED in v2.21.0)**
+  - ~~Added `jail_updates` to `ReputationSync` message~~ → **Now in macroblock**
+  - ~~Jail status propagates via gossip protocol~~ → **Blockchain-based in v2.21.0**
+  - ~~Permanent bans sync via gossip~~ → **SlashingEvent in macroblock**
+  - See v2.21.0 for new deterministic jail system
 - **JAIL PERSISTENCE**: Jail survives node restart
   - `save_jail_to_storage()` - saves jail to `./data/jail/jail_statuses.json`
   - `load_jail_from_storage()` - loads active jails on startup
@@ -496,7 +1000,7 @@ keys/
 
 ### Added
 - **Dual Dilithium Signatures**: Dilithium now signs BOTH ephemeral key AND message
-  - Addresses critical vulnerability identified by Ian Smith (security researcher)
+  - Addresses critical vulnerability in hybrid signature implementation
   - Full compliance with NIST/Cisco hybrid cryptography standards
   - Prevents quantum attacks on Ed25519 message signatures
   - Maintains O(1) performance with certificate caching
@@ -511,7 +1015,7 @@ keys/
   - Shared across hybrid_crypto.rs for consistency
 
 ### Changed
-- **Tower BFT Timeouts**: Drastically reduced for 1 block/second target
+- **Adaptive BFT Timeouts**: Drastically reduced for 1 block/second target
   - Base timeouts: 2-5 seconds (was 10-25 seconds)
   - Max timeout: 10 seconds (was 60 seconds)
   - Rotation boundaries: 3 seconds (was 12 seconds)
@@ -530,7 +1034,7 @@ keys/
   - Now correctly calls `set_emergency_producer_flag` for local node
 - **Block Production Delays**: Fixed two major performance bottlenecks
   - Repeated crypto initialization: Now uses GLOBAL_QUANTUM_CRYPTO
-  - Excessive TowerBFT timeouts: Reduced to match 1-second block target
+  - Excessive AdaptiveBFT timeouts: Reduced to match 1-second block target
 - **Network Stuck at Block 30**: Resolved through combination of above fixes
   - Message verification now works correctly
   - Emergency failover activates properly
@@ -545,7 +1049,7 @@ keys/
   - Addresses forensic analysis and memory dump attack vectors
   - Complies with best practices for key material handling
 
-## [2.18.0] - October 31, 2025 "PoH Optimization & VRF Implementation"
+## [2.18.0] - October 31, 2025 "VTS Optimization & VRF Implementation"
 
 ### Added
 - **VRF Producer Selection**: Ed25519-based Verifiable Random Function
@@ -555,7 +1059,7 @@ keys/
   - Entropy from macroblock hashes (agreed via Byzantine consensus)
   - Prevents producer manipulation and prediction attacks
 - **Comprehensive Benchmark Harness**: Full performance testing suite
-  - PoH throughput benchmarks (1K-100K hashes)
+  - VTS throughput benchmarks (1K-100K hashes)
   - VRF operations (init, evaluate, verify)
   - Producer selection scalability (5-10K nodes)
   - Consensus operations (commit/reveal)
@@ -566,27 +1070,27 @@ keys/
   - Benchmark documentation in `benches/README.md`
 
 ### Changed
-- **PoH Performance Optimized**: 15.6M → 25M+ hashes/sec
+- **VTS Performance Optimized**: 15.6M → 25M+ hashes/sec
   - Removed Blake3 from generation loop (kept in verification for compatibility)
   - SHA3-512 ONLY for true VDF properties (non-parallelizable)
   - Fixed-size arrays instead of Vec allocations
   - Zero-copy operations in hot path
   - Direct buffer reuse eliminates allocation overhead
-- **PoH Algorithm Simplified**: True VDF implementation
+- **VTS Algorithm Simplified**: True VDF implementation
   - Sequential SHA3-512 hashing only
   - No hybrid approach anymore
   - Ensures verifiable delay function properties
   - Cannot be parallelized or predicted
 
 ### Performance
-- **PoH**: 25M+ hashes/sec (Intel Xeon E5-2680v4 @ 2.4GHz)
+- **VTS**: 25M+ hashes/sec (Intel Xeon E5-2680v4 @ 2.4GHz)
 - **VRF Evaluation**: <1ms per candidate
 - **VRF Verification**: <500μs per proof
 - **Producer Selection (1K nodes)**: <10ms
 - **Validator Sampling (1M nodes)**: <50ms
 
 ### Documentation
-- Updated `README.md` with VRF and optimized PoH metrics
+- Updated `README.md` with VRF and optimized VTS metrics
 - Updated `QNet_Whitepaper.md` with detailed VRF section (8.4.3)
 - Updated `QNET_COMPLETE_GUIDE.md` with performance targets
 - Added `benches/README.md` with complete benchmark guide

@@ -66,7 +66,7 @@ impl StateDB {
             
             // Get or create sender account with real blockchain state
             let sender = accounts.entry(tx.from.clone()).or_insert_with(|| {
-                let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+                let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
                 Account {
                     address: tx.from.clone(),
                     balance: self.get_initial_balance_for_testnet(&tx.from),
@@ -104,12 +104,12 @@ impl StateDB {
             sender.nonce += 1;
             
             // Update activity timestamp  
-            let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+            let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
             sender.touch(timestamp);
             
             // Add to recipient
             let recipient = accounts.entry(to.clone()).or_insert_with(|| {
-                let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+                let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
                 Account {
                     address: to.clone(),
                     balance: 0,

@@ -1,10 +1,14 @@
-# Reputation System Audit Report
+# Reputation System Audit Report (DEPRECATED)
 **Date:** October 2, 2025  
-**Status:** ✅ PASSED (10/10 tests)
-**Version:** 2.0 FINAL
+**Status:** ⚠️ DEPRECATED - See docs/REPUTATION_SYSTEM.md for current system
+**Version:** 2.0 (SUPERSEDED by v2.1 Deterministic)
 
-## Executive Summary
-The QNet reputation system successfully implements Byzantine fault tolerance with progressive jail system, activity-based recovery, and atomic rotation rewards. All vulnerabilities have been fixed.
+> **⚠️ WARNING:** This audit covers the OLD P2P gossip-based reputation system.
+> The current system (v2.1) uses DETERMINISTIC blockchain-based reputation.
+> See [docs/REPUTATION_SYSTEM.md](../../docs/REPUTATION_SYSTEM.md) for current documentation.
+
+## Executive Summary (DEPRECATED)
+The OLD QNet reputation system used P2P gossip. This was REPLACED in v2.1 with deterministic blockchain-based reputation to prevent Sybil attacks and ensure all nodes see identical reputation.
 
 ## Test Results
 

@@ -86,8 +86,8 @@ impl ShardedRewardManager {
     
     /// Assign nodes to shards based on hash distribution
     pub async fn assign_nodes_to_shards(&self, node_ids: Vec<String>) -> IntegrationResult<()> {
-        let mut shards = self.shards.write().unwrap();
-        let mut assignments = self.shard_assignments.write().unwrap();
+        let mut shards = match self.shards.write() { Ok(g) => g, Err(p) => p.into_inner() };
+        let mut assignments = match self.shard_assignments.write() { Ok(g) => g, Err(p) => p.into_inner() };
         
         // Clear previous assignments
         for shard in shards.iter_mut() {
@@ -133,7 +133,7 @@ impl ShardedRewardManager {
         &self, 
         reward_manager: Arc<RwLock<PhaseAwareRewardManager>>
     ) -> IntegrationResult<u64> {
-        let shards = self.shards.read().unwrap().clone();
+        let shards = match self.shards.read() { Ok(g) => g, Err(p) => p.into_inner() }.clone();
         let mut futures = Vec::new();
         
         println!("[SHARDING] Starting parallel processing of {} shards", shards.len());
@@ -185,7 +185,13 @@ impl ShardedRewardManager {
             };
             
             futures.push(tokio::spawn(async move {
-                let _permit = sem.acquire().await.unwrap();
+                let _permit = match sem.acquire().await {
+                    Ok(p) => p,
+                    Err(_) => { 
+                        println!("[REWARDS] ⚠️ Semaphore closed"); 
+                        return Err(IntegrationError::ValidationError("Semaphore closed".to_string())); 
+                    }
+                };
                 Self::process_shard_with_counts(shard, storage, reward_manager, node_counts).await
             }));
         }
@@ -271,7 +277,7 @@ impl ShardedRewardManager {
                 // Load ping history from storage
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
+                    .unwrap_or_default()
                     .as_secs();
                 let since = now - (4 * 60 * 60); // Last 4 hours
                 
@@ -326,7 +332,7 @@ impl ShardedRewardManager {
                         
                         // Get actual genesis timestamp from reward_manager
                         let genesis_timestamp = {
-                            let rm = reward_manager.read().unwrap();
+                            let rm = match reward_manager.read() { Ok(g) => g, Err(p) => p.into_inner() };
                             rm.get_genesis_timestamp()
                         };
                         
@@ -369,7 +375,7 @@ impl ShardedRewardManager {
                         };
                         // Get Pool #2 transaction fees for distribution
                         let pool2_share = {
-                            let rm = reward_manager.read().unwrap();
+                            let rm = match reward_manager.read() { Ok(g) => g, Err(p) => p.into_inner() };
                             let total_fees = rm.get_pool2_fees();
                             
                             // CORRECT: Distribute Pool #2 by node type counts
@@ -417,7 +423,7 @@ impl ShardedRewardManager {
         shard.processing_state = ShardState::Complete;
         shard.last_processed = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
         
         println!("[SHARDING] Shard {} completed: {} nodes, {} QNC total", 
@@ -432,7 +438,7 @@ impl ShardedRewardManager {
     pub fn get_shard_stats(&self) -> HashMap<String, serde_json::Value> {
         use serde_json::json;
         
-        let shards = self.shards.read().unwrap();
+        let shards = match self.shards.read() { Ok(g) => g, Err(p) => p.into_inner() };
         let mut stats = HashMap::new();
         
         for shard in shards.iter() {
@@ -460,7 +466,7 @@ impl ShardedRewardManager {
     
     /// Rebalance shards if load is uneven
     pub async fn rebalance_shards(&self) -> IntegrationResult<()> {
-        let shards = self.shards.read().unwrap();
+        let shards = match self.shards.read() { Ok(g) => g, Err(p) => p.into_inner() };
         
         // Calculate average load
         let total_nodes: usize = shards.iter().map(|s| s.node_ids.len()).sum();

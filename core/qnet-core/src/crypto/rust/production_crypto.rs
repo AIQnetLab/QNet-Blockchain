@@ -8,7 +8,7 @@ use serde::{Serialize, Deserialize};
 use std::fmt;
 use thiserror::Error;
 use rand::RngCore;
-use sha2::{Sha256, Sha512, Digest};
+use sha3::{Sha3_256, Sha3_512, Digest};
 
 // Post-quantum cryptography imports with traits
 use pqcrypto_traits::sign::{PublicKey as PQPublicKey, SecretKey as PQSecretKey, DetachedSignature as PQDetachedSignature, SignedMessage as PQSignedMessage};
@@ -182,16 +182,18 @@ impl ProductionCrypto {
         }
     }
 
-    /// Secure hash function (SHA2-256)
+    /// Secure hash function (SHA3-256) - NIST FIPS 202 compliant
+    /// Used for all cryptographic hashing in post-quantum context
     pub fn secure_hash(&self, data: &[u8]) -> Vec<u8> {
-        let mut hasher = Sha256::new();
+        let mut hasher = Sha3_256::new();
         hasher.update(data);
         hasher.finalize().to_vec()
     }
 
-    /// Extended secure hash function (SHA2-512)
+    /// Extended secure hash function (SHA3-512) - NIST FIPS 202 compliant
+    /// Used for high-security contexts requiring longer hash output
     pub fn secure_hash_extended(&self, data: &[u8]) -> Vec<u8> {
-        let mut hasher = Sha512::new();
+        let mut hasher = Sha3_512::new();
         hasher.update(data);
         hasher.finalize().to_vec()
     }
@@ -518,7 +520,7 @@ impl ProductionCrypto {
     fn current_timestamp(&self) -> u64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs()
     }
 

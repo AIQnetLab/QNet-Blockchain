@@ -40,9 +40,9 @@ pub struct MicroBlock {
     pub previous_hash: [u8; 32],
     /// Merkle root of transactions
     pub merkle_root: [u8; 32],
-    /// Proof of History hash at block creation
+    /// Verifiable Time Sequence hash at block creation
     pub poh_hash: Vec<u8>,  // SHA3-512 produces 64 bytes
-    /// Proof of History counter at block creation
+    /// Verifiable Time Sequence counter at block creation
     pub poh_count: u64,
 }
 
@@ -61,9 +61,9 @@ pub struct MacroBlock {
     pub consensus_data: ConsensusData,
     /// Previous macroblock hash
     pub previous_hash: [u8; 32],
-    /// Proof of History hash at macroblock finalization
+    /// Verifiable Time Sequence hash at macroblock finalization
     pub poh_hash: Vec<u8>,  // SHA3-512 produces 64 bytes
-    /// Proof of History counter at macroblock finalization
+    /// Verifiable Time Sequence counter at macroblock finalization
     pub poh_count: u64,
 }
 
@@ -76,6 +76,65 @@ pub struct ConsensusData {
     pub reveals: HashMap<String, Vec<u8>>,
     /// Selected leader for next round
     pub next_leader: String,
+    
+    // ═══════════════════════════════════════════════════════════════════
+    // DETERMINISTIC REPUTATION DATA (v2.21.5)
+    // Stored in blockchain for all nodes to compute identical reputation
+    // ═══════════════════════════════════════════════════════════════════
+    
+    /// Serialized slashing events with cryptographic proof
+    /// Format: bincode serialized Vec<SlashingEventData>
+    #[serde(default)]
+    pub slashing_events_data: Option<Vec<u8>>,
+    
+    /// Serialized automatic jails (computed deterministically)
+    /// Format: bincode serialized Vec<AutomaticJailData>
+    #[serde(default)]
+    pub automatic_jails_data: Option<Vec<u8>>,
+    
+    // ═══════════════════════════════════════════════════════════════════
+    // REPUTATION SNAPSHOT (v2.24.0)
+    // Ethereum 2.0 style: snapshot stored in macroblock for consistency
+    // All nodes MUST have identical reputation after applying macroblock
+    // ═══════════════════════════════════════════════════════════════════
+    
+    /// Reputation snapshot at macroblock finalization
+    /// Format: bincode serialized HashMap<String, f64>
+    /// This ensures ALL nodes have IDENTICAL reputation (no drift!)
+    #[serde(default)]
+    pub reputation_snapshot: Option<Vec<u8>>,
+}
+
+/// Slashing event data for blockchain storage (simplified for serialization)
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SlashingEventData {
+    /// Node being slashed
+    pub offender: String,
+    /// Penalty amount (reputation points)
+    pub penalty: f64,
+    /// Block height when detected
+    pub detected_at_height: u64,
+    /// Reporter node
+    pub reporter: String,
+    /// Offense type code (0=DoubleSign, 1=InvalidBlock, 2=ChainFork, 3=MissedBlocks)
+    pub offense_type: u8,
+    /// SHA3 hash of evidence
+    pub evidence_hash: [u8; 32],
+    /// Is permanent ban
+    pub is_permanent_ban: bool,
+}
+
+/// Automatic jail data for blockchain storage
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AutomaticJailData {
+    /// Node being jailed
+    pub node_id: String,
+    /// Jail duration in seconds
+    pub jail_duration: u64,
+    /// Offense count (for progressive jail)
+    pub offense_count: u32,
+    /// Reason code
+    pub reason: String,
 }
 
 /// Efficient microblock structure - stores only transaction hashes instead of full transactions
@@ -96,9 +155,9 @@ pub struct EfficientMicroBlock {
     pub previous_hash: [u8; 32],
     /// Merkle root of transaction hashes
     pub merkle_root: [u8; 32],
-    /// Proof of History hash at block creation (SHA3-512 produces 64 bytes)
+    /// Verifiable Time Sequence hash at block creation (SHA3-512 produces 64 bytes)
     pub poh_hash: Vec<u8>,
-    /// Proof of History counter at block creation
+    /// Verifiable Time Sequence counter at block creation
     pub poh_count: u64,
 }
 
@@ -244,7 +303,7 @@ impl StoredMicroBlock {
     }
 }
 
-/// PoH (Proof of History) state for a block
+/// VTS (Verifiable Time Sequence) state for a block
 /// Stored separately for fast validation without loading full block
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PoHState {
@@ -535,8 +594,9 @@ impl MicroBlock {
             return Err(StateError::InvalidBlock("Invalid timestamp".to_string()));
         }
         
-        // Check transaction count (max 10,000)
-        if self.transactions.len() > 10_000 {
+        // Check transaction count (max 50,000 for high-throughput mode)
+        // PRODUCTION: 50K TX/block × 256 shards = 12.8M TPS theoretical max
+        if self.transactions.len() > 50_000 {
             return Err(StateError::InvalidBlock("Too many transactions in microblock".to_string()));
         }
         
@@ -685,7 +745,8 @@ impl EfficientMicroBlock {
         }
         
         // Check transaction count (same limit as regular microblock)
-        if self.transaction_hashes.len() > 10_000 {
+        // PRODUCTION: 50K TX/block × 256 shards = 12.8M TPS theoretical max
+        if self.transaction_hashes.len() > 50_000 {
             return Err(StateError::InvalidBlock("Too many transactions in microblock".to_string()));
         }
         

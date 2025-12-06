@@ -357,7 +357,7 @@ impl SyncService {
             
             // Validate timestamp progression
             if !validated_headers.is_empty() {
-                let prev_timestamp = validated_headers.last().unwrap().timestamp;
+                let prev_timestamp = validated_headers.last().expect("Checked non-empty above").timestamp;
                 if header.timestamp <= prev_timestamp {
                     warn!("Invalid timestamp at height {}", header.height);
                     break;

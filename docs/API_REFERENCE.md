@@ -1,17 +1,19 @@
-# QNet API Reference v2.19.13
+# QNet API Reference v2.19.22
 
 ## 📡 Base URL
 
 ```
-Production API: http://{node_ip}:8080/api/v1
-Production P2P: http://{node_ip}:8001
+REST API:     http://{node_ip}:8001/api/v1  (for Light nodes & external clients)
+P2P (QUIC):   quic://{node_ip}:10876        (for Full/Super nodes - internal)
 
 Genesis Nodes:
-  - 154.38.160.39:8080 (Node 001 API) / :8001 (P2P)
-  - 62.171.157.44:8080 (Node 002 API) / :8001 (P2P)
-  - 161.97.86.81:8080 (Node 003 API) / :8001 (P2P)
-  - 5.189.130.160:8080 (Node 004 API) / :8001 (P2P)
-  - 162.244.25.114:8080 (Node 005 API) / :8001 (P2P)
+  - 154.38.160.39:8001 (REST API) / :10876/udp (QUIC P2P)
+  - 62.171.157.44:8001 (REST API) / :10876/udp (QUIC P2P)
+  - 161.97.86.81:8001 (REST API) / :10876/udp (QUIC P2P)
+  - 5.189.130.160:8001 (REST API) / :10876/udp (QUIC P2P)
+  - 162.244.25.114:8001 (REST API) / :10876/udp (QUIC P2P)
+
+Note: Light nodes use REST API (HTTP). Full/Super nodes use QUIC for P2P.
 ```
 
 ## 🔐 Authentication
@@ -21,6 +23,14 @@ Most endpoints are public. Protected endpoints require:
 - Ed25519 signature verification
 
 > **📚 Cryptography Details**: See [CRYPTOGRAPHY_IMPLEMENTATION.md](../documentation/technical/CRYPTOGRAPHY_IMPLEMENTATION.md) for full cryptographic specifications.
+
+### Signature Types
+
+| Context | Algorithm | Notes |
+|---------|-----------|-------|
+| **User Transactions** | Ed25519 | Standard wallet signatures |
+| **Node-to-Node (P2P)** | Hybrid (Ed25519 + Dilithium) | NIST/Cisco compliant, ephemeral keys per message |
+| **Block Signatures** | Hybrid (Ed25519 + Dilithium) | Quantum-resistant, FIPS 204 |
 
 ---
 
@@ -956,7 +966,7 @@ price = max(1500 - floor(burn% / 10) × 150, 300)
 
 ## ⚙️ Advanced Endpoints
 
-### PoH Status
+### VTS Status
 ```http
 GET /api/v1/poh/status
 ```
@@ -975,16 +985,16 @@ GET /api/v1/poh/status
 
 ---
 
-### Turbine Metrics
+### Shred Protocol Metrics
 ```http
-GET /api/v1/turbine/metrics
+GET /api/v1/shred-protocol/metrics
 ```
 
 ---
 
-### Sealevel Metrics
+### Parallel Executor Metrics
 ```http
-GET /api/v1/sealevel/metrics
+GET /api/v1/parallel-executor/metrics
 ```
 
 ---
@@ -996,9 +1006,9 @@ GET /api/v1/pre-execution/status
 
 ---
 
-### Tower BFT Timeouts
+### Adaptive BFT Timeouts
 ```http
-GET /api/v1/tower-bft/timeouts
+GET /api/v1/adaptive-bft/timeouts
 ```
 
 ---
@@ -1348,7 +1358,10 @@ Content-Type: application/json
 
 ## 🔗 P2P Endpoints
 
-### P2P Message
+> **Note (v2.19.22)**: Full/Super nodes use QUIC (UDP 10876) for P2P communication.
+> These HTTP endpoints are for Light nodes and legacy compatibility only.
+
+### P2P Message (Light Nodes Only)
 ```http
 POST /api/v1/p2p/message
 Content-Type: application/json
@@ -1713,6 +1726,24 @@ GET /api/v1/snapshot/{height}
 
 ## 📝 Changelog
 
+### v2.19.20 (November 2025)
+- **OPTIMIZATION**: Fire-and-forget Shred Protocol broadcast (1 block/sec production guaranteed)
+- **OPTIMIZATION**: 30-second Genesis startup wait (prevents race conditions)
+- **OPTIMIZATION**: Emergency timeout increased to 10s (was 2s)
+- **RELIABILITY**: Pseudo-infinite retries for blocks (never discard critical data)
+- **RELIABILITY**: Exponential backoff: 10s (0-9) → 30s → 60s → 120s → 240s → 300s max
+- **MEMORY**: Adaptive buffer: Full/Super 500 blocks (~50MB), Light 100 blocks (~10MB)
+- **SYNC**: Background re-request every 30s with exponential backoff
+
+### v2.23 (December 2025)
+- **SECURITY**: Heartbeat with HYBRID signature (Ed25519 + Dilithium, quantum-resistant)
+- **OPTIMIZATION**: RAW bytes signatures (88% size reduction)
+- **OPTIMIZATION**: Shred Protocol block propagation for ALL network sizes
+- **OPTIMIZATION**: Kademlia K-neighbors for heartbeat routing (K=3)
+- **OPTIMIZATION**: Exponential backoff for failover (3s → 6s → 12s → 24s → 30s max)
+- **NEW**: `gossip_to_k_neighbors()` method for DHT-based message propagation
+- **SECURITY**: Heartbeat validation via active_full_super_nodes registry (NIST FIPS 204 compliant)
+
 ### v2.19.12 (November 2025)
 - **NEW**: QRC-20 Token endpoints:
   - `POST /api/v1/token/deploy` - Deploy QRC-20 token
@@ -1750,8 +1781,8 @@ GET /api/v1/snapshot/{height}
 
 ### v2.19.3 (October 2025)
 - Added MEV bundle endpoints
-- Added PoH status endpoint
-- Added Turbine/Sealevel metrics
+- Added VTS status endpoint
+- Added Shred Protocol/Parallel Executor metrics
 
 ### v2.19.0 (September 2025)
 - Initial API release

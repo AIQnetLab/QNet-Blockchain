@@ -3,6 +3,7 @@
 
 use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
+use once_cell::sync::OnceCell;
 
 // Import production crypto module
 use qnet_core::crypto::rust::production_crypto::{
@@ -122,13 +123,13 @@ impl CryptoService {
         
         // Store in key store
         {
-            let mut store = self.key_store.lock().unwrap();
+            let mut store = match self.key_store.lock() { Ok(g) => g, Err(p) => p.into_inner() };
             store.node_keys.insert(key_id.clone(), node_keys);
         }
         
         // Update metrics
         {
-            let mut metrics = self.metrics.lock().unwrap();
+            let mut metrics = match self.metrics.lock() { Ok(g) => g, Err(p) => p.into_inner() };
             metrics.key_pairs_generated += 1;
         }
         
@@ -152,13 +153,13 @@ impl CryptoService {
         
         // Store in key store
         {
-            let mut store = self.key_store.lock().unwrap();
+            let mut store = match self.key_store.lock() { Ok(g) => g, Err(p) => p.into_inner() };
             store.validator_keys.insert(validator_id.to_string(), validator_keys);
         }
         
         // Update metrics
         {
-            let mut metrics = self.metrics.lock().unwrap();
+            let mut metrics = match self.metrics.lock() { Ok(g) => g, Err(p) => p.into_inner() };
             metrics.key_pairs_generated += 1;
         }
         
@@ -179,13 +180,13 @@ impl CryptoService {
         
         // Store in key store
         {
-            let mut store = self.key_store.lock().unwrap();
+            let mut store = match self.key_store.lock() { Ok(g) => g, Err(p) => p.into_inner() };
             store.wallet_keys.insert(address.to_string(), wallet_keys);
         }
         
         // Update metrics
         {
-            let mut metrics = self.metrics.lock().unwrap();
+            let mut metrics = match self.metrics.lock() { Ok(g) => g, Err(p) => p.into_inner() };
             metrics.key_pairs_generated += 1;
         }
         
@@ -198,7 +199,7 @@ impl CryptoService {
         
         // Get node keys
         let secret_key = {
-            let store = self.key_store.lock().unwrap();
+            let store = match self.key_store.lock() { Ok(g) => g, Err(p) => p.into_inner() };
             let key_id = format!("node_{}", node_id);
             
             store.node_keys.get(&key_id)
@@ -215,7 +216,7 @@ impl CryptoService {
         
         // Update metrics
         {
-            let mut metrics = self.metrics.lock().unwrap();
+            let mut metrics = match self.metrics.lock() { Ok(g) => g, Err(p) => p.into_inner() };
             metrics.signatures_created += 1;
             
             let duration_ms = start_time.elapsed().as_millis() as f64;
@@ -233,7 +234,7 @@ impl CryptoService {
         
         // Get validator keys
         let secret_key = {
-            let store = self.key_store.lock().unwrap();
+            let store = match self.key_store.lock() { Ok(g) => g, Err(p) => p.into_inner() };
             
             store.validator_keys.get(validator_id)
                 .filter(|keys| keys.is_active)
@@ -250,7 +251,7 @@ impl CryptoService {
         
         // Update metrics
         {
-            let mut metrics = self.metrics.lock().unwrap();
+            let mut metrics = match self.metrics.lock() { Ok(g) => g, Err(p) => p.into_inner() };
             metrics.signatures_created += 1;
         }
         
@@ -263,7 +264,7 @@ impl CryptoService {
         
         // Get wallet keys
         let secret_key = {
-            let mut store = self.key_store.lock().unwrap();
+            let mut store = match self.key_store.lock() { Ok(g) => g, Err(p) => p.into_inner() };
             
             let wallet_keys = store.wallet_keys.get_mut(address)
                 .ok_or_else(|| CryptoError {
@@ -283,7 +284,7 @@ impl CryptoService {
         
         // Update metrics
         {
-            let mut metrics = self.metrics.lock().unwrap();
+            let mut metrics = match self.metrics.lock() { Ok(g) => g, Err(p) => p.into_inner() };
             metrics.signatures_created += 1;
         }
         
@@ -299,10 +300,10 @@ impl CryptoService {
         let cache_key = format!("{:?}_{:?}", message_hash, signature.as_bytes());
         
         {
-            let cache = self.signature_cache.lock().unwrap();
+            let cache = match self.signature_cache.lock() { Ok(g) => g, Err(p) => p.into_inner() };
             if let Some(cached) = cache.get(&cache_key) {
                 if cached.message_hash == message_hash {
-                    let mut metrics = self.metrics.lock().unwrap();
+                    let mut metrics = match self.metrics.lock() { Ok(g) => g, Err(p) => p.into_inner() };
                     metrics.cache_hits += 1;
                     return Ok(true);
                 }
@@ -322,13 +323,13 @@ impl CryptoService {
                 uses: 1,
             };
             
-            let mut cache = self.signature_cache.lock().unwrap();
+            let mut cache = match self.signature_cache.lock() { Ok(g) => g, Err(p) => p.into_inner() };
             cache.insert(cache_key, cached_sig);
         }
         
         // Update metrics
         {
-            let mut metrics = self.metrics.lock().unwrap();
+            let mut metrics = match self.metrics.lock() { Ok(g) => g, Err(p) => p.into_inner() };
             if is_valid {
                 metrics.signatures_verified += 1;
             } else {
@@ -347,32 +348,32 @@ impl CryptoService {
     
     /// Get public key for node
     pub fn get_node_public_key(&self, node_id: &str) -> Option<PublicKey> {
-        let store = self.key_store.lock().unwrap();
+        let store = match self.key_store.lock() { Ok(g) => g, Err(p) => p.into_inner() };
         let key_id = format!("node_{}", node_id);
         store.node_keys.get(&key_id).map(|keys| keys.public_key.clone())
     }
     
     /// Get public key for validator
     pub fn get_validator_public_key(&self, validator_id: &str) -> Option<PublicKey> {
-        let store = self.key_store.lock().unwrap();
+        let store = match self.key_store.lock() { Ok(g) => g, Err(p) => p.into_inner() };
         store.validator_keys.get(validator_id).map(|keys| keys.public_key.clone())
     }
     
     /// Get public key for wallet
     pub fn get_wallet_public_key(&self, address: &str) -> Option<PublicKey> {
-        let store = self.key_store.lock().unwrap();
+        let store = match self.key_store.lock() { Ok(g) => g, Err(p) => p.into_inner() };
         store.wallet_keys.get(address).map(|keys| keys.public_key.clone())
     }
     
     /// Get crypto service metrics
     pub fn get_metrics(&self) -> CryptoMetrics {
-        self.metrics.lock().unwrap().clone()
+        match self.metrics.lock() { Ok(g) => g, Err(p) => p.into_inner() }.clone()
     }
     
     /// Clean old cached signatures
     pub fn clean_signature_cache(&self, max_age_seconds: u64) {
         let current_time = current_timestamp();
-        let mut cache = self.signature_cache.lock().unwrap();
+        let mut cache = match self.signature_cache.lock() { Ok(g) => g, Err(p) => p.into_inner() };
         
         cache.retain(|_, cached| {
             current_time - cached.created_at < max_age_seconds
@@ -386,7 +387,7 @@ impl CryptoService {
         
         // Update validator keys
         {
-            let mut store = self.key_store.lock().unwrap();
+            let mut store = match self.key_store.lock() { Ok(g) => g, Err(p) => p.into_inner() };
             if let Some(validator_keys) = store.validator_keys.get_mut(validator_id) {
                 validator_keys.public_key = new_public_key;
                 validator_keys.secret_key = new_secret_key;
@@ -408,15 +409,15 @@ impl CryptoService {
     
     // Helper methods
     fn hash_message(&self, message: &[u8]) -> [u8; 32] {
-        use sha2::{Sha256, Digest};
-        let mut hasher = Sha256::new();
+        use sha3::{Sha3_256, Digest};
+        let mut hasher = Sha3_256::new();
         hasher.update(message);
         hasher.finalize().into()
     }
     
     fn clear_validator_cache(&self, _validator_id: &str) {
         // In production, would selectively clear cache entries for this validator
-        let mut cache = self.signature_cache.lock().unwrap();
+        let mut cache = match self.signature_cache.lock() { Ok(g) => g, Err(p) => p.into_inner() };
         cache.clear(); // Simplified for now
     }
 
@@ -430,7 +431,7 @@ impl CryptoService {
             loop {
                 interval.tick().await;
                 
-                let metrics = metrics_clone.lock().unwrap();
+                let metrics = match metrics_clone.lock() { Ok(g) => g, Err(p) => p.into_inner() };
                 println!("🔐 Crypto Performance:");
                 println!("   Signatures: {}", metrics.signatures_created);
                 println!("   Verifications: {}", metrics.signatures_verified);
@@ -470,27 +471,23 @@ impl Clone for CryptoMetrics {
 fn current_timestamp() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_secs()
 }
 
-/// Global crypto service instance
-static mut CRYPTO_SERVICE: Option<Arc<CryptoService>> = None;
-static INIT: std::sync::Once = std::sync::Once::new();
+/// Global crypto service instance (thread-safe, no unsafe)
+static CRYPTO_SERVICE: OnceCell<Arc<CryptoService>> = OnceCell::new();
 
 /// Initialize global crypto service
 pub fn initialize_crypto_service(algorithm: Algorithm) {
-    INIT.call_once(|| {
-        let service = Arc::new(CryptoService::new(algorithm));
-        unsafe {
-            CRYPTO_SERVICE = Some(service);
-        }
+    let _ = CRYPTO_SERVICE.get_or_init(|| {
+        Arc::new(CryptoService::new(algorithm))
     });
 }
 
 /// Get global crypto service instance
 pub fn get_crypto_service() -> Option<Arc<CryptoService>> {
-    unsafe { CRYPTO_SERVICE.clone() }
+    CRYPTO_SERVICE.get().cloned()
 }
 
 /// Initialize with production defaults

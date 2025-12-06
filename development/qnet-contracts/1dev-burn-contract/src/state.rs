@@ -89,7 +89,7 @@ impl BurnTracker {
         1;   // bump
 
     pub fn should_transition(&self) -> bool {
-        let current_time = Clock::get().unwrap().unix_timestamp;
+        let current_time = Clock::get().expect("Clock sysvar should be available").unix_timestamp;
         let days_elapsed = (current_time - self.genesis_timestamp) / 86400;
         
         // Transition at 90% 1DEV burned OR 5 years elapsed since QNet NETWORK GENESIS BLOCK

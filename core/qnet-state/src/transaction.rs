@@ -1199,16 +1199,25 @@ static DYNAMIC_GAS_PRICING: Lazy<Arc<RwLock<Option<DynamicGasPricing>>>> =
 /// Initialize dynamic gas pricing
 pub fn init_dynamic_gas_pricing() {
     let pricing = DynamicGasPricing::new();
-    *DYNAMIC_GAS_PRICING.write().unwrap() = Some(pricing);
+    match DYNAMIC_GAS_PRICING.write() {
+        Ok(mut guard) => *guard = Some(pricing),
+        Err(poisoned) => *poisoned.into_inner() = Some(pricing),
+    }
 }
 
 /// Get dynamic gas pricing
 pub fn get_dynamic_gas_pricing() -> Option<DynamicGasPricing> {
-    DYNAMIC_GAS_PRICING.read().unwrap().as_ref().cloned()
+    match DYNAMIC_GAS_PRICING.read() {
+        Ok(guard) => guard.as_ref().cloned(),
+        Err(poisoned) => poisoned.into_inner().as_ref().cloned(),
+    }
 }
 
 /// Update dynamic gas pricing
 pub fn update_dynamic_gas_pricing(new_pricing: DynamicGasPricing) {
-    *DYNAMIC_GAS_PRICING.write().unwrap() = Some(new_pricing);
+    match DYNAMIC_GAS_PRICING.write() {
+        Ok(mut guard) => *guard = Some(new_pricing),
+        Err(poisoned) => *poisoned.into_inner() = Some(new_pricing),
+    }
 }
 

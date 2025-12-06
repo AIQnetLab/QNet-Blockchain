@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock, Mutex};
-use sha2::{Sha256, Digest};
+use sha3::{Sha3_256, Digest};
 use serde::{Serialize, Deserialize};
 
 /// Shard configuration for production deployment
@@ -131,7 +131,7 @@ impl ProductionShardManager {
     
     /// Calculate shard assignment deterministically
     fn calculate_shard(&self, address: &str) -> u32 {
-        let mut hasher = Sha256::new();
+        let mut hasher = Sha3_256::new();
         hasher.update(address.as_bytes());
         let hash = hasher.finalize();
         
@@ -162,7 +162,10 @@ impl ProductionShardManager {
         }
         
         // Process transaction within shard
-        let mut states = self.shard_states.write().unwrap();
+        let mut states = match self.shard_states.write() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
         let shard_state = states.get_mut(&shard_id)
             .ok_or(ShardError::ShardNotFound(shard_id))?;
         
@@ -202,7 +205,7 @@ impl ProductionShardManager {
         };
         
         // Add to cross-shard queue
-        self.cross_shard_queue.lock().unwrap().push(cross_tx);
+        match self.cross_shard_queue.lock() { Ok(g) => g, Err(p) => p.into_inner() }.push(cross_tx);
         
         // Process if we manage source shard
         if self.config.managed_shards.contains(&from_shard) {
@@ -258,7 +261,7 @@ impl ProductionShardManager {
     
     /// Initiate cross-shard send (lock funds)
     fn initiate_cross_shard_send(&self, tx_id: &str) -> Result<(), ShardError> {
-        let mut queue = self.cross_shard_queue.lock().unwrap();
+        let mut queue = match self.cross_shard_queue.lock() { Ok(g) => g, Err(p) => p.into_inner() };
         let cross_tx = queue.iter_mut()
             .find(|tx| tx.tx_id == tx_id)
             .ok_or(ShardError::TransactionNotFound)?;
@@ -268,7 +271,10 @@ impl ProductionShardManager {
         }
         
         // Lock funds in source shard
-        let mut states = self.shard_states.write().unwrap();
+        let mut states = match self.shard_states.write() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
         let shard_state = states.get_mut(&cross_tx.from_shard)
             .ok_or(ShardError::ShardNotFound(cross_tx.from_shard))?;
         
@@ -292,7 +298,7 @@ impl ProductionShardManager {
     
     /// Complete cross-shard transaction
     pub fn complete_cross_shard_transaction(&self, tx_id: &str) -> Result<(), ShardError> {
-        let mut queue = self.cross_shard_queue.lock().unwrap();
+        let mut queue = match self.cross_shard_queue.lock() { Ok(g) => g, Err(p) => p.into_inner() };
         let cross_tx = queue.iter_mut()
             .find(|tx| tx.tx_id == tx_id && tx.status == CrossShardTxStatus::Locked)
             .ok_or(ShardError::TransactionNotFound)?;
@@ -302,7 +308,10 @@ impl ProductionShardManager {
         }
         
         // Credit funds in destination shard
-        let mut states = self.shard_states.write().unwrap();
+        let mut states = match self.shard_states.write() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
         let shard_state = states.get_mut(&cross_tx.to_shard)
             .ok_or(ShardError::ShardNotFound(cross_tx.to_shard))?;
         
@@ -344,7 +353,7 @@ impl ProductionShardManager {
     
     /// Get cross-shard transaction statistics
     pub fn get_cross_shard_stats(&self) -> CrossShardStats {
-        let queue = self.cross_shard_queue.lock().unwrap();
+        let queue = match self.cross_shard_queue.lock() { Ok(g) => g, Err(p) => p.into_inner() };
         
         let mut pending = 0;
         let mut locked = 0;
@@ -415,7 +424,7 @@ impl ProductionShardManager {
     }
     
     fn generate_tx_id(&self, from: &str, to: &str, nonce: u64) -> String {
-        let mut hasher = Sha256::new();
+        let mut hasher = Sha3_256::new();
         hasher.update(from.as_bytes());
         hasher.update(to.as_bytes());
         hasher.update(&nonce.to_le_bytes());
@@ -426,12 +435,12 @@ impl ProductionShardManager {
     fn current_timestamp(&self) -> u64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs()
     }
     
     fn calculate_state_root(&self, state: &ShardState) -> [u8; 32] {
-        let mut hasher = Sha256::new();
+        let mut hasher = Sha3_256::new();
         
         // Hash all accounts in deterministic order
         let mut addresses: Vec<_> = state.accounts.keys().collect();
@@ -466,7 +475,7 @@ impl ShardState {
             state_root: [0; 32],
             last_update: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_secs(),
         }
     }
@@ -481,7 +490,7 @@ impl ShardAccount {
             shard_id,
             last_activity: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_secs(),
         }
     }
@@ -571,7 +580,7 @@ pub fn create_production_config(region: &str, node_id: &str) -> ShardConfig {
     };
     
     // Shard ID based on node ID hash
-    let mut hasher = Sha256::new();
+    let mut hasher = Sha3_256::new();
     hasher.update(node_id.as_bytes());
     let hash = hasher.finalize();
     let shard_id = u32::from_le_bytes([hash[0], hash[1], hash[2], hash[3]]) % total_shards;

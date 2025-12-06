@@ -3,12 +3,14 @@
  * Self-contained cryptography for Chrome Extension compatibility
  */
 
-// Try to load tweetnacl if available (for fallback Ed25519 implementation)
+// Try to load tweetnacl and CryptoJS if available
 let nacl;
+let CryptoJS;
 try {
     if (typeof importScripts !== 'undefined') {
-        // Service worker context
+        // Service worker context - load required libraries
         importScripts('lib/tweetnacl.min.js');
+        importScripts('lib/crypto-js.min.js');
         
         // Check if nacl is now available globally
         if (typeof self !== 'undefined' && typeof self.nacl !== 'undefined') {
@@ -17,10 +19,16 @@ try {
             // Sometimes nacl is set globally without self prefix
             // console.warn('[Background] ⚠️ tweetnacl loaded but nacl not found');
         }
+        
+        // Check if CryptoJS is available
+        if (typeof self !== 'undefined' && typeof self.CryptoJS !== 'undefined') {
+            CryptoJS = self.CryptoJS;
+        }
     }
 } catch (e) {
-    // console.error('[Background] ❌ Failed to load tweetnacl:', e.message);
+    // console.error('[Background] ❌ Failed to load libraries:', e.message);
     nacl = undefined;
+    CryptoJS = undefined;
 }
 
 // Ensure nacl is accessible globally
@@ -2379,7 +2387,7 @@ class ProductionCrypto {
                 const part1 = fullHex.substring(0, 19).toLowerCase();
                 const part2 = fullHex.substring(19, 34).toLowerCase();
                 
-                // Generate checksum (same algorithm as mobile app)
+                // Generate SHA-256 checksum (same algorithm as mobile app)
                 const addressWithoutChecksum = part1 + 'eon' + part2;
                 const checksumEncoder = new TextEncoder();
                 
@@ -2575,7 +2583,7 @@ class ProductionCrypto {
             const part1 = fullHex.substring(0, 19).toLowerCase();
             const part2 = fullHex.substring(19, 34).toLowerCase();
             
-            // Generate checksum from the address parts
+            // Generate SHA-256 checksum from the address parts
             const addressWithoutChecksum = part1 + 'eon' + part2;
             const encoder = new TextEncoder();
             const checksumBuffer = await crypto.subtle.digest('SHA-256', encoder.encode(addressWithoutChecksum));
@@ -5972,14 +5980,14 @@ async function unlockWallet(password) {
                     const part1 = hashHex.substring(0, 19).toLowerCase();
                     const part2 = hashHex.substring(19, 34).toLowerCase();
                     
-                    // Generate checksum
-                    const checksumData = `qnet_${part1}_eon_${part2}`;
-                    const checksumBuffer = await crypto.subtle.digest('SHA-256', encoder.encode(checksumData));
+                    // Generate SHA-256 checksum
+                    const addressWithoutChecksum = part1 + 'eon' + part2;
+                    const checksumBuffer = await crypto.subtle.digest('SHA-256', encoder.encode(addressWithoutChecksum));
                     const checksumArray = Array.from(new Uint8Array(checksumBuffer));
                     const checksumHex = checksumArray.map(b => b.toString(16).padStart(2, '0')).join('');
-                    const checksum = checksumHex.substring(0, 4);
+                    const checksum = checksumHex.substring(0, 4).toLowerCase();
                     
-                    walletData.qnetAddress = `qnet_${part1}_eon_${part2}_${checksum}`;
+                    walletData.qnetAddress = `${part1}eon${part2}${checksum}`;
                     //console.log('[UnlockWallet] Generated new QNet address');
                 }
             } else if (walletData.qnetAddress.length < 40) {

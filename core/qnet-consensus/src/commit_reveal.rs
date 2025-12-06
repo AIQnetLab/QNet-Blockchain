@@ -601,8 +601,8 @@ impl CommitRevealConsensus {
             .collect();
         
         // 3. Sort by reputation (higher first)
-        super_nodes.sort_by(|a, b| b.reputation.partial_cmp(&a.reputation).unwrap());
-        full_nodes.sort_by(|a, b| b.reputation.partial_cmp(&a.reputation).unwrap());
+        super_nodes.sort_by(|a, b| b.reputation.partial_cmp(&a.reputation).unwrap_or(std::cmp::Ordering::Equal));
+        full_nodes.sort_by(|a, b| b.reputation.partial_cmp(&a.reputation).unwrap_or(std::cmp::Ordering::Equal));
         
         // 4. Simple selection: equal chance for all qualified nodes (QNet spec)
         let mut all_candidates = super_nodes;
@@ -742,8 +742,8 @@ impl CommitRevealConsensus {
             .collect();
         
         // Sort by reputation (higher first)
-        super_nodes.sort_by(|a, b| b.reputation.partial_cmp(&a.reputation).unwrap());
-        full_nodes.sort_by(|a, b| b.reputation.partial_cmp(&a.reputation).unwrap());
+        super_nodes.sort_by(|a, b| b.reputation.partial_cmp(&a.reputation).unwrap_or(std::cmp::Ordering::Equal));
+        full_nodes.sort_by(|a, b| b.reputation.partial_cmp(&a.reputation).unwrap_or(std::cmp::Ordering::Equal));
         
         let mut selected = Vec::new();
         

@@ -4,8 +4,8 @@ Comprehensive benchmark suite for all QNet blockchain components.
 
 ## 📊 Benchmark Suite
 
-### 1. PoH Performance (`poh_benchmark.rs`)
-Tests Proof of History throughput and VDF properties.
+### 1. VTS Performance (`poh_benchmark.rs`)
+Tests Verifiable Time Sequence throughput and VDF properties.
 
 **Metrics:**
 - SHA3-512 sequential hashing performance
@@ -23,7 +23,7 @@ Complete system performance testing.
 
 #### Components Tested:
 
-**PoH Throughput:**
+**VTS Throughput:**
 - Optimized SHA3-512 implementation
 - Fixed-size arrays, zero Vec allocations
 - Batch processing (1K-100K hashes)
@@ -95,7 +95,7 @@ cargo bench --bench full_benchmark
 
 **Terminal Output:**
 ```
-PoH Throughput/sha3_512_optimized/10000
+VTS Throughput/sha3_512_optimized/10000
                         time:   [399.23 μs 401.15 μs 403.27 μs]
                         thrpt:  [24.80 Melem/s 24.93 Melem/s 25.05 Melem/s]
 ```
@@ -113,7 +113,7 @@ start target/criterion/report/index.html
 
 | Component | Metric | Target | Notes |
 |-----------|--------|--------|-------|
-| **PoH** | Hashes/sec | 25M+ | Intel Xeon E5-2680v4 |
+| **VTS** | Hashes/sec | 25M+ | Intel Xeon E5-2680v4 |
 | **VRF Eval** | Time | <1ms | Per candidate |
 | **VRF Verify** | Time | <500μs | Per proof |
 | **Producer Select (1K)** | Time | <10ms | 1000 candidates |
