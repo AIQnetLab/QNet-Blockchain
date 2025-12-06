@@ -1128,8 +1128,10 @@ impl BlockchainNode {
             .or_else(|_| std::env::var("HOST_IP"))
             .ok();
         
-        // Run pre-flight checks unless explicitly disabled (for testing only)
-        if std::env::var("QNET_SKIP_PREFLIGHT").is_err() {
+        // Run pre-flight checks unless explicitly disabled or already done (Genesis nodes)
+        // QNET_PREFLIGHT_DONE is set by Genesis nodes after running preflight BEFORE GENESIS SYNC
+        if std::env::var("QNET_SKIP_PREFLIGHT").is_err() 
+            && std::env::var("QNET_PREFLIGHT_DONE").is_err() {
             match crate::preflight_checks::run_preflight_checks(external_ip.as_deref()).await {
                 Ok(result) => {
                     if !result.critical_failures.is_empty() {

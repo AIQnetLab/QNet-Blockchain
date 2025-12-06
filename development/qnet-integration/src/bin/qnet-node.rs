@@ -2627,16 +2627,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
         .unwrap_or(false);
     
-    // CRITICAL FIX v2.21.8: Keep signal_listener ALIVE until BlockchainNode is created!
-    // Previous bug: drop(signal_listener) caused ALL nodes to lose port 8001 simultaneously
-    // Then connectivity_test in BlockchainNode::new() would FAIL for all nodes
-    // Solution: Hold listener until AFTER BlockchainNode::new(), close BEFORE node.start()
+    // CRITICAL FIX v2.21.8: Run preflight checks BEFORE binding signal_listener
+    // This ensures ports are available, then we can bind 8001 for GENESIS SYNC
     let mut genesis_signal_listener: Option<tokio::net::TcpListener> = None;
     
     if is_genesis {
-        // Start TCP listener on port 8001 BEFORE waiting for other nodes
-        // This allows other Genesis nodes to detect us
-        // CRITICAL: Keep listener in main thread so we can properly drop it
+        // Run preflight FIRST - before we bind anything
+        println!("[GENESIS] 🔍 Running pre-flight checks...");
+        let external_ip = get_physical_ip().await.ok();
+        if let Err(e) = qnet_integration::preflight_checks::run_preflight_checks(external_ip.as_deref()).await {
+            eprintln!("❌ Pre-flight checks failed: {}", e);
+            return Err(e.into());
+        }
+        std::env::set_var("QNET_PREFLIGHT_DONE", "1");
+        println!("[GENESIS] ✅ Pre-flight checks passed");
+        
+        // Now bind signal_listener for GENESIS SYNC
         println!("[GENESIS SYNC] 📡 Starting signal listener on port 8001...");
         
         let signal_listener = tokio::net::TcpListener::bind("0.0.0.0:8001").await
@@ -2658,7 +2664,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut ready_count = 0;
         let mut attempts = 0;
         const MAX_ATTEMPTS: u32 = 60; // 60 * 2s = 120 seconds max wait
-        const REQUIRED_PEERS: usize = 3; // Need at least 3 other Genesis nodes ready
+        const REQUIRED_PEERS: usize = 4; // Need ALL 4 other Genesis nodes ready (5 total - 1 self = 4)
         
         while ready_count < REQUIRED_PEERS && attempts < MAX_ATTEMPTS {
             attempts += 1;
