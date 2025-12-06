@@ -2627,6 +2627,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
         .unwrap_or(false);
     
+    // CRITICAL FIX v2.21.8: Keep signal_listener ALIVE until BlockchainNode is created!
+    // Previous bug: drop(signal_listener) caused ALL nodes to lose port 8001 simultaneously
+    // Then connectivity_test in BlockchainNode::new() would FAIL for all nodes
+    // Solution: Hold listener until AFTER BlockchainNode::new(), close BEFORE node.start()
+    let mut genesis_signal_listener: Option<tokio::net::TcpListener> = None;
+    
     if is_genesis {
         // Start TCP listener on port 8001 BEFORE waiting for other nodes
         // This allows other Genesis nodes to detect us
@@ -2708,16 +2714,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                      ready_count, attempts);
         }
         
-        // CRITICAL: Drop listener to immediately release port 8001 for RPC server
-        println!("[GENESIS SYNC] 🔌 Releasing port 8001 for RPC server...");
-        drop(signal_listener);
+        // CRITICAL FIX v2.21.8: DO NOT drop listener here!
+        // Keep it alive so connectivity_test in BlockchainNode::new() will PASS
+        // Other nodes still have their listeners active = TCP 8001 is reachable
+        println!("[GENESIS SYNC] ✅ Keeping signal listener active for BlockchainNode creation...");
+        genesis_signal_listener = Some(signal_listener);
         
-        // Brief wait for OS to fully release socket
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        
-        // Wait for connections to stabilize
-        println!("[GENESIS SYNC] ⏳ Waiting 2s for connections to stabilize...");
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        // Brief wait for all nodes to reach this point
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 
     println!("🔍 DEBUG: About to create BlockchainNode...");
@@ -2750,6 +2754,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // Node type and region are configured during BlockchainNode::new()
     // They are derived from activation code and network topology
+    
+    // CRITICAL FIX v2.21.8: NOW release port 8001 for RPC server
+    // BlockchainNode is created, connectivity_test passed (other nodes still have listeners)
+    // Now we can drop our listener so RPC server can bind to 8001
+    if let Some(listener) = genesis_signal_listener.take() {
+        println!("[GENESIS SYNC] 🔌 Releasing port 8001 for RPC server...");
+        drop(listener);
+        // Brief wait for OS to release socket
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
     
     // Set RPC port environment variable
     std::env::set_var("QNET_RPC_PORT", config.rpc_port.to_string());

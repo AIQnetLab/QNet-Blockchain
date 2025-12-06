@@ -7503,63 +7503,41 @@ impl SimplifiedP2P {
     fn check_api_readiness_static(ip: &str) -> bool {
         use std::time::Duration;
         
-        // CRITICAL FIX v2.19.15: Extended timeout for international Genesis nodes
-        // PRODUCTION v2.19.22: Check QUIC port connectivity (replaces HTTP)
-        // QUIC is the primary transport, API is only for external clients
+        // CRITICAL FIX v2.21.8: Check API port 8001 (TCP) - this is what we actually use!
+        // Previous bug: checked 10876 (UDP port!) and 9876 (unused) - always failed!
+        // Port 8001 is the REST API port and is TCP, which we can test with TcpStream
         
-        // First check QUIC port
-        let quic_port_check = format!("{}:{}", ip, 10876); // QUIC port
-        if let Ok(addr) = quic_port_check.parse::<std::net::SocketAddr>() {
+        // Primary check: API port 8001
+        let api_port_check = format!("{}:{}", ip, 8001);
+        if let Ok(addr) = api_port_check.parse::<std::net::SocketAddr>() {
             if std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(3)).is_ok() {
                 return true;
             }
         }
         
-        // Fallback: check P2P port
-        let p2p_port_check = format!("{}:{}", ip, 9876);
-        if let Ok(addr) = p2p_port_check.parse::<std::net::SocketAddr>() {
-            if std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(3)).is_ok() {
-                return true;
-            }
-        }
-        
-        // CRITICAL FIX v2.21.3: Genesis peers MUST have at least one port reachable
-        // Previous bug: Genesis peers were added even when ALL ports failed
-        // This caused QUIC broadcast to "dead" connections and chunk loss
+        // CRITICAL FIX v2.21.8: Genesis peers get extended retry on API port
+        // During Genesis SYNC, all nodes have signal_listener on 8001 → TCP connect works
         let is_genesis_peer = is_genesis_node_ip(ip);
         if is_genesis_peer {
             // Retry with longer timeout for Genesis peers (network startup timing)
-            // PRIVACY: Use pseudonym for IP in logs
             println!("[P2P] 🔧 Genesis peer {} not ready, retrying with extended timeout...", get_privacy_id_for_addr(ip));
             
             // Extended retry for Genesis: 3 attempts with 2s delay
             for attempt in 1..=3 {
                 std::thread::sleep(Duration::from_secs(2));
                 
-                // Check QUIC port again
-                if let Ok(addr) = quic_port_check.parse::<std::net::SocketAddr>() {
+                // Check API port again
+                if let Ok(addr) = api_port_check.parse::<std::net::SocketAddr>() {
                     if std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(5)).is_ok() {
-                        // PRIVACY: Use pseudonym in logs
-                        println!("[P2P] ✅ Genesis peer {} ready after {} attempts (QUIC)", get_privacy_id_for_addr(ip), attempt);
+                        println!("[P2P] ✅ Genesis peer {} ready after {} attempts (API)", get_privacy_id_for_addr(ip), attempt);
                         return true;
                     }
                 }
                 
-                // Check P2P port again
-                if let Ok(addr) = p2p_port_check.parse::<std::net::SocketAddr>() {
-                    if std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(5)).is_ok() {
-                        // PRIVACY: Use pseudonym in logs
-                        println!("[P2P] ✅ Genesis peer {} ready after {} attempts (P2P)", get_privacy_id_for_addr(ip), attempt);
-                        return true;
-                    }
-                }
-                
-                // PRIVACY: Use pseudonym in logs
                 println!("[P2P] ⏳ Genesis peer {} attempt {}/3 failed, retrying...", get_privacy_id_for_addr(ip), attempt);
             }
             
             // CRITICAL: Do NOT add peer if unreachable after retries
-            // PRIVACY: Use pseudonym for IP in logs
             println!("[P2P] ❌ Genesis peer {} unreachable after 3 attempts - NOT adding", get_privacy_id_for_addr(ip));
             return false;
         }
