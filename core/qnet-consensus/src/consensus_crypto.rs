@@ -373,10 +373,15 @@ async fn verify_compact_hybrid_signature(
                 let ed25519_sig_len = ed25519_sig.len();  // Save length before ownership transfer
                 
                 // PRODUCTION: Real cryptographic verification with certificates
-                // CRITICAL: Use SHA3-256 to match signing!
+                // CRITICAL FIX: message is HEX string, must decode to bytes first!
+                // sign_message_compact() uses RAW message bytes for hash
                 use sha3::{Sha3_256, Digest};
+                let message_bytes = match hex::decode(message) {
+                    Ok(bytes) => bytes,
+                    Err(_) => message.as_bytes().to_vec(), // Fallback for non-hex
+                };
                 let mut hasher = Sha3_256::new();
-                hasher.update(message.as_bytes());
+                hasher.update(&message_bytes);
                 let message_hash = hasher.finalize();
                 let _message_hash_str = hex::encode(&message_hash); // For debugging if needed
                 
@@ -564,9 +569,15 @@ async fn verify_hybrid_binary_signature(
     }
     
     // Compute message hash
+    // CRITICAL FIX: message is HEX string, must decode to bytes first!
+    // sign_message() hashes RAW bytes, so we must match that
     use sha3::{Sha3_256, Digest};
+    let message_bytes = match hex::decode(message) {
+        Ok(bytes) => bytes,
+        Err(_) => message.as_bytes().to_vec(), // Fallback for non-hex
+    };
     let mut hasher = Sha3_256::new();
-    hasher.update(message.as_bytes());
+    hasher.update(&message_bytes);
     let message_hash = hasher.finalize();
     
     // Build encapsulated data: ephemeral_key || message_hash || timestamp
@@ -613,7 +624,8 @@ async fn verify_hybrid_binary_signature(
         }
     };
     
-    if ephemeral_pk.verify(message.as_bytes(), &ed25519_sig).is_err() {
+    // CRITICAL: Ed25519 signed RAW message bytes, not HEX string
+    if ephemeral_pk.verify(&message_bytes, &ed25519_sig).is_err() {
         println!("[CONSENSUS] ❌ Ed25519 message signature verification FAILED");
         return false;
     }
@@ -695,9 +707,14 @@ async fn verify_hybrid_signature(
                 println!("[CONSENSUS] 🔐 Verifying hybrid Dilithium signature...");
                 
                 // Compute message hash
+                // CRITICAL FIX: message is HEX string, must decode to bytes first!
                 use sha3::{Sha3_256, Digest};
+                let message_bytes = match hex::decode(message) {
+                    Ok(bytes) => bytes,
+                    Err(_) => message.as_bytes().to_vec(), // Fallback for non-hex
+                };
                 let mut hasher = Sha3_256::new();
-                hasher.update(message.as_bytes());
+                hasher.update(&message_bytes);
                 let message_hash = hasher.finalize();
                 
                 let mut encapsulated_data = Vec::new();
