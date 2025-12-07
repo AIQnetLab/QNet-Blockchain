@@ -4061,12 +4061,8 @@ async fn sign_with_dilithium(node_id: &str, challenge: &str) -> String {
     
     let mut instances_guard = instances.lock().await;
     
-    // Normalize node_id
-    let normalized_node_id = if node_id.starts_with("qn_") {
-        node_id.to_string()
-    } else {
-        format!("qn_{}", node_id)
-    };
+    // v2.24: Use node_id directly
+    let normalized_node_id = node_id.to_string();
     
     // Create instance if not exists
     if !instances_guard.contains_key(&normalized_node_id) {
@@ -4089,15 +4085,14 @@ async fn sign_with_dilithium(node_id: &str, challenge: &str) -> String {
     }
     
     // CRITICAL: Sign RAW challenge with hybrid (hashes before signing)
+    // OPTIMIZED v2.24: bincode+zstd - use standard compact_bin format for verification compatibility
     match hybrid.sign_raw_message_compact(challenge.as_bytes()).await {
         Ok(compact_sig) => {
-            match serde_json::to_string(&compact_sig) {
-                Ok(json) => {
-                    println!("[CRYPTO] ✅ HYBRID signature created for node {} (NIST/Cisco compliant)", node_id);
-                    println!("[CRYPTO]    Ephemeral key: ✅ (new for this challenge)");
-                    println!("[CRYPTO]    Dilithium key sig: ✅");
-                    println!("[CRYPTO]    Dilithium msg sig: ✅");
-                    format!("hybrid_rpc:{}", json)
+            match compact_sig.to_binary_compressed() {
+                Ok(binary_data) => {
+                    let base64_data = base64::engine::general_purpose::STANDARD.encode(&binary_data);
+                    println!("[CRYPTO] ✅ HYBRID RPC signature created for node {} (bincode v2.24)", node_id);
+                    format!("compact_bin:{}", base64_data)  // Standard format for verification
                 }
                 Err(e) => {
                     println!("[CRYPTO] ❌ Failed to serialize hybrid signature: {}", e);
@@ -4611,12 +4606,8 @@ async fn handle_light_node_ping_response(
             
             let mut instances_guard = instances.lock().await;
             
-            // Normalize node_id
-            let normalized_node_id = if our_node_id.starts_with("qn_") {
-                our_node_id.clone()
-            } else {
-                format!("qn_{}", our_node_id)
-            };
+            // v2.24: Use node_id directly
+            let normalized_node_id = our_node_id.clone();
             
             // Create instance if not exists
             if !instances_guard.contains_key(&normalized_node_id) {
@@ -4639,12 +4630,14 @@ async fn handle_light_node_ping_response(
             }
             
             // CRITICAL: Sign RAW attestation with hybrid (hashes before signing)
+            // OPTIMIZED v2.24: bincode+zstd instead of JSON
             match hybrid.sign_raw_message_compact(attestation_data.as_bytes()).await {
                 Ok(compact_sig) => {
-                    match serde_json::to_string(&compact_sig) {
-                        Ok(json) => {
-                            println!("[LIGHT] ✅ HYBRID attestation signature (NIST/Cisco compliant)");
-                            format!("hybrid_attest:{}", json)
+                    match compact_sig.to_binary_compressed() {
+                        Ok(binary_data) => {
+                            let base64_data = base64::engine::general_purpose::STANDARD.encode(&binary_data);
+                            println!("[LIGHT] ✅ HYBRID attestation signature (bincode v2.24)");
+                            format!("compact_bin:{}", base64_data)  // Standard format for verification
                         }
                         Err(e) => {
                             println!("[LIGHT] ❌ Failed to serialize hybrid signature: {}", e);
@@ -7429,12 +7422,8 @@ async fn generate_quantum_signature(node_id: &str, data: &str) -> String {
     
     let mut instances_guard = instances.lock().await;
     
-    // Normalize node_id
-    let normalized_node_id = if node_id.starts_with("qn_") {
-        node_id.to_string()
-    } else {
-        format!("qn_{}", node_id)
-    };
+    // v2.24: Use node_id directly
+    let normalized_node_id = node_id.to_string();
     
     // Create instance if not exists
     if !instances_guard.contains_key(&normalized_node_id) {
@@ -7457,12 +7446,14 @@ async fn generate_quantum_signature(node_id: &str, data: &str) -> String {
     }
     
     // CRITICAL: Sign RAW data with hybrid (hashes before signing)
+    // OPTIMIZED v2.24: bincode+zstd instead of JSON
     match hybrid.sign_raw_message_compact(data.as_bytes()).await {
         Ok(compact_sig) => {
-            match serde_json::to_string(&compact_sig) {
-                Ok(json) => {
-                    println!("[CRYPTO] ✅ HYBRID RPC signature created (NIST/Cisco compliant)");
-                    format!("hybrid_rpc:{}", json)
+            match compact_sig.to_binary_compressed() {
+                Ok(binary_data) => {
+                    let base64_data = base64::engine::general_purpose::STANDARD.encode(&binary_data);
+                    println!("[CRYPTO] ✅ HYBRID RPC signature created (bincode v2.24)");
+                    format!("compact_bin:{}", base64_data)  // Standard format for verification
                 }
                 Err(e) => {
                     println!("[CRYPTO] ❌ FATAL: Failed to serialize hybrid signature: {}", e);

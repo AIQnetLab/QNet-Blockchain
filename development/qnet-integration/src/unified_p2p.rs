@@ -3343,11 +3343,89 @@ impl SimplifiedP2P {
                     println!("[P2P] ✅ Cleaned up {} inactive peers", peers_to_remove.len());
                 }
                 
-                // CRITICAL: Also cleanup idle QUIC connections
+                // CRITICAL v2.24: QUIC health check and cleanup
                 if let Some(ref quic_transport) = quic_transport {
                     let transport = quic_transport.read().await;
+                    
+                    // v2.24: Health check removes dead connections
+                    let (alive, removed) = transport.health_check();
+                    
+                    // Cleanup idle connections
                     transport.cleanup_idle();
-                    println!("[QUIC] 🧹 Cleaned up idle QUIC connections (timeout: 90s)");
+                    
+                    if removed > 0 || alive < 4 {
+                        println!("[QUIC] 🧹 Health check: {} alive, {} removed | Reconnecting to missing peers...", 
+                                 alive, removed);
+                    }
+                }
+            }
+        });
+        
+        // v2.24: Start frequent QUIC health check task (every 15 seconds)
+        self.start_quic_health_check_task();
+    }
+    
+    /// v2.24: Frequent QUIC health check for proactive reconnection
+    /// SCALABLE: Works for any network size (5 nodes to 100K+)
+    fn start_quic_health_check_task(&self) {
+        let quic_transport = self.quic_transport.clone();
+        let connected_peers_lockfree = self.connected_peers_lockfree.clone();
+        let node_id = self.node_id.clone();
+        
+        tokio::spawn(async move {
+            println!("[QUIC] 🔄 Starting QUIC health check task (every 15s)...");
+            
+            // Initial delay to let network stabilize
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                
+                if let Some(ref quic_transport) = quic_transport {
+                    let transport = quic_transport.read().await;
+                    
+                    // Quick health check - removes dead connections
+                    let (alive, removed) = transport.health_check();
+                    
+                    // SCALABLE: Only reconnect if we have very few connections
+                    // For large networks, peer discovery will handle this
+                    // For small networks (genesis), ensure minimum connectivity
+                    let min_connections = 3; // Minimum for Byzantine tolerance
+                    
+                    if alive < min_connections && removed > 0 {
+                        drop(transport); // Release read lock
+                        
+                        // Get known peers from P2P layer (not just bootstrap)
+                        let peers_to_try: Vec<String> = connected_peers_lockfree
+                            .iter()
+                            .filter(|entry| entry.value().id != node_id)
+                            .take(10) // Limit reconnection attempts
+                            .map(|entry| entry.key().clone())
+                            .collect();
+                        
+                        if !peers_to_try.is_empty() {
+                            println!("[QUIC] 🔄 Low connections ({}/{}), attempting reconnect to {} peers...", 
+                                     alive, min_connections, peers_to_try.len());
+                            
+                            for peer_addr_str in peers_to_try {
+                                if let Ok(addr) = peer_addr_str.parse::<std::net::SocketAddr>() {
+                                    let quic_addr = std::net::SocketAddr::new(
+                                        addr.ip(),
+                                        crate::quic_transport::QUIC_PORT
+                                    );
+                                    
+                                    let transport_clone = quic_transport.clone();
+                                    tokio::spawn(async move {
+                                        let t = transport_clone.read().await;
+                                        if !t.is_connection_alive(&quic_addr) {
+                                            let _ = t.connect(quic_addr).await;
+                                            // Silent - avoid log spam
+                                        }
+                                    });
+                                }
+                            }
+                        }
+                    }
                 }
             }
         });
@@ -3933,9 +4011,15 @@ impl SimplifiedP2P {
                 let semaphore = Arc::new(Semaphore::new(max_concurrent));
                 
                 // Log rate limiting for first 100 blocks and every 50th
+                // NOTE: peers_for_broadcast contains DUPLICATES (one entry per chunk×peer)
+                // total_sends = chunks × fanout, NOT unique peer count
                 if height <= 100 || height % 50 == 0 {
-                    println!("[SHRED_PROTOCOL] 🚦 Rate limit: {}/{} sends concurrent (peers: {})", 
-                        max_concurrent, total_sends, peers_for_broadcast.len());
+                    // Count unique peers for accurate logging
+                    let unique_peers: std::collections::HashSet<String> = peers_for_broadcast.iter()
+                        .map(|p| p.id.clone())
+                        .collect();
+                    println!("[SHRED_PROTOCOL] 🚦 Rate limit: {}/{} sends to {} unique peers", 
+                        max_concurrent, total_sends, unique_peers.len());
                 }
                 
                 // Build list of (quic_addr, msg) tuples
@@ -9241,9 +9325,10 @@ impl SimplifiedP2P {
                                 }
                                 history.push((cert_serial_clone.clone(), cert.ed25519_public_key));
                                 
-                                // OPTIMISTIC: Move from pending to verified cache
-                                cert_manager.pending_certificates.remove(&cert_serial_clone);
+                                // ATOMIC MOVE: First add to verified, THEN remove from pending
+                                // This prevents race condition where cert is in neither cache
                                 cert_manager.store_remote_certificate(cert_serial_clone.clone(), certificate_clone);
+                                cert_manager.pending_certificates.remove(&cert_serial_clone);
                                 println!("[P2P] ✅ Certificate moved from PENDING to VERIFIED cache");
                             } else {
                                 println!("[P2P] ❌ Certificate rotation incompatible - rejecting");
@@ -10072,7 +10157,12 @@ impl SimplifiedP2P {
             return false;
         }
         
-        // NEW FORMAT: Hybrid P2P signature (NIST/Cisco compliant)
+        // OPTIMIZED v2.24: Binary hybrid P2P signature (bincode+zstd)
+        if signature.starts_with("hybrid_p2p_bin:") {
+            return self.verify_hybrid_p2p_binary_async(message, signature, node_id).await;
+        }
+        
+        // LEGACY: JSON hybrid P2P signature
         if signature.starts_with("hybrid_p2p:") {
             return self.verify_hybrid_p2p_signature_async(message, signature, node_id).await;
         }
@@ -10124,7 +10214,116 @@ impl SimplifiedP2P {
         }
     }
     
-    /// Verify HYBRID P2P signature (NIST/Cisco compliant with ephemeral keys)
+    /// OPTIMIZED v2.24: Verify HYBRID P2P BINARY signature (bincode+zstd)
+    async fn verify_hybrid_p2p_binary_async(&self, message: &str, signature: &str, node_id: &str) -> bool {
+        use crate::hybrid_crypto::{CompactHybridSignature, HybridCrypto};
+        use crate::quantum_crypto::DilithiumSignature;
+        use crate::node::GLOBAL_QUANTUM_CRYPTO;
+        use sha3::{Sha3_256, Digest};
+        use base64::engine::general_purpose;
+        use base64::Engine;
+        
+        // Parse hybrid_p2p_bin signature
+        let base64_data = &signature[15..]; // Skip "hybrid_p2p_bin:" prefix
+        let binary_data = match general_purpose::STANDARD.decode(base64_data) {
+            Ok(data) => data,
+            Err(e) => {
+                println!("[HEARTBEAT] ❌ Failed to decode base64: {}", e);
+                return false;
+            }
+        };
+        
+        let compact_sig: CompactHybridSignature = match CompactHybridSignature::from_binary_compressed(&binary_data) {
+            Ok(sig) => sig,
+            Err(e) => {
+                println!("[HEARTBEAT] ❌ Failed to parse binary signature: {}", e);
+                return false;
+            }
+        };
+        
+        // v2.24: Direct node_id comparison
+        if compact_sig.node_id != node_id {
+            println!("[HEARTBEAT] ❌ Node ID mismatch: {} vs {}", compact_sig.node_id, node_id);
+            return false;
+        }
+        
+        // Step 1: Verify ephemeral key is present
+        if compact_sig.ephemeral_public_key.iter().all(|&b| b == 0) {
+            println!("[HEARTBEAT] ❌ Ephemeral public key is all zeros!");
+            return false;
+        }
+        
+        // Step 2: Verify Ed25519 signature with ephemeral key
+        let mut hasher = Sha3_256::new();
+        hasher.update(message.as_bytes());
+        let message_hash = hasher.finalize();
+        
+        match HybridCrypto::verify_ed25519_signature(
+            &message_hash,
+            &compact_sig.message_signature,
+            &compact_sig.ephemeral_public_key
+        ) {
+            Ok(true) => {} // OK
+            Ok(false) => {
+                println!("[HEARTBEAT] ❌ Ed25519 signature INVALID!");
+                return false;
+            }
+            Err(e) => {
+                println!("[HEARTBEAT] ❌ Ed25519 verification error: {}", e);
+                return false;
+            }
+        }
+        
+        // Step 3: Verify Dilithium signature
+        if compact_sig.dilithium_key_signature.is_empty() {
+            println!("[HEARTBEAT] ❌ REJECTED: No Dilithium key signature!");
+            return false;
+        }
+        
+        // Get quantum crypto
+        let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
+        if crypto_guard.is_none() {
+            let mut crypto = crate::quantum_crypto::QNetQuantumCrypto::new();
+            let _ = crypto.initialize().await;
+            *crypto_guard = Some(crypto);
+        }
+        let crypto = crypto_guard.as_ref().expect("Crypto initialized above");
+        
+        // Verify Dilithium key signature (encapsulated_data = ephemeral_key || message_hash || timestamp)
+        let mut encapsulated_data = Vec::new();
+        encapsulated_data.extend_from_slice(&compact_sig.ephemeral_public_key);
+        encapsulated_data.extend_from_slice(&message_hash);
+        encapsulated_data.extend_from_slice(&compact_sig.signed_at.to_le_bytes());
+        let encapsulated_hex = hex::encode(&encapsulated_data);
+        
+        // Convert RAW bytes to signature string
+        use crate::crypto::hybrid_crypto::encode_dilithium_signature;
+        let signature_string = encode_dilithium_signature(&compact_sig.node_id, &compact_sig.dilithium_key_signature);
+        
+        let dilithium_key_sig = DilithiumSignature {
+            signature: signature_string,
+            algorithm: "CRYSTALS-Dilithium3".to_string(),
+            timestamp: compact_sig.signed_at,
+            strength: "quantum-resistant".to_string(),
+        };
+        
+        match crypto.verify_dilithium_signature(&encapsulated_hex, &dilithium_key_sig, &compact_sig.node_id).await {
+            Ok(true) => {
+                println!("[HEARTBEAT] ✅ Binary signature verified (v2.24)");
+                true
+            }
+            Ok(false) => {
+                println!("[HEARTBEAT] ❌ Dilithium signature INVALID!");
+                false
+            }
+            Err(e) => {
+                println!("[HEARTBEAT] ❌ Dilithium verification error: {}", e);
+                false
+            }
+        }
+    }
+    
+    /// LEGACY: Verify HYBRID P2P JSON signature (NIST/Cisco compliant with ephemeral keys)
     async fn verify_hybrid_p2p_signature_async(&self, message: &str, signature: &str, node_id: &str) -> bool {
         use crate::hybrid_crypto::{CompactHybridSignature, HybridCrypto};
         use crate::quantum_crypto::DilithiumSignature;
@@ -10141,13 +10340,8 @@ impl SimplifiedP2P {
             }
         };
         
-        // Verify node_id matches
-        let expected_node_id = if node_id.starts_with("qn_") {
-            node_id.to_string()
-        } else {
-            format!("qn_{}", node_id)
-        };
-        if compact_sig.node_id != expected_node_id && compact_sig.node_id != node_id {
+        // v2.24: Direct node_id comparison
+        if compact_sig.node_id != node_id {
             println!("[HEARTBEAT] ❌ Node ID mismatch: {} vs {}", compact_sig.node_id, node_id);
             return false;
         }
@@ -10240,7 +10434,12 @@ impl SimplifiedP2P {
             return false;
         }
         
-        // NEW FORMAT: Hybrid P2P signature (NIST/Cisco compliant)
+        // OPTIMIZED v2.24: Binary hybrid P2P signature (bincode+zstd)
+        if signature.starts_with("hybrid_p2p_bin:") {
+            return self.verify_hybrid_p2p_binary_sync(message, signature, node_id);
+        }
+        
+        // LEGACY: JSON hybrid P2P signature
         if signature.starts_with("hybrid_p2p:") {
             return self.verify_hybrid_p2p_signature_sync(message, signature, node_id);
         }
@@ -10320,7 +10519,107 @@ impl SimplifiedP2P {
         }
     }
     
-    /// Verify HYBRID P2P signature (SYNC version) - NIST/Cisco compliant
+    /// OPTIMIZED v2.24: Verify HYBRID P2P BINARY signature (SYNC version)
+    fn verify_hybrid_p2p_binary_sync(&self, message: &str, signature: &str, node_id: &str) -> bool {
+        let message = message.to_string();
+        let signature = signature.to_string();
+        let node_id = node_id.to_string();
+        
+        // Use std::thread::spawn to isolate runtime
+        let handle = std::thread::spawn(move || {
+            use crate::hybrid_crypto::{CompactHybridSignature, HybridCrypto};
+            use crate::quantum_crypto::DilithiumSignature;
+            use sha3::{Sha3_256, Digest};
+            use base64::engine::general_purpose;
+            use base64::Engine;
+            
+            // Parse binary signature
+            let base64_data = &signature[15..]; // Skip "hybrid_p2p_bin:" prefix
+            let binary_data = match general_purpose::STANDARD.decode(base64_data) {
+                Ok(data) => data,
+                Err(e) => {
+                    println!("[HEARTBEAT] ❌ Failed to decode base64 (sync): {}", e);
+                    return false;
+                }
+            };
+            
+            let compact_sig: CompactHybridSignature = match CompactHybridSignature::from_binary_compressed(&binary_data) {
+                Ok(sig) => sig,
+                Err(e) => {
+                    println!("[HEARTBEAT] ❌ Failed to parse binary signature (sync): {}", e);
+                    return false;
+                }
+            };
+            
+            // v2.24: Direct node_id comparison
+            if compact_sig.node_id != node_id {
+                println!("[HEARTBEAT] ❌ Node ID mismatch: {} vs {}", compact_sig.node_id, node_id);
+                return false;
+            }
+            
+            // Verify Ed25519 signature
+            let mut hasher = Sha3_256::new();
+            hasher.update(message.as_bytes());
+            let message_hash = hasher.finalize();
+            
+            match HybridCrypto::verify_ed25519_signature(
+                &message_hash,
+                &compact_sig.message_signature,
+                &compact_sig.ephemeral_public_key
+            ) {
+                Ok(true) => {} // OK
+                _ => {
+                    println!("[HEARTBEAT] ❌ Ed25519 signature INVALID (sync)!");
+                    return false;
+                }
+            }
+            
+            // Verify Dilithium via runtime
+            match tokio::runtime::Runtime::new() {
+                Ok(rt) => {
+                    rt.block_on(async {
+                        use crate::node::GLOBAL_QUANTUM_CRYPTO;
+                        let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
+                        if crypto_guard.is_none() {
+                            let mut crypto = crate::quantum_crypto::QNetQuantumCrypto::new();
+                            let _ = crypto.initialize().await;
+                            *crypto_guard = Some(crypto);
+                        }
+                        let crypto = crypto_guard.as_ref().expect("Crypto initialized above");
+                        
+                        let mut encapsulated_data = Vec::new();
+                        encapsulated_data.extend_from_slice(&compact_sig.ephemeral_public_key);
+                        encapsulated_data.extend_from_slice(&message_hash);
+                        encapsulated_data.extend_from_slice(&compact_sig.signed_at.to_le_bytes());
+                        let encapsulated_hex = hex::encode(&encapsulated_data);
+                        
+                        use crate::crypto::hybrid_crypto::encode_dilithium_signature;
+                        let signature_string = encode_dilithium_signature(&compact_sig.node_id, &compact_sig.dilithium_key_signature);
+                        
+                        let dilithium_key_sig = DilithiumSignature {
+                            signature: signature_string,
+                            algorithm: "CRYSTALS-Dilithium3".to_string(),
+                            timestamp: compact_sig.signed_at,
+                            strength: "quantum-resistant".to_string(),
+                        };
+                        
+                        match crypto.verify_dilithium_signature(&encapsulated_hex, &dilithium_key_sig, &compact_sig.node_id).await {
+                            Ok(true) => {
+                                println!("[HEARTBEAT] ✅ Binary signature verified (sync v2.24)");
+                                true
+                            }
+                            _ => false
+                        }
+                    })
+                }
+                Err(_) => false
+            }
+        });
+        
+        handle.join().unwrap_or(false)
+    }
+    
+    /// LEGACY: Verify HYBRID P2P JSON signature (SYNC version) - NIST/Cisco compliant
     fn verify_hybrid_p2p_signature_sync(&self, message: &str, signature: &str, node_id: &str) -> bool {
         let message = message.to_string();
         let signature = signature.to_string();
@@ -10603,12 +10902,8 @@ impl SimplifiedP2P {
         
         let mut instances_guard = instances.lock().await;
         
-        // Normalize node_id
-        let normalized_node_id = if node_id.starts_with("qn_") {
-            node_id.to_string()
-        } else {
-            format!("qn_{}", node_id)
-        };
+        // v2.24: Use node_id directly
+        let normalized_node_id = node_id.to_string();
         
         // Create instance if not exists
         if !instances_guard.contains_key(&normalized_node_id) {
@@ -10632,16 +10927,16 @@ impl SimplifiedP2P {
         // CRITICAL: Sign RAW message with hybrid (ephemeral Ed25519 + Dilithium per NIST/Cisco)
         // Using sign_raw_message_compact which hashes the message before signing
         // This ensures consistency with verification which also hashes
+        // OPTIMIZED v2.24: bincode+zstd instead of JSON
         match hybrid.sign_raw_message_compact(message.as_bytes()).await {
             Ok(compact_sig) => {
-                // Serialize to JSON with prefix
-                match serde_json::to_string(&compact_sig) {
-                    Ok(json) => {
-                        let sig_with_prefix = format!("hybrid_p2p:{}", json);
-                        println!("[CRYPTO] ✅ HYBRID P2P signature created (NIST/Cisco compliant)");
-                        println!("[CRYPTO]    Ephemeral key: ✅ (new for this message)");
-                        println!("[CRYPTO]    Dilithium key sig: ✅");
-                        println!("[CRYPTO]    Dilithium msg sig: ✅");
+                // Serialize to bincode+zstd+base64
+                match compact_sig.to_binary_compressed() {
+                    Ok(binary_data) => {
+                        let base64_data = base64::engine::general_purpose::STANDARD.encode(&binary_data);
+                        let sig_with_prefix = format!("hybrid_p2p_bin:{}", base64_data);
+                        println!("[CRYPTO] ✅ HYBRID P2P signature created (bincode v2.24)");
+                        println!("[CRYPTO]    Size: {} bytes (optimized)", binary_data.len());
                         Some(sig_with_prefix)
                     }
                     Err(e) => {
@@ -10680,12 +10975,8 @@ impl SimplifiedP2P {
                     
                     let mut instances_guard = instances.lock().await;
                     
-                    // Normalize node_id
-                    let normalized_node_id = if node_id_owned.starts_with("qn_") {
-                        node_id_owned.clone()
-                    } else {
-                        format!("qn_{}", node_id_owned)
-                    };
+                    // v2.24: Use node_id directly
+                    let normalized_node_id = node_id_owned.clone();
                     
                     // Create instance if not exists
                     if !instances_guard.contains_key(&normalized_node_id) {
@@ -10710,10 +11001,11 @@ impl SimplifiedP2P {
                 
                 match result {
                     Ok(compact_sig) => {
-                        match serde_json::to_string(&compact_sig) {
-                            Ok(json) => {
-                                let sig_with_prefix = format!("hybrid_p2p:{}", json);
-                                Some(sig_with_prefix)
+                        // OPTIMIZED v2.24: bincode+zstd
+                        match compact_sig.to_binary_compressed() {
+                            Ok(binary_data) => {
+                                let base64_data = base64::engine::general_purpose::STANDARD.encode(&binary_data);
+                                Some(format!("hybrid_p2p_bin:{}", base64_data))
                             }
                             Err(_) => None
                         }
@@ -13441,12 +13733,8 @@ impl SimplifiedP2P {
         
         let mut instances_guard = instances.lock().await;
         
-        // Normalize node_id
-        let normalized_node_id = if self.node_id.starts_with("qn_") {
-            self.node_id.clone()
-        } else {
-            format!("qn_{}", self.node_id)
-        };
+        // v2.24: Use node_id directly
+        let normalized_node_id = self.node_id.clone();
         
         // Create instance if not exists
         if !instances_guard.contains_key(&normalized_node_id) {
@@ -13466,12 +13754,14 @@ impl SimplifiedP2P {
         }
         
         // CRITICAL: Sign RAW message with hybrid (hashes before signing)
+        // OPTIMIZED v2.24: bincode+zstd - use standard compact_bin format
         match hybrid.sign_raw_message_compact(entry_hash.as_bytes()).await {
             Ok(compact_sig) => {
-                match serde_json::to_string(&compact_sig) {
-                    Ok(json) => {
-                        println!("[AUDIT] ✅ Generated HYBRID signature for audit entry (NIST/Cisco)");
-                        format!("hybrid:{}", json)
+                match compact_sig.to_binary_compressed() {
+                    Ok(binary_data) => {
+                        let base64_data = base64::engine::general_purpose::STANDARD.encode(&binary_data);
+                        println!("[AUDIT] ✅ Generated HYBRID signature for audit entry (bincode v2.24)");
+                        format!("compact_bin:{}", base64_data)  // CompactHybridSignature uses compact_bin
                     }
                     Err(e) => {
                         println!("[AUDIT] ❌ Failed to serialize hybrid signature: {}", e);
@@ -13508,12 +13798,8 @@ impl SimplifiedP2P {
                         
                         let mut instances_guard = instances.lock().await;
                         
-                        // Normalize node_id
-                        let normalized_node_id = if node_id.starts_with("qn_") {
-                            node_id.clone()
-                        } else {
-                            format!("qn_{}", node_id)
-                        };
+                        // v2.24: Use node_id directly
+                        let normalized_node_id = node_id.clone();
                         
                         // Create instance if not exists
                         if !instances_guard.contains_key(&normalized_node_id) {
@@ -13535,8 +13821,12 @@ impl SimplifiedP2P {
                     
                     match result {
                         Ok(compact_sig) => {
-                            match serde_json::to_string(&compact_sig) {
-                                Ok(json) => format!("hybrid:{}", json),
+                            // OPTIMIZED v2.24: bincode+zstd - use standard compact_bin format
+                            match compact_sig.to_binary_compressed() {
+                                Ok(binary_data) => {
+                                    let base64_data = base64::engine::general_purpose::STANDARD.encode(&binary_data);
+                                    format!("compact_bin:{}", base64_data)  // CompactHybridSignature
+                                }
                                 Err(_) => String::from("UNSIGNED_SERIALIZE_FAILED")
                             }
                         }
@@ -13549,8 +13839,8 @@ impl SimplifiedP2P {
         
         match handle.join() {
             Ok(sig) => {
-                if sig.starts_with("hybrid:") {
-                    println!("[AUDIT] ✅ Generated HYBRID signature for audit entry (NIST/Cisco)");
+                if sig.starts_with("hybrid_bin:") || sig.starts_with("hybrid:") {
+                    println!("[AUDIT] ✅ Generated HYBRID signature for audit entry");
                 }
                 sig
             }
@@ -14750,12 +15040,8 @@ impl SimplifiedP2P {
                     
                     let mut instances_guard = instances.lock().await;
                     
-                    // Normalize node_id
-                    let normalized_node_id = if node_id.starts_with("qn_") {
-                        node_id.clone()
-                    } else {
-                        format!("qn_{}", node_id)
-                    };
+                    // v2.24: Use node_id directly
+                    let normalized_node_id = node_id.clone();
                     
                     // Create instance if not exists
                     if !instances_guard.contains_key(&normalized_node_id) {
@@ -14777,10 +15063,13 @@ impl SimplifiedP2P {
                 
                 match result {
                     Ok(compact_sig) => {
-                        match serde_json::to_string(&compact_sig) {
-                            Ok(json) => {
-                                println!("[P2P] ✅ Generated HYBRID signature for reputation sync (NIST/Cisco)");
-                                json.as_bytes().to_vec()
+                        // OPTIMIZED v2.24: bincode+zstd
+                        match compact_sig.to_binary_compressed() {
+                            Ok(binary_data) => {
+                                let base64_data = base64::engine::general_purpose::STANDARD.encode(&binary_data);
+                                let sig_with_prefix = format!("compact_bin:{}", base64_data);
+                                println!("[P2P] ✅ Generated HYBRID signature for reputation sync (bincode v2.24)");
+                                sig_with_prefix.as_bytes().to_vec()
                             }
                             Err(e) => {
                                 println!("[P2P] ❌ Failed to serialize hybrid signature: {}", e);
@@ -15541,9 +15830,9 @@ mod tests {
     /// Test hybrid P2P signature format detection
     #[test]
     fn test_hybrid_p2p_signature_format() {
-        let hybrid_sig = r#"hybrid_p2p:{"node_id":"qn_test"}"#;
+        let hybrid_sig = r#"hybrid_p2p:{"node_id":"test_node"}"#;
         let legacy_sig = "dilithium_sig_abc123";
-        let heartbeat_sig = "heartbeat_v2_qn_test_1234567890";
+        let heartbeat_sig = "heartbeat_v2_test_node_1234567890";
         
         assert!(hybrid_sig.starts_with("hybrid_p2p:"));
         assert!(legacy_sig.starts_with("dilithium_sig_"));
@@ -15563,7 +15852,7 @@ mod tests {
         
         // OPTIMIZED v2.23: Create signature directly (RAW bytes format)
         let sig = CompactHybridSignature {
-            node_id: "qn_p2p_test".to_string(),
+            node_id: "p2p_test".to_string(),
             cert_serial: "CERT-P2P-123".to_string(),
             ephemeral_public_key: ephemeral_pk,
             message_signature: msg_sig,

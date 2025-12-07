@@ -104,8 +104,12 @@ impl BlockValidator {
     /// Verify transaction signature (Ed25519 or Hybrid)
     fn verify_ed25519_signature(&self, tx: &Transaction, signature_hex: &str) -> IntegrationResult<bool> {
         // PRODUCTION: Support multiple signature formats
-        if signature_hex.starts_with("hybrid:") {
-            // Node hybrid signature (with certificate) - for consensus messages
+        // v2.24: Prioritize binary formats (bincode+zstd)
+        if signature_hex.starts_with("hybrid_bin:") {
+            // OPTIMIZED v2.24: Binary hybrid signature (bincode+zstd)
+            self.verify_hybrid_binary_signature(tx, signature_hex)
+        } else if signature_hex.starts_with("hybrid:") {
+            // Legacy: Node hybrid signature JSON (with certificate)
             self.verify_hybrid_signature(tx, signature_hex)
         } else if signature_hex.starts_with("dilithium_sig_") {
             // Pure Dilithium signature
@@ -163,7 +167,49 @@ impl BlockValidator {
         }
     }
     
-    /// Verify hybrid signature (O(1) performance with caching)
+    /// OPTIMIZED v2.24: Verify hybrid BINARY signature (bincode+zstd)
+    fn verify_hybrid_binary_signature(&self, tx: &Transaction, signature_hex: &str) -> IntegrationResult<bool> {
+        use crate::hybrid_crypto::{HybridSignature, HybridCrypto};
+        use base64::{Engine as _, engine::general_purpose};
+        
+        // Parse binary signature: "hybrid_bin:<base64_bincode_zstd>"
+        let base64_data = &signature_hex[11..]; // Skip "hybrid_bin:" prefix
+        let binary_data = general_purpose::STANDARD.decode(base64_data)
+            .map_err(|e| IntegrationError::ValidationError(format!("Invalid base64 in hybrid_bin: {}", e)))?;
+        
+        let hybrid_sig: HybridSignature = HybridSignature::from_binary_compressed(&binary_data)
+            .map_err(|e| IntegrationError::ValidationError(format!("Invalid binary hybrid signature: {}", e)))?;
+        
+        // Create message to verify
+        let message = self.create_signing_message(tx)?;
+        
+        // Verify using hybrid crypto (with certificate caching)
+        let rt = tokio::runtime::Handle::try_current()
+            .or_else(|_| tokio::runtime::Runtime::new().map(|rt| rt.handle().clone()))
+            .map_err(|e| IntegrationError::ValidationError(format!("Runtime error: {}", e)))?;
+        
+        let result = rt.block_on(async {
+            let verifier = HybridCrypto::new(hybrid_sig.certificate.node_id.clone());
+            verifier.verify_signature(&message, &hybrid_sig).await
+        });
+        
+        match result {
+            Ok(valid) => {
+                if valid {
+                    println!("[VALIDATOR] ✅ Binary hybrid signature verified (v2.24 bincode)");
+                } else {
+                    println!("[VALIDATOR] ❌ Invalid binary hybrid signature");
+                }
+                Ok(valid)
+            }
+            Err(e) => {
+                println!("[VALIDATOR] ⚠️ Binary hybrid verification error: {}", e);
+                Ok(false)
+            }
+        }
+    }
+    
+    /// LEGACY: Verify hybrid JSON signature (O(1) performance with caching)
     fn verify_hybrid_signature(&self, tx: &Transaction, signature_hex: &str) -> IntegrationResult<bool> {
         use crate::hybrid_crypto::{HybridSignature, HybridCrypto};
         use serde_json;

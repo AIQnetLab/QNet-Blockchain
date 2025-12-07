@@ -1,17 +1,21 @@
-//! # QNet Hybrid Cryptography Module (v2.23)
+//! # QNet Hybrid Cryptography Module (v2.24)
 //!
 //! ## Overview
 //! Implements hybrid post-quantum cryptography with CRYSTALS-Dilithium and Ed25519
 //! following NIST and Cisco recommendations. Optimized for minimal bandwidth with
-//! RAW bytes format (no base64 overhead).
+//! bincode + zstd compression format.
 //!
-//! ## Architecture (v2.23 - RAW bytes optimization)
+//! ## Architecture (v2.24 - Bincode + Zstd optimization)
 //!
 //! ### Signature System
 //! - **Ed25519**: Fast classical signatures (64 bytes RAW)
 //! - **CRYSTALS-Dilithium**: Post-quantum signatures (~2500 bytes RAW)
 //! - **Hybrid**: Single Dilithium signature covers ephemeral_key + message_hash + timestamp
-//! - **Format**: RAW bytes via serde_bytes (88% size reduction vs base64 JSON)
+//! - **Format**: Bincode + Zstd compression (90% size reduction vs JSON)
+//!
+//! ### Serialization Formats
+//! - **Production**: `to_binary_compressed()` / `from_binary_compressed()` - bincode + zstd
+//! - **Legacy**: `to_json()` / `from_json()` - for backwards compatibility only
 //!
 //! ### Certificate Management
 //! - **Lifetime**: 4.5 minutes (270 seconds) - frequent rotation for security
@@ -19,9 +23,9 @@
 //! - **Storage**: LRU cache (100K certificates)
 //! - **Distribution**: P2P broadcast on rotation
 //!
-//! ## Signature Formats (v2.23)
+//! ## Signature Formats (v2.24)
 //!
-//! ### Compact Signature (Microblocks - ~2.6KB)
+//! ### Compact Signature (Microblocks - ~2.6KB bincode)
 //! ```rust
 //! pub struct CompactHybridSignature {
 //!     pub node_id: String,
@@ -32,9 +36,10 @@
 //!     pub signed_at: u64,
 //! }
 //! ```
-//! **Bandwidth**: ~2.6KB (was 22KB - 88% reduction!)
+//! **Bandwidth**: ~2.6KB bincode (was 5KB JSON, was 22KB base64 JSON)
+//! **Wire format**: `compact_bin:<base64(zstd(bincode(sig)))>`
 //!
-//! ### Full Signature (Macroblocks - ~5KB)
+//! ### Full Signature (Macroblocks - ~5KB bincode)
 //! ```rust
 //! pub struct HybridSignature {
 //!     pub certificate: HybridCertificate,
@@ -44,11 +49,14 @@
 //!     pub signed_at: u64,
 //! }
 //! ```
-//! **Bandwidth**: ~5KB (certificate + signature RAW bytes)
+//! **Bandwidth**: ~5KB bincode (was 27KB JSON)
+//! **Wire format**: `hybrid_bin:<base64(zstd(bincode(sig)))>`
 //!
 //! ## Helper Functions
 //! - `extract_dilithium_raw_bytes()` - Extract RAW bytes from signature string
 //! - `encode_dilithium_signature()` - Encode RAW bytes to signature string
+//! - `to_binary_compressed()` - Serialize to bincode + zstd (production)
+//! - `from_binary_compressed()` - Deserialize from bincode + zstd (production)
 //!
 //! ## Global Instance Management
 //! Thread-safe, globally accessible cache of HybridCrypto instances for all nodes.
@@ -326,13 +334,17 @@ impl CompactHybridSignature {
             .map_err(|e| anyhow!("Bincode deserialization failed: {}", e))
     }
     
-    /// Serialize to JSON (legacy format)
+    /// Serialize to JSON (LEGACY - use to_binary_compressed() for production)
+    /// Only kept for backwards compatibility with old signatures
+    #[allow(dead_code)]
     pub fn to_json(&self) -> Result<String> {
         serde_json::to_string(self)
             .map_err(|e| anyhow!("JSON serialization failed: {}", e))
     }
     
-    /// Deserialize from JSON (legacy format)
+    /// Deserialize from JSON (LEGACY - use from_binary_compressed() for production)
+    /// Only kept for backwards compatibility with old signatures
+    #[allow(dead_code)]
     pub fn from_json(json: &str) -> Result<Self> {
         serde_json::from_str(json)
             .map_err(|e| anyhow!("JSON deserialization failed: {}", e))

@@ -36,14 +36,23 @@ use crate::p2p_transport::*;
 use crate::unified_p2p::{NetworkMessage, PeerInfo, get_privacy_id_for_addr};
 
 // ============================================================================
-// RETRY CONSTANTS
+// RETRY CONSTANTS (v2.24 - improved reconnect logic)
 // ============================================================================
 
-/// Number of connection retry attempts
-const CONNECT_RETRY_ATTEMPTS: u32 = 3;
+/// Number of connection retry attempts (increased from 3 for better resilience)
+const CONNECT_RETRY_ATTEMPTS: u32 = 5;
 
-/// Delay between retry attempts (exponential backoff base)
-const RETRY_DELAY_MS: u64 = 100;
+/// Extended retry for handshake failures (aborted by peer is common at startup)
+const HANDSHAKE_RETRY_ATTEMPTS: u32 = 7;
+
+/// Delay between retry attempts (exponential backoff base, reduced for faster reconnect)
+const RETRY_DELAY_MS: u64 = 50;
+
+/// Maximum delay between retries (cap exponential backoff)
+const MAX_RETRY_DELAY_MS: u64 = 2000;
+
+/// Health check interval for proactive reconnection
+const HEALTH_CHECK_INTERVAL_SECS: u64 = 15;
 
 // ============================================================================
 // CONSTANTS - ALIGNED WITH HTTP VALUES
@@ -398,52 +407,58 @@ impl QuicTransport {
     }
     
     /// Handle server-side handshake
+    /// v2.24: Added timeout to prevent hanging connections
     async fn handle_server_handshake(
         conn: &Connection,
         our_node_id: &str,
         our_cert_serial: &str,
         our_node_type: &str,
     ) -> Result<(String, String, String), String> {
-        // Accept bidirectional stream for handshake
-        let (mut send, mut recv) = conn.accept_bi().await
-            .map_err(|e| format!("Accept stream failed: {}", e))?;
+        // v2.24: Timeout for entire handshake (prevents "aborted by peer" errors)
+        let handshake_timeout = Duration::from_secs(CONNECT_TIMEOUT_SECS);
         
-        // Receive peer's handshake
-        let mut len_buf = [0u8; 4];
-        recv.read_exact(&mut len_buf).await.map_err(|e| format!("Read len failed: {}", e))?;
-        let len = u32::from_be_bytes(len_buf) as usize;
-        
-        if len > MAX_MESSAGE_SIZE {
-            return Err(format!("Handshake too large: {}", len));
-        }
-        
-        let mut data = vec![0u8; len];
-        recv.read_exact(&mut data).await.map_err(|e| format!("Read data failed: {}", e))?;
-        
-        let peer_handshake: NodeHandshake = bincode::deserialize(&data)
-            .map_err(|e| format!("Handshake deserialize failed: {}", e))?;
-        
-        // Send our handshake
-        let our_handshake = NodeHandshake {
-            node_id: our_node_id.to_string(),
-            cert_serial: our_cert_serial.to_string(),
-            protocol_version: PROTOCOL_VERSION,
-            node_type: our_node_type.to_string(),
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-        };
-        
-        let handshake_bytes = bincode::serialize(&our_handshake)
-            .map_err(|e| format!("Handshake serialize failed: {}", e))?;
-        
-        let len_bytes = (handshake_bytes.len() as u32).to_be_bytes();
-        send.write_all(&len_bytes).await.map_err(|e| format!("Write len failed: {}", e))?;
-        send.write_all(&handshake_bytes).await.map_err(|e| format!("Write data failed: {}", e))?;
-        send.finish().map_err(|e| format!("Finish failed: {}", e))?;
-        
-        Ok((peer_handshake.node_id, peer_handshake.cert_serial, peer_handshake.node_type))
+        tokio::time::timeout(handshake_timeout, async {
+            // Accept bidirectional stream for handshake
+            let (mut send, mut recv) = conn.accept_bi().await
+                .map_err(|e| format!("Accept stream failed: {}", e))?;
+            
+            // Receive peer's handshake
+            let mut len_buf = [0u8; 4];
+            recv.read_exact(&mut len_buf).await.map_err(|e| format!("Read len failed: {}", e))?;
+            let len = u32::from_be_bytes(len_buf) as usize;
+            
+            if len > MAX_MESSAGE_SIZE {
+                return Err(format!("Handshake too large: {}", len));
+            }
+            
+            let mut data = vec![0u8; len];
+            recv.read_exact(&mut data).await.map_err(|e| format!("Read data failed: {}", e))?;
+            
+            let peer_handshake: NodeHandshake = bincode::deserialize(&data)
+                .map_err(|e| format!("Handshake deserialize failed: {}", e))?;
+            
+            // Send our handshake
+            let our_handshake = NodeHandshake {
+                node_id: our_node_id.to_string(),
+                cert_serial: our_cert_serial.to_string(),
+                protocol_version: PROTOCOL_VERSION,
+                node_type: our_node_type.to_string(),
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            };
+            
+            let handshake_bytes = bincode::serialize(&our_handshake)
+                .map_err(|e| format!("Handshake serialize failed: {}", e))?;
+            
+            let len_bytes = (handshake_bytes.len() as u32).to_be_bytes();
+            send.write_all(&len_bytes).await.map_err(|e| format!("Write len failed: {}", e))?;
+            send.write_all(&handshake_bytes).await.map_err(|e| format!("Write data failed: {}", e))?;
+            send.finish().map_err(|e| format!("Finish failed: {}", e))?;
+            
+            Ok((peer_handshake.node_id, peer_handshake.cert_serial, peer_handshake.node_type))
+        }).await.map_err(|_| "Handshake timeout".to_string())?
     }
     
     /// Handle incoming streams from a connection
@@ -611,6 +626,7 @@ impl QuicTransport {
     
     /// Connect to a peer (client mode) with auto-retry
     /// CRITICAL: Thread-safe with double-check to prevent race conditions
+    /// v2.24: Improved retry logic for handshake failures
     pub async fn connect(&self, peer_addr: SocketAddr) -> Result<Arc<QuicConnection>, String> {
         // FIRST CHECK: Existing connection - but only if it's ALIVE
         if let Some(conn) = self.connections.get(&peer_addr) {
@@ -627,9 +643,12 @@ impl QuicTransport {
         let endpoint = self.endpoint.as_ref()
             .ok_or("Endpoint not initialized")?;
         
-        // Retry loop for connection attempts
+        // v2.24: Use extended retry for handshake failures (common at startup)
+        let max_attempts = HANDSHAKE_RETRY_ATTEMPTS;
         let mut last_error = String::new();
-        for attempt in 1..=CONNECT_RETRY_ATTEMPTS {
+        let mut handshake_failures = 0u32;
+        
+        for attempt in 1..=max_attempts {
             // CRITICAL FIX: Double-check before creating connection (race condition protection)
             // Another task may have created connection while we were waiting
             if let Some(conn) = self.connections.get(&peer_addr) {
@@ -641,20 +660,37 @@ impl QuicTransport {
             match self.try_connect_once(endpoint, peer_addr).await {
                 Ok(conn) => return Ok(conn),
                 Err(e) => {
+                    // v2.24: Track handshake failures separately
+                    if e.contains("aborted by peer") || e.contains("handshake") {
+                        handshake_failures += 1;
+                    }
                     last_error = e;
-                    if attempt < CONNECT_RETRY_ATTEMPTS {
-                        let delay = Duration::from_millis(RETRY_DELAY_MS * (1 << (attempt - 1))); // Exponential backoff
-                        println!("[QUIC] ⚠️ Connection attempt {}/{} to {} failed, retrying in {:?}...",
-                            attempt, CONNECT_RETRY_ATTEMPTS,
-                            get_privacy_id_for_addr(&peer_addr.to_string()),
-                            delay);
+                    
+                    if attempt < max_attempts {
+                        // v2.24: Exponential backoff with cap
+                        let base_delay = RETRY_DELAY_MS * (1 << (attempt - 1).min(5));
+                        let delay = Duration::from_millis(base_delay.min(MAX_RETRY_DELAY_MS));
+                        
+                        // Only log every other attempt to reduce spam
+                        if attempt % 2 == 1 || attempt == max_attempts - 1 {
+                            println!("[QUIC] ⚠️ Connection attempt {}/{} to {} failed, retrying in {:?}...",
+                                attempt, max_attempts,
+                                get_privacy_id_for_addr(&peer_addr.to_string()),
+                                delay);
+                        }
                         tokio::time::sleep(delay).await;
                     }
                 }
             }
         }
         
-        Err(format!("Failed to connect after {} attempts: {}", CONNECT_RETRY_ATTEMPTS, last_error))
+        // v2.24: More informative error message
+        if handshake_failures > 0 {
+            Err(format!("Failed after {} attempts ({} handshake failures): {}", 
+                max_attempts, handshake_failures, last_error))
+        } else {
+            Err(format!("Failed to connect after {} attempts: {}", max_attempts, last_error))
+        }
     }
     
     /// Single connection attempt (internal helper)
@@ -743,48 +779,54 @@ impl QuicTransport {
     }
     
     /// Perform client-side handshake
+    /// v2.24: Added timeout to prevent hanging connections
     async fn perform_client_handshake(&self, conn: &Connection) -> Result<(String, String, String), String> {
-        // Our handshake
-        let our_handshake = NodeHandshake {
-            node_id: self.node_id.clone(),
-            cert_serial: self.cert_serial.clone(),
-            protocol_version: PROTOCOL_VERSION,
-            node_type: self.node_type.clone(),
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-        };
+        // v2.24: Timeout for entire handshake
+        let handshake_timeout = Duration::from_secs(CONNECT_TIMEOUT_SECS);
         
-        let handshake_bytes = bincode::serialize(&our_handshake)
-            .map_err(|e| format!("Serialize failed: {}", e))?;
-        
-        // Open stream
-        let (mut send, mut recv) = conn.open_bi().await
-            .map_err(|e| format!("Open stream failed: {}", e))?;
-        
-        // Send our handshake
-        let len_bytes = (handshake_bytes.len() as u32).to_be_bytes();
-        send.write_all(&len_bytes).await.map_err(|e| format!("Write len failed: {}", e))?;
-        send.write_all(&handshake_bytes).await.map_err(|e| format!("Write data failed: {}", e))?;
-        send.finish().map_err(|e| format!("Finish failed: {}", e))?;
-        
-        // Receive peer's handshake
-        let mut len_buf = [0u8; 4];
-        recv.read_exact(&mut len_buf).await.map_err(|e| format!("Read len failed: {}", e))?;
-        let len = u32::from_be_bytes(len_buf) as usize;
-        
-        if len > MAX_MESSAGE_SIZE {
-            return Err(format!("Handshake too large: {}", len));
-        }
-        
-        let mut data = vec![0u8; len];
-        recv.read_exact(&mut data).await.map_err(|e| format!("Read data failed: {}", e))?;
-        
-        let peer_handshake: NodeHandshake = bincode::deserialize(&data)
-            .map_err(|e| format!("Deserialize failed: {}", e))?;
-        
-        Ok((peer_handshake.node_id, peer_handshake.cert_serial, peer_handshake.node_type))
+        tokio::time::timeout(handshake_timeout, async {
+            // Our handshake
+            let our_handshake = NodeHandshake {
+                node_id: self.node_id.clone(),
+                cert_serial: self.cert_serial.clone(),
+                protocol_version: PROTOCOL_VERSION,
+                node_type: self.node_type.clone(),
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            };
+            
+            let handshake_bytes = bincode::serialize(&our_handshake)
+                .map_err(|e| format!("Serialize failed: {}", e))?;
+            
+            // Open stream
+            let (mut send, mut recv) = conn.open_bi().await
+                .map_err(|e| format!("Open stream failed: {}", e))?;
+            
+            // Send our handshake
+            let len_bytes = (handshake_bytes.len() as u32).to_be_bytes();
+            send.write_all(&len_bytes).await.map_err(|e| format!("Write len failed: {}", e))?;
+            send.write_all(&handshake_bytes).await.map_err(|e| format!("Write data failed: {}", e))?;
+            send.finish().map_err(|e| format!("Finish failed: {}", e))?;
+            
+            // Receive peer's handshake
+            let mut len_buf = [0u8; 4];
+            recv.read_exact(&mut len_buf).await.map_err(|e| format!("Read len failed: {}", e))?;
+            let len = u32::from_be_bytes(len_buf) as usize;
+            
+            if len > MAX_MESSAGE_SIZE {
+                return Err(format!("Handshake too large: {}", len));
+            }
+            
+            let mut data = vec![0u8; len];
+            recv.read_exact(&mut data).await.map_err(|e| format!("Read data failed: {}", e))?;
+            
+            let peer_handshake: NodeHandshake = bincode::deserialize(&data)
+                .map_err(|e| format!("Deserialize failed: {}", e))?;
+            
+            Ok((peer_handshake.node_id, peer_handshake.cert_serial, peer_handshake.node_type))
+        }).await.map_err(|_| "Handshake timeout".to_string())?
     }
     
     /// Send message to peer (request-response) with retry
@@ -1019,6 +1061,59 @@ impl QuicTransport {
                 }
             })
             .collect()
+    }
+    
+    /// v2.24: Health check - cleanup dead connections and return count of alive connections
+    /// Call this periodically (every 15s) to maintain healthy connection pool
+    pub fn health_check(&self) -> (usize, usize) {
+        let mut alive = 0;
+        let mut removed = 0;
+        let mut dead_addrs = Vec::new();
+        
+        for entry in self.connections.iter() {
+            if entry.value().connection.close_reason().is_some() {
+                dead_addrs.push(*entry.key());
+            } else {
+                alive += 1;
+            }
+        }
+        
+        for addr in dead_addrs {
+            self.connections.remove(&addr);
+            removed += 1;
+        }
+        
+        if removed > 0 {
+            println!("[QUIC] 🧹 Health check: removed {} dead connections, {} alive", removed, alive);
+        }
+        
+        (alive, removed)
+    }
+    
+    /// v2.24: Get alive connection count (excludes dead connections)
+    pub fn alive_connection_count(&self) -> usize {
+        self.connections.iter()
+            .filter(|entry| entry.value().connection.close_reason().is_none())
+            .count()
+    }
+    
+    /// v2.24: Check if a specific connection is alive
+    pub fn is_connection_alive(&self, peer_addr: &SocketAddr) -> bool {
+        self.connections.get(peer_addr)
+            .map(|conn| conn.connection.close_reason().is_none())
+            .unwrap_or(false)
+    }
+    
+    /// v2.24: Force reconnect to a peer (removes dead connection and creates new one)
+    pub async fn force_reconnect(&self, peer_addr: SocketAddr) -> Result<Arc<QuicConnection>, String> {
+        // Remove any existing connection (dead or alive)
+        if self.connections.remove(&peer_addr).is_some() {
+            println!("[QUIC] 🔄 Force removing connection to {} for reconnect", 
+                     get_privacy_id_for_addr(&peer_addr.to_string()));
+        }
+        
+        // Create new connection
+        self.connect(peer_addr).await
     }
     
     /// Stop server

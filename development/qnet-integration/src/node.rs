@@ -4858,7 +4858,8 @@ impl BlockchainNode {
                                                     }).await;
                                                     
                                                     let mut instances_guard = instances.lock().await;
-                                                    let normalized_id = node_id.replace('-', "_");
+                                                    // v2.24: Use unified normalize_node_id for consistent key lookup
+                                                    let normalized_id = Self::normalize_node_id(&node_id);
                                                     
                                                     // CRITICAL: Always create/get instance for certificate broadcast
                                                     if !instances_guard.contains_key(&normalized_id) {
@@ -4958,7 +4959,8 @@ impl BlockchainNode {
                                     }).await;
                                     
                                     let mut instances_guard = instances.lock().await;
-                                    let normalized_id = node_id.replace('-', "_");
+                                    // v2.24: Use unified normalize_node_id for consistent key lookup
+                                    let normalized_id = Self::normalize_node_id(&node_id);
                                     
                                     // CRITICAL: Always create/get instance for certificate broadcast
                                     if !instances_guard.contains_key(&normalized_id) {
@@ -10630,9 +10632,10 @@ impl BlockchainNode {
         // Use explicit parameter passed from caller who knows the context
         
         if is_macroblock {
-            // MACROBLOCK: Use FULL signature (12KB) with embedded certificate
+            // MACROBLOCK: Use FULL signature (5KB bincode) with embedded certificate
             // No delay for certificate requests, immediate verification
             // CRITICAL: commit_hash is HEX string, need to decode to actual bytes
+            use base64::{Engine as _, engine::general_purpose};
             let commit_bytes = match hex::decode(commit_hash) {
                 Ok(bytes) => bytes,
                 Err(e) => {
@@ -10643,14 +10646,16 @@ impl BlockchainNode {
             };
             match hybrid.sign_message(&commit_bytes).await {
                 Ok(full_sig) => {
-                    println!("[CONSENSUS] ✅ Generated FULL hybrid signature for MACROBLOCK (12KB)");
-                    println!("[CONSENSUS]    Certificate embedded: {}", full_sig.certificate.serial_number);
-                    println!("[CONSENSUS]    Immediate verification: No network delays");
-                    
-                    // Format: "hybrid:<json_data>" for full signatures
-                    match serde_json::to_string(&full_sig) {
-                        Ok(json_data) => {
-                            format!("hybrid:{}", json_data)
+                    // OPTIMIZED v2.24: Use bincode+zstd instead of JSON (5KB vs 27KB!)
+                    match full_sig.to_binary_compressed() {
+                        Ok(binary_data) => {
+                            let base64_data = general_purpose::STANDARD.encode(&binary_data);
+                            println!("[CONSENSUS] ✅ Generated FULL hybrid signature for MACROBLOCK ({}KB bincode)", 
+                                     binary_data.len() / 1024);
+                            println!("[CONSENSUS]    Certificate embedded: {}", full_sig.certificate.serial_number);
+                            println!("[CONSENSUS]    Format: bincode+zstd+base64 (optimized v2.24)");
+                            // Format: "hybrid_bin:<base64_bincode_data>" for binary signatures
+                            format!("hybrid_bin:{}", base64_data)
                         }
                         Err(e) => {
                             println!("[CONSENSUS] ⚠️ Failed to serialize full signature: {}", e);
@@ -10679,14 +10684,17 @@ impl BlockchainNode {
             };
             match hybrid.sign_message_compact(&commit_bytes).await {
                 Ok(compact_sig) => {
-                    println!("[CONSENSUS] ✅ Generated COMPACT hybrid signature for MICROBLOCK (3KB)");
-                    println!("[CONSENSUS]    Certificate: {}", compact_sig.cert_serial);
-                    println!("[CONSENSUS]    Optimized for high throughput");
-                    
-                    // Format: "compact:<json_data>" for compact signatures
-                    match serde_json::to_string(&compact_sig) {
-                        Ok(json_data) => {
-                            format!("compact:{}", json_data)
+                    // OPTIMIZED v2.24: Use bincode+zstd instead of JSON (2.6KB vs 5KB!)
+                    use base64::{Engine as _, engine::general_purpose};
+                    match compact_sig.to_binary_compressed() {
+                        Ok(binary_data) => {
+                            let base64_data = general_purpose::STANDARD.encode(&binary_data);
+                            println!("[CONSENSUS] ✅ Generated COMPACT hybrid signature for MICROBLOCK ({}KB bincode)", 
+                                     binary_data.len() / 1024);
+                            println!("[CONSENSUS]    Certificate: {}", compact_sig.cert_serial);
+                            println!("[CONSENSUS]    Format: bincode+zstd (optimized v2.24)");
+                            // Format: "compact_bin:<base64_bincode_data>" for binary signatures
+                            format!("compact_bin:{}", base64_data)
                         }
                         Err(e) => {
                             println!("[CONSENSUS] ⚠️ Failed to serialize compact signature: {}", e);
@@ -10720,12 +10728,8 @@ impl BlockchainNode {
         
         let mut instances_guard = instances.lock().await;
         
-        // Normalize node_id
-        let normalized_node_id = if node_id.starts_with("qn_") {
-            node_id.to_string()
-        } else {
-            format!("qn_{}", node_id)
-        };
+        // v2.24: Use node_id directly
+        let normalized_node_id = node_id.to_string();
         
         // Create instance if not exists - MUST succeed
         if !instances_guard.contains_key(&normalized_node_id) {
@@ -10749,12 +10753,15 @@ impl BlockchainNode {
         };
         
         // CRITICAL: Sign with hybrid (ephemeral Ed25519 + Dilithium per NIST/Cisco)
+        // OPTIMIZED v2.24: bincode+zstd format
+        use base64::{Engine as _, engine::general_purpose};
         match hybrid.sign_message_compact(&commit_bytes).await {
             Ok(compact_sig) => {
-                match serde_json::to_string(&compact_sig) {
-                    Ok(json) => {
-                        println!("[CRYPTO] ✅ RECOVERY: HYBRID signature created (NIST/Cisco)");
-                        format!("compact:{}", json)
+                match compact_sig.to_binary_compressed() {
+                    Ok(binary_data) => {
+                        let base64_data = general_purpose::STANDARD.encode(&binary_data);
+                        println!("[CRYPTO] ✅ RECOVERY: HYBRID signature created (bincode v2.24)");
+                        format!("compact_bin:{}", base64_data)
                     }
                     Err(e) => {
                         println!("[CRYPTO] ❌ FATAL: Cannot serialize hybrid signature: {}", e);
@@ -10865,19 +10872,30 @@ impl BlockchainNode {
             }
         }
         
-        // Create COMPACT signature for microblock (3KB)
+        // Create COMPACT signature for microblock (2.6KB bincode)
         // CRITICAL: Sign the raw hash bytes, not the hex string!
+        // OPTIMIZED v2.24: bincode+zstd instead of JSON
+        use base64::{Engine as _, engine::general_purpose};
         match hybrid.sign_message_compact(message_hash.as_ref()).await {
             Ok(compact_sig) => {
-                // Serialize compact signature to JSON string
-                let sig_json = serde_json::to_string(&compact_sig).map_err(|e| e.to_string())?;
-                let sig_with_prefix = format!("compact:{}", sig_json);
-                let sig_bytes = sig_with_prefix.as_bytes().to_vec();
-                
-                println!("[CRYPTO] ✅ Microblock #{} signed with COMPACT hybrid signature", microblock.height);
-                println!("[CRYPTO]    Certificate: {}", compact_sig.cert_serial);
-                println!("[CRYPTO]    Size: {} bytes (~3KB optimized)", sig_bytes.len());
-                Ok(sig_bytes)
+                // Serialize to bincode+zstd+base64
+                match compact_sig.to_binary_compressed() {
+                    Ok(binary_data) => {
+                        let base64_data = general_purpose::STANDARD.encode(&binary_data);
+                        let sig_with_prefix = format!("compact_bin:{}", base64_data);
+                        let sig_bytes = sig_with_prefix.as_bytes().to_vec();
+                        
+                        println!("[CRYPTO] ✅ Microblock #{} signed with COMPACT hybrid signature", microblock.height);
+                        println!("[CRYPTO]    Certificate: {}", compact_sig.cert_serial);
+                        println!("[CRYPTO]    Size: {} bytes (bincode v2.24)", sig_bytes.len());
+                        Ok(sig_bytes)
+                    }
+                    Err(e) => {
+                        println!("[CRYPTO] ❌ Compact signature serialization failed: {:?}", e);
+                        drop(instances_guard);
+                        Self::sign_microblock_with_pure_dilithium(microblock, node_id).await
+                    }
+                }
             }
             Err(e) => {
                 println!("[CRYPTO] ❌ Compact signature failed for microblock: {:?}", e);
@@ -10929,13 +10947,16 @@ impl BlockchainNode {
         let hybrid = instances_guard.get_mut(&normalized_node_id).expect("Inserted above");
         
         // CRITICAL: Sign with hybrid (ephemeral Ed25519 + Dilithium per NIST/Cisco)
+        // OPTIMIZED v2.24: bincode+zstd format
+        use base64::{Engine as _, engine::general_purpose};
         match hybrid.sign_message_compact(message_hash.as_ref()).await {
             Ok(compact_sig) => {
-                match serde_json::to_string(&compact_sig) {
-                    Ok(json) => {
-                        let sig_with_prefix = format!("compact:{}", json);
+                match compact_sig.to_binary_compressed() {
+                    Ok(binary_data) => {
+                        let base64_data = general_purpose::STANDARD.encode(&binary_data);
+                        let sig_with_prefix = format!("compact_bin:{}", base64_data);
                         let sig_bytes = sig_with_prefix.as_bytes().to_vec();
-                        println!("[CRYPTO] ✅ RECOVERY: Microblock #{} signed with HYBRID (NIST/Cisco)", microblock.height);
+                        println!("[CRYPTO] ✅ RECOVERY: Microblock #{} signed with HYBRID (bincode v2.24)", microblock.height);
                         Ok(sig_bytes)
                     }
                     Err(e) => {
@@ -10986,296 +11007,245 @@ impl BlockchainNode {
             }
         };
         
-        // PRODUCTION: Check if this is a compact signature (new format)
-        if sig_str.starts_with("compact:") {
-            // Parse compact signature JSON
-            let sig_json = &sig_str[8..]; // Skip "compact:" prefix
-            let compact_sig: crate::hybrid_crypto::CompactHybridSignature = match serde_json::from_str(sig_json) {
+        // PRODUCTION: Check if this is a compact signature
+        // v2.24: Support both bincode (compact_bin:) and legacy JSON (compact:)
+        use base64::{Engine as _, engine::general_purpose};
+        let compact_sig: crate::hybrid_crypto::CompactHybridSignature = if sig_str.starts_with("compact_bin:") {
+            // v2.24: Parse binary compact signature (bincode+zstd+base64)
+            let base64_data = &sig_str[12..]; // Skip "compact_bin:" prefix
+            let binary_data = match general_purpose::STANDARD.decode(base64_data) {
+                Ok(data) => data,
+                Err(e) => {
+                    println!("[CRYPTO] ❌ Failed to decode compact_bin base64: {}", e);
+                    return Ok(false);
+                }
+            };
+            match crate::hybrid_crypto::CompactHybridSignature::from_binary_compressed(&binary_data) {
                 Ok(sig) => sig,
                 Err(e) => {
-                    println!("[CRYPTO] ❌ Failed to parse compact signature: {}", e);
+                    println!("[CRYPTO] ❌ Failed to parse compact_bin signature: {}", e);
                     return Ok(false);
                 }
-            };
-            
-            // Verify node_id matches
-            if compact_sig.node_id != microblock.producer {
-                println!("[CRYPTO] ❌ Node ID mismatch in signature: {} != {}", 
-                         compact_sig.node_id, microblock.producer);
-                return Ok(false);
             }
-            
-            // Recreate message hash for verification
-            let mut hasher = Sha3_256::new();
-            hasher.update(&microblock.height.to_be_bytes());
-            hasher.update(&microblock.timestamp.to_be_bytes());
-            hasher.update(&microblock.merkle_root);
-            hasher.update(&microblock.previous_hash);
-            hasher.update(microblock.producer.as_bytes());
-            let message_hash_str = hex::encode(hasher.finalize());
-            
-            // PRODUCTION: REAL cryptographic verification for post-quantum blockchain
-            // CRITICAL: Both Ed25519 AND Dilithium MUST be verified for NIST/Cisco compliance
-            
-            // Basic size validation
-            if compact_sig.message_signature.len() != 64 {
-                println!("[CRYPTO] ❌ Invalid Ed25519 signature size: {}", compact_sig.message_signature.len());
-                return Ok(false);
-            }
-            
-            // OPTIMIZED v2.23: RAW bytes format with single Dilithium signature
-            // dilithium_message_signature removed (redundant - message_hash is in encapsulated_data)
-            
-            // STEP 1: Get certificate from P2P cache for Ed25519 verification
-            println!("[CRYPTO] 🔐 Verifying compact signature for block #{}", microblock.height);
-            
-            // STEP 2: Verify Ed25519 signature with certificate
-            // For decentralized post-quantum blockchain, we need BOTH signatures valid
-            use crate::hybrid_crypto::{HybridCrypto, HybridCertificate};
-            use ed25519_dalek::{Signature as Ed25519Signature, VerifyingKey, Verifier};
-            
-            // Get certificate from P2P cache
-            let ed25519_verified = if let Some(p2p_ref) = p2p {
-                // Get certificate from P2P certificate manager
-                // MUST use write lock to properly track usage_count for LRU
-                let mut cert_manager = match p2p_ref.certificate_manager.write() {
-                    Ok(guard) => guard,
-                    Err(poisoned) => {
-                        println!("[CRYPTO] ⚠️ Certificate manager mutex poisoned, recovering...");
-                        poisoned.into_inner()
-                    }
-                };
-                if let Some(cert_data) = cert_manager.get_and_mark_used(&compact_sig.cert_serial) {
-                    drop(cert_manager); // Release lock early
-                    
-                    // Deserialize certificate
-                    if let Ok(certificate) = bincode::deserialize::<HybridCertificate>(&cert_data) {
-                        // Verify certificate belongs to the producer
-                        if certificate.node_id != compact_sig.node_id {
-                            println!("[CRYPTO] ❌ Certificate node_id mismatch: {} != {}", 
-                                     certificate.node_id, compact_sig.node_id);
-                            false
-                        } else if certificate.node_id != microblock.producer {
-                            println!("[CRYPTO] ❌ Certificate doesn't belong to block producer: {} != {}", 
-                                     certificate.node_id, microblock.producer);
-                            false
-                        } else {
-                            // Check certificate expiration with GRACE PERIOD
-                            // CRITICAL: Allow 60 second grace period for network propagation delays
-                            // Blocks signed just before certificate expiry should still be valid
-                            const CERTIFICATE_VERIFICATION_GRACE_SECS: u64 = 60;
-                            let now = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs();
-                            let expires_with_grace = certificate.expires_at + CERTIFICATE_VERIFICATION_GRACE_SECS;
-                            if now > expires_with_grace {
-                                println!("[CRYPTO] ❌ Certificate expired at {} (with 60s grace), now is {}", 
-                                         expires_with_grace, now);
-                                false
-                            } else {
-                                // Verify Ed25519 signature using ephemeral public key (NIST/Cisco requirement)
-                                if let Ok(ed_sig_bytes) = compact_sig.message_signature.as_slice().try_into() {
-                                    let ed_sig_array: [u8; 64] = ed_sig_bytes;
-                                    
-                                    // Use HybridCrypto's verify_ed25519_signature method
-                                    // CRITICAL: Sign the raw hash bytes, not the hex string
-                                    // CRITICAL: Use EPHEMERAL public key, not certificate key!
-                                    let message_hash_bytes = hex::decode(&message_hash_str)
-                                        .map_err(|_| "Invalid hex in message hash")?;
-                                    match HybridCrypto::verify_ed25519_signature(
-                                        &message_hash_bytes,
-                                        &ed_sig_array,
-                                        &compact_sig.ephemeral_public_key  // Use ephemeral key per NIST/Cisco
-                                    ) {
-                                        Ok(true) => {
-                                            println!("[CRYPTO] ✅ Ed25519 signature verified with ephemeral key");
-                                            println!("[CRYPTO]    Certificate: {}", certificate.serial_number);
-                                            println!("[CRYPTO]    Producer: {}", certificate.node_id);
-                                            true
-                                        }
-                                        Ok(false) => {
-                                            println!("[CRYPTO] ❌ Ed25519 signature verification failed!");
-                                            false
-                                        }
-                                        Err(e) => {
-                                            println!("[CRYPTO] ❌ Ed25519 verification error: {}", e);
-                                            false
-                                        }
-                                    }
-                                } else {
-                                    println!("[CRYPTO] ❌ Ed25519 signature wrong size!");
-                                    false
-                                }
-                            }
-                        }
-                    } else {
-                        println!("[CRYPTO] ⚠️ Failed to deserialize certificate for {}", compact_sig.cert_serial);
-                        // Byzantine consensus will catch this if majority of nodes fail
-                        false
-                    }
-                } else {
-                    println!("[CRYPTO] ⚠️ Certificate {} not found in cache", compact_sig.cert_serial);
-                    
-                    // ACTIVE REQUEST: Send CertificateRequest to producer if not recently requested
-                    if let Some(p2p_ref) = p2p {
-                        let now = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap_or(Duration::from_secs(0))
-                            .as_secs();
-                        
-                        // DDoS PROTECTION: Check if we already requested this certificate recently (5s cooldown)
-                        let should_request = match REQUESTED_CERTIFICATES.lock() {
-                            Ok(mut requested) => {
-                                if let Some(&last_request) = requested.get(&compact_sig.cert_serial) {
-                                    if now - last_request < 5 {
-                                        false // Too soon, skip request
-                                    } else {
-                                        requested.insert(compact_sig.cert_serial.clone(), now);
-                                        true
-                                    }
-                                } else {
-                                    requested.insert(compact_sig.cert_serial.clone(), now);
-                                    true
-                                }
-                            }
-                            Err(poisoned) => {
-                                // SECURITY: Recover from poisoned lock to prevent DoS
-                                let mut requested = poisoned.into_inner();
-                                requested.insert(compact_sig.cert_serial.clone(), now);
-                                true
-                            }
-                        };
-                        
-                        if should_request {
-                            println!("[CRYPTO] 📤 Requesting missing certificate {} from producer {}", 
-                                compact_sig.cert_serial, compact_sig.node_id);
-                            
-                            // Get producer address
-                            if let Some(producer_addr) = p2p_ref.get_peer_address(&compact_sig.node_id) {
-                                // Random delay (0-1000ms) to prevent thundering herd
-                                let delay_ms = (now % 1000) as u64;
-                                let p2p_clone = p2p_ref.clone();
-                                let cert_serial = compact_sig.cert_serial.clone();
-                                let producer_id = compact_sig.node_id.clone();
-                                
-                                // PRODUCTION: Request certificate directly from producer via P2P
-                                let p2p_for_cert = p2p_clone.clone();
-                                let cert_serial_clone = cert_serial.clone();
-                                let producer_id_clone = producer_id.clone();
-                                tokio::spawn(async move {
-                                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                                    
-                                    // Send certificate request to producer
-                                    p2p_for_cert.request_certificate(&producer_id_clone, &cert_serial_clone);
-                                    println!("[CRYPTO] 📤 Requested certificate {} from producer {}", 
-                                             cert_serial_clone, producer_id_clone);
-                                });
-                            }
-                        }
-                    }
-                    
-                    println!("[CRYPTO]    Block will be buffered and retried after certificate arrives");
-                    false // Reject for now, will succeed on retry after certificate arrives
-                }
-            } else {
-                println!("[CRYPTO] ⚠️ No P2P instance available for certificate verification");
-                // Fallback: only check signature format
-                if let Ok(ed_sig_bytes) = compact_sig.message_signature.as_slice().try_into() {
-                    let ed_sig_array: [u8; 64] = ed_sig_bytes;
-                    let _signature = Ed25519Signature::from_bytes(&ed_sig_array);
-                    println!("[CRYPTO] ⚠️ Ed25519 signature format valid but not cryptographically verified");
-                    false // Conservative: reject if we can't fully verify
-                } else {
-                    println!("[CRYPTO] ❌ Ed25519 signature wrong size!");
-                    false
-                }
-            };
-            
-            if !ed25519_verified {
-                return Ok(false);
-            }
-            
-            // STEP 3: Verify Dilithium signatures (quantum-resistant, MANDATORY per NIST/Cisco)
-            // NIST/Cisco requirement: Verify BOTH Dilithium signatures
-            // 1. Dilithium signature of encapsulated_data (ephemeral key)
-            // 2. Dilithium signature of message
-            use crate::quantum_crypto::{QNetQuantumCrypto, DilithiumSignature};
-            let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
-            if crypto_guard.is_none() {
-                let mut crypto = QNetQuantumCrypto::new();
-                let _ = crypto.initialize().await;
-                *crypto_guard = Some(crypto);
-            }
-            let crypto = crypto_guard.as_mut().expect("Crypto initialized above");
-            
-            // SECURITY: Dilithium key signature is MANDATORY - no bypass!
-            // OPTIMIZED v2.23: RAW bytes format
-            if compact_sig.dilithium_key_signature.is_empty() {
-                println!("[CRYPTO] ❌ REJECTED: No Dilithium key signature - quantum attack possible!");
-                return Ok(false);
-            }
-            
-            // Verify Dilithium signature of encapsulated_data (ephemeral_key || message_hash || timestamp)
-            // This single signature proves:
-            // 1. Ephemeral key binding (key is bound to this message)
-            // 2. Message integrity (message_hash is inside)
-            // 3. Freshness (timestamp is inside)
-            let message_hash_bytes = hex::decode(&message_hash_str)
-                .map_err(|_| "Invalid hex in message hash")?;
-            let mut encapsulated_data = Vec::new();
-            encapsulated_data.extend_from_slice(&compact_sig.ephemeral_public_key);
-            encapsulated_data.extend_from_slice(&message_hash_bytes);
-            encapsulated_data.extend_from_slice(&compact_sig.signed_at.to_le_bytes());
-            let encapsulated_hex = hex::encode(&encapsulated_data);
-            
-            // OPTIMIZED v2.23: Convert RAW bytes to signature string
-            use crate::crypto::hybrid_crypto::encode_dilithium_signature;
-            let signature_string = encode_dilithium_signature(&compact_sig.node_id, &compact_sig.dilithium_key_signature);
-            
-            let dilithium_key_sig = DilithiumSignature {
-                signature: signature_string,
-                algorithm: "CRYSTALS-Dilithium3".to_string(),
-                timestamp: compact_sig.signed_at,
-                strength: "quantum-resistant".to_string(),
-            };
-            
-            match crypto.verify_dilithium_signature(&encapsulated_hex, &dilithium_key_sig, &compact_sig.node_id).await {
-                Ok(true) => {
-                    println!("[CRYPTO] ✅ Signatures verified (Ed25519 + Dilithium key)");
-                    println!("[CRYPTO]    Producer: {}", compact_sig.node_id);
-                    println!("[CRYPTO]    Certificate: {}", compact_sig.cert_serial);
-                    println!("[CRYPTO]    NIST/Cisco: ✅ Post-quantum compliant");
-                    return Ok(true);
-                }
-                Ok(false) => {
-                    println!("[CRYPTO] ❌ Dilithium key signature INVALID!");
-                    return Ok(false);
-                }
+        } else if sig_str.starts_with("compact:") {
+            // Legacy: Parse compact signature JSON
+            let sig_json = &sig_str[8..]; // Skip "compact:" prefix
+            match serde_json::from_str(sig_json) {
+                Ok(sig) => sig,
                 Err(e) => {
-                    println!("[CRYPTO] ❌ Dilithium verification error: {}", e);
-                    // SECURITY: NO BYPASS - Dilithium verification is MANDATORY
+                    println!("[CRYPTO] ❌ Failed to parse compact JSON signature: {}", e);
                     return Ok(false);
                 }
             }
+        } else {
+            // Not a recognized signature format - reject
+            println!("[CRYPTO] ❌ Unknown signature format: {}", &sig_str[..sig_str.len().min(20)]);
+            return Ok(false);
+        };
+        
+        // Verify node_id matches
+        if compact_sig.node_id != microblock.producer {
+            println!("[CRYPTO] ❌ Node ID mismatch in signature: {} != {}", 
+                     compact_sig.node_id, microblock.producer);
+            return Ok(false);
         }
         
-        // FALLBACK: Old format (pure Dilithium) for backward compatibility
-        // Recreate message hash (same as signing)
+        // Recreate message hash for verification
         let mut hasher = Sha3_256::new();
         hasher.update(&microblock.height.to_be_bytes());
         hasher.update(&microblock.timestamp.to_be_bytes());
         hasher.update(&microblock.merkle_root);
         hasher.update(&microblock.previous_hash);
         hasher.update(microblock.producer.as_bytes());
+        let message_hash_str = hex::encode(hasher.finalize());
         
-        let message_hash = hasher.finalize();
-        let microblock_hash = hex::encode(message_hash);
+        // PRODUCTION: REAL cryptographic verification for post-quantum blockchain
+        // CRITICAL: Both Ed25519 AND Dilithium MUST be verified for NIST/Cisco compliance
         
-        // Use EXISTING QNetQuantumCrypto for old format verification
+        // Basic size validation
+        if compact_sig.message_signature.len() != 64 {
+            println!("[CRYPTO] ❌ Invalid Ed25519 signature size: {}", compact_sig.message_signature.len());
+            return Ok(false);
+        }
+        
+        // OPTIMIZED v2.23: RAW bytes format with single Dilithium signature
+        // dilithium_message_signature removed (redundant - message_hash is in encapsulated_data)
+        
+        // STEP 1: Get certificate from P2P cache for Ed25519 verification
+        println!("[CRYPTO] 🔐 Verifying compact signature for block #{}", microblock.height);
+        
+        // STEP 2: Verify Ed25519 signature with certificate
+        // For decentralized post-quantum blockchain, we need BOTH signatures valid
+        use crate::hybrid_crypto::{HybridCrypto, HybridCertificate};
+        use ed25519_dalek::{Signature as Ed25519Signature, VerifyingKey, Verifier};
+        
+        // Get certificate from P2P cache
+        let ed25519_verified = if let Some(p2p_ref) = p2p {
+            // Get certificate from P2P certificate manager
+            // MUST use write lock to properly track usage_count for LRU
+            let mut cert_manager = match p2p_ref.certificate_manager.write() {
+                Ok(guard) => guard,
+                Err(poisoned) => {
+                    println!("[CRYPTO] ⚠️ Certificate manager mutex poisoned, recovering...");
+                    poisoned.into_inner()
+                }
+            };
+            if let Some(cert_data) = cert_manager.get_and_mark_used(&compact_sig.cert_serial) {
+                drop(cert_manager); // Release lock early
+                
+                // Deserialize certificate
+                if let Ok(certificate) = bincode::deserialize::<HybridCertificate>(&cert_data) {
+                    // Verify certificate belongs to the producer
+                    if certificate.node_id != compact_sig.node_id {
+                        println!("[CRYPTO] ❌ Certificate node_id mismatch: {} != {}", 
+                                 certificate.node_id, compact_sig.node_id);
+                        false
+                    } else if certificate.node_id != microblock.producer {
+                        println!("[CRYPTO] ❌ Certificate doesn't belong to block producer: {} != {}", 
+                                 certificate.node_id, microblock.producer);
+                        false
+                    } else {
+                        // Check certificate expiration with GRACE PERIOD
+                        // CRITICAL: Allow 60 second grace period for network propagation delays
+                        // Blocks signed just before certificate expiry should still be valid
+                        const CERTIFICATE_VERIFICATION_GRACE_SECS: u64 = 60;
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        let expires_with_grace = certificate.expires_at + CERTIFICATE_VERIFICATION_GRACE_SECS;
+                        if now > expires_with_grace {
+                            println!("[CRYPTO] ❌ Certificate expired at {} (with 60s grace), now is {}", 
+                                     expires_with_grace, now);
+                            false
+                        } else {
+                            // Verify Ed25519 signature using ephemeral public key (NIST/Cisco requirement)
+                            if let Ok(ed_sig_bytes) = compact_sig.message_signature.as_slice().try_into() {
+                                let ed_sig_array: [u8; 64] = ed_sig_bytes;
+                                
+                                // Use HybridCrypto's verify_ed25519_signature method
+                                // CRITICAL: Sign the raw hash bytes, not the hex string
+                                // CRITICAL: Use EPHEMERAL public key, not certificate key!
+                                let message_hash_bytes = hex::decode(&message_hash_str)
+                                    .map_err(|_| "Invalid hex in message hash")?;
+                                match HybridCrypto::verify_ed25519_signature(
+                                    &message_hash_bytes,
+                                    &ed_sig_array,
+                                    &compact_sig.ephemeral_public_key  // Use ephemeral key per NIST/Cisco
+                                ) {
+                                    Ok(true) => {
+                                        println!("[CRYPTO] ✅ Ed25519 signature verified with ephemeral key");
+                                        println!("[CRYPTO]    Certificate: {}", certificate.serial_number);
+                                        println!("[CRYPTO]    Producer: {}", certificate.node_id);
+                                        true
+                                    }
+                                    Ok(false) => {
+                                        println!("[CRYPTO] ❌ Ed25519 signature verification failed!");
+                                        false
+                                    }
+                                    Err(e) => {
+                                        println!("[CRYPTO] ❌ Ed25519 verification error: {}", e);
+                                        false
+                                    }
+                                }
+                            } else {
+                                println!("[CRYPTO] ❌ Ed25519 signature wrong size!");
+                                false
+                            }
+                        }
+                    }
+                } else {
+                    println!("[CRYPTO] ⚠️ Failed to deserialize certificate for {}", compact_sig.cert_serial);
+                    // Byzantine consensus will catch this if majority of nodes fail
+                    false
+                }
+            } else {
+                println!("[CRYPTO] ⚠️ Certificate {} not found in cache", compact_sig.cert_serial);
+                
+                // ACTIVE REQUEST: Send CertificateRequest to producer if not recently requested
+                if let Some(p2p_ref) = p2p {
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or(Duration::from_secs(0))
+                        .as_secs();
+                    
+                    // DDoS PROTECTION: Check if we already requested this certificate recently (5s cooldown)
+                    let should_request = match REQUESTED_CERTIFICATES.lock() {
+                        Ok(mut requested) => {
+                            if let Some(&last_request) = requested.get(&compact_sig.cert_serial) {
+                                if now - last_request < 5 {
+                                    false // Too soon, skip request
+                                } else {
+                                    requested.insert(compact_sig.cert_serial.clone(), now);
+                                    true
+                                }
+                            } else {
+                                requested.insert(compact_sig.cert_serial.clone(), now);
+                                true
+                            }
+                        }
+                        Err(poisoned) => {
+                            // SECURITY: Recover from poisoned lock to prevent DoS
+                            let mut requested = poisoned.into_inner();
+                            requested.insert(compact_sig.cert_serial.clone(), now);
+                            true
+                        }
+                    };
+                    
+                    if should_request {
+                        println!("[CRYPTO] 📤 Requesting missing certificate {} from producer {}", 
+                            compact_sig.cert_serial, compact_sig.node_id);
+                        
+                        // Get producer address
+                        if let Some(producer_addr) = p2p_ref.get_peer_address(&compact_sig.node_id) {
+                            // Random delay (0-1000ms) to prevent thundering herd
+                            let delay_ms = (now % 1000) as u64;
+                            let p2p_clone = p2p_ref.clone();
+                            let cert_serial = compact_sig.cert_serial.clone();
+                            let producer_id = compact_sig.node_id.clone();
+                            
+                            // PRODUCTION: Request certificate directly from producer via P2P
+                            let p2p_for_cert = p2p_clone.clone();
+                            let cert_serial_clone = cert_serial.clone();
+                            let producer_id_clone = producer_id.clone();
+                            tokio::spawn(async move {
+                                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                                
+                                // Send certificate request to producer
+                                p2p_for_cert.request_certificate(&producer_id_clone, &cert_serial_clone);
+                                println!("[CRYPTO] 📤 Requested certificate {} from producer {}", 
+                                         cert_serial_clone, producer_id_clone);
+                            });
+                        }
+                    }
+                }
+                
+                println!("[CRYPTO]    Block will be buffered and retried after certificate arrives");
+                false // Reject for now, will succeed on retry after certificate arrives
+            }
+        } else {
+            println!("[CRYPTO] ⚠️ No P2P instance available for certificate verification");
+            // Fallback: only check signature format
+            if let Ok(ed_sig_bytes) = compact_sig.message_signature.as_slice().try_into() {
+                let ed_sig_array: [u8; 64] = ed_sig_bytes;
+                let _signature = Ed25519Signature::from_bytes(&ed_sig_array);
+                println!("[CRYPTO] ⚠️ Ed25519 signature format valid but not cryptographically verified");
+                false // Conservative: reject if we can't fully verify
+            } else {
+                println!("[CRYPTO] ❌ Ed25519 signature wrong size!");
+                false
+            }
+        };
+        
+        if !ed25519_verified {
+            return Ok(false);
+        }
+        
+        // STEP 3: Verify Dilithium signatures (quantum-resistant, MANDATORY per NIST/Cisco)
+        // NIST/Cisco requirement: Verify BOTH Dilithium signatures
+        // 1. Dilithium signature of encapsulated_data (ephemeral key)
+        // 2. Dilithium signature of message
         use crate::quantum_crypto::{QNetQuantumCrypto, DilithiumSignature};
-        
-        // Use global crypto instance to avoid repeated initialization
         let mut crypto_guard = GLOBAL_QUANTUM_CRYPTO.lock().await;
         if crypto_guard.is_none() {
             let mut crypto = QNetQuantumCrypto::new();
@@ -11284,41 +11254,55 @@ impl BlockchainNode {
         }
         let crypto = crypto_guard.as_mut().expect("Crypto initialized above");
         
-        // Create DilithiumSignature from microblock signature
-        // Convert back to string directly, no hex decoding needed
-        let signature = DilithiumSignature {
-            signature: String::from_utf8(microblock.signature.clone())
-                .unwrap_or_else(|_| hex::encode(&microblock.signature)),  // Fallback to hex if not UTF-8
+        // SECURITY: Dilithium key signature is MANDATORY - no bypass!
+        // OPTIMIZED v2.23: RAW bytes format
+        if compact_sig.dilithium_key_signature.is_empty() {
+            println!("[CRYPTO] ❌ REJECTED: No Dilithium key signature - quantum attack possible!");
+            return Ok(false);
+        }
+        
+        // Verify Dilithium signature of encapsulated_data (ephemeral_key || message_hash || timestamp)
+        // This single signature proves:
+        // 1. Ephemeral key binding (key is bound to this message)
+        // 2. Message integrity (message_hash is inside)
+        // 3. Freshness (timestamp is inside)
+        let message_hash_bytes = hex::decode(&message_hash_str)
+            .map_err(|_| "Invalid hex in message hash")?;
+        let mut encapsulated_data = Vec::new();
+        encapsulated_data.extend_from_slice(&compact_sig.ephemeral_public_key);
+        encapsulated_data.extend_from_slice(&message_hash_bytes);
+        encapsulated_data.extend_from_slice(&compact_sig.signed_at.to_le_bytes());
+        let encapsulated_hex = hex::encode(&encapsulated_data);
+        
+        // OPTIMIZED v2.23: Convert RAW bytes to signature string
+        use crate::crypto::hybrid_crypto::encode_dilithium_signature;
+        let signature_string = encode_dilithium_signature(&compact_sig.node_id, &compact_sig.dilithium_key_signature);
+        
+        let dilithium_key_sig = DilithiumSignature {
+            signature: signature_string,
             algorithm: "CRYSTALS-Dilithium3".to_string(),
-            timestamp: microblock.timestamp,
+            timestamp: compact_sig.signed_at,
             strength: "quantum-resistant".to_string(),
         };
         
-        // Verify using existing quantum crypto
-        let signature_valid = match crypto.verify_dilithium_signature(&microblock_hash, &signature, &microblock.producer).await {
-            Ok(is_valid) => {
-                if is_valid {
-                    println!("[CRYPTO] ✅ Microblock signature verified with existing QNetQuantumCrypto");
-                } else {
-                    println!("[CRYPTO] ❌ Microblock signature verification failed");
-                }
-                is_valid
+        match crypto.verify_dilithium_signature(&encapsulated_hex, &dilithium_key_sig, &compact_sig.node_id).await {
+            Ok(true) => {
+                println!("[CRYPTO] ✅ Signatures verified (Ed25519 + Dilithium key)");
+                println!("[CRYPTO]    Producer: {}", compact_sig.node_id);
+                println!("[CRYPTO]    Certificate: {}", compact_sig.cert_serial);
+                println!("[CRYPTO]    NIST/Cisco: ✅ Post-quantum compliant");
+                return Ok(true);
+            }
+            Ok(false) => {
+                println!("[CRYPTO] ❌ Dilithium key signature INVALID!");
+                return Ok(false);
             }
             Err(e) => {
-                // NO FALLBACK - quantum crypto is mandatory for production
-                println!("[CRYPTO] ❌ Quantum crypto verification error: {:?}", e);
-                println!("[CRYPTO] ❌ Block rejected - invalid quantum signature");
-                false  // ALWAYS reject if quantum verification fails
+                println!("[CRYPTO] ❌ Dilithium verification error: {}", e);
+                // SECURITY: NO BYPASS - Dilithium verification is MANDATORY
+                Ok(false)
             }
-        };
-        
-        if signature_valid {
-            println!("[CRYPTO] ✅ Dilithium signature verified for microblock #{}", microblock.height);
-        } else {
-            println!("[CRYPTO] ❌ Dilithium signature verification failed for microblock #{}", microblock.height);
         }
-        
-        Ok(signature_valid)
     }
     
     async fn get_previous_microblock_hash(
@@ -14650,7 +14634,7 @@ mod tests {
         
         // OPTIMIZED v2.23: Create signature directly (JSON with byte arrays is complex)
         let sig = crate::crypto::CompactHybridSignature {
-            node_id: "qn_test_node".to_string(),
+            node_id: "test_node".to_string(),
             cert_serial: "CERT-123".to_string(),
             ephemeral_public_key: ephemeral_pk,
             message_signature: msg_sig,
@@ -14659,7 +14643,7 @@ mod tests {
         };
         
         // Verify fields
-        assert_eq!(sig.node_id, "qn_test_node");
+        assert_eq!(sig.node_id, "test_node");
         assert_eq!(sig.cert_serial, "CERT-123");
         assert!(!sig.dilithium_key_signature.is_empty());
         
