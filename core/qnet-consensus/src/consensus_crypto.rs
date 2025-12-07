@@ -227,10 +227,11 @@ async fn verify_compact_binary_signature(
     }
     
     // Verify Dilithium: signs (ephemeral_key || message_hash || timestamp)
+    // CRITICAL FIX: Must use to_le_bytes() to match hybrid_crypto.rs signing!
     let mut encapsulated_data = Vec::new();
     encapsulated_data.extend_from_slice(&compact_sig.ephemeral_public_key);
     encapsulated_data.extend_from_slice(&message_hash);
-    encapsulated_data.extend_from_slice(&compact_sig.signed_at.to_be_bytes());
+    encapsulated_data.extend_from_slice(&compact_sig.signed_at.to_le_bytes());
     let encapsulated_hex = hex::encode(&encapsulated_data);
     
     // Convert RAW Dilithium bytes to signature format for verification
