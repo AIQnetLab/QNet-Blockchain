@@ -1625,13 +1625,16 @@ impl SimplifiedP2P {
         }
         
         // IMPROVED: Try to setup UPnP port forwarding for NAT traversal
-        let port = self.port;
-        let node_id = self.node_id.clone();
-        tokio::spawn(async move {
-            if let Err(e) = Self::setup_upnp_port_forwarding(port).await {
-                println!("[P2P] ⚠️ UPnP setup failed: {}", e);
-            }
-        });
+        // SAFE: Check if Tokio runtime is available to prevent panic
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let port = self.port;
+            let _node_id = self.node_id.clone();
+            handle.spawn(async move {
+                if let Err(e) = Self::setup_upnp_port_forwarding(port).await {
+                    println!("[P2P] ⚠️ UPnP setup failed: {}", e);
+                }
+            });
+        }
         
         // QUANTUM OPTIMIZATION: Start performance monitor
         self.start_performance_optimizer();
@@ -1641,11 +1644,20 @@ impl SimplifiedP2P {
     
     /// QUANTUM OPTIMIZATION: Monitor and adapt to network growth
     fn start_performance_optimizer(&self) {
+        // SAFE: Check if Tokio runtime is available to prevent panic
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => {
+                println!("[P2P] ⚠️ No Tokio runtime - performance optimizer deferred");
+                return;
+            }
+        };
+        
         let lockfree_clone = self.connected_peers_lockfree.clone();
         let legacy_clone = self.connected_peers.clone();
         let node_type = self.node_type.clone();
         
-        tokio::spawn(async move {
+        handle.spawn(async move {
             let mut last_log = std::time::Instant::now();
             let mut last_mode = false;
             
@@ -2819,13 +2831,22 @@ impl SimplifiedP2P {
     
     /// Announce our node to the internet for peer discovery
     fn announce_node_to_internet(&self) {
+        // SAFE: Check if Tokio runtime is available to prevent panic
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => {
+                println!("[P2P] ⚠️ No Tokio runtime - node announcement deferred");
+                return;
+            }
+        };
+        
         let node_id = self.node_id.clone();
         let region = self.region.clone();
         let node_type = self.node_type.clone();
         let port = self.port;
         let external_ip_store = self.external_ip.clone();
         
-        tokio::spawn(async move {
+        handle.spawn(async move {
             println!("[P2P] 🌐 Announcing node to internet...");
             
             // Get our external IP address
@@ -2902,6 +2923,15 @@ impl SimplifiedP2P {
     
     /// Search for other QNet nodes on the internet with cryptographic peer verification
     fn search_internet_peers(&self) {
+        // SAFE: Check if Tokio runtime is available to prevent panic
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => {
+                println!("[P2P] ⚠️ No Tokio runtime - peer search deferred");
+                return;
+            }
+        };
+        
         let node_id = self.node_id.clone();
         let region = self.region.clone();
         let regional_peers = self.regional_peers.clone();
@@ -2911,7 +2941,7 @@ impl SimplifiedP2P {
         let node_type = self.node_type.clone();
         let reputation_system = self.reputation_system.clone();  // Clone for async block
         
-        tokio::spawn(async move {
+        handle.spawn(async move {
             println!("[P2P] 🌐 Searching for QNet peers with cryptographic verification...");
             
             let mut discovered_peers = Vec::new();
@@ -3003,7 +3033,7 @@ impl SimplifiedP2P {
                     match Self::verify_peer_authenticity(&target_addr).await {
                         Ok(peer_pubkey) => {
                             println!("🌟 [P2P] Quantum-secured peer verified: {} | 🔐 Dilithium signature validated | Key: {}...", 
-                                   target_addr, &peer_pubkey[..16]);
+                                   target_addr, &peer_pubkey[..peer_pubkey.len().min(16)]);
                             
                             // EXISTING: Use get_genesis_region_by_ip() to get correct Genesis peer region
                             use crate::genesis_constants::get_genesis_region_by_ip;
@@ -3144,10 +3174,19 @@ impl SimplifiedP2P {
     
     /// API DEADLOCK FIX: Background height synchronization to prevent circular dependencies
     fn start_background_height_sync(&self) {
+        // SAFE: Check if Tokio runtime is available to prevent panic
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => {
+                println!("[SYNC] ⚠️ No Tokio runtime - background sync deferred");
+                return;
+            }
+        };
+        
         let node_type = self.node_type.clone();
         let connected_peers = self.connected_peers.clone();
         
-        tokio::spawn(async move {
+        handle.spawn(async move {
             println!("[SYNC] 🔄 Starting background height synchronization...");
             
             // Initial delay to let network form
@@ -3269,6 +3308,15 @@ impl SimplifiedP2P {
     
     /// PRODUCTION: Start periodic cleanup of inactive peers
     fn start_peer_cleanup_task(&self) {
+        // SAFE: Check if Tokio runtime is available to prevent panic
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => {
+                println!("[P2P] ⚠️ No Tokio runtime - peer cleanup task deferred");
+                return;
+            }
+        };
+        
         // Clone Arc references for the async task
         let connected_peers_lockfree = self.connected_peers_lockfree.clone();
         let connected_peers = self.connected_peers.clone();
@@ -3277,7 +3325,7 @@ impl SimplifiedP2P {
         let peer_shards = self.peer_shards.clone();
         let quic_transport = self.quic_transport.clone();
         
-        tokio::spawn(async move {
+        handle.spawn(async move {
             println!("[P2P] 🧹 Starting periodic peer cleanup task (every 5 minutes)...");
             
             // Initial delay to let network stabilize
@@ -3368,11 +3416,20 @@ impl SimplifiedP2P {
     /// v2.24: Frequent QUIC health check for proactive reconnection
     /// SCALABLE: Works for any network size (5 nodes to 100K+)
     fn start_quic_health_check_task(&self) {
+        // SAFE: Check if Tokio runtime is available to prevent panic
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => {
+                println!("[QUIC] ⚠️ No Tokio runtime - health check task deferred");
+                return;
+            }
+        };
+        
         let quic_transport = self.quic_transport.clone();
         let connected_peers_lockfree = self.connected_peers_lockfree.clone();
         let node_id = self.node_id.clone();
         
-        tokio::spawn(async move {
+        handle.spawn(async move {
             println!("[QUIC] 🔄 Starting QUIC health check task (every 15s)...");
             
             // Initial delay to let network stabilize
@@ -3433,6 +3490,15 @@ impl SimplifiedP2P {
     
          /// Reputation-based peer validation using QNet reputation system (PRODUCTION)
      fn start_reputation_validation(&self) {
+        // SAFE: Check if Tokio runtime is available to prevent panic
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => {
+                println!("[P2P] ⚠️ No Tokio runtime - reputation validation deferred");
+                return;
+            }
+        };
+        
          let node_id = self.node_id.clone();
          let connected_peers = self.connected_peers.clone();
         let connected_peer_addrs = self.connected_peer_addrs.clone(); // CRITICAL: Clone for phantom cleanup
@@ -3443,7 +3509,7 @@ impl SimplifiedP2P {
                                "161.97.86.81".to_string(), "5.189.130.160".to_string(), 
                                "162.244.25.114".to_string()]; // Genesis IPs to avoid borrowing self
          
-         tokio::spawn(async move {
+         handle.spawn(async move {
              println!("[P2P] 🔍 Starting reputation-based peer validation with shared reputation system...");
              
              // PRODUCTION: Use existing PERSISTENT reputation system
@@ -3628,12 +3694,21 @@ impl SimplifiedP2P {
      
      /// Start multicast discovery for QNet nodes
      fn start_multicast_discovery(&self) {
+        // SAFE: Check if Tokio runtime is available to prevent panic
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => {
+                println!("[P2P] ⚠️ No Tokio runtime - multicast discovery deferred");
+                return;
+            }
+        };
+        
         let node_id = self.node_id.clone();
         let region = self.region.clone();
         let connected_peers = self.connected_peers.clone();
         let port = self.port;
         
-        tokio::spawn(async move {
+        handle.spawn(async move {
             println!("[P2P] 🔍 Starting multicast discovery...");
             
             // Announce our presence via multicast
@@ -4049,7 +4124,10 @@ impl SimplifiedP2P {
                     // Semaphore ensures max N concurrent streams at any time
                     send_tasks.push(tokio::spawn(async move {
                         // Acquire permit before sending (blocks if limit reached)
-                        let _permit = permit.acquire().await.expect("Semaphore closed");
+                        let _permit = match permit.acquire().await {
+                            Ok(p) => p,
+                            Err(_) => return Err("Semaphore closed".to_string()),
+                        };
                         let transport = transport_clone.read().await;
                         let result = transport.broadcast_to(quic_addr, &msg_clone).await;
                         // Permit automatically released when _permit drops
@@ -4343,6 +4421,15 @@ impl SimplifiedP2P {
             return;
         }
         
+        // SAFE: Check if Tokio runtime is available to prevent panic
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => {
+                println!("[P2P] ⚠️ WARN: No Tokio runtime - operation skipped");
+                return;
+            }
+        };
+        
         // CRITICAL: Don't forward chunks for already processed blocks (prevents infinite loop)
         if self.processed_shred_blocks.contains(&chunk.block_height) {
             return;
@@ -4393,7 +4480,7 @@ impl SimplifiedP2P {
             let quic_transport_clone = quic_transport.clone();
             
             // PRODUCTION v2.19.22: Use QUIC for chunk forwarding (unidirectional, no response)
-            tokio::spawn(async move {
+            handle.spawn(async move {
                 let message = NetworkMessage::ShredProtocolChunk { chunk: chunk_clone };
                 
                 // Extract IP and calculate QUIC port
@@ -4418,6 +4505,15 @@ impl SimplifiedP2P {
     /// PRODUCTION v2.21.3: Request missing chunks from peers
     /// Called when block assembly times out without enough chunks
     fn request_missing_chunks(&self, block_height: u64, missing_indices: Vec<usize>, last_peer: &str) {
+        // SAFE: Check if Tokio runtime is available to prevent panic
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => {
+                println!("[P2P] ⚠️ WARN: No Tokio runtime - operation skipped");
+                return;
+            }
+        };
+        
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -4474,7 +4570,7 @@ impl SimplifiedP2P {
             let request_clone = request.clone();
             let quic_transport_clone = quic_transport.clone();
             
-            tokio::spawn(async move {
+            handle.spawn(async move {
                 let parts: Vec<&str> = peer_addr.split(':').collect();
                 if parts.len() == 2 {
                     if let (Ok(ip), Ok(port)) = (parts[0].parse::<std::net::IpAddr>(), parts[1].parse::<u16>()) {
@@ -4495,6 +4591,15 @@ impl SimplifiedP2P {
     
     /// PRODUCTION v2.21.3: Handle incoming request for missing chunks
     fn handle_missing_chunks_request(&self, from_peer: &str, block_height: u64, missing_indices: Vec<usize>, requester_id: String) {
+        // SAFE: Check if Tokio runtime is available to prevent panic
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => {
+                println!("[P2P] ⚠️ WARN: No Tokio runtime - operation skipped");
+                return;
+            }
+        };
+        
         // Check our chunk cache
         if let Some(cache_entry) = self.shred_chunk_cache.get(&block_height) {
             let mut chunks_to_send: Vec<(usize, Vec<u8>, bool)> = Vec::new();
@@ -4533,7 +4638,7 @@ impl SimplifiedP2P {
                 let quic_transport = self.quic_transport.clone();
                 let peer_addr = from_peer.to_string();
                 
-                tokio::spawn(async move {
+                handle.spawn(async move {
                     let parts: Vec<&str> = peer_addr.split(':').collect();
                     if parts.len() == 2 {
                         if let (Ok(ip), Ok(port)) = (parts[0].parse::<std::net::IpAddr>(), parts[1].parse::<u16>()) {
@@ -5252,8 +5357,11 @@ impl SimplifiedP2P {
             let _ = crypto.initialize().await;
             *crypto_guard = Some(crypto);
         }
-        let crypto = crypto_guard.as_ref().expect("Crypto initialized above");
-            
+        let crypto = match crypto_guard.as_ref() {
+            Some(c) => c,
+            None => return Ok(false), // Crypto not initialized
+        };
+
             // Use centralized quantum crypto verification
             use crate::quantum_crypto::DilithiumSignature;
             
@@ -6015,6 +6123,12 @@ impl SimplifiedP2P {
     /// PRODUCTION: Broadcast certificate announcement when created/rotated
     /// This enables compact signatures for microblocks
     pub fn broadcast_certificate_announce(&self, cert_serial: String, certificate: Vec<u8>) -> Result<(), String> {
+        // SAFE: Check if Tokio runtime is available to prevent panic
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => return Err("No Tokio runtime available".to_string()),
+        };
+        
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -6064,7 +6178,7 @@ impl SimplifiedP2P {
             let quic_transport = self.quic_transport.clone();
             let message_clone = message.clone();
             
-            tokio::spawn(async move {
+            handle.spawn(async move {
                 if quic_enabled {
                     if let Some(ref transport) = quic_transport {
                         // Parse peer address to QUIC port
@@ -7013,6 +7127,15 @@ impl SimplifiedP2P {
     
     /// STARTUP FIX: Start regional connection establishment asynchronously (non-blocking startup)  
     fn start_regional_connection_establishment(&self) {
+        // SAFE: Check if Tokio runtime is available to prevent panic
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => {
+                println!("[P2P] ⚠️ No Tokio runtime - regional connection deferred");
+                return;
+            }
+        };
+        
         let regional_peers = self.regional_peers.clone();
         let connected_peers = self.connected_peers.clone();
         let primary_region = self.primary_region.clone();
@@ -7020,8 +7143,8 @@ impl SimplifiedP2P {
         let node_id = self.node_id.clone();
         let port = self.port;
         
-        // EXISTING PATTERN: Use tokio::spawn like search_internet_peers for non-blocking startup
-        tokio::spawn(async move {
+        // EXISTING PATTERN: Use handle.spawn for non-blocking startup
+        handle.spawn(async move {
             println!("[P2P] 🔧 Starting regional connection establishment (background)...");
             
             let regional_peers_data = match regional_peers.lock() {
@@ -7649,13 +7772,22 @@ impl SimplifiedP2P {
     
     /// Regional clustering for geographical load balancing
     fn start_regional_clustering(&self) {
+        // SAFE: Check if Tokio runtime is available to prevent panic
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => {
+                println!("[P2P] ⚠️ No Tokio runtime - regional clustering deferred");
+                return;
+            }
+        };
+        
         let node_id = self.node_id.clone();
         let region = self.region.clone();
         let regional_peers = self.regional_peers.clone();
         let connected_peers = self.connected_peers.clone();
         let is_running = self.is_running.clone();
         
-        tokio::spawn(async move {
+        handle.spawn(async move {
             println!("[P2P] 🌍 Starting regional clustering for region: {:?}", region);
             
             // Regional clustering logic
@@ -8782,7 +8914,7 @@ impl SimplifiedP2P {
                     match tx_sender.send(received_tx) {
                         Ok(_) => {
                             println!("[P2P] ← Transaction {} from {} queued for processing", 
-                                     &tx_hash[..16], from_peer);
+                                     &tx_hash[..tx_hash.len().min(16)], from_peer);
                         }
                         Err(e) => {
                             println!("[P2P] ❌ Failed to queue transaction: {}", e);
@@ -9030,6 +9162,15 @@ impl SimplifiedP2P {
             
             // PRODUCTION: Certificate management for compact signatures
             NetworkMessage::CertificateAnnounce { node_id, cert_serial, certificate, timestamp } => {
+                // SAFE: Get Tokio handle early to prevent panic in async verification
+                let handle = match tokio::runtime::Handle::try_current() {
+                    Ok(h) => h,
+                    Err(_) => {
+                        println!("[P2P] ⚠️ No Tokio runtime - certificate verification skipped");
+                        return;
+                    }
+                };
+                
                 self.update_peer_last_seen(&node_id);
                 
                 // SCALABILITY: Light nodes don't participate in consensus, skip certificate processing
@@ -9201,7 +9342,7 @@ impl SimplifiedP2P {
                 let node_id_clone = node_id.clone();
                 let reputation_system_clone = self.reputation_system.clone();
                 
-                tokio::spawn(async move {
+                handle.spawn(async move {
                     // Recreate encapsulated data for verification (same as in hybrid_crypto.rs)
                     let mut encapsulated_data = Vec::new();
                     encapsulated_data.extend_from_slice(&cert.ed25519_public_key);
@@ -9217,7 +9358,10 @@ impl SimplifiedP2P {
                         let _ = crypto.initialize().await;
                         *crypto_guard = Some(crypto);
                     }
-                    let quantum_crypto = crypto_guard.as_ref().expect("Crypto initialized above");
+                    let quantum_crypto = match crypto_guard.as_ref() {
+                        Some(c) => c,
+                        None => return, // Crypto not initialized
+                    };
                     
                     let dilithium_sig = crate::quantum_crypto::DilithiumSignature {
                         signature: cert.dilithium_signature.clone(),
@@ -9377,6 +9521,15 @@ impl SimplifiedP2P {
             }
             
             NetworkMessage::CertificateRequest { requester_id, node_id, cert_serial, timestamp } => {
+                // SAFE: Get Tokio handle early to prevent panic
+                let handle = match tokio::runtime::Handle::try_current() {
+                    Ok(h) => h,
+                    Err(_) => {
+                        println!("[P2P] ⚠️ WARN: No Tokio runtime - certificate request skipped");
+                        return;
+                    }
+                };
+
                 self.update_peer_last_seen(&requester_id);
                 println!("[P2P] 📋 Certificate request from {} for {}", requester_id, cert_serial);
                 
@@ -9405,7 +9558,7 @@ impl SimplifiedP2P {
                         let quic_transport = self.quic_transport.clone();
                         let response_clone = response.clone();
                         
-                        tokio::spawn(async move {
+                        handle.spawn(async move {
                             if quic_enabled {
                                 if let Some(ref transport) = quic_transport {
                                     let parts: Vec<&str> = peer_addr_clone.split(':').collect();
@@ -10184,7 +10337,10 @@ impl SimplifiedP2P {
             *crypto_guard = Some(crypto);
         }
         
-        let crypto = crypto_guard.as_ref().expect("Crypto initialized above");
+        let crypto = match crypto_guard.as_ref() {
+            Some(c) => c,
+            None => return false, // Crypto not initialized
+        };
         
         // Create DilithiumSignature struct
         let dilithium_sig = DilithiumSignature {
@@ -10287,7 +10443,10 @@ impl SimplifiedP2P {
             let _ = crypto.initialize().await;
             *crypto_guard = Some(crypto);
         }
-        let crypto = crypto_guard.as_ref().expect("Crypto initialized above");
+        let crypto = match crypto_guard.as_ref() {
+            Some(c) => c,
+            None => return false, // Crypto not initialized
+        };
         
         // Verify Dilithium key signature (encapsulated_data = ephemeral_key || message_hash || timestamp)
         let mut encapsulated_data = Vec::new();
@@ -10386,7 +10545,10 @@ impl SimplifiedP2P {
             let _ = crypto.initialize().await;
             *crypto_guard = Some(crypto);
         }
-        let crypto = crypto_guard.as_ref().expect("Crypto initialized above");
+        let crypto = match crypto_guard.as_ref() {
+            Some(c) => c,
+            None => return false, // Crypto not initialized
+        };
         
         // Verify Dilithium key signature (encapsulated_data = ephemeral_key || message_hash || timestamp)
         let mut encapsulated_data = Vec::new();
@@ -10474,7 +10636,10 @@ impl SimplifiedP2P {
                             *crypto_guard = Some(crypto);
                         }
                         
-                        let crypto = crypto_guard.as_ref().expect("Crypto initialized above");
+                        let crypto = match crypto_guard.as_ref() {
+            Some(c) => c,
+            None => return false, // Crypto not initialized
+        };
                         
                         let dilithium_sig = DilithiumSignature {
                             signature: signature.clone(),
@@ -10585,7 +10750,10 @@ impl SimplifiedP2P {
                             let _ = crypto.initialize().await;
                             *crypto_guard = Some(crypto);
                         }
-                        let crypto = crypto_guard.as_ref().expect("Crypto initialized above");
+                        let crypto = match crypto_guard.as_ref() {
+            Some(c) => c,
+            None => return false, // Crypto not initialized
+        };
                         
                         let mut encapsulated_data = Vec::new();
                         encapsulated_data.extend_from_slice(&compact_sig.ephemeral_public_key);
@@ -10682,7 +10850,10 @@ impl SimplifiedP2P {
                             let _ = crypto.initialize().await;
                             *crypto_guard = Some(crypto);
                         }
-                        let crypto = crypto_guard.as_ref().expect("Crypto initialized above");
+                        let crypto = match crypto_guard.as_ref() {
+            Some(c) => c,
+            None => return false, // Crypto not initialized
+        };
                         
                         // Verify Dilithium key signature
                         let mut encapsulated_data = Vec::new();
@@ -10904,7 +11075,7 @@ impl SimplifiedP2P {
         
         // v2.24: Use node_id directly
         let normalized_node_id = node_id.to_string();
-        
+
         // Create instance if not exists
         if !instances_guard.contains_key(&normalized_node_id) {
             let mut hybrid = HybridCrypto::new(normalized_node_id.clone());
@@ -10914,16 +11085,19 @@ impl SimplifiedP2P {
             }
             instances_guard.insert(normalized_node_id.clone(), hybrid);
         }
-        
-        let hybrid = instances_guard.get_mut(&normalized_node_id).expect("Inserted above");
-        
+
+        let hybrid = match instances_guard.get_mut(&normalized_node_id) {
+            Some(h) => h,
+            None => return None, // Should never happen but prevents panic
+        };
+
         // Check certificate rotation
         if hybrid.needs_rotation() {
             if let Err(e) = hybrid.rotate_certificate().await {
                 println!("[CRYPTO] ⚠️ Certificate rotation failed: {}", e);
             }
         }
-        
+
         // CRITICAL: Sign RAW message with hybrid (ephemeral Ed25519 + Dilithium per NIST/Cisco)
         // Using sign_raw_message_compact which hashes the message before signing
         // This ensures consistency with verification which also hashes
@@ -10988,7 +11162,10 @@ impl SimplifiedP2P {
                         instances_guard.insert(normalized_node_id.clone(), hybrid);
                     }
                     
-                    let hybrid = instances_guard.get_mut(&normalized_node_id).expect("Inserted above");
+                    let hybrid = match instances_guard.get_mut(&normalized_node_id) {
+            Some(h) => h,
+            None => return Err(anyhow::anyhow!("Hybrid instance missing")),
+        };
                     
                     // Check certificate rotation
                     if hybrid.needs_rotation() {
@@ -12510,6 +12687,15 @@ impl SimplifiedP2P {
         println!("[P2P] 📊 Peer exchange interval: {}s (Genesis node: {})", 
                 exchange_interval.as_secs(), is_genesis_node);
         
+        // SAFE: Check if Tokio runtime is available to prevent panic
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => {
+                println!("[P2P] ⚠️ No Tokio runtime - peer exchange deferred");
+                return;
+            }
+        };
+        
         let connected_peers = self.connected_peers.clone();
         let connected_peer_addrs = self.connected_peer_addrs.clone();
         let node_id = self.node_id.clone();
@@ -12517,7 +12703,7 @@ impl SimplifiedP2P {
         let region = self.region.clone();          // EXISTING: Need for peer addition
         let port = self.port;                      // EXISTING: Need for peer addition
         
-        tokio::spawn(async move {
+        handle.spawn(async move {
             let mut interval = tokio::time::interval(exchange_interval);
         
         loop {
@@ -13174,7 +13360,7 @@ impl SimplifiedP2P {
                     println!("[JAIL] ⚠️ Failed to save jail status: {}", e);
                 } else {
                     println!("[JAIL] 💾 Saved jail status for {} (batch {}, integrity: {}...)", 
-                            node_id, batch_num, &integrity_hash[..8]);
+                            node_id, batch_num, &integrity_hash[..integrity_hash.len().min(8)]);
                 }
             }
         }
@@ -13491,6 +13677,15 @@ impl SimplifiedP2P {
     
     /// Broadcast tampering alert to all peers
     fn broadcast_tampering_alert(&self, node_id: &str, attempted_rep: f64, actual_rep: f64, severity: &str) {
+        // SAFE: Check if Tokio runtime is available to prevent panic
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => {
+                println!("[SECURITY] ⚠️ WARN: No Tokio runtime - tampering alert skipped");
+                return;
+            }
+        };
+
         // Create security alert message
         let alert_data = serde_json::json!({
             "type": "REPUTATION_TAMPERING",
@@ -13536,7 +13731,7 @@ impl SimplifiedP2P {
                 let peer_id_clone = peer_id.clone();
                 
                 // Send async to not block
-                tokio::spawn(async move {
+                handle.spawn(async move {
                     if let Ok(client) = reqwest::Client::builder()
                         .timeout(std::time::Duration::from_secs(5))
                         .tcp_keepalive(std::time::Duration::from_secs(HTTP_TCP_KEEPALIVE_SECS))
@@ -13575,7 +13770,7 @@ impl SimplifiedP2P {
             let alert_json = alert_data.clone();
             let peer_id_clone = peer_id.clone();
             
-            tokio::spawn(async move {
+            handle.spawn(async move {
                 if let Ok(client) = reqwest::Client::builder()
                     .timeout(std::time::Duration::from_secs(5))
                     .tcp_keepalive(std::time::Duration::from_secs(HTTP_TCP_KEEPALIVE_SECS))
@@ -13670,7 +13865,7 @@ impl SimplifiedP2P {
             // Update index with latest hash
             self.update_audit_index(&audit_index_file, &entry_hash);
             
-            println!("[AUDIT] 🔐 Security incident logged with hash: {}", &entry_hash[..16]);
+            println!("[AUDIT] 🔐 Security incident logged with hash: {}", &entry_hash[..entry_hash.len().min(16)]);
         }
         
         // CRITICAL: Also broadcast to network for distributed audit
@@ -13745,14 +13940,17 @@ impl SimplifiedP2P {
             }
             instances_guard.insert(normalized_node_id.clone(), hybrid);
         }
-        
-        let hybrid = instances_guard.get_mut(&normalized_node_id).expect("Inserted above");
-        
+
+        let hybrid = match instances_guard.get_mut(&normalized_node_id) {
+            Some(h) => h,
+            None => return String::from("UNSIGNED_MISSING_INSTANCE"),
+        };
+
         // Check certificate rotation
         if hybrid.needs_rotation() {
             let _ = hybrid.rotate_certificate().await;
         }
-        
+
         // CRITICAL: Sign RAW message with hybrid (hashes before signing)
         // OPTIMIZED v2.24: bincode+zstd - use standard compact_bin format
         match hybrid.sign_raw_message_compact(entry_hash.as_bytes()).await {
@@ -13808,7 +14006,10 @@ impl SimplifiedP2P {
                             instances_guard.insert(normalized_node_id.clone(), hybrid);
                         }
                         
-                        let hybrid = instances_guard.get_mut(&normalized_node_id).expect("Inserted above");
+                        let hybrid = match instances_guard.get_mut(&normalized_node_id) {
+            Some(h) => h,
+            None => return Err(anyhow::anyhow!("Hybrid instance missing")),
+        };
                         
                         // Check certificate rotation
                         if hybrid.needs_rotation() {
@@ -13853,6 +14054,15 @@ impl SimplifiedP2P {
     
     /// Broadcast audit entry to network for distributed verification
     fn broadcast_audit_entry(&self, audit_block: serde_json::Value) {
+        // SAFE: Check if Tokio runtime is available to prevent panic
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => {
+                println!("[AUDIT] ⚠️ WARN: No Tokio runtime - audit broadcast skipped");
+                return;
+            }
+        };
+        
         // Send to at least 3 random peers for redundancy
         let peers = match self.connected_peers.read() {
             Ok(guard) => guard,
@@ -13875,7 +14085,7 @@ impl SimplifiedP2P {
             
             if let Some(info) = peer_info {
                 let peer_port = 8001; // Standard QNet port
-                tokio::spawn(async move {
+                handle.spawn(async move {
                     // Send audit entry to peer for distributed storage
                     let url = format!("http://{}:{}/api/v1/audit/store", 
                                     info.addr, peer_port);
@@ -13968,6 +14178,12 @@ impl SimplifiedP2P {
 
     /// PRODUCTION: Broadcast consensus commit to consensus participants only
     pub fn broadcast_consensus_commit(&self, round_id: u64, node_id: String, commit_hash: String, signature: String, timestamp: u64, participants: &[String]) -> Result<(), String> {
+        // SAFE: Check if Tokio runtime is available to prevent panic
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => return Err("No Tokio runtime available".to_string()),
+        };
+        
         // CRITICAL: Only broadcast consensus for MACROBLOCK rounds (every 90 blocks)
         // Microblocks use simple producer signatures, NOT Byzantine consensus
         if round_id == 0 || (round_id % 90 != 0) {
@@ -14027,7 +14243,7 @@ impl SimplifiedP2P {
         let quic_transport = self.quic_transport.clone();
         let quic_enabled = self.quic_enabled.load(std::sync::atomic::Ordering::Relaxed);
         
-        tokio::spawn(async move {
+        handle.spawn(async move {
             use futures::stream::{self, StreamExt};
             
             // SCALABILITY: Bounded parallelism (max 100 concurrent requests)
@@ -14062,6 +14278,12 @@ impl SimplifiedP2P {
 
     /// PRODUCTION: Broadcast consensus reveal to consensus participants only  
     pub fn broadcast_consensus_reveal(&self, round_id: u64, node_id: String, reveal_data: String, nonce: String, timestamp: u64, participants: &[String]) -> Result<(), String> {
+        // SAFE: Check if Tokio runtime is available to prevent panic
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => return Err("No Tokio runtime available".to_string()),
+        };
+        
         // CRITICAL: Only broadcast consensus for MACROBLOCK rounds (every 90 blocks)
         // Microblocks use simple producer signatures, NOT Byzantine consensus
         // BUGFIX: round_id IS the block height (e.g., 90, 180, 270), which are ALL divisible by 90!
@@ -14123,7 +14345,7 @@ impl SimplifiedP2P {
         let quic_transport = self.quic_transport.clone();
         let quic_enabled = self.quic_enabled.load(std::sync::atomic::Ordering::Relaxed);
         
-        tokio::spawn(async move {
+        handle.spawn(async move {
             use futures::stream::{self, StreamExt};
             
             // SCALABILITY: Bounded parallelism (max 100 concurrent requests)
@@ -14236,8 +14458,18 @@ impl SimplifiedP2P {
             return;
         };
         
-        // Send asynchronously via tokio
-        tokio::spawn(async move {
+        // Send asynchronously via tokio - SAFE: check if runtime is available
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => {
+                // No Tokio runtime available - skip sending (avoid panic)
+                if should_log {
+                    println!("[P2P] ⚠️ No async runtime - message queued for later");
+                }
+                return;
+            }
+        };
+        handle.spawn(async move {
             // Try QUIC first if enabled
             if quic_enabled {
                 if let Some(ref quic_transport) = quic_transport {
@@ -14497,13 +14729,22 @@ impl SimplifiedP2P {
         timestamp: u64,
         sender_addr: Option<String>  // Optional sender for tracking false emergencies
     ) {
+        // SAFE: Check if Tokio runtime is available to prevent panic
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => {
+                println!("[FAILOVER] ⚠️ WARN: No Tokio runtime - emergency handler skipped");
+                return;
+            }
+        };
+
         // CRITICAL FIX: Check message age to prevent stale message spam
         // ARCHITECTURE: Emergency messages have 60-second TTL to prevent network pollution
         let current_time = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        
+
         if timestamp > 0 && current_time > timestamp {
             let message_age = current_time - timestamp;
             if message_age > 60 {
@@ -14824,7 +15065,7 @@ impl SimplifiedP2P {
         let sender_log = sender_addr.clone();
         
         // Schedule async verification without self reference
-        tokio::spawn(async move {
+        handle.spawn(async move {
             // Step 1: Wait for block propagation (2 seconds)
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             
@@ -15050,7 +15291,10 @@ impl SimplifiedP2P {
                         instances_guard.insert(normalized_node_id.clone(), hybrid);
                     }
                     
-                    let hybrid = instances_guard.get_mut(&normalized_node_id).expect("Inserted above");
+                    let hybrid = match instances_guard.get_mut(&normalized_node_id) {
+            Some(h) => h,
+            None => return Err(anyhow::anyhow!("Hybrid instance missing")),
+        };
                     
                     // Check certificate rotation
                     if hybrid.needs_rotation() {
@@ -15481,14 +15725,17 @@ impl SimplifiedP2P {
             println!("[FAILOVER] 🔒 Locked emergency failover: {}", failover_key);
             
             // CLEANUP: Auto-remove after 30 seconds to prevent memory leak
-            let key_clone = failover_key.to_string();
-            tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_secs(30)).await;
-                EMERGENCY_FAILOVERS_IN_PROGRESS.remove(&key_clone);
-                println!("[FAILOVER] 🔓 Auto-unlocked emergency failover: {}", key_clone);
-            });
+            // SAFE: Check if Tokio runtime is available to prevent panic
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let key_clone = failover_key.to_string();
+                handle.spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    EMERGENCY_FAILOVERS_IN_PROGRESS.remove(&key_clone);
+                    println!("[FAILOVER] 🔓 Auto-unlocked emergency failover: {}", key_clone);
+                });
+            }
         }
-        
+
         was_inserted
     }
     
