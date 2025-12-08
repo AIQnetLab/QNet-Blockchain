@@ -2,8 +2,8 @@
 ## Post-Quantum Decentralized Network - Technical Documentation
 
 **Last Updated**: December 8, 2025  
-**Version**: 2.25.0  
-**Status**: Production Ready (Gulf Stream + bincode)
+**Version**: 2.26.0  
+**Status**: Production Ready (Gulf Stream + bincode + Optional Quantum TX)
 
 > ⚠️ **REPUTATION SYSTEM UPDATED in v2.21.0**  
 > The reputation section in this document describes the OLD P2P gossip-based system.  
@@ -15,16 +15,17 @@
 1. [Overview](#overview)
 2. [Block Structure](#block-structure)
 3. [Signature System](#signature-system)
-4. [Transaction Architecture v2.25](#transaction-architecture-v225) ⭐ NEW
-5. [Gulf Stream Protocol](#gulf-stream-protocol) ⭐ NEW
-6. [Block Buffering and Memory Protection](#block-buffering-and-memory-protection)
-7. [Progressive Finalization Protocol](#progressive-finalization-protocol)
-8. [Node Types and Scaling](#node-types-and-scaling)
-9. [Reputation System](#reputation-system)
-10. [Reward System](#reward-system)
-11. [MEV Protection & Priority Mempool](#mev-protection--priority-mempool)
-12. [Security Model](#security-model)
-13. [Performance Characteristics](#performance-characteristics)
+4. [Transaction Architecture v2.25](#transaction-architecture-v225)
+5. [Optional Quantum TX v2.26](#optional-quantum-resistant-transactions-v226) ⭐ NEW
+6. [Gulf Stream Protocol](#gulf-stream-protocol)
+7. [Block Buffering and Memory Protection](#block-buffering-and-memory-protection)
+8. [Progressive Finalization Protocol](#progressive-finalization-protocol)
+9. [Node Types and Scaling](#node-types-and-scaling)
+10. [Reputation System](#reputation-system)
+11. [Reward System](#reward-system)
+12. [MEV Protection & Priority Mempool](#mev-protection--priority-mempool)
+13. [Security Model](#security-model)
+14. [Performance Characteristics](#performance-characteristics)
 
 ---
 
@@ -310,6 +311,50 @@ let tx = bincode::deserialize::<Transaction>(&tx_bytes)
         let json = String::from_utf8(tx_bytes)?;
         serde_json::from_str::<Transaction>(&json)
     })?;
+```
+
+### Optional Quantum-Resistant Transactions (v2.26)
+
+Standard transactions use **Ed25519** signatures (fast, ~64 bytes). For high-value transfers, users can opt-in to **CRYSTALS-Dilithium3** quantum-resistant signatures:
+
+```rust
+pub struct Transaction {
+    // ... standard fields ...
+    pub dilithium_signature: Option<String>,   // Optional quantum signature
+    pub dilithium_public_key: Option<String>,  // Optional quantum public key
+}
+
+impl Transaction {
+    /// Check if transaction has quantum-resistant signature
+    pub fn is_quantum_signed(&self) -> bool {
+        self.dilithium_signature.is_some() && self.dilithium_public_key.is_some()
+    }
+    
+    /// Quantum transactions pay +50% gas premium
+    pub fn effective_gas_price(&self) -> u64 {
+        if self.is_quantum_signed() {
+            self.gas_price + (self.gas_price / 2)  // +50%
+        } else {
+            self.gas_price
+        }
+    }
+}
+```
+
+| Type | Signature | Size | Gas Cost | Security |
+|------|-----------|------|----------|----------|
+| **Standard TX** | Ed25519 only | ~64 bytes | Base | Classical |
+| **Quantum TX** | Ed25519 + Dilithium3 | ~2.5KB | +50% premium | Post-quantum |
+
+**API Usage**:
+```json
+{
+  "from": "EON1...",
+  "to": "EON1...",
+  "amount": 1000000000,
+  "dilithium_signature": "base64...",  // Optional
+  "dilithium_public_key": "base64..."  // Optional
+}
 ```
 
 ---
