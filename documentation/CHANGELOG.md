@@ -5,6 +5,47 @@ All notable changes to the QNet project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.25.0] - December 8, 2025 "Quantum Transaction Signatures & TPS Optimization"
+
+### 🔐 MAJOR - Optional Quantum Signatures for Transactions
+
+**New Feature**: Users can now optionally add Dilithium3 signatures to transactions for post-quantum security.
+
+| TX Type | Signatures | Gas Multiplier | Security |
+|---------|------------|----------------|----------|
+| Standard | Ed25519 only | 1.0x | Classical |
+| Quantum | Ed25519 + Dilithium3 | **1.5x** | Post-Quantum |
+
+### ✅ Changes
+
+| Component | Change | Description |
+|-----------|--------|-------------|
+| **Transaction struct** | +`dilithium_signature`, +`dilithium_public_key` | Optional quantum fields |
+| **Transaction methods** | +`is_quantum_signed()`, +`effective_gas_price()` | Helper methods |
+| **Validator** | +`verify_quantum_signature()` | Dilithium verification |
+| **Node** | +`verify_ed25519_tx_signature()`, +`verify_dilithium_tx_signature()` | Full crypto verification |
+| **RPC API** | +`dilithium_signature`, +`dilithium_public_key` in TransactionRequest | API support |
+| **Gas calculation** | All places use `effective_gas_price()` | +50% for quantum TX |
+
+### 🚀 Performance Improvements
+
+- **TX/block limit**: 50K → 100K
+- **Mempool size**: 5M → 10M
+- **Gulf Stream Protocol**: Direct producer forwarding (10-50ms latency)
+- **bincode serialization**: 10-20x faster than JSON
+- **Anti-Storm Protection**: DashSet deduplication
+
+### 📚 Documentation Updates
+
+- `API_REFERENCE.md`: Quantum TX API endpoints
+- `ARCHITECTURE_v2.25.md`: Full quantum TX architecture
+- `CRYPTOGRAPHY_IMPLEMENTATION.md`: Dilithium TX details
+- `QNET_COMPLETE_GUIDE.md`: Transaction upgrade section
+- `QNet_Whitepaper.md`: v2.25.0, Quantum Transaction Premium
+- `README.md`: Optional Dilithium for enterprise
+
+---
+
 ## [2.24.0] - December 6, 2025 "Ethereum 2.0 Style Reputation Snapshots"
 
 ### 🔐 CRITICAL - Complete Reputation System Overhaul

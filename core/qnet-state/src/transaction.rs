@@ -234,6 +234,19 @@ pub struct Transaction {
     
     /// Call data
     pub data: Option<String>,
+    
+    /// QUANTUM v2.25: Optional CRYSTALS-Dilithium3 signature for post-quantum security
+    /// When present: TX is quantum-resistant + 50% higher gas cost
+    /// Format: hex-encoded Dilithium signature (~3293 bytes = 6586 hex chars)
+    /// Use case: High-value transfers, enterprise, paranoid users
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dilithium_signature: Option<String>,
+    
+    /// QUANTUM v2.25: Dilithium public key for signature verification
+    /// Required when dilithium_signature is present
+    /// Format: hex-encoded Dilithium public key (~1952 bytes = 3904 hex chars)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dilithium_public_key: Option<String>,
 }
 
 /// Transaction receipt (simplified)
@@ -318,9 +331,27 @@ impl Transaction {
             public_key: None, // Optional: Set by client for Ed25519 verification
             tx_type,
             data,
+            dilithium_signature: None, // QUANTUM v2.25: Optional post-quantum signature
+            dilithium_public_key: None, // QUANTUM v2.25: Optional post-quantum pubkey
         };
         tx.hash = tx.calculate_hash();
         tx
+    }
+    
+    /// QUANTUM v2.25: Check if transaction has Dilithium signature (quantum-resistant)
+    pub fn is_quantum_signed(&self) -> bool {
+        self.dilithium_signature.is_some() && self.dilithium_public_key.is_some()
+    }
+    
+    /// QUANTUM v2.25: Get effective gas price (50% higher for Dilithium TX)
+    /// This compensates for larger TX size and verification cost
+    pub fn effective_gas_price(&self) -> u64 {
+        if self.is_quantum_signed() {
+            // 50% gas premium for quantum-resistant TX
+            self.gas_price + (self.gas_price / 2)
+        } else {
+            self.gas_price
+        }
     }
     
     /// Calculate transaction hash as hex string
@@ -525,8 +556,8 @@ impl Transaction {
                     )));
                 }
                 
-                // Check balance
-                let total_amount = amount + self.gas_price * self.gas_limit;
+                // Check balance (QUANTUM v2.25: use effective_gas_price for +50% Dilithium TX)
+                let total_amount = amount + self.effective_gas_price() * self.gas_limit;
                 if sender.balance < total_amount {
                     return Err(StateError::InsufficientBalance {
                         have: sender.balance,
@@ -565,8 +596,8 @@ impl Transaction {
                     )));
                 }
 
-                // Fee calculation
-                let fee = self.gas_price * self.gas_limit;
+                // Fee calculation (QUANTUM v2.25: use effective_gas_price for +50% Dilithium TX)
+                let fee = self.effective_gas_price() * self.gas_limit;
                 let total_amount = amount + fee;
 
                 if sender.balance < total_amount {
@@ -596,8 +627,8 @@ impl Transaction {
                     )));
                 }
                 
-                // Check balance for deployment fee
-                let fee = self.gas_price * self.gas_limit;
+                // Check balance for deployment fee (QUANTUM v2.25: +50% for Dilithium TX)
+                let fee = self.effective_gas_price() * self.gas_limit;
                 if sender.balance < fee {
                     return Err(StateError::InsufficientBalance {
                         have: sender.balance,
@@ -625,8 +656,8 @@ impl Transaction {
                     )));
                 }
                 
-                // Check balance for call fee + value
-                let fee = self.gas_price * self.gas_limit;
+                // Check balance for call fee + value (QUANTUM v2.25: +50% for Dilithium TX)
+                let fee = self.effective_gas_price() * self.gas_limit;
                 let total_cost = fee + self.amount;
                 
                 if sender.balance < total_cost {
@@ -677,8 +708,8 @@ impl Transaction {
                     )));
                 }
 
-                // Calculate total fee for batch
-                let total_fee = (self.gas_price * self.gas_limit) * node_ids.len() as u64;
+                // Calculate total fee for batch (QUANTUM v2.25: +50% for Dilithium TX)
+                let total_fee = (self.effective_gas_price() * self.gas_limit) * node_ids.len() as u64;
 
                 if sender.balance < total_fee {
                     return Err(StateError::InsufficientBalance {
@@ -708,9 +739,9 @@ impl Transaction {
                     )));
                 }
 
-                // Calculate total activation amount and fees
+                // Calculate total activation amount and fees (QUANTUM v2.25: +50% for Dilithium TX)
                 let total_activation_amount: u64 = activation_data.iter().map(|d| d.activation_amount).sum();
-                let total_fee = (self.gas_price * self.gas_limit) * activation_data.len() as u64;
+                let total_fee = (self.effective_gas_price() * self.gas_limit) * activation_data.len() as u64;
                 let total_cost = total_activation_amount + total_fee;
 
                 if sender.balance < total_cost {
@@ -741,9 +772,9 @@ impl Transaction {
                     )));
                 }
 
-                // Calculate total transfer amount and fees
+                // Calculate total transfer amount and fees (QUANTUM v2.25: +50% for Dilithium TX)
                 let total_transfer_amount: u64 = transfers.iter().map(|t| t.amount).sum();
-                let total_fee = (self.gas_price * self.gas_limit) * transfers.len() as u64;
+                let total_fee = (self.effective_gas_price() * self.gas_limit) * transfers.len() as u64;
                 let total_cost = total_transfer_amount + total_fee;
 
                 if sender.balance < total_cost {
@@ -1017,11 +1048,12 @@ impl TransactionProcessor {
         tx.apply_to_state(accounts)?;
         
         // Calculate and process fee for Pool 2 - Phase 1 activations are FREE!
+        // QUANTUM v2.25: Use effective_gas_price() which adds +50% for Dilithium TX
         let fee_amount = match &tx.tx_type {
             TransactionType::NodeActivation { phase: ActivationPhase::Phase1, .. } => {
                 0 // Phase 1 activations are completely FREE - no QNC gas fees!
             },
-            _ => tx.gas_price * tx.gas_limit // Normal fees for other transactions
+            _ => tx.effective_gas_price() * tx.gas_limit // Normal fees (+50% for quantum TX)
         };
         
         if fee_amount > 0 {

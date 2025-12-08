@@ -11,17 +11,17 @@
 //! 
 //! Usage:
 //! ## Presets (use "preset" field):
-//! - "single_shard"  : 1 shard,   50K TPS,   50K TX
-//! - "small_scale"   : 8 shards,  400K TPS,  400K TX
-//! - "medium_scale"  : 32 shards, 1.6M TPS,  1.6M TX
-//! - "large_scale"   : 64 shards, 3.2M TPS,  3.2M TX
-//! - "extra_large"   : 128 shards, 6.4M TPS, 6.4M TX
-//! - "full_scale"    : 256 shards, 12.8M TPS, 12.8M TX (MAX)
+//! - "single_shard"  : 1 shard,   100K TPS,   100K TX
+//! - "small_scale"   : 8 shards,  800K TPS,   800K TX
+//! - "medium_scale"  : 32 shards, 3.2M TPS,   3.2M TX
+//! - "large_scale"   : 64 shards, 6.4M TPS,   6.4M TX
+//! - "extra_large"   : 128 shards, 12.8M TPS, 12.8M TX
+//! - "full_scale"    : 256 shards, 25.6M TPS, 25.6M TX (MAX)
 //! 
 //! ## API Examples:
 //! POST /api/v1/benchmark/start { "preset": "single_shard" }
 //! POST /api/v1/benchmark/start { "preset": "full_scale" }
-//! POST /api/v1/benchmark/start { "shards": 64, "total": 5000000, "target_tps": 3200000 }
+//! POST /api/v1/benchmark/start { "shards": 64, "total": 6400000, "target_tps": 6400000 }
 //! GET /api/v1/benchmark/status
 //! GET /api/v1/benchmark/results
 
@@ -44,17 +44,17 @@ pub const ONE_QNC: u64 = 1_000_000_000;
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum BenchmarkPreset {
-    /// Single shard test: 50K TPS
+    /// Single shard test: 100K TPS
     SingleShard,
-    /// 8 shards test: 400K TPS
+    /// 8 shards test: 800K TPS
     SmallScale,
-    /// 32 shards test: 1.6M TPS  
+    /// 32 shards test: 3.2M TPS  
     MediumScale,
-    /// 64 shards test: 3.2M TPS
+    /// 64 shards test: 6.4M TPS
     LargeScale,
-    /// 128 shards test: 6.4M TPS
+    /// 128 shards test: 12.8M TPS
     ExtraLarge,
-    /// Full 256 shards: 12.8M TPS (MAXIMUM)
+    /// Full 256 shards: 25.6M TPS (MAXIMUM)
     FullScale,
     /// Custom configuration
     Custom,
@@ -91,13 +91,13 @@ impl BenchmarkConfig {
     /// Create config from preset
     pub fn from_preset(preset: BenchmarkPreset) -> Self {
         let (shards, total, tps, accounts) = match preset {
-            BenchmarkPreset::SingleShard => (1, 50_000, 50_000, 100),
-            BenchmarkPreset::SmallScale => (8, 400_000, 400_000, 500),
-            BenchmarkPreset::MediumScale => (32, 1_600_000, 1_600_000, 2_000),
-            BenchmarkPreset::LargeScale => (64, 3_200_000, 3_200_000, 4_000),
-            BenchmarkPreset::ExtraLarge => (128, 6_400_000, 6_400_000, 8_000),
-            BenchmarkPreset::FullScale => (256, 12_800_000, 12_800_000, 10_000),
-            BenchmarkPreset::Custom => (256, 12_800_000, 12_800_000, 10_000),
+            BenchmarkPreset::SingleShard => (1, 100_000, 100_000, 100),
+            BenchmarkPreset::SmallScale => (8, 800_000, 800_000, 500),
+            BenchmarkPreset::MediumScale => (32, 3_200_000, 3_200_000, 2_000),
+            BenchmarkPreset::LargeScale => (64, 6_400_000, 6_400_000, 4_000),
+            BenchmarkPreset::ExtraLarge => (128, 12_800_000, 12_800_000, 8_000),
+            BenchmarkPreset::FullScale => (256, 25_600_000, 25_600_000, 10_000),
+            BenchmarkPreset::Custom => (256, 25_600_000, 25_600_000, 10_000),
         };
         
         Self {
@@ -448,6 +448,8 @@ impl BenchmarkManager {
                 to: receiver.address.clone(),
                 amount,
             },
+            dilithium_signature: None,   // Benchmark TX - no quantum sig
+            dilithium_public_key: None,
         };
         
         // Calculate hash

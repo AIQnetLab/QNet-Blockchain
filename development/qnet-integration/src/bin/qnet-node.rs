@@ -2930,8 +2930,8 @@ fn configure_production_mode() {
     
     std::env::set_var("QNET_HIGH_FREQUENCY", "1");
     std::env::set_var("QNET_MAX_TPS", "12800000");
-    std::env::set_var("QNET_MEMPOOL_SIZE", "5000000");
-    std::env::set_var("QNET_BATCH_SIZE", "50000");
+    std::env::set_var("QNET_MEMPOOL_SIZE", "10000000");
+    std::env::set_var("QNET_BATCH_SIZE", "100000");
     std::env::set_var("QNET_PARALLEL_VALIDATION", "1");
     std::env::set_var("QNET_PARALLEL_THREADS", "16");
     std::env::set_var("QNET_COMPRESSION", "1");

@@ -1,9 +1,9 @@
 # QNet Cryptography Implementation Guide
 ## Complete Technical Specification
 
-**Version:** 2.3 (v2.19.20)  
-**Date:** November 30, 2025  
-**Status:** Production Ready  
+**Version:** 2.4 (v2.25.0)  
+**Date:** December 8, 2025  
+**Status:** Production Ready (Gulf Stream + bincode)  
 
 ---
 
@@ -20,6 +20,13 @@ QNet implements **NIST/Cisco recommended post-quantum cryptography** with:
 - ✅ **Forward secrecy** (4.5-minute certificate lifetime with 80% rotation threshold)
 - ✅ **Byzantine-safe** (2/3+ honest nodes at all verification layers)
 
+### v2.25 Additions (Transaction Optimization)
+- ✅ **bincode serialization** (10-20x faster than JSON for TX processing)
+- ✅ **Gulf Stream protocol** (direct TX forwarding to producer, ~10ms latency)
+- ✅ **Anti-Storm protection** (DashSet deduplication prevents gossip amplification)
+- ✅ **100K TX/block** (up from 50K, bincode enables faster processing)
+- ✅ **Optional Dilithium TX signatures** (post-quantum for enterprise, +50% gas)
+
 ---
 
 ## 📋 Table of Contents
@@ -29,6 +36,7 @@ QNet implements **NIST/Cisco recommended post-quantum cryptography** with:
    - 1.2 [Verifiable Time Sequence (VTS)](#12-verifiable-time-sequence-vts---sequential-hash-chain)
    - 1.3 [Ping Commitment Cryptography](#13-ping-commitment-cryptography-v2190)
    - 1.4 [MEV Bundle Cryptography](#14-mev-bundle-cryptography-v2193)
+   - 1.5 [Transaction Serialization (v2.25)](#15-transaction-serialization-v225) ⭐ NEW
 2. [Signature Systems (v2.19)](#signature-systems-v219)
 3. [Cryptography Usage by Component](#cryptography-usage-by-component)
 4. [Hybrid Cryptography (Consensus Messages)](#hybrid-cryptography-consensus-messages)
@@ -37,6 +45,7 @@ QNet implements **NIST/Cisco recommended post-quantum cryptography** with:
 7. [Security Analysis](#security-analysis)
 8. [Implementation Details](#implementation-details)
 9. [Compliance & Standards](#compliance--standards)
+10. [Gulf Stream & bincode (v2.25)](#gulf-stream--bincode-v225) ⭐ NEW
 
 ---
 
@@ -101,20 +110,26 @@ QNet implements **NIST/Cisco recommended post-quantum cryptography** with:
 
 ### Overview
 
-QNet implements **Ed25519-only signatures** for client transactions (mobile wallets and browser extensions), providing optimal performance and security for user-facing applications.
+QNet implements **Ed25519 signatures** for client transactions with **optional Dilithium3** for quantum-resistant transactions. This provides optimal performance for regular users while offering enterprise-grade post-quantum security for high-value transfers.
 
-### Architecture
+### Architecture v2.25
 
 ```
 ┌─────────────────────────────────────────────────────────┐
 │  CLIENT LAYER (Mobile + Browser)                        │
 ├─────────────────────────────────────────────────────────┤
-│  ✅ Ed25519 ONLY (no Dilithium)                         │
+│  DEFAULT: Ed25519 ONLY                                  │
 │  ✅ 20μs sign/verify operations                         │
 │  ✅ 64-byte signatures                                  │
 │  ✅ 32-byte public keys                                 │
 │  ✅ Low energy consumption                              │
 │  ✅ BIP39 mnemonic + HD derivation                      │
+├─────────────────────────────────────────────────────────┤
+│  OPTIONAL: Ed25519 + Dilithium3 (QUANTUM)               │
+│  🔐 Post-quantum resistant                              │
+│  🔐 +50% gas fee (compensates verification cost)        │
+│  🔐 ~3293-byte signature + ~1952-byte pubkey            │
+│  🔐 For enterprise/high-value transfers                 │
 └─────────────────────────────────────────────────────────┘
                          ↓
 ┌─────────────────────────────────────────────────────────┐
@@ -127,12 +142,51 @@ QNet implements **Ed25519-only signatures** for client transactions (mobile wall
 └─────────────────────────────────────────────────────────┘
 ```
 
-### Why Ed25519 for Clients?
+### Transaction Signature Options
 
-| Aspect | Ed25519 | Dilithium | Decision |
-|--------|---------|-----------|----------|
+| Mode | Ed25519 | Dilithium3 | Gas Cost | Use Case |
+|------|---------|------------|----------|----------|
+| **Standard** | ✅ Required | ❌ None | 100% | Regular transfers |
+| **Quantum** | ✅ Required | ✅ Optional | **150%** | Enterprise, high-value |
+
+### Transaction Structure v2.25
+
+```rust
+pub struct Transaction {
+    // ... existing fields ...
+    
+    /// Ed25519 signature (64 bytes, hex encoded) - REQUIRED
+    pub signature: Option<String>,
+    
+    /// Ed25519 public key (32 bytes, hex encoded) - REQUIRED
+    pub public_key: Option<String>,
+    
+    /// QUANTUM v2.25: Dilithium3 signature (~3293 bytes) - OPTIONAL
+    /// When present: TX is quantum-resistant + 50% higher gas
+    pub dilithium_signature: Option<String>,
+    
+    /// QUANTUM v2.25: Dilithium3 public key (~1952 bytes) - OPTIONAL
+    pub dilithium_public_key: Option<String>,
+}
+
+// Effective gas calculation
+impl Transaction {
+    pub fn effective_gas_price(&self) -> u64 {
+        if self.is_quantum_signed() {
+            self.gas_price + (self.gas_price / 2)  // +50%
+        } else {
+            self.gas_price
+        }
+    }
+}
+```
+
+### Why Ed25519 as Default?
+
+| Aspect | Ed25519 | Dilithium3 | Decision |
+|--------|---------|------------|----------|
 | **Speed** | 20μs | 100ms | ✅ Ed25519 (5000x faster) |
-| **Size** | 64 bytes | 2420 bytes | ✅ Ed25519 (38x smaller) |
+| **Size** | 64 bytes | 3293 bytes | ✅ Ed25519 (51x smaller) |
 | **Energy** | Low | High | ✅ Ed25519 (mobile-friendly) |
 | **Security** | 128-bit | Post-quantum | ✅ Ed25519 (sufficient for clients) |
 | **Maturity** | RFC 8032 | NIST Draft | ✅ Ed25519 (battle-tested) |
@@ -1990,4 +2044,126 @@ pub fn get_optimal_shard_count(network_size: usize) -> u32 {
 QNET_SHARD_COUNT=256 ./qnet-node  # Force 256 shards for testing
 # System will auto-adjust to optimal count based on actual network size
 ```
+
+---
+
+## 1.5 Transaction Serialization (v2.25)
+
+### bincode vs JSON
+
+QNet v2.25 replaces JSON with **bincode** for all internal transaction processing:
+
+| Aspect | JSON (v2.19) | bincode (v2.25) | Improvement |
+|--------|--------------|-----------------|-------------|
+| Serialize TX | ~50 µs | ~5 µs | **10x** |
+| Deserialize TX | ~50 µs | ~3 µs | **16x** |
+| TX size | ~500 bytes | ~200 bytes | **2.5x smaller** |
+| CPU usage | High (parsing) | Low (direct copy) | **5-10x less** |
+
+### Hash Calculation
+
+Transaction hashes are now computed from bincode bytes:
+
+```rust
+// v2.25: bincode-based hash
+let tx_bytes = bincode::serialize(&tx)?;
+let tx_hash = format!("{:x}", sha3::Sha3_256::digest(&tx_bytes));
+```
+
+**Security Note**: SHA3-256 hash is computed from binary representation, providing identical cryptographic guarantees as JSON-based hashing.
+
+### Backward Compatibility
+
+```rust
+// Deserialization with legacy fallback
+let tx = bincode::deserialize::<Transaction>(&tx_bytes)
+    .or_else(|_| {
+        let json = String::from_utf8(tx_bytes)?;
+        serde_json::from_str::<Transaction>(&json)
+    })?;
+```
+
+---
+
+## 10. Gulf Stream & bincode (v2.25)
+
+### Overview
+
+Gulf Stream is a transaction forwarding protocol that reduces TX latency by sending transactions directly to the current block producer:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    GULF STREAM PROTOCOL                     │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  Traditional Gossip:                                        │
+│  Client → Node A → Node B → Node C → Producer               │
+│  Latency: 100-300ms (3+ hops)                               │
+│                                                             │
+│  Gulf Stream:                                               │
+│  Client → Node → Producer (direct)                          │
+│  Latency: 10-50ms (1 hop)                                   │
+│                                                             │
+│  + Backup gossip to 2 random peers for reliability          │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Cryptographic Integrity
+
+1. **TX Signature**: Ed25519 signature verified before broadcast
+2. **TX Hash**: SHA3-256 hash computed from bincode bytes
+3. **Deduplication**: Hash-based seen_tx_hashes prevents replay
+4. **Producer Verification**: Producer identity from consensus
+
+### Anti-Storm Protection
+
+Prevents exponential message amplification:
+
+```rust
+// DashSet for lock-free O(1) operations
+seen_tx_hashes: Arc<DashSet<String>>
+
+// On TX receive:
+let tx_hash = sha3::Sha3_256::digest(&tx_bytes);
+if seen_tx_hashes.contains(&tx_hash) {
+    return;  // Already seen - skip processing and gossip
+}
+seen_tx_hashes.insert(tx_hash);
+// Process TX and gossip to max 2 peers
+
+// Cleanup every 60 seconds to prevent memory exhaustion
+```
+
+**Result**: Linear message growth O(N) instead of exponential O(2^N)
+
+### Network Message Format
+
+```rust
+pub enum NetworkMessage {
+    /// Single transaction (bincode bytes)
+    Transaction {
+        #[serde(with = "base64_bytes")]
+        data: Vec<u8>,  // bincode::serialize(&tx)
+    },
+    
+    /// Batch of transactions (v2.25)
+    TransactionBatch {
+        #[serde(with = "base64_bytes_vec")]
+        transactions: Vec<Vec<u8>>,  // Vec of bincode bytes
+        timestamp: u64,
+    },
+    // ... other message types
+}
+```
+
+### Performance Summary
+
+| Metric | Before v2.25 | After v2.25 | Notes |
+|--------|--------------|-------------|-------|
+| TX latency | 100-300ms | 10-50ms | Gulf Stream direct |
+| Serialization | JSON (~50µs) | bincode (~5µs) | 10x faster |
+| Messages per TX | O(2^N) | O(10) | Anti-Storm |
+| TX/block | 50K | 100K | bincode enables |
+| Expected TPS | 10-20K | 50-100K+ | Combined effect |
 

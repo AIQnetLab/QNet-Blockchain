@@ -173,6 +173,20 @@ impl SimpleMempool {
             .collect()
     }
     
+    /// PRODUCTION v2.25: Get pending transactions as binary (for bincode deserialization)
+    /// Returns raw bytes - caller must deserialize with bincode::deserialize
+    /// PERFORMANCE: 10-20x faster than JSON for high TPS scenarios
+    pub fn get_pending_binary_transactions(&self, limit: usize) -> Vec<Vec<u8>> {
+        let priority_queue = self.by_gas_price.read();
+        
+        priority_queue.iter()
+            .rev()
+            .flat_map(|(_gas_price, hashes)| hashes.iter())
+            .take(limit)
+            .filter_map(|hash| self.get_binary_transaction(hash))
+            .collect()
+    }
+    
     /// Remove transaction (must remove from both transactions map AND priority queue)
     /// CRITICAL: Maintains consistency between storage and priority queue
     pub fn remove_transaction(&self, hash: &str) -> bool {
@@ -206,5 +220,53 @@ impl SimpleMempool {
     /// Get minimum gas price from config
     pub fn get_min_gas_price(&self) -> u64 {
         self.config.min_gas_price
+    }
+    
+    /// CRITICAL v2.26: Batch remove transactions after block inclusion
+    /// PERFORMANCE: O(n) batch removal instead of O(n*m) individual removals
+    /// This prevents mempool from filling up with already-processed transactions!
+    pub fn batch_remove_transactions(&self, hashes: &[String]) {
+        if hashes.is_empty() {
+            return;
+        }
+        
+        // Step 1: Remove from transactions map (fast O(1) per hash)
+        let mut removed_count = 0;
+        for hash in hashes {
+            if self.transactions.remove(hash).is_some() {
+                removed_count += 1;
+            }
+        }
+        
+        // Step 2: Clean priority queue in one pass (more efficient than individual removes)
+        if removed_count > 0 {
+            let hash_set: std::collections::HashSet<&String> = hashes.iter().collect();
+            let mut priority_queue = self.by_gas_price.write();
+            for (_gas_price, queue_hashes) in priority_queue.iter_mut() {
+                queue_hashes.retain(|h| !hash_set.contains(h));
+            }
+            // Remove empty gas_price levels
+            priority_queue.retain(|_, queue_hashes| !queue_hashes.is_empty());
+        }
+        
+        if removed_count > 0 {
+            println!("[MEMPOOL] 🗑️ Removed {} transactions after block inclusion", removed_count);
+        }
+    }
+    
+    /// CRITICAL v2.26: Get pending transactions WITH their hashes
+    /// Returns (hash, binary_data) pairs for block inclusion AND cleanup
+    /// This allows removing exact transactions that were included in a block
+    pub fn get_pending_transactions_with_hashes(&self, limit: usize) -> Vec<(String, Vec<u8>)> {
+        let priority_queue = self.by_gas_price.read();
+        
+        priority_queue.iter()
+            .rev()  // Highest gas_price first
+            .flat_map(|(_gas_price, hashes)| hashes.iter())
+            .take(limit)
+            .filter_map(|hash| {
+                self.get_binary_transaction(hash).map(|data| (hash.clone(), data))
+            })
+            .collect()
     }
 } 

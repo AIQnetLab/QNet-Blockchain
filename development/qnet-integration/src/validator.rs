@@ -70,9 +70,19 @@ impl BlockValidator {
         // Validate transaction type
         self.validate_transaction_type(&tx.tx_type)?;
         
-        // Validate signature if present
+        // Validate Ed25519 signature if present
         if let Some(ref signature) = tx.signature {
             self.validate_signature(tx, signature)?;
+        }
+        
+        // QUANTUM v2.25: Validate Dilithium signature if present
+        // This is OPTIONAL - TX can have Ed25519 only, or Ed25519 + Dilithium
+        if tx.dilithium_signature.is_some() {
+            if !self.verify_quantum_signature(tx)? {
+                return Err(IntegrationError::ValidationError(
+                    "Invalid Dilithium signature - quantum verification failed".to_string()
+                ));
+            }
         }
         
         Ok(())
@@ -117,6 +127,77 @@ impl BlockValidator {
         } else {
             // Ed25519 signature - requires public_key in transaction
             self.verify_ed25519_with_pubkey(tx, signature_hex)
+        }
+    }
+    
+    /// QUANTUM v2.25: Verify optional Dilithium signature for quantum-resistant TX
+    /// Returns Ok(true) if Dilithium signature is valid
+    /// Returns Ok(false) if Dilithium signature is present but invalid
+    /// Returns Ok(true) if no Dilithium signature (quantum signature is optional)
+    pub fn verify_quantum_signature(&self, tx: &Transaction) -> IntegrationResult<bool> {
+        // QUANTUM v2.25: Check if transaction has Dilithium signature
+        let dilithium_sig = match &tx.dilithium_signature {
+            Some(sig) if !sig.is_empty() => sig,
+            _ => return Ok(true), // No quantum signature - that's OK, it's optional
+        };
+        
+        let dilithium_pubkey = match &tx.dilithium_public_key {
+            Some(pk) if !pk.is_empty() => pk,
+            _ => return Err(IntegrationError::ValidationError(
+                "Dilithium signature present but missing dilithium_public_key".to_string()
+            )),
+        };
+        
+        println!("[VALIDATOR] 🔐 QUANTUM: Verifying Dilithium3 signature for TX from {}", tx.from);
+        
+        // Decode signature (~3293 bytes)
+        let sig_bytes = hex::decode(dilithium_sig)
+            .map_err(|e| IntegrationError::ValidationError(format!("Invalid Dilithium signature hex: {}", e)))?;
+        
+        // Decode public key (~1952 bytes)
+        let pubkey_bytes = hex::decode(dilithium_pubkey)
+            .map_err(|e| IntegrationError::ValidationError(format!("Invalid Dilithium public key hex: {}", e)))?;
+        
+        // Expected sizes for Dilithium3
+        const DILITHIUM3_SIG_SIZE: usize = 3293;
+        const DILITHIUM3_PK_SIZE: usize = 1952;
+        
+        if sig_bytes.len() != DILITHIUM3_SIG_SIZE {
+            return Err(IntegrationError::ValidationError(format!(
+                "Invalid Dilithium3 signature size: {} (expected {})", sig_bytes.len(), DILITHIUM3_SIG_SIZE
+            )));
+        }
+        
+        if pubkey_bytes.len() != DILITHIUM3_PK_SIZE {
+            return Err(IntegrationError::ValidationError(format!(
+                "Invalid Dilithium3 public key size: {} (expected {})", pubkey_bytes.len(), DILITHIUM3_PK_SIZE
+            )));
+        }
+        
+        // Create message to verify (same as Ed25519)
+        let message = self.create_client_signing_message(tx)?;
+        
+        // PRODUCTION: Real Dilithium3 verification
+        use pqcrypto_dilithium::dilithium3::{verify_detached_signature, PublicKey, DetachedSignature};
+        use pqcrypto_traits::sign::PublicKey as _;
+        use pqcrypto_traits::sign::DetachedSignature as _;
+        
+        let pk = PublicKey::from_bytes(&pubkey_bytes)
+            .map_err(|_| IntegrationError::ValidationError("Invalid Dilithium3 public key format".to_string()))?;
+        
+        let sig = DetachedSignature::from_bytes(&sig_bytes)
+            .map_err(|_| IntegrationError::ValidationError("Invalid Dilithium3 signature format".to_string()))?;
+        
+        match verify_detached_signature(&sig, &message, &pk) {
+            Ok(_) => {
+                println!("[VALIDATOR] ✅ QUANTUM: Dilithium3 signature verified for TX from {}", tx.from);
+                println!("[VALIDATOR] 🛡️ TX is POST-QUANTUM RESISTANT (+50% gas fee applied)");
+                Ok(true)
+            }
+            Err(_) => {
+                println!("[VALIDATOR] ❌ QUANTUM: Invalid Dilithium3 signature from {}", tx.from);
+                Ok(false)
+            }
         }
     }
     

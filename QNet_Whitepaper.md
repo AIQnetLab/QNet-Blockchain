@@ -3,8 +3,8 @@
 
 **⚠️ EXPERIMENTAL BLOCKCHAIN RESEARCH ⚠️**
 
-**Version**: 2.19.22-experimental  
-**Date**: November 30, 2025  
+**Version**: 2.25.0-experimental  
+**Date**: December 8, 2025  
 **Authors**: QNet Research Team  
 **Status**: Experimental Research Project  
 **Goal**: To prove that one person without multi-million investments can create an advanced blockchain
@@ -1562,6 +1562,39 @@ Priority Multipliers:
 ├── Standard: 1.5x (faster processing)
 ├── Fast: 2.0x (priority processing)
 └── Priority: 3.0x (immediate processing)
+
+Quantum Transaction Premium (v2.25):
+├── Standard TX: Ed25519 only (1.0x gas)
+└── Quantum TX: Ed25519 + Dilithium3 (1.5x gas)
+    ├── Optional post-quantum protection
+    ├── Both signatures verified
+    └── Enterprise-grade security
+```
+
+**Transaction Signature Architecture (v2.25):**
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    TRANSACTION SIGNATURES                           │
+├─────────────────────────────────────────────────────────────────────┤
+│  STANDARD TX (default)        │  QUANTUM TX (optional)              │
+│  ─────────────────────────    │  ──────────────────────────────────│
+│  Ed25519 signature: REQUIRED  │  Ed25519 signature: REQUIRED       │
+│  Ed25519 pubkey: REQUIRED     │  Ed25519 pubkey: REQUIRED          │
+│  Dilithium3 sig: null         │  Dilithium3 sig: REQUIRED          │
+│  Dilithium3 pubkey: null      │  Dilithium3 pubkey: REQUIRED       │
+│                               │                                     │
+│  Gas: gas_price * gas_limit   │  Gas: gas_price * 1.5 * gas_limit  │
+│  Use case: Regular users      │  Use case: Enterprise, high-value  │
+└─────────────────────────────────────────────────────────────────────┘
+
+Signature Flow:
+1. Client creates Ed25519 signature (always)
+2. Client optionally creates Dilithium3 signature
+3. Node verifies Ed25519 (mandatory)
+4. Node verifies Dilithium3 if present (optional)
+5. Gas fee calculated with quantum premium if applicable
+```
 
 Smart Contract Fees:
 ├── Base Execution: 0.001 QNC

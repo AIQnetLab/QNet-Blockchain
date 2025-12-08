@@ -394,7 +394,7 @@ mod stress_tests {
         let manager = BenchmarkManager::new();
         manager.initialize(100).await;
         
-        let target_tx = 50_000;
+        let target_tx = 100_000;
         let start = Instant::now();
         let mut generated = 0u64;
         

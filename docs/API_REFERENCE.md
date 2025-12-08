@@ -185,7 +185,12 @@ Content-Type: application/json
 - Ed25519 signature - **REQUIRED** for all transactions
 - Without signature, transaction will be **REJECTED**
 
-**Request Body:**
+**🔐 OPTIONAL Quantum-Resistant Signatures (v2.25):**
+- Dilithium3 signature - **OPTIONAL** for post-quantum security
+- When present: **+50% gas fee** (enterprise quantum protection)
+- Both Ed25519 AND Dilithium3 are verified if Dilithium present
+
+**Request Body (Standard TX - Ed25519 only):**
 ```json
 {
   "from": "a1b2c3d4e5f6g7h8i9jeon0k1l2m3n4o5p6q7r8s9a1b2",
@@ -198,6 +203,24 @@ Content-Type: application/json
   "public_key": "ed25519_pubkey_hex"
 }
 ```
+
+**Request Body (Quantum TX - Ed25519 + Dilithium3):**
+```json
+{
+  "from": "a1b2c3d4e5f6g7h8i9jeon0k1l2m3n4o5p6q7r8s9a1b2",
+  "to": "b2c3d4e5f6g7h8i9j0keonl1m2n3o4p5q6r7s8t9u0v1w2",
+  "amount": 1000000000,
+  "nonce": 42,
+  "gas_price": 100000,
+  "gas_limit": 10000,
+  "signature": "ed25519_signature_hex",
+  "public_key": "ed25519_pubkey_hex",
+  "dilithium_signature": "dilithium3_signature_hex_6586chars",
+  "dilithium_public_key": "dilithium3_pubkey_hex_3904chars"
+}
+```
+
+> **Note**: Quantum TX gas = `gas_price * 1.5 * gas_limit` (50% premium for post-quantum security)
 
 **Signature Message Format:**
 ```

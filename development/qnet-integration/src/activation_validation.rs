@@ -1723,6 +1723,8 @@ impl BlockchainActivationRegistry {
             public_key: None, // Not needed for activation transactions
             tx_type: TransactionType::ContractCall, // Use tx_type, not transaction_type
             timestamp: record.activated_at,
+            dilithium_signature: None,   // Activation TX - no quantum sig
+            dilithium_public_key: None,
         };
         
         // PRODUCTION: Submit to blockchain through GLOBAL mempool
@@ -1741,17 +1743,17 @@ impl BlockchainActivationRegistry {
         };
         
         if let Some(mempool_arc) = mempool_arc_opt {
-            // Serialize transaction to JSON for mempool
-            match serde_json::to_string(&transaction) {
-                Ok(tx_json) => {
-                    // Calculate transaction hash for mempool (using SHA3-256)
+            // PRODUCTION v2.26: Use bincode for consistency with block production
+            match bincode::serialize(&transaction) {
+                Ok(tx_bytes) => {
+                    // Calculate transaction hash for mempool (using SHA3-256 of bincode)
                     use sha3::{Sha3_256, Digest};
-                    let tx_hash_for_mempool = format!("{:x}", Sha3_256::digest(tx_json.as_bytes()));
+                    let tx_hash_for_mempool = format!("{:x}", Sha3_256::digest(&tx_bytes));
                     
                     // Add to mempool (blocks will pick it up automatically)
                     let mempool_write = mempool_arc.write().await;
-                    // PRODUCTION: Add with gas_price for priority ordering
-                    if mempool_write.add_raw_transaction(tx_json, tx_hash_for_mempool.clone(), transaction.gas_price) {
+                    // PRODUCTION v2.26: Use binary transaction for consistency
+                    if mempool_write.add_binary_transaction(tx_bytes, tx_hash_for_mempool.clone(), transaction.gas_price) {
                         println!("[REGISTRY] ✅ Activation transaction added to mempool: {}", tx_hash_for_mempool);
                     } else {
                         println!("[REGISTRY] ⚠️ Failed to add activation transaction to mempool (may be full or duplicate)");

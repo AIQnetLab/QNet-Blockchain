@@ -409,8 +409,10 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 **Cryptographic Approach:**
 - ✅ **Consensus Layer**: Real CRYSTALS-Dilithium3 (pqcrypto-dilithium 0.5) - fully post-quantum
 - ✅ **Node Signatures**: Hybrid Dilithium3 + Ed25519 with NIST/Cisco encapsulated keys
-- ⚠️ **Client Transactions**: Ed25519-only (NOT post-quantum, optimized for mobile/battery)
-- 🔄 **Migration Path**: Client layer upgrade planned when quantum threat becomes imminent (10-15 years)
+- ✅ **Client Transactions (v2.25)**: Ed25519 required + **optional Dilithium3** for quantum protection
+  - Standard TX: Ed25519 only (fast, low gas)
+  - Quantum TX: Ed25519 + Dilithium3 (+50% gas premium, post-quantum security)
+- 🔐 **Enterprise Option**: Optional Dilithium signatures for high-value transfers
 
 **Consensus Architecture:**
 - ⚠️ **Producer Selection**: Deterministic SHA3-512 (finality window), NOT true VRF with private keys

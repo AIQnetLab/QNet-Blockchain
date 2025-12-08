@@ -31,13 +31,30 @@ impl Default for GenesisConfig {
                 println!("[GENESIS] ⏰ Using real-time timestamp for Genesis: {}", real_time);
                 real_time
             });
+        
+        // PRODUCTION v2.26: Auto-add benchmark accounts if QNET_BENCHMARK_MODE=true
+        // This enables realistic TPS testing with valid balances on ALL nodes
+        let benchmark_mode = std::env::var("QNET_BENCHMARK_MODE")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
+        
+        let accounts = if benchmark_mode {
+            // Add 1000 benchmark accounts with 1M QNC each for load testing
+            // Total: 1B QNC reserved for benchmarks (doesn't affect Fair Launch economics)
+            println!("[GENESIS] 🧪 BENCHMARK MODE: Adding 1000 benchmark accounts with 1M QNC each");
+            let one_million_qnc = 1_000_000_000_000_000u64; // 1M QNC in nanoQNC
+            (0..1000)
+                .map(|i| (format!("EON1benchmark{:06}", i), one_million_qnc))
+                .collect()
+        } else {
+            // FAIR LAUNCH: Empty genesis - all QNC through Pool 1 Base Emission
+            // Pool 1: Dynamic halving system (245,100.67 QNC/4h initial)
+            // Sharp Drop Halving: ÷2 every 4 years, ÷10 at year 20-24
+            vec![]
+        };
             
         Self {
-            accounts: vec![
-                // FAIR LAUNCH: Empty genesis - all QNC through Pool 1 Base Emission
-                // Pool 1: Dynamic halving system (245,100.67 QNC/4h initial)
-                // Sharp Drop Halving: ÷2 every 4 years, ÷10 at year 20-24
-            ],
+            accounts,
             timestamp: genesis_timestamp,
             network: "mainnet".to_string(),
         }
@@ -66,6 +83,8 @@ pub fn create_genesis_block(config: GenesisConfig) -> IntegrationResult<Block> {
             initial_balance: 0, // Starts empty - Pool 1 emission happens every 4 hours
         },
         data: Some("System rewards pool for lazy rewards distribution".to_string()),
+        dilithium_signature: None,   // Genesis TX - no quantum sig
+        dilithium_public_key: None,
     };
     transactions.push(rewards_pool_tx);
     
@@ -88,6 +107,8 @@ pub fn create_genesis_block(config: GenesisConfig) -> IntegrationResult<Block> {
                 amount,
             },
             data: Some(format!("Genesis allocation to {}", address)),
+            dilithium_signature: None,   // Genesis TX - no quantum sig
+            dilithium_public_key: None,
         };
         transactions.push(tx);
     }

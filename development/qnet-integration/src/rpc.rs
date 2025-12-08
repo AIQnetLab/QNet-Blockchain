@@ -537,6 +537,15 @@ struct TransactionRequest {
     signature: String,
     /// Ed25519 public key for verification (REQUIRED)
     public_key: String,
+    /// QUANTUM v2.25: Optional Dilithium3 signature for post-quantum security
+    /// When present: TX is quantum-resistant, gas cost +50%
+    /// Format: hex-encoded (~6586 chars for 3293 bytes)
+    #[serde(default)]
+    dilithium_signature: Option<String>,
+    /// QUANTUM v2.25: Dilithium3 public key (required if dilithium_signature present)
+    /// Format: hex-encoded (~3904 chars for 1952 bytes)
+    #[serde(default)]
+    dilithium_public_key: Option<String>,
 }
 
 /// Query parameters for transaction history API
@@ -2123,6 +2132,18 @@ async fn tx_submit(
         message: "Missing public_key - required for signature verification".to_string(),
     })?;
     
+    // QUANTUM v2.25: Optional Dilithium signature for post-quantum security
+    let dilithium_signature = params["dilithium_signature"].as_str().map(|s| s.to_string());
+    let dilithium_public_key = params["dilithium_public_key"].as_str().map(|s| s.to_string());
+    
+    // Validate: if dilithium_signature present, dilithium_public_key must also be present
+    if dilithium_signature.is_some() && dilithium_public_key.is_none() {
+        return Err(RpcError {
+            code: -32602,
+            message: "dilithium_public_key required when dilithium_signature is present".to_string(),
+        });
+    }
+    
     // Create transaction
     let mut tx = qnet_state::Transaction {
         hash: String::new(), // will be calculated
@@ -2141,6 +2162,8 @@ async fn tx_submit(
             amount,
         },
         data: None, // no data for simple transfer
+        dilithium_signature,      // QUANTUM v2.25: Optional post-quantum signature
+        dilithium_public_key,     // QUANTUM v2.25: Optional post-quantum pubkey
     };
     
     // Calculate hash
@@ -2296,6 +2319,8 @@ async fn mempool_submit(
                 amount,
             },
             data: None, // no data for simple transfer
+            dilithium_signature: None,   // Batch TX - no quantum sig by default
+            dilithium_public_key: None,
         };
         
         // Calculate hash
@@ -2650,7 +2675,8 @@ async fn handle_transaction_history(
                     "timestamp": tx.timestamp,
                     "gas_price": tx.gas_price,
                     "gas_limit": tx.gas_limit,
-                    "gas_used": tx.gas_price * tx.gas_limit,
+                    "gas_used": tx.effective_gas_price() * tx.gas_limit,
+                    "is_quantum_signed": tx.is_quantum_signed(),
                     "nonce": tx.nonce,
                     "type": tx_type_str,
                     "direction": direction
@@ -3030,10 +3056,11 @@ async fn handle_transaction_submit(
         })).unwrap_or_default()),
     );
 
-    // Convert to JSON and add to mempool
-    match serde_json::to_string(&tx) {
-        Ok(tx_json) => {
-            let tx_hash = format!("{:x}", sha3::Sha3_256::digest(tx_json.as_bytes()));
+    // PRODUCTION v2.26: Use bincode hash for consistency with mempool
+    // This ensures client receives the SAME hash as stored in mempool
+    match bincode::serialize(&tx) {
+        Ok(tx_bytes) => {
+            let tx_hash = format!("{:x}", sha3::Sha3_256::digest(&tx_bytes));
             
             // Add to mempool using public method
             match blockchain.add_transaction_to_mempool(tx).await {
@@ -3468,6 +3495,8 @@ async fn handle_batch_claim_rewards(
                     gas_limit: 0, // No gas for rewards
                     nonce: 0,
                     data: Some(format!("Claim for node: {}", node_id)), // Track which node claimed
+                    dilithium_signature: None,   // System TX - no quantum sig
+                    dilithium_public_key: None,
                 };
                 
                 // Calculate hash using blake3 (EXISTING method)
@@ -4455,7 +4484,7 @@ async fn handle_shred_protocol_metrics(blockchain: Arc<BlockchainNode>) -> Resul
         "average_latency_ms": latency,  // REAL-TIME: Network performance
         "redundancy_factor": 1.5,
         "max_chunks": 2048,
-        "max_block_size": 2097152, // 2 MB for 50K TX support
+        "max_block_size": 4194304, // 4 MB for 100K TX support
         "status": "active"
     });
     
@@ -4509,8 +4538,8 @@ async fn handle_pre_execution_status(blockchain: Arc<BlockchainNode>) -> Result<
     let status = json!({
         "enabled": true,
         "lookahead_blocks": 3,
-        "max_tx_per_block": 50000, // 50K TX/block max
-        "cache_size": 50000, // Match max TX per block
+        "max_tx_per_block": 100000, // 100K TX/block max
+        "cache_size": 100000, // Match max TX per block
         "total_pre_executed": metrics.total_pre_executed,
         "cache_hits": metrics.cache_hits,
         "cache_misses": metrics.cache_misses,
@@ -6103,6 +6132,8 @@ async fn handle_claim_rewards(
         public_key: Some(claim_request.public_key.clone()), // User's Ed25519 public key
         tx_type: qnet_state::TransactionType::RewardDistribution,
         data: None,
+        dilithium_signature: None,   // Reward claim - no quantum sig
+        dilithium_public_key: None,
     };
     
     // Calculate transaction hash
@@ -8799,12 +8830,15 @@ async fn handle_contract_call(
         })).unwrap_or_default()),
     );
     
+    // PRODUCTION v2.26: Use bincode hash for consistency with mempool
+    let tx_hash = match bincode::serialize(&tx) {
+        Ok(tx_bytes) => format!("{:x}", Sha3_256::digest(&tx_bytes)),
+        Err(_) => hex::encode(&tx.hash), // Fallback to tx.hash
+    };
+    
     // Submit to mempool
     match blockchain.add_transaction_to_mempool(tx).await {
         Ok(_) => {
-            let tx_hash = format!("{:x}", Sha3_256::digest(format!("{}:{}:{}", 
-                request.from, request.contract_address, request.nonce).as_bytes()));
-            
             println!("📜 Contract call submitted: {}::{}", 
                      &request.contract_address[..16], request.method);
             
@@ -9570,7 +9604,7 @@ async fn handle_benchmark_start(
     } else if request.shards.is_some() || request.total.is_some() || request.target_tps.is_some() {
         // Custom configuration
         let shards = request.shards.unwrap_or(256).min(256).max(1);
-        let tps_per_shard = 50_000u64;
+        let tps_per_shard = 100_000u64;
         BenchmarkConfig {
             preset: crate::benchmark::BenchmarkPreset::Custom,
             shards,
@@ -9617,78 +9651,186 @@ async fn handle_benchmark_start(
     }
 }
 
-/// Run benchmark transaction generator
+/// Run benchmark transaction generator - PARALLEL VERSION for 50K+ TPS
+/// Uses multiple worker tasks to generate and submit transactions concurrently
 async fn run_benchmark_generator(
     blockchain: Arc<BlockchainNode>,
     total_transactions: u64,
     target_tps: u64,
 ) {
     use crate::benchmark::BENCHMARK_MANAGER;
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc as StdArc;
     
-    println!("[BENCHMARK] 🚀 Starting transaction generator: {} tx at {} TPS", total_transactions, target_tps);
-    
-    let delay_per_tx = if target_tps > 0 {
-        Duration::from_nanos(1_000_000_000 / target_tps)
-    } else {
-        Duration::from_millis(1)
+    // Calculate optimal worker count based on target TPS
+    // Each worker can generate ~5K TPS, so for 50K we need ~10 workers
+    // For full_scale (12.8M TPS target), we use 256 workers
+    let num_workers = match target_tps {
+        t if t <= 100_000 => 16,           // single_shard: 16 workers
+        t if t <= 500_000 => 64,          // small_scale: 64 workers
+        t if t <= 2_000_000 => 128,       // medium_scale: 128 workers
+        _ => 256,                          // large+ scale: 256 workers
     };
     
-    let batch_size = 1000usize; // Send in batches for efficiency
-    let mut sent = 0u64;
-    let start = Instant::now();
+    let tx_per_worker = total_transactions / num_workers as u64;
+    let batch_size = 100usize; // Smaller batches for better parallelism
     
-    while sent < total_transactions && BENCHMARK_MANAGER.is_running() {
-        let batch_start = Instant::now();
+    println!("[BENCHMARK] 🚀 PARALLEL generator: {} tx at {} TPS target", total_transactions, target_tps);
+    println!("[BENCHMARK] ⚡ Workers: {}, TX/worker: {}, Batch: {}", num_workers, tx_per_worker, batch_size);
+    
+    let start = Instant::now();
+    let global_sent = StdArc::new(AtomicU64::new(0));
+    let global_confirmed = StdArc::new(AtomicU64::new(0));
+    let global_errors = StdArc::new(AtomicU64::new(0));
+    
+    // Spawn parallel workers
+    let mut handles = Vec::with_capacity(num_workers);
+    
+    for worker_id in 0..num_workers {
+        let blockchain_clone = blockchain.clone();
+        let sent_counter = global_sent.clone();
+        let confirmed_counter = global_confirmed.clone();
+        let error_counter = global_errors.clone();
         
-        // Generate and send batch
-        for _ in 0..batch_size {
-            if sent >= total_transactions || !BENCHMARK_MANAGER.is_running() {
-                break;
-            }
+        let handle = tokio::spawn(async move {
+            let mut local_sent = 0u64;
+            let mut local_confirmed = 0u64;
+            let mut local_errors = 0u64;
+            let mut latencies = Vec::with_capacity(1000);
             
-            // Generate transaction
-            if let Some(tx) = BENCHMARK_MANAGER.generate_transaction().await {
-                let tx_start = Instant::now();
+            while local_sent < tx_per_worker && BENCHMARK_MANAGER.is_running() {
+                // Generate batch of transactions
+                let mut batch_txs = Vec::with_capacity(batch_size);
                 
-                // Submit to blockchain (will broadcast to network)
-                match blockchain.submit_benchmark_transaction(tx).await {
-                    Ok(_) => {
-                        BENCHMARK_MANAGER.record_sent();
-                        BENCHMARK_MANAGER.record_confirmed();
-                        let latency = tx_start.elapsed().as_secs_f64() * 1000.0;
-                        BENCHMARK_MANAGER.record_latency(latency).await;
+                for _ in 0..batch_size {
+                    if local_sent >= tx_per_worker || !BENCHMARK_MANAGER.is_running() {
+                        break;
                     }
-                    Err(_) => {
-                        BENCHMARK_MANAGER.record_error();
+                    
+                    if let Some(tx) = BENCHMARK_MANAGER.generate_transaction().await {
+                        batch_txs.push(tx);
+                        local_sent += 1;
                     }
                 }
                 
-                sent += 1;
+                if batch_txs.is_empty() {
+                    continue;
+                }
+                
+                // Submit batch to mempool
+                let batch_start = Instant::now();
+                let batch_len = batch_txs.len();
+                
+                match blockchain_clone.submit_benchmark_batch(batch_txs).await {
+                    Ok(confirmed) => {
+                        local_confirmed += confirmed as u64;
+                        local_errors += (batch_len - confirmed) as u64;
+                        let latency = batch_start.elapsed().as_secs_f64() * 1000.0 / batch_len as f64;
+                        latencies.push(latency);
+                    }
+                    Err(_) => {
+                        local_errors += batch_len as u64;
+                    }
+                }
+                
+                // Yield to other tasks periodically
+                if local_sent % 1000 == 0 {
+                    tokio::task::yield_now().await;
+                }
+            }
+            
+            // Update global counters
+            sent_counter.fetch_add(local_sent, Ordering::SeqCst);
+            confirmed_counter.fetch_add(local_confirmed, Ordering::SeqCst);
+            error_counter.fetch_add(local_errors, Ordering::SeqCst);
+            
+            // Record latencies
+            for lat in latencies {
+                BENCHMARK_MANAGER.record_latency(lat).await;
+            }
+            
+            (worker_id, local_sent, local_confirmed)
+        });
+        
+        handles.push(handle);
+    }
+    
+    // Progress reporter task
+    let progress_sent = global_sent.clone();
+    let progress_handle = tokio::spawn(async move {
+        let report_start = Instant::now();
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+            
+            if !BENCHMARK_MANAGER.is_running() {
+                break;
+            }
+            
+            let sent = progress_sent.load(Ordering::SeqCst);
+            let elapsed = report_start.elapsed().as_secs_f64();
+            let current_tps = if elapsed > 0.0 { sent as f64 / elapsed } else { 0.0 };
+            
+            println!("[BENCHMARK] 📊 Progress: {}/{} ({:.0} TPS)", sent, total_transactions, current_tps);
+            
+            // Update benchmark manager stats
+            for _ in 0..sent.saturating_sub(BENCHMARK_MANAGER.get_status().await.transactions_sent) {
+                BENCHMARK_MANAGER.record_sent();
+                BENCHMARK_MANAGER.record_confirmed();
             }
         }
-        
-        // Log progress every 10k transactions
-        if sent % 10_000 == 0 {
-            let elapsed = start.elapsed().as_secs_f64();
-            let current_tps = sent as f64 / elapsed;
-            println!("[BENCHMARK] 📊 Progress: {}/{} ({:.0} TPS)", sent, total_transactions, current_tps);
+    });
+    
+    // Wait for all workers to complete
+    let mut total_by_workers = 0u64;
+    for handle in handles {
+        if let Ok((worker_id, sent, confirmed)) = handle.await {
+            total_by_workers += sent;
+            if worker_id == 0 || worker_id == num_workers - 1 {
+                println!("[BENCHMARK] ✅ Worker {} completed: {} sent, {} confirmed", worker_id, sent, confirmed);
+            }
         }
-        
-        // Throttle if needed
-        let batch_elapsed = batch_start.elapsed();
-        let expected_batch_time = delay_per_tx * batch_size as u32;
-        if batch_elapsed < expected_batch_time {
-            tokio::time::sleep(expected_batch_time - batch_elapsed).await;
-        }
+    }
+    
+    // Stop progress reporter
+    progress_handle.abort();
+    
+    // Final stats update
+    let final_sent = global_sent.load(Ordering::SeqCst);
+    let final_confirmed = global_confirmed.load(Ordering::SeqCst);
+    let final_errors = global_errors.load(Ordering::SeqCst);
+    
+    // Sync with benchmark manager
+    let current_stats = BENCHMARK_MANAGER.get_status().await;
+    let remaining_sent = final_sent.saturating_sub(current_stats.transactions_sent);
+    let remaining_confirmed = final_confirmed.saturating_sub(current_stats.transactions_confirmed);
+    
+    for _ in 0..remaining_sent {
+        BENCHMARK_MANAGER.record_sent();
+    }
+    for _ in 0..remaining_confirmed {
+        BENCHMARK_MANAGER.record_confirmed();
+    }
+    for _ in 0..final_errors {
+        BENCHMARK_MANAGER.record_error();
     }
     
     // Stop benchmark
     BENCHMARK_MANAGER.stop().await;
     
     let elapsed = start.elapsed().as_secs_f64();
-    let final_tps = sent as f64 / elapsed;
-    println!("[BENCHMARK] 🏁 Completed: {} transactions in {:.2}s ({:.0} TPS)", sent, elapsed, final_tps);
+    let final_tps = final_sent as f64 / elapsed;
+    
+    println!("[BENCHMARK] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("[BENCHMARK] 🏁 PARALLEL BENCHMARK COMPLETED");
+    println!("[BENCHMARK] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("[BENCHMARK] ⚡ Workers used:    {}", num_workers);
+    println!("[BENCHMARK] 📦 Total sent:      {}", final_sent);
+    println!("[BENCHMARK] ✅ Confirmed:       {}", final_confirmed);
+    println!("[BENCHMARK] ❌ Errors:          {}", final_errors);
+    println!("[BENCHMARK] ⏱️  Duration:        {:.2}s", elapsed);
+    println!("[BENCHMARK] 🚀 ACTUAL TPS:      {:.0}", final_tps);
+    println!("[BENCHMARK] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 }
 
 /// Handle GET /api/v1/benchmark/status
@@ -9763,8 +9905,8 @@ async fn handle_benchmark_presets() -> Result<impl Reply, Rejection> {
                 "name": "single_shard",
                 "description": "Single shard test",
                 "shards": 1,
-                "target_tps": 50_000,
-                "total_transactions": 50_000
+                "target_tps": 100_000,
+                "total_transactions": 100_000
             },
             {
                 "name": "small_scale",

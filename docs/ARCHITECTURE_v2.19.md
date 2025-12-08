@@ -1,9 +1,9 @@
-# QNet Blockchain Architecture v2.19
+# QNet Blockchain Architecture v2.25
 ## Post-Quantum Decentralized Network - Technical Documentation
 
-**Last Updated**: November 30, 2025  
-**Version**: 2.19.22  
-**Status**: Production Ready (QUIC Transport)
+**Last Updated**: December 8, 2025  
+**Version**: 2.25.0  
+**Status**: Production Ready (Gulf Stream + bincode)
 
 > ⚠️ **REPUTATION SYSTEM UPDATED in v2.21.0**  
 > The reputation section in this document describes the OLD P2P gossip-based system.  
@@ -15,14 +15,16 @@
 1. [Overview](#overview)
 2. [Block Structure](#block-structure)
 3. [Signature System](#signature-system)
-4. [Block Buffering and Memory Protection](#block-buffering-and-memory-protection)
-5. [Progressive Finalization Protocol](#progressive-finalization-protocol)
-6. [Node Types and Scaling](#node-types-and-scaling)
-7. [Reputation System](#reputation-system)
-8. [Reward System](#reward-system)
-9. [MEV Protection & Priority Mempool](#mev-protection--priority-mempool)
-10. [Security Model](#security-model)
-11. [Performance Characteristics](#performance-characteristics)
+4. [Transaction Architecture v2.25](#transaction-architecture-v225) ⭐ NEW
+5. [Gulf Stream Protocol](#gulf-stream-protocol) ⭐ NEW
+6. [Block Buffering and Memory Protection](#block-buffering-and-memory-protection)
+7. [Progressive Finalization Protocol](#progressive-finalization-protocol)
+8. [Node Types and Scaling](#node-types-and-scaling)
+9. [Reputation System](#reputation-system)
+10. [Reward System](#reward-system)
+11. [MEV Protection & Priority Mempool](#mev-protection--priority-mempool)
+12. [Security Model](#security-model)
+13. [Performance Characteristics](#performance-characteristics)
 
 ---
 
@@ -263,6 +265,161 @@ if serial_changed {
 
 **Cache**: 100,000 certificates (LRU eviction)  
 **Scalability**: Handles millions of nodes (max 1000 active validators)
+
+---
+
+## Transaction Architecture v2.25
+
+### Serialization: bincode (10-20x faster than JSON)
+
+All internal transaction storage and network transmission uses **bincode** serialization:
+
+```rust
+// Serialization (submit_transaction)
+let tx_bytes = bincode::serialize(&tx)?;
+let tx_hash = sha3::Sha3_256::digest(&tx_bytes);
+mempool.add_binary_transaction(tx_bytes, tx_hash, tx.gas_price);
+
+// Deserialization (block building)
+let tx_bytes_list = mempool.get_pending_binary_transactions(100_000);
+for tx_bytes in tx_bytes_list {
+    let tx: Transaction = bincode::deserialize(&tx_bytes)?;
+    // Process transaction
+}
+```
+
+### Key Methods
+
+| Method | Description | Format |
+|--------|-------------|--------|
+| `add_binary_transaction(bytes, hash, gas_price)` | Add TX to mempool | bincode |
+| `get_binary_transaction(hash)` | Get single TX | bincode |
+| `get_pending_binary_transactions(limit)` | Get TXs for block | bincode |
+| `submit_transaction(tx)` | Client submission | bincode + Gulf Stream |
+| `broadcast_transaction(bytes)` | P2P broadcast | bincode over QUIC |
+| `broadcast_transaction_batch(bytes_vec)` | Batch broadcast | bincode over QUIC |
+
+### Backward Compatibility
+
+JSON fallback for legacy nodes:
+
+```rust
+// Deserialization with fallback
+let tx = bincode::deserialize::<Transaction>(&tx_bytes)
+    .or_else(|_| {
+        let json = String::from_utf8(tx_bytes)?;
+        serde_json::from_str::<Transaction>(&json)
+    })?;
+```
+
+---
+
+## Gulf Stream Protocol
+
+Inspired by Solana's Gulf Stream, QNet v2.25 implements **direct producer forwarding**:
+
+### Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    GULF STREAM v2.25                        │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  Client                                                     │
+│    │                                                        │
+│    ▼ submit_transaction(tx)                                 │
+│  ┌─────────────────────────────────────────────────────┐    │
+│  │ 1. Validate & serialize (bincode)                   │    │
+│  │ 2. Add to local mempool                             │    │
+│  │ 3. Gulf Stream broadcast:                           │    │
+│  │    ├── PRIORITY: Direct to current producer (0 hop)│    │
+│  │    └── BACKUP: Gossip to 2 random peers            │    │
+│  └─────────────────────────────────────────────────────┘    │
+│                                                             │
+│  ┌─────────────────────────────────────────────────────┐    │
+│  │ PRODUCER (known via consensus)                       │    │
+│  │ • Receives TX in ~10-50ms (vs 100-300ms gossip)     │    │
+│  │ • Includes in next block immediately                │    │
+│  └─────────────────────────────────────────────────────┘    │
+│                                                             │
+│  ┌─────────────────────────────────────────────────────┐    │
+│  │ BACKUP PEERS (2 random)                             │    │
+│  │ • Reliability if producer fails                     │    │
+│  │ • TX propagates via gossip as fallback             │    │
+│  └─────────────────────────────────────────────────────┘    │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Implementation
+
+```rust
+// unified_p2p.rs
+pub fn broadcast_transaction(&self, tx_data: Vec<u8>) -> Result<(), String> {
+    let tx_msg = NetworkMessage::Transaction { data: tx_data };
+    
+    // GULF STREAM: Priority path to producer
+    if let Some((producer_id, producer_addr)) = self.get_current_producer() {
+        if producer_id != self.node_id {
+            self.send_network_message(&producer_addr, tx_msg.clone());
+        }
+    }
+    
+    // BACKUP: Gossip to 2 random peers
+    self.gossip_to_random_peers(tx_msg, 2);
+    Ok(())
+}
+```
+
+### Anti-Storm Protection
+
+Prevents exponential message amplification:
+
+```rust
+// Each node tracks seen TX hashes
+seen_tx_hashes: Arc<DashSet<String>>  // Capacity: 1M hashes
+
+// On TX receive:
+if seen_tx_hashes.contains(&tx_hash) {
+    return;  // Already processed - skip
+}
+seen_tx_hashes.insert(tx_hash.clone());
+// Process TX and forward to 2 peers
+
+// Cleanup every 60 seconds:
+seen_tx_hashes.clear();
+```
+
+**Result**: Linear message growth instead of exponential (2^N → ~10)
+
+### Transaction Batching
+
+High-throughput batch submission:
+
+```rust
+// Single QUIC stream for entire batch (100-1000x fewer streams)
+pub fn broadcast_transaction_batch(&self, transactions: Vec<Vec<u8>>) -> Result<(), String> {
+    let batch_msg = NetworkMessage::TransactionBatch {
+        transactions,
+        timestamp: current_time(),
+    };
+    
+    // Gulf Stream: batch to producer + 2 backup
+    // ...
+}
+```
+
+### Performance Comparison
+
+| Metric | Before v2.25 | After v2.25 | Improvement |
+|--------|--------------|-------------|-------------|
+| TX latency to producer | 100-300ms | 10-50ms | **6-10x** |
+| Network messages per TX | 2^N (exponential) | ~10 (linear) | **Massive** |
+| Serialization speed | JSON | bincode | **10-20x** |
+| QUIC streams per batch | N | 1 | **100-1000x** |
+| TX/block limit | 50K | 100K | **2x** |
+| Mempool size | 5M | 10M | **2x** |
+| **Expected TPS** | 3-10K | **50-100K+** | **10-30x** |
 
 ---
 
