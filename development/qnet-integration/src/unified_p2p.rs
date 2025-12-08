@@ -3413,8 +3413,9 @@ impl SimplifiedP2P {
         self.start_quic_health_check_task();
     }
     
-    /// v2.24: Frequent QUIC health check for proactive reconnection
+    /// v2.24.2: Frequent QUIC health check with ACTIVE HealthPing probing
     /// SCALABLE: Works for any network size (5 nodes to 100K+)
+    /// ACTIVE: Sends HealthPing to all peers - detects zombie connections early
     fn start_quic_health_check_task(&self) {
         // SAFE: Check if Tokio runtime is available to prevent panic
         let handle = match tokio::runtime::Handle::try_current() {
@@ -3430,7 +3431,7 @@ impl SimplifiedP2P {
         let node_id = self.node_id.clone();
         
         handle.spawn(async move {
-            println!("[QUIC] 🔄 Starting QUIC health check task (every 15s)...");
+            println!("[QUIC] 🔄 Starting QUIC health check task (every 15s) with ACTIVE HealthPing...");
             
             // Initial delay to let network stabilize
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
@@ -3441,17 +3442,50 @@ impl SimplifiedP2P {
                 if let Some(ref quic_transport) = quic_transport {
                     let transport = quic_transport.read().await;
                     
-                    // Quick health check - removes dead connections
+                    // Step 1: Passive health check - removes connections with close_reason
                     let (alive, removed) = transport.health_check();
                     
-                    // SCALABLE: Only reconnect if we have very few connections
-                    // For large networks, peer discovery will handle this
-                    // For small networks (genesis), ensure minimum connectivity
+                    // Step 2: ACTIVE health check - send HealthPing to all connected peers
+                    // This detects zombie connections (NAT timeout) BEFORE they cause problems
+                    let connected_peers = transport.get_connected_peers();
+                    let mut zombie_count = 0;
+                    
+                    for (peer_addr, peer_id, _peer_type) in &connected_peers {
+                        let ping_msg = NetworkMessage::HealthPing {
+                            from: node_id.clone(),
+                            timestamp: std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs(),
+                        };
+                        
+                        // Try to send HealthPing - if it fails, connection is zombie
+                        match transport.broadcast_to(*peer_addr, &ping_msg).await {
+                            Ok(_) => {
+                                // Connection is healthy
+                            }
+                            Err(_e) => {
+                                // Connection is zombie - will be removed by retry logic
+                                zombie_count += 1;
+                                println!("[QUIC] 💀 Zombie connection detected to {} via HealthPing", 
+                                         get_privacy_id_for_addr(&peer_id));
+                            }
+                        }
+                    }
+                    
+                    // Log health status periodically
+                    if removed > 0 || zombie_count > 0 {
+                        println!("[QUIC] 🏥 Health check: {} alive, {} removed (passive), {} zombie (active)", 
+                                 alive, removed, zombie_count);
+                    }
+                    
+                    drop(transport); // Release read lock before reconnection
+                    
+                    // Step 3: Proactive reconnection if we have very few connections
+                    let effective_alive = alive.saturating_sub(zombie_count);
                     let min_connections = 3; // Minimum for Byzantine tolerance
                     
-                    if alive < min_connections && removed > 0 {
-                        drop(transport); // Release read lock
-                        
+                    if effective_alive < min_connections {
                         // Get known peers from P2P layer (not just bootstrap)
                         let peers_to_try: Vec<String> = connected_peers_lockfree
                             .iter()
@@ -3462,7 +3496,7 @@ impl SimplifiedP2P {
                         
                         if !peers_to_try.is_empty() {
                             println!("[QUIC] 🔄 Low connections ({}/{}), attempting reconnect to {} peers...", 
-                                     alive, min_connections, peers_to_try.len());
+                                     effective_alive, min_connections, peers_to_try.len());
                             
                             for peer_addr_str in peers_to_try {
                                 if let Ok(addr) = peer_addr_str.parse::<std::net::SocketAddr>() {

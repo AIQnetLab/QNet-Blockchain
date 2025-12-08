@@ -861,11 +861,17 @@ impl QuicTransport {
     }
     
     /// Single send attempt (internal helper)
+    /// v2.24.1: Added timeout on open_bi to match try_broadcast_once protection
     async fn try_send_once(&self, peer_addr: SocketAddr, wire_data: &[u8]) -> Result<(), String> {
         let conn = self.connect(peer_addr).await?;
         
-        // Open bidirectional stream
-        let (mut send, _recv) = conn.connection.open_bi().await
+        // v2.24.1: Timeout on open_bi to detect zombie connections
+        let (mut send, _recv) = tokio::time::timeout(
+            Duration::from_secs(MESSAGE_TIMEOUT_SECS),
+            conn.connection.open_bi()
+        )
+            .await
+            .map_err(|_| "Open bi stream timeout")?
             .map_err(|e| format!("Open stream failed: {}", e))?;
         
         // Send with timeout
@@ -874,7 +880,7 @@ impl QuicTransport {
             send.write_all(wire_data)
         )
             .await
-            .map_err(|_| "Send timeout")?
+            .map_err(|_| "Write timeout")?
             .map_err(|e| format!("Write failed: {}", e))?;
         
         send.finish().map_err(|e| format!("Finish failed: {}", e))?;
@@ -924,16 +930,28 @@ impl QuicTransport {
     }
     
     /// Single broadcast attempt (internal helper)
+    /// v2.24.1: Added timeouts to prevent hanging on zombie connections
     async fn try_broadcast_once(&self, peer_addr: SocketAddr, wire_data: &[u8]) -> Result<(), String> {
         let conn = self.connect(peer_addr).await?;
         
-        // Open unidirectional stream
-        let mut send = conn.connection.open_uni().await
+        // v2.24.1: Timeout on open_uni to detect zombie connections
+        let mut send = tokio::time::timeout(
+            Duration::from_secs(MESSAGE_TIMEOUT_SECS),
+            conn.connection.open_uni()
+        )
+            .await
+            .map_err(|_| "Open uni stream timeout")?
             .map_err(|e| format!("Open uni stream failed: {}", e))?;
         
-        // Send
-        send.write_all(wire_data).await
+        // v2.24.1: Timeout on write to detect zombie connections
+        tokio::time::timeout(
+            Duration::from_secs(MESSAGE_TIMEOUT_SECS),
+            send.write_all(wire_data)
+        )
+            .await
+            .map_err(|_| "Write timeout")?
             .map_err(|e| format!("Write failed: {}", e))?;
+        
         send.finish().map_err(|e| format!("Finish failed: {}", e))?;
         
         conn.bytes_sent.fetch_add(wire_data.len() as u64, Ordering::Relaxed);
