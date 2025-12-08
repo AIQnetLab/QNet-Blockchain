@@ -332,8 +332,8 @@ pub struct PeerInfo {
     pub network_score: f64,     // Network performance tracking (0-100, used for prioritization)
     
     // BACKWARD COMPATIBILITY: Keep old field for migration
+    // NOTE: No skip_serializing_if - bincode requires all fields to be serialized
     #[serde(default = "default_reputation")]
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub reputation_score: Option<f64>,  // Legacy field (migrated to split scores)
     
     #[serde(default)]
