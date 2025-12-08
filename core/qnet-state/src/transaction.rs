@@ -239,13 +239,13 @@ pub struct Transaction {
     /// When present: TX is quantum-resistant + 50% higher gas cost
     /// Format: hex-encoded Dilithium signature (~3293 bytes = 6586 hex chars)
     /// Use case: High-value transfers, enterprise, paranoid users
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// NOTE: No serde attributes - bincode handles Option<T> natively
     pub dilithium_signature: Option<String>,
     
     /// QUANTUM v2.25: Dilithium public key for signature verification
     /// Required when dilithium_signature is present
     /// Format: hex-encoded Dilithium public key (~1952 bytes = 3904 hex chars)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// NOTE: No serde attributes - bincode handles Option<T> natively
     pub dilithium_public_key: Option<String>,
 }
 
