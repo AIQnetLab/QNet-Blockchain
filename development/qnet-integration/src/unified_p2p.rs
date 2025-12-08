@@ -177,6 +177,18 @@ static HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
 // HTTP fallback has been removed for maximum performance
 // All nodes MUST support QUIC (port 10876 = P2P port + 1000)
 
+// v2.24.3: Global QUIC transport for static sync methods
+// Set during SimplifiedP2P initialization, used by download_block_range_static
+// ARCHITECTURE: Enables QUIC-based sync without passing &self to static methods
+// SCALABILITY: Single shared transport handles 100K+ nodes efficiently
+pub static GLOBAL_QUIC_TRANSPORT: Lazy<std::sync::RwLock<Option<Arc<tokio::sync::RwLock<crate::quic_transport::QuicTransport>>>>> = 
+    Lazy::new(|| std::sync::RwLock::new(None));
+
+// v2.24.3: Global node ID for static sync methods
+// Set during SimplifiedP2P initialization
+pub static GLOBAL_NODE_ID: Lazy<std::sync::RwLock<String>> = 
+    Lazy::new(|| std::sync::RwLock::new("unknown".to_string()));
+
 // SECURITY: Track invalid blocks from each node for malicious behavior detection
 // Format: node_id -> (invalid_count, first_invalid_time)
 // SCALABILITY: DashMap for lock-free concurrent access with millions of nodes
@@ -328,6 +340,11 @@ pub struct PeerInfo {
     pub successful_pings: u32,  // Successful interactions
     #[serde(default)]
     pub failed_pings: u32,      // Failed interactions
+    
+    // v2.24.3: Track peer's blockchain height (from blocks/heartbeats)
+    // Enables QUIC-only sync without HTTP height queries
+    #[serde(default)]
+    pub last_block_height: u64,
 }
 
 fn default_consensus_score() -> f64 {
@@ -1365,8 +1382,21 @@ impl SimplifiedP2P {
         transport.start_server().await
             .map_err(|e| format!("QUIC server start failed: {}", e))?;
         
-        self.quic_transport = Some(Arc::new(tokio::sync::RwLock::new(transport)));
+        let quic_arc = Arc::new(tokio::sync::RwLock::new(transport));
+        self.quic_transport = Some(quic_arc.clone());
         self.quic_enabled.store(true, std::sync::atomic::Ordering::SeqCst);
+        
+        // v2.24.3: Set global QUIC transport for static sync methods
+        // This enables QUIC-based block sync without passing &self
+        if let Ok(mut guard) = GLOBAL_QUIC_TRANSPORT.write() {
+            *guard = Some(quic_arc);
+            println!("[QUIC] 📦 Global QUIC transport registered for sync");
+        }
+        
+        // v2.24.3: Set global node ID for sync requests
+        if let Ok(mut guard) = GLOBAL_NODE_ID.write() {
+            *guard = self.node_id.clone();
+        }
         
         println!("[QUIC] ✅ Transport + Server initialized on port {}", quic_port);
         println!("[QUIC] 📊 Timeouts: connect=3s, idle=90s, keepalive=30s (aligned with HTTP)");
@@ -2221,6 +2251,7 @@ impl SimplifiedP2P {
             reputation_score: Some(consensus_score),
             successful_pings: 0,
             failed_pings: 0,
+            last_block_height: 0,      // v2.24.3: Will be updated from heartbeats/blocks
         };
         
         // Add peer using existing safe method
@@ -2234,6 +2265,7 @@ impl SimplifiedP2P {
     }
     
     /// CRITICAL FIX: Update peer last_seen AND optionally update their height
+    /// v2.24.3: Now stores height in PeerInfo for QUIC-only sync
     pub fn update_peer_last_seen_with_height(&self, peer_id_or_addr: &str, height: Option<u64>) {
         let current_time = self.current_timestamp();
         
@@ -2258,6 +2290,12 @@ impl SimplifiedP2P {
         if self.should_use_lockfree() {
             if let Some(mut peer) = self.connected_peers_lockfree.get_mut(&peer_addr) {
                 peer.last_seen = current_time;
+                // v2.24.3: Update height if provided (for sync without HTTP)
+                if let Some(h) = height {
+                    if h > peer.last_block_height {
+                        peer.last_block_height = h;
+                    }
+                }
                 return;
             }
         }
@@ -2266,6 +2304,12 @@ impl SimplifiedP2P {
         if let Ok(mut peers) = self.connected_peers.write() {
             if let Some(peer) = peers.get_mut(&peer_addr) {
                 peer.last_seen = current_time;
+                // v2.24.3: Update height if provided (for sync without HTTP)
+                if let Some(h) = height {
+                    if h > peer.last_block_height {
+                        peer.last_block_height = h;
+                    }
+                }
             }
         }
     }
@@ -3072,6 +3116,7 @@ impl SimplifiedP2P {
                                 reputation_score: Some(real_rep),
                                 successful_pings: 0,
                                 failed_pings: 0,
+                                last_block_height: 0,  // v2.24.3
                             };
                             
                             discovered_peers.push(peer_info);
@@ -3213,56 +3258,19 @@ impl SimplifiedP2P {
                     }
                 };
                 
-                // CRITICAL FIX: Actually update network height cache periodically
-                // Query peers for their current height
+                // v2.24.3: QUIC-ONLY SYNC - Use cached heights from PeerInfo
+                // Heights are updated via heartbeats and block broadcasts (no HTTP queries needed)
+                // SCALABILITY: O(n) where n = connected peers, no network overhead
                 let peers = match connected_peers.read() {
                     Ok(guard) => guard.clone(),
                     Err(poisoned) => poisoned.into_inner().clone(),
                 };
-                let mut peer_heights = Vec::new();
                 
-                for peer in peers.values().take(5) {  // Query up to 5 peers
-                    let peer_ip = peer.addr.split(':').next().unwrap_or("");
-                    let endpoint = format!("http://{}:8001/api/v1/height", peer_ip);
-                    
-                    // Simple HTTP query using reqwest with connection pooling
-                    match reqwest::Client::builder()
-                        .timeout(std::time::Duration::from_secs(2))
-                        .tcp_keepalive(std::time::Duration::from_secs(HTTP_TCP_KEEPALIVE_SECS))
-                        .pool_max_idle_per_host(HTTP_POOL_MAX_IDLE_PER_HOST)
-                        .pool_idle_timeout(std::time::Duration::from_secs(HTTP_POOL_IDLE_TIMEOUT_SECS))
-                        .build() 
-                    {
-                        Ok(client) => {
-                            match client.get(&endpoint).send().await {
-                                Ok(response) => {
-                                    // CRITICAL FIX: API returns JSON, not plain text
-                                    match response.json::<serde_json::Value>().await {
-                                        Ok(json) => {
-                                            if let Some(height) = json.get("height").and_then(|h| h.as_u64()) {
-                                                peer_heights.push(height);
-                                            } else {
-                                                // PRIVACY: Use pseudonym in logs
-                                                println!("[SYNC] ⚠️ Background: {} - malformed JSON response", get_privacy_id_for_addr(&peer_ip));
-                                            }
-                                        },
-                                        Err(e) => {
-                                            // PRIVACY: Use pseudonym in logs
-                                            println!("[SYNC] ⚠️ Background: {} - JSON parse error: {}", get_privacy_id_for_addr(&peer_ip), e);
-                                        }
-                                    }
-                                },
-                                Err(e) => {
-                                    // PRIVACY: Use pseudonym in logs
-                                    println!("[SYNC] ⚠️ Background: {} - HTTP error: {}", get_privacy_id_for_addr(&peer_ip), e);
-                                }
-                            }
-                        },
-                        Err(e) => {
-                            println!("[SYNC] ⚠️ Background: client build error: {}", e);
-                        }
-                    }
-                }
+                // Collect heights from peer cache (updated via heartbeat/block messages)
+                let mut peer_heights: Vec<u64> = peers.values()
+                    .filter(|p| p.last_block_height > 0)  // Only peers with known height
+                    .map(|p| p.last_block_height)
+                    .collect();
                 
                 // Update cache if we got responses
                 if !peer_heights.is_empty() {
@@ -5057,34 +5065,22 @@ impl SimplifiedP2P {
             return Ok(0);
         }
         
-        // PRODUCTION v2.19.21: Query peers in PARALLEL using async (not sequential blocking!)
-        // This dramatically improves sync speed and prevents runtime deadlock
-        let peer_addrs: Vec<String> = validated_peers.iter().map(|p| p.addr.clone()).collect();
-        let peer_ids: Vec<String> = validated_peers.iter().map(|p| p.id.clone()).collect();
-        
-        // Create futures for all peer queries
-        let query_futures: Vec<_> = peer_addrs.iter()
-            .map(|addr| self.query_peer_height(addr))
+        // v2.24.3: QUIC-ONLY SYNC - Use cached heights from PeerInfo
+        // Heights are updated via heartbeats and block broadcasts (no HTTP queries needed)
+        // SCALABILITY: O(n) where n = connected peers, zero network overhead
+        let mut peer_heights: Vec<u64> = validated_peers.iter()
+            .filter(|p| p.last_block_height > 0)  // Only peers with known height
+            .map(|p| p.last_block_height)
             .collect();
         
-        // Execute all queries in parallel
-        let results = future::join_all(query_futures).await;
-        
-        // Collect successful heights
-        let mut peer_heights = Vec::new();
-        for (i, result) in results.into_iter().enumerate() {
-            match result {
-                Ok(height) => {
-                    peer_heights.push(height);
-                    println!("[SYNC] Peer {} reports height: {}", peer_ids[i], height);
-                },
-                Err(e) => {
-                    println!("[SYNC] Failed to query peer {}: {}", peer_ids[i], e);
-                }
-            }
+        // Log peer heights for debugging
+        for peer in validated_peers.iter().filter(|p| p.last_block_height > 0) {
+            println!("[SYNC] Peer {} reports height: {} (cached)", peer.id, peer.last_block_height);
         }
         
         if peer_heights.is_empty() {
+            // Fallback: all peers have height 0 (network just started)
+            println!("[SYNC] ⚠️ No cached peer heights available - waiting for heartbeats");
             return Ok(0);
         }
         
@@ -5955,6 +5951,7 @@ impl SimplifiedP2P {
             reputation_score: Some(reputation),
             successful_pings: 0,
             failed_pings: 0,
+            last_block_height: 0,  // v2.24.3
         })
     }
     
@@ -6516,6 +6513,7 @@ impl SimplifiedP2P {
                                     reputation_score: Some(active_info.reputation),
                                     successful_pings: 0,
                                     failed_pings: 0,
+                                    last_block_height: 0,  // v2.24.3
                                 };
                                 println!("[P2P]   ├── {} (from active_nodes registry, rep: {:.1}%)", 
                                          node_id, active_info.reputation);
@@ -7141,6 +7139,7 @@ impl SimplifiedP2P {
             reputation_score: None,  // Will be populated from reputation system
             successful_pings: 0,
             failed_pings: 0,
+            last_block_height: 0,  // v2.24.3
         })
     }
     
@@ -8267,85 +8266,145 @@ impl SimplifiedP2P {
     }
     
     /// Download a range of blocks (helper for parallel sync)
-    async fn download_block_range_static(peers: &[String], storage: &crate::storage::Storage, start_height: u64, end_height: u64) {
+    /// v2.24.3: ARCHITECTURE FIX - Use QUIC RequestBlocks instead of HTTP
+    /// 
+    /// SCALABILITY: Designed for 100K+ nodes
+    /// - QUIC binary protocol: 10x faster than HTTP JSON
+    /// - Persistent connections: No TCP handshake per request
+    /// - Multiplexed streams: Parallel requests on single connection
+    /// - Backpressure: Built-in flow control prevents overload
+    async fn download_block_range_static(
+        peers: &[String], 
+        storage: &crate::storage::Storage, 
+        start_height: u64, 
+        end_height: u64
+    ) {
         if peers.is_empty() { return; }
         
+        // v2.24.3: Request blocks via QUIC (response comes async via handle_blocks_batch)
+        // Strategy: Send RequestBlocks to best peer, then poll storage for arrival
+        
         let mut consecutive_failures = 0;
-        const MAX_CONSECUTIVE_FAILURES: u32 = 20;  // CRITICAL FIX: Increased from 3 to 20 to handle async broadcast delays
+        const MAX_CONSECUTIVE_FAILURES: u32 = 30;  // Increased for QUIC async response
+        const POLL_INTERVAL_MS: u64 = 100;  // Check storage every 100ms
+        // v2.24.3: Increased timeout to handle batch validation latency
+        // Worst case: 100 blocks × 100ms validation = 10s + network latency
+        const REQUEST_TIMEOUT_SECS: u64 = 30;  // Max wait for QUIC response + validation
+        
+        // v2.24.3: Send initial QUIC RequestBlocks for entire range
+        // This triggers async response via handle_blocks_batch → block_tx → storage
+        Self::send_quic_block_request_static(peers, start_height, end_height).await;
         
         let mut height = start_height;
+        let mut last_request_time = std::time::Instant::now();
+        
         while height <= end_height {
-            // CRITICAL FIX: Check if block ACTUALLY exists (not just Ok())
+            // Check if block already exists in storage
             if storage.load_microblock(height).unwrap_or(None).is_some() {
                 consecutive_failures = 0;
                 height += 1;
                 continue;
             }
             
-            // Try downloading from peers
-            let mut fetched = false;
-            for peer_addr in peers {
-                let ip = peer_addr.split(':').next().unwrap_or("");
-                let url = format!("http://{}:8001/api/v1/microblock/{}", ip, height);
+            // v2.24.3: Poll storage for block arrival (QUIC response is async)
+            let poll_start = std::time::Instant::now();
+            let mut block_received = false;
+            
+            while poll_start.elapsed().as_secs() < REQUEST_TIMEOUT_SECS {
+                tokio::time::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS)).await;
                 
-                let client = match reqwest::Client::builder()
-                    .timeout(std::time::Duration::from_secs(5))
-                    .connect_timeout(std::time::Duration::from_secs(2))
-                    .user_agent("QNet-Node/1.0")
-                    .tcp_nodelay(true)
-                    .tcp_keepalive(std::time::Duration::from_secs(HTTP_TCP_KEEPALIVE_SECS))
-                    .pool_max_idle_per_host(HTTP_POOL_MAX_IDLE_PER_HOST)
-                    .pool_idle_timeout(std::time::Duration::from_secs(HTTP_POOL_IDLE_TIMEOUT_SECS))
-                    .build() {
-                    Ok(client) => client,
-                    Err(_) => continue,
-                };
-                
-                match client.get(&url).send().await {
-                    Ok(response) => {
-                        if response.status().is_success() {
-                            if let Ok(val) = response.json::<serde_json::Value>().await {
-                                if let Some(b64) = val.get("data").and_then(|v| v.as_str()) {
-                                    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) {
-                                        if storage.save_microblock(height, &bytes).is_ok() {
-                                            fetched = true;
-                                            consecutive_failures = 0;
-                                            
-                                            // CRITICAL FIX: Update LOCAL_BLOCKCHAIN_HEIGHT when syncing
-                                            LOCAL_BLOCKCHAIN_HEIGHT.store(height, Ordering::Relaxed);
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                        } else if response.status() == reqwest::StatusCode::NOT_FOUND {
-                            // Block not found on this peer - try next peer (don't break, maybe it's propagating)
-                            continue;
-                        }
-                    },
-                    Err(_) => continue,
+                if storage.load_microblock(height).unwrap_or(None).is_some() {
+                    block_received = true;
+                    LOCAL_BLOCKCHAIN_HEIGHT.store(height, Ordering::Relaxed);
+                    break;
                 }
             }
             
-            if !fetched {
-                consecutive_failures += 1;
-                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
-                    println!("[SYNC] ⚠️ Range {}-{} hit {} consecutive failures at block {} - waiting 3s for block propagation", 
-                             start_height, end_height, MAX_CONSECUTIVE_FAILURES, height);
-                    
-                    // CRITICAL FIX: Don't abort! Wait for blocks to propagate (async broadcast delay)
-                    // Then retry the same block - this handles producer async broadcast delays
-                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                    consecutive_failures = 0;  // Reset counter to retry
-                    // DON'T increment height - retry the same block!
-                } else {
-                    // CRITICAL FIX: Wait longer for blocks to propagate (async broadcast can take 1-3 seconds)
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                }
-            } else {
-                // Successfully fetched block - move to next height
+            if block_received {
+                consecutive_failures = 0;
                 height += 1;
+                continue;
             }
+            
+            // Block not received after timeout - retry request
+            consecutive_failures += 1;
+            
+            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                println!("[SYNC] ⚠️ Range {}-{} hit {} failures at block {} - waiting 5s", 
+                         start_height, end_height, MAX_CONSECUTIVE_FAILURES, height);
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                consecutive_failures = 0;
+            }
+            
+            // v2.24.3: Re-send QUIC request for remaining blocks (adaptive retry)
+            // Only re-request if enough time passed since last request
+            if last_request_time.elapsed().as_secs() >= 3 {
+                println!("[SYNC] 🔄 Re-requesting blocks {}-{} via QUIC", height, end_height);
+                Self::send_quic_block_request_static(peers, height, end_height).await;
+                last_request_time = std::time::Instant::now();
+            }
+        }
+    }
+    
+    /// v2.24.3: Send QUIC RequestBlocks to peers (static helper)
+    /// ARCHITECTURE: Fire-and-forget request, response handled by handle_blocks_batch
+    async fn send_quic_block_request_static(peers: &[String], from_height: u64, to_height: u64) {
+        use crate::quic_transport::QUIC_PORT_OFFSET;
+        
+        // Get global QUIC transport (set during node initialization)
+        let quic_transport = match GLOBAL_QUIC_TRANSPORT.read() {
+            Ok(guard) => guard.clone(),
+            Err(_) => None,
+        };
+        
+        let node_id = GLOBAL_NODE_ID.read()
+            .map(|g| g.clone())
+            .unwrap_or_else(|_| "unknown".to_string());
+        
+        if let Some(ref transport_arc) = quic_transport {
+            // Create RequestBlocks message
+            let request = NetworkMessage::RequestBlocks {
+                from_height,
+                to_height,
+                requester_id: node_id,
+            };
+            
+            // Send to first available peer via QUIC
+            // SCALABILITY: In production, could fan-out to multiple peers
+            for peer_addr in peers.iter().take(3) {  // Try up to 3 peers
+                let parts: Vec<&str> = peer_addr.split(':').collect();
+                if parts.len() != 2 { continue; }
+                
+                let ip = match parts[0].parse::<std::net::IpAddr>() {
+                    Ok(ip) => ip,
+                    Err(_) => continue,
+                };
+                let port = match parts[1].parse::<u16>() {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
+                
+                let quic_port = port.saturating_add(QUIC_PORT_OFFSET);
+                let quic_addr = std::net::SocketAddr::new(ip, quic_port);
+                
+                let transport = transport_arc.read().await;
+                match transport.broadcast_to(quic_addr, &request).await {
+                    Ok(_) => {
+                        // Request sent successfully - response will arrive async
+                        return;
+                    }
+                    Err(e) => {
+                        // Try next peer
+                        println!("[SYNC] ⚠️ QUIC request to {} failed: {}", 
+                                 get_privacy_id_for_addr(peer_addr), e);
+                    }
+                }
+            }
+            
+            println!("[SYNC] ⚠️ Failed to send QUIC RequestBlocks to any peer");
+        } else {
+            // Fallback: No QUIC transport available
+            println!("[SYNC] ⚠️ QUIC transport not available for sync request");
         }
     }
 }
@@ -9732,7 +9791,8 @@ impl SimplifiedP2P {
             NetworkMessage::NodeHeartbeat {
                 node_id, node_type, timestamp, block_height, signature, heartbeat_index, gossip_hop
             } => {
-                self.update_peer_last_seen(from_peer);
+                // v2.24.3: Update peer with height for QUIC-only sync (no HTTP height queries)
+                self.update_peer_last_seen_with_height(from_peer, Some(block_height));
                 
                 // GOSSIP TTL: Max 3 hops
                 if gossip_hop >= 3 {

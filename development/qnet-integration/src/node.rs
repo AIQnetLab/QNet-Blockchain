@@ -12983,32 +12983,17 @@ impl BlockchainNode {
                 return Ok(self.get_height().await);
             }
             
-            // Query multiple peers and take median for Byzantine safety
-            let mut heights = Vec::new();
-            for peer in peers.iter().take(3) {
-                // Use existing P2P infrastructure to query peer
-                let peer_ip = peer.addr.split(':').next().unwrap_or(&peer.addr);
-                let endpoint = format!("http://{}:8001/api/v1/height", peer_ip);
-                
-                // Simple HTTP query using reqwest
-                if let Ok(client) = reqwest::Client::builder()
-                    .timeout(std::time::Duration::from_secs(5))
-                    .build() 
-                {
-                    if let Ok(response) = client.get(&endpoint).send().await {
-                        // CRITICAL FIX: API returns JSON, not plain text (same fix as unified_p2p.rs)
-                        if let Ok(json) = response.json::<serde_json::Value>().await {
-                            if let Some(height) = json.get("height").and_then(|h| h.as_u64()) {
-                                heights.push(height);
-                                println!("[SYNC] 📏 Peer {} reports height: {}", peer.id, height);
-                            } else {
-                                println!("[SYNC] ⚠️ Peer {} - malformed JSON response", peer.id);
-                            }
-                        } else {
-                            println!("[SYNC] ⚠️ Peer {} - JSON parse error", peer.id);
-                        }
-                    }
-                }
+            // v2.24.3: QUIC-ONLY SYNC - Use cached heights from PeerInfo
+            // Heights are updated via heartbeats and block broadcasts (no HTTP queries needed)
+            // SCALABILITY: O(n) where n = connected peers, zero network overhead
+            let mut heights: Vec<u64> = peers.iter()
+                .filter(|p| p.last_block_height > 0)  // Only peers with known height
+                .map(|p| p.last_block_height)
+                .collect();
+            
+            // Log peer heights for debugging
+            for peer in peers.iter().filter(|p| p.last_block_height > 0).take(3) {
+                println!("[SYNC] 📏 Peer {} reports height: {} (cached)", peer.id, peer.last_block_height);
             }
             
             // Take median height for Byzantine fault tolerance
@@ -13018,7 +13003,7 @@ impl BlockchainNode {
                 println!("[SYNC] 📏 Network consensus height (median): {}", median);
                 Ok(median)
             } else {
-                println!("[SYNC] ⚠️ Could not query any peers, using local height");
+                println!("[SYNC] ⚠️ No cached peer heights - waiting for heartbeats, using local height");
                 Ok(self.get_height().await)
             }
         } else {
