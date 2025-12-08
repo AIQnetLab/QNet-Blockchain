@@ -2266,6 +2266,7 @@ impl SimplifiedP2P {
     
     /// CRITICAL FIX: Update peer last_seen AND optionally update their height
     /// v2.24.3: Now stores height in PeerInfo for QUIC-only sync
+    /// v2.24.4: Fixed port mismatch - find peer by IP when ports differ (QUIC vs HTTP)
     pub fn update_peer_last_seen_with_height(&self, peer_id_or_addr: &str, height: Option<u64>) {
         let current_time = self.current_timestamp();
         
@@ -2274,7 +2275,8 @@ impl SimplifiedP2P {
         let peer_addr = if let Some(addr_entry) = self.peer_id_to_addr.get(peer_id_or_addr) {
             addr_entry.clone()
         } else if peer_id_or_addr.contains(':') {
-            // Already an address
+            // v2.24.4: Address may have different port (QUIC 10876 vs P2P 9876 vs HTTP 8001)
+            // Extract IP and find peer by IP match
             peer_id_or_addr.to_string()
         } else if peer_id_or_addr.starts_with("genesis_node_") {
             // Try to construct address for Genesis nodes using helper
@@ -2286,11 +2288,15 @@ impl SimplifiedP2P {
             return; // Unknown peer format
         };
         
+        // v2.24.4: Extract IP for port-agnostic matching
+        // Problem: Heartbeat comes from QUIC port (10876), but peers stored with HTTP port (8001)
+        let peer_ip = peer_addr.split(':').next().unwrap_or(&peer_addr);
+        
         // QUANTUM ROUTING: Try lock-free first if should use it
         if self.should_use_lockfree() {
+            // v2.24.4: First try exact match
             if let Some(mut peer) = self.connected_peers_lockfree.get_mut(&peer_addr) {
                 peer.last_seen = current_time;
-                // v2.24.3: Update height if provided (for sync without HTTP)
                 if let Some(h) = height {
                     if h > peer.last_block_height {
                         peer.last_block_height = h;
@@ -2298,17 +2304,46 @@ impl SimplifiedP2P {
                 }
                 return;
             }
+            
+            // v2.24.4: If exact match fails, find by IP (port-agnostic)
+            for mut entry in self.connected_peers_lockfree.iter_mut() {
+                let stored_ip = entry.key().split(':').next().unwrap_or("");
+                if stored_ip == peer_ip {
+                    entry.last_seen = current_time;
+                    if let Some(h) = height {
+                        if h > entry.last_block_height {
+                            entry.last_block_height = h;
+                        }
+                    }
+                    return;
+                }
+            }
         }
         
         // Fallback to legacy
         if let Ok(mut peers) = self.connected_peers.write() {
+            // v2.24.4: First try exact match
             if let Some(peer) = peers.get_mut(&peer_addr) {
                 peer.last_seen = current_time;
-                // v2.24.3: Update height if provided (for sync without HTTP)
                 if let Some(h) = height {
                     if h > peer.last_block_height {
                         peer.last_block_height = h;
                     }
+                }
+                return;
+            }
+            
+            // v2.24.4: If exact match fails, find by IP (port-agnostic)
+            for (addr, peer) in peers.iter_mut() {
+                let stored_ip = addr.split(':').next().unwrap_or("");
+                if stored_ip == peer_ip {
+                    peer.last_seen = current_time;
+                    if let Some(h) = height {
+                        if h > peer.last_block_height {
+                            peer.last_block_height = h;
+                        }
+                    }
+                    return;
                 }
             }
         }
