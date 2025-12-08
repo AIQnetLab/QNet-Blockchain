@@ -8573,53 +8573,9 @@ impl SimplifiedP2P {
     }
 }
 
-/// PRODUCTION: Base64 serialization module for efficient binary data in JSON
-mod base64_bytes {
-    use serde::{Deserialize, Deserializer, Serializer};
-    use base64::{Engine as _, engine::general_purpose::STANDARD};
-    
-    pub fn serialize<S>(bytes: &Vec<u8>, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(&STANDARD.encode(bytes))
-    }
-    
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        STANDARD.decode(&s).map_err(serde::de::Error::custom)
-    }
-}
-
-/// PRODUCTION v2.25: Base64 serialization for Vec<Vec<u8>> (transaction batches)
-mod base64_bytes_vec {
-    use serde::{Deserialize, Deserializer, Serializer, ser::SerializeSeq};
-    use base64::{Engine as _, engine::general_purpose::STANDARD};
-    
-    pub fn serialize<S>(bytes_vec: &Vec<Vec<u8>>, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let mut seq = serializer.serialize_seq(Some(bytes_vec.len()))?;
-        for bytes in bytes_vec {
-            seq.serialize_element(&STANDARD.encode(bytes))?;
-        }
-        seq.end()
-    }
-    
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<Vec<u8>>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let strings: Vec<String> = Vec::deserialize(deserializer)?;
-        strings.into_iter()
-            .map(|s| STANDARD.decode(&s).map_err(serde::de::Error::custom))
-            .collect()
-    }
-}
+// NOTE: base64_bytes modules REMOVED in v2.26
+// bincode natively handles Vec<u8> as [u64_len][raw_bytes] - no base64 overhead needed!
+// This improves performance by ~33% for block/transaction serialization
 
 /// Push notification type for Light nodes
 /// Supports multiple providers for F-Droid compatibility
@@ -8694,29 +8650,29 @@ pub enum PingerRole {
 }
 
 /// Message types for simplified network
+/// ARCHITECTURE v2.26: Pure bincode serialization for maximum performance
+/// bincode natively handles Vec<u8> as [u64_len][raw_bytes] - no base64 needed!
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum NetworkMessage {
     /// Block data (microblock or macroblock)
-    /// PRODUCTION: Using base64 encoding for efficient binary data transfer over JSON
+    /// OPTIMIZED: Direct binary serialization via bincode (no base64 overhead)
     Block {
         height: u64,
-        #[serde(with = "base64_bytes")]
-        data: Vec<u8>,
+        data: Vec<u8>,  // bincode handles Vec<u8> natively
         block_type: String,  // "micro" or "macro"
     },
     
     /// Transaction data
+    /// OPTIMIZED: Direct binary serialization via bincode
     Transaction {
-        #[serde(with = "base64_bytes")]
-        data: Vec<u8>,
+        data: Vec<u8>,  // bincode handles Vec<u8> natively
     },
     
     /// PRODUCTION v2.25: Transaction batch for high-throughput TX propagation
     /// Sends multiple TXs in single message - reduces QUIC stream overhead
     /// Each TX in batch is still individually validated and added to mempool
     TransactionBatch {
-        /// Batch of serialized transactions
-        #[serde(with = "base64_bytes_vec")]
+        /// Batch of serialized transactions - bincode handles Vec<Vec<u8>> natively
         transactions: Vec<Vec<u8>>,
         /// Batch timestamp for ordering
         timestamp: u64,
@@ -8845,8 +8801,7 @@ pub enum NetworkMessage {
     /// Response with consensus state
     ConsensusState {
         round: u64,
-        #[serde(with = "base64_bytes")]
-        state_data: Vec<u8>,
+        state_data: Vec<u8>,  // bincode handles Vec<u8> natively
         sender_id: String,
     },
     
@@ -8867,8 +8822,7 @@ pub enum NetworkMessage {
     CertificateAnnounce {
         node_id: String,
         cert_serial: String,
-        #[serde(with = "base64_bytes")]
-        certificate: Vec<u8>,  // Serialized HybridCertificate
+        certificate: Vec<u8>,  // Serialized HybridCertificate - bincode handles natively
         timestamp: u64,
     },
     
@@ -8884,8 +8838,7 @@ pub enum NetworkMessage {
     CertificateResponse {
         node_id: String,
         cert_serial: String,
-        #[serde(with = "base64_bytes")]
-        certificate: Vec<u8>,  // Serialized HybridCertificate
+        certificate: Vec<u8>,  // Serialized HybridCertificate - bincode handles natively
         timestamp: u64,
     },
     
