@@ -9814,9 +9814,14 @@ async fn run_benchmark_generator(
                         local_errors += (batch_len - confirmed) as u64;
                         let latency = batch_start.elapsed().as_secs_f64() * 1000.0 / batch_len as f64;
                         latencies.push(latency);
+                        
+                        // v2.26.4: Update global counter IMMEDIATELY for live progress
+                        sent_counter.fetch_add(batch_len as u64, Ordering::SeqCst);
+                        confirmed_counter.fetch_add(confirmed as u64, Ordering::SeqCst);
                     }
                     Err(_) => {
                         local_errors += batch_len as u64;
+                        error_counter.fetch_add(batch_len as u64, Ordering::SeqCst);
                     }
                 }
                 
@@ -9824,10 +9829,7 @@ async fn run_benchmark_generator(
                 tokio::task::yield_now().await;
             }
             
-            // Update global counters
-            sent_counter.fetch_add(local_sent, Ordering::SeqCst);
-            confirmed_counter.fetch_add(local_confirmed, Ordering::SeqCst);
-            error_counter.fetch_add(local_errors, Ordering::SeqCst);
+            // Final counters already updated per-batch, just log
             
             // Record latencies
             for lat in latencies {
