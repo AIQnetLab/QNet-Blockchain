@@ -433,7 +433,7 @@ impl BenchmarkManager {
         }
     }
     
-    /// Generate a signed transaction
+    /// Generate a signed transaction (legacy - has lock contention!)
     pub async fn generate_transaction(&self) -> Option<qnet_state::Transaction> {
         let accounts = self.accounts.read().await;
         if accounts.len() < 2 {
@@ -487,6 +487,76 @@ impl BenchmarkManager {
         tx.hash = tx.calculate_hash();
         
         // Sign with Ed25519 - message format from CRYPTOGRAPHY_IMPLEMENTATION.md
+        let message = format!("transfer:{}:{}:{}:{}:{}", 
+            tx.from, receiver.address, amount, tx.gas_price, tx.gas_limit);
+        let signature = sender.signing_key.sign(message.as_bytes());
+        tx.signature = Some(hex::encode(signature.to_bytes()));
+        
+        Some(tx)
+    }
+    
+    /// Get accounts snapshot for lock-free transaction generation
+    /// Call ONCE per worker at start, then use generate_transaction_from_snapshot
+    pub async fn get_accounts_snapshot(&self) -> Vec<BenchmarkAccount> {
+        self.accounts.read().await.clone()
+    }
+    
+    /// Generate transaction from pre-cloned accounts snapshot (NO LOCK!)
+    /// This is the HIGH-PERFORMANCE path for benchmark workers
+    pub fn generate_transaction_from_snapshot(
+        accounts: &[BenchmarkAccount],
+    ) -> Option<qnet_state::Transaction> {
+        if accounts.len() < 2 {
+            return None;
+        }
+        
+        // Pick random sender and receiver
+        let sender_idx = rand::random::<usize>() % accounts.len();
+        let mut receiver_idx = rand::random::<usize>() % accounts.len();
+        while receiver_idx == sender_idx {
+            receiver_idx = rand::random::<usize>() % accounts.len();
+        }
+        
+        let sender = &accounts[sender_idx];
+        let receiver = &accounts[receiver_idx];
+        
+        let nonce = sender.get_next_nonce();
+        let amount = ONE_QNC; // 1 QNC = 10^9 nanoQNC
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        
+        // PRODUCTION VALUES - identical to production transactions
+        const GAS_LIMIT_TRANSFER: u64 = 10_000;
+        const GAS_PRICE_STANDARD: u64 = 1;
+        
+        // Create transaction with correct structure (100% production-identical)
+        let mut tx = qnet_state::Transaction {
+            hash: String::new(),
+            from: sender.address.clone(),
+            to: Some(receiver.address.clone()),
+            amount,
+            nonce,
+            timestamp,
+            gas_price: GAS_PRICE_STANDARD,
+            gas_limit: GAS_LIMIT_TRANSFER,
+            data: None,
+            signature: None,
+            public_key: Some(hex::encode(sender.verifying_key.as_bytes())),
+            tx_type: qnet_state::TransactionType::Transfer {
+                from: sender.address.clone(),
+                to: receiver.address.clone(),
+                amount,
+            },
+            dilithium_signature: None,
+            dilithium_public_key: None,
+        };
+        
+        // Calculate hash (real SHA3-256)
+        tx.hash = tx.calculate_hash();
+        
+        // Sign with Ed25519 (real cryptographic signature)
         let message = format!("transfer:{}:{}:{}:{}:{}", 
             tx.from, receiver.address, amount, tx.gas_price, tx.gas_limit);
         let signature = sender.signing_key.sign(message.as_bytes());

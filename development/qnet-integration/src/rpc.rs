@@ -9709,34 +9709,39 @@ async fn handle_benchmark_start(
 
 /// Run benchmark transaction generator - PARALLEL VERSION for 50K+ TPS
 /// Uses multiple worker tasks to generate and submit transactions concurrently
+/// v2.26.3: FIXED lock contention - uses snapshot accounts (NO RwLock per TX!)
 async fn run_benchmark_generator(
     blockchain: Arc<BlockchainNode>,
     total_transactions: u64,
     target_tps: u64,
 ) {
-    use crate::benchmark::BENCHMARK_MANAGER;
+    use crate::benchmark::{BENCHMARK_MANAGER, BenchmarkManager};
     use std::time::Instant;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc as StdArc;
     
-    // FIXED v2.26.2: Optimized workers for REAL single shard testing (5 nodes = 1 shard)
-    // 256 workers was overkill and blocked block production
-    // For 100K TPS target: need enough workers to saturate mempool, but not starve runtime
-    // Rule: ~10K TX/sec per worker, so 16 workers = 160K TX/sec generation capacity
-    let num_workers = match target_tps {
-        t if t <= 100_000 => 16,           // single_shard: 16 workers (MAX for real 100K TPS)
-        t if t <= 500_000 => 16,           // small_scale: still 16 (we only have 1 shard!)
-        _ => 16,                           // ALL tests: 16 workers MAX (more = runtime starvation)
-    };
+    // v2.26.3: 16 workers for maximum parallelism
+    // Lock contention FIXED via snapshot accounts - workers don't block each other
+    let num_workers = 16usize;
     
     let tx_per_worker = total_transactions / num_workers as u64;
-    // PRODUCTION v2.26.2: 10K batch for maximum throughput
-    // yield_now() after each batch prevents runtime starvation
-    // Same as production block processing batch size
+    // PRODUCTION batch size - same as block processing
     let batch_size = 10_000usize;
+    // Yield every N transactions to allow block production
+    let yield_interval = 100usize;
     
-    println!("[BENCHMARK] 🚀 PARALLEL generator: {} tx at {} TPS target", total_transactions, target_tps);
-    println!("[BENCHMARK] ⚡ Workers: {}, TX/worker: {}, Batch: {}", num_workers, tx_per_worker, batch_size);
+    println!("[BENCHMARK] 🚀 PARALLEL generator v2.26.3: {} tx at {} TPS target", total_transactions, target_tps);
+    println!("[BENCHMARK] ⚡ Workers: {}, TX/worker: {}, Batch: {}, Yield every: {} TX", 
+             num_workers, tx_per_worker, batch_size, yield_interval);
+    
+    // v2.26.3: Get accounts snapshot ONCE - eliminates ALL lock contention!
+    // Each worker gets its own clone - no RwLock during TX generation
+    let accounts_snapshot = BENCHMARK_MANAGER.get_accounts_snapshot().await;
+    if accounts_snapshot.len() < 2 {
+        println!("[BENCHMARK] ❌ Not enough accounts! Need at least 2, have {}", accounts_snapshot.len());
+        return;
+    }
+    println!("[BENCHMARK] 📋 Accounts snapshot: {} accounts cloned for workers", accounts_snapshot.len());
     
     let start = Instant::now();
     let global_sent = StdArc::new(AtomicU64::new(0));
@@ -9752,14 +9757,26 @@ async fn run_benchmark_generator(
         let confirmed_counter = global_confirmed.clone();
         let error_counter = global_errors.clone();
         
+        // v2.26.3: PARTITION accounts between workers to avoid nonce collision!
+        // Each worker gets a SLICE of accounts - no shared nonces
+        let accounts_per_worker = accounts_snapshot.len() / num_workers;
+        let start_idx = worker_id * accounts_per_worker;
+        let end_idx = if worker_id == num_workers - 1 {
+            accounts_snapshot.len()  // Last worker gets remainder
+        } else {
+            start_idx + accounts_per_worker
+        };
+        let worker_accounts: Vec<_> = accounts_snapshot[start_idx..end_idx].to_vec();
+        
         let handle = tokio::spawn(async move {
             let mut local_sent = 0u64;
             let mut local_confirmed = 0u64;
             let mut local_errors = 0u64;
             let mut latencies = Vec::with_capacity(1000);
+            let mut yield_counter = 0usize;
             
             while local_sent < tx_per_worker && BENCHMARK_MANAGER.is_running() {
-                // Generate batch of transactions
+                // Generate batch of transactions using SNAPSHOT (NO LOCK!)
                 let mut batch_txs = Vec::with_capacity(batch_size);
                 
                 for _ in 0..batch_size {
@@ -9767,13 +9784,23 @@ async fn run_benchmark_generator(
                         break;
                     }
                     
-                    if let Some(tx) = BENCHMARK_MANAGER.generate_transaction().await {
+                    // v2.26.3: Generate from snapshot - NO async, NO lock!
+                    if let Some(tx) = BenchmarkManager::generate_transaction_from_snapshot(&worker_accounts) {
                         batch_txs.push(tx);
                         local_sent += 1;
+                        yield_counter += 1;
+                        
+                        // v2.26.3: Yield every N TX to allow block production
+                        // This is CRITICAL - prevents runtime starvation
+                        if yield_counter >= yield_interval {
+                            yield_counter = 0;
+                            tokio::task::yield_now().await;
+                        }
                     }
                 }
                 
                 if batch_txs.is_empty() {
+                    tokio::task::yield_now().await;
                     continue;
                 }
                 
@@ -9793,9 +9820,7 @@ async fn run_benchmark_generator(
                     }
                 }
                 
-                // FIXED v2.26.2: Yield after EVERY batch to allow block production
-                // This prevents benchmark from starving the async runtime
-                // yield_now() is FREE (no sleep) - just gives other tasks a chance
+                // Yield after batch submission too
                 tokio::task::yield_now().await;
             }
             
@@ -9808,6 +9833,9 @@ async fn run_benchmark_generator(
             for lat in latencies {
                 BENCHMARK_MANAGER.record_latency(lat).await;
             }
+            
+            println!("[BENCHMARK] Worker {} finished: {} TX sent, {} confirmed", 
+                     worker_id, local_sent, local_confirmed);
             
             (worker_id, local_sent, local_confirmed)
         });
