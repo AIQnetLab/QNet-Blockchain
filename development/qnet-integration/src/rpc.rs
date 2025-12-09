@@ -9719,20 +9719,20 @@ async fn run_benchmark_generator(
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc as StdArc;
     
-    // Calculate optimal worker count based on target TPS
-    // Each worker can generate ~5K TPS, so for 50K we need ~10 workers
-    // For full_scale (12.8M TPS target), we use 256 workers
+    // FIXED v2.26.2: Optimized workers for REAL single shard testing (5 nodes = 1 shard)
+    // 256 workers was overkill and blocked block production
+    // For 100K TPS target: need enough workers to saturate mempool, but not starve runtime
+    // Rule: ~10K TX/sec per worker, so 16 workers = 160K TX/sec generation capacity
     let num_workers = match target_tps {
-        t if t <= 100_000 => 16,           // single_shard: 16 workers
-        t if t <= 500_000 => 64,          // small_scale: 64 workers
-        t if t <= 2_000_000 => 128,       // medium_scale: 128 workers
-        _ => 256,                          // large+ scale: 256 workers
+        t if t <= 100_000 => 16,           // single_shard: 16 workers (MAX for real 100K TPS)
+        t if t <= 500_000 => 16,           // small_scale: still 16 (we only have 1 shard!)
+        _ => 16,                           // ALL tests: 16 workers MAX (more = runtime starvation)
     };
     
     let tx_per_worker = total_transactions / num_workers as u64;
-    // PRODUCTION v2.25.2: Large batches for maximum TPS
-    // 10K batch = single lock acquisition, single network message
-    // Optimized for 100K TX/block throughput
+    // PRODUCTION v2.26.2: 10K batch for maximum throughput
+    // yield_now() after each batch prevents runtime starvation
+    // Same as production block processing batch size
     let batch_size = 10_000usize;
     
     println!("[BENCHMARK] 🚀 PARALLEL generator: {} tx at {} TPS target", total_transactions, target_tps);
@@ -9793,10 +9793,10 @@ async fn run_benchmark_generator(
                     }
                 }
                 
-                // Yield to other tasks periodically
-                if local_sent % 1000 == 0 {
-                    tokio::task::yield_now().await;
-                }
+                // FIXED v2.26.2: Yield after EVERY batch to allow block production
+                // This prevents benchmark from starving the async runtime
+                // yield_now() is FREE (no sleep) - just gives other tasks a chance
+                tokio::task::yield_now().await;
             }
             
             // Update global counters
@@ -9832,10 +9832,21 @@ async fn run_benchmark_generator(
             
             println!("[BENCHMARK] 📊 Progress: {}/{} ({:.0} TPS)", sent, total_transactions, current_tps);
             
-            // Update benchmark manager stats
-            for _ in 0..sent.saturating_sub(BENCHMARK_MANAGER.get_status().await.transactions_sent) {
-                BENCHMARK_MANAGER.record_sent();
-                BENCHMARK_MANAGER.record_confirmed();
+            // FIXED v2.26.2: Direct atomic update instead of async loop
+            // Previous version caused async deadlock with get_status().await in tight loop
+            let manager_sent = BENCHMARK_MANAGER.transactions_sent.load(Ordering::SeqCst);
+            let delta = sent.saturating_sub(manager_sent);
+            if delta > 0 {
+                BENCHMARK_MANAGER.transactions_sent.fetch_add(delta, Ordering::SeqCst);
+                BENCHMARK_MANAGER.transactions_confirmed.fetch_add(delta, Ordering::SeqCst);
+            }
+            
+            // Update peak TPS directly
+            {
+                let mut peak = BENCHMARK_MANAGER.peak_tps.write().await;
+                if current_tps > *peak {
+                    *peak = current_tps;
+                }
             }
         }
     });

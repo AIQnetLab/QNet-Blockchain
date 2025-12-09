@@ -5196,6 +5196,7 @@ impl SimplifiedP2P {
     
     /// API DEADLOCK FIX: Get cached network height WITHOUT triggering sync
     /// This method NEVER makes network calls - only reads cache
+    /// v2.26.1: Added fallback to max(peer.last_block_height) from HealthPing data
     pub fn get_cached_network_height(&self) -> Option<u64> {
         // Check cache actor first
         let height_cache_guard = match CACHE_ACTOR.height_cache.read() {
@@ -5222,7 +5223,49 @@ impl SimplifiedP2P {
             return Some(cache.0);
         }
         
+        // v2.26.1: Fallback to max(peer heights) from HealthPing data
+        // This ensures network_height is always accurate even without active sync
+        let max_peer_height = self.get_max_peer_height();
+        if max_peer_height > 0 {
+            return Some(max_peer_height);
+        }
+        
         None // No valid cache available
+    }
+    
+    /// v2.26.1: Get consensus network height from connected peers (from HealthPing data)
+    /// Uses median for Byzantine fault tolerance (same logic as sync_blockchain_height)
+    /// This provides real-time network height without HTTP calls
+    pub fn get_max_peer_height(&self) -> u64 {
+        let mut peer_heights: Vec<u64> = Vec::new();
+        
+        // Read from connected_peers with lock
+        if let Ok(peers) = self.connected_peers.read() {
+            peer_heights = peers.values()
+                .filter(|p| p.last_block_height > 0)
+                .map(|p| p.last_block_height)
+                .collect();
+        }
+        
+        // Also include local height
+        let local_height = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+        if local_height > 0 {
+            peer_heights.push(local_height);
+        }
+        
+        if peer_heights.is_empty() {
+            return local_height;
+        }
+        
+        // Use same consensus logic as sync_blockchain_height
+        peer_heights.sort();
+        if peer_heights.len() >= 3 {
+            // Median for Byzantine fault tolerance
+            peer_heights[peer_heights.len() / 2]
+        } else {
+            // Max if less than 3 peers
+            *peer_heights.iter().max().unwrap_or(&0)
+        }
     }
     
     /// Sync blockchain height with peers for consensus

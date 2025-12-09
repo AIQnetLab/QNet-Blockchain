@@ -202,14 +202,14 @@ pub struct BenchmarkManager {
     accounts: RwLock<Vec<BenchmarkAccount>>,
     /// Running state
     is_running: AtomicBool,
-    /// Transactions sent
-    transactions_sent: AtomicU64,
-    /// Transactions confirmed
-    transactions_confirmed: AtomicU64,
+    /// Transactions sent (pub for direct update from benchmark generator)
+    pub transactions_sent: AtomicU64,
+    /// Transactions confirmed (pub for direct update from benchmark generator)
+    pub transactions_confirmed: AtomicU64,
     /// Errors count
     errors: AtomicU64,
-    /// Peak TPS observed (instantaneous)
-    peak_tps: RwLock<f64>,
+    /// Peak TPS observed (instantaneous, pub for direct update)
+    pub peak_tps: RwLock<f64>,
     /// Start time
     start_time: RwLock<Option<Instant>>,
     /// End time
