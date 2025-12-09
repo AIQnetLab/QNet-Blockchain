@@ -89,15 +89,16 @@ fn default_shards() -> usize { 256 }
 
 impl BenchmarkConfig {
     /// Create config from preset
+    /// v2.26.5: Reduced FullScale to 2.56M for faster completion (was 25.6M)
     pub fn from_preset(preset: BenchmarkPreset) -> Self {
         let (shards, total, tps, accounts) = match preset {
-            BenchmarkPreset::SingleShard => (1, 100_000, 100_000, 100),
-            BenchmarkPreset::SmallScale => (8, 800_000, 800_000, 500),
-            BenchmarkPreset::MediumScale => (32, 3_200_000, 3_200_000, 2_000),
-            BenchmarkPreset::LargeScale => (64, 6_400_000, 6_400_000, 4_000),
-            BenchmarkPreset::ExtraLarge => (128, 12_800_000, 12_800_000, 8_000),
-            BenchmarkPreset::FullScale => (256, 25_600_000, 25_600_000, 10_000),
-            BenchmarkPreset::Custom => (256, 25_600_000, 25_600_000, 10_000),
+            BenchmarkPreset::SingleShard => (1, 100_000, 100_000, 1_000),
+            BenchmarkPreset::SmallScale => (8, 800_000, 100_000, 5_000),
+            BenchmarkPreset::MediumScale => (32, 1_600_000, 100_000, 10_000),
+            BenchmarkPreset::LargeScale => (64, 2_560_000, 100_000, 20_000),
+            BenchmarkPreset::ExtraLarge => (128, 2_560_000, 100_000, 30_000),
+            BenchmarkPreset::FullScale => (256, 2_560_000, 100_000, 50_000),
+            BenchmarkPreset::Custom => (256, 2_560_000, 100_000, 50_000),
         };
         
         Self {
