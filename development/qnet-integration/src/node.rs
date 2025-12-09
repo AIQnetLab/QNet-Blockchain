@@ -175,8 +175,9 @@ lazy_static::lazy_static! {
 // CRITICAL: Global mempool instance for activation registry integration
 // Allows BlockchainActivationRegistry to submit transactions to mempool
 // without circular dependency on Node
+// v2.26: No outer RwLock - SimpleMempool is already thread-safe (DashMap + parking_lot)
 lazy_static::lazy_static! {
-    pub static ref GLOBAL_MEMPOOL_INSTANCE: std::sync::Mutex<Option<Arc<RwLock<qnet_mempool::SimpleMempool>>>> = std::sync::Mutex::new(None);
+    pub static ref GLOBAL_MEMPOOL_INSTANCE: std::sync::Mutex<Option<Arc<qnet_mempool::SimpleMempool>>> = std::sync::Mutex::new(None);
 }
 
 // CRITICAL: Track certificate requests to prevent DDoS (request flooding)
@@ -462,7 +463,9 @@ impl RotationTracker {
 pub struct BlockchainNode {
     storage: Arc<Storage>,
     state: Arc<RwLock<StateManager>>,
-    mempool: Arc<RwLock<qnet_mempool::SimpleMempool>>,
+    // CRITICAL v2.26: Removed outer RwLock - SimpleMempool is already thread-safe (DashMap + parking_lot)
+    // This eliminates the 100K TPS bottleneck from external lock contention
+    mempool: Arc<qnet_mempool::SimpleMempool>,
     consensus: Arc<RwLock<qnet_consensus::ConsensusEngine>>,
     // validator: Arc<Validator>, // disabled for compilation
     
@@ -1262,7 +1265,9 @@ impl BlockchainNode {
             min_gas_price: 1,
         };
         
-        let mempool = Arc::new(RwLock::new(qnet_mempool::SimpleMempool::new(mempool_config)));
+        // CRITICAL v2.26: No outer RwLock - SimpleMempool is already thread-safe (DashMap + parking_lot)
+        // This eliminates 100K TPS bottleneck from external lock contention
+        let mempool = Arc::new(qnet_mempool::SimpleMempool::new(mempool_config));
         
         // CRITICAL: Set global mempool instance for activation registry
         // This allows Registry to submit transactions without circular dependency
@@ -2370,50 +2375,86 @@ impl BlockchainNode {
             const MAX_CACHE_SIZE: usize = 100_000; // 100K transactions
             const CLEANUP_INTERVAL_SECS: u64 = 300; // 5 minutes
             
-            while let Some(received_tx) = transaction_rx.recv().await {
-                // DEDUPLICATION: Skip already processed transactions
-                if processed_txs.contains(&received_tx.tx_hash) {
-                    continue;
+            // PRODUCTION v2.25.2: Batch accumulator for Ed25519 batch verification
+            // Optimal: 1000 TX gives ~3x speedup from batch verify
+            const BATCH_SIZE: usize = 1000;
+            const BATCH_TIMEOUT_MS: u64 = 100; // Process batch every 100ms max (balance latency vs throughput)
+            let mut tx_batch: Vec<(crate::unified_p2p::ReceivedTransaction, qnet_state::Transaction)> = 
+                Vec::with_capacity(BATCH_SIZE);
+            let mut last_batch_time = std::time::Instant::now();
+            
+            loop {
+                // Try to receive with timeout for batch processing
+                let received = tokio::time::timeout(
+                    tokio::time::Duration::from_millis(BATCH_TIMEOUT_MS),
+                    transaction_rx.recv()
+                ).await;
+                
+                match received {
+                    Ok(Some(received_tx)) => {
+                        // DEDUPLICATION: Skip already processed transactions
+                        if processed_txs.contains(&received_tx.tx_hash) {
+                            continue;
+                        }
+                        
+                        // PRODUCTION v2.25: Deserialize transaction (bincode first, JSON fallback)
+                        let tx_result: Result<qnet_state::Transaction, String> = 
+                            bincode::deserialize::<qnet_state::Transaction>(&received_tx.tx_data)
+                                .map_err(|e| e.to_string())
+                                .or_else(|_| {
+                                    serde_json::from_slice::<qnet_state::Transaction>(&received_tx.tx_data)
+                                        .map_err(|e| e.to_string())
+                                });
+                        
+                        if let Ok(tx) = tx_result {
+                            tx_batch.push((received_tx, tx));
+                        }
+                    }
+                    Ok(None) => break, // Channel closed
+                    Err(_) => {} // Timeout - process batch
                 }
                 
-                // PRODUCTION v2.25: Deserialize transaction (bincode first, JSON fallback)
-                let tx_result: Result<qnet_state::Transaction, String> = 
-                    bincode::deserialize::<qnet_state::Transaction>(&received_tx.tx_data)
-                        .map_err(|e| e.to_string())
-                        .or_else(|_| {
-                            // Legacy JSON fallback for backward compatibility
-                            serde_json::from_slice::<qnet_state::Transaction>(&received_tx.tx_data)
-                                .map_err(|e| e.to_string())
-                        });
+                // Process batch when full or timeout elapsed
+                let should_process = tx_batch.len() >= BATCH_SIZE || 
+                    (last_batch_time.elapsed().as_millis() as u64 >= BATCH_TIMEOUT_MS && !tx_batch.is_empty());
                 
-                match tx_result {
-                    Ok(tx) => {
-                        // PRODUCTION VALIDATION: Full validation before adding to mempool
-                        // Check signature, nonce, balance, etc.
+                if should_process {
+                    // PRODUCTION v2.25.2: Batch Ed25519 verification (2-3x faster)
+                    let transactions: Vec<qnet_state::Transaction> = tx_batch.iter()
+                        .map(|(_, tx)| tx.clone())
+                        .collect();
+                    
+                    let valid_indices = BlockchainNode::verify_ed25519_batch(&transactions);
+                    let valid_set: std::collections::HashSet<usize> = valid_indices.into_iter().collect();
+                    
+                    // Process only verified transactions
+                    let mut added = 0usize;
+                    for (idx, (received_tx, tx)) in tx_batch.drain(..).enumerate() {
+                        if !valid_set.contains(&idx) {
+                            continue; // Skip invalid signature
+                        }
+                        
+                        // Full validation (nonce, balance, etc.) and add to mempool
                         match blockchain_for_transactions.validate_and_add_network_transaction(tx).await {
-                            Ok(hash) => {
-                                // Add to deduplication cache
+                            Ok(_hash) => {
                                 processed_txs.insert(received_tx.tx_hash.clone());
-                                println!("[TX-SYNC] ✅ Transaction {} from {} added to mempool", 
-                                         &hash[..16], received_tx.from_peer);
+                                added += 1;
                             }
-                            Err(e) => {
-                                // Don't spam logs for common rejections (duplicates, etc.)
-                                if !e.to_string().contains("duplicate") && !e.to_string().contains("already") {
-                                    println!("[TX-SYNC] ⚠️ Transaction rejected: {}", e);
-                                }
+                            Err(_e) => {
+                                // Silent reject for common cases
                             }
                         }
                     }
-                    Err(e) => {
-                        println!("[TX-SYNC] ❌ Failed to deserialize transaction from {}: {}", 
-                                 received_tx.from_peer, e);
+                    
+                    if added > 0 {
+                        println!("[TX-SYNC] ✅ Batch verified & added: {} TX (batch verify)", added);
                     }
+                    
+                    last_batch_time = std::time::Instant::now();
                 }
                 
                 // MEMORY MANAGEMENT: Periodic cleanup of deduplication cache
                 if last_cleanup.elapsed().as_secs() > CLEANUP_INTERVAL_SECS || processed_txs.len() > MAX_CACHE_SIZE {
-                    // Keep only most recent transactions (simple strategy: clear half)
                     if processed_txs.len() > MAX_CACHE_SIZE / 2 {
                         let to_remove: Vec<_> = processed_txs.iter().take(processed_txs.len() / 2).cloned().collect();
                         for key in to_remove {
@@ -6555,7 +6596,8 @@ impl BlockchainNode {
                                 
                                 for tx_hash in &bundle.transactions {
                                     // PRODUCTION v2.26: Use binary transactions with hash for cleanup
-                                    if let Some(tx_bytes) = mempool.read().await.get_binary_transaction(tx_hash) {
+                                    // v2.26: Direct access - SimpleMempool is already thread-safe
+                                    if let Some(tx_bytes) = mempool.get_binary_transaction(tx_hash) {
                                         bundle_txs.push((tx_hash.clone(), tx_bytes));
                                     } else {
                                         println!("[MEV] ⚠️ Bundle {} rejected: TX {} not found in mempool", 
@@ -6581,11 +6623,8 @@ impl BlockchainNode {
                         // STEP 2: PUBLIC TXS (remaining 80-100% space)
                         let remaining_space = max_tx_per_microblock.saturating_sub(block_txs.len());
                         if remaining_space > 0 {
-                            let public_txs = {
-                                let mempool_guard = mempool.read().await;
-                                // PRODUCTION v2.26: Use transactions with hashes for cleanup
-                                mempool_guard.get_pending_transactions_with_hashes(remaining_space)
-                            };
+                            // v2.26: Direct access - SimpleMempool is already thread-safe
+                            let public_txs = mempool.get_pending_transactions_with_hashes(remaining_space);
                             block_txs.extend(public_txs);
                         }
                         
@@ -6606,9 +6645,8 @@ impl BlockchainNode {
                         block_txs
                     } else {
                         // NO MEV PROTECTION: Use public mempool only
-                        // PRODUCTION v2.26: Use binary transactions WITH hashes for cleanup
-                        let mempool_guard = mempool.read().await;
-                        mempool_guard.get_pending_transactions_with_hashes(max_tx_per_microblock)
+                        // v2.26: Direct access - SimpleMempool is already thread-safe
+                        mempool.get_pending_transactions_with_hashes(max_tx_per_microblock)
                     };
                     
                     // CRITICAL v2.26: Track TX hashes for mempool cleanup after block
@@ -6620,6 +6658,10 @@ impl BlockchainNode {
                     // bincode first (new format), JSON fallback (legacy)
                     let mut txs = Vec::new();
                     let state_snapshot = state.read().await;
+                    
+                    // NOTE v2.25.2: Parallel deserialization could be added with rayon for 100K+ TPS
+                    // Current implementation is sufficient for 50K TPS target
+                    // For higher TPS, add rayon dependency and use par_iter()
                     
                     for (mempool_hash, tx_bytes) in tx_bytes_list {
                         // Try bincode first (10-20x faster)
@@ -6680,9 +6722,9 @@ impl BlockchainNode {
                     
                     // CRITICAL v2.26: Remove invalid transactions from mempool immediately!
                     // This prevents them from blocking block production forever
+                    // v2.26: Direct access - SimpleMempool is already thread-safe
                     if !invalid_tx_hashes.is_empty() {
-                        let mempool_write = mempool.write().await;
-                        mempool_write.batch_remove_transactions(&invalid_tx_hashes);
+                        mempool.batch_remove_transactions(&invalid_tx_hashes);
                         println!("[MEMPOOL] 🗑️ Removed {} invalid TX (bad nonce/balance)", invalid_tx_hashes.len());
                     }
                     
@@ -7150,9 +7192,9 @@ impl BlockchainNode {
                         
                         // CRITICAL v2.26: Remove included TX from mempool AFTER block is saved!
                         // This prevents re-processing the same TX in future blocks
+                        // v2.26: Direct access - SimpleMempool is already thread-safe
                         if !included_tx_hashes.is_empty() {
-                            let mempool_write = mempool.write().await;
-                            mempool_write.batch_remove_transactions(&included_tx_hashes);
+                            mempool.batch_remove_transactions(&included_tx_hashes);
                             if included_tx_hashes.len() > 0 {
                                 println!("[MEMPOOL] ✅ Cleaned {} TX after block #{}", 
                                          included_tx_hashes.len(), height_for_storage);
@@ -7397,18 +7439,13 @@ impl BlockchainNode {
                         }
                     }
                     
-                    // CRITICAL FIX: Optimized mempool cleanup - batch removal for performance 
-                    // PERFORMANCE: Reduces lock contention from N operations to 1 operation
+                    // CRITICAL v2.26: Optimized mempool cleanup - batch removal for performance 
+                    // v2.26: Direct access - SimpleMempool is already thread-safe (DashMap + parking_lot)
+                    // No external lock needed - eliminates 100K TPS bottleneck!
                     {
-                        let mut mempool_guard = mempool.write().await;
                         let tx_hashes: Vec<String> = txs.iter().map(|tx| tx.hash.clone()).collect();
-                        for hash in tx_hashes {
-                            mempool_guard.remove_transaction(&hash);
-                        }
-                        let remaining_size = mempool_guard.size();
-                        drop(mempool_guard); // Release lock ASAP
-                        
-                        // PRODUCTION: Log outside lock for performance (millions of nodes)
+                        mempool.batch_remove_transactions(&tx_hashes);
+                        let remaining_size = mempool.size();
                         println!("[MEMPOOL] 🗑️ Removed {} processed transactions | Remaining: {}", 
                                  txs.len(), remaining_size);
                     }
@@ -8866,11 +8903,40 @@ impl BlockchainNode {
             // Same cryptographic guarantees as normal producer selection (NIST FIPS 204)
             println!("[EMERGENCY] 🔐 Using Hybrid VRF for emergency selection at block #{}", current_height);
             
+            // CRITICAL FIX v2.25.2: Use FINALITY WINDOW block hash for determinism
+            // This ensures ALL synchronized nodes compute IDENTICAL emergency producer
+            // Without this, different nodes may select different emergency producers → FORK!
+            let finality_hash = if let Some(ref store) = storage {
+                let finality_block_height = current_height.saturating_sub(FINALITY_WINDOW);
+                if finality_block_height > 0 {
+                    Self::get_finality_block_hash(store, finality_block_height, current_height).await
+                } else {
+                    // For very early blocks, use genesis
+                    match store.load_microblock(0) {
+                        Ok(Some(genesis_data)) => {
+                            use sha3::{Sha3_256, Digest};
+                            let mut h = Sha3_256::new();
+                            h.update(&genesis_data);
+                            let r = h.finalize();
+                            let mut hash = [0u8; 32];
+                            hash.copy_from_slice(&r);
+                            hash
+                        },
+                        _ => [0u8; 32]
+                    }
+                }
+            } else {
+                println!("[EMERGENCY] ⚠️ No storage - using zero entropy (may cause fork!)");
+                [0u8; 32]
+            };
+            
             // Create deterministic entropy for emergency VRF
+            // CRITICAL: Include finality_hash for cross-node determinism!
             let emergency_entropy = {
                 use sha3::{Sha3_256, Digest};
                 let mut hasher = Sha3_256::new();
-                hasher.update(b"EMERGENCY_VRF_ENTROPY_V6");
+                hasher.update(b"EMERGENCY_VRF_ENTROPY_V7"); // Version bump for new algorithm
+                hasher.update(&finality_hash);  // CRITICAL: Finality window block hash!
                 hasher.update(&current_height.to_le_bytes());
                 hasher.update(correct_producer.as_bytes());
                 for (node_id, _) in &sorted_candidates {
@@ -8881,6 +8947,9 @@ impl BlockchainNode {
                 entropy.copy_from_slice(&result);
                 entropy
             };
+            
+            println!("[EMERGENCY] 🔐 Finality block #{} used for deterministic entropy", 
+                     current_height.saturating_sub(FINALITY_WINDOW));
             
             // ═══════════════════════════════════════════════════════════════════════════
             // EMERGENCY: DETERMINISTIC SHA3 SELECTION (Same as normal selection)
@@ -12085,9 +12154,10 @@ impl BlockchainNode {
     
     async fn log_performance_metrics(
         microblock_height: u64,
-        mempool: &Arc<RwLock<qnet_mempool::SimpleMempool>>,
+        mempool: &Arc<qnet_mempool::SimpleMempool>,
     ) {
-        let mempool_size = mempool.read().await.size();
+        // v2.26: Direct access - SimpleMempool is already thread-safe
+        let mempool_size = mempool.size();
         let blocks_per_minute = 60; // Approximate for 1s intervals
         let estimated_tps = blocks_per_minute * 5000; // Assuming 5k tx per block average
         
@@ -12319,12 +12389,13 @@ impl BlockchainNode {
     }
     
     pub async fn get_mempool_size(&self) -> Result<usize, QNetError> {
-        let mempool = self.mempool.read().await;
-        Ok(mempool.size())
+        // v2.26: Direct access - SimpleMempool is already thread-safe
+        Ok(self.mempool.size())
     }
     
     /// Get mempool Arc for RPC access
-    pub fn get_mempool(&self) -> Arc<tokio::sync::RwLock<qnet_mempool::SimpleMempool>> {
+    /// v2.26: No outer RwLock - SimpleMempool is already thread-safe (DashMap + parking_lot)
+    pub fn get_mempool(&self) -> Arc<qnet_mempool::SimpleMempool> {
         self.mempool.clone()
     }
     
@@ -12553,11 +12624,9 @@ impl BlockchainNode {
             .map_err(|e| QNetError::SerializationError(format!("Failed to serialize transaction: {}", e)))?;
         let tx_hash = format!("{:x}", sha3::Sha3_256::digest(&tx_bytes));
         
-        {
-            let mut mempool = self.mempool.write().await;
-            // PRODUCTION v2.26: Use binary storage with consistent hash
-            mempool.add_binary_transaction(tx_bytes.clone(), tx_hash.clone(), tx.gas_price);
-        }
+        // v2.26: Direct access - SimpleMempool is already thread-safe
+        // No external lock needed - eliminates 100K TPS bottleneck!
+        self.mempool.add_binary_transaction(tx_bytes.clone(), tx_hash.clone(), tx.gas_price);
         
         // Broadcast to network only after successful validation
         // PRODUCTION v2.25: bincode for network (10-20x faster than JSON)
@@ -12622,6 +12691,95 @@ impl BlockchainNode {
             Ok(()) => Ok(true),
             Err(_) => Ok(false),
         }
+    }
+    
+    /// PRODUCTION v2.25.2: Batch verify Ed25519 signatures for high TPS
+    /// Uses ed25519_dalek::verify_batch for 2-3x faster verification
+    /// Returns indices of valid transactions
+    pub fn verify_ed25519_batch(transactions: &[qnet_state::Transaction]) -> Vec<usize> {
+        use ed25519_dalek::{Signature, VerifyingKey, Verifier};
+        
+        let mut valid_indices: Vec<usize> = Vec::with_capacity(transactions.len());
+        
+        // Prepare batch data
+        let mut messages: Vec<Vec<u8>> = Vec::with_capacity(transactions.len());
+        let mut signatures: Vec<Signature> = Vec::with_capacity(transactions.len());
+        let mut verifying_keys: Vec<VerifyingKey> = Vec::with_capacity(transactions.len());
+        let mut tx_indices: Vec<usize> = Vec::with_capacity(transactions.len());
+        
+        for (idx, tx) in transactions.iter().enumerate() {
+            // Skip if no signature
+            let (sig_hex, pk_hex) = match (&tx.signature, &tx.public_key) {
+                (Some(s), Some(p)) if !s.is_empty() && !p.is_empty() => (s, p),
+                _ => continue,
+            };
+            
+            // Create canonical message
+            let to_str = tx.to.as_ref().map(|s| s.as_str()).unwrap_or("");
+            let message = format!(
+                "{}|{}|{}|{}|{}|{}|{}",
+                tx.from, to_str, tx.amount, tx.nonce, tx.gas_price, tx.gas_limit, tx.timestamp
+            );
+            
+            // Decode signature
+            let sig_bytes = match hex::decode(sig_hex) {
+                Ok(b) if b.len() == 64 => b,
+                _ => continue,
+            };
+            let sig_array: [u8; 64] = match sig_bytes.try_into() {
+                Ok(a) => a,
+                Err(_) => continue,
+            };
+            let signature = Signature::from_bytes(&sig_array);
+            
+            // Decode public key
+            let pk_bytes = match hex::decode(pk_hex) {
+                Ok(b) if b.len() == 32 => b,
+                _ => continue,
+            };
+            let pk_array: [u8; 32] = match pk_bytes.try_into() {
+                Ok(a) => a,
+                Err(_) => continue,
+            };
+            let verifying_key = match VerifyingKey::from_bytes(&pk_array) {
+                Ok(vk) => vk,
+                Err(_) => continue,
+            };
+            
+            messages.push(message.into_bytes());
+            signatures.push(signature);
+            verifying_keys.push(verifying_key);
+            tx_indices.push(idx);
+        }
+        
+        if messages.is_empty() {
+            return valid_indices;
+        }
+        
+        // BATCH VERIFY: 2-3x faster than individual verification
+        // Try batch first, fallback to individual on failure
+        let message_refs: Vec<&[u8]> = messages.iter().map(|m| m.as_slice()).collect();
+        
+        match ed25519_dalek::verify_batch(&message_refs, &signatures, &verifying_keys) {
+            Ok(()) => {
+                // All signatures valid
+                valid_indices.extend(tx_indices);
+            }
+            Err(_) => {
+                // Batch failed - some signatures invalid, verify individually
+                for (i, ((msg, sig), vk)) in messages.iter()
+                    .zip(signatures.iter())
+                    .zip(verifying_keys.iter())
+                    .enumerate() 
+                {
+                    if vk.verify(msg, sig).is_ok() {
+                        valid_indices.push(tx_indices[i]);
+                    }
+                }
+            }
+        }
+        
+        valid_indices
     }
     
     /// QUANTUM v2.25: Verify Dilithium3 signature for quantum-resistant transactions
@@ -12764,15 +12922,12 @@ impl BlockchainNode {
         let hash = hex::encode(&tx.hash);
         
         // Add to mempool (NO BROADCAST - already received from network)
-        // PRODUCTION v2.25: Use bincode for high TPS
-        {
-            let mut mempool = self.mempool.write().await;
-            let tx_bytes = bincode::serialize(&tx).unwrap_or_default();
-            let tx_hash = format!("{:x}", sha3::Sha3_256::digest(&tx_bytes));
-            
-            if !mempool.add_binary_transaction(tx_bytes, tx_hash, tx.gas_price) {
-                return Err(QNetError::ValidationError("Transaction already in mempool or mempool full".to_string()));
-            }
+        // v2.26: Direct access - SimpleMempool is already thread-safe
+        let tx_bytes = bincode::serialize(&tx).unwrap_or_default();
+        let tx_hash = format!("{:x}", sha3::Sha3_256::digest(&tx_bytes));
+        
+        if !self.mempool.add_binary_transaction(tx_bytes, tx_hash, tx.gas_price) {
+            return Err(QNetError::ValidationError("Transaction already in mempool or mempool full".to_string()));
         }
         
         Ok(hash)
@@ -12808,13 +12963,10 @@ impl BlockchainNode {
             return Err(QNetError::ValidationError("Transaction signature is empty".to_string()));
         }
         
-        // Add to mempool - PRODUCTION v2.26: bincode for high TPS
+        // Add to mempool - v2.26: Direct access - SimpleMempool is already thread-safe
         let tx_bytes = bincode::serialize(&tx).unwrap_or_default();
         let tx_hash = format!("{:x}", sha3::Sha3_256::digest(&tx_bytes));
-        {
-            let mut mempool = self.mempool.write().await;
-            mempool.add_binary_transaction(tx_bytes.clone(), tx_hash.clone(), tx.gas_price);
-        }
+        self.mempool.add_binary_transaction(tx_bytes.clone(), tx_hash.clone(), tx.gas_price);
         
         // PRODUCTION v2.26: Full P2P broadcast for realistic testing
         // With QNET_BENCHMARK_MODE=true, benchmark accounts have real balances in genesis
@@ -12877,24 +13029,23 @@ impl BlockchainNode {
             }
         }
         
-        // Batch add to mempool with single lock acquisition
-        // PRODUCTION v2.25: Use binary storage for high TPS
+        // v2.26: Direct access - SimpleMempool is already thread-safe (DashMap + parking_lot)
+        // No external lock needed - eliminates 100K TPS bottleneck!
         if !valid_txs.is_empty() {
-            let mut mempool = self.mempool.write().await;
-            for (tx_bytes, tx_hash, gas_price) in &valid_txs {
-                mempool.add_binary_transaction(tx_bytes.clone(), tx_hash.clone(), *gas_price);
-            }
-        }
-        
-        // PRODUCTION v2.25: Use batch broadcast for high-throughput
-        // Single QUIC message for entire batch - reduces stream overhead
-        if let Some(unified_p2p) = &self.unified_p2p {
-            let tx_data_batch: Vec<Vec<u8>> = valid_txs.into_iter()
-                .map(|(tx_bytes, _, _)| tx_bytes)
+            let tx_data_for_broadcast: Vec<Vec<u8>> = valid_txs.iter()
+                .map(|(tx_bytes, _, _)| tx_bytes.clone())
                 .collect();
             
-            if !tx_data_batch.is_empty() {
-                let _ = unified_p2p.broadcast_transaction_batch(tx_data_batch);
+            // Use trusted batch add - 10-50x faster than individual adds
+            let actually_added = self.mempool.add_binary_transaction_batch_trusted(valid_txs);
+            confirmed = actually_added;
+            
+            // PRODUCTION v2.25: Use batch broadcast for high-throughput
+            // Single QUIC message for entire batch - reduces stream overhead
+            if let Some(unified_p2p) = &self.unified_p2p {
+                if !tx_data_for_broadcast.is_empty() {
+                    let _ = unified_p2p.broadcast_transaction_batch(tx_data_for_broadcast);
+                }
             }
         }
         
@@ -12902,10 +13053,8 @@ impl BlockchainNode {
     }
     
     pub async fn get_mempool_transactions(&self) -> Vec<qnet_state::Transaction> {
-        let mempool = self.mempool.read().await;
-        
-        // PRODUCTION v2.25: Use binary transactions for performance
-        let tx_bytes_list = mempool.get_pending_binary_transactions(1000);
+        // v2.26: Direct access - SimpleMempool is already thread-safe
+        let tx_bytes_list = self.mempool.get_pending_binary_transactions(1000);
         
         // Deserialize with bincode (10-20x faster than JSON)
         let mut transactions = Vec::new();
@@ -14088,11 +14237,9 @@ impl BlockchainNode {
     
     pub async fn get_transaction(&self, tx_hash: &str) -> Result<Option<TransactionInfo>, QNetError> {
         // Search in mempool first
-        // PRODUCTION v2.26: Use binary transactions with SHA3(bincode) hash matching
+        // v2.26: Direct access - SimpleMempool is already thread-safe
         {
-            let mempool = self.mempool.read().await;
-            // PRODUCTION v2.26: Use get_pending_transactions_with_hashes for correct matching
-            let pending_txs = mempool.get_pending_transactions_with_hashes(1000);
+            let pending_txs = self.mempool.get_pending_transactions_with_hashes(1000);
             
             for (stored_hash, tx_bytes) in pending_txs {
                 // PRODUCTION v2.26: Compare stored hash (SHA3 bincode) with requested hash
@@ -14121,6 +14268,9 @@ impl BlockchainNode {
                             safety_percentage: Some(0.0),
                             confirmations: Some(0),
                             time_to_finality: Some(90), // Max time to macroblock
+                            // QUANTUM v2.25.2: Dilithium signature info
+                            dilithium_signature: tx.dilithium_signature,
+                            dilithium_public_key: tx.dilithium_public_key,
                         }));
                     }
                 }
@@ -14189,6 +14339,9 @@ impl BlockchainNode {
                     safety_percentage: Some(safety_percentage),
                     confirmations: Some(confirmations),
                     time_to_finality: Some(time_to_finality),
+                    // QUANTUM v2.25.2: Dilithium signature info
+                    dilithium_signature: tx.dilithium_signature,
+                    dilithium_public_key: tx.dilithium_public_key,
                 }))
             }
             Ok(None) => Ok(None),
@@ -14817,6 +14970,25 @@ pub struct TransactionInfo {
     pub safety_percentage: Option<f64>,
     pub confirmations: Option<u32>,
     pub time_to_finality: Option<u64>,
+    // QUANTUM v2.25.2: Optional Dilithium signature info
+    pub dilithium_signature: Option<String>,
+    pub dilithium_public_key: Option<String>,
+}
+
+impl TransactionInfo {
+    /// QUANTUM v2.25.2: Check if transaction has Dilithium signature
+    pub fn is_quantum_signed(&self) -> bool {
+        self.dilithium_signature.is_some() && self.dilithium_public_key.is_some()
+    }
+    
+    /// QUANTUM v2.25.2: Get effective gas price (50% higher for Dilithium TX)
+    pub fn effective_gas_price(&self) -> u64 {
+        if self.is_quantum_signed() {
+            self.gas_price + (self.gas_price / 2)
+        } else {
+            self.gas_price
+        }
+    }
 }
 
 /// Fast Finality Indicators - confirmation levels for better UX

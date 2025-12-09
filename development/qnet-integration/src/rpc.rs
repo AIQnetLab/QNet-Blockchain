@@ -3042,15 +3042,16 @@ async fn handle_transaction_submit(
              &tx_request.to[..8.min(tx_request.to.len())]);
     
     // Create transaction from request WITH verified signature
+    // QUANTUM v2.25.2: Full support for both Ed25519 and Ed25519+Dilithium TX
     let tx = qnet_state::Transaction::new(
         tx_request.from.clone(),
-        Some(tx_request.signature.clone()), // CRITICAL: Include verified signature
+        Some(tx_request.to.clone()),
+        tx_request.amount,
         tx_request.nonce,
         tx_request.gas_price,
         tx_request.gas_limit,
         chrono::Utc::now().timestamp() as u64,
-        0, // block_height: u64
-        None, // block_hash: Option<String>
+        Some(tx_request.signature.clone()), // CRITICAL: Include verified Ed25519 signature
         qnet_state::TransactionType::Transfer {
             from: tx_request.from.clone(),
             to: tx_request.to.clone(),
@@ -3061,7 +3062,14 @@ async fn handle_transaction_submit(
             "public_key": tx_request.public_key,
             "standard": "NIST FIPS 186-5 (Ed25519)"
         })).unwrap_or_default()),
-    );
+    )
+    .with_public_key(Some(tx_request.public_key.clone()))
+    .with_quantum_signature(tx_request.dilithium_signature.clone(), tx_request.dilithium_public_key.clone());
+    
+    // Log quantum TX if present
+    if tx.is_quantum_signed() {
+        println!("[TX-QUANTUM] 🔐 Transaction with Dilithium signature from {}", &tx_request.from[..16.min(tx_request.from.len())]);
+    }
 
     // PRODUCTION v2.26: Use bincode hash for consistency with mempool
     // This ensures client receives the SAME hash as stored in mempool
@@ -3107,6 +3115,10 @@ async fn handle_transaction_get(
     // PRODUCTION: Fetch real transaction from blockchain storage
     match blockchain.get_transaction(&tx_hash).await {
         Ok(Some(tx)) => {
+            // QUANTUM v2.25.2: Include quantum signature info in explorer
+            let is_quantum = tx.is_quantum_signed();
+            let effective_gas = tx.effective_gas_price() * tx.gas_limit;
+            
             let mut transaction_data = json!({
                 "hash": tx.hash,
                 "from": tx.from,
@@ -3115,10 +3127,24 @@ async fn handle_transaction_get(
                 "nonce": tx.nonce,
                 "gas_price": tx.gas_price,
                 "gas_limit": tx.gas_limit,
+                "effective_gas_cost": effective_gas,
                 "timestamp": tx.timestamp,
                 "block_height": tx.block_height,
-                "status": tx.status
+                "status": tx.status,
+                "is_quantum_signed": is_quantum,
+                "signature_type": if is_quantum { "Ed25519 + Dilithium3" } else { "Ed25519" }
             });
+            
+            // Add quantum signature details if present
+            if is_quantum {
+                transaction_data["quantum_security"] = json!({
+                    "algorithm": "CRYSTALS-Dilithium3 (NIST FIPS 204)",
+                    "quantum_resistant": true,
+                    "gas_premium": "50%",
+                    "dilithium_signature_present": tx.dilithium_signature.is_some(),
+                    "dilithium_pubkey_present": tx.dilithium_public_key.is_some()
+                });
+            }
             
             // Add Fast Finality Indicators if available
             if let Some(ref confirmation_level) = tx.confirmation_level {
@@ -3268,19 +3294,25 @@ async fn handle_bundle_submit(
     };
     
     // Calculate total gas price for bundle
-    let mempool_arc = blockchain.get_mempool();
-    let mempool = mempool_arc.read().await;
+    // v2.26: Direct access - SimpleMempool is already thread-safe
+    // v2.26: Use binary transactions with bincode (not JSON!)
+    let mempool = blockchain.get_mempool();
     let mut total_gas_price = 0u64;
     for tx_hash in &transactions {
-        if let Some(tx_json) = mempool.get_raw_transaction(&tx_hash) {
-            if let Ok(tx_data) = serde_json::from_str::<serde_json::Value>(&tx_json) {
-                if let Some(gas_price) = tx_data["gas_price"].as_u64() {
-                    total_gas_price = total_gas_price.saturating_add(gas_price);
+        if let Some(tx_bytes) = mempool.get_binary_transaction(&tx_hash) {
+            // Try bincode first (new format), then JSON (legacy)
+            if let Ok(tx) = bincode::deserialize::<qnet_state::Transaction>(&tx_bytes) {
+                total_gas_price = total_gas_price.saturating_add(tx.gas_price);
+            } else if let Ok(json_str) = String::from_utf8(tx_bytes) {
+                // Fallback: legacy JSON format
+                if let Ok(tx_data) = serde_json::from_str::<serde_json::Value>(&json_str) {
+                    if let Some(gas_price) = tx_data["gas_price"].as_u64() {
+                        total_gas_price = total_gas_price.saturating_add(gas_price);
+                    }
                 }
             }
         }
     }
-    drop(mempool);
     
     // Create bundle
     let bundle = TxBundle {
@@ -9698,7 +9730,10 @@ async fn run_benchmark_generator(
     };
     
     let tx_per_worker = total_transactions / num_workers as u64;
-    let batch_size = 100usize; // Smaller batches for better parallelism
+    // PRODUCTION v2.25.2: Large batches for maximum TPS
+    // 10K batch = single lock acquisition, single network message
+    // Optimized for 100K TX/block throughput
+    let batch_size = 10_000usize;
     
     println!("[BENCHMARK] 🚀 PARALLEL generator: {} tx at {} TPS target", total_transactions, target_tps);
     println!("[BENCHMARK] ⚡ Workers: {}, TX/worker: {}, Batch: {}", num_workers, tx_per_worker, batch_size);

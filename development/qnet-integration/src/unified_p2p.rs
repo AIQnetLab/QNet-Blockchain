@@ -5908,6 +5908,19 @@ impl SimplifiedP2P {
             return Ok(());
         }
         
+        // PRODUCTION v2.25.2: Skip broadcast if WE are the current producer
+        // TX is already in our mempool - no need to send anywhere
+        let we_are_producer = if let Ok(guard) = self.current_producer_info.read() {
+            guard.as_ref().map_or(false, |(producer_id, _)| producer_id == &self.node_id)
+        } else {
+            false
+        };
+        
+        if we_are_producer {
+            // We're the producer - TX already in our mempool, skip network
+            return Ok(());
+        }
+        
         let batch_msg = NetworkMessage::TransactionBatch {
             transactions,
             timestamp: std::time::SystemTime::now()
@@ -5927,7 +5940,7 @@ impl SimplifiedP2P {
             }
         }
         
-        // BACKUP: Gossip to 2 random peers
+        // BACKUP: Gossip to 2 random peers (only if we're not producer)
         let backup_fanout = if sent_to_producer { 2 } else { 3 };
         self.gossip_to_random_peers(batch_msg, backup_fanout);
         

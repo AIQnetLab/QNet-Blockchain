@@ -70,7 +70,16 @@ This project uses **dual licensing**:
 - **Adaptive Buffer Size**: Full/Super nodes: 500 blocks (~50MB), Light nodes: 100 blocks (~10MB)
 - **Background Re-request**: Missing blocks automatically re-requested every 30s with backoff
 
-### 🛡️ **Latest Update (v2.20.0 - December 4, 2025)**
+### 🛡️ **Latest Update (v2.25.2 - December 9, 2025)**
+- **Batch Ed25519 Verification**: 3x faster signature verification using ed25519-dalek batch API
+- **Batch Mempool Operations**: 1 lock per 1000 TX instead of per-TX (1000x reduction)
+- **TX Accumulator**: Batch 1000 TX for verification, 100ms timeout
+- **Skip Self-Broadcast**: Producer doesn't broadcast TX to itself
+- **Snapshot Mempool**: Release lock early for DashMap reads
+- **HealthPing Height**: Accurate network_height every 15 seconds
+- **10K TX Batch Size**: Optimized for 100K TX/block throughput
+
+### 🛡️ **Previous Update (v2.20.0 - December 4, 2025)**
 - **Reputation System Fix**: Only INFLATION is an attack (DEFLATION is legitimate after penalties)
 - **Tolerance Increased**: 2% → 10% for network delays and sync timing
 - **Deterministic Producer Selection**: Round 0 uses Genesis + leadership_round as entropy

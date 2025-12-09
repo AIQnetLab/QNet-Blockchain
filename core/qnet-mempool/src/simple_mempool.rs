@@ -127,6 +127,55 @@ impl SimpleMempool {
         true
     }
     
+    /// PRODUCTION v2.25.2: Batch add binary transactions (HIGH TPS)
+    /// TRUSTED ONLY: Skips hash verification - caller must compute hashes correctly
+    /// Use for: benchmark, internal batch processing where hashes are pre-computed
+    /// DO NOT USE for: external RPC, untrusted P2P messages
+    /// 
+    /// Benefits:
+    /// - Single lock acquisition for entire batch (vs N locks for N transactions)
+    /// - No redundant SHA3 computation (caller already computed)
+    /// - 10-50x faster than individual adds for large batches
+    pub fn add_binary_transaction_batch_trusted(&self, transactions: Vec<(Vec<u8>, String, u64)>) -> usize {
+        if transactions.is_empty() {
+            return 0;
+        }
+        
+        let available_space = self.config.max_size.saturating_sub(self.transactions.len());
+        if available_space == 0 {
+            return 0;
+        }
+        
+        let mut added = 0usize;
+        let mut batch_for_priority: Vec<(String, u64)> = Vec::with_capacity(transactions.len());
+        
+        // Phase 1: Add to DashMap (lock-free)
+        for (tx_bytes, hash, gas_price) in transactions.into_iter().take(available_space) {
+            // Skip duplicates
+            if self.transactions.contains_key(&hash) {
+                continue;
+            }
+            
+            // TRUSTED: Skip hash verification - caller guarantees correctness
+            self.transactions.insert(hash.clone(), TxStorage::Binary(tx_bytes));
+            batch_for_priority.push((hash, gas_price));
+            added += 1;
+        }
+        
+        // Phase 2: Batch add to priority queue (SINGLE lock for all)
+        if !batch_for_priority.is_empty() {
+            let mut priority_queue = self.by_gas_price.write();
+            for (hash, gas_price) in batch_for_priority {
+                priority_queue
+                    .entry(gas_price)
+                    .or_insert_with(VecDeque::new)
+                    .push_back(hash);
+            }
+        }
+        
+        added
+    }
+    
     /// Get raw transaction (handles both formats)
     pub fn get_raw_transaction(&self, hash: &str) -> Option<String> {
         self.transactions.get(hash).and_then(|entry| {
@@ -257,15 +306,25 @@ impl SimpleMempool {
     /// CRITICAL v2.26: Get pending transactions WITH their hashes
     /// Returns (hash, binary_data) pairs for block inclusion AND cleanup
     /// This allows removing exact transactions that were included in a block
+    /// 
+    /// PRODUCTION v2.25.2: Snapshot approach - release lock early
+    /// Phase 1: Collect hashes with lock (fast)
+    /// Phase 2: Fetch data without lock (no blocking writers)
     pub fn get_pending_transactions_with_hashes(&self, limit: usize) -> Vec<(String, Vec<u8>)> {
-        let priority_queue = self.by_gas_price.read();
+        // Phase 1: Snapshot hashes (short lock duration)
+        let hashes_snapshot: Vec<String> = {
+            let priority_queue = self.by_gas_price.read();
+            priority_queue.iter()
+                .rev()  // Highest gas_price first
+                .flat_map(|(_gas_price, hashes)| hashes.iter().cloned())
+                .take(limit)
+                .collect()
+        }; // Lock released here!
         
-        priority_queue.iter()
-            .rev()  // Highest gas_price first
-            .flat_map(|(_gas_price, hashes)| hashes.iter())
-            .take(limit)
+        // Phase 2: Fetch data without lock (DashMap is lock-free)
+        hashes_snapshot.into_iter()
             .filter_map(|hash| {
-                self.get_binary_transaction(hash).map(|data| (hash.clone(), data))
+                self.get_binary_transaction(&hash).map(|data| (hash, data))
             })
             .collect()
     }

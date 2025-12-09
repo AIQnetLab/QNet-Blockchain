@@ -10,6 +10,8 @@ use std::collections::{VecDeque, BTreeMap};
 use sha3::{Sha3_256, Digest};
 
 use crate::simple_mempool::SimpleMempool;
+// v2.26: For bincode deserialization of transactions
+use qnet_state::Transaction;
 
 /// PRODUCTION: MEV-protected transaction bundle (Flashbots-style)
 /// ARCHITECTURE: Atomic execution, fair ordering, reputation-gated
@@ -131,7 +133,8 @@ impl Default for BundleAllocationConfig {
 /// ARCHITECTURE: Dual-pool design (public + private) with dynamic allocation
 pub struct MevProtectedMempool {
     /// Public mempool (existing priority queue - 80-100% block space)
-    pub public_pool: Arc<tokio::sync::RwLock<SimpleMempool>>,
+    /// v2.26: No outer RwLock - SimpleMempool is already thread-safe (DashMap + parking_lot)
+    pub public_pool: Arc<SimpleMempool>,
     
     /// Private bundles (MEV-protected - 0-20% block space)
     bundles: Arc<DashMap<String, TxBundle>>,  // bundle_id -> bundle
@@ -155,7 +158,8 @@ struct UserBundleRate {
 
 impl MevProtectedMempool {
     /// Create new MEV-protected mempool
-    pub fn new(public_pool: Arc<tokio::sync::RwLock<SimpleMempool>>, config: BundleAllocationConfig) -> Self {
+    /// v2.26: No outer RwLock - SimpleMempool is already thread-safe
+    pub fn new(public_pool: Arc<SimpleMempool>, config: BundleAllocationConfig) -> Self {
         Self {
             public_pool,
             bundles: Arc::new(DashMap::new()),
@@ -239,28 +243,37 @@ impl MevProtectedMempool {
         
         // CONSTRAINT 6: Gas premium validation (+20% required)
         // PRODUCTION: Each TX in bundle must have gas_price ≥ min_gas_price * premium
-        let min_gas_price = self.public_pool.read().await.get_min_gas_price();
+        // v2.26: Direct access - SimpleMempool is already thread-safe
+        let min_gas_price = self.public_pool.get_min_gas_price();
         let required_gas_price = ((min_gas_price as f64) * self.config.gas_premium) as u64;
         
         for tx_hash in &bundle.transactions {
-            if let Some(tx_json) = self.public_pool.read().await.get_raw_transaction(tx_hash) {
-                // Parse TX to get gas_price
-                if let Ok(tx_data) = serde_json::from_str::<serde_json::Value>(&tx_json) {
-                    if let Some(gas_price) = tx_data["gas_price"].as_u64() {
-                        if gas_price < required_gas_price {
-                            return Err(format!(
-                                "TX {} gas price too low: {} (required: {} with {}% premium)",
-                                tx_hash,
-                                gas_price,
-                                required_gas_price,
-                                ((self.config.gas_premium - 1.0) * 100.0) as u64
-                            ));
-                        }
-                    } else {
-                        return Err(format!("TX {} missing gas_price field", tx_hash));
+            // v2.26: Use binary transactions with bincode (not JSON!)
+            if let Some(tx_bytes) = self.public_pool.get_binary_transaction(tx_hash) {
+                // Try bincode first (new format), then JSON (legacy)
+                let gas_price_opt = if let Ok(tx) = bincode::deserialize::<Transaction>(&tx_bytes) {
+                    Some(tx.gas_price)
+                } else if let Ok(json_str) = String::from_utf8(tx_bytes) {
+                    // Fallback: legacy JSON format
+                    serde_json::from_str::<serde_json::Value>(&json_str)
+                        .ok()
+                        .and_then(|tx_data| tx_data["gas_price"].as_u64())
+                } else {
+                    None
+                };
+                
+                if let Some(gas_price) = gas_price_opt {
+                    if gas_price < required_gas_price {
+                        return Err(format!(
+                            "TX {} gas price too low: {} (required: {} with {}% premium)",
+                            tx_hash,
+                            gas_price,
+                            required_gas_price,
+                            ((self.config.gas_premium - 1.0) * 100.0) as u64
+                        ));
                     }
                 } else {
-                    return Err(format!("TX {} invalid JSON format", tx_hash));
+                    return Err(format!("TX {} has invalid format (bincode/JSON parse failed)", tx_hash));
                 }
             } else {
                 return Err(format!("TX {} not found in public mempool", tx_hash));

@@ -340,6 +340,20 @@ impl Transaction {
         tx
     }
     
+    /// QUANTUM v2.25.2: Set quantum signature fields after creation
+    /// This allows adding Dilithium signature to an existing transaction
+    pub fn with_quantum_signature(mut self, dilithium_sig: Option<String>, dilithium_pk: Option<String>) -> Self {
+        self.dilithium_signature = dilithium_sig;
+        self.dilithium_public_key = dilithium_pk;
+        self
+    }
+    
+    /// QUANTUM v2.25.2: Set public key for Ed25519 verification
+    pub fn with_public_key(mut self, public_key: Option<String>) -> Self {
+        self.public_key = public_key;
+        self
+    }
+    
     /// QUANTUM v2.25: Check if transaction has Dilithium signature (quantum-resistant)
     pub fn is_quantum_signed(&self) -> bool {
         self.dilithium_signature.is_some() && self.dilithium_public_key.is_some()

@@ -1750,10 +1750,8 @@ impl BlockchainActivationRegistry {
                     use sha3::{Sha3_256, Digest};
                     let tx_hash_for_mempool = format!("{:x}", Sha3_256::digest(&tx_bytes));
                     
-                    // Add to mempool (blocks will pick it up automatically)
-                    let mempool_write = mempool_arc.write().await;
-                    // PRODUCTION v2.26: Use binary transaction for consistency
-                    if mempool_write.add_binary_transaction(tx_bytes, tx_hash_for_mempool.clone(), transaction.gas_price) {
+                    // v2.26: Direct access - SimpleMempool is already thread-safe
+                    if mempool_arc.add_binary_transaction(tx_bytes, tx_hash_for_mempool.clone(), transaction.gas_price) {
                         println!("[REGISTRY] ✅ Activation transaction added to mempool: {}", tx_hash_for_mempool);
                     } else {
                         println!("[REGISTRY] ⚠️ Failed to add activation transaction to mempool (may be full or duplicate)");

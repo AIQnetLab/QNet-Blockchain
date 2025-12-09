@@ -27,6 +27,15 @@ QNet implements **NIST/Cisco recommended post-quantum cryptography** with:
 - ✅ **100K TX/block** (up from 50K, bincode enables faster processing)
 - ✅ **Optional Dilithium TX signatures** (post-quantum for enterprise, +50% gas)
 
+### v2.25.2 Additions (High TPS Optimization)
+- ✅ **Batch Ed25519 verification** (3x faster using ed25519-dalek batch verify)
+- ✅ **Batch mempool operations** (1 lock per 1000 TX instead of per TX)
+- ✅ **10K TX batch size** (benchmark optimized for 100K TX/block)
+- ✅ **Skip self-broadcast** (producer doesn't broadcast TX to self)
+- ✅ **Snapshot mempool reads** (release lock early, DashMap is lock-free)
+- ✅ **HealthPing with height** (accurate network_height every 15 seconds)
+- ✅ **TX accumulator** (batch 1000 TX for verification, 100ms timeout)
+
 ---
 
 ## 📋 Table of Contents

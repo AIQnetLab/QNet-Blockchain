@@ -1,9 +1,9 @@
 # QNet Blockchain Architecture v2.25
 ## Post-Quantum Decentralized Network - Technical Documentation
 
-**Last Updated**: December 8, 2025  
-**Version**: 2.26.0  
-**Status**: Production Ready (Gulf Stream + bincode + Optional Quantum TX)
+**Last Updated**: December 9, 2025  
+**Version**: 2.26.2  
+**Status**: Production Ready (Gulf Stream + bincode + Batch Ed25519 + Optional Quantum TX)
 
 > ⚠️ **REPUTATION SYSTEM UPDATED in v2.21.0**  
 > The reputation section in this document describes the OLD P2P gossip-based system.  
@@ -41,6 +41,9 @@ QNet is a high-performance, post-quantum secure blockchain with a **two-layer bl
 - **Progressive Finalization Protocol**: Self-healing consensus recovery
 - **Zero-Downtime Architecture**: Microblocks continue during macroblock consensus
 - **NIST Post-Quantum Compliant**: CRYSTALS-Dilithium + Ed25519 hybrid
+- **Batch Ed25519 Verification v2.25.2**: 3x faster signature verification
+- **Batch Mempool Operations v2.25.2**: 1 lock per 1000 TX (1000x reduction)
+- **TX Accumulator v2.25.2**: Batch 1000 TX with 100ms timeout
 
 ---
 

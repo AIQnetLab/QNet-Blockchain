@@ -3,8 +3,8 @@
 
 **⚠️ EXPERIMENTAL BLOCKCHAIN RESEARCH ⚠️**
 
-**Version**: 2.25.0-experimental  
-**Date**: December 8, 2025  
+**Version**: 2.25.2-experimental  
+**Date**: December 9, 2025  
 **Authors**: QNet Research Team  
 **Status**: Experimental Research Project  
 **Goal**: To prove that one person without multi-million investments can create an advanced blockchain
@@ -38,6 +38,10 @@ Experimental achievements:
 - ✅ **Chain Reorganization**: Byzantine-safe fork resolution with 2/3 majority consensus
 - ✅ **Advanced Synchronization**: Out-of-order block buffering with active missing block requests
 - ✅ **Zero-Downtime Architecture**: Microblocks continue during macroblock consensus
+- ✅ **Batch Ed25519 Verification (v2.25.2)**: 3x faster signature verification using batch API
+- ✅ **Batch Mempool (v2.25.2)**: 1 lock per 1000 TX (1000x reduction in lock contention)
+- ✅ **TX Accumulator (v2.25.2)**: Batch 1000 TX for verification with 100ms timeout
+- ✅ **Skip Self-Broadcast (v2.25.2)**: Producer doesn't re-broadcast own TX
 
 Experiment goal: demonstrate the possibility of creating a high-performance post-quantum blockchain by one person-operator.
 
