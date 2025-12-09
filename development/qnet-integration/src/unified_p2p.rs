@@ -739,6 +739,12 @@ impl CertificateManager {
         self.local_certificate = Some((cert_serial, certificate));
     }
     
+    /// v2.26: Get local certificate with serial number for SHRED_PROTOCOL inclusion
+    /// Returns (serial_number, certificate_bytes) for creating ProducerCertificate
+    pub fn get_local_cert_with_serial(&self) -> Option<(String, Vec<u8>)> {
+        self.local_certificate.clone()
+    }
+    
     /// Store remote certificate (for microblock producers only)
     pub fn store_remote_certificate(&mut self, cert_serial: String, certificate: Vec<u8>) {
         // CRITICAL: Light nodes should NEVER store certificates
@@ -1088,6 +1094,7 @@ const MAX_CONCURRENT_CHUNK_SENDS: usize = 20;       // Max concurrent QUIC strea
                                                      // Prevents receiver overload from burst of 72+ streams
 
 /// ShredProtocol chunk for block propagation
+/// v2.26: Added certificate field to eliminate certificate race condition
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShredProtocolChunk {
     pub block_height: u64,
@@ -1097,6 +1104,20 @@ pub struct ShredProtocolChunk {
     pub is_parity: bool,  // Reed-Solomon parity chunk
     pub original_block_size: usize,  // CRITICAL: Original block size for correct reconstruction
     pub is_macroblock: bool,  // PRODUCTION: Distinguish macro/micro for correct deserialization
+    /// v2.26: Producer certificate included in chunk #0 (data chunks only)
+    /// This eliminates race condition where block arrives before certificate
+    /// ~3KB overhead only in first chunk, but guarantees atomic block+cert delivery
+    #[serde(default)]
+    pub certificate: Option<ProducerCertificate>,
+}
+
+/// v2.26: Producer certificate for block signature verification
+/// Included in SHRED_PROTOCOL chunks to eliminate race condition
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProducerCertificate {
+    pub serial_number: String,
+    pub node_id: String,
+    pub certificate_bytes: Vec<u8>,  // Serialized HybridCertificate
 }
 
 /// ShredProtocol block assembly state
@@ -1112,6 +1133,8 @@ struct ShredProtocolBlockAssembly {
     started_at: Instant,
     retransmit_attempts: u8,  // PRODUCTION v2.21.3: Track retransmit attempts
     retransmit_requested_at: Option<Instant>,  // When last retransmit was requested
+    /// v2.26: Certificate received from chunk #0 (eliminates race condition)
+    certificate: Option<ProducerCertificate>,
 }
 
 /// PRODUCTION v2.21.3: Cache entry for chunk retransmit
@@ -4139,6 +4162,7 @@ impl SimplifiedP2P {
     
     /// PRODUCTION: Broadcast block (micro or macro) using ShredProtocol protocol via QUIC
     /// Supports both microblocks and macroblocks with correct type tagging
+    /// v2.26: Certificate is now included in chunk #0 to eliminate race condition
     pub async fn broadcast_block_shred_protocol_typed(&self, height: u64, block_data: Vec<u8>, is_macroblock: bool) -> Result<(), String> {
         use futures::future::join_all;
         use crate::p2p_transport::P2PTransport;
@@ -4157,6 +4181,29 @@ impl SimplifiedP2P {
             }
             return Ok(());
         }
+        
+        // v2.26: Get producer certificate to include in chunk #0
+        // This eliminates race condition where block arrives before certificate
+        let producer_certificate: Option<ProducerCertificate> = {
+            let cert_manager = match self.certificate_manager.read() { 
+                Ok(g) => g, 
+                Err(p) => p.into_inner() 
+            };
+            // Get local certificate (we are the producer)
+            if let Some((serial, cert_bytes)) = cert_manager.get_local_cert_with_serial() {
+                Some(ProducerCertificate {
+                    serial_number: serial,
+                    node_id: self.node_id.clone(),
+                    certificate_bytes: cert_bytes,
+                })
+            } else {
+                // No certificate yet - this can happen during genesis
+                if height > 0 {
+                    println!("[SHRED_PROTOCOL] ⚠️ No producer certificate for block #{} - peers may need to request it", height);
+                }
+                None
+            }
+        };
         
         // CRITICAL: Store original block size BEFORE splitting
         let original_block_size = block_data.len();
@@ -4187,6 +4234,7 @@ impl SimplifiedP2P {
         let mut chunk_sends: Vec<(PeerInfo, NetworkMessage)> = Vec::new();
         
         // Collect data chunks
+        // v2.26: Include certificate in chunk #0 to eliminate race condition
         for (chunk_index, chunk_data) in chunks.into_iter().enumerate() {
             let shred_protocol_chunk = ShredProtocolChunk {
                 block_height: height,
@@ -4196,6 +4244,8 @@ impl SimplifiedP2P {
                 is_parity: false,
                 original_block_size,  // CRITICAL: Include original size
                 is_macroblock,  // PRODUCTION: Tag block type
+                // v2.26: Certificate only in chunk #0 (saves bandwidth, still atomic)
+                certificate: if chunk_index == 0 { producer_certificate.clone() } else { None },
             };
             
             let target_peers = self.select_shred_protocol_targets(&routing_tree, chunk_index, shred_protocol_fanout);
@@ -4206,7 +4256,7 @@ impl SimplifiedP2P {
             }
         }
         
-        // Collect parity chunks
+        // Collect parity chunks (no certificate - only in data chunk #0)
         for (parity_index, parity_data) in parity_chunks.into_iter().enumerate() {
             let shred_protocol_chunk = ShredProtocolChunk {
                 block_height: height,
@@ -4216,6 +4266,7 @@ impl SimplifiedP2P {
                 is_parity: true,
                 original_block_size,  // CRITICAL: Include original size
                 is_macroblock,  // PRODUCTION: Tag block type
+                certificate: None,  // v2.26: Certificate only in data chunk #0
             };
             
             let target_peers = self.select_shred_protocol_targets(&routing_tree, total_chunks + parity_index, shred_protocol_fanout);
@@ -4467,7 +4518,32 @@ impl SimplifiedP2P {
                     started_at: Instant::now(),
                     retransmit_attempts: 0,  // v2.21.3
                     retransmit_requested_at: None,  // v2.21.3
+                    certificate: None,  // v2.26: Will be populated from chunk #0
                 });
+            
+            // v2.26: Extract certificate from chunk #0 (eliminates race condition!)
+            // Certificate is included in data chunk #0 by producer
+            if !chunk.is_parity && chunk.chunk_index == 0 {
+                if let Some(ref cert) = chunk.certificate {
+                    if assembly.certificate.is_none() {
+                        println!("[SHRED_PROTOCOL] 🔐 Certificate received in chunk #0 for block #{}: {} ({})", 
+                                 height, cert.serial_number, cert.node_id);
+                        assembly.certificate = Some(cert.clone());
+                        
+                        // CRITICAL: Store certificate in certificate_manager immediately!
+                        // This ensures it's available when block validation needs it
+                        let cert_manager_result = self.certificate_manager.write();
+                        if let Ok(mut cert_manager) = cert_manager_result {
+                            cert_manager.store_remote_certificate(
+                                cert.serial_number.clone(), 
+                                cert.certificate_bytes.clone()
+                            );
+                            println!("[SHRED_PROTOCOL] ✅ Certificate {} stored in manager (block #{})", 
+                                     cert.serial_number, height);
+                        }
+                    }
+                }
+            }
             
             // Store chunk
             if chunk.is_parity {
@@ -5077,6 +5153,17 @@ impl SimplifiedP2P {
             
             let elapsed = assembly.started_at.elapsed();
             println!("[SHRED_PROTOCOL] 🔧 Block #{} reconstructed with Reed-Solomon in {:?}", height, elapsed);
+            
+            // v2.26: Check if certificate was received (chunk #0 might have been lost)
+            // If no certificate, the block validation in node.rs will use fallback mechanism
+            // But we can log this for debugging
+            if assembly.certificate.is_none() {
+                println!("[SHRED_PROTOCOL] ⚠️ Block #{} reconstructed WITHOUT certificate (chunk #0 lost) - fallback will be used", height);
+                // NOTE: Don't panic - node.rs has retry mechanism for missing certificates
+                // The block will be buffered and certificate requested via broadcast_certificate_announce
+            } else {
+                println!("[SHRED_PROTOCOL] ✅ Block #{} has certificate from chunk #0", height);
+            }
             
             // PRODUCTION: Use correct block_type based on chunk metadata
             let block_type = if assembly.is_macroblock { "macro".to_string() } else { "micro".to_string() };
