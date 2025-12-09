@@ -14055,8 +14055,15 @@ impl BlockchainNode {
         let peer_infos = if let Some(ref p2p) = self.unified_p2p {
             let p2p_peers = p2p.get_discovery_peers(); // EXISTING: Fast method for DHT/API
             
+            // PRODUCTION v2.26: Get real reputation from deterministic blockchain system
+            let det_rep = self.deterministic_reputation.clone();
+            let rep_guard = det_rep.read().unwrap_or_else(|p| p.into_inner());
+            
             // Convert from unified_p2p::PeerInfo to node::PeerInfo format
             p2p_peers.iter().map(|p2p_peer| {
+                // Get REAL reputation from blockchain (not cached P2P value)
+                let real_reputation = rep_guard.get_reputation(&p2p_peer.id, current_time);
+                
                 PeerInfo {
                     id: p2p_peer.id.clone(),
                     address: p2p_peer.addr.clone(),
@@ -14068,7 +14075,7 @@ impl BlockchainNode {
                     } else { 
                         0 
                     },
-                    reputation: p2p_peer.combined_reputation(), // Use combined reputation from P2P system
+                    reputation: real_reputation, // REAL reputation from blockchain
                     version: Some("qnet-v1.0".to_string()), // EXISTING: Default version
                 }
             }).collect()

@@ -208,7 +208,7 @@ pub struct BenchmarkManager {
     transactions_confirmed: AtomicU64,
     /// Errors count
     errors: AtomicU64,
-    /// Peak TPS observed
+    /// Peak TPS observed (instantaneous)
     peak_tps: RwLock<f64>,
     /// Start time
     start_time: RwLock<Option<Instant>>,
@@ -216,6 +216,10 @@ pub struct BenchmarkManager {
     end_time: RwLock<Option<Instant>>,
     /// Latencies for percentile calculation
     latencies: RwLock<Vec<f64>>,
+    /// Last TPS check time (for instantaneous TPS calculation)
+    last_tps_check: RwLock<Option<Instant>>,
+    /// TX count at last TPS check
+    last_tx_count: AtomicU64,
 }
 
 impl BenchmarkManager {
@@ -231,6 +235,8 @@ impl BenchmarkManager {
             start_time: RwLock::new(None),
             end_time: RwLock::new(None),
             latencies: RwLock::new(Vec::new()),
+            last_tps_check: RwLock::new(None),
+            last_tx_count: AtomicU64::new(0),
         }
     }
     
@@ -262,6 +268,8 @@ impl BenchmarkManager {
         *self.start_time.write().await = Some(Instant::now());
         *self.end_time.write().await = None;
         self.latencies.write().await.clear();
+        *self.last_tps_check.write().await = None;
+        self.last_tx_count.store(0, Ordering::SeqCst);
         
         // Initialize accounts if needed
         let accounts_count = self.accounts.read().await.len();
@@ -312,6 +320,7 @@ impl BenchmarkManager {
         let sent = self.transactions_sent.load(Ordering::SeqCst);
         let confirmed = self.transactions_confirmed.load(Ordering::SeqCst);
         let errors = self.errors.load(Ordering::SeqCst);
+        let now = Instant::now();
         
         let elapsed = if let Some(start) = *self.start_time.read().await {
             start.elapsed().as_secs_f64()
@@ -319,23 +328,45 @@ impl BenchmarkManager {
             0.0
         };
         
-        let current_tps = if elapsed > 0.0 {
+        // Calculate cumulative average TPS
+        let avg_tps = if elapsed > 0.0 {
             sent as f64 / elapsed
         } else {
             0.0
         };
         
-        // Update peak TPS
+        // Calculate instantaneous TPS (TX since last check)
+        let last_check_opt = *self.last_tps_check.read().await;
+        let last_count = self.last_tx_count.load(Ordering::SeqCst);
+        
+        let instant_tps = if let Some(last_check) = last_check_opt {
+            let elapsed_since_last = now.duration_since(last_check).as_secs_f64();
+            let tx_delta = sent.saturating_sub(last_count);
+            
+            if elapsed_since_last > 0.01 { // Minimum 10ms between checks
+                tx_delta as f64 / elapsed_since_last
+            } else {
+                avg_tps // Too short interval, use average
+            }
+        } else {
+            avg_tps // First check, use average
+        };
+        
+        // Update last check timestamp and count
+        *self.last_tps_check.write().await = Some(now);
+        self.last_tx_count.store(sent, Ordering::SeqCst);
+        
+        // Update peak TPS with instantaneous value
         let mut peak = self.peak_tps.write().await;
-        if current_tps > *peak {
-            *peak = current_tps;
+        if instant_tps > *peak {
+            *peak = instant_tps;
         }
         
         BenchmarkStatus {
             is_running: self.is_running.load(Ordering::SeqCst),
             transactions_sent: sent,
             transactions_confirmed: confirmed,
-            current_tps,
+            current_tps: instant_tps,
             peak_tps: *peak,
             elapsed_seconds: elapsed,
             errors,

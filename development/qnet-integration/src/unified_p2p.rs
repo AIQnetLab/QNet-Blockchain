@@ -3579,6 +3579,9 @@ impl SimplifiedP2P {
                     let connected_peers = transport.get_connected_peers();
                     let mut zombie_count = 0;
                     
+                    // v2.25.1: Get current height for HealthPing
+                    let current_height = LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+                    
                     for (peer_addr, peer_id, _peer_type) in &connected_peers {
                         let ping_msg = NetworkMessage::HealthPing {
                             from: node_id.clone(),
@@ -3586,6 +3589,7 @@ impl SimplifiedP2P {
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
                                 .as_secs(),
+                            height: current_height,  // v2.25.1: Include height for network sync
                         };
                         
                         // Try to send HealthPing - if it fails, connection is zombie
@@ -8683,10 +8687,13 @@ pub enum NetworkMessage {
         requesting_node: PeerInfo,
     },
     
-    /// Simple health ping
+    /// Simple health ping with block height for network sync
+    /// v2.25.1: Added height field to keep peer heights updated
     HealthPing {
         from: String,
         timestamp: u64,
+        #[serde(default)]  // Backward compatible with old messages
+        height: u64,       // Current block height of sender
     },
     
     /// State snapshot announcement
@@ -9259,12 +9266,15 @@ impl SimplifiedP2P {
                 self.add_peer_to_region(requesting_node);
             }
             
-            NetworkMessage::HealthPing { from, timestamp: _ } => {
-                // Update last_seen for the peer who sent the ping
-                self.update_peer_last_seen(&from);
+            NetworkMessage::HealthPing { from, timestamp: _, height } => {
+                // v2.25.1: Update last_seen AND height for the peer who sent the ping
+                // This keeps network_height accurate without waiting for blocks/heartbeats
+                self.update_peer_last_seen_with_height(&from, Some(height));
                 // Simple acknowledgment - no complex processing
                 // NOTE: This is P2P health check, NOT reward system ping!
-                println!("[P2P] ← Health ping from {}", from);
+                if height > 0 {
+                    println!("[P2P] ← Health ping from {} at height {}", from, height);
+                }
             }
 
             NetworkMessage::ConsensusCommit { round_id, node_id, commit_hash, signature, timestamp } => {

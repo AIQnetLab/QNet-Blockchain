@@ -1117,18 +1117,25 @@ pub async fn start_rpc_server(blockchain: BlockchainNode, port: u16) {
                 let mut selected_genesis = Vec::new();
                 let max_genesis_to_return = std::cmp::min(2, genesis_ips.len());
                 
+                // Get deterministic reputation for real values
+                let det_rep = blockchain.get_deterministic_reputation();
+                let rep_guard = det_rep.read().unwrap_or_else(|p| p.into_inner());
+                
                 for (idx, ip) in genesis_ips.iter().enumerate().take(max_genesis_to_return) {
                     let genesis_addr = format!("{}:8001", ip);
+                    let genesis_id = format!("genesis_node_{:03}", idx + 1);
                     // Check if not already in list
                     let already_exists = peers.iter().any(|p| p.address == genesis_addr);
                     if !already_exists {
+                        // Get real reputation from deterministic system
+                        let real_reputation = rep_guard.get_reputation(&genesis_id, current_time);
                         selected_genesis.push(json!({
-                            "id": format!("genesis_node_{:03}", idx + 1),
+                            "id": genesis_id,
                             "address": genesis_addr,
                             "node_type": "Super",
                             "region": "Global",
                             "last_seen": current_time, // Genesis nodes are always active
-                            "reputation": 70.0, // Genesis nodes start at 70% reputation like all nodes
+                            "reputation": real_reputation, // Real reputation from blockchain
                             "version": "qnet-v1.0" // Include version
                         }));
                     }
@@ -8089,9 +8096,14 @@ async fn handle_sync_status(
     };
     
     let is_syncing = local_height < network_height;
+    let is_ahead = local_height > network_height;
     let blocks_behind = network_height.saturating_sub(local_height);
+    let blocks_ahead = local_height.saturating_sub(network_height);
+    
+    // FIX: sync_progress should be capped at 100%, with separate "ahead" indicator
     let sync_progress = if network_height > 0 {
-        (local_height as f64 / network_height as f64) * 100.0
+        let progress = (local_height as f64 / network_height as f64) * 100.0;
+        progress.min(100.0) // Cap at 100%
     } else {
         100.0
     };
@@ -8100,10 +8112,14 @@ async fn handle_sync_status(
         "local_height": local_height,
         "network_height": network_height,
         "is_syncing": is_syncing,
+        "is_ahead": is_ahead,
         "blocks_behind": blocks_behind,
+        "blocks_ahead": blocks_ahead,
         "sync_progress": format!("{:.2}%", sync_progress),
         "estimated_sync_time": if blocks_behind > 0 {
-            format!("{}s", blocks_behind) // 1 block per second
+            format!("{}s", blocks_behind)
+        } else if blocks_ahead > 0 {
+            format!("ahead by {} blocks", blocks_ahead)
         } else {
             "synced".to_string()
         }
@@ -8253,12 +8269,20 @@ async fn handle_reputation_history(
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(100);
     
-    // Get actual reputation from P2P if available
+    // Get actual reputation from deterministic blockchain system
     let current_reputation = if let Some(p2p) = blockchain.get_unified_p2p() {
-        // This is a real method that exists
-        crate::node::BlockchainNode::get_node_reputation_score(&node_id, &p2p).await * 100.0
+        // Use deterministic reputation from blockchain (not cached P2P value)
+        p2p.get_node_reputation_from_blockchain(&node_id)
     } else {
-        70.0 // Default reputation
+        // Fallback: try deterministic_reputation directly
+        let current_ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        blockchain.get_deterministic_reputation()
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .get_reputation(&node_id, current_ts)
     };
     
     // Get reputation history from persistent storage
