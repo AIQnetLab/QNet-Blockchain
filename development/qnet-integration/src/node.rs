@@ -1929,10 +1929,14 @@ impl BlockchainNode {
         // Initialize Adaptive BFT for adaptive timeouts
         // CRITICAL: Balance between 1 block/sec target and network latency
         // PRODUCTION: Must account for broadcast time (800-900ms) + processing + consensus
+        // v2.26.7: Extended timeout in benchmark mode to prevent deadlock during stress tests
+        let benchmark_mode_timeout = std::env::var("QNET_BENCHMARK_MODE")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
         let adaptive_bft_config = crate::adaptive_bft::AdaptiveBftConfig {
-            base_timeout_ms: 5000,      // 5 seconds base - parallel broadcast is fast now
+            base_timeout_ms: if benchmark_mode_timeout { 10000 } else { 5000 },  // 10s base in benchmark
             timeout_multiplier: 1.5,    
-            max_timeout_ms: 15000,      // 15 seconds max
+            max_timeout_ms: if benchmark_mode_timeout { 60000 } else { 15000 }, // 60s in benchmark, 15s in prod
             min_timeout_ms: 3000,       // 3 seconds minimum
             latency_window_size: 100,   
         };
