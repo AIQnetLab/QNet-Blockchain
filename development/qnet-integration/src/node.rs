@@ -6676,6 +6676,9 @@ impl BlockchainNode {
                             // BENCHMARK BYPASS v2.26: Skip balance/nonce validation for benchmark accounts
                             // SECURITY: Only enabled when QNET_BENCHMARK_MODE=true (test servers only!)
                             // In production this env var is NOT set → full validation always applied
+                            // NOTE v2.26.6: Ed25519 signatures are ALREADY verified:
+                            //   - Benchmark TX: verified in submit_benchmark_batch() via verify_ed25519_batch()
+                            //   - Real TX: verified in start_transaction_processing_task() via verify_ed25519_batch()
                             let benchmark_mode_enabled = std::env::var("QNET_BENCHMARK_MODE")
                                 .map(|v| v == "true" || v == "1")
                                 .unwrap_or(false);
@@ -6684,7 +6687,7 @@ impl BlockchainNode {
                             // CRITICAL v2.26: Validate state BEFORE including in block!
                             // This prevents invalid TX from blocking the network
                             let is_valid = if is_benchmark {
-                                // Benchmark accounts (TEST MODE ONLY): only check basic structure
+                                // Benchmark accounts (TEST MODE ONLY): skip balance/nonce (signatures already verified!)
                                 tx.validate().is_ok()
                             } else {
                                 // Real accounts: full state validation
@@ -13004,8 +13007,18 @@ impl BlockchainNode {
         // PRODUCTION v2.25: Store bincode bytes directly (no JSON overhead)
         let mut valid_txs: Vec<(Vec<u8>, String, u64)> = Vec::with_capacity(transactions.len());
         
+        // PRODUCTION v2.26.6: FULL Ed25519 signature verification for honest benchmarks!
+        // This ensures benchmark TPS reflects REAL cryptographic overhead
+        let valid_sig_indices = Self::verify_ed25519_batch(&transactions);
+        let valid_sig_set: std::collections::HashSet<usize> = valid_sig_indices.into_iter().collect();
+        
         // Pre-validate and serialize all transactions with bincode
-        for tx in &transactions {
+        for (idx, tx) in transactions.iter().enumerate() {
+            // CRITICAL v2.26.6: Skip if signature verification failed
+            if !valid_sig_set.contains(&idx) {
+                continue;
+            }
+            
             // Only allow benchmark accounts
             if !BenchmarkManager::is_benchmark_account(&tx.from) {
                 continue;
@@ -13013,11 +13026,6 @@ impl BlockchainNode {
             
             // Basic validation (skip balance check for benchmark)
             if tx.validate().is_err() {
-                continue;
-            }
-            
-            // Signature must be present
-            if tx.signature.as_ref().map_or(true, |s| s.is_empty()) {
                 continue;
             }
             

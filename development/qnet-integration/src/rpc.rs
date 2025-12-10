@@ -8635,28 +8635,29 @@ async fn handle_contract_deploy(
     }
 }
 
-/// NIST FIPS 204: Verify Dilithium signature for smart contracts
+/// NIST FIPS 204: Verify Dilithium3 signature for smart contracts
+/// FIXED v2.26.6: Use Dilithium3 consistently across entire codebase (was Dilithium5)
 async fn verify_dilithium_signature_for_contract(
     message: &str,
     signature_hex: &str,
     public_key_hex: &str,
 ) -> bool {
-    use pqcrypto_dilithium::dilithium5;
+    use pqcrypto_dilithium::dilithium3;
     use pqcrypto_traits::sign::*;
     
     // Decode public key
     let pk_bytes = match hex::decode(public_key_hex) {
         Ok(bytes) => bytes,
         Err(e) => {
-            println!("[DILITHIUM] ❌ Invalid public key hex: {}", e);
+            println!("[DILITHIUM3] ❌ Invalid public key hex: {}", e);
             return false;
         }
     };
     
-    let public_key = match dilithium5::PublicKey::from_bytes(&pk_bytes) {
+    let public_key = match dilithium3::PublicKey::from_bytes(&pk_bytes) {
         Ok(pk) => pk,
         Err(e) => {
-            println!("[DILITHIUM] ❌ Invalid Dilithium public key: {:?}", e);
+            println!("[DILITHIUM3] ❌ Invalid Dilithium3 public key: {:?}", e);
             return false;
         }
     };
@@ -8665,7 +8666,7 @@ async fn verify_dilithium_signature_for_contract(
     let sig_bytes = match hex::decode(signature_hex) {
         Ok(bytes) => bytes,
         Err(e) => {
-            println!("[DILITHIUM] ❌ Invalid signature hex: {}", e);
+            println!("[DILITHIUM3] ❌ Invalid signature hex: {}", e);
             return false;
         }
     };
@@ -8674,22 +8675,22 @@ async fn verify_dilithium_signature_for_contract(
     let mut signed_msg = sig_bytes.clone();
     signed_msg.extend_from_slice(message.as_bytes());
     
-    let signed_message = match dilithium5::SignedMessage::from_bytes(&signed_msg) {
+    let signed_message = match dilithium3::SignedMessage::from_bytes(&signed_msg) {
         Ok(sm) => sm,
         Err(e) => {
-            println!("[DILITHIUM] ❌ Invalid signed message format: {:?}", e);
+            println!("[DILITHIUM3] ❌ Invalid signed message format: {:?}", e);
             return false;
         }
     };
     
     // Verify signature
-    match dilithium5::open(&signed_message, &public_key) {
+    match dilithium3::open(&signed_message, &public_key) {
         Ok(_) => {
-            println!("[DILITHIUM] ✅ Signature verified (NIST FIPS 204)");
+            println!("[DILITHIUM3] ✅ Signature verified (NIST FIPS 204, Level 3)");
             true
         }
         Err(_) => {
-            println!("[DILITHIUM] ❌ Signature verification failed");
+            println!("[DILITHIUM3] ❌ Signature verification failed");
             false
         }
     }

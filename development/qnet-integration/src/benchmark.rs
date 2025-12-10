@@ -487,9 +487,12 @@ impl BenchmarkManager {
         // Calculate hash
         tx.hash = tx.calculate_hash();
         
-        // Sign with Ed25519 - message format from CRYPTOGRAPHY_IMPLEMENTATION.md
-        let message = format!("transfer:{}:{}:{}:{}:{}", 
-            tx.from, receiver.address, amount, tx.gas_price, tx.gas_limit);
+        // Sign with Ed25519 - MUST match verify format in node.rs verify_ed25519_tx_signature
+        // Canonical message: from|to|amount|nonce|gas_price|gas_limit|timestamp
+        let message = format!(
+            "{}|{}|{}|{}|{}|{}|{}",
+            tx.from, receiver.address, amount, nonce, tx.gas_price, tx.gas_limit, timestamp
+        );
         let signature = sender.signing_key.sign(message.as_bytes());
         tx.signature = Some(hex::encode(signature.to_bytes()));
         
@@ -557,9 +560,12 @@ impl BenchmarkManager {
         // Calculate hash (real SHA3-256)
         tx.hash = tx.calculate_hash();
         
-        // Sign with Ed25519 (real cryptographic signature)
-        let message = format!("transfer:{}:{}:{}:{}:{}", 
-            tx.from, receiver.address, amount, tx.gas_price, tx.gas_limit);
+        // Sign with Ed25519 - MUST match verify format in node.rs verify_ed25519_tx_signature
+        // Canonical message: from|to|amount|nonce|gas_price|gas_limit|timestamp
+        let message = format!(
+            "{}|{}|{}|{}|{}|{}|{}",
+            tx.from, receiver.address, amount, nonce, tx.gas_price, tx.gas_limit, timestamp
+        );
         let signature = sender.signing_key.sign(message.as_bytes());
         tx.signature = Some(hex::encode(signature.to_bytes()));
         
