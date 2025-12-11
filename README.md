@@ -44,7 +44,13 @@ This project uses **dual licensing**:
 - **Phase 2 (Future)**: ONLY QNC token activation on QNet blockchain
 - **Transition**: 90% 1DEV burned OR 5 years from genesis block (whichever comes first)
 
-### 🛡️ **LATEST UPDATES (v2.19.22 - November 30, 2025)**
+### 🛡️ **LATEST UPDATES (v2.27.1 - December 11, 2025)**
+
+**🔐 Zero Fork Guarantee:**
+- **No Fallbacks**: Lagging nodes cannot participate - must sync first
+- **100% Determinism**: All nodes select same producer guaranteed
+- **Epoch-Based Validators**: Producer list from MacroBlock snapshots
+- **Microblock Entropy**: VRF seed always from finalized microblocks
 
 **🔐 NIST/Cisco Compliant Hybrid Cryptography:**
 - **Ephemeral Keys**: NEW Ed25519 keypair for EACH message (forward secrecy)

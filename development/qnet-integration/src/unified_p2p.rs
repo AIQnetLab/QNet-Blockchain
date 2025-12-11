@@ -36,7 +36,7 @@ const MAX_LIGHT_NODE_REGISTRY_SIZE: usize = 100_000;
 const MAX_ATTESTATIONS_SIZE: usize = 100_000;
 
 /// Max heartbeat records in RAM (24h window, auto-cleanup)
-/// 50K records × ~200 bytes = ~10MB RAM
+/// 100K records × ~200 bytes = ~20MB RAM
 const MAX_HEARTBEATS_SIZE: usize = 100_000;
 
 /// Max active Full/Super nodes tracked
@@ -6399,8 +6399,11 @@ impl SimplifiedP2P {
                 let addr = format!("{}:8001", ip);
                 let node_id = format!("genesis_node_{}", id);
                 
-                // Skip self and check if working
-                if !self.node_id.contains(&format!("{:03}", id.parse::<usize>().unwrap_or(0) + 1)) {
+                // Skip self - check if our node_id ends with this id
+                // BUGFIX v2.27.1: Was incorrectly skipping NEXT node instead of self!
+                // Old: format!("{:03}", id.parse::<usize>().unwrap_or(0) + 1) → "001" became "002"
+                // Fixed: Just check if node_id contains the id directly
+                if !self.node_id.ends_with(id) {
                     if working_genesis_ips.contains(&ip.to_string()) {
                         // PRODUCTION: Get REAL peer data from connected_peers_lockfree
                         // NO FALLBACK! If peer not found in P2P state, skip it (not really connected)

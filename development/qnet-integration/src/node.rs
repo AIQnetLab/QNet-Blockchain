@@ -795,38 +795,35 @@ impl BlockchainNode {
                 }
             }
             Ok(None) => {
-                println!("[PRODUCERS] ⚠️ MacroBlock #{} not found for height {}", macroblock_index, current_height);
+                // CRITICAL FIX v2.27.1: NO FALLBACK for producer list!
+                // 
+                // Problem: If node doesn't have MacroBlock N-1, it means:
+                // 1. Node didn't participate in consensus (was offline/lagging)
+                // 2. Using fallback (N-2 or Genesis) would cause DIFFERENT producer list
+                // 3. Different producer list = different VRF result = FORK!
+                //
+                // Solution: Node WITHOUT required macroblock CANNOT participate in production
+                // It must sync first. This is how Solana/Ethereum work.
+                //
+                // The network continues with nodes that ARE synchronized.
+                // Lagging nodes will catch up via block sync.
                 
-                // Emergency fallback: try previous macroblock
-                if macroblock_index > 1 {
-                    if let Ok(Some(prev_mb_data)) = storage.get_macroblock_by_height(macroblock_index - 1) {
-                        if let Ok(prev_mb) = bincode::deserialize::<qnet_state::MacroBlock>(&prev_mb_data) {
-                            if let Some(ref snapshot_data) = prev_mb.consensus_data.eligible_producers {
-                                if let Ok(producers) = bincode::deserialize::<Vec<qnet_state::EligibleProducer>>(snapshot_data) {
-                                    println!("[PRODUCERS] 🔄 Using previous MacroBlock #{} snapshot", macroblock_index - 1);
-                                    return producers.iter()
-                                        .map(|p| (p.node_id.clone(), p.reputation))
-                                        .collect();
-                                }
-                            }
-                        }
-                    }
-                }
+                println!("[PRODUCERS] ❌ MacroBlock #{} not found for height {}", macroblock_index, current_height);
+                println!("[PRODUCERS] 🚫 Node must sync before participating in block production!");
+                println!("[PRODUCERS] ℹ️ Returning empty list - node will not be selected as producer");
                 
-                // Ultimate fallback: Genesis list
-                use crate::genesis_constants::GENESIS_NODE_IPS;
-                GENESIS_NODE_IPS.iter()
-                    .map(|(_, id)| (format!("genesis_node_{}", id), 0.70))
-                    .collect()
+                // NO FALLBACK! Empty list = node cannot be producer
+                Vec::new()
             }
             Err(e) => {
-                println!("[PRODUCERS] ❌ Error loading MacroBlock #{}: {}", macroblock_index, e);
+                // CRITICAL FIX v2.27.1: NO FALLBACK on error either!
+                // Same logic - if we can't read macroblock, we can't participate
                 
-                // Fallback to Genesis
-                use crate::genesis_constants::GENESIS_NODE_IPS;
-                GENESIS_NODE_IPS.iter()
-                    .map(|(_, id)| (format!("genesis_node_{}", id), 0.70))
-                    .collect()
+                println!("[PRODUCERS] ❌ Error loading MacroBlock #{}: {}", macroblock_index, e);
+                println!("[PRODUCERS] 🚫 Node must sync before participating in block production!");
+                
+                // NO FALLBACK! Empty list = node cannot be producer
+                Vec::new()
             }
         }
     }
@@ -8602,41 +8599,27 @@ impl BlockchainNode {
                     }
                 } else {
                     // NORMAL PHASE: Use block that is FINALITY_WINDOW blocks behind
+                    // CRITICAL FIX v2.27.1: ALWAYS use microblock for entropy - NO FALLBACK!
+                    // 
+                    // Problem: Macroblock may not be synced to all nodes at the same time
+                    // If some nodes have macroblock and some don't → different entropy → FORK!
+                    //
+                    // Solution: ALWAYS use microblock[height - FINALITY_WINDOW]
+                    // - Microblock is GUARANTEED to exist on all nodes at height H
+                    // - This is an invariant: you can't be at height H without blocks H-10
+                    // - No fallback = no divergence = no forks
+                    //
+                    // Macroblocks are still used for:
+                    // - eligible_producers snapshot (epoch validator set)
+                    // - state checkpoints
+                    // - finality proofs
+                    // But NOT for VRF entropy!
+                    
                     let entropy_block_height = current_height.saturating_sub(FINALITY_WINDOW);
                     
-                    // For very high blocks, prefer macroblock if available (stronger entropy)
-                    let use_macroblock = entropy_block_height >= 90;
-                    
-                    if use_macroblock {
-                        // Try to use macroblock for stronger Byzantine-verified entropy
-                        let macroblock_index = ((entropy_block_height - 1) / 90) + 1;
-                        
-                        match store.get_macroblock_by_height(macroblock_index) {
-                            Ok(Some(macroblock_data)) => {
-                                // Use macroblock hash (Byzantine consensus verified)
-                                use sha3::{Sha3_256, Digest};
-                                let mut hasher = Sha3_256::new();
-                                hasher.update(&macroblock_data);
-                                let result = hasher.finalize();
-                                let mut hash = [0u8; 32];
-                                hash.copy_from_slice(&result);
-                                println!("[FINALITY] 🔐 Block #{}: Using MACROBLOCK #{} as entropy (Byzantine consensus)", 
-                                         current_height, macroblock_index);
-                                hash
-                            },
-                            _ => {
-                                // Fallback to microblock if macroblock not available
-                                println!("[FINALITY] 📦 Block #{}: Macroblock #{} not available, using microblock #{}", 
-                                         current_height, macroblock_index, entropy_block_height);
-                                Self::get_finality_block_hash(store, entropy_block_height, current_height).await
-                            }
-                        }
-                    } else {
-                        // Use regular microblock with finality window
-                        println!("[FINALITY] 📦 Block #{}: Using microblock #{} as entropy (finality window: {} blocks)", 
-                                 current_height, entropy_block_height, FINALITY_WINDOW);
-                        Self::get_finality_block_hash(store, entropy_block_height, current_height).await
-                    }
+                    println!("[FINALITY] 📦 Block #{}: Using microblock #{} as entropy (deterministic, no fallback)", 
+                             current_height, entropy_block_height);
+                    Self::get_finality_block_hash(store, entropy_block_height, current_height).await
                 };
                 prev_hash
             } else {
@@ -9443,54 +9426,26 @@ impl BlockchainNode {
                     }
                 }
                 _ => {
-                    println!("[CANDIDATES] ⚠️ MacroBlock #{} not available, using gossip fallback", macroblock_index);
+                    // CRITICAL FIX v2.27.1: NO FALLBACK to gossip registry!
+                    //
+                    // Problem: Gossip registry is NOT deterministic across nodes
+                    // Different nodes may see different active_full_super_nodes
+                    // This causes different producer lists = FORK!
+                    //
+                    // Solution: If macroblock not available, node cannot participate
+                    // It must sync first. This matches get_eligible_producers_for_height behavior.
+                    
+                    println!("[CANDIDATES] ❌ MacroBlock #{} not available for height {}", macroblock_index, current_height);
+                    println!("[CANDIDATES] 🚫 Node must sync before participating in producer selection!");
+                    println!("[CANDIDATES] ℹ️ Returning empty list - gossip fallback removed for determinism");
                 }
             }
         }
         
-        // ═══════════════════════════════════════════════════════════════════
-        // FALLBACK: Use gossip registry (only if macroblock not available)
-        // This should be rare in normal operation
-        // ═══════════════════════════════════════════════════════════════════
-        println!("[CANDIDATES] ⚠️ FALLBACK: Using gossip registry (macroblock not available)");
-        
-        let mut all_qualified: Vec<(String, f64)> = Vec::new();
-        let global_active_nodes = p2p.get_active_full_super_nodes();
-        
-        for (node_id, node_type, _last_seen) in &global_active_nodes {
-            if node_type != "super" && node_type != "full" {
-                continue;
-            }
-            
-            let reputation = Self::get_node_reputation_score(node_id, p2p).await;
-            
-            if reputation >= 0.70 {
-                all_qualified.push((node_id.clone(), reputation));
-            }
-        }
-        
-        // Add own node if eligible
-        if matches!(own_node_type, NodeType::Super | NodeType::Full) {
-            let own_reputation = Self::get_node_reputation_score(own_node_id, p2p).await;
-            if own_reputation >= 0.70 && !all_qualified.iter().any(|(id, _)| id == own_node_id) {
-                all_qualified.push((own_node_id.to_string(), own_reputation));
-            }
-        }
-        
-        // Sort for determinism
-        all_qualified.sort_by(|a, b| a.0.cmp(&b.0));
-        all_qualified.dedup_by(|a, b| a.0 == b.0);
-        
-        println!("[CANDIDATES] 📊 Fallback: {} qualified nodes from gossip", all_qualified.len());
-        
-        // Apply validator sampling for scalability
-        const MAX_VALIDATORS_PER_ROUND: usize = 1000;
-        
-        if all_qualified.len() <= MAX_VALIDATORS_PER_ROUND {
-            all_qualified
-        } else {
-            Self::deterministic_validator_sampling(&all_qualified, MAX_VALIDATORS_PER_ROUND).await
-        }
+        // CRITICAL FIX v2.27.1: NO FALLBACK!
+        // If we reach here, macroblock was not available
+        // Return empty list - node cannot participate in producer selection
+        Vec::new()
     }
     
     /// DEPRECATED: Legacy function - use calculate_qualified_candidates() instead

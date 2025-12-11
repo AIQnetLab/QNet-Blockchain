@@ -3065,7 +3065,7 @@ async fn handle_transaction_submit(
     )
     .with_public_key(Some(tx_request.public_key.clone()))
     .with_quantum_signature(tx_request.dilithium_signature.clone(), tx_request.dilithium_public_key.clone());
-    
+
     // Log quantum TX if present
     if tx.is_quantum_signed() {
         println!("[TX-QUANTUM] 🔐 Transaction with Dilithium signature from {}", &tx_request.from[..16.min(tx_request.from.len())]);
@@ -3306,12 +3306,12 @@ async fn handle_bundle_submit(
             } else if let Ok(json_str) = String::from_utf8(tx_bytes) {
                 // Fallback: legacy JSON format
                 if let Ok(tx_data) = serde_json::from_str::<serde_json::Value>(&json_str) {
-                    if let Some(gas_price) = tx_data["gas_price"].as_u64() {
-                        total_gas_price = total_gas_price.saturating_add(gas_price);
-                    }
+                if let Some(gas_price) = tx_data["gas_price"].as_u64() {
+                    total_gas_price = total_gas_price.saturating_add(gas_price);
                 }
             }
         }
+    }
     }
     
     // Create bundle
@@ -9764,9 +9764,9 @@ async fn run_benchmark_generator(
         let start_idx = worker_id * accounts_per_worker;
         let end_idx = if worker_id == num_workers - 1 {
             accounts_snapshot.len()  // Last worker gets remainder
-        } else {
+    } else {
             start_idx + accounts_per_worker
-        };
+    };
         let worker_accounts: Vec<_> = accounts_snapshot[start_idx..end_idx].to_vec();
         
         let handle = tokio::spawn(async move {
@@ -9780,11 +9780,11 @@ async fn run_benchmark_generator(
                 // Generate batch of transactions using SNAPSHOT (NO LOCK!)
                 let mut batch_txs = Vec::with_capacity(batch_size);
                 
-                for _ in 0..batch_size {
+        for _ in 0..batch_size {
                     if local_sent >= tx_per_worker || !BENCHMARK_MANAGER.is_running() {
-                        break;
-                    }
-                    
+                break;
+            }
+            
                     // v2.26.3: Generate from snapshot - NO async, NO lock!
                     if let Some(tx) = BenchmarkManager::generate_transaction_from_snapshot(&worker_accounts) {
                         batch_txs.push(tx);
@@ -9835,7 +9835,7 @@ async fn run_benchmark_generator(
             // Record latencies
             for lat in latencies {
                 BENCHMARK_MANAGER.record_latency(lat).await;
-            }
+                    }
             
             println!("[BENCHMARK] Worker {} finished: {} TX sent, {} confirmed", 
                      worker_id, local_sent, local_confirmed);
@@ -9844,8 +9844,8 @@ async fn run_benchmark_generator(
         });
         
         handles.push(handle);
-    }
-    
+        }
+        
     // Progress reporter task
     let progress_sent = global_sent.clone();
     let progress_handle = tokio::spawn(async move {
@@ -9908,7 +9908,7 @@ async fn run_benchmark_generator(
     
     for _ in 0..remaining_sent {
         BENCHMARK_MANAGER.record_sent();
-    }
+        }
     for _ in 0..remaining_confirmed {
         BENCHMARK_MANAGER.record_confirmed();
     }

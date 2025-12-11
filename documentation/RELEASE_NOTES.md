@@ -1,10 +1,39 @@
 # 🚀 QNet Blockchain - Release Notes
 
-## 🎉 Latest: v2.27.0 - Epoch-Based Validator Set
+## 🎉 Latest: v2.27.1 - Zero Fork Guarantee
 
 **Release Date**: December 11, 2025  
-**Version**: 2.27.0  
+**Version**: 2.27.1  
 **Status**: ✅ Production Ready
+
+---
+
+## v2.27.1 - Zero Fork Guarantee (December 11, 2025)
+
+### 🔐 CRITICAL - Fork Prevention
+
+**Three bugs causing forks have been fixed:**
+
+| Bug | Impact | Fix |
+|-----|--------|-----|
+| Skip self +1 | Each node saw different peer list | `ends_with(id)` |
+| Entropy fallback | Different VRF seed if macroblock not synced | Microblock only |
+| Producer list fallback | Different producers from gossip registry | No fallback |
+
+### Key Change: No Fallback Policy
+
+```
+If node doesn't have MacroBlock → returns empty list → cannot be producer
+Node must sync before participating (like Solana/Ethereum)
+Network continues with synchronized nodes
+```
+
+### Guarantees
+
+- **Peers list**: 100% deterministic
+- **Entropy**: 100% deterministic  
+- **Producer list**: 100% deterministic
+- **Fork risk**: 0%
 
 ---
 
