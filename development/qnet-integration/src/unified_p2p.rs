@@ -16269,14 +16269,47 @@ impl SimplifiedP2P {
     }
     
     fn select_emergency_producer_excluding(&self, exclude: &str, height: u64) -> String {
-        // Select any other active peer as emergency producer (Byzantine-safe)
-        for entry in self.connected_peers_lockfree.iter() {
-            let peer = entry.value();
-            if peer.id != exclude && peer.is_consensus_qualified() {  // Byzantine threshold check
-                return peer.id.clone();
+        // v2.27.0: Use epoch-based snapshot for deterministic selection (same as node.rs)
+        // This ensures all nodes agree on emergency producer even for critical attacks
+        
+        // Get candidates from macroblock snapshot (same logic as calculate_qualified_candidates)
+        let macroblock_index = if height <= 90 { 0 } else { (height - 1) / 90 };
+        
+        // Try to get from macroblock snapshot first
+        if macroblock_index > 0 {
+            if let Some(storage) = crate::node::GLOBAL_STORAGE_INSTANCE.lock()
+                .ok()
+                .and_then(|g| g.clone()) 
+            {
+                if let Ok(Some(mb_data)) = storage.get_macroblock_by_height(macroblock_index) {
+                    if let Ok(macroblock) = bincode::deserialize::<qnet_state::MacroBlock>(&mb_data) {
+                        if let Some(ref snapshot_data) = macroblock.consensus_data.eligible_producers {
+                            if let Ok(producers) = bincode::deserialize::<Vec<qnet_state::EligibleProducer>>(snapshot_data) {
+                                // Find first producer that isn't excluded
+                                for p in &producers {
+                                    if p.node_id != exclude {
+                                        println!("[SECURITY] ✅ Emergency producer from epoch snapshot: {}", p.node_id);
+                                        return p.node_id.clone();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
-        // Fallback to self if no other peers
+        
+        // Genesis epoch or fallback: use static Genesis list
+        use crate::genesis_constants::GENESIS_NODE_IPS;
+        for (_, id) in GENESIS_NODE_IPS.iter() {
+            let node_id = format!("genesis_node_{}", id);
+            if node_id != exclude {
+                println!("[SECURITY] ✅ Emergency producer from Genesis: {}", node_id);
+                return node_id;
+            }
+        }
+        
+        // Ultimate fallback
         if self.node_id != exclude {
             self.node_id.clone()
         } else {

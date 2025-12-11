@@ -103,6 +103,32 @@ pub struct ConsensusData {
     /// This ensures ALL nodes have IDENTICAL reputation (no drift!)
     #[serde(default)]
     pub reputation_snapshot: Option<Vec<u8>>,
+    
+    // ═══════════════════════════════════════════════════════════════════
+    // ELIGIBLE PRODUCERS SNAPSHOT (v2.27.0)
+    // Epoch-based validator set for deterministic producer selection
+    // Solana/Ethereum style: snapshot determines producers for next 90 blocks
+    // ═══════════════════════════════════════════════════════════════════
+    
+    /// Eligible producers for next epoch (90 blocks)
+    /// Format: bincode serialized Vec<EligibleProducer>
+    /// All nodes use this SAME list for producer selection - NO gossip!
+    /// This eliminates race conditions and guarantees determinism
+    #[serde(default)]
+    pub eligible_producers: Option<Vec<u8>>,
+}
+
+/// Eligible producer entry for epoch-based validator set
+/// Stored in macroblock, used for deterministic producer selection
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EligibleProducer {
+    /// Node identifier (e.g., "genesis_node_001" or "node_abc123")
+    pub node_id: String,
+    /// Reputation score at snapshot time (0.0 - 1.0)
+    pub reputation: f64,
+    /// Stake amount (for future PoS integration)
+    #[serde(default)]
+    pub stake: u64,
 }
 
 /// Slashing event data for blockchain storage (simplified for serialization)

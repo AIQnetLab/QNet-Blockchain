@@ -1,9 +1,9 @@
 # QNet Cryptography Implementation Guide
 ## Complete Technical Specification
 
-**Version:** 2.4 (v2.25.0)  
-**Date:** December 8, 2025  
-**Status:** Production Ready (Gulf Stream + bincode)  
+**Version:** 2.5 (v2.27.0)  
+**Date:** December 11, 2025  
+**Status:** Production Ready (Epoch-Based Validator Set + Gulf Stream + bincode)  
 
 ---
 
@@ -35,6 +35,13 @@ QNet implements **NIST/Cisco recommended post-quantum cryptography** with:
 - ✅ **Snapshot mempool reads** (release lock early, DashMap is lock-free)
 - ✅ **HealthPing with height** (accurate network_height every 15 seconds)
 - ✅ **TX accumulator** (batch 1000 TX for verification, 100ms timeout)
+
+### v2.27.0 Additions (Epoch-Based Validator Set)
+- ✅ **MacroBlock snapshots** (eligible producers stored in blockchain)
+- ✅ **Deterministic producer selection** (no gossip race conditions)
+- ✅ **VRF from finality block** (SHA3-512 entropy from FINALITY_WINDOW=10 blocks ago)
+- ✅ **Genesis epoch static list** (genesis_constants.rs for blocks 1-90)
+- ✅ **MAX_VALIDATORS_PER_EPOCH = 1000** (deterministic sampling for scalability)
 
 ---
 

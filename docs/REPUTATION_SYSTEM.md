@@ -1,9 +1,11 @@
-# QNET Deterministic Reputation System v2.24
+# QNET Deterministic Reputation System v2.27
 
 ## Overview
 
 QNET uses a **deterministic blockchain-based reputation system** that eliminates P2P gossip vulnerabilities.
 All nodes compute identical reputation scores from on-chain data.
+
+**NEW in v2.27:** Epoch-based validator sets eliminate gossip race conditions in producer selection!
 
 **NEW in v2.24:** Ethereum 2.0 style reputation snapshots ensure 100% synchronization across all nodes!
 
@@ -16,6 +18,40 @@ All nodes compute identical reputation scores from on-chain data.
 | Evidence | ❌ Ephemeral keys | ✅ Cryptographic proof |
 | Synchronization | ❌ Gossip lag | ✅ Block-based |
 | Long-Range Attack | ❌ Vulnerable | ✅ Finality Checkpoints |
+| **Producer Selection** | ❌ Gossip races | ✅ MacroBlock snapshot (v2.27) |
+
+---
+
+## Epoch-Based Validator Set (v2.27)
+
+Producer selection now uses **MacroBlock snapshots** instead of gossip registry:
+
+### Data Structure
+
+```rust
+// Stored in MacroBlock.consensus_data.eligible_producers
+pub struct EligibleProducer {
+    pub node_id: String,      // Node identifier
+    pub reputation: f64,      // 0.0 - 1.0 (from reputation system)
+    pub stake: u64,           // Future PoS integration
+}
+```
+
+### Epoch Flow
+
+| Blocks | Source | Description |
+|--------|--------|-------------|
+| 1-90 | `genesis_constants.rs` | Static Genesis nodes |
+| 91-180 | MacroBlock #1 | Snapshot from block 90 |
+| 181-270 | MacroBlock #2 | Snapshot from block 180 |
+| ... | ... | Each epoch uses previous MacroBlock |
+
+### Benefits
+
+1. **Determinism**: All nodes read same snapshot from blockchain
+2. **No Race Conditions**: Gossip propagation delays don't affect selection
+3. **Scalability**: MAX_VALIDATORS_PER_EPOCH = 1000 with deterministic sampling
+4. **Emergency Failover**: Uses same snapshot for consistency
 
 ---
 

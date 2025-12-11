@@ -1,9 +1,9 @@
-# QNet Blockchain Architecture v2.25
+# QNet Blockchain Architecture v2.27
 ## Post-Quantum Decentralized Network - Technical Documentation
 
-**Last Updated**: December 9, 2025  
-**Version**: 2.26.2  
-**Status**: Production Ready (Gulf Stream + bincode + Batch Ed25519 + Optional Quantum TX)
+**Last Updated**: December 11, 2025  
+**Version**: 2.27.0  
+**Status**: Production Ready (Epoch-Based Validator Set + Gulf Stream + bincode + Batch Ed25519)
 
 > ⚠️ **REPUTATION SYSTEM UPDATED in v2.21.0**  
 > The reputation section in this document describes the OLD P2P gossip-based system.  
@@ -37,6 +37,7 @@ QNet is a high-performance, post-quantum secure blockchain with a **two-layer bl
 - **Macroblocks**: Created every 90 seconds (consensus finalization)
 
 ### Key Innovations
+- **Epoch-Based Validator Set v2.27.0**: Deterministic producer selection from blockchain snapshots
 - **Compact Hybrid Signatures v2.23**: 88% bandwidth reduction (~2.6KB RAW bytes)
 - **Progressive Finalization Protocol**: Self-healing consensus recovery
 - **Zero-Downtime Architecture**: Microblocks continue during macroblock consensus
@@ -44,6 +45,69 @@ QNet is a high-performance, post-quantum secure blockchain with a **two-layer bl
 - **Batch Ed25519 Verification v2.25.2**: 3x faster signature verification
 - **Batch Mempool Operations v2.25.2**: 1 lock per 1000 TX (1000x reduction)
 - **TX Accumulator v2.25.2**: Batch 1000 TX with 100ms timeout
+
+---
+
+## Epoch-Based Validator Set (v2.27.0)
+
+### Problem Solved
+
+Previous gossip-based producer selection caused **network forks** when different nodes had different views of active peers at the moment of VRF selection.
+
+### Solution: MacroBlock Snapshots
+
+All eligible producers for an epoch (90 blocks) are stored in the MacroBlock:
+
+```rust
+pub struct ConsensusData {
+    // ... other fields ...
+    
+    /// Eligible producers for next epoch (90 blocks)
+    /// Format: bincode serialized Vec<EligibleProducer>
+    pub eligible_producers: Option<Vec<u8>>,
+}
+
+pub struct EligibleProducer {
+    pub node_id: String,      // Node identifier
+    pub reputation: f64,      // Reputation score (0.0 - 1.0)
+    pub stake: u64,           // Future PoS integration
+}
+```
+
+### Epoch Flow
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    EPOCH-BASED VALIDATOR SET                            │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  GENESIS EPOCH (blocks 1-90):                                           │
+│  └── Source: genesis_constants.rs (static hardcoded list)              │
+│                                                                         │
+│  EPOCH N (blocks N*90+1 to (N+1)*90):                                  │
+│  └── Source: MacroBlock N-1.eligible_producers (blockchain)            │
+│                                                                         │
+│  PRODUCER SELECTION:                                                    │
+│  └── calculate_qualified_candidates() → read snapshot from blockchain  │
+│  └── VRF selection from snapshot                                        │
+│  └── All nodes use SAME snapshot → DETERMINISM!                        │
+│                                                                         │
+│  EMERGENCY SELECTION:                                                   │
+│  └── Same snapshot, excluding failed producer                          │
+│  └── Same VRF entropy → DETERMINISM!                                   │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Guarantees
+
+| Property | Status |
+|----------|--------|
+| Determinism | ✅ All nodes read same snapshot from blockchain |
+| Scalability | ✅ MAX_VALIDATORS_PER_EPOCH = 1000 |
+| Genesis compatibility | ✅ Static list for blocks 1-90 |
+| Emergency failover | ✅ Uses same snapshot |
+| No gossip races | ✅ Blockchain is source of truth |
 
 ---
 

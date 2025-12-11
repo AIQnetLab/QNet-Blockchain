@@ -3,8 +3,8 @@
 
 **⚠️ EXPERIMENTAL BLOCKCHAIN RESEARCH ⚠️**
 
-**Version**: 2.25.2-experimental  
-**Date**: December 9, 2025  
+**Version**: 2.27.0-experimental  
+**Date**: December 11, 2025  
 **Authors**: QNet Research Team  
 **Status**: Experimental Research Project  
 **Goal**: To prove that one person without multi-million investments can create an advanced blockchain
@@ -42,6 +42,9 @@ Experimental achievements:
 - ✅ **Batch Mempool (v2.25.2)**: 1 lock per 1000 TX (1000x reduction in lock contention)
 - ✅ **TX Accumulator (v2.25.2)**: Batch 1000 TX for verification with 100ms timeout
 - ✅ **Skip Self-Broadcast (v2.25.2)**: Producer doesn't re-broadcast own TX
+- ✅ **Epoch-Based Validator Set (v2.27.0)**: Deterministic producer selection from MacroBlock snapshots
+- ✅ **No Gossip Race Conditions (v2.27.0)**: All nodes use same producer list from blockchain
+- ✅ **MAX_VALIDATORS_PER_EPOCH = 1000 (v2.27.0)**: Scalable deterministic sampling
 
 Experiment goal: demonstrate the possibility of creating a high-performance post-quantum blockchain by one person-operator.
 

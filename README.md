@@ -70,7 +70,14 @@ This project uses **dual licensing**:
 - **Adaptive Buffer Size**: Full/Super nodes: 500 blocks (~50MB), Light nodes: 100 blocks (~10MB)
 - **Background Re-request**: Missing blocks automatically re-requested every 30s with backoff
 
-### 🛡️ **Latest Update (v2.25.2 - December 9, 2025)**
+### 🛡️ **Latest Update (v2.27.0 - December 11, 2025)**
+- **Epoch-Based Validator Set**: Deterministic producer selection from MacroBlock snapshots
+- **No Gossip Race Conditions**: All nodes use same producer list from blockchain
+- **EligibleProducer Struct**: `{ node_id, reputation, stake }` stored in MacroBlock
+- **Genesis Epoch Static**: Blocks 1-90 use `genesis_constants.rs` hardcoded list
+- **MAX_VALIDATORS_PER_EPOCH = 1000**: Scalable deterministic sampling
+
+### 🛡️ **Previous Update (v2.25.2 - December 9, 2025)**
 - **Batch Ed25519 Verification**: 3x faster signature verification using ed25519-dalek batch API
 - **Batch Mempool Operations**: 1 lock per 1000 TX instead of per-TX (1000x reduction)
 - **TX Accumulator**: Batch 1000 TX for verification, 100ms timeout

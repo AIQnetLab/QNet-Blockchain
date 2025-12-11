@@ -5,6 +5,64 @@ All notable changes to the QNet project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.27.0] - December 11, 2025 "Epoch-Based Validator Set"
+
+### 🔐 CRITICAL - Deterministic Producer Selection
+
+**Problem Fixed:**
+Gossip-based producer selection caused network forks when different nodes had different active peer lists at the moment of VRF selection.
+
+**Solution:** Epoch-based validator set stored in MacroBlock snapshots (Solana/Ethereum 2.0 style)
+
+### ✅ Architecture Changes
+
+| Component | Before | After |
+|-----------|--------|-------|
+| **Producer candidates** | Gossip registry (non-deterministic) | MacroBlock snapshot (blockchain) |
+| **Genesis epoch (1-90)** | Gossip registry | Static `genesis_constants.rs` |
+| **Normal epochs (91+)** | Gossip registry | `MacroBlock.eligible_producers` |
+| **Emergency failover** | Mixed sources | Same MacroBlock snapshot |
+| **Determinism** | ❌ Race conditions | ✅ 100% deterministic |
+
+### 📦 New Data Structures
+
+```rust
+// Stored in MacroBlock.consensus_data
+pub struct EligibleProducer {
+    pub node_id: String,      // e.g., "genesis_node_001"
+    pub reputation: f64,      // 0.0 - 1.0
+    pub stake: u64,           // Future PoS integration
+}
+```
+
+### 🔧 Modified Functions
+
+| Function | File | Change |
+|----------|------|--------|
+| `calculate_qualified_candidates()` | node.rs | Uses epoch snapshot |
+| `select_emergency_producer()` | node.rs | Uses same snapshot |
+| `select_emergency_producer_excluding()` | unified_p2p.rs | Uses epoch snapshot |
+| `create_eligible_producers_snapshot()` | node.rs | NEW: Creates snapshot |
+| `get_eligible_producers_for_height()` | node.rs | NEW: Reads snapshot |
+
+### 🎯 Flow
+
+```
+Blocks 1-90 (Genesis):     genesis_constants.rs → static list
+Blocks 91-180 (Epoch 1):   MacroBlock #1.eligible_producers → from blockchain
+Blocks 181-270 (Epoch 2):  MacroBlock #2.eligible_producers → from blockchain
+...
+Emergency Failover:        Same MacroBlock snapshot (deterministic)
+```
+
+### 📊 Impact
+
+- **Network stability**: No more forks from gossip race conditions
+- **Scalability**: MAX_VALIDATORS_PER_EPOCH = 1000 (deterministic sampling)
+- **Consistency**: All nodes use identical producer lists
+
+---
+
 ## [2.25.2] - December 9, 2025 "Batch Ed25519 Verification & High TPS Optimization"
 
 ### 🚀 MAJOR - Batch Signature Verification

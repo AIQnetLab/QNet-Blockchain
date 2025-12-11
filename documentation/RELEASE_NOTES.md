@@ -1,9 +1,45 @@
-# 🚀 QNet Blockchain v1.0 - Release Notes
+# 🚀 QNet Blockchain - Release Notes
 
-## 🎉 Major Milestone: Complete Project Restructuring & Path Updates
+## 🎉 Latest: v2.27.0 - Epoch-Based Validator Set
+
+**Release Date**: December 11, 2025  
+**Version**: 2.27.0  
+**Status**: ✅ Production Ready
+
+---
+
+## v2.27.0 - Epoch-Based Validator Set (December 11, 2025)
+
+### 🔐 CRITICAL - Deterministic Producer Selection
+
+**Problem Fixed**: Gossip-based producer selection caused network forks when different nodes had different views of active peers.
+
+**Solution**: MacroBlock snapshots for epoch-based validator sets (Solana/Ethereum 2.0 style)
+
+### Changes
+
+| Component | Description |
+|-----------|-------------|
+| `ConsensusData.eligible_producers` | NEW: Stores validator snapshot in MacroBlock |
+| `EligibleProducer` struct | NEW: `{ node_id, reputation, stake }` |
+| `calculate_qualified_candidates()` | Uses MacroBlock snapshot instead of gossip |
+| `select_emergency_producer()` | Uses same MacroBlock snapshot |
+| `select_emergency_producer_excluding()` | Updated to use epoch snapshot |
+| Genesis epoch (blocks 1-90) | Uses static `genesis_constants.rs` |
+
+### Architecture
+
+```
+Blocks 1-90:   genesis_constants.rs → static list
+Blocks 91+:    MacroBlock.eligible_producers → blockchain
+Emergency:     Same MacroBlock snapshot → deterministic
+```
+
+---
+
+## v1.0.0 - Major Milestone: Complete Project Restructuring
 
 **Release Date**: December 14, 2025  
-**Version**: 1.0.0  
 **Status**: ✅ Production Ready
 
 ---

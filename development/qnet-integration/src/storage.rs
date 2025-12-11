@@ -1256,6 +1256,12 @@ impl PersistentStorage {
         }
     }
     
+    /// Save macroblock to storage (IDEMPOTENT - won't overwrite existing)
+    /// 
+    /// CRITICAL v2.26.8: Made idempotent to prevent:
+    /// - Race conditions between consensus and PFP
+    /// - Data inconsistency from parallel writes
+    /// - Overwriting valid macroblocks with different data
     pub async fn save_macroblock(&self, height: u64, macroblock: &qnet_state::MacroBlock) -> IntegrationResult<()> {
         let microblocks_cf = self.db.cf_handle("microblocks")
             .ok_or_else(|| IntegrationError::StorageError("microblocks column family not found".to_string()))?;
@@ -1263,6 +1269,16 @@ impl PersistentStorage {
             .ok_or_else(|| IntegrationError::StorageError("metadata column family not found".to_string()))?;
         
         let key = format!("macroblock_{}", height);
+        
+        // IDEMPOTENT CHECK: Don't overwrite existing macroblock
+        // This prevents race conditions and ensures data consistency
+        if let Some(existing) = self.db.get_cf(&microblocks_cf, key.as_bytes())? {
+            if !existing.is_empty() {
+                println!("[Storage] ℹ️ Macroblock #{} already exists - skipping save (idempotent)", height);
+                return Ok(());
+            }
+        }
+        
         let data = bincode::serialize(macroblock)
             .map_err(|e| IntegrationError::SerializationError(e.to_string()))?;
         
@@ -1274,6 +1290,7 @@ impl PersistentStorage {
         batch.put_cf(&metadata_cf, b"latest_macroblock_hash", &hash);
         
         self.db.write(batch)?;
+        println!("[Storage] ✅ Macroblock #{} saved successfully", height);
         Ok(())
     }
     

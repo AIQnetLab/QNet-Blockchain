@@ -131,8 +131,9 @@ static FAST_SYNC_START_TIME: AtomicU64 = AtomicU64::new(0);
 
 // CRITICAL: Global shared storage instance to avoid RocksDB lock conflicts
 // RocksDB does NOT support multiple connections to same database
+// v2.27.0: Made public for epoch-based validator set access from unified_p2p
 lazy_static::lazy_static! {
-    static ref GLOBAL_STORAGE_INSTANCE: std::sync::Mutex<Option<Arc<Storage>>> = std::sync::Mutex::new(None);
+    pub static ref GLOBAL_STORAGE_INSTANCE: std::sync::Mutex<Option<Arc<Storage>>> = std::sync::Mutex::new(None);
 }
 
 // CRITICAL FIX: Track last block production time globally for stall detection
@@ -599,6 +600,235 @@ impl BlockchainNode {
                 evidence_hash,
             }
         }).collect()
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // ELIGIBLE PRODUCERS SNAPSHOT (v2.27.0)
+    // Epoch-based validator set for deterministic producer selection
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /// Create eligible producers snapshot for next epoch (90 blocks)
+    /// This snapshot is stored in macroblock and used for deterministic producer selection
+    /// All nodes will read the SAME snapshot from blockchain - NO gossip race conditions!
+    /// 
+    /// PRODUCTION: Scales to millions of nodes with MAX_VALIDATORS_PER_EPOCH limit
+    async fn create_eligible_producers_snapshot(
+        p2p: &Arc<SimplifiedP2P>,
+        consensus_participants: &[String],
+        own_node_id: &str,
+        own_node_type: NodeType,
+    ) -> Vec<qnet_state::EligibleProducer> {
+        const MIN_REPUTATION: f64 = 0.70;  // 70% minimum for producer eligibility
+        const MAX_VALIDATORS_PER_EPOCH: usize = 1000;  // Scalability limit
+        
+        let mut eligible: Vec<qnet_state::EligibleProducer> = Vec::new();
+        
+        // Get reputation state for accurate scores
+        let current_timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        
+        let reputation_map: std::collections::HashMap<String, f64> = 
+            if let Some(rep_arc) = p2p.get_deterministic_reputation() {
+                if let Ok(rep_state) = rep_arc.read() {
+                    rep_state.get_all_reputations(current_timestamp)
+                } else {
+                    std::collections::HashMap::new()
+                }
+            } else {
+                std::collections::HashMap::new()
+            };
+        
+        // 1. Include all consensus participants with good reputation
+        for node_id in consensus_participants {
+            let reputation = reputation_map.get(node_id).copied().unwrap_or(0.70);
+            
+            if reputation >= MIN_REPUTATION {
+                eligible.push(qnet_state::EligibleProducer {
+                    node_id: node_id.clone(),
+                    reputation,
+                    stake: 0,  // Future PoS
+                });
+            }
+        }
+        
+        // 2. Include active nodes from registry with good reputation
+        let active_nodes = p2p.get_active_full_super_nodes();
+        for (node_id, _node_type, _last_seen) in &active_nodes {
+            // Skip if already added from participants
+            if eligible.iter().any(|e| &e.node_id == node_id) {
+                continue;
+            }
+            
+            let reputation = reputation_map.get(node_id).copied()
+                .unwrap_or(0.70);  // Default 70% for active nodes
+            
+            if reputation >= MIN_REPUTATION {
+                eligible.push(qnet_state::EligibleProducer {
+                    node_id: node_id.clone(),
+                    reputation,
+                    stake: 0,
+                });
+            }
+        }
+        
+        // 3. Ensure own node is included if eligible
+        if matches!(own_node_type, NodeType::Super | NodeType::Full) {
+            let own_reputation = reputation_map.get(own_node_id).copied().unwrap_or(0.70);
+            if own_reputation >= MIN_REPUTATION && !eligible.iter().any(|e| e.node_id == own_node_id) {
+                eligible.push(qnet_state::EligibleProducer {
+                    node_id: own_node_id.to_string(),
+                    reputation: own_reputation,
+                    stake: 0,
+                });
+            }
+        }
+        
+        // 4. Sort by node_id for determinism (all nodes will have SAME order)
+        eligible.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+        
+        // 5. Apply scalability limit with deterministic sampling if needed
+        if eligible.len() > MAX_VALIDATORS_PER_EPOCH {
+            println!("[SNAPSHOT] 📊 Limiting {} validators to {} (scalability)", 
+                     eligible.len(), MAX_VALIDATORS_PER_EPOCH);
+            
+            // Deterministic sampling: take top by reputation, then alphabetical
+            eligible.sort_by(|a, b| {
+                b.reputation.partial_cmp(&a.reputation)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.node_id.cmp(&b.node_id))
+            });
+            eligible.truncate(MAX_VALIDATORS_PER_EPOCH);
+            
+            // Re-sort by node_id for final determinism
+            eligible.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+        }
+        
+        println!("[SNAPSHOT] ✅ Created eligible producers snapshot: {} nodes (rep >= {}%)", 
+                 eligible.len(), (MIN_REPUTATION * 100.0) as u32);
+        
+        eligible
+    }
+    
+    /// Get eligible producers for a specific block height
+    /// This is the SINGLE SOURCE OF TRUTH for producer selection!
+    /// 
+    /// ARCHITECTURE (v2.27.0):
+    /// - Blocks 1-90 (Genesis epoch): Static genesis_constants list
+    /// - Blocks 91+: Snapshot from corresponding macroblock
+    /// 
+    /// All nodes call this function → All nodes get SAME list → Deterministic consensus!
+    pub async fn get_eligible_producers_for_height(
+        storage: &Storage,
+        current_height: u64,
+    ) -> Vec<(String, f64)> {
+        // ═══════════════════════════════════════════════════════════════════
+        // GENESIS EPOCH (blocks 1-90): Use static hardcoded list
+        // ═══════════════════════════════════════════════════════════════════
+        if current_height <= 90 {
+            use crate::genesis_constants::GENESIS_NODE_IPS;
+            
+            let genesis_producers: Vec<(String, f64)> = GENESIS_NODE_IPS.iter()
+                .map(|(_, id)| (format!("genesis_node_{}", id), 0.90))  // 90% reputation
+                .collect();
+            
+            println!("[PRODUCERS] 📜 Genesis epoch (height {}): {} static producers", 
+                     current_height, genesis_producers.len());
+            
+            return genesis_producers;
+        }
+        
+        // ═══════════════════════════════════════════════════════════════════
+        // NORMAL EPOCH (blocks 91+): Use snapshot from macroblock
+        // ═══════════════════════════════════════════════════════════════════
+        
+        // Calculate which macroblock's snapshot to use
+        // Block 91-180 → MacroBlock #1 (created at block 90)
+        // Block 181-270 → MacroBlock #2 (created at block 180)
+        let macroblock_index = (current_height - 1) / 90;
+        
+        // Load macroblock from storage
+        match storage.get_macroblock_by_height(macroblock_index) {
+            Ok(Some(macroblock_data)) => {
+                // Deserialize macroblock from raw bytes
+                match bincode::deserialize::<qnet_state::MacroBlock>(&macroblock_data) {
+                    Ok(macroblock) => {
+                        // Try to deserialize eligible_producers
+                        if let Some(ref snapshot_data) = macroblock.consensus_data.eligible_producers {
+                            match bincode::deserialize::<Vec<qnet_state::EligibleProducer>>(snapshot_data) {
+                                Ok(producers) => {
+                                    let result: Vec<(String, f64)> = producers.iter()
+                                        .map(|p| (p.node_id.clone(), p.reputation))
+                                        .collect();
+                                    
+                                    println!("[PRODUCERS] 📋 Epoch {} (height {}): {} producers from MacroBlock #{}", 
+                                             macroblock_index, current_height, result.len(), macroblock_index);
+                                    
+                                    return result;
+                                }
+                                Err(e) => {
+                                    println!("[PRODUCERS] ⚠️ Failed to deserialize eligible_producers: {}", e);
+                                }
+                            }
+                        }
+                        
+                        // Fallback: use consensus participants from macroblock
+                        println!("[PRODUCERS] ⚠️ No eligible_producers in MacroBlock #{}, using consensus participants", 
+                                 macroblock_index);
+                        
+                        let participants: Vec<(String, f64)> = macroblock.consensus_data.commits.keys()
+                            .map(|id| (id.clone(), 0.70))  // Default 70% reputation
+                            .collect();
+                        
+                        participants
+                    }
+                    Err(e) => {
+                        println!("[PRODUCERS] ⚠️ Failed to deserialize MacroBlock: {}", e);
+                        
+                        // Fallback to Genesis
+                        use crate::genesis_constants::GENESIS_NODE_IPS;
+                        GENESIS_NODE_IPS.iter()
+                            .map(|(_, id)| (format!("genesis_node_{}", id), 0.70))
+                            .collect()
+                    }
+                }
+            }
+            Ok(None) => {
+                println!("[PRODUCERS] ⚠️ MacroBlock #{} not found for height {}", macroblock_index, current_height);
+                
+                // Emergency fallback: try previous macroblock
+                if macroblock_index > 1 {
+                    if let Ok(Some(prev_mb_data)) = storage.get_macroblock_by_height(macroblock_index - 1) {
+                        if let Ok(prev_mb) = bincode::deserialize::<qnet_state::MacroBlock>(&prev_mb_data) {
+                            if let Some(ref snapshot_data) = prev_mb.consensus_data.eligible_producers {
+                                if let Ok(producers) = bincode::deserialize::<Vec<qnet_state::EligibleProducer>>(snapshot_data) {
+                                    println!("[PRODUCERS] 🔄 Using previous MacroBlock #{} snapshot", macroblock_index - 1);
+                                    return producers.iter()
+                                        .map(|p| (p.node_id.clone(), p.reputation))
+                                        .collect();
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                // Ultimate fallback: Genesis list
+                use crate::genesis_constants::GENESIS_NODE_IPS;
+                GENESIS_NODE_IPS.iter()
+                    .map(|(_, id)| (format!("genesis_node_{}", id), 0.70))
+                    .collect()
+            }
+            Err(e) => {
+                println!("[PRODUCERS] ❌ Error loading MacroBlock #{}: {}", macroblock_index, e);
+                
+                // Fallback to Genesis
+                use crate::genesis_constants::GENESIS_NODE_IPS;
+                GENESIS_NODE_IPS.iter()
+                    .map(|(_, id)| (format!("genesis_node_{}", id), 0.70))
+                    .collect()
+            }
+        }
     }
     
     /// Get Quantum VTS reference
@@ -5322,6 +5552,18 @@ impl BlockchainNode {
                             println!("[SYNC] ⚡ Syncing local height {} → {} (all blocks present)", 
                                     microblock_height, global_height);
                             microblock_height = global_height;
+                            
+                            // CRITICAL FIX v2.26.8: Also update last_macroblock_trigger when syncing!
+                            // Without this, trigger stays at 0 after sync, causing:
+                            // - PFP to search for macroblock #0 (doesn't exist)
+                            // - Infinite loop of creating macroblock #1
+                            // - Producer gets stuck in PFP instead of producing blocks
+                            let new_trigger = (global_height / 90) * 90;
+                            if new_trigger > last_macroblock_trigger {
+                                println!("[SYNC] 🔄 Updating macroblock trigger {} → {} (synced)", 
+                                        last_macroblock_trigger, new_trigger);
+                                last_macroblock_trigger = new_trigger;
+                            }
                         }
                     }
                 }
@@ -7942,9 +8184,10 @@ impl BlockchainNode {
                         tokio::time::sleep(Duration::from_secs(5)).await;
                         
                         // Check if macroblock was created
-                        // Macroblock is saved with key "macroblock_{height}" where height is macroblock number
-                        // For example, first macroblock (at block 90) is saved as "macroblock_1"
-                        let macroblock_exists = storage_check.load_microblock(expected_macroblock * 90 + 1)
+                        // CRITICAL FIX v2.26.8: Use get_macroblock_by_height, NOT load_microblock!
+                        // Macroblocks are stored with key "macroblock_{index}" where index = 1, 2, 3...
+                        // load_microblock loads microblocks, not macroblocks!
+                        let macroblock_exists = storage_check.get_macroblock_by_height(expected_macroblock)
                             .map(|mb| mb.is_some())
                             .unwrap_or(false);
                         
@@ -7989,7 +8232,19 @@ impl BlockchainNode {
                     // Don't trigger at macroblock boundaries (90, 180, 270...)
                     if blocks_since_trigger >= 30 && blocks_since_trigger % 30 == 0 && (microblock_height % 90) != 0 {
                         // Check if macroblock still missing
-                        let expected_macroblock = last_macroblock_trigger / 90;
+                        // CRITICAL FIX v2.26.8: Use consistent formula for expected_macroblock
+                        // Primary: use trigger-based calculation (always correct after fix #1)
+                        // Fallback: if trigger is 0, find the latest macroblock period we should have
+                        let expected_macroblock = if last_macroblock_trigger > 0 {
+                            // Normal case: trigger is properly updated
+                            last_macroblock_trigger / 90
+                        } else {
+                            // Fallback: trigger=0 means we synced but never hit a 90-block boundary
+                            // Search for the macroblock of the PREVIOUS period
+                            // height 91-179 → search #1, height 180-269 → search #2, etc.
+                            let period = microblock_height / 90;
+                            if period > 0 { period } else { 1 }
+                        };
                         // CRITICAL FIX: Check for the actual MACROBLOCK, not a microblock!
                         let macroblock_exists = storage.get_macroblock_by_height(expected_macroblock)
                             .map(|mb| mb.is_some())
@@ -9084,48 +9339,125 @@ impl BlockchainNode {
     }
     
     /// PRODUCTION: Calculate qualified candidates with validator sampling for scalability
-    /// ARCHITECTURE: Uses BlockchainRegistry ALWAYS for true decentralization from block #1
+    /// 
+    /// ARCHITECTURE v2.27.0: EPOCH-BASED VALIDATOR SET
+    /// ═══════════════════════════════════════════════════════════════════════════
+    /// 
+    /// OLD PROBLEM: Using gossip registry caused DIFFERENT candidate lists:
+    ///   - Node A gossip sees [1,2,3...100] → selects producer X
+    ///   - Node B gossip sees [50,51...150] → selects producer Y
+    ///   - RESULT: Network fork!
+    ///
+    /// NEW SOLUTION: Use MACROBLOCK SNAPSHOT (epoch-based)
+    ///   - Blocks 1-90: Static genesis_constants list (hardcoded)
+    ///   - Blocks 91+: Snapshot from corresponding macroblock
+    ///   - All nodes read SAME snapshot from blockchain
+    ///   - NO gossip race conditions!
+    ///   - Scales to millions of nodes!
+    /// ═══════════════════════════════════════════════════════════════════════════
     async fn calculate_qualified_candidates(
         p2p: &Arc<SimplifiedP2P>,
         own_node_id: &str,
         own_node_type: NodeType,
     ) -> Vec<(String, f64)> {
+        // Get current height for epoch determination
+        let current_height = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+        
+        // ═══════════════════════════════════════════════════════════════════
+        // GENESIS EPOCH (blocks 1-90): Use static hardcoded list
+        // ═══════════════════════════════════════════════════════════════════
+        if current_height <= 90 {
+            use crate::genesis_constants::GENESIS_NODE_IPS;
+            
+            let mut all_qualified: Vec<(String, f64)> = GENESIS_NODE_IPS.iter()
+                .map(|(_, id)| (format!("genesis_node_{}", id), 0.90))  // 90% reputation
+                .collect();
+            
+            // Ensure own node is included if Genesis
+            if own_node_id.starts_with("genesis_node_") && 
+               !all_qualified.iter().any(|(id, _)| id == own_node_id) {
+                all_qualified.push((own_node_id.to_string(), 0.90));
+            }
+            
+            // Sort for determinism
+            all_qualified.sort_by(|a, b| a.0.cmp(&b.0));
+            all_qualified.dedup_by(|a, b| a.0 == b.0);
+            
+            println!("[CANDIDATES] 📜 Genesis epoch (height {}): {} static producers", 
+                     current_height, all_qualified.len());
+            
+            return all_qualified;
+        }
+        
+        // ═══════════════════════════════════════════════════════════════════
+        // NORMAL EPOCH (blocks 91+): Try to use macroblock snapshot
+        // ═══════════════════════════════════════════════════════════════════
+        let macroblock_index = (current_height - 1) / 90;
+        
+        // Try to get snapshot from global storage
+        // CRITICAL: Use GLOBAL_STORAGE_INSTANCE to avoid RocksDB lock conflicts
+        let storage_opt = match GLOBAL_STORAGE_INSTANCE.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        
+        if let Some(storage) = storage_opt {
+            match storage.get_macroblock_by_height(macroblock_index) {
+                Ok(Some(macroblock_data)) => {
+                    // Deserialize macroblock from raw bytes
+                    match bincode::deserialize::<qnet_state::MacroBlock>(&macroblock_data) {
+                        Ok(macroblock) => {
+                            if let Some(ref snapshot_data) = macroblock.consensus_data.eligible_producers {
+                                match bincode::deserialize::<Vec<qnet_state::EligibleProducer>>(snapshot_data) {
+                                    Ok(producers) => {
+                                        let mut all_qualified: Vec<(String, f64)> = producers.iter()
+                                            .map(|p| (p.node_id.clone(), p.reputation))
+                                            .collect();
+                                        
+                                        // Sort for determinism
+                                        all_qualified.sort_by(|a, b| a.0.cmp(&b.0));
+                                        
+                                        println!("[CANDIDATES] 📋 Epoch {} (height {}): {} producers from MacroBlock #{}", 
+                                                 macroblock_index, current_height, all_qualified.len(), macroblock_index);
+                                        
+                                        return all_qualified;
+                                    }
+                                    Err(e) => {
+                                        println!("[CANDIDATES] ⚠️ Failed to deserialize snapshot: {}", e);
+                                    }
+                                }
+                            }
+                            
+                            // Fallback: use consensus participants from macroblock
+                            let mut all_qualified: Vec<(String, f64)> = macroblock.consensus_data.commits.keys()
+                                .map(|id| (id.clone(), 0.70))
+                                .collect();
+                            all_qualified.sort_by(|a, b| a.0.cmp(&b.0));
+                            
+                            println!("[CANDIDATES] ⚠️ Using consensus participants from MacroBlock #{}", macroblock_index);
+                            return all_qualified;
+                        }
+                        Err(e) => {
+                            println!("[CANDIDATES] ⚠️ Failed to deserialize MacroBlock: {}", e);
+                        }
+                    }
+                }
+                _ => {
+                    println!("[CANDIDATES] ⚠️ MacroBlock #{} not available, using gossip fallback", macroblock_index);
+                }
+            }
+        }
+        
+        // ═══════════════════════════════════════════════════════════════════
+        // FALLBACK: Use gossip registry (only if macroblock not available)
+        // This should be rare in normal operation
+        // ═══════════════════════════════════════════════════════════════════
+        println!("[CANDIDATES] ⚠️ FALLBACK: Using gossip registry (macroblock not available)");
+        
         let mut all_qualified: Vec<(String, f64)> = Vec::new();
-        
-        println!("[CANDIDATES] 📊 Calculating qualified candidates (UNIFIED decentralized system)");
-        
-        // ═══════════════════════════════════════════════════════════════════════════
-        // CRITICAL: Use GLOBAL REGISTRY as ONLY source - NO FALLBACKS!
-        // ═══════════════════════════════════════════════════════════════════════════
-        // 
-        // PROBLEM: Using connected_peers causes DIFFERENT candidate lists on different nodes:
-        //   - Node A connected to [1,2,3...100] → selects producer X
-        //   - Node B connected to [50,51...150] → selects producer Y
-        //   - RESULT: Network fork!
-        //
-        // SOLUTION: Use ONLY active_full_super_nodes (gossip-synced global registry)
-        //   - All nodes receive ActiveNodeAnnouncement via gossip
-        //   - All nodes build SAME global registry
-        //   - All nodes select SAME producer
-        //   - NO FALLBACK to connected_peers - wait until registry is populated!
-        //
-        // ARCHITECTURE: 
-        //   - ALWAYS use active_full_super_nodes (gossip-synced, deterministic)
-        //   - If empty: return empty list → producer selection waits
-        // ═══════════════════════════════════════════════════════════════════════════
-        
-        // STEP 1: Get candidates from GLOBAL REGISTRY (gossip-synced)
-        // CRITICAL: ALWAYS use global registry - NO fallback to connected_peers!
-        // This ensures ALL nodes use the SAME candidate list for deterministic producer selection
         let global_active_nodes = p2p.get_active_full_super_nodes();
-        println!("[CANDIDATES] 🌍 Global registry: {} active Full/Super nodes", global_active_nodes.len());
         
-        // ALWAYS use global registry - deterministic source for ALL nodes
-        println!("[CANDIDATES] ✅ Using GLOBAL REGISTRY (gossip-synced, deterministic)");
-        
-        // Get full node info with reputation from global registry
         for (node_id, node_type, _last_seen) in &global_active_nodes {
-            // Only Super and Full nodes participate
             if node_type != "super" && node_type != "full" {
                 continue;
             }
@@ -9134,61 +9466,29 @@ impl BlockchainNode {
             
             if reputation >= 0.70 {
                 all_qualified.push((node_id.clone(), reputation));
-                println!("[CANDIDATES]   ├── {} ({}, {:.1}%) [GLOBAL]", node_id, node_type, reputation * 100.0);
-            } else {
-                println!("[CANDIDATES]   ├── {} ({}, {:.1}%) - EXCLUDED (below 70%)", 
-                         node_id, node_type, reputation * 100.0);
             }
         }
         
         // Add own node if eligible
-        let can_participate = match own_node_type {
-            NodeType::Super | NodeType::Full => {
-                let own_reputation = Self::get_node_reputation_score(own_node_id, p2p).await;
-                if own_reputation >= 0.70 {
-                    println!("[CANDIDATES]   ├── Own node: {} ({:?}, {:.1}%) - ELIGIBLE", 
-                             own_node_id, own_node_type, own_reputation * 100.0);
-                    true
-                } else {
-                    println!("[CANDIDATES]   ├── Own node: {} ({:?}, {:.1}%) - EXCLUDED (below threshold)", 
-                             own_node_id, own_node_type, own_reputation * 100.0);
-                    false
-                }
-            },
-            NodeType::Light => {
-                println!("[CANDIDATES]   ├── Own node: {} (Light) - EXCLUDED (Light nodes don't participate)", own_node_id);
-                false
-            }
-        };
-        
-        if can_participate && !all_qualified.iter().any(|(id, _)| id == own_node_id) {
+        if matches!(own_node_type, NodeType::Super | NodeType::Full) {
             let own_reputation = Self::get_node_reputation_score(own_node_id, p2p).await;
-            all_qualified.push((own_node_id.to_string(), own_reputation));
+            if own_reputation >= 0.70 && !all_qualified.iter().any(|(id, _)| id == own_node_id) {
+                all_qualified.push((own_node_id.to_string(), own_reputation));
+            }
         }
         
-        // Remove duplicates and SORT for determinism
-        // CRITICAL: Sorting ensures ALL nodes have IDENTICAL candidate order
+        // Sort for determinism
         all_qualified.sort_by(|a, b| a.0.cmp(&b.0));
         all_qualified.dedup_by(|a, b| a.0 == b.0);
         
-        println!("[CANDIDATES] 📊 Total qualified: {} nodes (reputation >= 70%, sorted)", all_qualified.len());
+        println!("[CANDIDATES] 📊 Fallback: {} qualified nodes from gossip", all_qualified.len());
         
-        // CRITICAL: If NO candidates found, this is a P2P/gossip issue
-        if all_qualified.is_empty() {
-            println!("[CANDIDATES] ❌ FATAL: No qualified candidates found!");
-            println!("[CANDIDATES] 📋 This indicates gossip propagation failure");
-            println!("[CANDIDATES] 🔧 Check ActiveNodeAnnouncement gossip is working");
-            println!("[CANDIDATES] 💡 Nodes must register via register_as_active_node()");
-        }
-        
-        // Apply validator sampling for scalability (works for 5 nodes AND millions)
+        // Apply validator sampling for scalability
         const MAX_VALIDATORS_PER_ROUND: usize = 1000;
         
         if all_qualified.len() <= MAX_VALIDATORS_PER_ROUND {
             all_qualified
         } else {
-            println!("[CANDIDATES] 📊 Sampling {} validators from {} (scalability)", 
-                     MAX_VALIDATORS_PER_ROUND, all_qualified.len());
             Self::deterministic_validator_sampling(&all_qualified, MAX_VALIDATORS_PER_ROUND).await
         }
     }
@@ -9697,7 +9997,26 @@ impl BlockchainNode {
         tokio::spawn(async move {
             println!("[CONSENSUS-LISTENER] 🎧 Starting EVENT-BASED macroblock consensus listener for node: {}", node_id);
             
-            let mut last_consensus_round = 0u64;
+            // CRITICAL FIX v2.26.8: Initialize last_consensus_round from storage!
+            // Without this, restarted nodes try to create macroblocks that already exist
+            let mut last_consensus_round = {
+                // Find the highest existing macroblock using chain height
+                let chain_height = storage.get_chain_height().unwrap_or(0);
+                let max_possible_macroblock = chain_height / 90 + 1;  // +1 for safety margin
+                
+                let mut highest = 0u64;
+                for i in 1..=max_possible_macroblock.max(100) {  // At least check 100, or up to current
+                    if storage.get_macroblock_by_height(i).ok().flatten().is_some() {
+                        highest = i;
+                    } else {
+                        break;  // Macroblocks are sequential, no need to check further
+                    }
+                }
+                if highest > 0 {
+                    println!("[CONSENSUS-LISTENER] 📊 Initialized from storage: last macroblock #{} (chain height: {})", highest, chain_height);
+                }
+                highest
+            };
             
             loop {
                 // EVENT-BASED OPTIMIZATION: Wait for block events instead of polling
@@ -9723,17 +10042,22 @@ impl BlockchainNode {
                         break;
                     }
                 };
-                let current_round = current_height / 90;
-                
                 // Check if we're in consensus window (blocks 61-90 of each round)
+                // CRITICAL FIX v2.26.9: Include block 90 (180, 270...) in window
+                // blocks_in_round = 90 % 90 = 0, but block 90 IS part of macroblock #1
                 let blocks_in_round = current_height % 90;
-                if blocks_in_round >= 61 && blocks_in_round <= 90 {
+                let is_macroblock_boundary = blocks_in_round == 0 && current_height > 0;
+                let is_in_consensus_window = blocks_in_round >= 61 || is_macroblock_boundary;
+                
+                if is_in_consensus_window {
                     // Calculate which macroblock we're creating consensus for
                     // For heights 61-90: create macroblock #1 (blocks 1-90)
                     // For heights 151-180: create macroblock #2 (blocks 91-180)
                     // CRITICAL FIX: Use ((h-1)/90)+1 to handle boundary correctly
-                    // Heights 61-90: ((89-1)/90)+1 = 0+1 = 1 ✅
-                    // Heights 151-180: ((179-1)/90)+1 = 1+1 = 2 ✅
+                    // Height 61: ((61-1)/90)+1 = 0+1 = 1 ✅
+                    // Height 90: ((90-1)/90)+1 = 0+1 = 1 ✅
+                    // Height 151: ((151-1)/90)+1 = 1+1 = 2 ✅
+                    // Height 180: ((180-1)/90)+1 = 1+1 = 2 ✅
                     let macroblock_index = ((current_height - 1) / 90) + 1;
                     
                     // Check if this is a new consensus round
@@ -9966,14 +10290,22 @@ impl BlockchainNode {
             return Ok(());
         }
         
-        println!("[PFP] 🔨 Creating {} macroblock with {} participants", 
-                 finalization_type, participants.len());
+        // Calculate macroblock index FIRST for existence check
+        let macroblock_index = height / 90;  // Must match trigger_macroblock_consensus formula!
+        
+        // CRITICAL FIX v2.26.8: Check if macroblock already exists before creating!
+        // This prevents infinite loop of creating the same macroblock
+        if let Ok(Some(_)) = storage.get_macroblock_by_height(macroblock_index) {
+            println!("[PFP] ✅ Macroblock #{} already exists - skipping creation", macroblock_index);
+            return Ok(());
+        }
+        
+        println!("[PFP] 🔨 Creating {} macroblock #{} with {} participants", 
+                 finalization_type, macroblock_index, participants.len());
         
         // Calculate state root from microblocks
         // CRITICAL FIX: Correct calculation for macroblock boundaries
         // For height 90: blocks 1-90, for height 180: blocks 91-180
-        // CRITICAL FIX: Use same formula as normal consensus (height / 90) not (height - 1) / 90!
-        let macroblock_index = height / 90;  // Must match trigger_macroblock_consensus formula!
         // CRITICAL FIX: Adjust boundaries for new index formula
         // For index 1 (blocks 1-90): start=1, end=90
         // For index 2 (blocks 91-180): start=91, end=180
@@ -10013,6 +10345,18 @@ impl BlockchainNode {
             automatic_jails_data: None,
             // v2.24: No reputation snapshot in emergency mode (preserve current state)
             reputation_snapshot: None,
+            // v2.27.0: Emergency macroblocks use participants as eligible producers
+            // This ensures continuity even during recovery
+            eligible_producers: {
+                let producers: Vec<qnet_state::EligibleProducer> = participants.iter()
+                    .map(|id| qnet_state::EligibleProducer {
+                        node_id: id.clone(),
+                        reputation: 0.70,  // Default during emergency
+                        stake: 0,
+                    })
+                    .collect();
+                bincode::serialize(&producers).ok()
+            },
         };
         
         // Count microblocks before moving
@@ -11675,6 +12019,15 @@ impl BlockchainNode {
         node_type: NodeType,
         consensus_rx: &Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<ConsensusMessage>>>>, // CRITICAL: REAL channel
     ) -> Result<(), String> {
+        let macroblock_index = end_height / 90;
+        
+        // CRITICAL FIX v2.26.8: Check if macroblock already exists before starting consensus!
+        // This prevents race conditions and duplicate consensus attempts
+        if let Ok(Some(_)) = storage.get_macroblock_by_height(macroblock_index) {
+            println!("[MACROBLOCK] ✅ Macroblock #{} already exists - skipping consensus", macroblock_index);
+            return Ok(());
+        }
+        
         // ENHANCED MACROBLOCK CONSENSUS DASHBOARD
         println!("[MACROBLOCK] 🏛️ BYZANTINE CONSENSUS INITIATED:");
         println!("  ├── Consensus Type: Commit-Reveal Byzantine Fault Tolerance");
@@ -11892,6 +12245,29 @@ impl BlockchainNode {
             }
         }
         
+        // CRITICAL FIX v2.26.9: Wait for all blocks before hashing
+        // Consensus starts at block 61, but blocks 62-90 are created in parallel by main loop
+        // We must wait for all blocks to exist before creating macroblock
+        // This is the correct approach: start consensus early, wait for blocks before finalization
+        println!("[MACROBLOCK] ⏳ Waiting for all blocks {}-{} to be ready...", start_height, end_height);
+        let wait_start = std::time::Instant::now();
+        for height in start_height..=end_height {
+            let mut wait_attempts = 0;
+            while storage.load_microblock(height).ok().flatten().is_none() {
+                if wait_attempts == 0 {
+                    println!("[MACROBLOCK] ⏳ Block #{} not yet created, waiting...", height);
+                }
+                wait_attempts += 1;
+                if wait_attempts > 30 {
+                    // Timeout after 30 seconds - block production may have stalled
+                    println!("[MACROBLOCK] ⚠️ Block #{} not created after 30s timeout - aborting", height);
+                    return Err(format!("Block {} not created within timeout", height));
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        }
+        println!("[MACROBLOCK] ✅ All blocks {}-{} ready in {:?}", start_height, end_height, wait_start.elapsed());
+        
         // Production: Collect actual microblock hashes from storage
         let mut microblock_hashes = Vec::new();
         let mut state_accumulator = [0u8; 32];
@@ -11914,7 +12290,8 @@ impl BlockchainNode {
                     }
                 },
                 _ => {
-                    println!("[Macroblock] ⚠️  Missing microblock at height {}", height);
+                    // Should not happen after waiting, but handle gracefully
+                    println!("[MACROBLOCK] ❌ Missing microblock at height {} (unexpected after wait)", height);
                     return Err(format!("Missing microblock at height {}", height));
                 }
             }
@@ -12060,6 +12437,36 @@ impl BlockchainNode {
                         }
                     } else {
                         None
+                    }
+                },
+                // ═══════════════════════════════════════════════════════════════════
+                // v2.27.0: ELIGIBLE PRODUCERS SNAPSHOT - Epoch-based validator set
+                // Solana/Ethereum style: determines producers for NEXT 90 blocks
+                // All nodes use SAME snapshot for deterministic producer selection
+                // Eliminates gossip race conditions that cause forks!
+                // ═══════════════════════════════════════════════════════════════════
+                eligible_producers: {
+                    let snapshot = Self::create_eligible_producers_snapshot(
+                        p2p,
+                        &consensus_data.participants,
+                        node_id,
+                        node_type.clone(),
+                    ).await;
+                    
+                    if !snapshot.is_empty() {
+                        println!("[MACROBLOCK] 📋 Eligible producers snapshot: {} nodes for next epoch", snapshot.len());
+                        bincode::serialize(&snapshot).ok()
+                    } else {
+                        println!("[MACROBLOCK] ⚠️ Empty eligible producers snapshot - using participants");
+                        // Fallback: use consensus participants
+                        let fallback: Vec<qnet_state::EligibleProducer> = consensus_data.participants.iter()
+                            .map(|id| qnet_state::EligibleProducer {
+                                node_id: id.clone(),
+                                reputation: 0.70,  // Default
+                                stake: 0,
+                            })
+                            .collect();
+                        bincode::serialize(&fallback).ok()
                     }
                 },
             },
