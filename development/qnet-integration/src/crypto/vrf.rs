@@ -153,7 +153,9 @@ impl QNetVrf {
     }
 }
 
-/// Use VRF for producer selection
+/// DEPRECATED: Use deterministic SHA3-512 selection in node.rs instead!
+/// This function causes FORKS - each node has different keys = different outputs.
+#[allow(dead_code)]
 pub async fn select_producer_with_vrf(
     round: u64,
     candidates: &[(String, f64)],

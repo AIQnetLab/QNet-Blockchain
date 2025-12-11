@@ -5,7 +5,7 @@
 QNET uses a **deterministic blockchain-based reputation system** that eliminates P2P gossip vulnerabilities.
 All nodes compute identical reputation scores from on-chain data.
 
-**NEW in v2.27:** Epoch-based validator sets eliminate gossip race conditions in producer selection!
+**NEW in v2.27:** Epoch-based validator sets + QRDS (Quantum-Resistant Deterministic Selection) eliminate gossip race conditions!
 
 **NEW in v2.24:** Ethereum 2.0 style reputation snapshots ensure 100% synchronization across all nodes!
 

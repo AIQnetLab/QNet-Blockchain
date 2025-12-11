@@ -5,6 +5,64 @@ All notable changes to the QNet project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.0.0] - December 11, 2025 "Quantum Randomness Beacon"
+
+### 🎲 NEW - Quantum Randomness Beacon (QRB)
+
+**Native on-chain verifiable randomness for smart contracts!**
+
+Introduces RANDAO-style accumulated randomness with quantum-resistant VRF, providing "true unpredictability" for:
+- 🎰 On-chain gambling and lotteries
+- 🎨 Fair NFT mints and drops
+- 🎲 Gaming applications
+- ⚖️ Fair auctions and leader election
+
+### ✅ New Features
+
+| Feature | Description | Files |
+|---------|-------------|-------|
+| **VRF in Microblocks** | Each producer generates Hybrid VRF output | block.rs, node.rs |
+| **RANDAO Accumulator** | XOR all VRF outputs in MacroBlock | node.rs |
+| **RPC API** | `qrb_getRandomness`, `qrb_getLatestRandomness`, `qrb_getRandomnessWithSeed` | rpc.rs |
+| **Quantum Safety** | Dilithium3 VRF signatures (NIST FIPS 204) | vrf_hybrid.rs |
+
+### 🔐 Security Properties
+
+| Property | Value |
+|----------|-------|
+| Unpredictability | ✅ Nobody knows beacon until MacroBlock finalization |
+| Quantum Resistance | ✅ Dilithium3 + SHA3-512 |
+| Manipulation Resistance | ✅ Requires >50% producers to manipulate |
+| Verification | ✅ Any node can verify VRF proofs |
+
+### 📊 Comparison with Other L1s
+
+| Feature | Ethereum 2.0 | Solana | Chainlink VRF | QNet QRB |
+|---------|--------------|--------|---------------|----------|
+| Native | ✅ Yes | ❌ No | ❌ No (oracle) | ✅ Yes |
+| Quantum Safe | ❌ No | ❌ No | ❌ No | ✅ **Dilithium3** |
+| Cost | Gas fees | Minimal | High (oracle) | **Free** |
+
+### 🔧 API Example
+
+```bash
+# Get randomness for epoch 42
+curl -X POST http://localhost:8001/rpc -d '{
+  "method": "qrb_getRandomness",
+  "params": { "epoch": 42 }
+}'
+
+# Response:
+{
+  "randomness": "0x7a3f9c...",
+  "epoch": 42,
+  "vrf_contributions": 90,
+  "quantum_safe": true
+}
+```
+
+---
+
 ## [2.27.1] - December 11, 2025 "Zero Fork Guarantee"
 
 ### 🔐 CRITICAL - Fork Prevention Fixes
@@ -61,7 +119,7 @@ After v2.27.1:
 ### 🔐 CRITICAL - Deterministic Producer Selection
 
 **Problem Fixed:**
-Gossip-based producer selection caused network forks when different nodes had different active peer lists at the moment of VRF selection.
+Gossip-based producer selection caused network forks when different nodes had different active peer lists at the moment of deterministic selection.
 
 **Solution:** Epoch-based validator set stored in MacroBlock snapshots (Solana/Ethereum 2.0 style)
 
@@ -1238,7 +1296,7 @@ keys/
 ## [2.18.0] - October 31, 2025 "VTS Optimization & VRF Implementation"
 
 ### Added
-- **VRF Producer Selection**: Ed25519-based Verifiable Random Function
+- **Deterministic Producer Selection**: SHA3-512 based quantum-resistant selection
   - Unpredictable, verifiable, Byzantine-safe leader election
   - No OpenSSL dependencies (pure Rust with `ed25519-dalek`)
   - Evaluation: <1ms per candidate, Verification: <500μs per proof
@@ -1284,7 +1342,7 @@ keys/
 - All mentions of "Blake3 alternating" updated to "SHA3-512 only"
 
 ### Security
-- VRF prevents producer selection manipulation
+- Deterministic selection prevents producer manipulation via FINALITY_WINDOW
 - True VDF ensures time cannot be faked
 - Byzantine-safe entropy from macroblock consensus
 - No single node can predict or bias selection

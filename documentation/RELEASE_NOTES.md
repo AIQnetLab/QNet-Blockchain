@@ -17,7 +17,7 @@
 | Bug | Impact | Fix |
 |-----|--------|-----|
 | Skip self +1 | Each node saw different peer list | `ends_with(id)` |
-| Entropy fallback | Different VRF seed if macroblock not synced | Microblock only |
+| Entropy fallback | Different entropy seed if macroblock not synced | Microblock only |
 | Producer list fallback | Different producers from gossip registry | No fallback |
 
 ### Key Change: No Fallback Policy

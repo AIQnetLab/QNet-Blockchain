@@ -1,6 +1,12 @@
 //! QNet Hybrid VRF Implementation
 //! Quantum-resistant Verifiable Random Function using hybrid cryptography
 //! Combines CRYSTALS-Dilithium certificates with Ed25519 for performance
+//!
+//! IMPORTANT: This module is used for:
+//! - QRB (Quantum Randomness Beacon): VRF outputs in microblocks → RANDAO accumulation
+//! - Block signing proofs: Cryptographic proof that producer created the block
+//!
+//! NOT USED FOR: Producer selection (uses deterministic SHA3-512 in node.rs)
 
 use crate::hybrid_crypto::{HybridCrypto, HybridSignature};
 use sha3::{Sha3_512, Digest};  // Use SHA3 for quantum resistance, not SHA512
@@ -118,7 +124,13 @@ impl QNetHybridVrf {
     }
 }
 
-/// Use hybrid VRF for quantum-resistant producer selection
+/// DEPRECATED: Use deterministic SHA3-512 selection in node.rs instead!
+/// This function is NOT used in production - it causes FORKS because each node
+/// has different VRF keys and produces different outputs.
+/// 
+/// Production uses: node.rs::select_microblock_producer() with SHA3-512 hash
+/// This function is kept for reference/testing only.
+#[allow(dead_code)]
 pub async fn select_producer_with_hybrid_vrf(
     round: u64,
     candidates: &[(String, f64)],

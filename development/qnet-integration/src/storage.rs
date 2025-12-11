@@ -2286,7 +2286,7 @@ impl Storage {
                      height, total_original_size, total_compressed_size, tx_savings);
         }
         
-        // Step 2: Create EfficientMicroBlock with hashes only (includes PoH data)
+        // Step 2: Create EfficientMicroBlock with hashes only (includes PoH data + VRF)
         let efficient_block = qnet_state::EfficientMicroBlock {
             height: microblock.height,
             timestamp: microblock.timestamp,
@@ -2297,6 +2297,9 @@ impl Storage {
             merkle_root: microblock.merkle_root,
             poh_hash: microblock.poh_hash.clone(),
             poh_count: microblock.poh_count,
+            // Quantum Randomness Beacon (QRB) v3.0
+            vrf_output: microblock.vrf_output,
+            vrf_proof: microblock.vrf_proof.clone(),
         };
         
         // Step 3: Save PoH state separately for fast validation (v2.19.13)
@@ -2755,7 +2758,7 @@ impl Storage {
                         }
                     }
                     
-                    // Create full MicroBlock
+                    // Create full MicroBlock (including QRB VRF data)
                     let full_block = qnet_state::MicroBlock {
                         height: efficient_block.height,
                         timestamp: efficient_block.timestamp,
@@ -2766,6 +2769,9 @@ impl Storage {
                         merkle_root: efficient_block.merkle_root,
                         poh_hash: efficient_block.poh_hash,
                         poh_count: efficient_block.poh_count,
+                        // QRB v3.0: VRF fields
+                        vrf_output: efficient_block.vrf_output,
+                        vrf_proof: efficient_block.vrf_proof,
                     };
                     
                     // Serialize as full MicroBlock for network transmission
@@ -2923,7 +2929,7 @@ impl Storage {
                 }
             }
             
-            // Reconstruct full MicroBlock
+            // Reconstruct full MicroBlock (including QRB VRF data)
             let microblock = qnet_state::MicroBlock {
                 height: efficient_block.height,
                 timestamp: efficient_block.timestamp,
@@ -2934,6 +2940,9 @@ impl Storage {
                 merkle_root: efficient_block.merkle_root,
                 poh_hash: efficient_block.poh_hash,
                 poh_count: efficient_block.poh_count,
+                // Quantum Randomness Beacon (QRB) v3.0
+                vrf_output: efficient_block.vrf_output,
+                vrf_proof: efficient_block.vrf_proof,
             };
             
             return Ok(Some(microblock));

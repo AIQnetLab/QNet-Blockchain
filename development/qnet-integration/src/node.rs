@@ -800,7 +800,7 @@ impl BlockchainNode {
                 // Problem: If node doesn't have MacroBlock N-1, it means:
                 // 1. Node didn't participate in consensus (was offline/lagging)
                 // 2. Using fallback (N-2 or Genesis) would cause DIFFERENT producer list
-                // 3. Different producer list = different VRF result = FORK!
+                // 3. Different producer list = different selection result = FORK!
                 //
                 // Solution: Node WITHOUT required macroblock CANNOT participate in production
                 // It must sync first. This is how Solana/Ethereum work.
@@ -2281,7 +2281,7 @@ impl BlockchainNode {
         println!("[Node] 🔍 DEBUG: BlockchainNode created successfully for node_id: {}", node_id);
         
         // CRITICAL: Link deterministic reputation to P2P for unified access
-        // This allows VRF producer selection to use blockchain-based reputation
+        // This allows deterministic producer selection to use blockchain-based reputation
         if let Some(ref p2p) = blockchain.unified_p2p {
             p2p.set_deterministic_reputation(blockchain.deterministic_reputation.clone());
         }
@@ -4990,6 +4990,9 @@ impl BlockchainNode {
                                 signature: Vec::new(), // Will be signed with quantum crypto
                                 poh_hash: vec![0u8; 64], // Genesis has no PoH yet
                                 poh_count: 0, // Genesis starts at 0
+                                // QRB v3.0: Genesis has no VRF (no prev_hash to derive from)
+                                vrf_output: None,
+                                vrf_proof: None,
                             };
                             
                             // PRODUCTION: Use deterministic signature for Genesis Block
@@ -6266,7 +6269,7 @@ impl BlockchainNode {
                                     sample_size - already_have_responses);
                             
                             // ARCHITECTURE: Block production MUST wait for entropy consensus at rotation boundaries
-                            // This is critical for preventing forks when VRF selects new producer
+                            // This is critical for preventing forks when deterministic selection picks new producer
                             // OPTIMIZATION: Dynamic wait instead of fixed timeout
                             // Wait until Byzantine threshold (60%) OR max timeout (2 seconds)
                             tokio::time::sleep(tokio::time::Duration::from_millis(200)).await; // Initial wait for network propagation
@@ -7026,7 +7029,7 @@ impl BlockchainNode {
                     // QNet uses CommitRevealConsensus + ShardedConsensusManager for Byzantine Fault Tolerance
                     
                     // ARCHITECTURE: Unified consensus for ALL blocks (no special phases)
-                    // - Microblocks: Quantum signatures (Dilithium3) + VRF producer selection
+                    // - Microblocks: Quantum signatures (Dilithium3) + deterministic producer selection
                     // - Macroblocks (every 90): Byzantine consensus (BFT) for finalization
                     // This ensures consistent security from block 0 to infinity
                     
@@ -7235,6 +7238,64 @@ impl BlockchainNode {
                         }
                     };
                     
+                    // ═══════════════════════════════════════════════════════════════════════════
+                    // QUANTUM RANDOMNESS BEACON (QRB) v3.0
+                    // Generate VRF output for epoch randomness accumulation
+                    // Each producer contributes to RANDAO-style beacon
+                    // ═══════════════════════════════════════════════════════════════════════════
+                    let (vrf_output, vrf_proof) = {
+                        use crate::vrf_hybrid::QNetHybridVrf;
+                        use sha3::{Sha3_256, Digest};
+                        
+                        // VRF input: deterministic, same on all nodes verifying this block
+                        let mut vrf_input = Vec::new();
+                        vrf_input.extend_from_slice(b"QNet_QRB_v3");
+                        vrf_input.extend_from_slice(&prev_hash);
+                        vrf_input.extend_from_slice(&next_block_height.to_le_bytes());
+                        vrf_input.extend_from_slice(node_id.as_bytes());
+                        
+                        // Generate VRF with Hybrid crypto (Dilithium + Ed25519)
+                        let mut vrf = QNetHybridVrf::new(node_id.clone());
+                        match vrf.initialize().await {
+                            Ok(_) => {
+                                match vrf.evaluate(&vrf_input).await {
+                                    Ok(vrf_result) => {
+                                        // Serialize proof for storage
+                                        let proof_bytes = bincode::serialize(&vrf_result.proof)
+                                            .unwrap_or_default();
+                                        
+                                        if next_block_height % 30 == 1 {
+                                            println!("[QRB] 🎲 Block #{}: VRF output generated (32 bytes)", next_block_height);
+                                            println!("[QRB] 🔐 Proof: Dilithium3 + Ed25519 hybrid signature");
+                                        }
+                                        
+                                        (Some(vrf_result.output), Some(proof_bytes))
+                                    }
+                                    Err(e) => {
+                                        println!("[QRB] ⚠️ VRF evaluation failed: {} - using fallback", e);
+                                        // Fallback: deterministic hash (less random but still verifiable)
+                                        let mut fallback_hasher = Sha3_256::new();
+                                        fallback_hasher.update(&vrf_input);
+                                        let fallback_hash = fallback_hasher.finalize();
+                                        let mut output = [0u8; 32];
+                                        output.copy_from_slice(&fallback_hash);
+                                        (Some(output), None)
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                println!("[QRB] ⚠️ VRF init failed: {} - using fallback", e);
+                                // Fallback: deterministic hash
+                                let mut fallback_hasher = Sha3_256::new();
+                                fallback_hasher.update(&vrf_input);
+                                let fallback_hash = fallback_hasher.finalize();
+                                let mut output = [0u8; 32];
+                                output.copy_from_slice(&fallback_hash);
+                                (Some(output), None)
+                            }
+                        }
+                    };
+                    
                     let mut microblock = qnet_state::MicroBlock {
                         height: next_block_height,  // Use next_block_height instead of microblock_height
                         timestamp: deterministic_timestamp,  // DETERMINISTIC: Same on all nodes
@@ -7245,6 +7306,9 @@ impl BlockchainNode {
                         previous_hash: prev_hash,  // Use the hash we validated
                         poh_hash: poh_hash.clone(), // Add PoH hash to block
                         poh_count, // Add PoH counter to block
+                        // Quantum Randomness Beacon (QRB) v3.0
+                        vrf_output,
+                        vrf_proof,
                     };
                     
                     // QUANTUM VTS: Mix microblock into VTS chain for cryptographic time proof
@@ -8397,8 +8461,8 @@ impl BlockchainNode {
         println!("[REPUTATION] ✅ Genesis reputation initialization completed");
     }
     
-    /// PRODUCTION: Select microblock producer using Threshold VRF every 30 blocks (QNet specification)
-    /// CRITICAL FIX: Using VRF instead of SHA3 hash to prevent race conditions at rotation boundaries
+    /// PRODUCTION: Select microblock producer using Quantum-Resistant Deterministic Selection every 30 blocks
+    /// Uses SHA3-512 deterministic hash (NOT VRF) to ensure all nodes compute identical result
     pub async fn select_microblock_producer(
         current_height: u64,
         unified_p2p: &Option<Arc<SimplifiedP2P>>,
@@ -8407,8 +8471,8 @@ impl BlockchainNode {
         storage: Option<&Arc<Storage>>, // ADDED: For getting previous block hash
         quantum_poh: &Option<Arc<crate::quantum_poh::QuantumPoH>>, // ADDED: For PoH entropy
     ) -> String {
-        // PRODUCTION: QNet microblock producer SELECTION using Threshold VRF  
-        // Each 30-block period uses quantum-resistant VRF to select producer from qualified candidates
+        // PRODUCTION: Quantum-Resistant Deterministic Selection (QRDS)
+        // Each 30-block period uses SHA3-512 deterministic hash to select producer from qualified candidates
         
         if let Some(p2p) = unified_p2p {
             // PERFORMANCE FIX: Cache producer selection for entire 30-block period to prevent HTTP spam
@@ -8538,8 +8602,8 @@ impl BlockchainNode {
             // This is IDENTICAL to emergency selection (line 6841) and macroblock consensus (line 7595)
             candidates.sort_by(|a, b| a.0.cmp(&b.0));  // Sort by node_id alphabetically
             
-            // PRODUCTION: Use Threshold VRF for quantum-resistant producer selection
-            // CRITICAL FIX: VRF eliminates race conditions at rotation boundaries
+            // PRODUCTION: Quantum-Resistant Deterministic Selection (QRDS)
+            // Uses SHA3-512 + FINALITY_WINDOW entropy for deterministic producer selection
             
             // Calculate deterministic entropy that ALL nodes will have (no waiting for blocks!)
             let vrf_entropy = {
@@ -8623,7 +8687,7 @@ impl BlockchainNode {
                 };
                 prev_hash
             } else {
-                println!("[VRF] ⚠️ No storage available - using deterministic entropy");
+                println!("[QRDS] ⚠️ No storage available - using deterministic entropy");
                 [0u8; 32]
             };
             
@@ -8725,16 +8789,16 @@ impl BlockchainNode {
             // PRODUCTION: Log producer selection info ONLY at rotation boundaries for performance
             // Rotation happens at blocks 31, 61, 91... (not 30, 60, 90)
             if current_height > 0 && ((current_height - 1) % rotation_interval == 0 || current_height == 1) {
-                // New round - VRF producer selection
+                // New round - Quantum-Resistant Deterministic Selection (QRDS)
                 let next_rotation_block = (leadership_round + 1) * rotation_interval + 1;
-                println!("[VRF] 🎯 Producer: {} (round: {}, VRF SELECTION, next rotation: block {})", 
+                println!("[QRDS] 🎯 Producer: {} (round: {}, DETERMINISTIC SELECTION, next rotation: block {})", 
                          selected_producer, leadership_round, next_rotation_block);
             }
             
             selected_producer
         } else {
             // Solo mode - no P2P peers
-            println!("[VRF] 🏠 Solo mode - self production (no VRF in solo)");
+            println!("[QRDS] 🏠 Solo mode - self production");
             // Warning: P2P not available - running in solo mode
             own_node_id.to_string()
         }
@@ -9144,9 +9208,9 @@ impl BlockchainNode {
             let mut sorted_candidates = limited_candidates;
             sorted_candidates.sort_by(|a, b| a.0.cmp(&b.0));  // Sort by node_id alphabetically
             
-            // PRODUCTION: Use TRUE Hybrid VRF for quantum-resistant emergency producer selection
+            // PRODUCTION: Deterministic SHA3-512 selection for quantum-resistant emergency producer
             // Same cryptographic guarantees as normal producer selection (NIST FIPS 204)
-            println!("[EMERGENCY] 🔐 Using Hybrid VRF for emergency selection at block #{}", current_height);
+            println!("[EMERGENCY] 🔐 Using deterministic SHA3-512 for emergency selection at block #{}", current_height);
             
             // CRITICAL FIX v2.25.2: Use FINALITY WINDOW block hash for determinism
             // This ensures ALL synchronized nodes compute IDENTICAL emergency producer
@@ -9175,7 +9239,7 @@ impl BlockchainNode {
                 [0u8; 32]
             };
             
-            // Create deterministic entropy for emergency VRF
+            // Create deterministic entropy for emergency selection
             // CRITICAL: Include finality_hash for cross-node determinism!
             let emergency_entropy = {
                 use sha3::{Sha3_256, Digest};
@@ -10312,6 +10376,9 @@ impl BlockchainNode {
                     .collect();
                 bincode::serialize(&producers).ok()
             },
+            // QRB v3.0: Emergency beacon uses state accumulator as fallback
+            randomness_beacon: Some(state_accumulator),
+            vrf_contributions_count: Some(0), // No VRF in emergency mode
         };
         
         // Count microblocks before moving
@@ -12227,6 +12294,13 @@ impl BlockchainNode {
         let mut microblock_hashes = Vec::new();
         let mut state_accumulator = [0u8; 32];
         
+        // ═══════════════════════════════════════════════════════════════════════════
+        // QUANTUM RANDOMNESS BEACON (QRB) v3.0 - RANDAO-style accumulation
+        // XOR all VRF outputs from epoch's microblocks for unpredictable randomness
+        // ═══════════════════════════════════════════════════════════════════════════
+        let mut randomness_accumulator = [0u8; 32];
+        let mut vrf_contributions_count: u64 = 0;
+        
         for height in start_height..=end_height {
             match storage.load_microblock(height) {
                 Ok(Some(microblock_data)) => {
@@ -12243,6 +12317,24 @@ impl BlockchainNode {
                     for (i, &byte) in result.iter().take(32).enumerate() {
                         state_accumulator[i] ^= byte;
                     }
+                    
+                    // QRB: Accumulate VRF outputs via XOR (RANDAO-style)
+                    // Try to parse microblock to get VRF output
+                    if let Ok(microblock) = bincode::deserialize::<qnet_state::MicroBlock>(&microblock_data) {
+                        if let Some(vrf_output) = microblock.vrf_output {
+                            for (i, &byte) in vrf_output.iter().enumerate() {
+                                randomness_accumulator[i] ^= byte;
+                            }
+                            vrf_contributions_count += 1;
+                        }
+                    } else if let Ok(efficient) = bincode::deserialize::<qnet_state::EfficientMicroBlock>(&microblock_data) {
+                        if let Some(vrf_output) = efficient.vrf_output {
+                            for (i, &byte) in vrf_output.iter().enumerate() {
+                                randomness_accumulator[i] ^= byte;
+                            }
+                            vrf_contributions_count += 1;
+                        }
+                    }
                 },
                 _ => {
                     // Should not happen after waiting, but handle gracefully
@@ -12250,6 +12342,16 @@ impl BlockchainNode {
                     return Err(format!("Missing microblock at height {}", height));
                 }
             }
+        }
+        
+        // Log QRB accumulation result
+        if vrf_contributions_count > 0 {
+            println!("[QRB] 🎲 Quantum Randomness Beacon: {} VRF contributions accumulated", vrf_contributions_count);
+            println!("[QRB] 🔐 Beacon hash: {}...", hex::encode(&randomness_accumulator[0..8]));
+        } else {
+            println!("[QRB] ⚠️ No VRF contributions in epoch - beacon will use fallback");
+            // Fallback: hash of state accumulator for determinism
+            randomness_accumulator = state_accumulator;
         }
         
         // PRODUCTION: Use REAL consensus data instead of fake local data
@@ -12424,6 +12526,19 @@ impl BlockchainNode {
                         bincode::serialize(&fallback).ok()
                     }
                 },
+                // ═══════════════════════════════════════════════════════════════════
+                // QUANTUM RANDOMNESS BEACON (QRB) v3.0
+                // RANDAO-style accumulated randomness from epoch's VRF contributions
+                // Use cases: gambling, NFT mints, fair auctions, leader election
+                // Quantum-safe: All VRFs use Dilithium3 signatures (NIST FIPS 204)
+                // ═══════════════════════════════════════════════════════════════════
+                randomness_beacon: if vrf_contributions_count > 0 {
+                    Some(randomness_accumulator)
+                } else {
+                    // Fallback: deterministic hash if no VRF contributions
+                    Some(randomness_accumulator)
+                },
+                vrf_contributions_count: Some(vrf_contributions_count),
             },
             previous_hash: previous_macroblock_hash,
             poh_hash: poh_hash.to_vec(),

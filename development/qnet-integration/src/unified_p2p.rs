@@ -6376,7 +6376,7 @@ impl SimplifiedP2P {
     
     /// PRODUCTION: Get discovery peers for DHT/API (Fast method for millions of nodes)  
     pub fn get_discovery_peers(&self) -> Vec<PeerInfo> {
-        // ARCHITECTURE: Bootstrap nodes use deterministic Genesis peer list for consistent VRF
+        // ARCHITECTURE: Bootstrap nodes use deterministic Genesis peer list for consistent selection
         // Regular nodes use dynamic peer discovery from DHT for scalability
         // This ensures deterministic consensus among Genesis nodes while allowing network growth
         
@@ -6744,7 +6744,7 @@ impl SimplifiedP2P {
         
         // CRITICAL FIX: For Genesis bootstrap, return ALL configured peers WITHOUT TCP checks
         // TCP checks are ONLY for broadcast/failover, NOT for consensus candidate lists
-        // This ensures deterministic consensus: all nodes see SAME candidates for VRF
+        // This ensures deterministic consensus: all nodes see SAME candidates for QRDS
         if std::env::var("QNET_BOOTSTRAP_ID")
             .map(|id| ["001", "002", "003", "004", "005"].contains(&id.trim()))
             .unwrap_or(false) {
@@ -7020,7 +7020,7 @@ impl SimplifiedP2P {
                     let mut all_validated_peers = Vec::new();
                     
                     // STEP 1: Add deterministic Genesis peers for consensus (same as Genesis nodes)
-                    // This ensures all nodes agree on Genesis candidates for VRF producer selection
+                    // This ensures all nodes agree on Genesis candidates for deterministic producer selection
                     let genesis_ips = get_genesis_bootstrap_ips();
                     let mut genesis_peer_ids = std::collections::HashSet::new();
                     
@@ -16740,6 +16740,7 @@ mod tests {
             started_at: std::time::Instant::now(),
             retransmit_attempts: 0,
             retransmit_requested_at: None,
+            certificate: None, // v2.26: Certificate from chunk #0
         };
         
         assert_eq!(assembly.retransmit_attempts, 0);

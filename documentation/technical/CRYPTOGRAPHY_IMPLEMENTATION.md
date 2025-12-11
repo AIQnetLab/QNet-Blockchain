@@ -39,7 +39,7 @@ QNet implements **NIST/Cisco recommended post-quantum cryptography** with:
 ### v2.27.0 Additions (Epoch-Based Validator Set)
 - ✅ **MacroBlock snapshots** (eligible producers stored in blockchain)
 - ✅ **Deterministic producer selection** (no gossip race conditions)
-- ✅ **VRF from finality block** (SHA3-512 entropy from FINALITY_WINDOW=10 blocks ago)
+- ✅ **Entropy from finality block** (SHA3-512 hash from FINALITY_WINDOW=10 blocks ago)
 - ✅ **Genesis epoch static list** (genesis_constants.rs for blocks 1-90)
 - ✅ **MAX_VALIDATORS_PER_EPOCH = 1000** (deterministic sampling for scalability)
 
@@ -1662,7 +1662,7 @@ development/qnet-integration/src/
 ├── hybrid_crypto.rs          # Consensus commit/reveal signatures (NIST/Cisco ephemeral)
 ├── key_manager.rs            # Persistent block signatures (SHA3-512 + Dilithium)
 ├── quantum_crypto.rs         # Core crypto operations & Dilithium management
-├── vrf_hybrid.rs             # Hybrid VRF (used for block signing proof, NOT selection)
+├── vrf_hybrid.rs             # Hybrid VRF (used for QRB randomness beacon, NOT producer selection)
 └── vrf.rs                    # Legacy VRF (deprecated)
 
 core/qnet-consensus/src/

@@ -50,7 +50,7 @@ This project uses **dual licensing**:
 - **No Fallbacks**: Lagging nodes cannot participate - must sync first
 - **100% Determinism**: All nodes select same producer guaranteed
 - **Epoch-Based Validators**: Producer list from MacroBlock snapshots
-- **Microblock Entropy**: VRF seed always from finalized microblocks
+- **Microblock Entropy**: Selection seed always from finalized microblocks (Dilithium-signed)
 
 **🔐 NIST/Cisco Compliant Hybrid Cryptography:**
 - **Ephemeral Keys**: NEW Ed25519 keypair for EACH message (forward secrecy)
@@ -300,12 +300,12 @@ This project uses **dual licensing**:
   - 100 ticks per second (10ms intervals) for smooth entropy generation
   - 5,000 hashes per tick (optimized for 1-second microblocks)
   - Sequential ordering via SHA3-512 every 4th hash (limits parallelization, not formal VDF)
-  - Integrated into producer selection for unpredictable leader election
+  - Integrated into QRDS (Quantum-Resistant Deterministic Selection) for consensus
   - Checkpoint persistence with zstd compression (every 1M hashes)
   - Clock drift: 5-7% (excellent for production)
   - 72 bytes overhead per block (poh_hash: 64B + poh_count: 8B) = ~2-3%
   - Hardware: Intel Xeon E5-2680v4 @ 2.4GHz
-- **Quantum-Resistant Producer Selection**: Deterministic selection with finality window, Dilithium + Ed25519 hybrid cryptography for Byzantine-safe leader election
+- **QRDS (Quantum-Resistant Deterministic Selection)**: SHA3-512 deterministic selection with FINALITY_WINDOW entropy, Dilithium + Ed25519 hybrid cryptography for Byzantine-safe leader election
 - **Hybrid Parallel Executor Execution**: 5-stage pipeline with 10,000 parallel transactions
 - **Adaptive BFT Adaptive Timeouts**: Dynamic 7s base to 20s max (1.5x multiplier) based on network conditions
 - **Pre-Execution Cache**: Speculative execution with 10,000 transaction cache

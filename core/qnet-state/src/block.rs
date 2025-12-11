@@ -44,6 +44,24 @@ pub struct MicroBlock {
     pub poh_hash: Vec<u8>,  // SHA3-512 produces 64 bytes
     /// Verifiable Time Sequence counter at block creation
     pub poh_count: u64,
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // QUANTUM RANDOMNESS BEACON (QRB) v3.0
+    // Each producer contributes VRF output for epoch randomness accumulation
+    // Provides "true randomness" for gambling, NFT mints, fair auctions
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /// VRF output from producer (32 bytes) - quantum-resistant randomness contribution
+    /// Generated using Hybrid VRF (Dilithium3 + Ed25519)
+    /// Input: SHA3(prev_block_hash || height || producer_id)
+    #[serde(default)]
+    pub vrf_output: Option<[u8; 32]>,
+    
+    /// Serialized VRF proof for verification
+    /// Contains: HybridSignature (Dilithium certificate + Ed25519 ephemeral signature)
+    /// Any node can verify: VRF_verify(input, output, proof) = true
+    #[serde(default)]
+    pub vrf_proof: Option<Vec<u8>>,
 }
 
 /// Macroblock structure - consensus blocks that finalize microblocks
@@ -116,6 +134,24 @@ pub struct ConsensusData {
     /// This eliminates race conditions and guarantees determinism
     #[serde(default)]
     pub eligible_producers: Option<Vec<u8>>,
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // QUANTUM RANDOMNESS BEACON (QRB) v3.0
+    // Accumulated randomness from all VRF outputs in this epoch
+    // Ethereum 2.0 RANDAO style, but quantum-resistant with Dilithium VRF
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /// Quantum Randomness Beacon - accumulated from epoch's VRF outputs
+    /// Formula: QRB = XOR(vrf_output_1, vrf_output_2, ..., vrf_output_90)
+    /// Use cases: gambling, NFT mints, fair auctions, leader election
+    /// Quantum-safe: All VRFs use Dilithium3 signatures (NIST FIPS 204)
+    #[serde(default)]
+    pub randomness_beacon: Option<[u8; 32]>,
+    
+    /// Number of VRF contributions in this beacon (for verification)
+    /// Should equal number of microblocks in epoch (typically 90)
+    #[serde(default)]
+    pub vrf_contributions_count: Option<u64>,
 }
 
 /// Eligible producer entry for epoch-based validator set
@@ -185,6 +221,18 @@ pub struct EfficientMicroBlock {
     pub poh_hash: Vec<u8>,
     /// Verifiable Time Sequence counter at block creation
     pub poh_count: u64,
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // QUANTUM RANDOMNESS BEACON (QRB) v3.0
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /// VRF output from producer (32 bytes) - quantum-resistant randomness
+    #[serde(default)]
+    pub vrf_output: Option<[u8; 32]>,
+    
+    /// Serialized VRF proof (HybridSignature: Dilithium + Ed25519)
+    #[serde(default)]
+    pub vrf_proof: Option<Vec<u8>>,
 }
 
 /// Light microblock header for mobile nodes
@@ -577,6 +625,9 @@ impl MicroBlock {
             // Default PoH values for backward compatibility
             poh_hash: vec![0u8; 64], // SHA3-512 produces 64 bytes
             poh_count: 0,
+            // QRB v3.0: VRF fields (None for legacy/compatibility)
+            vrf_output: None,
+            vrf_proof: None,
         }
     }
     
@@ -663,6 +714,9 @@ impl EfficientMicroBlock {
             merkle_root,
             poh_hash: vec![],
             poh_count: 0,
+            // QRB v3.0: VRF fields (None for legacy/compatibility)
+            vrf_output: None,
+            vrf_proof: None,
         }
     }
     
@@ -708,6 +762,9 @@ impl EfficientMicroBlock {
             merkle_root: microblock.merkle_root,
             poh_hash: microblock.poh_hash.clone(),
             poh_count: microblock.poh_count,
+            // QRB v3.0: Copy VRF fields from source microblock
+            vrf_output: microblock.vrf_output,
+            vrf_proof: microblock.vrf_proof.clone(),
         }
     }
     

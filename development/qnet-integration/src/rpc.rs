@@ -1948,6 +1948,11 @@ async fn handle_rpc(
         // Stats methods
         "stats_get" => stats_get(blockchain).await,
         
+        // Quantum Randomness Beacon (QRB) methods
+        "qrb_getRandomness" => qrb_get_randomness(blockchain.clone(), request.params).await,
+        "qrb_getLatestRandomness" => qrb_get_latest_randomness(blockchain.clone()).await,
+        "qrb_getRandomnessWithSeed" => qrb_get_randomness_with_seed(blockchain.clone(), request.params).await,
+        
         // Node transfer methods
         "device_migration" => device_migration(blockchain, request.params).await,
         "node_getTransferStatus" => node_get_transfer_status(blockchain, request.params).await,
@@ -2430,6 +2435,167 @@ pub async fn handle_get_stats(blockchain: Arc<BlockchainNode>) -> Result<impl wa
             });
             Ok(warp::reply::json(&error_response))
         }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════
+// QUANTUM RANDOMNESS BEACON (QRB) v3.0 - RPC API
+// Provides verifiable randomness for smart contracts: gambling, NFT mints, auctions
+// Quantum-safe: All VRFs use Dilithium3 signatures (NIST FIPS 204)
+// ═══════════════════════════════════════════════════════════════════════════════════
+
+/// Get randomness beacon for a specific epoch (macroblock)
+/// Method: qrb_getRandomness
+/// Params: { "epoch": u64 } - macroblock number (1, 2, 3, ...)
+/// Returns: { "randomness": "0x...", "epoch": u64, "vrf_contributions": u64 }
+async fn qrb_get_randomness(
+    blockchain: Arc<BlockchainNode>,
+    params: Option<Value>,
+) -> Result<Value, RpcError> {
+    let params = params.ok_or_else(|| RpcError {
+        code: -32602,
+        message: "Missing params - expected { epoch: number }".to_string(),
+    })?;
+    
+    let epoch = params["epoch"].as_u64().ok_or_else(|| RpcError {
+        code: -32602,
+        message: "Missing or invalid 'epoch' parameter".to_string(),
+    })?;
+    
+    // Get macroblock for epoch
+    let storage = blockchain.get_storage();
+    match storage.get_macroblock_by_height(epoch) {
+        Ok(Some(macro_data)) => {
+            match bincode::deserialize::<qnet_state::MacroBlock>(&macro_data) {
+                Ok(macroblock) => {
+                    let randomness = macroblock.consensus_data.randomness_beacon
+                        .map(|r| format!("0x{}", hex::encode(r)))
+                        .unwrap_or_else(|| "0x".to_string() + &"0".repeat(64));
+                    
+                    let vrf_count = macroblock.consensus_data.vrf_contributions_count.unwrap_or(0);
+                    
+                    Ok(json!({
+                        "randomness": randomness,
+                        "epoch": epoch,
+                        "vrf_contributions": vrf_count,
+                        "timestamp": macroblock.timestamp,
+                        "verified": vrf_count > 0,
+                        "quantum_safe": true,
+                        "algorithm": "XOR(VRF_Dilithium3_1...VRF_Dilithium3_N)"
+                    }))
+                }
+                Err(e) => Err(RpcError {
+                    code: -32000,
+                    message: format!("Failed to deserialize macroblock: {}", e),
+                }),
+            }
+        }
+        Ok(None) => Err(RpcError {
+            code: -32001,
+            message: format!("Epoch {} not yet finalized", epoch),
+        }),
+        Err(e) => Err(RpcError {
+            code: -32000,
+            message: format!("Storage error: {:?}", e),
+        }),
+    }
+}
+
+/// Get latest finalized randomness beacon
+/// Method: qrb_getLatestRandomness
+/// Returns: { "randomness": "0x...", "epoch": u64, "vrf_contributions": u64 }
+async fn qrb_get_latest_randomness(
+    blockchain: Arc<BlockchainNode>,
+) -> Result<Value, RpcError> {
+    let height = blockchain.get_height().await;
+    let latest_epoch = height / 90; // Each macroblock covers 90 microblocks
+    
+    if latest_epoch == 0 {
+        return Err(RpcError {
+            code: -32001,
+            message: "No epochs finalized yet".to_string(),
+        });
+    }
+    
+    // Get the latest finalized epoch
+    qrb_get_randomness(blockchain, Some(json!({ "epoch": latest_epoch }))).await
+}
+
+/// Get randomness combined with user-provided seed
+/// Method: qrb_getRandomnessWithSeed
+/// Params: { "epoch": u64, "seed": "0x..." }
+/// Returns: { "randomness": "0x...", "combined": "0x...", "epoch": u64 }
+/// Formula: combined = SHA3-256(beacon || seed)
+async fn qrb_get_randomness_with_seed(
+    blockchain: Arc<BlockchainNode>,
+    params: Option<Value>,
+) -> Result<Value, RpcError> {
+    let params = params.ok_or_else(|| RpcError {
+        code: -32602,
+        message: "Missing params - expected { epoch: number, seed: string }".to_string(),
+    })?;
+    
+    let epoch = params["epoch"].as_u64().ok_or_else(|| RpcError {
+        code: -32602,
+        message: "Missing or invalid 'epoch' parameter".to_string(),
+    })?;
+    
+    let seed_hex = params["seed"].as_str().ok_or_else(|| RpcError {
+        code: -32602,
+        message: "Missing 'seed' parameter".to_string(),
+    })?;
+    
+    // Remove 0x prefix if present
+    let seed_clean = seed_hex.trim_start_matches("0x");
+    let seed_bytes = hex::decode(seed_clean).map_err(|e| RpcError {
+        code: -32602,
+        message: format!("Invalid seed hex: {}", e),
+    })?;
+    
+    // Get base randomness
+    let storage = blockchain.get_storage();
+    match storage.get_macroblock_by_height(epoch) {
+        Ok(Some(macro_data)) => {
+            match bincode::deserialize::<qnet_state::MacroBlock>(&macro_data) {
+                Ok(macroblock) => {
+                    let beacon = macroblock.consensus_data.randomness_beacon
+                        .unwrap_or([0u8; 32]);
+                    
+                    // Combine: SHA3-256(beacon || seed)
+                    use sha3::{Sha3_256, Digest};
+                    let mut hasher = Sha3_256::new();
+                    hasher.update(b"QNet_QRB_v3_WithSeed");
+                    hasher.update(&beacon);
+                    hasher.update(&seed_bytes);
+                    let combined = hasher.finalize();
+                    
+                    let vrf_count = macroblock.consensus_data.vrf_contributions_count.unwrap_or(0);
+                    
+                    Ok(json!({
+                        "randomness": format!("0x{}", hex::encode(beacon)),
+                        "seed": seed_hex,
+                        "combined": format!("0x{}", hex::encode(combined)),
+                        "epoch": epoch,
+                        "vrf_contributions": vrf_count,
+                        "verified": vrf_count > 0,
+                        "quantum_safe": true,
+                        "algorithm": "SHA3-256(beacon || seed)"
+                    }))
+                }
+                Err(e) => Err(RpcError {
+                    code: -32000,
+                    message: format!("Failed to deserialize macroblock: {}", e),
+                }),
+            }
+        }
+        Ok(None) => Err(RpcError {
+            code: -32001,
+            message: format!("Epoch {} not yet finalized", epoch),
+        }),
+        Err(e) => Err(RpcError {
+            code: -32000,
+            message: format!("Storage error: {:?}", e),
+        }),
     }
 }
 

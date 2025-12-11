@@ -53,7 +53,7 @@ QNet is a high-performance, post-quantum secure blockchain with a **two-layer bl
 
 ### Problem Solved
 
-Previous gossip-based producer selection caused **network forks** when different nodes had different views of active peers at the moment of VRF selection.
+Previous gossip-based producer selection caused **network forks** when different nodes had different views of active peers at the moment of QRDS (Quantum-Resistant Deterministic Selection).
 
 ### Solution: MacroBlock Snapshots
 
@@ -88,14 +88,14 @@ pub struct EligibleProducer {
 │  EPOCH N (blocks N*90+1 to (N+1)*90):                                  │
 │  └── Source: MacroBlock N-1.eligible_producers (blockchain)            │
 │                                                                         │
-│  PRODUCER SELECTION:                                                    │
+│  PRODUCER SELECTION (QRDS - Quantum-Resistant Deterministic Selection):│
 │  └── calculate_qualified_candidates() → read snapshot from blockchain  │
-│  └── VRF selection from snapshot                                        │
+│  └── SHA3-512 deterministic selection from snapshot                    │
 │  └── All nodes use SAME snapshot → DETERMINISM!                        │
 │                                                                         │
 │  EMERGENCY SELECTION:                                                   │
 │  └── Same snapshot, excluding failed producer                          │
-│  └── Same VRF entropy → DETERMINISM!                                   │
+│  └── Same SHA3 entropy → DETERMINISM!                                   │
 │                                                                         │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
@@ -121,7 +121,7 @@ Even with epoch-based validator sets, three sources of non-determinism caused fo
 | Bug | Impact |
 |-----|--------|
 | Skip self +1 in peer list | Each node saw different peer count |
-| Entropy fallback to macroblock | Different VRF seed if macroblock not synced |
+| Entropy fallback to macroblock | Different entropy seed if macroblock not synced |
 | Producer list fallback to gossip | Different producers from gossip registry |
 
 ### Solution: No Fallback Policy
@@ -149,13 +149,15 @@ Even with epoch-based validator sets, three sources of non-determinism caused fo
 
 ### Alignment with Top L1 Blockchains
 
-| Aspect | Solana | Ethereum 2.0 | QNet v2.27.1 |
+| Aspect | Solana | Ethereum 2.0 | QNet v3.0 |
 |--------|--------|--------------|--------------|
 | Validator Set | Epoch snapshot | Epoch snapshot | MacroBlock snapshot ✅ |
-| Entropy | VRF + blockhash | RANDAO | Microblock hash ✅ |
+| Entropy | VRF + blockhash | RANDAO | **QRB (Quantum Randomness Beacon)** ✅ |
+| True Randomness | Chainlink VRF | RANDAO accumulator | **Native QRB API** ✅ |
 | Fallback | ❌ None | ❌ None | **❌ None** ✅ |
 | Lagging nodes | Must sync | Must sync | **Must sync** ✅ |
 | Determinism | 100% | 100% | **100%** ✅ |
+| Quantum Safe | ❌ No | ❌ No | **✅ Dilithium3 VRF** |
 
 ### Fork Risk
 
@@ -217,6 +219,109 @@ pub struct MacroBlock {
 **Signature Type**: Full hybrid v2.23 (~5KB RAW bytes)  
 **Frequency**: Every 90 blocks (90 seconds)  
 **Verification**: Byzantine consensus (2/3+ nodes)
+
+---
+
+## Quantum Randomness Beacon (QRB) v3.0
+
+### Overview
+
+QNet v3.0 introduces a native **Quantum Randomness Beacon** - a RANDAO-style accumulated randomness system with quantum-resistant VRF. This provides "true unpredictability" for:
+- 🎰 On-chain gambling and lotteries
+- 🎨 Fair NFT mints and drops
+- 🎲 Gaming applications
+- ⚖️ Fair auctions and leader election
+
+### Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│               QUANTUM RANDOMNESS BEACON (QRB) v3.0                          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  EPOCH (90 microblocks) - Each producer contributes:                        │
+│                                                                             │
+│  Block 1:  Producer A → VRF_output_A (Dilithium3 signature)                │
+│  Block 2:  Producer B → VRF_output_B                                        │
+│  ...                                                                        │
+│  Block 90: Producer E → VRF_output_E                                        │
+│                                                                             │
+│  ═══════════════════════════════════════════════════════════════════════   │
+│  MacroBlock: randomness_beacon = XOR(VRF_1, VRF_2, ..., VRF_90)            │
+│  ═══════════════════════════════════════════════════════════════════════   │
+│                                                                             │
+│  Result: NOBODY knows randomness_beacon until MacroBlock finalization!     │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### VRF Generation (per Microblock)
+
+```rust
+// Input (deterministic, same on all nodes):
+vrf_input = SHA3-256(
+    "QNet_QRB_v3" ||
+    prev_block_hash ||
+    block_height ||
+    producer_id
+)
+
+// Output (quantum-resistant):
+vrf_output = HybridVRF.evaluate(vrf_input)
+// → 32 bytes random output
+// → Proof: Dilithium3 + Ed25519 signature
+```
+
+### Beacon Accumulation (per MacroBlock)
+
+```rust
+// RANDAO-style XOR accumulation:
+randomness_beacon = VRF_1 ⊕ VRF_2 ⊕ ... ⊕ VRF_90
+
+// Stored in MacroBlock.consensus_data:
+pub randomness_beacon: Option<[u8; 32]>,
+pub vrf_contributions_count: Option<u64>,
+```
+
+### RPC API
+
+| Method | Description | Params |
+|--------|-------------|--------|
+| `qrb_getRandomness` | Get beacon for epoch | `{ epoch: u64 }` |
+| `qrb_getLatestRandomness` | Get latest beacon | none |
+| `qrb_getRandomnessWithSeed` | Combine beacon with seed | `{ epoch: u64, seed: "0x..." }` |
+
+**Example Response:**
+```json
+{
+  "randomness": "0x7a3f9c...",
+  "epoch": 42,
+  "vrf_contributions": 90,
+  "verified": true,
+  "quantum_safe": true,
+  "algorithm": "XOR(VRF_Dilithium3_1...VRF_Dilithium3_N)"
+}
+```
+
+### Security Properties
+
+| Property | Value | Notes |
+|----------|-------|-------|
+| Unpredictability | ✅ 100% | No one knows beacon until finalization |
+| Quantum Resistance | ✅ Yes | Dilithium3 VRF (NIST FIPS 204) |
+| Manipulation Resistance | ✅ Yes | Requires controlling >50% of producers |
+| Last Revealer Attack | ⚠️ Mitigated | Withholding = lost rewards + slashing |
+| Verification | ✅ On-chain | Any node can verify VRF proofs |
+
+### Comparison with Other L1s
+
+| Feature | Ethereum 2.0 | Solana | Chainlink VRF | QNet QRB |
+|---------|--------------|--------|---------------|----------|
+| Native | ✅ Yes | ❌ No | ❌ No (oracle) | ✅ Yes |
+| Quantum Safe | ❌ No | ❌ No | ❌ No | ✅ **Dilithium3** |
+| Verifiable | ✅ Yes | ⚠️ Limited | ✅ Yes | ✅ Yes |
+| True Random | ✅ Yes | ⚠️ VRF only | ✅ Yes | ✅ Yes |
+| Cost | Gas fees | Minimal | High (oracle) | **Free** |
 
 ---
 
