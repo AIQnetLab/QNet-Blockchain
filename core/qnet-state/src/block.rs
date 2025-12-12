@@ -47,19 +47,21 @@ pub struct MicroBlock {
     
     // ═══════════════════════════════════════════════════════════════════════════
     // QUANTUM RANDOMNESS BEACON (QRB) v3.0
-    // Each producer contributes VRF output for epoch randomness accumulation
+    // Each producer contributes signed randomness for epoch accumulation
     // Provides "true randomness" for gambling, NFT mints, fair auctions
     // ═══════════════════════════════════════════════════════════════════════════
     
-    /// VRF output from producer (32 bytes) - quantum-resistant randomness contribution
-    /// Generated using Hybrid VRF (Dilithium3 + Ed25519)
+    /// QRB randomness output from producer (32 bytes)
+    /// Generated using Hybrid signature (Dilithium3 + Ed25519)
     /// Input: SHA3(prev_block_hash || height || producer_id)
+    /// Note: Field named vrf_output for serialization compatibility
     #[serde(default)]
     pub vrf_output: Option<[u8; 32]>,
     
-    /// Serialized VRF proof for verification
+    /// Serialized QRB proof for verification
     /// Contains: HybridSignature (Dilithium certificate + Ed25519 ephemeral signature)
-    /// Any node can verify: VRF_verify(input, output, proof) = true
+    /// Any node can verify the randomness contribution is authentic
+    /// Note: Field named vrf_proof for serialization compatibility
     #[serde(default)]
     pub vrf_proof: Option<Vec<u8>>,
 }
@@ -137,19 +139,20 @@ pub struct ConsensusData {
     
     // ═══════════════════════════════════════════════════════════════════════════
     // QUANTUM RANDOMNESS BEACON (QRB) v3.0
-    // Accumulated randomness from all VRF outputs in this epoch
-    // Ethereum 2.0 RANDAO style, but quantum-resistant with Dilithium VRF
+    // Accumulated randomness from all QRB outputs in this epoch
+    // Ethereum 2.0 RANDAO style, but quantum-resistant with Dilithium signatures
     // ═══════════════════════════════════════════════════════════════════════════
     
-    /// Quantum Randomness Beacon - accumulated from epoch's VRF outputs
-    /// Formula: QRB = XOR(vrf_output_1, vrf_output_2, ..., vrf_output_90)
+    /// Quantum Randomness Beacon - accumulated from epoch's randomness outputs
+    /// Formula: QRB = XOR(output_1, output_2, ..., output_90)
     /// Use cases: gambling, NFT mints, fair auctions, leader election
-    /// Quantum-safe: All VRFs use Dilithium3 signatures (NIST FIPS 204)
+    /// Quantum-safe: All signatures use Dilithium3 (NIST FIPS 204)
     #[serde(default)]
     pub randomness_beacon: Option<[u8; 32]>,
     
-    /// Number of VRF contributions in this beacon (for verification)
+    /// Number of QRB contributions in this beacon (for verification)
     /// Should equal number of microblocks in epoch (typically 90)
+    /// Note: Field named vrf_contributions_count for serialization compatibility
     #[serde(default)]
     pub vrf_contributions_count: Option<u64>,
 }
@@ -226,11 +229,13 @@ pub struct EfficientMicroBlock {
     // QUANTUM RANDOMNESS BEACON (QRB) v3.0
     // ═══════════════════════════════════════════════════════════════════════════
     
-    /// VRF output from producer (32 bytes) - quantum-resistant randomness
+    /// QRB randomness output from producer (32 bytes)
+    /// Note: Field named vrf_output for serialization compatibility
     #[serde(default)]
     pub vrf_output: Option<[u8; 32]>,
     
-    /// Serialized VRF proof (HybridSignature: Dilithium + Ed25519)
+    /// Serialized QRB proof (HybridSignature: Dilithium + Ed25519)
+    /// Note: Field named vrf_proof for serialization compatibility
     #[serde(default)]
     pub vrf_proof: Option<Vec<u8>>,
 }

@@ -7240,59 +7240,85 @@ impl BlockchainNode {
                     
                     // ═══════════════════════════════════════════════════════════════════════════
                     // QUANTUM RANDOMNESS BEACON (QRB) v3.0
-                    // Generate VRF output for epoch randomness accumulation
-                    // Each producer contributes to RANDAO-style beacon
+                    // Generate randomness contribution for epoch accumulation (RANDAO-style)
+                    // Each producer contributes signed randomness to beacon
+                    // CRITICAL FIX: Use EXISTING HybridCrypto instance (don't create new cert!)
                     // ═══════════════════════════════════════════════════════════════════════════
-                    let (vrf_output, vrf_proof) = {
-                        use crate::vrf_hybrid::QNetHybridVrf;
-                        use sha3::{Sha3_256, Digest};
+                    // Note: Fields named vrf_output/vrf_proof for serialization compatibility
+                    let (qrb_output, qrb_proof) = {
+                        use crate::hybrid_crypto::{GLOBAL_HYBRID_INSTANCES, HybridCrypto};
+                        use sha3::{Sha3_512, Sha3_256, Digest};
                         
-                        // VRF input: deterministic, same on all nodes verifying this block
-                        let mut vrf_input = Vec::new();
-                        vrf_input.extend_from_slice(b"QNet_QRB_v3");
-                        vrf_input.extend_from_slice(&prev_hash);
-                        vrf_input.extend_from_slice(&next_block_height.to_le_bytes());
-                        vrf_input.extend_from_slice(node_id.as_bytes());
+                        // QRB input: deterministic, same on all nodes verifying this block
+                        let mut qrb_input = Vec::new();
+                        qrb_input.extend_from_slice(b"QNet_QRB_v3");
+                        qrb_input.extend_from_slice(&prev_hash);
+                        qrb_input.extend_from_slice(&next_block_height.to_le_bytes());
+                        qrb_input.extend_from_slice(node_id.as_bytes());
                         
-                        // Generate VRF with Hybrid crypto (Dilithium + Ed25519)
-                        let mut vrf = QNetHybridVrf::new(node_id.clone());
-                        match vrf.initialize().await {
-                            Ok(_) => {
-                                match vrf.evaluate(&vrf_input).await {
-                                    Ok(vrf_result) => {
-                                        // Serialize proof for storage
-                                        let proof_bytes = bincode::serialize(&vrf_result.proof)
-                                            .unwrap_or_default();
-                                        
-                                        if next_block_height % 30 == 1 {
-                                            println!("[QRB] 🎲 Block #{}: VRF output generated (32 bytes)", next_block_height);
-                                            println!("[QRB] 🔐 Proof: Dilithium3 + Ed25519 hybrid signature");
-                                        }
-                                        
-                                        (Some(vrf_result.output), Some(proof_bytes))
+                        // CRITICAL FIX: Use EXISTING HybridCrypto instance from global cache
+                        // This prevents creating new certificate every block!
+                        let instances = GLOBAL_HYBRID_INSTANCES.get_or_init(|| async {
+                            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()))
+                        }).await;
+                        
+                        let normalized_id = Self::normalize_node_id(&node_id);
+                        let mut instances_guard = instances.lock().await;
+                        
+                        // Get or create instance (only creates cert if not exists)
+                        if !instances_guard.contains_key(&normalized_id) {
+                            let mut hybrid = HybridCrypto::new(normalized_id.clone());
+                            if let Err(e) = hybrid.initialize().await {
+                                println!("[QRB] ⚠️ Failed to initialize hybrid crypto: {}", e);
+                            } else {
+                                instances_guard.insert(normalized_id.clone(), hybrid);
+                            }
+                        }
+                        
+                        // Generate QRB randomness using EXISTING certificate
+                        // CRITICAL: Do NOT rotate certificate here!
+                        // Rotation happens in sign_microblock_with_dilithium() WITH broadcast
+                        // If we rotate here, the new cert won't be broadcast → other nodes reject
+                        if let Some(hybrid) = instances_guard.get(&normalized_id) {
+                            // Generate QRB output using CURRENT certificate (no rotation!)
+                            match hybrid.sign_message(&qrb_input).await {
+                                Ok(signature) => {
+                                    // QRB output = SHA3-512(signature) truncated to 32 bytes
+                                    let mut output_hasher = Sha3_512::new();
+                                    output_hasher.update(b"QNet_QRB_Output_v3");
+                                    output_hasher.update(&signature.message_signature);
+                                    let hash = output_hasher.finalize();
+                                    let mut vrf_out = [0u8; 32];
+                                    vrf_out.copy_from_slice(&hash[..32]);
+                                    
+                                    // Proof = serialized signature
+                                    let proof_bytes = bincode::serialize(&signature).unwrap_or_default();
+                                    
+                                    if next_block_height % 30 == 1 {
+                                        println!("[QRB] 🎲 Block #{}: Randomness output generated (32 bytes)", next_block_height);
+                                        println!("[QRB] 🔐 Using EXISTING certificate (no new cert created)");
                                     }
-                                    Err(e) => {
-                                        println!("[QRB] ⚠️ VRF evaluation failed: {} - using fallback", e);
-                                        // Fallback: deterministic hash (less random but still verifiable)
-                                        let mut fallback_hasher = Sha3_256::new();
-                                        fallback_hasher.update(&vrf_input);
-                                        let fallback_hash = fallback_hasher.finalize();
-                                        let mut output = [0u8; 32];
-                                        output.copy_from_slice(&fallback_hash);
-                                        (Some(output), None)
-                                    }
+                                    
+                                    (Some(vrf_out), Some(proof_bytes))
+                                }
+                                Err(e) => {
+                                    println!("[QRB] ⚠️ Randomness signing failed: {} - using fallback", e);
+                                    let mut fallback_hasher = Sha3_256::new();
+                                    fallback_hasher.update(&qrb_input);
+                                    let fallback_hash = fallback_hasher.finalize();
+                                    let mut output = [0u8; 32];
+                                    output.copy_from_slice(&fallback_hash);
+                                    (Some(output), None)
                                 }
                             }
-                            Err(e) => {
-                                println!("[QRB] ⚠️ VRF init failed: {} - using fallback", e);
-                                // Fallback: deterministic hash
-                                let mut fallback_hasher = Sha3_256::new();
-                                fallback_hasher.update(&vrf_input);
-                                let fallback_hash = fallback_hasher.finalize();
-                                let mut output = [0u8; 32];
-                                output.copy_from_slice(&fallback_hash);
-                                (Some(output), None)
-                            }
+                        } else {
+                            println!("[QRB] ⚠️ No hybrid crypto instance - using fallback");
+                            let mut fallback_hasher = Sha3_256::new();
+                            fallback_hasher.update(&qrb_input);
+                            let fallback_hash = fallback_hasher.finalize();
+                            let mut output = [0u8; 32];
+                            output.copy_from_slice(&fallback_hash);
+                            (Some(output), None)
                         }
                     };
                     
@@ -7307,8 +7333,9 @@ impl BlockchainNode {
                         poh_hash: poh_hash.clone(), // Add PoH hash to block
                         poh_count, // Add PoH counter to block
                         // Quantum Randomness Beacon (QRB) v3.0
-                        vrf_output,
-                        vrf_proof,
+                        // Note: struct fields named vrf_* for serialization compatibility
+                        vrf_output: qrb_output,
+                        vrf_proof: qrb_proof,
                     };
                     
                     // QUANTUM VTS: Mix microblock into VTS chain for cryptographic time proof
@@ -12296,7 +12323,7 @@ impl BlockchainNode {
         
         // ═══════════════════════════════════════════════════════════════════════════
         // QUANTUM RANDOMNESS BEACON (QRB) v3.0 - RANDAO-style accumulation
-        // XOR all VRF outputs from epoch's microblocks for unpredictable randomness
+        // XOR all QRB outputs from epoch's microblocks for unpredictable randomness
         // ═══════════════════════════════════════════════════════════════════════════
         let mut randomness_accumulator = [0u8; 32];
         let mut vrf_contributions_count: u64 = 0;
@@ -12318,8 +12345,8 @@ impl BlockchainNode {
                         state_accumulator[i] ^= byte;
                     }
                     
-                    // QRB: Accumulate VRF outputs via XOR (RANDAO-style)
-                    // Try to parse microblock to get VRF output
+                    // QRB: Accumulate randomness outputs via XOR (RANDAO-style)
+                    // Try to parse microblock to get QRB output
                     if let Ok(microblock) = bincode::deserialize::<qnet_state::MicroBlock>(&microblock_data) {
                         if let Some(vrf_output) = microblock.vrf_output {
                             for (i, &byte) in vrf_output.iter().enumerate() {
