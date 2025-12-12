@@ -5596,6 +5596,26 @@ impl Storage {
         
         Ok(result)
     }
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // CERTIFICATE STORAGE ARCHITECTURE v2.29
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Certificates are NOT stored separately!
+    // They are ALREADY embedded in each block's vrf_proof field.
+    // 
+    // vrf_proof contains HybridSignature which includes:
+    // - certificate: HybridCertificate (~2.6KB)
+    // - ephemeral_public_key
+    // - message_signature
+    // - dilithium_key_signature
+    //
+    // For historical block validation:
+    // 1. Load block from storage (already have vrf_proof)
+    // 2. Extract certificate from vrf_proof
+    // 3. Verify signature using extracted certificate
+    //
+    // This approach uses ZERO additional storage!
+    // ═══════════════════════════════════════════════════════════════════════════
 }
 
 // =========================================================================

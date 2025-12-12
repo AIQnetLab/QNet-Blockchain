@@ -9952,6 +9952,10 @@ impl SimplifiedP2P {
                                 cert_manager.store_remote_certificate(cert_serial_clone.clone(), certificate_clone);
                                 cert_manager.pending_certificates.remove(&cert_serial_clone);
                                 println!("[P2P] ✅ Certificate moved from PENDING to VERIFIED cache");
+                                
+                                // FIX v2.28: Signal retry loop that new certificate is available
+                                // This triggers immediate retry of buffered blocks
+                                crate::node::NEW_CERTIFICATE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             } else {
                                 println!("[P2P] ❌ Certificate rotation incompatible - rejecting");
                                 // Remove from pending without storing
@@ -10073,6 +10077,9 @@ impl SimplifiedP2P {
                 let mut cert_manager = match self.certificate_manager.write() { Ok(g) => g, Err(p) => p.into_inner() };
                 cert_manager.store_remote_certificate(cert_serial.clone(), certificate);
                 println!("[P2P] ✅ Received certificate {} cached", cert_serial);
+                
+                // FIX v2.28: Signal retry loop that new certificate is available
+                crate::node::NEW_CERTIFICATE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             
             // PRODUCTION: Light Node registration gossip handling
