@@ -1464,6 +1464,11 @@ impl BlockchainNode {
         let state = Arc::new(RwLock::new(StateManager::new()));
         
         // Initialize production-ready mempool with AUTO-SCALING
+        // v2.27.2: BENCHMARK MODE gets 10x larger mempool for 100K+ TPS testing
+        let benchmark_mode = std::env::var("QNET_BENCHMARK_MODE")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
+        
         let auto_mempool_size = if let Some(manual_size) = std::env::var("QNET_MEMPOOL_SIZE")
             .ok()
             .and_then(|s| s.parse().ok()) {
@@ -1474,11 +1479,20 @@ impl BlockchainNode {
             // Use same network size estimation as storage sharding
             let network_size = storage.estimate_network_size_for_config();
             
-            let calculated_size = match network_size {
+            let base_size = match network_size {
                 0..=100 => 100_000,        // Genesis/test: 100k
                 101..=10_000 => 500_000,   // Small network: 500k
                 10_001..=100_000 => 1_000_000,  // Medium network: 1M
                 _ => 2_000_000,            // Large network: 2M
+            };
+            
+            // BENCHMARK MODE: 10x larger mempool for 100K+ TPS testing!
+            let calculated_size = if benchmark_mode {
+                let boosted = base_size * 10;  // 1M for genesis, 5M for small, etc.
+                println!("[Mempool] 🔥 BENCHMARK MODE: 10x boost → {} tx capacity", boosted);
+                boosted
+            } else {
+                base_size
             };
             
             println!("[Mempool] 🔄 AUTO-SCALING: Network size {} nodes → {} tx capacity", 
@@ -2623,11 +2637,11 @@ impl BlockchainNode {
                 
                 match received {
                     Ok(Some(received_tx)) => {
-                        // DEDUPLICATION: Skip already processed transactions
-                        if processed_txs.contains(&received_tx.tx_hash) {
-                            continue;
-                        }
-                        
+                // DEDUPLICATION: Skip already processed transactions
+                if processed_txs.contains(&received_tx.tx_hash) {
+                    continue;
+                }
+                
                         // PRODUCTION v2.25: Deserialize transaction (bincode first, JSON fallback)
                         let tx_result: Result<qnet_state::Transaction, String> = 
                             bincode::deserialize::<qnet_state::Transaction>(&received_tx.tx_data)
@@ -6957,7 +6971,7 @@ impl BlockchainNode {
                             };
                             
                             if is_valid {
-                                txs.push(tx);
+                            txs.push(tx);
                                 // CRITICAL: Use mempool_hash (same as stored in mempool)
                                 included_tx_hashes.push(mempool_hash);
                             } else {
@@ -8710,7 +8724,7 @@ impl BlockchainNode {
                     
                     println!("[FINALITY] 📦 Block #{}: Using microblock #{} as entropy (deterministic, no fallback)", 
                              current_height, entropy_block_height);
-                    Self::get_finality_block_hash(store, entropy_block_height, current_height).await
+                                Self::get_finality_block_hash(store, entropy_block_height, current_height).await
                 };
                 prev_hash
             } else {
@@ -9489,7 +9503,7 @@ impl BlockchainNode {
                                             .collect();
                                         
                                         // Sort for determinism
-                                        all_qualified.sort_by(|a, b| a.0.cmp(&b.0));
+        all_qualified.sort_by(|a, b| a.0.cmp(&b.0));
                                         
                                         println!("[CANDIDATES] 📋 Epoch {} (height {}): {} producers from MacroBlock #{}", 
                                                  macroblock_index, current_height, all_qualified.len(), macroblock_index);
@@ -13438,7 +13452,7 @@ impl BlockchainNode {
         let tx_hash = format!("{:x}", sha3::Sha3_256::digest(&tx_bytes));
         
         if !self.mempool.add_binary_transaction(tx_bytes, tx_hash, tx.gas_price) {
-            return Err(QNetError::ValidationError("Transaction already in mempool or mempool full".to_string()));
+                return Err(QNetError::ValidationError("Transaction already in mempool or mempool full".to_string()));
         }
         
         Ok(hash)
@@ -13558,7 +13572,7 @@ impl BlockchainNode {
             
             // PRODUCTION v2.25: Use batch broadcast for high-throughput
             // Single QUIC message for entire batch - reduces stream overhead
-            if let Some(unified_p2p) = &self.unified_p2p {
+        if let Some(unified_p2p) = &self.unified_p2p {
                 if !tx_data_for_broadcast.is_empty() {
                     let _ = unified_p2p.broadcast_transaction_batch(tx_data_for_broadcast);
                 }
@@ -13580,8 +13594,8 @@ impl BlockchainNode {
                 transactions.push(tx);
             } else if let Ok(tx_json) = String::from_utf8(tx_bytes) {
                 // Legacy JSON fallback for backward compatibility
-                if let Ok(tx) = serde_json::from_str::<qnet_state::Transaction>(&tx_json) {
-                    transactions.push(tx);
+            if let Ok(tx) = serde_json::from_str::<qnet_state::Transaction>(&tx_json) {
+                transactions.push(tx);
                 }
             }
         }

@@ -9874,9 +9874,9 @@ async fn handle_benchmark_start(
     }
 }
 
-/// Run benchmark transaction generator - PARALLEL VERSION for 50K+ TPS
+/// Run benchmark transaction generator - MAXIMUM TPS with SMART BACKPRESSURE
 /// Uses multiple worker tasks to generate and submit transactions concurrently
-/// v2.26.3: FIXED lock contention - uses snapshot accounts (NO RwLock per TX!)
+/// v2.27.2: Smart backpressure - allows 100K+ TPS but prevents crash
 async fn run_benchmark_generator(
     blockchain: Arc<BlockchainNode>,
     total_transactions: u64,
@@ -9887,17 +9887,21 @@ async fn run_benchmark_generator(
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc as StdArc;
     
-    // v2.26.3: 16 workers for maximum parallelism
-    // Lock contention FIXED via snapshot accounts - workers don't block each other
+    // v2.27.2: NO TPS LIMIT - use smart backpressure instead!
+    // Target whatever user wants, backpressure handles overload automatically
+    println!("[BENCHMARK] 🔥 MAXIMUM TPS MODE - target: {} TPS", target_tps);
+    println!("[BENCHMARK] 🛡️ Smart backpressure enabled - prevents crash without limiting TPS");
+    
+    // v2.27.2: 16 workers for MAXIMUM parallelism (restored)
     let num_workers = 16usize;
     
     let tx_per_worker = total_transactions / num_workers as u64;
-    // PRODUCTION batch size - same as block processing
+    // PRODUCTION: Large batches for maximum throughput
     let batch_size = 10_000usize;
     // Yield every N transactions to allow block production
     let yield_interval = 100usize;
     
-    println!("[BENCHMARK] 🚀 PARALLEL generator v2.26.3: {} tx at {} TPS target", total_transactions, target_tps);
+    println!("[BENCHMARK] 🚀 MAXIMUM generator v2.27.2: {} tx at {} TPS target", total_transactions, target_tps);
     println!("[BENCHMARK] ⚡ Workers: {}, TX/worker: {}, Batch: {}, Yield every: {} TX", 
              num_workers, tx_per_worker, batch_size, yield_interval);
     
@@ -9971,6 +9975,30 @@ async fn run_benchmark_generator(
                     continue;
                 }
                 
+                // SMART BACKPRESSURE v2.27.2: Allow 100K+ TPS but prevent crash
+                // In benchmark mode, mempool is 10x larger (1M for Genesis)
+                let mempool_size = blockchain_clone.get_mempool_size().await.unwrap_or(0);
+                
+                // CRITICAL: Use ACTUAL boosted capacity for benchmark mode!
+                // Genesis = 100K base × 10 = 1,000,000 in benchmark mode
+                let mempool_capacity = 1_000_000usize;  // BENCHMARK MODE: 10x boosted!
+                let mempool_fill_ratio = mempool_size as f64 / mempool_capacity as f64;
+                
+                // SMART: Only backpressure at CRITICAL levels (>90% = 900K TX!)
+                // This allows MAXIMUM TPS while preventing crash
+                if mempool_fill_ratio > 0.95 {
+                    // CRITICAL: mempool >950K, pause briefly
+                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                    if local_sent % 100_000 == 0 {
+                        println!("[BENCHMARK] ⚠️ Mempool {:.0}% ({} TX) - brief pause", 
+                                 mempool_fill_ratio * 100.0, mempool_size);
+                    }
+                } else if mempool_fill_ratio > 0.90 {
+                    // HIGH: mempool >900K, yield more frequently
+                    tokio::task::yield_now().await;
+                }
+                // Below 90% (900K TX): FULL SPEED - no throttling!
+                
                 // Submit batch to mempool
                 let batch_start = Instant::now();
                 let batch_len = batch_txs.len();
@@ -9989,6 +10017,9 @@ async fn run_benchmark_generator(
                     Err(_) => {
                         local_errors += batch_len as u64;
                         error_counter.fetch_add(batch_len as u64, Ordering::SeqCst);
+                        
+                        // PROTECTION: If batch failed, brief wait then retry
+                        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
                     }
                 }
                 

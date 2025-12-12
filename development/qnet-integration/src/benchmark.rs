@@ -67,6 +67,7 @@ impl Default for BenchmarkPreset {
 }
 
 /// Benchmark configuration
+/// v2.27.2: NO artificial TPS limits - smart backpressure handles overload
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BenchmarkConfig {
     /// Preset type for quick configuration
@@ -77,7 +78,7 @@ pub struct BenchmarkConfig {
     pub shards: usize,
     /// Total number of transactions to generate
     pub total_transactions: u64,
-    /// Target TPS (transactions per second)
+    /// Target TPS (transactions per second) - NO LIMIT, backpressure handles it
     pub target_tps: u64,
     /// Number of test accounts to use
     pub num_accounts: usize,
@@ -89,16 +90,19 @@ fn default_shards() -> usize { 256 }
 
 impl BenchmarkConfig {
     /// Create config from preset
-    /// v2.26.5: Reduced FullScale to 2.56M for faster completion (was 25.6M)
+    /// v2.27.2: MAXIMUM TPS with smart backpressure (no artificial limits!)
     pub fn from_preset(preset: BenchmarkPreset) -> Self {
+        // v2.27.2: NO ARTIFICIAL LIMITS - smart backpressure handles overload
+        // Mempool boosted 10x in benchmark mode (1M for Genesis)
+        // Target 100K+ TPS - backpressure prevents crash automatically
         let (shards, total, tps, accounts) = match preset {
-            BenchmarkPreset::SingleShard => (1, 100_000, 100_000, 1_000),
-            BenchmarkPreset::SmallScale => (8, 800_000, 100_000, 5_000),
-            BenchmarkPreset::MediumScale => (32, 1_600_000, 100_000, 10_000),
-            BenchmarkPreset::LargeScale => (64, 2_560_000, 100_000, 20_000),
-            BenchmarkPreset::ExtraLarge => (128, 2_560_000, 100_000, 30_000),
-            BenchmarkPreset::FullScale => (256, 2_560_000, 100_000, 50_000),
-            BenchmarkPreset::Custom => (256, 2_560_000, 100_000, 50_000),
+            BenchmarkPreset::SingleShard => (1, 500_000, 100_000, 5_000),       // 100K TPS
+            BenchmarkPreset::SmallScale => (8, 1_000_000, 100_000, 10_000),     // 100K TPS
+            BenchmarkPreset::MediumScale => (32, 2_000_000, 100_000, 20_000),   // 100K TPS
+            BenchmarkPreset::LargeScale => (64, 3_000_000, 100_000, 30_000),    // 100K TPS
+            BenchmarkPreset::ExtraLarge => (128, 5_000_000, 100_000, 40_000),   // 100K TPS
+            BenchmarkPreset::FullScale => (256, 10_000_000, 100_000, 50_000),   // 100K TPS
+            BenchmarkPreset::Custom => (256, 5_000_000, 100_000, 50_000),
         };
         
         Self {
