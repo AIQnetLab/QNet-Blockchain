@@ -2859,8 +2859,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("");
     println!("=== BLOCKCHAIN LOGS (Live) ===");
     
-    // Continue with live blockchain logging - no background transition
-    let _ = node_handle.await;
+    // ═══════════════════════════════════════════════════════════════════════════
+    // PRODUCTION FIX v2.30: Graceful shutdown with certificate persistence
+    // Handles Ctrl+C and SIGTERM to save certificate_history before exit
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    tokio::select! {
+        // Normal monitoring loop
+        _ = node_handle => {
+            println!("[SHUTDOWN] Node monitoring ended unexpectedly");
+        }
+        
+        // Graceful shutdown on Ctrl+C or SIGTERM
+        _ = tokio::signal::ctrl_c() => {
+            println!("\n[SHUTDOWN] 🛑 Received shutdown signal...");
+            println!("[SHUTDOWN] 💾 Saving certificate history...");
+            
+            // Persist certificate history before exit
+            if node_type != NodeType::Light {
+                if let Some(p2p) = node.get_unified_p2p() {
+                    let data_dir = std::path::Path::new("data");
+                    if let Err(e) = std::fs::create_dir_all(data_dir) {
+                        println!("[SHUTDOWN] ⚠️ Failed to create data dir: {}", e);
+                    } else if let Ok(mut cert_manager) = p2p.certificate_manager.write() {
+                        let unified_node_type = match node_type {
+                            NodeType::Light => qnet_integration::unified_p2p::NodeType::Light,
+                            NodeType::Full => qnet_integration::unified_p2p::NodeType::Full,
+                            NodeType::Super => qnet_integration::unified_p2p::NodeType::Super,
+                        };
+                        match cert_manager.persist_to_disk(data_dir, unified_node_type) {
+                            Ok(_) => println!("[SHUTDOWN] ✅ Certificate history saved"),
+                            Err(e) => println!("[SHUTDOWN] ⚠️ Failed to save certificates: {}", e),
+                        }
+                    }
+                }
+            }
+            
+            println!("[SHUTDOWN] ✅ Graceful shutdown complete");
+        }
+    }
     
     Ok(())
 }

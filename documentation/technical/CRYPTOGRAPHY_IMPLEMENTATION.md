@@ -1,9 +1,9 @@
 # QNet Cryptography Implementation Guide
 ## Complete Technical Specification
 
-**Version:** 2.5 (v2.27.0)  
-**Date:** December 11, 2025  
-**Status:** Production Ready (Epoch-Based Validator Set + Gulf Stream + bincode)  
+**Version:** 2.7 (v2.31.0)  
+**Date:** December 13, 2025  
+**Status:** Production Ready (5-Layer Macroblock Protection + Proactive Fork Detection)  
 
 ---
 
@@ -40,8 +40,24 @@ QNet implements **NIST/Cisco recommended post-quantum cryptography** with:
 - ✅ **MacroBlock snapshots** (eligible producers stored in blockchain)
 - ✅ **Deterministic producer selection** (no gossip race conditions)
 - ✅ **Entropy from finality block** (SHA3-512 hash from FINALITY_WINDOW=10 blocks ago)
-- ✅ **Genesis epoch static list** (genesis_constants.rs for blocks 1-90)
+- ✅ **Genesis epoch static list** (genesis_constants.rs for blocks 1-180, N-2 logic)
 - ✅ **MAX_VALIDATORS_PER_EPOCH = 1000** (deterministic sampling for scalability)
+
+### v2.31.0 Additions (5-Layer Macroblock Protection)
+- ✅ **5-Layer Macroblock Sync** (unsync, not-validator, boundary, periodic, on-demand)
+- ✅ **Rate Limiting** (ACTIVE_MACROBLOCK_CHECK_TASKS, max 5 concurrent)
+- ✅ **TaskGuard RAII** (automatic cleanup of spawned tasks)
+- ✅ **Proactive Fork Detection** (rollback if local > network on startup)
+- ✅ **ShredProtocol Tuning** (5s timeout, 4 retries for reliability)
+
+### v2.30.0 Additions (Fork Prevention + State Machine)
+- ✅ **N-2 Entropy Source** (MacroBlock N-2 for producer selection, guarantees finalization)
+- ✅ **Extended Genesis Epoch** (180 blocks instead of 90 for N-2 compatibility)
+- ✅ **Real Reputation** (DeterministicReputationState instead of hardcoded values)
+- ✅ **State Machine** (27 integration points: Initializing, Syncing, Producing, Error, etc.)
+- ✅ **Graceful Shutdown** (tokio::signal::ctrl_c() saves certificates before exit)
+- ✅ **No Fallback Policy** (desynchronized nodes excluded from production)
+- ✅ **Certificate Persistence** (load_from_disk/persist_to_disk on startup/shutdown)
 
 ---
 

@@ -44,13 +44,30 @@ This project uses **dual licensing**:
 - **Phase 2 (Future)**: ONLY QNC token activation on QNet blockchain
 - **Transition**: 90% 1DEV burned OR 5 years from genesis block (whichever comes first)
 
-### 🛡️ **LATEST UPDATES (v2.27.1 - December 11, 2025)**
+### 🛡️ **LATEST UPDATES (v2.31.0 - December 13, 2025)**
 
-**🔐 Zero Fork Guarantee:**
+**🛡️ 5-Layer Macroblock Protection v2.31:**
+- **Layer 1**: Unsync node sync (45s delay + 3 retries)
+- **Layer 2**: Not-validator sync (15s delay + 3 retries)
+- **Layer 3**: Boundary verify (45s delay + 3 retries)
+- **Layer 4**: Periodic check every 60s (last 10 macroblocks)
+- **Layer 5**: On-demand sync in calculate_qualified_candidates
+- **Rate Limiting**: Max 5 concurrent macroblock check tasks (prevents spawn storm)
+- **TaskGuard RAII**: Automatic cleanup of spawned tasks
+- **Proactive Fork Detection**: Rollback if local height > network on startup
+
+**🔐 Zero Fork Guarantee v2.30:**
+- **N-2 Entropy Source**: MacroBlock N-2 for producer selection (guaranteed finalization)
+- **Extended Genesis**: 180 blocks (not 90) for N-2 compatibility
 - **No Fallbacks**: Lagging nodes cannot participate - must sync first
 - **100% Determinism**: All nodes select same producer guaranteed
 - **Epoch-Based Validators**: Producer list from MacroBlock snapshots
-- **Microblock Entropy**: Selection seed always from finalized microblocks (Dilithium-signed)
+
+**🚀 State Machine & Reliability:**
+- **Explicit State Machine**: 27 integration points (Syncing, Producing, Error, etc.)
+- **Real Reputation**: DeterministicReputationState instead of hardcoded values
+- **Graceful Shutdown**: Certificate persistence on Ctrl+C/SIGTERM
+- **No Fallback Policy**: Desynchronized nodes excluded from production
 
 **🔐 NIST/Cisco Compliant Hybrid Cryptography:**
 - **Ephemeral Keys**: NEW Ed25519 keypair for EACH message (forward secrecy)

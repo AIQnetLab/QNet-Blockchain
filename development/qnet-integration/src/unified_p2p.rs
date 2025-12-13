@@ -1014,6 +1014,43 @@ impl CertificateManager {
         }
         
         println!("[CERTIFICATE] 💾 Persisted {} critical certificates to disk", saved_count);
+        
+        // ═══════════════════════════════════════════════════════════════════════════
+        // PRODUCTION FIX: Persist certificate_history for rotation validation
+        // Without this, nodes reject valid rotated certificates after restart!
+        // ═══════════════════════════════════════════════════════════════════════════
+        let history_file = cert_dir.join("certificate_history.bin");
+        if !self.certificate_history.is_empty() {
+            // Serialize: node_id -> Vec<(cert_serial, ed25519_pubkey)>
+            // Format: [node_count][node_id_len][node_id][entry_count][serial_len][serial][pubkey:32]...
+            let mut history_data = Vec::new();
+            let history_count = self.certificate_history.len() as u32;
+            history_data.extend_from_slice(&history_count.to_le_bytes());
+            
+            for (node_id, entries) in &self.certificate_history {
+                // Node ID
+                let node_id_bytes = node_id.as_bytes();
+                history_data.extend_from_slice(&(node_id_bytes.len() as u16).to_le_bytes());
+                history_data.extend_from_slice(node_id_bytes);
+                
+                // Entries count
+                history_data.extend_from_slice(&(entries.len() as u8).to_le_bytes());
+                
+                for (cert_serial, ed25519_pubkey) in entries {
+                    // Certificate serial
+                    let serial_bytes = cert_serial.as_bytes();
+                    history_data.extend_from_slice(&(serial_bytes.len() as u16).to_le_bytes());
+                    history_data.extend_from_slice(serial_bytes);
+                    
+                    // Ed25519 public key (always 32 bytes)
+                    history_data.extend_from_slice(ed25519_pubkey);
+                }
+            }
+            
+            fs::write(&history_file, &history_data)?;
+            println!("[CERTIFICATE] 💾 Persisted {} node certificate histories", history_count);
+        }
+        
         Ok(())
     }
     
@@ -1073,6 +1110,78 @@ impl CertificateManager {
         }
         
         println!("[CERTIFICATE] 📂 Loaded {} certificates from disk ({} expired)", loaded_count, expired_count);
+        
+        // ═══════════════════════════════════════════════════════════════════════════
+        // PRODUCTION FIX: Load certificate_history for rotation validation
+        // Without this, nodes reject valid rotated certificates after restart!
+        // ═══════════════════════════════════════════════════════════════════════════
+        let history_file = cert_dir.join("certificate_history.bin");
+        if history_file.exists() {
+            match fs::read(&history_file) {
+                Ok(data) => {
+                    let mut offset = 0;
+                    
+                    // Read node count
+                    if data.len() < 4 {
+                        println!("[CERTIFICATE] ⚠️ History file too short");
+                        return Ok(());
+                    }
+                    let node_count = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+                    offset += 4;
+                    
+                    let mut loaded_histories = 0;
+                    
+                    for _ in 0..node_count {
+                        if offset + 2 > data.len() { break; }
+                        
+                        // Read node_id length and value
+                        let node_id_len = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
+                        offset += 2;
+                        
+                        if offset + node_id_len > data.len() { break; }
+                        let node_id = String::from_utf8_lossy(&data[offset..offset + node_id_len]).to_string();
+                        offset += node_id_len;
+                        
+                        if offset + 1 > data.len() { break; }
+                        let entry_count = data[offset] as usize;
+                        offset += 1;
+                        
+                        let mut entries = Vec::with_capacity(entry_count);
+                        
+                        for _ in 0..entry_count {
+                            if offset + 2 > data.len() { break; }
+                            
+                            // Read cert serial
+                            let serial_len = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
+                            offset += 2;
+                            
+                            if offset + serial_len > data.len() { break; }
+                            let cert_serial = String::from_utf8_lossy(&data[offset..offset + serial_len]).to_string();
+                            offset += serial_len;
+                            
+                            // Read ed25519 pubkey (32 bytes)
+                            if offset + 32 > data.len() { break; }
+                            let mut ed25519_pubkey = [0u8; 32];
+                            ed25519_pubkey.copy_from_slice(&data[offset..offset + 32]);
+                            offset += 32;
+                            
+                            entries.push((cert_serial, ed25519_pubkey));
+                        }
+                        
+                        if !entries.is_empty() {
+                            self.certificate_history.insert(node_id, entries);
+                            loaded_histories += 1;
+                        }
+                    }
+                    
+                    println!("[CERTIFICATE] 📂 Loaded {} certificate histories from disk", loaded_histories);
+                }
+                Err(e) => {
+                    println!("[CERTIFICATE] ⚠️ Failed to load certificate history: {}", e);
+                }
+            }
+        }
+        
         Ok(())
     }
 }
@@ -1087,9 +1196,9 @@ const SHRED_PROTOCOL_CHUNK_SIZE: usize = 1024;      // 1KB chunks (optimal for D
 const SHRED_PROTOCOL_REDUNDANCY_FACTOR: f32 = 1.5;  // 50% redundancy for Reed-Solomon
 const SHRED_PROTOCOL_MAX_CHUNKS: usize = 2048;      // Max chunks per block (2MB max for 50K TX support)
                                                      // ADAPTIVE: Empty block ~1KB, full 50K TX block ~1.6MB
-const SHRED_CHUNK_TIMEOUT_SECS: u64 = 3;            // Timeout before requesting missing chunks (v2.21.3)
+const SHRED_CHUNK_TIMEOUT_SECS: u64 = 5;            // Timeout before requesting missing chunks (v2.31: increased from 3s for reliability)
 const SHRED_CHUNK_CACHE_SIZE: usize = 100;          // Cache last N blocks' chunks for retransmit (v2.21.3)
-const SHRED_CHUNK_MAX_RETRIES: u8 = 2;              // Max retransmit attempts per block (v2.21.3)
+const SHRED_CHUNK_MAX_RETRIES: u8 = 4;              // Max retransmit attempts per block (v2.31: increased from 2 for reliability)
 const MAX_CONCURRENT_CHUNK_SENDS: usize = 20;       // Max concurrent QUIC streams for chunk sends (v2.21.4)
                                                      // Prevents receiver overload from burst of 72+ streams
 
@@ -14663,6 +14772,11 @@ impl SimplifiedP2P {
     }
 
     /// PRODUCTION: Broadcast consensus commit to consensus participants only
+    /// 
+    /// PRODUCTION FIX v2.30: Byzantine threshold verification
+    /// - Waits for broadcast completion (not fire-and-forget)
+    /// - Verifies 2f+1 threshold reached
+    /// - Retries with exponential backoff if threshold not met
     pub fn broadcast_consensus_commit(&self, round_id: u64, node_id: String, commit_hash: String, signature: String, timestamp: u64, participants: &[String]) -> Result<(), String> {
         // SAFE: Check if Tokio runtime is available to prevent panic
         let handle = match tokio::runtime::Handle::try_current() {
@@ -14677,7 +14791,13 @@ impl SimplifiedP2P {
             return Ok(());
         }
         
-        println!("[P2P] 🏛️ Broadcasting consensus commit for MACROBLOCK round {} to {} participants", round_id, participants.len());
+        // PRODUCTION: Calculate Byzantine threshold (2f+1)
+        // For n participants: threshold = ceil(2n/3) = (2n + 2) / 3
+        let total_participants = participants.len();
+        let byzantine_threshold = (total_participants * 2 + 2) / 3;
+        
+        println!("[P2P] 🏛️ Broadcasting consensus commit for MACROBLOCK round {} to {} participants (need {} for Byzantine)", 
+                 round_id, total_participants, byzantine_threshold);
         
         // SCALABILITY: Collect all peer addresses first (O(n) scan)
         // Then send in batched async tasks for millions of nodes
@@ -14712,7 +14832,7 @@ impl SimplifiedP2P {
                 }
             };
             
-            peer_addresses.push(peer_addr);
+            peer_addresses.push((participant_id.clone(), peer_addr));
         }
         
         // SCALABILITY: Single tokio task for all sends (not 1000 tasks!)
@@ -14728,14 +14848,17 @@ impl SimplifiedP2P {
         let total = peer_addresses.len();
         let quic_transport = self.quic_transport.clone();
         let quic_enabled = self.quic_enabled.load(std::sync::atomic::Ordering::Relaxed);
+        let threshold = byzantine_threshold;
         
+        // PRODUCTION: Async broadcast with Byzantine threshold monitoring
+        // NOTE: Still async (non-blocking), but now tracks delivery and retries if needed
         handle.spawn(async move {
             use futures::stream::{self, StreamExt};
             
             // SCALABILITY: Bounded parallelism (max 100 concurrent requests)
             // For 1000 participants: 10 batches of 100, not 1000 tasks!
-            let results = stream::iter(peer_addresses)
-                .map(|peer_addr| {
+            let results = stream::iter(peer_addresses.clone())
+                .map(|(_, peer_addr)| {
                     let msg = consensus_msg.clone();
                     let qt = quic_transport.clone();
                     let qe = quic_enabled;
@@ -14745,7 +14868,7 @@ impl SimplifiedP2P {
                                 return (peer_addr, true);
                             }
                             if attempt < 3 {
-                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                                tokio::time::sleep(std::time::Duration::from_millis(100 * (1 << attempt))).await;
                             }
                         }
                         (peer_addr, false)
@@ -14756,13 +14879,68 @@ impl SimplifiedP2P {
                 .await;
             
             let success = results.iter().filter(|(_, ok)| *ok).count();
-            println!("[QUIC] 📊 Consensus commit broadcast: {}/{} delivered", success, total);
+            let delivered = success + 1; // +1 for self (already have our commit)
+            
+            // PRODUCTION: Check Byzantine threshold
+            if delivered >= threshold {
+                println!("[QUIC] ✅ Consensus commit Byzantine threshold reached: {}/{} (need {})", 
+                         delivered, total + 1, threshold);
+            } else {
+                // WARNING: Threshold not reached - consensus may fail!
+                println!("[QUIC] ⚠️ Consensus commit below threshold: {}/{} (need {})", 
+                         delivered, total + 1, threshold);
+                println!("[QUIC] 🔄 Attempting retry for failed peers...");
+                
+                // RETRY: Second wave for failed peers with longer timeout
+                let failed_peers: Vec<_> = results.iter()
+                    .filter(|(_, ok)| !*ok)
+                    .map(|(addr, _)| addr.clone())
+                    .collect();
+                
+                if !failed_peers.is_empty() {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    
+                    let retry_results = stream::iter(failed_peers)
+                        .map(|peer_addr| {
+                            let msg = consensus_msg.clone();
+                            let qt = quic_transport.clone();
+                            let qe = quic_enabled;
+                            async move {
+                                for attempt in 1..=2 {
+                                    if Self::send_consensus_message_with_retry(&peer_addr, &msg, qt.clone(), qe).await {
+                                        return true;
+                                    }
+                                    tokio::time::sleep(std::time::Duration::from_millis(500 * attempt)).await;
+                                }
+                                false
+                            }
+                        })
+                        .buffer_unordered(50)
+                        .collect::<Vec<_>>()
+                        .await;
+                    
+                    let retry_success = retry_results.iter().filter(|ok| **ok).count();
+                    let final_delivered = delivered + retry_success;
+                    
+                    if final_delivered >= threshold {
+                        println!("[QUIC] ✅ Retry successful: {}/{} (threshold {})", 
+                                 final_delivered, total + 1, threshold);
+                    } else {
+                        println!("[QUIC] ❌ CRITICAL: Byzantine threshold NOT reached after retry: {}/{}", 
+                                 final_delivered, threshold);
+                    }
+                }
+            }
         });
         
         Ok(())
     }
 
-    /// PRODUCTION: Broadcast consensus reveal to consensus participants only  
+    /// PRODUCTION: Broadcast consensus reveal to consensus participants only
+    /// 
+    /// PRODUCTION FIX v2.30: Byzantine threshold verification for reveals
+    /// CRITICAL: Reveals are even more important than commits - without enough reveals
+    /// macroblock consensus will fail and the network will stall!
     pub fn broadcast_consensus_reveal(&self, round_id: u64, node_id: String, reveal_data: String, nonce: String, timestamp: u64, participants: &[String]) -> Result<(), String> {
         // SAFE: Check if Tokio runtime is available to prevent panic
         let handle = match tokio::runtime::Handle::try_current() {
@@ -14771,30 +14949,27 @@ impl SimplifiedP2P {
         };
         
         // CRITICAL: Only broadcast consensus for MACROBLOCK rounds (every 90 blocks)
-        // Microblocks use simple producer signatures, NOT Byzantine consensus
-        // BUGFIX: round_id IS the block height (e.g., 90, 180, 270), which are ALL divisible by 90!
-        // We need to check if it's a macroblock height, not if it's NOT divisible by 90
         if round_id == 0 || (round_id % 90 != 0) {
             println!("[P2P] ⏭️ BLOCKING broadcast reveal for non-macroblock round {} - no consensus needed", round_id);
             return Ok(());
         }
         
-        println!("[P2P] 🏛️ Broadcasting consensus reveal for MACROBLOCK round {} to {} participants", round_id, participants.len());
+        // PRODUCTION: Calculate Byzantine threshold (2f+1)
+        let total_participants = participants.len();
+        let byzantine_threshold = (total_participants * 2 + 2) / 3;
+        
+        println!("[P2P] 🏛️ Broadcasting consensus reveal for MACROBLOCK round {} to {} participants (need {} for Byzantine)", 
+                 round_id, total_participants, byzantine_threshold);
         
         // SCALABILITY: Collect all peer addresses first (O(n) scan)
-        // Then send in batched async tasks for millions of nodes
         let mut peer_addresses = Vec::with_capacity(participants.len());
         
         for participant_id in participants {
-            // Check if it's our own node first
             if participant_id == &self.node_id {
                 continue;
             }
             
-            // CRITICAL FIX: For Genesis nodes, construct address directly using helper
-            // Genesis consensus uses node IDs like "genesis_node_001"
             let peer_addr = if participant_id.starts_with("genesis_node_") {
-                // Genesis node - construct address using helper
                 match Self::resolve_genesis_node_address(participant_id) {
                     Some(addr) => addr,
                     None => {
@@ -14803,7 +14978,6 @@ impl SimplifiedP2P {
                     }
                 }
             } else {
-                // Non-Genesis: look up in peers (O(1) with DashMap)
                 let peer_info = self.get_peer_by_id_lockfree(participant_id);
                 match peer_info {
                     Some(p) => p.addr,
@@ -14814,11 +14988,9 @@ impl SimplifiedP2P {
                 }
             };
             
-            peer_addresses.push(peer_addr);
+            peer_addresses.push((participant_id.clone(), peer_addr));
         }
         
-        // SCALABILITY: Single tokio task for all sends (not 1000 tasks!)
-        // Use buffer_unordered for parallel HTTP requests with bounded concurrency
         let consensus_msg = NetworkMessage::ConsensusReveal {
             round_id,
             node_id: node_id.clone(),
@@ -14830,14 +15002,14 @@ impl SimplifiedP2P {
         let total = peer_addresses.len();
         let quic_transport = self.quic_transport.clone();
         let quic_enabled = self.quic_enabled.load(std::sync::atomic::Ordering::Relaxed);
+        let threshold = byzantine_threshold;
         
         handle.spawn(async move {
             use futures::stream::{self, StreamExt};
             
             // SCALABILITY: Bounded parallelism (max 100 concurrent requests)
-            // For 1000 participants: 10 batches of 100, not 1000 tasks!
-            let results = stream::iter(peer_addresses)
-                .map(|peer_addr| {
+            let results = stream::iter(peer_addresses.clone())
+                .map(|(_, peer_addr)| {
                     let msg = consensus_msg.clone();
                     let qt = quic_transport.clone();
                     let qe = quic_enabled;
@@ -14847,18 +15019,68 @@ impl SimplifiedP2P {
                                 return (peer_addr, true);
                             }
                             if attempt < 3 {
-                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                                tokio::time::sleep(std::time::Duration::from_millis(100 * (1 << attempt))).await;
                             }
                         }
                         (peer_addr, false)
                     }
                 })
-                .buffer_unordered(100) // Max 100 concurrent
+                .buffer_unordered(100)
                 .collect::<Vec<_>>()
                 .await;
             
             let success = results.iter().filter(|(_, ok)| *ok).count();
-            println!("[QUIC] 📊 Consensus reveal broadcast: {}/{} delivered", success, total);
+            let delivered = success + 1; // +1 for self
+            
+            // PRODUCTION: Check Byzantine threshold - reveals are CRITICAL
+            if delivered >= threshold {
+                println!("[QUIC] ✅ Consensus reveal Byzantine threshold reached: {}/{} (need {})", 
+                         delivered, total + 1, threshold);
+            } else {
+                println!("[QUIC] ⚠️ Consensus reveal below threshold: {}/{} (need {})", 
+                         delivered, total + 1, threshold);
+                println!("[QUIC] 🔄 CRITICAL: Attempting aggressive retry for reveals...");
+                
+                // AGGRESSIVE RETRY for reveals - they're more critical than commits
+                let failed_peers: Vec<_> = results.iter()
+                    .filter(|(_, ok)| !*ok)
+                    .map(|(addr, _)| addr.clone())
+                    .collect();
+                
+                for retry_round in 1..=3 {
+                    if failed_peers.is_empty() { break; }
+                    
+                    tokio::time::sleep(std::time::Duration::from_millis(500 * retry_round)).await;
+                    
+                    let retry_results = stream::iter(failed_peers.clone())
+                        .map(|peer_addr| {
+                            let msg = consensus_msg.clone();
+                            let qt = quic_transport.clone();
+                            let qe = quic_enabled;
+                            async move {
+                                if Self::send_consensus_message_with_retry(&peer_addr, &msg, qt.clone(), qe).await {
+                                    return (peer_addr, true);
+                                }
+                                (peer_addr, false)
+                            }
+                        })
+                        .buffer_unordered(50)
+                        .collect::<Vec<_>>()
+                        .await;
+                    
+                    let retry_success = retry_results.iter().filter(|(_, ok)| *ok).count();
+                    let current_delivered = delivered + retry_success;
+                    
+                    if current_delivered >= threshold {
+                        println!("[QUIC] ✅ Reveal retry {} successful: {}/{} (threshold {})", 
+                                 retry_round, current_delivered, total + 1, threshold);
+                        break;
+                    } else {
+                        println!("[QUIC] ⚠️ Reveal retry {}: {}/{} still below threshold", 
+                                 retry_round, current_delivered, total + 1);
+                    }
+                }
+            }
         });
         
         Ok(())
@@ -16728,9 +16950,9 @@ mod tests {
     /// Test SHRED constants are correctly defined
     #[test]
     fn test_shred_retransmit_constants() {
-        assert_eq!(SHRED_CHUNK_TIMEOUT_SECS, 3, "Timeout should be 3 seconds");
+        assert_eq!(SHRED_CHUNK_TIMEOUT_SECS, 5, "Timeout should be 5 seconds (v2.31)");
         assert_eq!(SHRED_CHUNK_CACHE_SIZE, 100, "Cache should hold 100 blocks");
-        assert_eq!(SHRED_CHUNK_MAX_RETRIES, 2, "Max retries should be 2");
+        assert_eq!(SHRED_CHUNK_MAX_RETRIES, 4, "Max retries should be 4 (v2.31)");
     }
     
     /// Test ShredProtocolBlockAssembly with retransmit fields

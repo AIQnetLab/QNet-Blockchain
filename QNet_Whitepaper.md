@@ -3,8 +3,8 @@
 
 **⚠️ EXPERIMENTAL BLOCKCHAIN RESEARCH ⚠️**
 
-**Version**: 2.27.0-experimental  
-**Date**: December 11, 2025  
+**Version**: 2.30.0-experimental  
+**Date**: December 13, 2025  
 **Authors**: QNet Research Team  
 **Status**: Experimental Research Project  
 **Goal**: To prove that one person without multi-million investments can create an advanced blockchain
@@ -45,6 +45,12 @@ Experimental achievements:
 - ✅ **Epoch-Based Validator Set (v2.27.0)**: Deterministic producer selection from MacroBlock snapshots
 - ✅ **No Gossip Race Conditions (v2.27.0)**: All nodes use same producer list from blockchain
 - ✅ **MAX_VALIDATORS_PER_EPOCH = 1000 (v2.27.0)**: Scalable deterministic sampling
+- ✅ **N-2 Entropy Source (v2.30.0)**: MacroBlock N-2 for producer selection (guaranteed finalization)
+- ✅ **Extended Genesis Epoch (v2.30.0)**: 180 blocks (not 90) for N-2 compatibility
+- ✅ **Explicit State Machine (v2.30.0)**: 27 integration points (Syncing, Producing, Error, etc.)
+- ✅ **Real Reputation (v2.30.0)**: DeterministicReputationState instead of hardcoded values
+- ✅ **Graceful Shutdown (v2.30.0)**: Certificate persistence on Ctrl+C/SIGTERM
+- ✅ **No Fallback Policy (v2.30.0)**: Desynchronized nodes excluded from production
 
 Experiment goal: demonstrate the possibility of creating a high-performance post-quantum blockchain by one person-operator.
 

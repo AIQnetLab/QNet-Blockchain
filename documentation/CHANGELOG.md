@@ -5,6 +5,116 @@ All notable changes to the QNet project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.31.0] - December 13, 2025 "5-Layer Macroblock Protection"
+
+### 🛡️ Critical Macroblock Synchronization
+
+**Problem Solved:**
+Node 002 missed ALL macroblocks #12-#26 because it was "not a validator" and skipped saving them.
+This caused cascade desynchronization - missing one macroblock leads to missing all subsequent ones.
+
+### 5 Layers of Macroblock Protection
+
+| Layer | Trigger | Implementation |
+|-------|---------|----------------|
+| **1. Unsync node sync** | `!is_synchronized` | Wait 45s → 3 retries `sync_macroblocks()` |
+| **2. Not-validator sync** | `is_validator=false` | Wait 15s → 3 retries `sync_macroblocks()` |
+| **3. Boundary verify** | Every block N*90 | Wait 45s → 3 retries `sync_macroblocks()` |
+| **4. Periodic check** | Every 60 seconds | Check last 10 MB → request up to 10 missing |
+| **5. On-demand sync** | Missing in `calculate_qualified_candidates` | Immediate `sync_macroblocks()` |
+
+### New Components
+
+```rust
+// Rate limiting to prevent spawn storm
+static ACTIVE_MACROBLOCK_CHECK_TASKS: AtomicU64 = AtomicU64::new(0);
+const MAX_CONCURRENT_MACROBLOCK_CHECKS: u64 = 5;
+
+// RAII pattern for safe task cleanup
+struct TaskGuard;
+impl Drop for TaskGuard {
+    fn drop(&mut self) {
+        ACTIVE_MACROBLOCK_CHECK_TASKS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+```
+
+### Proactive Fork Detection on Startup
+
+```rust
+// If local height AHEAD of network → possible fork!
+if local_height > network_height + 10 && network_height > 0 {
+    // 1. Delete blocks network_height+1 to local_height
+    // 2. Update chain height to network_height
+    // 3. Re-sync macroblocks from network
+}
+```
+
+### ShredProtocol Reliability Improvements
+
+| Parameter | v2.30 | v2.31 |
+|-----------|-------|-------|
+| `SHRED_CHUNK_TIMEOUT_SECS` | 3s | 5s |
+| `SHRED_CHUNK_MAX_RETRIES` | 2 | 4 |
+
+### Files Changed
+
+- `development/qnet-integration/src/node.rs` (5 new sync mechanisms)
+- `development/qnet-integration/src/unified_p2p.rs` (ShredProtocol tuning)
+- `documentation/RELEASE_NOTES.md` (v2.31 section)
+- `documentation/CHANGELOG.md` (this file)
+
+---
+
+## [2.30.0] - December 13, 2025 "N-2 Fork Prevention"
+
+### 🛡️ Critical Fork Prevention
+
+**N-2 Entropy Source:**
+- Producer selection now uses MacroBlock N-2 (not N-1)
+- N-2 is GUARANTEED to be finalized (90+ blocks buffer)
+- ALL synchronized nodes use IDENTICAL entropy source
+- Prevents forks caused by consensus timing race conditions
+
+**Extended Genesis Epoch:**
+- Genesis epoch extended from 90 to 180 blocks
+- Required for N-2 logic compatibility
+- MacroBlock #1 created at block 90, ready by ~block 120
+- Block 181+ uses real production logic with N-2
+
+### 🔧 State Machine
+
+**Explicit NodeState enum with 27 integration points:**
+- `Initializing` - Node starting up
+- `Syncing { local_height, target_height, progress_percent }` - Synchronizing with network
+- `Producing { current_height, as_producer }` - Producing/validating blocks
+- `WaitingForConsensus { epoch }` - Waiting for macroblock consensus
+- `WaitingForMacroblock { epoch }` - Waiting for macroblock from network
+- `ResolvingFork { our_height, network_height, our_hash }` - Handling chain fork
+- `Validating { block_height }` - Validating received block
+- `Error { reason, recoverable }` - Error state
+- `Idle { last_height }` - Waiting for next block
+
+### ✅ Improvements
+
+| Fix | Description |
+|-----|-------------|
+| **Real Reputation** | `get_deterministic_reputation()` instead of hardcoded 0.70/0.90 |
+| **Graceful Shutdown** | `tokio::signal::ctrl_c()` saves certificates before exit |
+| **Certificate Persistence** | `load_from_disk()` on startup, `persist_to_disk()` every 5 min + shutdown |
+| **No Fallback Policy** | Desynchronized nodes (empty candidates) excluded from production |
+| **N-2 in 7 places** | All producer selection and entropy uses N-2 macroblock |
+
+### 📁 Files Changed
+
+- `development/qnet-integration/src/node.rs` (+1872, -357 lines)
+- `development/qnet-integration/src/bin/qnet-node.rs` (graceful shutdown)
+- `documentation/technical/CRYPTOGRAPHY_IMPLEMENTATION.md` (v2.30 section)
+- `QNet_Whitepaper.md` (v2.30 features)
+- `README.md` (v2.30 updates)
+
+---
+
 ## [3.0.0] - December 11, 2025 "Quantum Randomness Beacon"
 
 ### 🎲 NEW - Quantum Randomness Beacon (QRB)

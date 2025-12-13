@@ -79,14 +79,15 @@ pub struct EligibleProducer {
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                    EPOCH-BASED VALIDATOR SET                            │
+│                    EPOCH-BASED VALIDATOR SET (v2.30)                    │
 ├─────────────────────────────────────────────────────────────────────────┤
 │                                                                         │
-│  GENESIS EPOCH (blocks 1-90):                                           │
+│  GENESIS EPOCH (blocks 1-180):  ← Extended from 90 for N-2 logic!      │
 │  └── Source: genesis_constants.rs (static hardcoded list)              │
 │                                                                         │
-│  EPOCH N (blocks N*90+1 to (N+1)*90):                                  │
-│  └── Source: MacroBlock N-1.eligible_producers (blockchain)            │
+│  EPOCH N (blocks 181+):                                                │
+│  └── Source: MacroBlock N-2.eligible_producers (blockchain)            │
+│  └── WHY N-2? N-1 may not be finalized yet! N-2 has 90+ blocks buffer │
 │                                                                         │
 │  PRODUCER SELECTION (QRDS - Quantum-Resistant Deterministic Selection):│
 │  └── calculate_qualified_candidates() → read snapshot from blockchain  │
@@ -106,7 +107,8 @@ pub struct EligibleProducer {
 |----------|--------|
 | Determinism | ✅ All nodes read same snapshot from blockchain |
 | Scalability | ✅ MAX_VALIDATORS_PER_EPOCH = 1000 |
-| Genesis compatibility | ✅ Static list for blocks 1-90 |
+| Genesis compatibility | ✅ Static list for blocks 1-180 (N-2 extended) |
+| N-2 finalization | ✅ 90+ blocks buffer guarantees readiness |
 | Emergency failover | ✅ Uses same snapshot |
 | No gossip races | ✅ Blockchain is source of truth |
 
