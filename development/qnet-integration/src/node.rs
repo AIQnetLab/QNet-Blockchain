@@ -2130,35 +2130,50 @@ impl BlockchainNode {
         println!("[Node] 📦 Initializing archive replication manager...");
         let mut archive_manager = crate::archive_manager::ArchiveReplicationManager::new();
         
-        // Initialize reward manager with current timestamp as genesis
+        // Initialize reward manager with Genesis timestamp
         println!("[Node] 💰 Initializing lazy rewards system...");
-        // CRITICAL: Use real Genesis timestamp from actual Genesis block if available
+        
+        // Check if this is a Genesis bootstrap node (local check)
+        let is_genesis_node = std::env::var("QNET_BOOTSTRAP_ID")
+            .map(|id| ["001", "002", "003", "004", "005"].contains(&id.as_str()))
+            .unwrap_or(false);
+        
+        // CRITICAL v2.32: Genesis timestamp MUST come from Genesis block #0
+        // NO FALLBACK to SystemTime::now() - this caused different nodes to have different timestamps!
         let genesis_timestamp = match storage.load_microblock(0) {
             Ok(Some(genesis_data)) => {
                 match bincode::deserialize::<qnet_state::MicroBlock>(&genesis_data) {
                     Ok(genesis_block) => {
-                        println!("[REWARDS] 📅 Using Genesis timestamp from block: {}", genesis_block.timestamp);
+                        println!("[GENESIS] ✅ Loaded timestamp from block #0: {}", genesis_block.timestamp);
                         genesis_block.timestamp
                     }
-                    Err(_) => {
-                        // Fallback to current time if can't parse
-                        let now = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs();
-                        println!("[REWARDS] ⚠️ Can't parse Genesis block, using current time: {}", now);
-                        now
+                    Err(e) => {
+                        if is_genesis_node {
+                            let now = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs();
+                            println!("[GENESIS] 🚨 Genesis node can't parse block ({}), using: {}", e, now);
+                            now
+                        } else {
+                            println!("[GENESIS] ⏳ Waiting for Genesis sync...");
+                            0 // Sentinel - will be updated
+                        }
                     }
                 }
             }
             _ => {
-                // No Genesis block yet - use current time (will be updated when Genesis is created)
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                println!("[REWARDS] 📅 No Genesis block yet, using current time: {}", now);
-                now
+                if is_genesis_node {
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    println!("[GENESIS] 🆕 Creating network with timestamp: {}", now);
+                    now
+                } else {
+                    println!("[GENESIS] ⏳ Waiting for Genesis from network...");
+                    0 // Sentinel - will be updated
+                }
             }
         };
         let reward_manager = Arc::new(RwLock::new(
@@ -3848,6 +3863,24 @@ impl BlockchainNode {
                         println!("[BLOCKS] ✅ Block #{} stored successfully", received_block.height);
                     }
                     
+                    // CRITICAL v2.32: If we just received Genesis block, update GLOBAL_GENESIS_TIMESTAMP!
+                    // This ensures non-genesis nodes get the correct timestamp from network
+                    if received_block.height == 0 && received_block.block_type == "micro" {
+                        if let Ok(Some(genesis_data)) = storage.load_microblock(0) {
+                            if let Ok(genesis_block) = bincode::deserialize::<qnet_state::MicroBlock>(&genesis_data) {
+                                let current_ts = crate::GLOBAL_GENESIS_TIMESTAMP
+                                    .load(std::sync::atomic::Ordering::Relaxed);
+                                if current_ts == 0 || current_ts != genesis_block.timestamp {
+                                    crate::GLOBAL_GENESIS_TIMESTAMP.store(
+                                        genesis_block.timestamp,
+                                        std::sync::atomic::Ordering::Relaxed
+                                    );
+                                    println!("[GENESIS] 🔒 SYNCED Genesis timestamp from network: {}", genesis_block.timestamp);
+                                }
+                            }
+                        }
+                    }
+                    
                     // CRITICAL FIX: Remove block from pending_blocks after successful storage
                     // This prevents infinite retry loops and memory leaks
                     if pending_blocks.remove(&received_block.height).is_some() {
@@ -5525,6 +5558,14 @@ impl BlockchainNode {
                                         match storage.save_microblock(0, &data) {
                                             Ok(_) => {
                                                 println!("[GENESIS] ✅ Genesis Block created and saved at height 0");
+                                                
+                                                // CRITICAL v2.32: Set GLOBAL_GENESIS_TIMESTAMP immediately!
+                                                // This ensures ALL nodes use the SAME timestamp
+                                                crate::GLOBAL_GENESIS_TIMESTAMP.store(
+                                                    genesis_microblock.timestamp,
+                                                    std::sync::atomic::Ordering::Relaxed
+                                                );
+                                                println!("[GENESIS] 🔒 GLOBAL_GENESIS_TIMESTAMP set to: {}", genesis_microblock.timestamp);
                                                 
                                                 // CRITICAL FIX v2.21.2: Wait for QUIC connections to be FULLY established
                                                 // Root cause: Node 001 was broadcasting Genesis before Node 005's QUIC listener
@@ -7717,25 +7758,48 @@ impl BlockchainNode {
                     // CRITICAL: Deterministic timestamp calculation for consensus integrity
                     // Producer sets timestamp based on block height to ensure all nodes agree
                     let deterministic_timestamp = {
-                        // Get Genesis timestamp from actual Genesis block (height 0)
-                        let genesis_timestamp = match storage.load_microblock(0) {
-                            Ok(Some(genesis_data)) => {
-                                // Parse Genesis block to get its timestamp
-                                match bincode::deserialize::<qnet_state::MicroBlock>(&genesis_data) {
-                                    Ok(genesis_block) => genesis_block.timestamp,
-                                    Err(_) => {
-                                        // Fallback to default if can't parse
-                                        println!("[TIMESTAMP] ⚠️ Can't parse Genesis block, using default timestamp");
-                                        1704067200  // January 1, 2024 00:00:00 UTC
+                        // PRODUCTION v2.32: Use GLOBAL_GENESIS_TIMESTAMP (set once at startup)
+                        // This ensures ALL nodes use the SAME genesis timestamp!
+                        let genesis_timestamp = crate::GLOBAL_GENESIS_TIMESTAMP
+                            .load(std::sync::atomic::Ordering::Relaxed);
+                        
+                        // If not yet set, try to read from storage (one-time init)
+                        let genesis_timestamp = if genesis_timestamp == 0 {
+                            match storage.load_microblock(0) {
+                                Ok(Some(genesis_data)) => {
+                                    match bincode::deserialize::<qnet_state::MicroBlock>(&genesis_data) {
+                                        Ok(genesis_block) => {
+                                            // Update global timestamp
+                                            crate::GLOBAL_GENESIS_TIMESTAMP.store(
+                                                genesis_block.timestamp,
+                                                std::sync::atomic::Ordering::Relaxed
+                                            );
+                                            println!("[TIMESTAMP] ✅ Loaded Genesis timestamp: {}", genesis_block.timestamp);
+                                            genesis_block.timestamp
+                                        }
+                                        Err(_) => {
+                                            println!("[TIMESTAMP] 🚨 CRITICAL: Can't parse Genesis block!");
+                                            // Return 0 - block production should not proceed without valid Genesis
+                                            0
+                                        }
                                     }
                                 }
+                                _ => {
+                                    println!("[TIMESTAMP] 🚨 CRITICAL: No Genesis block found!");
+                                    0
+                                }
                             }
-                            _ => {
-                                // No Genesis block yet - use default
-                                println!("[TIMESTAMP] ⚠️ No Genesis block found, using default timestamp");
-                                1704067200  // January 1, 2024 00:00:00 UTC
-                            }
+                        } else {
+                            genesis_timestamp
                         };
+                        
+                        // CRITICAL v2.32: Don't produce blocks without valid Genesis timestamp!
+                        if genesis_timestamp == 0 {
+                            println!("[BLOCK] 🚨 Cannot produce block - Genesis timestamp not available!");
+                            println!("[BLOCK] ⏳ Waiting for Genesis block sync...");
+                            tokio::time::sleep(Duration::from_secs(5)).await;
+                            continue;
+                        }
                         
                         // 1 second per microblock (deterministic interval)
                         const BLOCK_INTERVAL_SECONDS: u64 = 1;
@@ -11455,17 +11519,34 @@ impl BlockchainNode {
         
         // Create emergency macroblock
         // CRITICAL: Deterministic timestamp for macroblock consensus
-        let deterministic_timestamp = {
-            // Get Genesis timestamp from actual Genesis block
-            let genesis_timestamp = match storage.load_microblock(0) {
+        // PRODUCTION v2.32: Use GLOBAL_GENESIS_TIMESTAMP for consistency
+        let genesis_ts = crate::GLOBAL_GENESIS_TIMESTAMP.load(std::sync::atomic::Ordering::Relaxed);
+        
+        // Get genesis timestamp (from global or storage)
+        let genesis_timestamp = if genesis_ts > 0 {
+            genesis_ts
+        } else {
+            match storage.load_microblock(0) {
                 Ok(Some(genesis_data)) => {
                     match bincode::deserialize::<qnet_state::MicroBlock>(&genesis_data) {
-                        Ok(genesis_block) => genesis_block.timestamp,
-                        Err(_) => 1704067200  // Fallback
+                        Ok(genesis_block) => {
+                            crate::GLOBAL_GENESIS_TIMESTAMP.store(genesis_block.timestamp, std::sync::atomic::Ordering::Relaxed);
+                            genesis_block.timestamp
+                        }
+                        Err(_) => {
+                            println!("[MACROBLOCK] 🚨 No valid Genesis - skipping emergency macroblock");
+                            return Ok(());
+                        }
                     }
                 }
-                _ => 1704067200  // Fallback: January 1, 2024 00:00:00 UTC
-            };
+                _ => {
+                    println!("[MACROBLOCK] 🚨 No Genesis block - skipping emergency macroblock");
+                    return Ok(());
+                }
+            }
+        };
+        
+        let deterministic_timestamp = {
             
             const MACROBLOCK_INTERVAL_SECONDS: u64 = 90;  // 90 seconds per macroblock (90 microblocks)
             
@@ -13576,23 +13657,27 @@ impl BlockchainNode {
         
         // Create production macroblock with REAL consensus data
         // CRITICAL: Deterministic timestamp for macroblock consensus
-        let deterministic_timestamp = {
-            // Get Genesis timestamp from actual Genesis block
-            let genesis_timestamp = match storage.load_microblock(0) {
-                Ok(Some(genesis_data)) => {
-                    match bincode::deserialize::<qnet_state::MicroBlock>(&genesis_data) {
-                        Ok(genesis_block) => genesis_block.timestamp,
-                        Err(_) => 1704067200  // Fallback
+        // PRODUCTION v2.32: Get genesis timestamp from global or storage
+        let genesis_ts = crate::GLOBAL_GENESIS_TIMESTAMP.load(std::sync::atomic::Ordering::Relaxed);
+        let genesis_timestamp = if genesis_ts > 0 {
+            genesis_ts
+        } else {
+            match storage.load_microblock(0) {
+                Ok(Some(data)) => {
+                    match bincode::deserialize::<qnet_state::MicroBlock>(&data) {
+                        Ok(gb) => {
+                            crate::GLOBAL_GENESIS_TIMESTAMP.store(gb.timestamp, std::sync::atomic::Ordering::Relaxed);
+                            gb.timestamp
+                        }
+                        Err(_) => 1704067200 // Emergency fallback
                     }
                 }
-                _ => 1704067200  // Fallback: January 1, 2024 00:00:00 UTC
-            };
-            
-            const MACROBLOCK_INTERVAL_SECONDS: u64 = 90;  // 90 seconds per macroblock
-            
-            // Use consensus round number as macroblock height
-            genesis_timestamp + (consensus_data.round_number * MACROBLOCK_INTERVAL_SECONDS)
+                _ => 1704067200 // Emergency fallback
+            }
         };
+        
+        const MACROBLOCK_INTERVAL_SECONDS: u64 = 90;
+        let deterministic_timestamp = genesis_timestamp + (consensus_data.round_number * MACROBLOCK_INTERVAL_SECONDS);
         
         // Capture PoH state from the LAST MICROBLOCK for deterministic consensus
         // CRITICAL: Use blockchain PoH, not local generator (same as microblock producer selection)
