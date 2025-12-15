@@ -2021,7 +2021,8 @@ async fn get_finalized_entropy(
         // Normal: Use block 10 blocks behind current
         let entropy_height = current_height - FINALITY_WINDOW;
         let entropy_block = storage.load_microblock(entropy_height)?;
-        return Sha3_256::digest(&entropy_block).into();
+        // UNIFIED v2.36: SHA3-512 everywhere for maximum quantum security
+        return Sha3_512::digest(&entropy_block).into();
     }
 }
 

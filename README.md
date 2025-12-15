@@ -664,7 +664,7 @@ QNet implements production-grade failover mechanisms for zero-downtime operation
 - **Participant Filter**: Only Full and Super nodes (Light nodes excluded for mobile optimization)
 - **Producer Readiness Validation**: Pre-creation checks (reputation ≥70%, network health, connectivity)
 - **Fixed Timeout Detection**: 5 seconds (deterministic for consensus safety across all nodes)
-- **Emergency Selection**: Deterministic fallback selection from qualified backup producers (SHA3-256 hash)
+- **Emergency Selection**: Deterministic fallback selection from qualified backup producers (SHA3-512 hash, v2.36 unified)
 - **Enhanced Status Visibility**: Comprehensive failover dashboard with recovery metrics
 - **Network Recovery**: <7 seconds automatic recovery time with full broadcast success tracking
 - **Reputation Impact**: -20.0 penalty for failed producer, +5.0 reward for emergency takeover

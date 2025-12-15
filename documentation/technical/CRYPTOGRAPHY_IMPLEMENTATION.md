@@ -50,6 +50,11 @@ QNet implements **NIST/Cisco recommended post-quantum cryptography** with:
 - ✅ **Proactive Fork Detection** (rollback if local > network on startup)
 - ✅ **ShredProtocol Tuning** (5s timeout, 4 retries for reliability)
 
+### v2.36.0 Additions (Unified SHA3-512 Security)
+- ✅ **Unified hash algorithm** (SHA3-512 for ALL producer/leader selection)
+- ✅ **256-bit quantum resistance** (Grover's algorithm protection)
+- ✅ **Consistent selection** (microblock, macroblock, failover all use SHA3-512)
+
 ### v2.30.0 Additions (Fork Prevention + State Machine)
 - ✅ **N-2 Entropy Source** (MacroBlock N-2 for producer selection, guarantees finalization)
 - ✅ **Extended Genesis Epoch** (180 blocks instead of 90 for N-2 compatibility)

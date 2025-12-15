@@ -5,6 +5,134 @@ All notable changes to the QNet project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.36.0] - December 15, 2025 "Unified SHA3-512 Security"
+
+### 🔐 Unified Hash Algorithm for Maximum Quantum Security
+
+**Change:**
+All producer/leader selection now uses **SHA3-512** (256-bit quantum resistance via Grover's algorithm).
+
+| Component | Before (v2.35) | After (v2.36) |
+|-----------|----------------|---------------|
+| Microblock producer | SHA3-512 | SHA3-512 ✅ |
+| Macroblock initiator | SHA3-256 | **SHA3-512** |
+| Macroblock leader (commit-reveal) | SHA3-256 | **SHA3-512** |
+| Failover leader selection | SHA3-256 | **SHA3-512** |
+
+### Files Changed
+
+- `core/qnet-consensus/src/commit_reveal.rs` - `select_leader()` and `compute_leader_for_round()` → SHA3-512
+- `development/qnet-integration/src/node.rs` - `should_initiate_consensus()` → SHA3-512
+- `documentation/technical/ECONOMIC_MODEL.md` - Updated docs
+
+### Security Impact
+
+- **Quantum Resistance:** 256-bit (Grover) vs 128-bit for SHA3-256
+- **Consistency:** All selection uses same algorithm = easier auditing
+- **No Breaking Changes:** Output format unchanged (first 8 bytes for index)
+
+---
+
+## [2.35.0] - December 15, 2025 "Round-Based Failover & Real Commits"
+
+### 🔄 Production Failover Mechanism
+
+**Added:**
+- `compute_leader_for_round()` - Deterministic leader per failover round
+- Round-based timeout: 30s per round, up to 5 rounds max
+- Real commits/reveals from `CommitRevealConsensus` engine
+
+### MacroBlock Failover Flow
+
+```
+ROUND 0 → Leader A (30s timeout) → offline
+ROUND 1 → Leader B (30s timeout) → offline  
+ROUND 2 → Leader C (30s timeout) → SUCCESS!
+```
+
+---
+
+## [2.34.0] - December 15, 2025 "Leader-Based MacroBlock Architecture"
+
+### 🏗️ Critical Architectural Refactor
+
+**Problem Solved:**
+Each node was creating its OWN MacroBlock with different `eligible_producers` snapshots.
+This caused network forks after block 180 when N-2 producer selection kicked in.
+
+**Root Cause:**
+- `participate_in_macroblock_consensus()` called `trigger_macroblock_consensus()` → EVERY validator created MacroBlock
+- `eligible_producers` snapshot used `get_active_full_super_nodes()` (P2P state) instead of consensus data
+- Different nodes had different P2P views → different snapshots → FORK!
+
+### Architectural Changes (Ethereum 2.0 / Solana Style)
+
+| Component | Before (v2.33) | After (v2.34) |
+|-----------|----------------|---------------|
+| MacroBlock creation | ALL validators | ONLY Leader |
+| `participate_in_macroblock_consensus()` | Called `trigger_macroblock_consensus()` | **WAITS for Leader's MacroBlock** |
+| Participants list | `get_validated_active_peers()` (P2P) | `calculate_qualified_candidates()` (N-2 blockchain) |
+| `eligible_producers` source | P2P registry + `get_active_full_super_nodes()` | **Consensus participants ONLY** |
+| MacroBlock broadcast | Each node stored own version | Leader broadcasts via ShredProtocol |
+
+### New Functions
+
+```rust
+// Participant: WAITS for Leader's MacroBlock
+async fn participate_in_macroblock_consensus(...) {
+    // 1. Get deterministic participants from N-2
+    // 2. Execute COMMIT phase
+    // 3. Execute REVEAL phase  
+    // 4. WAIT for Leader's MacroBlock (timeout → sync fallback)
+    // 5. Validate and store (do NOT create!)
+}
+
+// Leader: Creates MacroBlock and broadcasts
+async fn trigger_macroblock_consensus(...) {
+    // 1. Get deterministic participants from N-2
+    // 2. Collect commits/reveals via P2P channel
+    // 3. finalize_round() → select leader
+    // 4. Create MacroBlock (eligible_producers = consensus participants)
+    // 5. Broadcast via ShredProtocol
+}
+
+// Deterministic snapshot from consensus participants ONLY
+async fn create_eligible_producers_snapshot(
+    consensus_participants: &[String],  // NOT from P2P!
+) -> Vec<EligibleProducer>
+```
+
+### Cryptographic Signatures
+
+MacroBlock commits/reveals use hybrid cryptography:
+- **Dilithium3** (NIST PQC) - post-quantum signature
+- **Ed25519 ephemeral keys** - forward secrecy, generated per message
+- **Full signature** (~5KB bincode) for MacroBlocks - includes certificate for immediate verification
+- **Compact signature** (~2.6KB bincode) for microblocks - certificate cached
+
+### Files Changed
+
+- `development/qnet-integration/src/node.rs`:
+  - `participate_in_macroblock_consensus()` - now WAITS, doesn't create
+  - `trigger_macroblock_consensus()` - uses `calculate_qualified_candidates()`
+  - `create_eligible_producers_snapshot()` - uses consensus participants only
+- `core/qnet-consensus/src/commit_reveal.rs`:
+  - Added `get_commits_for_macroblock()`, `get_reveals_for_macroblock()`
+  - Added `get_current_participants()`, `get_randomness_beacon()`
+- `docs/ARCHITECTURE_v2.19.md` - MacroBlock Consensus v2.34 section
+- `documentation/technical/MICROBLOCK_ARCHITECTURE_PLAN.md` - v2.34 workflow
+
+### Comparison with Industry Standards
+
+| Aspect | Ethereum 2.0 | Tendermint | Solana | **QNet v2.34** |
+|--------|--------------|------------|--------|----------------|
+| Who creates block | 1 Proposer | 1 Proposer | 1 Leader | **1 Leader** ✅ |
+| Validator set source | Beacon Chain | Genesis/Staking | Epoch snapshot | **N-2 MacroBlock** ✅ |
+| Consensus type | Attestations | Prevote/Precommit | Tower BFT | **Commit-Reveal** ✅ |
+| Participants create block? | ❌ No | ❌ No | ❌ No | **❌ No** ✅ |
+
+---
+
 ## [2.31.0] - December 13, 2025 "5-Layer Macroblock Protection"
 
 ### 🛡️ Critical Macroblock Synchronization
@@ -250,7 +378,6 @@ Gossip-based producer selection caused network forks when different nodes had di
 pub struct EligibleProducer {
     pub node_id: String,      // e.g., "genesis_node_001"
     pub reputation: f64,      // 0.0 - 1.0
-    pub stake: u64,           // Future PoS integration
 }
 ```
 

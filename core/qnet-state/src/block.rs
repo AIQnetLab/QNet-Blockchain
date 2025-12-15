@@ -165,9 +165,6 @@ pub struct EligibleProducer {
     pub node_id: String,
     /// Reputation score at snapshot time (0.0 - 1.0)
     pub reputation: f64,
-    /// Stake amount (for future PoS integration)
-    #[serde(default)]
-    pub stake: u64,
 }
 
 /// Slashing event data for blockchain storage (simplified for serialization)

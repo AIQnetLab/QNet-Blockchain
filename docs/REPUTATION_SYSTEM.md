@@ -33,7 +33,6 @@ Producer selection now uses **MacroBlock snapshots** instead of gossip registry:
 pub struct EligibleProducer {
     pub node_id: String,      // Node identifier
     pub reputation: f64,      // 0.0 - 1.0 (from reputation system)
-    pub stake: u64,           // Future PoS integration
 }
 ```
 

@@ -71,7 +71,6 @@ pub struct ConsensusData {
 pub struct EligibleProducer {
     pub node_id: String,      // Node identifier
     pub reputation: f64,      // Reputation score (0.0 - 1.0)
-    pub stake: u64,           // Future PoS integration
 }
 ```
 
@@ -111,6 +110,81 @@ pub struct EligibleProducer {
 | N-2 finalization | ✅ 90+ blocks buffer guarantees readiness |
 | Emergency failover | ✅ Uses same snapshot |
 | No gossip races | ✅ Blockchain is source of truth |
+
+---
+
+## MacroBlock Consensus (v2.36.0)
+
+### Architecture: Leader-Based Consensus
+
+**CRITICAL**: Only ONE node (Leader) creates MacroBlock. All other validators wait and receive it.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    MACROBLOCK CONSENSUS FLOW (v2.36)                        │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  STEP 1: LEADER SELECTION (Deterministic + Quantum-Resistant)              │
+│  └── should_initiate_consensus() selects ONE leader from N-2 snapshot     │
+│  └── Uses SHA3-512 + entropy + round_number for unpredictability          │
+│  └── 256-bit quantum resistance (Grover's algorithm)                      │
+│  └── ALL nodes compute SAME leader (determinism!)                         │
+│                                                                             │
+│  STEP 2: COMMIT-REVEAL PHASES                                              │
+│  ├── All validators submit COMMIT (cryptographic commitment)              │
+│  ├── All validators submit REVEAL (open commitment)                       │
+│  └── Leader collects commits/reveals via P2P channel                      │
+│                                                                             │
+│  STEP 3: LEADER CREATES MACROBLOCK                                         │
+│  └── ONLY Leader calls trigger_macroblock_consensus()                     │
+│  └── eligible_producers = ONLY consensus participants (commit+reveal)     │
+│  └── NO P2P registry lookups! Deterministic from consensus data.          │
+│                                                                             │
+│  STEP 4: BROADCAST                                                         │
+│  └── Leader broadcasts MacroBlock via ShredProtocol                       │
+│  └── All nodes receive and validate                                       │
+│                                                                             │
+│  STEP 5: PARTICIPANTS RECEIVE                                              │
+│  └── participate_in_macroblock_consensus() WAITS for Leader's MacroBlock  │
+│  └── Validates and stores (does NOT create own MacroBlock!)               │
+│  └── Timeout → sync fallback                                              │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Comparison with Top L1 Blockchains
+
+| Aspect | Ethereum 2.0 | Tendermint | Solana | QNet v2.36 |
+|--------|--------------|------------|--------|------------|
+| Who creates block | 1 Proposer | 1 Proposer | 1 Leader | **1 Leader** ✅ |
+| Validator set source | Beacon Chain | Genesis/Staking | Epoch snapshot | **N-2 MacroBlock** ✅ |
+| Consensus type | Attestations → Finality | Prevote→Precommit→Commit | Tower BFT | **Commit-Reveal** ✅ |
+| Participants create block? | ❌ No | ❌ No | ❌ No | **❌ No** ✅ |
+| Deterministic leader | ✅ Yes | ✅ Yes | ✅ Yes | **✅ Yes** ✅ |
+
+### Cryptographic Signatures
+
+MacroBlock consensus uses the same hybrid cryptography as microblocks:
+
+| Component | Algorithm | Purpose |
+|-----------|-----------|---------|
+| **Dilithium3** | CRYSTALS-Dilithium (NIST PQC) | Post-quantum signature |
+| **Ed25519** | Ephemeral keys per message | Forward secrecy |
+| **Signature Size** | ~5KB (Full) for MacroBlocks | Includes certificate |
+
+```rust
+// MacroBlock signature (Full type with embedded certificate)
+generate_consensus_signature(
+    message: &[u8],
+    is_macroblock: true,  // → Full signature (~5KB)
+)
+
+// Microblock signature (Compact type)
+generate_consensus_signature(
+    message: &[u8],
+    is_macroblock: false, // → Compact signature (~2.6KB)
+)
+```
 
 ---
 

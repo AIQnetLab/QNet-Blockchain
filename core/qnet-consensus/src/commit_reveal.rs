@@ -503,11 +503,12 @@ impl CommitRevealConsensus {
         let state = self.current_round.as_ref()?;
         let round_number = state.round_number;
         
-        use sha3::{Sha3_256, Digest};
-        let mut hasher = Sha3_256::new();
+        // UNIFIED v2.36: SHA3-512 everywhere for maximum security
+        use sha3::{Sha3_512, Digest};
+        let mut hasher = Sha3_512::new();
         
         // Version tag for hash domain separation
-        hasher.update(b"QNet_Leader_Selection_v2.32");
+        hasher.update(b"QNet_Leader_Selection_v2.36_SHA512");
         
         // PRIMARY ENTROPY: Randomness beacon from MacroBlock N-2
         // This is unpredictable until N-2 is finalized!
@@ -836,6 +837,132 @@ impl CommitRevealConsensus {
     /// Add reveal (alias for submit_reveal for API compatibility)
     pub fn add_reveal(&mut self, reveal: Reveal) -> Result<(), ConsensusError> {
         self.submit_reveal(reveal)
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // PRODUCTION v2.35: Methods for MacroBlock consensus
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// Get commits for MacroBlock storage (REAL data, not fake strings!)
+    pub fn get_commits_for_macroblock(&self) -> HashMap<String, Vec<u8>> {
+        if let Some(state) = &self.current_round {
+            state.commits.iter()
+                .map(|(node_id, commit)| {
+                    // Serialize commit to bytes
+                    let commit_bytes = bincode::serialize(commit).unwrap_or_default();
+                    (node_id.clone(), commit_bytes)
+                })
+                .collect()
+        } else {
+            HashMap::new()
+        }
+    }
+
+    /// Get reveals for MacroBlock storage (REAL data, not fake strings!)
+    pub fn get_reveals_for_macroblock(&self) -> HashMap<String, Vec<u8>> {
+        if let Some(state) = &self.current_round {
+            state.reveals.iter()
+                .map(|(node_id, reveal)| {
+                    // Serialize reveal to bytes
+                    let reveal_bytes = bincode::serialize(reveal).unwrap_or_default();
+                    (node_id.clone(), reveal_bytes)
+                })
+                .collect()
+        } else {
+            HashMap::new()
+        }
+    }
+
+    /// Get current participants list
+    pub fn get_current_participants(&self) -> Vec<String> {
+        if let Some(state) = &self.current_round {
+            state.participants.clone()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Get randomness beacon for MacroBlock storage
+    /// Returns XOR of all reveal nonces for unpredictable randomness
+    pub fn get_randomness_beacon(&self) -> Option<[u8; 32]> {
+        if let Some(state) = &self.current_round {
+            if state.reveals.is_empty() {
+                return None;
+            }
+            
+            // XOR all reveal nonces (RANDAO-style)
+            let mut beacon = [0u8; 32];
+            for reveal in state.reveals.values() {
+                for (i, byte) in reveal.nonce.iter().enumerate() {
+                    beacon[i] ^= byte;
+                }
+            }
+            Some(beacon)
+        } else {
+            None
+        }
+    }
+
+    /// PRODUCTION v2.35: Compute leader for specific round (for failover)
+    /// 
+    /// Uses same algorithm as select_leader() but accepts round parameter
+    /// This allows round-based failover: if round 0 leader offline → compute round 1 leader
+    pub fn compute_leader_for_round(
+        &self,
+        height: u64,
+        round: u64,
+        participants: &[String],
+        beacon: Option<&[u8; 32]>,
+    ) -> Option<String> {
+        if participants.is_empty() {
+            return None;
+        }
+
+        // UNIFIED v2.36: SHA3-512 everywhere for maximum security
+        use sha3::{Sha3_512, Digest};
+        let mut hasher = Sha3_512::new();
+
+        // Version tag for hash domain separation
+        hasher.update(b"QNet_Leader_Selection_v2.36_SHA512_Round");
+
+        // PRIMARY ENTROPY: Randomness beacon from MacroBlock N-2
+        if let Some(b) = beacon {
+            hasher.update(b);
+        } else {
+            // Fallback for epochs 1-2: Use Genesis seed
+            hasher.update(b"QNet_Genesis_Seed_Fallback");
+        }
+
+        // Height (deterministic)
+        hasher.update(&height.to_le_bytes());
+
+        // Round number (CRITICAL for failover - different round = different leader!)
+        hasher.update(&round.to_le_bytes());
+
+        // Sort participants for deterministic ordering
+        let mut sorted_participants = participants.to_vec();
+        sorted_participants.sort();
+
+        // Hash all participant IDs
+        for node_id in &sorted_participants {
+            hasher.update(node_id.as_bytes());
+        }
+
+        let hash = hasher.finalize();
+
+        // Convert hash to selection index
+        let hash_number = u64::from_le_bytes([
+            hash[0], hash[1], hash[2], hash[3],
+            hash[4], hash[5], hash[6], hash[7],
+        ]);
+
+        let selection_index = (hash_number as usize) % sorted_participants.len();
+        let selected_leader = sorted_participants[selection_index].clone();
+
+        println!("[INFO][CONS] leader_compute node={} round={} h={} idx={}/{}", 
+                 selected_leader, round, height, selection_index, sorted_participants.len());
+
+        Some(selected_leader)
     }
 
 } 

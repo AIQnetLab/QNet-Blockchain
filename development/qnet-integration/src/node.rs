@@ -469,27 +469,25 @@ impl Default for PerformanceConfig {
                 }
             });
         
-        println!("[Performance] 🔧 AUTO-TUNE: Detected {} CPU cores", cpu_count);
+        if is_info() { println!("[INFO][PERF] auto_tune cores={}", cpu_count); }
         if cpu_limit_percent < 100 {
-            println!("[Performance] 🎚️ CPU limit: {}% → using {} cores", 
-                    cpu_limit_percent, effective_cpu_count);
+            if is_info() { println!("[INFO][PERF] cpu_limit={}% effective_cores={}", 
+                    cpu_limit_percent, effective_cpu_count); }
             
             // WARNING: Extremely low CPU allocation
             if effective_cpu_count < 4 {
-                println!("[Performance] ⚠️  WARNING: Very low CPU allocation ({} cores)", 
-                        effective_cpu_count);
-                println!("[Performance]    Recommended minimum: 4 cores for production");
-                println!("[Performance]    Current allocation may impact performance");
+                if is_warn() { println!("[WARN][PERF] low_cpu_alloc cores={} min_recommended=4", 
+                        effective_cpu_count); }
             }
         } else if let Some(max) = max_threads_allowed {
-            println!("[Performance] 🎚️ Thread cap: {} (of {} available)", max, cpu_count);
+            if is_info() { println!("[INFO][PERF] thread_cap={} available={}", max, cpu_count); }
             if max < 4 {
-                println!("[Performance] ⚠️  WARNING: Low thread cap ({}), recommended ≥4", max);
+                if is_warn() { println!("[WARN][PERF] low_thread_cap={} recommended=4", max); }
             }
         }
-        println!("[Performance] ⚡ Parallel validation: {} (threshold: ≥8 cores)", 
-                if auto_parallel_validation { "ENABLED" } else { "DISABLED" });
-        println!("[Performance] 🧵 Parallel threads: {}", auto_parallel_threads);
+        if is_info() { println!("[INFO][PERF] parallel_validation={} threshold=8cores", 
+                if auto_parallel_validation { "enabled" } else { "disabled" }); }
+        if is_info() { println!("[INFO][PERF] parallel_threads={}", auto_parallel_threads); }
         
         Self {
             enable_sharding: env::var("QNET_ENABLE_SHARDING").unwrap_or_default() == "1",
@@ -544,7 +542,7 @@ impl SignedBlockTracker {
         for (existing_hash, existing_producer, timestamp) in entries.iter() {
             if existing_producer == producer && existing_hash != block_hash {
                 // Double-sign detected!
-                println!("[ERR][SEC] DOUBLE_SIGN producer={} h={}", producer, height);
+                eprintln!("[ERR][SEC] DOUBLE_SIGN producer={} h={}", producer, height);
                 
                 return Some(Evidence {
                     evidence_type: "double_sign".to_string(),
@@ -573,7 +571,7 @@ impl SignedBlockTracker {
         // Check timestamp is not too far in future (>5 seconds)
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         if block.timestamp > now + 5 {
-            println!("[ERR][SEC] TIME_MANIP future={}s", block.timestamp - now);
+            eprintln!("[ERR][SEC] TIME_MANIP future={}s", block.timestamp - now);
             return Some(Evidence {
                 evidence_type: "time_manipulation".to_string(),
                 node_id: block.producer.clone(),
@@ -823,18 +821,22 @@ impl BlockchainNode {
     /// All nodes will read the SAME snapshot from blockchain - NO gossip race conditions!
     /// 
     /// PRODUCTION: Scales to millions of nodes with MAX_VALIDATORS_PER_EPOCH limit
+    /// PRODUCTION v2.34: Create DETERMINISTIC eligible producers snapshot
+    /// 
+    /// ARCHITECTURE: Uses ONLY consensus participants (who proved participation via commit+reveal)
+    /// NO P2P registry lookups - all nodes compute IDENTICAL list from consensus data!
+    /// 
+    /// Reputation is taken from DeterministicReputationState which is synchronized via blockchain.
     async fn create_eligible_producers_snapshot(
         p2p: &Arc<SimplifiedP2P>,
         consensus_participants: &[String],
-        own_node_id: &str,
-        own_node_type: NodeType,
+        _own_node_id: &str,
+        _own_node_type: NodeType,
     ) -> Vec<qnet_state::EligibleProducer> {
-        const MIN_REPUTATION: f64 = 0.70;  // 70% minimum for producer eligibility
-        const MAX_VALIDATORS_PER_EPOCH: usize = 1000;  // Scalability limit
+        const MIN_REPUTATION: f64 = 0.70;
+        const MAX_VALIDATORS_PER_EPOCH: usize = 1000;
         
-        let mut eligible: Vec<qnet_state::EligibleProducer> = Vec::new();
-        
-        // Get reputation state for accurate scores
+        // Get deterministic reputation from blockchain-synchronized state
         let current_timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -851,74 +853,34 @@ impl BlockchainNode {
                 std::collections::HashMap::new()
             };
         
-        // 1. Include all consensus participants with good reputation
-        for node_id in consensus_participants {
-            let reputation = reputation_map.get(node_id).copied().unwrap_or(0.70);
-            
-            if reputation >= MIN_REPUTATION {
-                eligible.push(qnet_state::EligibleProducer {
+        // DETERMINISTIC: Use ONLY consensus participants (proved via commit+reveal)
+        // NO get_active_full_super_nodes() - that's P2P state which varies between nodes!
+        let mut eligible: Vec<qnet_state::EligibleProducer> = consensus_participants.iter()
+            .map(|node_id| {
+                let reputation = reputation_map.get(node_id).copied().unwrap_or(0.70);
+                qnet_state::EligibleProducer {
                     node_id: node_id.clone(),
                     reputation,
-                    stake: 0,  // Future PoS
-                });
-            }
-        }
+                }
+            })
+            .filter(|p| p.reputation >= MIN_REPUTATION)
+            .collect();
         
-        // 2. Include active nodes from registry with good reputation
-        let active_nodes = p2p.get_active_full_super_nodes();
-        for (node_id, _node_type, _last_seen) in &active_nodes {
-            // Skip if already added from participants
-            if eligible.iter().any(|e| &e.node_id == node_id) {
-                continue;
-            }
-            
-            let reputation = reputation_map.get(node_id).copied()
-                .unwrap_or(0.70);  // Default 70% for active nodes
-            
-            if reputation >= MIN_REPUTATION {
-                eligible.push(qnet_state::EligibleProducer {
-                    node_id: node_id.clone(),
-                    reputation,
-                    stake: 0,
-                });
-            }
-        }
-        
-        // 3. Ensure own node is included if eligible
-        if matches!(own_node_type, NodeType::Super | NodeType::Full) {
-            let own_reputation = reputation_map.get(own_node_id).copied().unwrap_or(0.70);
-            if own_reputation >= MIN_REPUTATION && !eligible.iter().any(|e| e.node_id == own_node_id) {
-                eligible.push(qnet_state::EligibleProducer {
-                    node_id: own_node_id.to_string(),
-                    reputation: own_reputation,
-                    stake: 0,
-                });
-            }
-        }
-        
-        // 4. Sort by node_id for determinism (all nodes will have SAME order)
+        // Sort by node_id for determinism
         eligible.sort_by(|a, b| a.node_id.cmp(&b.node_id));
         
-        // 5. Apply scalability limit with deterministic sampling if needed
+        // Apply scalability limit if needed
         if eligible.len() > MAX_VALIDATORS_PER_EPOCH {
-            if is_debug() { println!("[DBG][SNAP] limiting {} to {}", 
-                     eligible.len(), MAX_VALIDATORS_PER_EPOCH); }
-            
-            // Deterministic sampling: take top by reputation, then alphabetical
             eligible.sort_by(|a, b| {
                 b.reputation.partial_cmp(&a.reputation)
                     .unwrap_or(std::cmp::Ordering::Equal)
                     .then_with(|| a.node_id.cmp(&b.node_id))
             });
             eligible.truncate(MAX_VALIDATORS_PER_EPOCH);
-            
-            // Re-sort by node_id for final determinism
             eligible.sort_by(|a, b| a.node_id.cmp(&b.node_id));
         }
         
-        if is_info() { println!("[INFO][SNAP] eligible_producers={} min_rep={}%", 
-                 eligible.len(), (MIN_REPUTATION * 100.0) as u32); }
-        
+        if is_info() { println!("[INFO][SNAP] eligible={} source=consensus_participants", eligible.len()); }
         eligible
     }
     
@@ -992,15 +954,15 @@ impl BlockchainNode {
                                     return result;
                                 }
                                 Err(e) => {
-                                    println!("[WARN][PROD] Failed to deserialize eligible_producers: {}", e);
+                                    if is_warn() { println!("[WARN][PROD] deserialize_eligible_fail err={}", e); }
                                 }
                             }
                         }
                         
                         // Fallback: use consensus participants from macroblock
                         // NOTE: If node participated in consensus, it had reputation ≥ 70%
-                        println!("[WARN][PROD] No eligible_producers in MacroBlock #{}, using consensus participants", 
-                                 macroblock_index);
+                        if is_warn() { println!("[WARN][PROD] no_eligible_producers mb={} fallback=consensus_participants", 
+                                 macroblock_index); }
                         
                         // Try to get real reputation from eligible_producers if available
                         let mut reputation_map: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
@@ -1023,7 +985,7 @@ impl BlockchainNode {
                         participants
                     }
                     Err(e) => {
-                        println!("[WARN][PROD] Failed to deserialize MacroBlock: {}", e);
+                        if is_warn() { println!("[WARN][PROD] deserialize_macroblock_fail err={}", e); }
                         
                         // Fallback to Genesis with MIN_REPUTATION (not bootstrap 90%!)
                         use crate::genesis_constants::GENESIS_NODE_IPS;
@@ -1047,9 +1009,9 @@ impl BlockchainNode {
                 // The network continues with nodes that ARE synchronized.
                 // Lagging nodes will catch up via block sync.
                 
-                println!("[ERR][PROD] MacroBlock #{} not found for height {}", macroblock_index, current_height);
-                println!("[WARN][PROD] Node must sync before participating in block production");
-                println!("[INFO][PROD] Returning empty list - node will not be selected as producer");
+                eprintln!("[ERR][PROD] macroblock_missing mb={} h={}", macroblock_index, current_height);
+                if is_warn() { println!("[WARN][PROD] sync_required before_production"); }
+                if is_info() { println!("[INFO][PROD] empty_list node_excluded"); }
                 
                 // NO FALLBACK! Empty list = node cannot be producer
                 Vec::new()
@@ -1058,8 +1020,8 @@ impl BlockchainNode {
                 // CRITICAL FIX v2.27.1: NO FALLBACK on error either!
                 // Same logic - if we can't read macroblock, we can't participate
                 
-                println!("[ERR][PROD] Error loading MacroBlock #{}: {}", macroblock_index, e);
-                println!("[WARN][PROD] Node must sync before participating in block production");
+                eprintln!("[ERR][PROD] macroblock_load_fail mb={} err={}", macroblock_index, e);
+                if is_warn() { println!("[WARN][PROD] sync_required before_production"); }
                 
                 // NO FALLBACK! Empty list = node cannot be producer
                 Vec::new()
@@ -1122,7 +1084,7 @@ impl BlockchainNode {
         let p2p = match self.get_unified_p2p() {
             Some(p2p) => p2p,
             None => {
-                println!("[WARN][REWARDS] P2P not available, using local storage fallback");
+                if is_warn() { println!("[WARN][REWARDS] p2p_unavailable fallback=local_storage"); }
                 // Fallback to local storage if P2P not available
                 return self.process_reward_window_local(&mut reward_manager, window_start, current_height).await;
             }
@@ -1172,7 +1134,7 @@ impl BlockchainNode {
                     let mut rm = match reward_manager_mutex.lock() {
                         Ok(guard) => guard,
                         Err(poisoned) => {
-                            println!("[WARN][REWARDS] Reward manager mutex poisoned, recovering...");
+                            if is_warn() { println!("[WARN][REWARDS] reward_manager_mutex_poisoned recovering"); }
                             poisoned.into_inner()
                         }
                     };
@@ -1187,7 +1149,7 @@ impl BlockchainNode {
                     let mut pings = match all_pings_mutex.lock() {
                         Ok(guard) => guard,
                         Err(poisoned) => {
-                            println!("[PINGS] ⚠️ Pings mutex poisoned, recovering...");
+                            if is_warn() { println!("[WARN][PINGS] mutex_poisoned recovering"); }
                             poisoned.into_inner()
                         }
                     };
@@ -1195,8 +1157,8 @@ impl BlockchainNode {
                 }
             }
             
-            println!("[REWARDS] ⚡ Processed {} attestations in {:?} (chunked)", 
-                     attestation_count, start_time.elapsed());
+            if is_info() { println!("[INFO][REWARDS] attestations_processed n={} time={:?} mode=chunked", 
+                     attestation_count, start_time.elapsed()); }
         } else {
             // Small dataset: process sequentially (no overhead)
             for (light_node_id, _slot, pinger_id, timestamp) in &light_attestations {
@@ -1223,7 +1185,7 @@ impl BlockchainNode {
         // STEP 1B: Collect Full/Super node heartbeats from gossip-synced registry
         let heartbeats = p2p.get_heartbeats_for_window(window_start);
         let heartbeat_count = heartbeats.len();
-        println!("[REWARDS] 💓 Found {} Full/Super heartbeats (gossip-synced)", heartbeat_count);
+        if is_info() { println!("[INFO][REWARDS] heartbeats_found n={} source=gossip", heartbeat_count); }
         
         // Count heartbeats per node (HashMap is efficient for this)
         let mut heartbeat_counts: std::collections::HashMap<String, u8> = std::collections::HashMap::new();
@@ -1292,8 +1254,8 @@ impl BlockchainNode {
                         .collect();
                     hashes.extend(chunk_hashes);
                 }
-                println!("[REWARDS] ⚡ Hashed {} pings in {:?} (chunked)", 
-                         total_count, hash_start.elapsed());
+                if is_info() { println!("[INFO][REWARDS] pings_hashed n={} time={:?} mode=chunked", 
+                         total_count, hash_start.elapsed()); }
                 hashes
             } else {
                 all_pings.iter()
@@ -1333,8 +1295,8 @@ impl BlockchainNode {
             let sample_size = ((total_count as u32 * PING_SAMPLE_PERCENTAGE) / 100)
                 .max(MIN_PING_SAMPLES.min(total_count) as u32) as usize;
             
-            println!("[REWARDS] 🎲 Sampling {} pings ({} total, {}%)",
-                     sample_size, total_count, PING_SAMPLE_PERCENTAGE);
+            if is_info() { println!("[INFO][REWARDS] ping_sampling n={} total={} pct={}", 
+                     sample_size, total_count, PING_SAMPLE_PERCENTAGE); }
             
             // Deterministic sampling
             let mut ping_samples = Vec::new();
@@ -1372,7 +1334,7 @@ impl BlockchainNode {
             (merkle_root, ping_samples, total_count as u32, successful_count, sample_seed_hex)
         } else {
             // No pings - create empty commitment
-            println!("[WARN][REWARDS] No pings collected, creating empty commitment");
+            if is_warn() { println!("[WARN][REWARDS] no_pings_collected commitment=empty"); }
             let empty_seed = String::from("0000000000000000000000000000000000000000000000000000000000000000");
             (String::from("0000000000000000000000000000000000000000000000000000000000000000"), Vec::new(), 0, 0, empty_seed)
         };
@@ -1411,9 +1373,9 @@ impl BlockchainNode {
             
             // Add to mempool
             if let Err(e) = self.add_transaction_to_mempool(commitment_tx).await {
-                eprintln!("[WARN][REWARDS] Failed to add ping commitment to mempool: {}", e);
+                eprintln!("[WARN][REWARDS] ping_commitment_mempool_fail err={}", e);
             } else {
-                println!("[REWARDS] 📝 Ping commitment added to mempool");
+                if is_debug() { println!("[DBG][REWARDS] ping_commitment_added"); }
             }
         }
         
@@ -1427,7 +1389,7 @@ impl BlockchainNode {
         let pending_rewards = reward_manager.get_all_pending_rewards();
         
         if pending_rewards.is_empty() {
-            println!("[WARN][REWARDS] No nodes eligible for rewards in this window");
+            if is_warn() { println!("[WARN][REWARDS] no_eligible_nodes_in_window"); }
             return Ok(());
         }
         
@@ -1446,12 +1408,11 @@ impl BlockchainNode {
         
         match emission_result {
             Ok(actual_emission) => {
-                if is_info() { println!("[INFO][REWARDS] EMISSION_COMPLETE"); }
-                println!("   📈 New tokens emitted: {} QNC", actual_emission / 1_000_000_000);
+                if is_info() { println!("[INFO][REWARDS] EMISSION_COMPLETE amount={} eligible={}", 
+                         actual_emission / 1_000_000_000, pending_rewards.len()); }
                 let state = self.state.read().await;
                 let total_supply = (*state).get_total_supply();
-                println!("   🏦 New total supply: {} QNC", total_supply / 1_000_000_000);
-                println!("   📊 Eligible nodes: {}", pending_rewards.len());
+                if is_debug() { println!("[DBG][REWARDS] total_supply={}", total_supply / 1_000_000_000); }
                 
                 // CRITICAL: Create system emission transaction for blockchain record
                 if actual_emission > 0 {
@@ -1487,14 +1448,14 @@ impl BlockchainNode {
                     
                     // Add emission transaction to mempool for blockchain record
                     if let Err(e) = self.add_transaction_to_mempool(emission_tx).await {
-                        eprintln!("[WARN][REWARDS] Failed to add emission tx to mempool: {}", e);
+                        eprintln!("[WARN][REWARDS] emission_tx_mempool_fail err={}", e);
                     } else {
-                        println!("[REWARDS] 📝 Emission transaction added to mempool for consensus");
+                        if is_debug() { println!("[DBG][REWARDS] emission_tx_added"); }
                     }
                 }
             }
             Err(e) => {
-                eprintln!("[ERR][REWARDS] Emission failed: {}", e);
+                eprintln!("[ERR][REWARDS] emission_failed err={}", e);
                 return Err(QNetError::ConsensusError(format!("Failed to emit rewards: {}", e)));
             }
         }
@@ -1503,9 +1464,9 @@ impl BlockchainNode {
         for (node_id, _amount) in &pending_rewards {
             if let Some(reward) = reward_manager.get_pending_reward(&node_id) {
                 if let Err(e) = self.storage.save_pending_reward(&node_id, reward) {
-                    eprintln!("[WARN][REWARDS] Failed to save pending reward for {}: {}", node_id, e);
+                    eprintln!("[WARN][REWARDS] pending_reward_save_fail node={} err={}", node_id, e);
                 } else {
-                    println!("[REWARDS] 💾 Saved pending reward for {} to storage", node_id);
+                    if is_debug() { println!("[DBG][REWARDS] pending_reward_saved node={}", node_id); }
                 }
             }
         }
@@ -1522,7 +1483,7 @@ impl BlockchainNode {
         window_start: u64,
         current_height: u64
     ) -> Result<(), QNetError> {
-        println!("[WARN][REWARDS] Using local storage fallback for reward processing");
+        if is_warn() { println!("[WARN][REWARDS] local_storage_fallback"); }
         
         let mut all_pings: Vec<PingData> = Vec::new();
         let registered_nodes = reward_manager.get_all_registered_nodes();
@@ -1649,17 +1610,17 @@ impl BlockchainNode {
                 }
             }
         } else {
-            println!("[WARN][NODE] QNET_SKIP_PREFLIGHT set - skipping pre-flight checks (NOT FOR PRODUCTION!)");
+            if is_warn() { println!("[WARN][NODE] preflight_skipped not_for_production"); }
         }
         
         // NOTE: Light node server blocking is already implemented in bin/qnet-node.rs (lines 78-83, 173-184)
         // No need to duplicate the check here
         
         // Initialize storage
-        println!("[Node] 🔍 DEBUG: Initializing storage at '{}'", data_dir);
+        if is_debug() { println!("[DBG][NODE] storage_init path={}", data_dir); }
         let storage = match Storage::new(data_dir) {
             Ok(storage) => {
-                println!("[Node] 🔍 DEBUG: Storage initialized successfully");
+                if is_debug() { println!("[DBG][NODE] storage_init_ok"); }
                 
                 let storage_arc = Arc::new(storage);
                 
@@ -1668,48 +1629,47 @@ impl BlockchainNode {
                 match GLOBAL_STORAGE_INSTANCE.lock() {
                     Ok(mut guard) => {
                         *guard = Some(storage_arc.clone());
-                        println!("[Node] 🔐 Global storage instance set (shared across components)");
+                        if is_debug() { println!("[DBG][NODE] global_storage_set"); }
                     }
                     Err(poisoned) => {
                         // SECURITY: Recover from poisoned lock during initialization
                         *poisoned.into_inner() = Some(storage_arc.clone());
-                        println!("[WARN][NODE] Recovered from poisoned lock, storage instance set");
+                        if is_warn() { println!("[WARN][NODE] storage_lock_poisoned recovered"); }
                     }
                 }
                 
                 // PRODUCTION: Set storage path for registry to read activations
                 std::env::set_var("QNET_STORAGE_PATH", data_dir);
-                println!("[Node] 📁 Storage path set: QNET_STORAGE_PATH={}", data_dir);
+                if is_debug() { println!("[DBG][NODE] storage_path_env={}", data_dir); }
                 
                 // POH STATE MIGRATION (v2.19.13): Migrate existing blocks to have separate PoH state
                 // This enables O(1) PoH validation without loading full blocks
                 // Migration is idempotent and only runs once per block
                 match storage_arc.needs_poh_migration() {
                     Ok(true) => {
-                        println!("[Node] 🔄 PoH state migration needed, starting...");
+                        if is_info() { println!("[INFO][NODE] poh_migration_starting"); }
                         match storage_arc.migrate_all_poh_states() {
                             Ok(count) => {
                                 if is_info() { println!("[INFO][NODE] poh_migrated n={}", count); }
                             }
                             Err(e) => {
                                 // Non-fatal: PoH validation will fall back to loading blocks
-                                println!("[WARN][NODE] PoH state migration failed (non-fatal): {}", e);
+                                if is_warn() { println!("[WARN][NODE] poh_migration_fail err={}", e); }
                             }
                         }
                     }
                     Ok(false) => {
-                        if is_info() { println!("[INFO][NODE] poh_already_migrated"); }
+                        if is_debug() { println!("[DBG][NODE] poh_already_migrated"); }
                     }
                     Err(e) => {
-                        println!("[WARN][NODE] Could not check PoH migration status: {}", e);
+                        if is_warn() { println!("[WARN][NODE] poh_migration_check_fail err={}", e); }
                     }
                 }
                 
                 storage_arc
             }
             Err(e) => {
-                println!("[ERR][NODE] ERROR: Storage initialization failed: {}", e);
-                eprintln!("[ERR][NODE] ERROR: Storage initialization failed: {}", e);
+                eprintln!("[ERR][NODE] storage_init_fail err={}", e);
                 // STATE MACHINE: Fatal storage error
                 set_node_state(NodeState::Error {
                     reason: format!("Storage initialization failed: {}", e),
@@ -1748,14 +1708,14 @@ impl BlockchainNode {
             // BENCHMARK MODE: 10x larger mempool for 100K+ TPS testing!
             let calculated_size = if benchmark_mode {
                 let boosted = base_size * 10;  // 1M for genesis, 5M for small, etc.
-                println!("[Mempool] 🔥 BENCHMARK MODE: 10x boost → {} tx capacity", boosted);
+                if is_info() { println!("[INFO][MEMPOOL] benchmark_mode capacity={}", boosted); }
                 boosted
             } else {
                 base_size
             };
             
-            println!("[Mempool] 🔄 AUTO-SCALING: Network size {} nodes → {} tx capacity", 
-                    network_size, calculated_size);
+            if is_info() { println!("[INFO][MEMPOOL] auto_scale network={} capacity={}", 
+                    network_size, calculated_size); }
             
             calculated_size
         };
@@ -1774,12 +1734,12 @@ impl BlockchainNode {
         match GLOBAL_MEMPOOL_INSTANCE.lock() {
             Ok(mut guard) => {
                 *guard = Some(mempool.clone());
-                println!("[Node] 🔐 Global mempool instance set (shared with activation registry)");
+                if is_debug() { println!("[DBG][NODE] global_mempool_set"); }
             }
             Err(poisoned) => {
                 // SECURITY: Recover from poisoned lock during initialization
                 *poisoned.into_inner() = Some(mempool.clone());
-                println!("[WARN][NODE] Recovered from poisoned lock, mempool instance set");
+                if is_warn() { println!("[WARN][NODE] mempool_lock_poisoned recovered"); }
             }
         }
         
@@ -1790,12 +1750,10 @@ impl BlockchainNode {
         if std::env::var("QNET_BOOTSTRAP_ID").is_ok() || std::env::var("DOCKER_ENV").is_ok() {
             // This is a Genesis node - MUST have proper genesis_node_XXX ID
             if !node_id.starts_with("genesis_node_") {
-                eprintln!("[CRITICAL] ❌ Genesis node has incorrect ID: {}", node_id);
-                eprintln!("[CRITICAL] ❌ Expected: genesis_node_XXX, got fallback ID!");
-                eprintln!("[CRITICAL] 🔧 Check environment variables:");
-                eprintln!("  QNET_BOOTSTRAP_ID = {:?}", std::env::var("QNET_BOOTSTRAP_ID"));
-                eprintln!("  QNET_ACTIVATION_CODE = {:?}", std::env::var("QNET_ACTIVATION_CODE"));
-                eprintln!("  DOCKER_ENV = {:?}", std::env::var("DOCKER_ENV"));
+                eprintln!("[ERR][NODE] genesis_invalid_id id={}", node_id);
+                eprintln!("[ERR][NODE] expected=genesis_node_XXX got=fallback");
+                eprintln!("[ERR][NODE] check_env QNET_BOOTSTRAP_ID={:?} DOCKER_ENV={:?}", 
+                         std::env::var("QNET_BOOTSTRAP_ID"), std::env::var("DOCKER_ENV"));
                 
                 // For Docker Genesis nodes, this is a critical error
                 if std::env::var("DOCKER_ENV").is_ok() && std::env::var("QNET_BOOTSTRAP_ID").is_ok() {
@@ -1807,17 +1765,13 @@ impl BlockchainNode {
                     panic!("[FATAL] Genesis node cannot start with fallback ID! Check QNET_BOOTSTRAP_ID environment variable!");
                 }
             } else {
-                println!("[NODE_ID] ✅ Genesis node ID validated: {}", node_id);
+                if is_info() { println!("[INFO][NODE] genesis_id_validated id={}", node_id); }
             }
         }
         
         // Validate no process ID in production node IDs (fallback detection)
         if node_id.contains(&std::process::id().to_string()) {
-            println!("[NODE_ID] ⚠️ WARNING: Using process-based fallback ID: {}", node_id);
-            println!("[NODE_ID] ⚠️ This is not recommended for production!");
-            println!("[NODE_ID] 🔧 Set proper environment variables:");
-            println!("  - QNET_BOOTSTRAP_ID for Genesis nodes");
-            println!("  - QNET_EXTERNAL_IP for regular nodes");
+            if is_warn() { println!("[WARN][NODE] fallback_id id={} not_for_production", node_id); }
         }
         let consensus_config = qnet_consensus::ConsensusConfig {
             commit_phase_duration: Duration::from_secs(12),    // OPTIMIZED: 12s commit phase (blocks 61-72)
@@ -1835,7 +1789,7 @@ impl BlockchainNode {
         // PERSISTENCE: Load consensus state if exists
         if let Ok(latest_round) = storage.get_latest_consensus_round() {
             if latest_round > 0 {
-                println!("[CONSENSUS] 📂 Loading consensus state from round {}", latest_round);
+                if is_info() { println!("[INFO][CONS] loading_state round={}", latest_round); }
                 if let Ok(Some(state_data)) = storage.load_consensus_state(latest_round) {
                     // VERSION CHECK: Ensure compatibility before restoring
                     if state_data.len() >= 4 {
@@ -1845,14 +1799,14 @@ impl BlockchainNode {
                             // Note: This requires adding a restore_state method to CommitRevealConsensus
                             // consensus_engine.restore_state(&state_data[4..]); 
                         } else {
-                            println!("[WARN][CONS] Incompatible consensus version: {} (current: {})", version, PROTOCOL_VERSION);
-                            println!("[CONSENSUS] 🔄 Starting fresh consensus state");
+                            if is_warn() { println!("[WARN][CONS] version_mismatch v={} current={}", version, PROTOCOL_VERSION); }
+                            if is_info() { println!("[INFO][CONS] fresh_state=true"); }
                         }
                     } else {
-                        println!("[WARN][CONS] Invalid consensus state format, starting fresh");
+                        if is_warn() { println!("[WARN][CONS] invalid_state_format fresh_start"); }
                     }
                 } else {
-                    println!("[WARN][CONS] No consensus state found, starting fresh");
+                    if is_warn() { println!("[WARN][CONS] no_state_found fresh_start"); }
                 }
             }
         }
@@ -1868,23 +1822,22 @@ impl BlockchainNode {
         }
         
         // Get current height from storage
-        println!("[Node] 🔍 DEBUG: Getting chain height from storage...");
+        if is_debug() { println!("[DBG][NODE] loading_chain_height"); }
         let mut height = match storage.get_chain_height() {
             Ok(height) => {
-                println!("[Node] 🔍 DEBUG: Chain height: {}", height);
+                if is_debug() { println!("[DBG][NODE] chain_height={}", height); }
                 
                 // CRITICAL FIX: Initialize P2P local height for message filtering
                 crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.store(
                     height, 
                     std::sync::atomic::Ordering::Relaxed
                 );
-                println!("[Node] 📊 P2P local height initialized to {}", height);
+                if is_debug() { println!("[DBG][NODE] p2p_height_init={}", height); }
                 
                 height
             }
             Err(e) => {
-                println!("[ERR][NODE] ERROR: Failed to get chain height: {}", e);
-                eprintln!("[ERR][NODE] ERROR: Failed to get chain height: {}", e);
+                eprintln!("[ERR][NODE] chain_height_fail err={}", e);
                 return Err(QNetError::StorageError(format!("Failed to get chain height: {}", e)));
             }
         };
@@ -1901,16 +1854,11 @@ impl BlockchainNode {
         if is_genesis_node && height > 0 {
             // Genesis phase is first 1000 blocks
             if height > 1000 {
-                println!("[Node] 📊 POST-GENESIS DATA DETECTED:");
-                println!("[Node]    Network: {}", network_type);
-                println!("[Node]    Current height: {}", height);
-                println!("[Node]    Age: ~{} days", height / (24 * 60 * 60));
-                println!("[Node]    Status: Normal operation phase (height > 1000)");
+                if is_info() { println!("[INFO][NODE] post_genesis network={} h={} age_days={}", 
+                         network_type, height, height / (24 * 60 * 60)); }
             } else {
-                println!("[Node] 📊 GENESIS PHASE DATA:");
-                println!("[Node]    Network: {}", network_type);
-                println!("[Node]    Current height: {}", height);
-                println!("[Node]    Blocks until normal phase: {}", 1000 - height);
+                if is_info() { println!("[INFO][NODE] genesis_phase network={} h={} remaining={}", 
+                         network_type, height, 1000 - height); }
             }
             
             // Check data integrity (but don't delete!)
@@ -1919,19 +1867,16 @@ impl BlockchainNode {
                     if is_info() { println!("[INFO][NODE] integrity_ok hash={}...", &hash[..8]); }
                 }
                 Ok(None) => {
-                    println!("[WARN][NODE] WARNING: Height is {} but no block found at that height!", height);
-                    println!("[Node] 💡 This might indicate corrupted data.");
-                    println!("[Node] 💡 To reset: stop node, run 'rm -rf node_data/*', restart");
+                    if is_warn() { println!("[WARN][NODE] block_missing h={} possible_corruption", height); }
                 }
                 Err(e) => {
-                    println!("[WARN][NODE] Could not verify data integrity: {}", e);
+                    if is_warn() { println!("[WARN][NODE] integrity_check_fail err={}", e); }
                 }
             }
             
             // Warn if mixing networks (but still allow it)
             if height > 1000 && is_genesis_node {
-                println!("[Node] ℹ️  Note: This Genesis node has post-Genesis data (height > 1000)");
-                println!("[Node]    This is fine for continuing an existing {}.", network_type);
+                if is_info() { println!("[INFO][NODE] genesis_post_data network={}", network_type); }
             }
         }
         
@@ -1939,21 +1884,16 @@ impl BlockchainNode {
         if std::env::var("QNET_FORCE_RESET").unwrap_or_default() == "1" {
             let confirm = std::env::var("QNET_CONFIRM_RESET").unwrap_or_default();
             if confirm == "YES" {
-                println!("[WARN][NODE] FORCE RESET REQUESTED via QNET_FORCE_RESET=1 + QNET_CONFIRM_RESET=YES");
-                println!("[Node] 🧹 Resetting blockchain to height 0...");
+                if is_warn() { println!("[WARN][NODE] force_reset_confirmed"); }
                 
                 if let Err(e) = storage.reset_chain_height() {
-                    println!("[ERR][NODE] Failed to reset chain height: {}", e);
+                    eprintln!("[ERR][NODE] reset_fail err={}", e);
                 } else {
                     height = 0;
                     if is_info() { println!("[INFO][NODE] reset_h=0"); }
                 }
             } else {
-                println!("[WARN][NODE] Reset requested but not confirmed!");
-                println!("[Node]    To reset, set BOTH environment variables:");
-                println!("[Node]    - QNET_FORCE_RESET=1");
-                println!("[Node]    - QNET_CONFIRM_RESET=YES");
-                println!("[Node] 📊 Continuing with existing height: {}", height);
+                if is_warn() { println!("[WARN][NODE] reset_not_confirmed h={}", height); }
             }
         }
         
@@ -1974,7 +1914,7 @@ impl BlockchainNode {
         );
         
         // Create unified P2P with regional clustering
-        println!("[UnifiedP2P] 🔍 DEBUG: Initializing unified P2P network");
+        if is_debug() { println!("[DBG][P2P] unified_p2p_init"); }
         
         let unified_node_type = match node_type {
             NodeType::Light => UnifiedNodeType::Light,
@@ -2012,7 +1952,7 @@ impl BlockchainNode {
         // Enables full transaction propagation from P2P to mempool
         let (transaction_tx, mut transaction_rx) = tokio::sync::mpsc::unbounded_channel::<crate::unified_p2p::ReceivedTransaction>();
         
-        println!("[UnifiedP2P] 🔍 DEBUG: Creating SimplifiedP2P instance...");
+        if is_debug() { println!("[DBG][P2P] simplified_p2p_create"); }
         let mut unified_p2p_instance = SimplifiedP2P::new(
             node_id.clone(),
             unified_node_type,
@@ -2046,8 +1986,8 @@ impl BlockchainNode {
             if data_dir.exists() {
                 if let Ok(mut cert_manager) = unified_p2p_instance.certificate_manager.write() {
                     match cert_manager.load_from_disk(data_dir) {
-                        Ok(_) => println!("[NODE] ✅ Certificate history loaded from disk"),
-                        Err(e) => println!("[NODE] ⚠️ Failed to load certificate history: {}", e),
+                        Ok(_) => { if is_info() { println!("[INFO][NODE] cert_history_loaded"); } }
+                        Err(e) => { if is_warn() { println!("[WARN][NODE] cert_load_fail err={}", e); } }
                     }
                 }
             }
@@ -2076,7 +2016,7 @@ impl BlockchainNode {
                 .map(|ip| format!("{}:8001", ip))
                 .collect();
             
-            println!("[P2P] 🌟 Genesis node: Adding {} Genesis bootstrap peers for initial network", genesis_peers.len());
+            if is_info() { println!("[INFO][P2P] genesis_bootstrap peers={}", genesis_peers.len()); }
             unified_p2p_instance.add_discovered_peers(&genesis_peers);
             
             // P2P FIX: Start peer exchange after adding Genesis peers
@@ -2087,26 +2027,15 @@ impl BlockchainNode {
             
             if !initial_peers.is_empty() {
                 unified_p2p_instance.start_peer_exchange_protocol(initial_peers);
-                println!("[P2P] 🔄 Genesis node: Started peer exchange protocol with {} peers", peer_count);
+                if is_info() { println!("[INFO][P2P] peer_exchange_started peers={}", peer_count); }
             } else {
-                println!("[P2P] ⏳ Genesis node: No peers yet, reconnection will be handled by main loop");
+                if is_debug() { println!("[DBG][P2P] no_peers_yet reconnect_later"); }
             }
         } else {
             // SCALABILITY: Regular nodes (Full/Light) in production with millions of nodes
             // Should NOT directly connect to Genesis nodes to avoid overload
             // They will discover peers through DHT and peer exchange protocol
-            match node_type {
-                NodeType::Light => {
-                    println!("[P2P] 📱 Light node: Will discover peers through DHT (no direct Genesis connection)");
-                },
-                NodeType::Full => {
-                    println!("[P2P] 💻 Full node: Will discover peers through DHT (no direct Genesis connection)");
-                },
-                NodeType::Super => {
-                    // Super nodes might need some Genesis connections for consensus
-                    println!("[P2P] 🖥️ Super node: Will discover peers through DHT with limited Genesis fallback");
-                }
-            }
+            if is_info() { println!("[INFO][P2P] dht_discovery type={:?}", node_type); }
         }
         
         // PRODUCTION v2.19.21: Initialize QUIC transport for high-performance P2P
@@ -2127,23 +2056,8 @@ impl BlockchainNode {
             if let Err(e) = unified_p2p_instance.init_quic(&external_ip, &cert_serial).await {
                 // QUIC is REQUIRED for v2.19.22+
                 // Without QUIC, node cannot participate in P2P network
-                println!("");
-                println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-                println!("🚨 FATAL: QUIC TRANSPORT INITIALIZATION FAILED!");
-                println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-                println!("Error: {}", e);
-                println!("");
-                println!("QUIC transport is REQUIRED for QNet v2.19.22+");
-                println!("Without QUIC, this node CANNOT:");
-                println!("  ❌ Receive blocks from other nodes");
-                println!("  ❌ Send blocks to other nodes");
-                println!("  ❌ Participate in consensus");
-                println!("");
-                println!("SOLUTION: Ensure UDP port 10876 is open in your firewall:");
-                println!("  sudo ufw allow 10876/udp && sudo ufw reload");
-                println!("");
-                println!("For Docker: add '-p 10876:10876/udp' to docker run command");
-                println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+                eprintln!("[ERR][QUIC] init_fail err={}", e);
+                eprintln!("[ERR][QUIC] required_for_p2p open_udp_10876");
                 
                 // STATE MACHINE: Fatal network error
                 set_node_state(NodeState::Error {
@@ -2176,7 +2090,7 @@ impl BlockchainNode {
             
             // Auto-enable when network grows (same threshold for all node types)
             if network_size >= 1000 {
-                println!("[SHARDING] ⚡ AUTO-ENABLED: {} active Full/Super nodes (threshold: 1000)", network_size);
+                if is_info() { println!("[INFO][SHARD] auto_enabled nodes={} threshold=1000", network_size); }
                 return true;
             }
             
@@ -2189,7 +2103,7 @@ impl BlockchainNode {
             let coordinator = Arc::new(qnet_sharding::ShardCoordinator::new());
             
             // Register P2P shard info with coordinator
-            println!("[SHARDING] 🔗 Connecting P2P shard {} to coordinator", unified_p2p.get_shard_id());
+            if is_info() { println!("[INFO][SHARD] connect shard_id={}", unified_p2p.get_shard_id()); }
             // Coordinator knows which shard this node handles
             // for efficient cross-shard communication
             
@@ -2207,11 +2121,11 @@ impl BlockchainNode {
         };
         
         // Initialize archive replication manager
-        println!("[Node] 📦 Initializing archive replication manager...");
+        if is_debug() { println!("[DBG][NODE] archive_manager_init"); }
         let mut archive_manager = crate::archive_manager::ArchiveReplicationManager::new();
         
         // Initialize reward manager with Genesis timestamp
-        println!("[Node] 💰 Initializing lazy rewards system...");
+        if is_debug() { println!("[DBG][NODE] rewards_system_init"); }
         
         // Check if this is a Genesis bootstrap node (local check)
         let is_genesis_node = std::env::var("QNET_BOOTSTRAP_ID")
@@ -2224,7 +2138,7 @@ impl BlockchainNode {
             Ok(Some(genesis_data)) => {
                 match bincode::deserialize::<qnet_state::MicroBlock>(&genesis_data) {
                     Ok(genesis_block) => {
-                        println!("[INFO][GEN] Loaded timestamp from block #0: {}", genesis_block.timestamp);
+                        if is_info() { println!("[INFO][GEN] loaded_ts={}", genesis_block.timestamp); }
                         genesis_block.timestamp
                     }
                     Err(e) => {
@@ -2233,10 +2147,10 @@ impl BlockchainNode {
                                 .duration_since(UNIX_EPOCH)
                                 .unwrap_or_default()
                                 .as_secs();
-                            println!("[ERR][GEN] Genesis node can't parse block ({}), using: {}", e, now);
+                            eprintln!("[ERR][GEN] parse_fail err={} fallback_ts={}", e, now);
                             now
                         } else {
-                            println!("[GENESIS] ⏳ Waiting for Genesis sync...");
+                            if is_info() { println!("[INFO][GEN] waiting_for_sync"); }
                             0 // Sentinel - will be updated
                         }
                     }
@@ -2248,10 +2162,10 @@ impl BlockchainNode {
                         .duration_since(UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_secs();
-                    println!("[GENESIS] 🆕 Creating network with timestamp: {}", now);
+                    if is_info() { println!("[INFO][GEN] new_network ts={}", now); }
                     now
                 } else {
-                    println!("[GENESIS] ⏳ Waiting for Genesis from network...");
+                    if is_info() { println!("[INFO][GEN] waiting_for_genesis"); }
                     0 // Sentinel - will be updated
                 }
             }
@@ -2300,11 +2214,11 @@ impl BlockchainNode {
                         }
                         if is_info() { println!("[INFO][REWARDS] restored={}", reward_count); }
                     } else {
-                        println!("[REWARDS] 📭 No pending rewards to restore");
+                        if is_debug() { println!("[DBG][REWARDS] no_pending_rewards"); }
                     }
                 }
                 Err(e) => {
-                    println!("[WARN][REWARDS] Failed to load pending rewards from storage: {}", e);
+                    if is_warn() { println!("[WARN][REWARDS] pending_load_fail err={}", e); }
                 }
             }
         }
@@ -2316,7 +2230,7 @@ impl BlockchainNode {
                 // PRODUCTION: Auto-detect public IP or use P2P discovered address
                 // For now, fallback to local for development only
                 if std::env::var("QNET_PRODUCTION").unwrap_or_default() == "1" {
-                    println!("[WARN][NODE] QNET_PUBLIC_IP not set for production node!");
+                    if is_warn() { println!("[WARN][NODE] public_ip_not_set"); }
                 }
                 format!("0.0.0.0:{}", p2p_port) // Listen on all interfaces
             }
@@ -2324,7 +2238,7 @@ impl BlockchainNode {
         
         // Register node for MANDATORY archival responsibilities (no choice)
         if let Err(e) = archive_manager.register_archive_node(&node_id, node_type, &node_ip).await {
-            println!("[WARN][NODE] Archive manager registration failed: {}", e);
+            if is_warn() { println!("[WARN][NODE] archive_reg_fail err={}", e); }
         } else {
             let quota = match node_type {
                 NodeType::Light => 0,
@@ -2334,7 +2248,7 @@ impl BlockchainNode {
             if is_info() { println!("[INFO][NODE] archive_reg chunks={}", quota); }
         }
         
-        println!("[Node] 🔍 DEBUG: Creating BlockchainNode struct...");
+        if is_debug() { println!("[DBG][NODE] creating_struct"); }
         
         // =========================================================================
         // QUANTUM VTS INITIALIZATION
@@ -2343,7 +2257,7 @@ impl BlockchainNode {
         // =========================================================================
         let (quantum_poh, poh_receiver): (Option<Arc<crate::quantum_poh::QuantumPoH>>, Option<Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<crate::quantum_poh::PoHEntry>>>>) = 
             if matches!(node_type, NodeType::Full | NodeType::Super) {
-                println!("[QuantumPoH] 🔧 Initializing PoH for {:?} node (block producer)", node_type);
+                if is_info() { println!("[INFO][POH] init type={:?}", node_type); }
                 
                 // Get genesis hash for PoH initialization
                 let genesis_hash = {
@@ -2355,9 +2269,9 @@ impl BlockchainNode {
                             let hash_result = hasher.finalize();
                             let mut hash_vec = vec![0u8; 32];
                             hash_vec.copy_from_slice(&hash_result);
-                            println!("[QuantumPoH] 📍 Using real genesis hash: {:x}", 
+                            if is_debug() { println!("[DBG][POH] genesis_hash={:x}", 
                                     u64::from_le_bytes([hash_vec[0], hash_vec[1], hash_vec[2], hash_vec[3],
-                                                       hash_vec[4], hash_vec[5], hash_vec[6], hash_vec[7]]));
+                                                       hash_vec[4], hash_vec[5], hash_vec[6], hash_vec[7]])); }
                             hash_vec
                         },
                         _ => {
@@ -2368,9 +2282,9 @@ impl BlockchainNode {
                             let hash_result = hasher.finalize();
                             let mut hash_vec = vec![0u8; 32];
                             hash_vec.copy_from_slice(&hash_result);
-                            println!("[QuantumPoH] 📍 Using deterministic genesis hash (no block 0 yet): {:x}",
+                            if is_debug() { println!("[DBG][POH] deterministic_hash={:x}",
                                     u64::from_le_bytes([hash_vec[0], hash_vec[1], hash_vec[2], hash_vec[3],
-                                                       hash_vec[4], hash_vec[5], hash_vec[6], hash_vec[7]]));
+                                                       hash_vec[4], hash_vec[5], hash_vec[6], hash_vec[7]])); }
                             hash_vec
                         }
                     }
@@ -2380,11 +2294,10 @@ impl BlockchainNode {
                 let initial_poh_state = Self::load_last_poh_checkpoint(&storage).await;
                 
                 let (poh, receiver) = if let Some((hash, count)) = initial_poh_state {
-                    println!("[QuantumPoH] 🔄 Recovering from checkpoint: count={}, hash={}", 
-                            count, hex::encode(&hash[..16]));
+                    if is_info() { println!("[INFO][POH] checkpoint_restore count={}", count); }
                     crate::quantum_poh::QuantumPoH::new_from_checkpoint(hash, count)
                 } else {
-                    println!("[QuantumPoH] 🆕 Starting fresh from genesis hash");
+                    if is_info() { println!("[INFO][POH] fresh_start"); }
                     crate::quantum_poh::QuantumPoH::new(genesis_hash)
                 };
                 
@@ -2395,14 +2308,14 @@ impl BlockchainNode {
                 let poh_clone = poh_arc.clone();
                 tokio::spawn(async move {
                     poh_clone.start().await;
-                    println!("[QuantumPoH] 🚀 PoH generator started (500K hashes/sec)");
+                    if is_info() { println!("[INFO][POH] generator_started rate=500k/s"); }
                 });
                 
                 // Start PoH checkpoint processor
                 let receiver_clone = receiver_arc.clone();
                 let storage_clone = storage.clone();
                 tokio::spawn(async move {
-                    println!("[QuantumPoH] 📝 Starting PoH checkpoint processor");
+                    if is_debug() { println!("[DBG][POH] checkpoint_processor_start"); }
                     let mut receiver = receiver_clone.lock().await;
                     let mut last_checkpoint = 0u64;
                     
@@ -2426,16 +2339,16 @@ impl BlockchainNode {
                                     let key = format!("poh_checkpoint_{}", rounded_count);
                                     
                                     if let Err(e) = storage_clone.save_raw(&key, &compressed) {
-                                        println!("[QuantumPoH] ⚠️ Failed to save checkpoint at {}: {}", 
-                                                rounded_count, e);
+                                        if is_warn() { println!("[WARN][POH] checkpoint_save_fail count={} err={}", 
+                                                rounded_count, e); }
                                     } else {
                                         // Also update the index for O(1) lookup on restart
                                         if let Ok(index_data) = bincode::serialize(&rounded_count) {
                                             let _ = storage_clone.save_raw("poh_checkpoint_latest", &index_data);
                                         }
                                         
-                                        println!("[QuantumPoH] 💾 Saved checkpoint at hash count: {} (compressed: {} -> {} bytes)", 
-                                                rounded_count, serialized.len(), compressed.len());
+                                        if is_debug() { println!("[DBG][POH] checkpoint_saved count={} compressed={}b", 
+                                                rounded_count, compressed.len()); }
                                         last_checkpoint = rounded_count;
                                     }
                                 }
@@ -2444,17 +2357,17 @@ impl BlockchainNode {
                         
                         // Log progress every 10M hashes
                         if entry.num_hashes % 10_000_000 == 0 {
-                            println!("[QuantumPoH] 📊 Progress: {} million hashes computed", 
-                                    entry.num_hashes / 1_000_000);
+                            if is_debug() { println!("[DBG][POH] progress={}M", 
+                                    entry.num_hashes / 1_000_000); }
                         }
                     }
-                    println!("[QuantumPoH] 🛑 Checkpoint processor stopped");
+                    if is_debug() { println!("[DBG][POH] checkpoint_processor_stopped"); }
                 });
                 
                 (Some(poh_arc), Some(receiver_arc))
             } else {
                 // Light nodes do NOT run PoH - they are mobile devices
-                println!("[QuantumPoH] ⏭️ Skipping PoH for Light node (mobile device - saves battery/CPU)");
+                if is_debug() { println!("[DBG][POH] skipped_light_node"); }
                 (None, None)
             };
         
@@ -2464,7 +2377,7 @@ impl BlockchainNode {
                 shard_coord.clone(),
                 parallel_val.clone(),
             ));
-            println!("[ParallelExecutor] 🚀 Initialized parallel transaction processor");
+            if is_info() { println!("[INFO][EXEC] parallel_executor_init"); }
             Some(executor)
         } else {
             None
@@ -3319,7 +3232,7 @@ impl BlockchainNode {
             
             // DIAGNOSTIC: Log retry attempts
             if is_retry {
-                println!("[BLOCKS] 🔄 RETRY processing block #{} (from pending buffer)", received_block.height);
+                println!("[INFO][BLOCK] retry h={}", received_block.height);
             }
             
             // Check for special ping signal
@@ -3357,7 +3270,7 @@ impl BlockchainNode {
             // Log every 10th block or special cases
             let should_log = received_block.height % 10 == 0 || received_block.height <= 5;
             if should_log {
-                println!("[BLOCKS] 📦 Received {} block #{} from {} | Size: {} bytes | Compressed: {}",
+                println!("[INFO][BLOCK] recv type={} h={} from={} bytes={} zstd={}",
                          received_block.block_type, 
                          received_block.height, 
                          received_block.from_peer, 
@@ -3382,7 +3295,7 @@ impl BlockchainNode {
                                 .unwrap_or(0);
                             
                             if retry_count < 5 { // Max 5 retries for certificate race (more than missing block)
-                                println!("[BLOCKS] 🔐 Buffering block #{} (retry #{}) - waiting for certificate from {}", 
+                                println!("[INFO][BLOCK] buffer h={} retry={} wait_cert={}", 
                                          received_block.height, retry_count, received_block.from_peer);
                                 
                                 // MEMORY PROTECTION: Enforce maximum buffer size (adaptive by node type)
@@ -3392,7 +3305,7 @@ impl BlockchainNode {
                                         .filter(|(&h, _)| h != received_block.height)  // Don't remove current block
                                         .min_by_key(|(_, (_, _, timestamp))| timestamp) {
                                         pending_blocks.remove(&oldest_height);
-                                        println!("[BLOCKS] 🚨 Max buffer ({}) reached - removed oldest block #{}", 
+                                        println!("[WARN][BLOCK] buffer_full max={} evicted={}", 
                                                  max_pending_blocks, oldest_height);
                                     }
                                 }
@@ -3409,10 +3322,10 @@ impl BlockchainNode {
                                 
                                 // Certificate will arrive via periodic broadcast (every 10s during first 2 minutes)
                                 // No need to request - adaptive re-broadcast will provide it
-                                println!("[BLOCKS] ⏳ Certificate will arrive via adaptive re-broadcast");
+                                println!("[INFO][BLOCK] cert_pending via_rebroadcast");
                                 continue; // Skip error logging, this is expected race condition
                             } else {
-                                println!("[BLOCKS] ❌ Block #{} rejected after {} certificate retries", 
+                                println!("[ERR][BLOCK] rejected h={} cert_retries={}", 
                                          received_block.height, retry_count);
                             }
                         }
@@ -3438,7 +3351,7 @@ impl BlockchainNode {
                                     // - Retries 0-9: aggressive (immediate)
                                     // - Retries 10+: exponential (30s, 60s, 120s, 240s, 300s max)
                                     let backoff_phase = if retry_count < 10 { "aggressive" } else { "backoff" };
-                                    println!("[BLOCKS] 📋 Buffering block #{} (retry #{}, {}) - waiting for previous block #{}", 
+                                    println!("[INFO][BLOCK] buffer h={} retry={} reason={} wait_prev={}", 
                                              received_block.height, retry_count, backoff_phase, missing_height);
                                     
                                     // ALWAYS buffer - never discard! (pseudo-infinite)
@@ -3450,7 +3363,7 @@ impl BlockchainNode {
                                                 .filter(|(&h, _)| h != received_block.height)  // Don't remove current block
                                                 .min_by_key(|(_, (_, _, timestamp))| timestamp) {
                                                 pending_blocks.remove(&oldest_height);
-                                                println!("[BLOCKS] 🚨 Max buffer ({}) reached - removed oldest block #{}", 
+                                                println!("[WARN][BLOCK] buffer_full max={} evicted={}", 
                                                          max_pending_blocks, oldest_height);
                                             }
                                         }
@@ -3490,7 +3403,7 @@ impl BlockchainNode {
                                             };
                                             
                                             if can_request {
-                                                println!("[BLOCKS] 🔄 Requesting missing block #{} from network (DDoS protected)", missing_height);
+                                                println!("[INFO][BLOCK] request_missing h={}", missing_height);
                                                 
                                                 // Update request tracking
                                                 let request_count = requested_blocks.get(&missing_height)
@@ -3508,27 +3421,27 @@ impl BlockchainNode {
                                                         for attempt in 1..=3 {
                                                         // SPECIAL CASE: Genesis block request
                                                             if retry_missing_height == 0 {
-                                                                println!("[BLOCKS] 🌍 Requesting Genesis block #0 from network (attempt {})", attempt);
+                                                                println!("[INFO][BLOCK] request_genesis attempt={}", attempt);
                                                             if let Err(e) = p2p_clone.sync_blocks(0, 0).await {
-                                                                    println!("[BLOCKS] ⚠️ Failed to request Genesis (attempt {}): {}", attempt, e);
+                                                                    println!("[WARN][BLOCK] genesis_req_fail attempt={} err={}", attempt, e);
                                                                     if attempt < 3 {
                                                                         tokio::time::sleep(Duration::from_secs(attempt)).await;
                                                                         continue;
                                                                     }
                                                             } else {
-                                                                println!("[BLOCKS] ✅ Genesis block requested from network");
+                                                                println!("[INFO][BLOCK] genesis_requested");
                                                                     break;
                                                             }
                                                         } else {
                                                             // Regular block request
                                                                 if let Err(e) = p2p_clone.sync_blocks(retry_missing_height, retry_missing_height).await {
-                                                                    println!("[BLOCKS] ⚠️ Failed to request block #{} (attempt {}): {}", retry_missing_height, attempt, e);
+                                                                    println!("[WARN][BLOCK] request_fail h={} attempt={} err={}", retry_missing_height, attempt, e);
                                                                     if attempt < 3 {
                                                                         tokio::time::sleep(Duration::from_secs(attempt)).await;
                                                                         continue;
                                                                     }
                                                             } else {
-                                                                    println!("[BLOCKS] ✅ Block #{} requested from network", retry_missing_height);
+                                                                    println!("[INFO][BLOCK] requested h={}", retry_missing_height);
                                                                     break;
                                                                 }
                                                             }
@@ -3864,7 +3777,7 @@ impl BlockchainNode {
                                     }).collect())
                                     .unwrap_or_default();
                                 
-                                println!("[MACROBLOCK] 📖 Read from blockchain: {} slashing, {} jails",
+                                println!("[INFO][MB] read slashing={} jails={}",
                                          slashing_events.len(), automatic_jails.len());
                                 
                                 let macro_consensus = MacroBlockConsensus {
@@ -4116,7 +4029,7 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                                          theoretical_tps, shard_count, avg_tx_per_block);
                                 println!("🚀 QUANTUM OPTIMIZATIONS: Lock-free + Sharding + Parallel validation");
                                 println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-                                println!("[MACROBLOCK] 🌐 ALL NODES see this boundary - not just producer!");
+                                println!("[INFO][MB] consensus_boundary all_nodes");
                                 println!("[MICROBLOCK] ⚡ Continuing with block #{} - ZERO DOWNTIME", received_block.height + 1);
                                 
                                 // ═══════════════════════════════════════════════════════════════════
@@ -5405,7 +5318,7 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
         
         match message {
             ConsensusMessage::RemoteCommit { round_id, node_id, commit_hash, signature, timestamp } => {
-                println!("[CONSENSUS] 📥 Processing REAL commit from remote node: {} (round {})", node_id, round_id);
+                println!("[INFO][CONS] remote_commit node={} round={}", node_id, round_id);
                 
                 // Create commit from remote node data
                 let remote_commit = Commit {
@@ -5430,7 +5343,7 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
             }
             
             ConsensusMessage::RemoteReveal { round_id, node_id, reveal_data, nonce, timestamp } => {
-                println!("[CONSENSUS] 📥 Processing REAL reveal from remote node: {} (round {})", node_id, round_id);
+                println!("[INFO][CONS] remote_reveal node={} round={}", node_id, round_id);
                 
                 // Create reveal from remote node data  
                 let reveal_bytes = hex::decode(&reveal_data)
@@ -6695,10 +6608,9 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                 
                 // Check if we're too far behind to participate safely
                 if local_stored_height + max_allowed_lag < expected_height {
-                    println!("[CONSENSUS] ⛔ Cannot participate in consensus: node not synchronized");
-                    println!("[CONSENSUS] 📊 Local height: {}, Expected: {}, Max lag: {}", 
+                    println!("[WARN][CONS] not_synced local={} expected={} lag={}", 
                             local_stored_height, expected_height, max_allowed_lag);
-                    println!("[CONSENSUS] 📊 Round: {}, Required sync level: {}%", 
+                    println!("[WARN][CONS] round={} sync={}%", 
                             current_round, 
                             ((local_stored_height as f64 / expected_height as f64) * 100.0) as u32);
                     
@@ -6920,7 +6832,7 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                 // Rotation happens when creating blocks 31, 61, 91... (first block of new round)
                 if next_block_height > 1 && (next_block_height - 1) % 30 == 0 {
                     // We're at a rotation boundary (blocks 31, 61, 91...)
-                    println!("[CONSENSUS] 🔄 Rotation boundary at block #{} - verifying entropy consensus", next_block_height);
+                    println!("[INFO][CONS] rotation_boundary h={}", next_block_height);
                     
                     if let Some(p2p) = &unified_p2p {
                         // CRITICAL FIX: Use FINALITY_WINDOW for entropy consensus (Byzantine-safe)
@@ -6968,7 +6880,7 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                         let mut entropy_mismatches = 0;
                         
                         // Log our entropy once
-                        println!("[CONSENSUS] 📊 Our entropy from block #{}: {:x}", 
+                        println!("[DBG][CONS] entropy_block={} hash={:x}", 
                                 entropy_height,
                                 u64::from_le_bytes([our_entropy[0], our_entropy[1], our_entropy[2], our_entropy[3],
                                                    our_entropy[4], our_entropy[5], our_entropy[6], our_entropy[7]]));
@@ -7020,7 +6932,7 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                             
                             // CRITICAL FIX: WAIT for entropy consensus at rotation boundaries
                             // This prevents forks by ensuring all nodes agree on entropy before proceeding
-                            println!("[CONSENSUS] 🔄 Sent entropy requests to {} peers - waiting for consensus...", 
+                            println!("[INFO][CONS] entropy_requests peers={}", 
                                     sample_size - already_have_responses);
                             
                             // ARCHITECTURE: Block production MUST wait for entropy consensus at rotation boundaries
@@ -7066,7 +6978,7 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                             
                             let byzantine_threshold = ((sample_size as f64 * 0.6).ceil() as usize).max(1); // 60% of peers, minimum 1
                             
-                            println!("[CONSENSUS] 🎯 Waiting for Byzantine threshold: {}/{} responses (60%)", 
+                            println!("[INFO][CONS] bft_wait responses={}/{} threshold=60%", 
                                      byzantine_threshold, sample_size);
                             
                             // STATE MACHINE: Waiting for consensus
@@ -7121,7 +7033,7 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                                 // Check timeout
                                 if consensus_start.elapsed() >= max_consensus_wait {
                                     let elapsed_ms = consensus_start.elapsed().as_millis();
-                                    println!("[CONSENSUS] ⏰ Timeout reached after {}ms: {} matches, {} mismatches", 
+                                    println!("[WARN][CONS] timeout={}ms matches={} mismatches={}", 
                                              elapsed_ms, matches, mismatches);
                                     break;
                                 }
@@ -7158,7 +7070,7 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                                     // Majority disagrees - STOP to prevent fork
                                     println!("[ERR][CONS] FORK DETECTED! {} peers have different entropy vs {} agree", 
                                         mismatches, matches);
-                                    println!("[CONSENSUS] 🛑 STOPPING production to prevent fork propagation!");
+                                    println!("[ERR][CONS] STOPPING production - fork prevention!");
                                     println!("[ERR][CONS] Cannot proceed - network has diverged");
                                     
                                     // STATE MACHINE: Fork detected error
@@ -7184,7 +7096,7 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                                 // If producer has correct block → entropy is correct
                                 // If producer has wrong block → other nodes will reject its blocks
                                 // Liveness: Network must continue even if peers are slow to respond
-                                println!("[CONSENSUS] ⏳ No entropy responses (peers lagging) - continuing with FINALITY_WINDOW safety");
+                                println!("[WARN][CONS] no_entropy_responses - using FINALITY_WINDOW");
                             }
                             
                             // CRITICAL FIX: Check if selected producer is synchronized
@@ -9068,7 +8980,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     if !is_synchronized {
                         println!("[WARN][MB] Node not synchronized - consensus handled by listener");
                             } else {
-                        println!("[MACROBLOCK] 📍 Block {} in consensus window (61-90) - handled by consensus listener", microblock_height);
+                        println!("[INFO][MB] h={} consensus_window=61-90", microblock_height);
                         consensus_started = true;
                     }
                 }
@@ -9089,7 +9001,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                              theoretical_tps, shard_count, avg_tx_per_block);
                     println!("🚀 QUANTUM OPTIMIZATIONS: Lock-free + Sharding + Parallel validation");
                     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-                    println!("[MACROBLOCK] 🌐 ALL NODES see this boundary - not just producer!");
+                    println!("[INFO][MB] consensus_boundary all_nodes");
                     
                     // PRODUCTION: Check macroblock status asynchronously (non-blocking)
                     let storage_check = storage.clone();
@@ -10921,7 +10833,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         // we need to be more lenient because consensus_lookahead adds 29 blocks
         if stored_height + max_allowed_lag < current_height - consensus_lookahead {
             println!("[WARN][CONS] Node not synchronized for consensus participation!");
-            println!("[CONSENSUS] 📊 Stored height: {}, Consensus height: {}, Max lag: {}", 
+            println!("[INFO][CONS] stored={} consensus={} max_lag={}", 
                      stored_height, current_height, max_allowed_lag);
             return false; // Cannot initiate or participate if not synced
         }
@@ -10929,7 +10841,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         // Check if node is TOO FAR AHEAD (should not happen, but safety check)
         if stored_height > current_height + consensus_lookahead {
             println!("[WARN][CONS] Node is ahead of consensus round!");
-            println!("[CONSENSUS] 📊 Current height: {}, Consensus round: {}", 
+            println!("[INFO][CONS] h={} round={}", 
                      stored_height, current_height);
             return false;
         }
@@ -10974,8 +10886,9 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         
         // ENTROPY-BASED: Select consensus initiator using blockchain entropy (like microblocks)
         // This ensures true decentralization and unpredictable initiator selection
-        use sha3::{Sha3_256, Digest};
-        let mut selection_hasher = Sha3_256::new();
+        // UNIFIED v2.36: SHA3-512 everywhere for maximum security (256-bit quantum resistance)
+        use sha3::{Sha3_512, Digest};
+        let mut selection_hasher = Sha3_512::new();
         
         // Get current macroblock round (every 90 blocks)
         let macroblock_round = current_height / 90;
@@ -10988,8 +10901,9 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             match storage.load_microblock(0) {
                 Ok(Some(genesis_data)) => {
                     // Calculate hash of Genesis block
-                    use sha3::{Sha3_256, Digest};
-                    let mut hasher = Sha3_256::new();
+                    // UNIFIED v2.36: SHA3-512 everywhere for maximum security
+                    use sha3::{Sha3_512, Digest};
+                    let mut hasher = Sha3_512::new();
                     hasher.update(&genesis_data);
                     let hash_result = hasher.finalize();
                     // Genesis hash for first macroblock initiator
@@ -11057,9 +10971,16 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         we_are_initiator
     }
     
-    /// CRITICAL FIX: Start consensus listener for ALL potential validators
-    /// This ensures ALL selected validators can participate in macroblock consensus, 
-    /// not just the block producer
+    /// PRODUCTION v2.34: Event-based MacroBlock consensus listener
+    /// 
+    /// ARCHITECTURE:
+    /// - Listens for block events (height changes)
+    /// - At blocks 61, 151, 241... (30 blocks before epoch end) triggers consensus
+    /// - Uses should_initiate_consensus() to deterministically select ONE Leader
+    /// - Leader calls trigger_macroblock_consensus() → creates and broadcasts MacroBlock
+    /// - Participants call participate_in_macroblock_consensus() → wait for Leader's MacroBlock
+    /// 
+    /// CRITICAL: Only ONE node (Leader) creates MacroBlock, others just validate and store!
     fn start_macroblock_consensus_listener(
         &self,
         storage: Arc<Storage>,
@@ -11584,7 +11505,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         qnet_state::EligibleProducer {
                             node_id: id.clone(),
                             reputation: (real_rep / 100.0).clamp(0.70, 1.0),
-                            stake: 0,
                         }
                     })
                     .collect();
@@ -11702,9 +11622,9 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         
         // SAFETY: Verify we're synchronized before participating
         // This prevents unsynchronized nodes from corrupting consensus
-        println!("[CONSENSUS] 🔍 Verifying synchronization before commit phase...");
+        println!("[INFO][CONS] verify_sync commit_phase");
         if round_id == 0 || (round_id % 90 != 0) {
-            println!("[CONSENSUS] ⏭️ BLOCKING commit phase for microblock round {} - no consensus needed", round_id);
+            println!("[INFO][CONS] skip_microblock_round={}", round_id);
             return;
         }
         
@@ -11718,7 +11638,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         let our_node_id = Some(node_id.to_string());
         
         if let Some(our_id) = our_node_id {
-            println!("[CONSENSUS] 🏛️ Generating REAL commit for OWN node: {}", our_id);
+            println!("[INFO][CONS] generate_commit node={}", our_id);
             
             // Generate ONLY our own commit (not for other participants)
             // Generate nonce for OUR node only
@@ -11738,7 +11658,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             {
                 let mut storage = nonce_storage.write().await;
                 storage.insert(our_id.clone(), (nonce, reveal_data.clone()));
-                println!("[CONSENSUS] 💾 Stored OWN nonce and reveal data for: {}", our_id);
+                println!("[INFO][CONS] stored_nonce node={}", our_id);
             }
             
             // Generate REAL signature for OUR node only
@@ -11761,9 +11681,8 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             };
             
             // CRITICAL FIX: Debug commit before processing
-            println!("[CONSENSUS] 🔍 DEBUG: About to process commit for node_id: '{}'", commit.node_id);
-            println!("[CONSENSUS] 🔍 DEBUG: Commit signature: '{}'", commit.signature);
-            println!("[CONSENSUS] 🔍 DEBUG: Commit hash: '{}'", commit.commit_hash);
+            println!("[DBG][CONS] process_commit node={} sig_len={} hash={}", 
+                commit.node_id, commit.signature.len(), &commit.commit_hash[..16]);
             
             // Submit OWN commit to consensus engine FIRST
             match consensus_engine.process_commit(commit.clone()).await {
@@ -11785,11 +11704,11 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                             participants  // CRITICAL FIX: Only broadcast to consensus participants (max 1000)
                         ) {
                             Ok(_) => {
-                                println!("[CONSENSUS] 📤 Successfully broadcasted OWN commit to peers");
+                                println!("[INFO][CONS] broadcast_commit=ok");
                             }
                             Err(e) => {
                                 println!("[WARN][CONS] Failed to broadcast commit: {}", e);
-                                println!("[CONSENSUS] 🔍 Round ID: {}, Expected macroblock: {}", 
+                                println!("[DBG][CONS] round={} is_mb={}", 
                                          round_id, round_id % 90 == 0);
                             }
                         }
@@ -11806,13 +11725,13 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                             5000u64  // 5s for large networks (up to 1000)
                         };
                         tokio::time::sleep(std::time::Duration::from_millis(propagation_delay_ms)).await;
-                        println!("[CONSENSUS] ⏳ Propagation delay: {}ms (adaptive for {} nodes)", 
+                        println!("[INFO][CONS] propagation_delay={}ms nodes={}", 
                                 propagation_delay_ms, participants.len());
                     }
                 }
                 Err(ConsensusError::InvalidSignature(msg)) => {
                     println!("[ERR][CONS] OWN signature validation failed: {}", msg);
-                    println!("[CONSENSUS] 🔍 DEBUG: This is why OWN commit was rejected!");
+                    println!("[DBG][CONS] own_commit_rejected");
                 }
                 Err(e) => {
                     println!("[WARN][CONS] OWN commit processing error: {:?}", e);
@@ -11823,7 +11742,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         }
         
         // PRODUCTION: Wait for commits from OTHER nodes via P2P message handler
-        println!("[CONSENSUS] ⏳ Waiting for commits from other {} participants...", participants.len() - 1);
+        println!("[INFO][CONS] waiting_commits from={} participants", participants.len() - 1);
         
         // PRODUCTION: Process incoming consensus messages during commit phase
         let mut received_commits = 0;
@@ -11845,9 +11764,9 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             std::time::Duration::from_millis(base_timeout * 1000 + additional_time_ms)
         };
         
-        println!("[CONSENSUS] ⏳ Commit phase timeout: {}s (adaptive for {} participants)", 
+        println!("[INFO][CONS] commit_timeout={}s participants={}", 
                  commit_timeout.as_secs(), participants.len());
-        println!("[CONSENSUS] ⏳ Waiting for commits from {} other participants...", participants.len() - 1);
+        println!("[INFO][CONS] waiting_commits remaining={}", participants.len() - 1);
         
         // PRODUCTION: Active commit processing loop for real inter-node consensus
         let start_time = std::time::Instant::now();
@@ -11860,7 +11779,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     // Try to read messages from consensus channel (non-blocking)
                     match consensus_rx_ref.try_recv() {
                         Ok(message) => {
-                            println!("[CONSENSUS] 📥 Processing REAL consensus message from P2P channel");
+                            println!("[INFO][CONS] p2p_msg received");
                             let (node_id, success, error) = Self::process_consensus_message(consensus_engine, message).await;
                             
                             // SECURITY: Reputation handled via DeterministicReputationState in macroblock
@@ -11903,14 +11822,14 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             let current_commits = consensus_engine.get_current_commit_count();
             
             if processed_messages % 10 == 0 { // Log every 2 seconds
-                println!("[CONSENSUS] 📊 Commits in engine: {} (target: {} for Byzantine)", 
+                println!("[INFO][CONS] commits={} target={}", 
                          current_commits, (participants.len() * 2 + 2) / 3);
             }
             
             // Check if we have Byzantine threshold for advancing to reveal phase
             let byzantine_threshold = (participants.len() * 2 + 2) / 3;
             if current_commits >= byzantine_threshold {
-                println!("[CONSENSUS] 🎯 Byzantine threshold reached with {} commits! Advancing to reveal phase", current_commits);
+                println!("[INFO][CONS] bft_threshold commits={} -> reveal_phase", current_commits);
                 break;
             }
         }
@@ -11926,7 +11845,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             println!("[WARN][CONS] Commit phase timeout: only {}/{} commits received", 
                      final_commits, byzantine_threshold);
             println!("[ERR][CONS] Byzantine threshold NOT reached - consensus will fail");
-            println!("[CONSENSUS] 🔄 Progressive Finalization Protocol will handle recovery");
+            println!("[INFO][CONS] PFP_recovery enabled");
             // Don't proceed to reveal phase - let PFP handle it
             return;
         }
@@ -11945,7 +11864,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         // CRITICAL: Only execute consensus for MACROBLOCK rounds (every 90 blocks)
         // Microblocks use simple producer signatures, NOT Byzantine consensus
         if round_id == 0 || (round_id % 90 != 0) {
-            println!("[CONSENSUS] ⏭️ BLOCKING reveal phase for microblock round {} - no consensus needed", round_id);
+            println!("[INFO][CONS] skip_reveal_microblock round={}", round_id);
             return;
         }
         
@@ -11959,14 +11878,14 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         let our_node_id = Some(node_id.to_string());
         
         if let Some(our_id) = our_node_id {
-            println!("[CONSENSUS] 🔓 Generating REAL reveal for OWN node: {}", our_id);
+            println!("[INFO][CONS] generate_reveal node={}", our_id);
             
             // Retrieve ONLY our own stored data
             let (nonce, reveal_data) = {
                 let storage = nonce_storage.read().await;
                 match storage.get(&our_id) {
                     Some((stored_nonce, stored_reveal)) => {
-                        println!("[CONSENSUS] 🔓 Retrieved OWN commit data: {} (nonce: {}...)", 
+                        println!("[INFO][CONS] retrieved_commit data_len={} nonce={}...", 
                                  our_id, hex::encode(&stored_nonce[..8]));
                         (*stored_nonce, stored_reveal.clone())
                     }
@@ -11975,7 +11894,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         // This is CORRECT Byzantine behavior - nodes that didn't commit can't reveal
                         // Otherwise malicious nodes could manipulate consensus by skipping commit
                         println!("[ERR][CONS] No OWN commit data found - cannot reveal (Byzantine safety)");
-                        println!("[CONSENSUS] 🔒 Node will not participate in this consensus round");
+                        println!("[WARN][CONS] no_commit_data - skipping round");
                         return; // Exit reveal phase for this node
                     }
                 }
@@ -12008,11 +11927,11 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                             participants  // CRITICAL FIX: Only broadcast to consensus participants (max 1000)
                         ) {
                             Ok(_) => {
-                                println!("[CONSENSUS] 📤 Successfully broadcasted OWN reveal with nonce to peers");
+                                println!("[INFO][CONS] broadcast_reveal=ok");
                             }
                             Err(e) => {
                                 println!("[WARN][CONS] Failed to broadcast reveal: {}", e);
-                                println!("[CONSENSUS] 🔍 Round ID: {}, Expected macroblock: {}", 
+                                println!("[DBG][CONS] round={} is_mb={}", 
                                          round_id, round_id % 90 == 0);
                             }
                         }
@@ -12029,7 +11948,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                             5000u64  // 5s for large networks (up to 1000)
                         };
                         tokio::time::sleep(std::time::Duration::from_millis(propagation_delay_ms)).await;
-                        println!("[CONSENSUS] ⏳ Propagation delay: {}ms (adaptive for {} nodes)", 
+                        println!("[INFO][CONS] propagation_delay={}ms nodes={}", 
                                 propagation_delay_ms, participants.len());
                     }
                 }
@@ -12042,7 +11961,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         }
         
         // PRODUCTION: Wait for reveals from OTHER nodes via P2P message handler
-        println!("[CONSENSUS] ⏳ Waiting for reveals from other {} participants...", participants.len() - 1);
+        println!("[INFO][CONS] waiting_reveals remaining={}", participants.len() - 1);
         
         // PRODUCTION: Process incoming consensus messages during reveal phase
         let mut received_reveals = 0;
@@ -12063,9 +11982,9 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         };
         let mut processed_messages = 0;
         
-        println!("[CONSENSUS] ⏳ Reveal phase timeout: {}s (adaptive for {} participants)", 
+        println!("[INFO][CONS] reveal_timeout={}s participants={}", 
                  reveal_timeout.as_secs(), participants.len());
-        println!("[CONSENSUS] ⏳ Waiting for reveals from {} other participants...", participants.len() - 1);
+        println!("[INFO][CONS] await_reveals from={}", participants.len() - 1);
         
         while start_time.elapsed() < reveal_timeout && received_reveals < (participants.len() - 1) {
             // CRITICAL: Process incoming reveal messages from P2P channel
@@ -12074,7 +11993,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     // Try to read messages from consensus channel (non-blocking)
                     match consensus_rx_ref.try_recv() {
                         Ok(message) => {
-                            println!("[CONSENSUS] 📥 Processing REAL reveal message from P2P channel");
+                            println!("[INFO][CONS] p2p_reveal received");
                             let (node_id, success, error) = Self::process_consensus_message(consensus_engine, message).await;
                             
                             // SECURITY: Reputation handled via DeterministicReputationState in macroblock
@@ -12112,14 +12031,14 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             let current_reveals = consensus_engine.get_current_reveal_count();
             
             if processed_messages % 6 == 0 { // Log every 3 seconds 
-                println!("[CONSENSUS] 📊 Reveals in engine: {} (target: {} for Byzantine)", 
+                println!("[INFO][CONS] reveals={} target={}", 
                          current_reveals, (participants.len() * 2 + 2) / 3);
             }
             
             // Check if we have enough reveals for Byzantine threshold
             let byzantine_threshold = (participants.len() * 2 + 2) / 3;
             if current_reveals >= byzantine_threshold {
-                println!("[CONSENSUS] 🎯 Byzantine reveal threshold reached with {} reveals!", current_reveals);
+                println!("[INFO][CONS] bft_threshold reveals={} -> finalize", current_reveals);
                 break;
             }
         }
@@ -12136,7 +12055,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             println!("[WARN][CONS] Reveal phase timeout: only {}/{} reveals received", 
                      final_reveals, byzantine_threshold);
             println!("[ERR][CONS] Byzantine threshold NOT reached - consensus failed");
-            println!("[CONSENSUS] 🔄 Progressive Finalization Protocol will handle recovery");
+            println!("[INFO][CONS] PFP_recovery enabled");
             // Don't proceed to finalization - let PFP handle it
             return;
         }
@@ -12361,7 +12280,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             if let Some(cert) = hybrid.get_current_certificate() {
                 // Serialize certificate for broadcast
                 if let Ok(cert_bytes) = bincode::serialize(&cert) {
-                    println!("[CONSENSUS] 📜 Broadcasting initial certificate: {}", cert.serial_number);
+                    println!("[INFO][CONS] broadcast_cert serial={}", cert.serial_number);
                     // Note: P2P broadcast happens asynchronously through the node's P2P instance
                     // The actual broadcast is handled by the node's main loop
                 }
@@ -12388,7 +12307,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     
                     if serial_changed {
                     if let Ok(cert_bytes) = bincode::serialize(&new_cert) {
-                            println!("[CONSENSUS] 📜 TRACKED broadcast of rotated certificate: {} (serial changed)", new_cert.serial_number);
+                            println!("[INFO][CONS] tracked_cert_broadcast serial={}", new_cert.serial_number);
                         // Broadcast to network if P2P instance available
                         if let Some(p2p) = unified_p2p {
                                 // CRITICAL: Use tracked broadcast for consensus certificate rotation
@@ -12398,13 +12317,13 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                     }
                                     Err(e) => {
                                         println!("[WARN][CONS] Byzantine threshold NOT reached: {}", e);
-                                        println!("[CONSENSUS] 🔄 Gossip protocol will propagate to remaining peers");
+                                        println!("[INFO][CONS] gossip_propagation pending");
                                     }
                                 }
                             }
                         }
                     } else {
-                        println!("[CONSENSUS] 📋 Certificate unchanged - skipping duplicate broadcast");
+                        println!("[DBG][CONS] cert_unchanged skip_broadcast");
                     }
                 }
             }
@@ -13352,8 +13271,18 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         }
     }
     
-    /// Participate in macroblock consensus as a non-initiator validator
-    /// This method allows validators to join consensus started by the initiator
+    /// PRODUCTION v2.35: Participate in macroblock consensus with ROUND-BASED FAILOVER
+    /// 
+    /// ARCHITECTURE (Tendermint-style):
+    /// 1. Participate in COMMIT phase (send our commit)
+    /// 2. Participate in REVEAL phase (send our reveal)
+    /// 3. For each round:
+    ///    - Compute leader deterministically using beacon + round
+    ///    - If WE are leader → create MacroBlock
+    ///    - If NOT leader → wait for MacroBlock (timeout → next round)
+    /// 4. Round+1 = NEW LEADER (failover!)
+    /// 
+    /// CRITICAL: Round-based failover ensures consensus completes even if leaders offline!
     async fn participate_in_macroblock_consensus(
         storage: Arc<Storage>,
         consensus: Arc<RwLock<qnet_consensus::CommitRevealConsensus>>,
@@ -13364,27 +13293,183 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         node_type: NodeType,
         consensus_rx: &Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<ConsensusMessage>>>>,
     ) -> Result<(), String> {
-        println!("[PARTICIPANT] 🤝 Joining macroblock consensus as participant");
-        println!("[PARTICIPANT] 📊 Round: blocks {}-{}", start_height, end_height);
-        println!("[PARTICIPANT] 🆔 Node: {} (Type: {:?})", node_id, node_type);
+        let macroblock_index = end_height / 90;
         
-        // Use the same consensus logic as initiator
-        // The difference is that participant waits for initiator's start signal
+        if is_info() { println!("[INFO][MB_PART] join mb={} h={}-{}", macroblock_index, start_height, end_height); }
         
-        // Wait briefly for initiator to start
-        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+        // Check if macroblock already exists
+        if let Ok(Some(_)) = storage.get_macroblock_by_height(macroblock_index) {
+            if is_info() { println!("[INFO][MB_PART] exists mb={} skip=true", macroblock_index); }
+            return Ok(());
+        }
         
-        // Now participate in consensus using the same method
-        Self::trigger_macroblock_consensus(
-            storage,
-            consensus,
-            start_height,
-            end_height,
-            p2p,
-            node_id,
-            node_type,
-            consensus_rx,
-        ).await
+        // Get deterministic participants list (same for all nodes via N-2 snapshot)
+        let qualified = Self::calculate_qualified_candidates(p2p, node_id, node_type).await;
+        let mut all_participants: Vec<String> = qualified.iter().map(|(id, _)| id.clone()).collect();
+        all_participants.sort();
+        
+        if all_participants.is_empty() {
+            return Err(format!("mb={} no_participants", macroblock_index));
+        }
+        
+        if is_info() { println!("[INFO][MB_PART] participants={} source=n2_snapshot", all_participants.len()); }
+        
+        // Get randomness beacon from MacroBlock N-2 (for unpredictable leader selection)
+        let beacon: Option<[u8; 32]> = if macroblock_index >= 2 {
+            let n_minus_2_index = macroblock_index - 2;
+            match storage.get_macroblock_by_height(n_minus_2_index) {
+                Ok(Some(prev_mb_data)) => {
+                    match bincode::deserialize::<qnet_state::MacroBlock>(&prev_mb_data) {
+                        Ok(prev_macroblock) => prev_macroblock.consensus_data.randomness_beacon,
+                        Err(_) => None,
+                    }
+                }
+                _ => None,
+            }
+        } else {
+            None // Genesis epochs 1-2: use fallback
+        };
+        
+        if is_debug() { println!("[DBG][MB_PART] beacon={}", beacon.is_some()); }
+        
+        // Initialize consensus round and execute commit/reveal phases
+        let consensus_nonce_storage = std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+        let unified_p2p_option = Some(p2p.clone());
+        
+        {
+            let mut consensus_engine = consensus.write().await;
+            if let Err(e) = consensus_engine.start_round(all_participants.clone()) {
+                println!("[WARN][MB_PART] round_start err={}", e);
+            }
+            
+            // Set beacon for leader selection
+            if let Some(b) = beacon {
+                consensus_engine.set_randomness_beacon(b);
+            }
+        }
+        
+        // Execute COMMIT phase
+        {
+            let mut consensus_engine = consensus.write().await;
+            Self::execute_real_commit_phase(
+                &mut consensus_engine,
+                &all_participants,
+                end_height,
+                &unified_p2p_option,
+                &consensus_nonce_storage,
+                node_id,
+                consensus_rx,
+            ).await;
+        }
+        
+        // Execute REVEAL phase
+        {
+            let mut consensus_engine = consensus.write().await;
+            Self::execute_real_reveal_phase(
+                &mut consensus_engine,
+                &all_participants,
+                end_height,
+                &unified_p2p_option,
+                &consensus_nonce_storage,
+                node_id,
+                consensus_rx,
+            ).await;
+        }
+        
+        // ═══════════════════════════════════════════════════════════════════════════
+        // PRODUCTION v2.35: ROUND-BASED FAILOVER
+        // If round N leader offline → round N+1 with different leader
+        // ═══════════════════════════════════════════════════════════════════════════
+        const MAX_ROUNDS: u64 = 5;
+        const ROUND_TIMEOUT_SECS: u64 = 30;
+        
+        let mut current_round: u64 = 0;
+        
+        while current_round < MAX_ROUNDS {
+            // Check if macroblock already exists (leader might have created it)
+            if let Ok(Some(_)) = storage.get_macroblock_by_height(macroblock_index) {
+                if is_info() { println!("[INFO][MB_PART] received mb={} round={}", macroblock_index, current_round); }
+                return Ok(());
+            }
+            
+            // Compute leader for this round using consensus engine
+            let leader = {
+                let consensus_engine = consensus.read().await;
+                consensus_engine.compute_leader_for_round(
+                    end_height,
+                    current_round,
+                    &all_participants,
+                    beacon.as_ref(),
+                )
+            };
+            
+            let leader_id = match leader {
+                Some(id) => id,
+                None => {
+                    println!("[ERR][MB_PART] no_leader round={}", current_round);
+                    current_round += 1;
+                    continue;
+                }
+            };
+            
+            if is_info() { println!("[INFO][MB_PART] round={} leader={} we={}", 
+                                    current_round, leader_id, node_id == leader_id); }
+            
+            // Check if WE are the leader for this round
+            if node_id == leader_id {
+                // WE are the leader - create MacroBlock!
+                println!("[INFO][MB_PART] round={} role=LEADER → trigger_consensus", current_round);
+                
+                return Self::trigger_macroblock_consensus(
+                    storage.clone(),
+                    consensus.clone(),
+                    start_height,
+                    end_height,
+                    p2p,
+                    node_id,
+                    node_type,
+                    consensus_rx,
+                ).await;
+            }
+            
+            // NOT leader - wait for MacroBlock from leader
+            if is_info() { println!("[INFO][MB_PART] round={} wait_leader={} timeout={}s", 
+                                    current_round, leader_id, ROUND_TIMEOUT_SECS); }
+            
+            let wait_start = std::time::Instant::now();
+            let round_timeout = std::time::Duration::from_secs(ROUND_TIMEOUT_SECS);
+            
+            while wait_start.elapsed() < round_timeout {
+                // Check if MacroBlock arrived from Leader
+                if let Ok(Some(_)) = storage.get_macroblock_by_height(macroblock_index) {
+                    if is_info() { println!("[INFO][MB_PART] received mb={} round={} elapsed={:?}", 
+                                            macroblock_index, current_round, wait_start.elapsed()); }
+                    return Ok(());
+                }
+                
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            
+            // Timeout - move to next round with NEW leader!
+            println!("[WARN][MB_PART] timeout round={} leader={} → round={}", 
+                     current_round, leader_id, current_round + 1);
+            current_round += 1;
+        }
+        
+        // All rounds exhausted - try sync as last resort
+        println!("[ERR][MB_PART] all_rounds_failed mb={} action=sync", macroblock_index);
+        if let Err(e) = p2p.sync_macroblocks(macroblock_index, macroblock_index).await {
+            println!("[WARN][MB_PART] sync_failed err={}", e);
+        }
+        
+        // Final check
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        if storage.get_macroblock_by_height(macroblock_index).ok().flatten().is_some() {
+            if is_info() { println!("[INFO][MB_PART] received mb={} via=sync", macroblock_index); }
+            return Ok(());
+        }
+        
+        Err(format!("mb={} all_rounds_failed max={}", macroblock_index, MAX_ROUNDS))
     }
     
     async fn trigger_macroblock_consensus(
@@ -13406,47 +13491,23 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             return Ok(());
         }
         
-        // ENHANCED MACROBLOCK CONSENSUS DASHBOARD
-        println!("[MACROBLOCK] 🏛️ BYZANTINE CONSENSUS INITIATED:");
-        println!("  ├── Consensus Type: Commit-Reveal Byzantine Fault Tolerance");
-        println!("  ├── Microblock Range: blocks {}-{} ({} blocks)", start_height, end_height, end_height - start_height + 1);
-        println!("  ├── Macroblock Height: #{}", end_height / 90);
-        println!("  ├── Quantum Security: CRYSTALS-Dilithium + SHA3-256");
-        println!("  └── Phase: Initializing consensus participants...");
+        // PRODUCTION: Leader initiates MacroBlock consensus
+        if is_info() { println!("[INFO][MB_LEAD] init mb={} range={}-{} blocks={}", 
+                                macroblock_index, start_height, end_height, end_height - start_height + 1); }
         
         // PRODUCTION: Execute REAL Byzantine consensus for macroblock creation
         let consensus_data = {
             let mut consensus_engine = consensus.write().await;
             
-            // CRITICAL: Execute REAL INTER-NODE CONSENSUS instead of Genesis bootstrap fake
-            let round_id = end_height; // Macroblock height as round ID
+            let round_id = end_height;
             
-            // CRITICAL FIX: Build participants list WITHOUT reputation filter
-            // Reputation check happens at commit/reveal validation (unified_p2p.rs)
-            // This ensures ALL nodes agree on SAME participants list → deterministic consensus
+            // PRODUCTION v2.34: Use DETERMINISTIC participant list from N-2 macroblock!
+            let qualified = Self::calculate_qualified_candidates(p2p, node_id, node_type).await;
+            let mut all_participants: Vec<String> = qualified.iter().map(|(id, _)| id.clone()).collect();
+            all_participants.sort();
             
-            // Get ALL validated peers (no reputation filter)
-            let validated_peers = p2p.get_validated_active_peers();
-            let mut all_participants: Vec<String> = validated_peers.iter()
-                .map(|peer| peer.id.clone())
-                .collect();
-            
-            // Add own node if eligible (Super or Full node type)
-            let can_participate = matches!(node_type, NodeType::Super | NodeType::Full);
-            if can_participate && !all_participants.contains(&node_id.to_string()) {
-                all_participants.push(node_id.to_string());
-            }
-            
-            println!("[CONSENSUS] 📊 Byzantine participants (pre-reputation-filter): {} nodes", all_participants.len());
-            println!("[CONSENSUS]    Jailed nodes will be rejected at commit/reveal validation");
-            
-            // CRITICAL: Sort participants to ensure deterministic ordering across ALL nodes
-            // next_leader selection uses participants.first() - MUST be same on all nodes!
-            // Without sorting: different nodes calculate DIFFERENT next_leader → consensus failure!
-            all_participants.sort();  // Sort alphabetically by node_id
-            
-            println!("[CONSENSUS] 🏛️ Initializing Byzantine consensus round {} with {} participants", 
-                     round_id, all_participants.len());
+            if is_info() { println!("[INFO][MB_LEAD] participants={} source=n2_snapshot round={}", 
+                                    all_participants.len(), round_id); }
             
             // CRITICAL FIX: Progressive degradation for macroblock consensus
             // Matches microblock logic to prevent deadlock in small networks
@@ -13477,7 +13538,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 if network_size <= 10 {
                     println!("[WARN][CONS] DEGRADED Byzantine consensus: {}/{} nodes (small/Genesis network)", 
                              all_participants.len(), required_byzantine_nodes);
-                    println!("[CONSENSUS] 🔧 Proceeding with reduced safety for network continuity");
+                    println!("[WARN][CONS] reduced_safety continuing");
                     // Continue with degraded consensus rather than blocking
                 } else {
                     return Err(format!("Insufficient nodes for Byzantine safety: {}/4", all_participants.len()));
@@ -13531,7 +13592,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             }
             
             // STEP 3: Execute REAL COMMIT phase with P2P communication
-            println!("[CONSENSUS] 📝 Starting COMMIT phase...");
+            println!("[INFO][CONS] start_commit_phase");
             // CRITICAL FIX: Create persistent storage for consensus nonces (shared between commit and reveal)
             let consensus_nonce_storage = std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
             let unified_p2p_option = Some(p2p.clone()); // Pass REAL P2P system
@@ -13539,7 +13600,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             // CRITICAL: Use macroblock height for P2P broadcast, not consensus round number!
             // P2P expects height (90, 180, 270) to identify macroblock rounds
             let macroblock_height = round_id; // round_id IS the end_height (90, 180, 270)
-            println!("[CONSENSUS] 🎯 Using macroblock height {} for P2P broadcast", macroblock_height);
+            println!("[INFO][CONS] p2p_broadcast mb_h={}", macroblock_height);
             
             Self::execute_real_commit_phase(
                 &mut consensus_engine,
@@ -13552,7 +13613,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             ).await;
             
             // STEP 4: Execute REAL REVEAL phase with P2P communication  
-            println!("[CONSENSUS] 🔓 Starting REVEAL phase...");
+            println!("[INFO][CONS] start_reveal_phase");
             Self::execute_real_reveal_phase(
                 &mut consensus_engine,
                 &all_participants,
@@ -13588,7 +13649,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             // This prevents "Not in reveal phase" error if advance_phase was called extra times
             match consensus_engine.finalize_round() {
                 Ok(leader_id) => {
-                    println!("[CONSENSUS] 🎯 Byzantine consensus FINALIZED! Leader: {}", leader_id);
+                    println!("[INFO][CONS] FINALIZED leader={}", leader_id);
                     qnet_consensus::commit_reveal::ConsensusResultData {
                         round_number: end_height / 90,
                         leader_id,
@@ -13599,7 +13660,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     // Check if this is a phase error and try to recover
                     if e.to_string().contains("Not in reveal phase") || e.to_string().contains("NoActiveRound") {
                         println!("[WARN][CONS] Phase error during finalization: {}", e);
-                        println!("[CONSENSUS] 🔄 Attempting recovery with fallback leader selection");
+                        println!("[WARN][CONS] fallback_leader_selection");
                         
                         // Fallback: Use deterministic leader selection based on participants
                         use sha3::{Sha3_256, Digest};
@@ -13614,7 +13675,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         let leader_idx = index % all_participants.len();
                         let fallback_leader = all_participants[leader_idx].clone();
                         
-                        println!("[CONSENSUS] 🆘 Using fallback leader: {} (deterministic selection)", fallback_leader);
+                        println!("[INFO][CONS] fallback_leader={}", fallback_leader);
                         qnet_consensus::commit_reveal::ConsensusResultData {
                             round_number: end_height / 90,
                             leader_id: fallback_leader,
@@ -13658,7 +13719,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 if let Err(e) = storage.save_consensus_state(round, &versioned_state) {
                     println!("[WARN][CONS] Failed to save consensus state: {}", e);
                 } else {
-                    println!("[CONSENSUS] 💾 Consensus state saved for round {} (version: {})", round, PROTOCOL_VERSION);
+                    println!("[INFO][CONS] state_saved round={} v={}", round, PROTOCOL_VERSION);
                 }
             }
         }
@@ -13667,13 +13728,13 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         // Consensus starts at block 61, but blocks 62-90 are created in parallel by main loop
         // We must wait for all blocks to exist before creating macroblock
         // This is the correct approach: start consensus early, wait for blocks before finalization
-        println!("[MACROBLOCK] ⏳ Waiting for all blocks {}-{} to be ready...", start_height, end_height);
+        println!("[INFO][MB] waiting blocks={}-{}", start_height, end_height);
         let wait_start = std::time::Instant::now();
         for height in start_height..=end_height {
             let mut wait_attempts = 0;
             while storage.load_microblock(height).ok().flatten().is_none() {
                 if wait_attempts == 0 {
-                    println!("[MACROBLOCK] ⏳ Block #{} not yet created, waiting...", height);
+                    println!("[INFO][MB] waiting h={}", height);
                 }
                 wait_attempts += 1;
                 if wait_attempts > 30 {
@@ -13734,7 +13795,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 },
                 _ => {
                     // Should not happen after waiting, but handle gracefully
-                    println!("[MACROBLOCK] ❌ Missing microblock at height {} (unexpected after wait)", height);
+                    println!("[ERR][MB] missing_block h={}", height);
                     return Err(format!("Missing microblock at height {}", height));
                 }
             }
@@ -13750,19 +13811,17 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             randomness_accumulator = state_accumulator;
         }
         
-        // PRODUCTION: Use REAL consensus data instead of fake local data
-        let mut consensus_commits = std::collections::HashMap::new();
-        let mut consensus_reveals = std::collections::HashMap::new();
+        // PRODUCTION v2.35: Use REAL consensus data from engine (no fake strings!)
+        let (consensus_commits, consensus_reveals) = {
+            let consensus_engine = consensus.read().await;
+            (
+                consensus_engine.get_commits_for_macroblock(),
+                consensus_engine.get_reveals_for_macroblock()
+            )
+        };
         
-        // Extract real commits and reveals from finalized consensus
-        for participant in &consensus_data.participants {
-            // Use real consensus commits/reveals (when available from consensus engine)
-            let commit_data = format!("real_commit_{}_{}", participant, consensus_data.round_number);
-            let reveal_data = format!("real_reveal_{}_{}", participant, consensus_data.round_number);
-            
-            consensus_commits.insert(participant.clone(), commit_data.as_bytes().to_vec());
-            consensus_reveals.insert(participant.clone(), reveal_data.as_bytes().to_vec());
-        }
+        if is_info() { println!("[INFO][MB] real_data commits={} reveals={}", 
+                                consensus_commits.len(), consensus_reveals.len()); }
         
         // Get previous macroblock hash from storage
         let previous_macroblock_hash = storage.get_latest_macroblock_hash()
@@ -13798,7 +13857,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         let (poh_hash, poh_count) = if let Ok(Some(last_micro_data)) = storage.load_microblock(end_height) {
             match bincode::deserialize::<qnet_state::MicroBlock>(&last_micro_data) {
                 Ok(last_micro) => {
-                    println!("[MACROBLOCK] 🔐 Using PoH from last microblock #{}: count={}", 
+                    println!("[INFO][MB] poh_from_last h={} count={}", 
                             end_height, last_micro.poh_count);
                     (last_micro.poh_hash, last_micro.poh_count)
                 }
@@ -13868,7 +13927,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             None
         };
         
-        println!("[MACROBLOCK] 📝 Reputation data: {} slashing events, {} auto-jails → STORED IN BLOCKCHAIN",
+        println!("[INFO][MB] reputation slashing={} jails={} stored=true",
                  slashing_events.len(), automatic_jails.len());
         
         let macroblock = qnet_state::MacroBlock {
@@ -13911,7 +13970,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     ).await;
                     
                     if !snapshot.is_empty() {
-                        println!("[MACROBLOCK] 📋 Eligible producers snapshot: {} nodes for next epoch", snapshot.len());
+                        println!("[INFO][MB] eligible_snapshot nodes={}", snapshot.len());
                         bincode::serialize(&snapshot).ok()
                     } else {
                         println!("[WARN][MB] Empty eligible producers snapshot - using participants");
@@ -13920,7 +13979,6 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                             .map(|id| qnet_state::EligibleProducer {
                                 node_id: id.clone(),
                                 reputation: 0.70,  // Default
-                                stake: 0,
                             })
                             .collect();
                         bincode::serialize(&fallback).ok()
@@ -13950,12 +14008,9 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             Ok(_) => {
                 println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
                 if is_info() { println!("[INFO][MB] created h={}", macroblock.height); }
-                println!("[MACROBLOCK] 📦 Aggregated {} microblocks (heights {}-{})", 
-                         end_height - start_height + 1, start_height, end_height);
-                println!("[MACROBLOCK] 📊 State root: {}", hex::encode(macroblock.state_root));
-                println!("[MACROBLOCK] 🏛️ Consensus leader: {}", consensus_data.leader_id);
-                println!("[MACROBLOCK] 👥 Byzantine participants: {}", consensus_data.participants.len());
-                println!("[MACROBLOCK] ⏰ Timestamp: {}", macroblock.timestamp);
+                println!("[INFO][MB] aggregated={} h={}-{} leader={} bft={}", 
+                         end_height - start_height + 1, start_height, end_height,
+                         consensus_data.leader_id, consensus_data.participants.len());
                 println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
                 
                 // ═══════════════════════════════════════════════════════════════════
@@ -14011,7 +14066,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     // Use macroblock index as height for ShredProtocol
                     let macroblock_height = macroblock.height;
                     
-                    println!("[MACROBLOCK] 📡 Broadcasting macroblock #{} via ShredProtocol ({} bytes compressed)", 
+                    println!("[INFO][MB] broadcast idx={} bytes={}", 
                              macroblock_height, compressed_data.len());
                     
                     match p2p.broadcast_block_shred_protocol_typed(macroblock_height, compressed_data, true).await {
@@ -14184,7 +14239,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             Ok(mut responses) => {
                 responses.insert((block_height, responder_id.clone()), entropy_hash);
                 
-                println!("[CONSENSUS] 🎯 Stored entropy response for block {} from {}: {:x}", 
+                println!("[DBG][CONS] entropy_stored h={} from={} hash={:x}", 
                         block_height, responder_id,
                         u64::from_le_bytes([entropy_hash[0], entropy_hash[1], entropy_hash[2], entropy_hash[3],
                                            entropy_hash[4], entropy_hash[5], entropy_hash[6], entropy_hash[7]]));
@@ -15422,7 +15477,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             let latest_round = self.storage.get_latest_consensus_round()?;
             
             if latest_round > 0 {
-                println!("[CONSENSUS] 🔄 Requesting consensus state for round {}", latest_round);
+                println!("[INFO][CONS] request_state round={}", latest_round);
                 
                 // Request consensus state from peers
                 if let Err(e) = p2p.sync_consensus_state(latest_round).await {
