@@ -72,6 +72,9 @@ pub struct RoundState {
     pub commits: HashMap<String, Commit>,
     pub reveals: HashMap<String, Reveal>,  // FIXED: Store full Reveal with nonce
     pub participants: Vec<String>,
+    /// Randomness beacon from MacroBlock N-2 for unpredictable leader selection
+    /// None for first 2 epochs (use Genesis seed fallback)
+    pub prev_randomness_beacon: Option<[u8; 32]>,
 }
 
 /// Reveal structure
@@ -153,10 +156,27 @@ impl CommitRevealConsensus {
             commits: HashMap::new(),
             reveals: HashMap::new(),
             participants,
+            prev_randomness_beacon: None, // Set via set_randomness_beacon() before finalize
         };
         
         self.current_round = Some(round_state);
         Ok(round_number)
+    }
+    
+    /// Set randomness beacon from MacroBlock N-2 for unpredictable leader selection
+    /// Call BEFORE finalize_round() to enable beacon-based selection
+    /// 
+    /// ARCHITECTURE (same as Ethereum 2.0 RANDAO):
+    /// - Epoch 1-2: No beacon available, use Genesis seed (deterministic)
+    /// - Epoch 3+: Use randomness_beacon from MacroBlock N-2
+    /// - Beacon = accumulated reveal_data from previous epochs
+    /// - Unpredictable until N-2 is finalized, then deterministic
+    pub fn set_randomness_beacon(&mut self, beacon: [u8; 32]) {
+        if let Some(state) = &mut self.current_round {
+            state.prev_randomness_beacon = Some(beacon);
+            println!("[INFO][CONS] beacon_set round={} hash={}...", 
+                state.round_number, hex::encode(&beacon[..8]));
+        }
     }
     
     /// Process commit from validator (simplified version)
@@ -456,41 +476,77 @@ impl CommitRevealConsensus {
         })
     }
     
-    /// PRODUCTION: Select leader from reveals using cryptographic fairness
+    /// PRODUCTION v2.32: DETERMINISTIC + UNPREDICTABLE leader selection
+    /// ═══════════════════════════════════════════════════════════════════════════
+    /// 
+    /// PROBLEM (v2.30): reveal_data varies between nodes → FORK!
+    /// PROBLEM (v2.31): No beacon → leader predictable (DoS risk)
+    /// 
+    /// SOLUTION (v2.32 - Ethereum 2.0 RANDAO style):
+    /// - Use randomness_beacon from MacroBlock N-2 as entropy source
+    /// - Beacon is accumulated reveal_data from previous epochs
+    /// - Unpredictable until N-2 finalized, then deterministic for all nodes
+    /// - Fallback to Genesis seed for first 2 epochs (no N-2 yet)
+    ///
+    /// ENTROPY SOURCES (all deterministic across nodes):
+    /// 1. prev_randomness_beacon (from MacroBlock N-2) - unpredictable!
+    /// 2. round_number (same on all nodes)
+    /// 3. sorted participant list (same on all nodes)
+    ///
+    /// SCALABILITY: Works with 1000 validators per round
+    /// ═══════════════════════════════════════════════════════════════════════════
     fn select_leader(&self, reveals: &HashMap<String, Reveal>) -> Option<String> {
         if reveals.is_empty() {
             return None;
         }
         
-        // PRODUCTION: Cryptographically fair leader selection
+        let state = self.current_round.as_ref()?;
+        let round_number = state.round_number;
+        
         use sha3::{Sha3_256, Digest};
+        let mut hasher = Sha3_256::new();
         
-        // Create deterministic randomness from all reveals combined
-        let mut combined_hasher = Sha3_256::new();
+        // Version tag for hash domain separation
+        hasher.update(b"QNet_Leader_Selection_v2.32");
         
-        // Sort by node_id for deterministic ordering
-        let mut sorted_reveals: Vec<_> = reveals.iter().collect();
-        sorted_reveals.sort_by(|a, b| a.0.cmp(b.0));
+        // PRIMARY ENTROPY: Randomness beacon from MacroBlock N-2
+        // This is unpredictable until N-2 is finalized!
+        let has_beacon = if let Some(beacon) = &state.prev_randomness_beacon {
+            hasher.update(beacon);
+            true
+        } else {
+            // Fallback for epochs 1-2: Use Genesis seed
+            // Predictable but necessary for bootstrap
+            hasher.update(b"QNet_Genesis_Seed_Fallback");
+            false
+        };
         
-        // Hash all reveals together for randomness
-        for (node_id, reveal) in &sorted_reveals {
-            combined_hasher.update(node_id.as_bytes());
-            combined_hasher.update(&reveal.reveal_data);
+        // Round number (deterministic)
+        hasher.update(&round_number.to_le_bytes());
+        
+        // Sort participants for deterministic ordering (CRITICAL!)
+        let mut participants: Vec<_> = reveals.keys().cloned().collect();
+        participants.sort();
+        
+        // Hash all participant IDs
+        for node_id in &participants {
+            hasher.update(node_id.as_bytes());
         }
         
-        let combined_hash = combined_hasher.finalize();
+        let hash = hasher.finalize();
         
         // Convert hash to selection index
         let hash_number = u64::from_le_bytes([
-            combined_hash[0], combined_hash[1], combined_hash[2], combined_hash[3],
-            combined_hash[4], combined_hash[5], combined_hash[6], combined_hash[7],
+            hash[0], hash[1], hash[2], hash[3],
+            hash[4], hash[5], hash[6], hash[7],
         ]);
         
-        let selection_index = (hash_number as usize) % sorted_reveals.len();
-        let selected_leader = sorted_reveals[selection_index].0.clone();
+        let selection_index = (hash_number as usize) % participants.len();
+        let selected_leader = participants[selection_index].clone();
         
-        println!("[CONSENSUS] 🎯 Cryptographic leader selection: {} (index {} of {})", 
-                 selected_leader, selection_index, sorted_reveals.len());
+        // Professional log: [LEVEL][MODULE] key=value
+        println!("[INFO][CONS] leader_select node={} idx={}/{} round={} beacon={}", 
+                 selected_leader, selection_index, participants.len(), round_number, has_beacon);
         
         Some(selected_leader)
     }
