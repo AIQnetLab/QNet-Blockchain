@@ -21,18 +21,12 @@ interface QNetWallet {
   version?: string;
 }
 
-// Don't redeclare window.qnet since it's already declared in AppContext.tsx
-// Just extend the Window interface for ethereum
-declare global {
-  interface Window {
-    ethereum?: any;
-  }
-}
+// QNet Wallet is the only supported wallet
 
 export default function WalletConnection() {
   const [isConnected, setIsConnected] = useState(false);
   const [walletAddress, setWalletAddress] = useState<string | null>(null);
-  const [walletType, setWalletType] = useState<'qnet' | 'phantom' | null>(null);
+  const [walletType, setWalletType] = useState<'qnet' | null>(null);
   const [isConnecting, setIsConnecting] = useState(false);
   const [balance, setBalance] = useState<number>(0);
   const [network, setNetwork] = useState<string>('');
@@ -52,15 +46,10 @@ export default function WalletConnection() {
    */
   const checkWalletConnection = async () => {
     try {
-      // Check QNet Wallet first (priority)
+      // Check QNet Wallet only
       if (window.qnet) {
         console.log('QNet Wallet detected');
         await checkQNetConnection();
-      }
-      // Fallback to Phantom for Solana
-      else if (window.ethereum || (window as any).solana) {
-        console.log('Phantom Wallet detected');
-        await checkPhantomConnection();
       }
     } catch (error) {
       console.error('Error checking wallet connection:', error);
@@ -93,25 +82,6 @@ export default function WalletConnection() {
     }
   };
 
-  /**
-   * Check Phantom Wallet connection
-   */
-  const checkPhantomConnection = async () => {
-    const phantom = (window as any).solana;
-    if (!phantom?.isPhantom) return;
-
-    try {
-      if (phantom.isConnected) {
-        setIsConnected(true);
-        setWalletAddress(phantom.publicKey.toString());
-        setWalletType('phantom');
-        setNetwork('solana');
-        setError(null);
-      }
-    } catch (error) {
-      console.error('Phantom wallet connection check failed:', error);
-    }
-  };
 
   /**
    * Setup wallet event listeners
@@ -123,13 +93,6 @@ export default function WalletConnection() {
       window.qnet.on('networkChanged', handleNetworkChanged);
       window.qnet.on('disconnect', handleDisconnect);
     }
-
-    // Phantom listeners
-    const phantom = (window as any).solana;
-    if (phantom && phantom.on) {
-      phantom.on('accountChanged', handleAccountsChanged);
-      phantom.on('disconnect', handleDisconnect);
-    }
   };
 
   /**
@@ -140,12 +103,6 @@ export default function WalletConnection() {
       window.qnet.removeListener('accountsChanged', handleAccountsChanged);
       window.qnet.removeListener('networkChanged', handleNetworkChanged);
       window.qnet.removeListener('disconnect', handleDisconnect);
-    }
-
-    const phantom = (window as any).solana;
-    if (phantom && phantom.removeListener) {
-      phantom.removeListener('accountChanged', handleAccountsChanged);
-      phantom.removeListener('disconnect', handleDisconnect);
     }
   };
 
@@ -240,39 +197,6 @@ export default function WalletConnection() {
     }
   };
 
-  /**
-   * Connect Phantom Wallet
-   */
-  const connectPhantomWallet = async () => {
-    setIsConnecting(true);
-    setError(null);
-
-    try {
-      const phantom = (window as any).solana;
-      
-      if (!phantom?.isPhantom) {
-        throw new Error('Phantom Wallet not found. Please install Phantom Wallet.');
-      }
-
-      const response = await phantom.connect();
-      
-      if (response.publicKey) {
-        setIsConnected(true);
-        setWalletAddress(response.publicKey.toString());
-        setWalletType('phantom');
-        setNetwork('solana');
-        
-        console.log('Phantom Wallet connected successfully');
-      } else {
-        throw new Error('Failed to get public key from Phantom');
-      }
-    } catch (error: any) {
-      console.error('Failed to connect Phantom Wallet:', error);
-      setError(error.message || 'Failed to connect Phantom Wallet');
-    } finally {
-      setIsConnecting(false);
-    }
-  };
 
   /**
    * Disconnect wallet
@@ -281,11 +205,6 @@ export default function WalletConnection() {
     try {
       if (walletType === 'qnet' && window.qnet) {
         await window.qnet.disconnect();
-      } else if (walletType === 'phantom') {
-        const phantom = (window as any).solana;
-        if (phantom) {
-          await phantom.disconnect();
-        }
       }
       
       handleDisconnect();
@@ -295,32 +214,6 @@ export default function WalletConnection() {
     }
   };
 
-  /**
-   * Switch network (QNet Wallet only)
-   */
-  const switchNetwork = async (targetNetwork: string) => {
-    if (walletType !== 'qnet' || !window.qnet) return;
-
-    try {
-      if (window.qnet.switchNetwork) {
-        await window.qnet.switchNetwork(targetNetwork);
-      } else if (window.qnet.request) {
-        // Fallback to request method
-        await window.qnet.request({ 
-          method: 'wallet_switchEthereumChain',
-          params: [{ chainId: targetNetwork }]
-        });
-      } else {
-        throw new Error('Network switching not supported');
-      }
-      setNetwork(targetNetwork);
-      await updateWalletInfo();
-      console.log(`Switched to ${targetNetwork} network`);
-    } catch (error) {
-      console.error('Failed to switch network:', error);
-      setError(`Failed to switch to ${targetNetwork} network`);
-    }
-  };
 
   /**
    * Format address for display
@@ -334,14 +227,7 @@ export default function WalletConnection() {
    * Get wallet display name
    */
   const getWalletDisplayName = () => {
-    switch (walletType) {
-      case 'qnet':
-        return 'QNet Wallet';
-      case 'phantom':
-        return 'Phantom Wallet';
-      default:
-        return 'Unknown Wallet';
-    }
+    return 'QNet Wallet';
   };
 
   /**
@@ -349,14 +235,12 @@ export default function WalletConnection() {
    */
   const getNetworkDisplayName = () => {
     switch (network) {
-      case 'solana':
-        return 'Solana';
       case 'qnet':
         return 'QNet';
       case 'testnet':
         return 'Testnet';
       default:
-        return network || 'Unknown';
+        return network || 'QNet';
     }
   };
 
@@ -366,9 +250,7 @@ export default function WalletConnection() {
         <div className="wallet-info">
           <div className="wallet-header">
             <div className="wallet-badge">
-              <span className="wallet-icon">
-                {walletType === 'qnet' ? '💎' : '👻'}
-              </span>
+              <span className="wallet-icon">💎</span>
               <span className="wallet-name">{getWalletDisplayName()}</span>
             </div>
             <div className="network-badge">
@@ -389,32 +271,12 @@ export default function WalletConnection() {
               <div className="wallet-balance">
                 <span className="balance-label">Balance:</span>
                 <span className="balance-value">
-                  {balance.toFixed(4)} {network === 'solana' ? 'SOL' : 'QNC'}
+                  {balance.toFixed(4)} QNC
                 </span>
               </div>
             )}
           </div>
 
-          {walletType === 'qnet' && (
-            <div className="network-switcher">
-              <Button
-                size="sm"
-                variant={network === 'solana' ? 'default' : 'outline'}
-                onClick={() => switchNetwork('solana')}
-                disabled={network === 'solana'}
-              >
-                Solana
-              </Button>
-              <Button
-                size="sm"
-                variant={network === 'qnet' ? 'default' : 'outline'}
-                onClick={() => switchNetwork('qnet')}
-                disabled={network === 'qnet'}
-              >
-                QNet
-              </Button>
-            </div>
-          )}
         </div>
 
         <Button
@@ -429,31 +291,34 @@ export default function WalletConnection() {
     );
   }
 
+  // Open Chrome Web Store to install QNet Wallet
+  const openWalletStore = () => {
+    window.open('https://chromewebstore.google.com/detail/qnet-wallet/pahnggomgmhhjjncgfnmmofmplfhkncg?hl=en-US&utm_source=ext_sidebar', '_blank');
+  };
+
   return (
     <div className="wallet-connection-container">
       <div className="wallet-options">
-        <Button
-          onClick={connectQNetWallet}
-          disabled={isConnecting}
-          className="wallet-connect-button qnet-button"
-        >
-          <span className="wallet-icon">💎</span>
-          <span className="wallet-text">
-            {isConnecting ? 'Connecting...' : 'GET WALLET'}
-          </span>
-        </Button>
-
-        <Button
-          onClick={connectPhantomWallet}
-          disabled={isConnecting}
-          variant="outline"
-          className="wallet-connect-button phantom-button"
-        >
-          <span className="wallet-icon">👻</span>
-          <span className="wallet-text">
-            {isConnecting ? 'Connecting...' : 'Connect Phantom'}
-          </span>
-        </Button>
+        {window.qnet ? (
+          <Button
+            onClick={connectQNetWallet}
+            disabled={isConnecting}
+            className="wallet-connect-button qnet-button"
+          >
+            <span className="wallet-icon">💎</span>
+            <span className="wallet-text">
+              {isConnecting ? 'Connecting...' : 'Connect Wallet'}
+            </span>
+          </Button>
+        ) : (
+          <Button
+            onClick={openWalletStore}
+            className="wallet-connect-button qnet-button"
+          >
+            <span className="wallet-icon">💎</span>
+            <span className="wallet-text">GET WALLET</span>
+          </Button>
+        )}
       </div>
 
       {error && (
@@ -465,10 +330,7 @@ export default function WalletConnection() {
 
       <div className="wallet-help">
         <p>
-          <strong>Recommended:</strong> Use QNet Wallet for full dual-network support (Solana + QNet)
-        </p>
-        <p>
-          <strong>Alternative:</strong> Use Phantom for Solana-only features
+          <strong>QNet Wallet</strong> - Official wallet for QNet blockchain
         </p>
       </div>
 
@@ -564,12 +426,6 @@ export default function WalletConnection() {
           font-family: monospace;
         }
 
-        .network-switcher {
-          display: flex;
-          gap: 8px;
-          margin-bottom: 12px;
-        }
-
         .wallet-options {
           display: flex;
           flex-direction: column;
@@ -593,10 +449,6 @@ export default function WalletConnection() {
 
         .qnet-button:hover {
           background: linear-gradient(135deg, #357abd, #2a5d8f);
-        }
-
-        .phantom-button {
-          border: 1px solid rgba(255, 255, 255, 0.3);
         }
 
         .wallet-text {
@@ -656,10 +508,6 @@ export default function WalletConnection() {
 
           .wallet-details {
             padding: 10px;
-          }
-
-          .network-switcher {
-            flex-direction: column;
           }
         }
       `}</style>

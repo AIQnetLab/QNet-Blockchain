@@ -94,21 +94,7 @@ export default function RootLayout({
                 }, 2000);
               }
               
-              // Suppress non-QNet wallet errors
-              const originalError = console.error;
-              console.error = function(...args) {
-                const message = args[0];
-                if (typeof message === 'string') {
-                  if (message.includes('MetaMask') ||
-                      message.includes('Phantom') ||
-                      message.includes('Solflare') ||
-                      message.includes('ChromeTransport') ||
-                      message.includes('inpage.js')) {
-                    return; // Suppress other wallet errors
-                  }
-                }
-                originalError.apply(console, args);
-              };
+              // QNet is the only supported wallet
               
               // Handle favicon errors gracefully
               window.addEventListener('error', function(e) {
