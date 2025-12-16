@@ -720,9 +720,10 @@ pub struct FullReputationSnapshot {
 |--------|------------|--------|-------------|
 | **Full Rotation** | +2.0 | block producer | **30/30 blocks only!** |
 | **Consensus Participation** | +1.0 | macroblock commit+reveal | Full participation |
-| **Invalid Block** | -20.0 | SlashingEvent in macroblock | Cryptographic proof |
-| **Double-Sign** | -50.0 + BAN | SlashingEvent | Both blocks as evidence |
-| **Chain Fork** | PERMANENT BAN | SlashingEvent | Fork evidence |
+| **Double-Sign** | -100% + BAN | SlashingEvent | 2 signatures at same height |
+| **Invalid Block** | -20% | SlashingEvent | Invalid signature/hash |
+| **Chain Fork** | -100% + BAN | SlashingEvent | Conflicting signed blocks |
+| **Missed Blocks** | 0 (no penalty) | — | **Not slashable** (no reward instead) |
 | **Passive Recovery** | +1.0/4h | online nodes 10-69% | Not jailed |
 | **Partial Rotation** | 0 | — | NO REWARD if <30 blocks! |
 
@@ -2200,10 +2201,11 @@ Layer 3: Coordination Complexity
 ├── Large networks: coordination becomes exponentially harder
 └── Example: 1M nodes network = 670K nodes must coordinate
 
-Layer 4: Reputation Slashing
-├── InvalidBlock: -20 points
-├── MaliciousBehavior: -50 points → jail
-├── DoubleSign: -100 points → instant jail
+Layer 4: Reputation Slashing (Cryptographic Proof Only)
+├── DoubleSign: -100% → permanent ban (proof: 2 sigs at same height)
+├── InvalidBlock: -20% (proof: bad signature/hash)
+├── ChainFork: -100% → permanent ban (proof: conflicting blocks)
+├── MissedBlocks: NOT slashable (no proof possible, use reputation decay)
 └── consensus_score < 70% → excluded from consensus
 
 Layer 5: Network Effects

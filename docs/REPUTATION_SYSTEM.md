@@ -512,32 +512,62 @@ history.retain(|_, record| record.timestamp >= cutoff);
 
 ---
 
-## Slashing Events
+## Slashing Events (v2.38)
 
-### Types
+### Architecture: Cryptographic Proof Only
 
-| Type | Penalty | Evidence Required |
-|------|---------|-------------------|
-| DoubleSign | -50% + Permanent Ban | Both signed blocks |
-| InvalidBlock | -20% | Invalid block data |
-| ChainFork | -100% + Permanent Ban | Conflicting chain data |
-| MissedBlocks | -2% per block | List of missed heights |
+Slashing is applied **ONLY** for offenses with cryptographic proof.
+This prevents false positives from network delays or P2P gossip inconsistencies.
 
-### Collection Flow
+### Slashable Offenses
+
+| Type | Penalty | Evidence Required | Detection |
+|------|---------|-------------------|-----------|
+| DoubleSign | -100% + Permanent Ban | 2 signatures at same height | On-chain analysis |
+| InvalidBlock | -20% | Invalid signature/hash | Block validation |
+| ChainFork | -100% + Permanent Ban | Conflicting blocks | On-chain analysis |
+
+### NOT Slashable (v2.38 Change)
+
+| Type | Reason | Alternative |
+|------|--------|-------------|
+| MissedBlocks | Cannot prove "who should have produced" | Reputation decay (no reward) |
+
+**Why MissedBlocks removed:**
+- Block structure has no `original_producer` field
+- Emergency producer overwrites `block.producer`
+- Network delays would cause false positives
+- Cannot deterministically prove who was assigned
+
+### Collection Flow (v2.38)
 
 ```
+                    ON-CHAIN SLASHING ANALYSIS
+                    
 ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│  Detect Offense │────►│ report_invalid_ │────►│ slashing_       │
-│  (validation)   │     │ block() / etc   │     │ collector       │
+│  MacroBlock     │────►│ analyze_chain_  │────►│ SlashingEvent   │
+│  Creation       │     │ for_slashing()  │     │ (if proof)      │
 └─────────────────┘     └─────────────────┘     └────────┬────────┘
                                                          │
-                                                         │ Macroblock
-                                                         │ creation
+                        Checks for:                      │
+                        - Double-sign (2 sigs @ height)  │
+                        - Invalid blocks                 │
                                                          ▼
 ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│ All nodes apply │◄────│ drain_slashing_ │◄────│ MacroBlock      │
-│ same penalties  │     │ events()        │     │ ConsensusData   │
+│ All nodes apply │◄────│ process_        │◄────│ MacroBlock      │
+│ same penalties  │     │ macroblock()    │     │ ConsensusData   │
 └─────────────────┘     └─────────────────┘     └─────────────────┘
+
+Result: DETERMINISTIC - all nodes analyzing same chain = same result!
+```
+
+### Emergency Failover (NOT Slashing)
+
+```
+Emergency notification → Failover only (chain continues)
+                       → NO immediate slashing
+                       → Producer recorded in block.producer
+                       → Reputation: no reward for missed rotation
 ```
 
 ---

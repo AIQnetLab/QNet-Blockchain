@@ -575,9 +575,8 @@ pub struct SimplifiedP2P {
     /// Reputation system for consensus (public for ping service access)
     pub reputation_system: Arc<Mutex<NodeReputation>>,
     
-    /// PRODUCTION: Slashing event collector for next macroblock
-    /// Events are collected during block production and included in macroblock
-    slashing_collector: Arc<Mutex<Vec<qnet_consensus::deterministic_reputation::SlashingEvent>>>,
+    // DEPRECATED v2.38: slashing_collector removed
+    // Slashing now determined on-chain via analyze_chain_for_slashing()
     
     /// PRODUCTION: Deterministic reputation state (shared with BlockchainNode)
     /// Set via set_deterministic_reputation() after BlockchainNode creation
@@ -1366,7 +1365,6 @@ impl SimplifiedP2P {
                 
                 Arc::new(Mutex::new(reputation_sys))
             },
-            slashing_collector: Arc::new(Mutex::new(Vec::new())),
             deterministic_reputation: Arc::new(std::sync::RwLock::new(None)),
             consensus_tx: None,
             block_tx: Arc::new(Mutex::new(None)),
@@ -13713,90 +13711,19 @@ impl SimplifiedP2P {
         }
     }
     
-    /// PRODUCTION: Add slashing event for inclusion in next macroblock
-    /// Events are collected and processed deterministically by all nodes
-    pub fn add_slashing_event(&self, event: qnet_consensus::deterministic_reputation::SlashingEvent) {
-        if let Ok(mut collector) = self.slashing_collector.lock() {
-            // Prevent duplicates
-            if !collector.iter().any(|e| e.offender == event.offender && e.detected_at_height == event.detected_at_height) {
-                println!("[SLASHING] 📝 Recorded offense: {} at height {} (penalty: -{:.1}%)", 
-                         event.offender, event.detected_at_height, event.penalty);
-                collector.push(event);
-            }
-        }
-    }
+    // ═══════════════════════════════════════════════════════════════════════════
+    // DEPRECATED v2.38: P2P-based slashing removed
+    // Slashing now determined ONLY from on-chain analysis in MacroBlock creation
+    // These methods kept for logging/monitoring only - NO effect on consensus
+    // ═══════════════════════════════════════════════════════════════════════════
     
-    /// PRODUCTION: Get and clear collected slashing events for macroblock
-    pub fn drain_slashing_events(&self) -> Vec<qnet_consensus::deterministic_reputation::SlashingEvent> {
-        if let Ok(mut collector) = self.slashing_collector.lock() {
-            std::mem::take(&mut *collector)
-        } else {
-            Vec::new()
-        }
-    }
-    
-    /// PRODUCTION: Create slashing event for invalid block
+    /// DEPRECATED v2.38: Log invalid block for monitoring (NO slashing effect!)
+    /// Slashing is now determined on-chain via analyze_chain_for_slashing()
+    #[allow(unused_variables)]
     pub fn report_invalid_block(&self, offender: &str, height: u64, block_hash: [u8; 32], reason: &str) {
-        use qnet_consensus::deterministic_reputation::{SlashingEvent, SlashingType};
-        use sha3::{Sha3_256, Digest};
-        
-        // Create evidence hash
-        let mut hasher = Sha3_256::new();
-        hasher.update(offender.as_bytes());
-        hasher.update(&height.to_le_bytes());
-        hasher.update(&block_hash);
-        hasher.update(reason.as_bytes());
-        let evidence_hash: [u8; 32] = hasher.finalize().into();
-        
-        let event = SlashingEvent {
-            offender: offender.to_string(),
-            offense: SlashingType::InvalidBlock {
-                height,
-                block_hash,
-                reason: reason.to_string(),
-            },
-            penalty: SlashingEvent::calculate_penalty(&SlashingType::InvalidBlock {
-                height,
-                block_hash,
-                reason: reason.to_string(),
-            }),
-            detected_at_height: height,
-            reporter: self.node_id.clone(),
-            evidence_hash,
-        };
-        
-        self.add_slashing_event(event);
-    }
-    
-    /// PRODUCTION: Create slashing event for double signing
-    pub fn report_double_sign(&self, offender: &str, height: u64, hash_a: [u8; 32], hash_b: [u8; 32], sig_a: Vec<u8>, sig_b: Vec<u8>) {
-        use qnet_consensus::deterministic_reputation::{SlashingEvent, SlashingType};
-        use sha3::{Sha3_256, Digest};
-        
-        // Create evidence hash
-        let mut hasher = Sha3_256::new();
-        hasher.update(offender.as_bytes());
-        hasher.update(&height.to_le_bytes());
-        hasher.update(&hash_a);
-        hasher.update(&hash_b);
-        let evidence_hash: [u8; 32] = hasher.finalize().into();
-        
-        let event = SlashingEvent {
-            offender: offender.to_string(),
-            offense: SlashingType::DoubleSign {
-                height,
-                hash_a,
-                hash_b,
-                signature_a: sig_a,
-                signature_b: sig_b,
-            },
-            penalty: qnet_consensus::deterministic_reputation::PENALTY_DOUBLE_SIGN,
-            detected_at_height: height,
-            reporter: self.node_id.clone(),
-            evidence_hash,
-        };
-        
-        self.add_slashing_event(event);
+        // v2.38: Only log for monitoring - NO slashing action!
+        // Slashing determined on-chain in MacroBlock creation
+        println!("[WARN][MONITOR] invalid_block offender={} h={} reason={}", offender, height, reason);
     }
     
     /// DEPRECATED: Update node reputation via P2P
@@ -15971,39 +15898,29 @@ impl SimplifiedP2P {
         
         println!("[FAILOVER] ⏸️ Verification scheduled (2s timeout)");
         
-        // Apply penalties IMMEDIATELY based on current confirmation count
-        // This avoids async complexity while still using consensus
-        let conf_key = (block_height, failed_producer.clone());
-        let current_confirmations = EMERGENCY_CONFIRMATIONS
-            .get(&conf_key)
-            .map(|entry| entry.0.load(Ordering::Relaxed))
-            .unwrap_or(1);
+        // ═══════════════════════════════════════════════════════════════════════════
+        // ARCHITECTURE v2.38: ON-CHAIN SLASHING ONLY
+        // ═══════════════════════════════════════════════════════════════════════════
+        // Emergency notifications are for FAILOVER only, NOT for slashing!
+        // 
+        // Slashing is determined in MacroBlock creation by analyzing the blockchain:
+        // 1. Emergency notification → triggers failover (continues the chain)
+        // 2. Emergency producer creates block with their ID in block.producer
+        // 3. At MacroBlock creation → analyze chain: assigned vs actual producer
+        // 4. If assigned ≠ actual → slashing recorded in MacroBlock (deterministic)
+        //
+        // WHY ON-CHAIN: P2P-based slashing causes false positives:
+        // - Race conditions (slashing before block propagates)
+        // - Network issues (receiver's problem ≠ producer's fault)
+        // - Non-determinism (nodes see different confirmation counts)
+        //
+        // ON-CHAIN slashing is deterministic - all nodes analyze same blockchain!
+        // ═══════════════════════════════════════════════════════════════════════════
         
-        println!("[CONSENSUS] 📊 Current confirmations: {}", current_confirmations);
-        
-        if current_confirmations >= 3 {
-            println!("[CONSENSUS] ✅ CONSENSUS REACHED: 3+ nodes confirm emergency");
-            // Report failed producer for slashing
-            self.report_invalid_block(&failed_producer, block_height, [0u8; 32], "Confirmed failed production (3+ nodes)");
-            println!("[FAILOVER] ⚔️ Slashing event recorded for {}", failed_producer);
-            
-            if new_producer != "emergency_consensus" {
-                // Emergency producer reward processed via DeterministicReputationState.process_block()
-                println!("[FAILOVER] ✅ Emergency producer {} will be rewarded via block production", new_producer);
-            }
-        } else if current_confirmations >= 2 {
-            println!("[CONSENSUS] ⚠️ PARTIAL CONSENSUS: 2 nodes confirm emergency");
-            // Report failed producer for slashing (partial consensus)
-            self.report_invalid_block(&failed_producer, block_height, [0u8; 32], "Confirmed failed production (2 nodes)");
-            println!("[FAILOVER] ⚔️ Slashing event recorded for {}", failed_producer);
-            
-            if new_producer != "emergency_consensus" {
-                // Emergency producer reward processed via DeterministicReputationState.process_block()
-                println!("[FAILOVER] ✅ Emergency producer {} will be rewarded via block production", new_producer);
-            }
-        } else {
-            println!("[CONSENSUS] ⚠️ SINGLE REPORT: No penalty for {}", failed_producer);
-        }
+        // Log emergency for monitoring (NO slashing action here!)
+        println!("[INFO][FAILOVER] emergency_recorded producer={} h={} new_producer={}", 
+                 failed_producer, block_height, new_producer);
+        println!("[INFO][FAILOVER] slashing=deferred_to_macroblock reason=on_chain_analysis");
     }
     
     
@@ -16650,18 +16567,10 @@ impl SimplifiedP2P {
             change_type
         )?;
         
-        // Report double sign attack with cryptographic proof
-        self.report_double_sign(
-            attacker,
-            block_height,
-            [0u8; 32], // hash_a placeholder - real evidence in consensus
-            [0u8; 32], // hash_b placeholder - real evidence in consensus
-            vec![],    // sig_a placeholder
-            vec![]     // sig_b placeholder
-        );
-        
-        // v2.21.5: Jail via slashing event in next macroblock
-        println!("[SECURITY] ✅ Critical attack by {} reported - will be permanently banned via slashing event", attacker);
+        // v2.38: Log critical attack for monitoring
+        // Double-sign slashing is determined on-chain in MacroBlock creation
+        println!("[CRIT][SECURITY] critical_attack attacker={} h={} type={}", attacker, block_height, change_type);
+        println!("[INFO][SECURITY] slashing=on_chain_detection note=double_sign_detected_in_macroblock");
         Ok(())
     }
     

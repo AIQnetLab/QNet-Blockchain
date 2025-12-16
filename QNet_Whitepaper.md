@@ -864,11 +864,12 @@ REWARDS (from blockchain data):
   ├── Consensus Participation: +1.0 (macroblock commit+reveal)
   └── Passive Recovery: +1.0/4h (online nodes with rep 10-69%)
 
-PENALTIES (SlashingEvent with cryptographic proof):
-  ├── Invalid Block: -20.0 (proof: the invalid block itself)
-  ├── Double Sign: -50.0 + PERMANENT BAN (proof: both signed blocks)
-  ├── Chain Fork: PERMANENT BAN (proof: conflicting chains)
-  └── Missed Blocks: -2.0 per block (AutomaticJail in macroblock)
+PENALTIES (SlashingEvent - cryptographic proof REQUIRED):
+  ├── Double Sign: -100% + PERMANENT BAN (proof: 2 signatures at same height)
+  ├── Invalid Block: -20% (proof: invalid signature/hash)
+  ├── Chain Fork: -100% + PERMANENT BAN (proof: conflicting signed blocks)
+  └── Missed Blocks: NOT SLASHABLE (no cryptographic proof possible)
+      └── Instead: No reward for partial rotation (natural consequence)
 
 SNAPSHOT STORAGE (every 90 blocks in macroblock):
   ├── All reputations (HashMap<String, f64>)

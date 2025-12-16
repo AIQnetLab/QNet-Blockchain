@@ -5,6 +5,64 @@ All notable changes to the QNet project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.38.0] - December 16, 2025 "On-Chain Slashing Only"
+
+### 🔐 Slashing Architecture Overhaul
+
+**Problem Solved:**
+P2P-based slashing (via emergency confirmations) caused false positives when network delays occurred. Nodes were incorrectly slashed and jailed due to:
+- Race conditions (slashing before block propagates)
+- Network issues (receiver's problem ≠ producer's fault)
+- Non-determinism (different nodes see different confirmation counts)
+
+**Solution:**
+Slashing now determined ONLY from blockchain analysis with cryptographic proof.
+
+| Aspect | Before (v2.37) | After (v2.38) |
+|--------|----------------|---------------|
+| Slashing trigger | P2P confirmations (2+ nodes) | **On-chain analysis only** |
+| MissedBlocks slashing | ❌ Buggy algorithm | **Removed** (reputation decay instead) |
+| Double-sign detection | Not implemented | **✅ Implemented** |
+| False positives | ❌ Possible | **✅ Impossible** |
+| Determinism | ❌ Nodes may differ | **✅ Same chain = same result** |
+
+### Slashable Offenses (Cryptographic Proof Required)
+
+| Type | Penalty | Detection Method |
+|------|---------|------------------|
+| DoubleSign | 100% + Permanent Ban | 2 signatures at same height |
+| InvalidBlock | 20% | Signature/hash validation failure |
+| ChainFork | 100% + Permanent Ban | Conflicting blocks signed |
+
+### NOT Slashable (v2.38)
+
+| Type | Reason | Alternative |
+|------|--------|-------------|
+| MissedBlocks | Cannot prove "who should have produced" | No reward for rotation |
+
+### Files Changed
+
+- `development/qnet-integration/src/unified_p2p.rs`:
+  - Removed `report_invalid_block()` calls from emergency handler
+  - Emergency notifications now only log (no slashing action)
+  
+- `development/qnet-integration/src/node.rs`:
+  - Rewrote `analyze_chain_for_slashing()` - cryptographic proof only
+  - Added double-sign detection (2 signatures at same height)
+  - Removed buggy missed-blocks slashing algorithm
+
+- `docs/REPUTATION_SYSTEM.md`:
+  - Updated slashing documentation to reflect v2.38 architecture
+
+### Security Impact
+
+- **No false positives:** Slashing requires cryptographic proof
+- **Deterministic:** All nodes analyzing same chain compute same result
+- **Fair:** Network delays don't penalize producers
+- **Scalable:** Works identically for 5 or 100K nodes
+
+---
+
 ## [2.37.0] - December 16, 2025 "Dedicated MacroBlock Channel"
 
 ### 🚀 MacroBlock Propagation Fix

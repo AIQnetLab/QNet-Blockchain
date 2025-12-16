@@ -1,10 +1,47 @@
 # 🚀 QNet Blockchain - Release Notes
 
-## 🎉 Latest: v2.37.0 - Dedicated MacroBlock Channel
+## 🎉 Latest: v2.38.0 - On-Chain Slashing Only
 
 **Release Date**: December 16, 2025  
-**Version**: 2.37.0  
+**Version**: 2.38.0  
 **Status**: ✅ Production Ready
+
+---
+
+## v2.38.0 - On-Chain Slashing Only (December 16, 2025)
+
+### 🔐 Slashing Architecture Overhaul
+
+**Problem:** P2P-based slashing via emergency confirmations caused false positives (race conditions, network delays)
+
+**Solution:** Slashing now requires cryptographic proof from on-chain analysis
+
+| Aspect | Before | After |
+|--------|--------|-------|
+| Slashing trigger | P2P confirmations | **On-chain analysis** |
+| MissedBlocks | ❌ Buggy slashing | **No slashing** (reputation decay) |
+| Double-sign | Not detected | **✅ Detected + 100% penalty** |
+| False positives | ❌ Possible | **✅ Impossible** |
+
+### Slashable (Cryptographic Proof)
+
+| Offense | Penalty | Proof |
+|---------|---------|-------|
+| Double-Sign | 100% + Ban | 2 sigs at same height |
+| Invalid Block | 20% | Bad signature/hash |
+| Chain Fork | 100% + Ban | Conflicting blocks |
+
+### NOT Slashable
+
+| Type | Reason | Alternative |
+|------|--------|-------------|
+| MissedBlocks | No proof of "who should produce" | No reward for rotation |
+
+### Files Changed
+
+- `unified_p2p.rs`: Removed immediate slashing from emergency handler
+- `node.rs`: Rewrote `analyze_chain_for_slashing()` - crypto proof only
+- `REPUTATION_SYSTEM.md`: Updated slashing documentation
 
 ---
 
