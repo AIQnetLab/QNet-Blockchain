@@ -5,6 +5,62 @@ All notable changes to the QNet project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.37.0] - December 16, 2025 "Dedicated MacroBlock Channel"
+
+### 🚀 MacroBlock Propagation Fix
+
+**Problem Solved:**
+ShredProtocol uses block height as dedup key. MacroBlock #1 and Microblock #1 both have height=1 → collision! One gets dropped by `processed_shred_blocks`.
+
+**Solution:**
+Dedicated `MacroBlockBroadcast` message type via QUIC (same transport as consensus commits/reveals).
+
+| Aspect | Before (v2.36) | After (v2.37) |
+|--------|----------------|---------------|
+| MacroBlock transport | ShredProtocol | **Dedicated QUIC channel** |
+| Height collision | ❌ Possible | ✅ Impossible |
+| Retry logic | ShredProtocol internal | **3 attempts + exponential backoff** |
+| Parallelism | ShredProtocol internal | **100 concurrent (bounded)** |
+| HTTP fallback | None | **None (QUIC mandatory)** |
+
+### Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    BLOCK PROPAGATION v2.37                      │
+├─────────────────────────────────────────────────────────────────┤
+│  MICROBLOCKS:                                                   │
+│  └── ShredProtocol (chunks, Reed-Solomon, dedup by height)      │
+│                                                                 │
+│  MACROBLOCKS:                                                   │
+│  └── Dedicated NetworkMessage::MacroBlockBroadcast              │
+│  └── Direct QUIC broadcast (no ShredProtocol)                   │
+│  └── 3 retries + exponential backoff (100ms, 200ms, 400ms)      │
+│  └── Second retry wave for failed peers (+2 attempts)           │
+│  └── Bounded parallelism: 100 concurrent                        │
+│                                                                 │
+│  Dedicated channel for reliable MacroBlock delivery             │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Files Changed
+
+- `development/qnet-integration/src/unified_p2p.rs`:
+  - Added `NetworkMessage::MacroBlockBroadcast` enum variant
+  - Added `broadcast_macroblock()` method (QUIC-only, 3 retries)
+  - Added handler for `MacroBlockBroadcast` in `handle_message()`
+  
+- `development/qnet-integration/src/node.rs`:
+  - Changed `trigger_macroblock_consensus()` to use `broadcast_macroblock()`
+
+### Security Impact
+
+- **No HTTP fallback:** QUIC is mandatory (validated at node startup)
+- **Same retry logic as consensus:** Consistent reliability guarantees
+- **Collision-free:** MacroBlocks and microblocks never interfere
+
+---
+
 ## [2.36.0] - December 15, 2025 "Unified SHA3-512 Security"
 
 ### 🔐 Unified Hash Algorithm for Maximum Quantum Security
@@ -65,7 +121,7 @@ This caused network forks after block 180 when N-2 producer selection kicked in.
 - `eligible_producers` snapshot used `get_active_full_super_nodes()` (P2P state) instead of consensus data
 - Different nodes had different P2P views → different snapshots → FORK!
 
-### Architectural Changes (Ethereum 2.0 / Solana Style)
+### Architectural Changes
 
 | Component | Before (v2.33) | After (v2.34) |
 |-----------|----------------|---------------|
@@ -73,7 +129,7 @@ This caused network forks after block 180 when N-2 producer selection kicked in.
 | `participate_in_macroblock_consensus()` | Called `trigger_macroblock_consensus()` | **WAITS for Leader's MacroBlock** |
 | Participants list | `get_validated_active_peers()` (P2P) | `calculate_qualified_candidates()` (N-2 blockchain) |
 | `eligible_producers` source | P2P registry + `get_active_full_super_nodes()` | **Consensus participants ONLY** |
-| MacroBlock broadcast | Each node stored own version | Leader broadcasts via ShredProtocol |
+| MacroBlock broadcast | Each node stored own version | Leader broadcasts via dedicated QUIC channel (v2.37) |
 
 ### New Functions
 
@@ -311,7 +367,7 @@ Network forks caused by three sources of non-determinism:
 2. Entropy fallback to macroblock when not synced
 3. Producer list fallback to gossip registry
 
-**Solution:** Removed ALL fallbacks - nodes must sync before participating (Solana/Ethereum style)
+**Solution:** Removed ALL fallbacks - nodes must sync before participating
 
 ### ✅ Bug Fixes
 
@@ -359,7 +415,7 @@ After v2.27.1:
 **Problem Fixed:**
 Gossip-based producer selection caused network forks when different nodes had different active peer lists at the moment of deterministic selection.
 
-**Solution:** Epoch-based validator set stored in MacroBlock snapshots (Solana/Ethereum 2.0 style)
+**Solution:** Epoch-based validator set stored in MacroBlock snapshots
 
 ### ✅ Architecture Changes
 
@@ -486,7 +542,7 @@ Emergency Failover:        Same MacroBlock snapshot (deterministic)
 
 ---
 
-## [2.24.0] - December 6, 2025 "Ethereum 2.0 Style Reputation Snapshots"
+## [2.24.0] - December 6, 2025 "Deterministic Reputation Snapshots"
 
 ### 🔐 CRITICAL - Complete Reputation System Overhaul
 
@@ -495,7 +551,7 @@ Emergency Failover:        Same MacroBlock snapshot (deterministic)
 2. Reward given for partial rotation (failover) - should be 30/30 only!
 3. Snapshot only stored reputations, not jails/bans/offense counts
 
-**Solution**: Full Ethereum 2.0 style reputation snapshots + strict 30/30 rule!
+**Solution**: Full reputation snapshots + strict 30/30 rule!
 
 ### ✅ Changes
 

@@ -140,8 +140,9 @@ pub struct EligibleProducer {
 │  └── eligible_producers = ONLY consensus participants (commit+reveal)     │
 │  └── NO P2P registry lookups! Deterministic from consensus data.          │
 │                                                                             │
-│  STEP 4: BROADCAST                                                         │
-│  └── Leader broadcasts MacroBlock via ShredProtocol                       │
+│  STEP 4: BROADCAST (v2.37)                                                 │
+│  └── Leader broadcasts MacroBlock via dedicated QUIC channel              │
+│  └── NOT ShredProtocol! (avoids height collision with microblocks)        │
 │  └── All nodes receive and validate                                       │
 │                                                                             │
 │  STEP 5: PARTICIPANTS RECEIVE                                              │
@@ -218,7 +219,7 @@ Even with epoch-based validator sets, three sources of non-determinism caused fo
 │  LAGGING NODES:                                                         │
 │  └── Cannot be producer (empty list)                                    │
 │  └── Must sync first                                                    │
-│  └── Network continues without them (like Solana/Ethereum)             │
+│  └── Network continues without them (standard blockchain behavior)     │
 │                                                                         │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
@@ -667,7 +668,7 @@ impl Transaction {
 
 ## Gulf Stream Protocol
 
-Inspired by Solana's Gulf Stream, QNet v2.25 implements **direct producer forwarding**:
+QNet v2.25 implements **direct producer forwarding**:
 
 ### Architecture
 
@@ -808,7 +809,7 @@ if pending_blocks.len() >= max_pending_blocks {
 #### Pseudo-Infinite Retry Mechanism (v2.19.20)
 
 ```rust
-// CRITICAL v2.19.20: PSEUDO-INFINITE retries (like Solana/Ethereum)
+// CRITICAL v2.19.20: PSEUDO-INFINITE retries for block reliability
 // Blocks are critical data - NEVER discard them!
 // Protection layers:
 // 1. max_pending_blocks = 500 Full/Super, 100 Light (memory protection)

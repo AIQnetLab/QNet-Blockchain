@@ -7,7 +7,7 @@ All nodes compute identical reputation scores from on-chain data.
 
 **NEW in v2.27:** Epoch-based validator sets + QRDS (Quantum-Resistant Deterministic Selection) eliminate gossip race conditions!
 
-**NEW in v2.24:** Ethereum 2.0 style reputation snapshots ensure 100% synchronization across all nodes!
+**NEW in v2.24:** Reputation snapshots ensure 100% synchronization across all nodes!
 
 **Architecture Comparison:**
 | Feature | OLD (P2P Gossip) | NEW (Deterministic) |
@@ -639,7 +639,7 @@ Before v2.24, nodes could have different reputation values due to:
 - Failed deserialization of some blocks
 - Different blockchain heights
 
-### Solution: Ethereum 2.0 Style Snapshots
+### Solution: Deterministic Snapshots
 
 Every macroblock now contains a **FULL reputation snapshot** stored in blockchain:
 

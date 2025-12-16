@@ -135,7 +135,7 @@ Consensus Layer (consensus_crypto.rs)
 ### Adaptive Memory Protection
 - **Max Pending (Light)**: 100 blocks (~10 MB)
 - **Max Pending (Full/Super)**: 500 blocks (~50 MB)
-- **Retry**: Pseudo-infinite (like Solana/Ethereum)
+- **Retry**: Pseudo-infinite
 - **Backoff (0-9 retries)**: 10 seconds (aggressive)
 - **Backoff (10+ retries)**: 30s → 60s → 120s → 240s → 300s max
 - **Eviction**: FIFO (oldest first)

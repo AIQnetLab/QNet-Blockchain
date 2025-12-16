@@ -293,7 +293,7 @@ Block #N+5 arrives → Missing #N+1,N+2,N+3,N+4 → Buffer #N+5 → Request Miss
 
 **Buffer Management (v2.19.20):**
 - HashMap storage: O(1) lookup by block height
-- **Pseudo-infinite retries** (like Solana/Ethereum) - blocks NEVER discarded
+- **Pseudo-infinite retries** - blocks NEVER discarded
 - **Adaptive buffer size**: Full/Super 500 blocks (~50MB), Light 100 blocks (~10MB)
 - **Exponential backoff**: 10s (retries 0-9) → 30s → 60s → 120s → 240s → 300s max
 - Timestamp tracking for age-based re-request (not eviction)
@@ -828,7 +828,7 @@ MAX_MESSAGE_SIZE: 10 MB       // Supports full macroblocks (~3MB)
 
 ### 6.5 Reputation System
 
-**Deterministic Blockchain-Based Reputation (v2.24 - Ethereum 2.0 Style):**
+**Deterministic Blockchain-Based Reputation (v2.24):**
 
 > **ARCHITECTURE v2.24:** Reputation computed from blockchain data + FULL snapshots in macroblocks.
 > All nodes have IDENTICAL reputation state after every macroblock - 100% synchronized.
@@ -972,7 +972,7 @@ OPTIMIZATIONS (v2.19.20):
 ├── Fire-and-Forget Broadcast: Shred Protocol doesn't block production (1 block/sec guaranteed)
 ├── Genesis Startup Wait: 30-second network stabilization before production
 ├── Emergency Timeout 10s: Allows original producer delivery (was 2s)
-├── Pseudo-Infinite Retries: Blocks NEVER discarded (like Solana/Ethereum)
+├── Pseudo-Infinite Retries: Blocks NEVER discarded
 ├── Exponential Backoff: 10s (0-9) → 30s → 60s → 120s → 240s → 300s max
 ├── Adaptive Buffer: Full/Super 500 blocks (~50MB), Light 100 blocks (~10MB)
 ├── Kademlia K-neighbors: Heartbeats use DHT distance for efficient routing

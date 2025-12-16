@@ -114,7 +114,7 @@ pub struct ConsensusData {
     
     // ═══════════════════════════════════════════════════════════════════
     // REPUTATION SNAPSHOT (v2.24.0)
-    // Ethereum 2.0 style: snapshot stored in macroblock for consistency
+    // Snapshot stored in macroblock for consistency across all nodes
     // All nodes MUST have identical reputation after applying macroblock
     // ═══════════════════════════════════════════════════════════════════
     
@@ -127,7 +127,7 @@ pub struct ConsensusData {
     // ═══════════════════════════════════════════════════════════════════
     // ELIGIBLE PRODUCERS SNAPSHOT (v2.27.0)
     // Epoch-based validator set for deterministic producer selection
-    // Solana/Ethereum style: snapshot determines producers for next 90 blocks
+    // Snapshot determines producers for next 90 blocks (next epoch)
     // ═══════════════════════════════════════════════════════════════════
     
     /// Eligible producers for next epoch (90 blocks)
@@ -140,7 +140,7 @@ pub struct ConsensusData {
     // ═══════════════════════════════════════════════════════════════════════════
     // QUANTUM RANDOMNESS BEACON (QRB) v3.0
     // Accumulated randomness from all QRB outputs in this epoch
-    // Ethereum 2.0 RANDAO style, but quantum-resistant with Dilithium signatures
+    // Quantum-resistant randomness beacon with Dilithium signatures
     // ═══════════════════════════════════════════════════════════════════════════
     
     /// Quantum Randomness Beacon - accumulated from epoch's randomness outputs

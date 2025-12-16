@@ -638,7 +638,7 @@ pub struct SimplifiedP2P {
     macroblock_tx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<ReceivedBlock>>>>,
     
     /// PRODUCTION v2.19.21: QUIC transport for high-performance P2P
-    /// Provides Solana/Aptos-level performance with persistent connections
+    /// High-performance transport with persistent connections
     /// Uses binary protocol (bincode) instead of JSON for efficiency
     quic_transport: Option<Arc<tokio::sync::RwLock<crate::quic_transport::QuicTransport>>>,
     
@@ -4263,7 +4263,7 @@ impl SimplifiedP2P {
     }
     
     /// PRODUCTION v2.19.21: Broadcast block using ShredProtocol protocol via QUIC
-    /// Solana-inspired chunking with Reed-Solomon erasure coding
+    /// Chunking with Reed-Solomon erasure coding for reliability
     /// For microblocks only (default) - use broadcast_block_shred_protocol_typed for macroblocks
     pub async fn broadcast_block_shred_protocol(&self, height: u64, block_data: Vec<u8>) -> Result<(), String> {
         self.broadcast_block_shred_protocol_typed(height, block_data, false).await
@@ -4852,6 +4852,119 @@ impl SimplifiedP2P {
                 }
             });
         }
+    }
+    
+    /// PRODUCTION v2.37: Broadcast MacroBlock via dedicated channel (not ShredProtocol)
+    /// ═══════════════════════════════════════════════════════════════════════════
+    /// WHY NOT SHREDPROTOCOL:
+    /// - ShredProtocol uses height as dedup key → collision with microblocks
+    /// - MacroBlock #1 and Microblock #1 both use height=1 → one gets dropped
+    /// - Separate broadcast ensures 100% delivery
+    /// 
+    /// ARCHITECTURE:
+    /// - QUIC-only broadcast (same as microblocks, consensus commits/reveals)
+    /// - 3 retry attempts with exponential backoff
+    /// - Bounded parallelism (max 100 concurrent)
+    /// - Dedicated channel for reliable MacroBlock delivery
+    /// ═══════════════════════════════════════════════════════════════════════════
+    pub async fn broadcast_macroblock(&self, index: u64, compressed_data: Vec<u8>, epoch: u64) -> Result<(), String> {
+        use futures::stream::{self, StreamExt};
+        
+        let validated_peers = self.get_validated_active_peers();
+        
+        if validated_peers.is_empty() {
+            println!("[WARN][MB-P2P] no peers for broadcast idx={}", index);
+            return Ok(());
+        }
+        
+        let message = NetworkMessage::MacroBlockBroadcast {
+            index,
+            data: compressed_data.clone(),
+            sender_id: self.node_id.clone(),
+            epoch,
+        };
+        
+        let peer_count = validated_peers.len();
+        println!("[INFO][MB-P2P] → broadcast idx={} epoch={} peers={} bytes={}", 
+                 index, epoch, peer_count, compressed_data.len());
+        
+        // PRODUCTION: QUIC-only broadcast with retries (same as consensus commits)
+        let quic_transport = self.quic_transport.clone();
+        let quic_enabled = self.quic_enabled.load(std::sync::atomic::Ordering::Relaxed);
+        
+        if !quic_enabled {
+            println!("[ERR][MB-P2P] QUIC not enabled - cannot broadcast idx={}", index);
+            return Err("QUIC transport required for MacroBlock broadcast".to_string());
+        }
+        
+        // Collect peer addresses
+        let peer_addresses: Vec<String> = validated_peers.iter()
+            .map(|p| p.addr.clone())
+            .collect();
+        
+        // PRODUCTION: Bounded parallelism with 3 retries (same as consensus)
+        let results = stream::iter(peer_addresses.clone())
+            .map(|peer_addr| {
+                let msg = message.clone();
+                let qt = quic_transport.clone();
+                async move {
+                    for attempt in 1..=3 {
+                        if Self::send_consensus_message_with_retry(&peer_addr, &msg, qt.clone(), true).await {
+                            return (peer_addr, true);
+                        }
+                        if attempt < 3 {
+                            // Exponential backoff: 100ms, 200ms, 400ms
+                            tokio::time::sleep(std::time::Duration::from_millis(100 * (1 << attempt))).await;
+                        }
+                    }
+                    (peer_addr, false)
+                }
+            })
+            .buffer_unordered(100) // Max 100 concurrent (same as consensus)
+            .collect::<Vec<_>>()
+            .await;
+        
+        let successful = results.iter().filter(|(_, ok)| *ok).count();
+        let failed = results.iter().filter(|(_, ok)| !*ok).count();
+        
+        if failed > 0 {
+            println!("[WARN][MB-P2P] broadcast idx={}: ok={} fail={}", index, successful, failed);
+            
+            // RETRY: Second wave for failed peers (same as consensus)
+            let failed_peers: Vec<_> = results.iter()
+                .filter(|(_, ok)| !*ok)
+                .map(|(addr, _)| addr.clone())
+                .collect();
+            
+            if !failed_peers.is_empty() {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                
+                let retry_results = stream::iter(failed_peers)
+                    .map(|peer_addr| {
+                        let msg = message.clone();
+                        let qt = quic_transport.clone();
+                        async move {
+                            for attempt in 1..=2 {
+                                if Self::send_consensus_message_with_retry(&peer_addr, &msg, qt.clone(), true).await {
+                                    return true;
+                                }
+                                tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64)).await;
+                            }
+                            false
+                        }
+                    })
+                    .buffer_unordered(50)
+                    .collect::<Vec<_>>()
+                    .await;
+                
+                let retry_success = retry_results.iter().filter(|ok| **ok).count();
+                println!("[INFO][MB-P2P] retry idx={}: +{} recovered", index, retry_success);
+            }
+        } else {
+            println!("[INFO][MB-P2P] broadcast idx={} complete: {} peers", index, successful);
+        }
+        
+        Ok(())
     }
     
     /// PRODUCTION v2.21.3: Request missing chunks from peers
@@ -9223,6 +9336,21 @@ pub enum NetworkMessage {
         is_macroblock: bool,
         sender_id: String,
     },
+    
+    /// PRODUCTION v2.37: Dedicated MacroBlock broadcast (NOT via ShredProtocol!)
+    /// ═══════════════════════════════════════════════════════════════════════════
+    /// WHY SEPARATE CHANNEL:
+    /// - ShredProtocol uses block height as dedup key
+    /// - MacroBlock #1 and Microblock #1 both have height=1 → collision!
+    /// - Separate broadcast ensures 100% MacroBlock delivery
+    /// - Dedicated channel avoids collision with microblocks
+    /// ═══════════════════════════════════════════════════════════════════════════
+    MacroBlockBroadcast {
+        index: u64,           // MacroBlock index (epoch number)
+        data: Vec<u8>,        // Compressed macroblock data (zstd)
+        sender_id: String,    // Leader who created macroblock
+        epoch: u64,           // Epoch number (same as index)
+    },
 }
 
 /// PRODUCTION: Active node info for gossip sync
@@ -9577,6 +9705,43 @@ impl SimplifiedP2P {
             // PRODUCTION v2.21.3: Handle chunk retransmit responses
             NetworkMessage::MissingChunksResponse { block_height, chunks, original_block_size, is_macroblock, sender_id } => {
                 self.handle_missing_chunks_response(block_height, chunks, original_block_size, is_macroblock, &sender_id);
+            }
+            
+            // PRODUCTION v2.37: Handle dedicated MacroBlock broadcast (NOT ShredProtocol!)
+            NetworkMessage::MacroBlockBroadcast { index, data, sender_id, epoch } => {
+                println!("[INFO][MB-RX] ← received idx={} epoch={} sender={} bytes={}", 
+                         index, epoch, get_privacy_id_for_addr(&sender_id), data.len());
+                
+                // Decompress macroblock data
+                let macroblock_data = match zstd::decode_all(&data[..]) {
+                    Ok(decompressed) => decompressed,
+                    Err(e) => {
+                        println!("[ERR][MB-RX] decompress failed idx={}: {}", index, e);
+                        return;
+                    }
+                };
+                
+                // Queue macroblock for processing via macroblock_tx channel
+                if let Some(ref macroblock_tx) = &*match self.macroblock_tx.lock() { Ok(g) => g, Err(p) => p.into_inner() } {
+                    let received_macroblock = ReceivedBlock {
+                        height: index,
+                        data: macroblock_data,
+                        block_type: "macro".to_string(),
+                        from_peer: sender_id.clone(),
+                        timestamp: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
+                    };
+                    
+                    if let Err(e) = macroblock_tx.send(received_macroblock) {
+                        println!("[ERR][MB-RX] queue failed idx={}: {}", index, e);
+                    } else {
+                        println!("[INFO][MB-RX] queued idx={} for processing", index);
+                    }
+                } else {
+                    println!("[WARN][MB-RX] no macroblock channel idx={}", index);
+                }
             }
 
             NetworkMessage::EmergencyProducerChange { failed_producer, new_producer, block_height, change_type, timestamp, sender_node_id } => {

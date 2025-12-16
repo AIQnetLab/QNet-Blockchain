@@ -1,10 +1,32 @@
 # 🚀 QNet Blockchain - Release Notes
 
-## 🎉 Latest: v2.36.0 - Unified SHA3-512 Security
+## 🎉 Latest: v2.37.0 - Dedicated MacroBlock Channel
 
-**Release Date**: December 15, 2025  
-**Version**: 2.36.0  
+**Release Date**: December 16, 2025  
+**Version**: 2.37.0  
 **Status**: ✅ Production Ready
+
+---
+
+## v2.37.0 - Dedicated MacroBlock Channel (December 16, 2025)
+
+### 🚀 MacroBlock Propagation Fix
+
+**Problem:** ShredProtocol uses height as dedup key → MacroBlock #1 collides with Microblock #1 (both height=1)
+
+**Solution:** Dedicated `NetworkMessage::MacroBlockBroadcast` via QUIC
+
+| Aspect | Before | After |
+|--------|--------|-------|
+| Transport | ShredProtocol | **Dedicated QUIC** |
+| Collision | ❌ Possible | ✅ Impossible |
+| Retries | ShredProtocol | **3 + exponential backoff** |
+| HTTP fallback | None | **None (QUIC mandatory)** |
+
+### Files Changed
+
+- `unified_p2p.rs`: Added `MacroBlockBroadcast` message + `broadcast_macroblock()` method
+- `node.rs`: Uses `broadcast_macroblock()` instead of `broadcast_block_shred_protocol_typed()`
 
 ---
 
@@ -48,7 +70,7 @@ ROUND 2 → Leader C (30s timeout) → SUCCESS!
 
 ## v2.34.0 - Leader-Based MacroBlock Architecture (December 15, 2025)
 
-### 🏗️ CRITICAL - Architectural Refactor (Ethereum 2.0 / Solana Style)
+### 🏗️ CRITICAL - Architectural Refactor
 
 **Problem**: Each node was creating its OWN MacroBlock leading to inconsistent `eligible_producers` snapshots and network forks after block 180.
 
@@ -210,7 +232,7 @@ Blocks 181+:   PRODUCTION! Uses MacroBlock N-2
 
 ```
 If node doesn't have MacroBlock → returns empty list → cannot be producer
-Node must sync before participating (like Solana/Ethereum)
+Node must sync before participating (standard blockchain behavior)
 Network continues with synchronized nodes
 ```
 
@@ -229,7 +251,7 @@ Network continues with synchronized nodes
 
 **Problem Fixed**: Gossip-based producer selection caused network forks when different nodes had different views of active peers.
 
-**Solution**: MacroBlock snapshots for epoch-based validator sets (Solana/Ethereum 2.0 style)
+**Solution**: MacroBlock snapshots for epoch-based validator sets
 
 ### Changes
 

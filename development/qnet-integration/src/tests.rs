@@ -133,7 +133,7 @@ pub const API_ENDPOINTS: &[(&str, &str)] = &[
     // Gas
     ("GET", "/api/v1/gas/recommendations"),
     
-    // Solana-inspired
+    // ShredProtocol metrics
     ("GET", "/api/v1/turbine/metrics"),
     ("GET", "/api/v1/poh/status"),
     ("GET", "/api/v1/sealevel/metrics"),

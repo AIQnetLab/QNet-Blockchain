@@ -88,7 +88,7 @@ This project uses **dual licensing**:
 - **Fire-and-Forget Broadcast**: Shred Protocol block propagation no longer blocks production (1 block/sec guaranteed)
 - **Genesis Startup Wait**: 30-second network stabilization before block production (prevents race conditions)
 - **Emergency Timeout 10s**: Increased from 2s to allow original producer delivery
-- **Pseudo-Infinite Retries**: Blocks are NEVER discarded (like Solana/Ethereum)
+- **Pseudo-Infinite Retries**: Blocks are NEVER discarded
 - **Exponential Backoff**: 10s (retries 0-9) → 30s → 60s → 120s → 240s → 300s max
 - **Adaptive Buffer Size**: Full/Super nodes: 500 blocks (~50MB), Light nodes: 100 blocks (~10MB)
 - **Background Re-request**: Missing blocks automatically re-requested every 30s with backoff
@@ -462,7 +462,7 @@ For production testnet deployment, see: **[PRODUCTION_TESTNET_MANUAL.md](PRODUCT
 **Security Trade-offs:**
 - ✅ **AES-256-GCM**: Grover-resistant (2^128 operations = 10^38 years attack time)
 - ✅ **Nonce Management**: CSPRNG with 2^96 space, 10^-10% collision probability
-- ⚠️ **Architecture Inspiration**: Shred Protocol propagation concept inspired by Solana (original implementation)
+- ⚠️ **ShredProtocol**: Original implementation with Reed-Solomon erasure coding
 - ✅ **Sybil Resistance**: Multi-layer (1DEV burn + QNC pool, reputation, time barrier, 67%+ coordination cost)
 
 ### 💾 Ultra-Modern Storage Architecture
@@ -691,13 +691,13 @@ When all nodes fall below 70% reputation threshold:
 - **Progressive Penalties**: Escalating reputation penalties prevent repeated failures
 - **Network Transparency**: All failover events logged and broadcast to peers
 
-## 💎 Reputation System (v2.24 - Ethereum 2.0 Style Snapshots)
+## 💎 Reputation System (v2.24 - Deterministic Snapshots)
 
 **ARCHITECTURE v2.24:** Blockchain-based reputation with full state snapshots
 - All nodes compute identical reputation from on-chain data
 - Sybil-resistant: Cannot fake reputation via gossip
 - Deterministic: Verifiable by replaying blockchain from genesis
-- **NEW:** Full reputation snapshot in every macroblock (Ethereum 2.0 style)
+- **NEW:** Full reputation snapshot in every macroblock
 - **NEW:** Strict 30/30 rule - only FULL rotation gets reward!
 
 See full documentation: [docs/REPUTATION_SYSTEM.md](docs/REPUTATION_SYSTEM.md)

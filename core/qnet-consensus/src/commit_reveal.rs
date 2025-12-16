@@ -166,7 +166,7 @@ impl CommitRevealConsensus {
     /// Set randomness beacon from MacroBlock N-2 for unpredictable leader selection
     /// Call BEFORE finalize_round() to enable beacon-based selection
     /// 
-    /// ARCHITECTURE (same as Ethereum 2.0 RANDAO):
+    /// ARCHITECTURE:
     /// - Epoch 1-2: No beacon available, use Genesis seed (deterministic)
     /// - Epoch 3+: Use randomness_beacon from MacroBlock N-2
     /// - Beacon = accumulated reveal_data from previous epochs
@@ -482,7 +482,7 @@ impl CommitRevealConsensus {
     /// PROBLEM (v2.30): reveal_data varies between nodes → FORK!
     /// PROBLEM (v2.31): No beacon → leader predictable (DoS risk)
     /// 
-    /// SOLUTION (v2.32 - Ethereum 2.0 RANDAO style):
+    /// SOLUTION (v2.32):
     /// - Use randomness_beacon from MacroBlock N-2 as entropy source
     /// - Beacon is accumulated reveal_data from previous epochs
     /// - Unpredictable until N-2 finalized, then deterministic for all nodes

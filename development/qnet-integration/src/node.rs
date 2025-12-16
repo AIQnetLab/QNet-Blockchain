@@ -160,7 +160,7 @@ const MAX_CONCURRENT_MACROBLOCK_CHECKS: u64 = 5;
 // ═══════════════════════════════════════════════════════════════════════════
 // QNET STRUCTURED LOGGING SYSTEM v2.32
 // ═══════════════════════════════════════════════════════════════════════════
-// Professional logging like Solana/Ethereum validators
+// Professional logging for production validators
 // 
 // Levels (QNET_LOG_LEVEL env var):
 //   0 = OFF    - No logs except panics
@@ -226,7 +226,7 @@ lazy_static::lazy_static! {
 // ═══════════════════════════════════════════════════════════════════════════════
 // PRODUCTION v2.30: EXPLICIT NODE STATE MACHINE
 // Provides clear visibility into node's current operational state
-// Similar to Solana's ReplayStage, Cosmos's ConsensusState, ETH's SyncState
+// Industry-standard state machine for blockchain nodes
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Node operational state for debugging and monitoring
@@ -1004,7 +1004,7 @@ impl BlockchainNode {
                 // 3. Different producer list = different selection result = FORK!
                 //
                 // Solution: Node WITHOUT required macroblock CANNOT participate in production
-                // It must sync first. This is how Solana/Ethereum work.
+                // It must sync first. This is standard blockchain behavior.
                 //
                 // The network continues with nodes that ARE synchronized.
                 // Lagging nodes will catch up via block sync.
@@ -2039,7 +2039,7 @@ impl BlockchainNode {
         }
         
         // PRODUCTION v2.19.21: Initialize QUIC transport for high-performance P2P
-        // This provides Solana/Aptos-level performance with binary protocol
+        // High-performance binary protocol for production networks
         {
             // Get external IP for QUIC
             let external_ip = std::env::var("EXTERNAL_IP")
@@ -2443,7 +2443,7 @@ impl BlockchainNode {
             let bundle_config = qnet_mempool::BundleAllocationConfig {
                 min_allocation: 0.0,     // 0% minimum (no reservation when no demand)
                 max_allocation: 0.20,    // 20% maximum (protects public TXs ≥80%)
-                max_txs_per_bundle: 10,  // Max 10 TXs per bundle (Ethereum standard)
+                max_txs_per_bundle: 10,  // Max 10 TXs per bundle
                 min_reputation: 80.0,    // 80% reputation required (anti-spam)
                 gas_premium: 1.20,       // +20% gas (compensates block space inefficiency)
                 max_lifetime_sec: 60,    // 60 seconds max (prevents mempool bloat)
@@ -2614,7 +2614,7 @@ impl BlockchainNode {
                                 consensus: macro_consensus,
                             };
                             
-                            // v2.24: Apply reputation snapshot if present (Ethereum 2.0 style)
+                            // v2.24: Apply reputation snapshot if present
                             if let Some(ref snapshot_data) = macroblock.consensus_data.reputation_snapshot {
                                 if !snapshot_data.is_empty() {
                                     if let Ok(count) = rep_state.apply_snapshot(snapshot_data) {
@@ -3339,7 +3339,7 @@ impl BlockchainNode {
                                         .map(|(_, count, _)| count + 1)
                                         .unwrap_or(0);
                                     
-                                    // CRITICAL v2.19.20: PSEUDO-INFINITE retries (like Solana/Ethereum)
+                                    // CRITICAL v2.19.20: PSEUDO-INFINITE retries for block reliability
                                     // Blocks are critical data - NEVER discard them!
                                     // Protection layers:
                                     // 1. max_pending_blocks = 500 Full/Super, 100 Light (memory protection)
@@ -3797,7 +3797,7 @@ impl BlockchainNode {
                                 // 4. Update deterministic reputation state (in-memory)
                                 {
                                     if let Ok(mut rep_state) = deterministic_reputation.write() {
-                                        // v2.24: Apply reputation snapshot if present (Ethereum 2.0 style)
+                                        // v2.24: Apply reputation snapshot if present
                                         // This is AUTHORITATIVE - blockchain is source of truth!
                                         if let Some(ref snapshot_data) = macroblock.consensus_data.reputation_snapshot {
                                             if !snapshot_data.is_empty() {
@@ -4027,10 +4027,7 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                                 println!("⚡ MICROBLOCKS CONTINUE | Zero downtime architecture");
                                 println!("📊 PERFORMANCE: {:.0} TPS capacity ({} shards × {} tx/block)", 
                                          theoretical_tps, shard_count, avg_tx_per_block);
-                                println!("🚀 QUANTUM OPTIMIZATIONS: Lock-free + Sharding + Parallel validation");
-                                println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-                                println!("[INFO][MB] consensus_boundary all_nodes");
-                                println!("[MICROBLOCK] ⚡ Continuing with block #{} - ZERO DOWNTIME", received_block.height + 1);
+                                if is_info() { println!("[INFO][MB] consensus_boundary h={} next={}", received_block.height, received_block.height + 1); }
                                 
                                 // ═══════════════════════════════════════════════════════════════════
                                 // PRODUCTION v2.31: Schedule macroblock verification after boundary
@@ -4097,7 +4094,7 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                     requested_blocks.remove(&received_block.height);
                     
                     // CRITICAL FIX: Check if any pending blocks can now be processed
-                    // SOLANA-STYLE: Process multiple consecutive blocks in parallel
+                    // Process multiple consecutive blocks in parallel
                     let mut blocks_to_retry = Vec::new();
                     let mut check_height = received_block.height + 1;
                     
@@ -5207,7 +5204,7 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                 }
             }
             
-        println!("[Node] ⚡ Starting microblock production (1-second intervals)");
+        if is_info() { println!("[INFO][NODE] microblock_production_start interval=1s"); }
         self.start_microblock_production().await;
         } else {
             println!("[Node] 📱 Light node: Sync-only mode (no block production)");
@@ -6528,14 +6525,13 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                             _ => "CRITICAL",
                         };
                         
-                        println!("[MICROBLOCK] ⏳ {} Byzantine safety: {} nodes < {} required (height: {})", 
-                                degradation_mode, active_node_count, required_byzantine_nodes, microblock_height);
-                        println!("[MICROBLOCK] 🌱 Genesis phase: Progressive degradation active");
+                        if is_warn() { println!("[WARN][MB] byzantine_wait mode={} nodes={} required={} h={}", 
+                                degradation_mode, active_node_count, required_byzantine_nodes, microblock_height); }
                         
                         if is_selected_producer {
-                            println!("[MICROBLOCK] 🎯 Selected producer '{}' WAITING for Byzantine safety", own_node_id);
+                            if is_info() { println!("[INFO][MB] producer_wait id={} reason=byzantine_safety", own_node_id); }
                         } else {
-                            println!("[MICROBLOCK] 🛡️ Non-producer node waiting for network formation");
+                            if is_debug() { println!("[DBG][MB] non_producer_wait reason=network_formation"); }
                         }
                         
                         // Shorter wait time for degraded modes
@@ -6549,10 +6545,7 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                         tokio::time::sleep(Duration::from_secs(wait_time)).await;
                         continue;
                     } else {
-                        println!("[MICROBLOCK] ⏳ Full node waiting for minimum {} nodes (current: {})", 
-                                required_byzantine_nodes, active_node_count);
-                        println!("[MICROBLOCK] 🛡️ Byzantine safety cannot be guaranteed with fewer than {} nodes", 
-                                required_byzantine_nodes);
+                        if is_warn() { println!("[WARN][MB] full_node_wait nodes={} required={}", active_node_count, required_byzantine_nodes); }
                         tokio::time::sleep(Duration::from_secs(2)).await; // EXISTING: 2-second timeout
                         continue;
                     }
@@ -6641,9 +6634,8 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                     continue;
                 }
                 
-                println!("[MICROBLOCK] 🚀 Starting microblock production with {} nodes (Byzantine safe)", active_node_count);
-                println!("[MICROBLOCK] ✅ Node synchronized: local={}, expected={}, lag={}", 
-                        local_stored_height, expected_height, expected_height - local_stored_height);
+                if is_info() { println!("[INFO][MB] production_start nodes={} local={} expected={} lag={}", 
+                        active_node_count, local_stored_height, expected_height, expected_height - local_stored_height); }
                 
                 // PRODUCTION: QNet microblock producer SELECTION for decentralization (per MICROBLOCK_ARCHITECTURE_PLAN.md)
                 // Each 30-block period selects ONE producer using cryptographic hash from qualified candidates
@@ -7111,8 +7103,7 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                                 match producer_entropy {
                                     Some(entropy) if *entropy == [0u8; 32] => {
                                         // Producer returned 0 = NOT synchronized (doesn't have entropy block)
-                                        println!("[ERR][PROD] Selected producer {} returned entropy=0 (NOT SYNCHRONIZED)", current_producer);
-                                        println!("[PRODUCER] 📊 Producer is missing block #{} (finality window)", entropy_height);
+                                        eprintln!("[ERR][PROD] not_synced producer={} entropy_h={}", current_producer, entropy_height);
                                         false
                                     }
                                     Some(_) => {
@@ -7131,7 +7122,7 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                             
                             // If producer is NOT synchronized, select next candidate
                             if !producer_is_synchronized {
-                                println!("[PRODUCER] 🔄 Selecting next synchronized candidate...");
+                                if is_info() { println!("[INFO][PROD] fallback_select reason=not_synced"); }
                                 
                                 // Get list of candidates who ARE synchronized (returned valid entropy)
                                 let synchronized_candidates: Vec<String> = {
@@ -7203,7 +7194,7 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                                 is_my_turn_to_produce = current_producer == node_id;
                                 
                                 if is_my_turn_to_produce {
-                                    println!("[PRODUCER] 🎯 WE are the fallback producer for block #{}", next_block_height);
+                                    if is_info() { println!("[INFO][PROD] fallback_selected h={}", next_block_height); }
                                 }
                             }
                         }
@@ -7373,8 +7364,7 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                         // CRITICAL: Check emergency stop flag first
                         // If we received emergency failover notification, stop producing immediately
                         if crate::unified_p2p::EMERGENCY_STOP_PRODUCTION.load(std::sync::atomic::Ordering::Relaxed) {
-                            println!("[PRODUCER] 🛑 Emergency stop flag set - cannot produce blocks");
-                            println!("[PRODUCER] 💀 We were failed producer in emergency failover");
+                            eprintln!("[ERR][PROD] emergency_stop reason=failover");
                             false
                         } else {
                         // Check if we have recent blocks (not stuck at height 0)
@@ -7382,8 +7372,7 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                         let current_stored_height = match storage.get_chain_height() {
                             Ok(height) => height,
                             Err(e) => {
-                                println!("[ERR][PROD] Storage error during production: {}", e);
-                                println!("[PRODUCER] 🚨 Database may be corrupted or deleted!");
+                                eprintln!("[ERR][PROD] storage_error err={}", e);
                                 0  // Treat as unsynchronized
                             }
                         };
@@ -7409,9 +7398,7 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                         // Not just for producers - this was moved to fix the bug
                         
                         if !is_synchronized {
-                            println!("[WARN][PROD] Selected as producer but not synchronized!");
-                            println!("[PRODUCER] 📊 Expected height: {}, Stored height: {}", 
-                                    microblock_height, current_stored_height);
+                            if is_warn() { println!("[WARN][PROD] not_synced expected={} stored={}", microblock_height, current_stored_height); }
                         }
                         
                         is_synchronized
@@ -7419,7 +7406,7 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                     };
                     
                     if !can_produce {
-                        println!("[PRODUCER] 🔄 Cannot produce - passing to next candidate");
+                        if is_info() { println!("[INFO][PROD] skip_production reason=cannot_produce"); }
                         
                         // Mark ourselves as not leader
                         *is_leader.write().await = false;
@@ -7435,7 +7422,7 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                             Some(storage.clone()),  // Pass storage for deterministic entropy
                             ).await;
                             
-                            println!("[PRODUCER] 🆘 Emergency handover to: {}", emergency_producer);
+                            if is_warn() { println!("[WARN][PROD] emergency_handover to={}", emergency_producer); }
                             
                             // Broadcast emergency change for CURRENT height
                             // CRITICAL FIX: Use current height, not +1
@@ -7803,9 +7790,7 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                         let retry_count = PREV_HASH_RETRY_COUNTER.fetch_add(1, Ordering::SeqCst) + 1;
                         
                         if retry_count >= 10 {  // Max 5 seconds wait (10 * 500ms)
-                            println!("[ERR][PROD] TIMEOUT: Cannot get prev_hash for block #{} after {} retries", 
-                                     next_block_height, retry_count);
-                            println!("[PRODUCER] 🆘 Triggering emergency producer selection");
+                            eprintln!("[ERR][PROD] prev_hash_timeout h={} retries={}", next_block_height, retry_count);
                             PREV_HASH_RETRY_COUNTER.store(0, Ordering::SeqCst);  // Reset counter
                             
                             // Trigger emergency producer selection
@@ -7832,8 +7817,8 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                             continue;
                         }
                         
-                        println!("[PRODUCER] ⏳ Cannot produce block #{} - waiting for previous block #{} (retry {}/10)", 
-                                 next_block_height, next_block_height - 1, retry_count);
+                        if is_debug() { println!("[DBG][PROD] wait_prev h={} prev={} retry={}/10", 
+                                 next_block_height, next_block_height - 1, retry_count); }
                         
                         // PERFORMANCE FIX: Reduce retry delay from 500ms to 100ms for faster recovery
                         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -8463,7 +8448,7 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                         );
                     }
                     
-                    println!("[PRODUCER] 📈 Advanced to height {} after producing block", microblock_height);
+                    if is_info() { println!("[INFO][PROD] block_created h={}", microblock_height); }
                     
                     // v2.24: CRITICAL - Producer MUST call process_block for OWN blocks!
                     // This ensures producer's reputation is updated immediately
@@ -8640,9 +8625,8 @@ if is_debug() { println!("[DBG][PROD] fallback={} cand={}", new_producer, sorted
                     // Emergency producer logic already handled above at line 3122
                     
                     // CPU OPTIMIZATION: Only log every 10th block to reduce IO load
-                    if next_block_height % 10 == 0 {
-                        // CRITICAL FIX: When not producer, wait for NEXT block to be created
-                        println!("[MICROBLOCK] 👥 Waiting for block #{} from producer: {}", next_block_height, current_producer);
+                    if next_block_height % 10 == 0 && is_debug() {
+                        println!("[DBG][MB] wait_block h={} producer={}", next_block_height, current_producer);
                     }
                     
                     // STATE MACHINE: Idle - waiting for block from producer
@@ -8873,8 +8857,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                 // This prevents race condition where block arrives just as timeout triggers
                                 let block_exists = match storage_timeout.load_microblock(expected_height_timeout) {
                                     Ok(Some(_)) => {
-                                        println!("[FAILOVER] ✅ Block #{} received during timeout - cancelling failover", 
-                                                 expected_height_timeout);
+                                        if is_debug() { println!("[DBG][FAIL] block_arrived h={}", expected_height_timeout); }
                                         true
                                     },
                                     _ => false,
@@ -8890,13 +8873,13 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                     
                                     // Special logging for rotation boundaries
                                     if is_rotation_boundary {
-                                        println!("[FAILOVER] 🔄 ROTATION DEADLOCK: Block #{} not received after {}s timeout from producer: {}", 
-                                                 expected_height_timeout, timeout_duration, current_producer_timeout);
+                                        if is_warn() { println!("[WARN][FAIL] rotation_deadlock h={} timeout={}s producer={}", 
+                                                 expected_height_timeout, timeout_duration, current_producer_timeout); }
                                         // Invalidate producer cache to force new selection
                                         crate::node::BlockchainNode::invalidate_producer_cache();
                                     } else {
-                                    println!("[FAILOVER] 🚨 Microblock #{} not received after {}s timeout from producer: {}", 
-                                             expected_height_timeout, timeout_duration, current_producer_timeout);
+                                    if is_warn() { println!("[WARN][FAIL] timeout h={} secs={} producer={}", 
+                                             expected_height_timeout, timeout_duration, current_producer_timeout); }
                                     }
                                     
                                     // EXISTING: Use same emergency selection as implemented in select_emergency_producer
@@ -8909,7 +8892,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                         Some(storage_timeout.clone()),  // Pass storage for deterministic entropy
                                     ).await;
                                     
-                                    println!("[FAILOVER] 🆘 Emergency microblock producer selected: {}", emergency_producer);
+                                    if is_info() { println!("[INFO][FAIL] emergency_producer={}", emergency_producer); }
                                     
                                     // EXISTING: Use same emergency broadcast as macroblock (line 2114)
                                     if let Err(e) = p2p_timeout.broadcast_emergency_producer_change(
@@ -8918,19 +8901,19 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                                         expected_height_timeout,
                                         "microblock"
                                     ) {
-                                        println!("[FAILOVER] ⚠️ Emergency microblock broadcast failed: {}", e);
+                                        if is_warn() { println!("[WARN][FAIL] broadcast_fail err={}", e); }
                                     } else {
-                                        println!("[FAILOVER] ✅ Emergency microblock producer change broadcasted to network");
+                                        if is_info() { println!("[INFO][FAIL] broadcast_ok h={}", expected_height_timeout); }
                                         
                                         // CRITICAL FIX: If WE are the emergency producer, start producing immediately!
                                         if emergency_producer == node_id_timeout {
-                                            println!("[FAILOVER] 🚀 WE ARE THE EMERGENCY PRODUCER - CREATING BLOCK #{} NOW!", expected_height_timeout);
+                                            if is_info() { println!("[INFO][FAIL] we_are_emergency h={}", expected_height_timeout); }
                                             
                                             // Signal main loop to produce block immediately
                                             // Store emergency producer flag in a shared location
                                             if let Ok(mut emergency_flag) = EMERGENCY_PRODUCER_FLAG.lock() {
                                                 *emergency_flag = Some((expected_height_timeout, emergency_producer.clone()));
-                                                println!("[FAILOVER] 🔥 Emergency flag set for block #{}", expected_height_timeout);
+                                                if is_debug() { println!("[DBG][FAIL] flag_set h={}", expected_height_timeout); }
                                             }
                                             
                                             // NOTE: Emergency producer will be checked on next iteration
@@ -9050,7 +9033,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     consensus_started = false; // Reset for next round
                     
                     // CRITICAL: Microblocks continue immediately without ANY pause
-                    println!("[MICROBLOCK] ⚡ Continuing with block #{} - ZERO DOWNTIME", microblock_height + 1);
+                    if is_debug() { println!("[DBG][MB] continue h={}", microblock_height + 1); }
                 }
                 
                 // CRITICAL: Progressive retry for failed macroblocks
@@ -9136,8 +9119,8 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 } else {
                     // We're running behind - catch up without accumulating delay
                     let behind_ms = (now - next_block_time).as_millis();
-                    if behind_ms > 50 { // Only log if significantly behind
-                        println!("[MICROBLOCK] ⚠️ Running {}ms behind schedule - catching up", behind_ms);
+                    if behind_ms > 50 && is_debug() {
+                        println!("[DBG][MB] behind_schedule ms={}", behind_ms);
                     }
                     
                     // CRITICAL FIX: Don't reset timing, just skip missed intervals
@@ -9148,7 +9131,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     
                     // If we're too far behind (>5 seconds), reset to avoid infinite catch-up
                     if behind_ms > 5000 {
-                        println!("[MICROBLOCK] 🔄 Too far behind ({}ms) - resetting schedule", behind_ms);
+                        if is_warn() { println!("[WARN][MB] schedule_reset behind_ms={}", behind_ms); }
                         next_block_time = now + microblock_interval;
                     }
                 }
@@ -9336,7 +9319,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     // Reject fallback IDs that look like process IDs
                     if id.contains("_legacy_") || 
                        (id.starts_with("node_") && id.chars().filter(|c| c.is_ascii_digit()).count() > 8) {
-                        println!("[MICROBLOCK] ⚠️ Filtering out invalid fallback ID from candidates: {}", id);
+                        if is_debug() { println!("[DBG][MB] filter_invalid id={}", id); }
                         false
                     } else {
                         true
@@ -9361,9 +9344,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     // Epoch 2+: MacroBlock is REQUIRED!
                     // This node CANNOT produce - it must wait for macroblock sync
                     let required_epoch = (current_height - 1) / 90;
-                    println!("[MICROBLOCK] ❌ CANNOT PRODUCE: Missing MacroBlock #{} for height {}!", 
-                             required_epoch, current_height);
-                    println!("[MICROBLOCK] 🛑 Node must WAIT for macroblock sync before producing!");
+                    eprintln!("[ERR][MB] missing_macroblock mb={} h={}", required_epoch, current_height);
                     
                     // Return EMPTY - this node should NOT be selected as producer!
                     // The main loop sync check should prevent us from getting here
@@ -9382,8 +9363,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             // The SYNCHRONIZED nodes will continue producing blocks.
             // This node will sync via background task and rejoin later.
             if candidates.is_empty() && current_height > 180 {
-                println!("[MICROBLOCK] 🛑 DESYNCHRONIZED: No candidates at height {} (> 180) - node cannot produce!", current_height);
-                println!("[MICROBLOCK] 🔄 Waiting for macroblock sync to complete...");
+                eprintln!("[ERR][MB] desync h={} no_candidates", current_height);
                 
                 // STATE MACHINE: Error state
                 set_node_state(NodeState::Error {
@@ -9472,7 +9452,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     // - If fork exists, microblock[height-10] is DIFFERENT on different nodes!
                     // - Different entropy → different producer selection → fork continues!
                     //
-                    // SOLUTION (same as Solana/Ethereum):
+                    // SOLUTION:
                     // - Use MACROBLOCK N-2 hash for entropy (Byzantine finalized + SAFE MARGIN!)
                     // - All nodes have IDENTICAL macroblock N-2 (consensus completed ~90 blocks ago)
                     // - Same entropy → same producer selection → NO FORK!
@@ -9591,8 +9571,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             // QUANTUM-RESISTANT DETERMINISTIC SELECTION
             // Uses entropy from Dilithium-signed blocks for quantum resistance
             
-            println!("[PRODUCER] 🎲 Deterministic producer selection for round {}", leadership_round);
-            println!("[PRODUCER] 📊 {} qualified candidates (≥70% reputation)", candidates.len());
+            if is_debug() { println!("[DBG][PROD] select round={} candidates={}", leadership_round, candidates.len()); }
             
             // CRITICAL: The entropy comes from:
             // 1. Previous block hash (signed with Dilithium - quantum resistant!)
@@ -9651,10 +9630,8 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 
                 // Log at rotation boundaries only (performance)
                 if current_height > 0 && ((current_height - 1) % 30 == 0 || current_height == 1) {
-                    println!("[PRODUCER] 🎲 Deterministic selection: {} (round {}, index {}/{})", 
-                             winner.0, leadership_round, selection_index + 1, candidates.len());
-                    println!("[PRODUCER] 🔐 Entropy source: Dilithium-signed finality block");
-                    if is_debug() { println!("[DBG][PROD] sha3-512"); }
+                    if is_info() { println!("[INFO][PROD] selected={} round={} idx={}/{}", 
+                             winner.0, leadership_round, selection_index + 1, candidates.len()); }
                 }
                 
                 winner.0.clone()
@@ -9915,7 +9892,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 .filter(|(id, _)| {
                     // Reject fallback IDs that contain process IDs
                     if id.contains("_legacy_") || id.chars().any(|c| c.is_ascii_hexdigit() && id.len() > 20) {
-                        println!("[EMERGENCY_SELECTION] ⚠️ Filtering out invalid fallback ID: {}", id);
+                        if is_debug() { println!("[DBG][EMERG] filter_invalid id={}", id); }
                         false
                     } else {
                         true
@@ -13942,7 +13919,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 // BLOCKCHAIN STORAGE for deterministic reputation:
                 slashing_events_data,
                 automatic_jails_data,
-                // v2.24: REPUTATION SNAPSHOT - Ethereum 2.0 style
+                // v2.24: REPUTATION SNAPSHOT - deterministic state sync
                 // All nodes MUST have IDENTICAL reputation after applying macroblock
                 reputation_snapshot: {
                     if let Some(rep_arc) = p2p.get_deterministic_reputation() {
@@ -13957,7 +13934,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 },
                 // ═══════════════════════════════════════════════════════════════════
                 // v2.27.0: ELIGIBLE PRODUCERS SNAPSHOT - Epoch-based validator set
-                // Solana/Ethereum style: determines producers for NEXT 90 blocks
+                // Determines producers for NEXT 90 blocks (next epoch)
                 // All nodes use SAME snapshot for deterministic producer selection
                 // Eliminates gossip race conditions that cause forks!
                 // ═══════════════════════════════════════════════════════════════════
@@ -14052,9 +14029,10 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 println!("[REPUTATION] 🏆 Consensus leader {} - reward via macroblock", consensus_data.leader_id);
                 println!("[REPUTATION] ✅ {} participants - rewards via macroblock", consensus_data.participants.len());
                 
-                // PRODUCTION: Broadcast macroblock to ALL nodes via ShredProtocol
-                // This ensures non-consensus participants (new nodes, light nodes) receive macroblock
-                // Uses same infrastructure as microblocks for scalability to millions of nodes
+                // PRODUCTION v2.37: Broadcast macroblock via dedicated channel (NOT ShredProtocol!)
+                // WHY: ShredProtocol uses height as dedup key → collision with microblocks
+                // MacroBlock #1 and Microblock #1 both use height=1 → one gets dropped
+                // This ensures ALL non-consensus participants receive macroblock
                 {
                     let macroblock_data = bincode::serialize(&macroblock)
                         .map_err(|e| format!("Failed to serialize macroblock: {}", e))?;
@@ -14063,19 +14041,19 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     let compressed_data = zstd::encode_all(&macroblock_data[..], 3)
                         .unwrap_or_else(|_| macroblock_data.clone());
                     
-                    // Use macroblock index as height for ShredProtocol
-                    let macroblock_height = macroblock.height;
+                    let macroblock_index = macroblock.height;
+                    let epoch = macroblock_index; // Epoch = MacroBlock index
                     
-                    println!("[INFO][MB] broadcast idx={} bytes={}", 
-                             macroblock_height, compressed_data.len());
+                    println!("[INFO][MB] broadcast idx={} epoch={} bytes={}", 
+                             macroblock_index, epoch, compressed_data.len());
                     
-                    match p2p.broadcast_block_shred_protocol_typed(macroblock_height, compressed_data, true).await {
+                    match p2p.broadcast_macroblock(macroblock_index, compressed_data, epoch).await {
                         Ok(_) => {
-                            if is_info() { println!("[INFO][MB] broadcast h={}", macroblock_height); }
+                            if is_info() { println!("[INFO][MB] broadcast complete idx={}", macroblock_index); }
                         },
                         Err(e) => {
                             // Non-fatal: consensus participants already have the block
-                            println!("[WARN][MB] Macroblock #{} broadcast failed: {} (consensus participants already have it)", macroblock_height, e);
+                            println!("[WARN][MB] MacroBlock #{} broadcast failed: {} (consensus participants already have it)", macroblock_index, e);
                         }
                     }
                 }
@@ -15337,7 +15315,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         // Save macroblock to storage
         self.storage.save_macroblock(index, &macroblock).await?;
         
-        // v2.24: Apply reputation snapshot from macroblock (Ethereum 2.0 style)
+        // v2.24: Apply reputation snapshot from macroblock
         // This ensures ALL nodes have IDENTICAL reputation after syncing
         if let Some(ref snapshot_data) = macroblock.consensus_data.reputation_snapshot {
             if !snapshot_data.is_empty() {

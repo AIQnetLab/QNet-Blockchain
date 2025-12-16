@@ -120,7 +120,7 @@ impl Default for BundleAllocationConfig {
         Self {
             min_allocation: 0.0,        // 0% minimum (no reservation!)
             max_allocation: 0.20,       // 20% maximum (protect public!)
-            max_txs_per_bundle: 10,     // Max 10 TXs per bundle (Ethereum standard)
+            max_txs_per_bundle: 10,     // Max 10 TXs per bundle
             min_reputation: 80.0,       // 80% reputation required (proven trustworthy)
             gas_premium: 1.20,          // +20% gas (economic incentive + compensation)
             max_lifetime_sec: 60,       // 60 seconds max (1 minute)
