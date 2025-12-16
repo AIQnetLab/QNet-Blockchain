@@ -13809,8 +13809,23 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             }
         };
         
-        // CRITICAL FIX: Clean up consensus state IMMEDIATELY after finalization
-        // This must happen BEFORE any other operations that might fail
+        // CRITICAL FIX v2.39: Get consensus data BEFORE advance_phase!
+        // advance_phase() sets current_round = None, which makes get_commits_for_macroblock() return empty!
+        // This was the root cause of cascade jailing - commits/reveals were lost before macroblock creation
+        let (consensus_commits, consensus_reveals) = {
+            let consensus_engine = consensus.read().await;
+            (
+                consensus_engine.get_commits_for_macroblock(),
+                consensus_engine.get_reveals_for_macroblock()
+            )
+        };
+        
+        if is_info() { 
+            println!("[INFO][CONS] captured commits={} reveals={} BEFORE_ADVANCE", 
+                     consensus_commits.len(), consensus_reveals.len()); 
+        }
+        
+        // NOW clean up consensus state after capturing data
         // Ensures consensus is ready for next round even if macroblock creation fails
         {
             let mut consensus_engine = consensus.write().await;
@@ -13932,17 +13947,12 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             randomness_accumulator = state_accumulator;
         }
         
-        // PRODUCTION v2.35: Use REAL consensus data from engine (no fake strings!)
-        let (consensus_commits, consensus_reveals) = {
-            let consensus_engine = consensus.read().await;
-            (
-                consensus_engine.get_commits_for_macroblock(),
-                consensus_engine.get_reveals_for_macroblock()
-            )
-        };
-        
-        if is_info() { println!("[INFO][MB] real_data commits={} reveals={}", 
-                                consensus_commits.len(), consensus_reveals.len()); }
+        // PRODUCTION v2.39: Consensus data already captured BEFORE advance_phase()
+        // This ensures commits/reveals are not lost when current_round is cleared
+        if is_info() { 
+            println!("[INFO][MB] real_data commits={} reveals={}", 
+                     consensus_commits.len(), consensus_reveals.len()); 
+        }
         
         // Get previous macroblock hash from storage
         let previous_macroblock_hash = storage.get_latest_macroblock_hash()
