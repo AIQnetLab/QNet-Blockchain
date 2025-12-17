@@ -654,6 +654,92 @@ impl PhaseAwareRewardManager {
     pub fn restore_pending_reward(&mut self, node_id: String, reward: PhaseAwareReward) {
         self.pending_rewards.insert(node_id, reward);
     }
+    
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // v2.41.0: BLOCKCHAIN-BASED HEARTBEATS
+    // Load heartbeat data from MacroBlock for deterministic reward calculation
+    // Replaces gossip-based ping_histories which were non-deterministic
+    // ═══════════════════════════════════════════════════════════════════════════════
+    
+    /// Process heartbeats from MacroBlock for reward calculation
+    /// This is the NEW deterministic method - all nodes get identical data from blockchain
+    /// Called when MacroBlock is received/created
+    pub fn process_macroblock_heartbeats(&mut self, heartbeat_summaries: &[HeartbeatSummaryData]) -> Result<(), ConsensusError> {
+        let current_phase = self.get_current_phase();
+        
+        // Count eligible nodes from MacroBlock data
+        let mut eligible_light_nodes = 0u32;
+        let mut eligible_full_nodes = 0u32;
+        let mut eligible_super_nodes = 0u32;
+        
+        for summary in heartbeat_summaries {
+            if summary.is_eligible {
+                match summary.node_type {
+                    0 => eligible_light_nodes += 1,  // Light
+                    1 => eligible_full_nodes += 1,   // Full
+                    2 => eligible_super_nodes += 1,  // Super
+                    _ => {}
+                }
+            }
+        }
+        
+        let total_eligible_nodes = eligible_light_nodes + eligible_full_nodes + eligible_super_nodes;
+        
+        if total_eligible_nodes == 0 {
+            println!("[INFO][REWARDS] macroblock_heartbeats no_eligible_nodes");
+            return Ok(());
+        }
+        
+        println!("[INFO][REWARDS] macroblock_heartbeats eligible_light={} full={} super={}", 
+                 eligible_light_nodes, eligible_full_nodes, eligible_super_nodes);
+        
+        // Calculate rewards for each eligible node from MacroBlock data
+        for summary in heartbeat_summaries {
+            if summary.is_eligible {
+                let node_type = match summary.node_type {
+                    0 => NodeType::Light,
+                    1 => NodeType::Full,
+                    2 => NodeType::Super,
+                    _ => NodeType::Full,
+                };
+                
+                let reward = self.calculate_node_reward(
+                    &node_type,
+                    &current_phase,
+                    total_eligible_nodes,
+                    eligible_full_nodes,
+                    eligible_super_nodes,
+                );
+                
+                self.pending_rewards.insert(summary.node_id.clone(), reward);
+            }
+        }
+        
+        println!("[INFO][REWARDS] macroblock_rewards_calculated nodes={}", 
+                 self.pending_rewards.len());
+        
+        // Reset transaction fees (they're distributed)
+        self.pool2_transaction_fees = 0;
+        
+        // Reset Pool 3 if Phase 2 (it's distributed)
+        if current_phase == QNetPhase::Phase2 {
+            self.pool3_activation_pool = 0;
+        }
+        
+        Ok(())
+    }
+}
+
+/// Heartbeat summary data for cross-crate compatibility
+/// Mirrors qnet_state::HeartbeatSummary but without dependency
+#[derive(Debug, Clone)]
+pub struct HeartbeatSummaryData {
+    pub node_id: String,
+    pub node_type: u8,
+    pub heartbeat_count: u8,
+    pub first_heartbeat: u64,
+    pub last_heartbeat: u64,
+    pub is_eligible: bool,
 }
 
 /// Phase-aware reward statistics

@@ -1,10 +1,50 @@
 # 🚀 QNet Blockchain - Release Notes
 
-## 🎉 Latest: v2.40.0 - Block-Based Consensus Phases
+## 🎉 Latest: v2.41.1 - Deterministic Reward Heartbeats
 
 **Release Date**: December 17, 2025  
-**Version**: 2.40.0  
+**Version**: 2.41.1  
 **Status**: ✅ Production Ready
+
+---
+
+## v2.41.1 - Deterministic Reward Heartbeats (December 17, 2025)
+
+### 💓 Critical Fix: On-Chain Heartbeat Recording
+
+**Problem:** Heartbeats via gossip → non-deterministic → nodes see different counts → "no_eligible_nodes" errors
+
+**Solution:** Heartbeats recorded in MacroBlock blockchain = deterministic for all nodes
+
+| Aspect | Before (Gossip) | After (Blockchain) |
+|--------|-----------------|-------------------|
+| Storage | RAM (volatile) | MacroBlock (permanent) |
+| Visibility | Gossip peers only | All nodes |
+| Determinism | ❌ Non-deterministic | ✅ Deterministic |
+| Data loss | ❌ Common | ✅ Impossible |
+
+### Emission MacroBlocks
+
+| MacroBlock | Heartbeats | Rewards Calc |
+|------------|------------|--------------|
+| #1-159 | None | No |
+| #160 | `Vec<HeartbeatSummary>` | ✅ Yes |
+| #161-319 | None | No |
+| #320 | `Vec<HeartbeatSummary>` | ✅ Yes |
+
+**Math:** 14400 microblocks / 90 = 160 MacroBlocks per 4h window
+
+### Strict Node ID Validation (No Defaults!)
+
+- Valid: `light_*`, `full_*`, `super_*`, `genesis_node_*`
+- Invalid formats: **REJECTED** (security fix)
+
+### Files Changed
+
+- `block.rs`: `RewardHeartbeat`, `HeartbeatSummary`, `reward_heartbeats` field
+- `unified_p2p.rs`: `get_heartbeat_summaries_for_macroblock()`
+- `node.rs`: Emission-only heartbeat recording and processing
+- `lazy_rewards.rs`: `process_macroblock_heartbeats()`
 
 ---
 

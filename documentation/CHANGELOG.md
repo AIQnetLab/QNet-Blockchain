@@ -5,6 +5,140 @@ All notable changes to the QNet project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.41.1] - December 17, 2025 "Emission MacroBlock Fix + Adaptive Sampling"
+
+### 🎯 Critical Fix: Emission-Only Heartbeat Recording
+
+**Problem Found in v2.41.0:**
+- Heartbeats were written to EVERY MacroBlock (every 90 seconds)
+- `process_macroblock_heartbeats()` called on EVERY sync → rewards recalculated every 90s
+- Should be calculated only every 4 hours (160 MacroBlocks)
+
+**Solution:**
+- Heartbeats now recorded ONLY in EMISSION MacroBlocks (every 160th = 4 hours)
+- Rewards calculated ONLY when syncing emission MacroBlock
+- Saves blockchain space (159/160 MacroBlocks have no heartbeat data)
+
+| MacroBlock | Heartbeats | Rewards Calculated |
+|------------|------------|-------------------|
+| #1-159 | None | No |
+| #160 | Vec<HeartbeatSummary> | ✅ Yes |
+| #161-319 | None | No |
+| #320 | Vec<HeartbeatSummary> | ✅ Yes |
+
+### 🔧 Critical Fix: Adaptive Ping Sampling
+
+**Problem:** `transaction.rs` required 10,000 samples regardless of network size!
+- 10 nodes → required 10,000 samples → FAIL
+- Light nodes couldn't get rewards in small networks
+
+**Solution:** Adaptive formula: `min_samples = max(total/100, min(10000, total))`
+
+| Network Size | Old (Bug) | New (Fixed) | Mode |
+|-------------|-----------|-------------|------|
+| 10 nodes | 10,000 ❌ | **10** ✅ | ALL verified |
+| 100 nodes | 10,000 ❌ | **100** ✅ | ALL verified |
+| 1,000 nodes | 10,000 ❌ | **1,000** ✅ | ALL verified |
+| 10K+ nodes | 10,000 ✅ | 10,000 ✅ | 1% sampling |
+
+### 🔒 Strict Node Type Validation (No Defaults Anywhere!)
+
+**Removed ALL default node_type assignments:**
+
+| Location | Before | After |
+|----------|--------|-------|
+| `rpc.rs` register | `unwrap_or("light")` | **REQUIRED param + validation** |
+| `storage.rs` load | `unwrap_or("light")` | **Error if missing** |
+| `activation_validation.rs` | `unwrap_or("Full")` | **Skip + warning** |
+| `unified_p2p.rs` eligible | `unwrap_or("full")` | **genesis→super, unknown→skip** |
+
+**Node ID format validation:**
+- Valid: `light_*`, `full_*`, `super_*`, `genesis_node_*`
+- Invalid formats: **REJECTED** (no rewards)
+
+---
+
+## [2.41.0] - December 17, 2025 "Deterministic Reward Heartbeats"
+
+### 🎯 Critical Architecture Fix: On-Chain Heartbeat Recording
+
+**Problem Solved:**
+Reward heartbeats were distributed via gossip protocol, causing:
+- Non-deterministic: different nodes saw different heartbeat counts
+- Data loss: heartbeats lost due to network issues
+- `no_eligible_nodes_in_window` errors: nodes not meeting thresholds
+- Only 7 heartbeats recorded instead of expected 100+ over 8 hours
+
+**Solution:**
+Heartbeats now recorded in **MacroBlock** (on-chain, deterministic).
+
+| Aspect | Before (Gossip) | After (MacroBlock) |
+|--------|-----------------|-------------------|
+| Storage | RAM (volatile) | Blockchain (permanent) |
+| Visibility | Only gossip peers | All nodes |
+| Determinism | ❌ Non-deterministic | ✅ Deterministic |
+| Data loss | ❌ Common | ✅ Impossible |
+| Reward fairness | ❌ Variable | ✅ Consistent |
+
+### New Data Structures
+
+```rust
+// core/qnet-state/src/block.rs
+pub struct RewardHeartbeat {
+    pub node_id: String,
+    pub sequence: u8,           // 1-10 within window
+    pub block_height: u64,
+    pub timestamp: u64,
+    pub signature_hash: [u8; 8],
+}
+
+pub struct HeartbeatSummary {
+    pub node_id: String,
+    pub node_type: u8,          // 0=Light, 1=Full, 2=Super
+    pub heartbeat_count: u8,    // 0-10
+    pub first_heartbeat: u64,
+    pub last_heartbeat: u64,
+    pub is_eligible: bool,      // Meets threshold?
+}
+```
+
+### ConsensusData New Fields
+
+```rust
+// In MacroBlock.consensus_data
+pub reward_heartbeats: Option<Vec<u8>>,      // Serialized Vec<HeartbeatSummary>
+pub heartbeats_merkle_root: Option<[u8; 32]>, // For light client verification
+```
+
+### Reward Eligibility (Unchanged)
+
+| Node Type | Required Heartbeats | Threshold |
+|-----------|---------------------|-----------|
+| Light | 1/1 | 100% |
+| Full | 8/10 | 80% |
+| Super | 9/10 | 90% |
+
+### Files Changed
+
+- `core/qnet-state/src/block.rs`:
+  - Added `RewardHeartbeat` struct
+  - Added `HeartbeatSummary` struct
+  - Added `reward_heartbeats` and `heartbeats_merkle_root` to `ConsensusData`
+
+- `development/qnet-integration/src/unified_p2p.rs`:
+  - Added `get_heartbeat_summaries_for_macroblock()` - collect heartbeats for on-chain storage
+  - Added `calculate_heartbeats_merkle_root()` - Merkle root for verification
+
+- `development/qnet-integration/src/node.rs`:
+  - MacroBlock creation now includes heartbeat summaries
+  - MacroBlock sync now processes heartbeats for reward calculation
+
+- `core/qnet-consensus/src/lazy_rewards.rs`:
+  - Added `process_macroblock_heartbeats()` - process on-chain heartbeat data
+  - Added `HeartbeatSummaryData` struct for cross-crate compatibility
+
+---
+
 ## [2.40.0] - December 17, 2025 "Block-Based Consensus Phases"
 
 ### 🎯 Critical Architecture Fix: Deterministic Phase Synchronization

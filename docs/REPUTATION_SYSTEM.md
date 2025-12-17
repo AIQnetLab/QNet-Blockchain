@@ -467,6 +467,41 @@ let cutoff = now - (24 * 60 * 60);
 history.retain(|_, record| record.timestamp >= cutoff);
 ```
 
+### v2.41 On-Chain Heartbeat Recording
+
+**Critical Change:** Heartbeats are now recorded in MacroBlock for deterministic rewards!
+
+#### Flow (v2.41.1):
+```
+1. Full/Super send heartbeats → Gossip → heartbeat_history (RAM)
+2. MacroBlock creation:
+   - Regular MacroBlock (#1-159): reward_heartbeats = None
+   - EMISSION MacroBlock (#160, #320...): collect heartbeats → blockchain!
+3. EMISSION = every 160th MacroBlock (14400 microblocks / 90 = 160)
+4. MacroBlock sync:
+   - Regular: don't process rewards
+   - EMISSION: process_macroblock_heartbeats() → calculate rewards
+5. All nodes read SAME data from blockchain = deterministic!
+```
+
+**Location:** `node.rs:15547` - MacroBlock sync
+
+```rust
+const EMISSION_MACROBLOCK_INTERVAL: u64 = 160; // 4 hours
+let is_emission_macroblock = index > 0 && index % EMISSION_MACROBLOCK_INTERVAL == 0;
+
+if is_emission_macroblock {
+    if let Some(ref heartbeats_data) = macroblock.consensus_data.reward_heartbeats {
+        // Deserialize and process rewards
+        reward_manager.process_macroblock_heartbeats(&summary_data);
+    }
+}
+```
+
+**Strict Node ID Validation (v2.41.1):**
+- Valid formats: `light_*`, `full_*`, `super_*`, `genesis_node_*`
+- Invalid formats: **REJECTED** (no default assignments!)
+
 ### Requirements Summary
 
 | Node Type | Pings/4h | Required | Success Rate | Timeout | Reputation |

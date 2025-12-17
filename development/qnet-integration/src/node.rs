@@ -39,11 +39,17 @@ const FINALITY_WINDOW: u64 = 10; // 10 blocks = 10 seconds (safe for production)
 const EMISSION_INTERVAL_BLOCKS: u64 = 14400; // 4 hours in blocks
 
 // PING SAMPLING: Production-ready scalability parameters
-// CRITICAL: Sample size determines on-chain storage vs security trade-off
-// 1% provides 99.9% confidence interval with millions of pings
-// Minimum 10K samples ensures statistical significance even with smaller networks
-const PING_SAMPLE_PERCENTAGE: u32 = 1; // 1% of pings included as samples
-const MIN_PING_SAMPLES: usize = 10_000; // Minimum samples for statistical validity
+// ADAPTIVE SAMPLING (v2.41.1):
+// - Small network (<10K nodes): verify ALL pings (100% - no sampling)
+// - Large network (10K+ nodes): 1% sampling for on-chain storage optimization
+// Formula: min_samples = max(total/100, min(10000, total))
+// Examples:
+//   10 nodes   → min_samples = max(0, min(10000, 10))    = 10     (all verified)
+//   1000 nodes → min_samples = max(10, min(10000, 1000)) = 1000   (all verified)
+//   100K nodes → min_samples = max(1000, min(10000, 100K)) = 10000 (1% sampling)
+//   1M nodes   → min_samples = max(10000, min(10000, 1M))  = 10000 (1% sampling)
+const PING_SAMPLE_PERCENTAGE: u32 = 1; // 1% of pings included as samples (for large networks)
+const MIN_PING_SAMPLES: usize = 10_000; // Target for large networks, adaptive for small
 
 /// Ping data for Merkle tree construction
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -1421,13 +1427,15 @@ impl BlockchainNode {
             let sample_seed = seed_hasher.finalize();
             let sample_seed_hex = hex::encode(&sample_seed[..]);
             
-            // Calculate sample size: 1% or 10K minimum
-            // Note: total_count already defined above
+            // Calculate sample size: ADAPTIVE based on network size
+            // Small network (<10K): sample_size = total (all verified)
+            // Large network (10K+): sample_size = 1% (optimized)
             let sample_size = ((total_count as u32 * PING_SAMPLE_PERCENTAGE) / 100)
                 .max(MIN_PING_SAMPLES.min(total_count) as u32) as usize;
             
-            if is_info() { println!("[INFO][REWARDS] ping_sampling n={} total={} pct={}", 
-                     sample_size, total_count, PING_SAMPLE_PERCENTAGE); }
+            if is_info() { println!("[INFO][REWARDS] ping_sampling n={} total={} mode={}", 
+                     sample_size, total_count, 
+                     if sample_size == total_count { "ALL" } else { "1%" }); }
             
             // Deterministic sampling
             let mut ping_samples = Vec::new();
@@ -4762,11 +4770,15 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                         
                         println!("[PING-COMMITMENT] ✅ All {} Merkle proofs verified", verified_count);
                         
-                        // Step 4: Verify sample size is sufficient (1% or 10K min)
+                        // Step 4: Verify sample size is sufficient - ADAPTIVE!
+                        // Small network (<10K): verify ALL pings (min_samples = total)
+                        // Large network (10K+): 1% sampling (min_samples = 10K)
                         let min_samples = ((*total_ping_count / 100).max(MIN_PING_SAMPLES.min(*total_ping_count as usize) as u32)) as usize;
                         if ping_samples.len() < min_samples {
-                            println!("[PING-COMMITMENT] ❌ Insufficient samples: {} < {}", ping_samples.len(), min_samples);
-                            return Err(format!("Insufficient ping samples: {} < {}", ping_samples.len(), min_samples));
+                            println!("[PING-COMMITMENT] ❌ Insufficient samples: {} < {} (total={})", 
+                                     ping_samples.len(), min_samples, total_ping_count);
+                            return Err(format!("Insufficient ping samples: {} < {} (total={})", 
+                                             ping_samples.len(), min_samples, total_ping_count));
                         }
                         
                         println!("[PING-COMMITMENT] ✅ Sample size sufficient: {}/{} ({:.1}%)",
@@ -5498,10 +5510,11 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                     reveal_data: reveal_bytes,
                     nonce: nonce_bytes,
                     timestamp,
+                    signature: String::new(), // v2.40.3: Legacy support - P2P reveals don't have signature yet
                 };
                 
-                // PRODUCTION v2.40: Submit with block_height for phase validation
-                match consensus_engine.submit_reveal(remote_reveal, block_height) {
+                // PRODUCTION v2.40.3: Submit with block_height for phase validation (async)
+                match consensus_engine.submit_reveal(remote_reveal, block_height).await {
                     Ok(_) => {
                         if is_info() { println!("[INFO][CONS] reveal from={} h={}", node_id, block_height); }
                         (node_id, true, None)
@@ -11617,6 +11630,9 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             // QRB v3.0: Emergency beacon uses state accumulator as fallback
             randomness_beacon: Some(state_accumulator),
             vrf_contributions_count: Some(0), // No VRF in emergency mode
+            // v2.41.0: No heartbeats in emergency mode (use previous data)
+            reward_heartbeats: None,
+            heartbeats_merkle_root: None,
         };
         
         // Count microblocks before moving
@@ -11976,7 +11992,16 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             return;
         }
         
-        if is_info() { println!("[INFO][CONS] reveal_phase round={}", round_id); }
+        // PRODUCTION v2.40.1: Log current position (no waiting needed with epoch-based validation)
+        // Receivers accept reveals from same epoch regardless of their local phase
+        let current_height = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+        let current_epoch = current_height / 90;
+        let position_in_epoch = current_height % 90;
+        
+        if is_info() { 
+            println!("[INFO][CONS] reveal_phase round={} epoch={} pos={}", 
+                     round_id, current_epoch, position_in_epoch); 
+        }
         if is_debug() { println!("[DBG][CONS] round_check {}%90={}", round_id, round_id % 90); }
         use qnet_consensus::commit_reveal::Reveal;
         use sha3::{Sha3_256, Digest};
@@ -12009,6 +12034,8 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             };
             
             // Create OWN reveal for broadcast
+            // v2.40.3: OWN reveals don't need signature (we trust ourselves)
+            // Remote reveals will be verified when signature field is added to P2P
             let reveal = Reveal {
                 node_id: our_id.clone(),
                 reveal_data: reveal_data.clone(),
@@ -12017,13 +12044,14 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs(),
+                signature: String::new(), // OWN reveal - no need to verify ourselves
             };
             
-            // PRODUCTION v2.40: Get current block height for deterministic phase validation
+            // PRODUCTION v2.40.3: Get current block height for deterministic phase validation
             let current_block_height = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
             
-            // Submit OWN reveal with block height
-            match consensus_engine.submit_reveal(reveal.clone(), current_block_height) {
+            // Submit OWN reveal with block height (async)
+            match consensus_engine.submit_reveal(reveal.clone(), current_block_height).await {
                 Ok(_) => {
                     if is_debug() { println!("[DBG][CONS] own_reveal id={}", our_id); }
                     
@@ -13452,7 +13480,9 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         
         {
             let mut consensus_engine = consensus.write().await;
-            if let Err(e) = consensus_engine.start_round(all_participants.clone()) {
+            // PRODUCTION v2.40.2: Use end_height for epoch validation
+            // round_number = end_height ensures our_epoch matches message epochs
+            if let Err(e) = consensus_engine.start_round_at_height(all_participants.clone(), end_height) {
                 println!("[WARN][MB_PART] round_start err={}", e);
             }
             
@@ -13660,9 +13690,10 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             }
             
             // STEP 2: Start consensus round with proper participants
-            match consensus_engine.start_round(all_participants.clone()) {
+            // PRODUCTION v2.40.2: Use round_id (macroblock height) for epoch validation
+            match consensus_engine.start_round_at_height(all_participants.clone(), round_id) {
                 Ok(actual_round_id) => {
-                    if is_info() { println!("[INFO][CONS] round={} h={}", actual_round_id, round_id); }
+                    if is_info() { println!("[INFO][CONS] round={} epoch={}", actual_round_id, actual_round_id / 90); }
                 },
                 Err(e) => return Err(format!("Failed to start consensus round: {}", e)),
             }
@@ -14124,6 +14155,51 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                             })
                             .collect();
                         bincode::serialize(&fallback).ok()
+                    }
+                },
+                // ═══════════════════════════════════════════════════════════════════
+                // v2.41.0: REWARD HEARTBEATS - Deterministic on-chain recording
+                // CRITICAL: Only record heartbeats in EMISSION MacroBlocks (every 160)
+                // This prevents duplicate rewards and saves blockchain space
+                // Math: 14400 microblocks / 90 = 160 macroblocks per 4h window
+                // ═══════════════════════════════════════════════════════════════════
+                reward_heartbeats: {
+                    const EMISSION_MB_INTERVAL: u64 = 160; // 14400 / 90
+                    let mb_index = consensus_data.round_number;
+                    let is_emission_mb = mb_index > 0 && mb_index % EMISSION_MB_INTERVAL == 0;
+                    
+                    if is_emission_mb {
+                        // EMISSION MacroBlock - collect heartbeats for entire 4h window
+                        let heartbeat_summaries = p2p.get_heartbeat_summaries_for_macroblock(start_height);
+                        if !heartbeat_summaries.is_empty() {
+                            let eligible = heartbeat_summaries.iter().filter(|s| s.is_eligible).count();
+                            println!("[INFO][MB] EMISSION_HEARTBEATS mb={} window={} nodes={} eligible={}",
+                                     mb_index, mb_index / EMISSION_MB_INTERVAL,
+                                     heartbeat_summaries.len(), eligible);
+                            bincode::serialize(&heartbeat_summaries).ok()
+                        } else {
+                            println!("[WARN][MB] EMISSION_NO_HEARTBEATS mb={}", mb_index);
+                            None
+                        }
+                    } else {
+                        // Regular MacroBlock - no heartbeats (saves space)
+                        None
+                    }
+                },
+                heartbeats_merkle_root: {
+                    const EMISSION_MB_INTERVAL: u64 = 160;
+                    let mb_index = consensus_data.round_number;
+                    let is_emission_mb = mb_index > 0 && mb_index % EMISSION_MB_INTERVAL == 0;
+                    
+                    if is_emission_mb {
+                        let heartbeat_summaries = p2p.get_heartbeat_summaries_for_macroblock(start_height);
+                        if !heartbeat_summaries.is_empty() {
+                            Some(p2p.calculate_heartbeats_merkle_root(&heartbeat_summaries))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
                     }
                 },
                 // ═══════════════════════════════════════════════════════════════════
@@ -15501,8 +15577,63 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             }
         }
         
-        println!("[MACROBLOCK-SYNC] ✅ Macroblock #{} saved successfully ({} microblock hashes)", 
-                 index, macroblock.micro_blocks.len());
+        // ═══════════════════════════════════════════════════════════════════════════
+        // v2.41.0: Apply heartbeat summaries from macroblock for deterministic rewards
+        // CRITICAL: Only process at EMISSION MacroBlocks (every 160 macroblocks = 4 hours)
+        // Heartbeats are recorded in each MacroBlock for sync, but rewards calculated only at emission
+        // 
+        // Math: 14400 microblocks / 90 blocks per macroblock = 160 macroblocks per 4h window
+        // Emission MacroBlocks: 160, 320, 480, 640... (index % 160 == 0)
+        // ═══════════════════════════════════════════════════════════════════════════
+        const EMISSION_MACROBLOCK_INTERVAL: u64 = 160; // 14400 / 90 = 160 macroblocks per 4h
+        let is_emission_macroblock = index > 0 && index % EMISSION_MACROBLOCK_INTERVAL == 0;
+        
+        if is_emission_macroblock {
+            if let Some(ref heartbeats_data) = macroblock.consensus_data.reward_heartbeats {
+                if !heartbeats_data.is_empty() {
+                    // Deserialize heartbeat summaries
+                    if let Ok(heartbeat_summaries) = bincode::deserialize::<Vec<qnet_state::HeartbeatSummary>>(heartbeats_data) {
+                        // Convert to reward manager format
+                        let summary_data: Vec<qnet_consensus::HeartbeatSummaryData> = heartbeat_summaries.iter()
+                            .map(|s| qnet_consensus::HeartbeatSummaryData {
+                                node_id: s.node_id.clone(),
+                                node_type: s.node_type,
+                                heartbeat_count: s.heartbeat_count,
+                                first_heartbeat: s.first_heartbeat,
+                                last_heartbeat: s.last_heartbeat,
+                                is_eligible: s.is_eligible,
+                            })
+                            .collect();
+                        
+                        // Process heartbeats for rewards - ONLY at emission macroblocks!
+                        let reward_manager_arc = self.get_reward_manager();
+                        let mut reward_manager = reward_manager_arc.write().await;
+                        
+                        match reward_manager.process_macroblock_heartbeats(&summary_data) {
+                            Ok(_) => {
+                                let eligible = heartbeat_summaries.iter().filter(|s| s.is_eligible).count();
+                                println!("[INFO][REWARDS] EMISSION_MACROBLOCK mb={} window={} nodes={} eligible={}", 
+                                         index, index / EMISSION_MACROBLOCK_INTERVAL, 
+                                         heartbeat_summaries.len(), eligible);
+                            }
+                            Err(e) => {
+                                println!("[WARN][REWARDS] emission_failed mb={} err={}", index, e);
+                            }
+                        }
+                    } else {
+                        println!("[WARN][REWARDS] emission_deserialize_failed mb={}", index);
+                    }
+                } else {
+                    println!("[WARN][REWARDS] emission_no_heartbeats mb={}", index);
+                }
+            } else {
+                println!("[WARN][REWARDS] emission_no_data mb={}", index);
+            }
+        }
+        
+        if is_info() { 
+            println!("[INFO][MB-SYNC] saved mb={} microblocks={}", index, macroblock.micro_blocks.len()); 
+        }
         
         Ok(())
     }

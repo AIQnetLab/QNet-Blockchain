@@ -1535,12 +1535,22 @@ impl BlockchainActivationRegistry {
                                         }
                                         
                                         // Create activation record from transaction
+                                        // PRODUCTION v2.41.1: node_type is REQUIRED
+                                        let node_type = match activation_json["node_type"].as_str() {
+                                            Some(t) => t.to_string(),
+                                            None => {
+                                                eprintln!("[WARN][ACTIVATION] missing_node_type code={} tx={}", 
+                                                         code_hash, burn_tx_hash);
+                                                continue; // Skip invalid activation
+                                            }
+                                        };
+                                        
                                         let record = ActivationRecord {
                                             code_hash: code_hash.clone(),
                                             wallet_address: activation_json["wallet"].as_str().unwrap_or("").to_string(),
                                             tx_hash: burn_tx_hash, // Use burn_tx_hash from JSON
                                             activated_at: activation_json["activated_at"].as_u64().unwrap_or(0),
-                                            node_type: activation_json["node_type"].as_str().unwrap_or("Full").to_string(),
+                                            node_type,
                                             phase: 1, // Phase 1 (Solana burn)
                                             activation_amount: 0, // Phase 1: no QNC cost
                                             blockchain_height: block_height,

@@ -9,19 +9,28 @@
 //! - Mempool processing
 //! - Block inclusion
 //! 
-//! Usage:
-//! ## Presets (use "preset" field):
-//! - "single_shard"  : 1 shard,   100K TPS,   100K TX
-//! - "small_scale"   : 8 shards,  800K TPS,   800K TX
-//! - "medium_scale"  : 32 shards, 3.2M TPS,   3.2M TX
-//! - "large_scale"   : 64 shards, 6.4M TPS,   6.4M TX
-//! - "extra_large"   : 128 shards, 12.8M TPS, 12.8M TX
-//! - "full_scale"    : 256 shards, 25.6M TPS, 25.6M TX (MAX)
+//! ## v2.41.2: STABILITY-FIRST Presets
+//! 
+//! ### SAFE Presets (recommended for single-node testing):
+//! - "stability_test"  : 5K TPS,  50K TX   - GUARANTEED STABLE! ✅ (DEFAULT)
+//! - "stress_test"     : 20K TPS, 200K TX  - Find real capacity
+//! - "max_capacity"    : 50K TPS, 500K TX  - Push to safe limit
+//! - "progressive_max" : AUTO-FIND MAX!    - Starts 5K, +5K every 10s until limit
+//! 
+//! ### DANGEROUS Presets (may crash single node!):
+//! - "single_shard"  : 100K TPS ⚠️ - Too fast for single node!
+//! - "small_scale"   : 100K TPS ⚠️
+//! - "medium_scale"  : 100K TPS ⚠️
+//! - "large_scale"   : 100K TPS ⚠️
+//! - "extra_large"   : 100K TPS ⚠️
+//! - "full_scale"    : 100K TPS ⚠️⚠️ - WILL CRASH!
 //! 
 //! ## API Examples:
-//! POST /api/v1/benchmark/start { "preset": "single_shard" }
-//! POST /api/v1/benchmark/start { "preset": "full_scale" }
-//! POST /api/v1/benchmark/start { "shards": 64, "total": 6400000, "target_tps": 6400000 }
+//! POST /api/v1/benchmark/start                              → stability_test (SAFE)
+//! POST /api/v1/benchmark/start { "preset": "stability_test" } → 5K TPS, stable
+//! POST /api/v1/benchmark/start { "preset": "stress_test" }    → 20K TPS, moderate
+//! POST /api/v1/benchmark/start { "preset": "max_capacity" }   → 50K TPS, high load
+//! POST /api/v1/benchmark/start { "target_tps": 10000, "total": 100000 } → custom
 //! GET /api/v1/benchmark/status
 //! GET /api/v1/benchmark/results
 
@@ -44,17 +53,30 @@ pub const ONE_QNC: u64 = 1_000_000_000;
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum BenchmarkPreset {
-    /// Single shard test: 100K TPS
+    /// v2.41.2: STABILITY TEST - safe for single node, guaranteed not to crash
+    /// 5K TPS, 50K TX, 2 workers - USE THIS FOR TESTING!
+    StabilityTest,
+    /// v2.41.2: STRESS TEST - find real node capacity
+    /// 20K TPS, 200K TX, 4 workers - moderate load
+    StressTest,
+    /// v2.41.2: MAX CAPACITY - push node to limit with protection
+    /// 50K TPS, 500K TX, 8 workers - high load with early backpressure
+    MaxCapacity,
+    /// v2.41.2: PROGRESSIVE TEST - automatically find node's maximum TPS!
+    /// Starts at 5K, increases by 5K every 10 seconds until failure
+    /// Returns the actual maximum TPS the node can handle
+    ProgressiveMax,
+    /// Single shard test: 100K TPS (DANGEROUS for single node!)
     SingleShard,
-    /// 8 shards test: 800K TPS
+    /// 8 shards test: 100K TPS (DANGEROUS!)
     SmallScale,
-    /// 32 shards test: 3.2M TPS  
+    /// 32 shards test: 100K TPS (DANGEROUS!)
     MediumScale,
-    /// 64 shards test: 6.4M TPS
+    /// 64 shards test: 100K TPS (DANGEROUS!)
     LargeScale,
-    /// 128 shards test: 12.8M TPS
+    /// 128 shards test: 100K TPS (DANGEROUS!)
     ExtraLarge,
-    /// Full 256 shards: 25.6M TPS (MAXIMUM)
+    /// Full 256 shards: 100K TPS (EXTREMELY DANGEROUS - WILL CRASH!)
     FullScale,
     /// Custom configuration
     Custom,
@@ -62,7 +84,8 @@ pub enum BenchmarkPreset {
 
 impl Default for BenchmarkPreset {
     fn default() -> Self {
-        BenchmarkPreset::FullScale
+        // v2.41.2: Safe default - won't crash node!
+        BenchmarkPreset::StabilityTest
     }
 }
 
@@ -90,18 +113,25 @@ fn default_shards() -> usize { 256 }
 
 impl BenchmarkConfig {
     /// Create config from preset
-    /// v2.27.2: MAXIMUM TPS with smart backpressure (no artificial limits!)
+    /// v2.41.2: Safe presets for single-node testing + dangerous high-load presets
     pub fn from_preset(preset: BenchmarkPreset) -> Self {
-        // v2.27.2: NO ARTIFICIAL LIMITS - smart backpressure handles overload
-        // Mempool boosted 10x in benchmark mode (1M for Genesis)
-        // Target 100K+ TPS - backpressure prevents crash automatically
+        // v2.41.2: STABILITY-FIRST presets
+        // StabilityTest/StressTest/MaxCapacity are SAFE for single node
+        // Other presets are DANGEROUS and may crash the node!
         let (shards, total, tps, accounts) = match preset {
-            BenchmarkPreset::SingleShard => (1, 500_000, 100_000, 5_000),       // 100K TPS
-            BenchmarkPreset::SmallScale => (8, 1_000_000, 100_000, 10_000),     // 100K TPS
-            BenchmarkPreset::MediumScale => (32, 2_000_000, 100_000, 20_000),   // 100K TPS
-            BenchmarkPreset::LargeScale => (64, 3_000_000, 100_000, 30_000),    // 100K TPS
-            BenchmarkPreset::ExtraLarge => (128, 5_000_000, 100_000, 40_000),   // 100K TPS
-            BenchmarkPreset::FullScale => (256, 10_000_000, 100_000, 50_000),   // 100K TPS
+            // === SAFE PRESETS (v2.41.2) ===
+            BenchmarkPreset::StabilityTest => (1, 50_000, 5_000, 1_000),      // 5K TPS - SAFE!
+            BenchmarkPreset::StressTest => (4, 200_000, 20_000, 2_000),       // 20K TPS - moderate
+            BenchmarkPreset::MaxCapacity => (8, 500_000, 50_000, 5_000),      // 50K TPS - high
+            BenchmarkPreset::ProgressiveMax => (1, 1_000_000, 5_000, 10_000), // Start 5K, auto-increase
+            
+            // === DANGEROUS PRESETS (may crash single node!) ===
+            BenchmarkPreset::SingleShard => (1, 500_000, 100_000, 5_000),     // 100K TPS ⚠️
+            BenchmarkPreset::SmallScale => (8, 1_000_000, 100_000, 10_000),   // 100K TPS ⚠️
+            BenchmarkPreset::MediumScale => (32, 2_000_000, 100_000, 20_000), // 100K TPS ⚠️
+            BenchmarkPreset::LargeScale => (64, 3_000_000, 100_000, 30_000),  // 100K TPS ⚠️
+            BenchmarkPreset::ExtraLarge => (128, 5_000_000, 100_000, 40_000), // 100K TPS ⚠️
+            BenchmarkPreset::FullScale => (256, 10_000_000, 100_000, 50_000), // 100K TPS ⚠️⚠️
             BenchmarkPreset::Custom => (256, 5_000_000, 100_000, 50_000),
         };
         
@@ -116,6 +146,15 @@ impl BenchmarkConfig {
     }
     
     /// Quick presets
+    pub fn stability_test() -> Self { Self::from_preset(BenchmarkPreset::StabilityTest) }
+    pub fn stress_test() -> Self { Self::from_preset(BenchmarkPreset::StressTest) }
+    pub fn max_capacity() -> Self { Self::from_preset(BenchmarkPreset::MaxCapacity) }
+    pub fn progressive_max() -> Self { Self::from_preset(BenchmarkPreset::ProgressiveMax) }
+    
+    /// Check if this is a progressive test that auto-scales TPS
+    pub fn is_progressive(&self) -> bool {
+        self.preset == BenchmarkPreset::ProgressiveMax
+    }
     pub fn single_shard() -> Self { Self::from_preset(BenchmarkPreset::SingleShard) }
     pub fn small_scale() -> Self { Self::from_preset(BenchmarkPreset::SmallScale) }
     pub fn medium_scale() -> Self { Self::from_preset(BenchmarkPreset::MediumScale) }
@@ -126,7 +165,8 @@ impl BenchmarkConfig {
 
 impl Default for BenchmarkConfig {
     fn default() -> Self {
-        Self::from_preset(BenchmarkPreset::FullScale)
+        // v2.41.2: Safe default - StabilityTest won't crash node!
+        Self::from_preset(BenchmarkPreset::StabilityTest)
     }
 }
 

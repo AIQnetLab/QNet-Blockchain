@@ -155,6 +155,24 @@ pub struct ConsensusData {
     /// Note: Field named vrf_contributions_count for serialization compatibility
     #[serde(default)]
     pub vrf_contributions_count: Option<u64>,
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // REWARD HEARTBEATS (v2.41.0)
+    // Deterministic heartbeat recording for Full/Super node rewards
+    // Replaces gossip-based heartbeats which were non-deterministic and lossy
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    /// Aggregated heartbeat summaries for all nodes in this epoch
+    /// Format: bincode serialized Vec<HeartbeatSummary>
+    /// Deterministic: all nodes see same heartbeat data from blockchain
+    /// Used for reward calculation at emission blocks (every 4 hours)
+    #[serde(default)]
+    pub reward_heartbeats: Option<Vec<u8>>,
+    
+    /// Merkle root of all individual heartbeats for verification
+    /// Allows light clients to verify heartbeat inclusion without full data
+    #[serde(default)]
+    pub heartbeats_merkle_root: Option<[u8; 32]>,
 }
 
 /// Eligible producer entry for epoch-based validator set
@@ -197,6 +215,47 @@ pub struct AutomaticJailData {
     pub offense_count: u32,
     /// Reason code
     pub reason: String,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// REWARD HEARTBEAT DATA (v2.41.0)
+// Deterministic heartbeat recording for Full/Super node rewards
+// Stored in MacroBlock for verifiable, deterministic reward calculation
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Reward heartbeat entry for blockchain storage
+/// Each Full/Super node must send 10 heartbeats per 4-hour window
+/// Super nodes need 9/10 (90%), Full nodes need 8/10 (80%) for rewards
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RewardHeartbeat {
+    /// Node identifier (pseudonym, not IP)
+    pub node_id: String,
+    /// Heartbeat sequence number within 4-hour window (1-10)
+    pub sequence: u8,
+    /// Block height when heartbeat was recorded
+    pub block_height: u64,
+    /// Timestamp of heartbeat
+    pub timestamp: u64,
+    /// Dilithium signature hash (first 8 bytes for compactness)
+    pub signature_hash: [u8; 8],
+}
+
+/// Aggregated heartbeat summary for a node in a reward window
+/// Used for efficient storage: one entry per node instead of 10
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HeartbeatSummary {
+    /// Node identifier
+    pub node_id: String,
+    /// Node type: 0=Light, 1=Full, 2=Super
+    pub node_type: u8,
+    /// Number of successful heartbeats in this epoch (0-10 for Full/Super)
+    pub heartbeat_count: u8,
+    /// First heartbeat timestamp in epoch
+    pub first_heartbeat: u64,
+    /// Last heartbeat timestamp in epoch  
+    pub last_heartbeat: u64,
+    /// Whether node meets reward threshold (8/10 for Full, 9/10 for Super)
+    pub is_eligible: bool,
 }
 
 /// Efficient microblock structure - stores only transaction hashes instead of full transactions

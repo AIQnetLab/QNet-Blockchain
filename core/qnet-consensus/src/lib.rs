@@ -46,7 +46,7 @@ pub use macro_consensus::{
 };
 
 // Common types used across modules
-pub use lazy_rewards::{NodeType, QNetPhase};
+pub use lazy_rewards::{NodeType, QNetPhase, HeartbeatSummaryData};
 
 // Type aliases for compatibility
 pub type ConsensusEngine = CommitRevealConsensus;

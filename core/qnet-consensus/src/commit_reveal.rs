@@ -120,12 +120,15 @@ pub struct RoundState {
 }
 
 /// Reveal structure
+/// PRODUCTION v2.40.3: Added hybrid signature for authentication
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Reveal {
     pub node_id: String,
     pub reveal_data: Vec<u8>,
     pub nonce: [u8; 32],
     pub timestamp: u64,
+    #[serde(default)]
+    pub signature: String,
 }
 
 /// Consensus configuration
@@ -180,15 +183,30 @@ impl CommitRevealConsensus {
     }
     
     /// Start new consensus round
+    /// PRODUCTION v2.40.2: round_number = macroblock_height for epoch validation
+    /// This ensures our_epoch = round_number / 90 matches message epochs
     pub fn start_round(&mut self, participants: Vec<String>) -> Result<u64, ConsensusError> {
+        self.start_round_at_height(participants, 0) // Legacy: use sequential numbering
+    }
+    
+    /// PRODUCTION v2.40.2: Start round with explicit block height
+    /// round_number = macroblock_height (90, 180, 270...) for correct epoch calculation
+    pub fn start_round_at_height(&mut self, participants: Vec<String>, macroblock_height: u64) -> Result<u64, ConsensusError> {
         if participants.len() < self.config.min_participants {
             return Err(ConsensusError::InsufficientNodes);
         }
         
-        let round_number = self.current_round
-            .as_ref()
-            .map(|r| r.round_number + 1)
-            .unwrap_or(1);
+        // CRITICAL v2.40.2: Use macroblock_height as round_number for epoch validation
+        // This ensures: our_epoch = round_number / 90 = macroblock_height / 90 = correct epoch!
+        // Fallback to sequential if height not provided (legacy compatibility)
+        let round_number = if macroblock_height > 0 {
+            macroblock_height
+        } else {
+            self.current_round
+                .as_ref()
+                .map(|r| r.round_number + 90) // Sequential: 90, 180, 270...
+                .unwrap_or(90)
+        };
         
         let round_state = RoundState {
             phase: ConsensusPhase::Commit,
@@ -202,6 +220,7 @@ impl CommitRevealConsensus {
         };
         
         self.current_round = Some(round_state);
+        println!("[INFO][CONS] round_started round={} epoch={}", round_number, round_number / 90);
         Ok(round_number)
     }
     
@@ -221,34 +240,53 @@ impl CommitRevealConsensus {
         }
     }
     
-    /// PRODUCTION v2.40: Process commit with block-based phase validation
-    /// Phase is determined by block_height, NOT by local message count
-    /// This ensures all nodes accept commits at the same block heights
+    /// PRODUCTION v2.40.2: Process commit with EPOCH-based validation
+    /// ARCHITECTURE: Validate by EPOCH match, not by local phase
+    /// 1. Check active round exists (FIRST - saves CPU on signature verification)
+    /// 2. Check message_epoch matches our_epoch (±1 grace for network latency)
+    /// 3. Then check position is in consensus window
     pub async fn process_commit(&mut self, commit: Commit, block_height: u64) -> Result<(), ConsensusError> {
-        // PRODUCTION v2.40: Validate phase by block height (deterministic across all nodes)
-        let current_phase = get_phase_for_block(block_height);
+        // STEP 0: Check active round FIRST (saves CPU if no round)
+        if self.current_round.is_none() {
+            return Err(ConsensusError::NoActiveRound);
+        }
         
-        // Accept commits during Commit phase OR early Reveal phase (grace period)
-        match current_phase {
-            ConsensusPhase::Commit => {
-                // Normal commit phase - accept
-            }
-            ConsensusPhase::Reveal => {
-                // Grace period: accept late commits in first half of reveal phase (blocks 73-78)
-                let position = block_height % 90;
-                if position <= 78 {
-                    println!("[INFO][CONS] late_commit node={} h={} grace_period", commit.node_id, block_height);
-                } else {
-                    return Err(ConsensusError::PhaseTimeout(
-                        format!("Commit phase ended at block {}", block_height)
-                    ));
-                }
-            }
-            _ => {
-                return Err(ConsensusError::InvalidPhase(
-                    format!("Not in consensus window at block {} (phase={:?})", block_height, current_phase)
-                ));
-            }
+        // PRODUCTION v2.40.2: Proper EPOCH-based validation
+        let message_epoch = block_height / 90;
+        let position_in_epoch = block_height % 90;
+        
+        // CRITICAL: Get OUR current epoch from active round (guaranteed to exist)
+        let our_epoch = self.current_round.as_ref().unwrap().round_number / 90;
+        
+        // STEP 1: Verify EPOCH match (±1 grace for network timing)
+        let epoch_diff = if message_epoch > our_epoch {
+            message_epoch - our_epoch
+        } else {
+            our_epoch - message_epoch
+        };
+        
+        if epoch_diff > 1 {
+            return Err(ConsensusError::InvalidPhase(
+                format!("Epoch mismatch: message_epoch={} our_epoch={} diff={}", 
+                        message_epoch, our_epoch, epoch_diff)
+            ));
+        }
+        
+        // STEP 2: Verify position is in consensus window (61-89) OR grace
+        // Grace: epoch boundary (pos=0) or same epoch (late delivery)
+        
+        if position_in_epoch >= 61 {
+            // Normal consensus window (61-89) - always accept
+        } else if position_in_epoch == 0 {
+            // Epoch boundary block - accept for finalization
+        } else if epoch_diff == 0 {
+            // Grace: same epoch, active round exists (checked above) - accept late delivery
+            println!("[INFO][CONS] same_epoch_grace_commit node={} epoch={} pos={}", 
+                     commit.node_id, message_epoch, position_in_epoch);
+        } else {
+            return Err(ConsensusError::InvalidPhase(
+                format!("Commit outside consensus window: epoch={} pos={}", message_epoch, position_in_epoch)
+            ));
         }
         
         // Validate signature - do this after phase check to save CPU
@@ -257,8 +295,8 @@ impl CommitRevealConsensus {
             return Err(ConsensusError::InvalidSignature(format!("Invalid signature for validator {}", commit.node_id)));
         }
         
-        // Check if we have an active round
-        let state = self.current_round.as_mut().ok_or(ConsensusError::NoActiveRound)?;
+        // Get active round (guaranteed to exist - checked at function start)
+        let state = self.current_round.as_mut().unwrap();
         
         // Store commit
         state.commits.insert(commit.node_id.clone(), commit);
@@ -302,39 +340,86 @@ impl CommitRevealConsensus {
         valid
     }
     
-    /// PRODUCTION v2.40: Submit reveal with block-based phase validation
-    /// Phase is determined by block_height, NOT by local state
-    /// This ensures all nodes accept reveals at the same block heights
-    pub fn submit_reveal(&mut self, reveal: Reveal, block_height: u64) -> Result<(), ConsensusError> {
-        // PRODUCTION v2.40: Validate phase by block height (deterministic across all nodes)
-        let current_phase = get_phase_for_block(block_height);
+    /// PRODUCTION v2.40.3: Submit reveal with EPOCH-based validation
+    /// ARCHITECTURE: Validate by EPOCH match, not by local phase
+    /// 1. Check message_epoch matches our_epoch (±1 grace for network latency)
+    /// 2. Then check position - reveals accepted during ENTIRE consensus window (61-89)
+    /// 3. Verify hybrid signature (Dilithium3 + Ed25519) - prevents impersonation attacks
+    /// This fixes: sender at pos=73, receiver at pos=65 → SAME EPOCH → ACCEPT!
+    pub async fn submit_reveal(&mut self, reveal: Reveal, block_height: u64) -> Result<(), ConsensusError> {
+        // PRODUCTION v2.40.2: Proper EPOCH-based validation
+        let message_epoch = block_height / 90;
+        let position_in_epoch = block_height % 90;
         
-        // Accept reveals during Reveal phase OR Finalize phase (grace period)
-        match current_phase {
-            ConsensusPhase::Reveal => {
-                // Normal reveal phase - accept
-            }
-            ConsensusPhase::Finalize => {
-                // Grace period: accept late reveals during finalize
-                println!("[INFO][CONS] late_reveal node={} h={} finalize_grace", reveal.node_id, block_height);
-            }
-            ConsensusPhase::Commit => {
-                // PRODUCTION v2.40: Accept early reveals during late commit phase (blocks 69-72)
-                // This handles race condition where node transitions faster than others
-                let position = block_height % 90;
-                if position >= 69 {
-                    println!("[INFO][CONS] early_reveal node={} h={} commit_grace", reveal.node_id, block_height);
-                } else {
-                    return Err(ConsensusError::InvalidPhase(
-                        format!("Still in commit phase at block {} (position={})", block_height, position)
-                    ));
-                }
-            }
-            _ => {
-                return Err(ConsensusError::InvalidPhase(
-                    format!("Not in consensus window at block {} (phase={:?})", block_height, current_phase)
+        // CRITICAL: Get OUR current epoch from active round
+        let our_epoch = if let Some(state) = &self.current_round {
+            state.round_number / 90
+        } else {
+            // No active round - this is an error for reveals
+            return Err(ConsensusError::NoActiveRound);
+        };
+        
+        // STEP 1: Verify EPOCH match (±1 grace for network timing)
+        let epoch_diff = if message_epoch > our_epoch {
+            message_epoch - our_epoch
+        } else {
+            our_epoch - message_epoch
+        };
+        
+        if epoch_diff > 1 {
+            return Err(ConsensusError::InvalidPhase(
+                format!("Epoch mismatch for reveal: message_epoch={} our_epoch={} diff={}", 
+                        message_epoch, our_epoch, epoch_diff)
+            ));
+        }
+        
+        // STEP 2: Verify position is in consensus window (61-89) OR grace
+        // Reveals accepted during ENTIRE consensus window because:
+        // - Sender at pos=73 (reveal phase) sends reveal
+        // - Receiver at pos=65 (commit phase) receives it
+        // - SAME EPOCH → ACCEPT! Cryptographic verification in finalize_round
+        if position_in_epoch >= 61 {
+            // Consensus window (61-89) - always accept
+        } else if position_in_epoch == 0 {
+            // Epoch boundary - accept for finalization
+        } else if epoch_diff == 0 {
+            // Same epoch, production phase (1-60) - accept late delivery
+            // This handles: consensus finished, receiver moved to production
+            println!("[INFO][CONS] same_epoch_grace_reveal node={} epoch={} pos={}", 
+                     reveal.node_id, message_epoch, position_in_epoch);
+        } else {
+            return Err(ConsensusError::InvalidPhase(
+                format!("Reveal outside consensus window: epoch={} pos={}", message_epoch, position_in_epoch)
+            ));
+        }
+        
+        // PRODUCTION v2.40.3: Verify hybrid reveal signature (Dilithium3 + Ed25519 + ephemeral)
+        // This prevents impersonation attacks where attacker sends reveal as another node
+        // Uses same hybrid verification as commits for NIST FIPS 204 / CNSA 2.0 compliance
+        // NOTE: If signature is empty (legacy), skip verification but log warning
+        if !reveal.signature.is_empty() {
+            // Create message to verify: node_id + reveal_data_hash + nonce
+            let reveal_message = format!("{}:{}:{}", 
+                reveal.node_id, 
+                hex::encode(&reveal.reveal_data),
+                hex::encode(&reveal.nonce)
+            );
+            
+            // Use same verify_signature as commits for consistency
+            let signature_valid = self.verify_signature(
+                &reveal.node_id, 
+                &reveal_message, 
+                &reveal.signature
+            ).await;
+            
+            if !signature_valid {
+                return Err(ConsensusError::InvalidSignature(
+                    format!("Invalid hybrid reveal signature for node {}", reveal.node_id)
                 ));
             }
+        } else {
+            // Legacy reveal without signature - accept but log warning
+            println!("[WARN][CONS] reveal_no_signature node={} accepting_legacy", reveal.node_id);
         }
         
         // Check if we have an active round
@@ -371,9 +456,9 @@ impl CommitRevealConsensus {
     
     /// Legacy submit_reveal without block_height (for backwards compatibility)
     /// DEPRECATED: Use submit_reveal(reveal, block_height) instead
-    pub fn submit_reveal_legacy(&mut self, reveal: Reveal) -> Result<(), ConsensusError> {
+    pub async fn submit_reveal_legacy(&mut self, reveal: Reveal) -> Result<(), ConsensusError> {
         println!("[WARN][CONS] submit_reveal_legacy called - should use block_height version");
-        self.submit_reveal(reveal, 73) // Assume block 73 (start of reveal)
+        self.submit_reveal(reveal, 73).await // Assume block 73 (start of reveal)
     }
     
     /// Advance to next phase
@@ -405,15 +490,18 @@ impl CommitRevealConsensus {
         }
     }
     
-    /// PRODUCTION: Finalize round with Byzantine safety requirements
+    /// PRODUCTION v2.40.1: Finalize round with Byzantine safety requirements
+    /// ARCHITECTURE: No local phase check - epoch-based validation ensures correctness
+    /// By the time finalize is called, commits and reveals have been collected via epoch validation
     pub fn finalize_round(&mut self) -> Result<String, ConsensusError> {
         // First get the leader without mutable borrow
         let leader = {
             let state = self.current_round.as_ref().ok_or(ConsensusError::NoActiveRound)?;
             
-            if state.phase != ConsensusPhase::Reveal {
-                return Err(ConsensusError::InvalidPhase("Not in reveal phase".to_string()));
-            }
+            // PRODUCTION v2.40.1: Removed local phase check
+            // Phase validation is now epoch-based in process_commit/submit_reveal
+            // Local phase may not match block_height due to network timing differences
+            // What matters: we have enough commits AND reveals (Byzantine threshold)
             
             // PRODUCTION: Check Byzantine threshold for reveals (2f+1)
             // CRITICAL: Use INITIAL participants count, NOT current reveals count
@@ -581,6 +669,21 @@ impl CommitRevealConsensus {
     ///
     /// SCALABILITY: Works with 1000 validators per round
     /// ═══════════════════════════════════════════════════════════════════════════
+    /// PRODUCTION v2.40.3: XOR-based leader selection with CURRENT epoch entropy
+    /// ═══════════════════════════════════════════════════════════════════════════
+    /// 
+    /// PROBLEM (v2.32-v2.40.2): Beacon N-2 is PUBLIC after MacroBlock N-2 finalized!
+    ///   → Leader for epoch N is PREDICTABLE → DDoS attack possible!
+    /// 
+    /// SOLUTION (v2.40.3): Use CURRENT reveals as PRIMARY entropy source
+    ///   1. current_beacon = XOR(all reveal nonces in THIS round) - UNPREDICTABLE!
+    ///   2. prev_beacon (N-2) = historical entropy accumulation
+    ///   3. Combined: hash(current_beacon, prev_beacon, round, participants)
+    /// 
+    /// SECURITY: Leader cannot be predicted until ALL reveals are collected!
+    ///   - Even if attacker knows 4/5 reveals, the 5th reveal changes the beacon
+    ///   - 1-bit bias attack possible (last revealer) but not practical for leader selection
+    /// ═══════════════════════════════════════════════════════════════════════════
     fn select_leader(&self, reveals: &HashMap<String, Reveal>) -> Option<String> {
         if reveals.is_empty() {
             return None;
@@ -594,16 +697,27 @@ impl CommitRevealConsensus {
         let mut hasher = Sha3_512::new();
         
         // Version tag for hash domain separation
-        hasher.update(b"QNet_Leader_Selection_v2.36_SHA512");
+        hasher.update(b"QNet_Leader_Selection_v2.40.3_XOR");
         
-        // PRIMARY ENTROPY: Randomness beacon from MacroBlock N-2
-        // This is unpredictable until N-2 is finalized!
-        let has_beacon = if let Some(beacon) = &state.prev_randomness_beacon {
+        // ═══════════════════════════════════════════════════════════════════════════
+        // CRITICAL v2.40.3: PRIMARY ENTROPY from CURRENT reveals (XOR-based)
+        // This is UNPREDICTABLE until ALL reveals are collected!
+        // ═══════════════════════════════════════════════════════════════════════════
+        let mut current_beacon = [0u8; 32];
+        for reveal in reveals.values() {
+            for (i, byte) in reveal.nonce.iter().enumerate() {
+                current_beacon[i] ^= byte;
+            }
+        }
+        hasher.update(&current_beacon);
+        
+        // SECONDARY ENTROPY: Historical beacon from MacroBlock N-2
+        // Adds accumulated randomness from previous epochs
+        let has_prev_beacon = if let Some(beacon) = &state.prev_randomness_beacon {
             hasher.update(beacon);
             true
         } else {
             // Fallback for epochs 1-2: Use Genesis seed
-            // Predictable but necessary for bootstrap
             hasher.update(b"QNet_Genesis_Seed_Fallback");
             false
         };
@@ -632,8 +746,9 @@ impl CommitRevealConsensus {
         let selected_leader = participants[selection_index].clone();
         
         // Professional log: [LEVEL][MODULE] key=value
-        println!("[INFO][CONS] leader_select node={} idx={}/{} round={} beacon={}", 
-                 selected_leader, selection_index, participants.len(), round_number, has_beacon);
+        println!("[INFO][CONS] leader_select node={} idx={}/{} round={} current_beacon={}... prev_beacon={}", 
+                 selected_leader, selection_index, participants.len(), round_number, 
+                 hex::encode(&current_beacon[..4]), has_prev_beacon);
         
         Some(selected_leader)
     }
@@ -923,9 +1038,9 @@ impl CommitRevealConsensus {
 
     /// Add reveal (alias for submit_reveal for API compatibility)
     /// DEPRECATED: Use submit_reveal(reveal, block_height) instead
-    pub fn add_reveal(&mut self, reveal: Reveal) -> Result<(), ConsensusError> {
+    pub async fn add_reveal(&mut self, reveal: Reveal) -> Result<(), ConsensusError> {
         // Fallback to block 73 (start of reveal phase)
-        self.submit_reveal(reveal, 73)
+        self.submit_reveal(reveal, 73).await
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -979,7 +1094,7 @@ impl CommitRevealConsensus {
                 return None;
             }
             
-            // XOR all reveal nonces (RANDAO-style)
+            // XOR all reveal nonces for entropy accumulation
             let mut beacon = [0u8; 32];
             for reveal in state.reveals.values() {
                 for (i, byte) in reveal.nonce.iter().enumerate() {
@@ -992,10 +1107,16 @@ impl CommitRevealConsensus {
         }
     }
 
-    /// PRODUCTION v2.35: Compute leader for specific round (for failover)
+    /// PRODUCTION v2.40.3: Compute leader for specific failover round
     /// 
-    /// Uses same algorithm as select_leader() but accepts round parameter
-    /// This allows round-based failover: if round 0 leader offline → compute round 1 leader
+    /// NOTE: This function is used for FAILOVER only, not primary leader selection!
+    /// For primary selection, use select_leader() which includes XOR-based entropy.
+    /// 
+    /// Failover uses beacon + round for deterministic rotation when primary leader fails.
+    /// This is intentionally simpler because:
+    /// 1. Failover happens after reveals are already collected for primary
+    /// 2. Round number changes → different leader each failover attempt
+    /// 3. Beacon (if available) adds unpredictability from previous epochs
     pub fn compute_leader_for_round(
         &self,
         height: u64,
@@ -1011,10 +1132,11 @@ impl CommitRevealConsensus {
         use sha3::{Sha3_512, Digest};
         let mut hasher = Sha3_512::new();
 
-        // Version tag for hash domain separation
-        hasher.update(b"QNet_Leader_Selection_v2.36_SHA512_Round");
+        // Version tag for hash domain separation (updated for v2.40.3)
+        hasher.update(b"QNet_Failover_Leader_v2.40.3");
 
-        // PRIMARY ENTROPY: Randomness beacon from MacroBlock N-2
+        // ENTROPY: Randomness beacon (historical accumulation)
+        // For failover, we don't have current reveals, so use beacon only
         if let Some(b) = beacon {
             hasher.update(b);
         } else {

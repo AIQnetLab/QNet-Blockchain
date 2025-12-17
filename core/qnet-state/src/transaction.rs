@@ -531,12 +531,15 @@ impl Transaction {
                     return Err("Successful ping count cannot exceed total ping count".to_string());
                 }
                 
-                // Validate sample size (must be at least 1% or 10,000, whichever is larger)
-                let min_sample_size = (*total_ping_count / 100).max(10_000);
+                // Validate sample size: ADAPTIVE based on network size!
+                // - Small network (<10K nodes): verify ALL pings (no sampling)
+                // - Large network (10K+ nodes): 1% sampling for scalability
+                // Formula: max(total/100, min(10000, total))
+                let min_sample_size = (*total_ping_count / 100).max(10_000_u32.min(*total_ping_count));
                 if ping_samples.len() < min_sample_size as usize {
                     return Err(format!(
-                        "Insufficient samples: got {}, expected at least {}",
-                        ping_samples.len(), min_sample_size
+                        "Insufficient samples: got {}, expected at least {} (total={})",
+                        ping_samples.len(), min_sample_size, total_ping_count
                     ));
                 }
                 

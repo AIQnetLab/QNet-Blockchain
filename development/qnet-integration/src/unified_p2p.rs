@@ -11994,6 +11994,164 @@ impl SimplifiedP2P {
         }
     }
     
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // v2.41.0: DETERMINISTIC HEARTBEAT COLLECTION FOR MACROBLOCK
+    // Collects heartbeat summaries for on-chain recording instead of gossip
+    // Ensures all nodes see identical heartbeat data = deterministic rewards
+    // ═══════════════════════════════════════════════════════════════════════════════
+    
+    /// Get heartbeat summaries for MacroBlock inclusion
+    /// Called during MacroBlock creation to record heartbeats on-chain
+    /// Returns Vec<HeartbeatSummary> for all nodes that sent heartbeats in current epoch
+    pub fn get_heartbeat_summaries_for_macroblock(&self, epoch_start_height: u64) -> Vec<qnet_state::HeartbeatSummary> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        
+        // Calculate 4-hour window start for current epoch
+        let current_4h_window = now - (now % (4 * 60 * 60));
+        
+        // Get heartbeat history
+        let history = match self.heartbeat_history.read() { 
+            Ok(g) => g, 
+            Err(p) => p.into_inner() 
+        };
+        
+        // Group heartbeats by node_id
+        let mut node_heartbeats: std::collections::HashMap<String, Vec<&HeartbeatRecord>> = 
+            std::collections::HashMap::new();
+        
+        for (_, record) in history.iter() {
+            // Only include heartbeats from current 4h window
+            let record_4h = record.timestamp - (record.timestamp % (4 * 60 * 60));
+            if record_4h == current_4h_window && record.verified {
+                node_heartbeats
+                    .entry(record.node_id.clone())
+                    .or_insert_with(Vec::new)
+                    .push(record);
+            }
+        }
+        
+        // Create summaries
+        let mut summaries = Vec::new();
+        
+        for (node_id, heartbeats) in node_heartbeats {
+            // ═══════════════════════════════════════════════════════════════════════════
+            // PRODUCTION: Strict node type detection - NO DEFAULTS!
+            // Node IDs MUST follow naming conventions:
+            // - "light_{region}_{hash}" for Light nodes (mobile apps)
+            // - "full_{activation_code}" for Full nodes (servers with partial state)
+            // - "super_{id}" or "genesis_node_{N}" for Super nodes (full validators)
+            // Unknown formats are REJECTED (not counted for rewards)
+            // ═══════════════════════════════════════════════════════════════════════════
+            let node_type: Option<u8> = if node_id.starts_with("light_") {
+                Some(0) // Light node - mobile app
+            } else if node_id.starts_with("full_") {
+                Some(1) // Full node - server with partial state
+            } else if node_id.starts_with("super_") || node_id.starts_with("genesis_node_") {
+                Some(2) // Super node - full validator
+            } else {
+                // PRODUCTION: Unknown format - REJECT, don't guess!
+                // Node must re-register with correct ID format
+                println!("[WARN][HEARTBEAT] rejected_unknown_format id={} action=skip_rewards", node_id);
+                None // Skip this node - invalid format
+            };
+            
+            // Skip nodes with invalid ID format
+            let node_type = match node_type {
+                Some(t) => t,
+                None => continue, // Skip to next node - no rewards for invalid format
+            };
+            
+            let heartbeat_count = heartbeats.len() as u8;
+            
+            // PRODUCTION: Eligibility thresholds per node type
+            // Light nodes: 1 ping per 4h window (100% - single ping must succeed)
+            // Full nodes: 8/10 heartbeats (80% - allows 2 failures per window)
+            // Super nodes: 9/10 heartbeats (90% - stricter, only 1 failure allowed)
+            let required: u8 = match node_type {
+                0 => 1,  // Light: 1/1 (100%)
+                1 => 8,  // Full: 8/10 (80%)
+                2 => 9,  // Super: 9/10 (90%)
+                // Note: node_type is 0, 1, or 2 only - no other values possible
+                // This arm is unreachable but required for exhaustive match
+                3..=u8::MAX => unreachable!("node_type validated above"),
+            };
+            let is_eligible = heartbeat_count >= required;
+            
+            // Get first and last timestamps
+            let first_heartbeat = heartbeats.iter()
+                .map(|h| h.timestamp)
+                .min()
+                .unwrap_or(0);
+            let last_heartbeat = heartbeats.iter()
+                .map(|h| h.timestamp)
+                .max()
+                .unwrap_or(0);
+            
+            summaries.push(qnet_state::HeartbeatSummary {
+                node_id: node_id.clone(),
+                node_type,
+                heartbeat_count,
+                first_heartbeat,
+                last_heartbeat,
+                is_eligible,
+            });
+        }
+        
+        println!("[INFO][HEARTBEAT] collected_for_macroblock nodes={} eligible={}", 
+                 summaries.len(),
+                 summaries.iter().filter(|s| s.is_eligible).count());
+        
+        summaries
+    }
+    
+    /// Calculate Merkle root of heartbeat summaries for light client verification
+    pub fn calculate_heartbeats_merkle_root(&self, summaries: &[qnet_state::HeartbeatSummary]) -> [u8; 32] {
+        use sha3::{Sha3_256, Digest};
+        
+        if summaries.is_empty() {
+            return [0u8; 32];
+        }
+        
+        // Create leaf hashes
+        let mut leaves: Vec<[u8; 32]> = summaries.iter().map(|s| {
+            let mut hasher = Sha3_256::new();
+            hasher.update(s.node_id.as_bytes());
+            hasher.update(&[s.node_type]);
+            hasher.update(&[s.heartbeat_count]);
+            hasher.update(&s.first_heartbeat.to_le_bytes());
+            hasher.update(&s.last_heartbeat.to_le_bytes());
+            hasher.update(&[if s.is_eligible { 1 } else { 0 }]);
+            let result = hasher.finalize();
+            let mut hash = [0u8; 32];
+            hash.copy_from_slice(&result);
+            hash
+        }).collect();
+        
+        // Build Merkle tree
+        while leaves.len() > 1 {
+            let mut new_leaves = Vec::new();
+            for chunk in leaves.chunks(2) {
+                let mut hasher = Sha3_256::new();
+                hasher.update(&chunk[0]);
+                if chunk.len() > 1 {
+                    hasher.update(&chunk[1]);
+                } else {
+                    hasher.update(&chunk[0]); // Duplicate for odd count
+                }
+                let result = hasher.finalize();
+                let mut hash = [0u8; 32];
+                hash.copy_from_slice(&result);
+                new_leaves.push(hash);
+            }
+            leaves = new_leaves;
+        }
+        
+        leaves[0]
+    }
+    
     /// Get Light Node registry (for ping service)
     pub fn get_light_node_registry(&self) -> HashMap<String, LightNodeRegistrationData> {
         match self.light_node_registry.read() { Ok(g) => g, Err(p) => p.into_inner() }.clone()
@@ -12704,11 +12862,20 @@ impl SimplifiedP2P {
         let active_nodes = match self.active_full_super_nodes.read() { Ok(g) => g, Err(p) => p.into_inner() };
         
         counts.into_iter()
-            .map(|(node_id, (_, count))| {
-                let node_type = active_nodes.get(&node_id)
-                    .map(|n| n.node_type.clone())
-                    .unwrap_or_else(|| "full".to_string());
-                (node_id, node_type, count)
+            .filter_map(|(node_id, (_, count))| {
+                // PRODUCTION v2.41.1: Strict node type - NO DEFAULTS!
+                // Node must be in active registry OR be a genesis node
+                let node_type = if let Some(n) = active_nodes.get(&node_id) {
+                    n.node_type.clone()
+                } else if node_id.starts_with("genesis_node_") {
+                    // Genesis nodes are always Super
+                    "super".to_string()
+                } else {
+                    // Unknown node - REJECT (shouldn't happen if heartbeat validation works)
+                    println!("[REWARDS] ⚠️ Unknown node {} in heartbeat history - skipping", node_id);
+                    return None;
+                };
+                Some((node_id, node_type, count))
             })
             .filter(|(node_id, node_type, count)| {
                 // CRITICAL FIX v2.21.1: Check reputation >= 70% for QNC rewards!

@@ -44,7 +44,14 @@ This project uses **dual licensing**:
 - **Phase 2 (Future)**: ONLY QNC token activation on QNet blockchain
 - **Transition**: 90% 1DEV burned OR 5 years from genesis block (whichever comes first)
 
-### 🛡️ **LATEST UPDATES (v2.40.0 - December 17, 2025)**
+### 🛡️ **LATEST UPDATES (v2.41.1 - December 17, 2025)**
+
+**💓 Deterministic Reward Heartbeats v2.41:**
+- **On-Chain Recording**: Heartbeats stored in MacroBlock (not gossip)
+- **Emission MacroBlocks**: Heartbeats only in every 160th MacroBlock (4 hours)
+- **Strict Validation**: Unknown node_id formats REJECTED (no defaults)
+- **Full/Super**: 10 heartbeats per 4h (80%/90% threshold)
+- **Light Nodes**: Separate ping system (MIN_PING_SAMPLES = 10,000)
 
 **🎯 Block-Based Consensus Phases v2.40:**
 - **Deterministic Phases**: `get_phase_for_block(height)` - identical on ALL nodes

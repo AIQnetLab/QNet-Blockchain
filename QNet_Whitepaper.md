@@ -910,6 +910,14 @@ Architecture (v2.23):
 ├── Storage: Tiered (Light ~100MB headers, Full ~500GB pruned, Super ~2TB full)
 └── Mobile monitoring: viewing only, no attestations
 
+Deterministic On-Chain Heartbeats (v2.41):
+├── Heartbeats collected via gossip → stored in heartbeat_history (RAM)
+├── ONLY recorded in EMISSION MacroBlocks (every 160th = 4 hours)
+├── HeartbeatSummary[] → ConsensusData.reward_heartbeats (BLOCKCHAIN)
+├── All nodes read SAME data from blockchain = deterministic rewards
+├── Strict node_id validation: light_, full_, super_, genesis_node_ only
+└── Invalid formats REJECTED (no default assignments)
+
 > **Note (v2.19.10)**: Sharding is for parallel TX processing, NOT storage partitioning. All nodes receive all blocks via P2P.
 ```
 

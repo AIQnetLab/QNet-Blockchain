@@ -3994,11 +3994,20 @@ impl Storage {
                 let parsed: serde_json::Value = serde_json::from_str(json_str)
                     .map_err(|e| IntegrationError::DeserializationError(e.to_string()))?;
                 
-                Ok(Some((
-                    parsed["node_type"].as_str().unwrap_or("light").to_string(),
-                    parsed["wallet"].as_str().unwrap_or("").to_string(),
-                    parsed["reputation"].as_f64().unwrap_or(70.0)
-                )))
+                // PRODUCTION v2.41.1: Validate required fields
+                let node_type = match parsed["node_type"].as_str() {
+                    Some(t) => t.to_string(),
+                    None => {
+                        eprintln!("[WARN][STORAGE] node_registration_missing_type id={} data={}", 
+                                 node_id, json_str);
+                        return Err(IntegrationError::DeserializationError(
+                            format!("Missing node_type for {}", node_id)));
+                    }
+                };
+                let wallet = parsed["wallet"].as_str().unwrap_or("").to_string();
+                let reputation = parsed["reputation"].as_f64().unwrap_or(70.0);
+                
+                Ok(Some((node_type, wallet, reputation)))
             },
             None => Ok(None),
         }
