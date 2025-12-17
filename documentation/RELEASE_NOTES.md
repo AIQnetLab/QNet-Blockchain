@@ -1,10 +1,63 @@
 # 🚀 QNet Blockchain - Release Notes
 
-## 🎉 Latest: v2.38.0 - On-Chain Slashing Only
+## 🎉 Latest: v2.40.0 - Block-Based Consensus Phases
 
-**Release Date**: December 16, 2025  
-**Version**: 2.38.0  
+**Release Date**: December 17, 2025  
+**Version**: 2.40.0  
 **Status**: ✅ Production Ready
+
+---
+
+## v2.40.0 - Block-Based Consensus Phases (December 17, 2025)
+
+### 🎯 Critical Fix: Deterministic Phase Synchronization
+
+**Problem:** Phases determined locally by message counts → desync → cascade jailing
+
+**Solution:** Phases determined by block height (identical on all nodes)
+
+| Aspect | Before | After |
+|--------|--------|-------|
+| Phase trigger | `commits >= threshold` | `get_phase_for_block(h)` |
+| Synchronization | ❌ Local | ✅ Global (height-based) |
+| Cascade jailing | ❌ Common | ✅ Eliminated |
+
+### Block Layout (90-block epoch)
+
+| Blocks | Phase |
+|--------|-------|
+| 1-60 | Production |
+| 61-72 | Commit (12s) |
+| 73-84 | Reveal (12s) |
+| 85-90 | Finalize (6s) |
+
+### Grace Periods
+
+- **Commits:** Accept in Commit (61-72) + early Reveal (73-78)
+- **Reveals:** Accept in late Commit (69-72) + Reveal (73-84) + Finalize (85-90)
+
+### Automatic Jails: REMOVED
+
+| Before | After |
+|--------|-------|
+| Commit without reveal = 1h jail | **No jail** (timing not offense) |
+| Cascade effect | **Impossible** |
+
+### Files Changed
+
+- `commit_reveal.rs`: `get_phase_for_block()`, height-based validation
+- `node.rs`: All consensus calls pass `LOCAL_BLOCKCHAIN_HEIGHT`
+- `rpc.rs`: RPC handlers with block height
+
+---
+
+## v2.39.0 - Consensus Data Preservation (December 17, 2025)
+
+### 🔧 Fix: Commits/Reveals Lost Before MacroBlock
+
+**Problem:** `advance_phase()` called before data capture → empty consensus data
+
+**Solution:** Capture data BEFORE `advance_phase()`
 
 ---
 

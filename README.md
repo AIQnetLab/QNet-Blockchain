@@ -44,7 +44,21 @@ This project uses **dual licensing**:
 - **Phase 2 (Future)**: ONLY QNC token activation on QNet blockchain
 - **Transition**: 90% 1DEV burned OR 5 years from genesis block (whichever comes first)
 
-### 🛡️ **LATEST UPDATES (v2.31.0 - December 13, 2025)**
+### 🛡️ **LATEST UPDATES (v2.40.0 - December 17, 2025)**
+
+**🎯 Block-Based Consensus Phases v2.40:**
+- **Deterministic Phases**: `get_phase_for_block(height)` - identical on ALL nodes
+- **No Local Transitions**: Phases determined by block height, not message counts
+- **Eliminated Cascade Jailing**: Timing issues are NOT offenses (no auto-jails)
+- **Grace Periods**: Commits accepted until block 78, reveals until block 90
+- **Phase Layout**: Commit (61-72) → Reveal (73-84) → Finalize (85-90)
+
+**🔐 On-Chain Slashing v2.38:**
+- **Cryptographic Proof Only**: Slashing requires on-chain evidence
+- **Double-Sign Detection**: 100% penalty + permanent ban
+- **No False Positives**: Network delays don't cause slashing
+
+### 🛡️ **Previous Updates (v2.31.0 - December 13, 2025)**
 
 **🛡️ 5-Layer Macroblock Protection v2.31:**
 - **Layer 1**: Unsync node sync (45s delay + 3 retries)

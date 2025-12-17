@@ -1,9 +1,11 @@
-# QNET Deterministic Reputation System v2.27
+# QNET Deterministic Reputation System v2.40
 
 ## Overview
 
 QNET uses a **deterministic blockchain-based reputation system** that eliminates P2P gossip vulnerabilities.
 All nodes compute identical reputation scores from on-chain data.
+
+**NEW in v2.40:** Block-based consensus phases eliminate cascade jailing!
 
 **NEW in v2.27:** Epoch-based validator sets + QRDS (Quantum-Resistant Deterministic Selection) eliminate gossip race conditions!
 
@@ -512,7 +514,7 @@ history.retain(|_, record| record.timestamp >= cutoff);
 
 ---
 
-## Slashing Events (v2.38)
+## Slashing & Jailing (v2.40)
 
 ### Architecture: Cryptographic Proof Only
 
@@ -527,17 +529,45 @@ This prevents false positives from network delays or P2P gossip inconsistencies.
 | InvalidBlock | -20% | Invalid signature/hash | Block validation |
 | ChainFork | -100% + Permanent Ban | Conflicting blocks | On-chain analysis |
 
-### NOT Slashable (v2.38 Change)
+### NOT Slashable (v2.38+)
 
 | Type | Reason | Alternative |
 |------|--------|-------------|
 | MissedBlocks | Cannot prove "who should have produced" | Reputation decay (no reward) |
 
-**Why MissedBlocks removed:**
-- Block structure has no `original_producer` field
-- Emergency producer overwrites `block.producer`
-- Network delays would cause false positives
-- Cannot deterministically prove who was assigned
+### Automatic Jails: REMOVED (v2.40)
+
+| Before (v2.39) | After (v2.40) |
+|----------------|---------------|
+| Commit without reveal = 1h jail | **No jail** |
+| Cascade jail effect | **Impossible** |
+| Timing issues = offense | **Timing issues = NOT offense** |
+
+**Why removed:**
+- Block-based phases mean nodes may miss reveal window due to network latency
+- This is NOT a provable offense (cannot determine if malicious or network issue)
+- Alternative: -1% reputation penalty (`PENALTY_MISSED_CONSENSUS`)
+- Node can still participate in next consensus (89% > 70% threshold)
+
+### Consensus Phase Synchronization (v2.40)
+
+Phases are now determined by **block height**, not message counts:
+
+```
+Block Layout per 90-block epoch:
+├── Blocks 1-60:  Production (microblocks only)
+├── Blocks 61-72: Commit phase (12 seconds)
+├── Blocks 73-84: Reveal phase (12 seconds)
+└── Blocks 85-90: Finalize phase (6 seconds)
+
+get_phase_for_block(height) = deterministic on ALL nodes
+```
+
+**Grace Periods:**
+| Message | Accept In |
+|---------|-----------|
+| Commits | Commit (61-72) + early Reveal (73-78) |
+| Reveals | late Commit (69-72) + Reveal (73-84) + Finalize (85-90) |
 
 ### Collection Flow (v2.38)
 

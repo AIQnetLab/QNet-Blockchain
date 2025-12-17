@@ -5,6 +5,88 @@ All notable changes to the QNet project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.40.0] - December 17, 2025 "Block-Based Consensus Phases"
+
+### 🎯 Critical Architecture Fix: Deterministic Phase Synchronization
+
+**Problem Solved:**
+Consensus phases were determined LOCALLY based on received message counts. This caused:
+- Desynchronization: Node A in Reveal phase, Node B still in Commit phase
+- `InvalidPhase("Still in commit phase")` errors
+- Cascade jailing: nodes that couldn't reveal were jailed → more nodes fail → network death
+
+**Solution:**
+Phases now determined by **block height** (deterministic across all nodes).
+
+| Aspect | Before (v2.39) | After (v2.40) |
+|--------|----------------|---------------|
+| Phase trigger | `commits.len() >= threshold` | `get_phase_for_block(height)` |
+| Synchronization | ❌ Local, message-based | ✅ Global, height-based |
+| Race conditions | ❌ Possible | ✅ Impossible |
+| Cascade jailing | ❌ Happened frequently | ✅ Eliminated |
+
+### Block Layout per 90-Block Epoch
+
+| Blocks | Phase | Duration |
+|--------|-------|----------|
+| 1-60 | Production | 60 seconds |
+| 61-72 | Commit | 12 seconds |
+| 73-84 | Reveal | 12 seconds |
+| 85-90 | Finalize | 6 seconds |
+
+### Grace Periods (Network Tolerance)
+
+| Message Type | Accept In |
+|--------------|-----------|
+| Commits | Commit (61-72) + Reveal grace (73-78) |
+| Reveals | Late Commit (69-72) + Reveal (73-84) + Finalize (85-90) |
+
+### Automatic Jails Removed
+
+| Before | After |
+|--------|-------|
+| Commit without reveal → 1h jail | No jail (timing issues are not offenses) |
+| Cascade jail effect | Impossible |
+| Node recovery | Immediate | Still immediate, reputation -1% only |
+
+### Files Changed
+
+- `core/qnet-consensus/src/commit_reveal.rs`:
+  - Added `get_phase_for_block(height)` - deterministic phase calculation
+  - Added `ConsensusPhase::Production` variant
+  - `process_commit(commit, block_height)` - height-based validation
+  - `submit_reveal(reveal, block_height)` - height-based validation
+  - Removed local phase transitions based on message counts
+
+- `development/qnet-integration/src/node.rs`:
+  - `process_consensus_message()` now takes `block_height`
+  - All consensus calls pass `LOCAL_BLOCKCHAIN_HEIGHT`
+  - `compute_automatic_jails()` returns empty vector
+
+- `development/qnet-integration/src/rpc.rs`:
+  - RPC handlers pass `block_height` to consensus methods
+
+### Security & Scalability
+
+- **Deterministic:** All nodes compute identical phases from height
+- **Scalable:** O(1) phase check for any number of validators
+- **Fair:** Network delays don't cause permanent penalties
+- **Byzantine-safe:** BFT threshold (2f+1) still enforced
+
+---
+
+## [2.39.0] - December 17, 2025 "Consensus Data Preservation"
+
+### 🔧 Critical Fix: Commits/Reveals Lost Before MacroBlock Creation
+
+**Problem:**
+`advance_phase()` was called BEFORE `get_commits_for_macroblock()`, setting `current_round = None` and returning empty data.
+
+**Solution:**
+Capture consensus data BEFORE calling `advance_phase()`.
+
+---
+
 ## [2.38.0] - December 16, 2025 "On-Chain Slashing Only"
 
 ### 🔐 Slashing Architecture Overhaul

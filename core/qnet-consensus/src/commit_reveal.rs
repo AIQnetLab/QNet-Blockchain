@@ -34,6 +34,48 @@ pub enum ConsensusPhase {
     Commit,
     Reveal,
     Finalize,
+    /// Production phase - microblock creation (blocks 1-60 of each epoch)
+    Production,
+}
+
+/// PRODUCTION v2.40: Deterministic phase calculation based on block height
+/// This ensures ALL nodes are in the same phase at the same block height
+/// Eliminates race conditions from local phase transitions
+/// 
+/// Block layout per 90-block epoch:
+/// - Blocks 1-60:  Production (microblocks only)
+/// - Blocks 61-72: Commit phase (12 blocks = 12 seconds)
+/// - Blocks 73-84: Reveal phase (12 blocks = 12 seconds)  
+/// - Blocks 85-90: Finalize phase (6 blocks = 6 seconds)
+pub fn get_phase_for_block(block_height: u64) -> ConsensusPhase {
+    if block_height == 0 {
+        return ConsensusPhase::Production;
+    }
+    
+    let position_in_epoch = block_height % 90;
+    
+    match position_in_epoch {
+        // Block 90, 180, 270... (position 0) = last block of finalize
+        0 => ConsensusPhase::Finalize,
+        // Blocks 1-60 = Production
+        1..=60 => ConsensusPhase::Production,
+        // Blocks 61-72 = Commit (12 seconds)
+        61..=72 => ConsensusPhase::Commit,
+        // Blocks 73-84 = Reveal (12 seconds)
+        73..=84 => ConsensusPhase::Reveal,
+        // Blocks 85-89 = Finalize (5 seconds, block 90 handled above)
+        85..=89 => ConsensusPhase::Finalize,
+        _ => ConsensusPhase::Production,
+    }
+}
+
+/// Check if block height is in consensus window (blocks 61-90)
+pub fn is_in_consensus_window(block_height: u64) -> bool {
+    if block_height == 0 {
+        return false;
+    }
+    let position = block_height % 90;
+    position >= 61 || position == 0
 }
 
 /// Node type for validator selection
@@ -179,9 +221,37 @@ impl CommitRevealConsensus {
         }
     }
     
-    /// Process commit from validator (simplified version)
-    pub async fn process_commit(&mut self, commit: Commit) -> Result<(), ConsensusError> {
-        // Validate signature (simplified) - do this before any borrows
+    /// PRODUCTION v2.40: Process commit with block-based phase validation
+    /// Phase is determined by block_height, NOT by local message count
+    /// This ensures all nodes accept commits at the same block heights
+    pub async fn process_commit(&mut self, commit: Commit, block_height: u64) -> Result<(), ConsensusError> {
+        // PRODUCTION v2.40: Validate phase by block height (deterministic across all nodes)
+        let current_phase = get_phase_for_block(block_height);
+        
+        // Accept commits during Commit phase OR early Reveal phase (grace period)
+        match current_phase {
+            ConsensusPhase::Commit => {
+                // Normal commit phase - accept
+            }
+            ConsensusPhase::Reveal => {
+                // Grace period: accept late commits in first half of reveal phase (blocks 73-78)
+                let position = block_height % 90;
+                if position <= 78 {
+                    println!("[INFO][CONS] late_commit node={} h={} grace_period", commit.node_id, block_height);
+                } else {
+                    return Err(ConsensusError::PhaseTimeout(
+                        format!("Commit phase ended at block {}", block_height)
+                    ));
+                }
+            }
+            _ => {
+                return Err(ConsensusError::InvalidPhase(
+                    format!("Not in consensus window at block {} (phase={:?})", block_height, current_phase)
+                ));
+            }
+        }
+        
+        // Validate signature - do this after phase check to save CPU
         let signature_valid = self.verify_signature(&commit.node_id, &commit.commit_hash, &commit.signature).await;
         if !signature_valid {
             return Err(ConsensusError::InvalidSignature(format!("Invalid signature for validator {}", commit.node_id)));
@@ -190,46 +260,28 @@ impl CommitRevealConsensus {
         // Check if we have an active round
         let state = self.current_round.as_mut().ok_or(ConsensusError::NoActiveRound)?;
         
-        // CRITICAL FIX: Accept late commits during grace period
-        // This handles network delays without breaking consensus
-        if state.phase != ConsensusPhase::Commit {
-            // Check if we're in reveal phase and can still accept late commits
-            if state.phase == ConsensusPhase::Reveal {
-                // CRITICAL: Accept ALL late commits during reveal phase (grace period)
-                // This prevents PhaseTimeout errors due to network delays
-                // Byzantine safety is ensured by checking threshold in finalize_round
-                let elapsed = state.phase_start.elapsed();
-                if elapsed < Duration::from_secs(5) {
-                    // Grace period: first 5 seconds of reveal phase
-                    println!("[CONSENSUS] ⚠️ Accepting late commit from {} during reveal grace period ({:?} elapsed)", 
-                             commit.node_id, elapsed);
-                } else {
-                    return Err(ConsensusError::PhaseTimeout("Commit phase ended and grace period expired".to_string()));
-                }
-            } else {
-            return Err(ConsensusError::PhaseTimeout("Commit phase ended".to_string()));
-            }
-        }
-        
         // Store commit
         state.commits.insert(commit.node_id.clone(), commit);
         
-        // Check if we have enough commits for Byzantine safety (2f+1 threshold)
-        // CRITICAL: Use INITIAL participants count, NOT current commits count
-        // Threshold must be based on total participants, not who responded
-        // Otherwise malicious nodes could reduce threshold by not responding!
+        // PRODUCTION v2.40: Log progress but do NOT change local phase!
+        // Phase transitions are determined ONLY by block_height
         let total_participants = state.participants.len();
-        let byzantine_threshold = (total_participants * 2 + 2) / 3; // 2f+1 for all participants
-        if state.commits.len() >= byzantine_threshold {
-            // Advance to reveal phase with Byzantine safety
-            println!("[CONSENSUS] ✅ Byzantine threshold reached: {}/{} commits", 
-                     state.commits.len(), byzantine_threshold);
-            state.phase = ConsensusPhase::Reveal;
-            state.phase_start = Instant::now();
-            state.phase_duration = self.config.reveal_phase_duration;
+        let byzantine_threshold = (total_participants * 2 + 2) / 3;
+        if state.commits.len() >= byzantine_threshold && state.commits.len() == byzantine_threshold {
+            // Log only once when threshold is reached
+            println!("[INFO][CONS] bft_threshold commits={}/{}", state.commits.len(), byzantine_threshold);
         }
         
         Ok(())
+    }
+    
+    /// Legacy process_commit without block_height (for backwards compatibility)
+    /// DEPRECATED: Use process_commit(commit, block_height) instead
+    pub async fn process_commit_legacy(&mut self, commit: Commit) -> Result<(), ConsensusError> {
+        // Fallback: use current stored height or assume we're in commit phase
+        // This should NOT be used in production
+        println!("[WARN][CONS] process_commit_legacy called - should use block_height version");
+        self.process_commit(commit, 61).await // Assume block 61 (start of commit)
     }
     
     /// PRODUCTION: Verify CRYSTALS-Dilithium post-quantum signature
@@ -243,58 +295,90 @@ impl CommitRevealConsensus {
         
         let valid = consensus_crypto::verify_consensus_signature(node_id, message, signature).await;
         
-        if valid {
-            println!("[CONSENSUS] ✅ Signature verified using consensus_crypto module");
-            println!("   Algorithm: CRYSTALS-Dilithium (quantum-resistant)");
-            println!("   Node: {}", node_id);
-        } else {
-            println!("[CONSENSUS] ❌ Signature verification failed");
-            println!("   Node: {}", node_id);
-            println!("   Possible attack: Forged or manipulated signature");
+        if !valid {
+            println!("[WARN][CONS] sig_verify_failed node={}", node_id);
         }
         
         valid
     }
     
-    /// Submit reveal for current round
-    pub fn submit_reveal(&mut self, reveal: Reveal) -> Result<(), ConsensusError> {
-        // First, check phase without mutable borrow
-        {
-            let state = self.current_round.as_ref().ok_or(ConsensusError::NoActiveRound)?;
-            
-            if state.phase != ConsensusPhase::Reveal {
-                if state.phase == ConsensusPhase::Commit {
-                    return Err(ConsensusError::InvalidPhase("Still in commit phase".to_string()));
-                }
-                return Err(ConsensusError::PhaseTimeout("Reveal phase ended".to_string()));
+    /// PRODUCTION v2.40: Submit reveal with block-based phase validation
+    /// Phase is determined by block_height, NOT by local state
+    /// This ensures all nodes accept reveals at the same block heights
+    pub fn submit_reveal(&mut self, reveal: Reveal, block_height: u64) -> Result<(), ConsensusError> {
+        // PRODUCTION v2.40: Validate phase by block height (deterministic across all nodes)
+        let current_phase = get_phase_for_block(block_height);
+        
+        // Accept reveals during Reveal phase OR Finalize phase (grace period)
+        match current_phase {
+            ConsensusPhase::Reveal => {
+                // Normal reveal phase - accept
             }
-            
-            // CRITICAL FIX: Don't verify reveal immediately if commit hasn't arrived yet
-            // Store reveal first, verification happens in finalize_round
-            // This handles race condition where reveal arrives before commit due to network delays
-            if let Err(e) = self.verify_reveal(&reveal, &state.commits) {
-                // If commit not found, check if we're in grace period (first 10 seconds)
-                let elapsed = state.phase_start.elapsed();
-                if elapsed < Duration::from_secs(10) && e.to_string().contains("No matching commit") {
-                    println!("[CONSENSUS] ⚠️ Reveal from {} arrived before commit (grace period, {:?} elapsed)", 
-                             reveal.node_id, elapsed);
-                    println!("[CONSENSUS] 💾 Storing reveal, will verify when commit arrives");
-                    // Continue to store reveal - will verify in finalize_round
+            ConsensusPhase::Finalize => {
+                // Grace period: accept late reveals during finalize
+                println!("[INFO][CONS] late_reveal node={} h={} finalize_grace", reveal.node_id, block_height);
+            }
+            ConsensusPhase::Commit => {
+                // PRODUCTION v2.40: Accept early reveals during late commit phase (blocks 69-72)
+                // This handles race condition where node transitions faster than others
+                let position = block_height % 90;
+                if position >= 69 {
+                    println!("[INFO][CONS] early_reveal node={} h={} commit_grace", reveal.node_id, block_height);
                 } else {
-                    // Outside grace period or other error
-                    return Err(e);
+                    return Err(ConsensusError::InvalidPhase(
+                        format!("Still in commit phase at block {} (position={})", block_height, position)
+                    ));
                 }
+            }
+            _ => {
+                return Err(ConsensusError::InvalidPhase(
+                    format!("Not in consensus window at block {} (phase={:?})", block_height, current_phase)
+                ));
             }
         }
         
-        // Now get mutable reference to insert reveal
+        // Check if we have an active round
+        let state = self.current_round.as_ref().ok_or(ConsensusError::NoActiveRound)?;
+        
+        // Clone commits for verification (avoids borrow issues)
+        let commits_clone = state.commits.clone();
+        
+        // Verify reveal matches commit if commit exists
+        // If commit not found, store anyway - will verify in finalize_round
+        if let Err(e) = self.verify_reveal(&reveal, &commits_clone) {
+            if e.to_string().contains("No matching commit") {
+                println!("[INFO][CONS] reveal_before_commit node={} storing_for_later", reveal.node_id);
+                // Continue to store - will verify in finalize_round
+            } else {
+                // Other verification error
+                return Err(e);
+            }
+        }
+        
+        // Now get mutable reference to store reveal
         let state = self.current_round.as_mut().ok_or(ConsensusError::NoActiveRound)?;
-        state.reveals.insert(reveal.node_id.clone(), reveal);  // Store full Reveal with nonce
+        state.reveals.insert(reveal.node_id.clone(), reveal);
+        
+        // Log progress
+        let total_participants = state.participants.len();
+        let byzantine_threshold = (total_participants * 2 + 2) / 3;
+        if state.reveals.len() >= byzantine_threshold && state.reveals.len() == byzantine_threshold {
+            println!("[INFO][CONS] bft_threshold reveals={}/{}", state.reveals.len(), byzantine_threshold);
+        }
         
         Ok(())
     }
     
+    /// Legacy submit_reveal without block_height (for backwards compatibility)
+    /// DEPRECATED: Use submit_reveal(reveal, block_height) instead
+    pub fn submit_reveal_legacy(&mut self, reveal: Reveal) -> Result<(), ConsensusError> {
+        println!("[WARN][CONS] submit_reveal_legacy called - should use block_height version");
+        self.submit_reveal(reveal, 73) // Assume block 73 (start of reveal)
+    }
+    
     /// Advance to next phase
+    /// PRODUCTION v2.40: This is mainly for cleanup after consensus completes
+    /// Phase transitions are now determined by block height, not this method
     pub fn advance_phase(&mut self) -> Result<ConsensusPhase, ConsensusError> {
         let state = self.current_round.as_mut().ok_or(ConsensusError::NoActiveRound)?;
         
@@ -313,6 +397,10 @@ impl CommitRevealConsensus {
             ConsensusPhase::Finalize => {
                 self.current_round = None;
                 Ok(ConsensusPhase::Commit) // Ready for next round
+            }
+            ConsensusPhase::Production => {
+                // Production phase - consensus not active, no transition
+                Ok(ConsensusPhase::Production)
             }
         }
     }
@@ -347,13 +435,12 @@ impl CommitRevealConsensus {
                 if let Some(_commit) = state.commits.get(node_id) {
                     // Verify reveal matches commit
                     if let Err(e) = self.verify_reveal(reveal, &state.commits) {
-                        println!("[CONSENSUS] ⚠️ Invalid reveal from {}: {}", node_id, e);
-                        // Skip invalid reveal
+                        println!("[WARN][CONS] invalid_reveal node={} err={}", node_id, e);
                         continue;
                     }
                     valid_reveals += 1;
                 } else {
-                    println!("[CONSENSUS] ⚠️ Reveal from {} has no matching commit - discarding", node_id);
+                    println!("[WARN][CONS] reveal_no_commit node={}", node_id);
                 }
             }
             
@@ -365,8 +452,7 @@ impl CommitRevealConsensus {
                 ));
             }
             
-            println!("[CONSENSUS] ✅ Byzantine finalization threshold reached: {}/{} valid reveals", 
-                     valid_reveals, byzantine_threshold);
+            println!("[INFO][CONS] finalize_ok valid={}/{}", valid_reveals, byzantine_threshold);
             
             // Byzantine-safe leader selection
             self.select_leader(&state.reveals)
@@ -585,9 +671,8 @@ impl CommitRevealConsensus {
                        existing_commit.signature != current_signature &&
                        self.verify_signature(node_id, &existing_commit.commit_hash, &existing_commit.signature).await {
                         
-                        // DOUBLE SIGNING DETECTED! - USE EXISTING REPUTATION SYSTEM
-                        println!("[CONSENSUS] 🚨 DOUBLE SIGNING DETECTED! Node {} signed different hashes for round {}", 
-                                node_id, round_number);
+                        // DOUBLE SIGNING DETECTED - cryptographic proof!
+                        println!("[CRITICAL][CONS] double_sign_detected node={} round={}", node_id, round_number);
                         
                         // PRODUCTION: Use EXISTING reputation system for slashing
                         let evidence = DoubleSignEvidence {
@@ -603,10 +688,10 @@ impl CommitRevealConsensus {
                             signature_b: current_signature.as_bytes().to_vec(),
                         };
                         
-                        // EXISTING SYSTEM: Use reputation system for slashing
+                        // Apply slashing via reputation system
                         let slashing_result = self.reputation.process_double_sign_evidence(&evidence);
-                        println!("[CONSENSUS] ⚔️ REPUTATION SLASHING: -{} reputation, new score: {}, banned: {}", 
-                                slashing_result.slashed_amount, slashing_result.new_reputation, slashing_result.is_banned);
+                        println!("[CRITICAL][CONS] slashing_applied node={} penalty={} new_rep={} banned={}", 
+                                node_id, slashing_result.slashed_amount, slashing_result.new_reputation, slashing_result.is_banned);
                         
                         return Err(ConsensusError::DoubleSigningDetected(
                             format!("Node {} double signed round {} - REPUTATION SLASHED! (hashes: {} vs {})", 
@@ -830,13 +915,17 @@ impl CommitRevealConsensus {
     }
 
     /// Add commit (alias for process_commit for API compatibility)
+    /// DEPRECATED: Use process_commit(commit, block_height) instead
     pub async fn add_commit(&mut self, commit: Commit) -> Result<(), ConsensusError> {
-        self.process_commit(commit).await
+        // Fallback to block 61 (start of commit phase)
+        self.process_commit(commit, 61).await
     }
 
     /// Add reveal (alias for submit_reveal for API compatibility)
+    /// DEPRECATED: Use submit_reveal(reveal, block_height) instead
     pub fn add_reveal(&mut self, reveal: Reveal) -> Result<(), ConsensusError> {
-        self.submit_reveal(reveal)
+        // Fallback to block 73 (start of reveal phase)
+        self.submit_reveal(reveal, 73)
     }
 
     // ═══════════════════════════════════════════════════════════════════════════

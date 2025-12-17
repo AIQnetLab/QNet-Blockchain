@@ -27,7 +27,7 @@ pub use batch_operations::{
     BatchOperationsManager, BatchRewardClaimRequest, BatchRewardClaimResult,
     BatchNodeActivationRequest, BatchNodeActivationResult, BatchTransferRequest, BatchTransferResult
 };
-pub use commit_reveal::{CommitRevealConsensus, ConsensusConfig};
+pub use commit_reveal::{CommitRevealConsensus, ConsensusConfig, ConsensusPhase, get_phase_for_block, is_in_consensus_window};
 pub use errors::ConsensusError;
 pub use reputation::{NodeReputation, ReputationConfig, MaliciousBehavior};
 pub use kademlia::{KademliaDht, KademliaNode, generate_node_id};

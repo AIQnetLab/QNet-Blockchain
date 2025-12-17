@@ -7191,14 +7191,17 @@ async fn handle_consensus_commit(
             signature: generate_quantum_signature(&commit_request.node_id, &commit_request.commit_hash).await,
         };
 
-        // Process commit through consensus engine
-        match consensus_engine.process_commit(commit).await {
+        // PRODUCTION v2.40: Get current block height for phase validation
+        let current_height = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+        
+        // Process commit through consensus engine with block height
+        match consensus_engine.process_commit(commit, current_height).await {
             Ok(_) => {
-                println!("[CONSENSUS] ✅ Commit processed by engine for round {}", commit_request.round);
+                println!("[INFO][CONS] rpc_commit round={} h={}", commit_request.round, current_height);
                 true
             }
             Err(e) => {
-                println!("[CONSENSUS] ❌ Commit rejected by engine: {:?}", e);
+                println!("[WARN][CONS] rpc_commit_rejected: {:?}", e);
                 false
             }
         }
@@ -7262,14 +7265,17 @@ async fn handle_consensus_reveal(
             timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
         };
 
-        // Process reveal through consensus engine
-        match consensus_engine.submit_reveal(reveal) {
+        // PRODUCTION v2.40: Get current block height for phase validation
+        let current_height = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+        
+        // Process reveal through consensus engine with block height
+        match consensus_engine.submit_reveal(reveal, current_height) {
             Ok(_) => {
-                println!("[CONSENSUS] ✅ Reveal processed by engine for round {}", reveal_request.round);
+                println!("[INFO][CONS] rpc_reveal round={} h={}", reveal_request.round, current_height);
                 true
             }
             Err(e) => {
-                println!("[CONSENSUS] ❌ Reveal rejected by engine: {:?}", e);
+                println!("[WARN][CONS] rpc_reveal_rejected: {:?}", e);
                 false
             }
         }
@@ -7312,6 +7318,7 @@ async fn handle_consensus_round_status(
                     qnet_consensus::commit_reveal::ConsensusPhase::Commit => "commit",
                     qnet_consensus::commit_reveal::ConsensusPhase::Reveal => "reveal",
                     qnet_consensus::commit_reveal::ConsensusPhase::Finalize => "finalize",
+                    qnet_consensus::commit_reveal::ConsensusPhase::Production => "production",
                 };
 
                 json!({

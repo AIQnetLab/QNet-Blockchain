@@ -1,9 +1,13 @@
-# QNet Blockchain Architecture v2.27
+# QNet Blockchain Architecture v2.40
 ## Post-Quantum Decentralized Network - Technical Documentation
 
-**Last Updated**: December 11, 2025  
-**Version**: 2.27.1  
-**Status**: Production Ready (Zero Fork Guarantee + Epoch-Based Validator Set)
+**Last Updated**: December 17, 2025  
+**Version**: 2.40.0  
+**Status**: Production Ready (Block-Based Consensus Phases + Zero Fork Guarantee)
+
+> ⚠️ **CONSENSUS UPDATED in v2.40.0**  
+> Phases now determined by block height (deterministic), not message counts.  
+> See [docs/REPUTATION_SYSTEM.md](REPUTATION_SYSTEM.md) for updated slashing/jailing policies.
 
 > ⚠️ **REPUTATION SYSTEM UPDATED in v2.21.0**  
 > The reputation section in this document describes the OLD P2P gossip-based system.  
@@ -121,7 +125,7 @@ pub struct EligibleProducer {
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                    MACROBLOCK CONSENSUS FLOW (v2.36)                        │
+│                    MACROBLOCK CONSENSUS FLOW (v2.40)                        │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
 │  STEP 1: LEADER SELECTION (Deterministic + Quantum-Resistant)              │
@@ -130,15 +134,20 @@ pub struct EligibleProducer {
 │  └── 256-bit quantum resistance (Grover's algorithm)                      │
 │  └── ALL nodes compute SAME leader (determinism!)                         │
 │                                                                             │
-│  STEP 2: COMMIT-REVEAL PHASES                                              │
-│  ├── All validators submit COMMIT (cryptographic commitment)              │
-│  ├── All validators submit REVEAL (open commitment)                       │
-│  └── Leader collects commits/reveals via P2P channel                      │
+│  STEP 2: BLOCK-BASED CONSENSUS PHASES (v2.40)                              │
+│  ├── Blocks 61-72: COMMIT PHASE (12 seconds)                              │
+│  │   └── All validators submit COMMIT (cryptographic commitment)          │
+│  │   └── Phase determined by get_phase_for_block(height)                  │
+│  ├── Blocks 73-84: REVEAL PHASE (12 seconds)                              │
+│  │   └── All validators submit REVEAL (open commitment)                   │
+│  │   └── Grace periods: accepts late commits (73-78), early reveals (69-72)│
+│  └── Blocks 85-90: FINALIZE PHASE (6 seconds)                             │
+│      └── Leader collects commits/reveals, prepares MacroBlock             │
 │                                                                             │
 │  STEP 3: LEADER CREATES MACROBLOCK                                         │
 │  └── ONLY Leader calls trigger_macroblock_consensus()                     │
 │  └── eligible_producers = ONLY consensus participants (commit+reveal)     │
-│  └── NO P2P registry lookups! Deterministic from consensus data.          │
+│  └── NO automatic jails (v2.40) - timing issues are not offenses          │
 │                                                                             │
 │  STEP 4: BROADCAST (v2.37)                                                 │
 │  └── Leader broadcasts MacroBlock via dedicated QUIC channel              │

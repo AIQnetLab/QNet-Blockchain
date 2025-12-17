@@ -728,44 +728,31 @@ impl BlockchainNode {
         self.deterministic_reputation.clone()
     }
     
-    /// PRODUCTION: Compute automatic jails for nodes that committed but didn't reveal
-    /// These nodes started consensus but failed to complete it (possible attack or failure)
+    /// PRODUCTION v2.40: Compute automatic jails
+    /// 
+    /// ARCHITECTURE DECISION: NO JAIL for commit-without-reveal!
+    /// 
+    /// Reason: Block-based phase transitions mean nodes may miss reveal window
+    /// due to legitimate network conditions (latency, clock skew). This is NOT
+    /// a provable offense. Instead:
+    /// - Nodes that didn't reveal simply don't get consensus reward (+1%)
+    /// - They get small penalty (-1%) via PENALTY_MISSED_CONSENSUS
+    /// - This is sufficient deterrent without cascade jail problems
+    /// 
+    /// Jails are ONLY for cryptographically provable severe offenses:
+    /// - Double-signing (2 signatures on conflicting blocks at same height)
+    /// - Invalid block production (signature/hash verification failure)
     fn compute_automatic_jails(
-        commit_participants: &std::collections::HashSet<String>,
-        reveal_participants: &std::collections::HashSet<String>,
-        timestamp: u64
+        _commit_participants: &std::collections::HashSet<String>,
+        _reveal_participants: &std::collections::HashSet<String>,
+        _timestamp: u64
     ) -> Vec<qnet_consensus::deterministic_reputation::AutomaticJail> {
-        use qnet_consensus::deterministic_reputation::AutomaticJail;
-        
-        use sha3::{Sha3_256, Digest};
-        
-        // Find nodes that committed but didn't reveal
-        let commit_only: Vec<String> = commit_participants
-            .difference(reveal_participants)
-            .cloned()
-            .collect();
-        
-        // Get current block height
-        let current_height = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
-        
-        // Create automatic jail for each (1 hour jail for first offense, escalates)
-        commit_only.into_iter().map(|node_id| {
-            // Create evidence hash from node_id and timestamp
-            let mut hasher = Sha3_256::new();
-            hasher.update(node_id.as_bytes());
-            hasher.update(&timestamp.to_le_bytes());
-            hasher.update(b"commit_without_reveal");
-            let evidence_hash: [u8; 32] = hasher.finalize().into();
-            
-            AutomaticJail {
-                node_id,
-                offense_count: 1, // Will be updated by DeterministicReputationState
-                jail_start_height: current_height,
-                jail_duration: 3600, // 1 hour base jail
-                reason: "Committed but failed to reveal in consensus".to_string(),
-                evidence_hash,
-            }
-        }).collect()
+        // PRODUCTION v2.40: Return empty - no automatic jails for timing issues
+        // Commit-without-reveal is handled by:
+        // 1. No reward (+1% consensus participation)
+        // 2. Small penalty (-1% PENALTY_MISSED_CONSENSUS)
+        // This avoids cascade jailing from network timing issues
+        Vec::new()
     }
     
     // ═══════════════════════════════════════════════════════════════════════════
@@ -5449,54 +5436,51 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
     }
     
     
-    /// PRODUCTION: Process consensus messages from other nodes 
-    /// Returns (node_id, success) for reputation tracking
+    /// PRODUCTION v2.40: Process consensus messages with block-based phase validation
+    /// Returns (node_id, success, error) for reputation tracking
+    /// Phase is determined by block_height, ensuring all nodes validate identically
     async fn process_consensus_message(
         consensus_engine: &mut qnet_consensus::CommitRevealConsensus,
         message: ConsensusMessage,
+        block_height: u64,  // PRODUCTION v2.40: Block height for deterministic phase
     ) -> (String, bool, Option<String>) {
         use qnet_consensus::commit_reveal::{Commit, Reveal};
         
         match message {
             ConsensusMessage::RemoteCommit { round_id, node_id, commit_hash, signature, timestamp } => {
-                println!("[INFO][CONS] remote_commit node={} round={}", node_id, round_id);
+                if is_debug() { println!("[DBG][CONS] remote_commit node={} round={} h={}", node_id, round_id, block_height); }
                 
                 // Create commit from remote node data
                 let remote_commit = Commit {
                     node_id: node_id.clone(),
                     commit_hash,
                     timestamp,
-                    signature,  // CONSENSUS FIX: Use real signature from remote node for Byzantine validation
+                    signature,
                 };
                 
-                // Submit remote commit to consensus engine
-                match consensus_engine.process_commit(remote_commit).await {
+                // PRODUCTION v2.40: Submit with block_height for phase validation
+                match consensus_engine.process_commit(remote_commit, block_height).await {
                     Ok(_) => {
-                        if is_info() { println!("[INFO][CONS] commit from={}", node_id); }
+                        if is_info() { println!("[INFO][CONS] commit from={} h={}", node_id, block_height); }
                         (node_id, true, None)
                     }
                     Err(e) => {
                         let error_str = format!("{:?}", e);
-                        println!("[ERR][CONS] Remote commit rejected from {}: {}", node_id, error_str);
+                        println!("[WARN][CONS] commit_rejected node={} h={}: {}", node_id, block_height, error_str);
                         (node_id, false, Some(error_str))
                     }
                 }
             }
             
             ConsensusMessage::RemoteReveal { round_id, node_id, reveal_data, nonce, timestamp } => {
-                println!("[INFO][CONS] remote_reveal node={} round={}", node_id, round_id);
+                if is_debug() { println!("[DBG][CONS] remote_reveal node={} round={} h={}", node_id, round_id, block_height); }
                 
                 // Create reveal from remote node data  
                 let reveal_bytes = hex::decode(&reveal_data)
-                    .unwrap_or_else(|_| reveal_data.as_bytes().to_vec()); // Try hex decode first, fallback to direct bytes
+                    .unwrap_or_else(|_| reveal_data.as_bytes().to_vec());
                 
-                // CRITICAL: Use the nonce transmitted from the remote node, NOT a new one!
-                // The nonce must match what was used in the commit phase for verification
+                // CRITICAL: Use the nonce transmitted from the remote node
                 let nonce_bytes = hex::decode(&nonce)
-                    .map_err(|e| {
-                        println!("[ERR][CONS] Failed to decode nonce hex: {}", e);
-                        e
-                    })
                     .ok()
                     .and_then(|bytes| {
                         if bytes.len() == 32 {
@@ -5504,28 +5488,27 @@ if is_info() { println!("[INFO][MB] rep participants={} online={}", macroblock.c
                             array.copy_from_slice(&bytes);
                             Some(array)
                         } else {
-                            println!("[ERR][CONS] Invalid nonce length: {} (expected 32)", bytes.len());
                             None
                         }
                     })
-                    .unwrap_or([0u8; 32]); // Fallback to zeros if decoding fails
+                    .unwrap_or([0u8; 32]);
                 
                 let remote_reveal = Reveal {
                     node_id: node_id.clone(),
                     reveal_data: reveal_bytes,
-                    nonce: nonce_bytes,  // Use the decoded nonce bytes
+                    nonce: nonce_bytes,
                     timestamp,
                 };
                 
-                // Submit remote reveal to consensus engine
-                match consensus_engine.submit_reveal(remote_reveal) {
+                // PRODUCTION v2.40: Submit with block_height for phase validation
+                match consensus_engine.submit_reveal(remote_reveal, block_height) {
                     Ok(_) => {
-                        if is_info() { println!("[INFO][CONS] reveal from={}", node_id); }
+                        if is_info() { println!("[INFO][CONS] reveal from={} h={}", node_id, block_height); }
                         (node_id, true, None)
                     }
                     Err(e) => {
                         let error_str = format!("{:?}", e);
-                        println!("[ERR][CONS] Remote reveal rejected from {}: {}", node_id, error_str);
+                        println!("[WARN][CONS] reveal_rejected node={} h={}: {}", node_id, block_height, error_str);
                         (node_id, false, Some(error_str))
                     }
                 }
@@ -11801,12 +11784,17 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 signature,
             };
             
-            // CRITICAL FIX: Debug commit before processing
-            println!("[DBG][CONS] process_commit node={} sig_len={} hash={}", 
-                commit.node_id, commit.signature.len(), &commit.commit_hash[..16]);
+            // PRODUCTION v2.40: Get current block height for deterministic phase validation
+            let current_block_height = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
             
-            // Submit OWN commit to consensus engine FIRST
-            match consensus_engine.process_commit(commit.clone()).await {
+            // CRITICAL FIX: Debug commit before processing
+            if is_debug() {
+                println!("[DBG][CONS] process_commit node={} h={} sig_len={}", 
+                    commit.node_id, current_block_height, commit.signature.len());
+            }
+            
+            // Submit OWN commit to consensus engine with block height
+            match consensus_engine.process_commit(commit.clone(), current_block_height).await {
                 Ok(_) => {
                     if is_debug() { println!("[DBG][CONS] own_commit id={}", our_id); }
                     
@@ -11900,24 +11888,23 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     // Try to read messages from consensus channel (non-blocking)
                     match consensus_rx_ref.try_recv() {
                         Ok(message) => {
-                            println!("[INFO][CONS] p2p_msg received");
-                            let (node_id, success, error) = Self::process_consensus_message(consensus_engine, message).await;
+                            // PRODUCTION v2.40: Get current block height for phase validation
+                            let current_height = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+                            if is_debug() { println!("[DBG][CONS] p2p_msg h={}", current_height); }
+                            
+                            let (node_id, success, error) = Self::process_consensus_message(consensus_engine, message, current_height).await;
                             
                             // SECURITY: Reputation handled via DeterministicReputationState in macroblock
                             if !success {
                                 if let Some(err) = error {
-                                    // Invalid commit/reveal - report for slashing
+                                    // Invalid signature - report for slashing
                                     if err.contains("InvalidSignature") {
-                                        println!("[SECURITY] 🚨 Invalid signature from {} - reporting for slashing", node_id);
+                                        println!("[SECURITY] invalid_sig node={}", node_id);
                                         if let Some(ref p2p) = unified_p2p {
-                                            let current_height = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
                                             p2p.report_invalid_block(&node_id, current_height, [0u8; 32], "Invalid signature in consensus");
                                         }
-                                    } else if err.contains("PhaseTimeout") {
-                                        // Late submission - minor issue, no penalty
-                                        println!("[WARN][CONS] Late submission from {} - no penalty", node_id);
                                     }
-                                    // Other errors (NoActiveRound, etc.) - no penalty, could be timing issue
+                                    // Phase/timing errors - no penalty (block-based phases handle this)
                                 }
                             }
                             
@@ -12024,7 +12011,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
             // Create OWN reveal for broadcast
             let reveal = Reveal {
                 node_id: our_id.clone(),
-                reveal_data: reveal_data.clone(), // Already Vec<u8>
+                reveal_data: reveal_data.clone(),
                 nonce,
                 timestamp: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -12032,8 +12019,11 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     .as_secs(),
             };
             
-            // Submit OWN reveal to consensus engine
-            match consensus_engine.submit_reveal(reveal.clone()) {
+            // PRODUCTION v2.40: Get current block height for deterministic phase validation
+            let current_block_height = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+            
+            // Submit OWN reveal with block height
+            match consensus_engine.submit_reveal(reveal.clone(), current_block_height) {
                 Ok(_) => {
                     if is_debug() { println!("[DBG][CONS] own_reveal id={}", our_id); }
                     
@@ -12114,17 +12104,20 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                     // Try to read messages from consensus channel (non-blocking)
                     match consensus_rx_ref.try_recv() {
                         Ok(message) => {
-                            println!("[INFO][CONS] p2p_reveal received");
-                            let (node_id, success, error) = Self::process_consensus_message(consensus_engine, message).await;
+                            // PRODUCTION v2.40: Get current block height for phase validation
+                            let current_height = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+                            if is_debug() { println!("[DBG][CONS] p2p_reveal h={}", current_height); }
+                            
+                            let (node_id, success, error) = Self::process_consensus_message(consensus_engine, message, current_height).await;
                             
                             // SECURITY: Reputation handled via DeterministicReputationState in macroblock
                             if success {
-                                received_reveals += 1; // Only count valid reveals
+                                received_reveals += 1;
                             } else if let Some(err) = error {
+                                // Only report cryptographic errors, not timing issues
                                 if err.contains("InvalidSignature") || err.contains("InvalidReveal") {
-                                    println!("[SECURITY] 🚨 Invalid reveal from {} - reporting for slashing", node_id);
+                                    println!("[SECURITY] invalid_reveal node={}", node_id);
                                     if let Some(ref p2p) = unified_p2p {
-                                        let current_height = crate::unified_p2p::LOCAL_BLOCKCHAIN_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
                                         p2p.report_invalid_block(&node_id, current_height, [0u8; 32], "Invalid reveal in consensus");
                                     }
                                 }

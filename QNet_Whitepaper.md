@@ -2265,10 +2265,39 @@ pub struct PreExecutionMetrics {
 - Prevention of voting manipulation
 - Finalization through information disclosure
 - Resistance to 33% malicious nodes
+- **Block-based phase synchronization (v2.40)**: All nodes in same phase at same height
 
-### 9.2 Detailed Process
+### 9.2 Block-Based Phase Layout (v2.40)
 
-**Phase 1 - Commit (15 seconds):**
+**90-Block Epoch Structure:**
+| Blocks | Phase | Duration | Purpose |
+|--------|-------|----------|---------|
+| 1-60 | Production | 60s | Microblock creation only |
+| 61-72 | Commit | 12s | Validators submit encrypted votes |
+| 73-84 | Reveal | 12s | Validators reveal votes |
+| 85-90 | Finalize | 6s | Leader creates MacroBlock |
+
+**Phase Determination:**
+```rust
+// DETERMINISTIC: All nodes compute IDENTICAL phase from height
+fn get_phase_for_block(height: u64) -> ConsensusPhase {
+    match height % 90 {
+        0 => Finalize,        // Block 90, 180, 270...
+        1..=60 => Production, // Microblocks only
+        61..=72 => Commit,    // Submit commits
+        73..=84 => Reveal,    // Submit reveals
+        85..=89 => Finalize,  // Create MacroBlock
+    }
+}
+```
+
+**Grace Periods (Network Tolerance):**
+- Commits accepted: blocks 61-78 (includes early Reveal grace)
+- Reveals accepted: blocks 69-90 (includes late Commit and Finalize grace)
+
+### 9.3 Message Structures
+
+**Commit Message:**
 ```rust
 commit = {
     round_id: u64,
@@ -2279,7 +2308,7 @@ commit = {
 }
 ```
 
-**Phase 2 - Reveal (15 seconds):**
+**Reveal Message:**
 ```rust
 reveal = {
     round_id: u64,
@@ -2296,7 +2325,17 @@ reveal = {
 - Count votes from valid reveals
 - Consensus at 2f+1 agreeing votes
 
-### 9.3 Validator Selection
+### 9.4 No Automatic Jailing (v2.40)
+
+**Previous behavior:** Nodes that committed but didn't reveal were jailed (1h+)
+**Current behavior:** Only -1% reputation penalty (no jail)
+
+**Rationale:**
+- Timing issues may be caused by network latency, not malicious intent
+- Cannot cryptographically prove if miss was intentional
+- Prevents cascade jailing that kills the network
+
+### 9.5 Validator Selection
 
 **Cryptographically deterministic selection:**
 
