@@ -11373,7 +11373,7 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         ).await;
     }
     
-    /// CRITICAL: Progressive Finalization with degradation level
+    /// PRODUCTION v2.42: Progressive Finalization Protocol with deterministic leader
     async fn activate_progressive_finalization_with_level(
         storage: Arc<Storage>,
         consensus: Arc<RwLock<qnet_consensus::CommitRevealConsensus>>,
@@ -11381,116 +11381,201 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         unified_p2p: Option<Arc<SimplifiedP2P>>,
         blocks_without_finalization: u64,
     ) {
-        println!("[PFP] 🚀 PROGRESSIVE FINALIZATION PROTOCOL");
-        println!("[PFP]    Height: {} | Blocks without macroblock: {}", 
-                 current_height, blocks_without_finalization);
-        println!("[PFP]    Expected macroblock: #{}", current_height / 90);
+        let expected_macroblock = current_height / 90;
+        
+        if is_info() { 
+            println!("[INFO][PFP] activated h={} mb={} blocks_without={}", 
+                     current_height, expected_macroblock, blocks_without_finalization); 
+        }
         
         if let Some(p2p) = unified_p2p {
             let validated_peers = p2p.get_validated_active_peers();
             let available_nodes = validated_peers.len() + 1; // Include self
-        
             
-            println!("[PFP]    Height: {} | Available nodes: {}", 
-                     current_height,
-                     available_nodes);
-            
-            // Progressive degradation based on ACTUAL network size
-            // No artificial phases - use real node count
-            let total_for_consensus = std::cmp::min(available_nodes, 1000); // Cap at 1000 for scalability
+            // Progressive degradation based on network size
+            let total_for_consensus = std::cmp::min(available_nodes, 1000);
             
             let (required_nodes, timeout, finalization_type) = {
                 match blocks_without_finalization {
                     0..=90 => {
-                        // Standard: 80% of available (max 800)
                         let required = std::cmp::min((total_for_consensus * 80) / 100, 800);
                         (std::cmp::max(required, 1), 30, "standard")
                     }
                     91..=180 => {
-                        // Checkpoint: 60% of available (max 600)
                         let required = std::cmp::min((total_for_consensus * 60) / 100, 600);
                         (std::cmp::max(required, 1), 10, "checkpoint")
                     }
                     181..=270 => {
-                        // Emergency: 40% of available (max 400)
                         let required = std::cmp::min((total_for_consensus * 40) / 100, 400);
                         (std::cmp::max(required, 1), 5, "emergency")
                     }
                     _ => {
-                        // Critical: 1% of available (min 1, max 10)
                         let required = std::cmp::min((total_for_consensus * 1) / 100, 10);
                         (std::cmp::max(required, 1), 2, "critical")
                     }
                 }
             };
             
-            println!("[PFP]    Mode: {} finalization", finalization_type);
-            println!("[PFP]    Required nodes: {}/{} | Timeout: {} seconds", 
-                     required_nodes, available_nodes, timeout);
+            if is_debug() { 
+                println!("[DBG][PFP] mode={} required={}/{} timeout={}s", 
+                         finalization_type, required_nodes, available_nodes, timeout); 
+            }
             
             // Execute progressive finalization
             let storage_finalize = storage.clone();
             let consensus_finalize = consensus.clone();
             let p2p_finalize = p2p.clone();
             
+            // Get own node_id for leader selection
+            let own_node_id = p2p.get_node_id();
+            
             tokio::spawn(async move {
                 // ═══════════════════════════════════════════════════════════════════
-                // PRODUCTION v2.31: TRY TO SYNC FROM NETWORK FIRST before emergency!
-                // If macroblock exists in network, we should GET it, not CREATE it
+                // PRODUCTION v2.42: DETERMINISTIC LEADER SELECTION FOR PFP
+                // Same architecture as normal consensus - ONE leader creates MacroBlock
                 // ═══════════════════════════════════════════════════════════════════
                 let expected_macroblock = current_height / 90;
                 
-                println!("[PFP] 📡 Step 1: Trying to sync macroblock #{} from network...", expected_macroblock);
+                if is_info() { println!("[INFO][PFP] sync_attempt mb={} h={}", expected_macroblock, current_height); }
                 
-                // Try to request macroblock from network (3 attempts with increasing delay)
+                // Step 1: Try to sync from network first
                 let mut synced_from_network = false;
                 for attempt in 1..=3 {
                     if let Err(e) = p2p_finalize.sync_macroblocks(expected_macroblock, expected_macroblock).await {
-                        println!("[PFP] ⚠️ Sync attempt {}/3 failed: {}", attempt, e);
+                        if is_debug() { println!("[DBG][PFP] sync_failed mb={} attempt={} err={}", expected_macroblock, attempt, e); }
                     }
                     
-                    // Wait for sync to complete
                     tokio::time::sleep(Duration::from_secs(2 * attempt)).await;
                     
-                    // Check if we received it
                     let has_macroblock = storage_finalize.get_macroblock_by_height(expected_macroblock)
                         .map(|mb| mb.is_some())
                         .unwrap_or(false);
                     
                     if has_macroblock {
-                        println!("[PFP] ✅ Macroblock #{} received from network! No emergency creation needed.", expected_macroblock);
+                        if is_info() { println!("[INFO][PFP] synced mb={} source=network", expected_macroblock); }
                         synced_from_network = true;
                         break;
                     }
                 }
                 
-                // If synced from network - we're done, no need for emergency creation
                 if synced_from_network {
                     return;
                 }
                 
-                println!("[PFP] ⚠️ Step 2: Network sync failed, proceeding with emergency creation...");
+                // ═══════════════════════════════════════════════════════════════════
+                // CRITICAL v2.42: DETERMINISTIC PARTICIPANTS LIST
+                // All nodes MUST compute IDENTICAL list for deterministic leader!
+                // ═══════════════════════════════════════════════════════════════════
                 
-                // Wait for shortened timeout
-                tokio::time::sleep(Duration::from_secs(timeout)).await;
-                
-                // Collect available participants
-                let mut participants = p2p_finalize.get_validated_active_peers()
+                // Get all validated peers + self = complete participant list
+                let mut all_participants: Vec<String> = p2p_finalize.get_validated_active_peers()
                     .into_iter()
-                    .take(required_nodes)
                     .map(|peer| peer.id)
-                    .collect::<Vec<_>>();
+                    .collect();
                 
-                // Add self if needed
-                if participants.len() < required_nodes {
-                    participants.push(p2p_finalize.get_node_id());
+                // CRITICAL: Always include self in participants (was the bug!)
+                let self_id = p2p_finalize.get_node_id();
+                if !all_participants.contains(&self_id) {
+                    all_participants.push(self_id.clone());
                 }
                 
-                // CRITICAL: Sort participants for deterministic next_leader selection (line 7966)
-                participants.sort();
+                // CRITICAL: Sort for deterministic ordering across ALL nodes
+                all_participants.sort();
                 
-                if participants.len() >= required_nodes {
-                    // Create emergency macroblock with reduced requirements
+                // Limit to required nodes (deterministic: first N after sort)
+                let participants: Vec<String> = all_participants.iter()
+                    .take(required_nodes.max(1))
+                    .cloned()
+                    .collect();
+                
+                if participants.is_empty() {
+                    println!("[ERR][PFP] no_participants mb={}", expected_macroblock);
+                    return;
+                }
+                
+                // ═══════════════════════════════════════════════════════════════════
+                // CRITICAL v2.42: SELECT ONE LEADER DETERMINISTICALLY
+                // Same logic as should_initiate_consensus() - SHA3-512 entropy
+                // Only leader creates MacroBlock, others wait for sync
+                // ═══════════════════════════════════════════════════════════════════
+                
+                let pfp_leader = {
+                    use sha3::{Sha3_512, Digest};
+                    let mut hasher = Sha3_512::new();
+                    
+                    // Entropy from blockchain (deterministic across all nodes)
+                    hasher.update(b"QNet_PFP_Leader_Selection_v2.43");
+                    hasher.update(&expected_macroblock.to_le_bytes());
+                    hasher.update(&current_height.to_le_bytes());
+                    
+                    // v2.43: Add attempt-based rotation to prevent deadlock
+                    // Uses deterministic counter based on how many times PFP was triggered
+                    // All nodes increment this counter together when they detect stall
+                    // REMOVED time-based: different node clocks could cause different leaders!
+                    
+                    // Calculate PFP attempt from blockchain state (deterministic!)
+                    // If macroblock doesn't exist after expected_height, increment attempt
+                    let blocks_past_expected = current_height.saturating_sub(expected_macroblock * 90);
+                    let pfp_attempt = blocks_past_expected / 30;  // New leader every 30 blocks past deadline
+                    hasher.update(&pfp_attempt.to_le_bytes());
+                    
+                    // Add finality block hash for additional entropy
+                    let finality_height = current_height.saturating_sub(10);
+                    if let Ok(Some(block_data)) = storage_finalize.load_microblock(finality_height) {
+                        use sha3::Sha3_256;
+                        let mut block_hasher = Sha3_256::new();
+                        block_hasher.update(&block_data);
+                        hasher.update(&block_hasher.finalize());
+                    }
+                    
+                    // Add sorted participant list
+                    for p in &participants {
+                        hasher.update(p.as_bytes());
+                    }
+                    
+                    let hash = hasher.finalize();
+                    let selection_value = u64::from_le_bytes([
+                        hash[0], hash[1], hash[2], hash[3],
+                        hash[4], hash[5], hash[6], hash[7],
+                    ]);
+                    
+                    let leader_index = (selection_value as usize) % participants.len();
+                    
+                    if is_info() { 
+                        println!("[INFO][PFP] entropy mb={} h={} attempt={} candidates={}", 
+                                 expected_macroblock, current_height, pfp_attempt, participants.len()); 
+                    }
+                    
+                    participants[leader_index].clone()
+                };
+                
+                let is_leader = own_node_id == pfp_leader;
+                
+                if is_info() { 
+                    println!("[INFO][PFP] leader_selected mb={} leader={} is_self={} participants={}", 
+                             expected_macroblock, pfp_leader, is_leader, participants.len()); 
+                }
+                
+                if is_leader {
+                    // ═══════════════════════════════════════════════════════════════
+                    // WE ARE THE LEADER - Create and broadcast MacroBlock
+                    // ═══════════════════════════════════════════════════════════════
+                    
+                    // Wait for timeout before creating (give normal consensus chance)
+                    tokio::time::sleep(Duration::from_secs(timeout)).await;
+                    
+                    // Double-check: maybe someone else created it during wait
+                    if storage_finalize.get_macroblock_by_height(expected_macroblock)
+                        .map(|mb| mb.is_some())
+                        .unwrap_or(false) 
+                    {
+                        if is_info() { println!("[INFO][PFP] already_exists mb={} skip=leader_create", expected_macroblock); }
+                        return;
+                    }
+                    
+                    if is_info() { println!("[INFO][PFP] creating mb={} type={} nodes={}", 
+                             expected_macroblock, finalization_type, participants.len()); }
+                    
                     match Self::create_emergency_macroblock_internal(
                         storage_finalize.clone(),
                         consensus_finalize,
@@ -11499,56 +11584,81 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         finalization_type
                     ).await {
                         Ok(_) => {
-                            println!("[PFP] ✅ {} macroblock created with {} nodes", 
-                                     finalization_type, participants.len());
+                            if is_info() { println!("[INFO][PFP] created mb={} type={}", expected_macroblock, finalization_type); }
                             
-                            // Broadcast success
+                            // Broadcast to network so others can sync
                             let _ = p2p_finalize.broadcast_emergency_producer_change(
-                                "failed_consensus",
-                                &format!("{}_finalization", finalization_type),
-                current_height,
-                "macroblock"
+                                "pfp_leader",
+                                &pfp_leader,
+                                current_height,
+                                "macroblock"
                             );
                         }
                         Err(e) => {
-                            println!("[PFP] ❌ {} finalization failed: {}", finalization_type, e);
+                            println!("[ERR][PFP] create_failed mb={} err={}", expected_macroblock, e);
                         }
                     }
-            } else {
-                    println!("[PFP] ❌ Not enough nodes: {}/{}", participants.len(), required_nodes);
+                } else {
+                    // ═══════════════════════════════════════════════════════════════
+                    // WE ARE NOT THE LEADER - Wait for leader to create, then sync
+                    // ═══════════════════════════════════════════════════════════════
+                    
+                    if is_debug() { println!("[DBG][PFP] waiting_for_leader mb={} leader={}", expected_macroblock, pfp_leader); }
+                    
+                    // Wait longer than leader's timeout to give them time to create
+                    tokio::time::sleep(Duration::from_secs(timeout + 10)).await;
+                    
+                    // Try to sync the macroblock created by leader
+                    for attempt in 1..=5 {
+                        if let Err(e) = p2p_finalize.sync_macroblocks(expected_macroblock, expected_macroblock).await {
+                            if is_debug() { println!("[DBG][PFP] leader_sync_failed mb={} attempt={} err={}", expected_macroblock, attempt, e); }
+                        }
+                        
+                        tokio::time::sleep(Duration::from_secs(3)).await;
+                        
+                        if storage_finalize.get_macroblock_by_height(expected_macroblock)
+                            .map(|mb| mb.is_some())
+                            .unwrap_or(false) 
+                        {
+                            if is_info() { println!("[INFO][PFP] synced_from_leader mb={} leader={}", expected_macroblock, pfp_leader); }
+                            return;
+                        }
+                    }
+                    
+                    // Leader failed - but we should NOT create our own to avoid fork!
+                    // Next PFP cycle will select new leader
+                    println!("[WARN][PFP] leader_timeout mb={} leader={} action=wait_next_cycle", expected_macroblock, pfp_leader);
                 }
             });
         }
     }
     
-    /// Create emergency macroblock with reduced consensus requirements
+    /// PRODUCTION v2.42: Create emergency macroblock (called ONLY by PFP leader)
     async fn create_emergency_macroblock_internal(
         storage: Arc<Storage>,
-        consensus: Arc<RwLock<qnet_consensus::CommitRevealConsensus>>,
+        _consensus: Arc<RwLock<qnet_consensus::CommitRevealConsensus>>,
         height: u64,
         participants: Vec<String>,
         finalization_type: &str,
     ) -> Result<(), String> {
         use sha3::{Sha3_256, Digest};
         
-        // CRITICAL FIX: Don't create macroblock for Genesis (height=0)
+        // Validate height
         if height == 0 {
-            println!("[PFP] ⚠️ Skipping macroblock creation for Genesis (height=0)");
+            if is_debug() { println!("[DBG][PFP] skip_genesis h=0"); }
             return Ok(());
         }
         
-        // Calculate macroblock index FIRST for existence check
-        let macroblock_index = height / 90;  // Must match trigger_macroblock_consensus formula!
+        let macroblock_index = height / 90;
         
-        // CRITICAL FIX v2.26.8: Check if macroblock already exists before creating!
-        // This prevents infinite loop of creating the same macroblock
+        // Check if already exists (race condition protection)
         if let Ok(Some(_)) = storage.get_macroblock_by_height(macroblock_index) {
-            println!("[PFP] ✅ Macroblock #{} already exists - skipping creation", macroblock_index);
+            if is_debug() { println!("[DBG][PFP] already_exists mb={}", macroblock_index); }
             return Ok(());
         }
         
-        println!("[PFP] 🔨 Creating {} macroblock #{} with {} participants", 
-                 finalization_type, macroblock_index, participants.len());
+        if is_info() { println!("[INFO][PFP] creating_macroblock mb={} type={} participants={}", 
+                 macroblock_index, finalization_type, participants.len()); }
         
         // Calculate state root from microblocks
         // CRITICAL FIX: Correct calculation for macroblock boundaries
@@ -11694,10 +11804,10 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
         storage.save_macroblock(macroblock.height, &macroblock).await
             .map_err(|e| format!("Failed to save macroblock: {:?}", e))?;
         
-        println!("[PFP] ✅ {} macroblock #{} saved successfully", 
-                 finalization_type, macroblock.height);
-        println!("[PFP]    Finalized {} microblocks", microblock_count);
-        println!("[PFP]    Participants: {:?}", participants);
+        if is_info() { 
+            println!("[INFO][PFP] saved mb={} type={} blocks={} participants={}", 
+                     macroblock.height, finalization_type, microblock_count, participants.len()); 
+        }
         
         Ok(())
     }
