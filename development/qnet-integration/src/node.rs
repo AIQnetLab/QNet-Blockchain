@@ -10000,6 +10000,17 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 &None  // Don't pass PoH to avoid race conditions
             ).await;
             
+            // CRITICAL FIX v2.44: If correct_producer is empty, node is DESYNC'd
+            // Node MUST NOT participate in emergency selection - it would cause FORK!
+            if correct_producer.is_empty() {
+                println!("[ERR][EMERGENCY] correct_producer=EMPTY node_desync=true h={}", current_height);
+                println!("[ERR][EMERGENCY] Node is NOT synchronized - CANNOT participate in emergency selection!");
+                println!("[ERR][EMERGENCY] Returning failed_producer to avoid fork: {}", failed_producer);
+                // Return failed producer - this node should NOT produce
+                // Other synchronized nodes will select proper emergency producer
+                return failed_producer.to_string();
+            }
+            
             println!("[EMERGENCY_SELECTION] 🔄 Recalculated correct producer for block #{}: {}", current_height, correct_producer);
             println!("[EMERGENCY_SELECTION] ℹ️  Reported failed producer: {} (may be stale)", failed_producer);
             
@@ -10010,6 +10021,13 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                 println!("[EMERGENCY_SELECTION] 📋 Using standard qualified candidates");
                 
                 let qualified = Self::calculate_qualified_candidates(p2p, own_node_id, own_node_type).await;
+                
+                // CRITICAL FIX v2.44: If qualified is empty, node is DESYNC'd - abort!
+                if qualified.is_empty() {
+                    println!("[ERR][EMERGENCY] no_qualified_candidates node_desync=true h={}", current_height);
+                    println!("[ERR][EMERGENCY] Returning failed_producer to prevent fork: {}", failed_producer);
+                    return failed_producer.to_string();
+                }
                 
                 for (node_id, reputation) in qualified {
                     // Exclude the CORRECT producer (not the stale failed_producer)
@@ -11586,13 +11604,35 @@ if is_info() { println!("[INFO][SYNC] recovered node={} lag={}", node_id_for_syn
                         Ok(_) => {
                             if is_info() { println!("[INFO][PFP] created mb={} type={}", expected_macroblock, finalization_type); }
                             
-                            // Broadcast to network so others can sync
-                            let _ = p2p_finalize.broadcast_emergency_producer_change(
-                                "pfp_leader",
-                                &pfp_leader,
-                                current_height,
-                                "macroblock"
-                            );
+                            // CRITICAL FIX v2.44: Broadcast MacroBlock data (not just notification!)
+                            // Previous code only sent notification, not actual data → nodes couldn't sync
+                            if let Ok(Some(mb_data)) = storage_finalize.get_macroblock_by_height(expected_macroblock) {
+                                // Compress for efficient transmission
+                                let compressed_data = zstd::encode_all(&mb_data[..], 3)
+                                    .unwrap_or_else(|_| mb_data.clone());
+                                
+                                if is_info() { 
+                                    println!("[INFO][PFP] broadcast mb={} bytes={}", 
+                                             expected_macroblock, compressed_data.len()); 
+                                }
+                                
+                                match p2p_finalize.broadcast_macroblock(
+                                    expected_macroblock, 
+                                    compressed_data, 
+                                    expected_macroblock // epoch = macroblock index
+                                ).await {
+                                    Ok(_) => {
+                                        if is_info() { 
+                                            println!("[INFO][PFP] broadcast_complete mb={}", expected_macroblock); 
+                                        }
+                                    }
+                                    Err(e) => {
+                                        println!("[WARN][PFP] broadcast_failed mb={} err={}", expected_macroblock, e);
+                                    }
+                                }
+                            } else {
+                                println!("[ERR][PFP] broadcast_failed mb={} reason=not_found_after_save", expected_macroblock);
+                            }
                         }
                         Err(e) => {
                             println!("[ERR][PFP] create_failed mb={} err={}", expected_macroblock, e);
